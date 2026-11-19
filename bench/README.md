@@ -613,11 +613,15 @@ section table with a decision and a reason.
 | `run_command` | `shell` |
 | `run` | `shell` |
 | `read_file` | `read` |
+| `read_files` | `read` |
 | `write_file` | `write` |
 | `edit_file` | `edit` |
 | `apply_patch` | `edit` |
 
-**Tools OpenCode has no counterpart for** (`prepare_workspace`, `run_checks`, `ask_user`, `commit_and_push`, `open_pull_request`, `share_file`, `start_scratch`, `request_repository`, `read_files`): the sentence that uses each is rewritten to a fixed neutral sentence or dropped, as listed next. In this benchmark the repository is already checked out, nobody answers a question, and the harness collects the working tree, so there is no pull request.
+`read_files` (1 to 16 files in one call, #184; the pin's text names it since `3f668c3`): OpenCode's `read` reads one file, so it is
+renamed like `read_file`.
+
+**Tools OpenCode has no counterpart for** (`prepare_workspace`, `run_checks`, `ask_user`, `commit_and_push`, `open_pull_request`, `share_file`, `start_scratch`, `request_repository`): the sentence that uses each is rewritten to a fixed neutral sentence or dropped, as listed next. In this benchmark the repository is already checked out, nobody answers a question, and the harness collects the working tree, so there is no pull request.
 
 | Where | Change | adam's words | OpenCode's words |
 |---|---|---|---|
@@ -629,7 +633,7 @@ section table with a decision and a reason.
 | how-4-commit | rewritten | Commit, push and open the pull request only at the end: you do that. | Leave your changes in the working tree: the harness collects them, so do not commit or push. |
 | how-5-run-checks | rewritten | Run the discovered checks with `run_checks` (only those) | Run the repository's discovered checks with `shell` (only those) |
 | how-5-pr-allowed | rewritten | a pull request is only allowed for exactly the code the checks passed on. | a change is only as good as the code the checks passed on. |
-| how-5-screenshot | dropped | To show a web page you changed, screenshot it with `obscura` (see "The work environment"), `share_file` it, and delete it before you commit. (in a later revision: To show a web page you changed, screenshot it with `obscura`, share it, and delete it before you commit.) | (nothing) |
+| how-5-screenshot | dropped | To show a web page you changed, screenshot it with `obscura` (see "The work environment"), `share_file` it, and delete it before you commit. (in a later revision, preceded by: A call that must follow another sets `after_previous: true`; calls that conflict keep their order automatically, so batching cannot reorder them. To show a web page you changed, screenshot it with `obscura`, share it, and delete it before you commit.) | (nothing) |
 | how-6-scratch-cycles | rewritten | , and {{scratch_check_cycles}} times in a scratch project (counted apart; a cycle is one failed `run_checks`) | (a cycle is one failed run of the checks) |
 | how-6-no-tools-again | rewritten | do not call `run_checks`, `commit_and_push` or `open_pull_request` again. | do not run the checks again. |
 | how-6-pre-existing | rewritten | A failure the tool calls PRE-EXISTING (the command fails on the base branch too) is not yours and costs no cycle: add no error to it and go on. The pull request is allowed and says so. | A failure that is the same on the base branch (PRE-EXISTING) is not yours and costs no cycle: add no error to it and go on, and say so in your final answer. |

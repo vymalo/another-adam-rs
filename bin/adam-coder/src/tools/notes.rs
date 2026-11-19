@@ -27,7 +27,8 @@ use super::checks::ChecksReport;
 pub struct CheckRecord {
     /// The tool call that ran it.
     pub call_id: String,
-    /// The command.
+    /// The command as the redactor showed it, for people and the model: two commands that differ
+    /// only in a secret read the same here. [`command_sha`](Self::command_sha) is their identity.
     pub command: String,
     /// Exit code 0 and no timeout.
     pub passed: bool,
@@ -36,9 +37,17 @@ pub struct CheckRecord {
     /// The output tail the model saw (the "findings" of a failed run).
     pub tail: String,
     /// The tree id of the code the command ran on (see
-    /// `gitcli::working_tree_id`); `None` if it could not be determined.
+    /// `gitcli::working_tree_id`); `None` if it could not be determined. It is the tree the command
+    /// **left** (a check may write a file): what a pull request on this code contains, and what the
+    /// gate binds the report to.
     #[serde(default)]
     pub tree: Option<String>,
+    /// The tree id of the code the command **started** on, before it ran: a failed record is reused
+    /// only for a command about to start on exactly that code. A check that writes a file leaves
+    /// [`tree`](Self::tree) different from this one, and the next run would start on another input,
+    /// so the two are kept apart. Absent in notes written before it existed, and then never reused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_tree: Option<String>,
     /// The directory the command ran in, relative to the worktree (`""` for its root): the same
     /// command in another directory is another check. Absent (empty) in notes written before it
     /// existed.
@@ -50,6 +59,16 @@ pub struct CheckRecord {
     /// never reused.
     #[serde(default = "legacy_epoch")]
     pub epoch: u64,
+    /// The timeout the command ran with, in seconds: a command killed after 1 s says nothing about
+    /// the same command given 900 s, so a longer timeout is another check. `0` in notes written
+    /// before the field existed; no live timeout is 0, so such a record is never reused.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub timeout_secs: u64,
+    /// The SHA-256 of the **raw** command, which the redactor may have changed in
+    /// [`command`](Self::command): two commands that differ only in a secret are two checks.
+    /// Absent (empty) in notes written before it existed, and then never reused.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command_sha: String,
     /// What the run reported as its `checks` artifact, so `commit_and_push` can bind it to the
     /// commit it makes when the tree is the same.
     #[serde(default)]
@@ -144,8 +163,9 @@ pub struct ChecksNotes {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub base: Vec<BaseResult>,
     /// How many times files a check reads may have changed without the tree id changing: bumped by
-    /// `run` (which keeps files, ignored ones included) and by `rebuild_environment`. A failed
-    /// record is reused only while this is the epoch it ran at
+    /// `run` (which keeps files, ignored ones included), by the file tools (`write_file`,
+    /// `edit_file`, `apply_patch`: a file the project ignores does not change the tree) and by
+    /// `rebuild_environment`. A failed record is reused only while this is the epoch it ran at
     /// ([`RunNotes::failed_check_on`]).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub epoch: u64,
@@ -157,6 +177,29 @@ fn is_zero(n: &u32) -> bool {
 
 fn is_zero_u64(n: &u64) -> bool {
     *n == 0
+}
+
+/// What makes two `run_checks` calls the same check on the same code: the command (by the SHA-256
+/// of its raw text, so that two commands that differ only in a secret are two checks), the
+/// directory, the slot, the timeout, the tree the command is about to run on, the epoch (see
+/// [`ChecksNotes::epoch`]) and whether the command runs in a scratch project. Two calls with the
+/// same key would do the same thing to the same code, in the same environment.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckKey<'a> {
+    /// The tree id of the code the command is about to run on.
+    pub tree: &'a str,
+    /// The SHA-256 of the command's raw text (see [`CheckRecord::command_sha`]).
+    pub command_sha: &'a str,
+    /// The directory the command runs in, relative to the worktree (`""` for its root).
+    pub cwd: &'a str,
+    /// The slot the command runs in (its directory name).
+    pub slot: &'a str,
+    /// The run's check epoch.
+    pub epoch: u64,
+    /// The timeout the command runs with, in seconds.
+    pub timeout_secs: u64,
+    /// The command runs in a scratch project, not in a repository's worktree.
+    pub scratch: bool,
 }
 
 /// The pull request the run opened.
@@ -658,25 +701,22 @@ impl RunNotes {
             .is_some_and(|record| record.passed)
     }
 
-    /// The most recent **failed** run of `command` in `cwd` and `slot` on exactly the code with tree
-    /// id `tree`, made while the run's files and environment were at `epoch`
-    /// ([`ChecksNotes::epoch`]): what `run_checks` answers with instead of running the command
-    /// again, since the code, the command and everything a check reads are as they were.
+    /// The most recent **failed** run of the check `key` describes on exactly the code it names,
+    /// made while the run's files and environment were at its epoch: what `run_checks` answers with
+    /// instead of running the command again, since the code, the command and everything a check
+    /// reads are as they were.
+    ///
+    /// `key.tree` is the code the command is **about to start** on: a check may have written a file
+    /// when it failed, and a run starting on the code it left is another input
+    /// ([`CheckRecord::start_tree`]).
     ///
     /// A passing run is never reused (the model may be confirming it, and the environment may have
     /// changed under it), and neither is a pre-existing failure: it spends no cycle already, and the
     /// model is told the failure is the repository's, so it is run again and answered as such. The
     /// most recent run of the check on the tree decides: a pass after a failure means the command
-    /// runs again, not that the older failure is the answer. Records written before this one existed
-    /// have no `cwd` or `epoch`, and are not reused.
-    pub fn failed_check_on(
-        &self,
-        tree: &str,
-        command: &str,
-        cwd: &str,
-        slot: &str,
-        epoch: u64,
-    ) -> Option<&CheckRecord> {
+    /// runs again, not that the older failure is the answer. Records written before `cwd`, `epoch`,
+    /// `timeout_secs` or `command_sha` existed have none of them, and are not reused.
+    pub fn failed_check_on(&self, key: &CheckKey<'_>) -> Option<&CheckRecord> {
         // The most recent run of this check on this tree decides: a pass after a failure means the
         // command must run again, not that the older failure is the answer.
         self.checks
@@ -684,12 +724,18 @@ impl RunNotes {
             .iter()
             .rev()
             .find(|record| {
-                record.tree.as_deref() == Some(tree)
-                    && record.command == command
-                    && record.cwd == cwd
-                    && record.slot.as_deref() == Some(slot)
+                record.start_tree.as_deref() == Some(key.tree)
+                    && record.command_sha == key.command_sha
+                    && record.cwd == key.cwd
+                    && record.slot.as_deref() == Some(key.slot)
+                    && record.scratch == key.scratch
             })
-            .filter(|record| !record.passed && !record.preexisting && record.epoch == epoch)
+            .filter(|record| {
+                !record.passed
+                    && !record.preexisting
+                    && record.epoch == key.epoch
+                    && record.timeout_secs == key.timeout_secs
+            })
     }
 
     /// Remember the repositories `keys` names; returns whether anything was new.
@@ -1255,8 +1301,11 @@ mod tests {
             exit_code: Some(i32::from(!passed)),
             tail: "out".into(),
             tree: Some("t1".into()),
+            start_tree: Some("t1".into()),
             cwd: String::new(),
             epoch: 0,
+            timeout_secs: 900,
+            command_sha: "sha-cargo-test".into(),
             report: None,
             slot: None,
             scratch: false,
@@ -1381,45 +1430,121 @@ mod tests {
         assert_eq!(notes.checks.failures, 2, "cumulative");
     }
 
-    /// The reuse is exact: the tree, the command, the directory, the slot and the epoch all have to
-    /// be the record's, and the most recent run of the check decides (a pass, a pre-existing
-    /// failure or a moved epoch is not reused).
+    /// The reuse is exact: the tree, the raw command, the directory, the slot, the timeout, the kind
+    /// of work and the epoch all have to be the record's, and the most recent run of the check
+    /// decides (a pass, a pre-existing failure or a moved epoch is not reused).
     #[test]
-    fn a_failed_record_is_reused_only_for_its_tree_command_directory_slot_and_epoch() {
+    fn a_failed_record_is_reused_only_for_its_tree_command_directory_slot_timeout_and_epoch() {
         let mut notes = RunNotes::default();
         let mut red = record("c1", false);
         red.tree = Some("t1".into());
         red.cwd = "web".into();
         red.slot = Some("app".into());
         red.epoch = 4;
-        notes.record_check(red);
+        red.timeout_secs = 900;
+        notes.record_check(red.clone());
 
-        fn find<'a>(
-            notes: &'a RunNotes,
-            tree: &str,
-            command: &str,
-            cwd: &str,
-            slot: &str,
-            epoch: u64,
-        ) -> Option<&'a str> {
-            notes
-                .failed_check_on(tree, command, cwd, slot, epoch)
-                .map(|r| r.call_id.as_str())
+        fn key<'a>(tree: &'a str, epoch: u64) -> CheckKey<'a> {
+            CheckKey {
+                tree,
+                command_sha: "sha-cargo-test",
+                cwd: "web",
+                slot: "app",
+                epoch,
+                timeout_secs: 900,
+                scratch: false,
+            }
         }
+        fn find<'a>(notes: &'a RunNotes, key: &CheckKey<'_>) -> Option<&'a str> {
+            notes.failed_check_on(key).map(|r| r.call_id.as_str())
+        }
+        assert_eq!(find(&notes, &key("t1", 4)), Some("c1"));
+        assert_eq!(find(&notes, &key("t2", 4)), None);
         assert_eq!(
-            find(&notes, "t1", "cargo test", "web", "app", 4),
-            Some("c1")
+            find(
+                &notes,
+                &CheckKey {
+                    command_sha: "sha-cargo-build",
+                    ..key("t1", 4)
+                }
+            ),
+            None,
+            "another command (the raw text's SHA-256)"
         );
-        assert_eq!(find(&notes, "t2", "cargo test", "web", "app", 4), None);
-        assert_eq!(find(&notes, "t1", "cargo build", "web", "app", 4), None);
-        assert_eq!(find(&notes, "t1", "cargo test", "", "app", 4), None);
-        assert_eq!(find(&notes, "t1", "cargo test", "web", "other", 4), None);
         assert_eq!(
-            find(&notes, "t1", "cargo test", "web", "app", 5),
+            find(
+                &notes,
+                &CheckKey {
+                    cwd: "",
+                    ..key("t1", 4)
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            find(
+                &notes,
+                &CheckKey {
+                    slot: "other",
+                    ..key("t1", 4)
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            find(
+                &notes,
+                &CheckKey {
+                    epoch: 5,
+                    ..key("t1", 4)
+                }
+            ),
             None,
             "the epoch moved"
         );
+        assert_eq!(
+            find(
+                &notes,
+                &CheckKey {
+                    timeout_secs: 60,
+                    ..key("t1", 4)
+                }
+            ),
+            None,
+            "another timeout: a 60 s kill says nothing about a 900 s run"
+        );
+        assert_eq!(
+            find(
+                &notes,
+                &CheckKey {
+                    scratch: true,
+                    ..key("t1", 4)
+                }
+            ),
+            None,
+            "a scratch project is not a repository"
+        );
+        // A record with no tree id is not reused for a tree.
+        let mut headless = record("c0", false);
+        headless.tree = None;
+        headless.start_tree = None;
+        headless.cwd = "web".into();
+        headless.slot = Some("app".into());
+        headless.epoch = 4;
+        notes.record_check(headless);
+        assert_eq!(find(&notes, &key("t1", 4)), Some("c1"), "the tree decides");
+        let mut notes = RunNotes::default();
+        let mut headless = record("c0", false);
+        headless.tree = None;
+        headless.start_tree = None;
+        headless.cwd = "web".into();
+        headless.slot = Some("app".into());
+        headless.epoch = 4;
+        notes.record_check(headless);
+        assert_eq!(find(&notes, &key("t1", 4)), None);
 
+        let mut notes = RunNotes::default();
+        notes.record_check(red.clone());
         // A pass after the failure is the latest run of the check: it is not reused, and the older
         // failure does not stand in for it.
         let mut green = record("c2", true);
@@ -1428,7 +1553,7 @@ mod tests {
         green.slot = Some("app".into());
         green.epoch = 4;
         notes.record_check(green);
-        assert_eq!(find(&notes, "t1", "cargo test", "web", "app", 4), None);
+        assert_eq!(find(&notes, &key("t1", 4)), None);
 
         // Nor is a pre-existing failure.
         let mut old = record("c3", false);
@@ -1438,10 +1563,10 @@ mod tests {
         old.epoch = 4;
         old.preexisting = true;
         notes.record_check(old);
-        assert_eq!(find(&notes, "t1", "cargo test", "web", "app", 4), None);
+        assert_eq!(find(&notes, &key("t1", 4)), None);
 
-        // A record written before the epoch existed loads with `LEGACY_EPOCH`, which no live epoch
-        // has: it is not reused, even on a run that has not moved its epoch yet.
+        // A record written before the epoch, the timeout and the raw command existed loads with
+        // `LEGACY_EPOCH`, `0` and `""`, none of which a live call has: it is not reused.
         let legacy: CheckRecord = serde_json::from_value(serde_json::json!({
             "call_id": "old",
             "command": "cargo test",
@@ -1454,9 +1579,11 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.epoch, LEGACY_EPOCH);
+        assert_eq!(legacy.timeout_secs, 0);
+        assert!(legacy.command_sha.is_empty());
         let mut notes = RunNotes::default();
         notes.record_check(legacy);
-        assert_eq!(find(&notes, "t1", "cargo test", "web", "app", 0), None);
+        assert_eq!(find(&notes, &key("t1", 0)), None);
     }
 
     fn scratch(call: &str, passed: bool) -> CheckRecord {

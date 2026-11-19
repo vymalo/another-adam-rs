@@ -16,13 +16,14 @@ export const NAMES = Object.freeze({
   run_command: 'shell',
   run: 'shell',
   read_file: 'read',
+  read_files: 'read', // one call for 1 to 16 files (since #184, in the pin's text at 3f668c3); OpenCode's `read` reads one file per call
   write_file: 'write',
   edit_file: 'edit',
   apply_patch: 'edit', // 2.3.0 has no `patch`: `edit` is its only edit tool
 });
 
 /** adam tools OpenCode has no counterpart for: each is handled by a span below. */
-export const NO_COUNTERPART = Object.freeze(['prepare_workspace', 'run_checks', 'ask_user', 'commit_and_push', 'open_pull_request', 'share_file', 'start_scratch', 'request_repository', 'read_files']);
+export const NO_COUNTERPART = Object.freeze(['prepare_workspace', 'run_checks', 'ask_user', 'commit_and_push', 'open_pull_request', 'share_file', 'start_scratch', 'request_repository']);
 
 const NOBODY = 'Nobody can answer questions in this run';
 
@@ -40,7 +41,10 @@ export const SPANS = Object.freeze([
   { id: 'how-4-file-tools', kind: 'rewrite', find: '`read_file`, `write_file`, `edit_file` and `apply_patch`', to: '`read`, `write` and `edit`' },
   { id: 'how-5-run-checks', kind: 'rewrite', find: 'Run the discovered checks with `run_checks` (only those)', to: "Run the repository's discovered checks with `shell` (only those)" },
   { id: 'how-5-pr-allowed', kind: 'rewrite', find: 'a pull\n   request is only allowed for exactly the code the checks passed on.', to: 'a change is\n   only as good as the code the checks passed on.' },
-  { id: 'how-5-screenshot', kind: 'drop', find: ['\n   To show a web page you changed, screenshot it with `obscura` (see "The work environment"),\n   `share_file` it, and delete it before you commit.', '\n   To show a web page you changed, screenshot it with `obscura`, share it, and delete it before\n   you commit.'], to: '' },
+  // The sentence about `after_previous` is adam's own argument (ADR 0049), and OpenCode keeps no order between a read and a write of one
+  // file: the spelling that carries it is dropped with the screenshot sentence. It is listed first, because it contains the last spelling
+  // as a suffix, and the first spelling found exactly once is the one used.
+  { id: 'how-5-screenshot', kind: 'drop', find: ['\n   A call that must follow another sets `after_previous: true`; calls that conflict\n   keep their order automatically, so batching cannot reorder them.\n   To show a web page you changed, screenshot it with `obscura`, share it, and delete it before\n   you commit.', '\n   To show a web page you changed, screenshot it with `obscura` (see "The work environment"),\n   `share_file` it, and delete it before you commit.', '\n   To show a web page you changed, screenshot it with `obscura`, share it, and delete it before\n   you commit.'], to: '' },
   { id: 'how-6-scratch-cycles', kind: 'rewrite', find: ', and {{scratch_check_cycles}} times in a scratch project (counted apart; a\n   cycle is one failed `run_checks`)', to: ' (a cycle is one\n   failed run of the checks)' },
   { id: 'how-6-no-tools-again', kind: 'rewrite', find: 'do not call `run_checks`, `commit_and_push` or\n   `open_pull_request` again.', to: 'do not run the checks again.' },
   { id: 'how-6-pre-existing', kind: 'rewrite', find: 'A failure the tool calls PRE-EXISTING (the command fails on the base branch too)\n   is not yours and costs no cycle: add no error to it and go on. The pull request\n   is allowed and says so.', to: 'A failure that is the same on the base branch (PRE-EXISTING) is not yours and\n   costs no cycle: add no error to it and go on, and say so in your final answer.' },
