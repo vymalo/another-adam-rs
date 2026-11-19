@@ -852,7 +852,7 @@ other). The `split` front and a control plane run none and get none.
   while the cache is on.
 * Installed binaries (`cargo install`) stay private in the home. Nothing prunes the volume: size it, and clean it
   (`pnpm store prune`, `npm cache verify`) if it fills.
-* The image must have the caches under `/cache`: `image.tag` and `runPods.image` are on `1.98.1-e6a528f` or later of the
+* The image must have the caches under `/cache`: `image.tag` and `runPods.image` are on `1.98.1-8c297d3` or later of the
   workspace image. An older image mounts a volume no tool uses.
 
 Checked by `tests/render-check.sh` (the claim and the mounts, the policy, the refusals; the render with run pods is

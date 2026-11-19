@@ -1063,7 +1063,7 @@ check "template: its own name label, not the coder's (the StatefulSet and its Ne
   tpl '^    app.kubernetes.io/name: coder-run$'
 check "template: the run container is named run" tpl '^    - name: run$'
 check "template: the workspace image by tag AND digest" \
-  tpl 'image: "ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-e6a528f@sha256:d2aae762ecad2c13bb697332507d236a75d8233d061f38cc97dc9227192b0797"'
+  tpl 'image: "ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-8c297d3@sha256:b465808bfb8a1baae5e59a429bf292726b021e3b37322f759dbda3ee2c57ed67"'
 check "template: the memory limit is 2Gi" tpl '^        limits:$'
 check "template: memory: 2Gi" tpl '^          memory: 2Gi$'
 check "template: requests 250m and 512Mi" tpl '^          cpu: 250m$'
@@ -1334,7 +1334,7 @@ check "policy: only CREATE of pods" rhas ValidatingAdmissionPolicy "$pn" 'operat
 check "policy: refuses a pod without the run label and the managed-by label" policy_has "$pn" "'adam.vymalo.com/run' in object.metadata.labels"
 check "policy: ... or without the priority class" policy_has "$pn" "object.spec.priorityClassName == 'coder-run'"
 check "policy: ... or with another image (the run image by digest and the coder's)" \
-  policy_has "$pn" "c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-e6a528f@sha256:d2aae762ecad2c13bb697332507d236a75d8233d061f38cc97dc9227192b0797', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234']"
+  policy_has "$pn" "c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-8c297d3@sha256:b465808bfb8a1baae5e59a429bf292726b021e3b37322f759dbda3ee2c57ed67', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234']"
 check "policy: ... or a hostPath: only emptyDir and the work claim" \
   policy_has "$pn" "has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'work-coder-0'))"
 check "policy: ... or a Secret as a volume (a run pod mounts no Secret at all)" \
