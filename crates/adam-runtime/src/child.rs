@@ -120,7 +120,11 @@ impl std::fmt::Debug for ChildStarter {
 
 impl ChildStarter {
     pub(crate) fn new(runtime: Runtime, parent: RunId, conversation: Option<&str>) -> Self {
-        let conversation = conversation.map_or_else(|| format!("run:{parent}"), str::to_owned);
+        // A timer run of a session speaks for the conversation it was made unique from.
+        let conversation = conversation.map_or_else(
+            || format!("run:{parent}"),
+            |c| crate::session::parse_timer_conversation_id(c).unwrap_or_else(|| c.to_owned()),
+        );
         Self {
             runtime,
             parent,
@@ -214,10 +218,12 @@ impl ChildStarter {
 
     /// Start a run of `agent` as a child of [`parent`](Self::parent) under `id`, in the conversation
     /// the sessions of this run belong to, from a round of one of them: the round's conversation is
-    /// the session's, and the new run's is its parent's. A timer run that is parked until the
-    /// session may have expired starts here, and reads the session with [`session`](Self::session)
-    /// when it wakes (its own [`Ctx::child_starter`](crate::Ctx::child_starter) then speaks for that
-    /// conversation). Idempotent, as [`Runtime::start_child`].
+    /// the session's, and the new run's is its parent's, made unique by its id: a conversation holds
+    /// one open run per agent, and a timer that is parked until the session may have expired must
+    /// not keep the timer of another round or session from being set. A timer run reads the
+    /// session with [`session`](Self::session) when it wakes (its own
+    /// [`Ctx::child_starter`](crate::Ctx::child_starter) speaks for the parent conversation).
+    /// Idempotent, as [`Runtime::start_child`].
     ///
     /// # Errors
     ///
@@ -235,8 +241,9 @@ impl ChildStarter {
                 reason: "this run is not a round of a session".into(),
             });
         };
+        let conversation = crate::session::timer_conversation_id(&parent, id);
         self.runtime
-            .start_child_in(self.parent, id, agent, input, &parent)
+            .start_child_in(self.parent, id, agent, input, &conversation)
             .await
     }
 

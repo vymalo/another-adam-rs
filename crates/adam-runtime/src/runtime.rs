@@ -958,7 +958,8 @@ impl Runtime {
 
     /// [`start_child`](Self::start_child) for a child that lives in `conversation_id`, which is not
     /// a session's: a timer run of a session ([`ChildStarter::start_in_parent_conversation`]) sits
-    /// in the conversation its session belongs to, so that it can read the session later.
+    /// in a conversation made from the one its session belongs to, so that it can read the session
+    /// later and is not in the way of another timer.
     pub async fn start_child_in(
         &self,
         parent: RunId,
