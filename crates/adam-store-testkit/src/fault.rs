@@ -34,7 +34,7 @@ use adam_core::{
     RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError, StoreResult,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 
 /// A [`Store`] method a fault can target. `migrate` is not injectable: a
 /// store that cannot migrate never gets as far as running anything.
@@ -352,7 +352,7 @@ impl Store for FaultyStore {
         worker: &str,
         scope: ClaimScope,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>> {
@@ -375,7 +375,7 @@ impl Store for FaultyStore {
         &self,
         id: RunId,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
     ) -> StoreResult<bool> {
         self.run(
@@ -395,7 +395,7 @@ impl Store for FaultyStore {
         .await
     }
 
-    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         self.run(Method::LeaseUntil, Some(id), self.inner.lease_until(id))
             .await
     }
@@ -434,7 +434,7 @@ impl Store for FaultyStore {
         &self,
         agents: &[String],
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<PushRecord>> {
@@ -461,7 +461,7 @@ impl Store for FaultyStore {
         .await
     }
 
-    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64> {
         self.run(
             Method::PurgeFinished,
             None,

@@ -42,6 +42,13 @@ index. No transaction is held open while agent code runs. `JSONB` cannot hold
 the same value in every backend ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
 The guarantee table is in the [store adapters reference](../../docs/reference/store-adapters.md#how-each-adapter-keeps-the-contract).
 
+Time columns (`wake_at`, `sched_at`, `lease_until`, `created_at`, `updated_at`, `recorded_at` and
+the push scheduling fields) are `TIMESTAMPTZ`. sqlx 0.9 has no jiff support, so the adapter maps
+`adam_core::time::Timestamp` through a private `PgTime` that encodes and decodes as sqlx's
+`chrono::DateTime<Utc>`: the column type and the bytes on the wire are unchanged
+([ADR 0053](../../docs/decisions/0053-time-is-jiff-with-the-bytes-chrono-wrote.md)). `chrono` is
+a dependency of this crate only, for that bridge.
+
 ## Schema version 3: the push table
 
 `migrate()` also creates the index `ListTasks` reads runs by (`<prefix>runs_list`: `(agent, conversation_id COLLATE "C", updated_at DESC, id DESC)`; a conversation prefix is a range over it plus an exact `starts_with`). It creates `<prefix>push` and its index **before** the statements that lock `runs`

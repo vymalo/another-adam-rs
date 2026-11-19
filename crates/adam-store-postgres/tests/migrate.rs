@@ -5,11 +5,23 @@
 use std::time::Duration;
 
 use adam_core::store::now;
+use adam_core::time::Timestamp;
 use adam_core::{ClaimScope, RunStatus, RunUpdate, Store};
 use adam_store_postgres::{PgStore, SCHEMA_VERSION};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool};
+
+/// A [`Timestamp`] as the driver type a raw statement binds (the store's own `PgTime` is private).
+fn chrono_of(at: Timestamp) -> chrono::DateTime<chrono::Utc> {
+    let (second, nanosecond) = (at.as_second(), at.subsec_nanosecond());
+    let (second, nanosecond) = if nanosecond < 0 {
+        (second - 1, (nanosecond + 1_000_000_000) as u32)
+    } else {
+        (second, nanosecond as u32)
+    };
+    chrono::DateTime::from_timestamp(second, nanosecond).expect("in range")
+}
 
 /// The tables exactly as schema version 1 made them: no `owner` column, version row `1`.
 async fn create_v1_schema(pool: &PgPool, p: &str) {
@@ -99,14 +111,14 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
 
     // A run a version 1 process left behind, with a lease that has long expired.
     let id = uuid::Uuid::now_v7();
-    let old = now() - chrono::Duration::hours(1);
+    let old = now() - jiff::SignedDuration::from_hours(1);
     sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO {p}runs (id, agent, status, state, sched_at, version, lease_owner, lease_until,
                               created_at, updated_at)
          VALUES ($1, 'legacy', 'runnable', '{{\"turn\": 3}}', $2, 7, 'dead-worker', $2, $2, $2)"
     )))
     .bind(id)
-    .bind(old)
+    .bind(chrono_of(old))
     .execute(&pool)
     .await
     .unwrap();
@@ -145,7 +157,7 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
         let (store, agents) = (store.clone(), agents.clone());
         async move {
             // A commit makes a run due at the time of the commit, so look a moment ahead.
-            let at = now() + chrono::Duration::seconds(1);
+            let at = now() + jiff::SignedDuration::from_secs(1);
             store
                 .claim_due(&agents, worker, scope, &[], at, ttl, 10)
                 .await

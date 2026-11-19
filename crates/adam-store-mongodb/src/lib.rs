@@ -47,6 +47,7 @@ use std::time::Duration;
 use adam_core::store::{
     add_ttl, now, open_conversation_key, sched_at, storable, storable_owned, truncate_ms,
 };
+use adam_core::time::Timestamp;
 use adam_core::{
     ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
     PushRecord, PushState, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreError,
@@ -54,7 +55,6 @@ use adam_core::{
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
 use futures::TryStreamExt;
 use mongodb::bson::{self, Bson, Document, doc};
 use mongodb::error::{ErrorKind, WriteFailure};
@@ -196,11 +196,11 @@ fn uuid(id: RunId) -> Bson {
     Bson::from(bson::Uuid::from_bytes(id.0.into_bytes()))
 }
 
-fn date(t: DateTime<Utc>) -> Bson {
-    Bson::DateTime(bson::DateTime::from_millis(t.timestamp_millis()))
+fn date(t: Timestamp) -> Bson {
+    Bson::DateTime(bson::DateTime::from_millis(t.as_millisecond()))
 }
 
-fn opt_date(t: Option<DateTime<Utc>>) -> Bson {
+fn opt_date(t: Option<Timestamp>) -> Bson {
     t.map(date).unwrap_or(Bson::Null)
 }
 
@@ -299,14 +299,12 @@ fn get_uuid(d: &Document, field: &str) -> StoreResult<Option<RunId>> {
     }
 }
 
-fn get_date(d: &Document, field: &str) -> StoreResult<Option<DateTime<Utc>>> {
+fn get_date(d: &Document, field: &str) -> StoreResult<Option<Timestamp>> {
     match d.get(field) {
         None | Some(Bson::Null) => Ok(None),
-        Some(Bson::DateTime(t)) => Utc
-            .timestamp_millis_opt(t.timestamp_millis())
-            .single()
+        Some(Bson::DateTime(t)) => Timestamp::from_millisecond(t.timestamp_millis())
             .map(Some)
-            .ok_or_else(|| bad(field)),
+            .map_err(|_| bad(field)),
         Some(_) => Err(bad(field)),
     }
 }
@@ -725,7 +723,7 @@ impl Store for MongoStore {
         worker: &str,
         scope: ClaimScope,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>> {
@@ -822,7 +820,7 @@ impl Store for MongoStore {
         &self,
         id: RunId,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
     ) -> StoreResult<bool> {
         let now = truncate_ms(now);
@@ -848,7 +846,7 @@ impl Store for MongoStore {
         Ok(())
     }
 
-    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         let found = self
             .runs
             .find_one(doc! { "_id": uuid(id) })
@@ -987,7 +985,7 @@ impl Store for MongoStore {
         &self,
         agents: &[String],
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<PushRecord>> {
@@ -1069,11 +1067,13 @@ impl Store for MongoStore {
         }
     }
 
-    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64> {
         // `updated_at < before` at millisecond precision, rounding `before` up so
-        // a sub-millisecond cutoff selects the same runs as in the other stores.
-        let mut cutoff = before.timestamp_millis();
-        if !before.timestamp_subsec_nanos().is_multiple_of(1_000_000) {
+        // a sub-millisecond cutoff selects the same runs as in the other stores. As in
+        // `truncate_ms`, a cutoff before 1970 with a fractional millisecond rounds the other
+        // way; nothing adam-rs stores is written before 1970.
+        let mut cutoff = before.as_millisecond();
+        if before.subsec_nanosecond() % 1_000_000 != 0 {
             cutoff += 1;
         }
         let finished = doc! {

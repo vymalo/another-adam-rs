@@ -40,8 +40,8 @@ async fn a_document_without_an_owner_field_is_unowned() {
     let agent = adam_store_testkit::agent();
     let id = RunId::new();
     let t = now();
-    let date = |at: chrono::DateTime<chrono::Utc>| {
-        Bson::DateTime(mongodb::bson::DateTime::from_millis(at.timestamp_millis()))
+    let date = |at: adam_core::time::Timestamp| {
+        Bson::DateTime(mongodb::bson::DateTime::from_millis(at.as_millisecond()))
     };
     // Exactly the fields version 1 wrote: no `owner`.
     let legacy = doc! {
@@ -70,7 +70,7 @@ async fn a_document_without_an_owner_field_is_unowned() {
 
     let agents = [agent.clone()];
     let ttl = Duration::from_secs(30);
-    let at = t + chrono::Duration::seconds(1);
+    let at = t + jiff::SignedDuration::from_secs(1);
     let first = store
         .claim_due(&agents, "w1", ClaimScope::Pinned, &[], at, ttl, 10)
         .await

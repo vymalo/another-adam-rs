@@ -32,7 +32,7 @@ use adam_core::{
     ClaimScope, ConversationScope, DynStore, JournalEntry, NewPushConfig, NewRun, PushProgress,
     PushState, RunId, RunQuery, RunStatus, RunUpdate, StoreError,
 };
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 use futures::future::join_all;
 use serde_json::json;
 
@@ -45,7 +45,8 @@ use serde_json::json;
 macro_rules! store_conformance {
     ($make:path) => {
         $crate::store_conformance!(@cases $make;
-            create_and_load, state_roundtrip, nul_characters_are_stored_as_the_replacement_character,
+            create_and_load, timestamps_keep_millisecond_precision, state_roundtrip,
+            nul_characters_are_stored_as_the_replacement_character,
             create_duplicate_id, load_missing,
             commit_advances_version, commit_stale_version_conflicts, commit_missing_run,
             concurrent_commits_single_winner, journal_roundtrip_and_order,
@@ -101,7 +102,7 @@ pub mod cases {
             .create_run(NewRun::new(&agent, json!({})))
             .await
             .unwrap();
-        let wake = now() + chrono::Duration::minutes(5);
+        let wake = now() + jiff::SignedDuration::from_mins(5);
         let new = NewRun::new(&agent, json!({"turn": 0}))
             .conversation("conv-1")
             .parent(parent.id)
@@ -116,7 +117,7 @@ pub mod cases {
         assert_eq!(created.status, RunStatus::Parked);
         assert_eq!(created.wake_at, Some(truncate_ms(wake)));
         assert_eq!(created.version, 1);
-        assert!(created.created_at >= before - chrono::Duration::seconds(5));
+        assert!(created.created_at >= before - jiff::SignedDuration::from_secs(5));
         assert_eq!(created.created_at, created.updated_at);
 
         let loaded = store
@@ -125,6 +126,52 @@ pub mod cases {
             .unwrap()
             .expect("run exists");
         assert_eq!(loaded, created);
+    }
+
+    /// The instant `.120` survives the column (a value whose serde bytes jiff's own serde would
+    /// trim to `.12`), and anything finer than a millisecond truncates rather than rounds.
+    pub async fn timestamps_keep_millisecond_precision(store: DynStore) {
+        let agent = agent();
+        let at: Timestamp = "2026-01-02T03:04:05.120Z".parse().unwrap();
+        let run = store
+            .create_run(
+                NewRun::new(&agent, json!({}))
+                    .status(RunStatus::Parked)
+                    .wake_at(at),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.wake_at, Some(at));
+        assert_eq!(
+            store.load_run(run.id).await.unwrap().unwrap().wake_at,
+            Some(at)
+        );
+        let committed = store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Parked, json!({})).wake_at(at),
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed.wake_at, Some(at));
+
+        let finer: Timestamp = "2026-01-02T03:04:05.120500000Z".parse().unwrap();
+        let rounded = store
+            .commit_run(
+                run.id,
+                committed.version,
+                RunUpdate::new(RunStatus::Parked, json!({})).wake_at(finer),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rounded.wake_at, Some(at), "truncated, never rounded up");
+
+        let entry = store
+            .journal_put(run.id, JournalEntry::ok(0, "s", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(entry.recorded_at, truncate_ms(entry.recorded_at));
     }
 
     pub async fn state_roundtrip(store: DynStore) {
@@ -281,7 +328,7 @@ pub mod cases {
             .create_run(NewRun::new(agent(), json!({"turn": 0})))
             .await
             .unwrap();
-        let wake = now() + chrono::Duration::hours(1);
+        let wake = now() + jiff::SignedDuration::from_hours(1);
         let v2 = store
             .commit_run(
                 run.id,
@@ -515,7 +562,7 @@ pub mod cases {
     pub async fn claim_respects_due_rules(store: DynStore) {
         let agent = agent();
         let t0 = now();
-        let soon = t0 + chrono::Duration::seconds(30);
+        let soon = t0 + jiff::SignedDuration::from_secs(30);
         let runnable = store
             .create_run(NewRun::new(&agent, json!("runnable")))
             .await
@@ -546,7 +593,7 @@ pub mod cases {
             &store,
             &agent,
             "w1",
-            t0 + chrono::Duration::seconds(1),
+            t0 + jiff::SignedDuration::from_secs(1),
             ttl,
             10,
         )
@@ -557,7 +604,7 @@ pub mod cases {
             "only the plain runnable run is due now"
         );
 
-        let later = soon + chrono::Duration::seconds(1);
+        let later = soon + jiff::SignedDuration::from_secs(1);
         let mut second = claim_ids(&store, &agent, "w1", later, ttl, 10).await;
         second.sort();
         let mut expected = vec![delayed.id, timer.id];
@@ -567,7 +614,7 @@ pub mod cases {
             "the delayed runnable run and the timer become due; the first lease is still held"
         );
 
-        let far = t0 + chrono::Duration::days(365);
+        let far = t0 + jiff::SignedDuration::from_hours(24 * (365));
         let third = claim_ids(&store, &agent, "w2", far, ttl, 10).await;
         let third: HashSet<_> = third.into_iter().collect();
         assert!(
@@ -593,7 +640,7 @@ pub mod cases {
             &store,
             &agent,
             "w3",
-            far + chrono::Duration::days(1),
+            far + jiff::SignedDuration::from_hours(24 * (1)),
             ttl,
             10,
         )
@@ -614,7 +661,7 @@ pub mod cases {
             );
             store.create_run(NewRun::new(&b, json!(i))).await.unwrap();
         }
-        let now = now() + chrono::Duration::seconds(1);
+        let now = now() + jiff::SignedDuration::from_secs(1);
         let ttl = Duration::from_secs(60);
         let leases = store
             .claim_due(
@@ -632,7 +679,7 @@ pub mod cases {
         for l in &leases {
             assert_eq!(l.run.agent, a, "only requested agents are claimed");
             assert_eq!(l.worker, "w");
-            assert_eq!(l.until, truncate_ms(now) + chrono::Duration::seconds(60));
+            assert_eq!(l.until, truncate_ms(now) + jiff::SignedDuration::from_secs(60));
         }
         let first_three: Vec<_> = leases.iter().map(|l| l.run.id).collect();
         assert_eq!(first_three, a_ids[..3].to_vec(), "earliest sched_at first");
@@ -693,7 +740,7 @@ pub mod cases {
                 );
             }
             let [first, second, third] = [runs[0], runs[1], runs[2]];
-            let t = now() + chrono::Duration::seconds(1);
+            let t = now() + jiff::SignedDuration::from_secs(1);
             let ttl = Duration::from_secs(30);
 
             let got = claim_ids_busy(&store, scope, &agent, &[first], t, ttl, 2).await;
@@ -709,7 +756,7 @@ pub mod cases {
             );
 
             // All three leases have run out. Two runs are busy, so only the third is leased.
-            let later = t + chrono::Duration::seconds(31);
+            let later = t + jiff::SignedDuration::from_secs(31);
             assert_eq!(
                 claim_ids_busy(&store, scope, &agent, &[first, second], later, ttl, 10).await,
                 vec![third],
@@ -736,7 +783,7 @@ pub mod cases {
                 .await
                 .unwrap();
         }
-        let now = now() + chrono::Duration::seconds(1);
+        let now = now() + jiff::SignedDuration::from_secs(1);
         let workers = (0..8).map(|w| {
             let store = store.clone();
             let agent = agent.clone();
@@ -782,20 +829,20 @@ pub mod cases {
             .create_run(NewRun::new(&agent, json!({})))
             .await
             .unwrap();
-        let t = now() + chrono::Duration::seconds(1);
+        let t = now() + jiff::SignedDuration::from_secs(1);
         let ttl = Duration::from_secs(30);
         assert_eq!(
             claim_ids(&store, &agent, "w1", t, ttl, 1).await,
             vec![run.id]
         );
         assert!(claim_ids(&store, &agent, "w2", t, ttl, 1).await.is_empty());
-        let just_before = t + chrono::Duration::seconds(29);
+        let just_before = t + jiff::SignedDuration::from_secs(29);
         assert!(
             claim_ids(&store, &agent, "w2", just_before, ttl, 1)
                 .await
                 .is_empty()
         );
-        let after = t + chrono::Duration::seconds(30);
+        let after = t + jiff::SignedDuration::from_secs(30);
         assert_eq!(
             claim_ids(&store, &agent, "w2", after, ttl, 1).await,
             vec![run.id]
@@ -820,12 +867,12 @@ pub mod cases {
             .create_run(NewRun::new(&agent, json!({})))
             .await
             .unwrap();
-        let t = now() + chrono::Duration::seconds(1);
+        let t = now() + jiff::SignedDuration::from_secs(1);
         let ttl = Duration::from_secs(10);
         claim_ids(&store, &agent, "w1", t, ttl, 1).await;
 
         assert!(!store.renew_lease(run.id, "intruder", t, ttl).await.unwrap());
-        let t_renew = t + chrono::Duration::seconds(8);
+        let t_renew = t + jiff::SignedDuration::from_secs(8);
         assert!(store.renew_lease(run.id, "w1", t_renew, ttl).await.unwrap());
         // Would have expired at t+10 without the renewal; now valid until t+18.
         assert!(
@@ -833,7 +880,7 @@ pub mod cases {
                 &store,
                 &agent,
                 "w2",
-                t + chrono::Duration::seconds(15),
+                t + jiff::SignedDuration::from_secs(15),
                 ttl,
                 1
             )
@@ -848,7 +895,7 @@ pub mod cases {
                 &store,
                 &agent,
                 "w2",
-                t + chrono::Duration::seconds(15),
+                t + jiff::SignedDuration::from_secs(15),
                 ttl,
                 1
             )
@@ -862,7 +909,7 @@ pub mod cases {
                 &store,
                 &agent,
                 "w2",
-                t + chrono::Duration::seconds(15),
+                t + jiff::SignedDuration::from_secs(15),
                 ttl,
                 1
             )
@@ -872,7 +919,7 @@ pub mod cases {
         );
         assert!(
             !store
-                .renew_lease(run.id, "w1", t + chrono::Duration::seconds(16), ttl)
+                .renew_lease(run.id, "w1", t + jiff::SignedDuration::from_secs(16), ttl)
                 .await
                 .unwrap()
         );
@@ -892,18 +939,18 @@ pub mod cases {
         assert_eq!(store.lease_until(run.id).await.unwrap(), None, "unclaimed");
         assert_eq!(store.lease_until(RunId::new()).await.unwrap(), None);
 
-        let t = truncate_ms(now() + chrono::Duration::seconds(1));
+        let t = truncate_ms(now() + jiff::SignedDuration::from_secs(1));
         let ttl = Duration::from_secs(10);
         assert_eq!(
             claim_ids(&store, &agent, "w1", t, ttl, 1).await,
             vec![run.id]
         );
-        let first_end = t + chrono::Duration::seconds(10);
+        let first_end = t + jiff::SignedDuration::from_secs(10);
         assert_eq!(store.lease_until(run.id).await.unwrap(), Some(first_end));
 
-        let t_renew = t + chrono::Duration::seconds(8);
+        let t_renew = t + jiff::SignedDuration::from_secs(8);
         assert!(store.renew_lease(run.id, "w1", t_renew, ttl).await.unwrap());
-        let renewed_end = t_renew + chrono::Duration::seconds(10);
+        let renewed_end = t_renew + jiff::SignedDuration::from_secs(10);
         assert_eq!(store.lease_until(run.id).await.unwrap(), Some(renewed_end));
 
         // Not the lease's business: a commit leaves it as it is.
@@ -924,14 +971,14 @@ pub mod cases {
         assert_eq!(store.lease_until(run.id).await.unwrap(), None, "released");
 
         // A lease that ran out is reported as it was; whether it still counts is the caller's call.
-        let t2 = renewed_end + chrono::Duration::seconds(1);
+        let t2 = renewed_end + jiff::SignedDuration::from_secs(1);
         assert_eq!(
             claim_ids(&store, &agent, "w2", t2, ttl, 1).await,
             vec![run.id]
         );
         assert_eq!(
             store.lease_until(run.id).await.unwrap(),
-            Some(t2 + chrono::Duration::seconds(10))
+            Some(t2 + jiff::SignedDuration::from_secs(10))
         );
     }
 
@@ -950,12 +997,12 @@ pub mod cases {
             );
         }
         mine.sort();
-        let t = now() + chrono::Duration::seconds(1);
+        let t = now() + jiff::SignedDuration::from_secs(1);
         let ttl = Duration::from_secs(30);
         let pinned = ClaimScope::Pinned;
 
         // Order is not the point here (a commit moves a run to the back), membership is.
-        let claim = |worker: &'static str, at: DateTime<Utc>| {
+        let claim = |worker: &'static str, at: Timestamp| {
             let (store, agent) = (store.clone(), agent.clone());
             async move {
                 let mut ids = claim_ids_as(&store, pinned, &agent, worker, at, ttl, 10).await;
@@ -988,7 +1035,7 @@ pub mod cases {
         );
         assert_eq!(claim("w1", t).await, mine, "w1 gets them all back");
         // The owner's lease runs out (a crashed worker): the run is stranded, not adopted.
-        let after = t + chrono::Duration::seconds(31);
+        let after = t + jiff::SignedDuration::from_secs(31);
         assert!(
             claim("w2", after).await.is_empty(),
             "an expired lease does not hand a pinned run to another worker"
@@ -1006,7 +1053,7 @@ pub mod cases {
             .create_run(NewRun::new(&agent, json!("late")))
             .await
             .unwrap();
-        let later = after + chrono::Duration::seconds(1);
+        let later = after + jiff::SignedDuration::from_secs(1);
         assert_eq!(claim("w2", later).await, vec![late.id]);
         store.release_lease(late.id, "w2").await.unwrap();
         assert!(
@@ -1023,7 +1070,7 @@ pub mod cases {
             .create_run(NewRun::new(&agent, json!({})))
             .await
             .unwrap();
-        let t = now() + chrono::Duration::seconds(1);
+        let t = now() + jiff::SignedDuration::from_secs(1);
         let ttl = Duration::from_secs(30);
         assert_eq!(
             claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 1).await,
@@ -1056,7 +1103,7 @@ pub mod cases {
             .create_run(NewRun::new(&agent, json!({})))
             .await
             .unwrap();
-        let t = now() + chrono::Duration::seconds(1);
+        let t = now() + jiff::SignedDuration::from_secs(1);
         let ttl = Duration::from_secs(30);
         for worker in ["w1", "w2", "w1", "w3"] {
             assert_eq!(
@@ -1090,7 +1137,7 @@ pub mod cases {
                 .await
                 .unwrap();
         }
-        let t = now() + chrono::Duration::seconds(1);
+        let t = now() + jiff::SignedDuration::from_secs(1);
         let ttl = Duration::from_secs(60);
         let workers = (0..4).map(|w| {
             let store = store.clone();
@@ -1290,13 +1337,13 @@ pub mod cases {
             .await
             .unwrap();
 
-        let cutoff_before = done.updated_at - chrono::Duration::seconds(1);
+        let cutoff_before = done.updated_at - jiff::SignedDuration::from_secs(1);
         assert_eq!(
             store.purge_finished(&agent, cutoff_before).await.unwrap(),
             0
         );
 
-        let cutoff = now() + chrono::Duration::seconds(1);
+        let cutoff = now() + jiff::SignedDuration::from_secs(1);
         assert_eq!(store.purge_finished(&agent, cutoff).await.unwrap(), 2);
         assert_eq!(store.load_run(done.id).await.unwrap(), None);
         assert_eq!(store.load_run(failed.id).await.unwrap(), None);
@@ -1320,7 +1367,7 @@ pub mod cases {
         }
     }
 
-    fn progress(state: PushState, at: DateTime<Utc>) -> PushProgress {
+    fn progress(state: PushState, at: Timestamp) -> PushProgress {
         PushProgress {
             state,
             cursor: json!({"status": "working"}),
@@ -1350,7 +1397,7 @@ pub mod cases {
         assert_eq!(created.last_error, None);
         assert_eq!(created.version, 1);
         assert!(
-            created.next_attempt_at >= before - chrono::Duration::seconds(5),
+            created.next_attempt_at >= before - jiff::SignedDuration::from_secs(5),
             "a new config is due at once"
         );
         assert_eq!(created.created_at, created.updated_at);
@@ -1493,7 +1540,7 @@ pub mod cases {
             store.push_put(new_push(run.id, &agent, id)).await.unwrap();
         }
         let t = now();
-        let soon = t + chrono::Duration::seconds(30);
+        let soon = t + jiff::SignedDuration::from_secs(30);
         let version_of = |id: &str| {
             let store = store.clone();
             let id = id.to_owned();
@@ -1537,7 +1584,7 @@ pub mod cases {
             .unwrap();
 
         let ttl = Duration::from_secs(60);
-        let at = t + chrono::Duration::seconds(1);
+        let at = t + jiff::SignedDuration::from_secs(1);
         let agents = [agent.clone()];
         let first = store
             .push_claim_due(&agents, "w1", at, ttl, 10)
@@ -1557,7 +1604,7 @@ pub mod cases {
                 .is_empty()
         );
         // Once the lease has run out it is claimable again; a later config becomes due in time.
-        let after = at + chrono::Duration::seconds(61);
+        let after = at + jiff::SignedDuration::from_secs(61);
         let again = store
             .push_claim_due(&agents, "w2", after, ttl, 10)
             .await
@@ -1585,7 +1632,7 @@ pub mod cases {
             .push_put(new_push(foreign.id, &other, "x"))
             .await
             .unwrap();
-        let at = now() + chrono::Duration::seconds(1);
+        let at = now() + jiff::SignedDuration::from_secs(1);
         let ttl = Duration::from_secs(60);
         assert!(
             store
@@ -1637,7 +1684,7 @@ pub mod cases {
                 .await
                 .unwrap();
         }
-        let at = now() + chrono::Duration::seconds(1);
+        let at = now() + jiff::SignedDuration::from_secs(1);
         let workers = (0..8).map(|w| {
             let store = store.clone();
             let agent = agent.clone();
@@ -1690,7 +1737,7 @@ pub mod cases {
             .await
             .unwrap();
         let t = now();
-        let at = t + chrono::Duration::seconds(1);
+        let at = t + jiff::SignedDuration::from_secs(1);
         let ttl = Duration::from_secs(60);
         let agents = [agent.clone()];
         let claimed = store
@@ -1699,7 +1746,7 @@ pub mod cases {
             .unwrap()
             .remove(0);
         assert_eq!(claimed.version, 1);
-        let next = t + chrono::Duration::seconds(10);
+        let next = t + jiff::SignedDuration::from_secs(10);
         let committed = store
             .push_commit(
                 run.id,
@@ -1732,7 +1779,7 @@ pub mod cases {
                 .unwrap()
                 .is_empty()
         );
-        let later = next + chrono::Duration::seconds(1);
+        let later = next + jiff::SignedDuration::from_secs(1);
         let again = store
             .push_claim_due(&agents, "w2", later, ttl, 1)
             .await
@@ -1825,7 +1872,7 @@ pub mod cases {
             .push_put(new_push(open.id, &agent, "c1"))
             .await
             .unwrap();
-        let cutoff = now() + chrono::Duration::seconds(1);
+        let cutoff = now() + jiff::SignedDuration::from_secs(1);
         assert_eq!(store.purge_finished(&agent, cutoff).await.unwrap(), 1);
         assert!(
             store.push_list(finished.id).await.unwrap().is_empty(),
@@ -1833,7 +1880,7 @@ pub mod cases {
         );
         assert_eq!(store.push_list(open.id).await.unwrap().len(), 1);
         // Nothing of the purged run is claimable either.
-        let at = now() + chrono::Duration::seconds(1);
+        let at = now() + jiff::SignedDuration::from_secs(1);
         let claimed = store
             .push_claim_due(
                 std::slice::from_ref(&agent),
@@ -1977,7 +2024,7 @@ pub mod cases {
         let since = store.list_runs(&q).await.unwrap();
         assert!(since.iter().all(|r| r.updated_at >= cut));
         assert!(since.iter().any(|r| r.id == all[1].id), "at or after");
-        q.updated_since = Some(all[0].updated_at + chrono::Duration::seconds(1));
+        q.updated_since = Some(all[0].updated_at + jiff::SignedDuration::from_secs(1));
         assert!(store.list_runs(&q).await.unwrap().is_empty());
     }
 
@@ -2152,7 +2199,7 @@ pub mod cases {
         store: &DynStore,
         agent: &str,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> Vec<RunId> {
@@ -2164,7 +2211,7 @@ pub mod cases {
         scope: ClaimScope,
         agent: &str,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> Vec<RunId> {
@@ -2183,7 +2230,7 @@ pub mod cases {
         scope: ClaimScope,
         agent: &str,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> Vec<RunId> {
