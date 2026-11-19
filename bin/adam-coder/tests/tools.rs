@@ -807,6 +807,31 @@ async fn a_failed_check_runs_again_after_the_tree_changes() {
     assert_eq!(notes_of(&rig).await.checks.failures, 2);
 }
 
+/// A check that writes a file leaves a different tree than the one it started on: the next run
+/// starts on the code it left, which is another input, so the failure is not reused (here the
+/// command passes the second time because the file it made is now there).
+#[tokio::test]
+async fn a_failed_check_that_wrote_a_file_runs_again_on_the_code_it_left() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let command = common::red("if [ -f made ]; then exit 0; else touch made; exit 1; fi");
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    assert_eq!(checks_of(&first)["passed"], false);
+    let again = RunChecks
+        .call(&another_call(&rig, "call-2"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(
+        !again.is_error,
+        "the check made `made`, and now passes: {}",
+        again.content
+    );
+}
+
 /// `run` keeps files a check reads that the tree does not show (an ignored `target/`, a
 /// `node_modules/`): the epoch it bumps makes a failed record on the same tree run again.
 #[tokio::test]
@@ -883,6 +908,201 @@ async fn a_passing_check_runs_again_on_the_same_tree() {
     assert_eq!(checks_of(&again)["passed"], true);
 }
 
+/// The timeout is part of what makes a failure: a run killed after 1 s says nothing about the same
+/// command given 10 s, so the longer timeout runs it again (and here it passes).
+#[tokio::test]
+async fn a_failed_check_runs_again_with_another_timeout() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let command = common::red("sleep 2");
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command, "timeout": 1}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    assert!(first.content.contains("TIMED OUT"), "{}", first.content);
+    let again = RunChecks
+        .call(
+            &another_call(&rig, "call-2"),
+            json!({"command": command, "timeout": 10}),
+        )
+        .await
+        .unwrap();
+    assert!(!again.is_error, "the 10 s run passes: {}", again.content);
+}
+
+/// The command's identity is its raw text, not what the redactor shows: two commands that differ
+/// only in a secret are two checks, so the failure of one is not the answer for the other (here the
+/// second passes).
+#[tokio::test]
+async fn a_failure_is_not_reused_for_a_command_that_only_looks_the_same_after_scrubbing() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let fails = common::red(&format!(
+        "echo {} | grep -q {}",
+        common::GITHUB_TOKEN,
+        common::MODEL_KEY
+    ));
+    let passes = common::red(&format!(
+        "echo {} | grep -q {}",
+        common::GITHUB_TOKEN,
+        common::GITHUB_TOKEN
+    ));
+    assert_eq!(
+        rig.fx.env.redactor.scrub(&fails),
+        rig.fx.env.redactor.scrub(&passes),
+        "the two commands are the same once scrubbed"
+    );
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": fails}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    let again = RunChecks
+        .call(&another_call(&rig, "call-2"), json!({"command": passes}))
+        .await
+        .unwrap();
+    assert!(
+        !again.is_error,
+        "the second command passes: {}",
+        again.content
+    );
+}
+
+/// A file the project ignores is still a file a check reads: `write_file` may change it without
+/// changing the tree id, so it moves the epoch and the failed check runs again.
+#[tokio::test]
+async fn a_failed_check_runs_again_after_write_file_wrote_an_ignored_file() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join(".gitignore"), "conf/\n").unwrap();
+    std::fs::create_dir_all(rig.worktree().join("conf")).unwrap();
+    std::fs::write(rig.worktree().join("conf/setting"), "bad\n").unwrap();
+    let command = common::red("grep -q good conf/setting");
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    WriteFile
+        .call(
+            &another_call(&rig, "call-2"),
+            json!({"path": "conf/setting", "content": "good\n"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes_of(&rig).await.checks.epoch, 1);
+    let again = RunChecks
+        .call(&another_call(&rig, "call-3"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(
+        !again.is_error,
+        "the ignored file now says good: {}",
+        again.content
+    );
+}
+
+/// `edit_file` and `apply_patch` write ignored files too: each moves the epoch, so a failed check
+/// from before them is not reused.
+#[tokio::test]
+async fn an_edit_and_a_patch_of_an_ignored_file_move_the_check_epoch() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join(".gitignore"), "conf/\n").unwrap();
+    std::fs::create_dir_all(rig.worktree().join("conf")).unwrap();
+    std::fs::write(rig.worktree().join("conf/setting"), "one\n").unwrap();
+    EditFile
+        .call(
+            &rig.ctx,
+            json!({"path": "conf/setting", "old": "one", "new": "two"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes_of(&rig).await.checks.epoch, 1, "edit_file");
+    ApplyPatch
+        .call(
+            &another_call(&rig, "call-2"),
+            json!({"patch": "--- a/conf/setting\n+++ b/conf/setting\n@@ -1 +1 @@\n-two\n+good\n"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes_of(&rig).await.checks.epoch, 2, "apply_patch");
+    assert_eq!(
+        std::fs::read_to_string(rig.worktree().join("conf/setting")).unwrap(),
+        "good\n"
+    );
+}
+
+/// The documented hole: `run_command` is for looking, and its guard compares the tree, which does
+/// not show a file the project ignores. It does not move the epoch (that would end the reuse after
+/// every `ls`), so a failure is still answered from the notes although an ignored file changed; the
+/// result's claim that nothing a check reads changed is then wrong. `run` is the tool that moves the
+/// epoch, and the model is told to install with `run`.
+#[tokio::test]
+async fn a_run_command_that_changes_only_an_ignored_file_does_not_move_the_epoch() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join(".gitignore"), "conf/\n").unwrap();
+    std::fs::create_dir_all(rig.worktree().join("conf")).unwrap();
+    std::fs::write(rig.worktree().join("conf/setting"), "bad\n").unwrap();
+    let command = common::red("grep -q good conf/setting");
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    let looked = RunCommand
+        .call(
+            &another_call(&rig, "call-2"),
+            json!({"command": "printf 'good\\n' > conf/setting"}),
+        )
+        .await
+        .unwrap();
+    assert!(!looked.is_error, "{}", looked.content);
+    assert_eq!(
+        std::fs::read_to_string(rig.worktree().join("conf/setting")).unwrap(),
+        "good\n",
+        "run_command kept the ignored file"
+    );
+    let again = RunChecks
+        .call(&another_call(&rig, "call-3"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(again.is_error, "{}", again.content);
+    assert!(again.content.contains("not run again"), "{}", again.content);
+    assert_eq!(notes_of(&rig).await.checks.epoch, 0);
+}
+
+/// `web`, `./web` and `web/` are the same directory: a check is told apart by where it ran, not by
+/// how the model spelled it.
+#[tokio::test]
+async fn a_failure_is_reused_for_the_same_directory_spelled_another_way() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::create_dir_all(rig.worktree().join("web")).unwrap();
+    std::fs::write(rig.worktree().join("web/x"), "x\n").unwrap();
+    let command = "false".to_owned();
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command, "cwd": "web"}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    let again = RunChecks
+        .call(
+            &another_call(&rig, "call-2"),
+            json!({"command": command, "cwd": "./web"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        again.content.contains("not run again"),
+        "the same directory, spelled another way: {}",
+        again.content
+    );
+    assert_eq!(notes_of(&rig).await.checks.failures, 1);
+}
+
 /// The gate is unchanged by the reuse: a pull request on a tree whose only check failed is refused,
 /// and one after a real green run on the pushed tree opens.
 #[tokio::test]
@@ -950,6 +1170,53 @@ async fn a_reused_failure_still_refuses_the_pull_request_and_a_real_green_opens_
         .unwrap();
     assert!(!opened.is_error, "{}", opened.content);
     assert_eq!(rig.fx.created_pulls().await.len(), 1);
+}
+
+/// The earlier run's report is the verdict the commit carries: a reused failure is never a green,
+/// and `commit_and_push` binds the failed report (with its findings) to the pushed commit.
+#[tokio::test]
+async fn a_reused_failure_is_the_verdict_commit_and_push_binds() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("a.txt"), "a\n").unwrap();
+    std::fs::write(rig.worktree().join("broken.flag"), "x\n").unwrap();
+    let command = "test ! -f broken.flag";
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    assert_eq!(checks_of(&first)["passed"], false);
+    let reused = RunChecks
+        .call(&another_call(&rig, "call-2"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(reused.is_error, "{}", reused.content);
+    assert!(reused.artifacts.is_empty(), "no new artifact: {reused:?}");
+
+    let pushed = CommitAndPush
+        .call(
+            &another_call(&rig, "call-3"),
+            json!({"message": "feat: add a"}),
+        )
+        .await
+        .unwrap();
+    assert!(!pushed.is_error, "{}", pushed.content);
+    let (bound, branch) = commit_artifacts(&pushed);
+    assert_eq!(bound["passed"], false, "{bound}");
+    assert_eq!(bound["commit"], branch["commit"], "{bound} {branch}");
+    assert_eq!(
+        bound["findings"][0]["check"], "test ! -f broken.flag",
+        "{bound}"
+    );
+    assert!(
+        bound["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exit code 1"),
+        "{bound}"
+    );
 }
 
 /// The tail of a long output that the base commit's run keeps (and the notes and the model read) is
@@ -7337,8 +7604,11 @@ fn failed(call: &str, scratch: bool) -> CheckRecord {
         exit_code: Some(1),
         tail: "red".into(),
         tree: None,
+        start_tree: None,
         cwd: String::new(),
         epoch: 0,
+        timeout_secs: 0,
+        command_sha: String::new(),
         report: None,
         slot: None,
         scratch,
