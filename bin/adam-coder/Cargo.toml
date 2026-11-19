@@ -71,6 +71,7 @@ adam-mcp-testkit.workspace = true
 adam-model-openai.workspace = true
 adam-store-postgres.workspace = true
 adam-store-testkit.workspace = true
+adam-code-tools = { workspace = true, features = ["test-util"] }
 adam-workspace = { workspace = true, features = ["test-util"] }
 kube.workspace = true
 proptest.workspace = true
