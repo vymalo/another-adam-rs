@@ -365,6 +365,24 @@ mod tests {
             ),
             "a call after a barrier waits for the turn"
         );
+        // The barrier outlives the next call: a non-barrier does not clear it.
+        let third = call("list", json!({"path": "c"}));
+        let key = crate::agent::call_key(&third);
+        assert!(
+            !gate.admits(
+                2,
+                &Candidate {
+                    after_previous: Order::Plain,
+                    shortcut: false,
+                    access: &independent,
+                    key: &key,
+                    doom_loop: false,
+                    running: 0,
+                    conflicts: false,
+                }
+            ),
+            "a barrier still refuses the calls after the next one"
+        );
     }
 
     #[test]
