@@ -117,7 +117,7 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
     store.migrate().await.unwrap();
     assert!(has_owner_column(&pool, &p).await, "the column was added");
     assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
-    assert_eq!(SCHEMA_VERSION, 3);
+    assert_eq!(SCHEMA_VERSION, 4);
     // The push table exists now (a missing table would be a backend error).
     assert!(
         store
@@ -129,7 +129,7 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
 
     // Nothing was lost, and migrating again changes nothing.
     store.migrate().await.unwrap();
-    assert_eq!(version(&pool, &p).await, "3");
+    assert_eq!(version(&pool, &p).await, "4");
     let run = store
         .load_run(adam_core::RunId(id))
         .await
@@ -223,7 +223,7 @@ async fn has_table(pool: &PgPool, name: &str) -> bool {
 }
 
 #[tokio::test]
-async fn a_version_2_schema_migrates_to_3_and_gets_the_push_table() {
+async fn a_version_2_schema_migrates_to_the_current_one_and_gets_the_push_table() {
     let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
         return;
     };
@@ -243,8 +243,86 @@ async fn a_version_2_schema_migrates_to_3_and_gets_the_push_table() {
         .with_table_prefix(&p)
         .unwrap();
     store.migrate().await.unwrap();
-    assert_eq!(version(&pool, &p).await, "3");
+    assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
     assert!(has_table(&pool, &format!("{p}push")).await);
+
+    drop_tables(&pool, &p).await;
+}
+
+async fn index_definition(pool: &PgPool, name: &str) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes
+          WHERE schemaname = current_schema() AND indexname = $1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+/// The listing index answers the status filter from the index (`INCLUDE (status)`), so a page does
+/// not fetch the rows it filters out. A database made by schema version 3 has the same index name
+/// without it, and `CREATE INDEX IF NOT EXISTS` would leave it alone: the migration drops and
+/// recreates it.
+#[tokio::test]
+async fn the_listing_index_answers_the_status_filter() {
+    let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let p = format!(
+        "adam_mig_{}_",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let store = PgStore::from_pool(pool.clone())
+        .with_table_prefix(&p)
+        .unwrap();
+    store.migrate().await.unwrap();
+    let index = format!("{p}runs_list");
+    let fresh = index_definition(&pool, &index).await.expect("the index");
+    assert!(
+        fresh.contains("INCLUDE (status)"),
+        "the listing index covers the status filter: {fresh}"
+    );
+    assert!(fresh.contains("updated_at DESC"), "{fresh}");
+
+    // A version 3 database: the same index, without the included column, and the version row.
+    sqlx::query(AssertSqlSafe(format!("DROP INDEX {index}")))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE INDEX {index} ON {p}runs (agent, (conversation_id COLLATE \"C\"),
+                                            updated_at DESC, id DESC)
+         WHERE conversation_id IS NOT NULL"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE {p}meta SET value = '3' WHERE key = 'schema_version'"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !index_definition(&pool, &index)
+            .await
+            .unwrap()
+            .contains("INCLUDE")
+    );
+
+    store.migrate().await.unwrap();
+    let migrated = index_definition(&pool, &index).await.expect("the index");
+    assert!(
+        migrated.contains("INCLUDE (status)"),
+        "the version 3 index was replaced: {migrated}"
+    );
+    assert_eq!(version(&pool, &p).await, "4");
 
     drop_tables(&pool, &p).await;
 }

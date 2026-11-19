@@ -15,7 +15,7 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `PgStore::from_pool(pool)`: reuse your application's `PgPool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
-* `PgStore::pool()`, `SCHEMA_VERSION` (3).
+* `PgStore::pool()`, `SCHEMA_VERSION` (4).
 * The `Store` implementation: call `migrate()` once at boot (idempotent, safe
   from every replica). On a schema that is already current it runs no DDL and takes no table
   lock, so a start cannot deadlock with live traffic (see "Schema version 3").
@@ -44,11 +44,20 @@ The guarantee table is in the [store adapters reference](../../docs/reference/st
 
 ## Schema version 3: the push table
 
-`migrate()` also creates the index `ListTasks` reads runs by (`<prefix>runs_list`: `(agent, conversation_id COLLATE "C", updated_at DESC, id DESC)`; a conversation prefix is a range over it plus an exact `starts_with`). It creates `<prefix>push` and its index **before** the statements that lock `runs`
+`migrate()` also creates the index `ListTasks` reads runs by (`<prefix>runs_list`: `(agent, conversation_id COLLATE "C", updated_at DESC, id DESC) INCLUDE (status)`; a conversation prefix is a range over it plus an exact `starts_with`, and the status filter is answered from the index, not the heap). It creates `<prefix>push` and its index **before** the statements that lock `runs`
 exclusively, so a migration takes its locks in the order a `push_put` does and the two cannot
 deadlock (found by the conformance suite, whose cases all migrate). Claiming push configs is
 `FOR UPDATE SKIP LOCKED` in one statement, progress is `UPDATE .. WHERE version = $expected`, and
 putting an id again is `INSERT .. ON CONFLICT DO UPDATE` that bumps the version.
+
+## Schema version 4: the listing index covers the status filter
+
+`runs_list` gains `INCLUDE (status)`. A page is ordered across the conversations of a prefix, so
+the sort remains; with the status in the index the sort is over index entries and the page fetches
+only the rows it returns, instead of heap-fetching every candidate to test its status. The migration
+drops the index first: `CREATE INDEX IF NOT EXISTS` leaves an index of the same name alone, whatever
+its definition. The drop and the recreate hold `AccessExclusiveLock`/`ShareLock` on `runs` for the
+length of the rebuild, once, on the upgrade.
 
 A start on a current schema runs **no DDL**. After the advisory lock `migrate()` checks that the
 meta table exists (`to_regclass`) and reads `schema_version`; at `SCHEMA_VERSION` or above (an
@@ -61,7 +70,7 @@ runs the statements.
 
 ## Schema version and the owner column
 
-`SCHEMA_VERSION` is 2. Version 2 adds `<prefix>runs.owner TEXT`, the worker a pinned claim
+The owner column is schema version 2. Version 2 adds `<prefix>runs.owner TEXT`, the worker a pinned claim
 (`ClaimScope::Pinned`, see [`adam-core`](../adam-core/README.md#claim-scope-and-the-run-owner))
 tied the run to. `migrate()` runs `ALTER TABLE .. ADD COLUMN IF NOT EXISTS owner TEXT`, so a
 database made by version 1 upgrades in place and keeps its runs (they have no owner), then raises
@@ -107,9 +116,10 @@ PostgreSQL manual's error-code appendix, recalled from memory, not re-checked.
 retryable (needs the server), and an unreachable server is `Transient` (offline).
 `tests/migrate.rs` builds a version 1 schema by hand with a legacy run, migrates it and checks the
 column, the version row, that the run survived and that pinning works on it; it also checks that an
-older release does not lower the version. A version 2 schema migrates to 3 and gets the push
-table, and a start on a current schema finishes while another connection holds `ROW EXCLUSIVE`
-locks on `runs` and `push` (it runs no DDL).
+older release does not lower the version. A version 2 schema migrates to the current one and gets the
+push table, a version 3 schema gets the listing index with `INCLUDE (status)`, and a start on a
+current schema finishes while another connection holds `ROW EXCLUSIVE` locks on `runs` and `push`
+(it runs no DDL).
 Unit tests in `src/lib.rs` cover the driver-error table, and one of them
 (`sqlstates_are_classified_against_a_real_server`) provokes real SQLSTATEs
 when the server variable is set.

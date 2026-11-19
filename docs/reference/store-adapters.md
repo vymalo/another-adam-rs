@@ -40,7 +40,7 @@ cron tick across all replicas. A second message on a conversation that has an op
 | Journal deleted with its run | `ON DELETE CASCADE` | journal first, then runs, in batches |
 | Push configs (`push_*`, schema version 3): put, claim, commit | `INSERT .. ON CONFLICT DO UPDATE` bumping `version`; one `FOR UPDATE SKIP LOCKED` claim; `UPDATE .. WHERE version = $n` | update-or-insert on `_id = "<run>:<id>"`; a loop of `findOneAndUpdate` claims, each atomic; `findOneAndUpdate({_id, version: n})` |
 | Push configs deleted with their run | `ON DELETE CASCADE` | deleted with the journal by the purge |
-| `list_runs` / `count_runs` (`ListTasks`), keyset on `(updated_at, id)` | `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC)`, a prefix is a range plus `starts_with` | `(agent, conversation_id, updated_at, _id)`, a prefix is an anchored escaped regex |
+| `list_runs` / `count_runs` (`ListTasks`), keyset on `(updated_at, id)` | `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC) INCLUDE (status)`, a prefix is a range plus `starts_with` | `(agent, conversation_id, updated_at, _id)`; `(agent, status, conversation_id, updated_at, _id)` when a status filter is set; a prefix is an anchored escaped regex |
 | State | `JSONB` (queryable with SQL) | real BSON document (queryable with dot paths) |
 | Transactions | none held open | none |
 | Cross-process signals | `LISTEN`/`NOTIFY` via `adam-notify-postgres` | none: workers poll |

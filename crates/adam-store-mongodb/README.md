@@ -25,7 +25,7 @@ accept the poll latency.
 * `MongoStore::new(database)`: reuse your application's `Database` handle.
 * `MongoStore::with_collection_prefix(prefix)`: collection-name prefix
   (default `adam_`; alphanumerics, `_` and `-`, at most 40 characters).
-* `MongoStore::database()`, `SCHEMA_VERSION` (3).
+* `MongoStore::database()`, `SCHEMA_VERSION` (4).
 * `codec::{json_to_bson, bson_to_json, encode_key, decode_key}`: the reversible key escaping
   (`$ref`, dotted, empty keys, NUL). Ordinary keys are stored verbatim, so
   `state.messages.0.role` is still a valid query path. The store replaces a NUL with U+FFFD before
@@ -62,14 +62,19 @@ requirement is `3.9` (verified 2026-09-29, `Cargo.toml`).
 `cursor` as BSON, the scheduling fields (`state`, `next_attempt_at`, `lease_until`) and `version`.
 Indexes: `(agent, state, next_attempt_at)` for claiming and `(run_id, id)` for listing. Runs get `adam_list`
 (`agent, conversation_id, updated_at -1, _id -1`) for `list_runs`, which matches a conversation prefix with an anchored,
-escaped regular expression and leaves out runs a purge has tombstoned. Claiming is
+escaped regular expression, and `adam_list_status` (`agent, status, conversation_id, updated_at -1, _id -1`) for the
+same listing with a status filter: the status is an equality bound before the prefix range, so the index yields only
+the matching runs and a page fetches its own rows, not every candidate (`explain` on 2 000 runs: 10 documents examined
+for a page of 10, against 500 with the index absent). Neither index carries
+`purging`: a tombstoned run is left out of `commit_run`, and a listing may show one for the moments before the purge
+deletes it. Claiming is
 a loop of `findOneAndUpdate` (each atomic on its document, so two workers never lease one config),
 progress is `findOneAndUpdate({_id, version: expected})`, and the purge deletes a purged run's
 configs after its journal. Still single-document writes only, so a standalone `mongod` is enough.
 
 ## Schema version and the owner field
 
-`SCHEMA_VERSION` is 2. Version 2 adds an `owner` field to run documents, set by the first pinned
+The owner field is schema version 2. Version 2 adds an `owner` field to run documents, set by the first pinned
 claim (`ClaimScope::Pinned`, see
 [`adam-core`](../adam-core/README.md#claim-scope-and-the-run-owner)). No data is rewritten: a
 document without the field reads as `owner: null` (`{ owner: null }` matches a missing field), so

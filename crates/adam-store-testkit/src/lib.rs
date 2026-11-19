@@ -67,6 +67,7 @@ macro_rules! store_conformance {
             push_commit_detects_stale_versions_and_missing_configs,
             push_configs_go_with_their_run,
             list_runs_is_scoped_ordered_and_pages_by_keyset, list_runs_filters_by_status_and_time,
+            list_runs_prefix_status_filter_is_ordered_and_paged,
             list_runs_scopes_match_exactly, count_runs_ignores_the_page,
             list_runs_prefixes_with_slashes_match_literally,
             two_creates_with_different_ids_in_one_conversation_leave_one_open_run,
@@ -1979,6 +1980,64 @@ pub mod cases {
         assert!(since.iter().any(|r| r.id == all[1].id), "at or after");
         q.updated_since = Some(all[0].updated_at + chrono::Duration::seconds(1));
         assert!(store.list_runs(&q).await.unwrap().is_empty());
+    }
+
+    /// A prefix listing with a status filter returns the same rows in the same order as the
+    /// unfiltered page restricted to that status, and the keyset pages over it the same way.
+    /// This is the shape `ListTasks` sends, and the one the adapters index
+    /// (`runs_list INCLUDE (status)`, `adam_list_status`).
+    pub async fn list_runs_prefix_status_filter_is_ordered_and_paged(store: DynStore) {
+        let agent = agent();
+        let made = listing_fixture(&store, &agent).await;
+        // `made[2]` (`a:2`) and `made[5]` (`a:4`) become the two parked runs of the prefix, in
+        // that order, so the filtered page is not creation order: `a:4` is updated last.
+        let mut parked = Vec::new();
+        for at in [2, 5] {
+            parked.push(
+                store
+                    .commit_run(
+                        made[at].id,
+                        made[at].version,
+                        RunUpdate::new(RunStatus::Parked, json!("still waiting")),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        let fields = |r: &adam_core::RunRecord| (r.id, r.status, r.updated_at, r.version);
+        let mut want: Vec<_> = parked.iter().map(fields).collect();
+        want.sort_by_key(|(_, _, at, _)| std::cmp::Reverse(*at));
+        assert_eq!(want.len(), 2, "a:2 and a:4 are parked");
+
+        let mut query = RunQuery::new(&agent, ConversationScope::Prefix("a:".into()), 100);
+        query.statuses = Some(vec![RunStatus::Parked]);
+        let page = store.list_runs(&query).await.unwrap();
+        assert_eq!(
+            page.iter().map(fields).collect::<Vec<_>>(),
+            want,
+            "the status filter keeps the page's order"
+        );
+        assert_eq!(store.count_runs(&query).await.unwrap(), 2);
+
+        // Keyset pages of one cover the filtered list once each, in order.
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let mut q = query.clone();
+            q.limit = 1;
+            q.after = after;
+            let page = store.list_runs(&q).await.unwrap();
+            assert!(page.len() <= 1);
+            seen.extend(page.iter().map(fields));
+            match page.last() {
+                Some(last) if !page.is_empty() && seen.len() < want.len() => {
+                    after = Some((last.updated_at, last.id));
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(seen, want);
     }
 
     pub async fn list_runs_scopes_match_exactly(store: DynStore) {

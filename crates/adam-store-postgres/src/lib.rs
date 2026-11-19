@@ -57,7 +57,9 @@ use uuid::Uuid;
 /// * 2: `runs.owner`, the worker a pinned claim ties a run to (see [`ClaimScope`]).
 /// * 3: the `push` table (A2A push-notification configurations and their delivery progress) and
 ///   the index `ListTasks` reads runs by (`runs_list`).
-pub const SCHEMA_VERSION: i32 = 3;
+/// * 4: `runs_list` gains `INCLUDE (status)`, so the listing's status filter is answered from the
+///   index instead of the heap.
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// Purge deletes in batches of this many runs (plus their journals).
 const PURGE_BATCH: i64 = 500;
@@ -313,10 +315,16 @@ impl Sql {
             ),
             format!("CREATE INDEX IF NOT EXISTS {p}runs_parent ON {runs} (parent_id) WHERE parent_id IS NOT NULL"),
             // Listing an owner's runs, newest first (`ListTasks`): the conversation id is compared
-            // in the "C" collation, so that a prefix is a range the index can serve.
+            // in the "C" collation, so that a prefix is a range the index can serve. `status` is
+            // included so a status filter is answered from the index; the page is ordered across
+            // the conversations of a prefix, which is a sort of the matching index entries, not of
+            // the rows. Schema version 4: `CREATE INDEX IF NOT EXISTS` leaves an index made by
+            // version 3 alone, so the old one is dropped first.
+            format!("DROP INDEX IF EXISTS {p}runs_list"),
             format!(
                 "CREATE INDEX IF NOT EXISTS {p}runs_list
                  ON {runs} (agent, (conversation_id COLLATE \"C\"), updated_at DESC, id DESC)
+                 INCLUDE (status)
                  WHERE conversation_id IS NOT NULL"
             ),
             format!(

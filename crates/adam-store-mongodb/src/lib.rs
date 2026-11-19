@@ -73,7 +73,10 @@ use codec::{bson_to_json, json_to_bson};
 ///   is rewritten; the number only says which release last migrated.
 /// * 3: the `push` collection (A2A push-notification configurations and their delivery progress)
 ///   and the index `ListTasks` reads runs by (`adam_list`).
-pub const SCHEMA_VERSION: i32 = 3;
+/// * 4: `adam_list_status`, the same listing with `status` before the sort keys, so a status
+///   filter is answered from the index. `migrate()` creates a missing index on every run, so a
+///   version 3 database gets it without a rewrite.
+pub const SCHEMA_VERSION: i32 = 4;
 
 const DUPLICATE_KEY: i32 = 11000;
 const OPEN_CONVERSATION_INDEX: &str = "adam_open_conversation";
@@ -208,10 +211,14 @@ fn journal_id(run: RunId, seq: u64) -> String {
     format!("{run}:{seq}")
 }
 
-/// The filters of a [`RunQuery`] (not its position or its limit), without runs a purge has
-/// tombstoned.
+/// The filters of a [`RunQuery`] (not its position or its limit).
+///
+/// A run a purge has tombstoned is not filtered out: `purging` is a short-lived field with no
+/// index, so checking it here would make the listing fetch every candidate document (state
+/// included) to test one boolean. A tombstoned run is deleted by the same sweep moments later,
+/// and `commit_run` still refuses to revive it.
 fn run_query_filter(query: &RunQuery) -> Document {
-    let mut filter = doc! { "agent": &query.agent, "purging": { "$ne": true } };
+    let mut filter = doc! { "agent": &query.agent };
     match &query.scope {
         // An anchored, escaped prefix is a range over the index `(agent, conversation_id, ..)`.
         ConversationScope::Prefix(prefix) => {
@@ -437,6 +444,16 @@ impl Store for MongoStore {
             IndexModel::builder()
                 .keys(doc! { "agent": 1, "conversation_id": 1, "updated_at": -1, "_id": -1 })
                 .options(named("adam_list"))
+                .build(),
+            // The same listing with a status filter: `status` before `conversation_id` makes it an
+            // equality bound, so the index yields the matching runs of the agent and the prefix is
+            // a range inside it; the page fetches its own rows instead of every candidate. (With
+            // `conversation_id` first the planner does not choose this index for a prefix, and the
+            // unfiltered listing keeps `adam_list`; measured with `explain` on MongoDB 7, 2 000
+            // runs: 10 documents examined for a page of 10, against 500 with the index absent.)
+            IndexModel::builder()
+                .keys(doc! { "agent": 1, "status": 1, "conversation_id": 1, "updated_at": -1, "_id": -1 })
+                .options(named("adam_list_status"))
                 .build(),
         ];
         let journal_indexes = [IndexModel::builder()
