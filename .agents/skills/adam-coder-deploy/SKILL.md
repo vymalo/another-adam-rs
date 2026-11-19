@@ -5,9 +5,10 @@ description: "Build, publish and deploy the adam-rs coder image (ghcr.io/vymalo/
 
 # Build, publish and deploy the coder image and chart
 
-One image, `ghcr.io/vymalo/another-adam-rs/coder`, carries two binaries: `adam-coder` (the
-entrypoint) and `adam-agent` (run with `--entrypoint tini ... -- adam-agent`, see
-`adam-agent-folder`). One Helm chart, `deploy/coder`, deploys the coder. There is no second image
+One image, `ghcr.io/vymalo/another-adam-rs/coder`, carries six static binaries: `adam-coder` (the
+entrypoint), `adam-agent` (run with `--entrypoint tini ... -- adam-agent`, see `adam-agent-folder`),
+`adam-kube-exec`, `adam-egress`, `adam-git-sandbox` and `adam-git` (run pods and the git sandbox, see
+`deploy/coder/README.md`). One Helm chart, `deploy/coder`, deploys the coder. There is no second image
 or package.
 
 On Kubernetes the coder (or a folder agent) can also run as `AgentService` and `AgentConfig` custom
@@ -30,14 +31,16 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
 ## Procedure
 
 1. **The image.** `docker/coder/Dockerfile` builds from the **repository root**
-   (`docker buildx build -f docker/coder/Dockerfile .`): stage 1 compiles `adam-coder` and
-   `adam-agent` on a pinned `rust:1.94-trixie` (tag and digest); stage 2 is the workspace image
+   (`docker buildx build -f docker/coder/Dockerfile .`): stage 1 compiles the six binaries for
+   `x86_64-unknown-linux-musl` on a pinned `rust:1.94-trixie` (tag and digest, plus `musl-tools` and the
+   target), statically linked with `mimalloc` as the global allocator, so they start in any x86-64 Linux
+   image whatever its C library (ADR 0053 decision 11); stage 2 is the workspace image
    `ghcr.io/vymalo/another-agentic-images/workspace:${WORKSPACE_TAG}` (the `ARG WORKSPACE_TAG` is
    an immutable `<rust toolchain>-<sha7>` tag; it moves together with the default devcontainer image's digest in
    `bin/adam-coder/src/config.rs` and `runPods.image` of the chart) with the binaries, the pinned
    `github-mcp-server`, the devcontainer CLI and Podman's remote client added. Runtime user is
    uid 10001, `/work` is the workspace volume, `EXPOSE 8080`, entrypoint
-   `tini -- adam-coder`. The build argument `ADAM_BUILD_REVISION` (CI passes the commit) is baked into both
+   `tini -- adam-coder`. The build argument `ADAM_BUILD_REVISION` (CI passes the commit) is baked into the
    binaries and shows on the card as the version's `+<sha7>` and in `build/v1` (ADR 0028). Tool pins carry a "verified <date>" comment: move a tag, its digest and
    the claims next to it together (the GitHub MCP server's are also in
    `docs/decisions/0009-github-per-installation-read-through-mcp.md` and in
@@ -137,6 +140,7 @@ sh deploy/coder/tests/render-check.sh        # from the repository root
 sh deploy/coder/tests/bump-tag-test.sh
 shellcheck deploy/coder/bump-tag.sh deploy/coder/tests/*.sh docker/coder/test/*.sh dev/*.sh
 docker buildx build -f docker/coder/Dockerfile -t coder:smoke --load .
+sh docker/coder/test/static-smoke.sh coder:smoke    # `file` says static; each binary starts in debian:bookworm-slim and alpine
 sh docker/coder/test/container-smoke.sh coder:smoke   # needs a reachable Postgres, see the script header; EXPECT_REVISION=<sha> checks the build argument
 sh docker/coder/test/agent-smoke.sh coder:smoke
 ```
@@ -166,6 +170,10 @@ Then the compose scenarios of the `image` job in `.github/workflows/coder.yml`
 * A new GHCR package is private until its owner makes it public: check an anonymous pull before
   a deployment points at it (`adam-upgrade` has the token and manifest request).
 * The build context is the repository root, not `docker/coder`.
+* The binaries are static (musl), but their TLS roots are not: each reads the system's CA bundle, so an
+  image that runs the coder without CA certificates cannot reach an HTTPS gateway, GitHub or a git remote.
+* A musl build needs `musl-gcc` in the builder (`musl-tools`); a missing one fails in `aws-lc-sys` or
+  `mimalloc`'s C sources, not in Rust code.
 * A workspace base tag that is a placeholder (`...PENDING`) makes the workflow skip the build
   with a warning instead of failing.
 * The image sets no `MCP_ALLOW_STDIO`; `adam-agent` from this image refuses local-process MCP

@@ -5,6 +5,12 @@ default) or as a front Deployment plus a worker StatefulSet (`topology: split`),
 own CloudNativePG database or an existing one (see [Database](#database)), for the `netcup-k8s`
 cluster.
 
+The image (`docker/coder/Dockerfile`) carries six static binaries — `adam-coder`, `adam-agent`, `adam-kube-exec`,
+`adam-egress`, `adam-git-sandbox` and `adam-git` — built for `x86_64-unknown-linux-musl` with `mimalloc` as the
+allocator ([ADR 0053](../../docs/decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)
+decision 11), so they start in any x86-64 Linux image whatever its C library. The runtime base is still the
+`workspace` image, and the paths are unchanged (`/usr/local/bin`).
+
 | Object | What |
 |---|---|
 | `StatefulSet` | `replicaCount` replicas (1 by default; the worker with `topology: split`), `work` at `/work`: a PVC per pod on `longhorn` by default (mirrors and worktrees persist), or one shared claim, see [Workspace placement](#workspace-placement); `fsGroupChangePolicy: OnRootMismatch`, uid/gid 10001, probes on `/healthz`; on the roles that run workers, the GitHub MCP server as a native sidecar, see [The GitHub MCP server](#the-github-mcp-server-a-sidecar), and, with `runPods.enabled`, the git sandbox as another, see [The git sandbox](#the-git-sandbox) |

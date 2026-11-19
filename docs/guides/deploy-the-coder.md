@@ -72,8 +72,12 @@ flowchart LR
 ## The image
 
 `docker/coder/Dockerfile`, built from the **repository root**, has three stages: it compiles `adam-coder`,
-`adam-agent`, `adam-kube-exec`, `adam-egress` and the two binaries of `adam-git-sandbox` on a pinned `rust:1.94-trixie` (tag and digest, so glibc matches the
-runtime image; `adam-egress` is the HTTPS-only proxy for run pods, [`bin/adam-egress`](../../bin/adam-egress/README.md),
+`adam-agent`, `adam-kube-exec`, `adam-egress` and the two binaries of `adam-git-sandbox` for
+`x86_64-unknown-linux-musl` on a pinned `rust:1.94-trixie` (tag and digest, plus `musl-tools` for the C
+sources), so each is statically linked with `mimalloc` as its allocator and starts in any x86-64 Linux image
+whatever its C library ([ADR 0053](../decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)
+decision 11; the image's smoke test runs each in `debian:bookworm-slim` and Alpine, as uid 10001, and expects
+its configuration error, never a loader error). `adam-egress` is the HTTPS-only proxy for run pods, [`bin/adam-egress`](../../bin/adam-egress/README.md),
 smoke-tested in the image and run by the chart with run pods; `adam-git-sandbox` is the server that runs the coder's git
 where no secret is readable and `adam-git` the relay that stands in for git, [`crates/adam-git-sandbox`](../../crates/adam-git-sandbox/README.md),
 smoke-tested in the image and run by the chart, with run pods, as a container of the coder's pod that mounts the same work volume and holds no secret;
@@ -81,10 +85,12 @@ a deployment without run pods that sets `GIT_SANDBOX_SOCKET` runs the server its
 `workspace` image of `vymalo/another-agentic-images` (Rust, Flutter/Dart, Node, git, tini, the obscura
 headless browser), pinned by an immutable tag, with those binaries, the devcontainer CLI and Podman's remote client
 added. It runs as uid 10001, listens on `0.0.0.0:8080`, keeps its files in `/work`, and its entrypoint is
-`tini -- adam-coder` (`tini` forwards SIGTERM and reaps children). Tags are `sha-<7>` of the commit. Both agents' binaries are smoke-tested in CI
-(`docker/coder/test/`).
+`tini -- adam-coder` (`tini` forwards SIGTERM and reaps children). Tags are `sha-<7>` of the commit. The binaries are smoke-tested in CI
+(`docker/coder/test/`). Static linking brings no certificates: each binary still reads the system's CA bundle
+for HTTPS (the `workspace` base has one), so an image that runs the coder without one cannot reach the model
+gateway, GitHub or a git remote.
 
-The build argument `ADAM_BUILD_REVISION` (CI passes the commit) is baked into both binaries. The agent card then says
+The build argument `ADAM_BUILD_REVISION` (CI passes the commit) is baked into the binaries. The agent card then says
 which build answers: `version` is `<crate version>+<first 7>` and the `build/v1` extension carries the whole revision
 and a digest of the agent's files ([ADR 0028](../decisions/0028-the-card-says-which-build-answers.md), contract in
 [A2A server](../reference/a2a-server.md)). A build without the argument says `unknown`. The smoke tests check the card
