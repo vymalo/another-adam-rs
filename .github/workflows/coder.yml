@@ -221,7 +221,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck deploy/coder/bump-tag.sh deploy/coder/tests/*.sh docker/coder/test/*.sh dev/*.sh
+        run: shellcheck deploy/coder/bump-tag.sh deploy/coder/tests/*.sh docker/coder/test/*.sh dev/*.sh tools/check-dev-stack.sh
       - name: bump-tag.sh is idempotent and edits only image.tag
         run: sh deploy/coder/tests/bump-tag-test.sh
       - name: the stub model compiles
