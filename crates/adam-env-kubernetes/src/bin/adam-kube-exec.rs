@@ -37,6 +37,11 @@ const EX_USAGE: u8 = 64;
 /// The cluster could not run the command.
 const EX_UNAVAILABLE: u8 = 69;
 
+/// The process-wide allocator: mimalloc in place of musl's own, which is slow under many threads
+/// (ADR 0053 decision 11).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn fail(code: u8, message: &str) -> u8 {
     eprintln!("adam-kube-exec: {message}");
     code

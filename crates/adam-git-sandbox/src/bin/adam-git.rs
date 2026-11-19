@@ -26,6 +26,11 @@ use adam_git_sandbox::{
     Client, ClientError, EX_CONFIG, EX_IOERR, Request, SOCKET_ENV, environment, socket_from_env,
 };
 
+/// The process-wide allocator: mimalloc in place of musl's own, which is slow under many threads
+/// (ADR 0053 decision 11).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// The code of a command whose output has nowhere to go: what a shell reports for SIGPIPE.
 const EX_PIPE: u8 = 141;
 
