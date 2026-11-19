@@ -46,8 +46,10 @@ Time columns (`wake_at`, `sched_at`, `lease_until`, `created_at`, `updated_at`, 
 the push scheduling fields) are `TIMESTAMPTZ`. sqlx 0.9 has no jiff support, so the adapter maps
 `adam_core::time::Timestamp` through a private `PgTime` that encodes and decodes as sqlx's
 `chrono::DateTime<Utc>`: the column type and the bytes on the wire are unchanged
-([ADR 0053](../../docs/decisions/0053-time-is-jiff-with-the-bytes-chrono-wrote.md)). `chrono` is
-a dependency of this crate only, for that bridge.
+([ADR 0057](../../docs/decisions/0057-time-is-jiff-with-the-bytes-chrono-wrote.md)). `chrono` is
+a dependency of this crate only, for that bridge. The bridge is temporary: when the store moves from sqlx to
+tokio-postgres, `postgres-types`'s `with-jiff-0_2` feature does this natively (the same `TIMESTAMPTZ`,
+microseconds since 2000, the same bytes as `with-chrono-0_4`), and it goes with sqlx's `chrono` feature.
 
 ## Schema version 3: the push table
 

@@ -748,7 +748,7 @@ token, and a message does not repeat its source.
 
 | Feature | Default | Effect |
 |---|---|---|
-| `github` | yes | the `GitHub` code host and the `GitHubApp` credentials (pull in `reqwest`, and `aws-lc-rs`, `rustls-pki-types` and `chrono` to sign and read the App's JWT and key; `aws-lc-rs` and `rustls-pki-types` are already in the tree under `rustls`) |
+| `github` | yes | the `GitHub` code host and the `GitHubApp` credentials (pull in `reqwest`, and `aws-lc-rs`, `rustls-pki-types` and `jiff` to sign and read the App's JWT and key; `aws-lc-rs` and `rustls-pki-types` are already in the tree under `rustls`) |
 | `test-util` | no | `MemoryCodeHost` for downstream tests, and with `github` also `testing::TestAppKey`; and the seam that makes a slot's directory swap between a check and the use that follows it (`safe_fs::race::on_checkpoint`, `SlotDir::open_using`): without it `race::checkpoint` does nothing; and `testing_sandbox::GitSandboxServer`, a real `adam-git-sandbox` process (built with `cargo build -p adam-git-sandbox` on first use) with its log, for tests of the commands that go through it; and `testing_stdio` (`framed_stdio_until_eof`, `framed_stdio_until_kill`, `StdioProbe`), which asks an `EnvSession` whether a process can be written to on stdin for minutes and answers on stdout (`Content-Length` frames, `cat` as the server) |
 
 The only environment variable the crate reads is the one you name in

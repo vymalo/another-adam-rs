@@ -57,12 +57,16 @@ cron tick across all replicas. A second message on a conversation that has an op
   (`adam_core::storable`) before it writes a state, a journal payload or a push configuration,
   and returns what it stored, so the value is the same in every backend and a tool that printed a
   NUL does not fail the run ([ADR 0051](../decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
-* **Time** is truncated to milliseconds in every store. Lease expiry uses the `now` the caller passes in:
-  keep worker clocks in sync (NTP) and lease TTLs well above the expected skew.
+* **Time** is `adam_core::time::Timestamp` (ADR 0057), a `jiff::Timestamp` whose serde bytes are the ones
+  `chrono::DateTime<Utc>` wrote. Every store truncates it to milliseconds; PostgreSQL keeps it in `TIMESTAMPTZ`
+  through sqlx's chrono support and MongoDB in a BSON date, so the stored value is the same in every backend.
+  Lease expiry uses the `now` the caller passes in: keep worker clocks in sync (NTP) and lease TTLs well above
+  the expected skew.
 
 ## Adding a backend
 
 Implement `Store` and add one line: `adam_store_testkit::store_conformance!(make_store);`. A `Notifier`
 (Redis, NATS) runs `adam_notify_testkit::notifier_conformance!(make_pair);`. The `adam-store-adapter`
 skill walks through it; adding a required method to a trait breaks implementers, so say so in the PR and
-in the crate README.
+in the crate README. **A new required type does the same**: `Timestamp` replaced `chrono::DateTime<Utc>` in
+every `Store` signature (ADR 0057), so an implementation written before it must change with it.

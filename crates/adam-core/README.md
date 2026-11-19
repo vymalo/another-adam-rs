@@ -25,7 +25,7 @@ database driver.
 | `RunQuery`, `ConversationScope` | what `list_runs` and `count_runs` select: always scoped (`Prefix` of an owner's conversations, or `Exact`), optionally by run statuses and last update, one page after a `(updated_at, id)` position |
 | `NewPushConfig`, `PushRecord`, `PushProgress`, `PushState` | an A2A push-notification configuration and how far its delivery got; `PushState` (`Active`, `Done`, `GaveUp`) is closed on purpose |
 | `StoreError`, `StoreResult` | `AlreadyExists`, `NotFound`, `Conflict`, `ConversationBusy`, `NonDeterminism`, `InvalidInput`, `Corrupt`, `Backend { class, source }`; `#[non_exhaustive]`, see *Errors* |
-| `Timestamp`, `now`, `truncate_ms`, `add_ttl` | the instant every `Store` value carries: a `jiff::Timestamp` whose serde bytes are the ones `chrono::DateTime<Utc>` wrote ([ADR 0053](../../docs/decisions/0053-time-is-jiff-with-the-bytes-chrono-wrote.md)) |
+| `Timestamp`, `now`, `truncate_ms`, `add_ttl` | the instant every `Store` value carries: a `jiff::Timestamp` whose serde bytes are the ones `chrono::DateTime<Utc>` wrote ([ADR 0057](../../docs/decisions/0057-time-is-jiff-with-the-bytes-chrono-wrote.md)) |
 | `storable` | the one rule every adapter applies before it writes a JSON value: a NUL in a string or a key becomes U+FFFD, so a state or a journal payload is the same value in every backend ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)) |
 | `MemoryStore` | in-memory `Store`, the reference implementation of the suite |
 | `testing` (`#[doc(hidden)]`) | `test_env`, `skipped`, `require_db`: gate for database-backed tests, not part of the supported API |
@@ -114,7 +114,7 @@ implementation, for both scopes. The signature change is breaking for anyone who
 ## Time
 
 Every timestamp in this crate is [`Timestamp`](src/time.rs), a newtype over `jiff::Timestamp`
-(ADR 0053). Stores keep milliseconds (`truncate_ms`), because BSON dates are millisecond-precision
+(ADR 0057). Stores keep milliseconds (`truncate_ms`), because BSON dates are millisecond-precision
 and every adapter normalizes to it so they behave the same. The newtype's serde writes RFC 3339
 with `Z` and chrono's `AutoSi` digits (0, 3, 6 or 9, the shortest exact one), which is what a
 state or a push cursor written before the migration holds: jiff's own serde trims every trailing

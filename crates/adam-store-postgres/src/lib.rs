@@ -46,10 +46,10 @@ use adam_core::{
 use adam_error::ErrorClass;
 use async_trait::async_trait;
 use serde_json::Value;
+use sqlx::encode::IsNull;
 use sqlx::error::BoxDynError;
 use sqlx::postgres::{PgArgumentBuffer, PgPool, PgPoolOptions, PgRow, PgValueRef};
 use sqlx::types::Json;
-use sqlx::encode::IsNull;
 use sqlx::{AssertSqlSafe, Decode, Encode, Executor, Postgres, Row, Type};
 use uuid::Uuid;
 
@@ -558,7 +558,10 @@ fn to_i64(n: u64, what: &str) -> StoreResult<i64> {
 /// A [`Timestamp`] as PostgreSQL's `TIMESTAMPTZ`.
 ///
 /// sqlx 0.9 has no jiff support, so this delegates to its chrono support: the column type, the
-/// encoded value and the bytes on the wire are exactly what the store wrote before ADR 0053.
+/// encoded value and the bytes on the wire are exactly what the store wrote before ADR 0057.
+/// **Temporary:** when the store moves from sqlx to tokio-postgres, `postgres-types`'s
+/// `with-jiff-0_2` feature does this natively (the same `TIMESTAMPTZ`, microseconds since 2000,
+/// the same bytes as `with-chrono-0_4`), and this bridge is deleted with sqlx's `chrono` feature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct PgTime(Timestamp);
 
