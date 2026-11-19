@@ -1292,6 +1292,69 @@ async fn repeating_a_message_returns_the_task_and_delivers_the_input_once() {
     worker.stop().await;
 }
 
+/// A repeated submission reads the run it already created once: the view that settles the repeat
+/// (ownership and context) is the task's, not a second read.
+#[tokio::test]
+async fn a_repeated_submission_reads_the_run_once() {
+    use adam_store_testkit::fault::{FaultyStore, Method};
+
+    let counting = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+    let rig = Rig::over(counting.clone());
+    let first = rig
+        .backend
+        .submit(alice(), user_with_id("go", "m-1"), None, Some("c1".into()))
+        .await
+        .unwrap();
+    let before = (
+        counting.calls(Method::LeaseUntil),
+        counting.calls(Method::LoadRun),
+    );
+    let retry = rig
+        .backend
+        .submit(alice(), user_with_id("go", "m-1"), None, Some("c1".into()))
+        .await
+        .unwrap();
+    assert_eq!(retry, first, "the repeated request answers the same task");
+    assert_eq!(
+        (
+            counting.calls(Method::LeaseUntil) - before.0,
+            counting.calls(Method::LoadRun) - before.1,
+        ),
+        (1, 1),
+        "one view for the repeat, not two"
+    );
+}
+
+#[tokio::test]
+async fn a_get_reads_the_run_once() {
+    use adam_store_testkit::fault::{FaultyStore, Method};
+
+    let counting = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+    let rig = Rig::over(counting.clone());
+    let task = rig
+        .backend
+        .submit(alice(), user_with_id("go", "m-1"), None, Some("c1".into()))
+        .await
+        .unwrap();
+    let before = (
+        counting.calls(Method::LeaseUntil),
+        counting.calls(Method::LoadRun),
+    );
+    let read = rig.backend.get(&alice(), &task.id).await.unwrap().unwrap();
+    // The submission carries the message it started with; a read does not (the handler adds it).
+    let mut expected = task.clone();
+    expected.history = None;
+    assert_eq!(read, expected);
+    assert_eq!(
+        (
+            counting.calls(Method::LeaseUntil) - before.0,
+            counting.calls(Method::LoadRun) - before.1,
+        ),
+        (1, 1),
+        "one view for the task"
+    );
+}
+
 #[tokio::test]
 async fn a_repeat_without_a_context_id_finds_the_context_the_first_attempt_made() {
     let rig = Rig::new();
