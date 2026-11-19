@@ -1689,3 +1689,31 @@ impl EnvSession for FakeSession {
         }
     }
 }
+
+/// [`a2a_client`](a2a_client) that also activates `extension` (the `A2A-Extensions` header) on every
+/// call, as a client of a contract such as `child-sessions/v1` does. The card's URLs are pointed at
+/// `addr` first.
+pub async fn a2a_client_activating(
+    addr: std::net::SocketAddr,
+    token: &str,
+    extension: &str,
+) -> a2a_client::A2AClient<Box<dyn a2a_client::Transport>> {
+    let mut card = a2a_client::agent_card::AgentCardResolver::new(None)
+        .resolve(&format!("http://{addr}"))
+        .await
+        .expect("the agent card");
+    for interface in &mut card.supported_interfaces {
+        interface.url = format!("http://{addr}/");
+    }
+    a2a_client::A2AClientFactory::builder()
+        .with_interceptor(std::sync::Arc::new(
+            a2a_client::auth::AuthInterceptor::bearer(token),
+        ))
+        .with_interceptor(std::sync::Arc::new(
+            a2a_client::auth::AuthInterceptor::custom("A2A-Extensions", extension),
+        ))
+        .build()
+        .create_from_card(&card)
+        .await
+        .expect("an A2A client")
+}

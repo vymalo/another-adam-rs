@@ -200,7 +200,7 @@ activation the message is refused as before ([`adam-a2a-runtime`](../../crates/a
 
 The person's screen (the orchestration layer's chat) can draw a form. The coder announces that on its card
 (`adam_ui::with_card_extensions`: A2UI v0.9.1 with `acceptsInlineCatalogs: true`, `ui-catalog/v1`,
-`thread-tools/v1`, `mentions/v1`, `steer/v1`; `agent_card_from` adds them, with `steps/v1`, `text-stream/v1`, `usage/v1`, `access-tier/v1` ([above](#access-tiers-what-the-person-lets-it-do-alone)), `commands/v1` (the three commands of `agent/commands/`: `review`, `fix-checks` and `explain`; templates the agent expands, never part of the prompt) and `build/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
+`thread-tools/v1`, `mentions/v1`, `steer/v1`; `agent_card_from` adds them, with `steps/v1`, `text-stream/v1`, `usage/v1`, `access-tier/v1` ([above](#access-tiers-what-the-person-lets-it-do-alone)), `child-sessions/v1` (added by `adam_service::serve`, not by `agent_card_from`, and only when the backend serves it: [Sessions a person opens](#sessions-a-person-opens)), `commands/v1` (the three commands of `agent/commands/`: `review`, `fix-checks` and `explain`; templates the agent expands, never part of the prompt) and `build/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
 a screen (`vymalo_inbound`, set by `Coder::new_with` and `serve`), and gives the model `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`:
 three questions at once (a database, a login, where it runs) become **one Choices surface** beside the question, with a title
 and a description of why, and the person's answers come back as the tool result, `- db: pg` per question, which the model quotes in its next words.
@@ -863,6 +863,22 @@ are pinned in `crates/adam-llm-agent/tests/fixtures/session-tools.json`. A round
 so it works in that task's worktree and, in a later task of the conversation, `subagent_send` starts the next round in the
 worktree of the later task. The prompt is not changed: the descriptions carry the guidance, and `explorer` and `reviewer` stay
 the way to ask and wait.
+
+### Sessions a person opens
+
+The card also lists `child-sessions/v1` ([ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)
+slice 6 part c; [`a2a-server.md`](../../docs/reference/a2a-server.md#child-sessions-child-sessionsv1)): `explorer` and `reviewer` are offered
+to a person as sessions they open, talk to and close from their client, with `maxOpen` the effective `SESSION_MAX_OPEN` (16 by default;
+`limits.max_open_sessions` of the folder's root may lower it, never raise it). `serve` reads it from the files alone, with
+`config.service.sessions.limits`, so `all` and `control-plane` list and serve the same; the control plane registers the helpers' starters
+(`coder/explorer`, `coder/reviewer`) beside `CoderStarter` and a worker steps the rounds. `app.rs` (`Coder::new_with`, the control-plane
+constructors) is unchanged. The card entry is not in `tests/fixtures/agent/card.json`: that is `agent_card_for`'s card, which `serve` extends.
+
+**The limit: a person's round has no workspace.** A round a person starts is its own parent, so its `root_run_id()` is the round itself, and the
+tools find the workspace by the root run: there is no worktree for it until slice 7 of ADR 0045 binds a round to the parent task's workspace.
+Until then a person's `explorer` or `reviewer` can answer from the conversation and the tier's tools (`plan` tier and below; the tier a
+message names is read as for any task and capped by `MAX_ACCESS_TIER`), but cannot read a repository. The model's own `subagent_start` is
+unaffected: its rounds are children of the task that started them and work in its worktree.
 
 ### Scratch projects
 
@@ -2250,7 +2266,7 @@ notifications and the drain are [`adam-service`](../../crates/adam-service/READM
 | Role | Starts | Listener | Workspace root |
 |---|---|---|---|
 | `all` (default) | the A2A server and the workers, in one process: today's behaviour | A2A and `/healthz` on `LISTEN_ADDR` | created |
-| `control-plane` | the A2A server over `Coder::control_plane_with`: a `Runtime` with the agent's `CoderStarter` only, used to start, deliver to, cancel and view runs; `run_worker` is never called | A2A and `/healthz` on `LISTEN_ADDR` | **not** created |
+| `control-plane` | the A2A server over `Coder::control_plane_with`: a `Runtime` with the agent's `CoderStarter` and its helpers' starters only (`coder/explorer`, `coder/reviewer`, for a person's sessions), used to start, deliver to, cancel and view runs; `run_worker` is never called | A2A and `/healthz` on `LISTEN_ADDR` | **not** created |
 | `worker` | `Runtime::run_worker`, and a listener that answers `GET /healthz` (`200 ok`, the route the A2A router serves) and nothing else | `/healthz` only on `LISTEN_ADDR` | created |
 
 Every role also runs the component `notify` (below). The roles meet in the Postgres store (the
