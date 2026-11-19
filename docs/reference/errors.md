@@ -305,12 +305,14 @@ An image does not fail a task by itself: it is one line of text in the image's p
 | The history already holds `MODEL_IMAGE_MAX_COUNT` images | `[image not shown: … is past the 8 images this run sends to the model]` |
 | The run keeps no more in its state (an agent folder: 4 MiB with its long outputs), or the keeper refused | `[image not shown: … does not fit: a run keeps at most 4 MiB of images and long results here]`, `[image not shown: … could not be kept for the model: …]` |
 | The run's tool steps have journaled as many image bytes as a run may (a folder agent) | `[image not shown: … is not kept: this run has kept as many image bytes as it may]` |
-| The bytes cannot be read back when a request is built (**not kept, changed on the volume: the hash is checked**; nothing else) | `[image not shown: shot.png (…) could not be loaded; read it again if it matters]` (the client's line, `ImageRef::missing_line`; the history still names the image) |
+| The bytes cannot be read back when a request is built (**not kept, or changed before the first read of this process: the hash is checked then**; nothing else) | `[image not shown: shot.png (…) could not be loaded; read it again if it matters]` (the client's line, `ImageRef::missing_line`; the history still names the image) |
 | The settings changed since the image was admitted (said in every request, recorded nowhere) | `[image not shown: shot.png (…): this deployment no longer sends images from mcp]`, `[… : it is over the 1.0 MiB this deployment sends]`, `[… : this model cannot see images]` |
 | The provider refused a request that carried the image | `[image not shown: shot.png (…): the model's service refused the request that carried it]` (recorded) |
 | A shortening of the history took an old tool result's images out | `[image removed from the history: shot.png; read it again to see it]` |
 
 A message part that is not an image has its own line, from the A2A front: `[attached: report.pdf (pdf, 84.0 KiB); only images are read]`, `[linked: <url>]` (never fetched), and `[image not shown: … is over what one message may carry (4 images and 2 MiB)]`. A name in a line is a file name (`_` for every other character, at most 64 characters), and an MCP server's declared type is cut to the characters of a media type (at most 64). All of these lines are built by `adam_runtime::SystemLine`, and the coder never reads them as the person's words.
+
+The **first read of an image in a process** (one `(scope, SHA-256)` of the history) reads the bytes and checks the hash; the checked bytes are kept in memory for the life of the process (64 MiB in all, oldest entry first) and later requests of the same scope send them without reading the file again. A file changed after that first read is not re-read: its checked bytes are what is sent, and the changed bytes are never sent.
 
 ## Retry
 

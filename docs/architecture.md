@@ -1226,14 +1226,16 @@ stateDiagram-v2
 The **images** a model sees are kept the same way, apart from the text: the history holds an `ImageRef` (SHA-256,
 type, size, dimensions, origin) and never a byte. Where the bytes are depends on the agent. The inbound message holds
 them (and `Conversation::pending_images`, at most 2 MiB) until the first step reads it. After that the coder has them
-**only on its volume**, `<root>/images/<scope>/<sha256>.<ext>`, per conversation, hash checked when read back, never in
-the journal, the state or the stored record (an MCP image of a server with `files: true` is also a file artifact and is
-journaled as every artifact is). An agent that is only a folder keeps them in the run's state (base64, within the 4 MiB
-it shares with kept outputs) **and** in the journal of the tool step that kept them, as a kept output is, within a run's
-6 MiB of journaled image bytes. Whether they are sent at all is the deployment's word (`MODEL_INPUT_MODALITIES`): an image
-is admitted or replaced by a line once, when it enters the history, and what a request sends about it follows the
-settings now, so the prompt a request starts with only grows while the settings stay. See
-[Images in](reference/a2a-server.md#images-in) and [the coder](reference/coder-agent.md#images).
+**on its volume**, `<root>/images/<scope>/<sha256>.<ext>`, per conversation, and in the process's memory once a request
+has read them: the hash is checked on the first read, and the checked bytes are kept for the life of the process (64 MiB
+in all, oldest first) so a later turn sends them without reading the file again (a file changed after that first read is
+not re-read). They are never in the journal, the state or the stored record (an MCP image of a server with `files: true`
+is also a file artifact and is journaled as every artifact is). An agent that is only a folder keeps them in the run's
+state (base64, within the 4 MiB it shares with kept outputs) **and** in the journal of the tool step that kept them, as a
+kept output is, within a run's 6 MiB of journaled image bytes. Whether they are sent at all is the deployment's word
+(`MODEL_INPUT_MODALITIES`): an image is admitted or replaced by a line once, when it enters the history, and what a
+request sends about it follows the settings now, so the prompt a request starts with only grows while the settings stay.
+See [Images in](reference/a2a-server.md#images-in) and [the coder](reference/coder-agent.md#images).
 
 A **command that keeps running** (`start_command`, a development server) writes into the same file as it prints, line by line,
 after the secrets are scrubbed, and has a record `<id>.cmd` beside it. The coder holds the process (the worker that started it is its
