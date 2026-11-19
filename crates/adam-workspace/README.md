@@ -392,6 +392,14 @@ A run's files are `Workspaces::run(run)`: a directory of **slots** ([ADR 0008](.
 * **Order.** Every slot records `seq`, the place it joined the run, from 1; the legacy worktree is 0.
   `slots()` lists the legacy worktree first and then by directory; `slots_in_join_order()` by `seq`, whose first
   element is "the first repository". A slot whose directory is gone is not listed.
+* **Listing.** `slots()` keeps the list it made for the process and serves it while the metadata has not moved: a stamp
+  (`stat`) of the directory of slot files (`<root>/meta/<run>`) and of the legacy file beside it (`<root>/meta/<run>.json`)
+  is taken on every call, and an add, a removal or an update — `write_meta_at` writes a temporary file and renames it into
+  place — moves one of them, in this process or in another one on the same root (the `shared` placement). A listing whose
+  stamp moved is read again. A cached list is checked again for what a command of the run can change under it: a slot whose
+  directory was moved away or replaced is not listed, and a worktree whose git directory (the mirror's `worktrees/<name>`,
+  and its `gitdir`) no longer names it makes the call list again, so a name from before names carried the run is found
+  through the mirror and recorded, as a first listing does.
 * **`copy_into(scratch, worktree, path, overwrite)`** copies the project's files under the directory `path` of the worktree
   (`.` for its root; no `..`, absolute path or `.git`), each written next to its place and renamed over it, with the
   executable bit. A symbolic link is copied only when its target is relative and stays inside the project. **All or

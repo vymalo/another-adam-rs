@@ -4326,11 +4326,88 @@ async fn a_worktree_directory_of_the_mirror_is_never_taken_over_by_another_run()
         format!("{}\n", a.path().join(".git").display()),
     )
     .unwrap();
+    // A new handle reads the metadata the record was written to (a process keeps the list it
+    // read, and this edit writes the file in place: no directory moves).
+    let again = Workspaces::new(env.root.clone(), Arc::new(StaticToken::new(TOKEN)));
     let slots = again.run("run-aaaaaaaa-1").unwrap().slots().await.unwrap();
     assert!(
         slots[0].worktree().unwrap().git_dir().is_none(),
         "a record that names another run's directory is not believed even when its gitdir was made to agree"
     );
+}
+
+#[tokio::test]
+async fn a_git_directory_from_before_names_carried_the_run_is_found_on_every_listing() {
+    let env = Env::new();
+    let run = env.ws.run("run-aaaaaaaa-1").unwrap();
+    let slot = run.add_repository(&env.repo).await.unwrap();
+    let admin = slot.worktree().unwrap().git_dir().unwrap().to_owned();
+    // A directory from before names carried the run (ADR 0041): no `<run>+` prefix, so the
+    // record cannot vouch for it and only the mirror can name it.
+    let legacy = admin.with_file_name("legacy-app");
+    std::fs::rename(&admin, &legacy).unwrap();
+    std::fs::write(
+        legacy.join("gitdir"),
+        format!("{}\n", slot.path().join(".git").display()),
+    )
+    .unwrap();
+    std::fs::write(
+        slot.path().join(".git"),
+        format!("gitdir: {}\n", legacy.display()),
+    )
+    .unwrap();
+    let mut meta = meta_json(&env, "run-aaaaaaaa-1", &slot);
+    meta["admin"] = "legacy-app".into();
+    let meta_path = env
+        .root
+        .join("meta/run-aaaaaaaa-1")
+        .join(format!("{}.json", slot.dir()));
+    std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+    // The first listing finds the name through the mirror; the second is served from the list the
+    // first made and must give the same answer: a legacy name is not "gone" because it carries no
+    // prefix.
+    for listing in ["first", "cached"] {
+        let slots = run.slots().await.unwrap();
+        let wt = slots[0].worktree().unwrap();
+        assert_eq!(wt.git_dir(), Some(legacy.as_path()), "{listing}");
+        assert!(wt.git_pin().is_some(), "{listing}: git can run");
+        assert!(wt.status().await.unwrap().is_empty(), "{listing}: git runs");
+    }
+}
+
+#[tokio::test]
+async fn a_slot_another_workspace_on_the_same_root_adds_is_listed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, repo) = remote_with(tmp.path(), "acme", "lib", &[("lib.txt", "lib\n")]);
+    let a = workspaces(tmp.path());
+    let run = a.run(RUN).unwrap();
+    assert!(run.slots().await.unwrap().is_empty(), "listed and kept");
+    // Another worker process on the same volume (the `shared` placement) adds a slot.
+    let b = workspaces(tmp.path());
+    b.run(RUN).unwrap().add_repository(&repo).await.unwrap();
+    assert_eq!(
+        run.slots().await.unwrap().len(),
+        1,
+        "a slot another process added is listed"
+    );
+}
+
+#[tokio::test]
+async fn a_metadata_file_moved_behind_the_handle_is_read_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    run.add_scratch("fib", &me()).await.unwrap();
+    assert_eq!(run.slots().await.unwrap().len(), 1, "listed and kept");
+    // A file moved out of the metadata directory and back (a person, another tool): the
+    // directory moves, so the list is read again.
+    let meta = scratch_meta_path(&tmp.path().join("root"), RUN, "fib");
+    let moved = meta.with_extension("away");
+    std::fs::rename(&meta, &moved).unwrap();
+    assert!(run.slots().await.unwrap().is_empty(), "a removal is seen");
+    std::fs::rename(&moved, &meta).unwrap();
+    assert_eq!(run.slots().await.unwrap().len(), 1, "and an add is seen");
 }
 
 #[tokio::test]
@@ -4794,6 +4871,9 @@ async fn a_generation_in_the_metadata_that_is_not_a_token_is_not_believed() {
         edit_scratch_meta(&meta, |m| {
             m.insert("dir_gen".to_owned(), bad.into());
         });
+        // A new handle reads the metadata again: a process keeps the list it listed, and this
+        // edit moves no directory (it writes the file in place).
+        let run = workspaces(tmp.path()).run(RUN).unwrap();
         let listed = run.slot("fib").await.unwrap().unwrap();
         assert_eq!(listed.generation(), None, "{bad:?}");
     }

@@ -37,7 +37,14 @@ fn as_refs<'a>(files: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a st
 
 /// A rig and a run whose first slot is the `devbox` repository, with the container's inspect ready.
 async fn devbox() -> (Rig, adam_workspace::RunWorkspace, PathBuf) {
-    let rig = Rig::new();
+    devbox_with(|_| {}).await
+}
+
+/// [`devbox`] with settings `tweak` changes (a short liveness cache, a timeout).
+async fn devbox_with(
+    tweak: impl FnOnce(&mut adam_devcontainer::Settings),
+) -> (Rig, adam_workspace::RunWorkspace, PathBuf) {
+    let rig = Rig::with(tweak);
     let ws = rig.run(RUN);
     let slot = rig
         .repository(&ws, "devbox", &as_refs(&devbox_files()))
@@ -1146,7 +1153,9 @@ async fn ten_commands_ask_the_service_once_that_the_container_is_there() {
 
 #[tokio::test]
 async fn a_container_that_dies_is_noticed_when_the_verdict_expires() {
-    let (rig, ws, _) = devbox().await;
+    // The liveness cache is the setting, so the test waits for its own short one, not the
+    // default's three seconds.
+    let (rig, ws, _) = devbox_with(|s| s.alive_ttl = std::time::Duration::from_secs(1)).await;
     rig.env.ensure(&ws, &Steps::default()).await.unwrap();
     // The answer is cached by this call.
     rig.env.ensure(&ws, &Steps::default()).await.unwrap();
@@ -1158,9 +1167,42 @@ async fn a_container_that_dies_is_noticed_when_the_verdict_expires() {
         "within the cache the container is not asked about again"
     );
     // After it, the container is gone and the environment is made again.
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let steps = Steps::default();
     rig.env.ensure(&ws, &steps).await.unwrap();
+    assert_eq!(
+        steps.latest()[0].label,
+        "The environment was lost; rebuilding it"
+    );
+    assert_eq!(rig.cli("up").len(), 2);
+}
+
+#[tokio::test]
+async fn a_rebuild_that_could_not_remove_the_container_is_checked_again() {
+    // A rebuild that succeeds writes a `Building` state, so the next `ensure` builds without
+    // asking whether a container is there. One that fails leaves the state `Ready`: the verdict it
+    // forgot must not be believed by the next command, which would otherwise run in a container
+    // that is gone.
+    let (rig, ws, _) = devbox().await;
+    rig.env.ensure(&ws, &Steps::default()).await.unwrap();
+    // The container was seen there: the verdict is cached.
+    rig.env.ensure(&ws, &Steps::default()).await.unwrap();
+    rig.put("rm.fails", "");
+    rig.put("podman.rm.exit", "125");
+    assert!(
+        rig.env.rebuild(RUN, false).await.is_err(),
+        "the container could not be removed"
+    );
+    rig.remove("rm.fails");
+    rig.remove("podman.rm.exit");
+    rig.put("ps.json", "[]");
+    let asked = rig.podman("ps").len();
+    let steps = Steps::default();
+    rig.env.ensure(&ws, &steps).await.unwrap();
+    assert!(
+        rig.podman("ps").len() > asked,
+        "the next command asks the service whether the container is there"
+    );
     assert_eq!(
         steps.latest()[0].label,
         "The environment was lost; rebuilding it"

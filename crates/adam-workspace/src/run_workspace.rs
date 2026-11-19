@@ -504,12 +504,13 @@ impl RunWorkspace {
     /// after its repository), then the others sorted by directory name. A slot whose directory is
     /// gone is not listed.
     ///
-    /// The list is kept for the process: it changes only through this type's own methods
+    /// The list is kept for the process until the metadata moves: a tool call asks for it on every
+    /// call, and it changes through this type's own methods
     /// ([`add_repository`](Self::add_repository), [`add_scratch`](Self::add_scratch),
-    /// [`remove`](Self::remove), ...), which forget it, and a tool call asks for it on every call.
-    /// What a command of the run can change under it — its slot's directory, and the mirror's
-    /// `worktrees/<name>/gitdir` when the run works in the coder's own environment — is checked
-    /// again on every call, as a fresh listing does.
+    /// [`remove`](Self::remove), ...) or through another process on the same root (the `shared`
+    /// placement). A stamp of the metadata directory (`Inner::slots_stamp`) is taken on every call
+    /// and a listing whose stamp moved is read again; so is one whose slot directory a command of
+    /// the run moved, and one whose worktree's git directory it rewrote.
     ///
     /// # Errors
     ///
@@ -517,7 +518,8 @@ impl RunWorkspace {
     #[tracing::instrument(skip(self), fields(run = %self.run))]
     pub async fn slots(&self) -> WorkspaceResult<Vec<Slot>> {
         let inner = self.inner();
-        if let Some(cached) = inner.cached_slots(&self.run)
+        let stamp = inner.slots_stamp(&self.run).await;
+        if let Some(cached) = inner.cached_slots(&self.run, &stamp)
             && let Some(slots) = self.rechecked(&cached).await
         {
             return Ok(slots);
@@ -528,53 +530,37 @@ impl RunWorkspace {
         for meta in inner.read_slot_metas(&self.run).await? {
             slots.extend(self.slot_of(&meta).await?);
         }
-        inner.cache_slots(&self.run, epoch, &slots);
+        inner.cache_slots(&self.run, epoch, stamp, &slots);
         Ok(slots)
     }
 
     /// The cached slots, with the two things a command of the run can change under them checked
     /// again: the slot's directory must still be the one the coder opened ([`Slot::root`]), and a
-    /// worktree's git directory must still name it (`Inner::admin_is_gone`). A slot that fails the
-    /// first is not listed; one that fails the second is listed without a git directory, and git
-    /// refuses to run on it.
+    /// worktree's git directory must still name it (`Inner::admin_is_gone`).
     ///
-    /// `None` when a worktree's git directory was never told: the mirror may have gained exactly
-    /// one answer since (a slot from before the directory was recorded), which a listing made now
-    /// finds and records, so the caller lists again.
+    /// `None` when a listing must be made: a slot's directory was moved away or replaced, or a
+    /// worktree's git directory was never told or no longer names it. A listing made now resolves
+    /// the git directory through the mirror (`admin_by_backpointer`), which knows the names from
+    /// before they carried the run, and records it; stripping it from the cached slot would leave
+    /// a legacy worktree without git for the life of the process.
     async fn rechecked(&self, slots: &[Slot]) -> Option<Vec<Slot>> {
         let inner = self.inner();
         let mut checked = Vec::with_capacity(slots.len());
         for slot in slots {
             if !slot.root().is_still_here() {
-                continue;
+                return None;
             }
-            let kind = match slot.kind() {
-                SlotKind::Repository(wt) => {
+            match slot.kind() {
+                SlotKind::Repository(wt) | SlotKind::Reference(wt) => {
                     // A worktree whose git directory was never told: list again.
                     wt.git_dir()?;
                     if inner.admin_is_gone(wt).await {
-                        SlotKind::Repository(wt.without_git_dir())
-                    } else {
-                        SlotKind::Repository(wt.clone())
+                        return None;
                     }
                 }
-                SlotKind::Reference(wt) => {
-                    // A worktree whose git directory was never told: list again.
-                    wt.git_dir()?;
-                    if inner.admin_is_gone(wt).await {
-                        SlotKind::Reference(wt.without_git_dir())
-                    } else {
-                        SlotKind::Reference(wt.clone())
-                    }
-                }
-                SlotKind::Scratch(scratch) => SlotKind::Scratch(scratch.clone()),
-            };
-            checked.push(Slot {
-                dir: slot.dir.clone(),
-                path: slot.path.clone(),
-                seq: slot.seq,
-                kind,
-            });
+                SlotKind::Scratch(_) => {}
+            }
+            checked.push(slot.clone());
         }
         Some(checked)
     }

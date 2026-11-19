@@ -41,12 +41,6 @@ use crate::{Runtime, Settings};
 /// What the step of building an environment shows.
 const STEP: &str = "environment";
 
-/// How long a verdict that a run's container is there is believed. `ensure` is asked on every
-/// tool call that runs a process, and a container does not come and go between two commands of a
-/// turn; a container that dies is caught by the command it breaks and by the first `ensure` after
-/// this.
-const ALIVE_TTL: Duration = Duration::from_secs(3);
-
 /// The verdict that a run's container was there, when it was asked, and which container was seen
 /// (a rebuild makes another one).
 struct Alive {
@@ -409,13 +403,16 @@ impl DevContainer {
         })
     }
 
-    /// Whether the container of `state` is there and running, believed for [`ALIVE_TTL`]: `ensure`
-    /// asks on every tool call, and `podman ps` is a process per call for an answer that only a
-    /// container dying changes. A verdict is only cached when the container was seen there, and
-    /// only for the container it was seen for.
+    /// Whether the container of `state` is there and running, believed for
+    /// [`Settings::alive_ttl`]: `ensure` asks on every tool call, and `podman ps` is a process per
+    /// call for an answer that only a container dying changes. A verdict is only cached when the
+    /// container was seen there, and only for the container it was seen for.
     async fn alive(&self, run: &str, state: &State) -> Result<bool, EnvError> {
+        let env_file = state::run_dir(&self.inner.settings.root, run)?.join("devcontainer.json");
+        let env_file_is_there = env_file.is_file();
         let id = state.container_id.as_deref().filter(|id| !id.is_empty());
-        if let Some(id) = id
+        if env_file_is_there
+            && let Some(id) = id
             && self.alive_recently(run, id)
         {
             return Ok(true);
@@ -429,8 +426,7 @@ impl DevContainer {
         let Some(id) = id else {
             return Ok(false);
         };
-        let env_file = state::run_dir(&self.inner.settings.root, run)?.join("devcontainer.json");
-        let alive = env_file.is_file()
+        let alive = env_file_is_there
             && rows.iter().any(|r: &Row| {
                 r.running && (r.id == id || r.id.starts_with(id) || id.starts_with(&r.id))
             });
@@ -438,16 +434,16 @@ impl DevContainer {
         Ok(alive)
     }
 
-    /// Whether the container `id` of `run` was found there less than [`ALIVE_TTL`] ago.
+    /// Whether the container `id` of `run` was found there less than [`Settings::alive_ttl`] ago.
     fn alive_recently(&self, run: &str, id: &str) -> bool {
         let cache = self
             .inner
             .alive
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache
-            .get(run)
-            .is_some_and(|seen| seen.container == id && seen.at.elapsed() < ALIVE_TTL)
+        cache.get(run).is_some_and(|seen| {
+            seen.container == id && seen.at.elapsed() < self.inner.settings.alive_ttl
+        })
     }
 
     /// Keep (or forget) what `alive` found: only a container that was there is worth believing.

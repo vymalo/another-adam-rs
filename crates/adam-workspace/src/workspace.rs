@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::io;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -130,13 +131,51 @@ pub(crate) struct Inner {
 /// The slots of each run as this process last listed them.
 ///
 /// A tool call lists a run's slots on every call (`ToolEnv::slot_to_read`), and listing them
-/// opens every slot's directory and reads its metadata; the set changes only through
-/// [`RunWorkspace`]'s own methods in this process, which call `Inner::forget_slots`. `epoch`
-/// makes a listing that was read while a change was being written not overwrite the newer one.
+/// opens every slot's directory and reads its metadata; the set changes through
+/// [`RunWorkspace`]'s own methods in this process, which call `Inner::forget_slots`, and through
+/// another process on the same root (the `shared` placement), which the stamp of the metadata
+/// sees. `epoch` makes a listing that was read while a change was being written not overwrite the
+/// newer one.
 #[derive(Default)]
 struct SlotCache {
     epoch: u64,
-    by_run: HashMap<String, Vec<Slot>>,
+    by_run: HashMap<String, CachedSlots>,
+}
+
+/// The slots of one run as they were listed, and what the metadata looked like then.
+struct CachedSlots {
+    stamp: SlotStamp,
+    slots: Vec<Slot>,
+}
+
+/// What a run's metadata looked like when its slots were listed: the directory of slot files
+/// (`<root>/meta/<run>`) and the legacy file beside it (`<root>/meta/<run>.json`).
+///
+/// `Inner::write_meta_at` writes a temporary file and renames it into place, so an add, a removal
+/// or an update moves the directory's mtime and inode — in this process or in another one on the
+/// same root. A listing whose stamp differs is read again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlotStamp {
+    slots: Option<Stamp>,
+    legacy: Option<Stamp>,
+}
+
+/// A path's modification time and inode, as `stat` gives them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Stamp {
+    mtime: i64,
+    nanos: i64,
+    ino: u64,
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            mtime: meta.mtime(),
+            nanos: meta.mtime_nsec(),
+            ino: meta.ino(),
+        }
+    }
 }
 
 /// Held while a mirror is being changed: the in-process lock, then the file lock. Fields drop
@@ -1263,13 +1302,32 @@ impl Inner {
         &self.root
     }
 
-    /// The slots of `run` as this process last listed them, if it did.
-    pub(crate) fn cached_slots(&self, run: &str) -> Option<Vec<Slot>> {
+    /// The slots of `run` as this process last listed them, if it did and its metadata is still
+    /// what it was then.
+    pub(crate) fn cached_slots(&self, run: &str, stamp: &SlotStamp) -> Option<Vec<Slot>> {
         let cache = self
             .slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.by_run.get(run).cloned()
+        cache
+            .by_run
+            .get(run)
+            .filter(|cached| &cached.stamp == stamp)
+            .map(|cached| cached.slots.clone())
+    }
+
+    /// What the metadata of `run`'s slots looks like now: [`SlotStamp`].
+    pub(crate) async fn slots_stamp(&self, run: &str) -> SlotStamp {
+        let stamp = |path: PathBuf| async move {
+            match tokio::fs::metadata(&path).await {
+                Ok(meta) => Some(Stamp::of(&meta)),
+                Err(_) => None,
+            }
+        };
+        SlotStamp {
+            slots: stamp(self.slot_meta_dir(run)).await,
+            legacy: stamp(self.meta_path(run)).await,
+        }
     }
 
     /// The token a listing of the slots must still be current to be kept: [`Self::cache_slots`].
@@ -1281,13 +1339,19 @@ impl Inner {
     }
 
     /// Keep the listing of `run`'s slots read at `epoch`, unless the slots changed meanwhile.
-    pub(crate) fn cache_slots(&self, run: &str, epoch: u64, slots: &[Slot]) {
+    pub(crate) fn cache_slots(&self, run: &str, epoch: u64, stamp: SlotStamp, slots: &[Slot]) {
         let mut cache = self
             .slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if cache.epoch == epoch {
-            cache.by_run.insert(run.to_owned(), slots.to_vec());
+            cache.by_run.insert(
+                run.to_owned(),
+                CachedSlots {
+                    stamp,
+                    slots: slots.to_vec(),
+                },
+            );
         }
     }
 
