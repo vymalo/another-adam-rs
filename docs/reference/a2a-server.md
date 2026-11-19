@@ -527,7 +527,7 @@ The states that are lines: `StandIn` is written once into the history (the recor
   | Agent | The bytes are in | Until | Bound |
   |---|---|---|---|
   | any | the inbound message in the inbox, and `Conversation::pending_images` for the start message | the first step that reads it | 4 images and 2 MiB a message |
-  | any (what a request read) | the process's memory, by scope and SHA-256 (`ImageCache`) | the life of the process; the oldest entry goes first | 64 MiB a process |
+  | any (what a request read) | the process's memory, by scope and SHA-256 (`ImageCache`) | the life of the process; the oldest entry goes first | 64 MiB per agent (one per process in the coder) |
   | the coder (it has an `ImageStore`) | files on its volume, per conversation | the janitor removes the scope ([the coder](coder-agent.md#images)) | 4 MiB an image, 64 MiB a scope; **nothing in the journal and nothing in the state** after the first step |
   | a folder agent (no store) | the run's state, base64, and the journal of the tool step that kept them (as a kept output) | the state: until no message names the image; the journal: for good | the state: the 4 MiB it shares with kept outputs; the journal: `MAX_RUN_JOURNALED_IMAGE_BYTES` (6 MiB, a run's budget of file bytes) over the whole run, never freed by a shortening or a compaction, then an image is a line that says the run has kept as many image bytes as it may |
   | a tool's image with `files: true` (MCP) | also a file artifact, journaled as every artifact is, with the same SHA-256 | as an artifact | the artifact bounds |

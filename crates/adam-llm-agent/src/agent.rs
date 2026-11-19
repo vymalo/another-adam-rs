@@ -4338,8 +4338,8 @@ impl Agent for LlmAgent {
         if expired > 0 {
             tracing::debug!(expired, "expired entries left the run's context");
         }
-        // One shared copy of the run's context for this step: every tool call and every source
-        // sees the same map, and no call clones it. Built after this step's messages merged their
+        // One shared copy of the run's context for this step: when there is a context, every tool
+        // call and every source sees the same map, and no call clones it. Built after this step's messages merged their
         // context and the expired entries left, so it is the map the tools of this step read, and
         // only when there is something in it: a step with no context (a wake that only looks at a
         // wait) does not copy one.
