@@ -41,11 +41,11 @@ scan_over() { # scan_over <scan> <root>...
       return 2
       ;;
   esac
-  for root in $required; do
+  for scan_root in $required; do
     case " $* " in
-      *" $root "*) ;;
+      *" $scan_root "*) ;;
       *)
-        echo "the $scan scan was narrowed: it no longer reads $root" >&2
+        echo "the $scan scan was narrowed: it no longer reads $scan_root" >&2
         return 2
         ;;
     esac
