@@ -736,8 +736,12 @@ alone hold the notes across their work and save them once. `tests/tool_access.rs
 this table, so a tool added without a decision fails it, and runs the classes through the loop (two reads overlap,
 a read and a write of one path do not, a command waits for a write and runs beside reads, two commands never overlap).
 
-The prompt tells the model to ask for independent calls together in one reply; the bench counts the calls per model
-turn to see whether it does ([bench README](../../bench/README.md), "Calls per model turn").
+The prompt asks for the calls of a step together in one reply, where the model plans its work: the reads of a
+step ("How to work" step 3), the independent edits of different files (step 4), and `run_command` as one look per
+command with several short looks in it (`ls && cat package.json`, `git status && git diff`). A call that must
+follow another sets `after_previous: true`, and the prompt says that calls which conflict keep their order by
+themselves, so batching cannot reorder them. The bench counts the calls per model turn to see whether the model
+does it ([bench README](../../bench/README.md), "Calls per model turn").
 
 ### Time limit of each tool
 

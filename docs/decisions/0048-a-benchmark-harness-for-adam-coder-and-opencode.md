@@ -283,6 +283,7 @@ own file unchanged. Every replaced or dropped phrase:
 | `run_command` | `shell` |
 | `run` | `shell` |
 | `read_file` | `read` |
+| `read_files` | `read` |
 | `write_file` | `write` |
 | `edit_file` | `edit` |
 | `apply_patch` | `edit` |
@@ -299,7 +300,7 @@ own file unchanged. Every replaced or dropped phrase:
 | how-4-commit | rewritten | Commit, push and open the pull request only at the end: you do that. | Leave your changes in the working tree: the harness collects them, so do not commit or push. |
 | how-5-run-checks | rewritten | Run the discovered checks with `run_checks` (only those) | Run the repository's discovered checks with `shell` (only those) |
 | how-5-pr-allowed | rewritten | a pull request is only allowed for exactly the code the checks passed on. | a change is only as good as the code the checks passed on. |
-| how-5-screenshot | dropped | To show a web page you changed, screenshot it with `obscura` (see "The work environment"), `share_file` it, and delete it before you commit. | (nothing) |
+| how-5-screenshot | dropped | To show a web page you changed, screenshot it with `obscura` (see "The work environment"), `share_file` it, and delete it before you commit. (in a later revision, preceded by: A call that must follow another sets `after_previous: true`; calls that conflict keep their order automatically, so batching cannot reorder them. To show a web page you changed, screenshot it with `obscura`, share it, and delete it before you commit.) | (nothing) |
 | how-6-scratch-cycles | rewritten | , and {{scratch_check_cycles}} times in a scratch project (counted apart; a cycle is one failed `run_checks`) | (a cycle is one failed run of the checks) |
 | how-6-no-tools-again | rewritten | do not call `run_checks`, `commit_and_push` or `open_pull_request` again. | do not run the checks again. |
 | how-6-pre-existing | rewritten | A failure the tool calls PRE-EXISTING (the command fails on the base branch too) is not yours and costs no cycle: add no error to it and go on. The pull request is allowed and says so. | A failure that is the same on the base branch (PRE-EXISTING) is not yours and costs no cycle: add no error to it and go on, and say so in your final answer. |
@@ -336,3 +337,9 @@ that adam makes about 1.8 times the calls of OpenCode on the tasks both finish, 
 to. A call the answer did not name (or one beyond the 64-name cap) is counted in the calls and shown in a `(no name)`
 row, never guessed from the arguments; a ledger written before this says `n/a`. No decision above changes: it is an addition to the ledger's
 records and to the report.
+
+## Amended 2026-11-19: `read_files`
+
+`read_files` (#184) reads 1 to 16 files in one call and is a later revision than the pin. The pin's text does not name it; the coder's
+step 3 does (since #184), and OpenCode's `read` reads one file, so it is renamed to `read` in the table above like `read_file`. Nothing
+else in the decision changes.
