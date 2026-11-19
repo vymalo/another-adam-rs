@@ -10,15 +10,17 @@ use adam_agent_fs::{
     AgentManifest, Diagnostic, EmbeddedAgent, InstructionPart, Instructions, Limits as FileLimits,
     ManifestSource, McpConfig, ModelRef, SkillSelection, Strictness, Subagent, ToolList,
 };
-use adam_llm_agent::{DynTool, Limits, SESSION_TOOLS, SessionAgent, SessionTools, ToolSet};
-use adam_runtime::SessionLimits;
+use adam_llm_agent::{
+    DynTool, Limits, LlmStarter, SESSION_TOOLS, SessionAgent, SessionTools, ToolSet,
+};
+use adam_runtime::{RuntimeBuilder, SessionLimits};
 use secrecy::SecretString;
 
 use crate::assembly::BoundDef;
 use crate::error::{Error, Origin, ToolClash};
 use crate::mcp::{self, McpBinding};
 use crate::remote::{RemoteSettings, RemoteSubagentTool};
-use crate::remote_session::RemoteRoundAgent;
+use crate::remote_session::{RemoteRoundAgent, RemoteRoundStarter};
 use crate::skills::{self, RunSkills, RunSkillsHandle, SkillFiles, SkillSet};
 use crate::subagent::{DEFAULT_SUBAGENT_MINUTES, SubagentTool};
 use crate::suggest::closest;
@@ -335,6 +337,65 @@ impl AgentDef {
         )
     }
 
+    /// What the root's A2A front serves `child-sessions/v1` for: each subagent of the root, local
+    /// and remote, in the order of the manifest, with the time limit of its rounds, and the
+    /// *effective* limits ([`effective_session_limits`](Self::effective_session_limits)). `None`
+    /// when the root has no subagent: it has no session tools either. The same function on every
+    /// process role and made without binding, so a control plane that never builds the agent
+    /// serves the card and the sessions a worker's tools agree with.
+    ///
+    /// Only with the feature `a2a`.
+    #[cfg(feature = "a2a")]
+    pub fn child_sessions(&self) -> Option<adam_a2a_runtime::ChildSessions> {
+        use adam_a2a_runtime::{ChildSessionAgent, ChildSessions};
+        let limits = self.effective_session_limits();
+        let helpers = session_roster(&self.manifest, &self.manifest.name, &self.remote)
+            .into_iter()
+            .map(|helper| {
+                let agent = ChildSessionAgent::new(helper.name, helper.agent, helper.description);
+                match helper.within {
+                    Some(within) => agent.within(within),
+                    None => agent,
+                }
+            })
+            .collect::<Vec<_>>();
+        if helpers.is_empty() {
+            return None;
+        }
+        match ChildSessions::new(helpers, limits.max_open()) {
+            Ok(sessions) => Some(sessions.with_limits(limits)),
+            Err(problem) => {
+                tracing::warn!(agent = %self.manifest.name, %problem, "no child sessions");
+                None
+            }
+        }
+    }
+
+    /// Register, on a process that serves the A2A front but does not step the root's helpers, the
+    /// starters of each of them, local and remote, under `<root>/<name>`: what a person's session
+    /// round needs to be started there. A worker with the full agents
+    /// ([`Assembly::register`](crate::Assembly::register)) steps them. An agent with no subagent
+    /// registers nothing. Do not call it on a runtime that also registers the assembly: a second
+    /// registration under a name replaces the first.
+    ///
+    /// A process that registers only starters cannot cancel the task of a remote round it
+    /// cancels: the cancel is sent by the full agent, where it commits ([`RemoteRoundAgent`]).
+    #[must_use]
+    pub fn session_starters(&self, builder: RuntimeBuilder) -> RuntimeBuilder {
+        let root = &self.manifest.name;
+        self.manifest
+            .subagents
+            .iter()
+            .fold(builder, |builder, sub| match sub {
+                Subagent::Local(child) => {
+                    builder.starter(LlmStarter::new(format!("{root}/{}", child.name)))
+                }
+                Subagent::Remote(agent) => {
+                    builder.starter(RemoteRoundStarter::new(format!("{root}/{}", agent.name)))
+                }
+            })
+    }
+
     /// How long a parent waits for the task of a remote subagent before the call is answered with
     /// an error result (default one hour; the remote task is left where it is). A zero is raised to
     /// one millisecond.
@@ -481,6 +542,8 @@ impl AgentDef {
     /// The first problem found, in the order above; see [`Error`].
     pub fn bind(self, tools: ToolSet) -> Result<BoundDef, Error> {
         let catalog = Catalog::new(&tools)?;
+        #[cfg(feature = "a2a")]
+        let child_sessions = self.child_sessions();
         // An agent given MCP tools that the definition does not contain: a typo, found before the
         // walk, so that the message is about the name and not about a server that "is not
         // connected".
@@ -530,6 +593,8 @@ impl AgentDef {
         }
         let root = self.manifest.name.clone();
         let bound = BoundDef::new(self.manifest, nodes, remotes, session_limits);
+        #[cfg(feature = "a2a")]
+        let bound = bound.with_child_sessions(child_sessions);
         #[cfg(feature = "mcp")]
         let bound = bound.with_prompt_commands(
             self.mcp
@@ -932,26 +997,7 @@ fn add_subagent_tools(
     }
     // The tools that run a subagent in the background: after the one tool per subagent, and named
     // so that a clash with a tool or a subagent is found now.
-    let roster: Vec<SessionAgent> = manifest
-        .subagents
-        .iter()
-        .map(|sub| match sub {
-            Subagent::Local(child) => SessionAgent {
-                name: child.name.clone(),
-                agent: format!("{}/{}", origin.agent, child.name),
-                description: child.frontmatter.description.clone().unwrap_or_default(),
-                within: run_limit(child.frontmatter.limits.as_ref()),
-                remote: false,
-            },
-            Subagent::Remote(agent) => SessionAgent {
-                name: agent.name.clone(),
-                agent: format!("{}/{}", origin.agent, agent.name),
-                description: agent.description.clone(),
-                within: Some(remote.max_wait),
-                remote: true,
-            },
-        })
-        .collect();
+    let roster = session_roster(manifest, &origin.agent, remote);
     let session_tools = SessionTools::new(roster).with_limits(session_limits.unwrap_or_default());
     for name in SESSION_TOOLS {
         if tools.iter().any(|(n, _)| n == name) {
@@ -976,6 +1022,37 @@ fn add_subagent_tools(
         tools.push((tool.spec().name, tool));
     }
     Ok((session_tools.session_agents(), rounds))
+}
+
+/// The subagents of the root a session can be started on, in the order of the manifest: the one
+/// list the session tools, the card and the A2A front are made from, so they cannot disagree. A
+/// local subagent's rounds are limited by its `limits.max_minutes`, a remote one's by the
+/// deployment's remote wait.
+fn session_roster(
+    manifest: &AgentManifest,
+    root: &str,
+    remote: &RemoteSettings,
+) -> Vec<SessionAgent> {
+    manifest
+        .subagents
+        .iter()
+        .map(|sub| match sub {
+            Subagent::Local(child) => SessionAgent {
+                name: child.name.clone(),
+                agent: format!("{root}/{}", child.name),
+                description: child.frontmatter.description.clone().unwrap_or_default(),
+                within: run_limit(child.frontmatter.limits.as_ref()),
+                remote: false,
+            },
+            Subagent::Remote(agent) => SessionAgent {
+                name: agent.name.clone(),
+                agent: format!("{root}/{}", agent.name),
+                description: agent.description.clone(),
+                within: Some(remote.max_wait),
+                remote: true,
+            },
+        })
+        .collect()
 }
 
 /// The deployment's session limits lowered by the root's file: each value of the file that is
