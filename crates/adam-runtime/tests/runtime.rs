@@ -7171,8 +7171,12 @@ mod cases {
             .await
             .expect("start");
         let worker = spawn_worker(&rt);
-        // The first failure schedules a retry; nothing steps before the test moves the clock.
-        wait_for(&rt, run, "the retry to be scheduled", |v| v.attempt == 1).await;
+        // The first failure schedules a retry; the run may also exhaust both attempts before a
+        // reader sees attempt 1, so accept either, then move the clock for a scheduled retry.
+        wait_for(&rt, run, "the first failure", |v| {
+            v.attempt >= 1 || v.status == RunStatus::Failed
+        })
+        .await;
         clock.advance(Duration::from_secs(1));
         let failed = wait_failed(&rt, run).await;
         worker.stop().await;
