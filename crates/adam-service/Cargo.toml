@@ -23,6 +23,7 @@ adam-error.workspace = true
 adam-host.workspace = true
 adam-mcp = { workspace = true, optional = true }
 adam-model.workspace = true
+adam-model-oauth.workspace = true
 adam-model-openai.workspace = true
 adam-notify-postgres.workspace = true
 adam-runtime.workspace = true

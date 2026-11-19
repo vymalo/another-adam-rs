@@ -1,0 +1,27 @@
+[package]
+name = "adam-model-oauth"
+description = "OAuth 2.0 device-grant credentials for adam-rs model calls (ADR 0058)"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-model.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+adam-model-openai.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

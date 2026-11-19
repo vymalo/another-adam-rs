@@ -25,6 +25,10 @@ the provider asked to wait, and the runtime owns backoff.
 | `Message`, `ContentPart`, `ToolCall`, `ToolSpec`, `Usage`, `FinishReason` | conversation and tool-calling types; all derive `Serialize`/`Deserialize` because a run persists its history. `ToolCall` has `new(id, name, arguments)`, `with_invalid_arguments(id, name, raw)` and `Default`; its `invalid_arguments: Option<String>` holds the raw argument text when it was not JSON (`arguments` is then `{}`). **Breaking:** a `ToolCall { id, name, arguments }` literal no longer compiles (use `ToolCall::new` or `..Default::default()`); the serialized form and the `ModelClient` trait are unchanged, and journals written before the field decode with `None` |
 | `ModelError` | `RateLimited { retry_after }`, `Transient`, `ContextLength`, `InvalidRequest`, `Auth`, `Protocol`; `#[non_exhaustive]`, see *Errors* |
 | `Classify`, `ErrorClass` | re-exported from `adam-error`: `class()`, `is_retryable()`, `retry_after()` |
+| `ModelCredentials` (trait), `DynCredentials` | where the credentials of a model call come from, **asked for every call** ([ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)): `headers(CredentialRequest { method, url, attempt }) -> CredentialHeaders` and `rejected(call, &Rejection { status, www_authenticate, dpop_nonce }) -> AfterRejection` (`Retry` or `GiveUp`, the default). A host mints, renews or proves a credential at the moment of use (a token renewed from the person's session, a DPoP proof over the method and URL), or gives a header with no key at all (an injector's run tag). Its errors are its choice of class: `Auth` when the person must act, `Transient` when the issuer did not answer. `Arc<T>` forwards it |
+| `CredentialHeaders` | the headers of one call: `none()`, `bearer(&token)`, `.with(name, value)` (a later one of the same name replaces it, case-insensitive); values are `SecretString`, `Debug` shows the names only |
+| `StaticBearer` | a fixed bearer, the same for every call (an empty one sends no header): what `MODEL_API_KEY` gives. It gives up on a rejection |
+| `RenewingCredentials` | a test double: `token-1`, `token-2`, ... moved on by each rejection, which it asks to retry; `issued()`, `rejections()` |
 | `MockModel`, `RecordedCall` | scripted `ModelClient` that records requests; always compiled, no feature flag; `.with_provider(label)` and `.with_context_window(alias, n)` say what a real client would |
 
 ```rust
@@ -127,7 +131,7 @@ None.
 Doctests (the crate docs run as tests in CI's `cargo test --doc`) and unit
 tests in `src/error.rs` (`class_table`,
 `retry_after_comes_from_the_rate_limit_only`,
-`a_source_is_kept_and_printed_once`), `src/mock.rs` and `src/types.rs` (the usage accounting:
+`a_source_is_kept_and_printed_once`), `src/credentials.rs` (a fixed key and an empty one, giving up, `Debug` without values, a header replaced by name, the double's renewal), `src/mock.rs` and `src/types.rs` (the usage accounting:
 `a_part_above_its_total_is_added_in_and_one_within_it_is_left`, `usages_add_part_by_part_and_saturate`). No external
 service, no environment variables. [`adam-model-openai`](../adam-model-openai/README.md)
 tests a real implementation against a mock HTTP server.
