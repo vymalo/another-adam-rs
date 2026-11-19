@@ -405,6 +405,39 @@ pub async fn serve(
     agents: Agents,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), ServeError> {
+    run(config, agents, Listen::Addr(config.listen_addr), shutdown).await
+}
+
+/// [`serve`] on a listener the caller has already bound; [`ServiceConfig::listen_addr`] is not read.
+///
+/// For a host that must know its address before the process starts (a test, a supervisor handing
+/// over a socket): binding first and handing the listener over leaves no moment in which another
+/// process can take the port. Everything else, the order of the checks included, is [`serve`]'s.
+///
+/// # Errors
+///
+/// As [`serve`], except [`ServeError::Bind`], which this never returns.
+pub async fn serve_on(
+    config: &ServiceConfig,
+    agents: Agents,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send,
+) -> Result<(), ServeError> {
+    run(config, agents, Listen::Bound(listener), shutdown).await
+}
+
+/// Where the server listens: an address to bind once the store is ready, or a bound listener.
+enum Listen {
+    Addr(SocketAddr),
+    Bound(TcpListener),
+}
+
+async fn run(
+    config: &ServiceConfig,
+    agents: Agents,
+    listen: Listen,
+    shutdown: impl Future<Output = ()> + Send,
+) -> Result<(), ServeError> {
     let role = config.role;
     let Agents {
         name,
@@ -471,12 +504,12 @@ pub async fn serve(
         .map_err(ServeError::Migrate)?;
 
     // Bind before anything runs: an address that cannot be bound fails the process at once.
-    let listener = TcpListener::bind(config.listen_addr)
-        .await
-        .map_err(|source| ServeError::Bind {
-            addr: config.listen_addr,
-            source,
-        })?;
+    let listener = match listen {
+        Listen::Addr(addr) => TcpListener::bind(addr)
+            .await
+            .map_err(|source| ServeError::Bind { addr, source })?,
+        Listen::Bound(listener) => listener,
+    };
     // The bound address, not the configured one: `LISTEN_ADDR=…:0` picks a
     // free port, and this line is how a supervisor (or a test) learns it.
     let addr = listener.local_addr().map_err(ServeError::LocalAddr)?;
