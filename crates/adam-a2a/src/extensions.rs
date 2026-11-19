@@ -368,6 +368,14 @@ pub const REPLACEABLE_ARTIFACT: &str = "vymalo.replaceable";
 mod tests {
     use super::*;
 
+    /// The metadata key is part of the wire: clients and delivery cursors read it by name.
+    #[test]
+    fn the_replaceable_artifact_key_is_the_wire_name() {
+        assert_eq!(REPLACEABLE_ARTIFACT, "vymalo.replaceable");
+        #[cfg(feature = "server")]
+        assert_eq!(crate::push::REPLACEABLE_ARTIFACT, REPLACEABLE_ARTIFACT);
+    }
+
     #[test]
     fn a_version_carries_the_short_revision_as_build_metadata() {
         let sha = "6478fbc1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7";
