@@ -51,10 +51,11 @@ use std::time::Duration;
 
 use adam_error::{BoxError, Classify, ErrorClass};
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
+
+use crate::time::{Timestamp, span_of};
 
 pub use push::{NewPushConfig, PushProgress, PushRecord, PushState};
 pub use query::{ConversationScope, RunQuery};
@@ -143,7 +144,7 @@ pub struct NewRun {
     pub parent_id: Option<RunId>,
     pub status: RunStatus,
     pub state: Value,
-    pub wake_at: Option<DateTime<Utc>>,
+    pub wake_at: Option<Timestamp>,
 }
 
 impl NewRun {
@@ -180,7 +181,7 @@ impl NewRun {
         self
     }
 
-    pub fn wake_at(mut self, at: DateTime<Utc>) -> Self {
+    pub fn wake_at(mut self, at: Timestamp) -> Self {
         self.wake_at = Some(truncate_ms(at));
         self
     }
@@ -191,7 +192,7 @@ impl NewRun {
 pub struct RunUpdate {
     pub status: RunStatus,
     pub state: Value,
-    pub wake_at: Option<DateTime<Utc>>,
+    pub wake_at: Option<Timestamp>,
 }
 
 impl RunUpdate {
@@ -203,7 +204,7 @@ impl RunUpdate {
         }
     }
 
-    pub fn wake_at(mut self, at: DateTime<Utc>) -> Self {
+    pub fn wake_at(mut self, at: Timestamp) -> Self {
         self.wake_at = Some(truncate_ms(at));
         self
     }
@@ -218,15 +219,15 @@ pub struct RunRecord {
     pub parent_id: Option<RunId>,
     pub status: RunStatus,
     pub state: Value,
-    pub wake_at: Option<DateTime<Utc>>,
+    pub wake_at: Option<Timestamp>,
     /// Starts at 1 on creation and increases by exactly 1 per successful commit.
     pub version: u64,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 impl RunRecord {
-    pub fn sched_at(&self) -> Option<DateTime<Utc>> {
+    pub fn sched_at(&self) -> Option<Timestamp> {
         sched_at(self.status, self.wake_at, self.updated_at)
     }
 }
@@ -255,7 +256,7 @@ pub enum ClaimScope {
 pub struct Lease {
     pub run: RunRecord,
     pub worker: String,
-    pub until: DateTime<Utc>,
+    pub until: Timestamp,
 }
 
 /// The recorded outcome of one `ctx.step(..)`.
@@ -268,7 +269,7 @@ pub struct JournalEntry {
     pub ok: bool,
     /// Serialized step output (or error).
     pub payload: Value,
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
 }
 
 impl JournalEntry {
@@ -483,7 +484,7 @@ pub trait Store: Send + Sync + 'static {
         worker: &str,
         scope: ClaimScope,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>>;
@@ -494,7 +495,7 @@ pub trait Store: Send + Sync + 'static {
         &self,
         id: RunId,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
     ) -> StoreResult<bool>;
 
@@ -508,7 +509,7 @@ pub trait Store: Send + Sync + 'static {
     /// for the caller to say against its own clock (a claim treats `until <= now` as free). This is
     /// how a reader that is not a worker (the A2A server, which may run in another process) learns
     /// that a worker is stepping a run: see `RunView::claimed` in `adam-runtime`.
-    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>>;
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>>;
 
     /// The runs `query` selects, ordered by `updated_at` descending and then `id` descending, one
     /// page of at most `query.limit`: the keyset page that starts strictly after `query.after`.
@@ -547,7 +548,7 @@ pub trait Store: Send + Sync + 'static {
         &self,
         agents: &[String],
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<PushRecord>>;
@@ -573,7 +574,7 @@ pub trait Store: Send + Sync + 'static {
     /// minute (`adam-runtime`), and fails when the parent is `Failed`; a parent that is missing is
     /// treated as unknown and cancels nothing, so a failed parent purged before its children saw it
     /// leaves them running to their own limits.
-    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64>;
+    async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64>;
 }
 
 /// Shared, type-erased store handle used by the runtime.
@@ -584,9 +585,9 @@ pub type DynStore = Arc<dyn Store>;
 /// Every store persists this value so claiming is one indexed range scan.
 pub fn sched_at(
     status: RunStatus,
-    wake_at: Option<DateTime<Utc>>,
-    updated_at: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    wake_at: Option<Timestamp>,
+    updated_at: Timestamp,
+) -> Option<Timestamp> {
     match status {
         RunStatus::Runnable => Some(wake_at.unwrap_or(updated_at)),
         RunStatus::Parked => wake_at,
@@ -595,19 +596,21 @@ pub fn sched_at(
 }
 
 /// Truncate to millisecond precision (see the module docs on time).
+///
+/// A value before 1970 with a fractional millisecond truncates **toward zero**, while chrono's
+/// `timestamp_millis` floored it: the two differ by one millisecond only there, and nothing
+/// adam-rs stores is written before 1970. A value after 1970 is floored, as before.
 #[allow(
     clippy::expect_used,
-    reason = "a millisecond count taken from a DateTime is always representable"
+    reason = "a millisecond count taken from a Timestamp is always representable"
 )]
-pub fn truncate_ms(t: DateTime<Utc>) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(t.timestamp_millis())
-        .single()
-        .expect("millisecond timestamp in range")
+pub fn truncate_ms(t: Timestamp) -> Timestamp {
+    Timestamp::from_millisecond(t.as_millisecond()).expect("millisecond timestamp in range")
 }
 
 /// Current time, truncated to milliseconds.
-pub fn now() -> DateTime<Utc> {
-    truncate_ms(Utc::now())
+pub fn now() -> Timestamp {
+    truncate_ms(Timestamp::now())
 }
 
 /// A JSON value as **every** store keeps it: the NUL character (`\u{0}`) in a string or an object
@@ -690,12 +693,8 @@ fn replace_nul(value: &mut Value) {
 }
 
 /// `now + ttl`, truncated to milliseconds.
-pub fn add_ttl(now: DateTime<Utc>, ttl: Duration) -> DateTime<Utc> {
-    let ttl = chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX);
-    truncate_ms(
-        now.checked_add_signed(ttl)
-            .unwrap_or(DateTime::<Utc>::MAX_UTC),
-    )
+pub fn add_ttl(now: Timestamp, ttl: Duration) -> Timestamp {
+    truncate_ms(now + span_of(ttl))
 }
 
 /// A single-field key for stores that enforce "one open run per conversation"

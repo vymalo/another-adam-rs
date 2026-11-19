@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use tokio::sync::Mutex;
 
 use super::{
@@ -28,12 +28,12 @@ struct Inner {
 
 struct PushSlot {
     record: PushRecord,
-    lease: Option<(String, DateTime<Utc>)>,
+    lease: Option<(String, Timestamp)>,
 }
 
 struct Slot {
     run: RunRecord,
-    lease: Option<(String, DateTime<Utc>)>,
+    lease: Option<(String, Timestamp)>,
     /// Set by the first [`ClaimScope::Pinned`] claim; never cleared.
     owner: Option<String>,
 }
@@ -198,7 +198,7 @@ impl Store for MemoryStore {
         worker: &str,
         scope: ClaimScope,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>> {
@@ -248,7 +248,7 @@ impl Store for MemoryStore {
         &self,
         id: RunId,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
     ) -> StoreResult<bool> {
         let now = truncate_ms(now);
@@ -278,7 +278,7 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         let inner = self.inner.lock().await;
         Ok(inner
             .runs
@@ -371,7 +371,7 @@ impl Store for MemoryStore {
         &self,
         agents: &[String],
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<PushRecord>> {
@@ -432,7 +432,7 @@ impl Store for MemoryStore {
         Ok(slot.record.clone())
     }
 
-    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64> {
         let mut inner = self.inner.lock().await;
         let doomed: Vec<RunId> = inner
             .runs

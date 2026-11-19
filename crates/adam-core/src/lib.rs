@@ -9,6 +9,7 @@ pub mod store;
 // supported API.
 #[doc(hidden)]
 pub mod testing;
+pub mod time;
 
 pub use store::memory::MemoryStore;
 pub use store::{
@@ -16,3 +17,4 @@ pub use store::{
     PushProgress, PushRecord, PushState, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store,
     StoreError, StoreResult, storable, storable_owned, storable_text,
 };
+pub use time::Timestamp;

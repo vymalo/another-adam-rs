@@ -346,7 +346,7 @@ version = "0.1.0"
 dependencies = [
  "adam-error",
  "async-trait",
- "chrono",
+ "jiff",
  "serde",
  "serde_json",
  "thiserror",
