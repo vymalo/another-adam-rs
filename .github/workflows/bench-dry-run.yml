@@ -1,8 +1,9 @@
 name: bench dry run
 
 # The benchmark harness's dry run (bench/dry-run.sh): both agents on three self-test tasks and a scripted model, on the
-# stack of bench/compose.yaml. It needs a container service and pulls the coder image (about 3 GB), so it is started by
-# hand; the ordinary tests of the harness are bench.yml's. No model, no key, no money.
+# stack of bench/compose.yaml with the arms as host containers of the task images. It needs the host's Docker and pulls
+# the coder image (about 9.7 GB), so it is started by hand; the ordinary tests of the harness are bench.yml's. No model,
+# no key, no money.
 on:
   workflow_dispatch:
     inputs:
@@ -30,13 +31,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Allow user namespaces for the rootless Podman service
-        run: |
-          # Ubuntu 24.04 runners restrict them under AppArmor; where the key does not exist there is nothing to set.
-          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-      - name: Tests that need no container service
+      - name: Tests that need no container runtime
         run: node --test "bench/test/*.test.mjs"
       - name: Dry run
         env:

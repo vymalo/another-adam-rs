@@ -171,10 +171,11 @@ so pulled images and layers are reused across runs.
   record their arguments and environment) and a real `Workspaces`, and asserts the order and arguments of every call, the steps,
   every refusal, the state across a restart, single-flight, release and the sweep; `tests/adam_exec.rs` runs the embedded script.
 * `tests/podman.rs` runs against a real Podman service and the real CLI. It is gated on `ADAM_TEST_DEVCONTAINER=1`,
-  `CONTAINER_HOST` and `ADAM_TEST_DEVCONTAINER_ROOT` (`ADAM_TEST_REQUIRE_DEVCONTAINER=1` makes a skip fail); the CI job
-  `devcontainer` runs it ([`dev/podman/README.md`](../../dev/podman/README.md)). It also holds a framed conversation on stdin and stdout
+  `CONTAINER_HOST` and `ADAM_TEST_DEVCONTAINER_ROOT` (`ADAM_TEST_REQUIRE_DEVCONTAINER=1` makes a skip fail); no CI job
+  runs it any more ([ADR 0052](../../docs/decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)).
+  It also holds a framed conversation on stdin and stdout
   with `cat` in the container (a first message, a silence with stdin open, a 64 KiB message, then EOF or a kill:
-  `adam_workspace::testing_stdio`; the CI job asks for 90 s of silence), so it answers whether `devcontainer exec` forwards a piped stdin.
+  `adam_workspace::testing_stdio`), so it answers whether `devcontainer exec` forwards a piped stdin.
 * The `podman inspect`, `ps` and `images` JSON of the unit tests is written by hand in the shapes of Podman v5.8.7's own structs
   (`libpod/define/container_inspect.go`, `pkg/domain/entities/types`, *verified* against the source on 2026-10-01), not recorded from
   a live Podman: the gated test is what shows they match.
@@ -187,5 +188,4 @@ and `Lost` are `Transient`; `Config`, `Refused` and `Build` are `Invalid`; `Io` 
 ## See also
 
 * [`adam-workspace`](../adam-workspace/README.md): the port (`Environment`, `EnvSession`, `ExecSpec`, `PreparedCommand`) and `Local`.
-* [`dev/podman/README.md`](../../dev/podman/README.md): the service, what it is given and why, the pinned seccomp profile.
 * [ADR 0010](../../docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md).

@@ -8,6 +8,7 @@ import { MODEL, OpenCodeAgent, opencodeConfig, opencodeEnv, opencodeExportScript
 import { FakeContainers } from '../lib/containers.mjs';
 import { IntegrityError } from '../lib/npm.mjs';
 import { PINS } from '../lib/pins.mjs';
+import { RUNTIME } from '../lib/runtime.mjs';
 import { createScriptedModel } from '../lib/scripted-model.mjs';
 import { loadTask } from '../lib/task.mjs';
 import { commitFiles, initRepo } from './gitfix.mjs';
@@ -118,8 +119,12 @@ function setup(t, { runResult = { exitCode: 0 }, outFiles = null, refused = [], 
   const out = { files: new Map(outFiles ?? [['events.jsonl', Buffer.from(jsonl(EVENTS))], ['stderr.txt', Buffer.from(`warn ${URL}\n`)], ['export.json', Buffer.from(JSON.stringify({ info: { id: 'ses_abc123XYZ', url: URL } }))]]), refused };
   const containers = new FakeContainers({ onRun: (spec) => (spec.script.includes(' run --standalone ') ? runResult : { exitCode: 0 }) });
   const slotDir = path.join(home, 'slots', '2'); // as Stack.slotDir: a directory of the harness's own home
+  const workRoot = path.join(home, 'work', '2');
+  fs.mkdirSync(workRoot, { recursive: true });
   const stack = {
     slotDir: () => slotDir,
+    workRoot: () => workRoot,
+    coderContainers: () => ({ listContainers: async () => [{ image: task.image.ref, imageId: 'f'.repeat(64), labels: {}, names: ['coder-2'] }] }),
     workDir: async (slot, dir, o) => stackCalls.push(['workDir', slot, dir, Boolean(o?.remove)]),
     readFiles: async (slot, dir, names) => {
       stackCalls.push(['readFiles', slot, dir, names]);
@@ -164,19 +169,20 @@ function setup(t, { runResult = { exitCode: 0 }, outFiles = null, refused = [], 
     contextWindow: 131072,
     log: () => {},
   };
-  return { agent, ctx, containers, stackCalls, task, fetched, slotDir, out };
+  return { agent, ctx, containers, stackCalls, task, fetched, slotDir, workRoot, out };
 }
 
-test('prepare: the verified binary and the statement in the slot\'s directory, and a clone of the base in a directory of the volume', async (t) => {
-  const { agent, ctx, containers, stackCalls, slotDir } = setup(t);
+test('prepare: the verified binary and the statement in the slot\'s directory, and a clone of the base in a directory of the work directory', async (t) => {
+  const { agent, ctx, containers, stackCalls, slotDir, workRoot } = setup(t);
   await agent.prepare(ctx);
   assert.equal(fs.statSync(path.join(slotDir, 'bin', 'opencode')).mode & 0o777, 0o555);
   assert.equal(fs.readFileSync(path.join(slotDir, 'in-r1-a1', 'instruction.md'), 'utf8'), 'Make the thing work.\n', 'the statement, byte for byte');
   assert.deepEqual(stackCalls.filter((c) => c[0] === 'workDir').map((c) => c.slice(2).join(' ')), ['/work/workspaces/oc-r1-a1 true', '/work/workspaces/oc-r1-a1 false', '/work/bench-out/oc-r1-a1 true', '/work/bench-out/oc-r1-a1 false']);
   const clone = containers.runs[0];
   assert.equal(clone.network, 'none');
+  assert.equal(clone.user, '10001:10001');
   assert.match(clone.script, /git clone -q --no-hardlinks \/work\/bench-base\/base\.git \/work\/workspaces\/oc-r1-a1\/demo-1-aaaaaa/);
-  assert.deepEqual(clone.mounts.map((m) => [m.source, m.target, Boolean(m.readOnly)]), [['/work/bench-base', '/work/bench-base', true], ['/work/workspaces/oc-r1-a1', '/work/workspaces/oc-r1-a1', false]]);
+  assert.deepEqual(clone.mounts.map((m) => [m.source, m.target, Boolean(m.readOnly)]), [[workRoot, '/work', false]]);
   assert.equal(clone.labels['bench.slot'], '2');
 });
 
@@ -218,15 +224,16 @@ test('prepare: the binary is the pinned one, fetched once, under one directory o
   assert.match(fetched[0].dir, new RegExp(`/opencode/${PINS.opencode.version}$`));
 });
 
-test('run: the container of the task image by digest, the binary read-only, the config on stdin and nowhere else, the task\'s cpus and memory, a label, the time limit', async (t) => {
-  const { agent, ctx, containers, task } = setup(t);
+test('run: the container of the task image by digest, as uid 10001, the binary read-only, the config on stdin and nowhere else, the runtime limits, a label, the time limit', async (t) => {
+  const { agent, ctx, containers, task, workRoot } = setup(t);
   await agent.prepare(ctx);
   const result = await agent.run(ctx);
   const spec = containers.runs.find((s) => s.script.includes(' run --standalone '));
   assert.equal(spec.image, task.image.ref);
-  assert.equal(spec.network, 'default', 'the Podman service\'s own network: the meter relay and nothing else');
+  assert.equal(spec.network, 'slot', 'the slot\'s network: the meter relay and nothing else');
+  assert.equal(spec.user, '10001:10001');
   assert.equal(spec.timeoutMs, undefined, 'the time limit is the driver\'s own: a polite stop, the grace, then a forced stop');
-  assert.deepEqual([spec.cpus, spec.memoryMb], [task.cpus, task.memoryMb]);
+  assert.deepEqual([spec.cpus, spec.memoryMb], [RUNTIME.cpus, RUNTIME.memoryMb], 'the same limits the coder gets');
   assert.equal(spec.name, 'adam-bench-oc-r1-a1');
   assert.equal(spec.labels['bench.slot'], '2');
   assert.equal(JSON.parse(spec.input).provider.bench.options.baseURL, URL);
@@ -235,10 +242,12 @@ test('run: the container of the task image by digest, the binary read-only, the 
   const mounts = Object.fromEntries(spec.mounts.map((m) => [m.target, m]));
   assert.equal(mounts['/opt/bench/opencode'].readOnly, true);
   assert.equal(mounts['/bench/in'].readOnly, true);
-  assert.equal(mounts['/bench/out'].source, '/work/bench-out/oc-r1-a1', 'the output is on the volume, where the agent writes and the host does not read');
+  assert.equal(mounts['/bench/out'].source, path.join(workRoot, 'bench-out', 'oc-r1-a1'), 'the output is on the work directory, where the agent writes and the host does not read it');
+  assert.equal(mounts['/work'].source, workRoot);
   assert.equal(result.exit, 'done');
   assert.equal(result.sessionId, 'ses_abc123XYZ');
   assert.deepEqual(result.selfReported, { input: 150, output: 20, cached: 47, calls: 2 });
+  assert.equal(result.record.limits, 'runtime');
   const exp = containers.runs.find((s) => s.script.includes('session export'));
   assert.match(exp.script, /session export --standalone 'ses_abc123XYZ'/);
   assert.equal(exp.network, 'none');
@@ -320,36 +329,15 @@ test('finding 6: a symbolic link, FIFO or device where a log should be is refuse
   assert.equal(fs.readFileSync(path.join(runDir, 'opencode', 'events.jsonl'), 'utf8'), '');
 });
 
-test('defect 7: the task\'s limits are passed when the service accepts them, and the run record says so', async (t) => {
+test('defect 7: both arms get the runtime\'s limits, never the task\'s, and the run record says so', async (t) => {
   const { agent, ctx, containers, task } = setup(t);
   await agent.prepare(ctx);
   const r = await agent.run(ctx);
-  const probes = containers.runs.filter((s) => s.script === 'true');
-  assert.equal(probes.length, 2, 'a container without the limits, then one with them');
-  assert.deepEqual([probes[1].cpus, probes[1].memoryMb], [task.cpus, task.memoryMb]);
   const spec = containers.runs.find((x) => x.script.includes(' run --standalone '));
-  assert.deepEqual([spec.cpus, spec.memoryMb], [task.cpus, task.memoryMb]);
-  assert.equal(r.record.limits, 'task');
-});
-
-test('defect 7: limits a cgroup-less service refuses are not passed, the run goes on, and the record says the limits are the service\'s own', async (t) => {
-  const { agent, ctx, containers } = setup(t);
-  const real = containers.onRun;
-  containers.onRun = (spec, i) => (spec.cpus !== undefined || spec.memoryMb !== undefined ? { exitCode: 125, stderr: 'Error: cpu limit is not supported with cgroups disabled' } : real(spec, i));
-  await agent.prepare(ctx);
-  const r = await agent.run(ctx);
-  const spec = containers.runs.find((x) => x.script.includes(' run --standalone '));
-  assert.deepEqual([spec.cpus, spec.memoryMb], [undefined, undefined]);
-  assert.equal(r.exit, 'done', 'not every run fails');
-  assert.equal(r.record.limits, 'service');
-  await agent.prepare({ ...ctx, run: 'r2' });
-  assert.equal(containers.runs.filter((x) => x.script === 'true').length, 2, 'the probe is made once for a slot');
-});
-
-test('defect 7: a service that cannot even run a container without limits is infrastructure, not a refusal of limits', async (t) => {
-  const { agent, ctx, containers } = setup(t);
-  containers.onRun = (spec) => (spec.script === 'true' ? { exitCode: 125, stderr: 'Error: the service is down' } : { exitCode: 0 });
-  await assert.rejects(agent.prepare(ctx), (e) => e instanceof InfraError && e.reason === 'runtime');
+  assert.deepEqual([spec.cpus, spec.memoryMb], [RUNTIME.cpus, RUNTIME.memoryMb]);
+  assert.notDeepEqual([spec.cpus, spec.memoryMb], [task.cpus, task.memoryMb]);
+  assert.equal(r.record.limits, 'runtime');
+  assert.equal(containers.runs.filter((x) => x.script === 'true').length, 0, 'no probe: the runtime is asked once, by bench doctor');
 });
 
 test('M-oc-task-digest: a task image not named by digest is infrastructure and no agent container starts', async (t) => {
@@ -483,7 +471,7 @@ test('defect 4: both drivers are given the one configured grace and the one limi
   assert.ok(agent);
 });
 
-test('finding 11 and 9: stop reaps the service and confirms it, and a failure is infrastructure', async (t) => {
+test('finding 11 and 9: stop reaps the containers and confirms it, and a failure is infrastructure', async (t) => {
   const { agent, ctx, containers } = setup(t);
   await agent.stop(ctx);
   assert.equal(containers.reaped, 1);
@@ -503,7 +491,7 @@ test('collect: the clone comes out as a tar stream into a directory the harness 
   assert.match(r.patch.toString('utf8'), /\+\+\+ b\/hello\.txt/);
 });
 
-test('finding 5: cleanup removes the volume\'s directories inside the service, reaps it, and removes only what the harness wrote', async (t) => {
+test('finding 5: cleanup removes the work directory\'s directories as uid 10001, reaps it, and removes only what the harness wrote', async (t) => {
   const { agent, ctx, stackCalls, containers, slotDir } = setup(t);
   await agent.prepare(ctx);
   await agent.cleanup(ctx);

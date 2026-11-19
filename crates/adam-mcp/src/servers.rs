@@ -87,9 +87,9 @@ impl McpServers {
     ///
     /// Two passes. First, with no process started and no request made, each server is checked:
     /// `type: sse` is refused, a local process only when [`McpPolicy::allow_stdio`], every
-    /// `${VAR}` in the command, arguments, `env` and headers is expanded (from `env`, then
-    /// the process environment; `${VAR:-default}` takes the default for an unset or empty
-    /// variable), a `${VAR}` in the URL is refused ([`Error::UrlSecret`]) unless
+    /// `${VAR}` in the command, arguments, `env` and headers is expanded (from `env`'s values,
+    /// then its source, the process environment by default; `${VAR:-default}` takes the default
+    /// for an unset, empty or refused variable), a `${VAR}` in the URL is refused ([`Error::UrlSecret`]) unless
     /// [`McpPolicy::allow_url_secrets`], the URL must be https (or local, unless
     /// [`McpPolicy::allow_insecure`]) with no credentials in it, and the headers must be valid. Then each server is started or dialled,
     /// initialized and asked for its tools, and the `tools:` allow-list (or, without one, every

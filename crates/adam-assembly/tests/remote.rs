@@ -663,6 +663,23 @@ fn a_missing_token_variable_is_a_bind_error_that_names_it() {
     def_of(&files).bind(ToolSet::new()).unwrap();
 }
 
+/// ADR 0047, decision 5: a host that gives `NoSecrets` gets no token from the process environment,
+/// even for a name it has; a value given with `env` is still given.
+#[test]
+fn a_source_that_refuses_every_name_refuses_a_token_the_process_has() {
+    let files = remote_files("coder", "https://billing.example.com/card", Some("PATH"));
+    let refusing = || def_of(&files).secrets(Arc::new(adam_core::NoSecrets));
+    let error = refusing().bind(ToolSet::new()).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            Error::RemoteAuth { var, problem: RemoteAuthProblem::Refused, .. } if var == "PATH"
+        ),
+        "{error}"
+    );
+    refusing().env("PATH", TOKEN).bind(ToolSet::new()).unwrap();
+}
+
 #[tokio::test]
 async fn a_wrong_token_is_an_error_result_not_a_failed_run_and_the_token_stays_out_of_it() {
     let server = Server::start(InMemoryBackend::new(), TOKEN).await;

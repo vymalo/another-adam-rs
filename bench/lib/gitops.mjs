@@ -39,7 +39,9 @@ export function pushScript({ base, url }) {
     'export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 HOME=/tmp',
     'P=$(mktemp -d)',
     'git init -q "$P"',
-    `git -C "$P" fetch -q ${base} refs/heads/main`,
+    // The base may have been made by another uid (a task image whose default user is root): the repository is the
+    // harness's own, and this git runs in a container with no secret, so its ownership is not a question here.
+    `git -c safe.directory='*' -C "$P" fetch -q ${base} refs/heads/main`,
     `git -C "$P" push -q --force ${url} FETCH_HEAD:refs/heads/main`,
   ].join('\n');
 }

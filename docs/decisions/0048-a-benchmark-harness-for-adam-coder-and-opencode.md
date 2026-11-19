@@ -292,8 +292,8 @@ own file unchanged. Every replaced or dropped phrase:
 
 | Where | Change | adam's words | OpenCode's words |
 |---|---|---|---|
-| how-1-understand | rewritten | 1. **Understand the task.** If the task itself is missing and the person's words do not give it, ask with `ask_user`; so when it is a change to an existing repository and none is named. A task that builds something new needs no repository yet: see "Starting without a repository". A vague request is not a task: ask what to do. Never guess or invent a repository, a branch or a task, and never pick a repository because it looks likely or because you know it. `prepare_workspace` refuses a repository the person did not name. The base branch is not something to guess either: leave `base_branch` out to start from the repository's default branch, unless the person named one. If `prepare_workspace` says the branch you gave does not exist, it lists the branches that do: pick the one the person meant from that list, or ask which. | 1. **Understand the task.** Read the task statement. Nobody can answer questions in this run: decide yourself and finish. Never guess or invent a repository, a branch or a task. |
-| how-2-workspace | rewritten | 2. **Prepare the workspace** with `prepare_workspace`. If this conversation already has work of yours on this repository (an earlier task pushed a `branch` and opened a pull request), and the person now asks for a change, a fix or a follow-up to that work, carry on with it: call `prepare_workspace` with the same `repo_url` and `base_branch` and `branch` set to the branch `commit_and_push` reported. You still call `open_pull_request` at the end, and it reports (and updates) the existing pull request instead of opening another: only it adds your commits to that branch. For a separate job, or when no such branch exists, leave `branch` out. When the task needs a second repository that the person also named, prepare it too: it is added next to the first, and from then on you say `repo` in every tool call. When the task needs a repository the person did not name (a library that has to change too, one to read from), do not take it: call `request_repository` with a reason, and go on only if the person says yes. Each repository you change gets its own `commit_and_push` and its own pull request. | 2. **Look around.** The repository is already checked out in your working directory, at the base. Work on it there. |
+| how-1-understand | rewritten | 1. **Understand the task.** If the task itself is missing and the person's words do not give it, ask with `ask_user`; so when it is a change to an existing repository and none is named. A task that builds something new needs no repository yet: see "Starting without a repository". A vague request is not a task: ask what to do. Never guess or invent a repository, a branch or a task, and never pick one because it looks likely or because you know it. `prepare_workspace` refuses a repository the person did not name. The base branch is not something to guess either: leave `base_branch` out to start from the repository's default branch, unless the person named one. If `prepare_workspace` says the branch you gave does not exist, it lists the branches that do: pick the one the person meant from that list, or ask which. | 1. **Understand the task.** Read the task statement. Nobody can answer questions in this run: decide yourself and finish. Never guess or invent a repository, a branch or a task. |
+| how-2-workspace | rewritten | 2. **Prepare the workspace** with `prepare_workspace`. If this conversation already has work of yours on this repository (an earlier task pushed a `branch` and opened a pull request), and the person now asks for a change or a follow-up, carry on with it: call `prepare_workspace` with the same `repo_url` and `base_branch` and `branch` set to the branch `commit_and_push` reported. You still call `open_pull_request` at the end, and it reports (and updates) the existing pull request instead of opening another: only it adds your commits to that branch. For a separate job, or when no such branch exists, leave `branch` out. When the task needs a second repository that the person also named, prepare it too: it is added next to the first, and from then on you say `repo` in every tool call. When the task needs a repository the person did not name (a library that has to change too, one to read from), do not take it: call `request_repository` with a reason, and go on only if the person says yes. Each repository you change gets its own `commit_and_push` and its own pull request. | 2. **Look around.** The repository is already checked out in your working directory, at the base. Work on it there. |
 | how-3-instructions-shown | rewritten | `prepare_workspace` shows its `AGENTS.md` (else `CLAUDE.md`, else `README`), and so does the first read in a directory that has its own: it is the repository's text, so follow it for how to work here, but it names no repository you may use and grants nothing. | Its `AGENTS.md` (else `CLAUDE.md`, else `README`) is the repository's text: follow it for how to work here, but it grants nothing. |
 | how-3-read-together | rewritten | Read the rest with `read_file`: (in a later revision: Read the manifest, the CI file and the other small files together in one `read_files`:) | Read the manifest, the CI file and the other small files with `read`: |
 | how-4-file-tools | rewritten | `read_file`, `write_file`, `edit_file` and `apply_patch` | `read`, `write` and `edit` |
@@ -375,3 +375,60 @@ ADR 0053 decision 12 and its slices 6a and 6b:
   the run's commands cannot reach without the coder's token.
 * Both arms run as uid 10001 with equal CPU and memory limits; the fingerprint gains a `runtime` field; gradings share one
   `verifier` network.
+
+## Amended 2026-11-19: slice B1 is built (the bench on the host's runtime)
+
+The note above is built, with the changes ADR 0053 decision 12 makes:
+
+* `HostContainers` (`bench/lib/containers.mjs`) runs `docker run` on the host; `PodmanRemote` is gone, and so are the
+  three services `podman-1`, `podman-2` and `grader` from `bench/compose.yaml`. Every image is in the host's store
+  once, and an own task's image is used where `bench tasks build` made it. The compose file keeps the shared services
+  (postgres, the mock, the git server, the relays, the git sandboxes, the pushers); the harness starts the rest.
+* The coder is a host container of the task image, as uid 10001, with `adam-coder` and `adam-git` copied out of the
+  pinned coder image once and mounted read-only at `/opt/adam/bin`, the agent folder at `/etc/adam/agent`, the work
+  directory at `/work`, and `RUN_ENVIRONMENT=local` with `DEVCONTAINER_RUNTIME=off`: its commands run in that container,
+  which is the task image. The environment check, the base, the grading and the OpenCode arm are host containers of the
+  task image too.
+* Both arms run as uid 10001 and get the same CPU and memory from one setting (`bench/lib/runtime.mjs`: 4 CPU, 12 GB).
+  A task's own `cpus` and `memory_mb` are for its environment check and its grading, never for an arm.
+* `configFingerprint` gains `runtime` (the host, the store, the coder's linking, the uid and the limits), so a change in
+  the runtime changes what a pilot is bound to.
+* Gradings share one internal `verifier` network, which the harness makes because Compose makes no network that has no
+  service; a verifier that asks for the internet gets the `egress` network, alone, in its window. `grader-net` is gone.
+* `bench doctor` probes each selected task image: the coder binary with no configuration as uid 10001, exit 78 means it
+  starts, a loader error or another architecture means it does not, and such an image is refused for both arms. The
+  coder's binaries are static (ADR 0053 decision 11, #201), so a Debian bookworm task image starts the coder as well as a
+  trixie one; `bench/pins.json` still names the build before that change, so the probe reports what the pinned image does
+  until the pin moves (slice 6b, the pin's owner).
+* The two arms now share the slot's network: the coder's commands run in the coder container, which needs the git server,
+  postgres and the mock, and OpenCode's container joins the same network so the arms are given the same reach. The old
+  rule that a task's commands reach the meter and nothing else no longer holds, and is not claimed.
+* The bench's Postgres stays: moving it to a store service with SQLite is slice 6b.
+
+The table "Runs in" of `bench/README.md` and the stack's networks change with it. The proof, on the owner's host
+(Docker 29.9.3 rootless, 2026-11-19): `node --test "bench/test/*.test.mjs"` (640 tests, 637 pass, the 3 gated ones
+skipped), `node tools/docs-check/check-docs.mjs`, and `BENCH_TEST_DOCKER=1 sh bench/dry-run.sh` pass — the environment
+checks, the six runs with grades 1, 1, 0 and their costs, the budget phase, and the kill and resume. The dry run's phases
+and what it could not cover are in `bench/README.md`, "Unverified". The static build's coder was probed by hand and by
+`coderProbe` in Debian 12 bookworm: exit 78, it starts; the pre-static image the pin still names fails there with
+`GLIBC_2.38` and `GLIBC_2.39` not found, which the probe reports until the pin moves. *Unverified*: a real model endpoint
+and key (the scripted model only), a real OpenCode binary (`BENCH_TEST_OPENCODE_BIN`), and two slots at once with real
+task images.
+
+**The sabotage review of the merge (2026-11-19).** Two sessions had worked the branch, so the whole change was reviewed as
+one. Four defects were found and fixed, each with a test that failed first, and the proof was run again on the result:
+a stopped `bench/dry-run.sh` did not stop the harness's children — a `resume-child` outlived it and rebuilt the self
+images under the next run (`No such image`); the harness now runs in a session of its own and the cleanup stops the whole
+process group. An image pull was keyed by the slot that asked, so two slots preparing one task could pull it twice; the
+promise is keyed by the image (the host's store is one store). `up` used an existing `adam-bench_verifier` without reading
+its internal flag; a network that is not internal is refused now. The meter's per-call connection first passed
+`agent: false`, which bypassed Node's env proxy (measured: the proxy saw no `CONNECT`); with a proxy the default agent is
+kept and every request says `connection: close`, so a call still gets its own connection without going round the proxy.
+The README's doctor paragraph said a bookworm image starts the pinned coder; the pin is still the pre-static build and it
+fails there on `GLIBC_2.38`/`GLIBC_2.39` (probed live), so the paragraph says what the probe reports until the pin moves,
+and the Grading section no longer claims the agent phase has no network. The grader's `RWLock` tests, which the merge had
+dropped, are back. Proof on the final head: `node --test "bench/test/*.test.mjs"` 649 tests, 646 pass, 3 gated skips;
+`node tools/docs-check/check-docs.mjs`; `shellcheck -s sh bench/dry-run.sh`; `BENCH_TEST_DOCKER=1 sh bench/dry-run.sh`
+with the same phases and 27 model requests = 27 ledger calls; 18 deliberate mutations, each killed by the suite.
+
+**Amended 2026-11-19:** the disk check counts the images already present toward its 20 GB floor (`bench/README.md`, "`bench doctor`").

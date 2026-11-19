@@ -16,7 +16,7 @@ import { CapBook } from './cap.mjs';
 import { assertOutsideRepo, benchHome, normalizeConfig } from './config.mjs';
 import { checkBudgetHit, checkCost, checkGrades, checkResume, report } from './dryrun-checks.mjs';
 import { checkTask } from './envcheck.mjs';
-import { localGit } from './grade.mjs';
+import { hostGradeIO, localGit } from './grade.mjs';
 import { Ledger } from './ledger.mjs';
 import { createMeter } from './meter.mjs';
 import { PINS, coderRef } from './pins.mjs';
@@ -104,29 +104,26 @@ async function startHarness({ env, home, name, raw, killSpec = null }) {
     },
   });
   const meterPort = Number(env.BENCH_METER_PORT ?? 18090);
-  await meter.listen(meterPort, env.BENCH_METER_BIND ?? '127.0.0.1');
+  await meter.listen(meterPort, env.BENCH_METER_BIND ?? '0.0.0.0');
   const stack = new Stack({
     composeFile: path.join(BENCH_DIR, 'compose.yaml'),
     home,
-    tasksDir: path.join(BENCH_DIR, 'tasks'),
-    seccomp: path.join(REPO_DIR, 'dev', 'podman', 'seccomp.json'),
     meterPort,
     ports: { git: Number(env.BENCH_GIT_PORT ?? 18083), coder1: Number(env.BENCH_CODER_1_PORT ?? 18081), coder2: Number(env.BENCH_CODER_2_PORT ?? 18082) },
     baseEnv: env,
   });
+  // The coder image is the base of the self-test images and the source of the coder's binaries: pull it once, before
+  // compose starts the services that run it.
+  await stack.containers(1).pull(coderRef(PINS));
   await stack.up();
   const containers = stack.containers(1);
   const grader = stack.graderContainers();
-  await stack.pullWindow(1, () => containers.pull(coderRef(PINS)));
-  await stack.graderWindow(() => grader.pull(coderRef(PINS)));
   const base = config.tasks.workspaceImage;
   const pins = {};
   const tasks = {};
   for (const id of SELF_IDS) {
     const m = await materializeSelf({ srcDir: path.join(BENCH_DIR, 'tasks', 'self', id), home });
-    // The same image in both places: the agents' service runs the agent, the grader grades.
     await containers.build(m.context, m.tag, m.dockerfile, { BASE_IMAGE: base });
-    await grader.build(m.context, m.tag, m.dockerfile, { BASE_IMAGE: base });
     try {
       pins[m.tag] = await containers.digestOf(m.tag);
     } catch {
@@ -140,7 +137,7 @@ async function startHarness({ env, home, name, raw, killSpec = null }) {
     meter,
     stack,
     config,
-    home: dir, // results of this phase; the shared home above is what the Podman services see
+    home: dir, // results of this phase; the shared home above is what the stack mounts
     agents: {
       adam: new AdamAgent({ pins: PINS, home, repoDir: REPO_DIR, contextWindow: config.contextWindow }),
       opencode: new OpenCodeAgent({ pins: PINS, home, contextWindow: config.contextWindow, sharedPrompt: await readSharedPrompt({ repoDir: REPO_DIR, revision: PINS.coder.revision }) }),
@@ -159,9 +156,10 @@ const specs = (tasks, agents, arm = 'max') => SELF_IDS.flatMap((id) => agents.ma
 async function phaseEnvCheck(h) {
   lines('phase 0: the environment check of each self-test task (gold passes three times, the empty patch fails three times)');
   const results = [];
-  fs.mkdirSync(path.join(h.deps.home, 'work'), { recursive: true });
+  const workRoot = path.join(h.deps.home, 'work');
+  fs.mkdirSync(workRoot, { recursive: true });
   for (const id of SELF_IDS) {
-    const r = await checkTask({ containers: h.containers, task: h.tasks[id], workRoot: path.join(h.deps.home, 'work'), ...(h.stack.graderIO ? { io: h.stack.graderIO() } : {}) });
+    const r = await checkTask({ containers: h.containers, task: h.tasks[id], workRoot, io: hostGradeIO(workRoot) });
     results.push({ ok: r.ok, what: `the environment check of ${id} passes`, detail: r.reason ?? '' });
   }
   return report(results, lines);
@@ -169,6 +167,7 @@ async function phaseEnvCheck(h) {
 
 async function phaseGrades(env, home) {
   lines('phase 1: both agents on the three tasks; grades, cost');
+  fs.rmSync(path.join(home, 'dryrun', 'grades'), { recursive: true, force: true });
   const h = await startHarness({ env, home, name: 'grades', raw: dryRunConfig({ endpoint: 'http://127.0.0.1:1/v1' }) });
   try {
     const envOk = await phaseEnvCheck(h);
@@ -183,6 +182,7 @@ async function phaseGrades(env, home) {
 
 async function phaseBudget(env, home) {
   lines('phase 2: a run over its budget ends budget_hit and is graded');
+  fs.rmSync(path.join(home, 'dryrun', 'budget'), { recursive: true, force: true });
   const reserved = 34;
   const h = await startHarness({ env, home, name: 'budget', raw: dryRunConfig({ endpoint: 'http://127.0.0.1:1/v1', prices: DEAR, perRunBudgetUSD: reserved }) });
   try {
@@ -230,7 +230,7 @@ export async function runDryRun({ phase = 'all', down = false, env = process.env
   assertOutsideRepo(home, 'BENCH_HOME');
   fs.mkdirSync(home, { recursive: true, mode: 0o755 });
   if (down) {
-    const stack = new Stack({ composeFile: path.join(BENCH_DIR, 'compose.yaml'), home, tasksDir: path.join(BENCH_DIR, 'tasks'), seccomp: path.join(REPO_DIR, 'dev', 'podman', 'seccomp.json'), meterPort: Number(env.BENCH_METER_PORT ?? 18090), baseEnv: env });
+    const stack = new Stack({ composeFile: path.join(BENCH_DIR, 'compose.yaml'), home, meterPort: Number(env.BENCH_METER_PORT ?? 18090), baseEnv: env });
     await stack.down({ volumes: true });
     return 0;
   }

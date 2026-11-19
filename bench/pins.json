@@ -1,10 +1,10 @@
 {
   "coder": {
     "image": "ghcr.io/vymalo/another-adam-rs/coder",
-    "tag": "sha-3f668c3",
-    "digest": "sha256:dad89fc8f89f176cd4884d2370bc7de73bb8a884c067867ec1d2344586d8c72b",
-    "revision": "3f668c3b207b501ac4da1a7341bcb96e0f38bed4",
-    "verified": "2026-11-18"
+    "tag": "sha-e46c8f4",
+    "digest": "sha256:60b211ab2709913d0e175d07cc00af9e431a94dc55f0bdcb26cbd33e4f305744",
+    "revision": "e46c8f405b686d9ac82d5279d57db4bfd7f2d505",
+    "verified": "2026-11-19"
   },
   "opencode": {
     "version": "2.3.0",

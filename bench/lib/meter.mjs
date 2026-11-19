@@ -110,6 +110,16 @@ const agentStatusFor = (upstream) => (upstream === 429 ? 429 : upstream >= 400 &
 /** The only thing the agent learns of an upstream error: no body, header or URL of the endpoint. */
 const upstreamError = (upstream) => ({ error: { message: 'upstream error', type: 'upstream_error', status: upstream } });
 
+/**
+ * The `agent` of an upstream request: a fresh connection for each call, except when a proxy is in use. Node applies
+ * its env proxy (`NODE_USE_ENV_PROXY=1`, `HTTPS_PROXY`) to the default agent only, so `agent: false` would send every
+ * call around the proxy; there the default agent is kept and the request says `connection: close`.
+ */
+export function upstreamAgent(env = process.env) {
+  const proxy = env.HTTPS_PROXY ?? env.https_proxy;
+  return env.NODE_USE_ENV_PROXY === '1' && proxy ? undefined : false;
+}
+
 /** After a 413 the rest of the upload is read and dropped (so the answer arrives); a client that goes on is cut after a while. */
 function drainThenCut(req) {
   req.resume();
@@ -400,12 +410,18 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
           port: upstream.port || undefined,
           path: upstreamPath,
           method: 'POST',
+          // One connection for each call, without losing the proxy: an endpoint or a proxy that closes an idle socket
+          // (Node's own default is 5 s) must not turn the next call into a failed one charged its worst case. Node
+          // applies its env proxy (`NODE_USE_ENV_PROXY=1`) only to the default agent, so `agent: false` would go round
+          // it; with a proxy the default agent is kept and `connection: close` ends each socket after its call.
+          agent: upstreamAgent(env),
           headers: {
             authorization: `Bearer ${key}`,
             'content-type': 'application/json',
             'content-length': payload.length,
             accept: stream ? 'text/event-stream' : 'application/json',
             'accept-encoding': 'identity',
+            connection: 'close',
             'user-agent': 'adam-bench-meter',
           },
         };
