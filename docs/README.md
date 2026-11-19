@@ -7,6 +7,7 @@ Start with the [root README](../README.md), then the guide for what you are doin
 
 | Guide | When |
 |---|---|
+| [Try the agents](guides/try-the-agents.md) | you want to chat with the Assistant, give Adam a task, write your own agent, then do it all on a real model |
 | [Run it locally](guides/run-locally.md) | you want the coder and the general agent running on your machine in minutes |
 | [Write an agent](guides/write-an-agent.md) | you want an agent that is a folder of Markdown, or one with `#[tool]` functions |
 | [Deploy the coder](guides/deploy-the-coder.md) | you are installing the image and the Helm chart on Kubernetes |

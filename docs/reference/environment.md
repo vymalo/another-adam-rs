@@ -185,6 +185,7 @@ Put these in a `.env` next to `compose.yaml`.
 | `CODER_IMAGE` | image of both agents; with `--no-build` runs a prebuilt one | `adam-rs/coder:dev` |
 | `CODER_MODEL`, `AGENT_MODEL` | the scripted models | `mock-coder`, `mock-assistant` |
 | `AGENT_MCP_ALLOW_INSECURE` | `MCP_ALLOW_INSECURE` of the `agent` service: plain `http` to another container, for a folder whose `mcp.json` names a mock (the painter); development only | `false` |
+| `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `MODEL_CONTEXT_WINDOW` | read only with `-f dev/compose.real-model.yaml`: the real model of the `agent` and the `coder` (the first three required). Export the key in your shell rather than writing it in `.env` | unset; `131072` for the window |
 | `CODER_AGENT_DIR`, `AGENT_FOLDER` | the agent folders mounted at `/etc/adam/agent` | `./bin/adam-coder/agent`, `./dev/agents/assistant/agent` |
 
 ## Tests

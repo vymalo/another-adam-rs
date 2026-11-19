@@ -1,10 +1,59 @@
 # adam-rs
 
-adam-rs is a Rust framework for **durable AI agents**: an agent is a state machine whose state and every side
-effect are saved after each step, so a worker that dies loses nothing and another resumes the run. Every piece
-of infrastructure (database, model, code host) sits behind a trait with a conformance testkit, and agents are
-authored as Markdown folders plus `#[tool]` functions, in the spirit of [eve](https://eve.dev). It ships two
-agents over A2A 1.0: Adam, a general agent that answers, researches, writes documents and turns a coding task into a verified pull request, and one that serves any agent folder.
+adam-rs is a Rust framework for **durable AI agents**. An agent is a state machine whose state and every side
+effect are saved after each step, so a worker that dies loses nothing and another resumes the run. Agents are
+written as **Markdown folders** (plus `#[tool]` functions when you need code), speak **A2A 1.0**, and run on any
+OpenAI-compatible model. Every piece of infrastructure (database, model, code host) is a trait with a test kit.
+
+## What is in the box
+
+| | What it is | Try it |
+|---|---|---|
+| **Assistant** | a chat-only agent: answers in plain words and asks when it needs to know more. It is [`adam-agent`](bin/adam-agent/README.md) serving the folder [`dev/agents/assistant`](dev/agents/assistant/agent/instructions.md) | `dev/chat.sh` |
+| **Adam** ([`adam-coder`](bin/adam-coder/README.md)) | a general agent that also takes a coding task to a checked pull request: worktree, edits, the project's own checks, push, pull request | `dev/chat.sh http://127.0.0.1:8080` |
+| **Your agent** | [`adam-agent`](bin/adam-agent/README.md) serves **any** agent folder (instructions, skills, subagents, MCP tools) with no build; the Painter in [`dev/agents/painter`](dev/agents/painter/agent/instructions.md) is one with tools | [write an agent](docs/guides/write-an-agent.md) |
+| [`adam-egress`](bin/adam-egress/README.md) | an HTTPS-only forward proxy with an allow-list, for the sandboxes that run an agent's commands | its README |
+| The library | [`crates/`](docs/architecture.md#the-crate-map): host adam agents in your own Rust program | [embed adam](docs/guides/embed-adam.md) |
+
+All binaries ship in one image, `ghcr.io/vymalo/another-adam-rs/coder`.
+
+## Try it in five minutes
+
+You need Docker with Compose v2, `curl` and `jq`. The stack runs on mocks (a scripted model, a fake GitHub, a
+local git server), so no credential is needed. The first build takes several minutes.
+
+```sh
+docker compose --profile app up -d --build --wait
+dev/chat.sh                                  # chat with the Assistant (:8084)
+dev/chat.sh http://127.0.0.1:8080            # Adam, the coder; try:
+# In http://git-server:8080/local/sandbox.git (base branch main), add hello.txt containing hello.
+docker compose --profile app down -v         # stop and forget everything
+```
+
+On the mocks the model is scripted, so the answers are canned. **For a real conversation**, point the stack at any
+OpenAI-compatible endpoint; the key stays in your shell:
+
+```sh
+export MODEL_BASE_URL=https://your-gateway.example/v1 MODEL=your-model MODEL_API_KEY=...
+docker compose -f compose.yaml -f dev/compose.real-model.yaml --profile app up -d --wait
+```
+
+Adam still works on the local git server and the mock GitHub, so nothing but the model calls leaves your machine.
+The whole walk-through, the Painter and your own agent included: **[Try the agents](docs/guides/try-the-agents.md)**.
+
+## Make your own agent
+
+An agent is a folder with an `instructions.md`: a YAML header (name, limits, the card other agents read) and the
+instructions in Markdown. Copy the Assistant, change the words, restart:
+
+```sh
+cp -R dev/agents/assistant/agent /tmp/my-agent && chmod -R a+rX /tmp/my-agent
+AGENT_FOLDER=/tmp/my-agent docker compose --profile app up -d --wait agent
+```
+
+Add `skills/`, `subagents/`, `commands/` or an `mcp.json` for tools: [the agent files](docs/reference/agent-files.md).
+
+## How it works
 
 ```mermaid
 flowchart LR
@@ -27,44 +76,18 @@ flowchart LR
     worker --> tools
 ```
 
-## Quickstart
-
-You need Docker with Compose v2. Everything runs against mocks (a scripted model, a fake GitHub, a git server),
-so no credential is needed. The first build compiles the workspace and takes several minutes.
-
-```sh
-docker compose --profile app up -d --build --wait
-curl -N http://127.0.0.1:8080/ \
-  -H 'Authorization: Bearer dev-token' -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":"1","method":"SendStreamingMessage","params":{"message":{
-        "messageId":"m1","role":"ROLE_USER","parts":[{"text":
-        "In http://git-server:8080/local/sandbox.git (base branch main), add hello.txt containing hello."}]}}}'
-docker compose down -v      # stop and forget everything
-```
-
-The stream ends in `TASK_STATE_COMPLETED` with a `pull_request` artifact. More: [Run it locally](docs/guides/run-locally.md).
-
-## The two agents
-
-| | What it does | Read |
-|---|---|---|
-| [`adam-coder`](bin/adam-coder/README.md) (the binary of **Adam**) | answers, researches, writes documents, and takes a coding task to a verified pull request: worktree, file edits, the project's own checks, push, PR | [the coder](docs/reference/coder-agent.md), [deploy it](docs/guides/deploy-the-coder.md) |
-| [`adam-agent`](bin/adam-agent/README.md) | serves **any agent folder** (instructions, skills, subagents, MCP tools) with no build | [write an agent](docs/guides/write-an-agent.md) |
-
-Both ship in one image, `ghcr.io/vymalo/another-adam-rs/coder`, and share the process in
-[`adam-service`](crates/adam-service/README.md).
+A client sends a message; the server stores a task; a worker claims it, calls the model and the tools, and saves
+each step. Any worker can resume a run another one left: [the architecture](docs/architecture.md).
 
 ## Documentation
 
 | | |
 |---|---|
 | [`docs/`](docs/README.md) | the index |
-| [Architecture](docs/architecture.md) | the crate map, the path of a task, the run lifecycle, the data schema |
-| [Guides](docs/guides/) | [run locally](docs/guides/run-locally.md), [write an agent](docs/guides/write-an-agent.md), [deploy the coder](docs/guides/deploy-the-coder.md), [embed adam](docs/guides/embed-adam.md), [testing](docs/guides/testing.md) |
-| [Reference](docs/reference/) | [environment variables](docs/reference/environment.md), [agent files](docs/reference/agent-files.md), [errors](docs/reference/errors.md), [store adapters](docs/reference/store-adapters.md), [the local stack](docs/reference/dev-stack.md) |
+| [Guides](docs/guides/) | [try the agents](docs/guides/try-the-agents.md), [run locally](docs/guides/run-locally.md), [write an agent](docs/guides/write-an-agent.md), [embed adam](docs/guides/embed-adam.md), [deploy the coder](docs/guides/deploy-the-coder.md), [testing](docs/guides/testing.md) |
+| [Reference](docs/reference/) | [environment variables](docs/reference/environment.md), [agent files](docs/reference/agent-files.md), [the A2A server](docs/reference/a2a-server.md), [errors](docs/reference/errors.md), [the local stack](docs/reference/dev-stack.md) |
 | [Decisions](docs/decisions/) | ADRs: why it is the way it is |
-| [Crates](docs/architecture.md#the-crate-map) | every crate has a `README.md` next to its `Cargo.toml` |
-| [Chart](deploy/coder/README.md) | the Helm chart of the coder |
+| [Benchmark](bench/README.md) | adam-coder against OpenCode on the same tasks and model |
 
 ## Roadmap and contributing
 
