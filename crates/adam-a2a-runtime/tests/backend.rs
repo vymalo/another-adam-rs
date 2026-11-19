@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use a2a::{Message, Part, Role, Task, TaskState};
 use adam_a2a::{
-    A2aServer, AgentCardConfig, AuthConfig, BackendError, Caller, TaskBackend, TaskEvent,
+    A2aServer, AgentCardConfig, AuthConfig, BackendError, Caller, TaskBackend, TaskEvent, TaskQuery,
 };
 use adam_a2a_runtime::RuntimeTaskBackend;
 use adam_core::{DynStore, MemoryStore, RunId};
@@ -18,6 +18,7 @@ use adam_runtime::{
     Agent, AgentError, AgentStarter, Artifact as RunArtifact, BroadcastSink, Ctx, Inbound,
     RunEvent, Runtime, Transition,
 };
+use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -168,6 +169,21 @@ impl Agent for Scripted {
                 output: json!({"text": format!("answered: {answer}")}),
             });
         }
+        if text.contains("[turns]") {
+            // Five turns: the first outlives the subscription's 2 s fallback and the watch's 1 s
+            // interval, so a counting test sees both loops tick; the rest are short, so the run is
+            // about four seconds and its commits are what the stream reads it for.
+            let hold = if phase == 0 { 2000 } else { 500 };
+            tokio::time::sleep(Duration::from_millis(hold)).await;
+            if phase < 4 {
+                state["phase"] = json!(phase + 1);
+                return Ok(Transition::Continue(state));
+            }
+            return Ok(Transition::Done {
+                state,
+                output: json!({"text": "finished"}),
+            });
+        }
         if text.contains("[flip]") {
             // A, then B, then A again, all under one id.
             if let Some(v) = ["A", "B", "A"].get(usize::try_from(phase).unwrap_or(3)) {
@@ -268,6 +284,32 @@ impl Rig {
         Self {
             store,
             agent: agent.to_owned(),
+            runtime,
+            backend,
+        }
+    }
+
+    /// A rig whose three intervals are explicit: the worker's idle poll, a step's cancel watch and
+    /// a subscription's re-read. `over` uses 10 ms for all of them, which measures a test rather
+    /// than what a deployment pays.
+    fn over_with_polls(
+        store: DynStore,
+        poll: Duration,
+        cancel_poll: Duration,
+        view_poll: Duration,
+    ) -> Self {
+        let events = BroadcastSink::default();
+        let runtime = Runtime::builder(store.clone())
+            .agent(Scripted(AGENT.to_owned()))
+            .event_sink(events.clone())
+            .poll_interval(poll)
+            .cancel_poll_interval(cancel_poll)
+            .build();
+        let backend =
+            RuntimeTaskBackend::new(runtime.clone(), events, AGENT).with_poll_interval(view_poll);
+        Self {
+            store,
+            agent: AGENT.to_owned(),
             runtime,
             backend,
         }
@@ -495,6 +537,108 @@ async fn a_new_task_is_a_run_and_streams_snapshot_progress_artifact_completed() 
     let artifacts = done.artifacts.expect("artifacts on the task");
     assert_eq!(artifacts[0].name.as_deref(), Some("report"));
     assert_eq!(artifacts[0].parts[0].as_text(), Some("# done"));
+}
+
+/// A subscriber reads the run once per commit (a `Status` event makes it poll at once) and on its
+/// fallback interval, not on the worker's: a five-turn run of a few seconds costs a handful of
+/// record reads where the 250 ms fallback of both loops cost tens.
+///
+/// What the counters see is what crosses the `FaultyStore` seam: the stream's `view` calls
+/// (`LoadRun`) and the watch's `run_header` calls (`RunHeader`). The reads a store's own default
+/// `run_header` makes inside itself are below the wrapper and are not counted here.
+#[tokio::test]
+async fn a_stream_reads_the_run_once_per_commit_not_once_per_poll() {
+    let faulty = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+    let rig = Rig::over_with_polls(
+        faulty.clone(),
+        Duration::from_millis(10),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+    );
+    let task = rig
+        .backend
+        .submit(alice(), user("[turns]"), None, Some("ctx-turns".into()))
+        .await
+        .expect("submit");
+    let mut events = rig.backend.subscribe(&alice(), &task.id);
+    let _snapshot = next(&mut events).await;
+    let before_loads = faulty.calls(Method::LoadRun);
+    let before_headers = faulty.calls(Method::RunHeader);
+    let worker = rig.worker();
+    let events = rest(&mut events).await;
+    worker.stop().await;
+
+    assert_eq!(label(events.last().unwrap()), "status:Completed");
+    let loads = faulty.calls(Method::LoadRun) - before_loads;
+    let headers = faulty.calls(Method::RunHeader) - before_headers;
+    // Five steps commit five times: one poll each, plus the first tick of the interval (which
+    // `tokio::time::interval` fires at once) and the tick at 2 s. The 250 ms fallback would be
+    // ~10 polls of the stream alone.
+    assert!(loads <= 12, "the stream read the record {loads} times");
+    // The first step outlives the 1 s cancel interval by a second (and the 2 s fallback), so the
+    // watch reads it at least once; the rest do not. The 250 ms interval it used to share read the
+    // whole record instead, once per tick while the step ran.
+    assert!(
+        (1..=3).contains(&headers),
+        "the cancel watch read {headers} headers"
+    );
+}
+
+/// `ListTasks` builds a task from the record the listing already returned: one count, one list and
+/// one lease read per runnable run at version 1 (the only row whose state can still turn from
+/// `submitted` to `working`), and no record read per task. A 50-task page was 1 count + 1 list +
+/// 50 views (two calls each) = 102 store calls; it is 52 now. The tasks are exactly what `GetTask`
+/// answers for the same runs.
+#[tokio::test]
+async fn a_listed_task_is_built_from_the_record_the_listing_has() {
+    let faulty = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+    let store: DynStore = faulty.clone();
+    let rig = Rig::front_only(store);
+    let caller = alice();
+    for n in 0..50 {
+        rig.backend
+            .submit(
+                caller.clone(),
+                user(&format!("task {n}")),
+                None,
+                Some(format!("ctx-{n}")),
+            )
+            .await
+            .expect("submit");
+    }
+    let before = (
+        faulty.calls(Method::CountRuns),
+        faulty.calls(Method::ListRuns),
+        faulty.calls(Method::LeaseUntil),
+        faulty.calls(Method::LoadRun),
+    );
+    let mut query = TaskQuery::new();
+    query.page_size = 50;
+    let page = rig.backend.list(&caller, &query).await.expect("list");
+    assert_eq!(page.tasks.len(), 50);
+    assert_eq!(
+        (
+            faulty.calls(Method::CountRuns) - before.0,
+            faulty.calls(Method::ListRuns) - before.1,
+            faulty.calls(Method::LeaseUntil) - before.2,
+            faulty.calls(Method::LoadRun) - before.3,
+        ),
+        (1, 1, 50, 0),
+        "one count, one page, one lease per submitted task, and no record read"
+    );
+    for task in &page.tasks {
+        let got = rig
+            .backend
+            .get(&caller, &task.id)
+            .await
+            .expect("get")
+            .expect("task");
+        assert_eq!(
+            serde_json::to_value(&got).expect("json"),
+            serde_json::to_value(task).expect("json"),
+            "the listed task is the task GetTask answers"
+        );
+    }
 }
 
 /// A file the agent shares reaches an A2A client as a standard artifact: one `raw` part with its
@@ -1290,6 +1434,69 @@ async fn repeating_a_message_returns_the_task_and_delivers_the_input_once() {
     assert_eq!(late.id, first.id);
     assert_eq!(late.status.state, TaskState::Completed);
     worker.stop().await;
+}
+
+/// A repeated submission reads the run it already created once: the view that settles the repeat
+/// (ownership and context) is the task's, not a second read.
+#[tokio::test]
+async fn a_repeated_submission_reads_the_run_once() {
+    use adam_store_testkit::fault::{FaultyStore, Method};
+
+    let counting = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+    let rig = Rig::over(counting.clone());
+    let first = rig
+        .backend
+        .submit(alice(), user_with_id("go", "m-1"), None, Some("c1".into()))
+        .await
+        .unwrap();
+    let before = (
+        counting.calls(Method::LeaseUntil),
+        counting.calls(Method::LoadRun),
+    );
+    let retry = rig
+        .backend
+        .submit(alice(), user_with_id("go", "m-1"), None, Some("c1".into()))
+        .await
+        .unwrap();
+    assert_eq!(retry, first, "the repeated request answers the same task");
+    assert_eq!(
+        (
+            counting.calls(Method::LeaseUntil) - before.0,
+            counting.calls(Method::LoadRun) - before.1,
+        ),
+        (1, 1),
+        "one view for the repeat, not two"
+    );
+}
+
+#[tokio::test]
+async fn a_get_reads_the_run_once() {
+    use adam_store_testkit::fault::{FaultyStore, Method};
+
+    let counting = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+    let rig = Rig::over(counting.clone());
+    let task = rig
+        .backend
+        .submit(alice(), user_with_id("go", "m-1"), None, Some("c1".into()))
+        .await
+        .unwrap();
+    let before = (
+        counting.calls(Method::LeaseUntil),
+        counting.calls(Method::LoadRun),
+    );
+    let read = rig.backend.get(&alice(), &task.id).await.unwrap().unwrap();
+    // The submission carries the message it started with; a read does not (the handler adds it).
+    let mut expected = task.clone();
+    expected.history = None;
+    assert_eq!(read, expected);
+    assert_eq!(
+        (
+            counting.calls(Method::LeaseUntil) - before.0,
+            counting.calls(Method::LoadRun) - before.1,
+        ),
+        (1, 1),
+        "one view for the task"
+    );
 }
 
 #[tokio::test]

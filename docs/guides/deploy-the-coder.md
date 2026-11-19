@@ -134,6 +134,10 @@ helm upgrade --install coder deploy/coder --namespace another-agentic-system -f 
 
 `image.tag` is bumped by CI on every green build of `main` (`sha-<7>`); do not edit it by hand.
 
+**Upgrading a release installed with chart 0.4.x or earlier** needs one extra step before this: `podManagementPolicy` is
+immutable, so delete the StatefulSet once, keeping its pods (`kubectl delete statefulset <release>-coder
+--cascade=orphan`). See [the chart README](../../deploy/coder/README.md#workspace-placement).
+
 The values you will actually set:
 
 | Value | Decision |

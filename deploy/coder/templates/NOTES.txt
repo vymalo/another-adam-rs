@@ -21,6 +21,13 @@ Workspace placement: {{ . }}
 {{- end }}
 {{- end }}
 
+{{- if gt (int .Values.replicaCount) 1 }}
+
+Scaling down deletes every removed worker at once (`podManagementPolicy: Parallel`). A per-pod volume stays, and the
+runs that worker owned are stranded: only a shared placement (`workspace.placement: shared` or `affinity`) keeps them
+reachable from another worker.
+{{- end }}
+
 {{- if include "coder.githubApp" . }}
 
 GitHub: App {{ include "coder.githubAppId" . }}, installation {{ include "coder.githubAppInstallationId" . }}. The coder trades a JWT signed with

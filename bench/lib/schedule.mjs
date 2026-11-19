@@ -51,7 +51,7 @@ export async function runSchedule({ deps, specs, slots, onOutcome = () => {} }) 
     const held = new Map(); // block -> what its runs still to start have been promised
     const heldTotal = () => [...held.values()].reduce((x, y) => x + y, 0);
     const toStart = (spec) => {
-      const state = deps.ledger.fold().get(spec.run)?.state;
+      const state = folded.get(spec.run)?.state;
       return state === undefined || state === 'Planned';
     };
     const claim = (slot) => {
@@ -75,7 +75,7 @@ export async function runSchedule({ deps, specs, slots, onOutcome = () => {} }) 
         if (held.get(key) === 0 && ![...queue].some((q) => (q.block ?? q.run) === key)) held.delete(key);
         active++;
         maxActive = Math.max(maxActive, active);
-        return { running: advance({ deps, spec: { ...spec, slot } }) };
+        return { running: advance({ deps, spec: { ...spec, slot }, folded }) };
       });
       gate = turn.then(
         () => {},

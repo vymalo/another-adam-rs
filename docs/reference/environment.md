@@ -3,12 +3,13 @@
 Configuration of both agents is environment variables only. Problems are reported all at once at startup
 (`invalid configuration`, exit 78). Sources of truth: `crates/adam-service/src/config.rs` (the common ones),
 `bin/adam-coder/src/config.rs`, `bin/adam-agent/src/config.rs`, `crates/adam-env-kubernetes/src/settings.rs`,
-`bin/adam-egress/src/config.rs`, `crates/adam-git-sandbox/src/config.rs`.
+`bin/adam-egress/src/config.rs`, `crates/adam-git-sandbox/src/config.rs`, and for the one row below
+`crates/adam-notify-postgres/src/lib.rs`.
 The chart sets these from its values: [chart README](../../deploy/coder/README.md). Secrets are never in
 files or logs; they are `SecretString`s and absent from `Debug`.
 
 The roles that run workers (`all`, `worker`) read everything below except where a row says otherwise.
-A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR`,
+A `control-plane` reads only `ROLE`, `DATABASE_URL`, `ADAM_PG_POOL_SIZE`, `NOTIFY_LOCAL_ONLY`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR`,
 `ADAM_AGENT_DIR`, the `SESSION_*` limits and the optional `A2A_PUSH_*`, `A2A_CARD_SIGNING_*` and `A2A_DOCS`, and a chart may set the rest for every role.
 
 ## Both binaries (`adam-service`)
@@ -17,6 +18,7 @@ A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLI
 |---|---|---|
 | `ROLE` | `all`, `control-plane` or `worker` | `all` |
 | `DATABASE_URL` | Postgres for the run store | required |
+| `ADAM_PG_POOL_SIZE` | connections in the Postgres store's pool, **per process** (2 to 65535; one is refused because an `adam-notify-postgres` listener holds a connection for the process's lifetime, so a one-connection pool would leave none for a query; **two is the floor, not a size to run** — the default 16 is the intended size). Read by `adam-store-postgres` when it connects, not by `adam-service`'s own configuration: a value that is not an integer in range fails that connect at startup | `16` |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens; **none = no server** | required by `all`, `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (goes in the agent card) | required by `all`, `control-plane` |
 | `LISTEN_ADDR` | the A2A server, or a worker's `/healthz` | `0.0.0.0:8080` |
@@ -62,6 +64,17 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 | `A2A_CARD_SIGNING_KEY_ID` | the signature's `kid`; needs the key file | the key's RFC 7638 thumbprint |
 | `A2A_CARD_SIGNING_JKU` | the `jku` in the signature's header (where clients fetch the key set; the server serves it at `/.well-known/jwks.json`); needs the key file | unset |
 | `A2A_DOCS` | Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, both public (the calls still need a token); `false` (or `0`) turns them off | `true` |
+
+## Cross-process notifications (`adam-notify-postgres`)
+
+`adam-coder`, in every role (`all`, `control-plane`, `worker`): the `notify` component. Both binaries'
+shared configuration parses the variable, so a bad value is exit 78 in either; `adam-agent` runs no
+`notify` component, so the value has no effect there. Source: `crates/adam-notify-postgres/src/lib.rs`,
+[the crate README](../../crates/adam-notify-postgres/README.md).
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0` (any case): keep this process's events local. `emit` delivers them to the in-process sink and does not encode, queue or `NOTIFY` them; every process's listener drops an event of its own origin anyway. Signals (wake-ups, cancels) still cross. One **process** (`ROLE=all`, one pod): with `topology: split` (a front and its workers, even one replica each) it silences the live events between them, whose state changes still reach a subscriber's 2 s fallback poll. A deployment choice, never detected. Anything else: a startup problem, exit 78 | `false` |
 
 ## Agent folder (both binaries)
 
@@ -117,7 +130,7 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 | `RUN_POD_EXEC_BINARY` | the program that runs a command in a pod | `adam-kube-exec` |
 | `RUN_POD_READY_TIMEOUT_SECS` | how long a pod may take to be ready | `300` (chart: `600`) |
 | `RUN_POD_IDLE_SECS` | idle time before a pod is deleted; `0` keeps it until the run ends | `900` |
-| `RUN_POD_WAIT_SECS` | how long a run retries for a pod the cluster cannot give now | `600` |
+| `RUN_POD_WAIT_SECS` | how long a run retries for a pod the cluster cannot give now | `600` (chart: `1020`) |
 | `DEVCONTAINER_RUNTIME` | `off` or `podman` (the repository's devcontainer on a rootless Podman service) | `off` |
 | `CONTAINER_HOST` | Podman's own variable, e.g. `unix:///run/podman/podman.sock`; required with `podman` | unset |
 | `DEVCONTAINER_DEFAULT_IMAGE` | image for a repository with no `devcontainer.json`; **by digest only** | the `workspace` image the coder is built on |

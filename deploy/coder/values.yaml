@@ -7,7 +7,7 @@ image:
   # Bumped on every green build of main by .github/workflows/coder.yml
   # (`sha-<first 7 of the commit>`). A plain key so the workflow can edit it.
   # sha-0000000 is the placeholder that exists before the first build.
-  tag: sha-64383db
+  tag: sha-a019956
   pullPolicy: IfNotPresent
 
 # The image package may be private; name a pull secret here if so.
@@ -422,8 +422,12 @@ runPods:
   idleSecs: 900
   # How long a pod may take to be ready (scheduling, the first pull of the image on a node).
   readyTimeoutSecs: 600
-  # How long a run waits for a slot when the quota (or the nodes) cannot give one now.
-  waitSecs: 600
+  # How long a run waits for a slot when the quota (or the nodes) cannot give one now. It must outlast the idle life of a
+  # pod, the sweep that deletes it and its delete grace, or the run gives up while a slot is about to free: 900 + 60 + 2 =
+  # 962, rounded up. The chart refuses a waitSecs below idleSecs + 62 (unless idleSecs is 0). When nothing frees (the quota
+  # is exhausted and no pod goes idle), a tool call stalls the whole 1020 s (17 minutes) before it fails. Lowering idleSecs
+  # instead would change the intended idle behaviour.
+  waitSecs: 1020
   # The coder pod's own resources while run pods are on, instead of `resources` above (which is untouched when they
   # are off): it holds no build. Empty uses `resources`.
   coderResources:

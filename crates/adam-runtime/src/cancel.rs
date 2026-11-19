@@ -25,7 +25,7 @@ use tokio::sync::watch;
 /// on the same [`Runtime`](crate::Runtime) that holds the run's lease; at once
 /// when another process cancels and the two share a
 /// [`Notifier`](crate::Notifier) (a [`Signal::Finished`](crate::Signal)); and
-/// within one `poll_interval` when the run turns terminal in the store for any
+/// within one `cancel_poll_interval` when the run turns terminal in the store for any
 /// other reason (a cancel whose signal was lost, a purge). The token is
 /// per transition: the next transition of the run gets a fresh one. Reacting
 /// is optional and never affects correctness, which rests on the version CAS;

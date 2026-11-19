@@ -265,11 +265,16 @@ export class Stack {
     await this.compose(['exec', '-T', 'postgres', 'psql', '-U', 'postgres', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
   }
 
-  /** The slot's work volume as it is when the coder first starts: nothing of an earlier run but the sandbox's directory. */
-  async resetWork(slot) {
+  /**
+   * The slot's work volume as it is when the coder first starts: nothing of an earlier run but the sandbox's directory and
+   * the names `keep` lists (a task's base, which is derived from its image and validated by its own marker).
+   */
+  async resetWork(slot, { keep = [] } = {}) {
+    if (!keep.every((n) => /^[A-Za-z0-9._-]+$/.test(n))) throw new StackError('a kept name is not plain');
+    const kept = keep.map((n) => `! -name ${n} `).join('');
     const service = this.slotService('podman', slot);
-    await this.execIn(service, 'find /work -mindepth 1 -maxdepth 1 ! -name .gitbox -exec rm -rf {} + ; mkdir -p /work/workspaces /work/.gitbox');
-    const left = (await this.listDir(slot, '/work')).filter((n) => !['workspaces', '.gitbox'].includes(n));
+    await this.execIn(service, `find /work -mindepth 1 -maxdepth 1 ! -name .gitbox ${kept}-exec rm -rf {} + ; mkdir -p /work/workspaces /work/.gitbox`);
+    const left = (await this.listDir(slot, '/work')).filter((n) => !['workspaces', '.gitbox', ...keep].includes(n));
     if (left.length > 0) throw new StackError(`the work volume still holds ${left.join(', ')}`);
   }
 

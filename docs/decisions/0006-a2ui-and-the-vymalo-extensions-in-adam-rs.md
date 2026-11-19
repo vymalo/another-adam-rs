@@ -78,6 +78,10 @@ What adam-rs had, *verified 2026-10-01 by reading the code at commit `bec4044`*:
    thread-tools client (`adam_ui::ThreadTools`) is one: it lists the endpoint's `tools/list` each turn and offers
    **every listed tool under its listed name**, so the relayed tools of attached servers and `ask_agent` of later
    slices appear with no change here. `adam-assembly`'s `BoundDef::tool_source` gives a source to every agent.
+   *Amended 2026-11-19 (P14 of the 2026-11-18 optimisation review):* the listing is still read inside the journaled
+   model step, but it is kept for the grant that read it (`adam_ui::LISTING_TTL`, 60 s, never past the grant's
+   `expiresAt`) and reused by later turns; a new grant (a reconnect), a call the endpoint refuses, or the TTL lists
+   again. A stateless endpoint cannot announce a tool-set change, so one is seen at the next session or TTL.
 5. **One `show` tool, not one tool per component.** The catalog is the screen's and changes with its version; a
    model's tool list should not, and a screen is several blocks together. `ui_catalog {}` gives the components and
    their schemas; `show { blocks, title? }` takes `{component, ...properties}` blocks, **validates each against the

@@ -16,9 +16,10 @@ database driver.
 
 | Item | What |
 |---|---|
-| `Store` (trait) | `migrate`, `create_run`, `load_run`, `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs of the runs it purges), `list_runs` and `count_runs` (a caller's runs, newest update first, by keyset: `RunQuery`, `ConversationScope`), and the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*) |
+| `Store` (trait) | `migrate`, `create_run`, `load_run`, `run_header` (a run without its state, from one projected read where the adapter can), `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs of the runs it purges), `list_runs` and `count_runs` (a caller's runs, newest update first, by keyset: `RunQuery`, `ConversationScope`), and the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*) |
 | `DynStore` | `Arc<dyn Store>`, the handle the runtime holds |
 | `RunRecord`, `NewRun`, `RunUpdate`, `RunStatus`, `RunId` | a run and how to create or advance one |
+| `RunHeader` | a run without its state: `run_header`'s answer, with `claimed(now)` (a runnable run and a live lease) for a reader that only needs the run's own bookkeeping. `adam_core::claimed(status, lease_until, now)` is that rule, shared with a runtime view |
 | `JournalEntry` | the recorded outcome of one step, keyed by `(run, seq)` |
 | `ClaimScope` | `Any` (default) or `Pinned`, the scope of a `claim_due`. Closed: no `#[non_exhaustive]` |
 | `Lease` | a run claimed by a worker until a deadline |
@@ -42,6 +43,13 @@ let run = store
     .commit_run(run.id, run.version, RunUpdate::new(RunStatus::Parked, json!({"turn": 1})))
     .await?;
 ```
+
+`create_run` and `commit_run` return the record **without its state** (`state` is `null`): the caller
+supplied it, and the state is the largest member of the record. Read the run for the stored state.
+Of the run writes, `journal_put` is the exception: it returns the payload it stored, which is what the
+loop decodes the step's outcome from (a store may have replaced a NUL in it,
+[ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)); the push
+methods return the cleaned configuration and cursor too.
 
 The semantics (CAS commits, first-writer-wins journal, leases, one open run
 per conversation) are described in the [architecture](../../docs/architecture.md#the-mental-model).
@@ -74,6 +82,22 @@ another owner's runs by leaving a filter out: `ConversationScope::Prefix` for ev
 `<subject>:`), `Exact` for one conversation. Every adapter serves a page from an index (Postgres compares the conversation id
 in the `"C"` collation so a prefix is a range, MongoDB uses an anchored escaped prefix). Two more **required** `Store` methods:
 breaking for implementers, proved by the `list_runs_*` and `count_runs_*` conformance cases.
+
+## Reading a header
+
+`Store::run_header(id)` answers a `RunHeader` — the run's id, agent,
+conversation, parent, status, wake time, version, timestamps and lease, **never its state** — or
+`None`. A reader that only needs the run's own bookkeeping (a parent check, a
+step's cancel watch, a listing that builds its view from the record it already has) reads this
+instead of `load_run`: the state is the largest member of a run, and for an `LlmAgent` it is the
+whole transcript. `RunHeader::claimed(now)` applies the same rule as `RunView::claimed`: only a
+runnable run, and only a lease that has not run out.
+
+The method is **defaulted**, so it breaks no implementer: the default reads `lease_until` and
+`load_run` and projects the record (two reads, in that order, for the same interleaving reason
+`Runtime::view` reads them in that order). Both shipped adapters override it with one statement that
+projects the header columns and the lease, and the conformance case
+`run_header_matches_the_record` proves an implementation agrees with `load_run` + `lease_until`.
 
 ## Push configurations
 

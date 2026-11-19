@@ -1,5 +1,6 @@
-//! The thread-tools client: the endpoint a message announces (`thread-tools/v1`), read at every
-//! model turn and called like any tool, and the refetch of the screen's catalog through it.
+//! The thread-tools client: the endpoint a message announces (`thread-tools/v1`), read once per
+//! grant (a turn reuses the listing; see [`LISTING_TTL`]) and called like any tool, and the refetch
+//! of the screen's catalog through it.
 //!
 //! A message from the orchestration layer carries `{url, token, expiresAt}` for the one thread it
 //! belongs to; `adam-a2a-runtime`'s `vymalo_inbound` puts it in the run's inbound context under
@@ -15,8 +16,11 @@
 //!     participant E as Thread-tools endpoint
 //!     L->>T: specs(context)
 //!     T->>T: the grant in the context, not expired?
-//!     T->>E: tools/list (Bearer token)
-//!     E-->>T: get_ui_catalog, and the tools attached since
+//!     T->>T: a listing of this grant, younger than the TTL?
+//!     opt no listing to reuse
+//!         T->>E: tools/list (Bearer token)
+//!         E-->>T: get_ui_catalog, and the tools attached since
+//!     end
 //!     T-->>L: every listed tool, under its listed name
 //!     L->>T: call(name, args), inside the journaled step
 //!     T->>E: tools/call
@@ -36,7 +40,7 @@
 //! ```
 //!
 //! **What a call carries and waits for.** The endpoint lists each tool with `_meta["thread-tools/v1"]`
-//! (`{reportsStep, timeoutSecs}`); the listing is read once per model turn and its notes ride in the run's
+//! (`{reportsStep, timeoutSecs}`); the listing is read once per grant and its notes ride in the run's
 //! state ([`ToolNote`]), so the call, made later and possibly elsewhere, knows them. A call waits as
 //! long as the tool's `timeoutSecs` says, **capped** by [`McpPolicy::thread_tools_max_call`] (`THREAD_TOOLS_MAX_CALL_SECS`,
 //! default 3600 s), and by the policy's call timeout (60 s) for a tool that says nothing; it is sent with
@@ -49,7 +53,8 @@
 //! Nothing here fails a run: with no usable grant the source offers no tools and a call is an
 //! error result that says the tools are gone; an endpoint that is down is a warning and no tools.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use adam_a2a_runtime::{CONTEXT_THREAD_TOOLS, integral_numbers};
@@ -58,7 +63,7 @@ use adam_mcp::{CallOptions, Endpoint, EndpointError, McpPolicy, RemoteTool};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
@@ -91,8 +96,23 @@ pub const TURN_OUTPUT_TITLE: &str = "Send the answer";
 pub const TURN_OUTPUT_DELIVERED: &str = "Delivered to the person as your answer. Do not repeat it.";
 
 /// The longest a listing waits for the endpoint, whatever the policy's connect timeout: it is paid
-/// at every model turn.
+/// whenever a listing is read.
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a listing is reused for the grant that read it. A model turn reuses the listing of its
+/// grant instead of dialling the endpoint again (initialize, `tools/list`, close); the endpoint is
+/// asked again when the grant changes (a new token or URL is a new session), when a call it lists is
+/// refused (the tool set may have changed), and at the latest after this.
+pub const LISTING_TTL: Duration = Duration::from_secs(60);
+
+/// The most listings kept: a process serves several threads at once, each with its own grant.
+const MAX_CACHED_LISTINGS: usize = 16;
+
+/// One listing and the instant it stops being reused.
+struct CachedListing {
+    tools: Arc<Vec<RemoteTool>>,
+    until: DateTime<Utc>,
+}
 
 /// What an inbound context can say about the thread's tools, when it says nothing usable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +160,10 @@ impl std::fmt::Debug for Grant {
 pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
 /// Reaches the thread-tools endpoint a run's context announces.
+///
+/// The listings this process has read are kept here, by `(url, sha256(token))`: a model turn reuses
+/// the one its grant read instead of opening a new MCP session for the same static list. A call
+/// still dials per call (the token is short-lived, and the endpoint is stateless).
 #[derive(Clone)]
 pub struct ThreadToolsClient {
     policy: McpPolicy,
@@ -148,6 +172,9 @@ pub struct ThreadToolsClient {
     default_call: Duration,
     /// The longest any call is waited for, whatever the tool says.
     max_call: Duration,
+    /// The listings read for each grant, until [`LISTING_TTL`] or the grant's expiry. Shared by the
+    /// clones of this client.
+    listings: Arc<Mutex<HashMap<(String, String), CachedListing>>>,
 }
 
 impl std::fmt::Debug for ThreadToolsClient {
@@ -167,7 +194,7 @@ pub(crate) struct Fetched {
 impl ThreadToolsClient {
     /// A client under `policy`: its URL rules (https, or plain `http` only to this machine unless
     /// [`McpPolicy::allow_insecure`] says otherwise) and its timeouts. A listing waits at most ten
-    /// seconds, whatever the connect timeout, because it is paid at every model turn. A call waits
+    /// seconds, whatever the connect timeout, because it is paid whenever a listing is read. A call waits
     /// as long as its tool says it may take ([`ToolNote::timeout`]), and at most
     /// [`McpPolicy::thread_tools_max_call`]; for a tool that says nothing, [`McpPolicy::call_timeout`]
     /// (60 s by default), under the same cap.
@@ -178,6 +205,7 @@ impl ThreadToolsClient {
             max_call: policy.thread_tools_max_call_value(),
             policy: policy.connect_timeout(listing),
             clock: Arc::new(Utc::now),
+            listings: Arc::default(),
         }
     }
 
@@ -228,6 +256,74 @@ impl ThreadToolsClient {
     /// The endpoint of `grant`, under the policy.
     pub(crate) fn endpoint(&self, grant: &Grant) -> Result<Endpoint, EndpointError> {
         Endpoint::new(&grant.url, &grant.token, &self.policy)
+    }
+
+    /// The tools `grant`'s endpoint lists, from the listing this client read for it when that is
+    /// still reusable ([`LISTING_TTL`], and never past the grant's expiry), else over a new session
+    /// (initialize, `tools/list`, close). A failed listing is not remembered, and neither is an
+    /// empty one: an endpoint that lists nothing is asked again next turn.
+    pub(crate) async fn listed(
+        &self,
+        grant: &Grant,
+    ) -> Result<Arc<Vec<RemoteTool>>, EndpointError> {
+        let key = listing_key(grant);
+        let now = (self.clock)();
+        if let Some(tools) = self.cached(&key, now) {
+            return Ok(tools);
+        }
+        let tools = Arc::new(self.endpoint(grant)?.list_tools().await?);
+        if !tools.is_empty() {
+            self.remember(key, Arc::clone(&tools), now, grant.expires_at);
+        }
+        Ok(tools)
+    }
+
+    /// Drop the listing read for `grant`: the next turn lists again. A call the endpoint refused
+    /// may name a tool it no longer has, so the list it came from is not trusted after it. Any
+    /// protocol refusal counts, bad arguments included: the cost is one `tools/list` on the next
+    /// turn, and the alternative is trusting a list the endpoint just disagreed with.
+    pub(crate) fn forget_listing(&self, grant: &Grant) {
+        let now = (self.clock)();
+        let mut listings = self.listings.lock().unwrap_or_else(PoisonError::into_inner);
+        listings.retain(|_, listing| listing.until > now);
+        listings.remove(&listing_key(grant));
+    }
+
+    fn cached(&self, key: &(String, String), now: DateTime<Utc>) -> Option<Arc<Vec<RemoteTool>>> {
+        let mut listings = self.listings.lock().unwrap_or_else(PoisonError::into_inner);
+        listings.retain(|_, listing| listing.until > now);
+        listings.get(key).map(|listing| Arc::clone(&listing.tools))
+    }
+
+    fn remember(
+        &self,
+        key: (String, String),
+        tools: Arc<Vec<RemoteTool>>,
+        now: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) {
+        let ttl = chrono::Duration::from_std(LISTING_TTL).unwrap_or_default();
+        let until = (now + ttl).min(expires_at);
+        let mut listings = self.listings.lock().unwrap_or_else(PoisonError::into_inner);
+        listings.retain(|_, listing| listing.until > now);
+        if listings.len() >= MAX_CACHED_LISTINGS
+            && let Some(oldest) = listings
+                .iter()
+                .min_by_key(|(_, listing)| listing.until)
+                .map(|(key, _)| key.clone())
+        {
+            listings.remove(&oldest);
+        }
+        listings.insert(key, CachedListing { tools, until });
+    }
+
+    /// How many listings the cache holds (a test of the expiry sweep).
+    #[cfg(test)]
+    fn cached_listings(&self) -> usize {
+        self.listings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// Ask the endpoint for the thread's current catalog: `get_ui_catalog` with `known_digest`
@@ -292,6 +388,14 @@ fn fetched_from(body: &Value) -> Result<Fetched, String> {
         },
         document,
     })
+}
+
+/// The key a listing is kept under: the endpoint and the credential that read it. A new grant (a
+/// new token or URL) is a new session, and lists again.
+fn listing_key(grant: &Grant) -> (String, String) {
+    let digest = Sha256::digest(grant.token.expose_secret().as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    (grant.url.clone(), hex)
 }
 
 /// What the endpoint's listing says about `tool` for the agent (`_meta["thread-tools/v1"]`): whether
@@ -373,9 +477,9 @@ fn is_relayed(name: &str) -> bool {
 }
 
 /// The tools of the thread-tools endpoint a run's messages announced, as a
-/// [`ToolSource`]: every tool the endpoint lists, under its listed name, listed again at every
-/// model turn, so the tools of later slices of the orchestration layer (the relayed tools of attached
-/// servers, `ask_agent`) appear with no change here.
+/// [`ToolSource`]: every tool the endpoint lists, under its listed name, read once per grant (a turn
+/// reuses the listing; [`LISTING_TTL`]) so the tools of later slices of the orchestration layer (the
+/// relayed tools of attached servers, `ask_agent`) appear with no change here.
 ///
 /// With no usable grant the source offers nothing. A call goes straight to the endpoint (it
 /// answers a name it does not have with a protocol error, which the model reads as an error
@@ -478,14 +582,11 @@ impl ToolSource for ThreadTools {
                 return Listing::default();
             }
         };
-        let listed = match self.client.endpoint(&grant) {
-            Ok(endpoint) => endpoint.list_tools().await,
-            Err(e) => Err(e),
-        };
+        let listed = self.client.listed(&grant).await;
         match listed {
             Ok(tools) => {
-                let tools: Vec<RemoteTool> = tools
-                    .into_iter()
+                let tools: Vec<&RemoteTool> = tools
+                    .iter()
                     .filter(|tool| !self.hidden.contains(&tool.name.as_str()))
                     .filter(|tool| {
                         let fine = fits(&tool.name);
@@ -499,8 +600,8 @@ impl ToolSource for ThreadTools {
                     })
                     .collect();
                 Listing {
-                    specs: tools.iter().map(RemoteTool::spec).collect(),
-                    notes: tools.iter().filter_map(note_of).collect(),
+                    specs: tools.iter().map(|tool| tool.spec()).collect(),
+                    notes: tools.iter().filter_map(|tool| note_of(tool)).collect(),
                 }
             }
             Err(e) => {
@@ -590,11 +691,16 @@ impl ToolSource for ThreadTools {
                 Some(text) => ToolOutput::text(TURN_OUTPUT_DELIVERED).final_answer(text),
                 None => ToolOutput::text(result.text),
             })),
-            Err(EndpointError::Unauthorized) => error_result(format!(
-                "`{name}` was refused: the endpoint does not accept this conversation's grant any \
-                 more (it may have expired). Go on without it."
-            )),
+            Err(EndpointError::Unauthorized) => {
+                self.client.forget_listing(&grant);
+                error_result(format!(
+                    "`{name}` was refused: the endpoint does not accept this conversation's grant any \
+                     more (it may have expired). Go on without it."
+                ))
+            }
             Err(EndpointError::Rejected(why)) => {
+                // The endpoint may have changed its tools: the next turn lists again.
+                self.client.forget_listing(&grant);
                 error_result(format!("`{name}` was refused by the endpoint: {why}"))
             }
             Err(other) => error_result(format!(
@@ -710,10 +816,33 @@ mod tests {
         ))
     }
 
+    /// A clock a test moves, and the instant it reads.
+    fn moving_clock(time: &str) -> (Clock, Arc<Mutex<DateTime<Utc>>>) {
+        let now = Arc::new(Mutex::new(
+            DateTime::parse_from_rfc3339(time)
+                .unwrap()
+                .with_timezone(&Utc),
+        ));
+        let clock: Clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || *now.lock().unwrap_or_else(PoisonError::into_inner))
+        };
+        (clock, now)
+    }
+
+    fn set(now: &Arc<Mutex<DateTime<Utc>>>, time: &str) {
+        *now.lock().unwrap_or_else(PoisonError::into_inner) = DateTime::parse_from_rfc3339(time)
+            .unwrap()
+            .with_timezone(&Utc);
+    }
+
     #[tokio::test]
-    async fn every_listed_tool_is_offered_under_its_name_and_listed_again_each_time() {
-        let server = ThreadToolsServer::start(&["tok"]).await;
-        let source = source("2026-10-01T12:00:00Z");
+    async fn a_listing_is_read_once_per_grant_and_again_on_reconnect_or_after_the_ttl() {
+        let server = ThreadToolsServer::start(&["tok", "tok2"]).await;
+        let (clock, now) = moving_clock("2026-10-01T12:00:00Z");
+        let source = ThreadTools::new(Arc::new(
+            ThreadToolsClient::new(McpPolicy::default()).with_clock(clock),
+        ));
         let ctx = SourceCtx::detached(context(&server.url("t1"), "tok", "2026-10-01T14:00:00Z"));
 
         let first = source.specs(&ctx).await;
@@ -722,7 +851,15 @@ mod tests {
             ["get_ui_catalog"]
         );
         assert_eq!(first[0].parameters["type"], "object");
-        // A tool the orchestrator attached since is there on the next turn.
+        // A second turn of the same grant reuses the listing: no session is opened.
+        assert_eq!(source.specs(&ctx).await, first);
+        assert_eq!(
+            (server.initializations(), server.lists()),
+            (1, 1),
+            "one session for the grant"
+        );
+
+        // A tool the endpoint attached since is not in the listing this session read.
         server.add_tool(
             "relay__search",
             "Search.",
@@ -735,11 +872,87 @@ mod tests {
             json!({"type": "object"}),
             "x",
         );
+        assert_eq!(
+            source.specs(&ctx).await,
+            first,
+            "the listing of the session is reused"
+        );
+        assert_eq!(server.lists(), 1);
+
+        // The TTL passes: the endpoint is listed again, and the tools attached since are there.
+        set(&now, "2026-10-01T12:01:01Z");
         let second = source.specs(&ctx).await;
         assert_eq!(
             second.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             ["get_ui_catalog", "relay__search"],
             "a name no provider accepts is left out"
+        );
+        assert_eq!((server.initializations(), server.lists()), (2, 2));
+
+        // A new grant (a reconnect) is a new session: it lists again, whatever the TTL.
+        let renewed =
+            SourceCtx::detached(context(&server.url("t1"), "tok2", "2026-10-01T14:00:00Z"));
+        assert_eq!(source.specs(&renewed).await, second);
+        assert_eq!((server.initializations(), server.lists()), (3, 3));
+    }
+
+    #[tokio::test]
+    async fn an_expired_listing_is_dropped_even_when_nothing_is_read() {
+        let server = ThreadToolsServer::start(&["tok", "tok2"]).await;
+        let (clock, now) = moving_clock("2026-10-01T12:00:00Z");
+        let client = ThreadToolsClient::new(McpPolicy::default()).with_clock(clock);
+        let source = ThreadTools::new(Arc::new(client.clone()));
+        let ctx = SourceCtx::detached(context(&server.url("t1"), "tok", "2026-10-01T14:00:00Z"));
+        assert!(!source.specs(&ctx).await.is_empty());
+        assert_eq!(client.cached_listings(), 1);
+
+        set(&now, "2026-10-01T12:01:01Z");
+        // Dropping another grant's listing prunes what expired on the way, so an idle process does
+        // not keep a digest and a URL for ever.
+        let other = client
+            .grant(&context(&server.url("t1"), "tok2", "2026-10-01T14:00:00Z"))
+            .unwrap();
+        client.forget_listing(&other);
+        assert_eq!(client.cached_listings(), 0, "the expired entry was swept");
+    }
+
+    #[tokio::test]
+    async fn a_refused_call_drops_the_listing_so_the_next_turn_lists_again() {
+        let server = ThreadToolsServer::start(&["tok"]).await;
+        server.add_tool(
+            "relay__search",
+            "Search.",
+            json!({"type": "object"}),
+            "found",
+        );
+        let source = source("2026-10-01T12:00:00Z");
+        let ctx = ToolCtx::detached("relay__search", "c1", Arc::new(adam_runtime::NoopSink))
+            .with_context(context(&server.url("t1"), "tok", "2026-10-01T14:00:00Z"));
+        assert!(
+            !source
+                .specs(&SourceCtx::detached(ctx.context_map().clone()))
+                .await
+                .is_empty()
+        );
+        assert_eq!(server.lists(), 1);
+
+        // The endpoint no longer has the tool: the call is refused, and the listing is dropped.
+        server.remove_tool("relay__search");
+        let refused = source
+            .call(&ctx, "relay__search", json!({}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(refused.is_error);
+        assert_eq!(server.lists(), 1, "a call is not a listing");
+
+        // The next turn lists again, and the tool is gone.
+        let listed = source
+            .specs(&SourceCtx::detached(ctx.context_map().clone()))
+            .await;
+        assert_eq!(
+            listed.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["get_ui_catalog"]
         );
         assert_eq!(server.lists(), 2);
     }
