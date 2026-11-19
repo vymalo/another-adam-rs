@@ -1554,6 +1554,7 @@ async fn each_failure_maps_to_the_exit_code_of_its_cause() {
     let model = adam_service::ModelConfig {
         base_url: "not a url".into(),
         api_key: String::new().into(),
+        device_grant: None,
         alias: "m".into(),
         extra_body: None,
         echo_reasoning: None,

@@ -29,7 +29,10 @@ A `control-plane` reads only `ROLE`, `DATABASE_URL`, `ADAM_PG_POOL_SIZE`, `NOTIF
 | `SESSION_MAX_ROUNDS` | the most rounds one session may have, a close included, 2 to 200; `limits.max_session_rounds` may lower it | `20` |
 | `SESSION_IDLE_DAYS` | days a kept-open session may sit idle (its latest round ended, nobody wrote to it) before it **reads closed**: it takes no message and frees its place under `SESSION_MAX_OPEN`; a round that works never expires. 1 to 365. Set it the same on every process that serves one database, and purge finished runs only after longer than this | `7` |
 | `WORKER_ID` | lease identity: 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; required by `affinity`, `isolated` |
-| `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and key | required by `all`, `worker` (key may be empty) |
+| `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and key | required by `all`, `worker` (key may be empty; not with `MODEL_AUTH=device`) |
+| `MODEL_AUTH` | `key` (send `MODEL_API_KEY`) or `device`: sign in to an OAuth 2.0 issuer with the device grant and renew the token ([ADR 0058](../decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md), [`adam-model-oauth`](../../crates/adam-model-oauth/README.md)). The code and the link are a `WARN` log line at startup (`sign in to use the model: open … and enter the code …`); a model call waits for the sign-in at most 120 s, then is retried. A denied or expired code, or a refused renewal, makes every call fail until a restart. With `device`, a non-empty `MODEL_API_KEY` is exit 78; anything but `key` or `device` is exit 78 | `key` |
+| `MODEL_OAUTH_ISSUER` | with `device`: the issuer; its `/.well-known/openid-configuration` names the device and token endpoints, which must be on its origin. `https`, or `http` on a loopback address (else exit 78) | required with `device` |
+| `MODEL_OAUTH_CLIENT_ID`, `MODEL_OAUTH_SCOPE` | with `device`: the public client the issuer knows the process as, and the scope asked for | client required with `device`; scope `offline_access` |
 | `MODEL` | the agent's model alias | required by `all`, `worker` |
 | `MODEL_EXTRA_BODY` | JSON object merged into every chat request, e.g. `{"reasoning_effort":"medium"}`; **not a secret**; may not set `model`, `messages`, `tools`, `tool_choice`, `stream` | unset |
 | `MODEL_ECHO_REASONING` | `reasoning_content` or `reasoning`: send earlier reasoning back under that name (DeepSeek thinking mode with tools needs it) | unset |
@@ -198,7 +201,7 @@ Put these in a `.env` next to `compose.yaml`.
 | `CODER_IMAGE` | image of both agents; with `--no-build` runs a prebuilt one | `adam-rs/coder:dev` |
 | `CODER_MODEL`, `AGENT_MODEL` | the scripted models | `mock-coder`, `mock-assistant` |
 | `AGENT_MCP_ALLOW_INSECURE` | `MCP_ALLOW_INSECURE` of the `agent` service: plain `http` to another container, for a folder whose `mcp.json` names a mock (the painter); development only | `false` |
-| `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `MODEL_CONTEXT_WINDOW` | read only with `-f dev/compose.real-model.yaml`: the real model of the `agent` and the `coder` (the first three required). Export the key in your shell rather than writing it in `.env` | unset; `131072` for the window |
+| `MODEL_BASE_URL`, `MODEL`, `MODEL_API_KEY`, `MODEL_AUTH`, `MODEL_OAUTH_ISSUER`, `MODEL_OAUTH_CLIENT_ID`, `MODEL_OAUTH_SCOPE`, `MODEL_CONTEXT_WINDOW` | read only with `-f dev/compose.real-model.yaml`: the real model of the `agent` and the `coder` (`MODEL_BASE_URL` and `MODEL` required; a key, or `MODEL_AUTH=device` with an issuer and a client). Export the key in your shell rather than writing it in `.env` | unset; `key`; `131072` for the window |
 | `CODER_AGENT_DIR`, `AGENT_FOLDER` | the agent folders mounted at `/etc/adam/agent` | `./bin/adam-coder/agent`, `./dev/agents/assistant/agent` |
 
 ## Tests

@@ -1,23 +1,30 @@
 # The compose stack's agents on a real model instead of the scripted one: an override, never the default.
 #
 #   export MODEL_BASE_URL=https://your-gateway.example/v1   # any OpenAI-compatible endpoint, with its /v1
-#   export MODEL_API_KEY=...                                # from your environment only, never a file here
 #   export MODEL=your-model                                 # a model that can call tools
-#   docker compose -f compose.yaml -f dev/compose.real-model.yaml --profile app up -d --build --wait
+#   # then either a key, from your environment only, never a file here:
+#   export MODEL_API_KEY=...
+#   # or a sign-in with an OAuth 2.0 issuer (the device grant, ADR 0058):
+#   export MODEL_AUTH=device MODEL_OAUTH_ISSUER=https://id.example MODEL_OAUTH_CLIENT_ID=your-client
+#   docker compose -f compose.yaml -f dev/compose.real-model.yaml --profile app up -d --wait
 #
-# Both the `agent` (adam-agent, the chat-only Assistant by default) and the `coder` (Adam) use it. The
-# coder still pushes to the local git server and opens pull requests on the mock GitHub: a real model on
-# a sandbox, nothing leaves the machine but the model calls. docs/guides/try-the-agents.md walks through it.
+# With MODEL_AUTH=device each service signs in on its own (a refresh token is never shared): its code and link
+# are in its logs, `docker compose logs agent coder | grep "sign in"`. Both the `agent` (adam-agent, the chat-only
+# Assistant by default) and the `coder` (Adam) use this. The coder still pushes to the local git server and opens
+# pull requests on the mock GitHub: a real model on a sandbox, nothing leaves the machine but the model calls (and
+# the sign-in). docs/guides/try-the-agents.md walks through it.
+x-real-model: &real-model
+  MODEL_BASE_URL: ${MODEL_BASE_URL:?set MODEL_BASE_URL to an OpenAI-compatible endpoint}
+  MODEL: ${MODEL:?set MODEL to a model of that endpoint}
+  MODEL_API_KEY: ${MODEL_API_KEY:-}
+  MODEL_AUTH: ${MODEL_AUTH:-key}
+  MODEL_OAUTH_ISSUER: ${MODEL_OAUTH_ISSUER:-}
+  MODEL_OAUTH_CLIENT_ID: ${MODEL_OAUTH_CLIENT_ID:-}
+  MODEL_OAUTH_SCOPE: ${MODEL_OAUTH_SCOPE:-offline_access}
+  MODEL_CONTEXT_WINDOW: ${MODEL_CONTEXT_WINDOW:-131072}
+
 services:
   agent:
-    environment:
-      MODEL_BASE_URL: ${MODEL_BASE_URL:?set MODEL_BASE_URL to an OpenAI-compatible endpoint}
-      MODEL_API_KEY: ${MODEL_API_KEY:?set MODEL_API_KEY in your environment}
-      MODEL: ${MODEL:?set MODEL to a model of that endpoint}
-      MODEL_CONTEXT_WINDOW: ${MODEL_CONTEXT_WINDOW:-131072}
+    environment: *real-model
   coder:
-    environment:
-      MODEL_BASE_URL: ${MODEL_BASE_URL:?set MODEL_BASE_URL to an OpenAI-compatible endpoint}
-      MODEL_API_KEY: ${MODEL_API_KEY:?set MODEL_API_KEY in your environment}
-      MODEL: ${MODEL:?set MODEL to a model of that endpoint}
-      MODEL_CONTEXT_WINDOW: ${MODEL_CONTEXT_WINDOW:-131072}
+    environment: *real-model

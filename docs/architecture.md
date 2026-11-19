@@ -77,6 +77,7 @@ flowchart TB
         pg["adam-store-postgres"]
         mongo["adam-store-mongodb"]
         openai["adam-model-openai"]
+        oauth["adam-model-oauth"]
         ws["adam-workspace"]
         gitsb["adam-git-sandbox"]
         devc["adam-devcontainer"]
@@ -97,6 +98,7 @@ flowchart TB
     service --> a2art
     service --> host
     service --> openai
+    service --> oauth
     service --> pg
     service --> pgn
     service -.-> mcp
@@ -132,7 +134,7 @@ flowchart TB
 | Layer | Crates | Job |
 |---|---|---|
 | Contracts | [`adam-error`](../crates/adam-error/README.md), [`adam-core`](../crates/adam-core/README.md), [`adam-model`](../crates/adam-model/README.md), [`adam-a2a`](../crates/adam-a2a/README.md), [`adam-host`](../crates/adam-host/README.md) | Error classes, the `Store` port and run types, the `ModelClient` port, the `TaskBackend` port with the A2A 1.0 server, the process `Role` and `Placement` with a supervisor. |
-| Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-model-openai`, [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-devcontainer`](../crates/adam-devcontainer/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
+| Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-model-openai`, [`adam-model-oauth`](../crates/adam-model-oauth/README.md), [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-devcontainer`](../crates/adam-devcontainer/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
 | Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares. |
 | Agents and authoring | [`adam-llm-agent`](../crates/adam-llm-agent/README.md), [`adam-ui`](../crates/adam-ui/README.md), [`adam-mcp`](../crates/adam-mcp/README.md), [`adam-agent-fs`](../crates/adam-agent-fs/README.md), [`adam-assembly`](../crates/adam-assembly/README.md), [`adam-macros`](../crates/adam-macros/README.md), [`adam`](../crates/adam/README.md) | The model-and-tools loop; the screen's tools; MCP tools; the agent-folder parser; binding a folder to agents; `#[tool]`; the facade. See [Write an agent](guides/write-an-agent.md). |
 | Binaries | [`adam-coder`](../bin/adam-coder/README.md), [`adam-agent`](../bin/adam-agent/README.md), [`adam-egress`](../bin/adam-egress/README.md) | The two agents you can run, library and binary each, over `adam-service`; and the HTTPS-only egress proxy for run pods, which uses only `adam-error` and is in the same image; the chart deploys it with the run pods, whose network policy allows nothing else out ([ADR 0042](decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)). |
@@ -165,6 +167,7 @@ classDiagram
     class ModelCredentials { <<interface>> }
     ModelCredentials <|.. StaticBearer
     ModelCredentials <|.. RenewingCredentials
+    ModelCredentials <|.. DeviceGrant
     class TaskBackend { <<interface>> }
     TaskBackend <|.. RuntimeTaskBackend
     TaskBackend <|.. InMemoryBackend
@@ -196,7 +199,7 @@ classDiagram
 |---|---|---|---|
 | `Store` | `adam-core` | `PgStore`, `MongoStore` | `MemoryStore` (reference), `FaultyStore` (testkit) |
 | `ModelClient` | `adam-model` | `OpenAiCompatible` (`adam-model-openai`) | `MockModel` |
-| `ModelCredentials` | `adam-model` | `StaticBearer` (`MODEL_API_KEY`); a host's own: a renewed token, a proof, an injector's tag ([ADR 0058](decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)) | `RenewingCredentials` |
+| `ModelCredentials` | `adam-model` | `StaticBearer` (`MODEL_API_KEY`), `DeviceGrant` (`adam-model-oauth`, `MODEL_AUTH=device`); a host's own: a renewed token, a proof, an injector's tag ([ADR 0058](decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)) | `RenewingCredentials` |
 | `TaskBackend` | `adam-a2a` | `RuntimeTaskBackend` (`adam-a2a-runtime`) | `InMemoryBackend` (feature `test-util`) |
 | `PushStore` | `adam-a2a` | `StorePushStore` (`adam-a2a-runtime`, over the `Store`) | `InMemoryPushStore` (feature `test-util`) |
 | `Notifier`, `EventSink` | `adam-runtime` | `PgNotifier`, `PgEventSink` (`adam-notify-postgres`), `BroadcastSink` (in process) | `LocalNotifier`, `NoopSink`, `CollectingSink` |

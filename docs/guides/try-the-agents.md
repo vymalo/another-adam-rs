@@ -81,6 +81,17 @@ docker compose -f compose.yaml -f dev/compose.real-model.yaml --profile app up -
 dev/chat.sh                                # now a real conversation
 ```
 
+**An endpoint that takes tokens from a sign-in** instead of a key (an OAuth 2.0 issuer with the device grant): set
+`MODEL_AUTH=device` and the issuer instead of the key. Each agent asks for its own code; open the link in its log
+line, sign in and allow it. The token is renewed by itself; a restart asks for a new code.
+
+```sh
+export MODEL_BASE_URL=https://your-gateway.example/v1 MODEL=your-model
+export MODEL_AUTH=device MODEL_OAUTH_ISSUER=https://your-issuer.example MODEL_OAUTH_CLIENT_ID=your-client
+docker compose -f compose.yaml -f dev/compose.real-model.yaml --profile app up -d --wait
+docker compose logs agent coder | grep "sign in"   # one code and link per agent
+```
+
 [`dev/compose.real-model.yaml`](../../dev/compose.real-model.yaml) changes only the model: Adam still pushes to
 the local git server and opens pull requests on the mock GitHub, so try real tasks on `local/sandbox.git` or ask
 it to start a new project (it creates repositories for the owner `scratch` after asking). The Painter keeps its
@@ -102,7 +113,8 @@ docker compose --profile app down -v       # forget everything
 | You see | Why | Fix |
 |---|---|---|
 | `no agent card at ...` | the service is not up, or still starting | `docker compose ps`, `docker compose logs agent` (or `coder`) |
-| `required variable MODEL ... is missing a value` | the real-model override without its variables | export `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL` |
+| `required variable MODEL ... is missing a value` | the real-model override without its variables | export `MODEL_BASE_URL`, `MODEL`, and a key or `MODEL_AUTH=device` with its issuer |
+| every call fails with `Auth` after a sign-in | the code was denied or expired, or the issuer refused a renewal | restart the agent for a new code: `docker compose --profile app up -d --force-recreate agent` |
 | the task fails at once on a real model | wrong endpoint, key or model name | `docker compose logs agent` (or `coder`) says which call failed and why |
 | the task fails with `404 off_script` | the scripted model got a message it has no script for | expected on the mocks: free conversation needs a real model |
 

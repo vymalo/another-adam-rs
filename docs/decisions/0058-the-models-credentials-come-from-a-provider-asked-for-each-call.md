@@ -64,16 +64,31 @@ part of this decision.
 
 ## Not built here
 
-* **A provider that signs in.** An OAuth 2.0 device grant (RFC 8628) with refresh, for any issuer, configured by the
-  deployment (issuer, client id, scope), and its environment variables in the binaries. Next.
 * **What a host embeds.** The engine of ADR 0047 takes the host's provider when it is built.
 * **The injector's provider.** Its run header is the injector's decision (another-agentic-system#334).
 * **A signed-out person mid-run.** Today it is the call's `Auth` error, which ends the run; parking the run until the
   person signs in again is a later decision, beside the parked 402.
 * **The other clients** (MCP, the code host, remote A2A agents) keep their own credentials.
+* **A refresh token that survives a restart.** The device grant keeps its tokens in memory only, so a restart asks
+  for a new code; a store for it would be a port of its own.
+
+## A provider that signs in: the device grant
+
+Built in the same change: [`adam-model-oauth`](../../crates/adam-model-oauth/README.md)'s `DeviceGrant`, the OAuth 2.0
+device authorization grant (RFC 8628) for any issuer, and `MODEL_AUTH=device` with `MODEL_OAUTH_ISSUER`,
+`MODEL_OAUTH_CLIENT_ID` and `MODEL_OAUTH_SCOPE` in `adam-service`, so both binaries can use it.
+
+* **The issuer is a setting**, with no default: its discovery document names the endpoints, which must be on its
+  origin; `https`, or `http` on a loopback address.
+* **The person decides when a code is asked for.** One code per process, shown through a `SignInPrompt` (a log line
+  in the binaries, never a token). A denied or expired code, or a refused renewal, signs the process out until it
+  restarts; it never asks for a new code on its own.
+* **Renewal before expiry and after a 401**, one at a time, the rotated refresh token replacing the old one.
+* **A call waits for the sign-in** at most 120 s, then fails as transient (retried); the code is never in a run's error.
+* **Only `Bearer` tokens.** A DPoP-bound token needs the host's own provider, with its key.
 
 ## Where
 
 `crates/adam-model/src/credentials.rs` (the port, `StaticBearer`, `RenewingCredentials`, unit tests),
 `crates/adam-model-openai/src/lib.rs` (`with_credentials`, `send`, `credential_headers`, `rejection_of`),
-`crates/adam-model-openai/tests/credentials.rs`.
+`crates/adam-model-openai/tests/credentials.rs`; `crates/adam-model-oauth` (`src/lib.rs`, `tests/device_grant.rs`); `ModelConfig::parse` and `parse_device_grant` in `crates/adam-service/src/config.rs`.
