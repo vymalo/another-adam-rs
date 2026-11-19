@@ -1683,7 +1683,8 @@ stateDiagram-v2
 * **One writer, whole frames.** `rpc.rs` has a task that writes, fed by a queue: a message is written whole whatever happens to the call that queued it.
   A server that is starting counts toward `LANGUAGE_SERVERS_MAX`, and the bound is one decision at a time.
 * **The scripted server** `src/bin/adam-lsp-script.rs` (`tests/language_servers.rs`) is a second binary of the crate, not built into any image; the
-  gated `tests/real_language_servers.rs` runs the real servers (`ADAM_TEST_LANGUAGE_SERVERS=1`; no CI job yet).
+  gated `tests/real_language_servers.rs` runs the real servers (`ADAM_TEST_LANGUAGE_SERVERS=1`; the `image` job of `.github/workflows/coder.yml`
+  runs it in the built image, where the workspace base has them).
 * **Settings:** `LANGUAGE_SERVERS`, `LANGUAGE_SERVER_IDLE_SECS`, `LANGUAGE_SERVERS_MAX` ([Configuration](#configuration)).
 
 ### Making something with a command
