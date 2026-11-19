@@ -543,10 +543,28 @@ dependencies = [
  "adam-error",
  "async-trait",
  "futures",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "adam-model-oauth"
+version = "0.1.0"
+dependencies = [
+ "adam-model",
+ "adam-model-openai",
+ "async-trait",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -557,6 +575,7 @@ dependencies = [
  "adam-model",
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "futures",
  "httpdate",
  "memchr",
@@ -639,6 +658,7 @@ dependencies = [
  "adam-host",
  "adam-mcp",
  "adam-model",
+ "adam-model-oauth",
  "adam-model-openai",
  "adam-notify-postgres",
  "adam-runtime",
@@ -698,6 +718,7 @@ dependencies = [
  "futures",
  "jiff",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "uuid",
 ]

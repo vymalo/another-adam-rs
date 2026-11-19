@@ -16,9 +16,10 @@ database driver.
 
 | Item | What |
 |---|---|
-| `Store` (trait) | `migrate`, `create_run`, `load_run`, `run_header` (a run without its state, from one projected read where the adapter can), `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs of the runs it purges), `list_runs` and `count_runs` (a caller's runs, newest update first, by keyset: `RunQuery`, `ConversationScope`), and the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*) |
+| `Store` (trait) | `migrate`, `create_run`, `load_run`, `run_header` (a run without its state, from one projected read where the adapter can), `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs and blob references of the runs it purges, and collects unreferenced blobs), `list_runs` and `count_runs` (a caller's runs, newest update first, by keyset: `RunQuery`, `ConversationScope`), the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*), and the four **blob** methods `keeps_blobs`, `put_blob`, `get_blob`, `purge_blobs` (see *File bytes*) |
 | `DynStore` | `Arc<dyn Store>`, the handle the runtime holds |
 | `RunRecord`, `NewRun`, `RunUpdate`, `RunStatus`, `RunId` | a run and how to create or advance one |
+| `BlobId` | the content address of a file artifact's bytes: a SHA-256 as 64 lower-case hex, opaque in this crate (see *File bytes*) |
 | `RunHeader` | a run without its state: `run_header`'s answer, with `claimed(now)` (a runnable run and a live lease) for a reader that only needs the run's own bookkeeping. `adam_core::claimed(status, lease_until, now)` is that rule, shared with a runtime view |
 | `JournalEntry` | the recorded outcome of one step, keyed by `(run, seq)` |
 | `ClaimScope` | `Any` (default) or `Pinned`, the scope of a `claim_due`. Closed: no `#[non_exhaustive]` |
@@ -99,6 +100,31 @@ The method is **defaulted**, so it breaks no implementer: the default reads `lea
 `Runtime::view` reads them in that order). Both shipped adapters override it with one statement that
 projects the header columns and the lease, and the conformance case
 `run_header_matches_the_record` proves an implementation agrees with `load_run` + `lease_until`.
+
+## File bytes
+
+A file artifact's bytes are content-addressed: `adam_runtime::blob_id(&bytes)` is their SHA-256 as a
+`BlobId`, and the runtime uploads them before the commit that names them, so they survive the later
+commits of that run and are collected once no run references them. This crate keeps the address and
+the four **defaulted** `Store` methods; it has no hash dependency, so it never computes a digest
+itself.
+
+| Method | What |
+|---|---|
+| `keeps_blobs()` | whether the store keeps file bytes out of a run's state. `false` (the default) means the bytes live in the state, as before |
+| `put_blob(id, bytes)` | store `bytes` under `id`; idempotent, and the bytes behind an id never change. A store that keeps none answers `InvalidInput` |
+| `get_blob(id)` | the bytes, or `None` when none are stored (never written, or collected). A store that keeps none answers `InvalidInput`, as `put_blob` does |
+| `purge_blobs(before)` | delete the blobs written before `before` that no run references; returns how many |
+
+`RunUpdate` gained a public `blobs: Vec<BlobId>` field: **the ids the commit adds**, a delta the
+store unions with the ids it already recorded, so a commit that names none keeps the earlier ones.
+**A hand-built `RunUpdate { .. }` literal stops compiling**: add `blobs: Vec::new()` or use
+`RunUpdate::new(..)` / `.blobs(..)`, which keep their meaning. `RunUpdate::new` is unchanged and
+sets it empty, so every existing caller compiles.
+
+`purge_finished` keeps its signature and extends its contract: a run's references go with it, and
+the blobs no surviving run references and that were written before its `before` are deleted in the
+same sweep. A digest shared by several runs survives until the last one is purged.
 
 ## Push configurations
 

@@ -6,9 +6,7 @@ use std::time::Duration;
 
 use adam_core::store::now;
 use adam_core::time::Timestamp;
-use adam_core::{
-    ClaimScope, ConversationScope, NewRun, RunQuery, RunStatus, RunUpdate, Store,
-};
+use adam_core::{ClaimScope, ConversationScope, NewRun, RunQuery, RunStatus, RunUpdate, Store};
 use adam_store_postgres::{PgStore, SCHEMA_VERSION};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
@@ -65,7 +63,7 @@ async fn create_v1_schema(pool: &PgPool, p: &str) {
 }
 
 async fn drop_tables(pool: &PgPool, p: &str) {
-    for table in ["push", "journal", "runs", "meta"] {
+    for table in ["run_blob", "blob", "push", "journal", "runs", "meta"] {
         let _ = sqlx::query(AssertSqlSafe(format!(
             "DROP TABLE IF EXISTS {p}{table} CASCADE"
         )))
@@ -131,7 +129,7 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
     store.migrate().await.unwrap();
     assert!(has_owner_column(&pool, &p).await, "the column was added");
     assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
-    assert_eq!(SCHEMA_VERSION, 4);
+    assert_eq!(SCHEMA_VERSION, 5);
     // The push table exists now (a missing table would be a backend error).
     assert!(
         store
@@ -143,7 +141,7 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
 
     // Nothing was lost, and migrating again changes nothing.
     store.migrate().await.unwrap();
-    assert_eq!(version(&pool, &p).await, "4");
+    assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
     let run = store
         .load_run(adam_core::RunId(id))
         .await
@@ -385,7 +383,7 @@ async fn the_listing_index_answers_the_status_filter_and_replaces_the_version_3_
         None,
         "the version 3 index was dropped after the new one was valid"
     );
-    assert_eq!(version(&pool, &p).await, "4");
+    assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
 
     // The listing still reads the runs, newest first, through the new index.
     let query = RunQuery::new(&agent, ConversationScope::Prefix("c:".into()), 10);
@@ -470,7 +468,76 @@ async fn an_invalid_listing_index_is_dropped_and_rebuilt() {
         "the rebuilt index is the listing index, not the failed one: {definition}"
     );
     assert_eq!(index_valid(&pool, &new_index).await, Some(true));
-    assert_eq!(version(&pool, &p).await, "4");
+    assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
+
+    drop_tables(&pool, &p).await;
+}
+
+#[tokio::test]
+async fn a_version_4_schema_gets_the_blob_tables_and_keeps_its_runs() {
+    let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let p = format!(
+        "adam_mig_{}_",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let store = PgStore::from_pool(pool.clone())
+        .with_table_prefix(&p)
+        .unwrap();
+    store.migrate().await.unwrap();
+    let agent = format!("v4-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let run = store
+        .create_run(NewRun::new(&agent, json!({"turn": 1})))
+        .await
+        .unwrap();
+
+    // Back to version 4: no blob tables, the version 4 listing index still there.
+    sqlx::query(AssertSqlSafe(format!("DROP TABLE {p}run_blob, {p}blob")))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE {p}meta SET value = '4' WHERE key = 'schema_version'"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(!has_table(&pool, &format!("{p}blob")).await);
+    assert!(!has_table(&pool, &format!("{p}run_blob")).await);
+
+    store.migrate().await.unwrap();
+    assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
+    assert!(has_table(&pool, &format!("{p}blob")).await);
+    assert!(has_table(&pool, &format!("{p}run_blob")).await);
+    assert_eq!(
+        index_valid(&pool, &format!("{p}runs_list_status")).await,
+        Some(true),
+        "a version 4 start does not touch the listing index"
+    );
+    // The run survived, and the new tables answer.
+    assert_eq!(
+        store
+            .load_run(run.id)
+            .await
+            .unwrap()
+            .expect("the run")
+            .state,
+        json!({"turn": 1})
+    );
+    assert_eq!(
+        store
+            .purge_blobs(now() + jiff::SignedDuration::from_hours(1))
+            .await
+            .unwrap(),
+        0,
+        "the blob sweep runs against an empty table"
+    );
 
     drop_tables(&pool, &p).await;
 }

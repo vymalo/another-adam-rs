@@ -81,9 +81,13 @@ crate that reaches for chrono fails the check rather than arriving silently.
 | `Ctx::now`, `Ctx::now_journaled`, `Inbound.received_at`, `Envelope` deadlines and wakes, `SessionSummary.updated_at` | `Timestamp` | agents that read the clock or build an `Inbound`/`Transition::Park` |
 | `Conversation.chain_started`, `PendingRemote.deadline`, `RoundState.started`, `Grant.expires_at`, the `Clock` aliases of `adam-ui` and `adam-workspace` | `Timestamp` (workspace: `jiff::Timestamp`) | code that sets or reads them |
 | `PushCursor.failing_since`, `PushStore`'s `next_attempt_at` and `claim_due(now)` | `Timestamp` | push-store implementations and deliverers |
+| `RunHeader` (`wake_at`, `created_at`, `updated_at`, `lease_until`), `claimed(.., now)` and `Runtime::now` (merged from #199) | `Timestamp` | a reader that builds a header or computes `claimed` |
+| `Store::purge_blobs(before)` (ADR 0055 S1, merged as `c6594ce` while this decision was in review) | `Timestamp`; `RunUpdate` keeps its new `blobs` | a store's blob sweep takes the new type; a `RunUpdate` literal needs `blobs` (ADR 0055's row) |
 | `chrono` as a direct dependency of adam's crates | `jiff` | nothing at run time; the serialized bytes do not change |
 
-The consumer-facing note is the `adam-upgrade` skill's known-migrations table.
+The consumer-facing note is the `adam-upgrade` skill's known-migrations table. Two decisions merged while this
+one was in review added timestamps to the `Store` surface — #199's `RunHeader`/`claimed`/`Runtime::now` and ADR 0055
+S1's `purge_blobs` — and the merge converted them with the rest, so the public surface has no chrono type left.
 
 ## Consequences
 

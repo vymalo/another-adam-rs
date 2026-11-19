@@ -16,6 +16,7 @@ never see this crate's types. Retries are not done here: failures map onto
 | Item | What |
 |---|---|
 | `OpenAiConfig` | `base_url`, `api_key: SecretString`, `timeout`, `extra_headers`; `OpenAiConfig::new(base_url, api_key)` |
+| `OpenAiCompatible::with_credentials(DynCredentials)` | the headers of every call come from this provider instead of `api_key` ([ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)); see *Credentials* below |
 | `OpenAiCompatible` | the client: `OpenAiCompatible::new(config)`, `.with_max_tokens_field(field)`, `.with_extra_body(map)` (members merged into every request), `.with_echo_reasoning(Some(field))` (send reasoning back), `.with_prompt_cache_key(true)` (send `ModelRequest::prompt_cache_key` as the body's `prompt_cache_key`; off by default; a `with_extra_body` member of the same name wins; whether every gateway accepts it is *unverified*; OpenAI's reference page could not be fetched on 2026-11-15, so the field name is *unverified* against a primary source too), `.with_context_window(alias, tokens)` (what `ModelClient::context_window` answers for that alias; nothing is sent) |
 | `PROVIDER` | `"openai"`: what `ModelClient::provider` says for this client, whatever gateway is behind it |
 | `ReasoningField` | `ReasoningContent` (`reasoning_content`) or `Reasoning` (`reasoning`): the member that carries reasoning when a client echoes it |
@@ -45,7 +46,7 @@ Behaviour (details in the crate docs, `src/lib.rs`):
   for headers and then the silence between chunks.
 * The key is a `SecretString`, sent as a sensitive `Authorization: Bearer`
   header, and never appears in `Debug`, errors or logs. An empty key sends no
-  header. The gateway's address is not shown either: the `Debug` of `OpenAiConfig` and of
+  header. It is the default credentials provider (`StaticBearer`), asked for each call like any other. The gateway's address is not shown either: the `Debug` of `OpenAiConfig` and of
   `OpenAiCompatible` print its scheme, host and port only (`endpoint_for_logs(url)`, public: `<unset>` for a blank
   one, `<set>` for one that is no absolute URL), because a deployment keeps the address in a secret
   (an internal host, a tenant in the path, a key in the query).
@@ -162,6 +163,20 @@ for `invalid_request` or `authentication`, and `Transient` for anything else.
 `Client` (the HTTP client could not be built; the `reqwest` error is its
 `source`). No message carries the URL, the header value or the key.
 
+## Credentials
+
+Every call asks the client's `ModelCredentials` for its headers ([ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)): the key of the
+`OpenAiConfig` by default, or the provider given with `with_credentials`, so a host can mint or renew a token at the moment
+of use, prove it over the request, or send a run's tag with no key.
+
+* The provider is told the method (`POST`), the full URL and the attempt. Its headers are sent as sensitive values and
+  replace any of the same name; `content-type`, `content-length`, `accept`, `host` and `transfer-encoding` are refused, as is
+  a value that is no valid header, with `InvalidRequest` (the value is never in the error) and nothing sent.
+* A provider's error is the call's, before anything is sent: its class decides whether the runtime retries.
+* On a **401** the provider gets the `Rejection` (status, `WWW-Authenticate`, `DPoP-Nonce`). `Retry` asks for new headers
+  and sends the same body once more (`bytes::Bytes`, no copy); a second 401, or `GiveUp` (a fixed key's answer), is the
+  call's `Auth` error. A 403 is never retried. Streams and completions behave the same.
+
 ## Features and environment
 
 No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
@@ -176,6 +191,9 @@ No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
   `the_provider_is_openai_and_a_window_is_said_for_its_alias_only`) and `src/wire.rs` (the request shape, including several text parts
   sent as one string; the usage parts of a completion and of a stream's last chunk, absent ones, and reasoning beside a smaller
   completion count; made-up ids for calls with none: random, distinct, the same in the stream and the message).
+* `tests/credentials.rs`: the provider against a `wiremock` server: asked for every call, a 401 renewed once with the same
+  body, a second 401 as the answer, the configured key never retried, a stream renewed, a proof told the method and URL, a
+  provider with no key, a provider's error sent nowhere (its class kept), and the framing headers refused. Always runs.
 * `tests/wiremock_compose.rs`: the client against the `mock-openai` WireMock of `compose.yaml` (text and tool-call answers,
   streamed or not, the error scenarios), and **every scripted model** (`mock-coder`, `mock-assistant`, `mock-researcher`, `mock-painter`)
   played from its first request to its final answer both as a completion and as a stream, which must say the same, with the

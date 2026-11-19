@@ -1,8 +1,9 @@
 # Store adapters
 
 The `Store` port ([`adam-core`](../../crates/adam-core/README.md)) is the durable state: runs, journal,
-leases, A2A push-notification configs and their delivery progress, and the listing of a caller's runs. Two adapters ship, and every adapter must pass the same conformance suite
-([`adam-store-testkit`](../../crates/adam-store-testkit/README.md)). The model they implement is in
+leases, A2A push-notification configs and their delivery progress, a run's file bytes (blobs), and
+the listing of a caller's runs. Two adapters ship, and every adapter must pass the same conformance
+suite ([`adam-store-testkit`](../../crates/adam-store-testkit/README.md)). The model they implement is in
 [Architecture](../architecture.md#the-mental-model); the schema is in
 [Data: the run store](../architecture.md#data-the-run-store).
 
@@ -40,6 +41,15 @@ one is refused because the `adam-notify-postgres` listener holds a connection fo
 life); `connect_with_pool_size` takes the size explicitly, and `from_pool` uses the pool you pass. A
 value that is not an integer in range fails the connect rather than falling back to 16.
 
+`keeps_blobs` / `put_blob` / `get_blob` / `purge_blobs` keep a file artifact's bytes **out of the
+run's state**, content-addressed by `BlobId` (their SHA-256, 64 lower-case hex; the digest is
+computed in `adam-runtime`, which has the hash dependency). A commit names the digests it **adds**
+(`RunUpdate.blobs`, a delta the store unions; a commit that names none keeps the earlier ones), and
+`purge_finished` deletes a blob once no surviving run references it and it is older than the cutoff;
+`purge_blobs(before)` is the same sweep on its own. A store that keeps no blobs leaves the bytes in
+the state, exactly as before. **A hand-built `RunUpdate { .. }` literal stops compiling** when it
+gains the field: add `blobs: Vec::new()` or use `RunUpdate::new`.
+
 Creating a run with a deterministic id gives idempotent "fire once" semantics, for example one run per
 cron tick across all replicas. A second message on a conversation that has an open run gets
 `ConversationBusy`; resume the open run instead.
@@ -59,8 +69,12 @@ cron tick across all replicas. A second message on a conversation that has an op
 | Push configs deleted with their run | `ON DELETE CASCADE` | deleted with the journal by the purge |
 | `list_runs` / `count_runs` (`ListTasks`), keyset on `(updated_at, id)` | `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC) INCLUDE (status)`, a prefix is a range plus `starts_with`; a prefix page sorts the matching index entries (the status filter is answered from the index) | `(agent, conversation_id, updated_at, _id)`, and `(agent, status, conversation_id, updated_at, _id)` when a status filter is set: a prefix is an anchored escaped regex, so the index bounds the scan but the page still sorts the matches; a listing of one conversation is read in index order |
 | State | `JSONB` (queryable with SQL) | real BSON document (queryable with dot paths) |
+| Blobs (schema version 5, part 1): put, get | `INSERT .. ON CONFLICT (digest) DO NOTHING` into `blob`; one primary-key `SELECT` | `insertOne` on `_id = <digest>`; a duplicate key is a no-op; one `find_one` |
+| A commit's blob references | the CAS and `INSERT .. SELECT unnest($digests) ON CONFLICT DO NOTHING` in **one transaction** | one unordered `insertMany` **before** the CAS; a lost CAS leaves rows nothing names, deleted with the run's purge |
+| Blob GC | `DELETE .. WHERE created_at < $cutoff AND NOT EXISTS (a run_blob row)`, in batches; run references cascade with the run. The sweep and a commit's ref insert are **not one transaction**: under `READ COMMITTED` an uncommitted ref is invisible, so a sweep can collect a blob a commit is about to name; S2a's single CTE closes it | the same sweep in a loop; run references are deleted with the run. Its find-then-delete has the same uncommitted-ref window, closed by S2a's insert, completeness check, then CAS ([ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md), decision 3) |
+| Blob references deleted with their run | `ON DELETE CASCADE` | deleted by the purge before the run document |
 | `run_header`: a run without its state, with its lease | one primary-key statement selecting the header columns and `lease_until`, never `state` | one `find_one` projected to the header and `lease_until` |
-| Transactions | none held open | none |
+| Transactions | none held across calls; a commit that names blobs opens one for its two statements | none (single-document writes only) |
 | Cross-process signals | `LISTEN`/`NOTIFY` via `adam-notify-postgres` | none: workers poll |
 
 ## Data caveats
@@ -85,8 +99,19 @@ cron tick across all replicas. A second message on a conversation that has an op
 
 ## Adding a backend
 
-Implement `Store` and add one line: `adam_store_testkit::store_conformance!(make_store);`. A `Notifier`
+Implement `Store` and add one line: `adam_store_testkit::store_conformance!(make_store);`, plus
+`adam_store_testkit::blob_conformance!(make_store);` when the store keeps blobs. A `Notifier`
 (Redis, NATS) runs `adam_notify_testkit::notifier_conformance!(make_pair);`. The `adam-store-adapter`
 skill walks through it; adding a required method to a trait breaks implementers, so say so in the PR and
-in the crate README. **A new required type does the same**: `Timestamp` replaced `chrono::DateTime<Utc>` in
+in the crate README.
+
+A blob is global: a sweep deletes every unreferenced blob in the database, so the cases that read,
+upload or sweep one must not run beside each other. The suite's blob cases and the cases that call
+`purge_finished`/`purge_blobs` take a single-thread group (this repository's is
+`.config/nextest.toml`, `[test-groups.store-global-sweeps]`) and the suite's `BLOB_SUITE` lock under
+libtest. **A test that calls `purge_finished` or `purge_blobs` must carry `purge` in its name** (or
+be listed in the group's filter), and a repository that runs its own store tests must put the same
+cases in a single-thread group of its own.
+
+**A new required type does the same**: `Timestamp` replaced `chrono::DateTime<Utc>` in
 every `Store` signature (ADR 0057), so an implementation written before it must change with it.

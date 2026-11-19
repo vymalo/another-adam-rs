@@ -45,6 +45,10 @@ push a branch to the git server, open a pull request on the mock GitHub. The age
 `http://127.0.0.1:8080/.well-known/agent-card.json`, public like `/healthz`; Swagger UI is at
 `http://127.0.0.1:8080/docs` (press **Authorize** and paste the bearer token to try the calls).
 
+To talk to an agent from a terminal instead, `dev/chat.sh` (the general agent) or `dev/chat.sh http://127.0.0.1:8080`
+(the coder) keeps one conversation, prints the steps as they come and the answer when the task stops; on a real
+model with `-f dev/compose.real-model.yaml`: [Try the agents](try-the-agents.md).
+
 Say "hi" to either agent and it greets you from its own instructions. The other scenarios (a scratch project,
 a second repository, a repository created on request, the devcontainer, a GitHub App) are scripts:
 [Testing](testing.md#end-to-end-scenarios).

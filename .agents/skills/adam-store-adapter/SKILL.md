@@ -31,8 +31,11 @@ trait at your rev: its doc comments are the contract.
    `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`,
    `journal_put` (first writer wins), `journal_list`, `claim_due`, `renew_lease`, `release_lease`,
    `lease_until`, `purge_finished`, then the listing (`list_runs` and `count_runs`: a caller's runs,
-   newest update first, by keyset) and the five push-notification methods (`push_put`, `push_list`,
-   `push_delete`, `push_claim_due`, `push_commit`; schema version 3).
+   newest update first, by keyset), the five push-notification methods (`push_put`, `push_list`,
+   `push_delete`, `push_claim_due`, `push_commit`; schema version 3) and the four **defaulted** blob
+   methods (`keeps_blobs`, `put_blob`, `get_blob`, `purge_blobs`; schema version 5, part 1: file
+   bytes out of the run, content-addressed by `BlobId`). A defaulted method left out of your
+   implementation answers for your store with the trait's "I keep none" answer.
    Errors are `StoreError` (`crates/adam-core/README.md`, "Errors"): build a backend failure with
    `StoreError::unavailable(e)` (transient), `StoreError::internal(e)` or
    `StoreError::corrupt_source(e)`; callers decide from the error class, never from the variant.
@@ -40,8 +43,8 @@ trait at your rev: its doc comments are the contract.
    contract" in `docs/reference/store-adapters.md` lists, per guarantee, how Postgres and MongoDB do it
    (CAS commit, first-writer-wins journal, exclusive claiming, `busy` runs never claimed,
    pinned claims and the run `owner`, one open run per conversation, journal deleted with its
-   run). Time is truncated to milliseconds in every store; lease expiry uses the `now` the caller
-   passes.
+   run, blob put/get and the blob GC, schema version 5 part 1). Time is truncated to milliseconds
+   in every store; lease expiry uses the `now` the caller passes.
 3. **Implement `Store`** in a crate of its own, depending on `adam-core` only (no driver type in
    a trait signature). Reference implementations: `crates/adam-core/src/store/memory.rs`
    (`MemoryStore`), `crates/adam-store-postgres/src/lib.rs`, `crates/adam-store-mongodb/src/lib.rs`.
@@ -54,13 +57,23 @@ trait at your rev: its doc comments are the contract.
        Some(std::sync::Arc::new(MyStore::connect(&url).await.unwrap()))
    }
    adam_store_testkit::store_conformance!(make_store);
+   adam_store_testkit::blob_conformance!(make_store); // a store that keeps blobs
    ```
 
    `store_conformance!` generates one `#[tokio::test]` per case (48 at the time of writing) and
-   calls `migrate` first. `None` skips the suite. Cases isolate themselves with a unique agent
-   name, so they run in parallel on one shared database. `counting::measure_transcript_write` is a
-   measurement helper, not a conformance case: it runs one 50-commit transcript and prints the
-   bytes, and it asserts nothing.
+   calls `migrate` first. `blob_conformance!` adds the nine blob cases (put/get, a 4 MiB round trip,
+   an idempotent put, an unknown id, empty bytes, a run's reference keeping a blob alive (including
+   after a commit that names a different one), a shared digest surviving until the last run is
+   purged, the cutoff, and `purge_finished`'s sweep); every
+   case asserts `keeps_blobs()`, so do not give it to a store that keeps none. `None` skips the
+   suites. Cases isolate themselves with a unique agent name, so they run in parallel on one shared
+   database — **except the blob cases and the cases that purge**, which sweep every unreferenced
+   blob and therefore must not overlap: keep them in one nextest test group (`.config/nextest.toml`,
+   `[test-groups.store-global-sweeps]`) and take the suite's `BLOB_SUITE` lock under libtest. A test
+   that calls `purge_finished` or `purge_blobs` must carry `purge` in its name so the group's filter
+   catches it.
+   `counting::measure_transcript_write` is a measurement helper, not a conformance case: it runs one
+   50-commit transcript and prints the bytes, and it asserts nothing.
 5. **In CI set `ADAM_TEST_REQUIRE_DB=1`**: a suite whose database variable is unset then fails
    instead of skipping (`adam_core::testing::test_env`), so a typo cannot turn CI green.
 6. **After a trait change in adam-rs** (a method added or a signature changed): implement it in
@@ -104,6 +117,12 @@ trait at your rev: its doc comments are the contract.
 * `release_lease` never clears the run's owner (pinned claims).
 * Implementing the trait with default or `unimplemented!()` bodies to get a bump compiling: the
   suite exists to catch exactly that.
+* Blobs: `put_blob` is idempotent and **the bytes behind an id never change** (a second put under a
+  taken digest writes nothing), the id is the SHA-256 of the bytes as 64 lower-case hex, and a
+  commit's `RunUpdate.blobs` is a **delta** the store unions with what it already recorded — a
+  commit that names none keeps the earlier references. A blob a surviving run references is never
+  collected; `purge_blobs(before)` and `purge_finished` delete only unreferenced blobs older than
+  the cutoff.
 * A transient backend error must be classified transient so the runtime retries it.
 
 ## See also

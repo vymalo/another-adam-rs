@@ -33,6 +33,7 @@ adam-macros = { path = "crates/adam-macros", version = "0.1.0" }
 adam-mcp = { path = "crates/adam-mcp", version = "0.1.0" }
 adam-mcp-testkit = { path = "crates/adam-mcp-testkit", version = "0.1.0" }
 adam-model = { path = "crates/adam-model", version = "0.1.0" }
+adam-model-oauth = { path = "crates/adam-model-oauth", version = "0.1.0" }
 adam-model-openai = { path = "crates/adam-model-openai", version = "0.1.0" }
 adam-notify-postgres = { path = "crates/adam-notify-postgres", version = "0.1.0" }
 adam-notify-testkit = { path = "crates/adam-notify-testkit", version = "0.1.0" }
@@ -57,6 +58,8 @@ async-trait = "0.1"
 aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "alloc"] }
 axum = "0.8"
 base64 = "0.22"
+# A model request body sent twice (a retry after a 401, ADR 0058) without a copy; already in the tree under reqwest.
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4", default-features = false, features = ["std", "derive"] }
 futures = "0.3"

@@ -31,6 +31,8 @@ async fn make_store() -> Option<adam_core::DynStore> {
 
 adam_store_testkit::store_conformance!(make_store);
 
+adam_store_testkit::blob_conformance!(make_store);
+
 /// The listing `ListTasks` sends — a conversation prefix, a status filter, newest first — must be
 /// answered from an index that holds `status`: with `purging` in the filter and `status` in no
 /// index, MongoDB fetched every candidate document (state included) to test both.

@@ -24,7 +24,11 @@
 //! | `SESSION_IDLE_DAYS` | days a kept-open session may sit idle before it reads closed, 1 to 365; the same on every process that serves one store ([`SessionSettings::idle_ttl`]) | `7` |
 //! | `WORKER_ID` | stable identity of this worker (the lease identity; the run owner for a binary that pins runs); letters, digits, `.`, `_`, `-` | random per process |
 //! | `MODEL_BASE_URL` | OpenAI-compatible gateway, with its `/v1` prefix ([`ModelConfig`]) | required for `all` and `worker` |
-//! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required for `all` and `worker` |
+//! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required for `all` and `worker`, unless `MODEL_AUTH=device` |
+//! | `MODEL_AUTH` | `key` (the token of `MODEL_API_KEY`) or `device`: the process signs in to an OAuth 2.0 issuer with the device grant and renews its token (ADR 0058, [`ModelConfig::device_grant`]); the code and the link are a `WARN` log line at startup. With `device`, `MODEL_API_KEY` must be unset or empty | `key` |
+//! | `MODEL_OAUTH_ISSUER` | with `MODEL_AUTH=device`: the issuer, whose `/.well-known/openid-configuration` names the device and token endpoints (on its own origin); `https`, or `http` on a loopback address | required with `device` |
+//! | `MODEL_OAUTH_CLIENT_ID` | with `MODEL_AUTH=device`: the public client the issuer knows the process as | required with `device` |
+//! | `MODEL_OAUTH_SCOPE` | with `MODEL_AUTH=device`: the scope asked for | `offline_access` |
 //! | `MODEL` | model alias of the agent | required for `all` and `worker` |
 //! | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request, to make a gateway or a model emit its reasoning (`{"reasoning_effort":"medium"}`); **not secret**; an invalid value is a startup error ([`ModelConfig::extra_body`]) | unset (nothing added) |
 //! | `MODEL_ECHO_REASONING` | send the reasoning of earlier turns back, under this member name (`reasoning_content` or `reasoning`), for a provider that requires it (DeepSeek's thinking mode with tools); `false` or unset sends none ([`ModelConfig::echo_reasoning`]) | unset (never sent) |
@@ -64,6 +68,7 @@
 //!
 //! Secrets are wrapped in [`SecretString`] and never appear in `Debug` output.
 
+use adam_model_oauth::{DeviceGrant, DeviceGrantSettings, LogPrompt, OAuthConfigError};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
@@ -674,6 +679,10 @@ pub struct ModelConfig {
     pub base_url: String,
     /// `MODEL_API_KEY`: may be empty, for a gateway without auth.
     pub api_key: SecretString,
+    /// `MODEL_AUTH=device` and `MODEL_OAUTH_*`: the provider that signs the process in with the
+    /// OAuth 2.0 device grant and renews its token (ADR 0058), used instead of `api_key`. `None`
+    /// (the default) sends `api_key`.
+    pub device_grant: Option<DeviceGrant>,
     /// `MODEL`: the model alias the gateway knows.
     pub alias: String,
     /// `MODEL_EXTRA_BODY`: members merged into every request body (a flag that makes the model
@@ -731,6 +740,7 @@ impl std::fmt::Debug for ModelConfig {
             // The gateway's address is a secret of the deployment: scheme and host only.
             .field("base_url", &endpoint_for_logs(&self.base_url))
             .field("alias", &self.alias)
+            .field("device_grant", &self.device_grant)
             // The members, not their values.
             .field(
                 "extra_body",
@@ -761,9 +771,17 @@ impl ModelConfig {
         };
         let base_url = required("MODEL_BASE_URL");
         let alias = required("MODEL");
-        let api_key = match lookup("MODEL_API_KEY") {
-            Some(v) => v,
-            None => {
+        let (device, device_grant) = parse_device_grant(lookup, problems);
+        let api_key = match (lookup("MODEL_API_KEY"), device) {
+            (Some(v), false) => v,
+            (Some(v), true) if !v.is_empty() => {
+                problems.push(
+                    "MODEL_API_KEY and MODEL_AUTH=device are exclusive: unset MODEL_API_KEY or leave it empty".into(),
+                );
+                String::new()
+            }
+            (_, true) => String::new(),
+            (None, false) => {
                 problems.push(
                     "MODEL_API_KEY is required (set it empty for a gateway without auth)".into(),
                 );
@@ -773,6 +791,7 @@ impl ModelConfig {
         Self {
             base_url,
             api_key: SecretString::from(api_key),
+            device_grant,
             alias,
             extra_body: parse_extra_body(&get("MODEL_EXTRA_BODY"), problems),
             echo_reasoning: parse_echo_reasoning(&get("MODEL_ECHO_REASONING"), problems),
@@ -792,9 +811,15 @@ impl ModelConfig {
         let mut client = OpenAiCompatible::new(OpenAiConfig::new(
             self.base_url.clone(),
             self.api_key.clone(),
-        ))?
-        .with_echo_reasoning(self.echo_reasoning)
-        .with_prompt_cache_key(self.prompt_cache_key == PromptCacheKey::Conversation);
+        ))?;
+        if let Some(grant) = &self.device_grant {
+            // The code is asked for now, so the person can sign in before the first run.
+            grant.start();
+            client = client.with_credentials(std::sync::Arc::new(grant.clone()));
+        }
+        let mut client = client
+            .with_echo_reasoning(self.echo_reasoning)
+            .with_prompt_cache_key(self.prompt_cache_key == PromptCacheKey::Conversation);
         if let Some(window) = self.context_window {
             client = client.with_context_window(self.alias.clone(), window);
         }
@@ -809,6 +834,57 @@ impl ModelConfig {
         }
         Ok(std::sync::Arc::new(client))
     }
+}
+
+/// `MODEL_AUTH` and, with `device`, `MODEL_OAUTH_ISSUER`, `MODEL_OAUTH_CLIENT_ID` and
+/// `MODEL_OAUTH_SCOPE`: whether `device` was chosen, and its provider (`None` for `key`, the
+/// default, or when a setting has a problem). Each problem is added; nothing is sent.
+fn parse_device_grant(
+    lookup: &impl Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+) -> (bool, Option<DeviceGrant>) {
+    match not_blank(lookup, "MODEL_AUTH")
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("key") => return (false, None),
+        Some("device") => {}
+        Some(_) => {
+            problems.push("MODEL_AUTH must be `key` or `device`".into());
+            return (false, None);
+        }
+    }
+    let mut required = |name: &str| {
+        let value = not_blank(lookup, name);
+        if value.is_none() {
+            problems.push(format!("{name} is required with MODEL_AUTH=device"));
+        }
+        value
+    };
+    let issuer = required("MODEL_OAUTH_ISSUER");
+    let client_id = required("MODEL_OAUTH_CLIENT_ID");
+    let (Some(issuer), Some(client_id)) = (issuer, client_id) else {
+        return (true, None);
+    };
+    let mut settings = DeviceGrantSettings::new(issuer, client_id);
+    if let Some(scope) = not_blank(lookup, "MODEL_OAUTH_SCOPE") {
+        settings.scope = scope;
+    }
+    let grant = match DeviceGrant::new(settings, std::sync::Arc::new(LogPrompt)) {
+        Ok(grant) => Some(grant),
+        Err(OAuthConfigError::InvalidIssuer(_)) => {
+            problems.push(
+                "MODEL_OAUTH_ISSUER must be an absolute https URL (http only on a loopback address)".into(),
+            );
+            None
+        }
+        Err(e) => {
+            problems.push(format!("MODEL_AUTH=device: {e}"));
+            None
+        }
+    };
+    (true, grant)
 }
 
 /// The words of a `MODEL_*_MODALITIES` value: a comma-separated list of `text` and `image`, which
@@ -2085,6 +2161,78 @@ mod tests {
         assert!(client.input_modalities("large").images.is_some());
         // A subagent on another alias is text only, whatever the deployment said of `MODEL`.
         assert!(client.input_modalities("small").images.is_none());
+    }
+
+    #[test]
+    fn model_auth_device_signs_in_with_the_issuer_instead_of_the_key() {
+        let mut vars = model_vars();
+        vars.remove("MODEL_API_KEY");
+        vars.insert("MODEL_AUTH", "device");
+        vars.insert("MODEL_OAUTH_ISSUER", "https://id.example.test");
+        vars.insert("MODEL_OAUTH_CLIENT_ID", "tools");
+        let (model, problems) = model_problems(&vars);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(model.device_grant.is_some());
+        assert!(format!("{model:?}").contains("https://id.example.test"));
+        // An empty key is accepted beside it; a key is not.
+        vars.insert("MODEL_API_KEY", "");
+        assert!(model_problems(&vars).1.is_empty());
+        vars.insert("MODEL_API_KEY", "sk-secret");
+        let (_, problems) = model_problems(&vars);
+        assert!(
+            mentions(&problems, "MODEL_API_KEY and MODEL_AUTH=device"),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().all(|p| !p.contains("sk-secret")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn model_auth_device_needs_an_issuer_and_a_client() {
+        let mut vars = model_vars();
+        vars.insert("MODEL_AUTH", "device");
+        vars.remove("MODEL_API_KEY");
+        let (model, problems) = model_problems(&vars);
+        assert!(mentions(&problems, "MODEL_OAUTH_ISSUER"), "{problems:?}");
+        assert!(mentions(&problems, "MODEL_OAUTH_CLIENT_ID"), "{problems:?}");
+        assert!(
+            !mentions(&problems, "MODEL_API_KEY"),
+            "no key is asked for: {problems:?}"
+        );
+        assert!(model.device_grant.is_none());
+        vars.insert("MODEL_OAUTH_CLIENT_ID", "tools");
+        for bad in [
+            "http://id.example.test",
+            "id.example.test",
+            "ftp://id.example.test",
+        ] {
+            vars.insert("MODEL_OAUTH_ISSUER", bad);
+            let (_, problems) = model_problems(&vars);
+            assert!(
+                mentions(&problems, "MODEL_OAUTH_ISSUER"),
+                "{bad}: {problems:?}"
+            );
+        }
+        vars.insert("MODEL_OAUTH_ISSUER", "http://127.0.0.1:9");
+        assert!(
+            model_problems(&vars).1.is_empty(),
+            "loopback http is allowed"
+        );
+    }
+
+    #[test]
+    fn model_auth_is_key_or_device() {
+        let mut vars = model_vars();
+        for ok in ["key", "KEY", "", " "] {
+            vars.insert("MODEL_AUTH", ok);
+            let (model, problems) = model_problems(&vars);
+            assert!(problems.is_empty(), "{ok:?}: {problems:?}");
+            assert!(model.device_grant.is_none());
+        }
+        vars.insert("MODEL_AUTH", "oauth");
+        assert!(mentions(&model_problems(&vars).1, "MODEL_AUTH"));
     }
 
     #[test]

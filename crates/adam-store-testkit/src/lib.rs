@@ -31,8 +31,8 @@ use std::time::Duration;
 use adam_core::store::{now, truncate_ms};
 use adam_core::time::Timestamp;
 use adam_core::{
-    ClaimScope, ConversationScope, DynStore, JournalEntry, NewPushConfig, NewRun, PushProgress,
-    PushState, RunId, RunQuery, RunStatus, RunUpdate, StoreError,
+    BlobId, ClaimScope, ConversationScope, DynStore, JournalEntry, NewPushConfig, NewRun,
+    PushProgress, PushState, RunId, RunQuery, RunStatus, RunUpdate, StoreError,
 };
 use futures::future::join_all;
 use serde_json::json;
@@ -129,8 +129,319 @@ macro_rules! transcript_measurement {
     };
 }
 
+/// Generate one `#[tokio::test]` per blob conformance case. `$make` is a path to an
+/// `async fn() -> Option<DynStore>`, like [`store_conformance!`]: `None` skips the suite (and
+/// fails instead under `ADAM_TEST_REQUIRE_DB=1`, see `adam_core::testing`).
+///
+/// Every case asserts that the store keeps blobs ([`Store::keeps_blobs`](adam_core::Store::keeps_blobs)):
+/// a store that does not is not given this suite, rather than passing it by answering the
+/// defaulted methods. Blobs are global, so the cases take turns inside one test binary (see
+/// `BLOB_SUITE`).
+#[macro_export]
+macro_rules! blob_conformance {
+    ($make:path) => {
+        $crate::blob_conformance!(@cases $make;
+            blob_round_trip, blob_four_mib_round_trip, blob_put_is_idempotent, blob_unknown_id_is_none,
+            blob_empty_bytes, blob_a_run_reference_keeps_the_blob_alive,
+            blob_a_shared_digest_survives_until_the_last_run_is_purged,
+            blob_purge_respects_before, blob_purge_finished_removes_the_refs_and_the_blob,
+        );
+    };
+    (@cases $make:path; $($case:ident),* $(,)?) => {
+        $(
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn $case() {
+                let Some(store) = $make().await else {
+                    $crate::skipped(&format!(
+                        "{}: store not configured",
+                        stringify!($case)
+                    ));
+                    return;
+                };
+                store.migrate().await.expect("migrate");
+                $crate::cases::$case(store).await;
+            }
+        )*
+    };
+}
+
+/// Serialises the cases that sweep blobs inside one test binary: a blob is global and
+/// content-addressed, so a sweep (`purge_blobs`, and `purge_finished` in the same call) with a
+/// future cutoff deletes every unreferenced blob in the database, including one a case running at
+/// the same time is about to read. Runs are isolated by agent name; blobs cannot be, so every case
+/// that can sweep takes this lock. nextest runs each test in its own process, where a process-local
+/// mutex excludes nothing: `.config/nextest.toml` puts the same cases in one single-thread group.
+pub(crate) static BLOB_SUITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub mod cases {
     use super::*;
+
+    /// The digest of `bytes`, computed here so the suite pins the convention: the same SHA-256 the
+    /// runtime's `blob_id` makes, as 64 lower-case hex. A store trusts the id it is given.
+    fn blob_digest(bytes: &[u8]) -> BlobId {
+        use sha2::Digest as _;
+        let mut digest = [0_u8; 32];
+        digest.copy_from_slice(&sha2::Sha256::digest(bytes));
+        BlobId::from_sha256(&digest)
+    }
+
+    /// A store the blob suite runs against keeps blobs: a store that does not is not given
+    /// `blob_conformance!`, rather than passing it by defaulting every answer.
+    fn keeps_blobs(store: &DynStore) {
+        assert!(
+            store.keeps_blobs(),
+            "the blob suite needs a store that keeps blobs"
+        );
+    }
+
+    pub async fn blob_round_trip(store: DynStore) {
+        let _turn = BLOB_SUITE.lock().await;
+        keeps_blobs(&store);
+        let bytes = b"a run's file, byte for byte: \x00\xff\x01".to_vec();
+        let id = blob_digest(&bytes);
+        assert_eq!(
+            store.get_blob(&id).await.unwrap(),
+            None,
+            "nothing is stored under the digest yet"
+        );
+        store.put_blob(&id, &bytes).await.unwrap();
+        assert_eq!(store.get_blob(&id).await.unwrap(), Some(bytes));
+    }
+
+    pub async fn blob_four_mib_round_trip(store: DynStore) {
+        let _turn = BLOB_SUITE.lock().await;
+        keeps_blobs(&store);
+        // A file artifact's cap (`MAX_ARTIFACT_FILE_BYTES`), which is the largest blob a run can
+        // make — not a comparison with any older limit. The bytes are varied, so a store that
+        // compresses or truncates cannot pass by accident.
+        let bytes: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let id = blob_digest(&bytes);
+        store.put_blob(&id, &bytes).await.unwrap();
+        assert_eq!(
+            store.get_blob(&id).await.unwrap().as_deref(),
+            Some(bytes.as_slice()),
+            "four mebibytes round-trip byte for byte"
+        );
+        // Leave no four-mebibyte row behind in a suite that runs repeatedly.
+        store
+            .purge_blobs(now() + jiff::SignedDuration::from_hours(1))
+            .await
+            .unwrap();
+        assert_eq!(store.get_blob(&id).await.unwrap(), None);
+    }
+
+    pub async fn blob_put_is_idempotent(store: DynStore) {
+        let _turn = BLOB_SUITE.lock().await;
+        keeps_blobs(&store);
+        let id = blob_digest(b"first");
+        store.put_blob(&id, b"first").await.unwrap();
+        store.put_blob(&id, b"first").await.unwrap();
+        // The bytes behind an id never change: a put under a taken id is a no-op, whatever it
+        // carries.
+        store.put_blob(&id, b"second").await.unwrap();
+        assert_eq!(
+            store.get_blob(&id).await.unwrap(),
+            Some(b"first".to_vec()),
+            "the first bytes of a digest win"
+        );
+    }
+
+    pub async fn blob_unknown_id_is_none(store: DynStore) {
+        let _turn = BLOB_SUITE.lock().await;
+        keeps_blobs(&store);
+        let id = BlobId::from_hex(&"0".repeat(64)).expect("64 lower-case hex digits");
+        assert_eq!(store.get_blob(&id).await.unwrap(), None);
+    }
+
+    pub async fn blob_empty_bytes(store: DynStore) {
+        let _turn = BLOB_SUITE.lock().await;
+        keeps_blobs(&store);
+        let id = blob_digest(b"");
+        store.put_blob(&id, b"").await.unwrap();
+        assert_eq!(
+            store.get_blob(&id).await.unwrap(),
+            Some(Vec::new()),
+            "an empty file is a blob, not a missing one"
+        );
+    }
+
+    pub async fn blob_a_run_reference_keeps_the_blob_alive(store: DynStore) {
+        let _turn = BLOB_SUITE.lock().await;
+        keeps_blobs(&store);
+        let agent = agent();
+        let bytes = b"kept by a live run's reference".to_vec();
+        let id = blob_digest(&bytes);
+        store.put_blob(&id, &bytes).await.unwrap();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({"turn": 0})))
+            .await
+            .unwrap();
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1})).blobs(vec![id.clone()]),
+            )
+            .await
+            .unwrap();
+        // A cutoff past every blob: only the reference keeps this one. (The sweep may also collect
+        // an earlier case's unreferenced blob, so the count is not the assertion.)
+        let cutoff = now() + jiff::SignedDuration::from_hours(1);
+        store.purge_blobs(cutoff).await.unwrap();
+        assert_eq!(
+            store.get_blob(&id).await.unwrap(),
+            Some(bytes.clone()),
+            "a referenced blob is never collected, however old"
+        );
+
+        // A second commit names a **different** digest and not the first: a store unions each
+        // commit's delta with the references it already has, so both must survive the sweep. A
+        // store that replaced the set with the delta fails here.
+        let other_bytes = b"a second file the same run names".to_vec();
+        let other = blob_digest(&other_bytes);
+        store.put_blob(&other, &other_bytes).await.unwrap();
+        store
+            .commit_run(
+                run.id,
+                run.version + 1,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 2})).blobs(vec![other.clone()]),
+            )
+            .await
+            .unwrap();
+        store.purge_blobs(cutoff).await.unwrap();
+        assert_eq!(
+            store.get_blob(&id).await.unwrap(),
+            Some(bytes.clone()),
+            "an earlier reference survives a commit that names a different digest"
+        );
+        assert_eq!(
+            store.get_blob(&other).await.unwrap(),
+            Some(other_bytes.clone()),
+            "the new digest is recorded"
+        );
+
+        // Clean up: a finished run that is purged takes its references, and then the bytes. The
+        // last commit names no digest at all — the union keeps both.
+        store
+            .commit_run(
+                run.id,
+                run.version + 2,
+                RunUpdate::new(RunStatus::Done, json!({"turn": 3})),
+            )
+            .await
+            .unwrap();
+        store.purge_blobs(cutoff).await.unwrap();
+        assert_eq!(
+            store.get_blob(&id).await.unwrap(),
+            Some(bytes.clone()),
+            "a commit that names no blob keeps the earlier references"
+        );
+        assert_eq!(
+            store.get_blob(&other).await.unwrap(),
+            Some(other_bytes.clone()),
+            "and the one the previous commit added"
+        );
+        assert_eq!(store.purge_finished(&agent, cutoff).await.unwrap(), 1);
+        assert_eq!(store.get_blob(&id).await.unwrap(), None);
+        assert_eq!(store.get_blob(&other).await.unwrap(), None);
+    }
+
+    pub async fn blob_a_shared_digest_survives_until_the_last_run_is_purged(store: DynStore) {
+        let _turn = BLOB_SUITE.lock().await;
+        keeps_blobs(&store);
+        let bytes = b"shared by two runs".to_vec();
+        let id = blob_digest(&bytes);
+        store.put_blob(&id, &bytes).await.unwrap();
+        // Two agents, so each purge is one run's.
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let agent = agent();
+            let run = store
+                .create_run(NewRun::new(&agent, json!({})))
+                .await
+                .unwrap();
+            store
+                .commit_run(
+                    run.id,
+                    run.version,
+                    RunUpdate::new(RunStatus::Done, json!({"done": true})).blobs(vec![id.clone()]),
+                )
+                .await
+                .unwrap();
+            runs.push((agent, run.id));
+        }
+        let cutoff = now() + jiff::SignedDuration::from_hours(1);
+        assert_eq!(store.purge_finished(&runs[0].0, cutoff).await.unwrap(), 1);
+        assert_eq!(
+            store.get_blob(&id).await.unwrap(),
+            Some(bytes.clone()),
+            "the other run still names the digest"
+        );
+        assert_eq!(store.purge_finished(&runs[1].0, cutoff).await.unwrap(), 1);
+        assert_eq!(
+            store.get_blob(&id).await.unwrap(),
+            None,
+            "the last reference went with its run"
+        );
+    }
+
+    pub async fn blob_purge_respects_before(store: DynStore) {
+        let _turn = BLOB_SUITE.lock().await;
+        keeps_blobs(&store);
+        let bytes = b"written now".to_vec();
+        let id = blob_digest(&bytes);
+        // A cutoff a minute ago: nothing this suite wrote is older than it, whatever the
+        // millisecond rounding of the clock.
+        let before = now() - jiff::SignedDuration::from_mins(1);
+        store.put_blob(&id, &bytes).await.unwrap();
+        store.purge_blobs(before).await.unwrap();
+        assert_eq!(
+            store.get_blob(&id).await.unwrap(),
+            Some(bytes),
+            "a blob written after the cutoff is kept"
+        );
+        // At least this one: another case's unreferenced blob may go too, which is the contract.
+        assert!(
+            store
+                .purge_blobs(now() + jiff::SignedDuration::from_hours(1))
+                .await
+                .unwrap()
+                >= 1
+        );
+        assert_eq!(store.get_blob(&id).await.unwrap(), None);
+    }
+
+    pub async fn blob_purge_finished_removes_the_refs_and_the_blob(store: DynStore) {
+        let _turn = BLOB_SUITE.lock().await;
+        keeps_blobs(&store);
+        let agent = agent();
+        let bytes = b"collected with its run".to_vec();
+        let id = blob_digest(&bytes);
+        store.put_blob(&id, &bytes).await.unwrap();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Done, json!({"done": true})).blobs(vec![id.clone()]),
+            )
+            .await
+            .unwrap();
+        let cutoff = now() + jiff::SignedDuration::from_hours(1);
+        assert_eq!(store.purge_finished(&agent, cutoff).await.unwrap(), 1);
+        assert_eq!(
+            store.get_blob(&id).await.unwrap(),
+            None,
+            "the run's refs went with it, and nothing else named the digest"
+        );
+        assert!(
+            store.load_run(run.id).await.unwrap().is_none(),
+            "the run itself is gone"
+        );
+    }
 
     pub async fn create_and_load(store: DynStore) {
         let agent = agent();
@@ -1502,6 +1813,8 @@ pub mod cases {
     }
 
     pub async fn purge_finished_runs(store: DynStore) {
+        // It sweeps unreferenced blobs with its cutoff (see `BLOB_SUITE`).
+        let _turn = BLOB_SUITE.lock().await;
         let agent = agent();
         let open = store
             .create_run(NewRun::new(&agent, json!({})))
@@ -2046,6 +2359,8 @@ pub mod cases {
     }
 
     pub async fn push_configs_go_with_their_run(store: DynStore) {
+        // Its `purge_finished` sweeps unreferenced blobs (see `BLOB_SUITE`).
+        let _turn = BLOB_SUITE.lock().await;
         let agent = agent();
         let finished = store
             .create_run(NewRun::new(&agent, json!({})).status(RunStatus::Done))

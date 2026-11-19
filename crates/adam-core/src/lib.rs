@@ -13,7 +13,7 @@ pub mod time;
 
 pub use store::memory::MemoryStore;
 pub use store::{
-    ClaimScope, ConversationScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun,
+    BlobId, ClaimScope, ConversationScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun,
     PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
     RunUpdate, Store, StoreError, StoreResult, claimed, storable, storable_owned, storable_text,
 };
