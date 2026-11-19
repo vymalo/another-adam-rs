@@ -39,6 +39,12 @@ accept the poll latency.
   with U+FFFD before the codec (`adam_core::storable`), as every adapter does
   ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
 
+A commit reads the current document projected to the metadata it needs (`agent`, `conversation_id`,
+the version, the parent and the creation time): it never reads the state it is about to replace.
+`journal_put` inserts the entry and, when the run still exists, returns it as it was written; a
+duplicate key means an earlier writer won, and their entry is read back. A journaled step is two
+round trips rather than the four of read, check, insert, check. `lease_until` reads one field.
+
 ```rust
 use std::sync::Arc;
 use adam_core::{DynStore, Store};
@@ -123,9 +129,10 @@ None.
 field) is claimable and then pinned; `src/codec.rs` has property
 tests of the key escaping; `src/lib.rs` has unit tests of the error classes
 (`driver_errors_are_classified_by_what_they_mean`,
-`the_driver_error_is_kept_as_the_source`) and of what a write returns
+`the_driver_error_is_kept_as_the_source`), of what a write returns
 (`returned_value_tests`: the cleaned value it stored, without converting the stored document
-back to JSON).
+back to JSON) and of the round trips a journal entry costs (`round_trip_tests`, counting the
+driver's command events).
 
 | Variable | Meaning |
 |---|---|

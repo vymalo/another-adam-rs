@@ -19,9 +19,12 @@
 //! **standalone `mongod`** as well as replica sets and Atlas; no multi-document
 //! transactions are used.
 //!
-//! * Commits: `findOneAndUpdate({_id, version: expected}, {$inc: {version: 1}, ..})`.
-//! * Journal: `insertOne` with a deterministic `_id`; a duplicate-key error
-//!   means another writer won, and their entry is returned.
+//! * Commits: `findOneAndUpdate({_id, version: expected}, {$inc: {version: 1}, ..})`, after a
+//!   read projected to the metadata (no `state`) for `agent`/`conversation_id` and the record.
+//! * Journal: `insertOne` with a deterministic `_id = "<run>:<seq>"`; a duplicate key means an
+//!   earlier writer won, and their entry is read back and returned. After an insert, one check
+//!   that the run still exists (a purge that removed it must not leave an orphan), so a journaled
+//!   step is two round trips rather than the four of read, check, insert, check.
 //! * Claiming: read a page of due candidates, then `updateMany` them with the
 //!   due/lease conditions re-checked in the filter and a fresh `lease_token`,
 //!   then read back what carries that token. MongoDB re-evaluates the filter
@@ -172,14 +175,30 @@ impl MongoStore {
             .collect())
     }
 
-    /// A live run: present and not tombstoned by an in-progress purge.
-    async fn load_live(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
+    /// The fields `commit_run` reads from the current document before its CAS: no `state`, which
+    /// the CAS does not need and a commit must not transfer.
+    async fn commit_context(&self, id: RunId) -> StoreResult<Option<CommitContext>> {
         let found = self
             .runs
             .find_one(doc! { "_id": uuid(id), "purging": { "$ne": true } })
+            .projection(doc! {
+                "agent": 1, "conversation_id": 1, "parent_id": 1, "version": 1, "created_at": 1
+            })
             .await
             .map_err(classify)?;
-        found.as_ref().map(run_from_doc).transpose()
+        found.as_ref().map(commit_context_from_doc).transpose()
+    }
+
+    /// The version of a live run, or `None` if it is gone (or tombstoned by a purge): what a failed
+    /// CAS reports, without reading the document.
+    async fn live_version(&self, id: RunId) -> StoreResult<Option<u64>> {
+        let found = self
+            .runs
+            .find_one(doc! { "_id": uuid(id), "purging": { "$ne": true } })
+            .projection(doc! { "version": 1 })
+            .await
+            .map_err(classify)?;
+        found.as_ref().map(|d| get_u64(d, "version")).transpose()
     }
 
     async fn find_journal(&self, run: RunId, seq: u64) -> StoreResult<Option<JournalEntry>> {
@@ -348,6 +367,26 @@ fn run_from_doc(d: &Document) -> StoreResult<RunRecord> {
         version: get_u64(d, "version")?,
         created_at: get_date(d, "created_at")?.ok_or_else(|| bad("created_at"))?,
         updated_at: get_date(d, "updated_at")?.ok_or_else(|| bad("updated_at"))?,
+    })
+}
+
+/// The fields [`MongoStore::commit_context`] reads: everything `commit_run` needs to build the
+/// record it returns and the `open_key`, and nothing else.
+struct CommitContext {
+    version: u64,
+    agent: String,
+    conversation_id: Option<String>,
+    parent_id: Option<RunId>,
+    created_at: DateTime<Utc>,
+}
+
+fn commit_context_from_doc(d: &Document) -> StoreResult<CommitContext> {
+    Ok(CommitContext {
+        version: get_u64(d, "version")?,
+        agent: get_str(d, "agent")?.ok_or_else(|| bad("agent"))?,
+        conversation_id: get_str(d, "conversation_id")?,
+        parent_id: get_uuid(d, "parent_id")?,
+        created_at: get_date(d, "created_at")?.ok_or_else(|| bad("created_at"))?,
     })
 }
 
@@ -580,10 +619,14 @@ impl Store for MongoStore {
         expected: u64,
         update: RunUpdate,
     ) -> StoreResult<RunRecord> {
-        // open_key depends on agent and conversation, which never change, so
-        // read them from the current document. If the CAS below fails the read
-        // was pointless, but a commit that loses a race is the rare path.
-        let current = self.load_live(id).await?.ok_or(StoreError::NotFound(id))?;
+        // open_key depends on agent and conversation, which never change, so read them from the
+        // current document, projected to the metadata the CAS and the returned record need: a
+        // commit never reads the state it is about to replace. If the CAS below fails the read was
+        // pointless, but a commit that loses a race is the rare path.
+        let current = self
+            .commit_context(id)
+            .await?
+            .ok_or(StoreError::NotFound(id))?;
         if current.version != expected {
             return Err(StoreError::Conflict {
                 run: id,
@@ -638,12 +681,12 @@ impl Store for MongoStore {
                 created_at: current.created_at,
                 updated_at: t,
             }),
-            Ok(None) => match self.load_live(id).await? {
+            Ok(None) => match self.live_version(id).await? {
                 None => Err(StoreError::NotFound(id)),
-                Some(run) => Err(StoreError::Conflict {
+                Some(actual) => Err(StoreError::Conflict {
                     run: id,
                     expected,
-                    actual: run.version,
+                    actual,
                 }),
             },
             Err(err) if is_duplicate_key(&err) => Err(StoreError::ConversationBusy {
@@ -686,14 +729,9 @@ impl Store for MongoStore {
             payload: storable_owned(payload),
             recorded_at: truncate_ms(recorded_at),
         };
-        if let Some(existing) = self.find_journal(run, entry.seq).await? {
-            return check_same_step(run, existing, entry);
-        }
-        if !self.run_exists(run).await? {
-            return Err(StoreError::NotFound(run));
-        }
+        let id = journal_id(run, entry.seq);
         let doc = doc! {
-            "_id": journal_id(run, entry.seq),
+            "_id": &id,
             "run_id": uuid(run),
             "seq": to_i64(entry.seq, "journal seq")?,
             "name": &entry.name,
@@ -701,18 +739,22 @@ impl Store for MongoStore {
             "payload": json_to_bson(&entry.payload)?,
             "recorded_at": date(entry.recorded_at),
         };
+        // Insert first: the write is one round trip, and a duplicate key means an earlier writer
+        // won and their entry is the one to return. (A pre-read would add a round trip to every
+        // step to save one on the replay that only a crash causes.)
         match self.journal.insert_one(&doc).await {
             Ok(_) => {
-                // The run check above and the insert are not atomic: if a purge
-                // removed the run in between, don't leave an orphan behind for a
-                // future run with the same (deterministic) id to replay.
+                // The insert and the run check are not atomic: if a purge removed the run in
+                // between, don't leave an orphan behind for a future run with the same
+                // (deterministic) id to replay.
                 if !self.run_exists(run).await? {
                     self.journal
-                        .delete_one(doc! { "_id": journal_id(run, entry.seq) })
+                        .delete_one(doc! { "_id": &id })
                         .await
                         .map_err(classify)?;
                     return Err(StoreError::NotFound(run));
                 }
+                // The entry this call wrote, not a conversion of the document back.
                 Ok(entry)
             }
             Err(err) if is_duplicate_key(&err) => {
@@ -871,6 +913,7 @@ impl Store for MongoStore {
         let found = self
             .runs
             .find_one(doc! { "_id": uuid(id) })
+            .projection(doc! { "lease_until": 1 })
             .await
             .map_err(classify)?;
         found.map_or(Ok(None), |d| get_date(&d, "lease_until"))
@@ -1239,6 +1282,102 @@ mod classify_tests {
 }
 
 #[cfg(test)]
+mod round_trip_tests {
+    use std::sync::{Arc, Mutex};
+
+    use mongodb::event::EventHandler;
+    use mongodb::event::command::CommandEvent;
+    use mongodb::options::ClientOptions;
+    use serde_json::json;
+
+    use super::*;
+
+    /// A store whose client reports every command it starts, so a test can count the round trips
+    /// of one operation. The callback runs on the operation's own task, so nothing races.
+    async fn counted() -> Option<(MongoStore, Arc<Mutex<Vec<String>>>)> {
+        let uri = adam_core::testing::test_env("ADAM_TEST_MONGODB_URI")?;
+        let db = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let mut options = ClientOptions::parse(&uri).await.expect("options");
+        options.command_event_handler = Some(EventHandler::callback(move |event: CommandEvent| {
+            if let CommandEvent::Started(event) = event {
+                sink.lock().unwrap().push(event.command_name);
+            }
+        }));
+        let client = Client::with_options(options).expect("client");
+        Some((MongoStore::new(client.database(&db)), seen))
+    }
+
+    /// The commands a store operation sent since the last call, ignoring the driver's own
+    /// handshakes.
+    fn sent(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        let mut names = seen.lock().unwrap();
+        let taken = names.clone();
+        names.clear();
+        taken
+            .into_iter()
+            .filter(|name| {
+                !matches!(
+                    name.as_str(),
+                    "hello" | "isMaster" | "ismaster" | "ping" | "endSessions"
+                )
+            })
+            .collect()
+    }
+
+    /// A journaled step is `journal_get` (one read) plus `journal_put`. `journal_put` used to cost
+    /// four round trips (read, run check, insert, run check); an upsert that returns the winner
+    /// costs one write and the run check.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_journal_entry_is_one_write_and_one_check() {
+        let Some((store, seen)) = counted().await else {
+            return;
+        };
+        store.migrate().await.expect("migrate");
+        let run = store
+            .create_run(NewRun::new("round-trip", json!({})))
+            .await
+            .expect("create");
+        sent(&seen);
+
+        let entry = store
+            .journal_put(run.id, JournalEntry::ok(0, "tool", json!({"x": 1})))
+            .await
+            .expect("put");
+        assert_eq!(entry.payload, json!({"x": 1}));
+        let commands = sent(&seen);
+        assert!(
+            commands.len() <= 2,
+            "a journal entry costs at most two round trips: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|name| name == "findAndModify" || name == "update" || name == "insert"),
+            "one of them writes: {commands:?}"
+        );
+
+        // A replay writes nothing new: the winner's document comes back in the same round trip.
+        let again = store
+            .journal_put(run.id, JournalEntry::ok(0, "tool", json!({"x": 2})))
+            .await
+            .expect("put");
+        assert_eq!(again.payload, json!({"x": 1}), "the first writer wins");
+        let commands = sent(&seen);
+        assert!(
+            commands.len() <= 2,
+            "a replay costs at most two round trips: {commands:?}"
+        );
+        assert_eq!(
+            store.journal_get(run.id, 0).await.unwrap().unwrap(),
+            entry,
+            "the stored entry is the first one"
+        );
+    }
+}
+
+#[cfg(test)]
 mod returned_value_tests {
     use super::*;
     use serde_json::json;
@@ -1369,12 +1508,12 @@ mod returned_value_tests {
             .await
             .unwrap();
         // The one conversion is the current document `commit_run` reads for `agent` and
-        // `conversation_id` before the CAS; the record it returns adds none. A pre-read that
-        // projects `state` away makes this 0: lower the number then, it is not a regression.
+        // `conversation_id` before the CAS; the record it returns adds none, and the projection
+        // leaves the old state out.
         assert_eq!(
             conversion_counter::calls() - before,
-            1,
-            "commit_run converts the old state once, never the new one"
+            0,
+            "commit_run converts neither the old state nor the new one"
         );
         assert!(committed.state.is_null());
         let stored = store.load_run(created.id).await.unwrap().unwrap();
