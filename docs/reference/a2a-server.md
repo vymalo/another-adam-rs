@@ -96,7 +96,8 @@ it is not signed, and a forged position can only move within the forger's own ta
 
 Each candidate is built from the record the page returned (`adam_runtime::view_from_record`), not read a second time: a
 runnable run at version 1 — the only row whose state can still turn from `submitted` to `working` because a worker claimed it —
-also costs one lease read. A 50-task page is one count, one page and one lease read per submitted task.
+also costs one lease read. A 50-task page is one count, one page and one lease read per runnable run at version 1 (submitted,
+or claimed and still at version 1).
 
 ## The extended card
 
@@ -348,7 +349,9 @@ stateDiagram-v2
   `round`, `reported` (`done`, `failed`, `canceled`, `blocked`), `closed`, with `session`, `contextId`, `agent`, `description`,
   `keepOpen`, `by` and, except for `closed`, `round {number, taskId, state}` (the A2A JSON state, `TASK_STATE_COMPLETED`).
   Sessions that existed at the start say nothing (one that starts in between may be told twice); the listing is read at most every
-  200 ms when the parent's record changes, at least every second, and once more before the final event. A session whose listing
+  200 ms when the parent's record changes, on the subscription's next poll once a second has passed (`SESSIONS_POLL`), and once
+  more before the final event. **The real bound is `max(SESSIONS_POLL, poll)` — 2 s with the default 2 s fallback poll** —
+  because the tracker is evaluated only when the subscription polls. A session whose listing
   row did not change is not read again (its `view` is skipped), so an unchanged open session costs the listing, not a state
   read. `opened` carries the latest
   round, which is not round 1 for a session first seen late, and a session a shifting page hid may be told `opened` late. Only the

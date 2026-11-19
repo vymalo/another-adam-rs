@@ -170,9 +170,11 @@ impl Agent for Scripted {
             });
         }
         if text.contains("[turns]") {
-            // Five turns of half a second: long enough that a subscription's fallback poll would
-            // tick if it were fast, which is what a counting test measures.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Five turns: the first outlives the subscription's 2 s fallback and the watch's 1 s
+            // interval, so a counting test sees both loops tick; the rest are short, so the run is
+            // a few seconds and its commits are what the stream reads it for.
+            let hold = if phase == 0 { 1300 } else { 500 };
+            tokio::time::sleep(Duration::from_millis(hold)).await;
             if phase < 4 {
                 state["phase"] = json!(phase + 1);
                 return Ok(Transition::Continue(state));
@@ -538,9 +540,12 @@ async fn a_new_task_is_a_run_and_streams_snapshot_progress_artifact_completed() 
 }
 
 /// A subscriber reads the run once per commit (a `Status` event makes it poll at once) and on its
-/// fallback interval, not on the worker's, and a step's cancel watch reads a header rather than
-/// the record: a five-turn run of 2.5 s costs a handful of record reads where the 250 ms fallback
-/// of both loops cost tens. The stream is the only reader of the state.
+/// fallback interval, not on the worker's: a five-turn run of a few seconds costs a handful of
+/// record reads where the 250 ms fallback of both loops cost tens.
+///
+/// What the counters see is what crosses the `FaultyStore` seam: the stream's `view` calls
+/// (`LoadRun`) and the watch's `run_header` calls (`RunHeader`). The reads a store's own default
+/// `run_header` makes inside itself are below the wrapper and are not counted here.
 #[tokio::test]
 async fn a_stream_reads_the_run_once_per_commit_not_once_per_poll() {
     let faulty = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
@@ -566,13 +571,17 @@ async fn a_stream_reads_the_run_once_per_commit_not_once_per_poll() {
     assert_eq!(label(events.last().unwrap()), "status:Completed");
     let loads = faulty.calls(Method::LoadRun) - before_loads;
     let headers = faulty.calls(Method::RunHeader) - before_headers;
-    // Five steps of 500 ms commit five times: one poll each, plus the first tick of the interval
-    // (which `tokio::time::interval` fires at once) and the tick at 2 s. The 250 ms fallback
-    // would be ~10 polls of the stream alone.
+    // Five steps commit five times: one poll each, plus the first tick of the interval (which
+    // `tokio::time::interval` fires at once) and the tick at 2 s. The 250 ms fallback would be
+    // ~10 polls of the stream alone.
     assert!(loads <= 12, "the stream read the record {loads} times");
-    // Every step is shorter than the 1 s cancel interval, so the watch normally reads nothing;
-    // the 250 ms interval it used to share read the whole record ~10 times over the run.
-    assert!(headers <= 3, "the cancel watch read {headers} headers");
+    // The first step outlives the 1 s cancel interval and the rest do not, so the watch reads one
+    // header. The 250 ms interval it used to share read the whole record instead, once per tick
+    // while the step ran.
+    assert!(
+        (1..=3).contains(&headers),
+        "the cancel watch read {headers} headers"
+    );
 }
 
 /// `ListTasks` builds a task from the record the listing already returned: one count, one list and

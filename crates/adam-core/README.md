@@ -19,7 +19,7 @@ database driver.
 | `Store` (trait) | `migrate`, `create_run`, `load_run`, `run_header` (a run without its state, from one projected read where the adapter can), `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs of the runs it purges), `list_runs` and `count_runs` (a caller's runs, newest update first, by keyset: `RunQuery`, `ConversationScope`), and the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*) |
 | `DynStore` | `Arc<dyn Store>`, the handle the runtime holds |
 | `RunRecord`, `NewRun`, `RunUpdate`, `RunStatus`, `RunId` | a run and how to create or advance one |
-| `RunHeader` | a run without its state: `run_header`'s answer, with `claimed(now)` (a runnable run and a live lease) for a reader that only needs what the run is doing |
+| `RunHeader` | a run without its state: `run_header`'s answer, with `claimed(now)` (a runnable run and a live lease) for a reader that only needs the run's own bookkeeping. `adam_core::claimed(status, lease_until, now)` is that rule, shared with a runtime view |
 | `JournalEntry` | the recorded outcome of one step, keyed by `(run, seq)` |
 | `ClaimScope` | `Any` (default) or `Pinned`, the scope of a `claim_due`. Closed: no `#[non_exhaustive]` |
 | `Lease` | a run claimed by a worker until a deadline |

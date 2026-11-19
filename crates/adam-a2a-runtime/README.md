@@ -101,7 +101,8 @@ statuses its state can come from and each candidate is kept only if its state is
 at most `MAX_SCAN` (500) runs per page: a rare filter returns a short page and a token that continues. A candidate is built
 from the record the listing returned (`adam_runtime::view_from_record`), not read again: the state is already in it, and the
 lease is read only for a runnable run at version 1, the one row whose task state can still turn from `submitted` to
-`working` because a worker claimed it. A 50-task page is one count, one page and one lease read per submitted task.
+`working` because a worker claimed it. A 50-task page is one count, one page and one lease read per runnable run at version 1
+(submitted, or claimed and still at version 1).
 **`totalSize` is exact for
 no status filter and for `completed`, and an upper bound for the other states.** A run of another agent in the same store, an
 unreadable record and a record whose conversation id has no subject are not listed.
@@ -150,8 +151,12 @@ parent. **`round.state` is the A2A JSON spelling** (`TASK_STATE_WORKING`, `TASK_
 in the sessions object, not the contract's lower-case examples. The tracker lists the sessions once before the snapshot is built (so it is a separate listing from the one
 the snapshot's sessions object makes: a session that starts between the two may be told twice, once in the object and once as
 `opened`, never missed), and a session that existed then says nothing. It lists again after at least 200 ms when the parent's
-record changed and at least every second (`SESSIONS_MIN_INTERVAL`, `SESSIONS_POLL`); a listing that fails is warned about and
-retried after the full second; and it lists once more before the final event. A session whose latest round the listing cannot
+record changed, and on the subscription's next poll once a second has passed (`SESSIONS_MIN_INTERVAL`, `SESSIONS_POLL`); a
+listing that fails is warned about and retried at the next poll; and it lists once more before the final event. **The real
+bound for a session change is `max(SESSIONS_POLL, poll)` — 2 s with the default 2 s fallback poll** — because the tracker is
+evaluated only when the subscription polls. That is the deliberate trade: a listing arm of its own every second would pay a
+whole `list_sessions` (two counts, a page and a lease read per open round) per subscriber per second, for a change only a
+person acting on a session can cause. A session whose latest round the listing cannot
 read is left out until it can. **A session whose listing row did not change is not read again**: the tracker keeps the row its
 `Seen` came from and skips the `view` (two queries and the full state of an open round) when the next listing returns the same
 row. The row is the version that matters — a commit moves `updated_at`, a new round moves `round` and `latestRun`, and the

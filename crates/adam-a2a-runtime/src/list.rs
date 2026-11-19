@@ -9,7 +9,8 @@
 //! listing returned ([`view_from_record`]): its state is already there, and the lease is read only
 //! for the one record whose state can still turn from `submitted` to `working` (a runnable run at
 //! version 1, before a worker's first commit). A page is then one count, one list and one lease
-//! read per unclaimed task, not two more queries per record.
+//! read per runnable run at version 1 (submitted, or claimed and still at version 1), not two more
+//! queries per record.
 //!
 //! `total_size` comes from [`Store::count_runs`](adam_core::Store::count_runs) over those statuses,
 //! so it is **exact** with no `status` filter, for `completed` (one status, one state) and for the
@@ -173,17 +174,18 @@ impl RuntimeTaskBackend {
                 scanned += 1;
                 // `task_state` needs the lease only where it can still say `submitted` or
                 // `working`: a runnable run at version 1, the record as created, before any worker
-                // has committed. Every other row is not claimed, whatever lease it carries. The
-                // record was read before the lease, so a run that commits in between reads as it
-                // was listed; the next listing has it.
-                let claimed = if rec.status == RunStatus::Runnable && rec.version <= 1 {
+                // has committed. Every other row is not claimed, whatever lease it carries, so its
+                // lease is not read. The record was read before the lease, so a run that commits in
+                // between reads as it was listed; the next listing has it.
+                let lease = if rec.status == RunStatus::Runnable && rec.version <= 1 {
                     match store.lease_until(rec.id).await {
-                        Ok(until) => until.is_some_and(|until| until > self.runtime.now()),
+                        Ok(until) => until,
                         Err(e) => return Err(map_err(e.into())),
                     }
                 } else {
-                    false
+                    None
                 };
+                let claimed = adam_core::claimed(rec.status, lease, self.runtime.now());
                 // The record already holds the state a view is built from: decode it here instead
                 // of reading the run again (two more queries and a second state read per task).
                 // The state moves into the view; the rest of the record (a few strings) is what

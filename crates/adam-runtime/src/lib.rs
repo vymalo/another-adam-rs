@@ -99,6 +99,7 @@ mod text;
 mod usage;
 mod worker;
 
+pub use adam_core::RunHeader;
 pub use adam_error::{Classify, ErrorClass};
 pub use adam_model::Usage;
 pub use agent::{Agent, AgentError, AgentStarter, Inbound, Transition};

@@ -628,9 +628,10 @@ impl RuntimeBuilder {
     /// The watch is how a step learns that its run turned terminal in another process (a cancel, a
     /// time limit, a parent that ended) when no [`notifier`](Self::notifier) told it, and it is the
     /// fallback for the signal: a `Signal::Finished` fires the step's token at once. It reads the
-    /// run's **header** ([`Store::run_header`](adam_core::Store::run_header)), never its state, so
-    /// it is one small read per interval. The bound it implies: a state change that no event
-    /// announced reaches a step's cancel watch within this interval.
+    /// run's **header** ([`Store::run_header`](adam_core::Store::run_header)): an adapter that
+    /// overrides that method projects it and never reads the state; the trait's default (what
+    /// `MemoryStore` uses) reads the lease and then the record. The bound it implies: a state
+    /// change that no event announced reaches a step's cancel watch within this interval.
     ///
     /// Slower than [`poll_interval`](Self::poll_interval) on purpose: the worker's idle poll finds
     /// work that appeared, which a person waits for, while the cancel watch waits on something a
@@ -1176,6 +1177,13 @@ impl Runtime {
     /// a session's is not listed, and a session whose round 1 was purged is not either. Only the
     /// sessions of the parent itself are listed, not those of its sessions.
     ///
+    /// A session's header, outcome and report live in its latest round's **state** (the envelope's
+    /// `agent` member), so the scan reads whole records: a projection that dropped `state` could
+    /// not say what a session is, whether it is closed or how its round ended. The count before the
+    /// scan is the guard for that bound, not a consistency check: it refuses a parent with more than
+    /// [`MAX_SESSION_ROUNDS_SCANNED`](crate::MAX_SESSION_ROUNDS_SCANNED) rounds without reading one
+    /// of them (the count after the scan, below, is the consistency check).
+    ///
     /// The scan pages `list_runs`, which orders by `updated_at`, so a round that commits between
     /// two page reads can move past the cursor and be missed. The listing counts again after the
     /// scan and repeats it when the counts differ, up to three times, then fails with
@@ -1458,18 +1466,18 @@ impl Runtime {
             return Ok(None);
         };
         let env = Envelope::decode(run, &rec.state)?;
-        let claimed = rec.status == RunStatus::Runnable
-            && until.is_some_and(|until| until > self.inner.clock.now());
+        let claimed = adam_core::claimed(rec.status, until, self.inner.clock.now());
         Ok(Some(RunView::new(rec, env, claimed)))
     }
 
     /// The header of a run from its durable record (`None` if it does not exist): its status, its
     /// version and whether a worker holds it, without the state.
     ///
-    /// One store call ([`Store::run_header`](adam_core::Store::run_header)), which an adapter
-    /// answers from a projection that never reads the state; [`view`](Self::view) reads the whole
-    /// record because the view carries it. Use this for a reader that only needs to know what the
-    /// run is doing: a cancel watch, a status poll.
+    /// One store call ([`Store::run_header`](adam_core::Store::run_header)): an adapter that
+    /// overrides it projects the header and the lease; the trait's default (what `MemoryStore`
+    /// uses) reads the lease and then the record. Use it for a reader that only needs the run's own
+    /// bookkeeping — a step's cancel watch, a parent check. An A2A task's state also needs
+    /// `waiting`, which is in the state, so a status poll reads [`view`](Self::view).
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn header(&self, run: RunId) -> Result<Option<RunHeader>, RuntimeError> {
         Ok(self.inner.store.run_header(run).await?)

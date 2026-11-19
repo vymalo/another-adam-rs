@@ -234,13 +234,17 @@ impl RunRecord {
     }
 }
 
-/// A run without its state: what a reader that only needs to know what the run *is doing* reads.
+/// A run without its state: what a reader that only needs the run's own bookkeeping reads — its
+/// status, its version, its lease.
 ///
-/// The state is the largest member of a run (for an `LlmAgent`, the transcript), and most readers
-/// never look at it: a subscriber that polls for a status change, a cancel watch, a listing that
-/// builds its view from the record it already has. [`Store::run_header`] answers this from a
-/// projection that does not read the state at all, so it costs one small read where
-/// [`Store::load_run`] transfers the whole run.
+/// The state is the largest member of a run (for an `LlmAgent`, the transcript), and some readers
+/// never look at it: a step's cancel watch, a parent check, a listing that builds its view from the
+/// record it already has. [`Store::run_header`] answers this: an adapter that overrides it projects
+/// the header and the lease, so it costs one small read where [`Store::load_run`] transfers the
+/// whole run; the trait's default reads the record.
+///
+/// It does not answer an A2A task's state: `input-required` is `waiting`, which the runtime derives
+/// from the envelope's wake bookkeeping, so a task needs the view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunHeader {
     /// The run.
@@ -269,12 +273,20 @@ pub struct RunHeader {
 
 impl RunHeader {
     /// Whether a worker holds an unexpired lease on the run: it is being stepped right now,
-    /// though nothing has been committed yet. The same rule as a runtime view's `claimed`: only a
-    /// runnable run is being stepped, whatever lease a parked or finished one still carries, and a
-    /// lease that ran out (the worker died) does not count.
+    /// though nothing has been committed yet. [`claimed`] is the rule; this is it for a header.
     pub fn claimed(&self, now: DateTime<Utc>) -> bool {
-        self.status == RunStatus::Runnable && self.lease_until.is_some_and(|until| until > now)
+        claimed(self.status, self.lease_until, now)
     }
+}
+
+/// Whether a worker holds an unexpired lease on a run: it is being stepped right now, though
+/// nothing has been committed yet.
+///
+/// The one rule of [`RunHeader::claimed`], a runtime view's `claimed`, and a listing that builds a
+/// view from a record it already has: only a runnable run is being stepped, whatever lease a parked
+/// or finished one still carries, and a lease that ran out (the worker died) does not count.
+pub fn claimed(status: RunStatus, lease_until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    status == RunStatus::Runnable && lease_until.is_some_and(|until| until > now)
 }
 
 /// Whose runs a claim may take (see [`Store::claim_due`]).

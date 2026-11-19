@@ -30,8 +30,8 @@ on every transition. Read the run for the stored state (a store may have replace
 outcome from it.
 
 `run_header` answers a run **without its state** — its id, agent, conversation, parent, status, wake
-time, version, timestamps and lease — which is all a reader that only needs what the run is doing
-(a status poll, a cancel watch) reads. The trait defaults it to `lease_until` + `load_run`; both
+time, version, timestamps and lease — which is all a reader that only needs the run's own bookkeeping
+(a cancel watch, a parent check) reads. The trait defaults it to `lease_until` + `load_run`; both
 adapters override it with one projected read that never touches the state, and the conformance case
 `run_header_matches_the_record` proves an implementation agrees with the two reads.
 
