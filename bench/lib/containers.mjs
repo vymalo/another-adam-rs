@@ -310,6 +310,15 @@ export class HostContainers {
     throw new ContainerError(`asking for ${ref} failed (exit ${r.exitCode})`);
   }
 
+  /** Remove an image reference from the host's store (no force: an image a container still uses stays). False when it was not there. */
+  async removeImage(ref) {
+    if (!parseImageRef(ref) && !/^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+$/.test(ref)) throw new ContainerError('the image is not a plain reference');
+    const r = await this.#call(['image', 'rm', ref], { timeoutMs: 120_000 });
+    if (r.exitCode === 0) return true;
+    if (/no such image/i.test(r.stderr)) return false;
+    throw new ContainerError(`removing ${ref} failed (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
+  }
+
   async build(context, tag, dockerfile, buildArgs = {}) {
     await this.#must(['build', '-t', tag, '-f', dockerfile, ...buildArgsFlags(buildArgs), context], `building ${tag}`);
   }
@@ -404,6 +413,10 @@ export class FakeContainers {
   }
   async hasImage(ref) {
     return this.images?.has(ref) ?? false;
+  }
+  async removeImage(ref) {
+    this.removedImages = [...(this.removedImages ?? []), ref];
+    return true;
   }
   async build(context, tag, dockerfile, buildArgs = {}) {
     buildArgsFlags(buildArgs); // the same refusals as the real thing

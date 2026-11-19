@@ -303,10 +303,23 @@ change's added lines is in your statement. An `Interface` section is exempt: it 
   the base has a `.devcontainer`.
 * After the clone-path runs the check runs the gold **once more through the real grading path** (working directory `/app`,
   the original `test.sh`) and keeps the task only if that passes too (`gold-fails-at-app`).
+* **The public check does not walk every upstream task.** `select` needs 80 kept tasks, at most 9 per repository, so `check`
+  (public) walks the tasks in the order `select` uses (`selectionOrder` in `lib/select.mjs`: a seeded shuffle in each
+  repository, then rounds that take one task of every repository; `--seed`, default the configuration's) and stops as soon
+  as 80 are kept (`--total N` changes the target). A repository that already has 9 kept is skipped for the rest of the walk.
+  A walk that ends before the target says `shortfall: N of 80 kept`. The image of a task dropped by its verdict is removed
+  at once (`docker image rm`, by digest and by tag), unless a task kept so far, the workspace image or the pinned coder
+  uses that digest; a removal that fails is printed (`image not removed`) and the verdict stands. The kept tasks' images
+  stay: a run needs them. A re-run continues from `check.json`: a verdict recorded for the task as it is now (same checksum;
+  an `infra` result is not a verdict) is not run again, and the walk goes on in the same order. `--all` walks every task
+  (an audit; it still resumes and still removes the images of dropped tasks), `--only ID,ID` runs just those again.
+
 * `bench tasks select` keeps the checked tasks without a `.devcontainer`, whose check still fits the task (a result carries
-  the task's checksum and image digest and is ignored when either has changed), draws them stratified by repository with the
-  seeded generator of `lib/stats.mjs` (public: 80, at most 9 per repository; own: 20, at most 6 per repository and at
-  most 6 from `selfRepo`) and writes the lock files. The same seed gives the same list.
+  the task's checksum and image digest and is ignored when either has changed). For the public source
+  (public: 80, at most 9 per repository) it takes the first such tasks in the selection order above, which is exactly what
+  a full check would give from the same verdicts, so the partial `check.json` of a stopped walk selects the same set. For
+  the own source (own: 20, at most 6 per repository, and at most 6 from `selfRepo`) it draws stratified by repository with
+  the seeded generator of `lib/stats.mjs`. It writes the lock files. The same seed gives the same list.
 
 ## Grading
 

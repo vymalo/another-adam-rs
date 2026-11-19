@@ -432,3 +432,13 @@ dropped, are back. Proof on the final head: `node --test "bench/test/*.test.mjs"
 with the same phases and 27 model requests = 27 ledger calls; 18 deliberate mutations, each killed by the suite.
 
 **Amended 2026-11-19:** the disk check counts the images already present toward its 20 GB floor (`bench/README.md`, "`bench doctor`").
+
+**Amended 2026-11-19:** the public check no longer walks every upstream task. SWE-bench Pro V2 has 731 tasks and a check
+costs about 2.4 minutes each (about 29 hours, measured on the owner's machine), and it kept every pulled image, so the
+disk filled after about 75 tasks, while `select` needs 80 kept tasks, at most 9 per repository. `tasks check` (public)
+now walks the tasks in the seeded, stratified order `select` uses (one implementation, `selectionOrder`), skips a
+repository that has 9 kept, stops at the target, removes the image of each dropped task (never one a kept task, the
+workspace image or the coder uses) and resumes from `check.json`; `tasks select` takes the first 80 kept tasks in that
+order, so a partial check selects what a full one would. `--all` restores the full walk for audits. This changes which
+tasks a seed selects for the public source compared with the earlier equal-share draw over the checked tasks. The NodeBB
+gold-fails seen in the walk are under separate investigation and not addressed here.

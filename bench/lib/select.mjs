@@ -46,6 +46,65 @@ export function selectTasks(candidates, { seed, scope = 'tasks', total, perRepoC
   return chosen.sort((x, y) => (x.repo < y.repo ? -1 : x.repo > y.repo ? 1 : x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
 }
 
+/**
+ * The order in which the public tasks are walked, by `tasks check` and by `tasks select` alike: every task once, a function of
+ * the tasks' ids and repositories, the seed and the scope alone (never of a verdict). A seeded shuffle inside each repository,
+ * then rounds: each round takes the next task of every repository that still has one, the repositories in a seeded order.
+ */
+export function selectionOrder(tasks, { seed, scope = 'public' }) {
+  const rand = mulberry32(seedFrom(`${seed}:${scope}`));
+  const strata = new Map();
+  for (const c of [...tasks].sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0))) {
+    if (!strata.has(c.repo)) strata.set(c.repo, []);
+    strata.get(c.repo).push(c);
+  }
+  const queues = new Map([...strata.keys()].sort().map((r) => [r, shuffle(strata.get(r), rand)]));
+  const order = [];
+  for (let live = [...queues.keys()]; live.length > 0; live = live.filter((r) => queues.get(r).length > 0)) {
+    for (const r of shuffle(live, rand)) order.push(queues.get(r).shift());
+  }
+  return order;
+}
+
+/** What is still wanted from a walk: `total` kept in all, at most `perRepo` of each repository. */
+export class Quota {
+  #perRepo;
+  #total;
+  #byRepo = new Map();
+  kept = 0;
+  constructor({ total, perRepo }) {
+    if (!Number.isInteger(total) || total < 0) throw new RangeError('total must be a whole number');
+    if (!Number.isInteger(perRepo) || perRepo < 1) throw new RangeError('perRepo must be a whole number above 0');
+    this.#total = total;
+    this.#perRepo = perRepo;
+  }
+  get done() {
+    return this.kept >= this.#total;
+  }
+  /** Is a task of this repository still worth a check? */
+  open(repo) {
+    return !this.done && (this.#byRepo.get(repo) ?? 0) < this.#perRepo;
+  }
+  take(repo) {
+    this.#byRepo.set(repo, (this.#byRepo.get(repo) ?? 0) + 1);
+    this.kept++;
+  }
+}
+
+/** The tasks of `order` that `isKept` accepts, the first ones that fit the quota: what a full check selects. */
+export function pickInOrder(order, isKept, opts) {
+  const q = new Quota(opts);
+  const chosen = [];
+  for (const t of order) {
+    if (q.done) break;
+    if (q.open(t.repo) && isKept(t)) {
+      q.take(t.repo);
+      chosen.push(t);
+    }
+  }
+  return chosen;
+}
+
 /** The lock file body: ids, checksums, image digests and the seed, and what pins the source. Nothing else. */
 export function buildLock({ source, seed, upstreamCommit = null, tasks }) {
   const lock = { schema: 1, source, seed: String(seed) };
