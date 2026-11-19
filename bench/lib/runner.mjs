@@ -13,7 +13,7 @@
 // graded again.
 import fs from 'node:fs';
 import path from 'node:path';
-import { prepareBase } from './base.mjs';
+import { BaseCache, BASE_NAME, baseKey } from './base.mjs';
 import { CapBook } from './cap.mjs';
 import { callStats, classifyRun } from './classify.mjs';
 import { gradePatch } from './grade.mjs';
@@ -29,6 +29,9 @@ export class HarnessCrash extends Error {
 
 const SAFE_ID = /[^A-Za-z0-9._-]/g;
 export const runDirName = (run, attempt) => `${run.replace(SAFE_ID, '-')}-a${attempt}`;
+
+/** The bases this process has made, per (task, image): a second run of a task reuses the slot's copy and the host's. */
+const bases = new BaseCache();
 
 /**
  * @typedef {object} Deps
@@ -130,8 +133,16 @@ export async function executeRun({ deps, spec, attempt }) {
     // What an earlier run or a killed harness left in the slot's service is removed first, and checked.
     await containers.reapAll();
     await deps.pullImage?.(spec.slot, task);
-    await stack.resetWork(spec.slot);
-    const base = await (deps.prepareBase ?? prepareBase)({ containers, stack, slot: spec.slot, task, hostRoot: path.join(paths.scratch, 'base') });
+    await stack.resetWork(spec.slot, { keep: [BASE_NAME] });
+    const base = await (deps.prepareBase ?? ((o) => bases.prepare(o)))({
+      containers,
+      stack,
+      slot: spec.slot,
+      task,
+      // The host's repository of a task's base outlives the run (whose scratch is removed at cleanup): one directory per
+      // (task, image), reused by every run of it in this process.
+      hostRoot: path.join(deps.home, 'bases', baseKey(task)),
+    });
     const { token } = meter.openRun({ run, attempt, arm: spec.arm });
     opened.meter = true;
     ctx = {

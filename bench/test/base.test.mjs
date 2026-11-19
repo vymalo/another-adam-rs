@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { baseScript, prepareBase } from '../lib/base.mjs';
+import { BASE_MARKER, BaseCache, baseKey, baseScript, prepareBase } from '../lib/base.mjs';
 import { repoSlug } from '../lib/gitops.mjs';
 import { extractEntries, parseTar } from '../lib/tarstream.mjs';
 import { FakeContainers } from '../lib/containers.mjs';
@@ -94,6 +94,86 @@ test('prepareBase says why it failed', async (t) => {
   const task = loadTask(makeTask(tmp(t), 'demo-2'));
   const containers = new FakeContainers({ onRun: () => ({ exitCode: 3, stderr: 'fatal: not a git repository\n' }) });
   await assert.rejects(prepareBase({ containers, stack: fakeStack({}, []), slot: 1, task, hostRoot: tmp(t) }), /could not be made \(exit 3\).*not a git repository/);
+});
+
+/** A stack whose slot volumes remember what a base build would have written (the fake containers only record the script). */
+function cacheStack(produced, calls, volumes) {
+  const vol = (slot) => {
+    if (!volumes.has(slot)) volumes.set(slot, { marker: null, names: new Set() });
+    return volumes.get(slot);
+  };
+  return {
+    workDir: async (slot, dir, o) => {
+      calls.push(['workDir', slot, dir, Boolean(o?.remove)]);
+      if (o?.remove) {
+        const v = vol(slot);
+        v.marker = null;
+        v.names.clear();
+      }
+    },
+    listDir: async (slot) => [...vol(slot).names],
+    readFiles: async (slot) => {
+      const v = vol(slot);
+      return { files: v.marker === null ? new Map() : new Map([[BASE_MARKER, Buffer.from(`${v.marker}\n`)]]), refused: [] };
+    },
+    extractTree: async (slot, dir, dest) => {
+      calls.push(['extractTree', slot, dir]);
+      const tar = execFileSync('tar', ['--format=posix', '-cf', '-', '-C', produced.tree, '.'], { maxBuffer: 1 << 28 });
+      extractEntries(parseTar(tar, { allowSymlinks: true }), dest);
+    },
+  };
+}
+
+test('the cache makes a task base once per (task, image): the slot copy and the host repository are reused', async (t) => {
+  const task = loadTask(makeTask(tmp(t), 'demo-3'));
+  const produced = runBase(t, appRepo(t));
+  const calls = [];
+  const volumes = new Map();
+  const containers = new FakeContainers();
+  const stack = cacheStack(produced, calls, volumes);
+  const cache = new BaseCache();
+  const hostRoot = path.join(tmp(t), 'bases', baseKey(task));
+  const builds = () => containers.runs.length;
+  const extracts = () => calls.filter((c) => c[0] === 'extractTree').length;
+  const mark = (slot, marker = baseKey(task)) => {
+    volumes.set(slot, { marker, names: new Set(['base.git', 'tree', BASE_MARKER]) });
+  };
+
+  const first = await cache.prepare({ containers, stack, slot: 1, task, hostRoot });
+  assert.equal(builds(), 1);
+  assert.equal(extracts(), 1);
+  assert.ok(first.dir.startsWith(hostRoot), 'the host repository lives under the key, not under a run');
+  assert.equal(git(first.dir, 'rev-parse', 'HEAD').trim(), first.sha);
+  mark(1);
+  const again = await cache.prepare({ containers, stack, slot: 1, task, hostRoot });
+  assert.equal(builds(), 1, 'the slot copy is reused when its marker names the key');
+  assert.equal(extracts(), 1);
+  assert.deepEqual([again.dir, again.sha], [first.dir, first.sha]);
+  // Another slot has no copy: its own container side is made, the host's repository is not made again.
+  const other = await cache.prepare({ containers, stack, slot: 2, task, hostRoot });
+  assert.equal(builds(), 2);
+  assert.equal(extracts(), 1);
+  assert.deepEqual([other.dir, other.sha], [first.dir, first.sha]);
+  // A marker of another base (a task run with another image, or a deleted one) is remade.
+  mark(2, 'another-task-0000000000000000');
+  await cache.prepare({ containers, stack, slot: 2, task, hostRoot });
+  assert.equal(builds(), 3);
+  assert.equal(extracts(), 1);
+  // A volume with no base at all is remade too.
+  volumes.delete(1);
+  await cache.prepare({ containers, stack, slot: 1, task, hostRoot });
+  assert.equal(builds(), 4);
+  assert.equal(extracts(), 1);
+});
+
+test('the key of a base names the task and its image, and refuses a task without either', () => {
+  const a = { id: 'demo-1', image: { ref: 'ghcr.io/x/y@sha256:aa' } };
+  assert.equal(baseKey(a), baseKey({ ...a }));
+  assert.notEqual(baseKey(a), baseKey({ ...a, id: 'demo-2' }));
+  assert.notEqual(baseKey(a), baseKey({ ...a, image: { ref: 'ghcr.io/x/y@sha256:bb' } }));
+  assert.match(baseKey(a), /^demo-1-[0-9a-f]{16}$/);
+  assert.throws(() => baseKey({ id: '', image: a.image }), /task id and an image/);
+  assert.throws(() => baseKey({ id: 'demo-1' }), /task id and an image/);
 });
 
 test('the run\'s worktree is the one slot of the one run directory, or the one named after the repository', () => {
