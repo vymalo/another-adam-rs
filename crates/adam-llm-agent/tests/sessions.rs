@@ -562,6 +562,28 @@ async fn wait_for(
     }
 }
 
+/// The session `session` of `conversation` once `pred` holds of it.
+async fn session_until(
+    rt: &Runtime,
+    conversation: &str,
+    session: RunId,
+    pred: impl Fn(&adam_runtime::SessionView) -> bool,
+) -> adam_runtime::SessionView {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(view) = rt.session_view(conversation, session).await.unwrap()
+            && pred(&view)
+        {
+            return view;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the session"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 async fn wait_done(rt: &Runtime, run: RunId) -> RunView {
     wait_for(rt, run, "done", |v| v.status == RunStatus::Done).await
 }
@@ -3806,6 +3828,95 @@ mod cases {
         );
     }
 
+    /// A round that only cancels what the round before left running (a closing round in a session
+    /// that stays open) is the platform's, not the person's: it is not counted against
+    /// `max_rounds`, the next `subagent_send` starts an ordinary round (not another cleanup), and a
+    /// close that really closes is not taken for one.
+    pub async fn a_cleanup_round_is_not_counted_and_the_next_send_is_an_ordinary_round(
+        store: DynStore,
+    ) {
+        let mut rig = Rig::new();
+        rig.limits = Some(SessionLimits::new(4, 2, 2).unwrap());
+        rig.child_mock
+            .push_text("round one says 1")
+            .push_text("round three says 3");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        rig.parent_mock.push_text("first task");
+        let first = rig.start(&rt, &conv).await;
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, first).await;
+        let session = start_persons_round(&rt, &rig, &conv, "asked by a person").await;
+        wait_done(&rt, session).await;
+
+        let cleanup = RunId::new();
+        let header = SessionHeader {
+            id: session,
+            agent: rig.child_name.clone(),
+            description: "asked by a person".into(),
+            keep_open: true,
+            closed: false,
+            closing: true,
+            round: 2,
+        };
+        rt.start_child_continuing(
+            cleanup,
+            cleanup,
+            &rig.child_name,
+            Inbound::new("message", adam_runtime::closing_round_payload(&header)),
+            &adam_runtime::session_conversation_id(&conv, session),
+            Some(session),
+        )
+        .await
+        .unwrap();
+        wait_done(&rt, cleanup).await;
+        let view = rt.session_view(&conv, session).await.unwrap().unwrap();
+        assert_eq!((view.round, view.cleanup_rounds), (2, 1));
+
+        // Two rounds are the most, and one of them is ours: the person's second is still allowed.
+        rig.parent_mock
+            .push_tool_calls(vec![send_call("s1", session, "more")])
+            .push_text("sent");
+        let second = rt
+            .start_continuing(&rig.parent_name, user_message("second"), Some(&conv), first)
+            .await
+            .unwrap();
+        wait_done(&rt, second).await;
+        let results = tool_results(&state_of(&rt, second).await);
+        let (_, words, is_error) = result_of(&results, "s1");
+        assert!(
+            !is_error,
+            "a cleanup round does not use the person's rounds: {words}"
+        );
+        let view = session_until(&rt, &conv, session, |v| {
+            v.round == 3 && v.state == SessionState::Idle
+        })
+        .await;
+        let latest = view.header.clone().expect("a header");
+        assert!(
+            !latest.closing,
+            "the round after a cleanup is an ordinary round"
+        );
+        assert_eq!(view.cleanup_rounds, 1);
+
+        // A close that closes is not a cleanup round.
+        rig.parent_mock
+            .push_tool_calls(vec![close_call("x1", session, false)])
+            .push_text("closed");
+        let third = rt
+            .start_continuing(&rig.parent_name, user_message("third"), Some(&conv), second)
+            .await
+            .unwrap();
+        wait_done(&rt, third).await;
+        let view = session_until(&rt, &conv, session, |v| v.state == SessionState::Closed).await;
+        assert_eq!(
+            view.cleanup_rounds, 1,
+            "a closing round that closes is not a cleanup"
+        );
+        worker.stop().await;
+    }
+
     /// A task that does not continue another (a fresh `init`) does not tell the model of a
     /// person's round that ended before it began, however old: nothing records that it was told.
     /// It does tell one that ended after it began.
@@ -4470,6 +4581,7 @@ macro_rules! session_suite {
                 an_expired_sessions_report_is_still_told_once,
                 a_parent_that_fails_stops_its_rounds,
                 a_cancel_frees_the_working_slots_for_the_next_task,
+                a_cleanup_round_is_not_counted_and_the_next_send_is_an_ordinary_round,
             );
         }
     };

@@ -585,8 +585,8 @@ impl RemoteRoundAgent {
     /// A round of a session that may stay open has ended: start the timer run that, if nobody
     /// writes to the session by the time it expires, starts the closing round whose first act is to
     /// cancel what the remote still runs. Best effort and journaled: a failure is a warning, and
-    /// the next read of the session cleans up as well. The timer is a run of this agent in the
-    /// session's parent conversation, parked until the expiry, so a worker wakes it with no process
+    /// the next read of the session cleans up as well. The timer is a run of this agent in a
+    /// conversation of the session's parent, parked until the expiry, so a worker wakes it with no process
     /// of its own.
     async fn schedule_reap(&self, ctx: &mut Ctx, st: &RoundState) -> Result<(), AgentError> {
         let Some(header) = &st.session else {
@@ -1466,6 +1466,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next.prior_open_task, None);
+        assert_eq!(next.answer_task.as_deref(), Some("t9"));
+    }
+
+    /// A task the round before left working is the one a closing round cancels; the task that
+    /// waits for an answer is not swapped for it.
+    #[test]
+    fn a_closing_round_cancels_the_working_task_before_the_one_that_waits() {
+        let agent = round_agent();
+        let mut before = AgentStarter::init(&agent, message("m1", "first")).unwrap();
+        before.task = Some("t1".into());
+        before.answer_task = Some("t9".into());
+        let header = SessionHeader {
+            id: adam_core::RunId::new(),
+            agent: "coder/billing".into(),
+            description: String::new(),
+            keep_open: true,
+            closed: true,
+            closing: true,
+            round: 2,
+        };
+        let close = Inbound::new(
+            SESSION_CLOSE_KIND,
+            json!({ SESSION_STATE_KEY: header, SESSION_CLOSE_ROUND_KEY: true }),
+        );
+        let next =
+            AgentStarter::init_continuing(&agent, close, &before, adam_core::RunId::new()).unwrap();
+        assert_eq!(next.prior_open_task.as_deref(), Some("t1"));
         assert_eq!(next.answer_task.as_deref(), Some("t9"));
     }
 }

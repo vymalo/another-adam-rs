@@ -519,6 +519,56 @@ async fn cancel_of_a_working_round_makes_a_kept_open_session_idle() {
     }
 }
 
+/// What ends a remote task is for remote helpers only: a cancelled round, or an idle expiry, of a
+/// session on a local helper starts no round of its own, however often the session is read.
+#[tokio::test]
+async fn a_local_helper_session_is_never_followed_by_a_cleanup_round() {
+    for store in stores().await {
+        let clock = ManualClock::new();
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_helper_on: Some(0),
+                idle: Some((Duration::from_secs(3600), clock.clone())),
+                ..Options::new()
+            },
+        );
+        let rounds = |task: &Task| {
+            let session = RunId(task.id.parse().expect("the first round is the session"));
+            let (runtime, store) = (rig.runtime.clone(), store.clone());
+            async move {
+                let record = store.load_run(session).await.unwrap().expect("round 1");
+                let (parent, _) =
+                    parse_session_conversation_id(record.conversation_id.as_deref().unwrap())
+                        .expect("a session conversation");
+                let view = runtime
+                    .session_view(&parent, session)
+                    .await
+                    .unwrap()
+                    .expect("the session");
+                (view.round, view.cleanup_rounds)
+            }
+        };
+        rig.helper_mock.push_text("never read").push_text("second");
+        let one = rig.start(&alice(), None, "work", true).await;
+        rig.gate.reached.notified().await;
+        rig.backend.cancel(&alice(), &one.id).await.unwrap();
+        rig.task(&alice(), &one.id).await;
+        assert_eq!(rounds(&one).await, (1, 0), "a cancel starts no cleanup");
+        rig.gate.release.notify_one();
+
+        let two = rig.start(&alice(), None, "again", true).await;
+        rig.until(&alice(), &two.id, TaskState::Completed).await;
+        clock.advance(Duration::from_secs(2 * 3600));
+        rig.task(&alice(), &two.id).await;
+        let mut roots = TaskQuery::new();
+        roots.context_id = Some(two.context_id.clone());
+        rig.backend.list(&alice(), &roots).await.unwrap();
+        assert_eq!(rounds(&two).await, (1, 0), "an expiry starts no cleanup");
+        rig.stop().await;
+    }
+}
+
 /// A close: an idle session closes at once by a round of its own (and a later message is refused,
 /// and a repeated close changes nothing); a working one closes when its round ends, saying
 /// `closing`; with `cancel` the round is stopped first.

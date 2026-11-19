@@ -91,9 +91,14 @@ async fn an_unregistered_helper_is_78_before_the_database_is_asked() {
     );
     let helper = format!("{name}/helper");
     let agents = agents(&name, &cfg).child_sessions(sessions_for(&helper));
-    let error = adam_service::serve(&cfg, agents, std::future::pending())
-        .await
-        .unwrap_err();
+    // A `serve` that did not stop would never return: the bound fails the test instead of hanging it.
+    let error = tokio::time::timeout(
+        Duration::from_secs(20),
+        adam_service::serve(&cfg, agents, std::future::pending()),
+    )
+    .await
+    .expect("serve stops at once for a helper nobody registered")
+    .unwrap_err();
     assert!(
         matches!(&error, ServeError::ChildSessions { agent } if *agent == helper),
         "{error}"
