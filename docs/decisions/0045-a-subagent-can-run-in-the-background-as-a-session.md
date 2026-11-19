@@ -11,6 +11,8 @@ resume" of [ADR 0039](0039-the-agent-loop-takes-opencodes-structure-and-agents-g
 [ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) decisions 1 and 2 for its
 tools. The orchestration layer's side is its own ADR in `vymalo/another-agentic-system`.
 
+*Amended 2026-11-19 ([ADR 0054](0054-a-child-session-can-be-configured-within-what-its-folder-allows.md), not built):* `subagent_start` and a person's start (`start.config`) take an optional `config` that only chooses within, or narrows, what the subagent's folder and the deployment allow; the effective config is in the header (decision 1 gains `config`, `spent`, `deleted` and `edits`) and kept by later rounds. A sixth tool, `subagent_edit`, changes a session's settings within the same bounds; `subagent_close` gains `delete`; the system prompt of an agent with these tools gains a fixed section on them. Decision 3's table and decision 11's close change accordingly; `subagent_send` stays for messages only.
+
 *Built 2026-11-14 ([ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) slice 10):* the runtime half of decision 6: a cancelled or failed parent fails the open round (`cancelled: the parent run ended`) and the session stays usable; `start_child_continuing_within` gives a round the same time limit. Remote sessions are not cancelled (slice 5: *amended 2026-11-18*, built: a round sends `CancelTask`, see below).
 
 *Built 2026-11-14:* slice 1 (the runtime): `Runtime::start_child_continuing`, the kind `adam.child.reported`
@@ -127,6 +129,14 @@ wiring into `adam-assembly`, `adam-service` and `adam-coder` (part c).
 * **The coder lists the extension now, and a person's round has no workspace** until slice 7: a round a person starts is its own parent, so `root_run_id()` is the round, and the coder's tools find the workspace by it. A person's `explorer` or `reviewer` can answer in text but cannot read a repository; the model's own `subagent_start` is unaffected. The tier is read as for any message and capped by `MAX_ACCESS_TIER`. Recorded in `bin/adam-coder/README.md`.
 * Mixed versions: roll the workers before the control plane (a round for a helper an older worker does not know stays `working`).
 * adam stays as built where the contract differs (`UnsupportedOperation` past `max_working` and `max_rounds`, a required `start.description`); the system's contract is to be amended. Not built here: the system's own run against a real `adam-agent`.
+
+*Amended 2026-11-19* (slice 6 part b, the listing cadence): the tracker is evaluated only when the
+subscription polls — its fallback (`RuntimeTaskBackend::with_poll_interval`, 2 s by default) or a
+`Status` event of the task it streams — so the bound on a session change is
+`max(SESSIONS_POLL, poll)`, **2 s with the defaults**, not the second the paragraph above says. The
+2 s fallback is the deliberate trade: a listing arm of its own every second would pay a whole
+`list_sessions` (two counts and a page, plus a view per changed open round) per subscriber per
+second, for a change nobody is blocked on.
 
 *Built 2026-11-18:* slice 5 (remote sessions, `crates/adam-assembly/src/remote_session.rs`, `RemoteEndpoint` in `remote.rs`, `Agent::on_cancelled`
 in `crates/adam-runtime`, the roster in `crates/adam-llm-agent/src/sessions.rs`): a session on an `a2a:` subagent of the root is a chain of

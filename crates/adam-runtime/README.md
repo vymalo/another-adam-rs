@@ -23,8 +23,10 @@ over A2A).
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
 | `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
 | `Ctx`, `Emitter`, `ReservedStep` | `Ctx::step` journals a side effect's outcome; `Ctx::reserve_steps(&names)` takes the next seqs in order for steps that run at the same time (each `ReservedStep` has `seq()`, `name()`, `is_recorded()` and `run(f)`, with `step`'s contract), and `Ctx::step_all(steps, at_once)` runs them at most `at_once` at a time and returns the outcomes in the order given (see *Steps that run at the same time*); `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::arrived()` counts the messages delivered while the transition runs, `Ctx::reopen_on_arrival()` makes a `Done` that the transition returns go on instead, and `Ctx::read_already(&ids)` names the messages the run has read, whose copies are not counted (see *A message that arrives while a run finishes*); `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children and `Ctx::child_state(run)` its agent's own state (both live reads of the run's own children only), and `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*) |
-| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_child_continuing`, `list_sessions`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*) and the getters `worker_id()`, `claim_scope()` |
+| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_child_continuing`, `list_sessions`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `header`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*), `.poll_interval(..)` (the worker's idle poll, 250 ms) and `.cancel_poll_interval(..)` (a step's cancel watch, 1 s; see *Several processes*), and the getters `worker_id()`, `claim_scope()` |
+| `Runtime::notify_parent(child, output, error)` | tells a finished child's parent (`RUN_FINISHED_KIND`, or `CHILD_REPORTED_KIND` for a session round) from the `output`/`error` the caller just committed; `child` supplies the ids, the status and the parent. The runtime calls it itself after a commit and a cancel. **Breaking:** it used to take only `&RunRecord` and decoded the child's state, which `Store::commit_run` no longer returns (`RunRecord::state` is `null`); an embedder that called it must pass the values it committed |
 | `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`). `RunView::claimed` is true while a worker holds an unexpired lease on a runnable run (read with `Store::lease_until` against the runtime's clock, before the record, so a step that commits and releases between the two reads never reads as unclaimed at version 1): the first step of a run commits nothing until it ends, and this is how a reader, in any process, tells a run being stepped from one nobody has taken |
+| `RunHeader` (re-exported from `adam-core`), `Runtime::header`, `view_from_record`, `Runtime::now` | the record without its state: `Runtime::header(run)` is one `Store::run_header` call (an adapter that overrides it projects the header and the lease; the trait's default reads the lease and the record), for a reader that only needs the run's own bookkeeping (a cancel watch, a parent check; an A2A task's state also needs `waiting`, so a status poll reads `view`). `RunHeader::claimed(now)` is `RunView::claimed`'s rule, one `adam_core::claimed(..)` helper. `view_from_record(record, claimed)` builds the `RunView` of a record a caller already holds (a listing), so it does not read the run again; `Runtime::now()` is the clock to compare a lease against, so the result agrees with `view` |
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
 | `UsageEvent`, `UsageTotals`, `UsageTotal`, `Usage`, `MAX_USAGE_CALL_BYTES`, `MAX_USAGE_LABEL_BYTES`, `MAX_USAGE_TOTALS` | `RunEvent::Usage`: one model call completed, its tokens (`Usage`, re-exported from `adam-model`), its model, provider and context window, and the step of the task it ran under; and a task's totals, one entry per provider and model; see *Usage*. `Emitter::emit_for(run, event)` sends an event as another run's (a child's call is its root's) |
@@ -391,8 +393,17 @@ environment that measures wins. `SandboxEnvironment` is `Local`, `Devcontainer` 
 
 Processes share nothing but the store. A worker finds due runs by polling it
 (`poll_interval`, 250 ms by default), and a step learns of a cancel issued by
-another process when its worker next reads the run. Both are correct, and both
-cost up to one poll interval.
+another process when its cancel watch next reads the run's **header**
+(`cancel_poll_interval`, 1 s by default). Both are correct, and both cost up to
+their own interval: 250 ms for a run to start or resume, 1 s for a step to
+notice a cancel no signal announced.
+
+The two intervals are separate on purpose. The worker's idle poll finds work a
+person is waiting for; the cancel watch waits on something a person asked for,
+and a signal normally delivers it, so it is the slower fallback and it reads a
+projection rather than the whole record (see `Store::run_header`). Set them
+independently with `RuntimeBuilder::poll_interval` and
+`RuntimeBuilder::cancel_poll_interval`.
 
 A `Notifier` removes that latency. Configure one with
 `RuntimeBuilder::notifier(..)` on the front and on the workers:
@@ -533,7 +544,11 @@ takes nothing, a replay after a crash runs only the unrecorded steps, a gap is f
 tests sit in `src/cancel.rs`, `erased.rs` (an override reaches an agent and a starter, the default is `init`, a prior state that does not decode falls back to `init`), `child.rs` (the id derivation is pinned by a golden value, the notice payload), `ctx.rs` (`emit_for` reaches the other run and records no artifact, `child_state` reads the run's own children only), `events.rs`, `file.rs` (images by their first bytes, a claim that stands and every way the bytes overrule it, the extension table, the shared line and its sizes, `ReceivedFiles`: names, types, the caps, refusals), `usage.rs` (a report within its bounds, totals one entry per provider and model and at most 32), `step.rs` (the words of the kinds, states and icons are the contract's, a step is made within its bounds on a character boundary, the serde shape leaves out what a step does not say), `notify.rs` and `retry.rs`, and the
 class tables of `AgentError` and `RuntimeError` in `src/agent.rs`
 (`class_table`, `from_classified_maps_retryable_to_transient_and_keeps_the_hint`,
-`a_message_never_repeats_its_source`, `the_default_continuation_is_init_and_ignores_the_prior_state`) and `src/runtime.rs` (`error_tests`).
+`a_message_never_repeats_its_source`, `the_default_continuation_is_init_and_ignores_the_prior_state`) and `src/runtime.rs` (`error_tests`, and `defaults`: the worker's idle poll is 250 ms and a step's cancel watch 1 s, set separately).
+
+Two cases pin the read path: `a_header_is_one_store_call` (`Runtime::header` is one store call and reads neither the record
+nor the lease beside it) and `the_cancel_watch_polls_at_its_own_interval` (a 2.5 s step at a 1 s cancel interval reads the
+header about twice, not once per 20 ms worker poll; the watch reads no state at all).
 
 | Variable | Meaning |
 |---|---|

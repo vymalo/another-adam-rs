@@ -2413,6 +2413,43 @@ mod cases {
         assert_eq!(rt.agent_names(), vec![name]);
     }
 
+    /// A header is one store call: the runtime asks the store for it and reads neither the lease
+    /// nor the record beside it (an adapter answers it from a projection; the trait's default is
+    /// two reads inside the store, not beside it). A view reads both, because its state is the
+    /// record.
+    pub async fn a_header_is_one_store_call(store: DynStore) {
+        let (faulty, store) = faulty(store);
+        let rt = Runtime::builder(store.clone()).build();
+        let name = uniq("header");
+        let run = store
+            .create_run(NewRun::new(&name, json!({"turn": 0})))
+            .await
+            .unwrap();
+        let before = (
+            faulty.calls(Method::RunHeader),
+            faulty.calls(Method::LoadRun),
+            faulty.calls(Method::LeaseUntil),
+        );
+        let header = rt.header(run.id).await.expect("header").expect("the run");
+        assert_eq!((header.id, header.version), (run.id, 1));
+        assert_eq!(
+            faulty.calls(Method::RunHeader),
+            before.0 + 1,
+            "one header read"
+        );
+        assert_eq!(
+            faulty.calls(Method::LoadRun),
+            before.1,
+            "the runtime reads no record beside it"
+        );
+        assert_eq!(
+            faulty.calls(Method::LeaseUntil),
+            before.2,
+            "nor a lease beside it"
+        );
+        assert!(rt.header(RunId::new()).await.expect("header").is_none());
+    }
+
     /// A start-only runtime (`RuntimeBuilder::starter`) creates runs but never
     /// steps them; a runtime with the full agent over the same store does.
     pub async fn a_starter_only_runtime_starts_and_a_full_runtime_steps(store: DynStore) {
@@ -3849,6 +3886,9 @@ mod cases {
         let slow = |worker: &str| {
             builder(&store, worker, &agent)
                 .poll_interval(Duration::from_secs(30))
+                // The signal is what tells `a`, not its own watch: keep the watch's fallback
+                // slower than the assertion's timeout, or it would pass without the notifier.
+                .cancel_poll_interval(Duration::from_secs(30))
                 .notifier(notifier.clone())
                 .build()
         };
@@ -5478,6 +5518,9 @@ mod cases {
             .agent(child_listening(&child_name, &started, &saw))
             .agent(child_listening(&alone_name, &alone_started, &alone_saw))
             .poll_interval(Duration::from_millis(10))
+            // The watch's own interval, so the window has polls to count (the production default
+            // would make the window one read).
+            .cancel_poll_interval(Duration::from_millis(10))
             .build();
         let parent = rt.start(&name, inbound(), None).await.unwrap();
         let worker = spawn_worker(&rt);
@@ -5499,9 +5542,9 @@ mod cases {
                     .unwrap();
                 notified(&alone_started, "the run").await;
             }
-            let before = faulty.calls(Method::LoadRun);
+            let before = faulty.calls(Method::RunHeader);
             tokio::time::sleep(window).await;
-            reads.push(faulty.calls(Method::LoadRun) - before);
+            reads.push(faulty.calls(Method::RunHeader) - before);
             rt.cancel(id, "done measuring").await.unwrap();
         }
         worker.stop().await;
@@ -5512,6 +5555,39 @@ mod cases {
         assert!(
             extra <= reads[0] / 4,
             "the parent was read {extra} times more than a run with none: {reads:?}"
+        );
+    }
+
+    /// The cancel watch of a step reads the run's header on its own interval: a 2.5 s step at the
+    /// 1 s default is read about twice, not once per worker poll (the 20 ms idle poll would be
+    /// ~125 reads). It never reads the state: the header is a projection.
+    pub async fn the_cancel_watch_polls_at_its_own_interval(store: DynStore) {
+        let (faulty, dynamic) = faulty(store);
+        let name = uniq("watch-poll");
+        let agent = fn_agent(
+            &name,
+            step_fn(|_ctx, state| {
+                async move {
+                    tokio::time::sleep(Duration::from_millis(2500)).await;
+                    Ok(Transition::Done {
+                        state,
+                        output: json!("done"),
+                    })
+                }
+                .boxed()
+            }),
+        );
+        let rt = builder(&dynamic, &uniq("w"), &agent)
+            .cancel_poll_interval(Duration::from_secs(1))
+            .build();
+        let worker = spawn_worker(&rt);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        wait_done(&rt, run).await;
+        worker.stop().await;
+        let reads = faulty.calls(Method::RunHeader);
+        assert!(
+            (2..=5).contains(&reads),
+            "the watch read the header {reads} times over a 2.5 s step at a 1 s interval"
         );
     }
 
@@ -7365,6 +7441,7 @@ macro_rules! runtime_suite {
                 conversation_delivers_to_the_open_run,
                 start_with_id_is_idempotent,
                 api_errors,
+                a_header_is_one_store_call,
                 a_starter_only_runtime_starts_and_a_full_runtime_steps,
                 a_claimed_run_says_so_before_its_first_commit,
                 a_lease_that_ran_out_is_not_a_claim,
@@ -7417,6 +7494,7 @@ macro_rules! runtime_suite {
                 a_deadline_is_set_once_and_not_moved_by_later_commits,
                 a_round_with_a_limit_fails_past_it,
                 the_watch_reads_the_parent_about_once_a_second,
+                the_cancel_watch_polls_at_its_own_interval,
                 a_parent_that_loses_its_lease_does_not_start_or_resume_twice,
                 child_status_reads_only_the_callers_children,
                 a_purged_child_reads_as_gone,

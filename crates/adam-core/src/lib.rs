@@ -13,6 +13,6 @@ pub mod testing;
 pub use store::memory::MemoryStore;
 pub use store::{
     ClaimScope, ConversationScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun,
-    PushProgress, PushRecord, PushState, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store,
-    StoreError, StoreResult, storable, storable_owned, storable_text,
+    PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
+    RunUpdate, Store, StoreError, StoreResult, claimed, storable, storable_owned, storable_text,
 };

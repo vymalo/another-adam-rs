@@ -9,6 +9,11 @@ use std::process::ExitCode;
 use adam_git_sandbox::{Config, SandboxError, Server, exit_code};
 use tracing_subscriber::EnvFilter;
 
+/// The process-wide allocator: mimalloc in place of musl's own, which is slow under many threads
+/// (ADR 0053 decision 11).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Exit code 0 after a clean shutdown; otherwise the sysexits-style code of the error
 /// ([`adam_git_sandbox::exit_code`]: 78 configuration, 71 the socket cannot be made). The failure is
 /// one structured log line, with the whole cause chain.

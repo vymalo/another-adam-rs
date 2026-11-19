@@ -432,14 +432,15 @@ impl RunEnvironment {
 /// and then skips the image's details, the metadata that sets the remote user. It is the image this
 /// binary's own is built on ([`DEFAULT_DEVCONTAINER_IMAGE_TAG`] is its tag, which a test keeps equal to the
 /// `WORKSPACE_TAG` of `docker/coder/Dockerfile`), and it is a dev container base: its
-/// `devcontainer.metadata` label names the user. *Verified 2026-10-11*: an anonymous ghcr.io token and a
+/// `devcontainer.metadata` label names the user. *Verified 2026-11-19*: an anonymous ghcr.io token and a
 /// manifest request for the tag returned this digest (linux/amd64), and its config blob has the label and
-/// `CARGO_HOME=/cache/cargo`.
-pub const DEFAULT_DEVCONTAINER_IMAGE: &str = "ghcr.io/vymalo/another-agentic-images/workspace@sha256:d2aae762ecad2c13bb697332507d236a75d8233d061f38cc97dc9227192b0797";
+/// `CARGO_HOME=/cache/cargo`. It is the merge of vymalo/another-agentic-images#15, with the four language
+/// servers the tools of `src/tools/lsp` use (ADR 0044, slice 17).
+pub const DEFAULT_DEVCONTAINER_IMAGE: &str = "ghcr.io/vymalo/another-agentic-images/workspace@sha256:b465808bfb8a1baae5e59a429bf292726b021e3b37322f759dbda3ee2c57ed67";
 
 /// The tag [`DEFAULT_DEVCONTAINER_IMAGE`]'s digest was published as: not part of the reference (see
 /// there), but what a person reads to know which build it is, and what a test keeps with the Dockerfile.
-pub const DEFAULT_DEVCONTAINER_IMAGE_TAG: &str = "1.98.1-e6a528f";
+pub const DEFAULT_DEVCONTAINER_IMAGE_TAG: &str = "1.98.1-8c297d3";
 
 /// The devcontainer variables of a worker: see the table at the top of this module.
 #[derive(Debug, Clone)]
@@ -2890,7 +2891,8 @@ mod tests {
         assert!(parse_dc(&vars).is_ok());
     }
 
-    /// The default image is the base image of this binary's own image (`WORKSPACE_TAG`), by tag and digest.
+    /// The default image is the base image of this binary's own image (`WORKSPACE_TAG`) and the chart's run pod
+    /// image, by tag and digest.
     #[test]
     fn the_default_devcontainer_image_is_the_workspace_image_the_coder_is_built_on() {
         let dockerfile = include_str!("../../../docker/coder/Dockerfile");
@@ -2912,6 +2914,11 @@ mod tests {
         );
         assert_eq!(digest.len(), 64);
         assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+        let chart = include_str!("../../../deploy/coder/values.yaml");
+        assert!(
+            chart.contains(&format!("digest: sha256:{digest}")),
+            "the chart's runPods.image is the same build: move both digests together"
+        );
     }
 
     #[test]

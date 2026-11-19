@@ -146,6 +146,13 @@ relied on `commit` cloning `claimed` before an `await` (it does not: the clones 
 
 ### P2 — The whole transcript is rewritten on every commit
 
+> **Amended 2026-11-19.** The ratio below is half the real one: the bytes written over `T` turns are
+> `b·T(T+1)/2` against `b·T` for a delta store, so the ratio is `(T+1)/2` — **20× at 40 turns, 50× at
+> 100**, not 10× and 25×. The fix is decided in
+> [ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md): a head plus
+> an append-only transcript and content-addressed file blobs, schema 5, expand then contract across two
+> releases. It follows the I/O-layer pull request.
+
 **Current behaviour.** `RunUpdate.state` is the complete envelope (`adam-core/src/store/mod.rs:190`).
 Postgres writes it as one JSONB column (`store-postgres:356–362`); Mongo replaces the `state` member of the
 document (`store-mongodb:555–575`). The state grows with every turn: an assistant message plus its tool

@@ -363,3 +363,15 @@ ADR 0052's slice B1, the first after the record and independent of the rest:
 
 The proof is that `bench doctor` and the dry run pass on a host with about 20 GB free. The table "Runs in" of `bench/README.md`
 ("the coder container; its commands in a devcontainer of the task image on the Podman service") changes with it.
+
+## Amended 2026-11-19: a static coder and a store service ([ADR 0053](0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md))
+
+The owner decided how the bench's adam arm gets past the task image's C library and where its runs are stored. Not built yet;
+ADR 0053 decision 12 and its slices 6a and 6b:
+
+* The coder's binaries are static (musl), so the adam arm starts in every task image; the pin in `bench/pins.json` moves to
+  that build, and the configuration fingerprint's `pins` changes with it (a new pilot).
+* Postgres and `bench/postgres-init.sql` leave the stack; each slot gets a store service with SQLite on its own volume, which
+  the run's commands cannot reach without the coder's token.
+* Both arms run as uid 10001 with equal CPU and memory limits; the fingerprint gains a `runtime` field; gradings share one
+  `verifier` network.

@@ -25,9 +25,15 @@ pub struct RuntimeOptions {
     pub concurrency: usize,
     /// How long a claimed run stays leased without renewal.
     pub lease_ttl: Duration,
-    /// How often an idle worker polls for due runs, and a subscription re-reads
-    /// a run.
+    /// How often an idle worker polls for due runs.
     pub poll_interval: Duration,
+    /// How often a step's cancel watch re-reads the run it is stepping (default 1 s): the bound on
+    /// how long a step takes to notice a cancel that no event announced. It reads the run's header,
+    /// never its state.
+    pub cancel_poll_interval: Duration,
+    /// How often a subscription re-reads the durable run (default 2 s): the bound on how long a
+    /// subscriber takes to see a state change that no live event announced.
+    pub view_poll_interval: Duration,
     /// How long a kept-open session may sit idle before it reads closed
     /// ([`adam_runtime::RuntimeBuilder::session_idle_ttl`]); default seven days. [`serve`]
     /// takes it from `SESSION_IDLE_DAYS` ([`ServiceConfig::sessions`]) instead.
@@ -45,6 +51,8 @@ impl Default for RuntimeOptions {
             concurrency: 4,
             lease_ttl: Duration::from_secs(30),
             poll_interval: Duration::from_millis(250),
+            cancel_poll_interval: Duration::from_secs(1),
+            view_poll_interval: Duration::from_secs(2),
             session_idle_ttl: adam_runtime::DEFAULT_SESSION_IDLE_TTL,
         }
     }
@@ -137,6 +145,7 @@ impl Service {
             .concurrency(options.concurrency)
             .lease_ttl(options.lease_ttl)
             .poll_interval(options.poll_interval)
+            .cancel_poll_interval(options.cancel_poll_interval)
             .session_idle_ttl(options.session_idle_ttl);
         if let Some(id) = &options.worker_id {
             builder = builder.worker_id(id.clone());
@@ -146,7 +155,7 @@ impl Service {
         }
         let runtime = builder.build();
         let backend = RuntimeTaskBackend::new(runtime.clone(), broadcast, name)
-            .with_poll_interval(options.poll_interval);
+            .with_poll_interval(options.view_poll_interval);
         Self { runtime, backend }
     }
 
@@ -301,6 +310,11 @@ mod tests {
         assert_eq!(options.concurrency, 4);
         assert_eq!(options.claim_scope, ClaimScope::Any);
         assert_eq!(options.worker_id, None);
+        // Three intervals, three jobs: the worker's idle poll, a step's cancel watch, a
+        // subscription's fallback.
+        assert_eq!(options.poll_interval, Duration::from_millis(250));
+        assert_eq!(options.cancel_poll_interval, Duration::from_secs(1));
+        assert_eq!(options.view_poll_interval, Duration::from_secs(2));
         assert!(format!("{:?}", LiveSignals::local()).contains("notifier: false"));
     }
 }

@@ -38,7 +38,7 @@
 //!   A step that is running at that moment can observe it through
 //!   [`Ctx::cancelled`] / [`CancelToken`] and stop early: at once when the
 //!   runtime that holds it is the one cancelling or shares a [`Notifier`],
-//!   within one poll interval otherwise.
+//!   within one `cancel_poll_interval` otherwise.
 //!
 //! # Several processes
 //!
@@ -99,6 +99,7 @@ mod text;
 mod usage;
 mod worker;
 
+pub use adam_core::RunHeader;
 pub use adam_error::{Classify, ErrorClass};
 pub use adam_model::Usage;
 pub use agent::{Agent, AgentError, AgentStarter, Inbound, Transition};
@@ -119,7 +120,7 @@ pub use file::{
 pub use lines::{SystemLine, is_system_line, safe_file_name};
 pub use notify::{Delivery, DynNotifier, LocalNotifier, Notifier, Signal};
 pub use retry::{MAX_RETRY_AFTER, RetryPolicy};
-pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError};
+pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError, view_from_record};
 pub use session::{
     DEFAULT_SESSION_IDLE_TTL, MAX_SESSION_CONVERSATION_BYTES, MAX_SESSION_PAGE,
     MAX_SESSION_ROUNDS_SCANNED, ReportRound, RoundOutcome, SESSION_CLOSE_KIND,

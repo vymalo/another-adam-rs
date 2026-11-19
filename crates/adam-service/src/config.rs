@@ -4,6 +4,7 @@
 //! |---|---|---|
 //! | `ROLE` | what this process runs: `all`, `control-plane` or `worker` ([`adam_host::Role`]) | `all` |
 //! | `DATABASE_URL` | Postgres for the run store (`adam-store-postgres`) | required |
+//! | `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0`: keep this process's run events local, without `NOTIFY` (one process; `ROLE=all`, one pod); signals still cross. Never detected ([`ServiceConfig::notify_local_only`]) | `false` |
 //! | `A2A_BEARER_TOKENS` | comma-separated tokens accepted by the A2A server | required for `all` and `control-plane`, non-empty (fail closed) |
 //! | `PUBLIC_URL` | URL clients reach the JSON-RPC endpoint at (agent card) | required for `all` and `control-plane` |
 //! | `A2A_PUSH_ALLOWED_URLS` | turns A2A push notifications **on** and says which webhooks they may reach: comma-separated URL prefixes (`https://hooks.example.com/a2a/`) or hosts (`hooks.example.com`, `*.example.com`, `host:8443`) ([`PushSettings`]) | unset: push notifications are off, the card says so |
@@ -204,6 +205,9 @@ pub struct ServiceConfig {
     pub role: Role,
     /// `DATABASE_URL`.
     pub database_url: SecretString,
+    /// `NOTIFY_LOCAL_ONLY`: keep this process's run events local, without
+    /// `NOTIFY`. Read by every role: every role runs the `notify` component.
+    pub notify_local_only: bool,
     /// `A2A_BEARER_TOKENS`. Empty unless [`Role::runs_control_plane`].
     pub a2a_bearer_tokens: Vec<SecretString>,
     /// `PUBLIC_URL`. `Some` exactly when [`Role::runs_control_plane`].
@@ -225,6 +229,7 @@ impl std::fmt::Debug for ServiceConfig {
         f.debug_struct("ServiceConfig")
             .field("role", &self.role)
             .field("database_url", &"[REDACTED]")
+            .field("notify_local_only", &self.notify_local_only)
             .field("a2a_bearer_tokens", &self.a2a_bearer_tokens.len())
             .field(
                 "public_url",
@@ -243,9 +248,9 @@ impl std::fmt::Debug for ServiceConfig {
 
 impl ServiceConfig {
     /// Read the variables of the table in the [module docs](self) that [`ServiceConfig`] holds
-    /// (`ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR` and, for a role
-    /// that runs workers, `WORKERS` and `WORKER_ID`) through `lookup` (`None` = unset). A blank
-    /// value counts as unset.
+    /// (`ROLE`, `DATABASE_URL`, `NOTIFY_LOCAL_ONLY`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`,
+    /// `LISTEN_ADDR` and, for a role that runs workers, `WORKERS` and `WORKER_ID`) through
+    /// `lookup` (`None` = unset). A blank value counts as unset.
     ///
     /// Every missing or malformed variable adds a line to `problems`; the returned value then
     /// holds placeholders for it and must not be used. A role does not read the variables of the
@@ -315,6 +320,8 @@ impl ServiceConfig {
             problems,
         );
 
+        let notify_local_only = parse_flag(&get, "NOTIFY_LOCAL_ONLY", problems);
+
         let worker = role
             .runs_workers()
             .then(|| WorkerSettings::parse(lookup, problems));
@@ -327,6 +334,7 @@ impl ServiceConfig {
         Self {
             role,
             database_url: SecretString::from(database_url),
+            notify_local_only,
             a2a_bearer_tokens,
             public_url,
             listen_addr,
@@ -1230,6 +1238,36 @@ mod tests {
                 max_parallel_tool_calls: 10,
             })
         );
+    }
+
+    /// `NOTIFY_LOCAL_ONLY` is a startup variable of every role (every role runs
+    /// the `notify` component), so a bad value is exit 78, not a late failure.
+    #[test]
+    fn notify_local_only_is_a_boolean_read_by_every_role() {
+        let c = parse(&full()).expect("valid");
+        assert!(!c.notify_local_only, "off by default");
+        for (raw, want) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("false", false),
+            ("0", false),
+        ] {
+            let mut vars = full();
+            vars.insert("NOTIFY_LOCAL_ONLY", raw);
+            assert_eq!(
+                parse(&vars).expect("valid").notify_local_only,
+                want,
+                "{raw:?}"
+            );
+        }
+        // A control plane runs no workers, but it does run `notify`.
+        let mut vars = with_role("control-plane");
+        vars.insert("NOTIFY_LOCAL_ONLY", "true");
+        assert!(parse(&vars).expect("valid").notify_local_only);
+        let mut vars = full();
+        vars.insert("NOTIFY_LOCAL_ONLY", "yes");
+        assert!(mentions(&problems_of(&vars), "NOTIFY_LOCAL_ONLY"));
     }
 
     #[test]

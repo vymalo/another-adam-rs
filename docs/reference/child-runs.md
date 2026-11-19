@@ -112,9 +112,9 @@ stateDiagram-v2
   kept open stays usable. A parent that cannot be loaded (the store is down, or retention purged a finished run) is
   unknown, not ended: the child goes on (debug log). This assumes retention is longer than a minute
   (`Store::purge_finished`).
-* **Where it is checked** (`crates/adam-runtime/src/worker.rs`). Before a child's transition, with one `load_run(parent)`;
+* **Where it is checked** (`crates/adam-runtime/src/worker.rs`). Before a child's transition, with one `run_header(parent)`;
   on the cancel watch of a step in flight, at most once a second per child (`PARENT_CHECK_EVERY`; the watch itself polls
-  every `poll_interval`, 250 ms by default, and reads the child's own run each time); and for a **parked** child at its
+  every `cancel_poll_interval`, 1 s by default, and reads the child's own header each time); and for a **parked** child at its
   look (below). The cancel is `Inner::cancel_run`, the body of `Runtime::cancel`: idempotent, a no-op for a run that is
   already terminal.
 * **The look at a parked child.** A parked run that works for a parent, or has a deadline, is committed with a wake no later

@@ -168,3 +168,8 @@ stays as a per-node or per-release local cache, or goes. Products are not chosen
 only while the runs are. Once runs belong to different people, one run can write into the cache other people's builds read
 (cross-tenant integrity). Nothing about the cache changes; "a cache for each person, or read-only in run pods" is an open decision
 of ADR 0041.
+
+*2026-11-19 (the workspace pin):* the pin named above, `1.98.1-e6a528f` (its digest checked on 2026-10-11), has moved to
+`1.98.1-8c297d3` (`sha256:b465808bfb8a1baae5e59a429bf292726b021e3b37322f759dbda3ee2c57ed67`; *verified 2026-11-19*: an anonymous
+ghcr.io token and a manifest request). Its config keeps `CARGO_HOME=/cache/cargo`, so the caches this decision places there are
+unchanged; the chart's `runPods.image` (tag and digest) moved with it, and the coder image (`image.tag`) is rebuilt on it.

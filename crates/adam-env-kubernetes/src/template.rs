@@ -498,7 +498,7 @@ spec:
         - {name: tools, mountPath: /tools}
   containers:
     - name: run
-      image: ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-e6a528f
+      image: ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-8c297d3
       command: [tini, --, sleep, infinity]
       env:
         - name: CARGO_BUILD_JOBS
@@ -604,7 +604,7 @@ spec:
         let t = template();
         assert_eq!(
             t.image(),
-            Some("ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-e6a528f")
+            Some("ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-8c297d3")
         );
         assert_eq!(t.container(), "run");
         assert_eq!(t.workspace_path(), Path::new("/work"));

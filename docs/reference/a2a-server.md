@@ -94,6 +94,11 @@ The caller's own tasks (never another's, whatever the filters say), most recentl
 The token is a cursor (the position of the last task), not an offset, and bound to the caller and the filters by a digest;
 it is not signed, and a forged position can only move within the forger's own tasks.
 
+Each candidate is built from the record the page returned (`adam_runtime::view_from_record`), not read a second time: a
+runnable run at version 1 — the only row whose state can still turn from `submitted` to `working` because a worker claimed it —
+also costs one lease read. A 50-task page is one count, one page and one lease read per runnable run at version 1 (submitted,
+or claimed and still at version 1).
+
 ## The extended card
 
 `GetExtendedAgentCard` returns the public card plus what the agent adds for authenticated callers: in an agent folder,
@@ -305,7 +310,7 @@ sequenceDiagram
   B->>R: cancel
   C->>B: SubscribeToTask {parent task}
   B->>R: list_sessions (the snapshot, no event)
-  loop the parent's record changed or a second passed
+  loop the parent's record changed, or on the subscription's poll (2 s by default)
     B->>R: list_sessions
     B-->>C: status update, metadata event (opened, round, reported or closed)
   end
@@ -344,7 +349,11 @@ stateDiagram-v2
   `round`, `reported` (`done`, `failed`, `canceled`, `blocked`), `closed`, with `session`, `contextId`, `agent`, `description`,
   `keepOpen`, `by` and, except for `closed`, `round {number, taskId, state}` (the A2A JSON state, `TASK_STATE_COMPLETED`).
   Sessions that existed at the start say nothing (one that starts in between may be told twice); the listing is read at most every
-  200 ms when the parent's record changes, at least every second, and once more before the final event. `opened` carries the latest
+  200 ms when the parent's record changes, on the subscription's next poll once a second has passed (`SESSIONS_POLL`), and once
+  more before the final event. **The real bound is `max(SESSIONS_POLL, poll)` — 2 s with the default 2 s fallback poll** —
+  because the tracker is evaluated only when the subscription polls. A session whose listing
+  row did not change is not read again (its `view` is skipped), so an unchanged open session costs the listing, not a state
+  read. `opened` carries the latest
   round, which is not round 1 for a session first seen late, and a session a shifting page hid may be told `opened` late. Only the
   round immediately before a new one is settled, so a round skipped between two listings is not reported: the sessions object is
   the truth. A person's start on a running parent is `opened` with `by: person`. The stream of a round carries the session object
