@@ -181,7 +181,8 @@ macro_rules! body_conformance {
             body_a_compaction_starts_a_new_generation_and_the_gc_collects_the_old,
             body_a_lost_cas_leaves_only_the_winners_rows,
             body_a_first_split_writes_the_whole_transcript,
-            body_a_retry_with_the_same_writer_is_idempotent, body_purge_removes_the_rows,
+            body_the_same_transcript_committed_again_adds_no_row, body_purge_removes_the_rows,
+            body_a_non_contiguous_index_is_refused,
             body_an_unknown_generation_is_empty,
             body_a_nul_is_stored_as_the_replacement_character,
         );
@@ -201,6 +202,38 @@ macro_rules! body_conformance {
                 $crate::cases::$case(store).await;
             }
         )*
+    };
+}
+
+/// Generate the `measure_the_headless_transcript` test: run
+/// [`counting::measure_headless_transcript`] through `$make`, print its line, and assert that the
+/// workload ran.
+///
+/// `$make` is a path to an `async fn() -> Option<DynStore>`, like [`store_conformance!`]: `None`
+/// skips the test (and fails instead under `ADAM_TEST_REQUIRE_DB=1`). A store that keeps no bodies
+/// skips it too.
+#[macro_export]
+macro_rules! headless_measurement {
+    ($make:path) => {
+        #[tokio::test]
+        async fn measure_the_headless_transcript() {
+            let Some(store) = $make().await else {
+                $crate::skipped("measure_the_headless_transcript: store not configured");
+                return;
+            };
+            store.migrate().await.expect("migrate");
+            if !store.keeps_bodies() {
+                $crate::skipped("measure_the_headless_transcript: store keeps no bodies");
+                return;
+            }
+            let measured = $crate::counting::measure_headless_transcript(store).await;
+            println!("{measured}");
+            assert_eq!(
+                measured.steps,
+                $crate::counting::HEADLESS_STEPS,
+                "the workload ran to the end"
+            );
+        }
     };
 }
 
@@ -788,9 +821,10 @@ pub mod cases {
         }
     }
 
-    /// A retry of the same attempt (the same writer, the same transcript) adds no row and keeps the
-    /// first bytes.
-    pub async fn body_a_retry_with_the_same_writer_is_idempotent(store: DynStore) {
+    /// The same transcript committed again (a lost acknowledgement, or an append that adds
+    /// nothing) adds no row and keeps the first bytes. (A true CAS retry of one attempt is the
+    /// runtime's writer test: the store cannot see the attempt.)
+    pub async fn body_the_same_transcript_committed_again_adds_no_row(store: DynStore) {
         keeps_bodies(&store);
         let agent = agent();
         let run = store
@@ -839,6 +873,54 @@ pub mod cases {
                 json!("fourth")
             ],
             "the retry added no row and rewrote none"
+        );
+    }
+
+    /// A body row's `idx` is its position in the transcript: a gap or a repeated index is refused
+    /// before anything is written, because the head's `len` would still match.
+    pub async fn body_a_non_contiguous_index_is_refused(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let generation = Uuid::new_v4();
+        let err = store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                    .head(head_doc(2))
+                    .body(BodyWrite {
+                        generation: Some(generation),
+                        rows: vec![
+                            BodyRow {
+                                idx: 0,
+                                message: json!("a"),
+                            },
+                            BodyRow {
+                                idx: 5,
+                                message: json!("b"),
+                            },
+                        ],
+                        writer: Uuid::new_v4(),
+                    }),
+            )
+            .await
+            .expect_err("a gap is not a transcript");
+        assert!(
+            matches!(err, StoreError::InvalidInput(_)),
+            "the index is refused: {err:?}"
+        );
+        let loaded = store.load_run(run.id).await.unwrap().expect("the run");
+        assert_eq!(loaded.version, 1, "the CAS did not run");
+        assert!(
+            store
+                .body_list(run.id, generation)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -8069,3 +8069,88 @@ async fn a_cas_retry_reuses_the_body_writer() {
         "the retry writes the same transcript"
     );
 }
+
+/// A file a split uploaded is not sent again by the next split: one `put_blob` for the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_is_uploaded_once_across_splits() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let counting = Arc::new(CountingStore::new(inner.clone()));
+    let store: DynStore = counting.clone();
+    let agent = TranscriptAgent::new(&uniq("upload-once"), 2);
+    let file =
+        Artifact::file("chart", "image/svg+xml", "chart.svg", SVG.to_vec()).expect("a small file");
+    let state = json!({
+        "v": 1,
+        "agent": {"messages": ["start"], "turns": 0},
+        "inbox": [], "seq": 0, "attempt": 0, "rev": 0,
+        "output": null, "error": null,
+        "artifacts": [serde_json::to_value(&file).expect("an artifact is JSON")],
+    });
+    let run = store
+        .create_run(NewRun::new(&agent.name, state))
+        .await
+        .expect("create");
+    let rt = transcript_runtime(&store, &agent);
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run.id).await;
+    worker.stop().await;
+
+    assert_eq!(
+        counting.calls(Method::PutBlob),
+        1,
+        "the file's bytes are sent on the first split only"
+    );
+    assert!(
+        counting.calls(Method::BlobStored) >= 2,
+        "the second split checks the digest instead of re-sending it"
+    );
+    assert_eq!(
+        inner
+            .get_blob(&adam_runtime::blob_id(SVG))
+            .await
+            .expect("read the blob"),
+        Some(SVG.to_vec())
+    );
+}
+
+/// A store that keeps no blobs cannot back a file reference: the split is refused, and the state
+/// is written alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_without_blobs_clears_the_split() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let recording = Arc::new(common::recording::RecordingStore::new(inner.clone()).without_blobs());
+    let store: DynStore = recording.clone();
+    let agent = TranscriptAgent::new(&uniq("no-blob-store"), 1);
+    let file =
+        Artifact::file("chart", "image/svg+xml", "chart.svg", SVG.to_vec()).expect("a small file");
+    let state = json!({
+        "v": 1,
+        "agent": {"messages": ["start"], "turns": 0},
+        "inbox": [], "seq": 0, "attempt": 0, "rev": 0,
+        "output": null, "error": null,
+        "artifacts": [serde_json::to_value(&file).expect("an artifact is JSON")],
+    });
+    let run = store
+        .create_run(NewRun::new(&agent.name, state))
+        .await
+        .expect("create");
+    let rt = transcript_runtime(&store, &agent);
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run.id).await;
+    worker.stop().await;
+
+    assert!(
+        recording
+            .commits()
+            .iter()
+            .all(|update| update.head.is_none() && update.body.is_none()),
+        "a store that keeps no blobs never gets a head naming a file"
+    );
+    assert_eq!(
+        inner
+            .get_blob(&adam_runtime::blob_id(SVG))
+            .await
+            .expect("read the blob"),
+        None
+    );
+}

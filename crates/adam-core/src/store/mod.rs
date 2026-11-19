@@ -912,6 +912,17 @@ pub trait Store: Send + Sync + 'static {
         false
     }
 
+    /// Whether the store already holds the bytes of `id` (see [`put_blob`](Self::put_blob)).
+    ///
+    /// The default is `false` ("put it"), so a store that does not implement the check behaves as
+    /// before. A split checks this before it sends a file's bytes again: a file an earlier commit
+    /// uploaded is not re-sent, and a pre-E artifact that was never stored is. One indexed
+    /// existence check; an error is a backend error like any other.
+    async fn blob_stored(&self, id: &BlobId) -> StoreResult<bool> {
+        let _ = id;
+        Ok(false)
+    }
+
     /// Store `bytes` under `id`, their content address ([`BlobId`]).
     ///
     /// Idempotent: a second put of an id writes nothing, and the bytes behind an id never change,

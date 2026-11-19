@@ -56,6 +56,8 @@ pub enum Method {
     CommitRun,
     /// [`Store::body_list`].
     BodyList,
+    /// [`Store::gc_body`].
+    GcBody,
     /// [`Store::open_run_for_conversation`].
     OpenRunForConversation,
     /// [`Store::journal_get`].
@@ -88,6 +90,8 @@ pub enum Method {
     PushClaimDue,
     /// [`Store::push_commit`].
     PushCommit,
+    /// [`Store::blob_stored`].
+    BlobStored,
     /// [`Store::put_blob`].
     PutBlob,
     /// [`Store::get_blob`].
@@ -340,13 +344,36 @@ impl Store for FaultyStore {
         self.inner.keeps_bodies()
     }
 
-    async fn body_list(&self, run: RunId, commit: Uuid) -> StoreResult<Vec<adam_core::BodyRow>> {
+    async fn body_list(
+        &self,
+        run: RunId,
+        generation: Uuid,
+    ) -> StoreResult<Vec<adam_core::BodyRow>> {
         self.run(
             Method::BodyList,
             Some(run),
-            self.inner.body_list(run, commit),
+            self.inner.body_list(run, generation),
         )
         .await
+    }
+
+    async fn gc_body(
+        &self,
+        run: RunId,
+        keep_generation: Uuid,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<u64> {
+        self.run(
+            Method::GcBody,
+            Some(run),
+            self.inner.gc_body(run, keep_generation, before),
+        )
+        .await
+    }
+
+    async fn blob_stored(&self, id: &BlobId) -> StoreResult<bool> {
+        self.run(Method::BlobStored, None, self.inner.blob_stored(id))
+            .await
     }
 
     async fn open_run_for_conversation(
@@ -540,6 +567,44 @@ mod tests {
 
     fn faulty() -> Arc<FaultyStore> {
         Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())))
+    }
+
+    /// The wrapper must not swallow `gc_body` or `blob_stored`: a wrapped store that answers the
+    /// trait defaults would collect nothing and re-put every blob.
+    #[tokio::test]
+    async fn the_wrapper_forwards_gc_body_and_blob_stored() {
+        let store = faulty();
+        let run = create(&store).await.unwrap();
+        let generation = Uuid::new_v4();
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1})).body(
+                    adam_core::BodyWrite {
+                        generation: Some(generation),
+                        rows: vec![adam_core::BodyRow {
+                            idx: 0,
+                            message: json!("one"),
+                        }],
+                        writer: Uuid::new_v4(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let cutoff = adam_core::store::now() + chrono::Duration::hours(1);
+        assert_eq!(
+            store.gc_body(run.id, Uuid::new_v4(), cutoff).await.unwrap(),
+            1,
+            "the wrapper reaches the inner store's GC"
+        );
+        assert_eq!(store.calls(Method::GcBody), 1);
+        let id = BlobId::from_hex(&"a".repeat(64)).unwrap();
+        assert!(!store.blob_stored(&id).await.unwrap());
+        store.put_blob(&id, b"x").await.unwrap();
+        assert!(store.blob_stored(&id).await.unwrap());
+        assert_eq!(store.calls(Method::BlobStored), 2);
     }
 
     async fn create(store: &FaultyStore) -> StoreResult<RunRecord> {

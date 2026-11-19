@@ -185,6 +185,19 @@ impl Store for MemoryStore {
                 rows,
                 writer: _,
             } = body;
+            // The rows are a transcript: index `i` is the message at `i`. A wrong index would write
+            // the wrong offset while the head's `len` still matched.
+            for (position, row) in rows.iter().enumerate() {
+                let position = u32::try_from(position).map_err(|_| {
+                    StoreError::InvalidInput("a transcript is longer than u32".into())
+                })?;
+                if row.idx != position {
+                    return Err(StoreError::InvalidInput(format!(
+                        "body row {position} has index {}",
+                        row.idx
+                    )));
+                }
+            }
             let target = generation
                 .or(current_generation.map(|(generation, _)| generation))
                 .unwrap_or_else(Uuid::new_v4);
@@ -629,6 +642,10 @@ impl Store for MemoryStore {
         true
     }
 
+    async fn blob_stored(&self, id: &BlobId) -> StoreResult<bool> {
+        Ok(self.inner.lock().await.blobs.contains_key(id))
+    }
+
     async fn put_blob(&self, id: &BlobId, bytes: &[u8]) -> StoreResult<()> {
         let mut inner = self.inner.lock().await;
         // Idempotent, and the bytes behind an id never change: the first put wins.
@@ -785,12 +802,21 @@ mod tests {
             .create_run(NewRun::new("a", json!({"v": 1, "turn": 0})))
             .await
             .expect("create");
-        let head = json!({"v": 5, "agent": {"turn": 1}, "body": {"commit": Uuid::nil(), "len": 0}});
+        let head = json!({"v": 5, "agent": {"turn": 1}, "body": {"generation": null, "len": 1}});
         store
             .commit_run(
                 run.id,
                 1,
-                RunUpdate::new(RunStatus::Runnable, json!({"v": 1, "turn": 1})).head(head.clone()),
+                RunUpdate::new(RunStatus::Runnable, json!({"v": 1, "turn": 1}))
+                    .head(head.clone())
+                    .body(BodyWrite {
+                        generation: None,
+                        rows: vec![BodyRow {
+                            idx: 0,
+                            message: json!("one"),
+                        }],
+                        writer: Uuid::new_v4(),
+                    }),
             )
             .await
             .expect("commit");
@@ -799,8 +825,13 @@ mod tests {
             .await
             .expect("load")
             .expect("the run");
-        assert_eq!(loaded.state, head, "the head is served at its own version");
         assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.state["agent"], head["agent"]);
+        assert_eq!(loaded.state["body"]["len"], 1);
+        assert!(
+            loaded.state["body"]["generation"].as_str().is_some(),
+            "the store resolved and patched the generation"
+        );
 
         // No head on this commit: the stored one is now stale.
         store

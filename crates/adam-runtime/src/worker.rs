@@ -1,7 +1,7 @@
 //! The worker loop: claim due runs, advance them one transition, commit with
 //! CAS, renew leases while stepping, release.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -487,9 +487,9 @@ struct Next {
     generation: Option<Uuid>,
     /// The digests the shadow's upload pass stored (the union the commit references).
     shadow_blobs: Vec<BlobId>,
-    /// The digest and size of every file artifact in the head's upload pass, so `Head::of` does not
-    /// re-hash the bytes.
-    shadow_sizes: HashMap<BlobId, u64>,
+    /// The digest and size of every file artifact in the head's upload pass, in artifact order, so
+    /// `Head::of` does not re-hash the bytes.
+    shadow_files: Vec<(BlobId, u64)>,
     /// The deadline and what is left of the time limit to store (set once, when the run is made, or
     /// restored from what was left after a wait for a person: never recomputed from the commit).
     deadline: Option<DateTime<Utc>>,
@@ -652,18 +652,22 @@ async fn transition(
         None => None,
         Some((_, rows)) => {
             let previous = rec.state.get("agent").cloned();
-            let previous_rows = previous.and_then(|state| match agent.transcript(state) {
-                Ok(rows) => rows,
-                Err(e) => {
-                    tracing::warn!(
-                        run = %run,
-                        error = %report(&e),
-                        "the previous state's transcript does not decode; starting a new generation"
-                    );
-                    None
-                }
-            });
-            let compaction = env.rev == 0
+            let (previous_rows, unreadable) = match previous {
+                Some(state) => match agent.transcript(state) {
+                    Ok(rows) => (rows, false),
+                    Err(e) => {
+                        tracing::warn!(
+                            run = %run,
+                            error = %report(&e),
+                            "the previous state's transcript does not decode; starting a new generation"
+                        );
+                        (None, true)
+                    }
+                },
+                None => (None, false),
+            };
+            let compaction = unreadable
+                || env.rev == 0
                 || previous_rows
                     .as_ref()
                     .is_some_and(|previous| !is_prefix(previous, rows));
@@ -678,7 +682,7 @@ async fn transition(
         let artifacts = merged_artifacts(&env, &next);
         let uploaded = crate::blob::upload_all(&inner.store, &artifacts).await;
         if uploaded.all_stored {
-            next.shadow_sizes = uploaded.sizes;
+            next.shadow_files = uploaded.files;
             next.shadow_blobs = uploaded.ids;
         } else {
             tracing::error!(
@@ -790,7 +794,7 @@ fn plan(
         split,
         generation: None,
         shadow_blobs: Vec::new(),
-        shadow_sizes: HashMap::new(),
+        shadow_files: Vec::new(),
         deadline: base.deadline,
         remaining_secs: base.remaining_secs,
     };
@@ -811,7 +815,7 @@ fn plan(
         split: None,
         generation: None,
         shadow_blobs: Vec::new(),
-        shadow_sizes: HashMap::new(),
+        shadow_files: Vec::new(),
         deadline: base.deadline,
         remaining_secs: base.remaining_secs,
     };
@@ -859,7 +863,7 @@ fn plan(
                 split: None,
                 generation: None,
                 shadow_blobs: Vec::new(),
-                shadow_sizes: HashMap::new(),
+                shadow_files: Vec::new(),
                 deadline: base.deadline,
                 remaining_secs: base.remaining_secs,
             }
@@ -1035,7 +1039,7 @@ fn build_update(
     if let Some((head, rows)) = &next.split {
         let len = u32::try_from(rows.len())
             .map_err(|_| StoreError::InvalidInput("a transcript is longer than u32".into()))?;
-        let head = Head::of(&env, head.clone(), len, &next.shadow_sizes);
+        let head = Head::of(&env, head.clone(), len, &next.shadow_files);
         update.head = Some(head.encode()?);
         let rows = rows
             .iter()
@@ -1154,21 +1158,19 @@ async fn commit(
             body_writer,
         )?;
         // The bytes of every file artifact this commit's state names go to the store before the
-        // commit that names them (ADR 0055). Fail-open in the expand release: the state still
-        // carries them, so a failed upload costs a log line, not the transition.
-        //
-        // Only this transition's new artifacts, plus — before any worker commit (`rev == 0`) — the
-        // ones the run was created with: a run created directly with a file artifact in its state
-        // (a pre-E run) has no reference yet, and this is the commit that names it. The runtime's
-        // start paths do not copy a prior run's artifacts, so a seeded run has none here.
-        // Afterwards every file is uploaded once, not once per commit.
-        let mut blobs = Vec::new();
-        if cur_env.rev == 0 {
-            blobs = crate::blob::upload_files(&inner.store, &cur_env.artifacts).await;
-        }
-        blobs.extend(crate::blob::upload_files(&inner.store, &next.artifacts).await);
-        // The shadow's own upload pass (all file artifacts of the state it names), already checked.
-        blobs.extend(next.shadow_blobs.iter().cloned());
+        // commit that names them (ADR 0055). A split's own pass (`upload_all`, in `transition`)
+        // already stored what was missing and refused the head if one was not; a non-split commit
+        // keeps the fail-open per-artifact upload, which skips a digest the store already holds.
+        let mut blobs = if next.split.is_some() {
+            next.shadow_blobs.clone()
+        } else {
+            let mut blobs = Vec::new();
+            if cur_env.rev == 0 {
+                blobs = crate::blob::upload_files(&inner.store, &cur_env.artifacts).await;
+            }
+            blobs.extend(crate::blob::upload_files(&inner.store, &next.artifacts).await);
+            blobs
+        };
         blobs.sort();
         blobs.dedup();
         update.blobs = blobs;

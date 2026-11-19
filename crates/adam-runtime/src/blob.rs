@@ -7,7 +7,7 @@
 //! release**: a failed upload is logged and the commit goes on, because the run's state still
 //! carries the bytes. The contract release gates a run's head on the upload instead.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use adam_core::{BlobId, DynStore};
 use sha2::{Digest as _, Sha256};
@@ -26,8 +26,9 @@ pub fn blob_id(bytes: &[u8]) -> BlobId {
 pub(crate) struct Uploaded {
     /// The digests, without duplicates.
     pub ids: Vec<BlobId>,
-    /// Each digest and its byte length, for a head that names it by reference.
-    pub sizes: HashMap<BlobId, u64>,
+    /// Each file artifact's digest and byte length, **in artifact order** (a file that appears
+    /// twice appears twice), so a head can zip them without hashing the bytes again.
+    pub files: Vec<(BlobId, u64)>,
     /// Whether every file's bytes are stored. A head may only name bytes that are there.
     pub all_stored: bool,
 }
@@ -42,7 +43,7 @@ pub(crate) struct Uploaded {
 pub(crate) async fn upload_all(store: &DynStore, artifacts: &[Artifact]) -> Uploaded {
     let mut uploaded = Uploaded {
         ids: Vec::new(),
-        sizes: HashMap::new(),
+        files: Vec::new(),
         all_stored: true,
     };
     let files: Vec<&ArtifactFile> = artifacts
@@ -59,11 +60,16 @@ pub(crate) async fn upload_all(store: &DynStore, artifacts: &[Artifact]) -> Uplo
     let mut seen = HashSet::new();
     for file in files {
         let id = blob_id(&file.bytes);
-        uploaded.sizes.insert(
+        uploaded.files.push((
             id.clone(),
             u64::try_from(file.bytes.len()).unwrap_or(u64::MAX),
-        );
+        ));
         if !seen.insert(id.clone()) {
+            continue;
+        }
+        // A file an earlier commit uploaded is not sent again: one indexed existence check.
+        if store.blob_stored(&id).await.unwrap_or(false) {
+            uploaded.ids.push(id);
             continue;
         }
         if let Err(error) = store.put_blob(&id, &file.bytes).await {
@@ -100,7 +106,10 @@ pub(crate) async fn upload_files(store: &DynStore, artifacts: &[Artifact]) -> Ve
         if !seen.insert(id.clone()) {
             continue;
         }
-        if let Err(error) = store.put_blob(&id, &file.bytes).await {
+        // A file an earlier commit uploaded is not sent again.
+        if !store.blob_stored(&id).await.unwrap_or(false)
+            && let Err(error) = store.put_blob(&id, &file.bytes).await
+        {
             tracing::warn!(
                 blob = %id,
                 error = %adam_error::report(&error),

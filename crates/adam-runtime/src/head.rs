@@ -6,10 +6,9 @@
 //! delivery or a cancel never converts a run's format by accident.
 //!
 //! Layout: [`Head`] is the v4 envelope with `v: 5`, `agent` reduced to the agent's head, file
-//! artifacts by reference (`digest` and `size`, never the bytes), and a `body` naming the set:
-//! `{"commit": "<uuid>", "len": <rows>}`. The body rows are `(run, commit, idx)` in the store.
-
-use std::collections::HashMap;
+//! artifacts by reference (`digest` and `size`, never the bytes), and a `body` naming the
+//! generation: `{"generation": "<uuid>", "len": <rows>}`. The body rows are
+//! `(run, generation, idx)` in the store.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -121,7 +120,7 @@ pub(crate) struct Head {
 impl Head {
     /// The head of `env` whose agent state is `agent` (the split's head) and whose transcript has
     /// `len` rows. The generation is left for the store to resolve.
-    pub(crate) fn of(env: &Envelope, agent: Value, len: u32, sizes: &HashMap<BlobId, u64>) -> Self {
+    pub(crate) fn of(env: &Envelope, agent: Value, len: u32, files: &[(BlobId, u64)]) -> Self {
         Self {
             v: VERSION,
             agent,
@@ -131,11 +130,13 @@ impl Head {
             rev: env.rev,
             output: env.output.clone(),
             error: env.error.clone(),
-            artifacts: env
-                .artifacts
-                .iter()
-                .map(|artifact| head_artifact(artifact, sizes))
-                .collect(),
+            artifacts: {
+                let mut files = files.iter();
+                env.artifacts
+                    .iter()
+                    .map(|artifact| head_artifact(artifact, &mut files))
+                    .collect()
+            },
             deadline: env.deadline,
             limit_secs: env.limit_secs,
             remaining_secs: env.remaining_secs,
@@ -177,20 +178,23 @@ impl Head {
 
 /// An artifact as a head keeps it: the same shape, with a file's bytes replaced by its address.
 ///
-/// `sizes` is what the commit's upload pass computed (digest and length); a file the pass did not
-/// see (a store that keeps no blobs) is hashed here.
-fn head_artifact(artifact: &Artifact, sizes: &HashMap<BlobId, u64>) -> HeadArtifact {
+/// `files` is the commit's upload pass, in artifact order; it is advanced once per file artifact.
+/// A file the pass did not see (a head built without an upload, as in the unit tests) is hashed
+/// here.
+fn head_artifact(
+    artifact: &Artifact,
+    files: &mut std::slice::Iter<'_, (BlobId, u64)>,
+) -> HeadArtifact {
     HeadArtifact {
         id: artifact.id.clone(),
         name: artifact.name.clone(),
         mime_type: artifact.mime_type.clone(),
         data: artifact.data.clone(),
         file: artifact.file.as_ref().map(|file| {
-            let digest = blob_id(&file.bytes);
-            let size = sizes
-                .get(&digest)
-                .copied()
-                .unwrap_or_else(|| u64::try_from(file.bytes.len()).unwrap_or(u64::MAX));
+            let (digest, size) = files.next().cloned().unwrap_or_else(|| {
+                let digest = blob_id(&file.bytes);
+                (digest, u64::try_from(file.bytes.len()).unwrap_or(u64::MAX))
+            });
             HeadFile {
                 filename: file.filename.clone(),
                 digest,
@@ -292,7 +296,7 @@ mod tests {
         env.artifacts
             .push(Artifact::new("plan", None, json!({"steps": [1]})));
         env.hb = true;
-        let head = Head::of(&env, json!({"turns": 3}), 2, &HashMap::new());
+        let head = Head::of(&env, json!({"turns": 3}), 2, &[]);
         assert_eq!(head.v, 5);
         assert_eq!(head.agent, json!({"turns": 3}));
         assert_eq!((head.seq, head.attempt, head.rev), (7, 1, 4));
@@ -324,7 +328,7 @@ mod tests {
 
     #[test]
     fn a_head_is_v5_and_a_v4_envelope_is_not_mistaken_for_one() {
-        let head = Head::of(&Envelope::new(json!({})), json!({}), 0, &HashMap::new());
+        let head = Head::of(&Envelope::new(json!({})), json!({}), 0, &[]);
         let encoded = head.encode().expect("encodes");
         assert_eq!(encoded["v"], 5);
         // `Stored` tells them apart by `v`, and re-encodes the variant it read.
@@ -353,9 +357,7 @@ mod tests {
             Some("application/json".into()),
             json!({"steps": [1]}),
         ));
-        let encoded = Head::of(&env, json!({}), 0, &HashMap::new())
-            .encode()
-            .expect("encodes");
+        let encoded = Head::of(&env, json!({}), 0, &[]).encode().expect("encodes");
         let artifacts = encoded["artifacts"].as_array().expect("artifacts");
         // A file artifact: the v4 keys, with `file` naming the digest and size, never the bytes.
         let mut keys: Vec<&str> = artifacts[0]
@@ -397,7 +399,7 @@ mod tests {
         assert_eq!(full.error(), Some("boom"));
         assert_eq!(full.inbox_mut().len(), 1);
 
-        let mut head = Head::of(&Envelope::new(json!({})), json!({}), 0, &HashMap::new());
+        let mut head = Head::of(&Envelope::new(json!({})), json!({}), 0, &[]);
         head.error = Some("later".into());
         let mut stored = Stored::Head(head);
         stored

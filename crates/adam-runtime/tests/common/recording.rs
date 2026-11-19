@@ -35,6 +35,8 @@ pub struct RecordingStore {
     attempts: Mutex<Vec<RunUpdate>>,
     /// When set, the next `commit_run` answers `Conflict` without writing (a forced CAS retry).
     conflict_next: AtomicBool,
+    /// Whether the wrapper reports that it keeps blobs (the inner store still does).
+    keeps_blobs: bool,
 }
 
 impl RecordingStore {
@@ -44,7 +46,14 @@ impl RecordingStore {
             written: Mutex::new(Vec::new()),
             attempts: Mutex::new(Vec::new()),
             conflict_next: AtomicBool::new(false),
+            keeps_blobs: true,
         }
+    }
+
+    /// Report that this store keeps no blobs, as a store without the blob methods would.
+    pub fn without_blobs(mut self) -> Self {
+        self.keeps_blobs = false;
+        self
     }
 
     /// Everything written since the last [`reset`](Self::reset), in order.
@@ -271,7 +280,7 @@ impl Store for RecordingStore {
     }
 
     fn keeps_blobs(&self) -> bool {
-        self.inner.keeps_blobs()
+        self.keeps_blobs
     }
 
     async fn put_blob(&self, id: &BlobId, bytes: &[u8]) -> StoreResult<()> {

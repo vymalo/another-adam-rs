@@ -144,6 +144,8 @@ async fn a_document_without_an_owner_field_is_unowned() {
 
 adam_store_testkit::transcript_measurement!(make_store);
 
+adam_store_testkit::headless_measurement!(make_store);
+
 /// A body generation is `(run, generation, idx)`: its rows go in, the head names the generation,
 /// and `load_head` serves it at the version it was written at.
 ///
@@ -163,7 +165,7 @@ async fn a_head_is_stored_with_its_version_and_a_headless_commit_leaves_it_alone
     let db_name = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
     let prefix = format!(
         "s2a_head_{}_",
-        &uuid::Uuid::now_v7().simple().to_string()[..8]
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
     );
     let store = MongoStore::connect(&uri, &db_name)
         .await
@@ -313,7 +315,7 @@ async fn a_partial_body_insert_aborts_before_the_cas() {
     let db_name = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
     let prefix = format!(
         "s2a_partial_{}_",
-        &uuid::Uuid::now_v7().simple().to_string()[..8]
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
     );
     let store = MongoStore::connect(&uri, &db_name)
         .await
@@ -432,7 +434,7 @@ async fn the_body_gc_respects_an_explicit_cutoff() {
     let db_name = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
     let prefix = format!(
         "s2a_gc_{}_",
-        &uuid::Uuid::now_v7().simple().to_string()[..8]
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
     );
     let store = MongoStore::connect(&uri, &db_name)
         .await
@@ -547,7 +549,7 @@ async fn a_rejected_insert_command_aborts_before_the_cas() {
     let db_name = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
     let prefix = format!(
         "s2a_wc_{}_",
-        &uuid::Uuid::now_v7().simple().to_string()[..8]
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
     );
     let store = MongoStore::connect(&uri, &db_name)
         .await
@@ -674,7 +676,7 @@ async fn an_append_sends_only_the_delta() {
     let db_name = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
     let prefix = format!(
         "s2a_delta_{}_",
-        &uuid::Uuid::now_v7().simple().to_string()[..8]
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
     );
     let seen = Arc::new(Mutex::new(Vec::<(String, usize)>::new()));
     let sink = Arc::clone(&seen);
