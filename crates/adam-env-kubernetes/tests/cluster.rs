@@ -457,13 +457,25 @@ async fn a_repository_image_moves_the_run_and_a_build_is_refused(c: &Cluster) {
         .ok()
         .filter(|image| !image.trim().is_empty())
     else {
+        // The kind job sets it; under ADAM_TEST_REQUIRE_KUBERNETES a typo in the variable must not
+        // turn the job green by skipping the scenario.
+        assert!(
+            std::env::var("ADAM_TEST_REQUIRE_KUBERNETES").as_deref() != Ok("1"),
+            "ADAM_TEST_KUBE_REPOSITORY_IMAGE is not set, and ADAM_TEST_REQUIRE_KUBERNETES=1 says the cluster test must run"
+        );
         eprintln!(
             "skipped the repository image scenario: ADAM_TEST_KUBE_REPOSITORY_IMAGE is not set"
         );
         return;
     };
-    let prefix =
-        std::env::var("ADAM_TEST_KUBE_REPOSITORY_PREFIX").unwrap_or_else(|_| image.clone());
+    // The prefix defaults to the image's repository and tag separator (`repo:`), which is what the
+    // chart's policy admits: the full image is not a prefix (it does not end on a path boundary).
+    let prefix = std::env::var("ADAM_TEST_KUBE_REPOSITORY_PREFIX").unwrap_or_else(|_| {
+        image
+            .rsplit_once(':')
+            .map(|(repository, _)| format!("{repository}:"))
+            .unwrap_or_else(|| format!("{image}:"))
+    });
     eprintln!("--- repository image");
     let run = c.run_id("repo-image");
     let ws = c.workspaces().run(&run).unwrap();
