@@ -296,17 +296,35 @@ change's added lines is in your statement. An `Interface` section is exempt: it 
   clone into `tests/test_patch.patch`, the gold without them in `solution/`) and builds its image: the workspace image
   by digest, the repository at `/app` at the base with history up to the base only, the toolchain pins you wrote.
 * `bench tasks check` (needs the host's container runtime; it grades on the networks the stack names, `adam-bench_verifier` (internal) and, for a task that asks for the internet, `adam-bench_egress`: it makes the ones that are missing the way `bench doctor --start` does and removes what it made, uses and keeps those of a running stack, and refuses a verifier network that is not internal or an owner-named one that does not exist) runs, per task, the gold patch three times and the empty patch three
-  times **from the clone path the agents will use**, not from `/app`: the base is cloned there, the top-level ignored
-  entries are linked to `/app`'s, and `test.sh` runs with `/app` rewritten to that path. A task is kept only if the gold
+  times **from the clone path the agents will use**, not from `/app`: the image's whole working tree (`.git`, tracked,
+  untracked and ignored files) is copied there with `cp -a`, and `test.sh` runs with `/app` rewritten to that path, so a
+  task whose tests only work at `/app` is dropped. A copy, not links to `/app`'s ignored entries: through a linked
+  `node_modules` Node resolves a module's own requires from `/app` (its real path), `npm install` removes the link and
+  installs afresh, and what the test script writes (`config.json`) lands in `/app`, so the clone path graded another tree
+  than `/app` does (it dropped NodeBB tasks whose gold passes at `/app`; `bench/test/clonepath.test.mjs` runs the script on a
+  Node fixture). The copy costs the time of copying the image's tree, once per clone-path run. A task is kept only if the gold
   passes all three and the empty patch fails all three, and is dropped with its reason otherwise (`gold-fails`,
   `gold-flaky`, `gold-does-not-apply`, `empty-passes`, `empty-flaky`, `no-gold-patch`, `infra`). It also records whether
   the base has a `.devcontainer`.
 * After the clone-path runs the check runs the gold **once more through the real grading path** (working directory `/app`,
   the original `test.sh`) and keeps the task only if that passes too (`gold-fails-at-app`).
+* **The public check does not walk every upstream task.** `select` needs 80 kept tasks, at most 9 per repository, so `check`
+  (public) walks the tasks in the order `select` uses (`selectionOrder` in `lib/select.mjs`: a seeded shuffle in each
+  repository, then rounds that take one task of every repository; `--seed`, default the configuration's) and stops as soon
+  as 80 are kept (`--total N` changes the target). A repository that already has 9 kept is skipped for the rest of the walk.
+  A walk that ends before the target says `shortfall: N of 80 kept`. The image of a task dropped by its verdict is removed
+  at once (`docker image rm`, by digest and by tag), unless a task kept so far, the workspace image or the pinned coder
+  uses that digest; a removal that fails is printed (`image not removed`) and the verdict stands. The kept tasks' images
+  stay: a run needs them. A re-run continues from `check.json`: a verdict recorded for the task as it is now (same checksum;
+  an `infra` result is not a verdict) is not run again, and the walk goes on in the same order. `--all` walks every task
+  (an audit; it still resumes and still removes the images of dropped tasks), `--only ID,ID` runs just those again.
+
 * `bench tasks select` keeps the checked tasks without a `.devcontainer`, whose check still fits the task (a result carries
-  the task's checksum and image digest and is ignored when either has changed), draws them stratified by repository with the
-  seeded generator of `lib/stats.mjs` (public: 80, at most 9 per repository; own: 20, at most 6 per repository and at
-  most 6 from `selfRepo`) and writes the lock files. The same seed gives the same list.
+  the task's checksum and image digest and is ignored when either has changed). For the public source
+  (public: 80, at most 9 per repository) it takes the first such tasks in the selection order above, which is exactly what
+  a full check would give from the same verdicts, so the partial `check.json` of a stopped walk selects the same set. For
+  the own source (own: 20, at most 6 per repository, and at most 6 from `selfRepo`) it draws stratified by repository with
+  the seeded generator of `lib/stats.mjs`. It writes the lock files. The same seed gives the same list.
 
 ## Grading
 
@@ -341,6 +359,12 @@ patch that touches the grading's own machinery as **suspect**, for a person to r
 * **The verifier's network is an allow-list:** `none`, `default` (the internal `verifier` network, shared by the
   gradings), `public` (the `egress` network, alone in its window), or a name in `tasks.verifierNetworks` of the
   local configuration. `host` and anything else is refused, when the task is read and again when the container starts.
+  `public` is what upstream's `network_mode = "public"` is: a route to the internet, as the agent's `no-network` is none.
+* **A `public` verifier is probed first.** Before the patch is applied, the grading container itself opens a TCP
+  connection to each of `registry.npmjs.org`, `pypi.org` and `proxy.golang.org` on 443 (`EGRESS_PROBE`, bash's
+  `/dev/tcp`, 20 s each). One that fails ends the attempt with exit 98, an infrastructure error: a network with no route
+  out makes the grade `invalid` and a check's verdict `infra` (not recorded), never a fail or `gold-fails`. No proxy is
+  given to a verifier, so a host whose containers reach the internet only through a proxy cannot grade `public` tasks.
 * **Three attempts, two of three pass; a split is `flaky`.** An attempt that ends in an infrastructure error (exit 125,
   126, 127, 98, or a timeout of the container) is tried again, at most twice; if it is still one the grade is **`invalid`**:
   left out of the rates and listed in the report, never a fail. A patch that does not apply is a fail.
@@ -407,7 +431,7 @@ coder's A2A port on the loopback.
 | `slot-N` | `git-server`, `meter-N`, `mock-github`, `postgres`, `pub-coder-N`; the coder of the slot joins it at run time (`adam-bench_slot-N`) |
 | `gitpub-net` | `git-server`, `pub-git`, `pusher-1`, `pusher-2` |
 | `verifier` | no service: the network a grading's host container joins (`adam-bench_verifier`), so gradings share one internal network and have no route out. The harness makes it, because Compose makes no network that has no service, and refuses one that exists without the internal flag |
-| `egress` | the five relays and nothing else |
+| `egress` | the five relays and nothing else; a grading whose verifier asks for `public` joins it at run time. A plain bridge network (not internal): a container on it has the host's route out, any host and port, names resolved by Docker's resolver. No relay or allow-list stands in the way; "alone in its window" is about time, not reach |
 
 So no coder, sandbox, git server or database has a route to the internet, and slot 1 and slot 2 share no network (the
 git server, postgres and the mock answer on both; they do not connect the slots). A grading whose verifier asks for
@@ -901,6 +925,14 @@ Tests that need Docker skip unless `BENCH_TEST_DOCKER=1` and fail under `BENCH_T
   `<upstreamDir>/SHA256SUMS`), the exact form of `SHA256SUMS`, and the form of `solution/` (the check needs a `*.patch`
   there and drops a task without one as `no-gold-patch`).
 * That the miner's file classification (by path) matches your repositories' layouts.
+* **The copy clone path and the egress probe on real images.** *Verified 2026-11-19* in `scaleapi/SWE-bench_Pro-os` (NodeBB
+  `04998908`): `run_script.sh` runs `cp install/package.json .`, `npm install --production=false`, `npm install lodash underscore
+  async`, writes `config.json` in its working directory and runs `npx mocha`, and NodeBB's `.gitignore` ignores `node_modules/`,
+  `config.json`, `/package.json` and `package-lock.json`. *Verified 2026-11-19* with npm 10.9.9 here: `npm install` in a directory
+  whose `node_modules` is a link removes the link ("Removing non-directory") and installs afresh into a real directory.
+  *Unverified:* that the copy makes the two NodeBB tasks (`04998908`, `05f22361`) keep on the owner's host, which NodeBB module
+  made the six `test/user/emails.js` tests fail through the links, the time a copy adds per task image, and the probe in
+  every task image (it needs `bash` with `/dev/tcp`; a missing one is `infra`, never a fail).
 * **Verified 2026-11-17 for OpenCode 2.3.0:** the table "OpenCode V2" above. Of the plan's facts only those about 1.19.6 were
   verified before; those about 1.19.x are not carried over. **Unverified at 2.3.0:** the effect of `steps`, `small_model`,
   `autoupdate` and `share`; whether a subagent's background run ends a `run` that the time limit does not (it was not run);
