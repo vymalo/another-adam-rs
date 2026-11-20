@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
@@ -162,7 +162,7 @@ pub struct RunView {
     pub status: RunStatus,
     /// Timer: when a parked run wakes, or a runnable run (retry backoff)
     /// becomes due.
-    pub wake_at: Option<DateTime<Utc>>,
+    pub wake_at: Option<Timestamp>,
     /// Parked with no timer: only an inbound message (or cancel) resumes it.
     /// This is the "input required" state.
     pub waiting: bool,
@@ -194,9 +194,9 @@ pub struct RunView {
     /// Store version of the record (bumps on every commit).
     pub version: u64,
     /// When the run was created.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Last commit time.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl RunView {
@@ -740,7 +740,7 @@ impl Runtime {
     ///
     /// A caller that builds a view from a record it holds ([`view_from_record`]) reads the run's
     /// lease against this, so the `claimed` it computes agrees with [`view`](Self::view)'s.
-    pub fn now(&self) -> DateTime<Utc> {
+    pub fn now(&self) -> Timestamp {
         self.inner.clock.now()
     }
 

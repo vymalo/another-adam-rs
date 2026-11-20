@@ -847,8 +847,8 @@ mod tests {
             artifacts,
             state: json!({}),
             version,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: adam_core::store::now(),
+            updated_at: adam_core::store::now(),
         }
     }
 

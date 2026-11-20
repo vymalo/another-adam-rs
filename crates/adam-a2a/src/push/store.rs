@@ -11,9 +11,9 @@
 use std::time::Duration;
 
 use a2a::TaskPushNotificationConfig;
+use adam_core::time::Timestamp;
 use adam_error::{BoxError, Classify, ErrorClass};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 
 use super::cursor::PushCursor;
 
@@ -65,7 +65,7 @@ pub struct PushRecord {
     /// Why the last attempt failed: short, with no URL and no credential.
     pub last_error: Option<String>,
     /// When the config is due.
-    pub next_attempt_at: DateTime<Utc>,
+    pub next_attempt_at: Timestamp,
     /// The version to pass back to [`PushStore::commit`].
     pub version: u64,
 }
@@ -82,7 +82,7 @@ pub struct PushProgress {
     /// Why the last attempt failed.
     pub last_error: Option<String>,
     /// When the config is due next.
-    pub next_attempt_at: DateTime<Utc>,
+    pub next_attempt_at: Timestamp,
 }
 
 /// Why a [`PushStore`] call failed.
@@ -145,7 +145,7 @@ pub trait PushStore: Send + Sync + 'static {
     async fn claim_due(
         &self,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> Result<Vec<PushRecord>, PushStoreError>;
@@ -172,8 +172,8 @@ mod memory {
     use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
     use std::time::Duration;
 
+    use adam_core::time::Timestamp;
     use async_trait::async_trait;
-    use chrono::{DateTime, Utc};
 
     use super::{NewPushConfig, PushProgress, PushRecord, PushState, PushStore, PushStoreError};
 
@@ -186,7 +186,7 @@ mod memory {
 
     struct Slot {
         record: PushRecord,
-        lease_until: Option<DateTime<Utc>>,
+        lease_until: Option<Timestamp>,
     }
 
     impl std::fmt::Debug for InMemoryPushStore {
@@ -226,7 +226,7 @@ mod memory {
                 state: PushState::Active,
                 attempts: 0,
                 last_error: None,
-                next_attempt_at: Utc::now(),
+                next_attempt_at: adam_core::store::now(),
                 version,
             };
             slots.insert(
@@ -258,11 +258,11 @@ mod memory {
         async fn claim_due(
             &self,
             _worker: &str,
-            now: DateTime<Utc>,
+            now: Timestamp,
             ttl: Duration,
             limit: usize,
         ) -> Result<Vec<PushRecord>, PushStoreError> {
-            let until = now + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX);
+            let until = now + adam_core::time::span_of(ttl);
             let mut slots = self.lock();
             let mut due: Vec<_> = slots
                 .iter()

@@ -58,11 +58,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use adam_a2a_runtime::{CONTEXT_THREAD_TOOLS, integral_numbers};
+use adam_core::time::Timestamp;
 use adam_llm_agent::{Listing, SourceCtx, ToolCtx, ToolError, ToolNote, ToolOutput, ToolSource};
 use adam_mcp::{CallOptions, Endpoint, EndpointError, McpPolicy, RemoteTool};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -110,7 +110,7 @@ const MAX_CACHED_LISTINGS: usize = 16;
 /// One listing and the instant it stops being reused.
 struct CachedListing {
     tools: Arc<Vec<RemoteTool>>,
-    until: DateTime<Utc>,
+    until: Timestamp,
 }
 
 /// What an inbound context can say about the thread's tools, when it says nothing usable.
@@ -142,7 +142,7 @@ impl Unavailable {
 pub(crate) struct Grant {
     pub(crate) url: String,
     pub(crate) token: SecretString,
-    pub(crate) expires_at: DateTime<Utc>,
+    pub(crate) expires_at: Timestamp,
 }
 
 impl std::fmt::Debug for Grant {
@@ -156,7 +156,7 @@ impl std::fmt::Debug for Grant {
 }
 
 /// What the clock says now; replaced in tests.
-pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
 /// Reaches the thread-tools endpoint a run's context announces.
 ///
@@ -203,7 +203,7 @@ impl ThreadToolsClient {
             default_call: policy.call_timeout_value(),
             max_call: policy.thread_tools_max_call_value(),
             policy: policy.connect_timeout(listing),
-            clock: Arc::new(Utc::now),
+            clock: Arc::new(Timestamp::now),
             listings: Arc::default(),
         }
     }
@@ -239,9 +239,9 @@ impl ThreadToolsClient {
         else {
             return Err(Unavailable::Malformed);
         };
-        let expires_at = DateTime::parse_from_rfc3339(expires)
-            .map_err(|_| Unavailable::Malformed)?
-            .with_timezone(&Utc);
+        let expires_at = expires
+            .parse::<Timestamp>()
+            .map_err(|_| Unavailable::Malformed)?;
         if expires_at <= (self.clock)() {
             return Err(Unavailable::Expired);
         }
@@ -288,7 +288,7 @@ impl ThreadToolsClient {
         listings.remove(&listing_key(grant));
     }
 
-    fn cached(&self, key: &(String, String), now: DateTime<Utc>) -> Option<Arc<Vec<RemoteTool>>> {
+    fn cached(&self, key: &(String, String), now: Timestamp) -> Option<Arc<Vec<RemoteTool>>> {
         let mut listings = self.listings.lock().unwrap_or_else(PoisonError::into_inner);
         listings.retain(|_, listing| listing.until > now);
         listings.get(key).map(|listing| Arc::clone(&listing.tools))
@@ -298,10 +298,10 @@ impl ThreadToolsClient {
         &self,
         key: (String, String),
         tools: Arc<Vec<RemoteTool>>,
-        now: DateTime<Utc>,
-        expires_at: DateTime<Utc>,
+        now: Timestamp,
+        expires_at: Timestamp,
     ) {
-        let ttl = chrono::Duration::from_std(LISTING_TTL).unwrap_or_default();
+        let ttl = adam_core::time::span_of(LISTING_TTL);
         let until = (now + ttl).min(expires_at);
         let mut listings = self.listings.lock().unwrap_or_else(PoisonError::into_inner);
         listings.retain(|_, listing| listing.until > now);
@@ -721,9 +721,7 @@ mod tests {
     }
 
     fn at(time: &str) -> Clock {
-        let now = DateTime::parse_from_rfc3339(time)
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = time.parse::<Timestamp>().unwrap();
         Arc::new(move || now)
     }
 
@@ -812,12 +810,8 @@ mod tests {
     }
 
     /// A clock a test moves, and the instant it reads.
-    fn moving_clock(time: &str) -> (Clock, Arc<Mutex<DateTime<Utc>>>) {
-        let now = Arc::new(Mutex::new(
-            DateTime::parse_from_rfc3339(time)
-                .unwrap()
-                .with_timezone(&Utc),
-        ));
+    fn moving_clock(time: &str) -> (Clock, Arc<Mutex<Timestamp>>) {
+        let now = Arc::new(Mutex::new(time.parse::<Timestamp>().unwrap()));
         let clock: Clock = {
             let now = Arc::clone(&now);
             Arc::new(move || *now.lock().unwrap_or_else(PoisonError::into_inner))
@@ -825,10 +819,8 @@ mod tests {
         (clock, now)
     }
 
-    fn set(now: &Arc<Mutex<DateTime<Utc>>>, time: &str) {
-        *now.lock().unwrap_or_else(PoisonError::into_inner) = DateTime::parse_from_rfc3339(time)
-            .unwrap()
-            .with_timezone(&Utc);
+    fn set(now: &Arc<Mutex<Timestamp>>, time: &str) {
+        *now.lock().unwrap_or_else(PoisonError::into_inner) = time.parse::<Timestamp>().unwrap();
     }
 
     #[tokio::test]

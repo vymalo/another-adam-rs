@@ -68,7 +68,9 @@ Every operation is a single-document atomic write, so a standalone `mongod`
 is enough (no multi-document transactions). Integers above `i64::MAX` are
 rejected with `StoreError::InvalidInput`. A NUL in a string or a key is stored
 as U+FFFD (`adam_core::storable`), as in every adapter. Time is truncated to
-milliseconds.
+milliseconds and kept as a BSON date: `Bson::DateTime::from_millis(timestamp.as_millisecond())` on
+the way in, `Timestamp::from_millisecond(..)` on the way out, so the stored dates are the ones the
+adapter wrote before [ADR 0057](../../docs/decisions/0057-time-is-jiff-with-the-bytes-chrono-wrote.md).
 The guarantee table is in the [store adapters reference](../../docs/reference/store-adapters.md#how-each-adapter-keeps-the-contract).
 
 *Unverified:* the "MongoDB 5.0+" floor is the oldest server CI runs against

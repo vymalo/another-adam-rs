@@ -43,7 +43,7 @@ over A2A).
 | `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput`, `MAX_STEP_ID_BYTES`, `MAX_STEP_LABEL_CHARS`, `MAX_STEP_DETAIL_CHARS`, `STEP_INPUT_MAX_BYTES`, `STEP_INPUT_STRING_MAX_CHARS`, `STEP_OUTPUT_MAX_BYTES` | `RunEvent::Step`: a step of the run's work (a tool call, a sub-agent's work, a command) started, moved or ended, and which step it runs under; a tool call's step can carry what the tool was given (`input`) and answered (`output`), cut to the contract's bounds; see *Steps* |
 | `Notifier` (trait), `Signal`, `Delivery`, `LocalNotifier`, `DynNotifier` | cross-process wake-up and cancel; `RuntimeBuilder::notifier(..)`. See *Several processes* |
 | `RetryPolicy`, `MAX_RETRY_AFTER` | exponential backoff for transient errors |
-| `Clock`, `SystemClock`, `ManualClock` | injectable time |
+| `Clock`, `SystemClock`, `ManualClock` | injectable time: `Clock::now` returns `adam_core::time::Timestamp`, the instant the whole framework uses (ADR 0057) |
 
 ```rust
 use adam_runtime::{BroadcastSink, Runtime};

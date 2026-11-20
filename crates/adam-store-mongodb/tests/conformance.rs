@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use adam_core::Store;
 use adam_store_mongodb::MongoStore;
+use jiff::SignedDuration;
 
 async fn make_store() -> Option<adam_core::DynStore> {
     let uri = adam_core::testing::test_env("ADAM_TEST_MONGODB_URI")?;
@@ -98,8 +99,8 @@ async fn a_document_without_an_owner_field_is_unowned() {
     let agent = adam_store_testkit::agent();
     let id = RunId::new();
     let t = now();
-    let date = |at: chrono::DateTime<chrono::Utc>| {
-        Bson::DateTime(mongodb::bson::DateTime::from_millis(at.timestamp_millis()))
+    let date = |at: adam_core::time::Timestamp| {
+        Bson::DateTime(mongodb::bson::DateTime::from_millis(at.as_millisecond()))
     };
     // Exactly the fields version 1 wrote: no `owner`.
     let legacy = doc! {
@@ -128,7 +129,7 @@ async fn a_document_without_an_owner_field_is_unowned() {
 
     let agents = [agent.clone()];
     let ttl = Duration::from_secs(30);
-    let at = t + chrono::Duration::seconds(1);
+    let at = t + jiff::SignedDuration::from_secs(1);
     let first = store
         .claim_due(&agents, "w1", ClaimScope::Pinned, &[], at, ttl, 10)
         .await
@@ -486,12 +487,12 @@ async fn the_body_gc_respects_an_explicit_cutoff() {
             mongodb::bson::Uuid::from_bytes(old.into_bytes())
         ) },
         doc! { "$set": { "written_at": mongodb::bson::DateTime::from_millis(
-            (now() - chrono::Duration::hours(2)).timestamp_millis()
+            (now() - SignedDuration::from_hours(2)).as_millisecond()
         ) } },
     )
     .await
     .expect("age the old set");
-    let cutoff = now() - chrono::Duration::hours(1);
+    let cutoff = now() - SignedDuration::from_hours(1);
     assert_eq!(
         store.gc_body(run.id, current, cutoff).await.expect("gc"),
         1,
@@ -509,7 +510,7 @@ async fn the_body_gc_respects_an_explicit_cutoff() {
     // However old it is, the set a commit names is never collected.
     assert_eq!(
         store
-            .gc_body(run.id, current, now() + chrono::Duration::hours(24))
+            .gc_body(run.id, current, now() + SignedDuration::from_hours(24))
             .await
             .expect("gc"),
         0

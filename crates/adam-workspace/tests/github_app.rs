@@ -14,7 +14,7 @@ use adam_workspace::{
     AppKey, AppOwners, CodeHost, GitCredentials, GitHub, GitHubApp, HostScoped, Installation,
     MAX_CACHED_INSTALLATIONS, NewPullRequest, RepoRef, WorkspaceError,
 };
-use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
+use jiff::{SignedDuration, Timestamp};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path};
@@ -30,26 +30,22 @@ fn repo() -> RepoRef {
 
 /// A clock a test moves.
 #[derive(Clone)]
-struct TestClock(Arc<Mutex<DateTime<Utc>>>);
+struct TestClock(Arc<Mutex<Timestamp>>);
 
 impl TestClock {
     fn at(rfc3339: &str) -> Self {
-        Self(Arc::new(Mutex::new(
-            DateTime::parse_from_rfc3339(rfc3339)
-                .unwrap()
-                .with_timezone(&Utc),
-        )))
+        Self(Arc::new(Mutex::new(rfc3339.parse::<Timestamp>().unwrap())))
     }
 
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> Timestamp {
         *self.0.lock().unwrap()
     }
 
-    fn advance(&self, by: TimeDelta) {
+    fn advance(&self, by: SignedDuration) {
         *self.0.lock().unwrap() += by;
     }
 
-    fn as_fn(&self) -> impl Fn() -> DateTime<Utc> + Send + Sync + 'static {
+    fn as_fn(&self) -> impl Fn() -> Timestamp + Send + Sync + 'static {
         let clock = self.clone();
         move || clock.now()
     }
@@ -82,8 +78,7 @@ impl Respond for Mint {
                     .set_delay(self.delay)
                     .set_body_json(json!({
                         "token": format!("ghs_mock{n}"),
-                        "expires_at": (self.clock.now() + TimeDelta::hours(1))
-                            .to_rfc3339_opts(SecondsFormat::Secs, true),
+                        "expires_at": format!("{:.0}", self.clock.now() + SignedDuration::from_hours(1)),
                         "permissions": {"contents": "write", "pull_requests": "write"},
                     }))
             }
@@ -197,7 +192,7 @@ async fn a_token_is_minted_with_a_jwt_the_apps_key_signed_and_is_what_the_rest_a
     assert_eq!(rig.minted.load(Ordering::SeqCst), 1);
     let claims = rig.claims.lock().unwrap();
     assert_eq!(claims.len(), 1);
-    let now = rig.clock.now().timestamp();
+    let now = rig.clock.now().as_second();
     assert_eq!(claims[0]["iss"], 12345);
     assert_eq!(
         claims[0]["iat"],
@@ -232,21 +227,21 @@ async fn a_token_is_kept_until_five_minutes_before_it_expires_and_then_replaced(
     let app = rig.app();
     assert_eq!(rig.token(&app).await, "ghs_mock1");
     // Six minutes to go: the same token, nothing asked of GitHub.
-    rig.clock.advance(TimeDelta::minutes(54));
+    rig.clock.advance(SignedDuration::from_mins(54));
     assert_eq!(rig.token(&app).await, "ghs_mock1");
     assert_eq!(rig.minted.load(Ordering::SeqCst), 1);
     // Just under five minutes to go: a new token, from a new JWT that says the new time.
     rig.clock
-        .advance(TimeDelta::minutes(1) + TimeDelta::seconds(1));
+        .advance(SignedDuration::from_mins(1) + SignedDuration::from_secs(1));
     assert_eq!(rig.token(&app).await, "ghs_mock2");
     assert_eq!(rig.minted.load(Ordering::SeqCst), 2);
     {
         let claims = rig.claims.lock().unwrap();
-        assert_eq!(claims[1]["iat"], rig.clock.now().timestamp() - 60);
+        assert_eq!(claims[1]["iat"], rig.clock.now().as_second() - 60);
         assert_ne!(claims[0]["iat"], claims[1]["iat"]);
     }
     // And the new one is kept in its turn.
-    rig.clock.advance(TimeDelta::minutes(30));
+    rig.clock.advance(SignedDuration::from_mins(30));
     assert_eq!(rig.token(&app).await, "ghs_mock2");
     assert_eq!(rig.minted.load(Ordering::SeqCst), 2);
 }
@@ -448,7 +443,7 @@ async fn a_failed_mint_is_tried_again_and_the_jwt_is_never_in_the_error() {
             } else {
                 ResponseTemplate::new(201).set_body_json(json!({
                     "token": "ghs_second",
-                    "expires_at": (Utc::now() + TimeDelta::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true),
+                    "expires_at": format!("{:.0}", Timestamp::now() + SignedDuration::from_hours(1)),
                 }))
             }
         }
@@ -664,8 +659,7 @@ impl Respond for Fake {
                     .set_delay(self.mint_delay)
                     .set_body_json(json!({
                         "token": format!("ghs_{id}_{n}"),
-                        "expires_at": (self.clock.now() + TimeDelta::hours(1))
-                            .to_rfc3339_opts(SecondsFormat::Secs, true),
+                        "expires_at": format!("{:.0}", self.clock.now() + SignedDuration::from_hours(1)),
                     }))
             }
             _ => ResponseTemplate::new(404),
@@ -792,8 +786,8 @@ async fn without_an_installation_id_the_owners_installation_is_looked_up_with_th
     assert_eq!(claims.len(), 2);
     for claim in &claims {
         assert_eq!(claim["iss"], 12345);
-        assert_eq!(claim["iat"], world.clock.now().timestamp() - 60);
-        assert_eq!(claim["exp"], world.clock.now().timestamp() + 540);
+        assert_eq!(claim["iat"], world.clock.now().as_second() - 60);
+        assert_eq!(claim["exp"], world.clock.now().as_second() + 540);
     }
     // Kept: the installation, and the token.
     let found: Installation = app.installation_for("acme").await.unwrap();
@@ -892,14 +886,14 @@ async fn an_owner_the_app_is_not_installed_on_is_an_auth_error_naming_the_app_an
     );
 
     // "Not installed" is believed for 60 seconds: nothing is asked at +59 s ...
-    world.clock.advance(TimeDelta::seconds(59));
+    world.clock.advance(SignedDuration::from_secs(59));
     let err = app.token_for(&repo_of("ghost")).await.unwrap_err();
     assert!(matches!(err, WorkspaceError::Auth(_)), "{err:?}");
     assert!(err.to_string().contains("`adam-test`"), "{err}");
     assert_eq!(world.log().len(), 3, "no request at +59 s");
 
     // ... and GitHub is asked again at +61 s (still not installed: believed for 60 more seconds).
-    world.clock.advance(TimeDelta::seconds(2));
+    world.clock.advance(SignedDuration::from_secs(2));
     assert!(app.token_for(&repo_of("ghost")).await.is_err());
     assert_eq!(world.count("GET /orgs/ghost/installation"), 2);
     assert_eq!(world.count("GET /users/ghost/installation"), 2);
@@ -911,7 +905,7 @@ async fn an_owner_the_app_is_not_installed_on_is_an_auth_error_naming_the_app_an
     // Installing it meanwhile is not seen until the 60 seconds are over.
     world.install("ghost", Kind::Org, 333);
     assert!(app.token_for(&repo_of("ghost")).await.is_err());
-    world.clock.advance(TimeDelta::seconds(61));
+    world.clock.advance(SignedDuration::from_secs(61));
     assert_eq!(world.token(&app, "ghost").await, "ghs_333_1");
     // Another owner has an entry of its own.
     assert!(app.token_for(&repo_of("ghost2")).await.is_err());
@@ -1032,7 +1026,7 @@ async fn an_uninstalled_installation_is_looked_up_again_once() {
         s.gone.insert(111);
     });
     world.install("acme", Kind::Org, 333);
-    world.clock.advance(TimeDelta::minutes(56));
+    world.clock.advance(SignedDuration::from_mins(56));
     assert_eq!(world.token(&app, "acme").await, "ghs_333_1");
     assert_eq!(
         world.count("GET /orgs/acme/installation"),
@@ -1049,7 +1043,7 @@ async fn an_uninstalled_installation_is_looked_up_again_once() {
     world.with_state(|s| {
         s.gone.insert(333);
     });
-    world.clock.advance(TimeDelta::minutes(56));
+    world.clock.advance(SignedDuration::from_mins(56));
     let err = app.token_for(&repo_of("acme")).await.unwrap_err();
     assert!(matches!(err, WorkspaceError::Auth(_)), "{err:?}");
     assert_eq!(world.count("GET /orgs/acme/installation"), 3, "once more");

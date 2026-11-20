@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use adam_core::RunId;
+use adam_core::time::Timestamp;
 use adam_model::{Message, ToolCall, Usage};
 use adam_runtime::{
     AgentError, Inbound, SESSION_STATE_KEY, SandboxUsage, SessionHeader, UsageTotals,
 };
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -181,7 +181,7 @@ pub struct PendingRemote {
     /// When the agent gives up waiting and answers the call with an error result, if the tool
     /// asked for a limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline: Option<DateTime<Utc>>,
+    pub deadline: Option<Timestamp>,
 }
 
 /// A tool call that waits for the round of a child session to end ([ADR 0045]).
@@ -617,7 +617,7 @@ pub struct Conversation {
     /// (nothing records that it was). Absent from state written before it existed, and not written
     /// while `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chain_started: Option<DateTime<Utc>>,
+    pub chain_started: Option<Timestamp>,
 }
 
 /// How many rounds a run remembers having reported ([`Conversation::reported_rounds`]): the oldest
@@ -653,12 +653,12 @@ fn is_zero(n: &u32) -> bool {
 }
 
 /// Whether `value` is an object whose `expiresAt` (RFC 3339) is not after `now`.
-fn has_expired(value: &Value, now: DateTime<Utc>) -> bool {
+fn has_expired(value: &Value, now: Timestamp) -> bool {
     value
         .get("expiresAt")
         .and_then(Value::as_str)
-        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-        .is_some_and(|at| at.with_timezone(&Utc) <= now)
+        .and_then(|at| at.parse::<Timestamp>().ok())
+        .is_some_and(|at| at <= now)
 }
 
 /// The most serialized JSON, in bytes, of messages that a continued conversation carries from the
@@ -1044,7 +1044,7 @@ impl Conversation {
     /// `expiresAt` that is an RFC 3339 time not after `now`. An entry with no `expiresAt`, or one
     /// that does not parse, stays. Returns how many were removed; the agent calls it at the start
     /// of every step.
-    pub fn drop_expired_context(&mut self, now: DateTime<Utc>) -> usize {
+    pub fn drop_expired_context(&mut self, now: Timestamp) -> usize {
         let before = self.context.len();
         self.context.retain(|_, value| !has_expired(value, now));
         before - self.context.len()
@@ -1319,7 +1319,7 @@ mod tests {
     fn the_start_of_the_chain_is_carried_and_a_fresh_run_has_none() {
         let mut state = Conversation::new("go");
         assert_eq!(state.chain_started, None);
-        let at = Utc::now();
+        let at = Timestamp::now();
         state.chain_started = Some(at);
         assert_eq!(
             state.continued("next", RunId::new()).chain_started,

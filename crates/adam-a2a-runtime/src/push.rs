@@ -11,10 +11,10 @@ use a2a::TaskPushNotificationConfig;
 use adam_a2a::push::{
     NewPushConfig, PushCursor, PushProgress, PushRecord, PushState, PushStore, PushStoreError,
 };
+use adam_core::time::Timestamp;
 use adam_core::{DynStore, RunId, StoreError};
 use adam_error::{Classify, ErrorClass};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 /// A [`PushStore`] over an `adam_core::Store`, for one agent.
@@ -147,7 +147,7 @@ impl PushStore for StorePushStore {
     async fn claim_due(
         &self,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> Result<Vec<PushRecord>, PushStoreError> {
@@ -290,7 +290,7 @@ mod tests {
         let claimed = push
             .claim_due(
                 "w",
-                Utc::now() + chrono::Duration::seconds(1),
+                adam_core::store::now() + jiff::SignedDuration::from_secs(1),
                 Duration::from_secs(30),
                 5,
             )
@@ -302,7 +302,7 @@ mod tests {
             cursor: PushCursor::default(),
             attempts: 0,
             last_error: None,
-            next_attempt_at: Utc::now(),
+            next_attempt_at: adam_core::store::now(),
         };
         let done = push
             .commit(&task, "c1", claimed[0].version, progress(PushState::Done))
@@ -320,7 +320,7 @@ mod tests {
             other
                 .claim_due(
                     "w",
-                    Utc::now() + chrono::Duration::seconds(1),
+                    adam_core::store::now() + jiff::SignedDuration::from_secs(1),
                     Duration::from_secs(30),
                     5
                 )
@@ -353,7 +353,7 @@ mod tests {
         let claimed = push
             .claim_due(
                 "w",
-                Utc::now() + chrono::Duration::seconds(1),
+                adam_core::store::now() + jiff::SignedDuration::from_secs(1),
                 Duration::from_secs(30),
                 5,
             )

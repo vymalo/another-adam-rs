@@ -1462,7 +1462,7 @@ mod tests {
             round: 1,
             state,
             outcome: None,
-            updated_at: chrono::Utc::now() - chrono::Duration::seconds(age),
+            updated_at: adam_core::store::now() - jiff::SignedDuration::from_secs(age),
             description: String::new(),
             keep_open: true,
             closed,
@@ -1474,7 +1474,7 @@ mod tests {
                 ended: state != SessionState::Working,
                 cancelled: false,
                 started_by: None,
-                updated_at: chrono::Utc::now(),
+                updated_at: adam_core::store::now(),
             },
         }
     }

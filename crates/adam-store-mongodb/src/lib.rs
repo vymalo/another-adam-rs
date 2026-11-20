@@ -73,6 +73,7 @@ use adam_core::store::{
     add_ttl, head_body, now, open_conversation_key, sched_at, set_head_body, storable,
     storable_owned, truncate_ms,
 };
+use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig,
     NewRun, PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
@@ -80,8 +81,8 @@ use adam_core::{
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
 use futures::TryStreamExt;
+use jiff::SignedDuration;
 use mongodb::bson::{self, Bson, Document, doc};
 use mongodb::error::{ErrorKind, WriteFailure};
 use mongodb::options::{
@@ -329,11 +330,13 @@ fn uuid(id: RunId) -> Bson {
     Bson::from(bson::Uuid::from_bytes(id.0.into_bytes()))
 }
 
-fn date(t: DateTime<Utc>) -> Bson {
-    Bson::DateTime(bson::DateTime::from_millis(t.timestamp_millis()))
+fn date(t: Timestamp) -> Bson {
+    // `truncate_ms` floors as chrono's `timestamp_millis` did; jiff's `as_millisecond` would
+    // truncate toward zero for a pre-1970 cutoff, one millisecond off the old bytes.
+    Bson::DateTime(bson::DateTime::from_millis(truncate_ms(t).as_millisecond()))
 }
 
-fn opt_date(t: Option<DateTime<Utc>>) -> Bson {
+fn opt_date(t: Option<Timestamp>) -> Bson {
     t.map(date).unwrap_or(Bson::Null)
 }
 
@@ -360,7 +363,7 @@ fn body_id(run: RunId, generation: Uuid, idx: u32) -> String {
 
 /// How long a superseded body generation stays readable before the next commit of its run collects
 /// it.
-const BODY_GC_GRACE: chrono::Duration = chrono::Duration::hours(1);
+const BODY_GC_GRACE: SignedDuration = SignedDuration::from_hours(1);
 
 /// How old a foreign attempt's body row must be before a commit may collect it.
 ///
@@ -369,7 +372,7 @@ const BODY_GC_GRACE: chrono::Duration = chrono::Duration::hours(1);
 /// longer than the runtime's default 30 s lease. A row older than it belongs to an attempt that
 /// died between its insert and its CAS; nothing else will collect it, because the head it never
 /// wrote does not name it and the run may not be terminal.
-const BODY_ORPHAN_GRACE: chrono::Duration = chrono::Duration::minutes(5);
+const BODY_ORPHAN_GRACE: SignedDuration = SignedDuration::from_mins(5);
 
 /// One row as the document `adam_body` holds.
 fn body_doc(
@@ -377,7 +380,7 @@ fn body_doc(
     generation: Uuid,
     writer: Uuid,
     row: &BodyRow,
-    written_at: DateTime<Utc>,
+    written_at: Timestamp,
 ) -> StoreResult<Document> {
     let idx = i32::try_from(row.idx).map_err(|_| {
         StoreError::InvalidInput(format!("body index {} exceeds i32::MAX", row.idx))
@@ -427,7 +430,7 @@ struct BodyPlan {
     start: usize,
     writer: Uuid,
     rows: Vec<BodyRow>,
-    written_at: DateTime<Utc>,
+    written_at: Timestamp,
 }
 
 /// Whether a stored foreign row is the row this attempt would write at the same index: the
@@ -561,14 +564,12 @@ fn get_uuid(d: &Document, field: &str) -> StoreResult<Option<RunId>> {
     }
 }
 
-fn get_date(d: &Document, field: &str) -> StoreResult<Option<DateTime<Utc>>> {
+fn get_date(d: &Document, field: &str) -> StoreResult<Option<Timestamp>> {
     match d.get(field) {
         None | Some(Bson::Null) => Ok(None),
-        Some(Bson::DateTime(t)) => Utc
-            .timestamp_millis_opt(t.timestamp_millis())
-            .single()
+        Some(Bson::DateTime(t)) => Timestamp::from_millisecond(t.timestamp_millis())
             .map(Some)
-            .ok_or_else(|| bad(field)),
+            .map_err(|_| bad(field)),
         Some(_) => Err(bad(field)),
     }
 }
@@ -631,7 +632,7 @@ struct CommitContext {
     agent: String,
     conversation_id: Option<String>,
     parent_id: Option<RunId>,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     /// The v5 head, when one was written; a commit that appends reads its `body` generation.
     head: Option<serde_json::Value>,
     /// The version the head was written at; a stale head names no current generation.
@@ -1294,7 +1295,7 @@ impl Store for MongoStore {
         worker: &str,
         scope: ClaimScope,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>> {
@@ -1391,7 +1392,7 @@ impl Store for MongoStore {
         &self,
         id: RunId,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
     ) -> StoreResult<bool> {
         let now = truncate_ms(now);
@@ -1417,7 +1418,7 @@ impl Store for MongoStore {
         Ok(())
     }
 
-    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         let found = self
             .runs
             .find_one(doc! { "_id": uuid(id) })
@@ -1557,7 +1558,7 @@ impl Store for MongoStore {
         &self,
         agents: &[String],
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<PushRecord>> {
@@ -1639,11 +1640,13 @@ impl Store for MongoStore {
         }
     }
 
-    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64> {
         // `updated_at < before` at millisecond precision, rounding `before` up so
-        // a sub-millisecond cutoff selects the same runs as in the other stores.
-        let mut cutoff = before.timestamp_millis();
-        if !before.timestamp_subsec_nanos().is_multiple_of(1_000_000) {
+        // a sub-millisecond cutoff selects the same runs as in the other stores. The floor is
+        // `truncate_ms`'s (chrono's `timestamp_millis` rule), so a cutoff before 1970 rounds the
+        // same way too.
+        let mut cutoff = truncate_ms(before).as_millisecond();
+        if before.subsec_nanosecond() % 1_000_000 != 0 {
             cutoff += 1;
         }
         let finished = doc! {
@@ -1715,7 +1718,7 @@ impl Store for MongoStore {
         &self,
         run: RunId,
         keep_generation: Uuid,
-        before: DateTime<Utc>,
+        before: Timestamp,
     ) -> StoreResult<u64> {
         MongoStore::gc_body(self, run, keep_generation, before).await
     }
@@ -1788,7 +1791,7 @@ impl Store for MongoStore {
         }
     }
 
-    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_blobs(&self, before: Timestamp) -> StoreResult<u64> {
         self.sweep_blobs(before).await
     }
 }
@@ -1986,7 +1989,7 @@ impl MongoStore {
         &self,
         run: RunId,
         keep_generation: Uuid,
-        before: DateTime<Utc>,
+        before: Timestamp,
     ) -> StoreResult<u64> {
         let deleted = self
             .body
@@ -2005,7 +2008,7 @@ impl MongoStore {
     /// Candidates are paged by `_id` (the digest) so a batch that is entirely referenced still
     /// moves the cursor: a digest a surviving run names is kept, however old it is, and a shared
     /// digest is deleted only with the last run that references it.
-    async fn sweep_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn sweep_blobs(&self, before: Timestamp) -> StoreResult<u64> {
         let mut total = 0;
         let mut last: Option<String> = None;
         loop {
@@ -2257,6 +2260,23 @@ mod round_trip_tests {
             entry,
             "the stored entry is the first one"
         );
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+
+    /// BSON dates are milliseconds; a value before 1970 floors, as chrono's `timestamp_millis`
+    /// did. `date` is the one encoder a raw `purge_blobs` cutoff reaches without `truncate_ms`
+    /// first, so its own rule is pinned here.
+    #[test]
+    fn date_floors_before_the_epoch() {
+        let at: Timestamp = "1969-12-31T23:59:59.999500Z".parse().expect("a timestamp");
+        let Bson::DateTime(stored) = date(at) else {
+            panic!("a timestamp is stored as a BSON date");
+        };
+        assert_eq!(stored.timestamp_millis(), -1);
     }
 }
 
@@ -2917,7 +2937,7 @@ mod body_loser_tests {
             .await
             .expect("create");
         let generation = Uuid::new_v4();
-        let old = now() - BODY_ORPHAN_GRACE - chrono::Duration::minutes(1);
+        let old = now() - BODY_ORPHAN_GRACE - SignedDuration::from_mins(1);
         let rows = [0_u32, 1]
             .into_iter()
             .map(|idx| {

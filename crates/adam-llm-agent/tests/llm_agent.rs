@@ -988,14 +988,14 @@ async fn rate_limited_model_waits_for_retry_after_then_succeeds() {
 
     let scheduled = wait_for(&rt, run, "the retry to be scheduled", |v| v.attempt == 1).await;
     let wake_at = scheduled.wake_at.expect("a retry carries a timer");
-    let thirty = chrono::Duration::seconds(30);
+    let thirty = jiff::SignedDuration::from_secs(30);
     assert!(wake_at >= t0 + thirty, "Retry-After ignored: {wake_at}");
     assert!(wake_at <= clock.now() + thirty, "{wake_at}");
 
     // Five seconds short of the hint, several polls later: no second call.
-    let gap = (wake_at - clock.now() - chrono::Duration::seconds(5))
-        .to_std()
-        .expect("in the future");
+    let gap =
+        std::time::Duration::try_from(wake_at - clock.now() - jiff::SignedDuration::from_secs(5))
+            .expect("in the future");
     clock.advance(gap);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(h.mock.requests().len(), 1, "retried before Retry-After");

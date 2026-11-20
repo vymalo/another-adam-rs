@@ -407,8 +407,8 @@ mod tests {
             artifacts: Vec::new(),
             state,
             version: 2,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: adam_core::store::now(),
+            updated_at: adam_core::store::now(),
         }
     }
 

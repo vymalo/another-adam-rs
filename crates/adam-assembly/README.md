@@ -21,7 +21,7 @@ adam-mcp  (feature mcp) ──────────────────�
 ```
 
 It depends on `adam-agent-fs`, `adam-llm-agent`, `adam-model`, `adam-runtime`, `adam-error`,
-`adam-core`, `async-trait`, `chrono`, `serde`, `serde_json`, `thiserror` and `url`, on the A2A client for remote subagents (`a2a-client-lf`,
+`adam-core`, `async-trait`, `jiff`, `serde`, `serde_json`, `thiserror` and `url`, on the A2A client for remote subagents (`a2a-client-lf`,
 `a2a-lf`, `reqwest`, `tokio` for a lock and a timeout, `secrecy` for the token, `tracing`), and on `adam-a2a` and `adam-a2a-runtime` (its `ChildSessions` type) behind the
 feature `a2a`, on [`adam-mcp`](../adam-mcp/README.md) behind the feature `mcp` (the MCP client; see
 [MCP tools](#mcp-tools-feature-mcp)), and, behind the feature `dev` only, on [`notify`](https://crates.io/crates/notify) (see
