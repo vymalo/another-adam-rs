@@ -12,9 +12,11 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { localGit } from './grade.mjs';
+import { SAFE_C, localGit } from './grade.mjs';
 import { repoSlug } from './gitops.mjs';
 
+// The options the host's git runs with (`SAFE_C`), as a shell word list, so the container computes the tree as the host does.
+const HOST_C = SAFE_C.map((a) => (a === '-c' ? a : `'${a}'`)).join(' ');
 const SAFE_PATH = /^\/[A-Za-z0-9._/@+=-]*$/;
 /** The name of the directory of a task's base in a slot's work volume (what `Stack.resetWork` keeps). */
 export const BASE_NAME = 'bench-base';
@@ -77,8 +79,12 @@ export function baseScript({ workdir, out = '/out', scratch = '/tmp/bench-base' 
     `git clone -q --bare "$W" ${out}/base.git`,
     `mkdir ${out}/tree`,
     `tar --exclude=./.git -cf - . | tar -xf - -C ${out}/tree`,
-    // What the cache trusts is the content, not a name: the ref a clone would read, and the tree the host rebuilds.
-    `printf '%s %s\n' "$(git -C ${out}/base.git rev-parse refs/heads/main)" "$(git -C "$W" rev-parse 'HEAD^{tree}')" > ${out}/${BASE_MARKER}`,
+    // What the cache trusts is the content, not a name: the ref a clone would read, and the tree the host rebuilds. The host
+    // rebuilds it from `tree` (`makeHostBase`: `git add -A -f` in a new repository), so it is computed the same way from the
+    // same directory, in a repository of its own, with the options of the host's git. `HEAD^{tree}` of the clone is not
+    // that tree: a submodule is a tracked entry there and an empty directory in `tree`, which the host cannot add.
+    `T=$(export GIT_DIR="$W.tree.git" GIT_WORK_TREE=${out}/tree GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null; git ${HOST_C} init -q && git ${HOST_C} add -A -f && git ${HOST_C} write-tree)`,
+    `printf '%s %s\n' "$(git -C ${out}/base.git rev-parse refs/heads/main)" "$T" > ${out}/${BASE_MARKER}`,
     // The work directory is the host's, owned by the host user: a container as uid 10001 cannot chmod it.
     `chmod -R a+rX ${out} 2>/dev/null || true`,
   ].join('\n');
