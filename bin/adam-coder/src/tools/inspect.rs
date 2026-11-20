@@ -37,8 +37,6 @@ use super::gitcli::{
 };
 use super::{Outcome, ToolEnv};
 
-pub(super) use adam_code_tools::inspect::render;
-
 /// Look around in your worktree with a shell command: `git branch -r`, `git log --oneline`,
 /// `ls`, `cat README.md`, `grep -rn name src`. It runs in the workspace's environment (the
 /// repository's own devcontainer when it has one, so its tools are there). You get the exit code and

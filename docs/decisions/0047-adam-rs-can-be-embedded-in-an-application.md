@@ -137,6 +137,18 @@ workspace as it is.
    is refused, so a coder command never runs unguarded; and a look that reports `FilesChanged` (none does) says the
    files stay. **Not yet:** `run`, step 5c-2, which also decides whether a failing `after_run` should settle the guard
    first (today, as in the coder, a change to git then stays).
+   *Built 2026-11-20 (step 5c-2):* `run` is `adam_code_tools::make::run`, so `run_command` and `run` are both crate
+   functions over `CommandWorkspace`, with **no change to the trait**. `run` takes its place for a write and its guard
+   for a `Make`, and calls `after_run` once for a command that ran, **before** the guard is settled, so the coder's
+   check epoch moves for a command its guard then undoes too; the text of `after_run` (the coder's published note) is
+   appended only when files changed. `ToolEnv::after_run` now moves the epoch and gives the note for `run`, once; the
+   coder's own copy is gone. `git status` as text is `adam_code_tools::git::status_text`, re-exported by the coder. The
+   `#[tool]` declaration is unchanged and delegates; the pins of `tests/command_results.rs` and `tests/tool_specs.rs`
+   pass unchanged. Still the coder's: the background tools (`start_command`, `stop_command`, `list_commands`),
+   `run_checks`, and `Snapshot` and its restores. **Kept as they are, and fixed next, each in a change of its own:** the
+   list of changed files loses the first entry's leading space (`status_text` is trimmed), a file a command put back
+   as `HEAD` is said to be ignored by the project, and a failing `after_run` drops the guard unsettled, so a change to
+   git stays.
 8. **Commands run as the person unless a sandbox says otherwise.** A local sandbox is an `Environment`: first a process
    tree that can be killed, then the operating system's own confinement where there is one. `describe` says what is not
    protected.
