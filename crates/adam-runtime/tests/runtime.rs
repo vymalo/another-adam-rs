@@ -7613,6 +7613,9 @@ struct TranscriptAgent {
     file: Option<Artifact>,
     /// Replace the transcript on the second step: a compaction, not an append.
     compact: bool,
+    /// Pad every step's message with this many bytes, so a full state is too large to pass a
+    /// head-sized bound.
+    padding: usize,
 }
 
 impl TranscriptAgent {
@@ -7624,11 +7627,17 @@ impl TranscriptAgent {
             wrong: false,
             file: None,
             compact: false,
+            padding: 0,
         }
     }
 
     fn with_file(mut self, file: Artifact) -> Self {
         self.file = Some(file);
+        self
+    }
+
+    fn with_padding(mut self, bytes: usize) -> Self {
+        self.padding = bytes;
         self
     }
 }
@@ -7687,7 +7696,9 @@ impl Agent for TranscriptAgent {
             state.messages.push("compacted".into());
         }
         state.turns += 1;
-        state.messages.push(format!("turn {}", state.turns));
+        state
+            .messages
+            .push(format!("turn {}{}", state.turns, "x".repeat(self.padding)));
         if self.park_at == Some(state.turns) {
             return Ok(Transition::Park {
                 state,
@@ -7913,8 +7924,9 @@ async fn the_view_reads_the_head_and_the_state_joins_the_body() {
     let inner: DynStore = Arc::new(MemoryStore::new());
     let counting = Arc::new(CountingStore::new(inner.clone()));
     let store: DynStore = counting.clone();
-    // 49 turns after the start: a 50-message transcript.
-    let agent = TranscriptAgent::new(&uniq("view"), 49);
+    // 49 turns after the start: a 50-message transcript, each turn 10 KB, so the whole state is
+    // far larger than the head and a full-state read cannot pass the bound below.
+    let agent = TranscriptAgent::new(&uniq("view"), 49).with_padding(10 * 1024);
     let rt = transcript_runtime(&store, &agent);
     let run = rt.start(&agent.name, inbound(), None).await.expect("start");
     let worker = spawn_worker(&rt);
@@ -7956,7 +7968,19 @@ async fn the_view_reads_the_head_and_the_state_joins_the_body() {
     );
     assert_eq!(state["turns"], 49);
     assert_eq!(state["messages"][0], json!("start"));
-    assert_eq!(state["messages"][49], json!("turn 49"));
+    assert!(
+        state["messages"][49]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("turn 49"),
+        "the last message is back"
+    );
+    let joined = serde_json::to_vec(&state).expect("the joined state is JSON");
+    assert!(
+        joined.len() > 400 * 1024,
+        "the joined state is large ({} bytes), so the head's bound is not a small-state accident",
+        joined.len()
+    );
 }
 
 /// A head a headless commit left stale is not an error: `load_head` serves the whole state, and
@@ -8029,6 +8053,78 @@ async fn a_v4_runs_view_is_the_whole_state() {
     let state = rt.state(run).await.expect("state").expect("the run");
     assert_eq!(state, view.state);
     assert_eq!(counting.calls(Method::BodyList), 0);
+}
+
+/// A head that moves between `load_head` and `body_list` is re-read once: the new head and its new
+/// generation join to every message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_re_reads_a_moved_head_and_joins_its_new_generation() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let agent = TranscriptAgent::new(&uniq("moving"), 3);
+    let rt = transcript_runtime(&inner, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let first = inner.load_head(run).await.expect("load").expect("the run");
+    let generation = common::moving::generation_of(&first);
+    let moving = Arc::new(common::moving::MovingHead::new(
+        inner.clone(),
+        run,
+        first,
+        generation,
+        true,
+    ));
+    let store: DynStore = moving.clone();
+    let reader = transcript_runtime(&store, &agent);
+    let state = reader.state(run).await.expect("state").expect("the run");
+    assert_eq!(
+        common::moving::messages(&state).len(),
+        4,
+        "the new generation joins every message"
+    );
+    assert_eq!(moving.loads(), 2, "the head was read twice");
+    let current = inner.load_head(run).await.expect("load").expect("the run");
+    let new_generation = common::moving::generation_of(&current);
+    assert_ne!(new_generation, generation, "a compaction started a new one");
+    assert_eq!(
+        inner
+            .body_list(run, new_generation)
+            .await
+            .expect("the new generation")
+            .len(),
+        4,
+        "the new generation holds the whole transcript"
+    );
+}
+
+/// A body set that is short on both reads is `Corrupt`, not data loss: the version did not move, so
+/// the retry cannot help.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_is_corrupt_when_the_body_is_short_twice() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let agent = TranscriptAgent::new(&uniq("corrupt"), 3);
+    let rt = transcript_runtime(&inner, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let first = inner.load_head(run).await.expect("load").expect("the run");
+    let generation = common::moving::generation_of(&first);
+    let moving = Arc::new(common::moving::MovingHead::new(
+        inner.clone(),
+        run,
+        first,
+        generation,
+        false,
+    ));
+    let store: DynStore = moving.clone();
+    let reader = transcript_runtime(&store, &agent);
+    let error = reader.state(run).await.expect_err("the body is gone");
+    assert!(matches!(error, RuntimeError::Corrupt { .. }), "{error:?}");
+    assert_eq!(moving.loads(), 2, "one re-read, then the same short set");
 }
 
 /// A run created with a file artifact in its state but no blob (a pre-E run; the runtime's start

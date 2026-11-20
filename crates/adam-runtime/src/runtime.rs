@@ -195,10 +195,11 @@ pub struct RunView {
     /// [`Runtime::artifact_bytes`](Runtime::artifact_bytes), so a poll of a run never transfers a
     /// file it does not serve.
     pub artifacts: Vec<ArtifactRef>,
-    /// The agent's **head**: its state without the transcript for a v5 run, and the whole agent
-    /// state of a v4 run, which has no head. The pointers a front reads — `pending_wait`,
-    /// `pending_question`, `question`, `usage_totals`, `sandbox_usage`, `context`, `session` —
-    /// are in the head.
+    /// The agent's **head**: its state without the transcript for a v5 run. It is the whole agent
+    /// state for a v4 run, and for a v5 run whose head is stale (a delivery, a cancel or a park
+    /// since the last step), because there is no current head to serve. The pointers a front
+    /// reads — `pending_wait`, `pending_question`, `question`, `usage_totals`, `sandbox_usage`,
+    /// `context`, `session` — are in the head.
     ///
     /// Use [`Runtime::state`](Runtime::state) for the joined state (the head and the body
     /// generation it names); this member is not it.
@@ -414,11 +415,20 @@ impl Inner {
             return Ok(None);
         }
         let rows: Vec<Value> = rows.into_iter().map(|row| row.message).collect();
-        registered
-            .starter()
-            .join(stored.agent().clone(), rows)
-            .map(Some)
-            .map_err(RuntimeError::Agent)
+        let had_rows = !rows.is_empty();
+        let head = stored.agent();
+        let joined = registered.starter().join(head.clone(), rows)?;
+        if had_rows && joined == *head {
+            // A starter registered without delegating `join` (its default returns the head) would
+            // silently hand a consumer a state with no transcript. The in-repo starters delegate;
+            // this is for a consumer's front.
+            tracing::warn!(
+                run = %rec.id,
+                agent = %rec.agent,
+                "the registered starter's `join` ignored the transcript; delegate `split`/`join` to the agent's"
+            );
+        }
+        Ok(Some(joined))
     }
 
     pub fn notify_workers(&self) {
@@ -463,6 +473,8 @@ impl Inner {
                 self.fire_cancel(run);
                 return Ok(());
             }
+            // S3: `load_run` returns the head, and a cancel writes the head it read (this already
+            // re-encodes the same `Stored` variant, so it survives the switch).
             let mut stored = Stored::decode(run, &rec.state)?;
             let error = format!("cancelled: {reason}");
             *stored.error_mut() = Some(error.clone());
@@ -474,6 +486,7 @@ impl Inner {
             // with its body here, once, so the hook never sees a head with no transcript. A set
             // that does not join is skipped: the cancel still lands, and the hook is best effort.
             // A process that registered no full agent has no hook to tell, so it reads no body.
+            // In E `load_run` is the full state, so this join is inert; S3's head joins here.
             let hook_state = if self
                 .agents
                 .get(&rec.agent)
@@ -538,6 +551,8 @@ impl Inner {
                     status: rec.status,
                 });
             }
+            // S3: `load_run` returns the head; `deliver` must decode `Stored` and re-encode the
+            // variant it read, as `cancel_run` already does. In E the state is always `Full`.
             let mut env = Envelope::decode(run, &rec.state)?;
             env.inbox.push(inbound.clone());
             let woke = rec.status == RunStatus::Parked;
@@ -666,6 +681,11 @@ impl RuntimeBuilder {
     /// Nothing can check this across processes: a mismatch starts the run
     /// successfully, then fails it as permanent on the worker's first step,
     /// with an error naming the agent whose state did not decode.
+    ///
+    /// **A starter that delegates `init` must delegate `split` and `join` too**, or
+    /// [`Runtime::state`] and a continuation join the head without its transcript. The in-repo
+    /// starters delegate; the runtime logs a warning when a non-empty transcript comes back
+    /// unchanged.
     pub fn starter<S: AgentStarter>(self, starter: S) -> Self {
         let name = starter.name().to_owned();
         self.register(name, Registered::Starter(Arc::new(StarterOnly(starter))))
@@ -1298,7 +1318,9 @@ impl Runtime {
                 if !first_is_a_round {
                     return invalid("the session has no first round");
                 }
-                Some(Envelope::decode(prior, &rec.state)?.agent)
+                // Route the state read through `prior_state` (it joins a v5 prior run), so this
+                // path survives S3 when `load_run` returns the head.
+                Some(self.prior_state(agent, prior).await?)
             }
         };
         let new = self
@@ -1637,7 +1659,14 @@ impl Runtime {
     ///
     /// The agent must be registered on this runtime (an agent or a starter: both have `join`), and
     /// its `join` must be the one its `split` wrote the head with. A registration that only starts
-    /// runs answers here too, because the join is on [`AgentStarter`](crate::AgentStarter).
+    /// runs answers here too, because the join is on [`AgentStarter`](crate::AgentStarter); **a
+    /// starter that does not delegate `split`/`join` to the agent of the same name returns the head
+    /// without its transcript**, and the runtime logs a warning when it does.
+    ///
+    /// A [`RuntimeError::Corrupt`] answer is not data loss: the head and its generation are read
+    /// separately, so a set that was collected or superseded between the two reads is retried
+    /// internally once; a caller that still sees `Corrupt` may retry the call, and a head that
+    /// names no body is the run's own damage.
     ///
     /// # Errors
     ///

@@ -216,17 +216,17 @@ fn head_artifact(
     }
 }
 
-/// A head artifact as a view carries it: a file by content address, never its bytes.
-fn head_artifact_ref(artifact: &HeadArtifact) -> ArtifactRef {
+/// A head artifact as a view carries it: a file by content address, never its bytes. Consumes the
+/// head artifact, so a poll does not clone its members.
+fn head_artifact_ref(artifact: HeadArtifact) -> ArtifactRef {
     ArtifactRef {
-        id: artifact.id.clone(),
-        name: artifact.name.clone(),
-        mime_type: artifact.mime_type.clone(),
-        data: artifact.data.clone(),
+        id: artifact.id,
+        name: artifact.name,
+        mime_type: artifact.mime_type,
+        data: artifact.data,
         file: artifact
             .file
-            .as_ref()
-            .map(|file| FileRef::blob(file.filename.clone(), file.size, file.digest.clone())),
+            .map(|file| FileRef::blob(file.filename, file.size, file.digest)),
     }
 }
 
@@ -335,7 +335,7 @@ impl Stored {
                 attempt: head.attempt,
                 output: head.output,
                 error: head.error,
-                artifacts: head.artifacts.iter().map(head_artifact_ref).collect(),
+                artifacts: head.artifacts.into_iter().map(head_artifact_ref).collect(),
                 agent_wake: head.agent_wake,
                 hb: head.hb,
             },

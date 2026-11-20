@@ -246,6 +246,10 @@ impl RoundFacts {
     fn read(rec: &RunRecord) -> Option<Self> {
         // The envelope's version gate, without the envelope: a state another version wrote is not
         // read here, exactly as `Envelope::decode` refuses it.
+        //
+        // S3: `load_run` and `list_runs` return the head; the session header, `close_asked` and
+        // the error are in the head, so this must accept `v: 5` (and join only if it needs a
+        // member the head does not carry).
         if rec.state.get("v").and_then(Value::as_u64) != Some(u64::from(crate::envelope::VERSION)) {
             return None;
         }

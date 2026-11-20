@@ -25,6 +25,11 @@ pub(crate) const MAX_CACHED_ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
 /// [`MAX_CACHED_ARTIFACT_BYTES`] and never caches a blob larger than the whole budget. A blob is
 /// immutable and content-addressed, so an entry cannot be stale; the cost of the bound is a
 /// re-read, never a wrong byte.
+///
+/// The bound is in **bytes, not entries**: many tiny blobs can fill the map with many entries, and
+/// [`get`](Self::get)/[`put`](Self::put) scan the order deque linearly. A run's file artifacts are
+/// at most a handful (the artifact bounds), so the scan is short in practice; a store of millions of
+/// one-byte blobs would not be.
 #[derive(Default)]
 pub(crate) struct BlobCache {
     entries: HashMap<BlobId, Arc<[u8]>>,
