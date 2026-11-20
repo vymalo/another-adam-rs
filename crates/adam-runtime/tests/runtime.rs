@@ -8131,6 +8131,91 @@ async fn state_is_corrupt_when_the_body_is_short_twice() {
     assert_eq!(moving.loads(), 2, "one re-read, then the same short set");
 }
 
+/// A lost CAS leaves its extra rows in the current generation until its `delete_loser` runs (or
+/// the orphan grace collects them), so the generation can be **longer** than the head's `len`. The
+/// head names a prefix: `Runtime::state` joins it and ignores the rows past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_ignores_a_lost_attempts_rows_past_the_heads_prefix() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let agent = TranscriptAgent::new(&uniq("lost"), 3);
+    let rt = transcript_runtime(&inner, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let first = inner.load_head(run).await.expect("load").expect("the run");
+    let generation = common::moving::generation_of(&first);
+    let len = first.state["body"]["len"]
+        .as_u64()
+        .expect("the head names a length") as u32;
+    let lost = Arc::new(common::lost::LostRows::new(
+        inner.clone(),
+        run,
+        generation,
+        len,
+        json!("a lost attempt's extra message"),
+    ));
+    let store: DynStore = lost.clone();
+    let reader = transcript_runtime(&store, &agent);
+    let state = reader.state(run).await.expect("state").expect("the run");
+    let messages = common::moving::messages(&state);
+    assert_eq!(
+        messages.len(),
+        len as usize,
+        "the state is the head's prefix"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message == "a lost attempt's extra message"),
+        "the extra row is not part of the head's state: {messages:?}"
+    );
+    assert_eq!(
+        lost.lists(),
+        1,
+        "the prefix joined on the first read, with no re-read"
+    );
+}
+
+/// A generation longer than the head does not excuse a hole in the prefix: a missing row is still
+/// `Corrupt` after the one re-read, not a state with a gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_is_corrupt_when_a_row_is_missing_from_the_heads_prefix() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let agent = TranscriptAgent::new(&uniq("hole"), 3);
+    let rt = transcript_runtime(&inner, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let first = inner.load_head(run).await.expect("load").expect("the run");
+    let generation = common::moving::generation_of(&first);
+    let len = first.state["body"]["len"]
+        .as_u64()
+        .expect("the head names a length") as u32;
+    let lost = Arc::new(
+        common::lost::LostRows::new(
+            inner.clone(),
+            run,
+            generation,
+            len,
+            json!("a lost attempt's extra message"),
+        )
+        .with_missing(1),
+    );
+    let store: DynStore = lost.clone();
+    let reader = transcript_runtime(&store, &agent);
+    let error = reader.state(run).await.expect_err("the prefix has a hole");
+    assert!(matches!(error, RuntimeError::Corrupt { .. }), "{error:?}");
+    assert_eq!(
+        lost.lists(),
+        1,
+        "one body read; the re-read head did not move, so the hole is not retried"
+    );
+}
+
 /// `Runtime::artifact_bytes` answers an inline file's own bytes, a stored blob's bytes once, and
 /// `None` for a blob that is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
