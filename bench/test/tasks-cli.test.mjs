@@ -6,6 +6,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { ConfigError } from '../lib/config.mjs';
 import { FakeContainers } from '../lib/containers.mjs';
+import { PINS } from '../lib/pins.mjs';
 import { runTasks } from '../lib/tasks-cli.mjs';
 import { UpstreamError, fetchUpstream, parseSums, taskChecksum, verifySums } from '../lib/upstream.mjs';
 import { commitFiles, git, initRepo, lines, SHA } from './gitfix.mjs';
@@ -337,7 +338,7 @@ test('check resumes from check.json: a recorded verdict is not run again and the
 });
 
 
-test('check removes the image of a dropped task right after its verdict, and never one a kept task or the workspace image uses', async (t) => {
+test('check --keep-images removes the image of a dropped task right after its verdict, and never one a kept task or the workspace image uses', async (t) => {
   const ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2', 'instance_Org__Beta-bbbbbbb1', 'instance_Org__Beta-bbbbbbb2'];
   const bad = new Set([ids[0], ids[2], ids[3]]);
   const shared = `sha256:${sha('shared')}`;
@@ -347,7 +348,7 @@ test('check removes the image of a dropped task right after its verdict, and nev
   const up = upstream(t, ids, failing(bad));
   const s = setup(t, { tasks: { ...publicCfg(up).tasks, workspaceImage: `registry.example.test/workspace@${workspace}` } });
   const rt = walkRuntime({ ids, digestFor });
-  assert.equal(await s.run(['check', '--all'], () => rt), 0);
+  assert.equal(await s.run(['check', '--all', '--keep-images'], () => rt), 0);
   const removed = rt.removed.join('\n');
   assert.match(removed, new RegExp(`${IMAGE}@sha256:${sha(ids[2])}`), 'a dropped task\'s image is removed by digest');
   assert.match(removed, new RegExp(`${IMAGE}:${ids[2].slice(-8)}`), 'and by tag');
@@ -356,6 +357,43 @@ test('check removes the image of a dropped task right after its verdict, and nev
   assert.equal(removed.includes(workspace), false, 'the workspace (coder) image stays');
   assert.equal(removed.includes(`:${ids[1].slice(-8)}`), false, 'a kept task\'s image stays');
   assert.equal(removed.includes(`:${ids[3].slice(-8)}`), false);
+});
+
+test('check removes the image of a kept task too, once its digest is in check.json, never the workspace image or the coder\'s', async (t) => {
+  const ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2', 'instance_Org__Beta-bbbbbbb1', 'instance_Org__Beta-bbbbbbb2'];
+  const workspace = `sha256:${sha('workspace')}`;
+  const digestFor = (id) => (id === ids[3] ? workspace : id === ids[2] ? PINS.coder.digest : `sha256:${sha(id)}`);
+  const up = upstream(t, ids, failing(new Set([ids[0]])));
+  const s = setup(t, { tasks: { ...publicCfg(up).tasks, workspaceImage: `registry.example.test/workspace@${workspace}` } });
+  const rt = walkRuntime({ ids, digestFor });
+  const recordedAtRemoval = {};
+  const remove = rt.removeImage;
+  rt.removeImage = async (ref) => {
+    const digest = /@(sha256:[0-9a-f]{64})$/.exec(ref)?.[1];
+    if (digest) recordedAtRemoval[digest] = Object.values(checkJson(s)).some((r) => r.imageDigest === digest && r.ok !== undefined);
+    return remove(ref);
+  };
+  assert.equal(await s.run(['check', '--all'], () => rt), 0);
+  const removed = rt.removed.join('\n');
+  assert.match(removed, new RegExp(`${IMAGE}@sha256:${sha(ids[1])}`), 'a kept task\'s image is removed by digest');
+  assert.match(removed, new RegExp(`${IMAGE}:${ids[1].slice(-8)}`), 'and by tag');
+  assert.match(removed, new RegExp(`${IMAGE}@sha256:${sha(ids[0])}`), 'and a dropped task\'s, as before');
+  assert.equal(removed.includes(workspace), false, 'the workspace image stays');
+  assert.equal(removed.includes(PINS.coder.digest), false, 'the coder image stays');
+  assert.equal(recordedAtRemoval[`sha256:${sha(ids[1])}`], true, 'the digest was in check.json before the image went');
+  const kept = checkJson(s)[`public/${ids[1]}`];
+  assert.equal(kept.ok, true);
+  assert.equal(kept.imageDigest, `sha256:${sha(ids[1])}`);
+});
+
+test('check --keep-images keeps the images of the kept tasks', async (t) => {
+  const ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2'];
+  const up = upstream(t, ids);
+  const s = setup(t, publicCfg(up));
+  const rt = walkRuntime({ ids });
+  assert.equal(await s.run(['check', '--all', '--keep-images'], () => rt), 0);
+  assert.deepEqual(rt.removed, []);
+  assert.match(s.outLines.join('\n'), /2 kept, 0 dropped/);
 });
 
 test('a failed image removal is logged and does not change the verdict', async (t) => {
