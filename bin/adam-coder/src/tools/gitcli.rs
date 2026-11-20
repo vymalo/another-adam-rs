@@ -8,7 +8,7 @@ use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 
-pub(crate) use adam_code_tools::git::{GitAt, ListError, MAX_LISTED_PATHS, git_stdout, list_files};
+pub(crate) use adam_code_tools::git::{GitAt, git_stdout};
 /// The commit `HEAD` points at.
 pub(crate) async fn head_sha(at: &GitAt) -> Option<String> {
     git_stdout(at, &["rev-parse", "HEAD"])

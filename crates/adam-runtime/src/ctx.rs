@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 use futures::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -229,15 +229,15 @@ impl Ctx {
     /// for things that may differ between executions (computing a `wake_at`
     /// to park with); use [`Ctx::now_journaled`] when a decision must repeat
     /// identically on replay.
-    pub fn now(&self) -> DateTime<Utc> {
+    pub fn now(&self) -> Timestamp {
         self.clock.now()
     }
 
     /// Like [`Ctx::now`], but recorded in the journal (consuming one `seq`),
     /// so every replay of this transition sees the same instant.
-    pub async fn now_journaled(&mut self) -> Result<DateTime<Utc>, AgentError> {
+    pub async fn now_journaled(&mut self) -> Result<Timestamp, AgentError> {
         let clock = self.clock.clone();
-        let result: Result<DateTime<Utc>, String> = self
+        let result: Result<Timestamp, String> = self
             .step(NOW_STEP, || async move { Ok(clock.now()) })
             .await?;
         result.map_err(|e| AgentError::permanent(format!("journaled clock read failed: {e}")))
@@ -718,6 +718,38 @@ mod tests {
             cancel: CancelToken::new(),
             runtime,
         })
+    }
+
+    /// A clock that never moves: what a journaled read must reproduce byte for byte.
+    struct Fixed(Timestamp);
+
+    impl crate::Clock for Fixed {
+        fn now(&self) -> Timestamp {
+            self.0
+        }
+    }
+
+    /// `now_journaled` stores a bare timestamp string, with the bytes chrono wrote (`.120` keeps
+    /// its three digits), and a replay returns it without reading the clock again.
+    #[tokio::test]
+    async fn a_journaled_clock_read_is_a_bare_timestamp_string() {
+        let sink = CollectingSink::new();
+        let mut ctx = ctx(&sink).await;
+        let at: Timestamp = "2026-01-02T03:04:05.120Z".parse().expect("a timestamp");
+        ctx.clock = Arc::new(Fixed(at));
+        assert_eq!(ctx.now_journaled().await.expect("journaled"), at);
+        let entry = ctx
+            .store
+            .journal_get(ctx.run_id(), 0)
+            .await
+            .expect("get")
+            .expect("recorded");
+        assert_eq!(entry.payload, serde_json::json!("2026-01-02T03:04:05.120Z"));
+
+        let (store, run) = (ctx.store.clone(), ctx.run_id());
+        let mut replay = ctx_on(&store, run, 0);
+        replay.clock = Arc::new(Fixed(Timestamp::MAX));
+        assert_eq!(replay.now_journaled().await.expect("replayed"), at);
     }
 
     #[tokio::test]

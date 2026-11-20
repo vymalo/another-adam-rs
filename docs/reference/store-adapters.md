@@ -122,8 +122,11 @@ cron tick across all replicas. A second message on a conversation that has an op
   ([ADR 0051](../decisions/0051-a-nul-is-stored-as-the-replacement-character.md)). `journal_put`,
   `push_put` and `push_commit` return the cleaned value they stored; a run's `create_run`/`commit_run`
   return no state, and a read returns the stored one.
-* **Time** is truncated to milliseconds in every store. Lease expiry uses the `now` the caller passes in:
-  keep worker clocks in sync (NTP) and lease TTLs well above the expected skew.
+* **Time** is `adam_core::time::Timestamp` (ADR 0057), a `jiff::Timestamp` whose serde bytes are the ones
+  `chrono::DateTime<Utc>` wrote. Every store truncates it to milliseconds; PostgreSQL keeps it in `TIMESTAMPTZ`
+  through sqlx's chrono support and MongoDB in a BSON date, so the stored value is the same in every backend.
+  Lease expiry uses the `now` the caller passes in: keep worker clocks in sync (NTP) and lease TTLs well above
+  the expected skew.
 
 ## Adding a backend
 
@@ -141,3 +144,6 @@ upload or sweep one must not run beside each other. The suite's blob cases and t
 libtest. **A test that calls `purge_finished` or `purge_blobs` must carry `purge` in its name** (or
 be listed in the group's filter), and a repository that runs its own store tests must put the same
 cases in a single-thread group of its own.
+
+**A new required type does the same**: `Timestamp` replaced `chrono::DateTime<Utc>` in
+every `Store` signature (ADR 0057), so an implementation written before it must change with it.

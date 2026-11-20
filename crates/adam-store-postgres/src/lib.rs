@@ -44,6 +44,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_core::store::{add_ttl, now, sched_at, storable, truncate_ms};
+use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun,
     PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
@@ -51,11 +52,12 @@ use adam_core::{
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow};
+use sqlx::encode::IsNull;
+use sqlx::error::BoxDynError;
+use sqlx::postgres::{PgArgumentBuffer, PgConnection, PgPool, PgPoolOptions, PgRow, PgValueRef};
 use sqlx::types::Json;
-use sqlx::{AssertSqlSafe, Connection, Executor, Row};
+use sqlx::{AssertSqlSafe, Connection, Decode, Encode, Executor, Postgres, Row, Type};
 use uuid::Uuid;
 
 /// Current schema version written to the `<prefix>meta` table.
@@ -889,6 +891,64 @@ fn to_i64(n: u64, what: &str) -> StoreResult<i64> {
     i64::try_from(n).map_err(|_| StoreError::InvalidInput(format!("{what} {n} exceeds i64::MAX")))
 }
 
+/// A [`Timestamp`] as PostgreSQL's `TIMESTAMPTZ`.
+///
+/// sqlx 0.9 has no jiff support, so this delegates to its chrono support: the column type, the
+/// encoded value and the bytes on the wire are exactly what the store wrote before ADR 0057.
+/// **Temporary:** when the store moves from sqlx to tokio-postgres, `postgres-types`'s
+/// `with-jiff-0_2` feature does this natively (the same `TIMESTAMPTZ`, microseconds since 2000,
+/// the same bytes as `with-chrono-0_4`), and this bridge is deleted with sqlx's `chrono` feature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PgTime(Timestamp);
+
+impl Type<Postgres> for PgTime {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <chrono::DateTime<chrono::Utc> as Type<Postgres>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <chrono::DateTime<chrono::Utc> as Type<Postgres>>::compatible(ty)
+    }
+}
+
+impl Encode<'_, Postgres> for PgTime {
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+        Encode::<Postgres>::encode(chrono_of(self.0)?, buf)
+    }
+}
+
+impl<'r> Decode<'r, Postgres> for PgTime {
+    fn decode(value: PgValueRef<'r>) -> Result<Self, BoxDynError> {
+        let at = <chrono::DateTime<chrono::Utc> as Decode<Postgres>>::decode(value)?;
+        Ok(Self(timestamp_of(at)?))
+    }
+}
+
+/// `t` as chrono's UTC datetime, the driver type. chrono counts a fractional second as a
+/// non-negative part of the second before it; jiff keeps the fraction's sign.
+fn chrono_of(t: Timestamp) -> Result<chrono::DateTime<chrono::Utc>, BoxDynError> {
+    let mut second = t.as_second();
+    let mut nanosecond = t.subsec_nanosecond();
+    if nanosecond < 0 {
+        second = second
+            .checked_sub(1)
+            .ok_or("timestamp out of range for PostgreSQL")?;
+        nanosecond += 1_000_000_000;
+    }
+    let nanosecond = u32::try_from(nanosecond)?;
+    chrono::DateTime::from_timestamp(second, nanosecond)
+        .ok_or_else(|| format!("timestamp {t} is out of range for PostgreSQL").into())
+}
+
+/// chrono's UTC datetime as a [`Timestamp`], failing outside jiff's range (PostgreSQL's
+/// `TIMESTAMPTZ` reaches further).
+fn timestamp_of(at: chrono::DateTime<chrono::Utc>) -> Result<Timestamp, BoxDynError> {
+    let nanosecond = i32::try_from(at.timestamp_subsec_nanos())?;
+    jiff::Timestamp::new(at.timestamp(), nanosecond)
+        .map(Timestamp)
+        .map_err(|e| format!("PostgreSQL returned {at}, out of range for jiff: {e}").into())
+}
+
 fn run_from_row(row: &PgRow) -> StoreResult<RunRecord> {
     let mut run = run_metadata_from_row(row)?;
     let Json(state): Json<Value> = row.try_get("state").map_err(classify)?;
@@ -910,12 +970,12 @@ fn run_header_from_row(row: &PgRow) -> StoreResult<RunHeader> {
             .map(RunId),
         status: RunStatus::parse(&status)
             .ok_or_else(|| StoreError::Corrupt(format!("unknown run status {status:?}")))?,
-        wake_at: row.try_get("wake_at").map_err(classify)?,
+        wake_at: opt_time(row, "wake_at")?,
         version: u64::try_from(version)
             .map_err(|_| StoreError::Corrupt(format!("negative version {version}")))?,
-        created_at: row.try_get("created_at").map_err(classify)?,
-        updated_at: row.try_get("updated_at").map_err(classify)?,
-        lease_until: row.try_get("lease_until").map_err(classify)?,
+        created_at: time(row, "created_at")?,
+        updated_at: time(row, "updated_at")?,
+        lease_until: opt_time(row, "lease_until")?,
     })
 }
 
@@ -935,12 +995,23 @@ fn run_metadata_from_row(row: &PgRow) -> StoreResult<RunRecord> {
         status: RunStatus::parse(&status)
             .ok_or_else(|| StoreError::Corrupt(format!("unknown run status {status:?}")))?,
         state: Value::Null,
-        wake_at: row.try_get("wake_at").map_err(classify)?,
+        wake_at: opt_time(row, "wake_at")?,
         version: u64::try_from(version)
             .map_err(|_| StoreError::Corrupt(format!("negative version {version}")))?,
-        created_at: row.try_get("created_at").map_err(classify)?,
-        updated_at: row.try_get("updated_at").map_err(classify)?,
+        created_at: time(row, "created_at")?,
+        updated_at: time(row, "updated_at")?,
     })
+}
+
+fn time(row: &PgRow, column: &str) -> StoreResult<Timestamp> {
+    Ok(row.try_get::<PgTime, _>(column).map_err(classify)?.0)
+}
+
+fn opt_time(row: &PgRow, column: &str) -> StoreResult<Option<Timestamp>> {
+    Ok(row
+        .try_get::<Option<PgTime>, _>(column)
+        .map_err(classify)?
+        .map(|t| t.0))
 }
 
 fn push_from_row(row: &PgRow) -> StoreResult<PushRecord> {
@@ -961,11 +1032,11 @@ fn push_from_row(row: &PgRow) -> StoreResult<PushRecord> {
         attempts: u32::try_from(attempts)
             .map_err(|_| StoreError::Corrupt(format!("negative attempts {attempts}")))?,
         last_error: row.try_get("last_error").map_err(classify)?,
-        next_attempt_at: row.try_get("next_attempt_at").map_err(classify)?,
+        next_attempt_at: time(row, "next_attempt_at")?,
         version: u64::try_from(version)
             .map_err(|_| StoreError::Corrupt(format!("negative version {version}")))?,
-        created_at: row.try_get("created_at").map_err(classify)?,
-        updated_at: row.try_get("updated_at").map_err(classify)?,
+        created_at: time(row, "created_at")?,
+        updated_at: time(row, "updated_at")?,
     })
 }
 
@@ -977,7 +1048,7 @@ fn entry_from_row(row: &PgRow) -> StoreResult<JournalEntry> {
         name: row.try_get("name").map_err(classify)?,
         ok: row.try_get("ok").map_err(classify)?,
         payload,
-        recorded_at: row.try_get("recorded_at").map_err(classify)?,
+        recorded_at: time(row, "recorded_at")?,
     })
 }
 
@@ -1013,9 +1084,9 @@ impl Store for PgStore {
             .bind(new.parent_id.map(|p| p.0))
             .bind(new.status.as_str())
             .bind(Json(state.as_ref()))
-            .bind(wake_at)
-            .bind(sched_at(new.status, wake_at, t))
-            .bind(t)
+            .bind(wake_at.map(PgTime))
+            .bind(sched_at(new.status, wake_at, t).map(PgTime))
+            .bind(PgTime(t))
             .fetch_one(&self.pool)
             .await
             .map_err(|e| {
@@ -1066,9 +1137,9 @@ impl Store for PgStore {
             .bind(expected)
             .bind(status.as_str())
             .bind(Json(state.as_ref()))
-            .bind(wake_at)
-            .bind(sched_at(status, wake_at, t))
-            .bind(t);
+            .bind(wake_at.map(PgTime))
+            .bind(sched_at(status, wake_at, t).map(PgTime))
+            .bind(PgTime(t));
         // A commit with references is one transaction: a commit that loses the CAS writes no ref,
         // and a commit that wins has all of them. A run with no file bytes keeps the single
         // statement it always was (no BEGIN/COMMIT round trips on the common path).
@@ -1175,7 +1246,7 @@ impl Store for PgStore {
             .bind(&entry.name)
             .bind(entry.ok)
             .bind(Json(payload.as_ref()))
-            .bind(truncate_ms(entry.recorded_at))
+            .bind(PgTime(truncate_ms(entry.recorded_at)))
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| self.map_write_err(e, run, "", None))?;
@@ -1212,7 +1283,7 @@ impl Store for PgStore {
         worker: &str,
         scope: ClaimScope,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>> {
@@ -1228,10 +1299,10 @@ impl Store for PgStore {
         let busy: Vec<Uuid> = busy.iter().map(|id| id.0).collect();
         let rows = sqlx::query(safe(statement))
             .bind(agents)
-            .bind(now)
+            .bind(PgTime(now))
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .bind(worker)
-            .bind(until)
+            .bind(PgTime(until))
             .bind(busy)
             .fetch_all(&self.pool)
             .await
@@ -1240,7 +1311,7 @@ impl Store for PgStore {
         let mut claimed = rows
             .iter()
             .map(|row| {
-                let sched: DateTime<Utc> = row.try_get("sched_at").map_err(classify)?;
+                let sched: PgTime = row.try_get("sched_at").map_err(classify)?;
                 Ok((sched, run_from_row(row)?))
             })
             .collect::<StoreResult<Vec<_>>>()?;
@@ -1259,15 +1330,15 @@ impl Store for PgStore {
         &self,
         id: RunId,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
     ) -> StoreResult<bool> {
         let now = truncate_ms(now);
         let done = sqlx::query(safe(&self.sql.renew_lease))
             .bind(id.0)
             .bind(worker)
-            .bind(now)
-            .bind(add_ttl(now, ttl))
+            .bind(PgTime(now))
+            .bind(PgTime(add_ttl(now, ttl)))
             .execute(&self.pool)
             .await
             .map_err(classify)?;
@@ -1284,17 +1355,17 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         let row = sqlx::query(safe(&self.sql.lease_until))
             .bind(id.0)
             .fetch_optional(&self.pool)
             .await
             .map_err(classify)?;
         let until = row
-            .map(|r| r.try_get::<Option<DateTime<Utc>>, _>("lease_until"))
+            .map(|r| r.try_get::<Option<PgTime>, _>("lease_until"))
             .transpose()
             .map_err(classify)?;
-        Ok(until.flatten())
+        Ok(until.flatten().map(|t| t.0))
     }
 
     async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
@@ -1309,8 +1380,8 @@ impl Store for PgStore {
         let rows = sqlx::query(safe(statement))
             .bind(&query.agent)
             .bind(statuses)
-            .bind(query.updated_since.map(truncate_ms))
-            .bind(query.after.map(|(at, _)| truncate_ms(at)))
+            .bind(query.updated_since.map(truncate_ms).map(PgTime))
+            .bind(query.after.map(|(at, _)| PgTime(truncate_ms(at))))
             .bind(query.after.map(|(_, id)| id.0))
             .bind(i64::try_from(query.limit).unwrap_or(i64::MAX))
             .bind(scope)
@@ -1335,7 +1406,7 @@ impl Store for PgStore {
         let count: i64 = sqlx::query_scalar(safe(statement))
             .bind(&query.agent)
             .bind(statuses)
-            .bind(query.updated_since.map(truncate_ms))
+            .bind(query.updated_since.map(truncate_ms).map(PgTime))
             .bind(scope)
             .bind(upper)
             .fetch_one(&self.pool)
@@ -1354,7 +1425,7 @@ impl Store for PgStore {
             .bind(&new.owner)
             .bind(Json(config.as_ref()))
             .bind(Json(cursor.as_ref()))
-            .bind(now())
+            .bind(PgTime(now()))
             .fetch_one(&self.pool)
             .await
             .map_err(|e| self.map_write_err(e, new.run, &new.agent, None))?;
@@ -1384,7 +1455,7 @@ impl Store for PgStore {
         &self,
         agents: &[String],
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<PushRecord>> {
@@ -1394,10 +1465,10 @@ impl Store for PgStore {
         let now = truncate_ms(now);
         let rows = sqlx::query(safe(&self.sql.push_claim))
             .bind(agents)
-            .bind(now)
+            .bind(PgTime(now))
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .bind(worker)
-            .bind(add_ttl(now, ttl))
+            .bind(PgTime(add_ttl(now, ttl)))
             .fetch_all(&self.pool)
             .await
             .map_err(classify)?;
@@ -1431,8 +1502,8 @@ impl Store for PgStore {
             .bind(Json(cursor.as_ref()))
             .bind(attempts)
             .bind(&progress.last_error)
-            .bind(truncate_ms(progress.next_attempt_at))
-            .bind(now())
+            .bind(PgTime(truncate_ms(progress.next_attempt_at)))
+            .bind(PgTime(now()))
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| self.map_write_err(e, run, "", None))?;
@@ -1455,12 +1526,12 @@ impl Store for PgStore {
         }
     }
 
-    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64> {
         let mut total = 0;
         loop {
             let done = sqlx::query(safe(&self.sql.purge))
                 .bind(agent)
-                .bind(before)
+                .bind(PgTime(before))
                 .bind(PURGE_BATCH)
                 .execute(&self.pool)
                 .await
@@ -1487,7 +1558,7 @@ impl Store for PgStore {
             .bind(id.as_str())
             .bind(bytes)
             .bind(to_i64(bytes.len() as u64, "blob size")?)
-            .bind(now())
+            .bind(PgTime(now()))
             .execute(&self.pool)
             .await
             .map_err(classify)?;
@@ -1513,18 +1584,18 @@ impl Store for PgStore {
             .transpose()
     }
 
-    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_blobs(&self, before: Timestamp) -> StoreResult<u64> {
         self.sweep_blobs(before).await
     }
 }
 
 impl PgStore {
     /// Delete unreferenced blobs older than `before` in batches; returns how many.
-    async fn sweep_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn sweep_blobs(&self, before: Timestamp) -> StoreResult<u64> {
         let mut total = 0;
         loop {
             let done = sqlx::query(safe(&self.sql.purge_blobs))
-                .bind(before)
+                .bind(PgTime(before))
                 .bind(PURGE_BATCH)
                 .execute(&self.pool)
                 .await

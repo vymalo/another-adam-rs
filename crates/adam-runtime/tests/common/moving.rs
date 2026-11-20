@@ -13,12 +13,12 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, BodyRow, BodyWrite, ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun,
     PushProgress, PushRecord, RunHeader, RunId, RunQuery, RunRecord, RunUpdate, Store, StoreResult,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -88,7 +88,7 @@ impl Store for MovingHead {
         let Some((first, generation)) = self.first() else {
             return self.inner.load_head(id).await;
         };
-        let cutoff = Utc::now() + chrono::Duration::hours(1);
+        let cutoff = Timestamp::now() + jiff::SignedDuration::from_hours(1);
         if self.compact {
             let rec = self.inner.load_run(id).await?.expect("the run");
             let rows = self.inner.body_list(id, generation).await?;
@@ -176,7 +176,7 @@ impl Store for MovingHead {
         worker: &str,
         scope: ClaimScope,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>> {
@@ -189,7 +189,7 @@ impl Store for MovingHead {
         &self,
         id: RunId,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
     ) -> StoreResult<bool> {
         self.inner.renew_lease(id, worker, now, ttl).await
@@ -199,7 +199,7 @@ impl Store for MovingHead {
         self.inner.release_lease(id, worker).await
     }
 
-    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         self.inner.lease_until(id).await
     }
 
@@ -227,7 +227,7 @@ impl Store for MovingHead {
         &self,
         agents: &[String],
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<PushRecord>> {
@@ -248,7 +248,7 @@ impl Store for MovingHead {
             .await
     }
 
-    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64> {
         self.inner.purge_finished(agent, before).await
     }
 
@@ -264,7 +264,7 @@ impl Store for MovingHead {
         &self,
         run: RunId,
         keep_generation: Uuid,
-        before: DateTime<Utc>,
+        before: Timestamp,
     ) -> StoreResult<u64> {
         self.inner.gc_body(run, keep_generation, before).await
     }
@@ -285,7 +285,7 @@ impl Store for MovingHead {
         self.inner.get_blob(id).await
     }
 
-    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_blobs(&self, before: Timestamp) -> StoreResult<u64> {
         self.inner.purge_blobs(before).await
     }
 }

@@ -245,22 +245,22 @@ impl Worker {
 /// timestamps the store stamps in real time (a new run is due at its
 /// `updated_at`) are never in its future.
 #[derive(Clone)]
-struct FrozenClock(Arc<Mutex<chrono::DateTime<chrono::Utc>>>);
+struct FrozenClock(Arc<Mutex<adam_core::time::Timestamp>>);
 
 impl FrozenClock {
     fn new() -> Self {
-        let start = adam_core::store::now() + chrono::Duration::minutes(1);
+        let start = adam_core::store::now() + jiff::SignedDuration::from_mins(1);
         Self(Arc::new(Mutex::new(start)))
     }
 
     fn advance(&self, by: Duration) {
-        let by = chrono::Duration::from_std(by).expect("in range");
+        let by = jiff::SignedDuration::try_from(by).expect("in range");
         *self.0.lock().expect("lock") += by;
     }
 }
 
 impl Clock for FrozenClock {
-    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+    fn now(&self) -> adam_core::time::Timestamp {
         *self.0.lock().expect("lock")
     }
 }
@@ -398,7 +398,7 @@ impl Hold {
     }
 }
 
-const WAIT: chrono::Duration = chrono::Duration::seconds(60);
+const WAIT: jiff::SignedDuration = jiff::SignedDuration::from_secs(60);
 
 /// A small file for the artifact tests.
 const SVG: &[u8] = b"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'/>";
@@ -598,11 +598,8 @@ fn child_with_child(
 }
 
 /// Two instants of a clock that is the wall clock plus an offset are the same within a second or two.
-fn near(a: chrono::DateTime<chrono::Utc>, b: chrono::DateTime<chrono::Utc>) {
-    assert!(
-        (a - b).num_milliseconds().abs() < 2_000,
-        "{a} is not near {b}"
-    );
+fn near(a: adam_core::time::Timestamp, b: adam_core::time::Timestamp) {
+    assert!((a - b).as_millis().abs() < 2_000, "{a} is not near {b}");
 }
 
 /// A child that parks on a timer of `minutes` minutes, and does so again at each wake.
@@ -613,7 +610,7 @@ fn child_parked_on_a_timer(name: &str, minutes: i64) -> FnAgent {
             async move {
                 Ok(Transition::Park {
                     state,
-                    wake_at: Some(ctx.now() + chrono::Duration::minutes(minutes)),
+                    wake_at: Some(ctx.now() + jiff::SignedDuration::from_mins(minutes)),
                 })
             }
             .boxed()
@@ -1441,7 +1438,7 @@ mod cases {
                         if phase(&state) == 0 {
                             return Ok(Transition::Park {
                                 state: json!({"phase": 1}),
-                                wake_at: Some(ctx.now() + chrono::Duration::milliseconds(500)),
+                                wake_at: Some(ctx.now() + jiff::SignedDuration::from_millis(500)),
                             });
                         }
                         Ok(Transition::Done {
@@ -1502,7 +1499,7 @@ mod cases {
                         if phase(&state) == 0 {
                             return Ok(Transition::Park {
                                 state: json!({"phase": 1}),
-                                wake_at: Some(ctx.now() + chrono::Duration::hours(1)),
+                                wake_at: Some(ctx.now() + jiff::SignedDuration::from_hours(1)),
                             });
                         }
                         Ok(Transition::Done {
@@ -1580,7 +1577,7 @@ mod cases {
         // After each failed try the run waits, runnable, for its backoff to
         // pass. Time is frozen, so `wake_at - now` is exactly that backoff,
         // and the run cannot be tried again before the test advances time.
-        let mut delays: Vec<i64> = Vec::new();
+        let mut delays: Vec<i128> = Vec::new();
         for failed_tries in 1..=2u32 {
             let v = wait_for(&rt, run, "a retry is scheduled", |v| {
                 v.attempt == failed_tries && v.wake_at.is_some()
@@ -1593,8 +1590,8 @@ mod cases {
                 failed_tries as usize,
                 "not tried again before its backoff has passed"
             );
-            delays.push(delay.num_milliseconds());
-            clock.advance(delay.to_std().expect("a backoff in the future"));
+            delays.push(delay.as_millis());
+            clock.advance(std::time::Duration::try_from(delay).expect("a backoff in the future"));
         }
         let last = wait_for(&rt, run, "gave up", |v| v.status == RunStatus::Failed).await;
         worker.stop().await;
@@ -3033,7 +3030,7 @@ mod cases {
         })
         .await;
         let wake_at = scheduled.wake_at.expect("a retry carries a timer");
-        let thirty = chrono::Duration::seconds(30);
+        let thirty = jiff::SignedDuration::from_secs(30);
         assert!(wake_at >= t0 + thirty, "hint ignored: wake_at {wake_at}");
         assert!(
             wake_at <= clock.now() + thirty,
@@ -3041,9 +3038,10 @@ mod cases {
         );
 
         // 5 s before the hint is up: several polls later, still not stepped.
-        let gap = (wake_at - clock.now() - chrono::Duration::seconds(5))
-            .to_std()
-            .expect("the timer is in the future");
+        let gap = std::time::Duration::try_from(
+            wake_at - clock.now() - jiff::SignedDuration::from_secs(5),
+        )
+        .expect("the timer is in the future");
         clock.advance(gap);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(count(&steps), 1, "stepped before the hint elapsed");
@@ -3112,7 +3110,7 @@ mod cases {
         let worker = spawn_worker(&rt);
         let scheduled = wait_for(&rt, run, "the retry to be scheduled", |v| v.attempt == 1).await;
         let wake_at = scheduled.wake_at.expect("timer");
-        let twenty = chrono::Duration::seconds(20);
+        let twenty = jiff::SignedDuration::from_secs(20);
         assert!(wake_at >= t0 + twenty, "backoff was shortened: {wake_at}");
         assert!(
             wake_at <= clock.now() + twenty,
@@ -3156,7 +3154,7 @@ mod cases {
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
         let scheduled = wait_for(&rt, run, "the retry to be scheduled", |v| v.attempt == 1).await;
-        let cap = chrono::Duration::from_std(MAX_RETRY_AFTER).expect("cap fits");
+        let cap = jiff::SignedDuration::try_from(MAX_RETRY_AFTER).expect("cap fits");
         let wake_at = scheduled.wake_at.expect("timer");
         assert!(wake_at >= t0 + cap, "capped too low: {wake_at}");
         assert!(wake_at <= clock.now() + cap, "not capped: {wake_at}");
@@ -3210,7 +3208,7 @@ mod cases {
         let worker = spawn_worker(&rt);
         // Each failure schedules a retry at least 5 s away (the hint, not the
         // 10-50 ms policy). Nothing steps before the test moves the clock.
-        let hint = chrono::Duration::seconds(5);
+        let hint = jiff::SignedDuration::from_secs(5);
         for attempt in 1..3 {
             let scheduled = wait_for(&rt, run, "the retry to be scheduled", |v| {
                 v.attempt == attempt
@@ -4951,7 +4949,7 @@ mod cases {
         let parent = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
         let limit = Duration::from_secs(30 * 60);
-        let deadline = clock.now() + chrono::Duration::minutes(30);
+        let deadline = clock.now() + jiff::SignedDuration::from_mins(30);
 
         let parked = child_run_id(parent, "parked");
         rt.start_child_within(parent, parked, &parked_name, inbound(), Some(limit))
@@ -4968,7 +4966,7 @@ mod cases {
         let stored = store.load_run(parked).await.unwrap().unwrap();
         near(
             stored.wake_at.unwrap(),
-            clock.now() + chrono::Duration::seconds(60),
+            clock.now() + jiff::SignedDuration::from_secs(60),
         );
         assert!(
             deadline > stored.wake_at.unwrap(),
@@ -5182,7 +5180,7 @@ mod cases {
         let purged = store
             .purge_finished(
                 &parent_name,
-                chrono::Utc::now() + chrono::Duration::hours(1),
+                adam_core::store::now() + jiff::SignedDuration::from_hours(1),
             )
             .await
             .unwrap();
@@ -5304,7 +5302,7 @@ mod cases {
                         steps.fetch_add(1, SeqCst);
                         Ok(Transition::Park {
                             state,
-                            wake_at: Some(ctx.now() + chrono::Duration::minutes(50)),
+                            wake_at: Some(ctx.now() + jiff::SignedDuration::from_mins(50)),
                         })
                     }
                     .boxed()
@@ -5330,7 +5328,7 @@ mod cases {
         .unwrap();
         let worker = spawn_worker(&rt);
         wait_for(&rt, child, "parked", |v| v.status == RunStatus::Parked).await;
-        let deadline = start + chrono::Duration::seconds(1800);
+        let deadline = start + jiff::SignedDuration::from_secs(1800);
 
         // Five seconds before the deadline a wake is due that the deadline did not set.
         clock.advance(Duration::from_secs(1795));
@@ -5355,7 +5353,7 @@ mod cases {
         let rec = store.load_run(child).await.unwrap().unwrap();
         near(
             rec.wake_at.unwrap(),
-            deadline + chrono::Duration::seconds(1),
+            deadline + jiff::SignedDuration::from_secs(1),
         );
         assert_eq!(count(&steps), 1, "the agent was not stepped");
         assert_eq!(rec.version, version + 2, "and there was no loop");
@@ -5412,7 +5410,7 @@ mod cases {
         let retrying = wait_for(&rt, child, "retry scheduled", |v| v.attempt == 1).await;
         near(
             retrying.wake_at.unwrap(),
-            start + chrono::Duration::seconds(1800),
+            start + jiff::SignedDuration::from_secs(1800),
         );
         clock.advance(Duration::from_secs(31 * 60));
         let ended = wait_failed(&rt, child).await;
@@ -5438,7 +5436,7 @@ mod cases {
                         steps.fetch_add(1, SeqCst);
                         Ok(Transition::Park {
                             state,
-                            wake_at: Some(ctx.now() + chrono::Duration::minutes(20)),
+                            wake_at: Some(ctx.now() + jiff::SignedDuration::from_mins(20)),
                         })
                     }
                     .boxed()
@@ -5803,7 +5801,10 @@ mod cases {
         back_worker.stop().await;
 
         let purged = dynamic
-            .purge_finished(&child_name, chrono::Utc::now() + chrono::Duration::hours(1))
+            .purge_finished(
+                &child_name,
+                adam_core::store::now() + jiff::SignedDuration::from_hours(1),
+            )
             .await
             .expect("purge");
         assert!(purged >= 1);
@@ -5967,7 +5968,10 @@ mod cases {
                 .unwrap()
         );
         let purged = store
-            .purge_finished(&name, chrono::Utc::now() + chrono::Duration::hours(1))
+            .purge_finished(
+                &name,
+                adam_core::store::now() + jiff::SignedDuration::from_hours(1),
+            )
             .await
             .expect("purge");
         assert!(purged >= 2, "purged {purged}");

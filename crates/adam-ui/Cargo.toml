@@ -17,6 +17,7 @@ thread-tools = ["dep:adam-mcp", "dep:secrecy"]
 
 [dependencies]
 a2a-lf.workspace = true
+adam-core.workspace = true
 adam-a2a = { path = "../adam-a2a", version = "0.1.0", default-features = false }
 adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.1.0", default-features = false }
 adam-llm-agent.workspace = true
@@ -24,7 +25,7 @@ adam-mcp = { workspace = true, optional = true }
 adam-model.workspace = true
 adam-runtime.workspace = true
 async-trait.workspace = true
-chrono.workspace = true
+jiff.workspace = true
 jsonschema.workspace = true
 secrecy = { workspace = true, optional = true }
 serde.workspace = true

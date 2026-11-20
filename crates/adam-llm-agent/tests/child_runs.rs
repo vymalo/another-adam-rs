@@ -1152,7 +1152,8 @@ mod cases {
         // The new timer is one interval from the clock's now, not from the old timer.
         let until = second.wake_at.unwrap() - rig.clock.now();
         assert!(
-            until > chrono::Duration::seconds(3) && until <= chrono::Duration::seconds(5),
+            until > jiff::SignedDuration::from_secs(3)
+                && until <= jiff::SignedDuration::from_secs(5),
             "one interval from now, got {until}"
         );
         assert_eq!(
@@ -1192,7 +1193,7 @@ mod cases {
         dynamic
             .purge_finished(
                 &rig.child_name,
-                chrono::Utc::now() + chrono::Duration::hours(1),
+                adam_core::store::now() + jiff::SignedDuration::from_hours(1),
             )
             .await
             .expect("purge");

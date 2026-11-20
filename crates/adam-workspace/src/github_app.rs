@@ -48,7 +48,7 @@ use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::{SignedDuration, Timestamp};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use reqwest::{Method, Response, StatusCode};
 use rustls_pki_types::PrivateKeyDer;
@@ -66,11 +66,11 @@ const API_VERSION: &str = "2022-11-28";
 const DEFAULT_USER_AGENT: &str = concat!("adam-workspace/", env!("CARGO_PKG_VERSION"));
 
 /// How long before its expiry a cached token is replaced.
-const REFRESH_MARGIN: TimeDelta = TimeDelta::minutes(5);
+const REFRESH_MARGIN: SignedDuration = SignedDuration::from_mins(5);
 /// How far in the past a JWT's `iat` is set (GitHub's advice against clock drift).
-const JWT_BACKDATE: TimeDelta = TimeDelta::seconds(60);
+const JWT_BACKDATE: SignedDuration = SignedDuration::from_secs(60);
 /// How far ahead a JWT's `exp` is set (GitHub allows ten minutes at most).
-const JWT_LIFETIME: TimeDelta = TimeDelta::seconds(540);
+const JWT_LIFETIME: SignedDuration = SignedDuration::from_secs(540);
 
 /// The private key of a GitHub App: an RSA key, parsed from the PEM that GitHub lets the owner
 /// download (PKCS#1, `BEGIN RSA PRIVATE KEY`) or from its PKCS#8 form (`BEGIN PRIVATE KEY`).
@@ -112,12 +112,12 @@ impl fmt::Debug for AppKey {
 }
 
 /// The time source of a [`GitHubApp`]: a function, so that a test can move the clock.
-type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
 /// An installation access token and when it stops working.
 struct Cached {
     token: SecretString,
-    expires_at: DateTime<Utc>,
+    expires_at: Timestamp,
 }
 
 /// How many installations' tokens a [`GitHubApp`] keeps. The least recently used is forgotten
@@ -131,7 +131,7 @@ const INSTALLATIONS_PER_PAGE: usize = 100;
 /// How many pages of installations [`GitHubApp::accounts`] reads: 300 accounts.
 const MAX_INSTALLATION_PAGES: usize = 3;
 /// How long "the App is not installed on this account" is believed before GitHub is asked again.
-const NOT_INSTALLED_FOR: TimeDelta = TimeDelta::seconds(60);
+const NOT_INSTALLED_FOR: SignedDuration = SignedDuration::from_secs(60);
 
 /// Which accounts a [`GitHubApp`] that finds installations by itself may act for.
 ///
@@ -198,7 +198,7 @@ enum Entry {
     Installed(Installation),
     /// Both lookups answered 404 and the clock is before `until`.
     NotInstalled {
-        until: DateTime<Utc>,
+        until: Timestamp,
     },
 }
 
@@ -401,7 +401,7 @@ impl GitHubApp {
             app_id: app_id.into(),
             mode,
             key,
-            clock: Arc::new(Utc::now),
+            clock: Arc::new(Timestamp::now),
             tokens: Mutex::new(Lru::new(MAX_CACHED_INSTALLATIONS)),
             accounts: Mutex::new(Lru::new(MAX_CACHED_ACCOUNTS)),
             identity: tokio::sync::OnceCell::new(),
@@ -411,7 +411,7 @@ impl GitHubApp {
     /// Read the time from `clock` instead of the system clock: what the JWT says, when a
     /// cached token counts as about to expire, and how long "not installed" is believed.
     #[must_use]
-    pub fn with_clock(mut self, clock: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) -> Self {
+    pub fn with_clock(mut self, clock: impl Fn() -> Timestamp + Send + Sync + 'static) -> Self {
         self.clock = Arc::new(clock);
         self
     }
@@ -595,7 +595,7 @@ impl GitHubApp {
     }
 
     /// The JWT for `now`: `{"alg":"RS256","typ":"JWT"}.{"iat","exp","iss"}`, signed.
-    fn jwt(&self, now: DateTime<Utc>) -> WorkspaceResult<SecretString> {
+    fn jwt(&self, now: Timestamp) -> WorkspaceResult<SecretString> {
         let b64 = |bytes: &[u8]| URL_SAFE_NO_PAD.encode(bytes);
         // The classic application ID is a number, a client ID is a string: say each as it is.
         let issuer = match self.app_id.parse::<u64>() {
@@ -603,8 +603,8 @@ impl GitHubApp {
             Err(_) => json!(self.app_id),
         };
         let claims = json!({
-            "iat": (now - JWT_BACKDATE).timestamp(),
-            "exp": (now + JWT_LIFETIME).timestamp(),
+            "iat": (now - JWT_BACKDATE).as_second(),
+            "exp": (now + JWT_LIFETIME).as_second(),
             "iss": issuer,
         });
         let signing_input = format!(
@@ -651,7 +651,7 @@ impl GitHubApp {
     }
 
     /// Trade a fresh JWT for an installation access token of `installation`.
-    async fn mint(&self, installation: u64, now: DateTime<Utc>) -> Result<Cached, Failure> {
+    async fn mint(&self, installation: u64, now: Timestamp) -> Result<Cached, Failure> {
         let jwt = self.jwt(now)?;
         let response = self
             .send_as_app(
@@ -680,9 +680,10 @@ impl GitHubApp {
             )
         };
         let minted: Minted = response.json().await.map_err(|_| unreadable())?;
-        let expires_at = DateTime::parse_from_rfc3339(&minted.expires_at)
-            .map_err(|_| unreadable())?
-            .with_timezone(&Utc);
+        let expires_at = minted
+            .expires_at
+            .parse::<Timestamp>()
+            .map_err(|_| unreadable())?;
         Ok(Cached {
             token: SecretString::from(minted.token),
             expires_at,
@@ -697,7 +698,7 @@ impl GitHubApp {
         let mut cache = slot.lock().await;
         let now = (self.clock)();
         if let Some(cached) = cache.as_ref()
-            && cached.expires_at - now > REFRESH_MARGIN
+            && cached.expires_at.duration_since(now) > REFRESH_MARGIN
         {
             return Ok(cached.token.clone());
         }
@@ -718,7 +719,7 @@ impl GitHubApp {
 
     /// What GitHub says about the App's installation on `owner`: the organisation's first, then
     /// the person's. `None` when it has none (both said `404`).
-    async fn look_up(&self, owner: &str, now: DateTime<Utc>) -> WorkspaceResult<Option<Found>> {
+    async fn look_up(&self, owner: &str, now: Timestamp) -> WorkspaceResult<Option<Found>> {
         let jwt = self.jwt(now)?;
         for kind in ["orgs", "users"] {
             let response = self
@@ -996,14 +997,12 @@ mod tests {
             AppKey::from_pem(&key.pkcs1_pem).unwrap(),
         )
         .unwrap();
-        let now = DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = "2026-10-01T12:00:00Z".parse::<Timestamp>().unwrap();
         let jwt = app.jwt(now).unwrap();
         let claims = key.verify_jwt(jwt.expose_secret()).unwrap();
         assert_eq!(claims["iss"], 12345, "a numeric application ID is a number");
-        assert_eq!(claims["iat"], now.timestamp() - 60);
-        assert_eq!(claims["exp"], now.timestamp() + 540);
+        assert_eq!(claims["iat"], now.as_second() - 60);
+        assert_eq!(claims["exp"], now.as_second() + 540);
         // A client ID is a string.
         let by_client_id = GitHubApp::new(
             "https://api.github.com",

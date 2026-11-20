@@ -1714,7 +1714,7 @@ mod split {
     }
 
     /// When the timer run is parked until, as it says itself.
-    fn wakes(timer: &adam_core::RunRecord) -> Option<chrono::DateTime<chrono::Utc>> {
+    fn wakes(timer: &adam_core::RunRecord) -> Option<adam_core::time::Timestamp> {
         serde_json::from_value(timer.state["agent_wake"].clone()).ok()
     }
 
@@ -1781,7 +1781,7 @@ mod split {
             );
             let parked_for = wakes(&timer).expect("parked until") - timer.created_at;
             assert!(
-                parked_for >= chrono::Duration::seconds(3590),
+                parked_for >= jiff::SignedDuration::from_secs(3590),
                 "{backend}: parked for the idle TTL, not less: {parked_for}"
             );
             assert!(

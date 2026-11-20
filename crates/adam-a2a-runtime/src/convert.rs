@@ -7,6 +7,7 @@ use a2a::{Artifact, Message, Part, Role, Task, TaskState, TaskStatus};
 use adam_a2a::A2UI_MEDIA_TYPE;
 use adam_a2a::REPLACEABLE_ARTIFACT;
 use adam_core::RunStatus;
+use adam_core::time::Timestamp;
 use adam_runtime::{ArtifactRef, FileSource, Inbound, RunView};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -16,6 +17,31 @@ use crate::text_stream;
 
 /// Prefix `Runtime::cancel` puts on the error of a cancelled run.
 pub(crate) const CANCEL_PREFIX: &str = "cancelled: ";
+
+/// A [`Timestamp`] as chrono's UTC datetime, which the A2A types use.
+///
+/// The two ranges overlap where every value the framework handles lives; a value outside
+/// jiff's range cannot be one of its timestamps, and one outside chrono's is not a status a
+/// client could receive, so both directions clamp rather than fail.
+pub(crate) fn chrono_of(at: Timestamp) -> chrono::DateTime<chrono::Utc> {
+    let (second, nanosecond) = (at.as_second(), at.subsec_nanosecond());
+    let (second, nanosecond) = if nanosecond < 0 {
+        (
+            second.saturating_sub(1),
+            (nanosecond + 1_000_000_000) as u32,
+        )
+    } else {
+        (second, nanosecond as u32)
+    };
+    chrono::DateTime::from_timestamp(second, nanosecond)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+}
+
+/// chrono's UTC datetime as a [`Timestamp`] (the A2A types' own timestamps, on the way in).
+pub(crate) fn timestamp_of(at: chrono::DateTime<chrono::Utc>) -> Timestamp {
+    let nanosecond = i32::try_from(at.timestamp_subsec_nanos()).unwrap_or(0);
+    Timestamp(jiff::Timestamp::new(at.timestamp(), nanosecond).unwrap_or(jiff::Timestamp::MAX))
+}
 
 /// Extracts the question a run that is waiting for input asks its caller.
 ///
@@ -209,7 +235,7 @@ pub(crate) fn status_of(view: &RunView, prompt: &PromptFn) -> TaskStatus {
     TaskStatus {
         state,
         message,
-        timestamp: Some(view.updated_at),
+        timestamp: Some(chrono_of(view.updated_at)),
     }
 }
 
@@ -592,7 +618,6 @@ pub(crate) fn decode_conversation(conversation: &str) -> Option<(String, String)
 #[cfg(test)]
 mod tests {
     use adam_runtime::{ArtifactRef, FileRef};
-    use chrono::Utc;
 
     use super::*;
 
@@ -612,8 +637,8 @@ mod tests {
             artifacts: Vec::new(),
             state: json!({}),
             version: 2,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: adam_core::store::now(),
+            updated_at: adam_core::store::now(),
         }
     }
 
@@ -624,6 +649,43 @@ mod tests {
     /// The A2A artifact of a run artifact that needs no blob (a JSON one, or an inline file).
     fn served(artifact: &ArtifactRef) -> Artifact {
         artifact_of(artifact, None).expect("an inline or JSON artifact is served")
+    }
+
+    /// The A2A bridge keeps the instant exactly, before the epoch too, where jiff and chrono
+    /// disagree on the sign of the fraction.
+    #[test]
+    fn the_a2a_bridge_round_trips_a_timestamp() {
+        for text in [
+            "2026-01-02T03:04:05.120Z",
+            "2026-01-02T03:04:05.123456789Z",
+            "1969-12-31T23:59:59.500Z",
+            "1970-01-01T00:00:00Z",
+        ] {
+            let at: Timestamp = text.parse().expect("a timestamp");
+            assert_eq!(timestamp_of(chrono_of(at)), at, "{text}");
+        }
+    }
+
+    /// The A2A `TaskStatus` JSON keeps chrono's bytes: the SDK type is unchanged, and the bridge
+    /// from adam's `Timestamp` produces the same instant and the same `AutoSi` digits.
+    #[test]
+    fn a_task_status_serializes_chronos_bytes() {
+        let mut v = view(RunStatus::Parked);
+        // A different creation instant: the status reports the last update, not the creation.
+        v.created_at = "2020-05-06T07:08:09Z".parse().expect("a timestamp");
+        v.updated_at = "2026-01-02T03:04:05.120Z".parse().expect("a timestamp");
+        let status = status_of(&v, &prompt());
+        let timestamp = status.timestamp.expect("a status timestamp");
+        assert_eq!(
+            timestamp.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+            "2026-01-02T03:04:05.120Z"
+        );
+        assert_eq!(timestamp.timestamp_millis(), 1_767_323_045_120);
+        let json = serde_json::to_string(&status).expect("serialises");
+        assert!(
+            json.contains(r#""timestamp":"2026-01-02T03:04:05.120Z""#),
+            "{json}"
+        );
     }
 
     #[test]
@@ -637,7 +699,7 @@ mod tests {
         let mut v = view(RunStatus::Parked);
         assert_eq!(task_state(&v), TaskState::InputRequired);
         v.waiting = false;
-        v.wake_at = Some(Utc::now());
+        v.wake_at = Some(adam_core::store::now());
         assert_eq!(task_state(&v), TaskState::Working);
 
         assert_eq!(task_state(&view(RunStatus::Done)), TaskState::Completed);
@@ -758,7 +820,7 @@ mod tests {
         assert_eq!(id(&v), id(&v));
         // Time passing (a later snapshot of the same record) changes nothing.
         let mut later = v.clone();
-        later.updated_at = Utc::now() + chrono::Duration::seconds(5);
+        later.updated_at = adam_core::store::now() + jiff::SignedDuration::from_secs(5);
         assert_eq!(id(&v), id(&later));
 
         let mut other_text = v.clone();

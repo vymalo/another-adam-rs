@@ -14,8 +14,9 @@ dependency.
 
 ## API at a glance
 
-* `store_conformance!(make)` generates one `#[tokio::test]` per case (48
-  cases: create/load, `run_header` against `load_run` + `lease_until`, state round trip, CAS
+* `store_conformance!(make)` generates one `#[tokio::test]` per case (49
+  cases: create/load, the millisecond precision of every timestamp (`.120` survives, finer truncates),
+  `run_header` against `load_run` + `lease_until`, state round trip, CAS
   conflicts, concurrent commits, journal ordering and first-writer-wins, claim rules and
   exclusivity, busy runs that a claim leaves alone, lease expiry/renew/release, what `lease_until` reports, pinned claims and the
   run owner, one open run per conversation, purge, the listing of a caller's runs (scoped, ordered, keyset pages, status and time filters, literal prefixes including ones that hold or end in `/`, `count_runs`; two creates with different ids in one conversation leave one open run), and the push-notification configs: put/replace, list, delete, claim rules, exclusive claims under concurrency, commit, stale versions, removal with the run).

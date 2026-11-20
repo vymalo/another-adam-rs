@@ -10,6 +10,9 @@
 #![warn(missing_docs)]
 
 pub mod access;
+pub mod confine;
+pub mod files;
+pub mod find;
 pub mod git;
 pub mod redact;
 pub mod sandbox;

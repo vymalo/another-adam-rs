@@ -3,8 +3,8 @@
 //!
 //! A place is a slot: found and refused exactly as [`ToolEnv::slot_to_read`] and
 //! [`ToolEnv::slot_to_write`] do, named by its directory, read-only when it is a reference, and
-//! carrying the [`Slot`] itself, so the coder's own answers (the nested project instructions) work
-//! on what was found.
+//! carrying the [`Slot`] itself, so the coder's own answers (the nested project instructions, what
+//! follows a write) work on what was found.
 
 use adam_code_tools::git::GitAt;
 use adam_code_tools::{CodeWorkspace, Intent, Outcome, Place, Redactor, Target};
@@ -12,12 +12,13 @@ use adam_llm_agent::{ToolCtx, ToolError};
 use adam_workspace::Slot;
 use async_trait::async_trait;
 
-use super::ToolEnv;
 use super::project;
+use super::{ToolEnv, notes_error, scratch};
 
 // A block of the nested instructions fits the room the port promises (`MAX_INSTRUCTIONS_BLOCK`):
-// the text, cut at `NESTED_CAP`, and its header and footer.
-const _: () = assert!(project::NESTED_CAP + 4 * 1024 <= adam_code_tools::MAX_INSTRUCTIONS_BLOCK);
+// the text, cut at `NESTED_CAP`, and its header and footer. It is exactly that room, the room
+// `read_files` has always reserved for a block.
+const _: () = assert!(project::NESTED_CAP + 4 * 1024 == adam_code_tools::MAX_INSTRUCTIONS_BLOCK);
 
 /// A slot as a [`Place`].
 pub(crate) fn place_of(slot: Slot) -> Place {
@@ -65,5 +66,30 @@ impl CodeWorkspace for ToolEnv {
             Target::Either => project::Target::Either,
         };
         project::nested(self, ctx, slot, path, target).await
+    }
+
+    /// The check epoch moves: a file the project **ignores** does not change the tree id, and a
+    /// check may read it, so a failed record from before this change is not reused
+    /// (`ChecksNotes::epoch`). A write to a file the project tracks changes the tree anyway; the
+    /// bump costs nothing there. Then the model is told to run the checks again and, in a scratch
+    /// project that was published, that the change does not reach the repository.
+    async fn after_write(
+        &self,
+        ctx: &ToolCtx,
+        place: &Place,
+        _paths: &[String],
+    ) -> Result<String, ToolError> {
+        let run = ctx.root_run_id().to_string();
+        self.notes
+            .update(&run, |notes| {
+                notes.checks.epoch = notes.checks.epoch.saturating_add(1);
+            })
+            .await
+            .map_err(|e| notes_error(&e))?;
+        let mut tail = String::from(" Run the checks again before you commit.");
+        if let Some(slot) = place.handle::<Slot>() {
+            scratch::push_published_note(&mut tail, slot);
+        }
+        Ok(tail)
     }
 }

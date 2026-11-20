@@ -125,7 +125,7 @@ impl Agent for Scripted {
             });
         }
         if text.contains("[hold]") {
-            let wake_at = ctx.now() + chrono::Duration::hours(1);
+            let wake_at = ctx.now() + jiff::SignedDuration::from_hours(1);
             return Ok(Transition::Park {
                 state,
                 wake_at: Some(wake_at),
@@ -3032,7 +3032,7 @@ mod listing {
         forged.page_token = Some(PageToken::encode(
             &bob(),
             &TaskQuery::new(),
-            chrono::Utc::now() + chrono::Duration::days(1),
+            chrono::Utc::now() + chrono::Duration::hours(24),
             &RunId::new().to_string(),
         ));
         let page = listed(&rig, &bob(), &forged).await;
@@ -3460,7 +3460,7 @@ mod push {
         a.stop().await;
         b.stop().await;
         // Retention removes the run, and the config with it.
-        let cutoff = chrono::Utc::now() + chrono::Duration::seconds(5);
+        let cutoff = adam_core::store::now() + jiff::SignedDuration::from_secs(5);
         assert!(store.purge_finished("scripted", cutoff).await.unwrap() >= 1);
         assert!(store.push_list(id).await.unwrap().is_empty());
     }

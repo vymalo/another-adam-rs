@@ -4,8 +4,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
+use crate::time::Timestamp;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -39,22 +40,22 @@ struct Inner {
 
 struct BodySlot {
     message: serde_json::Value,
-    written_at: DateTime<Utc>,
+    written_at: Timestamp,
 }
 
 struct BlobSlot {
     bytes: Vec<u8>,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
 }
 
 struct PushSlot {
     record: PushRecord,
-    lease: Option<(String, DateTime<Utc>)>,
+    lease: Option<(String, Timestamp)>,
 }
 
 struct Slot {
     run: RunRecord,
-    lease: Option<(String, DateTime<Utc>)>,
+    lease: Option<(String, Timestamp)>,
     /// Set by the first [`ClaimScope::Pinned`] claim; never cleared.
     owner: Option<String>,
     /// The v5 head last written by a commit, and the version it was written at. A commit that
@@ -344,7 +345,7 @@ impl Store for MemoryStore {
         worker: &str,
         scope: ClaimScope,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>> {
@@ -394,7 +395,7 @@ impl Store for MemoryStore {
         &self,
         id: RunId,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
     ) -> StoreResult<bool> {
         let now = truncate_ms(now);
@@ -424,7 +425,7 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         let inner = self.inner.lock().await;
         Ok(inner
             .runs
@@ -517,7 +518,7 @@ impl Store for MemoryStore {
         &self,
         agents: &[String],
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<PushRecord>> {
@@ -578,7 +579,7 @@ impl Store for MemoryStore {
         Ok(slot.record.clone())
     }
 
-    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64> {
         let mut inner = self.inner.lock().await;
         let doomed: Vec<RunId> = inner
             .runs
@@ -620,7 +621,7 @@ impl Store for MemoryStore {
         &self,
         run: RunId,
         keep_generation: Uuid,
-        before: DateTime<Utc>,
+        before: Timestamp,
     ) -> StoreResult<u64> {
         let mut inner = self.inner.lock().await;
         Ok(collect_bodies(&mut inner, run, keep_generation, before))
@@ -661,7 +662,7 @@ impl Store for MemoryStore {
         Ok(inner.blobs.get(id).map(|slot| slot.bytes.clone()))
     }
 
-    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_blobs(&self, before: Timestamp) -> StoreResult<u64> {
         let mut inner = self.inner.lock().await;
         Ok(sweep_blobs(&mut inner, before))
     }
@@ -669,17 +670,12 @@ impl Store for MemoryStore {
 
 /// How long a superseded body generation stays readable before the next commit of its run collects
 /// it.
-const BODY_GC_GRACE: chrono::Duration = chrono::Duration::hours(1);
+const BODY_GC_GRACE: SignedDuration = SignedDuration::from_hours(1);
 
 /// Delete the body rows of `run` outside `keep_generation` that were written before `before`, and
 /// return how many rows went. The generation a commit names is never collected, however old it is;
 /// a superseded one is collected once the grace period has passed.
-fn collect_bodies(
-    inner: &mut Inner,
-    run: RunId,
-    keep_generation: Uuid,
-    before: DateTime<Utc>,
-) -> u64 {
+fn collect_bodies(inner: &mut Inner, run: RunId, keep_generation: Uuid, before: Timestamp) -> u64 {
     let before_len = inner.bodies.len();
     inner.bodies.retain(|(r, generation, _), slot| {
         !(*r == run && *generation != keep_generation && slot.written_at < before)
@@ -688,7 +684,7 @@ fn collect_bodies(
 }
 
 /// Delete the blobs written before `before` that no run references; returns how many.
-fn sweep_blobs(inner: &mut Inner, before: DateTime<Utc>) -> u64 {
+fn sweep_blobs(inner: &mut Inner, before: Timestamp) -> u64 {
     let referenced: HashSet<BlobId> = inner.run_blobs.values().flatten().cloned().collect();
     let doomed: Vec<BlobId> = inner
         .blobs
@@ -987,7 +983,7 @@ mod tests {
             let mut inner = store.inner.lock().await;
             for ((_, generation, _), slot) in inner.bodies.iter_mut() {
                 if *generation == first {
-                    slot.written_at = cutoff - chrono::Duration::hours(2);
+                    slot.written_at = cutoff - SignedDuration::from_hours(2);
                 }
             }
             assert_eq!(collect_bodies(&mut inner, run.id, second, cutoff), 1);
@@ -1013,7 +1009,7 @@ mod tests {
                     &mut inner,
                     run.id,
                     second,
-                    cutoff + chrono::Duration::hours(24)
+                    cutoff + SignedDuration::from_hours(24)
                 ),
                 0
             );

@@ -10,7 +10,7 @@
 //! generation: `{"generation": "<uuid>", "len": <rows>}`. The body rows are
 //! `(run, generation, idx)` in the store.
 
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -101,7 +101,7 @@ pub(crate) struct Head {
     pub artifacts: Vec<HeadArtifact>,
     /// When the run must have finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline: Option<DateTime<Utc>>,
+    pub deadline: Option<Timestamp>,
     /// The limit the deadline was set from, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_secs: Option<u64>,
@@ -110,7 +110,7 @@ pub(crate) struct Head {
     pub remaining_secs: Option<u64>,
     /// When the agent itself asked to be woken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_wake: Option<DateTime<Utc>>,
+    pub agent_wake: Option<Timestamp>,
     /// The runtime set the wake of this parked run.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hb: bool,
@@ -351,7 +351,7 @@ pub(crate) struct ViewParts {
     pub output: Value,
     pub error: Option<String>,
     pub artifacts: Vec<ArtifactRef>,
-    pub agent_wake: Option<DateTime<Utc>>,
+    pub agent_wake: Option<Timestamp>,
     pub hb: bool,
 }
 
@@ -405,6 +405,30 @@ mod tests {
         // And it round-trips through the JSON a store keeps.
         let encoded = head.encode().expect("encodes");
         assert_eq!(Head::decode(RunId::new(), &encoded).expect("decodes"), head);
+    }
+
+    /// The head's deadline and agent wake are `adam_core::time::Timestamp`s: a `.120` instant
+    /// keeps chrono's three digits (jiff's own serde would write `.12`), because the head is the
+    /// v5 form of the v4 envelope's stored bytes.
+    #[test]
+    fn a_head_deadline_keeps_chronos_bytes() {
+        let at: Timestamp = "2026-01-02T03:04:05.120Z".parse().expect("a timestamp");
+        let mut env = Envelope::new(json!({}));
+        env.deadline = Some(at);
+        env.agent_wake = Some(at);
+        let head = Head::of(&env, json!({}), 0, &[], &[]);
+        let value = head.encode().expect("encodes");
+        assert_eq!(value["deadline"].as_str(), Some("2026-01-02T03:04:05.120Z"));
+        assert_eq!(
+            value["agent_wake"].as_str(),
+            Some("2026-01-02T03:04:05.120Z")
+        );
+        assert_eq!(
+            Head::decode(RunId::new(), &value)
+                .expect("decodes")
+                .deadline,
+            Some(at)
+        );
     }
 
     /// The head's file references are paired **positionally** with the upload pass, and only a

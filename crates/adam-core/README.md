@@ -29,6 +29,7 @@ database driver.
 | `RunQuery`, `ConversationScope` | what `list_runs` and `count_runs` select: always scoped (`Prefix` of an owner's conversations, or `Exact`), optionally by run statuses and last update, one page after a `(updated_at, id)` position |
 | `NewPushConfig`, `PushRecord`, `PushProgress`, `PushState` | an A2A push-notification configuration and how far its delivery got; `PushState` (`Active`, `Done`, `GaveUp`) is closed on purpose |
 | `StoreError`, `StoreResult` | `AlreadyExists`, `NotFound`, `Conflict`, `ConversationBusy`, `NonDeterminism`, `InvalidInput`, `Corrupt`, `Backend { class, source }`; `#[non_exhaustive]`, see *Errors* |
+| `Timestamp`, `now`, `truncate_ms`, `add_ttl` | the instant every `Store` value carries: a `jiff::Timestamp` whose serde bytes are the ones `chrono::DateTime<Utc>` wrote ([ADR 0057](../../docs/decisions/0057-time-is-jiff-with-the-bytes-chrono-wrote.md)) |
 | `storable` | the one rule every adapter applies before it writes a JSON value: a NUL in a string or a key becomes U+FFFD, so a state or a journal payload is the same value in every backend ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)) |
 | `MemoryStore` | in-memory `Store`, the reference implementation of the suite |
 | `SecretSource` (trait), `DynSecretSource`, `SecretError` | where a secret that agent files name comes from ([ADR 0047](../../docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), decision 5): `secret(name)` gives a `SecretString` or `Missing`, `NotUnicode`, `Refused` (`#[non_exhaustive]`: a reader treats a reason it does not know as `Refused`); it is synchronous, so a source answers from memory (a host fetches a vault's secrets first); `kind()` names the source, and `Debug` of a `dyn SecretSource` shows only that, never a value, so a host's source needs no `Debug`; used by `adam-assembly`'s `AgentDef::secrets` and `adam-mcp`'s `Env::source` |
@@ -195,6 +196,18 @@ affected: it claims the run once the lease has expired, as before. The conforman
 `claim_skips_busy_runs` in [`adam-store-testkit`](../adam-store-testkit/README.md) proves an
 implementation, for both scopes. The signature change is breaking for anyone who implements
 `Store`.
+
+## Time
+
+Every timestamp in this crate is [`Timestamp`](src/time.rs), a newtype over `jiff::Timestamp`
+(ADR 0057). Stores keep milliseconds (`truncate_ms`), because BSON dates are millisecond-precision
+and every adapter normalizes to it so they behave the same. The newtype's serde writes RFC 3339
+with `Z` and chrono's `AutoSi` digits (0, 3, 6 or 9, the shortest exact one), which is what a
+state or a push cursor written before the migration holds: jiff's own serde trims every trailing
+zero and would change those bytes. `Timestamp` derefs to `jiff::Timestamp`; adding a
+`jiff::SignedDuration` saturates at `Timestamp::MAX`/`MIN`. `truncate_ms` floors, as chrono's
+`timestamp_millis` did, so a pre-1970 value with a fractional millisecond stores the same
+millisecond it stored before the migration.
 
 ## Errors
 

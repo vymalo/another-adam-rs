@@ -4,7 +4,7 @@
 //! a conversation id derived from the parent's, and the session id is round 1's run id. This module
 //! holds the derivation and what a listing reads back from the runs alone.
 
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -333,7 +333,7 @@ pub struct SessionSummary {
     /// How the latest round ended; `None` while it is open.
     pub outcome: Option<RoundOutcome>,
     /// When the latest round was last updated.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     /// What the session is for (empty for a session with no header).
     pub description: String,
     /// Whether the session waits for another message after a round (`true` for a session with no
@@ -367,7 +367,7 @@ pub struct ReportRound {
     /// The run that started it: its parent run.
     pub started_by: Option<RunId>,
     /// When it was last updated.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl ReportRound {
@@ -564,7 +564,7 @@ pub(crate) struct Latest {
 fn read_latest(
     latest: &RunRecord,
     facts: &RoundFacts,
-    now: DateTime<Utc>,
+    now: Timestamp,
     idle_ttl: Duration,
 ) -> Latest {
     let open = latest.status.is_open();
@@ -572,9 +572,8 @@ fn read_latest(
     let closed_already = facts.close_asked
         || facts.header.as_ref().is_some_and(|h| h.closed)
         || (!open && !keep_open);
-    let idle_expired = !open
-        && !closed_already
-        && chrono::Duration::from_std(idle_ttl).is_ok_and(|ttl| now - latest.updated_at >= ttl);
+    let idle_expired =
+        !open && !closed_already && now - latest.updated_at >= adam_core::time::span_of(idle_ttl);
     let closed = closed_already || idle_expired;
     let status = ChildStatus::from_record(latest);
     let (state, outcome) = if open {
@@ -616,7 +615,7 @@ pub(crate) fn page_of_sessions(
     rounds: HashMap<(String, String), Vec<RunRecord>>,
     offset: usize,
     limit: usize,
-    now: DateTime<Utc>,
+    now: Timestamp,
     idle_ttl: Duration,
 ) -> SessionList {
     let mut sessions: Vec<SessionSummary> = rounds
@@ -735,7 +734,7 @@ impl SessionView {
     pub(crate) fn from_rounds(
         session: RunId,
         runs: Vec<RunRecord>,
-        now: DateTime<Utc>,
+        now: Timestamp,
         idle_ttl: Duration,
     ) -> Option<Self> {
         let runs = ordered(runs);
@@ -866,7 +865,8 @@ mod tests {
     ) -> RunRecord {
         let mut env = crate::envelope::Envelope::new(serde_json::json!({}));
         env.error = error.map(str::to_owned);
-        let t = DateTime::from_timestamp(1_700_000_000, 0).unwrap() + chrono::Duration::seconds(at);
+        let t =
+            Timestamp::from_second(1_700_000_000).unwrap() + jiff::SignedDuration::from_secs(at);
         RunRecord {
             id,
             agent: "a".into(),
@@ -1135,7 +1135,7 @@ mod tests {
             serde_json::to_value(&header).expect("a header"),
         );
         agent.insert("messages".to_owned(), Value::Array(messages));
-        let t = DateTime::from_timestamp(1_700_000_000, 0).expect("a fixed instant");
+        let t = Timestamp::from_second(1_700_000_000).expect("a fixed instant");
         RunRecord {
             id,
             agent: "a".into(),
@@ -1299,7 +1299,7 @@ mod tests {
         let mk = |id: RunId, h: SessionHeader, status| {
             let mut rec = with_header(id, Some(h), status, vec![]);
             // Closed sessions are the most recently updated: still last.
-            rec.updated_at += chrono::Duration::seconds(if id == closed { 10 } else { 0 });
+            rec.updated_at += jiff::SignedDuration::from_secs(if id == closed { 10 } else { 0 });
             rec
         };
         let list = page_of_sessions(
@@ -1355,12 +1355,12 @@ mod tests {
     }
 
     /// The instant the test records are made at.
-    fn t0() -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    fn t0() -> Timestamp {
+        Timestamp::from_second(1_700_000_000).unwrap()
     }
 
-    fn after(rec: &RunRecord, secs: i64) -> DateTime<Utc> {
-        rec.updated_at + chrono::Duration::seconds(secs)
+    fn after(rec: &RunRecord, secs: i64) -> Timestamp {
+        rec.updated_at + jiff::SignedDuration::from_secs(secs)
     }
 
     #[test]

@@ -54,6 +54,15 @@ index. No transaction is held open while agent code runs. `JSONB` cannot hold
 the same value in every backend ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
 The guarantee table is in the [store adapters reference](../../docs/reference/store-adapters.md#how-each-adapter-keeps-the-contract).
 
+Time columns (`wake_at`, `sched_at`, `lease_until`, `created_at`, `updated_at`, `recorded_at` and
+the push scheduling fields) are `TIMESTAMPTZ`. sqlx 0.9 has no jiff support, so the adapter maps
+`adam_core::time::Timestamp` through a private `PgTime` that encodes and decodes as sqlx's
+`chrono::DateTime<Utc>`: the column type and the bytes on the wire are unchanged
+([ADR 0057](../../docs/decisions/0057-time-is-jiff-with-the-bytes-chrono-wrote.md)). `chrono` is
+a dependency of this crate only, for that bridge. The bridge is temporary: when the store moves from sqlx to
+tokio-postgres, `postgres-types`'s `with-jiff-0_2` feature does this natively (the same `TIMESTAMPTZ`,
+microseconds since 2000, the same bytes as `with-chrono-0_4`), and it goes with sqlx's `chrono` feature.
+
 ## Pool
 
 `connect` sizes the pool from `ADAM_PG_POOL_SIZE` (2 to 65535, default 16) and

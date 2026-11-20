@@ -532,6 +532,15 @@ pub(crate) fn published_note(slot: &Slot) -> Option<String> {
     ))
 }
 
+/// What a change to a scratch project that was already published adds to the tool's result: the
+/// change does not reach the repository ([`published_note`]).
+pub(super) fn push_published_note(text: &mut String, slot: &Slot) {
+    if let Some(note) = published_note(slot) {
+        text.push('\n');
+        text.push_str(&note);
+    }
+}
+
 /// `commit_and_push` in a scratch project: a commit, and nothing else. There is no remote, no
 /// `branch` and no bound `checks`: the verdict on a pushed commit exists only for a pushed commit.
 pub(crate) async fn commit_locally(

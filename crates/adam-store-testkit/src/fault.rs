@@ -29,12 +29,12 @@ use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
     PushRecord, RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError, StoreResult,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 /// A [`Store`] method a wrapper can target: [`FaultyStore`] injects a fault on it and
@@ -361,7 +361,7 @@ impl Store for FaultyStore {
         &self,
         run: RunId,
         keep_generation: Uuid,
-        before: chrono::DateTime<chrono::Utc>,
+        before: Timestamp,
     ) -> StoreResult<u64> {
         self.run(
             Method::GcBody,
@@ -418,7 +418,7 @@ impl Store for FaultyStore {
         worker: &str,
         scope: ClaimScope,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>> {
@@ -441,7 +441,7 @@ impl Store for FaultyStore {
         &self,
         id: RunId,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
     ) -> StoreResult<bool> {
         self.run(
@@ -461,7 +461,7 @@ impl Store for FaultyStore {
         .await
     }
 
-    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         self.run(Method::LeaseUntil, Some(id), self.inner.lease_until(id))
             .await
     }
@@ -500,7 +500,7 @@ impl Store for FaultyStore {
         &self,
         agents: &[String],
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<PushRecord>> {
@@ -527,7 +527,7 @@ impl Store for FaultyStore {
         .await
     }
 
-    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64> {
         self.run(
             Method::PurgeFinished,
             None,
@@ -550,7 +550,7 @@ impl Store for FaultyStore {
             .await
     }
 
-    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_blobs(&self, before: Timestamp) -> StoreResult<u64> {
         self.run(Method::PurgeBlobs, None, self.inner.purge_blobs(before))
             .await
     }
@@ -561,6 +561,7 @@ mod tests {
     use std::sync::Arc;
 
     use adam_core::{MemoryStore, RunStatus};
+    use jiff::SignedDuration;
     use serde_json::json;
 
     use super::*;
@@ -593,7 +594,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let cutoff = adam_core::store::now() + chrono::Duration::hours(1);
+        let cutoff = adam_core::store::now() + SignedDuration::from_hours(1);
         assert_eq!(
             store.gc_body(run.id, Uuid::new_v4(), cutoff).await.unwrap(),
             1,

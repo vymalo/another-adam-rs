@@ -4,7 +4,7 @@
 //! * **At prepare** `prepare_workspace` appends the text of the slot's `AGENTS.md`, else `CLAUDE.md`,
 //!   else `README.md` ([`at_prepare`]).
 //! * **Below the root** the first read tool call that touches a directory with an `AGENTS.md` or a
-//!   `CLAUDE.md` gets that file in front of its page ([`with_nested`]), once per run.
+//!   `CLAUDE.md` gets that file in front of its page ([`nested`]), once per run.
 //!
 //! The text is the repository's, not the person's: it is never a user message (the agent reads
 //! every user message as the person's words and would add the repositories it names to
@@ -360,33 +360,19 @@ fn slash(dir: &Path) -> String {
         .join("/")
 }
 
-/// `page`, the answer of a read tool that succeeded, behind the nested project instructions the
-/// call is the first to touch, if any. `path` is what the call read or looked in (`None`: all of
-/// the slot, which touches no directory below the root). The page is untouched and last, so its
-/// paging line stays the final line of the result.
+/// The nested project-instructions block `path` touches and has not shown yet, if any: the read
+/// tools (`adam_code_tools::find` and `files`, through the coder's `CodeWorkspace`) put it in
+/// front of the page of a call that succeeded, and the page stays untouched and last, so its paging
+/// line stays the final line of the result. `path` is what the call read or looked in (`None`: all
+/// of the slot, which touches no directory below the root). A caller that shows several paths in
+/// one result asks for each in turn: the first file of a directory claims its block, and the files
+/// after it get `None`.
 ///
 /// Only repository slots have instructions: a scratch project is the run's own.
 ///
 /// # Errors
 ///
 /// As [`at_prepare`].
-pub(super) async fn with_nested(
-    env: &ToolEnv,
-    ctx: &ToolCtx,
-    slot: &Slot,
-    path: Option<&str>,
-    target: Target,
-    page: String,
-) -> Result<ToolOutput, ToolError> {
-    match nested(env, ctx, slot, path, target).await? {
-        Some(block) => Ok(ToolOutput::text(format!("{block}\n\n{page}"))),
-        None => Ok(ToolOutput::text(page)),
-    }
-}
-
-/// The nested project-instructions block `path` touches and has not shown yet, if any (see
-/// [`with_nested`]). A caller that shows several paths in one result asks for each in turn: the
-/// first file of a directory claims its block, and the files after it get `None`.
 pub(super) async fn nested(
     env: &ToolEnv,
     ctx: &ToolCtx,

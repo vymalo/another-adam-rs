@@ -16,7 +16,7 @@
 
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde_json::Value;
 
 use super::RunId;
@@ -99,13 +99,13 @@ pub struct PushRecord {
     /// Why the last attempt failed, short and free of credentials; `None` when it did not.
     pub last_error: Option<String>,
     /// When the config is due: a claim takes it once this has passed (and no lease holds it).
-    pub next_attempt_at: DateTime<Utc>,
+    pub next_attempt_at: Timestamp,
     /// Starts at 1 and increases by exactly 1 per progress write or replacement.
     pub version: u64,
     /// When the config was first created (kept when it is replaced).
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// The last write.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// Input for [`Store::push_commit`](super::Store::push_commit): the next progress of a config.
@@ -120,5 +120,5 @@ pub struct PushProgress {
     /// Why the last attempt failed, if it did.
     pub last_error: Option<String>,
     /// When the config is due next.
-    pub next_attempt_at: DateTime<Utc>,
+    pub next_attempt_at: Timestamp,
 }

@@ -2400,7 +2400,7 @@ mod cases {
         let purged = store
             .purge_finished(
                 &rig.child_name,
-                chrono::Utc::now() + chrono::Duration::hours(1),
+                adam_core::store::now() + jiff::SignedDuration::from_hours(1),
             )
             .await
             .unwrap();

@@ -229,6 +229,25 @@ async fn instructions_come_in_server_name_order_and_all_together_are_bounded() {
         ["a", "b", "c"],
         "three fit in 8 KiB, in name order"
     );
+    // The per-server sections a host that loads some servers only sometimes appends are the same
+    // bytes, in the same order, as the one string a host that loads them all appends.
+    let sections = connected.instructions_by_server();
+    let names: Vec<&str> = sections.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["a", "b", "c", "d", "e", "f"]);
+    assert_eq!(
+        sections[..3]
+            .iter()
+            .map(|(_, section)| section.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        text,
+        "the sections that fit, joined, are the whole text: the host that loads some of them \
+         applies the same bound"
+    );
+    assert!(
+        sections[3].1.len() + text.len() + 2 > MAX_INSTRUCTIONS_BYTES,
+        "the fourth does not fit, which is why `instructions` stops there"
+    );
 }
 
 #[tokio::test]
