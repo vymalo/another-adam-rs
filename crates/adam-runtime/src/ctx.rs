@@ -534,6 +534,13 @@ impl Ctx {
         )
     }
 
+    /// A handle for starting root runs on the runtime that steps this run, only in `adam.schedule:`
+    /// conversations: owned and cloneable, so it can be moved into a [`Ctx::step`] closure (see
+    /// [`RunStarter`](crate::RunStarter)).
+    pub fn run_starter(&self) -> crate::RunStarter {
+        crate::RunStarter::new(self.runtime.clone())
+    }
+
     /// A handle on this transition's cancellation signal, cloneable and
     /// `'static`, so it can be moved into a [`Ctx::step`] closure or a spawned
     /// task (this `Ctx` cannot: `step` borrows it mutably). See [`CancelToken`].

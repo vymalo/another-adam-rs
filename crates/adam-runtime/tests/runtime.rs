@@ -2386,6 +2386,80 @@ mod cases {
         );
     }
 
+    /// `Ctx::run_starter` starts root runs from a step, idempotently, and only in `adam.schedule:`
+    /// conversations (ADR 0060, decision 2).
+    pub async fn a_step_starts_root_runs_only_in_schedule_conversations(store: DynStore) {
+        const FIRED: &str = "adam.schedule:a/daily@2026-12-24T18:00:00Z";
+        let name = uniq("starter");
+        let fired = RunId::new();
+        let agent_name = name.clone();
+        let agent = fn_agent(
+            &name,
+            step_fn(move |ctx, state| {
+                let starter = ctx.run_starter();
+                let name = agent_name.clone();
+                async move {
+                    if state["role"] == "fired" {
+                        return Ok(Transition::Done {
+                            state,
+                            output: json!("fired"),
+                        });
+                    }
+                    let input = || Inbound::new("start", json!({"role": "fired"}));
+                    let fail = |e: RuntimeError| AgentError::permanent(e.to_string());
+                    let first = starter
+                        .start_with_id(fired, &name, input(), FIRED)
+                        .await
+                        .map_err(fail)?;
+                    let again = starter
+                        .start_with_id(fired, &name, input(), FIRED)
+                        .await
+                        .map_err(fail)?;
+                    let foreign = starter
+                        .start_with_id(RunId::new(), &name, input(), "token-1:chat")
+                        .await;
+                    let refused = matches!(
+                        &foreign,
+                        Err(e @ RuntimeError::ForeignConversation { conversation_id })
+                            if conversation_id == "token-1:chat" && e.class() == adam_runtime::ErrorClass::Invalid
+                    );
+                    Ok(Transition::Done {
+                        state,
+                        output: json!([first, again, refused]),
+                    })
+                }
+                .boxed()
+            }),
+        );
+        let rt = runtime(&store, &agent);
+        let worker = spawn_worker(&rt);
+        let scheduler = rt
+            .start(
+                &name,
+                Inbound::new("start", json!({"role": "scheduler"})),
+                Some("adam.schedule:a/daily"),
+            )
+            .await
+            .expect("start");
+        let done = wait_done(&rt, scheduler).await;
+        assert_eq!(done.output, Some(json!([true, false, true])));
+        let fired_view = wait_done(&rt, fired).await;
+        assert_eq!(fired_view.agent, name);
+        assert_eq!(fired_view.conversation_id.as_deref(), Some(FIRED));
+        assert_eq!(fired_view.output, Some(json!("fired")));
+        // The refused start wrote nothing: the agent has the scheduler's run and the fired one.
+        let runs = store
+            .count_runs(&adam_core::RunQuery::new(
+                &name,
+                adam_core::ConversationScope::Prefix(String::new()),
+                10,
+            ))
+            .await
+            .expect("count");
+        assert_eq!(runs, 2);
+        worker.stop().await;
+    }
+
     /// Error surface of the control API.
     pub async fn api_errors(store: DynStore) {
         let name = uniq("errors");
@@ -7484,6 +7558,7 @@ macro_rules! runtime_suite {
                 graceful_shutdown,
                 conversation_delivers_to_the_open_run,
                 start_with_id_is_idempotent,
+                a_step_starts_root_runs_only_in_schedule_conversations,
                 api_errors,
                 a_header_is_one_store_call,
                 a_starter_only_runtime_starts_and_a_full_runtime_steps,
