@@ -121,8 +121,10 @@ docker build -q -f docker/coder/test/run-pod.Dockerfile --build-context "egress=
   --build-context "gitsandbox=$work/gitsandbox" -t "$image:$tag" .
 kind load docker-image "$image:$tag" --name "$kind_name"
 say "the repository's image: the same image with a marker (the run pod moves to it, ADR 0052)"
-printf 'FROM %s:%s\nRUN printf "repository\\n" > /etc/adam-repository-image\n' "$image" "$tag" \
-  | docker build -q -t "$image:repo" -
+# A `COPY`, not a `RUN`: the run-pod image is static musl and has no `/bin/sh` to run a shell.
+printf 'repository\n' > "$work/repository-marker"
+printf 'FROM %s:%s\nCOPY repository-marker /etc/adam-repository-image\n' "$image" "$tag" \
+  | docker build -q -t "$image:repo" -f - "$work"
 kind load docker-image "$image:repo" --name "$kind_name"
 
 say "the namespace, the volume the run pods mount at /work, and the model key's Secret"
