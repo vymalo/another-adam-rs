@@ -19,12 +19,15 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+# `reconcile_until_stopped`: `select!` on the stop, and the backoff's sleep.
+tokio = { workspace = true, features = ["macros", "time"] }
+tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 adam-store-testkit.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

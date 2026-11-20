@@ -29,6 +29,7 @@ pub use due::{Due, MISSED_MAX};
 pub use ids::{Trigger, fired_conversation_id, fired_run_id, schedule_conversation_id, trigger_of};
 pub use reconcile::{
     CHANGED_REASON, REMOVED_REASON, ReconcileError, Reconciled, reconcile, reconcile_store,
+    reconcile_until_stopped,
 };
 
 use adam_agent_fs::Schedule;
