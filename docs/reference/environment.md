@@ -134,6 +134,7 @@ shared configuration parses the variable, so a bad value is exit 78 in either; `
 | `RUN_POD_READY_TIMEOUT_SECS` | how long a pod may take to be ready | `300` (chart: `600`) |
 | `RUN_POD_IDLE_SECS` | idle time before a pod is deleted; `0` keeps it until the run ends | `900` |
 | `RUN_POD_WAIT_SECS` | how long a run retries for a pod the cluster cannot give now | `600` (chart: `1020`) |
+| `RUN_POD_REPOSITORY_IMAGES` | with `kubernetes`: the image prefixes a repository's `devcontainer.json` may name for its run pod (`use_repository_environment`, [ADR 0052](../decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)), separated by commas or spaces. Each ends with `/` (a registry path such as `ghcr.io/acme/`) or `:` (a tag such as `ghcr.io/acme/tool:`), so that a bare host cannot admit a look-alike; no `*` and no `${...}`. Empty: the tool is never offered and the run pods use the template's image | empty (chart: `runPods.repositoryImages.allowedPrefixes`) |
 | `DEVCONTAINER_RUNTIME` | `off` or `podman` (the repository's devcontainer on a rootless Podman service) | `off` |
 | `CONTAINER_HOST` | Podman's own variable, e.g. `unix:///run/podman/podman.sock`; required with `podman` | unset |
 | `DEVCONTAINER_DEFAULT_IMAGE` | image for a repository with no `devcontainer.json`; **by digest only** | the `workspace` image the coder is built on |
