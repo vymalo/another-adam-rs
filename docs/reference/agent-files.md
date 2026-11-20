@@ -700,7 +700,9 @@ bind. A root whose subagents are all remote gets the five tools as well.
 A subagent file with `a2a: <agent-card URL>` is a tool on the parent whose work happens on another A2A agent.
 Same shape, name checks and placement as a local subagent's tool; `limits`, `tools`, `model`, `skills` and
 `vars` mean nothing on it and warn. The sequence and states of the wait, the poll and the failure table are in
-[child runs](child-runs.md#remote-tasks-the-same-wait-without-a-message).
+[child runs](child-runs.md#remote-tasks-the-same-wait-without-a-message). It needs the feature `remote` of
+`adam-assembly`, on by default (and in `adam-agent` and `adam-coder`); a build without it, such as an application that
+embeds adam, refuses the file at `bind` with `Error::RemoteNotEnabled`, before any secret is read.
 
 * **Send.** One journaled step: `SendMessage` with `returnImmediately`, `messageId = child_run_id(parent run,
   call id)`, so a retry reaches the same task on a server that deduplicates (`adam-a2a-runtime` does).

@@ -13,4 +13,6 @@ resource bytes), and `verify()` accepts the generated digests.
 `cargo test -p adam-agent-fixture`.
 
 [`adam-assembly`](../adam-assembly/README.md) uses it too (a dev-dependency): its tests bind the embedded agent and
-the same files read from the directory, and run the agent end to end on a `MockModel`.
+the same files read from the directory, and run the agent end to end on a `MockModel`. It depends on `adam` with
+`default-features = false` (`include_agent!` needs none), so that it does not turn `adam-assembly`'s feature `remote`
+back on in that crate's builds without it; those tests need `remote`, since the fixture has an `a2a:` subagent.

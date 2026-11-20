@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["macros"]
+default = ["macros", "remote"]
 # `#[tool]` (and the paths it generates code against, which are always there).
 macros = ["dep:adam-macros"]
 # The root agent's A2A side (`adam-assembly/a2a`): `Assembly::card` and the `child-sessions/v1` helpers
@@ -21,10 +21,13 @@ dev = ["adam-assembly/dev"]
 # `mcp.json` tools (`adam::mcp`, `AgentDef::connect_mcp`): connect to the MCP servers an agent's files
 # name and give the agent their tools. Off by default: it brings the MCP client and can start processes.
 mcp = ["adam-assembly/mcp", "dep:adam-mcp"]
+# Remote subagents (`adam-assembly/remote`): `a2a:` in a subagent file, with the A2A client, an
+# HTTP client and TLS. On by default; an application that embeds adam (ADR 0047) turns it off.
+remote = ["adam-assembly/remote"]
 
 [dependencies]
 adam-agent-fs.workspace = true
-adam-assembly.workspace = true
+adam-assembly = { path = "../adam-assembly", version = "0.1.0", default-features = false }
 adam-core.workspace = true
 adam-error.workspace = true
 adam-llm-agent = { workspace = true, features = ["schema"] }

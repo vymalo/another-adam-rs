@@ -9,6 +9,7 @@ mod common;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
+#[cfg(feature = "remote")]
 use adam_agent_fixture::AGENT;
 use adam_agent_fs::Subagent;
 use adam_assembly::{AgentDef, Assembly, Error, SubagentTool, ToolClash};
@@ -266,6 +267,8 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
     }
 }
 
+// The fixture has a remote subagent (`a2a:`).
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn the_embedded_fixture_runs_a_subagent_end_to_end() {
     let model = Arc::new(MockModel::new());
