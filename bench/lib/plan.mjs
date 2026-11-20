@@ -10,6 +10,12 @@ import crypto from 'node:crypto';
 import { mulberry32, seedFrom } from './stats.mjs';
 
 const SAFE = /[^A-Za-z0-9._-]/g;
+/**
+ * The longest run id there is, the one place it is said: `runId` makes none longer, the ledger refuses a longer one, and
+ * every other consumer is checked against it (the OpenCode title and container name, `runDirName`, the message id). A
+ * consumer with a smaller bound of its own (a container name, 63) derives a name from the id and never refuses it.
+ */
+export const RUN_ID_MAX = 128;
 const byText = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 function shuffle(items, rand) {
@@ -28,7 +34,7 @@ function shuffle(items, rand) {
 export function runId(taskId, agent, arm, { prefix = '' } = {}) {
   const id = String(taskId);
   const suffix = `.${agent}.${arm}`;
-  const room = 128 - prefix.length - suffix.length;
+  const room = RUN_ID_MAX - prefix.length - suffix.length;
   const plain = id.replace(SAFE, '-');
   if (plain === id && id.length <= room) return `${prefix}${id}${suffix}`;
   const hash = crypto.createHash('sha256').update(id).digest('hex').slice(0, 8);

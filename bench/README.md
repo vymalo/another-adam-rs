@@ -132,7 +132,7 @@ The states and their transitions are `TRANSITIONS` in `bench/lib/ledger.mjs`, wh
 harness that drives a run through them is `lib/runner.mjs`. **Resume** reads the
 ledger (`resumeActions`): a `Done` or `StoppedByCap` run is never repeated, a `NotStarted` one is planned again by a start with room under the cap; a run that was
 `Reserved`, `Preparing`, `Running`, `Collecting` or `Interrupted` starts again from scratch; a `Grading` run is
-graded again and never run again; a `Failed_infra` run is retried twice and then given up. A run is allowed
+graded again and never run again; a `Failed_infra` run is retried twice and then given up, **unless its failure cannot change on a retry** (a clone the task image's git cannot read, a base that does not match its marker twice, a run id a driver refuses: `PermanentError` in `lib/errors.mjs`): that one is `final` at once and is left out like the third interruption. A run is allowed
 **at most two interruptions**: the third time it ends `Failed_infra` for good (`final`), so an interrupted run is not paid
 for on every restart. The report lists such a run among those left out, with its wasted spend.
 
@@ -408,7 +408,7 @@ environment. So one principle holds everywhere:
 | OpenCode's stream, stderr and export | `Stack.readFiles`: the three names only, a size cap, and a link, FIFO or device in their place is refused, logged and kept out |
 | the exit status of OpenCode | the container runtime's (`docker run`'s status and its time-out), never a file the agent could write |
 | the reward of a grading | read without following a link or blocking (`O_NOFOLLOW`, `O_NONBLOCK`), only if it is a regular file of at most 16 bytes |
-| the base of a task | made in the slot's work directory by the task image for each run, because `/work/bench-base` is shared by every task; the host builds its own repository from a tar of the tree once per (task, image, workdir) and reuses it (under `$BENCH_HOME`); adam's copy is pushed to the git server by a one-shot container with no secret |
+| the base of a task | made in the slot's work directory by the task image for each run, because `/work/bench-base` is shared by every task; the host builds its own repository from a tar of the tree once per (task, image, workdir) and reuses it (under `$BENCH_HOME`); adam's copy is pushed to the git server by a one-shot container with no secret. The marker's tree is computed from `tree` itself in a repository of its own, with the host's git options, because the clone's `HEAD^{tree}` tracks a submodule that `tree` holds as an empty directory (openlibrary, teleport). The base is written by the task image's user (often root) and read as uid 10001: the readers name `safe.directory` in a global file (`SAFE_DIRECTORY_LINES`), since the git of a task image ignores `-c` and `GIT_CONFIG_COUNT` for a local clone and answers "Could not read from remote repository" |
 | the pushed branches | `git ls-remote` of an `http://` address on the loopback, run in a new empty directory that is not a repository, with discovery stopped and only plain http allowed |
 | the environment of a host git | an allow-list (`PATH`, locale, temp directory); the model's key, a proxy and any credential are not in it. The clone and the fetch of the upstream tasks run in it too (`lib/upstream.mjs`), so an upstream cannot see the key |
 | the environment of a `docker` child | the same allow-list everywhere (`lib/containers.mjs` `dockerEnv`): `PATH`, `HOME`, `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`, `XDG_RUNTIME_DIR`, `TMPDIR`, `SSL_CERT_FILE`, `SSL_CERT_DIR`. Every entry is a path or a flag, never a secret; a proxy variable is not in it, because it can carry a password. The stack's compose calls and host containers, `bench tasks` and every probe of `bench doctor` use it, so the model's key and the rest of the harness's environment cannot reach a container with `-e`, a crash dump or `ps e` |
@@ -575,7 +575,7 @@ tag `v2.3.0` (`raw.githubusercontent.com/anomalyco/opencode/v2.3.0`) and its `CH
 of them; the container's time limit (50 minutes) is the only bound, as for adam, and a run that is killed at it is
 `timeout`. Turning subagents off would take away a tool that adam has too (its `explorer` and `reviewer`) and the report
 would compare a handicapped agent. The cost is the same as for adam: the meter counts every call of every session. OpenCode's
-own stream shows the main session only, so `selfReported` is lower than the meter's when subagents work; the export has them.
+own stream shows the main session only, so `selfReported` is lower than the meter's when subagents work; the export has them. `selfReported.input` is every input token, the cached ones included, as the meter's and adam's are (OpenCode's own `tokens.input` leaves the cache reads and writes out, so the driver adds them back); `cached` is a part of it. The meter's cost is the source of truth.
 The refusal of a call is retried by OpenCode, so the harness watches the meter and ends the container itself (`budget_hit`). The end
 of a run, at the time limit or on a refusal, is the same for both agents: a polite stop (OpenCode: SIGTERM; adam: `CancelTask`), the
 configured cancel grace, then a forced stop. OpenCode's stderr is capped at 1 MiB inside the container.
@@ -731,7 +731,7 @@ which the agent made no model call, in which more than two calls (or the last on
 task's image (adam), in which the coder reported an external cause, or that could not be stopped, is `Failed_infra` (tried
 again, then left out of the rates), never a fail. Grading runs as a host container of the task image, on the `verifier` network. `runPlan` first reads the ledger (`resumeActions`), so a start after a kill runs what is left: a `Done` run is not
 repeated, an interrupted one starts again from scratch (its first attempt's spend stays as waste), a `Grading` one is graded
-again from its saved patch. The patch is written to `runs/<run>-a<n>/model.patch` under the results directory before grading. A
+again from its saved patch. When a step of a run fails in the infrastructure, the full stderr of the command (capped at 64 KiB, the run's secrets taken out) is `runs/<run>-a<n>/prepare-stderr.txt`, and the ledger line keeps one short summary that includes git's `fatal:` line. The patch is written to `runs/<run>-a<n>/model.patch` under the results directory before grading. A
 verifier that needs the internet gets the `egress` network for the window of its grading. `runPlan` is one run at a time; the blocks and the slots are `lib/schedule.mjs` ("Pilot and run").
 
 ## Pilot and run
@@ -800,7 +800,9 @@ deletes the file first, so an old yes never covers a new pilot.
 * **Blocks (`lib/plan.mjs`).** A block is one task through all four cells (two agents, two arms). The tasks are shuffled with the
   seed of the configuration (`tasks.seed`); the cells of a block follow a cyclic Latin square, so in each round of four blocks
   every cell stands at every position once. A run id is `<task>.<agent>.<arm>`: a plain id is kept, any other is sanitised, cut
-  and given a short hash of the whole id, and `.agent.arm` is never cut; two runs with one id are an error. A task's `source` is
+  and given a short hash of the whole id, and `.agent.arm` is never cut; two runs with one id are an error. The longest run id is
+  `RUN_ID_MAX` (128, in `lib/plan.mjs`), which the ledger and the OpenCode driver accept; a container name, which Docker
+  limits to 63, is derived from the id by a hash and never refused. A task's `source` is
   `public`, `own`, or `own-self` (an own task from `tasks.selfRepo`, adam-rs itself), and the report keeps the three apart.
 * **The pilot is not part of the results.** It is the first blocks of the plan, as runs with the prefix `pilot.` and the phase
   `pilot`, under the configuration's per-run budget. `bench run` runs **every block again** under the confirmed budget of each arm;

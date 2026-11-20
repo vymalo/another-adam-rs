@@ -12,6 +12,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { PermanentError, summarize, withStderr } from './errors.mjs';
 import { SAFE_C, localGit } from './grade.mjs';
 import { repoSlug } from './gitops.mjs';
 
@@ -105,8 +106,7 @@ export async function makeContainerBase({ containers, stack, slot, task, timeout
     timeoutMs,
   });
   if (r.exitCode !== 0) {
-    const lines = r.stderr.trim().split('\n').filter(Boolean);
-    throw new Error(`the base of task ${task.id} could not be made (exit ${r.exitCode}): ${[lines[0], ...lines.slice(-2)].filter(Boolean).join(' | ')}`);
+    throw withStderr(new Error(`the base of task ${task.id} could not be made (exit ${r.exitCode}): ${summarize(r.stderr)}`), r.stderr);
   }
 }
 
@@ -158,7 +158,7 @@ export class BaseCache {
       if (!fresh) throw new Error(`the base of task ${task.id} has no content marker`);
       this.#host.delete(hostRoot);
       base = await this.#hostBase(hostRoot, () => makeHostBase({ stack, slot, task, hostRoot }));
-      if (base.tree !== fresh.tree) throw new Error(`the base of task ${task.id} does not match its marker`);
+      if (base.tree !== fresh.tree) throw new PermanentError(`the base of task ${task.id} does not match its marker (host tree ${base.tree.slice(0, 12)}, marker ${fresh.tree.slice(0, 12)}): a rebuild gave the same tree`);
     }
     return base;
   }
