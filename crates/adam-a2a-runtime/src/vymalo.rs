@@ -30,13 +30,17 @@ pub const CONTEXT_UI_CATALOG: &str = "vymalo.ui.catalog";
 /// duplicates and at most [`MAX_OFFERED_CATALOG_IDS`] of them. A message without that entry sets it
 /// to `null`, which deletes it: a run that continues another must not draw with an earlier
 /// message's offer, so a turn with no capabilities draws nothing.
-pub const CONTEXT_A2UI_RENDERER: &str = "vymalo.a2ui.renderer";
+///
+/// It is one of `adam_llm_agent::PER_MESSAGE_CONTEXT_KEYS`: when a message's context is too large
+/// and dropped, the key is deleted too (an earlier turn's offer never survives).
+pub const CONTEXT_A2UI_RENDERER: &str = adam_llm_agent::RENDERER_OFFER_CONTEXT_KEY;
 
 /// The most catalog ids kept in [`CONTEXT_A2UI_RENDERER`]; the ones after it are dropped.
 pub const MAX_OFFERED_CATALOG_IDS: usize = 32;
 
-/// The longest catalog id kept, in bytes; a longer one is left out.
-const MAX_CATALOG_ID_BYTES: usize = 2048;
+/// The longest catalog id kept, in bytes: the contract's limit (a `catalogId` is at most 256 bytes);
+/// a longer one is left out.
+const MAX_CATALOG_ID_BYTES: usize = 256;
 
 /// The context key of the thread-tools grant: `{url, token, expiresAt}`. A credential; the entry
 /// expires at `expiresAt`.

@@ -532,6 +532,25 @@ fn a_limit_the_person_set_is_kept_when_the_rest_of_the_context_is_dropped() {
     );
 }
 
+#[test]
+fn a_per_message_key_never_outlives_a_message_whose_context_is_dropped() {
+    let obj = |v: Value| v.as_object().cloned().unwrap();
+    let offer = |id: &str| json!({"catalogIds": [id]});
+    let key = "vymalo.a2ui.renderer";
+    let big = || "x".repeat(MAX_CONTEXT_BYTES);
+    // Turn 1 offered catalog C; turn 2 says nothing (null) and its context is too large.
+    let mut c = Conversation::new("t");
+    assert!(c.merge_context(&obj(json!({key: offer("C"), "keep": 1}))));
+    assert!(!c.merge_context(&obj(json!({key: null, "big": big()}))));
+    assert!(!c.context.contains_key(key));
+    assert_eq!(c.context["keep"], json!(1));
+    // Turn 2 offers another catalog and is too large: the offer is gone, not the old one, not the new.
+    let mut c = Conversation::new("t");
+    assert!(c.merge_context(&obj(json!({key: offer("C")}))));
+    assert!(!c.merge_context(&obj(json!({key: offer("D"), "big": big()}))));
+    assert!(!c.context.contains_key(key));
+}
+
 #[tokio::test]
 async fn a_message_with_a_large_context_and_a_tier_keeps_the_tier() {
     let h = Harness::new();

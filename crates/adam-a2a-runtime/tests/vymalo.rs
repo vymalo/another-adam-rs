@@ -453,6 +453,15 @@ fn the_offer_is_bounded() {
     assert_eq!(kept[0], "https://example.test/c0");
 }
 
+/// A `catalogId` is at most 256 bytes (the contract's limit): 256 is kept, 257 is left out.
+#[test]
+fn a_catalog_id_over_256_bytes_is_left_out() {
+    let (ok, long) = ("a".repeat(256), "b".repeat(257));
+    let m = renderer_message("hi", json!({"1.0": {"supportedCatalogIds": [long, ok]}}));
+    let context = vymalo_inbound(&m).unwrap().payload["context"].clone();
+    assert_eq!(context[CONTEXT_A2UI_RENDERER], json!({"catalogIds": [ok]}));
+}
+
 /// The offer is the message's own: a task that continues it with a message that has no capabilities
 /// does not draw with the earlier offer.
 #[tokio::test]
