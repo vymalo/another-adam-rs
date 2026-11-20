@@ -7619,6 +7619,8 @@ struct TranscriptAgent {
     stop_splitting: bool,
     /// Fail the step at this turn, after emitting an artifact (`None`: never).
     fail_at: Option<u32>,
+    /// A file artifact the failing step emits, for the carried head's upload gate.
+    fail_file: Option<Artifact>,
     /// A file artifact the first step emits, for the blob gate.
     file: Option<Artifact>,
     /// Replace the transcript on the second step: a compaction, not an append.
@@ -7637,6 +7639,7 @@ impl TranscriptAgent {
             wrong: false,
             stop_splitting: false,
             fail_at: None,
+            fail_file: None,
             file: None,
             compact: false,
             padding: 0,
@@ -7723,6 +7726,9 @@ impl Agent for TranscriptAgent {
                 json!({"at": state.turns}),
             )))
             .await;
+            if let Some(file) = &self.fail_file {
+                ctx.emit(RunEvent::from(file.clone())).await;
+            }
             return Err(AgentError::permanent("boom"));
         }
         if self.park_at == Some(state.turns) {
@@ -8425,6 +8431,195 @@ async fn a_failed_transition_keeps_its_artifact_in_the_head() {
         "and the head names it: {:?}",
         record.state["artifacts"]
     );
+}
+
+/// A carried head names only digests whose bytes are stored: a file the failing step emitted and
+/// whose `put_blob` failed is left out of the head (the state is the tombstone, so the head is the
+/// run's only copy), while the JSON artifact and the inherited file stay. No named digest is
+/// missing, so `Runtime::artifact_bytes` never answers `None` for one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_carried_head_names_only_stored_file_digests() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let faulty = Arc::new(FaultyStore::new(inner.clone()));
+    let recording = Arc::new(common::recording::RecordingStore::new(faulty.clone()));
+    let store: DynStore = recording.clone();
+    let stored =
+        Artifact::file("chart", "image/svg+xml", "chart.svg", SVG.to_vec()).expect("a small file");
+    let lost_bytes = b"the bytes that never land".to_vec();
+    let lost = Artifact::file(
+        "extra",
+        "application/octet-stream",
+        "extra.bin",
+        lost_bytes.clone(),
+    )
+    .expect("a small file");
+    let mut agent = TranscriptAgent::new(&uniq("carried-upload"), 2);
+    agent.park_at = Some(1);
+    agent.fail_at = Some(2);
+    agent.file = Some(stored);
+    agent.fail_file = Some(lost);
+    let rt = transcript_runtime(&store, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_waiting(&rt, run).await;
+    // The first split stored `chart.svg`; the failing step's `extra.bin` put fails once.
+    faulty.fail(Method::PutBlob, 1);
+    rt.deliver(run, late()).await.expect("deliver");
+    let failed = wait_failed(&rt, run).await;
+    worker.stop().await;
+
+    let named: Vec<&str> = failed
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.name.as_str())
+        .collect();
+    assert!(named.contains(&"failure-note"), "{named:?}");
+    assert!(named.contains(&"chart"), "{named:?}");
+    assert!(
+        !named.contains(&"extra"),
+        "the file whose bytes are not stored is left out: {named:?}"
+    );
+    // Every file the view names can be read: a head never names a missing digest.
+    for artifact in &failed.artifacts {
+        if let Some(file) = &artifact.file {
+            assert!(
+                rt.artifact_bytes(file)
+                    .await
+                    .expect("read the blob")
+                    .is_some(),
+                "the head names {} with bytes that are not stored",
+                artifact.name
+            );
+        }
+    }
+    let record = inner.load_run(run).await.unwrap().unwrap();
+    assert_eq!(record.state["v"], 5, "the head stayed the run");
+    let head: Vec<&str> = record.state["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| artifact["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        head,
+        ["chart", "failure-note"],
+        "the head names the stored ones"
+    );
+    assert_eq!(
+        inner
+            .get_blob(&adam_runtime::blob_id(&lost_bytes))
+            .await
+            .unwrap(),
+        None,
+        "the failed file's bytes were never stored"
+    );
+    let last = recording.commits().pop().expect("the failed commit");
+    assert!(
+        last.blobs.is_empty(),
+        "no reference is recorded for a digest the head does not name: {:?}",
+        last.blobs
+    );
+}
+
+/// A refused split whose inherited file's bytes are gone commits **nothing**: the demotion cannot
+/// write the state (a v4 state carries the bytes), so the run is left as it is and retried rather
+/// than writing zero-byte files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_split_with_a_missing_inherited_file_commits_nothing() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let recording = Arc::new(common::recording::RecordingStore::new(inner.clone()));
+    let store: DynStore = recording.clone();
+    let file =
+        Artifact::file("chart", "image/svg+xml", "chart.svg", SVG.to_vec()).expect("a small file");
+    let mut agent = TranscriptAgent::new(&uniq("lost-file"), 2).with_file(file);
+    agent.park_at = Some(1);
+    let rt = transcript_runtime(&store, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_waiting(&rt, run).await;
+    worker.stop().await;
+    let head = inner.load_head(run).await.unwrap().unwrap().state;
+    assert_eq!(head["v"], 5, "the first step split and stored the file");
+
+    // The inherited file's bytes are gone: the demotion must not write the state as zero-byte
+    // files, so it refuses and the commit does not land.
+    let lost: DynStore = Arc::new(common::lost::LostBlob::new(
+        inner.clone(),
+        adam_runtime::blob_id(SVG),
+    ));
+    let retried = Arc::new(common::recording::RecordingStore::new(lost));
+    let store: DynStore = retried.clone();
+    let mut broken = TranscriptAgent::new(&agent.name, 2);
+    broken.wrong = true;
+    let rt = transcript_runtime(&store, &broken);
+    rt.deliver(run, late()).await.expect("deliver");
+    retried.reset();
+    let worker = spawn_worker(&rt);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    worker.stop().await;
+
+    assert!(
+        retried.commits().is_empty(),
+        "the step's refused demotion commits nothing: {:?}",
+        retried.commits()
+    );
+    let served = inner.load_run(run).await.unwrap().unwrap();
+    assert_eq!(served.state["v"], 5, "the head is untouched");
+    assert!(
+        served.state["artifacts"][0]["file"]["digest"].is_string(),
+        "and it still names the file's digest: {:?}",
+        served.state["artifacts"]
+    );
+}
+
+/// A store that keeps no bodies gets the head it read as its **state**, and no head or row, on the
+/// paths that carry a document (a delivery and a cancel): `carried` is gated on `keeps_bodies`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_that_keeps_no_bodies_gets_the_head_as_its_state() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let mut agent = TranscriptAgent::new(&uniq("no-bodies-carried"), 1);
+    agent.park_at = Some(1);
+    let rt = transcript_runtime(&inner, &agent);
+    let parked = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let second = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_waiting(&rt, parked).await;
+    wait_waiting(&rt, second).await;
+    worker.stop().await;
+    let head = inner.load_head(parked).await.unwrap().unwrap().state;
+    assert_eq!(head["v"], 5);
+
+    // A wrapper that forwards the reads and the writes but reports it keeps no bodies.
+    let recording =
+        Arc::new(common::recording::RecordingStore::new(inner.clone()).without_bodies());
+    let store: DynStore = recording.clone();
+    let rt = transcript_runtime(&store, &agent);
+
+    rt.deliver(parked, late()).await.expect("deliver");
+    let delivered = recording.commits().pop().expect("a delivery commit");
+    assert!(
+        delivered.head.is_none() && delivered.body.is_none(),
+        "a store that keeps no bodies gets no head and no row"
+    );
+    assert_eq!(delivered.state["v"], 5, "the head becomes the state");
+    assert_eq!(
+        delivered.state["inbox"].as_array().unwrap().len(),
+        1,
+        "with the delivered message"
+    );
+    assert_eq!(
+        delivered.state["body"]["generation"], head["body"]["generation"],
+        "and the transcript set it names"
+    );
+
+    rt.cancel(second, "stop").await.expect("cancel");
+    let cancelled = recording.commits().pop().expect("a cancel commit");
+    assert!(
+        cancelled.head.is_none() && cancelled.body.is_none(),
+        "and the same on a cancel"
+    );
+    assert_eq!(cancelled.state["v"], 5);
+    assert_eq!(cancelled.state["error"], "cancelled: stop");
 }
 
 /// A run that never split is v4: its view is the whole agent state, and `Runtime::state` reads no

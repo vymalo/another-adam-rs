@@ -1078,6 +1078,7 @@ fn build_update(
     next: &Next,
     cur: &Envelope,
     base_head: Option<&HeadParts>,
+    carried: Option<&[Artifact]>,
     base_inbox_len: usize,
     base_rev: u64,
     parent: bool,
@@ -1188,13 +1189,18 @@ fn build_update(
         // it would put the transcript back in the head, so the run demotes to v4 instead.
         (None, Some(_)) if next.split_refused => update.state = env.encode()?,
         (None, Some(base)) if keeps_bodies => {
-            update.head = Some(base.carried(&env, &next.artifacts).encode()?);
+            update.head = Some(
+                base.carried(&env, carried.unwrap_or(&next.artifacts))
+                    .encode()?,
+            );
             update.state = Value::Null;
         }
         // A v5 document on a store that keeps no bodies (a third-party store that persists a head
         // but has not opted in): the head stays the state, and no head or row is written.
         (None, Some(base)) => {
-            update.state = base.carried(&env, &next.artifacts).encode()?;
+            update.state = base
+                .carried(&env, carried.unwrap_or(&next.artifacts))
+                .encode()?;
         }
         // A v4 run that did not split, or a split for a store that keeps no bodies: the whole
         // state, as it always was.
@@ -1229,6 +1235,8 @@ async fn inline_inherited_files(
             _ => return Ok(false),
         }
     }
+    // The pairing is exact: every file the head names has a carried artifact, in order.
+    debug_assert!(refs.next().is_none(), "a head file has no carried artifact");
     Ok(true)
 }
 
@@ -1323,10 +1331,33 @@ async fn commit(
             Some((rec, env, head)) => (rec, env, head.as_ref()),
             None => (claimed, base, base_head),
         };
+        // The bytes of every file artifact this commit names go to the store before the commit
+        // that names them (ADR 0055). A split's own pass (`upload_all`, in `transition`) already
+        // stored what was missing and refused the head if one was not. A commit that **carries a
+        // head** gates its files the same way: the head names only the digests whose bytes are
+        // stored, and a file whose put fails is left out of the head and its references (the state
+        // is the tombstone, so the head is the run's only copy). A v4 commit keeps the fail-open
+        // upload: its state carries the bytes.
+        let (mut blobs, carried) = if next.split.is_some() {
+            (next.shadow_blobs.clone(), None)
+        } else if cur_head.is_some() {
+            let carried = crate::blob::upload_carried(&inner.store, &next.artifacts).await;
+            (carried.ids.clone(), Some(carried.artifacts))
+        } else {
+            let mut blobs = Vec::new();
+            if cur_env.rev == 0 {
+                blobs = crate::blob::upload_files(&inner.store, &cur_env.artifacts).await;
+            }
+            blobs.extend(crate::blob::upload_files(&inner.store, &next.artifacts).await);
+            (blobs, None)
+        };
+        blobs.sort();
+        blobs.dedup();
         let mut update = build_update(
             next,
             cur_env,
             cur_head,
+            carried.as_deref(),
             base.inbox.len(),
             base.rev,
             parent,
@@ -1334,23 +1365,6 @@ async fn commit(
             body_writer,
             keeps_bodies,
         )?;
-        // The bytes of every file artifact this commit's state names go to the store before the
-        // commit that names them (ADR 0055). A split's own pass (`upload_all`, in `transition`)
-        // already stored what was missing and refused the head if one was not; a non-split commit
-        // keeps the fail-open per-artifact upload, which skips a digest the store already holds.
-        // A v5 run's inherited files are already stored and named by the head it read.
-        let mut blobs = if next.split.is_some() {
-            next.shadow_blobs.clone()
-        } else {
-            let mut blobs = Vec::new();
-            if cur_env.rev == 0 && cur_head.is_none() {
-                blobs = crate::blob::upload_files(&inner.store, &cur_env.artifacts).await;
-            }
-            blobs.extend(crate::blob::upload_files(&inner.store, &next.artifacts).await);
-            blobs
-        };
-        blobs.sort();
-        blobs.dedup();
         update.blobs = blobs;
         match inner.store.commit_run(run, cur_rec.version, update).await {
             Ok(rec) => {
