@@ -415,8 +415,6 @@ pub async fn read_file(
 
 // ------------------------------------------------------------------ read_files
 
-// ------------------------------------------------------------------ read_files
-
 /// Most paths one `read_files` call accepts.
 pub const READ_FILES_MAX: usize = 16;
 /// Most lines of one file's page in a `read_files` result.

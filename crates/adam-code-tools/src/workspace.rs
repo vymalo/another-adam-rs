@@ -163,7 +163,10 @@ pub trait CodeWorkspace: Send + Sync {
         intent: Intent,
     ) -> Result<Place, Outcome>;
 
-    /// What every text a tool returns goes through: the process's secrets, scrubbed.
+    /// The process's secrets, for what a tool must not let through while it works: a search matches
+    /// the scrubbed lines, so a secret is never findable. It is **not** applied to every result by
+    /// the tools: the workspace's host scrubs each result before the model sees it (the coder's
+    /// `Redacting` layer), and a host that serves these tools does the same.
     fn redactor(&self) -> &Redactor;
 
     /// The project instructions `path` touches in `place` and that this run has not been shown yet
