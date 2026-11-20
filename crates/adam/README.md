@@ -15,6 +15,7 @@ adam = "0.1"
 | Feature | Default | What |
 |---|---|---|
 | `macros` | yes | `#[tool]` (`adam::tool`, and in the prelude) |
+| `remote` | yes | remote subagents (`a2a:` in a subagent file): the A2A client, an HTTP client and TLS (turns on `adam-assembly/remote`; see [Without remote subagents](../adam-assembly/README.md#without-remote-subagents-feature-remote)). An application that embeds adam (ADR 0047) turns it off with `default-features = false`, and `bind` then refuses an `a2a:` subagent with `Error::RemoteNotEnabled`. This crate depends on `adam-assembly` without its defaults, so a crate that turns `adam`'s off gets no `remote` |
 | `a2a` | no | `Assembly::card`: the root agent's `card:` as an `adam_a2a::AgentCardConfig` (turns on `adam-assembly/a2a`) |
 | `mcp` | no | `mcp.json` tools: `adam::mcp` (the MCP client: `McpPolicy`, `Env`, `McpServers`) and `AgentDef::connect_mcp`, which connects each agent's MCP servers at startup and gives it their tools as `<server>__<tool>` (turns on `adam-assembly/mcp`; see [MCP tools](../adam-assembly/README.md#mcp-tools-feature-mcp)). Off by default: a build cannot start a process or reach a server because an `mcp.json` said so unless it opts in |
 | `dev` | no | dev reload: `adam::LiveAssembly` watches the agent directory and swaps the agents when a file changes (turns on `adam-assembly/dev`, which brings `notify`). Off by default, so a release build cannot watch and reload prompts unless it opts in. Reading a folder once, at startup, needs no feature: `adam::AgentFolder` |

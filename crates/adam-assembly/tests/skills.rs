@@ -4,9 +4,11 @@
 
 mod common;
 
+#[cfg(feature = "remote")]
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(feature = "remote")]
 use adam_agent_fixture::AGENT;
 use adam_agent_fs::{Dir, ManifestSource, Strictness};
 use adam_assembly::{
@@ -135,6 +137,8 @@ fn tool<'a>(request: &'a ModelRequest, name: &str) -> &'a adam_model::ToolSpec {
 
 // --- tier 1: the catalog ------------------------------------------------------------------
 
+// The fixture has a remote subagent (`a2a:`).
+#[cfg(feature = "remote")]
 #[test]
 fn the_catalog_of_the_fixture_matches_the_golden_file() {
     let fixture_tools = tools(&[
@@ -771,6 +775,8 @@ async fn a_subagent_has_its_own_skills() {
 
 // --- embedded and directory ---------------------------------------------------------------------
 
+// The fixture has a remote subagent (`a2a:`).
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn embedded_and_directory_manifests_behave_the_same() {
     let fixture_tools = || {

@@ -2,12 +2,14 @@
 # The embedded feature set (ADR 0047 decision 2), checked:
 #
 #   tools/embedded-deps/check.sh              every split crate builds with its defaults off and with each
-#                                             feature alone, clippy -D warnings; then adam-engine's tree
+#                                             feature alone, clippy -D warnings, and no dev-dependency turns
+#                                             its gate back on; then adam-engine's tree
 #   tools/embedded-deps/check.sh tree         adam-engine's tree only
 #   tools/embedded-deps/check.sh self-test    the tree check fails on a planted crate (axum, then rustls):
 #                                             it adds each to adam-engine's manifest in this working tree,
 #                                             expects a failure naming it, and puts the files back; and on
-#                                             a gate turned back on (adam-ui/thread-tools, adam-a2a-runtime/push)
+#                                             a gate turned back on (adam-ui/thread-tools, adam-a2a-runtime/push,
+#                                             adam-assembly/remote)
 #
 # The forbidden crates: an HTTP server or client, the A2A SDK's server and client, a database driver,
 # the Kubernetes client, a TLS stack (the host has its own), the MCP client.
@@ -23,7 +25,7 @@ rustls aws-lc-rs aws-lc-sys ring openssl openssl-sys native-tls
 rmcp'
 
 # crate:feature lists; each crate is also built with no feature at all.
-SPLIT='adam-a2a:server adam-a2a-runtime:push adam-ui:thread-tools'
+SPLIT='adam-a2a:server adam-a2a-runtime:push adam-ui:thread-tools adam-assembly:remote'
 
 tree() {
   local package=$1 found=0 names
@@ -56,8 +58,26 @@ defaults() {
   echo "embedded-deps: every gate is on by default"
 }
 
+# A crate's gate stays off in its own builds without defaults, its tests included: a dev-dependency
+# that depends back on it with its defaults (adam-assembly's fixture -> adam -> adam-assembly) would
+# turn the gate on, and the tests below would test a build no host gets. Not adam-a2a: its tests
+# depend on adam-a2a itself with `test-util` (and so its defaults), which turns `server` on there.
+gates_stay_off() {
+  for entry in adam-a2a-runtime:push adam-ui:thread-tools adam-assembly:remote; do
+    local crate=${entry%%:*} feature=${entry#*:} out
+    out=$(cargo tree --locked -p "$crate" --no-default-features -e features -i "$crate")
+    if grep -qF "$crate feature \"$feature\"" <<<"$out"; then
+      echo "embedded-deps: $crate's own build without defaults has $feature on:" >&2
+      echo "$out" >&2
+      return 1
+    fi
+  done
+  echo "embedded-deps: no dependency turns a gate back on in its crate's own builds"
+}
+
 features() {
   defaults
+  gates_stay_off
   for entry in $SPLIT; do
     local crate=${entry%%:*} feature=${entry#*:}
     # Tests included: a test that needs the feature says so with `required-features`.
@@ -103,7 +123,7 @@ self_test() {
   done
   # A gate turned back on brings its crates back: the features are what keeps them out.
   cp "$backup/Cargo.toml" "$manifest"
-  for gate in adam-ui/thread-tools:rmcp adam-a2a-runtime/push:axum; do
+  for gate in adam-ui/thread-tools:rmcp adam-a2a-runtime/push:axum adam-assembly/remote:reqwest; do
     local feature=${gate%%:*} crate=${gate#*:} out
     if out=$(tree adam-engine --features "$feature" 2>&1); then
       echo "embedded-deps self-test: $feature turned on was not found" >&2

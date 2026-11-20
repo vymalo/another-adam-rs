@@ -438,6 +438,7 @@ version = "0.1.0"
 dependencies = [
  "adam-a2a-runtime",
  "adam-agent-fs",
+ "adam-assembly",
  "adam-core",
  "adam-error",
  "adam-llm-agent",

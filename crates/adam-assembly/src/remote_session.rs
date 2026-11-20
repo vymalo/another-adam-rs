@@ -1186,8 +1186,9 @@ mod tests {
 
     #[test]
     fn debug_hides_the_token_and_the_state_holds_none() {
+        use crate::def::{RemoteSettings, Secrets};
         use crate::error::Origin;
-        use crate::remote::{RemoteEndpoint, RemoteSettings};
+        use crate::remote::RemoteEndpoint;
         use adam_agent_fs::{RemoteAgent, RemoteAuth};
         use secrecy::SecretString;
         let agent = RemoteAgent {
@@ -1199,7 +1200,7 @@ mod tests {
             note: String::new(),
             path: "agent/subagents/billing.md".into(),
         };
-        let settings = RemoteSettings {
+        let secrets = Secrets {
             env: Arc::new(
                 [(
                     "T".to_owned(),
@@ -1207,12 +1208,13 @@ mod tests {
                 )]
                 .into(),
             ),
-            ..RemoteSettings::default()
+            ..Secrets::default()
         };
         let endpoint = RemoteEndpoint::bind(
             &Origin::new("coder/billing", "billing.md"),
             &agent,
-            &settings,
+            &RemoteSettings::default(),
+            &secrets,
         )
         .unwrap();
         let round = RemoteRoundAgent::new(
@@ -1255,8 +1257,9 @@ mod tests {
     }
 
     fn round_agent() -> RemoteRoundAgent {
+        use crate::def::{RemoteSettings, Secrets};
         use crate::error::Origin;
-        use crate::remote::{RemoteEndpoint, RemoteSettings};
+        use crate::remote::RemoteEndpoint;
         use adam_agent_fs::RemoteAgent;
         let agent = RemoteAgent {
             name: "billing".into(),
@@ -1271,6 +1274,7 @@ mod tests {
             &Origin::new("coder/billing", "billing.md"),
             &agent,
             &RemoteSettings::default(),
+            &Secrets::default(),
         )
         .unwrap();
         RemoteRoundAgent::new(

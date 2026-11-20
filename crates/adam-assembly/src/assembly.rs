@@ -14,6 +14,7 @@ use adam_runtime::{RuntimeBuilder, SessionLimits};
 
 use crate::def::{Node, Remote};
 use crate::error::{AliasProblem, Error, Origin};
+#[cfg(feature = "remote")]
 use crate::remote_session::RemoteRoundAgent;
 use crate::scrub::{Scrub, Scrubbed};
 use crate::suggest::closest;
@@ -266,15 +267,13 @@ impl BoundDef {
             });
             resolved.push(alias);
         }
-        let rounds = self
-            .nodes
-            .iter()
-            .flat_map(|node| node.round_agents.iter().cloned())
-            .map(|round| match self.wait_poll {
-                Some(every) => round.with_wait_poll(every),
-                None => round,
-            })
-            .collect();
+        let mut rounds = Rounds::default();
+        for node in &self.nodes {
+            rounds.extend(&node.round_agents);
+        }
+        if let Some(every) = self.wait_poll {
+            rounds = rounds.with_wait_poll(every);
+        }
         let remotes = self
             .remotes
             .into_iter()
@@ -450,7 +449,7 @@ pub struct RemoteInfo {
 pub struct Assembly {
     manifest: AgentManifest,
     agents: Vec<LlmAgent>,
-    rounds: Vec<RemoteRoundAgent>,
+    rounds: Rounds,
     info: Vec<AgentInfo>,
     remotes: Vec<RemoteInfo>,
     session_limits: SessionLimits,
@@ -500,16 +499,22 @@ impl Assembly {
             .agents
             .iter()
             .fold(builder, |builder, agent| builder.agent(agent.clone()));
-        self.rounds
-            .iter()
-            .fold(builder, |builder, round| builder.agent(round.clone()))
+        self.rounds.register(builder)
     }
 
     /// The agents that work the rounds of a session on a remote subagent of the root, registered
     /// as `<root>/<subagent>`: [`register`](Self::register) registers them with the rest. A
     /// composition root that registers [`agents`](Self::agents) one by one registers these too, or
     /// `subagent_start` on a remote subagent is refused in a process that does not know the name.
+    /// Only with the feature `remote`.
+    #[cfg(feature = "remote")]
     pub fn remote_round_agents(&self) -> &[RemoteRoundAgent] {
+        &self.rounds.agents
+    }
+
+    /// The round agents, for a dev reload that registers them as they were at startup.
+    #[cfg(feature = "dev")]
+    pub(crate) fn rounds(&self) -> &Rounds {
         &self.rounds
     }
 
@@ -536,5 +541,57 @@ impl Assembly {
     /// skills and the MCP servers are bound; schedules are for a later slice).
     pub fn manifest(&self) -> &AgentManifest {
         &self.manifest
+    }
+}
+
+/// The agents that work the rounds of the sessions on remote subagents, one per remote subagent of
+/// the root. Always empty without the feature `remote`, where no remote subagent binds.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Rounds {
+    #[cfg(feature = "remote")]
+    agents: Vec<RemoteRoundAgent>,
+}
+
+#[cfg(feature = "remote")]
+impl Rounds {
+    pub(crate) fn push(&mut self, round: RemoteRoundAgent) {
+        self.agents.push(round);
+    }
+
+    pub(crate) fn extend(&mut self, other: &Self) {
+        self.agents.extend(other.agents.iter().cloned());
+    }
+
+    /// Each round agent with this longest wait between two looks at its task.
+    #[must_use]
+    pub(crate) fn with_wait_poll(self, every: Duration) -> Self {
+        let agents = self
+            .agents
+            .into_iter()
+            .map(|round| round.with_wait_poll(every))
+            .collect();
+        Self { agents }
+    }
+
+    /// Register each round agent on a runtime builder.
+    pub(crate) fn register(&self, builder: RuntimeBuilder) -> RuntimeBuilder {
+        self.agents
+            .iter()
+            .fold(builder, |builder, round| builder.agent(round.clone()))
+    }
+}
+
+/// Without the feature `remote` there is never a round agent: each of these does nothing.
+#[cfg(not(feature = "remote"))]
+impl Rounds {
+    pub(crate) fn extend(&mut self, _other: &Self) {}
+
+    #[must_use]
+    pub(crate) fn with_wait_poll(self, _every: Duration) -> Self {
+        self
+    }
+
+    pub(crate) fn register(&self, builder: RuntimeBuilder) -> RuntimeBuilder {
+        builder
     }
 }

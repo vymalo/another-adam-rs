@@ -35,6 +35,17 @@ catalog a message carries (`Ui::embedded`) and `Ui::screen`, a source that adds 
 `adam-engine` does not depend on `adam-assembly` yet; and the check on Windows and macOS, which is slice 8's runner.
 The model's credentials are ADR 0058's port: the host gives `ModelCredentials`, so the engine reads no key.
 
+*Amended 2026-11-20: slice 1b is built.* `adam-assembly` has the feature `remote`, on by default, which gates the remote
+(`a2a:`) subagents and the A2A client, `reqwest` and `url` they need; `a2a` turns it on. Without it `bind` refuses an
+`a2a:` subagent with the new `Error::RemoteNotEnabled`, before any secret is read; `env`, `secrets`,
+`allow_insecure_remotes`, `remote_timeout` and `connect_mcp` keep their signatures and behaviour. `adam` passes it on
+(`remote`, in its defaults, over `adam-assembly` without defaults), and `adam-agent-fixture` takes `adam` without
+defaults, so the dev-dependency cycle no longer turns `remote` on in `adam-assembly`'s own test builds; `check.sh`
+asserts that with `cargo tree -e features`, builds `adam-assembly` with and without it, and its self-test turns
+`adam-assembly/remote` back on and finds `reqwest`. `adam-engine` now depends on `adam-assembly` without defaults. With
+that, **decision 2's feature set is complete**: `server`, `push`, `remote` and `thread-tools`. The check on Windows and
+macOS is still slice 8's runner.
+
 ## Context
 
 A program that links adam-rs today takes `adam-service` (an HTTP server, Postgres, an OpenAI client, configuration read
@@ -155,7 +166,9 @@ is still `Runnable`: at the next start the engine releases its own leases and th
   2026-11-19 under decision 7), each with a default that keeps
   today's behaviour, and each with a testkit. A consumer that sets `default-features = false` on the four split crates
   loses what the features gate; with the defaults nothing changes.
-* **Rule 3.** No closed enum changes.
+* **Rule 3.** No closed enum changes. *Amended 2026-11-20 (slice 1b):* one, stated: `adam_assembly::Error` gains
+  `RemoteNotEnabled { origin }`, in every build, so a `match` on it without `_` breaks (the `adam-assembly` README says
+  so under **Breaking**).
 * **Rule 4.** The engine reads no environment variable and no file it was not given. An agent folder is embedded with
   `include_agent!` or named by the host.
 * **Platforms.** Linux and macOS first for the tools and the sandbox. Windows builds the engine from the first slice and
