@@ -89,6 +89,14 @@ impl AgentStarter for CoderStarter {
         }
         starter.init_continuing(input, prior, prior_run)
     }
+
+    fn split(&self, state: &Conversation) -> Option<(Conversation, Vec<Value>)> {
+        LlmStarter::new(AGENT_NAME).split(state)
+    }
+
+    fn join(&self, head: Conversation, rows: Vec<Value>) -> Result<Conversation, AgentError> {
+        LlmStarter::new(AGENT_NAME).join(head, rows)
+    }
 }
 
 /// What the prompt says in place of the folder's `repository_creation` var when nobody may create
@@ -1285,6 +1293,14 @@ impl Agent for CoderAgent {
         prior_run: RunId,
     ) -> Result<Conversation, AgentError> {
         CoderStarter.init_continuing(input, prior, prior_run)
+    }
+
+    fn split(&self, state: &Conversation) -> Option<(Conversation, Vec<Value>)> {
+        CoderStarter.split(state)
+    }
+
+    fn join(&self, head: Conversation, rows: Vec<Value>) -> Result<Conversation, AgentError> {
+        CoderStarter.join(head, rows)
     }
 
     async fn step(

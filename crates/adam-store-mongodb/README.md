@@ -26,7 +26,12 @@ accept the poll latency.
 * `MongoStore::new(database)`: reuse your application's `Database` handle.
 * `MongoStore::with_collection_prefix(prefix)`: collection-name prefix
   (default `adam_`; alphanumerics, `_` and `-`, at most 40 characters).
-* `MongoStore::database()`, `SCHEMA_VERSION` (5).
+* `MongoStore::database()`, `SCHEMA_VERSION` (5, parts 1 and 2).
+* `MongoStore::gc_body(run, keep, before)`: delete the superseded body generations of `run` written before
+  `before` (the commit path calls it with a one-hour grace; a test or an operator can pass its own
+  cutoff).
+* `Store::blob_stored(id)`: one `find_one` on `_id` in `adam_blob`, so a split that names a file an
+  earlier commit uploaded does not send its bytes again.
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
   state, and returning it would convert the document back on every transition. `load_run`, the claim
   and the listings return the stored state; `journal_put` returns the stored payload (the loop
@@ -44,7 +49,8 @@ accept the poll latency.
   ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
 
 A commit reads the current document projected to the metadata it needs (`agent`, `conversation_id`,
-the version, the parent and the creation time): it never reads the state it is about to replace.
+the version, the parent and the creation time, and only the head's `body` — not its agent or
+artifacts): it never reads the state it is about to replace.
 `journal_put` inserts the entry and, when the run still exists, returns it as it was written; a
 duplicate key means an earlier writer won, and their entry is read back. A journaled step is two
 round trips rather than the four of read, check, insert, check. `lease_until` reads one field.
@@ -123,6 +129,45 @@ keeps the earlier ones — so **a hand-built `RunUpdate { .. }` literal stops co
 **defaulted** on `Store`, so a store of your own that keeps no blobs still compiles and behaves as
 before.
 
+## Schema version 5, part 2: the head and the transcript
+
+A run document gains `head` (the v5 document the runtime writes beside `state`) and `head_version`
+(the version the head was written at). Nothing is rewritten by the migration: a version 4 document
+has neither field, and `{head_version: null}` matches a missing field, as `owner` did for version 2.
+A commit that writes a head sets both; a commit that does not (a delivery, a cancel, a park) leaves
+both alone, so the head becomes stale (`head_version < version`) and `load_head` serves the whole
+`state` instead.
+
+`<prefix>body` holds the transcript, **append-only per generation**: `_id =
+"<run>:<generation>:<idx>"`, `run_id`, `generation` and `writer` (binary UUIDs), `idx` (int),
+`message` (BSON through the codec) and `written_at`. Indexes: `adam_body_generation` (`run_id, generation, idx`) for reading a generation in order, `adam_body_gc` (`written_at`) for the sweep.
+
+A commit resolves the generation: `RunUpdate.body.generation` names a new one (a compaction, or a
+first split), else the current head's, else a new UUID. It writes only the rows after the old head's
+`len` for an append (all rows for a new generation), **before** the CAS, in one unordered
+`insertMany` (duplicates ignored), then **checks completeness**: `inserted + duplicate_keys ==
+rows.len()`. A duplicate is this attempt's own row when its `writer` is this attempt. A duplicate
+written by **another** attempt is read back with `adam_body_generation` over the attempted range: if
+every foreign row has the message this attempt would write, it is **adopted** and the CAS decides
+whose head names it; else if every foreign row is older than the orphan grace (5 minutes, far longer
+than the insert→CAS gap of a live attempt — milliseconds; the default lease is 30 s), its attempt
+died before its CAS, so the rows are deleted and the insert retried once; else a live attempt owns
+the slots and the commit is a `Conflict`. The runtime drops the result of a conflict and the next
+claim steps the run again. After a crash in the insert→CAS window the run is re-stepped and each
+attempt's result is dropped until the grace expires — minutes of wasted store round trips; the
+journaled steps replay, so no model call or tool side effect is repeated. A run wedged by an older
+binary is cancelled by an operator. Any other write error, and any **write-concern** error (the write
+may or may not have landed), aborts before the CAS — a head never names a generation that is missing
+a row. The refs go next, then the CAS, then the GC: the superseded generations of the run written
+more than an hour ago are deleted. A commit that loses the CAS deletes the rows and refs its
+`writer` added (but never a row or digest the winner's head names), so a loser cannot poison the
+next append. `load_head` reads the document once and serves the head only when `head_version ==
+version`.
+
+`purge_finished` deletes the purged runs' body rows with their journal and references. The body
+methods are **defaulted** on `Store`; `RunUpdate` gained the public fields `head` and `body`, so a
+hand-built literal stops compiling (see [`adam-core`](../adam-core/README.md#transcripts-the-head-and-the-body)).
+
 ## Schema version and the owner field
 
 The owner field is schema version 2. Version 2 adds an `owner` field to run documents, set by the first pinned
@@ -166,11 +211,17 @@ None.
 
 ## Tests
 
-`tests/conformance.rs` runs the shared suite and the blob suite, and checks that a version 1
-document (no `owner` field) is claimable and then pinned; `src/codec.rs` has property
+`tests/conformance.rs` runs the shared suite, the blob suite and the body suite (six cases: round
+trip and order, an idempotent retry, a superseded set, a headless commit leaving the head stale, sets
+per run, and the purge), checks that a version 1 document (no `owner` field) is claimable and then
+pinned, and adds three adapter-local cases: a head stored with its `head_version` and a headless
+commit leaving both alone (including a version 4 document with neither field), a partial body insert
+aborting before the CAS (a `collMod` validator rejects one row of a set, so the other lands and the
+commit must refuse it), and the body GC with an explicit cutoff; `src/codec.rs` has property
 tests of the key escaping; `src/lib.rs` has unit tests of the error classes
 (`driver_errors_are_classified_by_what_they_mean`,
-`the_driver_error_is_kept_as_the_source`), of what a write returns
+`the_driver_error_is_kept_as_the_source`), of the body completeness check
+(`a_body_insert_is_complete_only_when_every_row_landed`), of what a write returns
 (`returned_value_tests`: the cleaned value it stored, without converting the stored document
 back to JSON) and of the round trips a journal entry costs (`round_trip_tests`, counting the
 driver's command events).
