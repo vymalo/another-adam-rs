@@ -110,3 +110,23 @@ async fn command_harness() -> CommandHarness {
 }
 
 adam_code_tools_testkit::command_workspace_conformance!(command_harness().await);
+
+/// `run_command` resolves its `cwd` against `place.path()`, where the coder's tool used the slot's
+/// path: they are the same directory, the slot the place carries and the run's worktree.
+#[tokio::test]
+async fn a_place_is_at_the_path_of_its_slot() {
+    let h = prepared(Fixture::new().await).await;
+    let fx = h.alive.downcast_ref::<Fixture>().expect("the fixture");
+    for intent in [Intent::Read, Intent::Write] {
+        let place = h.workspace.place(&h.ctx, None, intent).await.unwrap();
+        let slot = place
+            .handle::<adam_workspace::Slot>()
+            .expect("a place of the coder carries its slot");
+        assert_eq!(place.path(), slot.path(), "{intent:?}");
+        assert_eq!(
+            place.path(),
+            common::slot_dir(&fx.root, &h.ctx.run_id().to_string()),
+            "{intent:?}"
+        );
+    }
+}

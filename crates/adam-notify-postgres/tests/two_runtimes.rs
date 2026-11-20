@@ -13,23 +13,22 @@
 //! (`adam_n<8 hex>_`) and drops the tables at the end.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, RunId, RunStatus};
 use adam_notify_postgres::PgNotify;
+use adam_postgres::PgConfig;
 use adam_runtime::{
     Agent, AgentError, AgentStarter, BroadcastSink, Ctx, Delivery, Inbound, Notifier, RunEvent,
     RunView, Runtime, Signal, Transition,
 };
 use adam_store_postgres::PgStore;
 use async_trait::async_trait;
+use deadpool_postgres::Pool;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
-use sqlx::{AssertSqlSafe, Row};
 use tokio::sync::{Notify, oneshot};
 use uuid::Uuid;
 
@@ -102,17 +101,16 @@ struct Env {
     url: String,
     tables: String,
     channels: String,
-    admin: PgPool,
+    admin: Pool,
 }
 
 impl Env {
     async fn new() -> Option<Self> {
         let url = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL")?;
-        let admin = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .expect("connect");
+        let admin = PgConfig::parse(&url)
+            .expect("DATABASE_URL")
+            .pool(2)
+            .expect("pool");
         Some(Self {
             url,
             tables: format!("adam_nt{}_", short()),
@@ -121,21 +119,29 @@ impl Env {
         })
     }
 
-    async fn pool(&self, application_name: &str) -> PgPool {
-        let options = PgConnectOptions::from_str(&self.url)
-            .expect("url")
-            .application_name(application_name);
-        PgPoolOptions::new()
-            .max_connections(6)
-            .connect_with(options)
-            .await
-            .expect("connect")
+    /// A pool whose connections are named in `pg_stat_activity`, so a test can find and terminate
+    /// the listener's backend.
+    async fn pool(&self, application_name: &str) -> Pool {
+        PgConfig::parse(&self.url)
+            .expect("DATABASE_URL")
+            .with_application_name(application_name)
+            .pool(6)
+            .expect("pool")
+    }
+
+    /// The config the listener uses, named like the pool above.
+    fn config(&self, application_name: &str) -> PgConfig {
+        PgConfig::parse(&self.url)
+            .expect("DATABASE_URL")
+            .with_application_name(application_name)
     }
 
     async fn cleanup(&self) {
         let p = &self.tables;
         let drop = format!("DROP TABLE IF EXISTS {p}journal, {p}runs, {p}meta");
-        let _ = sqlx::query(AssertSqlSafe(drop)).execute(&self.admin).await;
+        if let Ok(client) = self.admin.get().await {
+            let _ = client.batch_execute(&drop).await;
+        }
     }
 }
 
@@ -159,6 +165,7 @@ enum Role<'a> {
 
 async fn node(env: &Env, role: Role<'_>) -> Node {
     let application_name = format!("adam-nt-{}", short());
+    let notify_pg = env.config(&application_name);
     let notify_pool = env.pool(&application_name).await;
     let store_pool = env.pool(&format!("{application_name}-store")).await;
     let store = PgStore::from_pool(store_pool)
@@ -168,7 +175,7 @@ async fn node(env: &Env, role: Role<'_>) -> Node {
     let store: DynStore = Arc::new(store);
 
     let local = BroadcastSink::default();
-    let notify = PgNotify::new(notify_pool, local.clone())
+    let notify = PgNotify::new(notify_pool, notify_pg, local.clone())
         .with_channel_prefix(&env.channels)
         .expect("channel prefix")
         // An ambient NOTIFY_LOCAL_ONLY must not silence the events this test
@@ -463,17 +470,18 @@ async fn a_lost_connection_is_healed_with_a_resync() {
 
     // Kill every backend of the worker's notification pool, the listener's
     // included, and start a run while it is down.
-    let killed = sqlx::query(
-        "SELECT pg_terminate_backend(pid) AS ok FROM pg_stat_activity
-         WHERE application_name = $1 AND pid <> pg_backend_pid()",
-    )
-    .bind(&worker.application_name)
-    .fetch_all(&env.admin)
-    .await
-    .expect("terminate")
-    .iter()
-    .filter(|row| row.get::<bool, _>("ok"))
-    .count();
+    let admin = env.admin.get().await.expect("an admin connection");
+    let killed = admin
+        .query(
+            "SELECT pg_terminate_backend(pid) AS ok FROM pg_stat_activity
+             WHERE application_name = $1 AND pid <> pg_backend_pid()",
+            &[&worker.application_name],
+        )
+        .await
+        .expect("terminate")
+        .iter()
+        .filter(|row| row.get::<_, bool>("ok"))
+        .count();
     assert!(killed >= 1, "the listener's backend was found and killed");
     let run = front.rt.start(&name, inbound(), None).await.expect("start");
 

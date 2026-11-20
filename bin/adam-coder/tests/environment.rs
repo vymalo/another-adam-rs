@@ -332,7 +332,7 @@ async fn an_environment_that_cannot_be_made_is_a_result_for_the_model_and_nothin
 }
 
 /// `kube` builds its TLS configuration with rustls' process default provider (`ClientConfig::builder()`), and this
-/// binary's tree enables two providers (`aws-lc-rs`, and `ring` through sqlx's rustls): rustls then refuses to guess
+/// binary's tree enables two providers (`aws-lc-rs`, and `ring` through `mongodb`): rustls then refuses to guess
 /// and panics ("Could not automatically determine the process-level CryptoProvider"), which is what the first
 /// `kube::Client` of the process would do on the in-cluster path. `install_crypto_provider` (called by the
 /// production `connect` and by `adam-kube-exec`) is the fix; this is the proof, in this tree.

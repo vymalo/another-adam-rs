@@ -68,6 +68,15 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # ADR 0053 decision 1: sqlx must not come back. It locks sqlx-sqlite, whose libsqlite3-sys
+      # ceiling keeps rusqlite (and so adam-store-sqlite) out of the workspace. An absent package
+      # makes `cargo tree -i` exit 101, so only a present one runs the `then` branch.
+      - name: sqlx stays out of the workspace
+        run: |
+          if cargo tree --workspace --locked -i sqlx; then
+            echo "::error::sqlx is back in the dependency graph (ADR 0053 decision 1)"
+            exit 1
+          fi
 
   clippy-features:
     name: clippy (optional features)

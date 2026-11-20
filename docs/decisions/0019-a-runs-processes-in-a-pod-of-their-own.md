@@ -253,7 +253,7 @@ commands are gone, which the coder sees as a command that ended with a non-zero 
 * The `NetworkPolicy` is only as real as the cluster's CNI enforces it (*unverified* for the owner's cluster), and it blocks
   in-cluster services: a model gateway inside the cluster needs `runPods.networkPolicy.extraEgress` *(and, since [ADR 0042](0042-run-pods-reach-the-internet-through-an-egress-proxy.md), its host in `runPods.egressProxy.extraNoProxy`)*.
 * **TLS needs a named provider.** `kube` builds its TLS configuration with rustls' process default, and rustls refuses to guess one when
-  a binary's tree enables two (the coder's does: sqlx's rustls enables `ring` beside `aws-lc-rs`), so the first `kube::Client` of the
+  a binary's tree enables two (the coder's does: `mongodb`'s rustls enables `ring` beside `aws-lc-rs`; *amended 2026-11-20, ADR 0053 decision 1*: when this was written the second was `sqlx`'s), so the first `kube::Client` of the
   coder, and of `adam-kube-exec` when it is built with the coder, would panic. `install_crypto_provider` names aws-lc-rs and both call it
   (*verified* 2026-10-05 by a test in the coder, which panics without it in that tree). It adds `rustls` as a direct dependency of the crate.
 * `EnvKind` gains `Kubernetes { pod, image }` (it was `#[non_exhaustive]` already), so a `match` over it needs a wildcard,

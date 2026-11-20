@@ -9,16 +9,12 @@
 use std::sync::Arc;
 
 use adam_store_postgres::PgStore;
-use sqlx::postgres::PgPoolOptions;
 
 async fn make_store() -> Option<adam_core::DynStore> {
     let url = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL")?;
     // Each #[tokio::test] has its own runtime, so each gets its own small pool.
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&url)
-        .await
-        .expect("connect");
+    let config = adam_postgres::PgConfig::parse(&url).expect("DATABASE_URL");
+    let pool = config.pool(8).expect("pool");
     let prefix = std::env::var("ADAM_TEST_TABLE_PREFIX").unwrap_or_else(|_| "adam_test_".into());
     Some(Arc::new(
         PgStore::from_pool(pool)
@@ -31,4 +27,8 @@ adam_store_testkit::store_conformance!(make_store);
 
 adam_store_testkit::blob_conformance!(make_store);
 
+adam_store_testkit::body_conformance!(make_store);
+
 adam_store_testkit::transcript_measurement!(make_store);
+
+adam_store_testkit::headless_measurement!(make_store);

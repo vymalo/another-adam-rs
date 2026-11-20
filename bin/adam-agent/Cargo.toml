@@ -47,7 +47,8 @@ adam-store-postgres.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 futures.workspace = true
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
+adam-postgres.workspace = true
+tokio-postgres = { version = "0.7", features = ["with-jiff-0_2", "with-serde_json-1", "with-uuid-1"] }
 tempfile.workspace = true
 uuid.workspace = true
 wiremock.workspace = true

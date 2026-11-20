@@ -15,11 +15,11 @@ use std::time::Duration;
 
 use adam_core::RunId;
 use adam_notify_postgres::{MAX_BATCH_ITEMS, PgNotify};
+use adam_postgres::PgConfig;
 use adam_runtime::{
     BroadcastSink, Delivery, EventSink, Notifier, RunEvent, RunSubscription, Signal,
 };
 use futures::StreamExt;
-use sqlx::postgres::PgPoolOptions;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -33,13 +33,10 @@ fn short() -> String {
 /// A `PgNotify` that is not running yet: what is emitted before `run` waits in
 /// its outbox, which is how a test controls what one statement will carry.
 async fn quiet(url: &str, prefix: &str) -> (PgNotify, BroadcastSink) {
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(url)
-        .await
-        .expect("connect");
+    let pg = PgConfig::parse(url).expect("DATABASE_URL");
+    let pool = pg.pool(4).expect("pool");
     let local = BroadcastSink::default();
-    let notify = PgNotify::new(pool, local.clone())
+    let notify = PgNotify::new(pool, pg, local.clone())
         .with_channel_prefix(prefix)
         .expect("prefix")
         // The ambient environment must not decide what this test measures.

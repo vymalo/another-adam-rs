@@ -4,7 +4,11 @@ The `Store` port ([`adam-core`](../../crates/adam-core/README.md)) is the durabl
 leases, A2A push-notification configs and their delivery progress, a run's file bytes (blobs), a run's
 transcript (body), and the listing of a caller's runs. Two adapters ship, and every adapter must pass
 the same conformance suite ([`adam-store-testkit`](../../crates/adam-store-testkit/README.md)). The
-model they implement is in [Architecture](../architecture.md#the-mental-model); the schema is in
+PostgreSQL one runs on `tokio-postgres`, pooled by `deadpool-postgres`, with `rustls` on `aws-lc-rs`;
+`sqlx` left the workspace with
+[ADR 0053](../decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)
+decision 1, and the schema and statements did not change. The model they implement is in
+[Architecture](../architecture.md#the-mental-model); the schema is in
 [Data: the run store](../architecture.md#data-the-run-store).
 
 ## Using a store
@@ -37,9 +41,13 @@ adapters override it with one projected read that never touches the state, and t
 `run_header_matches_the_record` proves an implementation agrees with the two reads.
 
 `PgStore::connect` sizes its pool from `ADAM_PG_POOL_SIZE` (2 to 65535, default 16, per process;
-one is refused because the `adam-notify-postgres` listener holds a connection for the process's
-life); `connect_with_pool_size` takes the size explicitly, and `from_pool` uses the pool you pass. A
-value that is not an integer in range fails the connect rather than falling back to 16.
+one is refused because it serializes every store call, and a migration holds its connection); 
+`connect_with_pool_size` takes the size explicitly, `from_config` takes an already parsed
+[`adam-postgres`](../../crates/adam-postgres/README.md) `PgConfig` (what `adam-service` does, so
+`DATABASE_URL` is parsed once for the store and the notification listener), and `from_pool` uses the
+`deadpool_postgres::Pool` you pass. A value that is not an integer in range fails the connect rather
+than falling back to 16. TLS comes from `DATABASE_URL` (`sslmode`, `sslrootcert`, `sslcert`,
+`sslkey`); there are no Cargo features for it any more.
 
 `keeps_blobs` / `blob_stored` / `put_blob` / `get_blob` / `purge_blobs` keep a file artifact's bytes
 **out of the run's state**, content-addressed by `BlobId` (their SHA-256, 64 lower-case hex; the digest is
@@ -65,14 +73,15 @@ across splitting commits: a headless commit (`deliver`, `cancel`, `park_again`, 
 the next split a compaction until S3, which writes the head those paths read. A commit with `head: None` leaves the stored head and
 its `head_version` alone (a delivery, a cancel or a park keeps the format it read), and `load_head`
 serves the head only when `head_version == version`. `load_head` is the observer's read (`Runtime::view`). MongoDB overrides it with one **projected**
-`find_one` that carries the head and the record's own fields, never `state`: a current head
-transfers only the head, and a v4 state the run still carries (a transcript, file bytes) is not
-read. A stale or absent head takes the second, full read (`load_run`) and serves the state — the
+`find_one` that carries the head and the record's own fields, never `state`; PostgreSQL with one
+`SELECT` whose `state` column is `CASE WHEN head_version = version THEN head ELSE state END`. A
+current head transfers only the head, and a v4 state the run still carries (a transcript, file
+bytes) is not read. A stale or absent head takes the second, full read and serves the state — the
 `state` bytes are read only there. That is not rare in every deployment: it is the path of a run
 before its first split, of an agent whose `split` returns `None` (it never writes a head), and of a
 **cancelled** run, whose stale head is permanent because no step re-splits it. The trait default is
-`load_run`, so a store that keeps no head (PostgreSQL, until its half lands after #361) answers the
-whole state exactly as before, and its view is the whole state. A `head_version != version` is
+`load_run`, so a store that keeps no head answers the whole state exactly as before, and its view is
+the whole state. A `head_version != version` is
 **stale**, not corrupt: the whole state is served, and the next step re-splits and rewrites the
 head. That comparison is the whole mixed-fleet story in the read direction. A store that keeps no
 bodies
@@ -86,7 +95,7 @@ cron tick across all replicas. A second message on a conversation that has an op
 
 ## How each adapter keeps the contract
 
-| Guarantee | PostgreSQL 12+ (`sqlx`) | MongoDB 5.0+ (standalone is enough) |
+| Guarantee | PostgreSQL 12+ (`tokio-postgres`) | MongoDB 5.0+ (standalone is enough) |
 |---|---|---|
 | Commit CAS | `UPDATE .. WHERE version = $n RETURNING` | `findOneAndUpdate({_id, version: n}, {$inc: {version: 1}})` |
 | Journal first-writer-wins | `INSERT .. ON CONFLICT DO NOTHING`, read winner | `insertOne` on `_id = "<run>:<seq>"`; a duplicate key means an earlier writer won, and their entry is read back |
@@ -101,11 +110,11 @@ cron tick across all replicas. A second message on a conversation that has an op
 | State | `JSONB` (queryable with SQL) | real BSON document (queryable with dot paths) |
 | Blobs (schema version 5, part 1): put, get | `INSERT .. ON CONFLICT (digest) DO NOTHING` into `blob`; one primary-key `SELECT` | `insertOne` on `_id = <digest>`; a duplicate key is a no-op; one `find_one` |
 | A commit's blob references | the CAS and `INSERT .. SELECT unnest($digests) ON CONFLICT DO NOTHING` in **one transaction** | one unordered `insertMany` **before** the CAS; a lost CAS leaves rows nothing names, deleted with the run's purge |
-| Blob GC | `DELETE .. WHERE created_at < $cutoff AND NOT EXISTS (a run_blob row)`, in batches; run references cascade with the run. The sweep and a commit's ref insert are **not one transaction**: under `READ COMMITTED` an uncommitted ref is invisible, so a sweep can collect a blob a commit is about to name; the PostgreSQL follow-up (after #361) closes it with one data-modifying CTE | the same sweep in a loop; run references are deleted with the run. Its find-then-delete has the same uncommitted-ref window, closed by the insert, completeness check, then CAS ([ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md), decision 3) |
+| Blob GC | `DELETE .. WHERE created_at < $cutoff AND NOT EXISTS (a run_blob row)`, in batches; run references cascade with the run. The sweep and a commit's ref insert are **not one transaction**: under `READ COMMITTED` an uncommitted ref is invisible, so a sweep can collect a blob a commit is about to name; a later PostgreSQL change closes it with one data-modifying CTE | the same sweep in a loop; run references are deleted with the run. Its find-then-delete has the same uncommitted-ref window, closed by the insert, completeness check, then CAS ([ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md), decision 3) |
 | Blob references deleted with their run | `ON DELETE CASCADE` | deleted by the purge before the run document |
-| Transcript rows (schema version 5, part 2): a commit's delta, `body_list`, `gc_body` | **deferred**: the PostgreSQL store keeps `keeps_bodies() == false`, writes no row and answers `body_list` empty (the columns, the `adam_body` table and the one-transaction CTE are the PostgreSQL follow-up, after #361) | a generation is append-only: one unordered `insertMany` of the rows after the old head's `len` **before** the CAS, the completeness check (`inserted + duplicate_keys == rows.len()`, a write-concern error aborts), and a lost CAS deletes the attempt's `writer` rows and refs. A duplicate foreign slot is adopted when its message matches, collected after the 5-minute orphan grace, else a `Conflict`. A compaction writes all rows under a new generation; the old one is collected an hour later (`gc_body`) |
-| The head (schema version 5, part 2): `head`, `head_version`, `load_head` | **deferred**: the trait default (`load_head` = `load_run`) answers, so `Runtime::view` serves the whole state and reads no body; a commit's `head` is ignored | `head` and `head_version` on the run document; the store patches the head's `body` to `{generation, len}`; `load_head` is one projected `find_one` (the head and the record's fields, never `state`) when `head_version == version`, else a second full read (`load_run`) that serves the whole state; a headless commit leaves both alone. `Runtime::view` reads it, one projected query and no body on the current path |
-| Body rows deleted with their run | — | deleted by the purge with the journal and the references |
+| Transcript rows (schema version 5, part 2): a commit's delta, `body_list`, `gc_body` | the CAS, the rows after the head's `len` and the refs are **one transaction** (`INSERT .. SELECT unnest($idx, $messages) ON CONFLICT DO NOTHING`, then the slots another writer owns are read: identical adopted, older than the 5-minute orphan grace collected and retried once, live and different `Conflict`). A compaction writes all rows under a new generation; the old one is collected an hour after the commit (`gc_body`) | a generation is append-only: one unordered `insertMany` of the rows after the old head's `len` **before** the CAS, the completeness check (`inserted + duplicate_keys == rows.len()`, a write-concern error aborts), and a lost CAS deletes the attempt's `writer` rows and refs. A duplicate foreign slot is adopted when its message matches, collected after the 5-minute orphan grace, else a `Conflict`. A compaction writes all rows under a new generation; the old one is collected an hour later (`gc_body`) |
+| The head (schema version 5, part 2): `head`, `head_version`, `load_head` | `head` and `head_version` columns; the store patches the head's `body` to `{generation, len}`; `load_head` is one `SELECT` whose `state` column is the head when `head_version == version`, else the whole state; a headless commit leaves both alone. `Runtime::view` reads it: one lease read and one head read, no body | `head` and `head_version` on the run document; the store patches the head's `body` to `{generation, len}`; `load_head` is one projected `find_one` (the head and the record's fields, never `state`) when `head_version == version`, else a second full read (`load_run`) that serves the whole state; a headless commit leaves both alone. `Runtime::view` reads it, one projected query and no body on the current path |
+| Body rows deleted with their run | `ON DELETE CASCADE` | deleted by the purge with the journal and the references |
 | `run_header`: a run without its state, with its lease | one primary-key statement selecting the header columns and `lease_until`, never `state` | one `find_one` projected to the header and `lease_until` |
 | Transactions | none held across calls; a commit that names blobs opens one for its two statements | none (single-document writes only) |
 | Cross-process signals | `LISTEN`/`NOTIFY` via `adam-notify-postgres` | none: workers poll |
@@ -126,7 +135,8 @@ cron tick across all replicas. A second message on a conversation that has an op
   return no state, and a read returns the stored one.
 * **Time** is `adam_core::time::Timestamp` (ADR 0057), a `jiff::Timestamp` whose serde bytes are the ones
   `chrono::DateTime<Utc>` wrote. Every store truncates it to milliseconds; PostgreSQL keeps it in `TIMESTAMPTZ`
-  through sqlx's chrono support and MongoDB in a BSON date, so the stored value is the same in every backend.
+  through `postgres-types`' `with-jiff-0_2` (microseconds since 2000, the bytes chrono wrote) and MongoDB in
+  a BSON date, so the stored value is the same in every backend.
   Lease expiry uses the `now` the caller passes in: keep worker clocks in sync (NTP) and lease TTLs well above
   the expected skew.
 
