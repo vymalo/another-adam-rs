@@ -122,15 +122,33 @@ key from a table that is empty on a version 4 database, so no row of `runs` is r
 listing-index step and gets the blob tables from the migration transaction that follows; the blob
 step itself only runs from version 4.
 
-`purge_finished` sweeps unreferenced blobs written before its cutoff in the same call (the run's
-references cascaded away), and `purge_blobs(before)` is the explicit knob for a host that reclaims
-bytes without purging runs. A blob a surviving run references is kept, however old it is.
+`blob_stored(id)` is one `SELECT EXISTS` on the digest: the runtime checks it before it re-sends a
+file's bytes, so a file an earlier commit uploaded is uploaded once. `purge_finished` sweeps
+unreferenced blobs written before its cutoff in the same call (the run's references cascaded away),
+and `purge_blobs(before)` is the explicit knob for a host that reclaims bytes without purging runs. A blob a surviving run references is kept, however old it is.
 
 `RunUpdate` gained the public field `blobs` — a delta the store unions; a commit that names none
 keeps the earlier ones — so **a hand-built `RunUpdate { .. }` literal stops compiling**: add
 `blobs: Vec::new()` or use `RunUpdate::new(..)`/`.blobs(..)`. The four blob methods are
 **defaulted** on `Store`, so a store of your own that keeps no blobs still compiles and behaves as
 before.
+
+## Schema version 5, part 2: the head and the body (deferred)
+
+The head and the body are **not** in this store yet: `PgStore` keeps `keeps_bodies() == false`,
+writes no `head`/`head_version` and no `<prefix>body`, and answers `body_list` empty. `load_head` is
+the trait default (`load_run`), so an observer reads the whole v4 `state`, and `commit_run` ignores
+`RunUpdate.head`/`body` (its destructure names and drops them). The columns, the `adam_body` table
+and the one-transaction CTE are the PostgreSQL follow-up after #361.
+
+When that half lands, its upgrade gate must be `stored < 6` (or a check of
+`to_regclass('<prefix>body')`), **not** `stored == Some(4)`: a database stamped 5 by S1/S2a already
+has the blob tables but no head or body, so a gate on the blob step would skip the new columns
+silently. The follow-up bumps `SCHEMA_VERSION` to 6. It also applies the body duplicate rule the
+MongoDB half implements (ADR 0055, S2a amendment 6): an identical foreign row is adopted, a differing
+one older than the 5-minute orphan grace is collected and the insert retried once, and a live
+attempt's differing row is a `Conflict` — all inside the one transaction that writes the rows, the
+refs and the CAS.
 
 ## Schema version and the owner column
 

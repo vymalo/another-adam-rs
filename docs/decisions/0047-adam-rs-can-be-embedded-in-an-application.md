@@ -23,6 +23,18 @@ uses, so an application whose own state is on cratestack links one `sqlite3`. Th
 writer, immediate transactions, WAL, `LocalNotifier`, the lock file) and decision 2's check on `adam-engine` stand. Slice 3 here is
 ADR 0053's slice 3.
 
+*Built 2026-11-19, slice 1* (the owner exempted this ADR's slices on 2026-11-19, so they start now; the epic is
+vymalo/another-agentic-system#387): `adam-a2a`'s `server`, `adam-a2a-runtime`'s `push` and `adam-ui`'s `thread-tools`,
+all on by default, so a server build is unchanged; `adam-engine` exists as the embedded set (its API is slice 4), and
+`tools/embedded-deps/check.sh` (CI job `embedded`, part of the required `lint`) builds each split crate with its defaults
+off and with each feature alone, and fails when `adam-engine`'s tree holds an HTTP server or client, the A2A SDK's server
+or client, a database driver, the Kubernetes client, a TLS stack or the MCP client; its self-test plants `axum` and
+`rustls` and turns two gates back on, and each fails it. Without `thread-tools`, `adam-ui` keeps the screen's tools over a
+catalog a message carries (`Ui::embedded`) and `Ui::screen`, a source that adds the mentioned agents and describes `show`.
+**Not yet:** `adam-assembly`'s `remote` gate, whose files another track holds (asked on the coordination channel), so
+`adam-engine` does not depend on `adam-assembly` yet; and the check on Windows and macOS, which is slice 8's runner.
+The model's credentials are ADR 0058's port: the host gives `ModelCredentials`, so the engine reads no key.
+
 ## Context
 
 A program that links adam-rs today takes `adam-service` (an HTTP server, Postgres, an OpenAI client, configuration read
@@ -71,6 +83,11 @@ workspace as it is.
 5. **Secrets are a port.** A `SecretSource` trait replaces the direct reads of the process environment (a remote
    subagent's bearer, MCP variables). The process environment stays the default of a server; the engine's default
    refuses every name.
+   *Built 2026-11-19 (slice 2):* `adam_core::SecretSource` with `ProcessEnv` (the default of `AgentDef` and
+   `adam_mcp::Env`) and `NoSecrets`; `AgentDef::secrets` gives one source to the remote subagents and the MCP servers,
+   after the values of `AgentDef::env`. A refused name is `RemoteAuthProblem::Refused` or `VarProblem::Refused`, and a
+   `${VAR:-default}` keeps its default. `adam_engine::default_secrets()` is `NoSecrets` (its test is the slice's proof), and the engine's builder (slice 4)
+   takes it as its default.
 6. **A tool call can need the person's approval.** An `ApprovalPolicy` decides before a tool's journaled step: allow,
    refuse, or ask. An ask parks the run as a question; the answer runs or refuses **the same call**, once, and a replay
    never asks again. The access tiers of ADR 0036 decide what is asked.
@@ -78,6 +95,12 @@ workspace as it is.
    behind a `CodeWorkspace` trait. The coder implements it over its worktrees; a second implementation is **the person's
    own directory**, which a run never owns, cleans or restores: a command there reports what it changed and undoes
    nothing.
+   *Amended 2026-11-19 (slice 6, step 2b):* the port is two traits in `adam-code-tools`. `CodeWorkspace` serves the
+   file and search tools: the `Place` a tool works in (never a read-only one for a write), the redactor, the nested
+   project instructions and, with the file tools, a required hook after a write. The commands get a trait that
+   **extends** it and takes a `Place` from the same `place()`, so a command and a file tool find a place and refuse a
+   write the same way. Its guard (record what a command changed, undo it) is the workspace's: the person's directory
+   records and undoes nothing. The conformance cases are `adam-code-tools-testkit`.
 8. **Commands run as the person unless a sandbox says otherwise.** A local sandbox is an `Environment`: first a process
    tree that can be killed, then the operating system's own confinement where there is one. `describe` says what is not
    protected.
@@ -128,7 +151,8 @@ is still `Runnable`: at the next start the engine releases its own leases and th
 
 ## Consequences
 
-* **Rule 2.** Three new traits (`SecretSource`, `ApprovalPolicy`, `CodeWorkspace`), each with a default that keeps
+* **Rule 2.** Three new ports (`SecretSource`, `ApprovalPolicy`, `CodeWorkspace`, the last as two traits, amended
+  2026-11-19 under decision 7), each with a default that keeps
   today's behaviour, and each with a testkit. A consumer that sets `default-features = false` on the four split crates
   loses what the features gate; with the defaults nothing changes.
 * **Rule 3.** No closed enum changes.

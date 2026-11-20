@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use adam_core::RunId;
 use adam_model::{Message, ToolCall, Usage};
-use adam_runtime::{Inbound, SESSION_STATE_KEY, SandboxUsage, SessionHeader, UsageTotals};
+use adam_runtime::{
+    AgentError, Inbound, SESSION_STATE_KEY, SandboxUsage, SessionHeader, UsageTotals,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -945,6 +947,43 @@ impl Conversation {
             Some(Message::User { content }) => Some(content.first().map_or("", |p| p.as_text())),
             _ => None,
         }
+    }
+
+    /// The head and the transcript rows of this state: what
+    /// [`Agent::split`](adam_runtime::Agent::split) declares.
+    ///
+    /// The head is this conversation with [`messages`](Self::messages) emptied; the rows are the
+    /// messages as JSON, oldest first. Everything else — the shortenings, the counters, the
+    /// usage, the pending wait, the artifacts — stays in the head, because none of it grows with
+    /// the transcript. [`join`](Self::join) puts the messages back, and the round trip re-encodes
+    /// to the same bytes.
+    pub fn split(&self) -> (Self, Vec<Value>) {
+        let mut head = self.clone();
+        let messages = std::mem::take(&mut head.messages);
+        let rows = messages
+            .iter()
+            // A `Message` is plain JSON: this cannot fail. If it ever did, the runtime's
+            // reconstruction check would refuse the split and the run would stay v4.
+            .map(|message| serde_json::to_value(message).unwrap_or(Value::Null))
+            .collect();
+        (head, rows)
+    }
+
+    /// `head` with `rows` as its messages: the inverse of [`split`](Self::split).
+    ///
+    /// The messages are **replaced**, never appended: the head a commit writes has none, and a
+    /// row that does not decode fails the join rather than producing a state that differs from
+    /// the one it was split from.
+    pub fn join(head: Self, rows: Vec<Value>) -> Result<Self, AgentError> {
+        let messages = rows
+            .into_iter()
+            .map(serde_json::from_value::<Message>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                AgentError::permanent("a transcript row does not decode as a message")
+                    .with_source(e)
+            })?;
+        Ok(Self { messages, ..head })
     }
 
     /// Merge the `update` of one inbound message into [`context`](Self::context): a key it sets

@@ -378,6 +378,29 @@ async fn unconnected_and_failing_servers_fail_startup_naming_the_agent_and_the_f
     );
     assert_eq!(server.requests(), requests);
 
+    // A variable the process has, and a host whose source gives no secrets (ADR 0047): refused,
+    // before any request, and a value given with `env` is still given.
+    let refused = root_files(&uniq("root"), "", &mcp_json(&server.url(), "PATH", ""));
+    let error = def_of(&refused)
+        .secrets(std::sync::Arc::new(adam_core::NoSecrets))
+        .connect_mcp(&policy())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Mcp { source, .. }
+            if matches!(source.downcast_ref::<adam_mcp::Error>(),
+                Some(adam_mcp::Error::Var { var, problem: adam_mcp::VarProblem::Refused, .. })
+                    if var == "PATH")),
+        "{error}"
+    );
+    assert_eq!(server.requests(), requests);
+    def_of(&refused)
+        .secrets(std::sync::Arc::new(adam_core::NoSecrets))
+        .env("PATH", TOKEN)
+        .connect_mcp(&policy())
+        .await
+        .unwrap();
+
     // A server that is down.
     let mut down = TestHttpServer::start(None).await;
     let url = down.url();

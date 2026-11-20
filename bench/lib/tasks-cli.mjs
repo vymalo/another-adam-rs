@@ -9,12 +9,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ConfigError, assertOutsideRepo, benchHome, loadConfig } from './config.mjs';
-import { HostContainers, ContainerError } from './containers.mjs';
+import { execFile } from 'node:child_process';
+import { HostContainers, ContainerError, dockerEnv } from './containers.mjs';
 import { checkTask } from './envcheck.mjs';
+import { verifierNetwork } from './grade.mjs';
 import { findCheckCommand, lintStatement } from './lint.mjs';
 import { classifyPath, gitIn, mine } from './mine.mjs';
 import { OwnTaskError, loadOwnSpecs, materializeOwn, ownChecksum, ownImageTag, prepareOwnContext } from './own.mjs';
-import { buildLock, lockText, selectTasks } from './select.mjs';
+import { Quota, buildLock, lockText, pickInOrder, selectTasks, selectionOrder } from './select.mjs';
+import { PINS } from './pins.mjs';
 import { listTasks } from './task.mjs';
 import { UpstreamError, fetchUpstream, taskChecksum } from './upstream.mjs';
 
@@ -39,8 +42,10 @@ const USAGE = `usage: bench tasks <command>
                              candidate own tasks from the clones in the configuration -> $BENCH_HOME/tasks/own-candidates.json
   lint [ID...]               warn when an own statement names what only the gold change adds
   build [ID...]              build the image of each own task (needs the host's container runtime)
-  check [--source public|own] [--only ID,ID]
-                             gold passes three times and the empty patch fails three times (needs the host's container runtime)
+  check [--source public|own] [--only ID,ID] [--all] [--seed S] [--total N]
+                             gold passes three times and the empty patch fails three times (needs the host's container runtime);
+                             public: walks the tasks in the order select uses and stops at the target (80, at most 9 per
+                             repository), removes the image of a dropped task, resumes from check.json; --all walks every task
   select [--seed S] [--total N] [--source public|own|both]
                              write bench/tasks/public.lock.json and own.lock.json
 `;
@@ -157,6 +162,48 @@ async function cmdLint(config, p, argv, out) {
 
 const containersOf = (config, make) => (make ? make(config) : new HostContainers());
 
+const STACK_PROJECT = 'adam-bench';
+
+const realDocker = (args) =>
+  new Promise((resolve) => {
+    execFile('docker', args, { env: dockerEnv(), encoding: 'utf8', timeout: 60_000 }, (err, stdout, stderr) => resolve({ exitCode: err ? (typeof err.code === 'number' ? err.code : 125) : 0, stdout: stdout ?? '', stderr: stderr ?? '' }));
+  });
+
+/**
+ * The networks a check's gradings join, named as the stack names them (`adam-bench_verifier`, internal; `adam-bench_egress`, the
+ * internet), so a check grades exactly as a run does. One that is not there is made the way `Stack.up` makes it and removed by
+ * `cleanup`; one that is there (the stack is up) is used and left. A verifier that exists without the internal flag is refused.
+ * A network the owner named (`tasks.verifierNetworks`) is never made: it must exist.
+ */
+export async function checkNetworks({ docker, tasks }) {
+  const wanted = [...new Set(tasks.map((t) => verifierNetwork(t)).filter((n) => n !== 'none'))];
+  const aliases = {};
+  const made = [];
+  const cleanup = async () => {
+    for (const name of made.splice(0)) await docker(['network', 'rm', name]).catch(() => {});
+  };
+  try {
+    for (const logical of wanted) {
+      const named = logical === 'verifier' || logical === 'egress';
+      const full = named ? `${STACK_PROJECT}_${logical}` : logical;
+      if (named) aliases[logical] = full;
+      const inspect = await docker(['network', 'inspect', '--format', '{{.Internal}}', full]);
+      if (inspect.exitCode === 0) {
+        if (logical === 'verifier' && inspect.stdout.trim() !== 'true') throw new ContainerError(`the ${full} network exists and is not internal: remove it (docker network rm ${full}) and run the check again`);
+        continue;
+      }
+      if (!named) throw new ContainerError(`the verifier network ${logical} does not exist: create it (docker network create --internal ${logical}) or start the stack`);
+      const created = await docker(['network', 'create', ...(logical === 'verifier' ? ['--internal'] : []), full]);
+      if (created.exitCode !== 0) throw new ContainerError(`the ${full} network could not be made (exit ${created.exitCode}): ${created.stderr.trim()}`);
+      made.push(full);
+    }
+  } catch (e) {
+    await cleanup();
+    throw e;
+  }
+  return { aliases, cleanup };
+}
+
 async function cmdBuild(config, p, argv, out, make) {
   const containers = containersOf(config, make);
   const workspaceImage = need(config, 'workspaceImage');
@@ -178,10 +225,14 @@ async function cmdBuild(config, p, argv, out, make) {
   return 0;
 }
 
-async function cmdCheck(config, p, argv, out, make) {
-  const { values } = parseArgs({ args: argv, options: { source: { type: 'string', default: 'public' }, only: { type: 'string' } } });
+/** A recorded verdict stands for the task it was made for, unless it was an infra failure (which says nothing about the task). */
+const reusable = (r, checksum) => r && typeof r.ok === 'boolean' && r.reason !== 'infra' && typeof checksum === 'string' && r.checksum === checksum;
+const keptVerdict = (r) => r.ok === true && r.devcontainer === false;
+const digestOfRef = (ref) => /@(sha256:[0-9a-f]{64})$/.exec(String(ref ?? ''))?.[1] ?? null;
+
+async function cmdCheck(config, p, argv, out, make, docker) {
+  const { values } = parseArgs({ args: argv, options: { source: { type: 'string', default: 'public' }, only: { type: 'string' }, all: { type: 'boolean', default: false }, seed: { type: 'string' }, total: { type: 'string' } } });
   if (values.source !== 'public' && values.source !== 'own') throw new ConfigError('--source', 'is public or own');
-  const containers = containersOf(config, make);
   const pins = readJson(p.pins, {});
   const results = readJson(p.check, {});
   let tasks;
@@ -199,20 +250,67 @@ async function cmdCheck(config, p, argv, out, make) {
     checksumOf = (t) => (byId.has(t.id) ? ownChecksum(byId.get(t.id)) : null);
   }
   const only = values.only ? new Set(values.only.split(',')) : null;
+  // The public walk: the order of `select`, until the target is kept. --only, --all and the own source walk what they name.
+  const walk = values.source === 'public' && !only && !values.all;
+  const total = values.total ? positiveInt(values.total, '--total') : PUBLIC_TOTAL;
+  const target = walk ? new Quota({ total, perRepo: PUBLIC_PER_REPO }) : null;
+  const seed = values.seed ?? config.tasks.seed;
   fs.mkdirSync(p.work, { recursive: true });
   let kept = 0;
   let dropped = 0;
-  for (const task of tasks.filter((t) => !only || only.has(t.id))) {
-    const r = await checkTask({ containers, task, workRoot: p.work });
-    if (r.pin) pins[r.pin.ref] = r.pin.digest;
-    results[`${values.source}/${task.id}`] = { ok: r.ok, reason: r.reason, devcontainer: r.devcontainer, imageDigest: r.imageDigest, checksum: checksumOf(task) };
-    writeJson(p.pins, pins);
-    writeJson(p.check, results);
-    if (r.ok) kept++;
-    else dropped++;
-    out(`${task.id}: ${r.ok ? 'kept' : `dropped (${r.reason})`}${r.devcontainer ? ' (has a .devcontainer)' : ''}`);
+  let resumed = 0;
+  let skipped = 0;
+  const chosen = tasks.filter((t) => !only || only.has(t.id));
+  const order = values.source === 'public' && !only ? selectionOrder(chosen, { seed, scope: 'public' }) : chosen;
+  const nets = docker ? await checkNetworks({ docker, tasks: chosen }) : null;
+  // Images that stay: those of the tasks kept so far, the workspace image and the coder's.
+  const keep = new Set([digestOfRef(config.tasks.workspaceImage), PINS.coder.digest].filter(Boolean));
+  const keptDigests = new Set();
+  try {
+    const containers = make ? make(config) : new HostContainers({ aliases: nets?.aliases ?? {} });
+    for (const task of order) {
+      const key = `${values.source}/${task.id}`;
+      if (walk && target.done) break;
+      if (walk && !target.open(task.repo)) {
+        skipped++;
+        continue;
+      }
+      const recorded = !only && reusable(results[key], checksumOf(task)) ? results[key] : null;
+      let verdict = recorded;
+      if (recorded) {
+        resumed++;
+      } else {
+        const r = await checkTask({ containers, task, workRoot: p.work });
+        if (r.pin) pins[r.pin.ref] = r.pin.digest;
+        verdict = { ok: r.ok, reason: r.reason, devcontainer: r.devcontainer, imageDigest: r.imageDigest, checksum: checksumOf(task) };
+        results[key] = verdict;
+        writeJson(p.pins, pins);
+        writeJson(p.check, results);
+        out(`${task.id}: ${r.ok ? 'kept' : `dropped (${r.reason})`}${r.devcontainer ? ' (has a .devcontainer)' : ''}`);
+      }
+      const isKept = keptVerdict(verdict);
+      if (isKept) {
+        kept++;
+        target?.take(task.repo);
+        if (verdict.imageDigest) keptDigests.add(verdict.imageDigest);
+      } else {
+        dropped++;
+        if (!recorded && values.source === 'public' && verdict.reason !== 'infra' && verdict.imageDigest && !keep.has(verdict.imageDigest) && !keptDigests.has(verdict.imageDigest)) {
+          for (const ref of [`${task.image.name}@${verdict.imageDigest}`, task.image.tag ? `${task.image.name}:${task.image.tag}` : null].filter(Boolean)) {
+            try {
+              await containers.removeImage(ref);
+            } catch (e) {
+              out(`${task.id}: image not removed (${e.message})`);
+            }
+          }
+        }
+      }
+    }
+  } finally {
+    await nets?.cleanup();
   }
-  out(`${kept} kept, ${dropped} dropped`);
+  out(`${kept} kept, ${dropped} dropped${walk ? `, ${skipped} not needed` : ''}${resumed ? `, ${resumed} from an earlier check` : ''}`);
+  if (walk && !target.done) out(`shortfall: ${target.kept} of ${total} kept; every task that could count was walked (at most ${PUBLIC_PER_REPO} per repository), so bench tasks select will give ${target.kept}`);
   return 0;
 }
 
@@ -233,12 +331,18 @@ async function cmdSelect(config, p, argv, out) {
   };
   if (values.source === 'public' || values.source === 'both') {
     const up = fetchPublic(config, p);
-    const { tasks } = listTasks(up.tasksRoot, { pins, requireDigest: true, allowedNetworks: config.tasks.verifierNetworks });
+    // The order is that of `check`: over every listed task, pinned or not, so a verdict never moves it.
+    const { tasks } = listTasks(up.tasksRoot, { pins, requireDigest: false, allowedNetworks: config.tasks.verifierNetworks });
     const sumOf = (t) => taskChecksum(path.relative(up.tasksRoot, t.dir), up.sums);
     explain('public', tasks.map((t) => [t.id, sumOf(t), t.image.digest]));
-    const cands = tasks.filter((t) => usable('public', t.id, sumOf(t), t.image.digest)).map((t) => ({ id: t.id, repo: t.repo, checksum: sumOf(t), imageDigest: t.image.digest }));
     const total = totalOption ?? PUBLIC_TOTAL;
-    const chosen = selectTasks(cands, { seed, scope: 'public', total, perRepoCap: PUBLIC_PER_REPO });
+    const order = selectionOrder(tasks, { seed, scope: 'public' });
+    const picked = pickInOrder(order, (t) => usable('public', t.id, sumOf(t), t.image.digest), { total, perRepo: PUBLIC_PER_REPO });
+    const chosen = picked
+      .map((t) => ({ id: t.id, repo: t.repo, checksum: sumOf(t), imageDigest: t.image.digest }))
+      .sort((x, y) => (x.repo < y.repo ? -1 : x.repo > y.repo ? 1 : x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+    const usableCount = tasks.filter((t) => usable('public', t.id, sumOf(t), t.image.digest)).length;
+    const cands = { length: usableCount };
     fs.mkdirSync(p.repoTasks, { recursive: true });
     fs.writeFileSync(path.join(p.repoTasks, 'public.lock.json'), lockText(buildLock({ source: 'public', seed, upstreamCommit: up.head, tasks: chosen })));
     out(`public: ${chosen.length} of ${cands.length} selected`);
@@ -259,7 +363,7 @@ async function cmdSelect(config, p, argv, out) {
 }
 
 /** Run a `tasks` subcommand. `make(config)` builds the containers (tests pass a fake). Returns an exit code. */
-export async function runTasks(argv, { env = process.env, out = (l) => process.stdout.write(`${l}\n`), err = (l) => process.stderr.write(`${l}\n`), make } = {}) {
+export async function runTasks(argv, { env = process.env, out = (l) => process.stdout.write(`${l}\n`), err = (l) => process.stderr.write(`${l}\n`), make, docker = make ? null : realDocker } = {}) {
   const [sub, ...rest] = argv;
   if (!sub || !['fetch', 'mine', 'lint', 'build', 'check', 'select'].includes(sub)) {
     err(USAGE.trimEnd());
@@ -272,7 +376,7 @@ export async function runTasks(argv, { env = process.env, out = (l) => process.s
     if (sub === 'mine') return await cmdMine(config, p, rest, out);
     if (sub === 'lint') return await cmdLint(config, p, rest, out);
     if (sub === 'build') return await cmdBuild(config, p, rest, out, make);
-    if (sub === 'check') return await cmdCheck(config, p, rest, out, make);
+    if (sub === 'check') return await cmdCheck(config, p, rest, out, make, docker);
     return await cmdSelect(config, p, rest, out);
   } catch (e) {
     if (e instanceof ConfigError) throw e;

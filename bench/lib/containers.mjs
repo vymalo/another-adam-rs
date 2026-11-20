@@ -3,7 +3,7 @@
 //   run(spec)            -> { exitCode, stdout, stderr, timedOut } (a foreground container, removed when it ends)
 //   start(spec)          -> { exitCode, stdout, stderr, timedOut } (a detached container, kept; the caller names it)
 //   pull(ref)            -> void
-//   digestOf(ref)        -> 'sha256:...' (the registry digest of a pulled image)
+//   digestOf(ref)        -> 'sha256:...' (the manifest digest (RepoDigests))
 //   hasImage(ref)        -> boolean
 //   imageId(tag)         -> 'sha256:...' (the id of a local image)
 //   imageEnv(ref)        -> { PATH: '...' } (the image's own environment)
@@ -142,6 +142,25 @@ export function buildRunArgs(spec, { name = spec.name, labels = {} } = {}) {
   return args;
 }
 
+/**
+ * The manifest digest of an image from `{{json .RepoDigests}}`: the entry of the reference's own repository, else the first.
+ * Null when there is none (the classic store has no manifest digest for an image built locally): an image id is a config
+ * digest, never a manifest digest, so it is not a substitute.
+ */
+export function parseImageDigest(text, ref) {
+  let repoDigests = [];
+  try {
+    const v = JSON.parse(String(text).trim());
+    if (Array.isArray(v)) repoDigests = v.filter((x) => typeof x === 'string');
+  } catch {
+    return null;
+  }
+  const repo = String(ref).split('@')[0].replace(/:[^/:]*$/, '');
+  const own = repoDigests.find((d) => d.startsWith(`${repo}@`)) ?? repoDigests[0];
+  const digest = own?.slice(own.indexOf('@') + 1);
+  return digest && /^sha256:[0-9a-f]{64}$/.test(digest) ? digest : null;
+}
+
 /** `--build-arg NAME=value` for each argument; a name or a value that is not plain is refused. Pure. */
 export function buildArgsFlags(buildArgs) {
   const out = [];
@@ -275,9 +294,11 @@ export class HostContainers {
   }
 
   async digestOf(ref) {
-    const out = await this.#must(['image', 'inspect', '--format', '{{.Digest}}', ref], `reading the digest of ${ref}`);
-    if (!/^sha256:[0-9a-f]{64}$/.test(out)) throw new ContainerError(`the digest of ${ref} is not readable`);
-    return out;
+    // `.Digest` is not a field of `docker image inspect` (a template that names it fails); `.RepoDigests` is on both stores.
+    const out = await this.#must(['image', 'inspect', '--format', '{{json .RepoDigests}}', ref], `reading the digest of ${ref}`);
+    const digest = parseImageDigest(out, ref);
+    if (!digest) throw new ContainerError(`${ref} has no manifest digest in this Docker store (a locally built image on the classic overlay2 store has none; use the containerd image store, or pull the image)`);
+    return digest;
   }
 
   /** Is the image in the host's store? (`docker image inspect`: exit 0 yes, 1 no, anything else is an error.) */
@@ -287,6 +308,15 @@ export class HostContainers {
     if (r.exitCode === 0) return true;
     if (r.exitCode === 1) return false;
     throw new ContainerError(`asking for ${ref} failed (exit ${r.exitCode})`);
+  }
+
+  /** Remove an image reference from the host's store (no force: an image a container still uses stays). False when it was not there. */
+  async removeImage(ref) {
+    if (!parseImageRef(ref) && !/^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+$/.test(ref)) throw new ContainerError('the image is not a plain reference');
+    const r = await this.#call(['image', 'rm', ref], { timeoutMs: 120_000 });
+    if (r.exitCode === 0) return true;
+    if (/no such image/i.test(r.stderr)) return false;
+    throw new ContainerError(`removing ${ref} failed (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
   }
 
   async build(context, tag, dockerfile, buildArgs = {}) {
@@ -383,6 +413,10 @@ export class FakeContainers {
   }
   async hasImage(ref) {
     return this.images?.has(ref) ?? false;
+  }
+  async removeImage(ref) {
+    this.removedImages = [...(this.removedImages ?? []), ref];
+    return true;
   }
   async build(context, tag, dockerfile, buildArgs = {}) {
     buildArgsFlags(buildArgs); // the same refusals as the real thing

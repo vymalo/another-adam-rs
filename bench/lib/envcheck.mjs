@@ -1,6 +1,7 @@
 // The environment check: a task is kept only if its gold patch passes three times and the empty patch
-// fails three times, run from the clone path the agents will use (adam's worktree and OpenCode's clone
-// are never at the image's /app, so a task whose tests only work at /app would favour neither fairly).
+// fails three times, run from the clone path the agents will use, on a copy of the image's tree (adam's worktree
+// and OpenCode's clone are never at the image's /app, so a task whose tests only work at /app would favour neither
+// fairly).
 // No model is involved and nothing is spent.
 import os from 'node:os';
 import { GRADE_ATTEMPTS, gradeAttempt } from './grade.mjs';

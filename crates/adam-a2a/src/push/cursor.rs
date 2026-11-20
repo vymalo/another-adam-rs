@@ -82,11 +82,7 @@ fn state_name(state: &TaskState) -> String {
         .unwrap_or_default()
 }
 
-/// The member of an artifact's `metadata` that says its id is **its own and kept**: the run replaces
-/// the artifact under that id when it changes, so the same id can carry different content later. An
-/// artifact without it has an id made from its content (a different content is a different id),
-/// and a delivery cursor keeps nothing more about it than the id.
-pub const REPLACEABLE_ARTIFACT: &str = "vymalo.replaceable";
+pub use crate::extensions::REPLACEABLE_ARTIFACT;
 
 /// Whether `artifact` is one whose id can carry different content later ([`REPLACEABLE_ARTIFACT`]).
 fn replaceable(artifact: &a2a::Artifact) -> bool {

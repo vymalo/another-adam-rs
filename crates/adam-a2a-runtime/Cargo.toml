@@ -8,10 +8,16 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Push notifications: the store of configs and delivery cursors (`StorePushStore`) over the run store, and
+# adam-a2a's server and delivery client it serves. On by default; an embedded build (adam ADR 0047) turns it off.
+default = ["push"]
+push = ["adam-a2a/server"]
+
 [dependencies]
 adam-error.workspace = true
 a2a-lf.workspace = true
-adam-a2a = { path = "../adam-a2a", version = "0.1.0" }
+adam-a2a = { path = "../adam-a2a", version = "0.1.0", default-features = false }
 adam-agent-fs.workspace = true
 adam-core.workspace = true
 adam-runtime.workspace = true
@@ -39,6 +45,23 @@ secrecy.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
 tracing-subscriber.workspace = true
+
+# These tests need the server parts: an embedded build (no default features) leaves them out.
+[[test]]
+name = "backend"
+required-features = ["push"]
+
+[[test]]
+name = "text_stream"
+required-features = ["push"]
+
+[[test]]
+name = "steer"
+required-features = ["push"]
+
+[[test]]
+name = "usage"
+required-features = ["push"]
 
 [lints]
 workspace = true

@@ -18,7 +18,7 @@ use adam_mcp::{Env, McpPolicy, McpServers};
 // `config` is the `McpConfig` of an `mcp.json`, as `adam-agent-fs` parsed it.
 let servers = McpServers::connect(
     &config,
-    &Env::new().var("LINEAR_API_TOKEN", token),   // `${LINEAR_API_TOKEN}` in the file; else the process environment
+    &Env::new().var("LINEAR_API_TOKEN", token),   // `${LINEAR_API_TOKEN}` in the file; else `Env::source` (the process environment)
     &McpPolicy::default().allow_stdio(true),      // local processes are refused unless the deployment opts in
 )
 .await?;                                          // every server connected and listed, or an error
@@ -36,7 +36,7 @@ own.
 | `PromptCommand`, `PromptError`, `MAX_SERVER_INSTRUCTIONS_BYTES`, `MAX_INSTRUCTIONS_BYTES` | one prompt of a server as a command (`name()`, `description()`, `argument_hint()`, `server()`, `expand(&[String])`, `expand_text(&str)` for what a person typed), why it could not be expanded (`Invalid` or `Unavailable`), and the limits of the two features (2 KiB a server, 8 KiB in all; how many commands an agent serves is for `adam-service`) |
 | `McpPolicy` | what the deployment decides: `allow_stdio` (default off), `allow_insecure` (off), `allow_url_secrets` (off: no `${VAR}` in a `url`; if on, filter the `rmcp` log target), `inherit_env` (off), `connect_timeout` (30 s), `call_timeout` (60 s; the agent's time limit for an MCP tool is `call_timeout` + `connect_timeout` + 10 s, 100 s by default, `Tool::time_limit`: a call that has to dial again, or dials for itself, is within the limit; a server's own `timeoutSecs` and `connectTimeoutSecs` replace both for it), `max_call` (900 s, `DEFAULT_MAX_CALL`: the most one server of an `mcp.json` is waited for, for a call and for a connection each, **whoever asked for the value**: a file's key, the `call_timeout` and `connect_timeout` defaults, or a value a host set in code; one lowered is a warning; never under 1 s; the `MCP_MAX_CALL_SECS` of the binaries), `thread_tools_max_call` (3600 s: the cap a caller puts on a call to the thread-tools endpoint), `bearer_per_call(server, origin, Arc<dyn CallBearer>)` (a server name plus an origin bound to a bearer per call: see *A bearer per call*); `Debug` names the bindings (server and origin) and never a token |
 | `CallBearer` | the deployment's trait: `for_listing()` and `for_call(tool, &arguments)`, each a `SecretString` or a `ToolError` |
-| `Env` | values for `${VAR}`, taken before the process environment; held as secrets, `Debug` shows names only |
+| `Env` | values for `${VAR}`, taken before its source; held as secrets, `Debug` shows the names and the source's kind only. `Env::source(DynSecretSource)` replaces the source, the process environment (`adam_core::ProcessEnv`) by default; `adam_core::NoSecrets` refuses every name (ADR 0047) |
 | `Error` | closed enum, every variant names the server and none carries a value from a variable: `Var`, `StdioNotAllowed`, `SseUnsupported`, `Url`, `UrlSecret` (names the variable), `Header`, `Name`, `Spawn`, `Connect`, `ListTools`, `UnknownTool`, `BearerBinding` (a bearer-per-call binding the file or the bearer does not fit) |
 | `VarProblem`, `UrlProblem` | closed enums inside `Error::Var` and `Error::Url` |
 | `MAX_RESULT_BYTES` | 64 KiB: the most of an answer that reaches the model **whole**; a text over it is kept and paged (see *A call*) |
@@ -214,8 +214,11 @@ by `McpPolicy::thread_tools_max_call` (`THREAD_TOOLS_MAX_CALL_SECS`, 3600 s). A 
   second case the killed child stays a zombie until the process exits or a runtime reaps it).
 * **`${VAR}` and `${VAR:-default}`** are expanded once, in `connect`, in the command, arguments, `env` values,
   header values and (only with `McpPolicy::allow_url_secrets(true)`, see *Security*) the URL, from the `Env` and
-  then the process environment; the default stands for a variable that
-  is unset **or empty** (POSIX `:-`); a variable without a default that is unset is `Error::Var`, naming the
+  then its source (the process environment unless `Env::source` says otherwise); the default stands for a variable that
+  is unset **or empty** (POSIX `:-`), or refused by the source; a name the source refuses, with no default, is
+  `Error::Var` with `VarProblem::Refused` (**a new variant of a closed enum**). The source decides what `${VAR}`
+  reads, not what a stdio child inherits: with `inherit_env(true)` the child still gets this process's whole
+  environment, so a host that gives `NoSecrets` keeps `inherit_env` off; a variable without a default that is unset is `Error::Var`, naming the
   variable and never a value; a set-but-empty one expands to nothing, as in a shell, **except in a header**: a `${VAR}` with no default in a header value whose variable is empty is `Error::Var` with `VarProblem::Empty` (`Authorization: Bearer ` with the token gone is a mistake, not a header; write `${VAR:-x}` for a header that may be empty). The grammar is
   [`adam_agent_fs::split_env_references`](../adam-agent-fs/README.md), the same function `McpConfig::env_references`
   is built on, so the build and the run cannot disagree about what a reference is (a property test checks it).
@@ -593,7 +596,8 @@ per test): none relies on another test's runtime to reap a process or to install
   decoded), are lines and an error result while the next file is shared; three files of about 4 MiB share one, within
   the run's 6 MiB, and none with 1 KiB left; base64 without padding or with a line break is read and garbage is
   refused; one result shares 16 files; a text file is scrubbed, a binary one is not; a server's `isError` stays.
-* Unit: expansion (the `Env` before the process environment, defaults for unset and empty, a missing variable names
+* Unit: expansion (the `Env` before the process environment, a source that refuses a name the process has, a source of
+  the caller's asked for a name with no value and its value redacted, defaults for unset and empty, a missing variable names
   only itself, malformed references stay literal), the URL rules and that credentials are refused and never shown,
   `sse` and stdio refusals, the names (`server__tool`, unmappable names skipped, allow-list order), the schema
   pass-through, description fallbacks, the mapping of every content block, `isError`, a result over 64 KiB kept and paged (`a_result_over_64_kib_is_kept_and_its_first_page_returned`: 212,000 bytes read back page by page with no byte lost; `without_a_store_it_goes_to_the_state_under_its_budget`; `what_is_kept_is_as_scrubbed_as_what_is_shown`; an error result still cut; long structured content pretty-printed), the redactor

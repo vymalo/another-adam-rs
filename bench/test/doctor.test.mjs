@@ -14,11 +14,12 @@ const DIGEST = `sha256:${'a'.repeat(64)}`;
 const TASK = { id: 'hello', image: { ref: `registry.example.test/task@${DIGEST}` } };
 
 /** A machine: what each command answers. */
-function machine({ info = INFO(), compose = '2.40.0', digests = [`${PINS.coder.image}@${PINS.coder.digest}`], freeGb = 500 } = {}) {
+function machine({ info = INFO(), compose = '2.40.0', digests = [`${PINS.coder.image}@${PINS.coder.digest}`], freeGb = 500, sizeGb = 0 } = {}) {
   const exec = async (file, args) => {
     const key = `${file} ${args.join(' ')}`;
     if (key.startsWith('docker compose version')) return compose ? { exitCode: 0, stdout: `${compose}\n`, stderr: '' } : { exitCode: 127, stdout: '', stderr: '' };
     if (key.startsWith('docker info')) return info ? { exitCode: 0, stdout: info, stderr: '' } : { exitCode: 1, stdout: '', stderr: 'Cannot connect' };
+    if (key.includes('{{.Size}}')) return digests && sizeGb > 0 ? { exitCode: 0, stdout: `${Math.floor(sizeGb * GB)}\n`, stderr: '' } : { exitCode: 1, stdout: '', stderr: 'No such image' };
     if (key.startsWith('docker image inspect')) return digests ? { exitCode: 0, stdout: JSON.stringify(digests), stderr: '' } : { exitCode: 1, stdout: '', stderr: 'No such image' };
     return { exitCode: 127, stdout: '', stderr: '' };
   };
@@ -54,6 +55,19 @@ test('disk: below 20 GB fails, below 100 GB warns, and both the results and Dock
   assert.deepEqual(mid.checks.filter((c) => c.name.startsWith('free disk')).map((c) => c.status), ['warn', 'warn']);
   assert.match(by(mid, 'free disk, Docker root').detail, /60 GB free in \/var\/lib\/docker/);
   assert.equal(by(await run(machine({ freeGb: 19 })), 'free disk, results ($BENCH_HOME)').status, 'fail');
+});
+
+test('disk: the images already present count toward the floor, at exactly the boundary', async () => {
+  const states = (r) => r.checks.filter((c) => c.name.startsWith('free disk')).map((c) => c.status);
+  // the coder image (12 GB here) is present: free + present must reach MIN_FREE_GB
+  assert.deepEqual(states(await run(machine({ freeGb: 8, sizeGb: 12 }))), ['warn', 'warn'], 'free 8 + present 12 = 20: passes');
+  assert.equal((await run(machine({ freeGb: 8, sizeGb: 12 }))).exitCode, 0);
+  assert.deepEqual(states(await run(machine({ freeGb: 8, sizeGb: 0 }))), ['fail', 'fail'], 'free 8 + present 0: fails');
+  assert.equal((await run(machine({ freeGb: 8, sizeGb: 0 }))).exitCode, 1);
+  assert.equal((await run(machine({ freeGb: 8, sizeGb: 11.9 }))).exitCode, 1, 'just under the boundary');
+  const task = await run(machine({ freeGb: 8, sizeGb: 6 }), { tasks: [TASK] });
+  assert.equal(task.exitCode, 0, 'the coder image and one task image, 6 GB each as the fake answers');
+  assert.match(by(await run(machine({ freeGb: 8, sizeGb: 0 })), 'free disk, Docker root').detail, /8\.0 GB free .* 0\.0 GB of the images already present, less than 20/);
 });
 
 test('no daemon, no compose and an old Node are failures with a fix', async () => {
@@ -353,4 +367,24 @@ test('a probe that times out is unclear, and the doctor still reports the image'
   const r = await run(machine(), { tasks: [TASK], containers: timed, stack: probeStack(timed) });
   assert.equal(by(r, 'task image hello').status, 'warn');
   assert.match(by(r, 'task image hello').detail, /unclear/);
+});
+
+test('with the compose build off, the doctor fails closed when an image compose would have built is missing, and says how to build it', async () => {
+  const stack = { composeBuild: false, builtImages: () => ['adam-bench-git-server'], removeStaleEnvFiles: () => [], up: async () => { throw new Error('the stack must not start'); } };
+  const missing = machine({ digests: [`${PINS.coder.image}@${PINS.coder.digest}`] });
+  const exec = async (file, args) => (args[0] === 'image' && args.includes('adam-bench-git-server') ? { exitCode: 1, stdout: '', stderr: 'No such image' } : missing.exec(file, args));
+  const r = await run({ exec, statfs: missing.statfs }, { stack, start: true });
+  const c = by(r, 'compose images');
+  assert.equal(c.status, 'fail');
+  assert.match(c.detail, /adam-bench-git-server/);
+  assert.match(c.fix, /docker build/);
+  assert.match(c.fix, /BENCH_COMPOSE_BUILD/);
+  assert.equal(r.exitCode, 1);
+  assert.equal(by(r, 'stack'), undefined, 'the stack is never started');
+  // present: ok, and the stack starts
+  const upStack = { ...stack, up: async () => {}, containers: () => new FakeContainers(), graderContainers: () => new FakeContainers(), slots: 0, ensureCoderFiles: async () => '/h/bin' };
+  const present = await run(machine(), { stack: upStack, start: true });
+  assert.equal(by(present, 'compose images').status, 'ok');
+  // build on (the default): nothing to check
+  assert.equal(by(await run(machine(), { stack: { composeBuild: true, builtImages: () => ['x'], removeStaleEnvFiles: () => [] } }), 'compose images'), undefined);
 });

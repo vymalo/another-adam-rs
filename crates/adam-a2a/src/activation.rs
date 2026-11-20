@@ -13,9 +13,11 @@
 //! they cannot disagree.
 
 /// The header, as the SDK's `ServiceParams` and `http` spell it (lower case).
+#[cfg(feature = "server")]
 pub(crate) const HEADER: &str = "a2a-extensions";
 
 /// The URIs a header value names: split at commas, trimmed, empty entries skipped.
+#[cfg(feature = "server")]
 pub(crate) fn split(value: &str) -> impl Iterator<Item = &str> {
     value
         .split(',')
@@ -26,6 +28,7 @@ pub(crate) fn split(value: &str) -> impl Iterator<Item = &str> {
 /// The extensions a request activates: the URIs it names (the header values first, then the
 /// message's own list) that the card `declared`, each once, in the order they were named. An exact
 /// match: no other version, no trailing slash, no other case.
+#[cfg(feature = "server")]
 pub(crate) fn activated<'a>(
     declared: &[String],
     header: impl IntoIterator<Item = &'a str>,

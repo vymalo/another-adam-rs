@@ -34,6 +34,9 @@ export const DEFAULT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/
 const SAFE_VALUE = /^[^\n\r\0$"'\\]*$/;
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+/** The services of compose.yaml that have a `build:` (a test holds this equal to the file). */
+const BUILT_SERVICES = ['git-server'];
+
 /** The services a start brings up, for `slots` slots. The arms and the grading are host containers, not services. */
 export const serviceNames = (slots = SLOTS) => [
   'postgres',
@@ -182,10 +185,19 @@ export class Stack {
     this.ports = { git: ports.git ?? 18083, coder: { 1: ports.coder1 ?? 18081, 2: ports.coder2 ?? 18082 } };
     this.stackDir = path.join(home, 'stack');
     this.baseEnv = baseEnv;
+    const build = baseEnv.BENCH_COMPOSE_BUILD;
+    if (build !== undefined && build !== '0' && build !== '1') throw new StackError('BENCH_COMPOSE_BUILD is 0 or 1');
+    /** `BENCH_COMPOSE_BUILD=0`: start without `--build`; the images compose would build must already exist (the doctor checks). */
+    this.composeBuild = build !== '0';
     this.meterAddress = meterHost;
     this.secrets = new Set();
     this.gates = new Map();
     this.imageEnvCache = null;
+  }
+
+  /** The images compose builds from this repository (a service with `build:` in compose.yaml), as compose names them. */
+  builtImages() {
+    return BUILT_SERVICES.map((service) => `${this.project}-${service}`);
   }
 
   /** One lock for each service whose network is opened for a window: its windows and its gradings are told apart by it. */
@@ -296,7 +308,7 @@ export class Stack {
       fs.mkdirSync(this.slotDir(slot), { recursive: true, mode: 0o755 });
     }
     this.removeStaleEnvFiles();
-    await this.compose(['up', '-d', '--wait', '--build', ...serviceNames(this.slots)], { timeoutMs: 15 * 60 * 1000 });
+    await this.compose(['up', '-d', '--wait', ...(this.composeBuild ? ['--build'] : []), ...serviceNames(this.slots)], { timeoutMs: 15 * 60 * 1000 });
     // Compose does not make a network that has no service; the gradings need theirs.
     await this.ensureNetwork('verifier');
   }

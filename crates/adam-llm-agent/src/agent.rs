@@ -4642,6 +4642,14 @@ impl AgentStarter for LlmStarter {
     ) -> Result<Conversation, AgentError> {
         continue_conversation(&input, prior, prior_run)
     }
+
+    fn split(&self, state: &Conversation) -> Option<(Conversation, Vec<Value>)> {
+        Some(state.split())
+    }
+
+    fn join(&self, head: Conversation, rows: Vec<Value>) -> Result<Conversation, AgentError> {
+        Conversation::join(head, rows)
+    }
 }
 
 /// What a tool announced as the run's answer, and whether it ended the turn with it.
@@ -5081,6 +5089,14 @@ impl Agent for LlmAgent {
         prior_run: RunId,
     ) -> Result<Conversation, AgentError> {
         continue_conversation(&input, prior, prior_run)
+    }
+
+    fn split(&self, state: &Conversation) -> Option<(Conversation, Vec<Value>)> {
+        Some(state.split())
+    }
+
+    fn join(&self, head: Conversation, rows: Vec<Value>) -> Result<Conversation, AgentError> {
+        Conversation::join(head, rows)
     }
 
     #[tracing::instrument(skip_all, fields(run = %ctx.run_id(), agent = %self.name))]

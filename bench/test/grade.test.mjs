@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { ContainerError, FakeContainers, HostContainers, buildRunArgs } from '../lib/containers.mjs';
+import { ContainerError, FakeContainers, HostContainers, buildRunArgs, parseImageDigest } from '../lib/containers.mjs';
 import { CLONE_PATH, checkTask, pinTask } from '../lib/envcheck.mjs';
 import { MAX_PATCH_BYTES, PatchTooLarge, collectPatch, gradeOnce, gradePatch, gradeScript, verifierNetwork } from '../lib/grade.mjs';
 import { loadTask } from '../lib/task.mjs';
@@ -134,16 +134,36 @@ test('HostContainers runs docker with those arguments, and removes a container t
 });
 
 test('HostContainers reads digests and ids, and refuses what is not one', async () => {
-  const answers = { digest: `sha256:${'1'.repeat(64)}`, id: '2'.repeat(64) };
+  const answers = { digest: `["x/y@sha256:${'1'.repeat(64)}"]`, id: '2'.repeat(64) };
+  const calls = [];
   const exec = (bin, args, opts, cb) => {
-    cb(null, args.includes('{{.Digest}}') ? `${answers.digest}\n` : `${answers.id}\n`, '');
+    calls.push(args);
+    cb(null, args.some((a) => a.includes('RepoDigests')) ? `${answers.digest}\n` : `${answers.id}\n`, '');
     return {};
   };
   const p = new HostContainers({ exec });
-  assert.equal(await p.digestOf('x/y:1'), answers.digest);
+  assert.equal(await p.digestOf('x/y:1'), `sha256:${'1'.repeat(64)}`);
+  assert.ok(!calls[0].join(' ').includes('.Digest}}'), 'no template that names a field the inspect lacks');
   assert.equal(await p.imageId('x/y:1'), `sha256:${answers.id}`);
   answers.digest = 'nonsense';
   await assert.rejects(p.digestOf('x/y:1'), ContainerError);
+  answers.digest = '[]';
+  await assert.rejects(p.digestOf('x/y:1'), /no manifest digest in this Docker store/);
+});
+
+test('parseImageDigest reads the manifest digest of both image stores and never an image id', () => {
+  const h = (c) => `sha256:${c.repeat(64)}`;
+  // containerd store, a locally built image (recorded on this host)
+  assert.equal(parseImageDigest(`["adam-bench-own/confload-6@${h('3')}"]`, 'adam-bench-own/confload-6:749f0b9049b9'), h('3'));
+  // a pulled image: the digest of its own repository wins over another repository's
+  assert.equal(parseImageDigest(`["other/img@${h('5')}","ghcr.io/o/coder@${h('6')}"]`, `ghcr.io/o/coder:sha-1@${h('6')}`), h('6'));
+  assert.equal(parseImageDigest(`["ghcr.io/o/coder@${h('6')}"]`, 'ghcr.io/o/coder:sha-1'), h('6'));
+  assert.equal(parseImageDigest(`["a/b@${h('5')}","c/d@${h('6')}"]`, 'x/y:1'), h('5'), 'the first entry when none names the repository');
+  // classic store, a locally built image: no manifest digest, and the image id is not one
+  assert.equal(parseImageDigest('[]', 'adam-bench-own/x:1'), null);
+  assert.equal(parseImageDigest('null', 'adam-bench-own/x:1'), null);
+  assert.equal(parseImageDigest('nonsense', 'x:1'), null);
+  assert.equal(parseImageDigest('["x@sha256:zz"]', 'x:1'), null);
 });
 
 // ---- grading ----
@@ -212,16 +232,15 @@ test('the scratch directories are removed', async (t) => {
   assert.deepEqual(fs.readdirSync(root), []);
 });
 
-test('the grading script applies the patch in the working directory; the check clones to the agents\' path', () => {
+test('the grading script applies the patch in the working directory; the check copies the tree to the agents\' path', () => {
   const pristine = gradeScript({ workdir: '/app' });
   assert.match(pristine, /cd \/app/);
   assert.match(pristine, /\[ -s \/patch\/model\.patch \]/);
-  assert.doesNotMatch(pristine, /git clone/);
+  assert.doesNotMatch(pristine, new RegExp(CLONE_PATH));
   const clone = gradeScript({ workdir: '/app', cloneTo: CLONE_PATH });
-  assert.match(clone, new RegExp(`git clone -q --no-hardlinks /app ${CLONE_PATH}`));
+  assert.match(clone, new RegExp(`cp -a /app/\\. ${CLONE_PATH}/`));
   assert.match(clone, new RegExp(`cd ${CLONE_PATH}`));
   assert.match(clone, /sed 's#\/app/);
-  assert.match(clone, /ln -s \/app/);
 });
 
 test('the sed of the check rewrites the working directory and leaves other paths alone', (t) => {
@@ -258,8 +277,8 @@ test('the check keeps a task whose gold passes three times and empty fails three
   const r = await checkTask({ containers: c, task, workRoot: tmp(t) });
   assert.deepEqual([r.ok, r.reason, r.devcontainer, r.imageDigest], [true, null, true, DIGEST]);
   assert.equal(c.runs.length, 1 + 3 + 1 + 3);
-  assert.equal(c.runs.slice(1).filter((s) => /git clone/.test(s.script)).length, 6, 'six runs from the agents\' clone path');
-  assert.equal(c.runs.filter((s) => !/git clone/.test(s.script) && s.mounts?.some((m) => m.target === '/patch/model.patch')).length, 1, 'and the gold once through the real path');
+  assert.equal(c.runs.slice(1).filter((s) => s.script.includes(CLONE_PATH)).length, 6, 'six runs from the agents\' clone path');
+  assert.equal(c.runs.filter((s) => !s.script?.includes(CLONE_PATH) && s.mounts?.some((m) => m.target === '/patch/model.patch')).length, 1, 'and the gold once through the real path');
   assert.equal(c.runs[0].network, 'none');
 });
 

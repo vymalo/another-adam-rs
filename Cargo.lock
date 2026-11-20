@@ -294,6 +294,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-code-tools"
+version = "0.1.0"
+dependencies = [
+ "adam-llm-agent",
+ "adam-runtime",
+ "adam-workspace",
+ "aho-corasick",
+ "async-trait",
+ "base64 0.22.1",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "adam-code-tools-testkit"
+version = "0.1.0"
+dependencies = [
+ "adam-code-tools",
+ "adam-llm-agent",
+ "adam-runtime",
+ "adam-workspace",
+ "async-trait",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "adam-coder"
 version = "0.1.0"
 dependencies = [
@@ -303,6 +333,8 @@ dependencies = [
  "adam-a2a",
  "adam-a2a-runtime",
  "adam-agent-fs",
+ "adam-code-tools",
+ "adam-code-tools-testkit",
  "adam-core",
  "adam-devcontainer",
  "adam-env-kubernetes",
@@ -318,7 +350,6 @@ dependencies = [
  "adam-store-testkit",
  "adam-ui",
  "adam-workspace",
- "aho-corasick",
  "anyhow",
  "async-trait",
  "axum",
@@ -353,6 +384,7 @@ dependencies = [
  "adam-error",
  "async-trait",
  "chrono",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror",
@@ -391,6 +423,20 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "adam-engine"
+version = "0.1.0"
+dependencies = [
+ "adam-a2a-runtime",
+ "adam-agent-fs",
+ "adam-core",
+ "adam-error",
+ "adam-llm-agent",
+ "adam-model",
+ "adam-runtime",
+ "adam-ui",
 ]
 
 [[package]]
@@ -497,6 +543,7 @@ name = "adam-mcp"
 version = "0.1.0"
 dependencies = [
  "adam-agent-fs",
+ "adam-core",
  "adam-error",
  "adam-llm-agent",
  "adam-mcp-testkit",

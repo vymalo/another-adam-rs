@@ -1,11 +1,21 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { ensureAgentFolder, hostRepoUrl, repoSlug, runRepoName, stackRepoUrl } from '../lib/gitops.mjs';
+import { safeEnv } from '../lib/grade.mjs';
 import { commitFiles, git, initRepo } from './gitfix.mjs';
 import { tmp } from './helpers.mjs';
+
+/** The real extraction, as the module does it: a fake `unpack` writes a half tree and then calls this. */
+function realUnpack(tarball, dir, strip) {
+  return new Promise((resolve, reject) => {
+    const child = execFile('tar', ['-xf', '-', '-C', dir, `--strip-components=${strip}`, '--no-same-owner', '--no-same-permissions'], { env: safeEnv() }, (e) => (e ? reject(new Error('the agent folder could not be unpacked')) : resolve()));
+    child.stdin.on('error', () => {});
+    child.stdin.end(tarball);
+  });
+}
 
 function withEnv(t, vars) {
   const before = {};
@@ -63,8 +73,8 @@ function repoWithAgentFolder(t) {
     },
     'feat: the folder',
   );
-  commitFiles(dir, { 'bin/adam-coder/agent/instructions.md': '---\nlimits:\n  max_turns: 200\n---\n# coder, later\n' }, 'feat: later');
-  return { dir, first };
+  const second = commitFiles(dir, { 'bin/adam-coder/agent/instructions.md': '---\nlimits:\n  max_turns: 200\n---\n# coder, later\n' }, 'feat: later');
+  return { dir, first, second };
 }
 
 test('the agent folder is taken from the image\'s revision, not the checkout, and has no mcp.json', async (t) => {
@@ -79,6 +89,89 @@ test('the agent folder is taken from the image\'s revision, not the checkout, an
   assert.equal(fs.existsSync(path.join(dest, 'mcp.json')), false, 'no GitHub MCP server is connected');
   assert.equal(fs.existsSync(path.join(dest, 'README.md')), false);
   assert.ok((fs.statSync(path.join(dest, 'instructions.md')).mode & 0o444) === 0o444, 'readable by the coder\'s user');
+  assert.deepEqual(fs.readdirSync(path.dirname(dest)), ['folder'], 'the folder is renamed into place: no temporary sibling is left');
+});
+
+test('two slots preparing one agent folder at the same time make it once, and both see the complete tree', async (t) => {
+  const { dir, first } = repoWithAgentFolder(t);
+  const home = tmp(t);
+  const dest = path.join(home, 'folder');
+  let made = 0;
+  // A half-written tree, a pause, then the real extraction. A second preparation that emptied the destination while
+  // this one was writing would run this a second time, which the count catches.
+  const unpack = async (tarball, target, strip) => {
+    made++;
+    fs.writeFileSync(path.join(target, 'partial'), 'x');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    fs.rmSync(path.join(target, 'partial'), { force: true });
+    await realUnpack(tarball, target, strip);
+  };
+  const [a, b] = await Promise.all([
+    ensureAgentFolder({ repoDir: dir, revision: first, dest, steps: 150, unpack }),
+    ensureAgentFolder({ repoDir: dir, revision: first, dest, steps: 150, unpack }),
+  ]);
+  assert.equal(a, dest);
+  assert.equal(b, dest);
+  assert.equal(made, 1, 'the folder is made once: the second caller waits and finds the marker');
+  assert.match(fs.readFileSync(path.join(dest, 'instructions.md'), 'utf8'), /^---\nlimits:\n  max_turns: 150\n  max_tool_calls: 400\n---\n# coder\n$/);
+  assert.equal(fs.readFileSync(path.join(dest, 'skills', 'x', 'SKILL.md'), 'utf8'), 'skill\n');
+  assert.equal(fs.existsSync(path.join(dest, 'mcp.json')), false);
+  assert.deepEqual(fs.readdirSync(home), ['folder'], 'no temporary directory is left beside the folder');
+});
+
+test('the destination appears complete: while the folder is being made it does not exist', async (t) => {
+  const { dir, first } = repoWithAgentFolder(t);
+  const home = tmp(t);
+  const dest = path.join(home, 'folder');
+  let entered;
+  const reached = new Promise((resolve) => (entered = resolve));
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  let seen;
+  const unpack = async (tarball, target, strip) => {
+    await realUnpack(tarball, target, strip);
+    seen = fs.existsSync(dest);
+    entered();
+    await gate;
+  };
+  const pending = ensureAgentFolder({ repoDir: dir, revision: first, dest, steps: 150, unpack });
+  const which = await Promise.race([reached.then(() => 'unpacking'), pending.then(() => 'done'), new Promise((resolve) => setTimeout(() => resolve('timeout'), 5000))]);
+  try {
+    assert.equal(which, 'unpacking', 'the preparation uses the unpack it was given');
+    assert.equal(seen, false, 'nothing is published before the tree is complete');
+  } finally {
+    release();
+  }
+  await pending;
+  assert.match(fs.readFileSync(path.join(dest, 'instructions.md'), 'utf8'), /max_turns: 150/);
+  assert.deepEqual(fs.readdirSync(home), ['folder']);
+});
+
+test('a preparation that fails halfway leaves no folder and no temporary directory', async (t) => {
+  const { dir, first } = repoWithAgentFolder(t);
+  const home = tmp(t);
+  const dest = path.join(home, 'folder');
+  const unpack = async (tarball, target) => {
+    fs.writeFileSync(path.join(target, 'instructions.md'), '---\nlimits:\n  max_turns: 200\n---\n# coder\n');
+    throw new Error('tar failed');
+  };
+  await assert.rejects(ensureAgentFolder({ repoDir: dir, revision: first, dest, steps: 150, unpack }), /tar failed/);
+  assert.equal(fs.existsSync(dest), false, 'no partial folder is left');
+  assert.deepEqual(fs.readdirSync(home), [], 'no temporary directory is left');
+});
+
+test('a preparation that fails leaves a folder that was already complete as it was', async (t) => {
+  const { dir, first } = repoWithAgentFolder(t);
+  const home = tmp(t);
+  const dest = path.join(home, 'folder');
+  await ensureAgentFolder({ repoDir: dir, revision: first, dest, steps: 150 });
+  const before = fs.readFileSync(path.join(dest, 'instructions.md'), 'utf8');
+  const unpack = async () => {
+    throw new Error('tar failed');
+  };
+  await assert.rejects(ensureAgentFolder({ repoDir: dir, revision: first, dest, steps: 90, unpack }), /tar failed/);
+  assert.equal(fs.readFileSync(path.join(dest, 'instructions.md'), 'utf8'), before, 'the complete folder is untouched');
+  assert.deepEqual(fs.readdirSync(home), ['folder']);
 });
 
 test('a folder is made again for another step limit, and a missing limit is refused (finding 19)', async (t) => {
@@ -89,6 +182,82 @@ test('a folder is made again for another step limit, and a missing limit is refu
   assert.match(fs.readFileSync(path.join(dest, 'instructions.md'), 'utf8'), /  max_turns: 90\n/);
   await assert.rejects(ensureAgentFolder({ repoDir: dir, revision: first, dest: path.join(tmp(t), 'z') }), /turn limit is required/);
   await assert.rejects(ensureAgentFolder({ repoDir: dir, revision: first, dest: path.join(tmp(t), 'z'), steps: 0 }), /turn limit is required/);
+});
+
+test('a folder made for another revision is made again, never returned stale', async (t) => {
+  const { dir, first, second } = repoWithAgentFolder(t);
+  const dest = path.join(tmp(t), 'folder');
+  await ensureAgentFolder({ repoDir: dir, revision: first, dest, steps: 150 });
+  assert.match(fs.readFileSync(path.join(dest, 'instructions.md'), 'utf8'), /# coder\n$/, 'the first revision\'s file');
+  // The pinned coder moves: the same destination must be rebuilt, not handed back with the old revision's files.
+  await ensureAgentFolder({ repoDir: dir, revision: second, dest, steps: 150 });
+  assert.match(fs.readFileSync(path.join(dest, 'instructions.md'), 'utf8'), /# coder, later\n$/, 'the second revision\'s file, not the first');
+  assert.equal(fs.readFileSync(path.join(dest, '.revision'), 'utf8').trim(), `${second}:150`, 'the marker names the second revision');
+  assert.deepEqual(fs.readdirSync(path.dirname(dest)), ['folder'], 'no temporary sibling is left');
+});
+
+test('the prepared tree is renamed into place, not copied: the destination is the directory that was built', async (t) => {
+  const { dir, first } = repoWithAgentFolder(t);
+  const home = tmp(t);
+  const dest = path.join(home, 'folder');
+  let built;
+  const unpack = async (tarball, target, strip) => {
+    built = fs.statSync(target).ino;
+    await realUnpack(tarball, target, strip);
+  };
+  await ensureAgentFolder({ repoDir: dir, revision: first, dest, steps: 150, unpack });
+  assert.equal(fs.statSync(dest).ino, built, 'the destination is the temporary directory renamed, not a copy of it');
+});
+
+test('each preparation builds in a temporary sibling of its own, so two processes cannot share one', async (t) => {
+  const { dir, first, second } = repoWithAgentFolder(t);
+  const dest = path.join(tmp(t), 'folder');
+  const temps = [];
+  const unpack = async (tarball, target, strip) => {
+    temps.push(target);
+    await realUnpack(tarball, target, strip);
+  };
+  await ensureAgentFolder({ repoDir: dir, revision: first, dest, steps: 150, unpack });
+  await ensureAgentFolder({ repoDir: dir, revision: second, dest, steps: 150, unpack });
+  assert.equal(temps.length, 2);
+  assert.notEqual(temps[0], temps[1], 'each preparation has a temporary directory of its own');
+  assert.equal(path.dirname(temps[0]), path.dirname(dest), 'the temporary is a sibling of the destination, so the rename stays on one filesystem');
+});
+
+test('a tar that dies before reading its input rejects, and the closed pipe does not escape', async (t) => {
+  const dir = initRepo(t);
+  const rev = commitFiles(dir, {
+    'bin/adam-coder/agent/instructions.md': '---\nlimits:\n  max_turns: 200\n---\n# coder\n',
+    'bin/adam-coder/agent/big.bin': Buffer.alloc(4 * 1024 * 1024, 7),
+  }, 'feat: a large folder');
+  const home = tmp(t);
+  const dest = path.join(home, 'folder');
+  const bin = tmp(t);
+  // Reads 32 bytes and exits 1: the rest of the archive meets a closed pipe.
+  fs.writeFileSync(path.join(bin, 'tar'), '#!/bin/sh\nhead -c 32 >/dev/null\nexit 1\n', { mode: 0o755 });
+  const uncaught = [];
+  const onUncaught = (e) => uncaught.push(e);
+  process.on('uncaughtException', onUncaught);
+  t.after(() => process.off('uncaughtException', onUncaught));
+  withEnv(t, { PATH: `${bin}:${process.env.PATH}` });
+  await assert.rejects(ensureAgentFolder({ repoDir: dir, revision: rev, dest, steps: 150 }), /could not be unpacked/);
+  await new Promise((resolve) => setTimeout(resolve, 100)); // a socket error is emitted after the child exits
+  assert.deepEqual(uncaught, [], 'the closed stdin is an error on the socket, not an uncaught exception');
+  assert.equal(fs.existsSync(dest), false, 'no destination is published');
+  assert.deepEqual(fs.readdirSync(home), [], 'no temporary directory is left');
+});
+
+test('a destination with a trailing slash is prepared in a sibling, not inside itself', async (t) => {
+  const { dir, first, second } = repoWithAgentFolder(t);
+  const home = tmp(t);
+  const dest = path.join(home, 'folder');
+  await ensureAgentFolder({ repoDir: dir, revision: first, dest, steps: 150 });
+  // A caller may spell the same destination with a trailing slash. The temporary must be its sibling, never a
+  // child of it: a child is deleted by the `rmSync` that clears the old folder, and the rename then fails.
+  await ensureAgentFolder({ repoDir: dir, revision: second, dest: `${dest}/`, steps: 150 });
+  assert.match(fs.readFileSync(path.join(dest, 'instructions.md'), 'utf8'), /# coder, later\n$/, 'the folder is rebuilt, not destroyed');
+  assert.equal(fs.readFileSync(path.join(dest, '.revision'), 'utf8').trim(), `${second}:150`);
+  assert.deepEqual(fs.readdirSync(home), ['folder'], 'no temporary sibling is left');
 });
 
 test('a folder made for the revision is reused; an absent revision says how to get it', async (t) => {

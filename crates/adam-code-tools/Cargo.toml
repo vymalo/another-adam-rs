@@ -1,0 +1,33 @@
+[package]
+name = "adam-code-tools"
+description = "The file and command tools of adam-rs agents, as a library over a workspace port"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# `GitAt::plain` and `GitAt::refused`, for the tests of a crate that uses the tools.
+test-util = []
+
+[dependencies]
+adam-llm-agent.workspace = true
+adam-runtime.workspace = true
+# Without `github`: the GitHub code host and App credentials are the coder's, and bring `reqwest`.
+adam-workspace = { path = "../adam-workspace", version = "0.1.0", default-features = false }
+aho-corasick.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "process"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

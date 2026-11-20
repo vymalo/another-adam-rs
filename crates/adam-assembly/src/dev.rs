@@ -24,6 +24,7 @@ use adam_model::DynModel;
 use adam_runtime::{Agent, AgentError, Ctx, Inbound, RuntimeBuilder, Transition};
 use async_trait::async_trait;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use serde_json::Value;
 
 use crate::assembly::{AgentInfo, BoundDef};
 use crate::def::AgentDef;
@@ -953,6 +954,22 @@ impl Agent for LiveAgent {
     ) -> Result<Conversation, AgentError> {
         match self.agent_for_start() {
             Some(agent) => agent.init_continuing(input, prior, prior_run),
+            None => Err(AgentError::permanent(format!(
+                "agent `{}` is not loaded",
+                self.name
+            ))),
+        }
+    }
+
+    fn split(&self, state: &Conversation) -> Option<(Conversation, Vec<Value>)> {
+        // An unloaded agent splits nothing: the run stays in the v4 format rather than gaining a
+        // head no one could join.
+        self.agent_for_start()?.split(state)
+    }
+
+    fn join(&self, head: Conversation, rows: Vec<Value>) -> Result<Conversation, AgentError> {
+        match self.agent_for_start() {
+            Some(agent) => agent.join(head, rows),
             None => Err(AgentError::permanent(format!(
                 "agent `{}` is not loaded",
                 self.name

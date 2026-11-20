@@ -1,7 +1,10 @@
 //! Agent card configuration and its rendering as an A2A 1.0 `AgentCard`.
 
+#[cfg(feature = "server")]
 use std::collections::HashMap;
 
+// The card is rendered only by the server; without it the configuration is data.
+#[cfg(feature = "server")]
 use a2a::{
     AgentCapabilities, AgentCard, AgentExtension, AgentInterface, AgentSkill,
     HttpAuthSecurityScheme, SecurityScheme, TRANSPORT_PROTOCOL_HTTP_JSON,
@@ -10,6 +13,7 @@ use a2a::{
 use url::Url;
 
 /// Name under which the bearer scheme is advertised in the card.
+#[cfg(feature = "server")]
 const BEARER_SCHEME_NAME: &str = "bearer";
 
 /// What an agent tells the world about itself.
@@ -206,6 +210,7 @@ impl ExtensionConfig {
 
 /// What the server turned on, which the card has to say truthfully.
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(feature = "server")]
 pub(crate) struct Flags {
     /// The server enforces bearer tokens: the card advertises the scheme.
     pub bearer: bool,
@@ -215,6 +220,7 @@ pub(crate) struct Flags {
     pub extended: bool,
 }
 
+#[cfg(feature = "server")]
 fn extension_entry(e: &ExtensionConfig) -> AgentExtension {
     AgentExtension {
         uri: e.uri.clone(),
@@ -229,6 +235,7 @@ fn extension_entry(e: &ExtensionConfig) -> AgentExtension {
     }
 }
 
+#[cfg(feature = "server")]
 fn skill_entry(s: &SkillConfig) -> AgentSkill {
     AgentSkill {
         id: s.id.clone(),
@@ -244,6 +251,7 @@ fn skill_entry(s: &SkillConfig) -> AgentSkill {
 
 /// The extended card: the public card with what the config adds applied (see
 /// [`ExtendedCardConfig`]).
+#[cfg(feature = "server")]
 pub(crate) fn build_extended_card(
     config: &AgentCardConfig,
     extended: &ExtendedCardConfig,
@@ -276,6 +284,7 @@ pub(crate) fn build_extended_card(
 /// Streaming is on; push notifications and the extended card are on only when the server says
 /// so ([`Flags`]); the bearer scheme is advertised exactly when the server enforces bearer
 /// tokens. Signatures are not added here ([`crate::CardSigner`] does it).
+#[cfg(feature = "server")]
 pub(crate) fn build_card(config: &AgentCardConfig, flags: Flags) -> AgentCard {
     let bearer_auth = flags.bearer;
     let extensions = (!config.extensions.is_empty())

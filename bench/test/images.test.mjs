@@ -40,3 +40,20 @@ test('R14: the host asks whether an image is in its store, and tells a missing i
   assert.deepEqual(seen[0].slice(0, 3), ['image', 'inspect', '--format']);
   assert.equal(seen[0].at(-1), 'adam-bench-own/x:1');
 });
+
+test('removeImage runs `docker image rm` without force, treats a missing image as removed already and refuses a loose reference', async () => {
+  const seen = [];
+  const answers = [{ code: null }, { code: 1, stderr: 'Error: No such image: x' }, { code: 1, stderr: 'conflict: image is being used' }];
+  const exec = (bin, args, opts, cb) => {
+    seen.push(args);
+    const a = answers.shift();
+    cb(a.code === null ? null : Object.assign(new Error('x'), { code: a.code }), '', a.stderr ?? '');
+    return { stdin: { on() {}, end() {} } };
+  };
+  const p = new HostContainers({ exec });
+  assert.equal(await p.removeImage('adam-bench-own/x:1'), true);
+  assert.equal(await p.removeImage('adam-bench-own/x:1'), false);
+  await assert.rejects(p.removeImage('adam-bench-own/x:1'), /removing adam-bench-own\/x:1 failed \(exit 1\)/);
+  assert.deepEqual(seen[0], ['image', 'rm', 'adam-bench-own/x:1']);
+  await assert.rejects(p.removeImage('--force'), /plain reference/);
+});

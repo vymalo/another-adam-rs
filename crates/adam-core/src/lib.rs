@@ -4,15 +4,18 @@
 //! [`store::Store`]) that every backend adapter implements, so a developer can
 //! pick Postgres, MongoDB, or their own storage without touching agent code.
 
+pub mod secrets;
 pub mod store;
 // Test support for this workspace's database-gated suites, not part of the
 // supported API.
 #[doc(hidden)]
 pub mod testing;
 
+pub use secrets::{DynSecretSource, NoSecrets, ProcessEnv, SecretError, SecretSource};
 pub use store::memory::MemoryStore;
 pub use store::{
-    BlobId, ClaimScope, ConversationScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun,
-    PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
-    RunUpdate, Store, StoreError, StoreResult, claimed, storable, storable_owned, storable_text,
+    BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, DynStore, JournalEntry, Lease,
+    NewPushConfig, NewRun, PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery,
+    RunRecord, RunStatus, RunUpdate, Store, StoreError, StoreResult, claimed, head_body,
+    set_head_body, storable, storable_owned, storable_text,
 };

@@ -64,7 +64,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write as _};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -72,7 +72,7 @@ use std::time::Duration;
 use adam::prelude::*;
 use adam_llm_agent::{keep_image, paging};
 use adam_model::ImageOrigin;
-use adam_workspace::safe_fs::{BeneathError, Dir, Meta, SlotDir, WalkError, race};
+use adam_workspace::safe_fs::{BeneathError, Meta, SlotDir, race};
 
 use super::gitcli::GitAt;
 use super::{Outcome, ToolEnv, non_empty, notes_error};
@@ -95,228 +95,10 @@ const MAX_LISTED: usize = 40;
 /// The flag of the second reading of a patch ([`apply_in`]).
 const RECOUNT: &str = "--recount";
 
-/// What a path is used for; see [`confine`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Access {
-    /// The file is read. A symlink is followed, and must lead to something inside the root.
-    Read,
-    /// The file is created or replaced. No symlink may be on the way.
-    Write,
-}
-
-/// Whether `name` is a `.git` (any case).
-pub(super) fn is_dot_git(name: &std::ffi::OsStr) -> bool {
-    name.to_string_lossy().eq_ignore_ascii_case(".git")
-}
-
-/// The normal components of `rel`, or why the path is refused (see the module docs).
-fn parts_of(rel: &str) -> Result<Vec<OsString>, String> {
-    let trimmed = rel.trim();
-    if trimmed.is_empty() {
-        return Err("path is required".to_owned());
-    }
-    if trimmed.contains('\0') {
-        return Err(format!("`{}` is not a path", trimmed.escape_debug()));
-    }
-    let path = Path::new(trimmed);
-    if path.is_absolute() {
-        return Err(format!(
-            "`{trimmed}` is an absolute path: give a path relative to the root of the worktree"
-        ));
-    }
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(name) if is_dot_git(name) => {
-                return Err(format!(
-                    "`{trimmed}` is inside .git: the repository's own files are not for these tools"
-                ));
-            }
-            Component::Normal(name) => parts.push(name.to_owned()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(format!(
-                    "`{trimmed}` goes up with `..`: a path must stay inside the worktree"
-                ));
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(format!(
-                    "`{trimmed}` is an absolute path: give a path relative to the root of the worktree"
-                ));
-            }
-        }
-    }
-    if parts.is_empty() {
-        return Err(format!(
-            "`{trimmed}` is the root of the worktree, not a file: name a file"
-        ));
-    }
-    Ok(parts)
-}
-
-/// A path that [`confine`] accepted: the components below the slot's root. For a read they are the
-/// path with every link on the way followed (it has none), for a write the path as given.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Confined {
-    parts: Vec<OsString>,
-}
-
-impl Confined {
-    /// The path, relative to the slot's root.
-    pub fn rel(&self) -> PathBuf {
-        self.parts.iter().collect()
-    }
-}
-
-/// Check `rel` against the slot `root` for `access`, or give the reason the model is told.
-///
-/// The rule is in the [module docs](self#the-confinement-rule-confine). Everything is looked at
-/// relative to `root`, the slot's directory as the coder opened it, never by its name. For
-/// [`Access::Read`] the path must exist; for [`Access::Write`] it may not exist yet (nor its
-/// parents).
-///
-/// This is a **check**: it opens nothing the caller can use. A caller that goes on to read or write
-/// does it with `open_for_read` and `locate_for_write`, which look at the path again as they
-/// open it.
-///
-/// # Errors
-///
-/// A message for the model: the path is empty, absolute, goes up, names `.git`, leaves the
-/// worktree through a symlink, goes through a symlink to write, or (to read) does not exist.
-pub fn confine(root: &SlotDir, rel: &str, access: Access) -> Result<Confined, String> {
-    let parts = parts_of(rel)?;
-    let shown = rel.trim();
-    match access {
-        Access::Read => {
-            let path: PathBuf = parts.iter().collect();
-            let resolved = root
-                .resolve_inside(&path, &is_dot_git)
-                .map_err(|e| read_refusal(e, shown))?;
-            Ok(Confined { parts: resolved })
-        }
-        Access::Write => {
-            locate_for_write(root, &parts, shown, false)?;
-            Ok(Confined { parts })
-        }
-    }
-}
-
-/// What the model is told when a path cannot be resolved for a read.
-fn read_refusal(e: BeneathError, shown: &str) -> String {
-    match e {
-        BeneathError::Escapes => {
-            format!("`{shown}` leads outside the worktree (through a symlink): refused")
-        }
-        BeneathError::Avoided(_) => {
-            format!("`{shown}` leads into .git (through a symlink): refused")
-        }
-        BeneathError::TooManyLinks => {
-            format!("cannot resolve `{shown}`: too many levels of symbolic links")
-        }
-        BeneathError::Changed => {
-            format!("`{shown}` changed while it was opened (a symlink is on its way now): refused")
-        }
-        BeneathError::Io(e) if e.kind() == io::ErrorKind::NotFound => {
-            format!("`{shown}` does not exist")
-        }
-        BeneathError::Io(e) => format!("cannot resolve `{shown}`: {e}"),
-    }
-}
-
-/// Open `rel` of the slot `root` for reading, and say what it is (a file, a directory or
-/// something else: the caller tells the model).
-///
-/// The path is resolved inside the slot, following the links that stay inside it; the file is then
-/// opened by the path that resolution found, which has no link in it, relative to `root`. So a
-/// link put on the way after the resolution is refused and never followed, and so is a slot
-/// swapped for a link meanwhile (the descriptor is the directory that was opened).
-pub(super) fn open_for_read(root: &SlotDir, rel: &str) -> Result<(fs::File, Meta), String> {
-    let parts = parts_of(rel)?;
-    let shown = rel.trim();
-    let path: PathBuf = parts.iter().collect();
-    root.open_following(&path, &is_dot_git)
-        .map_err(|e| read_refusal(e, shown))
-}
-
-/// Where a write goes: the directory the file is in, as a descriptor, and the file.
-struct Located {
-    /// What the model called the file.
-    shown: String,
-    /// The slot, for the checkpoints of the tests.
-    slot: PathBuf,
-    /// The directory of the file; `None` when it (or a directory above it) is not there yet and
-    /// nothing was made.
-    parent: Option<Dir>,
-    name: OsString,
-    /// What is at `name`, without following it.
-    existing: Option<Meta>,
-}
-
-/// Find the directory a write to `parts` goes in, relative to `root`, making the directories that
-/// are missing when `create` is set, and what is at the file now. Refuses (as [`confine`] says) a
-/// link anywhere on the way, the file itself included, a file where a directory is needed and a
-/// directory where the file is to be.
-fn locate_for_write(
-    root: &SlotDir,
-    parts: &[OsString],
-    shown: &str,
-    create: bool,
-) -> Result<Located, String> {
-    let Some((name, dirs)) = parts.split_last() else {
-        return Err("path is required".to_owned());
-    };
-    let prefix = |upto: usize| -> String {
-        parts[..=upto]
-            .iter()
-            .collect::<PathBuf>()
-            .display()
-            .to_string()
-    };
-    let linked = |upto: usize| {
-        format!(
-            "`{shown}` goes through the symlink `{}`: writing through a symlink is refused",
-            prefix(upto)
-        )
-    };
-    let dir_path: PathBuf = dirs.iter().collect();
-    let parent = match root.walk(&dir_path, create) {
-        Ok(dir) => Some(dir),
-        Err(WalkError::Missing(_)) => None,
-        Err(WalkError::Link(at)) => return Err(linked(at)),
-        Err(WalkError::NotDirectory(at)) => {
-            return Err(format!(
-                "`{}` is a file, not a directory: `{shown}` cannot be inside it",
-                prefix(at)
-            ));
-        }
-        Err(WalkError::Io(e)) if create => {
-            return Err(format!("cannot create the directories of `{shown}`: {e}"));
-        }
-        Err(WalkError::Io(e)) => return Err(format!("cannot look at `{shown}`: {e}")),
-    };
-    let existing = match &parent {
-        Some(dir) => match dir.lstat(name) {
-            Ok(meta) => Some(meta),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(format!("cannot look at `{shown}`: {e}")),
-        },
-        None => None,
-    };
-    match existing {
-        Some(meta) if meta.is_symlink() => return Err(linked(parts.len() - 1)),
-        Some(meta) if meta.is_dir() => {
-            return Err(format!("`{shown}` is a directory: name a file"));
-        }
-        _ => {}
-    }
-    Ok(Located {
-        shown: shown.to_owned(),
-        slot: root.path().to_path_buf(),
-        parent,
-        name: name.clone(),
-        existing,
-    })
-}
+pub use adam_code_tools::confine::{Access, Confined, confine};
+pub(super) use adam_code_tools::confine::{
+    Located, is_dot_git, locate_for_write, open_for_read, parts_of,
+};
 
 /// Largest file `read_file` pages: counting its lines reads all of it, once.
 const READ_MAX_FILE: u64 = 512 * 1024 * 1024;
@@ -611,9 +393,7 @@ fn write_in(root: &SlotDir, rel: &str, content: &str) -> Result<Written, String>
             content.len()
         ));
     }
-    let shown = rel.trim();
-    let parts = parts_of(rel)?;
-    let located = locate_for_write(root, &parts, shown, true)?;
+    let located = locate_for_write(root, rel, true)?;
     write_located(&located, content)
 }
 
@@ -621,11 +401,11 @@ fn write_in(root: &SlotDir, rel: &str, content: &str) -> Result<Written, String>
 /// (`O_EXCL`, so nothing is followed), written, and renamed over the target.
 fn write_located(located: &Located, content: &str) -> Result<Written, String> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let shown = &located.shown;
-    let Some(parent) = &located.parent else {
+    let shown = located.shown();
+    let Some(parent) = located.parent() else {
         return Err(format!("`{shown}` has no directory to be written in"));
     };
-    race::checkpoint(&located.slot, "write");
+    race::checkpoint(located.slot(), "write");
     let tmp = OsString::from(format!(
         ".adam-write-{}-{}.tmp",
         std::process::id(),
@@ -636,18 +416,18 @@ fn write_located(located: &Located, content: &str) -> Result<Written, String> {
         let mut file = parent.create_new(&tmp)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
-        if let Some(meta) = &located.existing {
+        if let Some(meta) = located.existing() {
             file.set_permissions(fs::Permissions::from_mode(meta.permissions()))?;
         }
         drop(file);
-        parent.rename(&tmp, &located.name)
+        parent.rename(&tmp, located.name())
     })();
     if let Err(e) = written {
         let _ = parent.unlink(&tmp);
         return Err(format!("cannot write `{shown}`: {e}"));
     }
     Ok(Written {
-        created: located.existing.is_none(),
+        created: located.existing().is_none(),
         bytes: content.len(),
     })
 }
@@ -1506,10 +1286,9 @@ fn edit_in(
     if old == new {
         return Err("old and new are the same text: there is nothing to change".into());
     }
-    let parts = parts_of(rel)?;
-    let located = locate_for_write(root, &parts, shown, false)?;
+    let located = locate_for_write(root, rel, false)?;
     race::checkpoint(root.path(), "edit");
-    let (Some(parent), Some(meta)) = (&located.parent, located.existing) else {
+    let (Some(parent), Some(meta)) = (located.parent(), located.existing().copied()) else {
         return Err(format!(
             "`{shown}` does not exist: edit_file changes a file that is there (write_file \
              creates one)"
@@ -1525,7 +1304,7 @@ fn edit_in(
         ));
     }
     let (file, _) = parent
-        .open_regular(&located.name)
+        .open_regular(located.name())
         .map_err(|e| format!("cannot read `{shown}`: {e}"))?;
     let mut bytes = Vec::new();
     file.take(WRITE_CAP as u64 + 1)
