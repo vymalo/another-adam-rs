@@ -26,6 +26,7 @@ adam-model.workspace = true
 adam-model-oauth.workspace = true
 adam-model-openai.workspace = true
 adam-notify-postgres.workspace = true
+adam-postgres.workspace = true
 adam-runtime.workspace = true
 adam-store-postgres.workspace = true
 async-trait.workspace = true

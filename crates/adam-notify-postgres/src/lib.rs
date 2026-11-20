@@ -50,11 +50,11 @@
 //!
 //! [`PgNotify::run`] drives one publisher (a queue of 1024 drained with one
 //! `SELECT pg_notify(..)` statement per batch of up to [`MAX_BATCH_ITEMS`], in
-//! order) and one listener, until `stop` resolves. **The listener holds one
-//! connection of the pool for as long as `run` runs**, and `LISTEN` needs a
-//! session, so connect directly or through a session-mode pooler, not a
-//! transaction-mode one. The publisher never blocks the caller: a full queue
-//! drops the item.
+//! order) and one listener, until `stop` resolves. **The listener opens its own
+//! connection from the [`PgConfig`] it was built with** — a pooled client can
+//! never receive a notification — and `LISTEN` needs a session, so connect
+//! directly or through a session-mode pooler, not a transaction-mode one. The
+//! publisher never blocks the caller: a full queue drops the item.
 //!
 //! A process whose events no one else needs (`ROLE=all`, one pod) can keep them
 //! local: set `NOTIFY_LOCAL_ONLY` (`true`/`1`, default `false`) and
@@ -79,11 +79,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use adam_core::RunId;
+use adam_postgres::PgConfig;
 use adam_runtime::{BroadcastSink, Delivery, EventSink, LocalNotifier, Notifier, RunEvent, Signal};
 use async_trait::async_trait;
+use deadpool_postgres::Pool;
+use futures::future::poll_fn;
 use futures::stream::BoxStream;
-use sqlx::postgres::{PgListener, PgPool};
 use tokio::sync::{mpsc, watch};
+use tokio_postgres::{AsyncMessage, Client};
 use uuid::Uuid;
 
 use crate::wire::{Encoded, EventIn, SignalIn, WIRE_VERSION, encode_event, encode_signal};
@@ -130,7 +133,10 @@ struct Outgoing {
 
 #[derive(Debug)]
 struct Inner {
-    pool: PgPool,
+    /// The publisher's connections (`pg_notify`).
+    pool: Pool,
+    /// The listener's own connection: a pooled client would never see a notification.
+    pg: PgConfig,
     /// Where events of other processes are delivered.
     local: BroadcastSink,
     /// Tells our own events from those of others.
@@ -218,16 +224,21 @@ fn take_batch(first: Outgoing, outbox: &mut mpsc::Receiver<Outgoing>) -> Vec<Out
 }
 
 impl PgNotify {
-    /// Notifications over `pool`, delivering the events of other processes to
-    /// `local` (the sink the process's A2A backend subscribes to). Call
-    /// [`run`](Self::run) for anything to flow.
+    /// Notifications over `pool`, with the listener's connection built from `pg`, delivering the
+    /// events of other processes to `local` (the sink the process's A2A backend subscribes to).
+    /// Call [`run`](Self::run) for anything to flow.
+    ///
+    /// `pg` is the same [`PgConfig`] the store was built from, so `DATABASE_URL` is parsed once.
+    /// The listener needs a connection of its own: deadpool drives a connection as a `Future`,
+    /// which drops notifications, so a pooled client could never receive one.
     ///
     /// [`LOCAL_ONLY_ENV`] is read here, once: an unset variable is `false`, and
     /// [`local_only`](Self::local_only) overrides it.
-    pub fn new(pool: PgPool, local: BroadcastSink) -> Self {
+    pub fn new(pool: Pool, pg: PgConfig, local: BroadcastSink) -> Self {
         let (local_only, local_only_problem) = local_only_from_env();
         Self::build(
             pool,
+            pg,
             local,
             DEFAULT_PREFIX,
             Uuid::new_v4(),
@@ -248,6 +259,7 @@ impl PgNotify {
         }
         Ok(Self::build(
             self.inner.pool.clone(),
+            self.inner.pg.clone(),
             self.inner.local.clone(),
             prefix,
             self.inner.origin,
@@ -267,6 +279,7 @@ impl PgNotify {
     pub fn local_only(self, local_only: bool) -> Self {
         Self::build(
             self.inner.pool.clone(),
+            self.inner.pg.clone(),
             self.inner.local.clone(),
             &self.inner.prefix,
             self.inner.origin,
@@ -276,7 +289,8 @@ impl PgNotify {
     }
 
     fn build(
-        pool: PgPool,
+        pool: Pool,
+        pg: PgConfig,
         local: BroadcastSink,
         prefix: &str,
         origin: Uuid,
@@ -287,6 +301,7 @@ impl PgNotify {
         Self {
             inner: Arc::new(Inner {
                 pool,
+                pg,
                 local,
                 origin,
                 prefix: prefix.to_owned(),
@@ -350,8 +365,8 @@ impl PgNotify {
     /// (also through a clone), and with [`NotifyError::PoolClosed`] once the
     /// pool is closed.
     ///
-    /// The listener holds one connection of the pool for as long as this
-    /// runs. When `stop` resolves, the `pg_notify` in flight completes and the
+    /// The listener holds one connection of its own (outside the pool) for as
+    /// long as this runs. When `stop` resolves, the `pg_notify` in flight completes and the
     /// items still queued are sent for up to [`DRAIN_ON_STOP`] before `run`
     /// returns, so the events of a step that ended just before the stop still
     /// go out; what cannot be sent in that time is dropped (best effort, like
@@ -408,7 +423,7 @@ impl Drop for OutboxGuard<'_> {
 /// How a listener session ended.
 enum Session {
     Stopped,
-    Failed(sqlx::Error),
+    Failed(String),
 }
 
 impl Inner {
@@ -510,12 +525,16 @@ impl Inner {
         debug_assert!(!items.is_empty(), "a batch has at least one item");
         let (channels, payloads) = self.columns(items);
         let count = channels.len();
-        let sent = sqlx::query(
-            "SELECT pg_notify(channel, payload) FROM unnest($1::text[], $2::text[]) AS t(channel, payload)",
-        )
-        .bind(channels)
-        .bind(payloads)
-        .execute(&self.pool)
+        let sent: Result<u64, Box<dyn std::error::Error + Send + Sync>> = async {
+            let client = self.pool.get().await?;
+            let stmt = client
+                .prepare_cached(
+                    "SELECT pg_notify(channel, payload) \
+                     FROM unnest($1::text[], $2::text[]) AS t(channel, payload)",
+                )
+                .await?;
+            Ok(client.execute(&stmt, &[&channels, &payloads]).await?)
+        }
         .await;
         self.statements.fetch_add(1, Relaxed);
         match sent {
@@ -544,24 +563,22 @@ impl Inner {
         tokio::pin!(stop);
         let mut backoff = BACKOFF_START;
         loop {
+            // A closed pool is a shutdown: the publisher has nothing left to send on either.
+            if self.pool.is_closed() {
+                return Err(NotifyError::PoolClosed);
+            }
             let connect = async {
-                let mut listener = PgListener::connect_with(&self.pool).await?;
-                listener
-                    .listen_all([self.events_channel.as_str(), self.signals_channel.as_str()])
-                    .await?;
-                Ok::<_, sqlx::Error>(listener)
+                let (client, driver) = self.pg.connect_raw().await?;
+                Ok::<_, adam_core::StoreError>((client, driver))
             };
             let connected = tokio::select! {
                 () = &mut stop => return Ok(()),
                 connected = connect => connected,
             };
             let failure = match connected {
-                Ok(listener) => {
+                Ok((client, driver)) => {
                     let started = Instant::now();
-                    // LISTEN is active first, then subscribers catch up.
-                    self.listening.send_replace(true);
-                    self.fanout.resync();
-                    let session = self.session(listener, &mut stop).await;
+                    let session = self.session(client, driver, &mut stop).await;
                     self.listening.send_replace(false);
                     if started.elapsed() >= HEALTHY_AFTER {
                         backoff = BACKOFF_START;
@@ -571,9 +588,9 @@ impl Inner {
                         Session::Failed(e) => e,
                     }
                 }
-                Err(e) => e,
+                Err(e) => e.to_string(),
             };
-            if matches!(failure, sqlx::Error::PoolClosed) {
+            if self.pool.is_closed() {
                 return Err(NotifyError::PoolClosed);
             }
             tracing::warn!(error = %failure, retry_in = ?backoff, "notification listener lost, reconnecting");
@@ -585,24 +602,48 @@ impl Inner {
         }
     }
 
-    /// Receive notifications on one listener until it fails or `stop`.
+    /// `LISTEN` on both channels, then receive notifications on one connection until it fails or
+    /// `stop`. The connection is driven here, not by a spawned future: that future ignores
+    /// asynchronous messages.
     async fn session(
         &self,
-        mut listener: PgListener,
+        client: Client,
+        mut driver: adam_postgres::ConnectionDriver,
         stop: &mut (impl Future<Output = ()> + Unpin),
     ) -> Session {
+        let listen = format!(
+            "LISTEN {}; LISTEN {}",
+            self.events_channel, self.signals_channel
+        );
+        // The driver must be polled for the `LISTEN` response to arrive, so its future is polled
+        // beside the messages until it completes.
+        let listen = client.batch_execute(&listen);
+        tokio::pin!(listen);
+        let mut listening = false;
         loop {
             tokio::select! {
                 () = &mut *stop => return Session::Stopped,
-                received = listener.try_recv() => match received {
-                    Ok(Some(n)) => self.dispatch(n.channel(), n.payload()).await,
-                    // The connection dropped and sqlx has already replaced it
-                    // and listened again; what was sent in between is lost.
-                    Ok(None) => {
-                        tracing::warn!("notification connection was lost and re-established, resyncing");
+                result = &mut listen, if !listening => match result {
+                    Ok(()) => {
+                        // LISTEN is active first, then subscribers catch up.
+                        listening = true;
+                        self.listening.send_replace(true);
                         self.fanout.resync();
                     }
-                    Err(e) => return Session::Failed(e),
+                    Err(e) => return Session::Failed(e.to_string()),
+                },
+                message = poll_fn(|cx| driver.poll_message(cx)) => match message {
+                    Some(Ok(AsyncMessage::Notification(n))) => {
+                        self.dispatch(n.channel(), n.payload()).await;
+                    }
+                    Some(Ok(AsyncMessage::Notice(notice))) => {
+                        tracing::debug!(error = %notice, "notice on the notification connection");
+                    }
+                    // `AsyncMessage` is non-exhaustive; a future variant is not a notification.
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Session::Failed(e.to_string()),
+                    // The connection task ended: the session is gone, and what it missed with it.
+                    None => return Session::Failed("the notification connection closed".to_owned()),
                 },
             }
         }
@@ -702,7 +743,6 @@ mod tests {
 
     use adam_core::RunStatus;
     use futures::StreamExt;
-    use sqlx::postgres::PgPoolOptions;
 
     use super::*;
 
@@ -710,11 +750,13 @@ mod tests {
     /// touch the database. The explicit `local_only(false)` keeps an ambient
     /// `NOTIFY_LOCAL_ONLY` from changing what these tests measure.
     fn notify() -> (PgNotify, BroadcastSink) {
-        let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
-            .expect("lazy pool");
+        let pg = PgConfig::parse("postgres://nobody@127.0.0.1:1/none").expect("a URL");
+        let pool = pg.pool(2).expect("lazy pool");
         let local = BroadcastSink::default();
-        (PgNotify::new(pool, local.clone()).local_only(false), local)
+        (
+            PgNotify::new(pool, pg, local.clone()).local_only(false),
+            local,
+        )
     }
 
     fn progress(m: &str) -> RunEvent {
@@ -927,6 +969,7 @@ mod tests {
         let (n, _) = notify();
         let bad = PgNotify::build(
             n.inner.pool.clone(),
+            n.inner.pg.clone(),
             n.inner.local.clone(),
             "adam_",
             n.inner.origin,
@@ -1018,7 +1061,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_statement_is_counted_once_however_many_items_it_carried() {
         let (n, _) = notify();
-        n.inner.pool.close().await;
+        n.inner.pool.close();
         // The first failed statement is the big batch: it is the one the old item counter would
         // have swallowed (32, not 1), so the counters must still see one statement.
         let batch: Vec<Outgoing> = (0..MAX_BATCH_ITEMS)
