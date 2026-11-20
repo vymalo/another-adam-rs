@@ -35,7 +35,11 @@ port are `list_files`, `find_files` and `search_files`, then `read_file` and `re
 `edit_file`, then `apply_patch`: `tools::find` and `tools::files` still declare them (their descriptions are what the model reads, pinned by
 `tests/tool_specs.rs`) and `adam_code_tools::find` and `adam_code_tools::files` do them. What follows a write (the check
 epoch moved, "Run the checks again before you commit.", the note of a published scratch project) is the coder's
-`CodeWorkspace::after_write` in `src/tools/workspace.rs`, pinned by `tests/write_results.rs`. `Redactor::from_config` is the
+`CodeWorkspace::after_write` in `src/tools/workspace.rs`, pinned by `tests/write_results.rs`. The commands have their port,
+`CommandWorkspace`, which `ToolEnv` implements in the same file (the run's environment, `CHECK_TIMEOUT_SECS` and
+`CHECK_OUTPUT_TAIL_BYTES`, the kept files): `ToolEnv::run` and what a command shows and keeps (`tools::output`) are
+`adam_code_tools::commands` and `adam_code_tools::output`, while `run_command` and `run` are still declared and done here,
+pinned by `tests/command_results.rs`. `Redactor::from_config` is the
 coder's own trait, `RedactorFromConfig`, re-exported at the crate root.
 
 ```mermaid

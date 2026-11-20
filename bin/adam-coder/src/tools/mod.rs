@@ -152,16 +152,7 @@ pub use references::{References, ReferencesError, ReferencesSource};
 /// What a tool call returns.
 pub(crate) type Outcome = Result<ToolOutput, ToolError>;
 
-/// What a tool fails with when the run was cancelled under (or before) it.
-///
-/// The run is already `Failed` (`cancelled: ...`) by then and whatever the
-/// call returns is dropped, but the loop that called the tool goes on to the
-/// next call of the same model turn: the tools with effects outside the
-/// worktree ([`publish`]) therefore check [`ToolCtx::is_cancelled`] first and
-/// refuse with this.
-pub(crate) fn cancelled(what: &str) -> ToolError {
-    ToolError::Permanent(format!("cancelled: the run was cancelled; {what}"))
-}
+pub(crate) use adam_code_tools::commands::{cancelled, environment_error, run_error};
 
 /// The first pause between two tries for an environment that is not available now, doubled each time.
 const SLOT_PAUSE_START: Duration = Duration::from_secs(2);
@@ -559,10 +550,7 @@ impl ToolEnv {
         }
     }
 
-    /// [`run_in`](shell::run_in) for a tool (`keep`: the output is captured for `output::settle`,
-    /// which the caller then calls): the command runs in `session`, stopped when the run is
-    /// cancelled, and in a pod the time it ran is reported as the call's sandbox usage whatever its
-    /// end was (it exited, or a timeout or a cancel stopped it): ADR 0043.
+    /// [`commands::run`](adam_code_tools::commands::run) in the coder's workspace.
     pub(crate) async fn run(
         &self,
         ctx: &ToolCtx,
@@ -572,41 +560,7 @@ impl ToolEnv {
         tail_cap: usize,
         keep: bool,
     ) -> Result<shell::ShellOutcome, shell::RunError> {
-        let cancel = ctx.cancel_token();
-        let margin = self.redactor.margin();
-        let (outcome, ran) = if keep {
-            shell::run_captured(session, spec, timeout, tail_cap, margin, &cancel).await
-        } else {
-            shell::run_timed(session, spec, timeout, tail_cap, margin, &cancel).await
-        };
-        // A call that keeps nothing shows the tail of a long output: scrubbed here, with the bytes
-        // before it, so that a secret cut by the tail's start leaves no part of itself.
-        let outcome = outcome.map(|mut outcome| {
-            if !keep && !outcome.tail_raw.is_empty() {
-                let bytes = std::mem::take(&mut outcome.tail_raw);
-                let reaches_the_start = outcome.total <= bytes.len() as u64;
-                let raw = String::from_utf8_lossy(&bytes).into_owned();
-                let redactor = &self.redactor;
-                let scrub = |t: &str| redactor.scrub(t).into_owned();
-                // What was held reaches back to the start of the output: nothing was cut there,
-                // so it is scrubbed as it is; else its start is an edge, cut back.
-                let scrubbed = if reaches_the_start {
-                    scrub(&raw)
-                } else {
-                    adam_llm_agent::scrub_open_start(&raw, scrub, margin)
-                };
-                let mut start = scrubbed.len().saturating_sub(tail_cap.max(1));
-                while !scrubbed.is_char_boundary(start) {
-                    start += 1;
-                }
-                outcome.tail = scrubbed[start..].to_owned();
-            }
-            outcome
-        });
-        if let (Some(meter), Some(ran)) = (Meter::of(session), ran) {
-            meter.report_command(ctx, ran);
-        }
-        outcome
+        adam_code_tools::commands::run(self, ctx, session, spec, timeout, tail_cap, keep).await
     }
 
     /// One `ensure`, with the steps it reports shown as it goes. A cancel of the run stops the wait.
@@ -1388,26 +1342,6 @@ pub(crate) fn workspace_error(e: &WorkspaceError) -> ToolError {
     }
 }
 
-/// An environment failure as a tool error: worth retrying (it is not available now, too slow, lost),
-/// or a report to the model (the repository's configuration is wrong, the build failed). The end of
-/// a failed build's output is in the report.
-pub(crate) fn environment_error(redactor: &Redactor, e: &EnvError) -> ToolError {
-    // Journaled and shown to the model: a boundary, so the chain is flattened here, once.
-    let mut text = format!("the work environment: {}", report(e));
-    if let EnvError::Build { log_tail, .. } = e
-        && !log_tail.trim().is_empty()
-    {
-        text.push('\n');
-        text.push_str(log_tail.trim_end());
-    }
-    let text = redactor.scrub(&text).into_owned();
-    if e.is_retryable() {
-        ToolError::Transient(text)
-    } else {
-        ToolError::Permanent(text)
-    }
-}
-
 /// What the model is told when the environment of the run cannot be made and will not be made by
 /// asking again (a repository's `devcontainer.json` that is wrong, refused, or does not build).
 const BROKEN_ENVIRONMENT: &str = "\n\nThe environment is broken and stays broken until the person \
@@ -1449,15 +1383,6 @@ pub(crate) fn repository_file(path: &std::path::Path) -> String {
     match names.iter().position(|n| n.starts_with(".devcontainer")) {
         Some(at) => names[at..].join("/"),
         None => path.display().to_string(),
-    }
-}
-
-/// A command that did not run, as a tool error.
-pub(crate) fn run_error(redactor: &Redactor, e: &shell::RunError) -> ToolError {
-    match e {
-        shell::RunError::Prepare(e) => environment_error(redactor, e),
-        shell::RunError::Spawn(e) => ToolError::Transient(format!("cannot start the shell: {e}")),
-        shell::RunError::Cancelled => cancelled("the command was stopped"),
     }
 }
 

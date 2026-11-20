@@ -113,6 +113,17 @@ workspace as it is.
    **extends** it and takes a `Place` from the same `place()`, so a command and a file tool find a place and refuse a
    write the same way. Its guard (record what a command changed, undo it) is the workspace's: the person's directory
    records and undoes nothing. The conformance cases are `adam-code-tools-testkit`.
+   *Built 2026-11-20 (step 5b):* the commands' port, `adam_code_tools::commands::CommandWorkspace`, extends
+   `CodeWorkspace` with three required methods: `session` (where a command runs; the implementation reports it to the
+   call's usage), `limits` (`CommandLimits`: the timeout and the bytes of output shown) and `kept` (the `KeptOutputs` a long
+   output is kept in). It is additive: an implementation of `CodeWorkspace` alone is unchanged. The plumbing that
+   `run_command` and `run` share moved with it: `commands::run` (the body of the coder's `ToolEnv::run`, which now
+   delegates), `environment_error`, `run_error` and `cancelled`, and the coder's `tools::output` whole as `adam_code_tools::output`
+   (`settle` over the port, `timeout_of` over `CommandLimits`), behind thin wrappers in the coder, so no call site changed.
+   `ToolEnv` and the testkit's `DirWorkspace` (a local session, settable limits, `MemoryKept`) implement it and pass
+   `command_workspace_conformance!`; the pins of `tests/command_results.rs` and `tests/write_results.rs` pass unchanged.
+   `session_error` and its advice to call `rebuild_environment` stay the coder's. **Not yet:** the guard (what a command
+   changed, and its undo) and the tools themselves, step 5c; the trait's methods grow then.
 8. **Commands run as the person unless a sandbox says otherwise.** A local sandbox is an `Environment`: first a process
    tree that can be killed, then the operating system's own confinement where there is one. `describe` says what is not
    protected.
