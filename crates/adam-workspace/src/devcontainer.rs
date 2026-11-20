@@ -56,8 +56,8 @@ impl Devcontainer {
     ///
     /// `allowed_prefixes` are the prefixes the deployment allows (`RUN_POD_REPOSITORY_IMAGES`); each
     /// must end with `/` (a registry path) or `:` (a tag), so that a bare host cannot admit a
-    /// look-alike. An empty list refuses every image, which is the deployment that allows no
-    /// repository image at all.
+    /// look-alike. A prefix that does not is refused, not matched as a string. An empty list refuses
+    /// every image, which is the deployment that allows no repository image at all.
     ///
     /// # Errors
     ///
@@ -112,7 +112,7 @@ impl Devcontainer {
     /// does not set them. The lifecycle commands are not run by this slice, so they are listed as
     /// well.
     pub fn ignored(&self) -> Vec<&'static str> {
-        const IGNORED: [&str; 20] = [
+        const IGNORED: [&str; 22] = [
             "initializeCommand",
             "onCreateCommand",
             "updateContentCommand",
@@ -133,6 +133,8 @@ impl Devcontainer {
             "workspaceFolder",
             "remoteUser",
             "containerUser",
+            "updateRemoteUserUID",
+            "hostRequirements",
         ];
         IGNORED
             .into_iter()
@@ -416,6 +418,23 @@ fn check_image(image: &str, allowed: &[String]) -> Result<String, EnvError> {
              (RUN_POD_REPOSITORY_IMAGES is empty)"
         )));
     }
+    // A prefix is matched on a path boundary: `ghcr.io/acme/` admits `ghcr.io/acme/dev` and not
+    // `ghcr.io/acme.evil/dev`, and `ghcr.io/acme/tool:` admits a tag of that one repository. A
+    // prefix that does not end with `/` or `:` is a bare host or repository name, and matching it
+    // as a string would admit a look-alike; the deployment's value is refused instead of trusted.
+    let malformed: Vec<String> = allowed
+        .iter()
+        .filter(|prefix| !is_prefix(prefix))
+        .cloned()
+        .collect();
+    if !malformed.is_empty() {
+        return Err(refused(format!(
+            "this deployment's image prefixes are not usable ({}): each must end with `/` (a \
+             registry path) or `:` (a tag), so that a bare host cannot admit a look-alike; ask the \
+             person who runs this deployment",
+            prefixes(&malformed)
+        )));
+    }
     if !allowed.iter().any(|prefix| image.starts_with(prefix)) {
         return Err(refused(format!(
             "the image `{image}` is outside the prefixes this deployment allows ({}): build and \
@@ -424,6 +443,15 @@ fn check_image(image: &str, allowed: &[String]) -> Result<String, EnvError> {
         )));
     }
     Ok(image.to_owned())
+}
+
+/// Whether `prefix` ends on a path boundary: a registry path (`ghcr.io/acme/`) or a tag
+/// (`ghcr.io/acme/tool:`). A bare host, a repository name or an empty string does not, and matching
+/// it as a string prefix would admit a look-alike.
+fn is_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && !prefix.chars().any(char::is_whitespace)
+        && (prefix.ends_with('/') || prefix.ends_with(':'))
 }
 
 #[cfg(test)]
@@ -734,11 +762,98 @@ mod tests {
         );
     }
 
+    /// ADR 0052: a prefix is matched on a path boundary. A caller that hands the reader a bare
+    /// host (`ghcr.io/acme`, not `ghcr.io/acme/`) must not get a look-alike admitted: the prefix is
+    /// refused rather than matched as a string, and the image that really is under it is refused
+    /// with it (the deployment's value is wrong, and the reader fails closed).
+    #[test]
+    fn a_prefix_that_is_a_bare_host_is_refused_instead_of_admitting_a_look_alike() {
+        for image in ["ghcr.io/acme.evil/dev:1", "ghcr.io/acme/dev:1"] {
+            let slot = slot_with(&[(".devcontainer.json", &format!(r#"{{"image":"{image}"}}"#))]);
+            let error = read(slot.path(), None)
+                .unwrap()
+                .image(&["ghcr.io/acme".to_owned()])
+                .unwrap_err();
+            assert!(matches!(error, EnvError::Refused(_)), "{image}: {error}");
+            assert!(
+                error.to_string().contains("not usable")
+                    && error.to_string().contains("ghcr.io/acme")
+                    && error.to_string().contains("look-alike"),
+                "{image}: {error}"
+            );
+        }
+        // The same image under the path prefix the deployment should have written.
+        let slot = slot_with(&[(".devcontainer.json", r#"{"image":"ghcr.io/acme/dev:1"}"#)]);
+        assert_eq!(
+            read(slot.path(), None)
+                .unwrap()
+                .image(&["ghcr.io/acme/".to_owned()])
+                .unwrap(),
+            "ghcr.io/acme/dev:1"
+        );
+        // An empty prefix would be a string prefix of every image.
+        let error = read(slot.path(), None)
+            .unwrap()
+            .image(&[String::new()])
+            .unwrap_err();
+        assert!(error.to_string().contains("not usable"), "{error}");
+    }
+
+    #[test]
+    fn a_case_variant_or_another_path_of_the_same_host_is_not_admitted() {
+        for image in [
+            "GHCR.IO/acme/dev:1",
+            "ghcr.io/Acme/dev:1",
+            "ghcr.io/acme-evil/dev:1",
+            "ghcr.io/acme/dev/../evil:1",
+            "localhost:5000/team/dev:1",
+        ] {
+            let said = refusal(&format!(r#"{{"image":"{image}"}}"#));
+            assert!(
+                said.contains("outside the prefixes") || said.contains("is a path"),
+                "{image}: {said}"
+            );
+        }
+        let slot = slot_with(&[(
+            ".devcontainer.json",
+            r#"{"image":"localhost:5000/team/dev:1"}"#,
+        )]);
+        assert_eq!(
+            read(slot.path(), None)
+                .unwrap()
+                .image(&["localhost:5000/team/".to_owned()])
+                .unwrap(),
+            "localhost:5000/team/dev:1"
+        );
+        let slot = slot_with(&[(
+            ".devcontainer.json",
+            r#"{"image":"localhost:5000/other/dev:1"}"#,
+        )]);
+        assert!(
+            read(slot.path(), None)
+                .unwrap()
+                .image(&["localhost:5000/team/".to_owned()])
+                .is_err(),
+            "another path of the same registry is outside the prefix"
+        );
+    }
+
+    #[test]
+    fn an_image_beside_a_build_is_refused_too() {
+        for content in [
+            r#"{"image":"ghcr.io/acme/dev:1","build":{"dockerfile":"Dockerfile"}}"#,
+            r#"{"image":"ghcr.io/acme/dev:1","features":{"ghcr.io/devcontainers/features/node:1":{}}}"#,
+        ] {
+            let said = refusal(content);
+            assert!(said.contains("builds its image"), "{content}: {said}");
+        }
+    }
+
     #[test]
     fn the_keys_a_run_pod_ignores_are_listed() {
         let slot = slot_with(&[(
             ".devcontainer.json",
-            r#"{"image":"ghcr.io/acme/dev:1","remoteUser":"vscode","privileged":true,"mounts":[],"containerEnv":{"A":"b"},"postCreateCommand":"make","runArgs":["--init"]}"#,
+            r#"{"image":"ghcr.io/acme/dev:1","remoteUser":"vscode","privileged":true,"mounts":[],"containerEnv":{"A":"b"},"postCreateCommand":"make","runArgs":["--init"],"updateRemoteUserUID":true,"hostRequirements":{"cpus":4}}"#,
         )]);
         let found = read(slot.path(), None).unwrap();
         assert_eq!(
@@ -749,7 +864,9 @@ mod tests {
                 "privileged",
                 "runArgs",
                 "mounts",
-                "remoteUser"
+                "remoteUser",
+                "updateRemoteUserUID",
+                "hostRequirements"
             ]
         );
         let plain = slot_with(&[(".devcontainer.json", r#"{"image":"ghcr.io/acme/dev:1"}"#)]);
