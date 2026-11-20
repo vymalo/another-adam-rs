@@ -3981,10 +3981,10 @@ async fn another_caller_cannot_see_or_resume_the_task(store: DynStore) {
 
 // ------------------------------------------------------- asking with choices
 
-/// The screen's catalog (the web's, version 2: Text, Column, Choices): the copy `adam-ui` pins.
-const CATALOG: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.json");
+/// The screen's catalog (the web's, version 9): the copy `adam-ui` pins.
+const CATALOG: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v9.json");
 const CATALOG_LOCK: &str =
-    include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.lock.json");
+    include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v9.lock.json");
 const UI_CATALOG_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/ui-catalog/v2";
 const THREAD_TOOLS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/thread-tools/v1";
 
@@ -4035,6 +4035,12 @@ fn answers_to(task: &str, surface: &str, answers: serde_json::Value) -> Message 
     )]));
     let mut message = Message::new(Role::User, vec![part]);
     message.task_id = Some(task.to_owned());
+    // Every message of the screen says what it offers: an answer turn that did not would be in words.
+    let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    message.metadata = Some(std::collections::HashMap::from([(
+        "a2uiRendererCapabilities".to_owned(),
+        json!({"1.0": {"supportedCatalogIds": [catalog["catalogId"].clone()]}}),
+    )]));
     message
 }
 
@@ -4422,16 +4428,19 @@ async fn another_repository_joins_the_workspace_when_the_person_says_yes_on_the_
     assert_eq!(parts.len(), 2, "the question and its form: {parts:?}");
     let text = parts[0].as_text().unwrap();
     assert!(
-        text.contains("May I add the repository library")
-            && text.contains(&library_url)
-            && text.contains(
-                "The agent says why: \"the shared greeting lives in greeting.txt there\""
-            ),
+        text.contains("May I add the repository library") && text.contains(&library_url),
         "{text}"
     );
     let a2a::PartContent::Data(surface) = &parts[1].content else {
         panic!("the second part is the form: {parts:?}");
     };
+    // The screen's `Choices` has a description: the reason is drawn there, not folded into the words.
+    assert!(
+        surface
+            .to_string()
+            .contains(r#"The agent says why: \"the shared greeting lives in greeting.txt there\""#),
+        "{surface}"
+    );
     let choices = &surface[1]["updateComponents"]["components"][0];
     assert_eq!(choices["component"], "Choices");
     assert_eq!(choices["questions"][0]["id"], "consent");
