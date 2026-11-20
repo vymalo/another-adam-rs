@@ -23,7 +23,8 @@ receiver of an answer is tested with, under the keys `vectors` (133 cases), `who
 holds each case to the tool and puts it in a class (same result, made impossible by construction, only the web can know, not
 about a question), and fails when a case is deleted or moves class.
 
-`checklist-subset-v6.json` and `checklist-subset-v8.json` are **hand-written subsets** of the catalog's versions 6 and 8, for the
+`checklist-subset-v6.json` and `checklist-subset-v8.json` are **hand-written subsets** of the catalog's versions 6 and 8 (as
+`ui-catalog/v2` documents: they carry `protocolVersion`), for the
 plan's tests. Each holds `Text` and `Column` (copied from version 5) and a `Checklist` (`items` of `{label, state}`, `state` one
 of `done`, `doing`, `todo`, `failed`; `title`; 1 to 50 items; label at most 200 characters). The version 8 subset is the variant
 whose `Checklist` also allows the state `dropped` and an item `note`. Their digests are the canonical-JSON digests of the

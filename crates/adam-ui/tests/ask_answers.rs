@@ -36,13 +36,17 @@ struct Screen {
 
 fn screen(document: &str, lock: &str) -> Screen {
     let lock: Value = serde_json::from_str(lock).unwrap();
+    // The published catalogs of versions 2 to 8 have no `protocolVersion`; the screen sends them as
+    // `ui-catalog/v2` documents (the digest is of what is sent).
+    let mut document: Value = serde_json::from_str(document).unwrap();
+    document["protocolVersion"] = json!("1.0");
     Screen {
-        document: serde_json::from_str(document).unwrap(),
         claimed: Claimed {
             catalog_id: CATALOG_ID.to_owned(),
             version: u32::try_from(lock["version"].as_u64().unwrap()).unwrap(),
-            digest: lock["digest"].as_str().unwrap().to_owned(),
+            digest: adam_ui::catalog_digest(&document).unwrap(),
         },
+        document,
     }
 }
 
@@ -617,6 +621,43 @@ async fn the_same_answer_is_refused_the_same_way_every_time() {
         again.ui.unwrap()[0]["createSurface"]["surfaceId"],
         "ask-c1.r2"
     );
+}
+
+/// A form is asked again on a new surface only when every operation of the interface it copies says the
+/// version adam writes. One from before the cutover is judged the same way, but the question comes back in
+/// words: its operations are never copied into a new surface or edited into the current version.
+#[tokio::test]
+async fn a_form_from_before_the_cutover_is_asked_again_in_words_not_on_a_new_surface() {
+    let (tool, args, ui) = asked_with_v7().await;
+    let bad = payload(
+        "ask-c1",
+        json!({"answers": with("budget", json!(["1500"]))}),
+    );
+    let current = |ui: &Value| match tool.read_answer("c1", &args, Some(ui), &bad) {
+        AnswerCheck::Refuse(refusal) => refusal,
+        other => panic!("refused: {other:?}"),
+    };
+    // As it was drawn: every operation says "1.0" and the question comes back on `.r1`.
+    assert!(current(&ui).ui.is_some());
+    // One operation that does not say "1.0", whatever it says instead, and then all of them.
+    for (what, changed) in [
+        ("the pre-cutover version", json!("v0.9.1")),
+        ("0.9", json!("0.9")),
+        ("a number", json!(1)),
+        ("none", Value::Null),
+    ] {
+        let mut old = ui.clone();
+        old[1]["version"] = changed;
+        let words = current(&old);
+        assert!(words.ui.is_none(), "{what}: not copied");
+        assert_eq!(words.rule, "above_max", "{what}: judged as before");
+        assert!(words.question.contains("1500 is above the most"), "{what}");
+    }
+    let mut every = ui.clone();
+    for operation in every.as_array_mut().unwrap() {
+        operation["version"] = json!("v0.9.1");
+    }
+    assert!(current(&every).ui.is_none());
 }
 
 #[tokio::test]

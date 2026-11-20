@@ -20,7 +20,7 @@ use adam_mcp::McpPolicy;
 use adam_mcp_testkit::ThreadToolsServer;
 use adam_model::{MockModel, ModelRequest, ToolCall};
 use adam_runtime::{BroadcastSink, Runtime};
-use adam_ui::{Claimed, Ui};
+use adam_ui::{Claimed, Ui, catalog_digest};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -29,8 +29,16 @@ const FIXTURE: &str = include_str!("fixtures/catalog-v2.json");
 const LOCK: &str = include_str!("fixtures/catalog-v2.lock.json");
 const SECRET: &str = "sekret-token-4f1c9a";
 
-fn document() -> Value {
+/// The catalog as the web published it, with no `protocolVersion` (versions 2 to 8).
+fn published() -> Value {
     serde_json::from_str(FIXTURE).unwrap()
+}
+
+/// The catalog as a screen sends it now: a `ui-catalog/v2` document.
+fn document() -> Value {
+    let mut document = published();
+    document["protocolVersion"] = json!("1.0");
+    document
 }
 
 fn claimed() -> Claimed {
@@ -38,7 +46,7 @@ fn claimed() -> Claimed {
     Claimed {
         catalog_id: CATALOG_ID.to_owned(),
         version: u32::try_from(lock["version"].as_u64().unwrap()).unwrap(),
-        digest: lock["digest"].as_str().unwrap().to_owned(),
+        digest: catalog_digest(&document()).unwrap(),
     }
 }
 

@@ -37,13 +37,17 @@ struct Screen {
 
 fn screen(document: &str, lock: &str) -> Screen {
     let lock: Value = serde_json::from_str(lock).unwrap();
+    // The published catalogs of versions 2 to 8 have no `protocolVersion`; the screen sends them as
+    // `ui-catalog/v2` documents (the digest is of what is sent).
+    let mut document: Value = serde_json::from_str(document).unwrap();
+    document["protocolVersion"] = json!("1.0");
     Screen {
-        document: serde_json::from_str(document).unwrap(),
         claimed: Claimed {
             catalog_id: CATALOG_ID.to_owned(),
             version: u32::try_from(lock["version"].as_u64().unwrap()).unwrap(),
-            digest: lock["digest"].as_str().unwrap().to_owned(),
+            digest: adam_ui::catalog_digest(&document).unwrap(),
         },
+        document,
     }
 }
 

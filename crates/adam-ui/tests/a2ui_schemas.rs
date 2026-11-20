@@ -12,8 +12,13 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use adam_ui::catalog_digest;
+use adam_a2a::A2UI_MEDIA_TYPE;
+use adam_a2a_runtime::{CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
+use adam_llm_agent::{ToolCtx, ToolError};
+use adam_runtime::NoopSink;
+use adam_ui::{Ui, catalog_digest};
 use jsonschema::{Registry, Resource};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -97,7 +102,6 @@ fn validator_for(document: &Value, catalog: &Value) -> jsonschema::Validator {
         .unwrap_or_else(|e| panic!("the schema compiles: {e}"))
 }
 
-#[allow(dead_code)]
 fn errors(validator: &jsonschema::Validator, instance: &Value) -> Vec<String> {
     validator
         .iter_errors(instance)
@@ -213,4 +217,153 @@ fn the_digest_vector_of_ui_catalog_v2_is_pinned() {
         catalog_digest(&input).unwrap(),
         "sha256:9fdab0c5c2094871cfb01d15046f206f3460341960ddcee4767e2bd33ab8e8f8"
     );
+}
+
+// ---- what adam writes validates against agent_to_renderer.json
+
+/// The validator of the messages the agent sends, with catalog 9 standing for the catalog in use.
+fn agent_to_renderer() -> jsonschema::Validator {
+    validator_for(&schema("agent_to_renderer.json"), &catalog_nine())
+}
+
+/// Every operation of `surface` (the array of messages a tool wrote) must be valid, say "1.0" and be
+/// a `createSurface` or an `updateComponents` (the only two messages adam writes).
+fn assert_valid_surface(validator: &jsonschema::Validator, what: &str, surface: &Value) {
+    let operations = surface
+        .as_array()
+        .unwrap_or_else(|| panic!("{what}: not an array"));
+    assert!(!operations.is_empty(), "{what}");
+    for operation in operations {
+        let found = errors(validator, operation);
+        assert!(found.is_empty(), "{what}: {operation}\n{found:#?}");
+        assert_eq!(operation["version"], json!("1.0"), "{what}");
+        let keys: Vec<&str> = operation
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .filter(|k| *k != "version")
+            .collect();
+        assert!(
+            matches!(keys.as_slice(), ["createSurface"] | ["updateComponents"]),
+            "{what}: {keys:?}"
+        );
+    }
+}
+
+/// Every golden that holds a surface (a list of A2UI operations) validates, and says `"1.0"`. The goldens
+/// that are one component (`ask_form_v5.json`, `ask_form_v7.json`) are validated as the component of
+/// catalog 9 their `component` names.
+#[test]
+fn every_golden_validates_against_agent_to_renderer_with_catalog_nine() {
+    let validator = agent_to_renderer();
+    let catalog = adam_ui::Catalog::from_document(
+        catalog_nine(),
+        &adam_ui::Claimed {
+            catalog_id: catalog_nine()["catalogId"].as_str().unwrap().to_owned(),
+            version: 9,
+            digest: catalog_digest(&catalog_nine()).unwrap(),
+        },
+    )
+    .unwrap();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let mut surfaces = 0;
+    let mut components = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let golden: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if golden.is_array() {
+            assert_valid_surface(&validator, &name, &golden);
+            surfaces += 1;
+        } else {
+            catalog
+                .validate(&golden)
+                .unwrap_or_else(|why| panic!("{name}: {why}"));
+            components += 1;
+        }
+    }
+    assert_eq!((surfaces, components), (5, 2), "the goldens of this crate");
+}
+
+fn screen_context() -> serde_json::Map<String, Value> {
+    let catalog = catalog_nine();
+    let reference = json!({
+        "catalogId": catalog["catalogId"], "version": 9, "digest": catalog_digest(&catalog).unwrap()});
+    let mut inline = reference.clone();
+    inline["catalog"] = catalog;
+    json!({CONTEXT_UI_REF: reference, CONTEXT_UI_CATALOG: inline})
+        .as_object()
+        .cloned()
+        .unwrap()
+}
+
+async fn call(name: &str, args: Value) -> Result<adam_llm_agent::ToolOutput, ToolError> {
+    let ui = Ui::embedded();
+    let tool = ui.tools().get(name).cloned().unwrap();
+    tool.call(
+        &ToolCtx::detached(name, "call-1", Arc::new(NoopSink)).with_context(screen_context()),
+        args,
+    )
+    .await
+}
+
+/// Fresh output of the three tools that draw — `ask_user`, `show` and `plan_work` — on a screen with
+/// catalog 9 validates, so a change to a writer that the goldens do not cover is caught too.
+#[tokio::test]
+async fn fresh_ask_show_and_plan_output_validates_against_agent_to_renderer() {
+    let validator = agent_to_renderer();
+
+    let questions = json!({
+        "question": "Before I ship.",
+        "choices": [
+            {"id": "plan", "question": "Which layout?", "options": ["A", "B"],
+             "show": [
+                {"component": "Text", "text": "Two layouts fit."},
+                {"component": "Mermaid", "code": "graph TD; A-->B"},
+                {"component": "Code", "code": "let x = 1;", "language": "rust"}]},
+            {"id": "risk", "question": "Go on?", "type": "confirm",
+             "show": [
+                {"component": "Cards", "cards": [{"title": "Option A"}, {"title": "Option B"}]},
+                {"component": "Callout", "tone": "warning", "title": "Heads up", "text": "This cannot be undone."},
+                {"component": "Chart", "type": "bar", "labels": ["Mon", "Tue"], "series": [{"name": "Runs", "values": [3, 4]}]}]},
+            {"id": "n", "question": "How many?", "type": "number"},
+            {"id": "when", "question": "When?", "type": "date"}
+        ]
+    });
+    match call("ask_user", questions).await {
+        Err(ToolError::NeedsInput { ui: Some(ui), .. }) => {
+            assert_valid_surface(&validator, "ask_user", &ui);
+        }
+        other => panic!("ask_user should park with a form: {other:?}"),
+    }
+
+    let shown = call(
+        "show",
+        json!({"blocks": [
+            {"component": "Text", "text": "Three sources agree."},
+            {"component": "Cards", "title": "Sources", "layout": "list",
+             "cards": [{"title": "Tokio", "body": "The runtime."}]},
+            {"component": "Mermaid", "code": "graph TD; A-->B"}]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(shown.artifacts.len(), 1);
+    assert_eq!(
+        shown.artifacts[0].mime_type.as_deref(),
+        Some(A2UI_MEDIA_TYPE)
+    );
+    assert_valid_surface(&validator, "show", &shown.artifacts[0].data);
+
+    let plan = call(
+        "plan_work",
+        json!({"title": "Fix the date parser", "items": ["Reproduce it", "Fix it", "Open the pull request"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.artifacts.len(), 1);
+    assert_valid_surface(&validator, "plan_work", &plan.artifacts[0].data);
 }

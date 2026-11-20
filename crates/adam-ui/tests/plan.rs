@@ -41,17 +41,21 @@ impl Fixture {
     /// The context of a message that carried this catalog inline.
     fn context(&self) -> Map<String, Value> {
         let lock: Value = serde_json::from_str(self.lock).unwrap();
+        // The published version 5 has no `protocolVersion` (the subsets do): a screen sends a
+        // `ui-catalog/v2` document, and the digest is of what is sent.
+        let mut document: Value = serde_json::from_str(self.document).unwrap();
+        document["protocolVersion"] = json!("1.0");
         let claimed = Claimed {
             catalog_id: CATALOG_ID.to_owned(),
             version: u32::try_from(lock["version"].as_u64().unwrap()).unwrap(),
-            digest: lock["digest"].as_str().unwrap().to_owned(),
+            digest: adam_ui::catalog_digest(&document).unwrap(),
         };
         let reference = json!({"catalogId": claimed.catalog_id, "version": claimed.version, "digest": claimed.digest});
         json!({
             CONTEXT_UI_REF: reference,
             CONTEXT_UI_CATALOG: {
                 "catalogId": claimed.catalog_id, "version": claimed.version, "digest": claimed.digest,
-                "catalog": serde_json::from_str::<Value>(self.document).unwrap()},
+                "catalog": document},
         })
         .as_object()
         .cloned()
@@ -697,6 +701,7 @@ async fn a_blank_title_is_no_title_and_the_limits_are_exact() {
 fn changed(base: &Fixture, edit: impl FnOnce(&mut Value)) -> Map<String, Value> {
     let lock: Value = serde_json::from_str(base.lock).unwrap();
     let mut document: Value = serde_json::from_str(base.document).unwrap();
+    document["protocolVersion"] = json!("1.0");
     edit(&mut document);
     let digest = adam_ui::catalog_digest(&document).unwrap();
     let version = lock["version"].as_u64().unwrap();

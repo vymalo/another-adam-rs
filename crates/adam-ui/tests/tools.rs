@@ -17,8 +17,16 @@ const CATALOG_ID: &str = "https://agents.vymalo.com/a2ui/catalogs/chat";
 const FIXTURE: &str = include_str!("fixtures/catalog-v2.json");
 const LOCK: &str = include_str!("fixtures/catalog-v2.lock.json");
 
-fn document() -> Value {
+/// The catalog as the web published it, with no `protocolVersion` (versions 2 to 8).
+fn published() -> Value {
     serde_json::from_str(FIXTURE).unwrap()
+}
+
+/// The catalog as a screen sends it now: a `ui-catalog/v2` document.
+fn document() -> Value {
+    let mut document = published();
+    document["protocolVersion"] = json!("1.0");
+    document
 }
 
 fn claimed() -> Claimed {
@@ -26,7 +34,7 @@ fn claimed() -> Claimed {
     Claimed {
         catalog_id: CATALOG_ID.to_owned(),
         version: u32::try_from(lock["version"].as_u64().unwrap()).unwrap(),
-        digest: lock["digest"].as_str().unwrap().to_owned(),
+        digest: catalog_digest(&document()).unwrap(),
     }
 }
 
@@ -123,10 +131,11 @@ fn text_of(result: Result<ToolOutput, ToolError>) -> ToolOutput {
 #[test]
 fn the_web_catalog_hashes_to_its_lock_and_every_component_compiles() {
     let c = claimed();
+    let lock: Value = serde_json::from_str(LOCK).unwrap();
     assert_eq!(
-        catalog_digest(&document()).unwrap(),
-        c.digest,
-        "adam's digest is the web's"
+        catalog_digest(&published()).unwrap(),
+        lock["digest"],
+        "adam's digest of the published file is the web's"
     );
     let catalog = Catalog::from_document(document(), &c).unwrap();
     assert_eq!(catalog.names(), "Choices, Column, Text");
@@ -263,8 +272,7 @@ async fn on_a_screen_that_cannot_draw_it_the_options_go_in_the_text() {
     );
     assert_eq!((question.as_str(), interface), (expected, None));
     // A catalog without a Choices component (an older screen).
-    let text_only =
-        json!({"catalogId": CATALOG_ID, "components": {"Text": document()["components"]["Text"]}});
+    let text_only = json!({"catalogId": CATALOG_ID, "protocolVersion": "1.0", "components": {"Text": document()["components"]["Text"]}});
     let c = Claimed {
         catalog_id: CATALOG_ID.into(),
         version: 1,

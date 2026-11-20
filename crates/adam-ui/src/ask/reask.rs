@@ -17,7 +17,7 @@ use super::shown;
 use super::{
     Args, Form, Kind, MAX_LONG_TEXT, MAX_TEXT, clipped, kinds, lead_with_description, normalize,
 };
-use crate::surface::{ask_attempt, ask_retry_surface_id};
+use crate::surface::{A2UI_VERSION, ask_attempt, ask_retry_surface_id};
 
 /// The longest words of a question quoted back to the person.
 pub(super) const QUOTED_QUESTION: usize = 80;
@@ -320,7 +320,9 @@ fn ask_again(
     let surface = ask_retry_surface_id(call_id, attempt);
     set_surface(&mut asked, &surface);
     carry_answers(&mut asked, drawn, context, &verdict.valid);
-    let asked = fits(&mut asked, form).then_some(asked);
+    // A form from before the cutover (an operation that does not say `A2UI_VERSION`) is asked again in words:
+    // its operations are copied, never edited into the current version.
+    let asked = (is_current(ui) && fits(&mut asked, form)).then_some(asked);
     let refusal = Refusal::new(format!("{said}\n{lead}"), asked, rule);
     match &verdict.question {
         Some(id) => refusal.about(id.clone()),
@@ -355,6 +357,16 @@ fn fits(asked: &mut Value, form: &Form) -> bool {
         }
     }
     shown::check_size(asked).is_ok()
+}
+
+/// Whether every operation of the interface says [`A2UI_VERSION`].
+fn is_current(ui: &Value) -> bool {
+    ui.as_array().is_some_and(|messages| {
+        !messages.is_empty()
+            && messages
+                .iter()
+                .all(|m| m.get("version").and_then(Value::as_str) == Some(A2UI_VERSION))
+    })
 }
 
 /// The id of the surface the interface creates.

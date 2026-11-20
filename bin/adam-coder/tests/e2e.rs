@@ -3993,7 +3993,11 @@ const THREAD_TOOLS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/t
 /// tools when there is one.
 fn from_the_screen(text: &str, inline: bool, grant: Option<serde_json::Value>) -> Message {
     let lock: serde_json::Value = serde_json::from_str(CATALOG_LOCK).unwrap();
-    let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    let mut catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    // A screen sends a `ui-catalog/v2` document: the published version 2 gets `protocolVersion`, and the
+    // digest is of what is sent.
+    catalog["protocolVersion"] = json!("1.0");
+    let digest = adam_ui::catalog_digest(&catalog).unwrap();
     let id = catalog["catalogId"].clone();
     let mut capabilities = json!({"supportedCatalogIds": [id.clone()]});
     if inline {
@@ -4001,7 +4005,7 @@ fn from_the_screen(text: &str, inline: bool, grant: Option<serde_json::Value>) -
     }
     let mut metadata = json!({
         UI_CATALOG_EXTENSION: {
-            "catalogId": id, "version": lock["version"], "digest": lock["digest"], "inline": inline},
+            "catalogId": id, "version": lock["version"], "digest": digest, "inline": inline},
         "a2uiClientCapabilities": {"v0.9.1": capabilities},
     });
     if let Some(grant) = grant {
@@ -4209,12 +4213,14 @@ async fn the_catalog_is_read_again_over_the_thread_tools_and_their_tools_are_off
     store: DynStore,
 ) {
     let lock: serde_json::Value = serde_json::from_str(CATALOG_LOCK).unwrap();
-    let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    let mut catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    catalog["protocolVersion"] = json!("1.0");
+    let digest = adam_ui::catalog_digest(&catalog).unwrap();
     let thread = adam_mcp_testkit::ThreadToolsServer::start(&["thread-token"]).await;
     thread.set_catalog(Some((
         catalog["catalogId"].as_str().unwrap(),
         lock["version"].as_u64().unwrap(),
-        lock["digest"].as_str().unwrap(),
+        &digest,
         catalog.clone(),
     )));
     thread.add_tool(

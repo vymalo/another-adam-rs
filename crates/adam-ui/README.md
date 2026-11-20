@@ -37,7 +37,7 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 | `Catalog`, `Claimed`, `Component`, `CatalogError`, `canonical_json`, `catalog_digest` | a catalog read and checked against the digest it claims; `validate(instance)` against a component's schema; the canonical form and the digest of [the contract](https://github.com/vymalo/another-agentic-system/blob/main/docs/api/ui-catalog-v1.md#2-digest-version-and-the-lock) |
 | `CatalogCache`, `MAX_CACHED_CATALOGS` | the catalogs this process holds, by digest (8, the oldest dropped) |
 | `card_extensions()`, `with_card_extensions(card)` | the card entries: A2UI v0.9.1 (`acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1` (the host's promise that a message sent to a running task is read and never lost; `adam-llm-agent` keeps it) |
-| `A2UI_VERSION` | `v0.9.1`: the version the surfaces are written for |
+| `A2UI_VERSION` | `1.0`: the A2UI version the surfaces are written for (every operation says it in `version`) and the `protocolVersion` a catalog must have |
 | `ask_surface_id(call_id)` | the id of the surface `ask_user` draws its form on for a call: `ask-` and the call's id as an identifier (at most 64 characters). A form's answer names it (`(form ask-<id>)`), so a host that holds the call can tell whether the answer is for the question it asked |
 | `ask_retry_surface_id(call_id, n)`, `ask_attempt(surface)`, `is_ask_surface_of(call_id, surface)` | the surface of a form asked again after its answer was refused (`ask-<id>.r<n>`, still at most 64 characters after `ask-`), how many times a surface was asked again, and whether a surface is a call's form or one of its re-asks |
 | `comparable(text)`, `is_format_or_control(c)` (re-exported from `adam-a2a-runtime`, which marks typed lines with them) | `text` as it is compared with a typed question's default: without whitespace and without control or format characters (U+FEFF, the zero-width and bidirectional marks), in lowercase; the characters are those of Unicode categories Cc and Cf (*verified 2026-10-11*, Python 3's `unicodedata`, Unicode 14.0, widened for later versions) |
@@ -372,11 +372,17 @@ stateDiagram-v2
     Unreadable --> Text: the tools degrade to text, the run goes on
 ```
 
-* **The digest is checked, always.** A catalog is `{catalogId, components}`; its digest is `sha256:` and the hex of
+* **The digest is checked, always.** A catalog is `{catalogId, protocolVersion, components}`
+  ([`ui-catalog/v2`](https://github.com/vymalo/another-agentic-system/blob/66db4ee5c885c12f28367a4c623f9c97c38e0930/docs/api/ui-catalog-v2.md)):
+  exactly those three members, `protocolVersion` equal to `A2UI_VERSION`. A catalog with another value, or none (a catalog of
+  version 8 or before), is refused with `CatalogError::ProtocolVersion`; an extra member is `CatalogError::Shape`. Its digest is `sha256:` and the hex of
   SHA-256 over its canonical JSON (keys sorted, no whitespace, whole numbers as integers; ASCII keys and whole
   numbers only, otherwise it is refused). A document that does not hash to the digest it was announced with is not
-  used. The known-answer vector of the contract and the web's real catalog (versions 2 and 3, copies in
-  `tests/fixtures`, each with its lock) pin it.
+  used. The known-answer vector of `ui-catalog/v2` (`sha256:9fdab0c5…`, a unit test of `src/catalog.rs` and `tests/a2ui_schemas.rs`)
+  and the web's real catalogs (versions 2 to 9, copies in `tests/fixtures`, each with its lock; only 9 is a v2 document, the tests
+  give the others a `protocolVersion` and the digest of what is sent) pin it.
+* **A form asked again** (`src/ask/reask.rs`) goes out on a new surface only when every operation of the form it copies says
+  `A2UI_VERSION`; a form from before the cutover is judged the same way and asked again in words.
 * **Doubles.** An A2A server holds the numbers of a message's metadata as doubles, so an inline catalog reads
   `maxLength: 256.0`. `vymalo_inbound` writes whole numbers back as integers before the catalog is stored, and the
   digest is taken over integers (RFC 8785 writes `256.0` as `256`).
@@ -453,7 +459,9 @@ stateDiagram-v2
   `tools/check-vendored-catalogs.sh` compares them with upstream in CI). Catalog 9 (`tests/fixtures/catalog-v9.json`, the
   `json catalog-9` block of [`ui-catalog-v2.md`](https://github.com/vymalo/another-agentic-system/blob/66db4ee5c885c12f28367a4c623f9c97c38e0930/docs/api/ui-catalog-v2.md))
   is pinned by bytes and digest, equals catalog 8 plus `protocolVersion`, and validates against `catalog_definition.json`;
-  the digest vector of `ui-catalog/v2` is pinned. The test validator is the workspace's `jsonschema`, offline, with the
+  the digest vector of `ui-catalog/v2` is pinned. Every golden, and fresh `ask_user`, `show` and `plan_work` output on a screen
+  with catalog 9, validates against `agent_to_renderer.json` with catalog 9 standing for `catalog.json#/$defs/anyComponent` (the
+  document upstream does not publish) and says `"1.0"`. The test validator is the workspace's `jsonschema`, offline, with the
   schemas in a registry.
 * `tests/ask_v7.rs`, `tests/ask_answers.rs` and `src/ask/vectors.rs`: the five kinds against the published catalogs of
   versions 7, 6, 5 and 2 (byte copies, `tests/fixtures/UPSTREAM`; `tools/check-vendored-catalogs.sh` compares them, and the vectors, with

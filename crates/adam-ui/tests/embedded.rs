@@ -12,19 +12,26 @@ use adam_a2a_runtime::{
 use adam_llm_agent::{SourceCtx, ToolCtx, ToolSource as _};
 use adam_mcp_testkit::ThreadToolsServer;
 use adam_runtime::NoopSink;
-use adam_ui::{Claimed, Ui};
+use adam_ui::{Claimed, Ui, catalog_digest};
 use serde_json::{Map, Value, json};
 
 const CATALOG_ID: &str = "https://agents.vymalo.com/a2ui/catalogs/chat";
 const FIXTURE: &str = include_str!("fixtures/catalog-v2.json");
 const LOCK: &str = include_str!("fixtures/catalog-v2.lock.json");
 
+/// The catalog as a screen sends it: the published version 2 with the `ui-catalog/v2` `protocolVersion`.
+fn document() -> Value {
+    let mut document: Value = serde_json::from_str(FIXTURE).unwrap();
+    document["protocolVersion"] = json!("1.0");
+    document
+}
+
 fn claimed() -> Claimed {
     let lock: Value = serde_json::from_str(LOCK).unwrap();
     Claimed {
         catalog_id: CATALOG_ID.to_owned(),
         version: u32::try_from(lock["version"].as_u64().unwrap()).unwrap(),
-        digest: lock["digest"].as_str().unwrap().to_owned(),
+        digest: catalog_digest(&document()).unwrap(),
     }
 }
 
@@ -37,7 +44,7 @@ fn object(value: Value) -> Map<String, Value> {
 }
 
 fn inline_context(c: &Claimed) -> Map<String, Value> {
-    let document: Value = serde_json::from_str(FIXTURE).unwrap();
+    let document = document();
     object(json!({
         CONTEXT_UI_REF: reference(c),
         CONTEXT_UI_CATALOG: {
@@ -67,7 +74,7 @@ fn show_description(specs: &[adam_model::ToolSpec]) -> String {
 }
 
 async fn endpoint_with_catalog(c: &Claimed) -> ThreadToolsServer {
-    let document: Value = serde_json::from_str(FIXTURE).unwrap();
+    let document = document();
     let server = ThreadToolsServer::start(&["tok"]).await;
     server.set_catalog(Some((
         &c.catalog_id,

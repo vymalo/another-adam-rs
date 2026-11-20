@@ -26,11 +26,15 @@ fn screen() -> Map<String, Value> {
 
 fn screen_of(document: &str, lock: &str) -> Map<String, Value> {
     let lock: Value = serde_json::from_str(lock).unwrap();
+    // A screen sends a `ui-catalog/v2` document: the published catalogs before 9 get its `protocolVersion`
+    // and the digest is of what is sent.
+    let mut document: Value = serde_json::from_str(document).unwrap();
+    document["protocolVersion"] = json!("1.0");
     let claimed = json!({
         "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat",
-        "version": lock["version"], "digest": lock["digest"]});
+        "version": lock["version"], "digest": adam_ui::catalog_digest(&document).unwrap()});
     let mut inline = claimed.clone();
-    inline["catalog"] = serde_json::from_str(document).unwrap();
+    inline["catalog"] = document;
     json!({
         adam_a2a_runtime::CONTEXT_UI_REF: claimed,
         adam_a2a_runtime::CONTEXT_UI_CATALOG: inline,
