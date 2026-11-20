@@ -1,9 +1,9 @@
 //! `read_file`, `read_files`, `write_file`, `edit_file` and `apply_patch`: the coder edits small, well-located things itself.
 //!
-//! The coder declares the read tools, `write_file` and `edit_file` here and their logic is
-//! `adam_code_tools::files` (ADR 0047), over the run's slots (`ToolEnv` as a `CodeWorkspace`): what
-//! a page shows, the images, the closest paths, the write and the edit are there, and what follows a
-//! write is the coder's `CodeWorkspace::after_write`. `apply_patch` is still the coder's.
+//! The coder declares the five tools here and their logic is `adam_code_tools::files` (ADR 0047),
+//! over the run's slots (`ToolEnv` as a `CodeWorkspace`): what a page shows, the images, the closest
+//! paths, the write, the edit and the patch are there, and what follows a write is the coder's
+//! `CodeWorkspace::after_write`.
 //!
 //! These tools read and change files of the
 //! worktree directly, in the coder's own process, and are **confined to it**: the model chooses
@@ -69,278 +69,21 @@
 
 #[cfg(test)]
 use std::fs;
-use std::io;
 #[cfg(test)]
 use std::path::Path;
-use std::time::Duration;
 
 use adam::prelude::*;
-use adam_code_tools::CodeWorkspace as _;
 #[cfg(test)]
 use adam_workspace::safe_fs::SlotDir;
 
-use super::gitcli::GitAt;
-use super::workspace::place_of;
-use super::{Outcome, ToolEnv, non_empty};
+use super::{Outcome, ToolEnv};
 
-pub use adam_code_tools::files::WRITE_CAP;
-
-/// Most bytes of `patch` `apply_patch` accepts.
-pub const PATCH_CAP: usize = 1024 * 1024;
-
-/// How long one `git apply` may run.
-const APPLY_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Longest message of `git apply` kept in a result.
-const APPLY_MESSAGE_CAP: usize = 2000;
-
-/// Most changed files `apply_patch` lists in its result.
-const MAX_LISTED: usize = 40;
-
-/// The flag of the second reading of a patch ([`apply_in`]).
-const RECOUNT: &str = "--recount";
+pub use adam_code_tools::files::{PATCH_CAP, WRITE_CAP};
 
 pub use adam_code_tools::confine::{Access, Confined, confine};
 pub(super) use adam_code_tools::confine::{is_dot_git, open_for_read};
 #[cfg(test)]
 use adam_code_tools::files::{Edited, Written, edit_in, read_in, write_in};
-
-/// Why a patch was not applied.
-#[derive(Debug)]
-enum PatchError {
-    /// The model's problem: what to tell it.
-    Refused(String),
-    /// Git cannot read the patch, or it does not apply (what to tell the model if no reading of
-    /// it works).
-    Unreadable(String),
-    /// `git` could not be run.
-    Git(io::Error),
-}
-
-impl From<io::Error> for PatchError {
-    fn from(e: io::Error) -> Self {
-        Self::Git(e)
-    }
-}
-
-/// What a `git apply` printed and whether it succeeded.
-struct Applied {
-    success: bool,
-    stdout: Vec<u8>,
-    stderr: String,
-}
-
-/// `git apply <flags> -` where `at` says, with `patch` on its standard input.
-///
-/// Hooks and the file system monitor are off, and so are the user's and the system's git
-/// configuration and every variable that would point git elsewhere: the patch comes from the model.
-/// The repository is the slot's, pinned (`GitAt`), never found through files a command wrote.
-async fn git_apply(at: &GitAt, flags: &[&str], patch: &str) -> io::Result<Applied> {
-    // From an empty environment: the repository's own configuration can run a program. In the git
-    // sandbox when the deployment has one: the patch is the model's, and applying it writes files
-    // the repository's attributes may run a filter on.
-    let Some(cmd) = at.command().await else {
-        return Err(io::Error::other(
-            "git is not run here: the worktree's repository cannot be trusted",
-        ));
-    };
-    // The patch is the command's input. A patch git stops reading early (a parse error) breaks the
-    // pipe: its verdict is what counts.
-    let cmd = cmd
-        .arg("apply")
-        .args(flags)
-        .arg("-")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .stdin(patch.as_bytes().to_vec());
-    let output = match tokio::time::timeout(APPLY_TIMEOUT, cmd.output()).await {
-        Ok(output) => output?,
-        Err(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("git apply took more than {}s", APPLY_TIMEOUT.as_secs()),
-            ));
-        }
-    };
-    Ok(Applied {
-        success: output.success,
-        stdout: output.stdout,
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
-}
-
-/// `text` cut to [`APPLY_MESSAGE_CAP`] bytes, on a character boundary.
-fn clipped(text: &str) -> String {
-    let text = text.trim();
-    if text.len() <= APPLY_MESSAGE_CAP {
-        return text.to_owned();
-    }
-    let mut end = APPLY_MESSAGE_CAP;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &text[..end])
-}
-
-/// The paths `git apply --numstat -z` reports, which are the ones it would touch (a rename names
-/// both ends), each once, in order. `None` for a patch with a binary part.
-fn numstat_paths(stdout: &[u8]) -> Option<Vec<String>> {
-    let text = String::from_utf8_lossy(stdout);
-    let mut tokens = text.split('\0').filter(|t| !t.is_empty());
-    let mut paths: Vec<String> = Vec::new();
-    let mut add = |path: &str| {
-        if !paths.iter().any(|p| p == path) {
-            paths.push(path.to_owned());
-        }
-    };
-    while let Some(entry) = tokens.next() {
-        let mut fields = entry.splitn(3, '\t');
-        let (added, deleted, path) = (fields.next()?, fields.next()?, fields.next()?);
-        if added == "-" || deleted == "-" {
-            return None;
-        }
-        if path.is_empty() {
-            // A rename or a copy: the old and the new path follow, each ended by a NUL.
-            add(tokens.next()?);
-            add(tokens.next()?);
-        } else {
-            add(path);
-        }
-    }
-    Some(paths)
-}
-
-/// Whether `git apply --summary` says a file becomes a symlink, a submodule, or stops being one
-/// (a mode of 120000 or 160000).
-fn summary_has_link(summary: &str) -> bool {
-    summary.lines().any(|line| {
-        let line = line.trim();
-        let about_a_mode = line.starts_with("create mode ")
-            || line.starts_with("delete mode ")
-            || line.starts_with("mode change ");
-        about_a_mode && ["120000", "160000"].iter().any(|mode| line.contains(mode))
-    })
-}
-
-/// What came of reading and checking a patch.
-struct Plan {
-    /// The files it changes.
-    paths: Vec<String>,
-    /// Whether it must be applied with `--recount`.
-    recount: bool,
-}
-
-/// Read `patch` the way `git apply` does and check everything about it that does not need the
-/// files to change: the paths it would touch, the modes it sets, and that it applies.
-///
-/// `PatchError::Unreadable` is git saying it cannot read or apply the patch (the one thing
-/// `--recount` may cure); `PatchError::Refused` is a rule of ours, which no flag changes.
-async fn plan(at: &GitAt, patch: &str, recount: bool) -> Result<Plan, PatchError> {
-    let with = |flags: &[&'static str]| -> Vec<&'static str> {
-        let mut all = flags.to_vec();
-        if recount {
-            all.push(RECOUNT);
-        }
-        all
-    };
-    let listed = git_apply(at, &with(&["--numstat", "-z"]), patch).await?;
-    if !listed.success {
-        return Err(PatchError::Unreadable(format!(
-            "the patch is not a unified diff git can read: {}. Use `--- a/<path>`, `+++ b/<path>` \
-             and `@@ -<line>,<count> +<line>,<count> @@` hunks",
-            clipped(&listed.stderr)
-        )));
-    }
-    let Some(paths) = numstat_paths(&listed.stdout) else {
-        return Err(PatchError::Refused(
-            "the patch changes a binary file: binary patches are not accepted".to_owned(),
-        ));
-    };
-    if paths.is_empty() {
-        return Err(PatchError::Refused("the patch changes no file".to_owned()));
-    }
-    // Only a check: `git apply` writes these paths by name, which the coder cannot protect (see the
-    // module docs, *Races*).
-    for path in &paths {
-        confine(at.root(), path, Access::Write).map_err(PatchError::Refused)?;
-    }
-    let summary = git_apply(at, &with(&["--summary"]), patch).await?;
-    if summary.success && summary_has_link(&String::from_utf8_lossy(&summary.stdout)) {
-        return Err(PatchError::Refused(
-            "the patch creates or changes a symlink or a submodule: refused".to_owned(),
-        ));
-    }
-    let check = git_apply(at, &with(&["--check", "--whitespace=nowarn"]), patch).await?;
-    if !check.success {
-        return Err(PatchError::Unreadable(format!(
-            "the patch does not apply, and nothing was changed: {}. Read the file again with \
-             read_file and make the hunks match it exactly (context lines included)",
-            clipped(&check.stderr)
-        )));
-    }
-    Ok(Plan { paths, recount })
-}
-
-/// Check `patch` and apply it in `root`; the files it changed.
-///
-/// Every path git reads from the patch (`--numstat -z`: what it would touch, renames and copies
-/// included, however the patch spells them) is checked with [`confine`], a mode of a symlink or a
-/// submodule is refused, then `git apply --check` and `git apply` run, never with
-/// `--unsafe-paths`. `git apply` is all or nothing.
-///
-/// The line counts of a hunk header are written by a model, which counts badly. A patch git
-/// cannot read or apply as it is gets a second reading with `--recount` (git then goes by the
-/// lines themselves). It is a second try and not the rule, because `--recount` cannot tell where
-/// a hunk ends when the next file's `--- ` line follows it without a `diff --git` line: it takes
-/// that line for a removed one.
-async fn apply_in(at: &GitAt, patch: &str) -> Result<Vec<String>, PatchError> {
-    if patch.len() > PATCH_CAP {
-        return Err(PatchError::Refused(format!(
-            "the patch is {} bytes, over the limit of {PATCH_CAP}: split it into several patches",
-            patch.len()
-        )));
-    }
-    if patch.contains('\0') {
-        return Err(PatchError::Refused(
-            "the patch contains a NUL byte: binary patches are not accepted".to_owned(),
-        ));
-    }
-    let Plan { paths, recount } = match plan(at, patch, false).await {
-        Ok(plan) => plan,
-        Err(PatchError::Unreadable(first)) => match plan(at, patch, true).await {
-            Ok(plan) => plan,
-            Err(PatchError::Git(e)) => return Err(PatchError::Git(e)),
-            // Neither reading works: the first one, as git said it, is the one to act on.
-            Err(_) => return Err(PatchError::Refused(first)),
-        },
-        Err(e) => return Err(e),
-    };
-    let mut flags = vec!["--whitespace=nowarn"];
-    if recount {
-        flags.push(RECOUNT);
-    }
-    let applied = git_apply(at, &flags, patch).await?;
-    if !applied.success {
-        return Err(PatchError::Refused(format!(
-            "the patch could not be applied: {}",
-            clipped(&applied.stderr)
-        )));
-    }
-    Ok(paths)
-}
-
-/// The files of a patch as one line: the first few, then how many more.
-fn listed(paths: &[String]) -> String {
-    let mut line = paths
-        .iter()
-        .take(MAX_LISTED)
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(", ");
-    if paths.len() > MAX_LISTED {
-        line.push_str(&format!(" and {} more", paths.len() - MAX_LISTED));
-    }
-    line
-}
 
 /// Read a text file of your worktree, one page at a time (at most 2000 lines). Each line starts
 /// with its number. If the last line says `[more: ... offset=N]`, call again with offset N. A
@@ -439,31 +182,7 @@ pub async fn apply_patch(
     /// The slot to patch: its name, or the repository's address. Leave out when the workspace has one.
     repo: Option<String>,
 ) -> Outcome {
-    if non_empty(&patch).is_none() {
-        return Ok(ToolOutput::error("patch is required"));
-    }
-    let slot = match env.slot_to_write(ctx, repo.as_deref()).await {
-        Ok(slot) => slot,
-        Err(outcome) => return outcome,
-    };
-    match apply_in(&GitAt::slot(&slot), &patch).await {
-        Ok(paths) => {
-            let tail = env
-                .after_write(ctx, &place_of(slot.clone()), &paths)
-                .await?;
-            ctx.emit_progress(format!("patched {} ({})", listed(&paths), slot.dir()))
-                .await;
-            Ok(ToolOutput::text(format!(
-                "Applied the patch to {} file(s): {}.{tail}",
-                paths.len(),
-                listed(&paths)
-            )))
-        }
-        Err(PatchError::Refused(reason) | PatchError::Unreadable(reason)) => {
-            Ok(ToolOutput::error(reason))
-        }
-        Err(PatchError::Git(e)) => Err(ToolError::Transient(format!("cannot run git apply: {e}"))),
-    }
+    adam_code_tools::files::apply_patch(&*env, ctx, patch, repo).await
 }
 
 /// Replace exact text in a file of your worktree: every character of `old`, blanks and line breaks
@@ -1078,98 +797,5 @@ mod tests {
     fn reading_says_what_is_missing() {
         let dir = root();
         assert!(refused(dir.path(), "nope.txt", Access::Read).contains("does not exist"));
-    }
-
-    #[test]
-    fn numstat_gives_the_paths_git_would_touch() {
-        assert_eq!(
-            numstat_paths(b"1\t1\tsrc/a.rs\x000\t3\tb.txt\0").unwrap(),
-            ["src/a.rs", "b.txt"]
-        );
-        // A rename: empty path, then the old and the new.
-        assert_eq!(
-            numstat_paths(b"0\t0\t\0old.txt\0new.txt\0").unwrap(),
-            ["old.txt", "new.txt"]
-        );
-        // The same file twice is one.
-        assert_eq!(numstat_paths(b"1\t1\ta\x001\t1\ta\0").unwrap(), ["a"]);
-        // A binary part.
-        assert_eq!(numstat_paths(b"-\t-\timg.png\0"), None);
-        assert_eq!(numstat_paths(b"").unwrap(), Vec::<String>::new());
-    }
-
-    #[test]
-    fn a_link_in_the_summary_is_found() {
-        assert!(summary_has_link(" create mode 120000 link\n"));
-        assert!(summary_has_link(" mode change 100644 => 120000 x\n"));
-        assert!(summary_has_link(" create mode 160000 sub\n"));
-        assert!(!summary_has_link(
-            " create mode 100644 a.txt\n delete mode 100755 b.sh\n"
-        ));
-        assert!(!summary_has_link(" rename a.txt => 120000 (100%)\n"));
-    }
-
-    #[test]
-    fn the_files_of_a_patch_are_listed_with_a_limit() {
-        let few: Vec<String> = (0..3).map(|i| format!("f{i}")).collect();
-        assert_eq!(listed(&few), "f0, f1, f2");
-        let many: Vec<String> = (0..MAX_LISTED + 5).map(|i| format!("f{i}")).collect();
-        assert!(listed(&many).ends_with("and 5 more"));
-    }
-}
-
-/// The patch the model writes is applied by the git of the sandbox when the deployment has one: it
-/// travels as the command's standard input.
-#[cfg(test)]
-mod apply_sandbox_tests {
-    use std::sync::Arc;
-
-    use adam_workspace::testing_sandbox::GitSandboxServer;
-    use adam_workspace::{GitIdentity, StaticToken, Workspaces};
-
-    use super::*;
-    use crate::tools::gitcli::GitAt;
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_patch_is_applied_by_the_git_of_the_sandbox() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("root");
-        fs::create_dir_all(&root).unwrap();
-        let server = GitSandboxServer::start(tmp.path(), &root);
-        let workspaces = Workspaces::new(root, Arc::new(StaticToken::new("unused")))
-            .with_git_sandbox(server.socket());
-        let slot = workspaces
-            .run("run-aaaaaaaa-1")
-            .unwrap()
-            .add_scratch("proj", &GitIdentity::new("t", "t@example.com"))
-            .await
-            .unwrap();
-        fs::write(slot.path().join("a.txt"), "one\ntwo\n").unwrap();
-        let at = GitAt::slot(&slot);
-        let patch = "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n";
-
-        let checked = git_apply(&at, &["--check"], patch).await.unwrap();
-        assert!(checked.success, "{}", checked.stderr);
-        assert_eq!(
-            fs::read_to_string(slot.path().join("a.txt")).unwrap(),
-            "one\ntwo\n"
-        );
-        let applied = git_apply(&at, &[], patch).await.unwrap();
-        assert!(applied.success, "{}", applied.stderr);
-        assert_eq!(
-            fs::read_to_string(slot.path().join("a.txt")).unwrap(),
-            "one\nthree\n"
-        );
-        // A patch that does not apply is git's verdict, not an error of the call.
-        let refused = git_apply(&at, &[], patch).await.unwrap();
-        assert!(!refused.success);
-        assert!(!refused.stderr.is_empty());
-
-        let ran = server.subcommands();
-        assert_eq!(
-            ran.iter().filter(|s| *s == "apply").count(),
-            3,
-            "all three went through the server: {ran:?}"
-        );
     }
 }
