@@ -2,7 +2,7 @@
 //! every call through the code the A2A server calls.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use a2a::{Message, Part, Role, Task};
@@ -13,19 +13,26 @@ use adam_assembly::AgentDef;
 use adam_core::{DynSecretSource, DynStore, RunId};
 use adam_llm_agent::DEFAULT_MAX_PARALLEL;
 use adam_model::DynModel;
-use adam_runtime::{BroadcastSink, Runtime, RuntimeError};
+use adam_runtime::{BroadcastSink, Runtime, RuntimeBuilder, RuntimeError};
 use adam_ui::Ui;
 use tokio::sync::{RwLock, RwLockReadGuard, oneshot, watch};
 use tokio::task::AbortHandle;
 
+use crate::events::EngineSink;
 use crate::{
-    ConversationId, Delivered, EngineError, ListQuery, Page, RunInfo, RunState, Say, Turn,
-    default_secrets,
+    ConversationId, Delivered, EngineError, ListQuery, Page, RunEvents, RunInfo, RunState, Say,
+    Turn, default_secrets,
 };
 
 /// The one subject every call of an engine is made as: the engine serves one person, and the
 /// backend scopes runs to a subject. Not `anonymous`, which the backend lets continue nothing.
 const SUBJECT: &str = "adam-engine";
+
+/// The default of [`Limits::event_capacity`].
+const DEFAULT_EVENT_CAPACITY: usize = 256;
+
+/// The largest [`Limits::event_capacity`]: the channel allocates every slot at once.
+const MAX_EVENT_CAPACITY: usize = 1 << 16;
 
 /// What the engine runs within. Set the fields on [`Limits::default`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +45,11 @@ pub struct Limits {
     pub max_parallel_tools: usize,
     /// How long a run stays leased to the worker without renewal. Default 30 s; zero is refused.
     pub lease_ttl: Duration,
+    /// The live events the engine's ring holds, every run's together: a reader of
+    /// [`Engine::events`] that falls further behind loses the oldest and is told
+    /// ([`EngineEvent::Behind`](crate::EngineEvent::Behind)). The channel rounds it up to a power
+    /// of two. Default 256; zero is refused, and so is more than 65 536.
+    pub event_capacity: usize,
 }
 
 impl Default for Limits {
@@ -46,6 +58,7 @@ impl Default for Limits {
             concurrency: 4,
             max_parallel_tools: DEFAULT_MAX_PARALLEL,
             lease_ttl: Duration::from_secs(30),
+            event_capacity: DEFAULT_EVENT_CAPACITY,
         }
     }
 }
@@ -95,7 +108,8 @@ impl EngineBuilder {
     /// # Errors
     ///
     /// * [`EngineError::NoRuntime`] outside a tokio runtime;
-    /// * [`EngineError::Invalid`] for a zero [`Limits::lease_ttl`], and for an agent whose files
+    /// * [`EngineError::Invalid`] for a zero [`Limits::lease_ttl`], an [`Limits::event_capacity`] of
+    ///   zero or over 65 536, and for an agent whose files
     ///   name an MCP server or a remote (`a2a:`) subagent, its subagents' included: the engine runs
     ///   neither yet, whatever features the build turns on;
     /// * [`EngineError::Store`] when the store's migration fails;
@@ -116,6 +130,12 @@ impl EngineBuilder {
                 "the lease of a run must last longer than zero".to_owned(),
             ));
         }
+        if !(1..=MAX_EVENT_CAPACITY).contains(&limits.event_capacity) {
+            return Err(EngineError::Invalid(format!(
+                "the ring of live events holds 1 to {MAX_EVENT_CAPACITY} events, not {}",
+                limits.event_capacity
+            )));
+        }
         refuse_what_is_not_embedded(agent.manifest(), agent.name())?;
         let name = agent.name().to_owned();
         let ui = Ui::embedded();
@@ -129,14 +149,13 @@ impl EngineBuilder {
             .map_err(|e| EngineError::Agent(Box::new(e)))?;
         store.migrate().await.map_err(EngineError::Store)?;
 
-        let events = BroadcastSink::default();
-        let runtime = assembly
-            .register(Runtime::builder(store))
-            .event_sink(events.clone())
-            .concurrency(limits.concurrency)
-            .lease_ttl(limits.lease_ttl)
-            .build();
-        let backend = RuntimeTaskBackend::new(runtime.clone(), events, name.clone());
+        let (runtime, events) =
+            runtime_with_ring(assembly.register(Runtime::builder(store)), &limits);
+        // The backend is given the same ring, for the A2A path that streams a task
+        // (`TaskBackend::subscribe`), whose file parts are built from a live event's bytes. The engine
+        // never calls that path: an artifact in this ring has its bytes withheld, so a caller that
+        // streams a task through this backend must read files from the store.
+        let backend = RuntimeTaskBackend::new(runtime.clone(), events.clone(), name.clone());
 
         let (stop, stopped) = oneshot::channel::<()>();
         let running = handle.spawn(async move {
@@ -165,6 +184,7 @@ impl EngineBuilder {
                 steering: caller.clone().with_extensions([STEER_EXTENSION]),
                 caller,
                 backend,
+                events,
                 agent: name,
                 writes: RwLock::new(()),
                 stopping: AtomicBool::new(false),
@@ -178,9 +198,24 @@ impl EngineBuilder {
     }
 }
 
+/// The runtime `builder` builds (its agents registered) within `limits`, and the ring its events go
+/// to: through [`EngineSink`], which withholds a file artifact's bytes.
+pub(crate) fn runtime_with_ring(
+    builder: RuntimeBuilder,
+    limits: &Limits,
+) -> (Runtime, BroadcastSink) {
+    let events = BroadcastSink::new(limits.event_capacity);
+    let runtime = builder
+        .event_sink(EngineSink(events.clone()))
+        .concurrency(limits.concurrency)
+        .lease_ttl(limits.lease_ttl)
+        .build();
+    (runtime, events)
+}
+
 /// How the worker task ended.
 #[derive(Clone)]
-enum Ended {
+pub(crate) enum Ended {
     Clean,
     Failed(Arc<RuntimeError>),
     Aborted,
@@ -207,8 +242,11 @@ impl Drop for AbortOnDrop {
     }
 }
 
-struct Shared {
+pub(crate) struct Shared {
     backend: RuntimeTaskBackend,
+    /// The ring every reader of [`Engine::events`] subscribes to; the runtime emits into it through
+    /// [`EngineSink`], which takes a file's bytes out.
+    events: BroadcastSink,
     /// Every call but a steer.
     caller: Caller,
     /// The same subject, with `steer/v1` activated: a message for a running run is delivered.
@@ -417,6 +455,44 @@ impl Engine {
         }
     }
 
+    /// The events of `run`, from now on: see [`RunEvents`]. The run's recent events come first
+    /// (what happened since it last changed state, from the runtime's replay), then the live ones,
+    /// then [`EngineEvent::Ended`](crate::EngineEvent::Ended) once the store says it has ended. A
+    /// run that has already ended gives `Ended` at once. A reader that falls more than
+    /// [`Limits::event_capacity`] events behind loses the oldest, and is told with
+    /// [`EngineEvent::Behind`](crate::EngineEvent::Behind), then a
+    /// [`Snapshot`](crate::EngineEvent::Snapshot) read from the store.
+    ///
+    /// The subscription is made when this returns, so a reader may read later: what it missed in
+    /// between is either in the ring or said by `Behind`. Once the worker has stopped
+    /// ([`shutdown`](Self::shutdown), or every engine dropped) with the run unfinished, the stream
+    /// ends with [`EngineError::Stopped`].
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NotFound`] for a run this engine does not have (the stream would have nothing
+    /// to say), and the store's failures.
+    pub async fn events(&self, run: RunId) -> Result<RunEvents, EngineError> {
+        // Subscribed before the read: an event emitted after the read is in the subscription.
+        let subscription = self.shared.events.subscribe_run(run);
+        let info = self
+            .get(run)
+            .await?
+            .ok_or_else(|| EngineError::NotFound(format!("run {run}")))?;
+        Ok(RunEvents::new(
+            run,
+            subscription,
+            Arc::downgrade(&self.shared),
+            self.shared.worker.ended.clone(),
+            info,
+        ))
+    }
+
+    /// The engine `shared` is, while any [`Engine`] is left.
+    pub(crate) fn from_weak(shared: &Weak<Shared>) -> Option<Self> {
+        shared.upgrade().map(|shared| Self { shared })
+    }
+
     /// The runs that match `query`, the most recently updated first.
     ///
     /// # Errors
@@ -592,4 +668,126 @@ fn message(say: &Say) -> Message {
     let mut message = Message::new(Role::User, vec![Part::text(say.text.clone())]);
     message.message_id = say.id.clone();
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use adam_core::{MemoryStore, RunStatus};
+    use adam_runtime::{Agent, AgentError, Artifact, Ctx, Inbound, RunEvent, Transition};
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::WithheldFile;
+
+    const FILE: &[u8] = b"the bytes of the file, kept with the run";
+
+    /// One step: it makes a file, and is done.
+    struct MakesAFile;
+
+    #[async_trait]
+    impl Agent for MakesAFile {
+        type State = Value;
+
+        fn name(&self) -> &str {
+            "maker"
+        }
+
+        fn init(&self, _: Inbound) -> Result<Value, AgentError> {
+            Ok(Value::Null)
+        }
+
+        async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Transition<Value>, AgentError> {
+            let file = Artifact::file("notes", "text/plain", "notes.txt", FILE.to_vec())
+                .map_err(AgentError::permanent)?;
+            ctx.emit(file.into()).await;
+            Ok(Transition::Done {
+                state,
+                output: json!("made"),
+            })
+        }
+    }
+
+    /// The engine's runtime puts a file's event into its ring with the bytes withheld, while the
+    /// run's committed record keeps every byte.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_engines_runtime_withholds_file_bytes_from_the_ring_only() {
+        let store: DynStore = Arc::new(MemoryStore::new());
+        store.migrate().await.unwrap();
+        let (runtime, ring) = runtime_with_ring(
+            Runtime::builder(store).agent(MakesAFile),
+            &Limits::default(),
+        );
+        let run = runtime
+            .start("maker", Inbound::new("message", json!({})), None)
+            .await
+            .unwrap();
+        let mut reader = ring.subscribe_run(run);
+        let (stop, stopped) = oneshot::channel::<()>();
+        let worker = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime
+                    .run_worker(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+            })
+        };
+
+        let event = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let event = reader.recv().await.expect("the ring is open");
+                if matches!(event, RunEvent::Artifact { .. }) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the file's event");
+        let RunEvent::Artifact {
+            file: Some(file), ..
+        } = &event
+        else {
+            panic!("not a file: {event:?}");
+        };
+        assert!(
+            file.bytes.is_empty(),
+            "{} bytes in the ring",
+            file.bytes.len()
+        );
+        let sha256 = Artifact::file("notes", "text/plain", "notes.txt", FILE.to_vec())
+            .unwrap()
+            .file_sha256()
+            .unwrap();
+        assert_eq!(
+            WithheldFile::of(&event),
+            Some(WithheldFile {
+                len: FILE.len() as u64,
+                sha256
+            })
+        );
+
+        let view = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let view = runtime.view(run).await.unwrap().expect("the run");
+                if view.status == RunStatus::Done {
+                    return view;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the run is done");
+        let kept = view.artifacts[0].file.as_ref().expect("a file");
+        let bytes = runtime
+            .artifact_bytes(kept)
+            .await
+            .unwrap()
+            .expect("its bytes");
+        assert_eq!(&*bytes, FILE, "the record keeps the whole file");
+
+        let _ = stop.send(());
+        worker.await.unwrap().unwrap();
+    }
 }
