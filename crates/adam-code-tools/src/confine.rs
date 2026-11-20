@@ -16,6 +16,25 @@
 //!
 //! Everything is relative to the root **as it was opened** ([`SlotDir`]), never to its name: a swap
 //! of the directory, or of one below it, is not followed.
+//!
+//! # Races
+//!
+//! A process the place's owner does not control (a command a tool ran, and what it left running)
+//! can rename the place's directory, or one below it, and put a link at the old name while a tool
+//! works: a path may be checked and then used. So nothing here uses a name for what it checks. The
+//! check and the use are relative to the same descriptors (the root's, and the directory a file is
+//! written in); a link that appears on a path after it was resolved is refused when the file is
+//! opened (`RESOLVE_NO_SYMLINKS`, or `O_NOFOLLOW` one component at a time where `openat2` is
+//! missing), and a write is a new file renamed over its target, which replaces a link that appeared
+//! meanwhile instead of following it.
+//!
+//! What a descriptor cannot cover is `git`: `git apply` (`apply_patch`) writes the paths of a patch
+//! by name, after they are checked here, and `git` finds its work tree by name in its own process.
+//! A name is safe only where nothing can rename it, so that is the workspace's to ensure: the coder
+//! makes each slot of a run pod a mount point of its own ([ADR 0041], decision 3), and a host whose
+//! directory a command can rename has the same gap.
+//!
+//! [ADR 0041]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0041-a-run-pod-sees-only-its-own-run.md
 
 use std::ffi::OsString;
 use std::fs;
@@ -376,5 +395,235 @@ mod tests {
             !dir.path().join("src/deep").exists(),
             "a check makes nothing"
         );
+    }
+}
+
+/// The rule's cases, moved from the coder with it: each use of a path, `.git` in any case, links
+/// that stay inside or leave, and a root that is not a plain directory.
+#[cfg(test)]
+mod rules {
+    use std::fs;
+    use std::path::Path;
+
+    use super::{Access, Confined, SlotDir};
+
+    /// The slot at `root`, opened as the tools open it: the check and the hold of a slot.
+    fn open(root: &Path) -> Result<SlotDir, String> {
+        SlotDir::open(root).map_err(|e| {
+            format!(
+                "the worktree's directory is not a plain directory (a command replaced it by a link or a file): {e}"
+            )
+        })
+    }
+
+    fn confine(root: &Path, rel: &str, access: Access) -> Result<Confined, String> {
+        super::confine(&open(root)?, rel, access)
+    }
+
+    fn root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+        // What a worktree has: a `.git` file.
+        fs::write(dir.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        dir
+    }
+
+    fn refused(root: &Path, rel: &str, access: Access) -> String {
+        confine(root, rel, access).expect_err(rel)
+    }
+
+    #[test]
+    fn a_path_inside_the_worktree_is_accepted_for_both() {
+        let dir = root();
+        let accepted = |rel: &str, access| confine(dir.path(), rel, access).unwrap().rel();
+        assert_eq!(
+            accepted("src/main.rs", Access::Read),
+            Path::new("src/main.rs")
+        );
+        assert_eq!(
+            accepted("./src//main.rs", Access::Read),
+            Path::new("src/main.rs")
+        );
+        // A file that is not there yet, in a directory that is not there yet.
+        assert_eq!(
+            accepted("new/deep/file.txt", Access::Write),
+            Path::new("new/deep/file.txt")
+        );
+        assert_eq!(
+            accepted("src/main.rs", Access::Write),
+            Path::new("src/main.rs")
+        );
+        // Nothing was made by asking.
+        assert!(!dir.path().join("new").exists());
+    }
+
+    #[test]
+    fn an_empty_path_is_refused() {
+        let dir = root();
+        for rel in ["", "   ", ".", "./", "./."] {
+            for access in [Access::Read, Access::Write] {
+                let why = refused(dir.path(), rel, access);
+                assert!(
+                    why.contains("path is required") || why.contains("root of the worktree"),
+                    "{rel:?}: {why}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_path_that_goes_up_is_refused() {
+        let dir = root();
+        for rel in ["../x", "src/../../x", "..", "src/.."] {
+            for access in [Access::Read, Access::Write] {
+                let why = refused(dir.path(), rel, access);
+                assert!(why.contains("`..`"), "{rel}: {why}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_absolute_path_is_refused() {
+        let dir = root();
+        let inside = dir.path().join("README.md");
+        for rel in ["/etc/passwd", inside.to_str().unwrap()] {
+            for access in [Access::Read, Access::Write] {
+                let why = refused(dir.path(), rel, access);
+                assert!(why.contains("absolute"), "{rel}: {why}");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_inside_dot_git_is_touched_whatever_the_case() {
+        let dir = root();
+        for rel in [
+            ".git",
+            ".git/config",
+            ".GIT/x",
+            ".Git/hooks/pre-commit",
+            "a/.git/x",
+            "src/.GiT",
+        ] {
+            for access in [Access::Read, Access::Write] {
+                let why = refused(dir.path(), rel, access);
+                assert!(why.contains(".git"), "{rel}: {why}");
+            }
+        }
+        // `.github` is not `.git`.
+        fs::create_dir_all(dir.path().join(".github")).unwrap();
+        assert!(confine(dir.path(), ".github/workflows/ci.yml", Access::Write).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_file_outside_is_not_read() {
+        let dir = root();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret"), "s3cr3t").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("link")).unwrap();
+        let why = refused(dir.path(), "link", Access::Read);
+        assert!(why.contains("outside the worktree"), "{why}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_outside_is_not_read_or_written() {
+        let dir = root();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret"), "s3cr3t").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("dir")).unwrap();
+        let why = refused(dir.path(), "dir/secret", Access::Read);
+        assert!(why.contains("outside the worktree"), "{why}");
+        let why = refused(dir.path(), "dir/new.txt", Access::Write);
+        assert!(why.contains("symlink"), "{why}");
+        assert!(!outside.path().join("new.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_through_a_symlink_is_refused_even_when_it_stays_inside() {
+        let dir = root();
+        std::os::unix::fs::symlink("README.md", dir.path().join("alias")).unwrap();
+        std::os::unix::fs::symlink("src", dir.path().join("srclink")).unwrap();
+        // Reading follows a link that stays inside.
+        assert!(confine(dir.path(), "alias", Access::Read).is_ok());
+        assert!(confine(dir.path(), "srclink/main.rs", Access::Read).is_ok());
+        // Writing does not.
+        let why = refused(dir.path(), "alias", Access::Write);
+        assert!(why.contains("symlink `alias`"), "{why}");
+        let why = refused(dir.path(), "srclink/main.rs", Access::Write);
+        assert!(why.contains("symlink `srclink`"), "{why}");
+        // A dangling link is a link too.
+        std::os::unix::fs::symlink("nowhere", dir.path().join("dangling")).unwrap();
+        assert!(refused(dir.path(), "dangling", Access::Write).contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_is_a_link_to_another_directory_is_not_a_root() {
+        let dir = root();
+        let other = tempfile::tempdir().unwrap();
+        fs::write(other.path().join(".env"), "TOKEN=another run's").unwrap();
+        let link = other.path().join("slot");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        // A link to a worktree is canonicalised into that worktree: refused before.
+        for access in [Access::Read, Access::Write] {
+            let why = refused(&link, "README.md", access);
+            assert!(why.contains("not a plain directory"), "{why}");
+        }
+        // And the real directory is as it was.
+        assert!(confine(dir.path(), "README.md", Access::Read).is_ok());
+        // A file is no root either.
+        let why = refused(&dir.path().join("README.md"), "x", Access::Write);
+        assert!(why.contains("not a plain directory"), "{why}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_dot_git_is_not_read_either() {
+        let dir = root();
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::os::unix::fs::symlink("../.git", dir.path().join("sub/g")).unwrap();
+        let why = refused(dir.path(), "sub/g", Access::Read);
+        assert!(why.contains(".git"), "{why}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_is_absolute_is_refused_even_when_it_leads_into_the_worktree() {
+        let dir = root();
+        std::os::unix::fs::symlink(dir.path().join("README.md"), dir.path().join("abs")).unwrap();
+        let why = refused(dir.path(), "abs", Access::Read);
+        assert!(why.contains("outside the worktree"), "{why}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_goes_up_past_the_root_is_refused_and_one_that_comes_back_is_not() {
+        let dir = root();
+        std::os::unix::fs::symlink("../x", dir.path().join("up")).unwrap();
+        std::os::unix::fs::symlink("src/../README.md", dir.path().join("around")).unwrap();
+        let why = refused(dir.path(), "up", Access::Read);
+        assert!(why.contains("outside the worktree"), "{why}");
+        assert_eq!(
+            confine(dir.path(), "around", Access::Read).unwrap().rel(),
+            Path::new("README.md")
+        );
+    }
+
+    #[test]
+    fn a_directory_is_not_a_file_to_write_and_a_file_is_not_a_directory() {
+        let dir = root();
+        assert!(refused(dir.path(), "src", Access::Write).contains("is a directory"));
+        assert!(refused(dir.path(), "README.md/x", Access::Write).contains("is a file"));
+    }
+
+    #[test]
+    fn reading_says_what_is_missing() {
+        let dir = root();
+        assert!(refused(dir.path(), "nope.txt", Access::Read).contains("does not exist"));
     }
 }
