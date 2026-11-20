@@ -85,7 +85,7 @@ fn escape(name: &str) -> String {
 }
 
 /// The inverse of [`escape`]; `None` for a `%` that is not one of its three escapes.
-fn unescape(escaped: &str) -> Option<String> {
+pub(crate) fn unescape(escaped: &str) -> Option<String> {
     let mut out = String::with_capacity(escaped.len());
     let mut rest = escaped;
     while let Some(i) = rest.find('%') {
