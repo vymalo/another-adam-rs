@@ -86,7 +86,7 @@ fn builder(mock: &Arc<MockModel>) -> LlmAgentBuilder {
 }
 
 /// Run `agent` to its end on a scripted model and return the finished run.
-async fn run_to_end(agent: &LlmAgent) -> RunView {
+async fn run_to_end(agent: &LlmAgent) -> (Runtime, RunView) {
     let store: DynStore = Arc::new(MemoryStore::new());
     let rt = Runtime::builder(store)
         .agent(agent.clone())
@@ -116,11 +116,12 @@ async fn run_to_end(agent: &LlmAgent) -> RunView {
     };
     let _ = stop.send(());
     worker.await.unwrap().unwrap();
-    view
+    (rt, view)
 }
 
-fn tool_results(view: &RunView) -> Vec<(String, bool)> {
-    let state: Conversation = serde_json::from_value(view.state.clone()).unwrap();
+async fn tool_results(rt: &Runtime, view: &RunView) -> Vec<(String, bool)> {
+    let state = rt.state(view.id).await.unwrap().expect("the run");
+    let state: Conversation = serde_json::from_value(state).unwrap();
     state
         .messages
         .into_iter()
@@ -143,9 +144,12 @@ async fn state_given_to_the_builder_reaches_the_tool_in_a_run() {
         .tools(tools![Greet])
         .try_build()
         .unwrap();
-    let view = run_to_end(&agent).await;
+    let (rt, view) = run_to_end(&agent).await;
     assert_eq!(view.status, RunStatus::Done);
-    assert_eq!(tool_results(&view), vec![("Hello, Ada!".to_owned(), false)]);
+    assert_eq!(
+        tool_results(&rt, &view).await,
+        vec![("Hello, Ada!".to_owned(), false)]
+    );
 }
 
 #[tokio::test]
@@ -157,9 +161,9 @@ async fn bad_arguments_reach_the_model_as_an_error_result() {
         .state(Arc::new(Greeting("Hello")))
         .tool(Greet)
         .build();
-    let view = run_to_end(&agent).await;
+    let (rt, view) = run_to_end(&agent).await;
     assert_eq!(view.status, RunStatus::Done, "the run goes on");
-    let results = tool_results(&view);
+    let results = tool_results(&rt, &view).await;
     assert_eq!(results.len(), 1);
     assert!(results[0].1, "marked as an error");
     assert!(
@@ -176,8 +180,8 @@ async fn a_missing_state_under_build_is_an_error_result_when_the_tool_runs() {
         .push_text("done");
     // `build` stays permissive, for compatibility: no check, no panic.
     let agent = builder(&mock).tool(Greet).build();
-    let view = run_to_end(&agent).await;
-    let results = tool_results(&view);
+    let (rt, view) = run_to_end(&agent).await;
+    let results = tool_results(&rt, &view).await;
     assert!(results[0].1);
     assert!(results[0].0.contains("missing shared state"), "{results:?}");
     assert!(results[0].0.contains("Greeting"), "{results:?}");
@@ -299,8 +303,11 @@ async fn wrap_applies_middleware_to_every_tool_and_keeps_their_needs() {
         .tools(set)
         .try_build()
         .unwrap();
-    let view = run_to_end(&agent).await;
-    assert_eq!(tool_results(&view), vec![("HELLO, ADA!".to_owned(), false)]);
+    let (rt, view) = run_to_end(&agent).await;
+    assert_eq!(
+        tool_results(&rt, &view).await,
+        vec![("HELLO, ADA!".to_owned(), false)]
+    );
 }
 
 #[tokio::test]
@@ -326,10 +333,10 @@ async fn a_raw_fn_tool_runs_in_an_agent_and_converts_its_result() {
     mock.push_tool_calls(vec![call("c1", "lookup", json!({"key": "k"}))])
         .push_text("done");
     let agent = builder(&mock).tool(lookup).try_build().unwrap();
-    let view = run_to_end(&agent).await;
+    let (rt, view) = run_to_end(&agent).await;
     assert_eq!(calls.load(SeqCst), 1);
     assert_eq!(
-        tool_results(&view),
+        tool_results(&rt, &view).await,
         vec![(r#"{"found":"k"}"#.to_owned(), false)]
     );
 }

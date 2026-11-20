@@ -29,6 +29,7 @@ database driver.
 | `RunQuery`, `ConversationScope` | what `list_runs` and `count_runs` select: always scoped (`Prefix` of an owner's conversations, or `Exact`), optionally by run statuses and last update, one page after a `(updated_at, id)` position |
 | `NewPushConfig`, `PushRecord`, `PushProgress`, `PushState` | an A2A push-notification configuration and how far its delivery got; `PushState` (`Active`, `Done`, `GaveUp`) is closed on purpose |
 | `StoreError`, `StoreResult` | `AlreadyExists`, `NotFound`, `Conflict`, `ConversationBusy`, `NonDeterminism`, `InvalidInput`, `Corrupt`, `Backend { class, source }`; `#[non_exhaustive]`, see *Errors* |
+| `Timestamp`, `now`, `truncate_ms`, `add_ttl` | the instant every `Store` value carries: a `jiff::Timestamp` whose serde bytes are the ones `chrono::DateTime<Utc>` wrote ([ADR 0057](../../docs/decisions/0057-time-is-jiff-with-the-bytes-chrono-wrote.md)) |
 | `storable` | the one rule every adapter applies before it writes a JSON value: a NUL in a string or a key becomes U+FFFD, so a state or a journal payload is the same value in every backend ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)) |
 | `MemoryStore` | in-memory `Store`, the reference implementation of the suite |
 | `SecretSource` (trait), `DynSecretSource`, `SecretError` | where a secret that agent files name comes from ([ADR 0047](../../docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), decision 5): `secret(name)` gives a `SecretString` or `Missing`, `NotUnicode`, `Refused` (`#[non_exhaustive]`: a reader treats a reason it does not know as `Refused`); it is synchronous, so a source answers from memory (a host fetches a vault's secrets first); `kind()` names the source, and `Debug` of a `dyn SecretSource` shows only that, never a value, so a host's source needs no `Debug`; used by `adam-assembly`'s `AgentDef::secrets` and `adam-mcp`'s `Env::source` |
@@ -134,14 +135,15 @@ same sweep. A digest shared by several runs survives until the last one is purge
 
 The expand release of [ADR 0055](../../docs/decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md)
 adds the types and the **defaulted** methods a store needs to keep a run's transcript apart from its
-head; `state` is still the whole envelope, and the runtime reads neither in this slice.
+head; `state` is still the whole envelope a worker steps, and the observer reads the head
+(`Runtime::view` is one `load_head`, no body).
 
 | Method | What |
 |---|---|
 | `keeps_bodies()` | whether the store keeps a transcript beside the head (`body_list`, `RunUpdate::body`). `false` (the default) means `RunUpdate::state` is the whole run, exactly as before |
 | `body_list(run, generation)` | the rows of one generation, ordered by `idx`; empty when it does not exist. A store that keeps none answers empty |
 | `gc_body(run, keep_generation, before)` | delete the superseded generations of `run` written before `before`; returns how many rows. The generation a head names is never collected. A store that keeps none answers `0` |
-| `load_head(id)` | the run as an **observer** reads it: its `state` is the v5 head when the store has a current one (`head_version == version`), and the whole state otherwise. Defaults to `load_run`, so a store that keeps no head answers exactly as it does today. Nothing in the runtime calls it in the expand release: the tests do, and the read path (S2b) will |
+| `load_head(id)` | the run as an **observer** reads it: its `state` is the v5 head when the store has a current one (`head_version == version`), and the whole state otherwise. Defaults to `load_run`, so a store that keeps no head answers exactly as it does today. `Runtime::view` reads it and never a body; `Runtime::state` joins the head with the generation it names (`body_list`) |
 
 `BodyRow { idx, message }` is one row; `BodyWrite { generation, rows, writer }` is what a commit
 writes. A generation is **append-only**: `generation: None` appends `rows[old_len..]` to the current
@@ -194,6 +196,18 @@ affected: it claims the run once the lease has expired, as before. The conforman
 `claim_skips_busy_runs` in [`adam-store-testkit`](../adam-store-testkit/README.md) proves an
 implementation, for both scopes. The signature change is breaking for anyone who implements
 `Store`.
+
+## Time
+
+Every timestamp in this crate is [`Timestamp`](src/time.rs), a newtype over `jiff::Timestamp`
+(ADR 0057). Stores keep milliseconds (`truncate_ms`), because BSON dates are millisecond-precision
+and every adapter normalizes to it so they behave the same. The newtype's serde writes RFC 3339
+with `Z` and chrono's `AutoSi` digits (0, 3, 6 or 9, the shortest exact one), which is what a
+state or a push cursor written before the migration holds: jiff's own serde trims every trailing
+zero and would change those bytes. `Timestamp` derefs to `jiff::Timestamp`; adding a
+`jiff::SignedDuration` saturates at `Timestamp::MAX`/`MIN`. `truncate_ms` floors, as chrono's
+`timestamp_millis` did, so a pre-1970 value with a fractional millisecond stores the same
+millisecond it stored before the migration.
 
 ## Errors
 

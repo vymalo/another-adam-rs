@@ -197,7 +197,7 @@ async fn wait_for(
     }
 }
 
-async fn finish(rig: &Rig, first: &str) -> RunView {
+async fn finish(rig: &Rig, first: &str) -> (Runtime, RunView) {
     let agent = rig.agent().build();
     let rt = rig.runtime(&agent, "w", false);
     let run = rt
@@ -208,11 +208,12 @@ async fn finish(rig: &Rig, first: &str) -> RunView {
     let view = wait_for(&rt, run, "done", |v| v.status == RunStatus::Done).await;
     let _ = stop.send(());
     handle.await.unwrap().unwrap();
-    view
+    (rt, view)
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 #[tokio::test]
@@ -221,8 +222,11 @@ async fn a_plan_written_by_a_tool_is_in_the_state() {
     rig.mock
         .push_tool_calls(vec![call("c1", "plan_set", json!({"items": ["a", "b"]}))])
         .push_text("Done.");
-    let view = finish(&rig, "go").await;
-    assert_eq!(conversation(&view).plan, Some(plan_of(&["a", "b"])));
+    let (rt, view) = finish(&rig, "go").await;
+    assert_eq!(
+        conversation(&rt, &view).await.plan,
+        Some(plan_of(&["a", "b"]))
+    );
     assert_eq!(
         view.state["plan"]["items"][0],
         json!({"id": 1, "text": "a", "status": "pending"}),
@@ -247,9 +251,9 @@ async fn an_error_result_changes_no_plan() {
             json!({"items": ["x"], "fail": true}),
         )])
         .push_text("Done.");
-    let view = finish(&rig, "go").await;
+    let (rt, view) = finish(&rig, "go").await;
     assert_eq!(
-        conversation(&view).plan,
+        conversation(&rt, &view).await.plan,
         Some(plan_of(&["a"])),
         "the plan an error result carried is not applied"
     );
@@ -263,8 +267,8 @@ async fn an_error_result_changes_no_plan() {
             json!({"items": ["x"], "fail": true}),
         )])
         .push_text("Done.");
-    let view = finish(&rig, "go").await;
-    assert_eq!(conversation(&view).plan, None);
+    let (rt, view) = finish(&rig, "go").await;
+    assert_eq!(conversation(&rt, &view).await.plan, None);
     assert!(view.state.get("plan").is_none());
 }
 
@@ -277,8 +281,11 @@ async fn two_plan_calls_in_one_turn_see_each_other() {
             call("c2", "plan_set", json!({"items": ["b"]})),
         ])
         .push_text("Done.");
-    let view = finish(&rig, "go").await;
-    assert_eq!(conversation(&view).plan, Some(plan_of(&["a", "b"])));
+    let (rt, view) = finish(&rig, "go").await;
+    assert_eq!(
+        conversation(&rt, &view).await.plan,
+        Some(plan_of(&["a", "b"]))
+    );
     let saw = rig.saw.lock().unwrap().clone();
     assert_eq!(saw, vec![None, Some(plan_of(&["a"]))]);
 }
@@ -326,7 +333,10 @@ async fn a_plan_survives_a_replay_from_the_journal() {
         1,
         "the recorded result, plan included, is replayed and the tool does not run again"
     );
-    assert_eq!(conversation(&view).plan, Some(plan_of(&["a", "b"])));
+    assert_eq!(
+        conversation(&rt_b, &view).await.plan,
+        Some(plan_of(&["a", "b"]))
+    );
     assert_eq!(
         view.artifacts.len(),
         1,
@@ -367,7 +377,10 @@ async fn a_continued_run_starts_with_the_plan_before() {
     let _ = stop.send(());
     handle.await.unwrap().unwrap();
     assert_eq!(rig.saw.lock().unwrap()[1], Some(plan_of(&["a", "b"])));
-    assert_eq!(conversation(&view).plan, Some(plan_of(&["a", "b", "c"])));
+    assert_eq!(
+        conversation(&rt, &view).await.plan,
+        Some(plan_of(&["a", "b", "c"]))
+    );
 }
 
 /// A plan that changes twenty times is one artifact in the run and one reference in its output,
@@ -389,8 +402,8 @@ async fn twenty_changes_of_the_plan_leave_one_artifact_and_one_reference() {
         );
     }
     rig.mock.push_text("Done.");
-    let view = finish(&rig, "go").await;
-    assert_eq!(conversation(&view).plan.unwrap().items.len(), 20);
+    let (rt, view) = finish(&rig, "go").await;
+    assert_eq!(conversation(&rt, &view).await.plan.unwrap().items.len(), 20);
     assert_eq!(view.artifacts.len(), 1, "{:?}", view.artifacts);
     assert_eq!(view.artifacts[0].id.as_deref(), Some("plan-test"));
     assert_eq!(view.artifacts[0].data, json!({"items": 20}), "the newest");
@@ -479,7 +492,7 @@ async fn the_request_prefix_holds_across_plan_calls() {
             json!({"items": ["e"], "fail": true}),
         )])
         .push_text("Done.");
-    let view = finish(&rig, "go").await;
+    let (rt, view) = finish(&rig, "go").await;
     let requests = rig.mock.requests();
     assert_eq!(requests.len(), 4);
     assert_prefix_holds(&requests);
@@ -491,7 +504,7 @@ async fn the_request_prefix_holds_across_plan_calls() {
         );
     }
     assert_eq!(
-        conversation(&view).plan,
+        conversation(&rt, &view).await.plan,
         Some(plan_of(&["a", "b", "c", "d"]))
     );
 }

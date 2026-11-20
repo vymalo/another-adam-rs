@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
@@ -16,12 +16,15 @@ use adam_core::{
 use adam_error::{BoxError, Classify, ErrorClass};
 
 use crate::agent::{Agent, AgentError, AgentStarter, Inbound};
+use crate::artifact_ref::{ArtifactRef, FileRef, FileSource};
+use crate::blob::BlobCache;
 use crate::cancel::CancelToken;
 use crate::child::{CHILD_REPORTED_KIND, ChildStatus, RUN_FINISHED_KIND};
 use crate::clock::{Clock, DynClock, SystemClock};
 use crate::envelope::Envelope;
 use crate::erased::{Erased, ErasedAgent, ErasedStarter, StarterOnly};
-use crate::events::{Artifact, DynEventSink, EventSink, NoopSink, RunEvent};
+use crate::events::{DynEventSink, EventSink, NoopSink, RunEvent};
+use crate::head::Stored;
 use crate::notify::{DynNotifier, Notifier, Signal};
 use crate::retry::RetryPolicy;
 use crate::session::{
@@ -162,7 +165,7 @@ pub struct RunView {
     pub status: RunStatus,
     /// Timer: when a parked run wakes, or a runnable run (retry backoff)
     /// becomes due.
-    pub wake_at: Option<DateTime<Utc>>,
+    pub wake_at: Option<Timestamp>,
     /// Parked with no timer: only an inbound message (or cancel) resumes it.
     /// This is the "input required" state.
     pub waiting: bool,
@@ -187,25 +190,36 @@ pub struct RunView {
     pub attempt: u32,
     /// Messages delivered but not yet consumed by the agent.
     pub pending_inbox: usize,
-    /// Artifacts emitted by committed transitions, in order.
-    pub artifacts: Vec<Artifact>,
-    /// The agent's own serialized state (e.g. the question of a parked run).
+    /// Artifacts emitted by committed transitions, in order. A file artifact is a reference
+    /// ([`ArtifactRef::file`]): its bytes are fetched with
+    /// [`Runtime::artifact_bytes`](Runtime::artifact_bytes), so a poll of a run never transfers a
+    /// file it does not serve.
+    pub artifacts: Vec<ArtifactRef>,
+    /// The agent's **head**: its state without the transcript for a v5 run. It is the whole agent
+    /// state for a v4 run, and for a v5 run whose head is stale (a delivery, a cancel or a park
+    /// since the last step), because there is no current head to serve. The pointers a front
+    /// reads — `pending_wait`, `pending_question`, `question`, `usage_totals`, `sandbox_usage`,
+    /// `context`, `session` — are in the head.
+    ///
+    /// Use [`Runtime::state`](Runtime::state) for the joined state (the head and the body
+    /// generation it names); this member is not it.
     pub state: Value,
     /// Store version of the record (bumps on every commit).
     pub version: u64,
     /// When the run was created.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Last commit time.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl RunView {
-    fn new(rec: RunRecord, env: Envelope, claimed: bool) -> Self {
+    fn new(rec: RunRecord, stored: Stored, claimed: bool) -> Self {
+        let parts = stored.into_parts();
         // The wake the runtime set for a watched run (to look at its parent, ADR 0044 slice 10) is
         // not the agent's: a view says when the agent asked to be woken, so a run waiting for a
         // person or a message still reads as waiting.
-        let wake_at = if env.hb && rec.status == RunStatus::Parked {
-            env.agent_wake
+        let wake_at = if parts.hb && rec.status == RunStatus::Parked {
+            parts.agent_wake
         } else {
             rec.wake_at
         };
@@ -217,12 +231,12 @@ impl RunView {
             wake_at,
             waiting: rec.status == RunStatus::Parked && wake_at.is_none(),
             claimed,
-            output: (rec.status == RunStatus::Done).then_some(env.output),
-            error: env.error,
-            attempt: env.attempt,
-            pending_inbox: env.inbox.len(),
-            artifacts: env.artifacts,
-            state: env.agent,
+            output: (rec.status == RunStatus::Done).then_some(parts.output),
+            error: parts.error,
+            attempt: parts.attempt,
+            pending_inbox: parts.inbox.len(),
+            artifacts: parts.artifacts,
+            state: parts.agent,
             version: rec.version,
             created_at: rec.created_at,
             updated_at: rec.updated_at,
@@ -239,12 +253,16 @@ impl RunView {
 /// compares it against [`Runtime::now`], so the result agrees with [`Runtime::view`]. An
 /// unreadable state is [`RuntimeError::Corrupt`].
 ///
+/// A record from [`Store::list_runs`](adam_core::Store::list_runs) carries the whole v4 state in
+/// the expand release, so its view is the v4 one; a record read with
+/// [`Store::load_head`](adam_core::Store::load_head) may carry a v5 head.
+///
 /// # Errors
 ///
-/// [`RuntimeError::Corrupt`] when `rec.state` is not a valid envelope.
+/// [`RuntimeError::Corrupt`] when `rec.state` is neither a valid envelope nor a valid head.
 pub fn view_from_record(rec: RunRecord, claimed: bool) -> Result<RunView, RuntimeError> {
-    let env = Envelope::decode(rec.id, &rec.state)?;
-    Ok(RunView::new(rec, env, claimed))
+    let stored = Stored::decode(rec.id, &rec.state)?;
+    Ok(RunView::new(rec, stored, claimed))
 }
 
 pub(crate) struct Config {
@@ -301,6 +319,9 @@ pub(crate) struct Inner {
     pub notifier: Option<DynNotifier>,
     /// Cancellation tokens of the transitions this runtime is stepping now.
     pub in_flight: Mutex<HashMap<RunId, CancelToken>>,
+    /// The file bytes a view's reader has fetched, bounded and shared by every clone: a poll of a
+    /// run whose file was already served does not read the blob again.
+    pub blobs: Mutex<BlobCache>,
 }
 
 impl Inner {
@@ -328,6 +349,86 @@ impl Inner {
         if let Some(token) = token {
             token.cancel();
         }
+    }
+
+    /// The run's record and its joined agent state; see [`Runtime::state`].
+    async fn joined_state(&self, run: RunId) -> Result<Option<(RunRecord, Value)>, RuntimeError> {
+        let Some(first) = self.store.load_head(run).await? else {
+            return Ok(None);
+        };
+        let stored = Stored::decode(run, &first.state)?;
+        if let Some(state) = self.join_stored(&first, &stored).await? {
+            return Ok(Some((first, state)));
+        }
+        // The rows do not match the head: either the generation was collected between the two
+        // reads or the head moved. Re-read the head once; a version that changed names a new set.
+        let Some(second) = self.store.load_head(run).await? else {
+            return Ok(None);
+        };
+        if second.version == first.version {
+            return Err(RuntimeError::Corrupt {
+                run,
+                reason: format!(
+                    "the head names {} body rows and the generation does not hold them",
+                    stored.body().map_or(0, |body| body.len)
+                ),
+                source: None,
+            });
+        }
+        let stored = Stored::decode(run, &second.state)?;
+        match self.join_stored(&second, &stored).await? {
+            Some(state) => Ok(Some((second, state))),
+            None => Err(RuntimeError::Corrupt {
+                run,
+                reason: "the head moved and its body generation is still incomplete".into(),
+                source: None,
+            }),
+        }
+    }
+
+    /// The joined state of one record, or `None` when the body set does not match the head.
+    async fn join_stored(
+        &self,
+        rec: &RunRecord,
+        stored: &Stored,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Some(body) = stored.body() else {
+            return Ok(Some(stored.agent().clone()));
+        };
+        let Some(registered) = self.agents.get(&rec.agent) else {
+            return Err(RuntimeError::UnknownAgent(rec.agent.clone()));
+        };
+        let Some(generation) = body.generation else {
+            return Err(RuntimeError::Corrupt {
+                run: rec.id,
+                reason: "the head names no body generation".into(),
+                source: None,
+            });
+        };
+        let rows = self.store.body_list(rec.id, generation).await?;
+        if rows.len() != body.len as usize
+            || rows
+                .iter()
+                .enumerate()
+                .any(|(at, row)| row.idx as usize != at)
+        {
+            return Ok(None);
+        }
+        let rows: Vec<Value> = rows.into_iter().map(|row| row.message).collect();
+        let had_rows = !rows.is_empty();
+        let head = stored.agent();
+        let joined = registered.starter().join(head.clone(), rows)?;
+        if had_rows && joined == *head {
+            // A starter registered without delegating `join` (its default returns the head) would
+            // silently hand a consumer a state with no transcript. The in-repo starters delegate;
+            // this is for a consumer's front.
+            tracing::warn!(
+                run = %rec.id,
+                agent = %rec.agent,
+                "the registered starter's `join` ignored the transcript; delegate `split`/`join` to the agent's"
+            );
+        }
+        Ok(Some(joined))
     }
 
     pub fn notify_workers(&self) {
@@ -372,18 +473,45 @@ impl Inner {
                 self.fire_cancel(run);
                 return Ok(());
             }
-            let mut env = Envelope::decode(run, &rec.state)?;
+            // S3: `load_run` returns the head, and a cancel writes the head it read (this already
+            // re-encodes the same `Stored` variant, so it survives the switch).
+            let mut stored = Stored::decode(run, &rec.state)?;
             let error = format!("cancelled: {reason}");
-            env.error = Some(error.clone());
+            *stored.error_mut() = Some(error.clone());
             // A request to close the session survives: a cancel must not reopen it.
-            env.inbox.retain(|i| i.kind == crate::SESSION_CLOSE_KIND);
-            let update = RunUpdate::new(RunStatus::Failed, env.encode()?);
+            stored
+                .inbox_mut()
+                .retain(|i| i.kind == crate::SESSION_CLOSE_KIND);
+            // The hook receives the whole agent state. A v4 run carries it; a v5 head is joined
+            // with its body here, once, so the hook never sees a head with no transcript. A set
+            // that does not join is skipped: the cancel still lands, and the hook is best effort.
+            // A process that registered no full agent has no hook to tell, so it reads no body.
+            // In E `load_run` is the full state, so this join is inert; S3's head joins here.
+            let hook_state = if self
+                .agents
+                .get(&rec.agent)
+                .and_then(Registered::agent)
+                .is_some()
+            {
+                match self.join_stored(&rec, &stored).await {
+                    Ok(state) => state,
+                    Err(e) => {
+                        tracing::warn!(%run, error = %adam_error::report(&e), "the cancelled run's state could not be joined; its agent is not told");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let update = RunUpdate::new(RunStatus::Failed, stored.encode()?);
             match self.store.commit_run(run, rec.version, update).await {
                 Ok(committed) => {
                     // First, and on a task of its own: firing the token below lets the step end,
                     // and the worker then drops the cancel watch that may be running this very
                     // call, so anything awaited after it can be cut short.
-                    self.run_cancel_hook(run, &rec.agent, env.agent);
+                    if let Some(state) = hook_state {
+                        self.run_cancel_hook(run, &rec.agent, state);
+                    }
                     self.fire_cancel(run);
                     self.announce_finished(run).await;
                     self.emit_status(run, &rec.agent, RunStatus::Failed, Some(error.clone()))
@@ -423,6 +551,8 @@ impl Inner {
                     status: rec.status,
                 });
             }
+            // S3: `load_run` returns the head; `deliver` must decode `Stored` and re-encode the
+            // variant it read, as `cancel_run` already does. In E the state is always `Full`.
             let mut env = Envelope::decode(run, &rec.state)?;
             env.inbox.push(inbound.clone());
             let woke = rec.status == RunStatus::Parked;
@@ -551,6 +681,11 @@ impl RuntimeBuilder {
     /// Nothing can check this across processes: a mismatch starts the run
     /// successfully, then fails it as permanent on the worker's first step,
     /// with an error naming the agent whose state did not decode.
+    ///
+    /// **A starter that delegates `init` must delegate `split` and `join` too**, or
+    /// [`Runtime::state`] and a continuation join the head without its transcript. The in-repo
+    /// starters delegate; the runtime logs a warning when a non-empty transcript comes back
+    /// unchanged.
     pub fn starter<S: AgentStarter>(self, starter: S) -> Self {
         let name = starter.name().to_owned();
         self.register(name, Registered::Starter(Arc::new(StarterOnly(starter))))
@@ -692,6 +827,7 @@ impl RuntimeBuilder {
                 cfg: self.cfg,
                 wake: watch::channel(0).0,
                 in_flight: Mutex::default(),
+                blobs: Mutex::default(),
             }),
         }
     }
@@ -740,7 +876,7 @@ impl Runtime {
     ///
     /// A caller that builds a view from a record it holds ([`view_from_record`]) reads the run's
     /// lease against this, so the `claimed` it computes agrees with [`view`](Self::view)'s.
-    pub fn now(&self) -> DateTime<Utc> {
+    pub fn now(&self) -> Timestamp {
         self.inner.clock.now()
     }
 
@@ -1182,7 +1318,9 @@ impl Runtime {
                 if !first_is_a_round {
                     return invalid("the session has no first round");
                 }
-                Some(Envelope::decode(prior, &rec.state)?.agent)
+                // Route the state read through `prior_state` (it joins a v5 prior run), so this
+                // path survives S3 when `load_run` returns the head.
+                Some(self.prior_state(agent, prior).await?)
             }
         };
         let new = self
@@ -1395,11 +1533,13 @@ impl Runtime {
     }
 
     /// The agent state that `prior`'s last commit holds, for a run of `agent` that continues it.
+    ///
+    /// A v5 prior run is joined from its head and the body generation the head names (one body
+    /// read); a v4 one carries its whole state in the record.
     async fn prior_state(&self, agent: &str, prior: RunId) -> Result<Value, RuntimeError> {
-        let rec = self
+        let (rec, state) = self
             .inner
-            .store
-            .load_run(prior)
+            .joined_state(prior)
             .await?
             .ok_or(RuntimeError::NotFound(prior))?;
         if rec.agent != agent {
@@ -1409,7 +1549,7 @@ impl Runtime {
                 agent: agent.to_owned(),
             });
         }
-        Ok(Envelope::decode(prior, &rec.state)?.agent)
+        Ok(state)
     }
 
     async fn started(&self, rec: &RunRecord) {
@@ -1484,6 +1624,11 @@ impl Runtime {
 
     /// Snapshot of a run from its durable record (`None` if it does not exist).
     ///
+    /// One read of the run's head when the store has a current one
+    /// ([`Store::load_head`](adam_core::Store::load_head)), and the whole state when it does not (a
+    /// v4 run, or a head a v4 commit left stale). No body is read: a head-only view is the read
+    /// win of ADR 0055.
+    ///
     /// Polled: the span is `debug` so a control plane at `info` pays nothing per poll.
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn view(&self, run: RunId) -> Result<Option<RunView>, RuntimeError> {
@@ -1495,12 +1640,80 @@ impl Runtime {
         // read as version 1 with no lease, `submitted`, and a subscriber saw `working` go back.
         // It costs one primary-key read for a view of a parked or finished run.
         let until = self.inner.store.lease_until(run).await?;
-        let Some(rec) = self.inner.store.load_run(run).await? else {
+        let Some(rec) = self.inner.store.load_head(run).await? else {
             return Ok(None);
         };
-        let env = Envelope::decode(run, &rec.state)?;
+        let stored = Stored::decode(run, &rec.state)?;
         let claimed = adam_core::claimed(rec.status, until, self.inner.clock.now());
-        Ok(Some(RunView::new(rec, env, claimed)))
+        Ok(Some(RunView::new(rec, stored, claimed)))
+    }
+
+    /// The run's **whole** agent state (`None` if the run does not exist): the head and the body
+    /// generation it names, joined by the agent's
+    /// [`join`](crate::Agent::join). This is the only read of a v5 run's transcript.
+    ///
+    /// A v4 run's state is whole in its record, so it is returned as it is with no body read. For
+    /// a v5 run the rows the head names are read (`body_list`) and the join must reproduce the
+    /// state: a set that does not match the head's `len` is read again once, in case the head moved
+    /// between the two reads, and is [`RuntimeError::Corrupt`] if it did not.
+    ///
+    /// The agent must be registered on this runtime (an agent or a starter: both have `join`), and
+    /// its `join` must be the one its `split` wrote the head with. A registration that only starts
+    /// runs answers here too, because the join is on [`AgentStarter`](crate::AgentStarter); **a
+    /// starter that does not delegate `split`/`join` to the agent of the same name returns the head
+    /// without its transcript**, and the runtime logs a warning when it does.
+    ///
+    /// A [`RuntimeError::Corrupt`] answer is not data loss: the head and its generation are read
+    /// separately, so a set that was collected or superseded between the two reads is retried
+    /// internally once; a caller that still sees `Corrupt` may retry the call, and a head that
+    /// names no body is the run's own damage.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::UnknownAgent`] when the run's agent is not registered,
+    /// [`RuntimeError::Corrupt`] when the head or a body row does not decode or the generation does
+    /// not match the head, and the agent's own error when `join` refuses the rows.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn state(&self, run: RunId) -> Result<Option<Value>, RuntimeError> {
+        Ok(self.inner.joined_state(run).await?.map(|(_, state)| state))
+    }
+
+    /// The bytes of a file artifact of a view ([`ArtifactRef::file`]).
+    ///
+    /// An inline file (a v4 run) answers its own bytes. A blob is read once
+    /// ([`Store::get_blob`](adam_core::Store::get_blob)) and cached by content address in a
+    /// bounded, shared cache (32 MiB, least recently used first), so polling the same run does not
+    /// read the file again. `None` when the blob is gone (purged once no run referenced it): that
+    /// artifact cannot be served, and the run is intact.
+    ///
+    /// # Errors
+    ///
+    /// The store's errors. A missing blob is `Ok(None)`, not an error.
+    pub async fn artifact_bytes(&self, file: &FileRef) -> Result<Option<Arc<[u8]>>, RuntimeError> {
+        match &file.source {
+            FileSource::Inline(bytes) => Ok(Some(Arc::from(bytes.as_slice()))),
+            FileSource::Blob(id) => {
+                if let Some(bytes) = self
+                    .inner
+                    .blobs
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(id)
+                {
+                    return Ok(Some(bytes));
+                }
+                let Some(bytes) = self.inner.store.get_blob(id).await? else {
+                    return Ok(None);
+                };
+                let bytes: Arc<[u8]> = Arc::from(bytes);
+                self.inner
+                    .blobs
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .put(id.clone(), bytes.clone());
+                Ok(Some(bytes))
+            }
+        }
     }
 
     /// The header of a run from its durable record (`None` if it does not exist): its status, its

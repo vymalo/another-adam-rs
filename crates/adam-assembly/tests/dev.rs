@@ -3,7 +3,7 @@
 //! same code the watcher runs) loads it; one test uses a real `notify` watcher. The memory store
 //! always, PostgreSQL when `ADAM_TEST_POSTGRES_URL` is set, for the tests where a run outlives a
 //! reload.
-#![cfg(feature = "dev")]
+#![cfg(all(feature = "dev", feature = "remote"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;

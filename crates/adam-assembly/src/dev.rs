@@ -26,13 +26,12 @@ use async_trait::async_trait;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 
-use crate::assembly::{AgentInfo, BoundDef};
+use crate::assembly::{AgentInfo, BoundDef, Rounds};
 use crate::def::AgentDef;
 use crate::error::Error;
 use crate::folder::{agent_dir, project_root};
 #[cfg(feature = "mcp")]
 use crate::mcp::McpBinding;
-use crate::remote_session::RemoteRoundAgent;
 
 /// How long the files must be quiet before a watched change is loaded (an editor writes a file in
 /// several steps).
@@ -64,7 +63,7 @@ struct Built {
     loaded: Vec<Loaded>,
     /// The agents of the sessions on remote subagents: they are registered as they were at
     /// startup, a reload does not replace them.
-    rounds: Vec<RemoteRoundAgent>,
+    rounds: Rounds,
     warnings: Vec<Diagnostic>,
 }
 
@@ -92,7 +91,7 @@ impl Recipe {
         let warnings: Vec<Diagnostic> = report.warnings().cloned().collect();
         let package = report.into_package(self.strictness)?;
         let mut loaded = Vec::new();
-        let mut rounds = Vec::new();
+        let mut rounds = Rounds::default();
         for manifest in package.agents {
             let mut def = AgentDef::from_manifest(manifest)?.resources_from(&dir)?;
             for hook in &self.defs {
@@ -108,7 +107,7 @@ impl Recipe {
                 bound = hook(bound);
             }
             let assembly = bound.model(Arc::clone(&self.model), self.alias.clone())?;
-            rounds.extend(assembly.remote_round_agents().iter().cloned());
+            rounds.extend(assembly.rounds());
             for (agent, info) in assembly.agents().iter().zip(assembly.info()) {
                 loaded.push(Loaded {
                     name: info.name.clone(),
@@ -303,7 +302,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Shared {
     recipe: Recipe,
     /// The round agents of the first load.
-    rounds: Vec<RemoteRoundAgent>,
+    rounds: Rounds,
     registry: Mutex<Registry>,
     /// One reload at a time, so two triggers cannot install out of order.
     serial: Mutex<()>,
@@ -676,10 +675,7 @@ impl LiveAssembly {
         });
         // The agents of the sessions on remote subagents are the ones of the first load: a
         // reload that changes where a remote subagent lives needs a restart.
-        self.shared
-            .rounds
-            .iter()
-            .fold(builder, |builder, round| builder.agent(round.clone()))
+        self.shared.rounds.register(builder)
     }
 
     /// Load the files again now, exactly as a watched change does: on success the versions are

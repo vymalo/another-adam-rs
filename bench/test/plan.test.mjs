@@ -94,3 +94,8 @@ test('R8: two tasks that would share a run id are an error, not a silently skipp
   const same = [{ id: 'dup', source: 'public' }, { id: 'dup', source: 'public' }];
   assert.throws(() => specsOf(buildBlocks({ tasks: same, agents: ['adam'], arms: ['max'], seed: '1' })), /same run id/);
 });
+
+test('a run carries its task\'s agent-path attribute', () => {
+  const specs = specsOf(buildBlocks({ tasks: [{ id: 't1', source: 'public', repo: 'x/y', language: 'go', agentPath: 'fail' }], agents: ['adam'], arms: ['max'], seed: '1' }));
+  assert.equal(specs[0].agentPath, 'fail');
+});

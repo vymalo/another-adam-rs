@@ -201,7 +201,7 @@ async fn wait_for(
     }
 }
 
-async fn finish(rig: &Rig, first: &str) -> RunView {
+async fn finish(rig: &Rig, first: &str) -> (Runtime, RunView) {
     let agent = rig.agent().build();
     let rt = rig.runtime(&agent, "w", false);
     let run = rt
@@ -212,11 +212,12 @@ async fn finish(rig: &Rig, first: &str) -> RunView {
     let view = wait_for(&rt, run, "done", |v| v.status == RunStatus::Done).await;
     let _ = stop.send(());
     handle.await.unwrap().unwrap();
-    view
+    (rt, view)
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 fn text_of(view: &RunView) -> &str {
@@ -233,7 +234,7 @@ async fn an_announced_answer_is_the_runs_answer_and_the_closing_line_is_not() {
             json!({"text": "## The answer\n\nIt is **42**."}),
         )])
         .push_text("There it is.");
-    let view = finish(&rig, "what is it?").await;
+    let (rt, view) = finish(&rig, "what is it?").await;
 
     let output = view.output.clone().unwrap();
     assert_eq!(output["text"], "## The answer\n\nIt is **42**.");
@@ -249,7 +250,7 @@ async fn an_announced_answer_is_the_runs_answer_and_the_closing_line_is_not() {
         Some(&Message::tool_result("c1", TOLD))
     );
     // The state keeps it, and the history keeps the closing line (it was said).
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert_eq!(
         state.announced.as_deref(),
         Some("## The answer\n\nIt is **42**.")
@@ -297,10 +298,13 @@ async fn the_last_announcement_wins() {
         ])
         .push_tool_calls(vec![call("c3", "announce", json!({"text": "third"}))])
         .push_text("Done.");
-    let view = finish(&rig, "go").await;
+    let (rt, view) = finish(&rig, "go").await;
     assert_eq!(text_of(&view), "third");
     assert_eq!(rig.announced.load(SeqCst), 3);
-    assert_eq!(conversation(&view).announced.as_deref(), Some("third"));
+    assert_eq!(
+        conversation(&rt, &view).await.announced.as_deref(),
+        Some("third")
+    );
 }
 
 #[tokio::test]
@@ -313,9 +317,9 @@ async fn a_refused_announcement_changes_nothing_and_the_closing_words_are_the_an
             json!({"text": "too late", "refuse": true}),
         )])
         .push_text("The turn was over, so here it is: 42.");
-    let view = finish(&rig, "go").await;
+    let (rt, view) = finish(&rig, "go").await;
     assert_eq!(text_of(&view), "The turn was over, so here it is: 42.");
-    assert_eq!(conversation(&view).announced, None);
+    assert_eq!(conversation(&rt, &view).await.announced, None);
     // The model saw the error.
     assert_eq!(
         rig.mock.requests()[1].messages.last(),
@@ -334,7 +338,7 @@ async fn a_refusal_after_an_announcement_keeps_the_announcement() {
             json!({"text": "refused", "refuse": true}),
         )])
         .push_text("Done.");
-    let view = finish(&rig, "go").await;
+    let (_rt, view) = finish(&rig, "go").await;
     assert_eq!(text_of(&view), "kept");
 }
 
@@ -342,14 +346,14 @@ async fn a_refusal_after_an_announcement_keeps_the_announcement() {
 async fn with_no_announcement_the_closing_words_are_the_answer_as_before() {
     let rig = Rig::new();
     rig.mock.push_text("Just the words.");
-    let view = finish(&rig, "go").await;
+    let (rt, view) = finish(&rig, "go").await;
     assert_eq!(text_of(&view), "Just the words.");
     let output = view.output.clone().unwrap();
     assert!(
         output["stream"].is_string(),
         "an unannounced answer still names the stream it was sent as: {output}"
     );
-    assert_eq!(conversation(&view).announced, None);
+    assert_eq!(conversation(&rt, &view).await.announced, None);
     // The state of a run that announced nothing does not carry the member at all.
     assert!(view.state.get("announced").is_none());
 }
@@ -417,7 +421,7 @@ async fn a_message_that_reaches_the_run_ends_the_turn_and_the_announcement_with_
     let (stop, handle) = spawn_worker(&rt);
     let parked = wait_for(&rt, run, "parked on the question", |v| v.waiting).await;
     assert_eq!(
-        conversation(&parked).announced.as_deref(),
+        conversation(&rt, &parked).await.announced.as_deref(),
         Some("old answer"),
         "an announcement stands while the turn goes on"
     );
@@ -428,7 +432,7 @@ async fn a_message_that_reaches_the_run_ends_the_turn_and_the_announcement_with_
     let _ = stop.send(());
     handle.await.unwrap().unwrap();
     assert_eq!(text_of(&view), "The new closing words.");
-    assert_eq!(conversation(&view).announced, None);
+    assert_eq!(conversation(&rt, &view).await.announced, None);
 }
 
 #[test]
@@ -492,7 +496,7 @@ async fn a_final_answer_ends_the_turn_with_no_closing_line() {
         .count();
     assert_eq!(said, 0);
     // The state is what a run that announced would carry, plus the mark that it ended the turn.
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert_eq!(state.announced.as_deref(), Some("## It is **42**."));
     assert!(state.announced_final);
 }
@@ -520,7 +524,8 @@ async fn the_calls_of_the_turn_are_answered_before_a_final_answer_ends_it() {
     // Both calls ran and the last one is the answer; the history holds both results.
     assert_eq!(text_of(&view), "second");
     assert_eq!(rig.mock.requests().len(), 1);
-    let tool_results = conversation(&view)
+    let tool_results = conversation(&rt, &view)
+        .await
         .messages
         .iter()
         .filter(|m| matches!(m, Message::Tool { .. }))
@@ -557,5 +562,5 @@ async fn a_refused_final_answer_ends_nothing() {
         2,
         "the model read the error and answered"
     );
-    assert!(!conversation(&view).announced_final);
+    assert!(!conversation(&rt, &view).await.announced_final);
 }

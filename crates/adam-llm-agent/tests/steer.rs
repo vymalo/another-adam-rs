@@ -206,8 +206,9 @@ fn steer(id: &str, text: &str) -> Inbound {
     Inbound::new("message", json!({ "text": text })).with_id(id)
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("the run's state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 fn answer(view: &RunView) -> String {
@@ -310,7 +311,7 @@ async fn a_message_sent_during_the_final_model_call_is_answered() {
             ],
             "{backend}: the second request has the first answer and the message after it"
         );
-        let state = conversation(&done);
+        let state = conversation(&rt, &done).await;
         assert_eq!(state.turns, 2, "{backend}");
         assert_eq!(
             rig.said(run),
@@ -373,7 +374,7 @@ async fn the_same_message_is_read_once() {
         let done = wait_done(&rt, run).await;
         stop(worker).await;
 
-        let state = conversation(&done);
+        let state = conversation(&rt, &done).await;
         let said: Vec<&Message> = state
             .messages
             .iter()
@@ -430,7 +431,7 @@ async fn a_copy_of_a_read_message_sent_during_the_final_model_call_costs_no_turn
             2,
             "{backend}: no model call for the copy"
         );
-        let state = conversation(&done);
+        let state = conversation(&rt, &done).await;
         let said = state
             .messages
             .iter()

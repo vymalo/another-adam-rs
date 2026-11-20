@@ -12,7 +12,9 @@ use adam_a2a::{
     AccessTier, BackendError, CHILD_SESSIONS_EXTENSION, Caller, STEPS_EXTENSION,
     TEXT_STREAM_EXTENSION, TaskEvent, USAGE_EXTENSION,
 };
-use adam_runtime::{AGENT_TEXT_KIND, RunEvent, RunSubscription, RunView, StepEvent, StepState};
+use adam_runtime::{
+    AGENT_TEXT_KIND, ArtifactRef, FileRef, RunEvent, RunSubscription, RunView, StepEvent, StepState,
+};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::Value;
@@ -23,9 +25,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{RuntimeTaskBackend, map_err};
 use crate::child_sessions::{ContextKind, Round, kind_of};
-use crate::convert::{
-    ArtifactIds, StatusKey, artifact_of_with, artifact_slot, status_key, status_of, task_from_view,
-};
+use crate::convert::{ArtifactIds, StatusKey, artifact_slot, status_key, status_of};
 use crate::session_events::{SessionsTracker, quiet, read_due};
 use crate::steps::step_message;
 use crate::text_stream;
@@ -169,6 +169,10 @@ fn droppable(item: &Result<TaskEvent, BackendError>) -> bool {
 /// The bytes of payload an item holds, for the queue bound: the parts of its artifact or message (a
 /// file's bytes themselves) and the metadata around them, with a fixed cost for the event's own
 /// fields. A bound on what the queue holds, not a measurement of it.
+///
+/// A file artifact's raw part holds exactly the `FileRef::size` its head declared, so the charge
+/// of a file event is that size; the queue measures the built event (after the fetch), it is not
+/// given the ref beforehand. An artifact whose blob is gone has no event to charge.
 fn item_bytes(item: &Result<TaskEvent, BackendError>) -> usize {
     let event = match item {
         Ok(TaskEvent::Snapshot(task)) => task_bytes(task),
@@ -354,7 +358,7 @@ impl Tracker {
 
     /// Events for whatever the durable `view` says that the subscriber does
     /// not know yet: new artifacts first, then a changed status.
-    fn sync(&mut self, view: &RunView, backend: &RuntimeTaskBackend) -> Vec<TaskEvent> {
+    async fn sync(&mut self, view: &RunView, backend: &RuntimeTaskBackend) -> Vec<TaskEvent> {
         // A poll that reads the run it already read has nothing to say, and says it without
         // hashing or serialising an artifact and without building a status.
         let stamp = (view.version, view.claimed);
@@ -362,7 +366,7 @@ impl Tracker {
             return Vec::new();
         }
         self.seen = Some(stamp);
-        let mut events = self.artifacts(&view.artifacts);
+        let mut events = self.artifacts(&view.artifacts, backend).await;
         let status = status_of(view, &backend.prompt);
         let key = status_key(&status);
         if !waits(&status.state) {
@@ -391,33 +395,47 @@ impl Tracker {
 
     /// Events for the artifacts this subscriber has not been sent, each mapped from the entry of
     /// the last poll when it is the same artifact.
-    fn artifacts(&mut self, artifacts: &[adam_runtime::Artifact]) -> Vec<TaskEvent> {
+    ///
+    /// A file artifact's bytes are fetched here, once per blob (the runtime's cache answers a
+    /// later poll); an artifact whose blob is gone is left out, and a later version offers it
+    /// again.
+    async fn artifacts(
+        &mut self,
+        artifacts: &[ArtifactRef],
+        backend: &RuntimeTaskBackend,
+    ) -> Vec<TaskEvent> {
         let mut events = Vec::new();
         for (at, artifact) in artifacts.iter().enumerate() {
             let said = self.ids.mapped(at, artifact);
-            let told = self
-                .seen_artifacts
-                .insert(said.id.clone(), said.content.clone());
-            if told != Some(said.content) {
-                events.push(self.artifact_event(artifact, said.id));
+            if self.seen_artifacts.get(&said.id) == Some(&said.content) {
+                continue;
             }
+            let Some(event) = backend
+                .artifact_of_with(artifact, said.id.clone())
+                .await
+                .map(|served| self.artifact_event(served))
+            else {
+                continue;
+            };
+            self.seen_artifacts.insert(said.id, said.content);
+            events.push(event);
         }
         events
     }
 
     /// The slot of `artifact` when it is news to this subscriber, and now known to it: its slot
     /// last held other content (or nothing).
-    fn admit(&mut self, artifact: &adam_runtime::Artifact) -> Option<String> {
+    fn admit(&mut self, artifact: &ArtifactRef) -> Option<String> {
         let (slot, content) = artifact_slot(artifact);
         let told = self.seen_artifacts.insert(slot.clone(), content.clone());
         (told != Some(content)).then_some(slot)
     }
 
-    fn artifact_event(&self, artifact: &adam_runtime::Artifact, id: String) -> TaskEvent {
+    fn artifact_event(&self, artifact: Artifact) -> TaskEvent {
         TaskEvent::Artifact(TaskArtifactUpdateEvent {
             task_id: self.task_id.clone(),
             context_id: self.context_id.clone(),
-            artifact: artifact_of_with(artifact, id),
+            artifact,
             append: None,
             last_chunk: Some(true),
             metadata: None,
@@ -518,11 +536,13 @@ impl Tracker {
                 data,
                 file,
             } => {
-                let mut artifact = adam_runtime::Artifact::new(name, mime_type, data);
-                artifact.file = file;
+                let mut artifact = ArtifactRef::new(name, mime_type, data);
+                artifact.file = file.map(|file| FileRef::inline(file.filename, file.bytes));
                 artifact.id = id;
                 match self.admit(&artifact) {
-                    Some(id) => vec![self.artifact_event(&artifact, id)],
+                    Some(id) => crate::convert::artifact_of_with(&artifact, id, None)
+                        .map(|served| vec![self.artifact_event(served)])
+                        .unwrap_or_default(),
                     None => Vec::new(),
                 }
             }
@@ -584,11 +604,7 @@ async fn pump(
     };
 
     let told = backend.tier_said_to(caller, &view);
-    let task = backend.said(
-        caller,
-        &view,
-        task_from_view(&view, &context_id, &backend.prompt),
-    );
+    let task = backend.said(caller, &view, backend.task_of(&view, &context_id).await);
     // The sessions are read before the task says them, so one that starts in between is told twice
     // (here and as an event) and never missed.
     let kind = kind_of(&task.context_id);
@@ -678,7 +694,7 @@ async fn pump(
                 continue;
             }
         };
-        let mut events = tracker.sync(&view, backend);
+        let mut events = tracker.sync(&view, backend).await;
         let ends = events.iter().any(TaskEvent::ends_stream);
         // The sessions are listed once more before the final event, so nothing that happened
         // since the last listing is left unsaid.
@@ -753,7 +769,7 @@ async fn pump(
 #[cfg(test)]
 mod tests {
     use adam_core::{DynStore, MemoryStore, RunStatus};
-    use adam_runtime::{Artifact as RunArtifact, BroadcastSink, Runtime, StepKind};
+    use adam_runtime::{ArtifactRef, BroadcastSink, Runtime, StepKind};
     use serde_json::json;
 
     use super::*;
@@ -831,7 +847,7 @@ mod tests {
         RuntimeTaskBackend::new(Runtime::builder(store).build(), BroadcastSink::new(8), "a")
     }
 
-    fn view(version: u64, artifacts: Vec<RunArtifact>) -> RunView {
+    fn view(version: u64, artifacts: Vec<ArtifactRef>) -> RunView {
         RunView {
             id: adam_core::RunId::new(),
             agent: "a".into(),
@@ -847,13 +863,13 @@ mod tests {
             artifacts,
             state: json!({}),
             version,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: adam_core::store::now(),
+            updated_at: adam_core::store::now(),
         }
     }
 
-    fn tracker(view: &RunView, backend: &RuntimeTaskBackend) -> Tracker {
-        let task = task_from_view(view, "ctx", &backend.prompt);
+    async fn tracker(view: &RunView, backend: &RuntimeTaskBackend) -> Tracker {
+        let task = backend.task_of(view, "ctx").await;
         Tracker::new(&task, "ctx".into(), view, &Caller::new("t"), None)
     }
 
@@ -871,21 +887,21 @@ mod tests {
     /// A poll that reads the run it already read does no artifact work at all: no digest, no
     /// serialisation. The first sync of a changed run does both, so a counter that never counted
     /// cannot make the negative assertion green.
-    #[test]
-    fn a_poll_of_an_unchanged_run_derives_nothing() {
+    #[tokio::test]
+    async fn a_poll_of_an_unchanged_run_derives_nothing() {
         let backend = backend();
         let first = view(
             2,
             vec![
-                RunArtifact::file("logo", "image/svg+xml", "logo.svg", vec![7u8; 4096]).unwrap(),
-                RunArtifact::new("plan", Some("application/json".into()), json!({"v": 1}))
+                ArtifactRef::file("logo", "image/svg+xml", "logo.svg", vec![7u8; 4096]).unwrap(),
+                ArtifactRef::new("plan", Some("application/json".into()), json!({"v": 1}))
                     .with_id("plan-x"),
             ],
         );
-        let mut tracker = tracker(&view(1, Vec::new()), &backend);
+        let mut tracker = tracker(&view(1, Vec::new()), &backend).await;
 
         let before = work::counts();
-        let events = tracker.sync(&first, &backend);
+        let events = tracker.sync(&first, &backend).await;
         let after = work::counts();
         assert!(
             after.0 > before.0 && after.1 > before.1,
@@ -895,7 +911,7 @@ mod tests {
 
         // The same read again: nothing is asked about, nothing is derived and nothing is said.
         let asked = work::artifacts_asked();
-        let events = tracker.sync(&first, &backend);
+        let events = tracker.sync(&first, &backend).await;
         assert!(events.is_empty(), "{events:?}");
         assert_eq!(work::counts(), after, "an unchanged poll derives nothing");
         assert_eq!(
@@ -909,7 +925,7 @@ mod tests {
         let mut later = first.clone();
         later.version = 3;
         let asked = work::artifacts_asked();
-        let events = tracker.sync(&later, &backend);
+        let events = tracker.sync(&later, &backend).await;
         assert!(events.is_empty(), "{events:?}");
         assert_eq!(
             work::artifacts_asked() - asked,
@@ -925,25 +941,25 @@ mod tests {
 
     /// A changed run derives only the artifacts it added or replaced, never the ones the last poll
     /// already mapped.
-    #[test]
-    fn a_changed_run_derives_only_what_it_added_or_replaced() {
+    #[tokio::test]
+    async fn a_changed_run_derives_only_what_it_added_or_replaced() {
         let backend = backend();
         let first = view(
             2,
             vec![
-                RunArtifact::file("logo", "image/svg+xml", "logo.svg", vec![7u8; 4096]).unwrap(),
-                RunArtifact::new("plan", None, json!({"v": 1})).with_id("plan-x"),
+                ArtifactRef::file("logo", "image/svg+xml", "logo.svg", vec![7u8; 4096]).unwrap(),
+                ArtifactRef::new("plan", None, json!({"v": 1})).with_id("plan-x"),
             ],
         );
-        let mut tracker = tracker(&first, &backend);
+        let mut tracker = tracker(&first, &backend).await;
 
         // One artifact appended: it alone is derived.
         let mut more = first.clone();
         more.version = 3;
         more.artifacts
-            .push(RunArtifact::new("report", None, json!({"done": true})));
+            .push(ArtifactRef::new("report", None, json!({"done": true})));
         let before = work::counts();
-        let events = tracker.sync(&more, &backend);
+        let events = tracker.sync(&more, &backend).await;
         let after = work::counts();
         assert_eq!(
             after.0 - before.0,
@@ -956,9 +972,9 @@ mod tests {
         // One artifact replaced where it stands: it alone is derived again.
         let mut replaced = more.clone();
         replaced.version = 4;
-        replaced.artifacts[1] = RunArtifact::new("plan", None, json!({"v": 2})).with_id("plan-x");
+        replaced.artifacts[1] = ArtifactRef::new("plan", None, json!({"v": 2})).with_id("plan-x");
         let before = work::counts();
-        let events = tracker.sync(&replaced, &backend);
+        let events = tracker.sync(&replaced, &backend).await;
         let after = work::counts();
         assert_eq!(
             after.0 - before.0,
@@ -973,8 +989,8 @@ mod tests {
         let mut renamed = replaced.clone();
         renamed.version = 5;
         renamed.artifacts[1] =
-            RunArtifact::new("plan-renamed", None, json!({"v": 2})).with_id("plan-x");
-        let events = tracker.sync(&renamed, &backend);
+            ArtifactRef::new("plan-renamed", None, json!({"v": 2})).with_id("plan-x");
+        let events = tracker.sync(&renamed, &backend).await;
         assert_eq!(
             said(&events),
             vec!["plan-x".to_owned()],
@@ -984,20 +1000,20 @@ mod tests {
 
     /// An artifact the run changed is derived again: one without an id gets a new content-derived
     /// id, and one with an id is said again under that id.
-    #[test]
-    fn a_changed_artifact_gets_a_new_id() {
+    #[tokio::test]
+    async fn a_changed_artifact_gets_a_new_id() {
         let backend = backend();
-        let report = RunArtifact::new("report", None, json!({"v": 1}));
-        let plan = RunArtifact::new("plan", None, json!({"v": 1})).with_id("plan-x");
+        let report = ArtifactRef::new("report", None, json!({"v": 1}));
+        let plan = ArtifactRef::new("plan", None, json!({"v": 1})).with_id("plan-x");
         let first = view(2, vec![report.clone(), plan]);
         let was = artifact_id(&report);
-        let mut tracker = tracker(&first, &backend);
+        let mut tracker = tracker(&first, &backend).await;
 
         let mut changed = first.clone();
         changed.version = 3;
-        changed.artifacts[0] = RunArtifact::new("report", None, json!({"v": 2}));
-        changed.artifacts[1] = RunArtifact::new("plan", None, json!({"v": 2})).with_id("plan-x");
-        let events = tracker.sync(&changed, &backend);
+        changed.artifacts[0] = ArtifactRef::new("report", None, json!({"v": 2}));
+        changed.artifacts[1] = ArtifactRef::new("plan", None, json!({"v": 2})).with_id("plan-x");
+        let events = tracker.sync(&changed, &backend).await;
 
         assert_eq!(
             said(&events),

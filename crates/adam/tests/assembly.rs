@@ -145,7 +145,8 @@ async fn a_bound_agent_runs_a_macro_tool_through_the_runtime() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
     assert_eq!(view.output.as_ref().unwrap()["text"], "It is 18 C.");
-    let conversation: Conversation = serde_json::from_value(view.state).unwrap();
+    let state = rt.state(run).await.unwrap().expect("the run");
+    let conversation: Conversation = serde_json::from_value(state).unwrap();
     assert!(
         conversation
             .messages

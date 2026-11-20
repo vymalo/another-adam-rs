@@ -10,7 +10,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-adam.workspace = true
+# No default feature: `include_agent!` needs none, and the defaults would turn `remote` back on in
+# adam-assembly's own test builds without it (this crate is one of its dev-dependencies).
+adam = { path = "../adam", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true

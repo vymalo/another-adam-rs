@@ -151,8 +151,9 @@ async fn finish(rt: &Runtime, run: RunId) -> RunView {
     view
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 fn agent_with(mock: &Arc<MockModel>, tools: Vec<Arc<dyn Tool>>) -> LlmAgent {
@@ -198,7 +199,7 @@ async fn a_tool_past_its_limit_is_an_error_result_and_its_token_fires() {
         "the call's token fired when the limit passed"
     );
     assert_eq!(
-        conversation(&view).messages[2],
+        conversation(&rt, &view).await.messages[2],
         Message::tool_error("c1", SAID_120),
         "the late answer is not the result"
     );
@@ -240,7 +241,7 @@ async fn a_tool_that_ignores_its_token_is_dropped_after_the_grace() {
     assert!(started.elapsed() < Duration::from_secs(60));
     let Message::Tool {
         content, is_error, ..
-    } = &conversation(&view).messages[2]
+    } = &conversation(&rt, &view).await.messages[2]
     else {
         panic!("not a tool result")
     };
@@ -275,7 +276,7 @@ async fn an_undeclared_tool_gets_300_s() {
         .expect("start");
     let view = finish(&rt, run).await;
 
-    let messages = conversation(&view).messages;
+    let messages = conversation(&rt, &view).await.messages;
     assert_eq!(messages[2], Message::tool_result("c1", "woke up"));
     let Message::Tool {
         content, is_error, ..
@@ -352,7 +353,7 @@ async fn a_timed_out_call_replays_without_waiting() {
     );
     let Message::Tool {
         content, is_error, ..
-    } = &conversation(&view).messages[2]
+    } = &conversation(&rt_b, &view).await.messages[2]
     else {
         panic!("not a tool result")
     };
@@ -427,7 +428,7 @@ async fn a_child_past_its_limit_is_an_error_result_for_its_parent() {
 
     assert!(fired.load(SeqCst), "the child's tool saw its token fire");
     assert_eq!(
-        conversation(&view).messages[2],
+        conversation(&rt, &view).await.messages[2],
         Message::tool_error(
             "d1",
             "the run failed: cancelled: time limit: the run did not finish within 1 min"
@@ -479,7 +480,7 @@ async fn result_of_a_slow_call(limit: u64, after: u64) -> Message {
         .await
         .expect("start");
     let view = finish(&rt, run).await;
-    conversation(&view).messages[2].clone()
+    conversation(&rt, &view).await.messages[2].clone()
 }
 
 #[tokio::test(start_paused = true)]
@@ -562,7 +563,7 @@ async fn a_source_tool_gets_its_noted_timeout_plus_ten_seconds_and_300_s_without
         .await
         .expect("start");
     let view = finish(&rt, run).await;
-    let messages = conversation(&view).messages;
+    let messages = conversation(&rt, &view).await.messages;
     for (i, expect) in [(2, "within 15 s"), (4, "within 300 s")] {
         let Message::Tool {
             content, is_error, ..

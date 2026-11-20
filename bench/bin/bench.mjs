@@ -30,15 +30,19 @@ const USAGE = `usage: bench <command>
                                   build the report from the ledger (default $BENCH_HOME/report.md)
   tasks fetch|mine|lint|build|check|select
                                   task sources, the environment check and selection (bench tasks --help)
-  doctor [--start]                what the machine must have (Docker, disk, the coder image, the coder in each selected
+  doctor [--start] [--keep-images]
+                                  what the machine must have (Docker, disk, the coder image, the coder in each selected
                                   task image); --start brings the shared services up and runs a container on the host
   dry-run [--phase all|grades|budget|resume] [--down]
                                   both agents on three self-test tasks and a scripted model: grades, cost, budget, kill and resume
-  pilot [--blocks N]              the first blocks of the plan (default 5) with the configuration's per-run budget; prints the
+  pilot [--blocks N] [--keep-images]
+                                  the first blocks of the plan (default 5) with the configuration's per-run budget; prints the
                                   projection and writes $BENCH_HOME/pilot-budget.json
   confirm [--over-cap]            the owner's yes to that file; run refuses to start without it
-  run                             the full run: blocks, slots, resume, grading, then report.md
-  regrade                         grade again the runs whose grading failed in the infrastructure
+  run [--keep-images]             the full run: blocks, slots, resume, grading, then report.md
+  regrade [--keep-images]         grade again the runs whose grading failed in the infrastructure
+                                  (a public task's image is pulled by digest before its first run and removed after its last;
+                                  --keep-images keeps every image, as before)
 
 environment: BENCH_CONFIG (default ~/.config/adam-bench/config.json), BENCH_HOME (default ~/.local/share/adam-bench)
 `;
@@ -74,7 +78,7 @@ function report(argv, env) {
 }
 
 async function doctorCommand(argv, env) {
-  const { values } = parseArgs({ args: argv, options: { start: { type: 'boolean' } }, allowPositionals: false });
+  const { values } = parseArgs({ args: argv, options: { start: { type: 'boolean' }, 'keep-images': { type: 'boolean' } }, allowPositionals: false });
   const home = benchHome(env);
   assertOutsideRepo(home, 'BENCH_HOME');
   fs.mkdirSync(home, { recursive: true });
@@ -94,7 +98,7 @@ async function doctorCommand(argv, env) {
   } catch (e) {
     if (env.BENCH_CONFIG || fs.existsSync(configPath(env))) taskError = e.message;
   }
-  const result = await doctor({ home, pins: PINS, stack, start: values.start === true, tasks, taskError, containers: stack.hostContainers(), env });
+  const result = await doctor({ home, pins: PINS, stack, start: values.start === true, tasks, taskError, containers: stack.hostContainers(), env, justInTime: values['keep-images'] !== true });
   process.stdout.write(`${renderDoctor(result)}\n`);
   return result.exitCode;
 }

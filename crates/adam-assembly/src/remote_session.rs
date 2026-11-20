@@ -28,7 +28,6 @@ use adam_runtime::{
     child_run_id, closing_round_payload,
 };
 use async_trait::async_trait;
-use chrono::Duration as ChronoDuration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -101,7 +100,7 @@ pub struct RoundState {
     sending_count: usize,
     /// When the round first stepped: the round gives up `max_wait` after it, whatever started it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    started: Option<chrono::DateTime<chrono::Utc>>,
+    started: Option<adam_core::time::Timestamp>,
     /// Messages taken from the inbox that no step has dealt with yet.
     #[serde(default)]
     unhandled: Vec<Queued>,
@@ -207,7 +206,7 @@ const REAP_KIND: &str = "adam.session.reap";
 struct Reap {
     session: adam_core::RunId,
     round: adam_core::RunId,
-    due: chrono::DateTime<chrono::Utc>,
+    due: adam_core::time::Timestamp,
 }
 
 impl RoundState {
@@ -576,10 +575,10 @@ impl RemoteRoundAgent {
         &self,
         ctx: &mut Ctx,
         looks: u32,
-    ) -> Result<chrono::DateTime<chrono::Utc>, AgentError> {
+    ) -> Result<adam_core::time::Timestamp, AgentError> {
         let wait = look_delay(looks, self.wait_poll);
         let now = ctx.now_journaled().await?;
-        Ok(now + ChronoDuration::from_std(wait).unwrap_or(ChronoDuration::seconds(60)))
+        Ok(now + adam_core::time::span_of(wait))
     }
 
     /// A round of a session that may stay open has ended: start the timer run that, if nobody
@@ -596,8 +595,7 @@ impl RemoteRoundAgent {
             return Ok(());
         }
         let starter = ctx.child_starter();
-        let ttl =
-            ChronoDuration::from_std(starter.session_idle_ttl()).unwrap_or(ChronoDuration::days(7));
+        let ttl = adam_core::time::span_of(starter.session_idle_ttl());
         let round = ctx.run_id();
         let due = ctx.now_journaled().await? + ttl;
         let input = Inbound::new(
@@ -667,7 +665,7 @@ impl RemoteRoundAgent {
         if !(view.idle_expired || view.closed) {
             // The clocks differ by a moment: look again.
             return Ok(Transition::Park {
-                wake_at: Some(now + ChronoDuration::seconds(1)),
+                wake_at: Some(now + jiff::SignedDuration::from_secs(1)),
                 state: st,
             });
         }
@@ -764,11 +762,11 @@ fn look_delay(looks: u32, cap: Duration) -> Duration {
 
 /// Whether a round that first stepped at `started` has worked `max_wait`.
 fn past_limit(
-    now: chrono::DateTime<chrono::Utc>,
-    started: chrono::DateTime<chrono::Utc>,
+    now: adam_core::time::Timestamp,
+    started: adam_core::time::Timestamp,
     max_wait: Duration,
 ) -> bool {
-    ChronoDuration::from_std(max_wait).is_ok_and(|limit| now - started > limit)
+    now - started > adam_core::time::span_of(max_wait)
 }
 
 fn request_of(message: Message) -> SendMessageRequest {
@@ -1188,8 +1186,9 @@ mod tests {
 
     #[test]
     fn debug_hides_the_token_and_the_state_holds_none() {
+        use crate::def::{RemoteSettings, Secrets};
         use crate::error::Origin;
-        use crate::remote::{RemoteEndpoint, RemoteSettings};
+        use crate::remote::RemoteEndpoint;
         use adam_agent_fs::{RemoteAgent, RemoteAuth};
         use secrecy::SecretString;
         let agent = RemoteAgent {
@@ -1201,7 +1200,7 @@ mod tests {
             note: String::new(),
             path: "agent/subagents/billing.md".into(),
         };
-        let settings = RemoteSettings {
+        let secrets = Secrets {
             env: Arc::new(
                 [(
                     "T".to_owned(),
@@ -1209,12 +1208,13 @@ mod tests {
                 )]
                 .into(),
             ),
-            ..RemoteSettings::default()
+            ..Secrets::default()
         };
         let endpoint = RemoteEndpoint::bind(
             &Origin::new("coder/billing", "billing.md"),
             &agent,
-            &settings,
+            &RemoteSettings::default(),
+            &secrets,
         )
         .unwrap();
         let round = RemoteRoundAgent::new(
@@ -1257,8 +1257,9 @@ mod tests {
     }
 
     fn round_agent() -> RemoteRoundAgent {
+        use crate::def::{RemoteSettings, Secrets};
         use crate::error::Origin;
-        use crate::remote::{RemoteEndpoint, RemoteSettings};
+        use crate::remote::RemoteEndpoint;
         use adam_agent_fs::RemoteAgent;
         let agent = RemoteAgent {
             name: "billing".into(),
@@ -1273,6 +1274,7 @@ mod tests {
             &Origin::new("coder/billing", "billing.md"),
             &agent,
             &RemoteSettings::default(),
+            &Secrets::default(),
         )
         .unwrap();
         RemoteRoundAgent::new(

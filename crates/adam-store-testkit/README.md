@@ -14,8 +14,9 @@ dependency.
 
 ## API at a glance
 
-* `store_conformance!(make)` generates one `#[tokio::test]` per case (48
-  cases: create/load, `run_header` against `load_run` + `lease_until`, state round trip, CAS
+* `store_conformance!(make)` generates one `#[tokio::test]` per case (49
+  cases: create/load, the millisecond precision of every timestamp (`.120` survives, finer truncates),
+  `run_header` against `load_run` + `lease_until`, state round trip, CAS
   conflicts, concurrent commits, journal ordering and first-writer-wins, claim rules and
   exclusivity, busy runs that a claim leaves alone, lease expiry/renew/release, what `lease_until` reports, pinned claims and the
   run owner, one open run per conversation, purge, the listing of a caller's runs (scoped, ordered, keyset pages, status and time filters, literal prefixes including ones that hold or end in `/`, `count_runs`; two creates with different ids in one conversation leave one open run), and the push-notification configs: put/replace, list, delete, claim rules, exclusive claims under concurrency, commit, stale versions, removal with the run).
@@ -64,6 +65,11 @@ after a commit that names a different one), a shared
   returned without its state (a `create_run` or `commit_run` echo). `run_header` is forwarded: an
   adapter that overrides it answers in one small read with no state; one that does not reads the
   record inside the adapter, which the wrapper cannot see — never measure reads with `run_header`.
+  The read path of ADR 0055's S2b is what a measurement asserts: `Runtime::view` is one
+  `LoadHead` and no `BodyList`, and `Runtime::state` is one `LoadHead` and one `BodyList` for a v5
+  run (a v4 run answers from the record with no body read). A store
+  whose `load_head` is the trait default answers the `LoadRun` the wrapper sees inside the adapter,
+  which it cannot count: measure the head with `load_head`, as `adam-runtime`'s suite does.
 * `counting::measure_transcript_write`: a **measurement helper, not a conformance case**. One run,
   `Measurement::COMMITS` commits of a 10 KB message, the last one `Done`, then purged; returns
   `Measurement` (`commits`, `total_written`, `max_commit`, `first_read`, `final_read`) and

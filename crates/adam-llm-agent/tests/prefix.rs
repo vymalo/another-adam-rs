@@ -372,7 +372,7 @@ impl Rig {
         let _ = stop.send(());
         worker.await.expect("worker task");
         assert_eq!(view.status, RunStatus::Done, "{view:#?}");
-        (self.mock.requests(), conversation(&view))
+        (self.mock.requests(), conversation(&self.rt, &view).await)
     }
 }
 
@@ -388,8 +388,9 @@ async fn wait_terminal(rt: &Runtime, run: RunId) -> RunView {
     }
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 fn head(request: &ModelRequest) -> String {
@@ -680,7 +681,7 @@ async fn a_message_that_arrives_before_a_replay_does_not_move_the_cut() {
     let _ = stop.send(());
     worker.await.expect("worker task");
     assert_eq!(view.status, RunStatus::Done, "{view:#?}");
-    let (requests, state) = (rig.mock.requests(), conversation(&view));
+    let (requests, state) = (rig.mock.requests(), conversation(&rig.rt, &view).await);
     assert_eq!(requests.len(), 6, "{requests:#?}");
     // The first try's request (3) has no message and no cut; the replay answered from the journal,
     // which asked nothing; the model answers again at request 4, the first with the message, and
@@ -852,7 +853,8 @@ async fn the_closing_request_extends_the_one_before_and_its_turn_is_not_kept() {
         Some(adam_llm_agent::CLOSING_TURN.to_owned())
     );
     assert!(
-        !conversation(&view)
+        !conversation(&rt, &view)
+            .await
             .messages
             .iter()
             .any(|m| m.text() == adam_llm_agent::CLOSING_TURN),
@@ -1929,7 +1931,10 @@ async fn a_refusal_with_no_new_image_fails_the_run() {
     );
     // The person's picture was carried by a request that got through: it was not touched.
     assert_eq!(requests.len(), 2);
-    assert_eq!(images_of(&conversation(&view).messages).len(), 1);
+    assert_eq!(
+        images_of(&conversation(&rig.rt, &view).await.messages).len(),
+        1
+    );
 }
 
 /// A lost commit after the refusal replays the same decision: the same lines, the same requests.

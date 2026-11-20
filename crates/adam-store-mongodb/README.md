@@ -68,7 +68,9 @@ Every operation is a single-document atomic write, so a standalone `mongod`
 is enough (no multi-document transactions). Integers above `i64::MAX` are
 rejected with `StoreError::InvalidInput`. A NUL in a string or a key is stored
 as U+FFFD (`adam_core::storable`), as in every adapter. Time is truncated to
-milliseconds.
+milliseconds and kept as a BSON date: `Bson::DateTime::from_millis(timestamp.as_millisecond())` on
+the way in, `Timestamp::from_millisecond(..)` on the way out, so the stored dates are the ones the
+adapter wrote before [ADR 0057](../../docs/decisions/0057-time-is-jiff-with-the-bytes-chrono-wrote.md).
 The guarantee table is in the [store adapters reference](../../docs/reference/store-adapters.md#how-each-adapter-keeps-the-contract).
 
 *Unverified:* the "MongoDB 5.0+" floor is the oldest server CI runs against
@@ -161,8 +163,9 @@ may or may not have landed), aborts before the CAS — a head never names a gene
 a row. The refs go next, then the CAS, then the GC: the superseded generations of the run written
 more than an hour ago are deleted. A commit that loses the CAS deletes the rows and refs its
 `writer` added (but never a row or digest the winner's head names), so a loser cannot poison the
-next append. `load_head` reads the document once and serves the head only when `head_version ==
-version`.
+next append. `load_head` is one **projected** `find_one` (the head and the record's own fields,
+never `state`) when `head_version == version`; a stale, absent or null head falls back to a second,
+full read that serves the whole state.
 
 `purge_finished` deletes the purged runs' body rows with their journal and references. The body
 methods are **defaulted** on `Store`; `RunUpdate` gained the public fields `head` and `body`, so a
@@ -224,7 +227,12 @@ tests of the key escaping; `src/lib.rs` has unit tests of the error classes
 (`a_body_insert_is_complete_only_when_every_row_landed`), of what a write returns
 (`returned_value_tests`: the cleaned value it stored, without converting the stored document
 back to JSON) and of the round trips a journal entry costs (`round_trip_tests`, counting the
-driver's command events).
+driver's command events). `body_loser_tests` covers the loser path (its rows and refs deleted, an
+identical foreign row adopted, a live conflict, an orphan collected, a loser past the winner's
+`len`, a lost CAS with no body cleaning its refs, the commit context reading only the head's body)
+and the `load_head` cases: a current head served without the 12 MB state the run still carries (the
+driver's command monitor proves the projection), a stale head reading the whole state, a null head
+falling back, and the projected `find` itself.
 
 | Variable | Meaning |
 |---|---|

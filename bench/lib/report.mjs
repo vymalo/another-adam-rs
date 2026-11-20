@@ -222,6 +222,19 @@ export function buildReport(foldedOrRecords, opts = {}) {
   out.push(table(['Language', 'Agent', 'Arm', 'Runs', 'Solved', 'Rate', '95% interval (Wilson)'], langRows));
   if (langNotes.length > 0) out.push(`\n${langNotes.map((n) => `* ${n}`).join('\n')}\n`);
 
+  h('Agent path');
+  out.push('Whether the gold patch also passed at the agents\' working path (the clone path) when the task was checked. Tasks are kept and graded at `/app` whatever this says; a task that fails there did not fail for lack of a fix, and both arms work at the same path, so it is reported and never a reason to leave a task out. The tasks are counted once each, whatever the arm; the rates are of the rated runs.\n\n');
+  const pathOf = (v) => v.agentPath ?? 'not recorded';
+  const tasksByPath = new Map();
+  for (const v of rated) {
+    const k = pathOf(v);
+    if (!tasksByPath.has(k)) tasksByPath.set(k, new Set());
+    tasksByPath.get(k).add(v.task);
+  }
+  out.push(table(['Agent path', 'Tasks'], [...tasksByPath].sort(([x], [y]) => (x < y ? -1 : 1)).map(([k, ts]) => [k, ts.size])));
+  out.push('\n');
+  out.push(table(['Agent path', 'Agent', 'Arm', 'Runs', 'Solved', 'Rate', '95% interval (Wilson)'], [...group(rated, (v) => `${pathOf(v)} / ${cellKey(v)}`)].map(([, rs]) => rateRow([pathOf(rs[0]), rs[0].agent, rs[0].arm], rs))));
+
   h('Cost, tokens, time and calls');
   out.push('Every figure of this section sums all attempts of a run (an interrupted attempt that was run again is in it), and counts only Done runs.\n\n');
   const costRows = [];

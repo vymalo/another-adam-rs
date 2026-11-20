@@ -4,8 +4,8 @@
 //!
 //! **Slice 1 of ADR 0047:** this crate is the embedded set and nothing more yet. Its dependencies
 //! are the crates an embedded agent needs, each with its server parts turned off
-//! (`adam-a2a-runtime` without `push`, `adam-ui` without `thread-tools`, and through them
-//! `adam-a2a` without `server`), and `tools/embedded-deps/check.sh` fails when its tree holds an
+//! (`adam-a2a-runtime` without `push`, `adam-ui` without `thread-tools`, `adam-assembly` without
+//! `remote`, and through them `adam-a2a` without `server`), and `tools/embedded-deps/check.sh` fails when its tree holds an
 //! HTTP server or client, a database driver, the Kubernetes client, a TLS stack or the MCP client.
 //! The API (start, send, steer, answer, cancel, list and the events) is slice 4.
 //!
@@ -20,6 +20,7 @@
 
 pub use adam_a2a_runtime;
 pub use adam_agent_fs;
+pub use adam_assembly;
 pub use adam_core;
 pub use adam_error;
 pub use adam_llm_agent;

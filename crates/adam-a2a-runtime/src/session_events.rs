@@ -807,7 +807,7 @@ mod tests {
     }
 
     /// Ten listings of three open sessions read each session **once**: their row did not change,
-    /// so the view (two queries and a full state read per open round) is skipped. Without the
+    /// so the view (two queries and a head read per open round) is skipped. Without the
     /// cache it was one view per session per listing: 3 at the seed and 30 over the ten.
     #[tokio::test]
     async fn a_listing_does_not_read_a_session_whose_row_did_not_change() {
@@ -825,9 +825,14 @@ mod tests {
             .await
             .expect("seed");
         assert_eq!(
-            faulty.calls(Method::LoadRun),
+            faulty.calls(Method::LoadHead),
             3,
             "the seed reads one view per session"
+        );
+        assert_eq!(
+            faulty.calls(Method::LoadRun),
+            0,
+            "a view reads the head, not the whole state"
         );
         for listing in 0..10 {
             let events = tracker
@@ -836,7 +841,7 @@ mod tests {
             assert!(events.is_empty(), "listing {listing} said {events:?}");
         }
         assert_eq!(
-            faulty.calls(Method::LoadRun),
+            faulty.calls(Method::LoadHead),
             3,
             "ten listings of three unchanged sessions: 3 views, not 33"
         );
@@ -907,7 +912,7 @@ mod tests {
         )
         .await;
         // The seed's view of the session's round fails once: the store is unavailable.
-        faulty.fail_run(Method::LoadRun, session, 1);
+        faulty.fail_run(Method::LoadHead, session, 1);
 
         let mut tracker = SessionsTracker::seed(&backend, &caller, context, 1)
             .await

@@ -731,7 +731,7 @@ question parks the run. A model that wants the order of its calls to hold sets `
 
 **What makes it safe.** `write_file` and `edit_file` write a new file and rename it over the old, so a read of the
 same path beside a write sees the old file or the new one whole (`a_write_or_an_edit_replaces_the_file_and_never_changes_the_one_a_read_holds`
-in `src/tools/files.rs`). **What it does not do:** a scope is a path as written, so a read through a symlink inside the
+in `crates/adam-code-tools/src/files.rs`). **What it does not do:** a scope is a path as written, so a read through a symlink inside the
 slot (`link/a.rs` for `real/a.rs`) is not ordered with a write of the target, and the model's read-then-edit order is not
 kept across an alias. The read still sees one whole file, the old or the new, and a write through a symlink is refused;
 a model that needs the order sets `after_previous: true`. The

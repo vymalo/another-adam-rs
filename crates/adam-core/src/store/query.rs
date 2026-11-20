@@ -4,7 +4,7 @@
 //! scoping, the filtering it can express and the keyset pagination, so a page costs one indexed
 //! read and never an offset.
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use super::{RunId, RunStatus};
 
@@ -43,10 +43,10 @@ pub struct RunQuery {
     /// Only runs in one of these statuses; `None` for every status.
     pub statuses: Option<Vec<RunStatus>>,
     /// Only runs last updated at or after this instant.
-    pub updated_since: Option<DateTime<Utc>>,
+    pub updated_since: Option<Timestamp>,
     /// Only runs strictly after this position in the order: the `(updated_at, id)` of the last run
     /// of the previous page. Ignored by `count_runs`.
-    pub after: Option<(DateTime<Utc>, RunId)>,
+    pub after: Option<(Timestamp, RunId)>,
     /// The most runs to return. Ignored by `count_runs`.
     pub limit: usize,
 }

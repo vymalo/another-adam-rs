@@ -52,7 +52,7 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::backend::{RuntimeTaskBackend, map_err};
-use crate::convert::{decode_conversation, encode_conversation, task_from_view};
+use crate::convert::{decode_conversation, encode_conversation};
 use crate::ids::task_id_for;
 use crate::task_state;
 
@@ -524,12 +524,14 @@ impl RuntimeTaskBackend {
     }
 
     /// The round `run` as a task of child context `context`, and what it says about its session.
-    pub(crate) fn round_task(&self, caller: &Caller, session: &SessionView, round: &Round) -> Task {
-        let mut task = self.said(
-            caller,
-            &round.view,
-            task_from_view(&round.view, &round.context, &self.prompt),
-        );
+    pub(crate) async fn round_task(
+        &self,
+        caller: &Caller,
+        session: &SessionView,
+        round: &Round,
+    ) -> Task {
+        let task = self.task_of(&round.view, &round.context).await;
+        let mut task = self.said(caller, &round.view, task);
         task.metadata.get_or_insert_with(HashMap::new).insert(
             CHILD_SESSIONS_EXTENSION.to_owned(),
             self.round_object(session, round),
@@ -1138,12 +1140,12 @@ impl RuntimeTaskBackend {
             .session_of(caller, &round.parent_context, round.session)
             .await?
             .ok_or_else(|| BackendError::TaskNotFound(run.to_string()))?;
-        Ok(self.round_task(caller, &session, &round))
+        Ok(self.round_task(caller, &session, &round).await)
     }
 
     /// A listed record as a round task: the session's words on it, no tier (a listing never says
     /// one).
-    pub(crate) fn listed_round(
+    pub(crate) async fn listed_round(
         &self,
         session: &SessionView,
         context: &str,
@@ -1159,7 +1161,7 @@ impl RuntimeTaskBackend {
             by_person: rec.parent_id == Some(rec.id),
             view,
         };
-        let mut task = task_from_view(&round.view, context, &self.prompt);
+        let mut task = self.task_of(&round.view, context).await;
         task.metadata.get_or_insert_with(HashMap::new).insert(
             CHILD_SESSIONS_EXTENSION.to_owned(),
             self.round_object(session, &round),
@@ -1462,7 +1464,7 @@ mod tests {
             round: 1,
             state,
             outcome: None,
-            updated_at: chrono::Utc::now() - chrono::Duration::seconds(age),
+            updated_at: adam_core::store::now() - jiff::SignedDuration::from_secs(age),
             description: String::new(),
             keep_open: true,
             closed,
@@ -1474,7 +1476,7 @@ mod tests {
                 ended: state != SessionState::Working,
                 cancelled: false,
                 started_by: None,
-                updated_at: chrono::Utc::now(),
+                updated_at: adam_core::store::now(),
             },
         }
     }

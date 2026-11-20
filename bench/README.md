@@ -296,28 +296,40 @@ change's added lines is in your statement. An `Interface` section is exempt: it 
   clone into `tests/test_patch.patch`, the gold without them in `solution/`) and builds its image: the workspace image
   by digest, the repository at `/app` at the base with history up to the base only, the toolchain pins you wrote.
 * `bench tasks check` (needs the host's container runtime; it grades on the networks the stack names, `adam-bench_verifier` (internal) and, for a task that asks for the internet, `adam-bench_egress`: it makes the ones that are missing the way `bench doctor --start` does and removes what it made, uses and keeps those of a running stack, and refuses a verifier network that is not internal or an owner-named one that does not exist) runs, per task, the gold patch three times and the empty patch three
-  times **from the clone path the agents will use**, not from `/app`: the image's whole working tree (`.git`, tracked,
-  untracked and ignored files) is copied there with `cp -a`, and `test.sh` runs with `/app` rewritten to that path, so a
-  task whose tests only work at `/app` is dropped. A copy, not links to `/app`'s ignored entries: through a linked
-  `node_modules` Node resolves a module's own requires from `/app` (its real path), `npm install` removes the link and
-  installs afresh, and what the test script writes (`config.json`) lands in `/app`, so the clone path graded another tree
-  than `/app` does (it dropped NodeBB tasks whose gold passes at `/app`; `bench/test/clonepath.test.mjs` runs the script on a
-  Node fixture). The copy costs the time of copying the image's tree, once per clone-path run. A task is kept only if the gold
-  passes all three and the empty patch fails all three, and is dropped with its reason otherwise (`gold-fails`,
-  `gold-flaky`, `gold-does-not-apply`, `empty-passes`, `empty-flaky`, `no-gold-patch`, `infra`). It also records whether
-  the base has a `.devcontainer`.
-* After the clone-path runs the check runs the gold **once more through the real grading path** (working directory `/app`,
-  the original `test.sh`) and keeps the task only if that passes too (`gold-fails-at-app`).
+  times **at `/app`**, the image's working directory and the real grading path (the original `test.sh` in a fresh
+  container, as upstream does and as an agent's patch is graded). A task is kept when the gold passes all three and the
+  empty patch fails all three, and is dropped with its reason otherwise (`gold-fails`, `gold-flaky`, `gold-does-not-apply`,
+  `empty-passes`, `empty-flaky`, `no-gold-patch`, `infra`). It also records whether the base has a `.devcontainer`.
+* **The agent path is an attribute, not a reason.** A task that is kept then runs its gold **once** at the agents' working
+  path, the clone path (`/work/workspaces/bench/slot`): the image's whole working tree is copied there with `cp -a` and
+  `test.sh` runs with `/app` rewritten to that path. The result is recorded as `agentPath` in `check.json`, and in the lock
+  beside each task, with `agentPathReason`: `pass`; `fail` (`tests-fail`, or the grade's error such as `apply`); or `not-run`
+  (`dropped` for a task that was dropped, which makes no such run; `infra` or `timeout` when the run itself did not finish).
+  A `fail` never drops a task. Task tooling often assumes `/app` (NodeBB `05f22361`: its gold passes 173 of 173 at `/app`
+  and all 173 tests pass at the clone path too, but the task's `/tests/parser.py` strips only a literal `/app/` prefix, so
+  the grader finds none of the required tests and says "Required tests that passed: 0"), and `/tests` is the task's read-only
+  mount. Both arms work at the same agent path, so the attribute is the same for both and fair to report; `bench report`
+  counts the tasks by it and rates the runs by it (section "Agent path"). The copy is a copy, not links to `/app`'s ignored
+  entries (a linked `node_modules` makes Node resolve from `/app`, `npm install` removes the link, and the test script's
+  writes land in `/app`); it costs the time of one copy per kept task. At most 7 grading runs per task (3 gold, 3 empty,
+  1 probe), fewer for a task that is dropped early. The grading container of a `public` verifier first connects to the npm,
+  PyPI and Go registries; a failure is exit 98, `infra` (never a fail).
 * **The public check does not walk every upstream task.** `select` needs 80 kept tasks, at most 9 per repository, so `check`
   (public) walks the tasks in the order `select` uses (`selectionOrder` in `lib/select.mjs`: a seeded shuffle in each
   repository, then rounds that take one task of every repository; `--seed`, default the configuration's) and stops as soon
   as 80 are kept (`--total N` changes the target). A repository that already has 9 kept is skipped for the rest of the walk.
-  A walk that ends before the target says `shortfall: N of 80 kept`. The image of a task dropped by its verdict is removed
-  at once (`docker image rm`, by digest and by tag), unless a task kept so far, the workspace image or the pinned coder
-  uses that digest; a removal that fails is printed (`image not removed`) and the verdict stands. The kept tasks' images
-  stay: a run needs them. A re-run continues from `check.json`: a verdict recorded for the task as it is now (same checksum;
-  an `infra` result is not a verdict) is not run again, and the walk goes on in the same order. `--all` walks every task
-  (an audit; it still resumes and still removes the images of dropped tasks), `--only ID,ID` runs just those again.
+  A walk that ends before the target says `shortfall: N of 80 kept`. **The image of every checked public task is removed
+  as soon as its verdict and image digest are in `check.json`** (`docker image rm`, by digest and by tag), kept or dropped, so
+  80 kept tasks never sit on the disk together (the images are 2 to 3.5 GB each, 200 GB or more for 80); `run` pulls each by
+  the digest the lock holds, just in time (see "Task images just in time" below). The workspace image and the pinned coder are
+  never removed, nor are own task images (built here, they cannot be pulled again); a dropped task's image whose digest a task
+  kept so far uses stays; a removal that fails is printed (`image not removed`) and the verdict stands. `--keep-images`
+  keeps the images of the kept tasks, as before (a dropped task's image is still removed). A re-run continues from `check.json`: a verdict recorded for the task as it is now (same checksum;
+  an `infra` result is not a verdict) is not run again, and the walk goes on in the same order. **A verdict with no
+  `agentPath` was made under the earlier rule** (the clone path decided, and the empty patch ran only there), so it is run
+  again, and `select` does not take it: the old data has no empty run at `/app`, and a task dropped for a clone-path reason
+  cannot be told from one that fails at `/app`. `--all` walks every task
+  (an audit; it still resumes and still removes the images), `--only ID,ID` runs just those again.
 
 * `bench tasks select` keeps the checked tasks without a `.devcontainer`, whose check still fits the task (a result carries
   the task's checksum and image digest and is ignored when either has changed). For the public source
@@ -821,6 +833,17 @@ deletes the file first, so an old yes never covers a new pilot.
   shared side of one lock and a window the exclusive side, so no grading of an agent's patch ever has a route out and
   two windows never overlap. An own task's image is built where `bench tasks build` ran, in the host's store; a start
   checks that every own image is there **before anything is spent**, and a regrade makes the task's image present first.
+* **Task images just in time (2026-11-20).** A public task's image is on the disk only while its runs happen. Before a task's
+  first run in a pass the harness pulls it **by digest** (the lock's) if it is not in the host's store, once however many slots
+  ask; the reference carries the digest, so a present image is the pinned one. When the last run of an image in the pass ends,
+  every queued run of it done and none open (a block's arms run back to back, in whatever slot; two tasks that share an image
+  hold it until the last run of either), the schedule calls `releaseImage` and the image is removed (`docker image rm`, no
+  force). It is never removed while a run uses it, never for the coder, the workspace image or an own task, and a removal that
+  fails is printed (`image not removed`) and changes nothing. A pull that fails is `Failed_infra` with the reason `image_pull`
+  for that run (tried again, never a fail). `bench pilot` and `bench run` are separate starts: the pilot releases its blocks'
+  images when it ends and `run` pulls them again. `regrade` pulls and releases the same way. **`--keep-images`** (on `pilot`,
+  `run`, `regrade`, `doctor`, and `tasks check`) keeps every image, as before. Pulls and removals go through `dockerEnv`: no model
+  key and no proxy variable reaches `docker`.
 * **The end.** `report.md` has, for each agent and arm, the resolve rate with its Wilson interval and how many runs of the cell are
   left out, the paired differences, cost per run, per **resolved** task, and per resolved task with every run of the cell (waste
   included), the spend on unsolved runs, tokens (input, cached, cache write, output), the cache-hit rate (cached over input, all
@@ -834,7 +857,11 @@ plugin, whether the daemon is rootless, free disk (in `$BENCH_HOME` and in
 Docker's root) and the coder image by digest. **Disk rule (changed 2026-11-19; before it counted free space alone).** An image already
 on the machine is space the run does not need to find: the check **passes when `free + the size (docker's .Size) of the coder image and of
 each selected task image that is present` is at least 20 GB** (a failure under 20 GB), and warns under 100 GB on the same sum (so 8 GB free with a 12 GB coder
-image present passes, 8 GB free with none present fails). A task image's size includes its shared base, so a few shared layers
+image present passes, 8 GB free with none present fails). **Just in time (the default; `--keep-images` gives the rule above):**
+the floor is the coder image plus the largest task image plus 10 GB of margin (the layers being unpacked, the bases, the
+results), never under 20 GB, and only the coder counts as present, because task images are removed after their runs; it uses
+the sizes found here, else 12 GB for the coder and 3.5 GB for a task image, and warns under the floor plus 30 GB
+(about 25.5 GB and 55.5 GB with nothing measured). A task image's size includes its shared base, so a few shared layers
 are counted more than once. The failure says both numbers. **For each selected task image** it runs the coder's binary with no
 configuration as uid 10001 in that image: exit 78 means the coder starts (it refuses an empty configuration), a loader
 error or another architecture means the image cannot run it. **The probe runs the binaries of the pinned coder image**, and
@@ -925,7 +952,7 @@ Tests that need Docker skip unless `BENCH_TEST_DOCKER=1` and fail under `BENCH_T
   `<upstreamDir>/SHA256SUMS`), the exact form of `SHA256SUMS`, and the form of `solution/` (the check needs a `*.patch`
   there and drops a task without one as `no-gold-patch`).
 * That the miner's file classification (by path) matches your repositories' layouts.
-* **The copy clone path and the egress probe on real images.** *Verified 2026-11-19* in `scaleapi/SWE-bench_Pro-os` (NodeBB
+* **The copy clone path (now the `agentPath` attribute) and the egress probe on real images.** *Verified 2026-11-19* in `scaleapi/SWE-bench_Pro-os` (NodeBB
   `04998908`): `run_script.sh` runs `cp install/package.json .`, `npm install --production=false`, `npm install lodash underscore
   async`, writes `config.json` in its working directory and runs `npx mocha`, and NodeBB's `.gitignore` ignores `node_modules/`,
   `config.json`, `/package.json` and `package-lock.json`. *Verified 2026-11-19* with npm 10.9.9 here: `npm install` in a directory

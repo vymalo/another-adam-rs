@@ -187,7 +187,7 @@ pub async fn run(
         text.push_str(&changes_note(
             status_text(&GitAt::slot(&slot)).await.as_deref(),
         ));
-        super::files::push_published_note(&mut text, &slot);
+        super::scratch::push_published_note(&mut text, &slot);
     } else {
         text.push_str(
             "(git sees no change in the worktree; files the project ignores are kept too, and \

@@ -73,6 +73,7 @@ use adam_core::store::{
     add_ttl, head_body, now, open_conversation_key, sched_at, set_head_body, storable,
     storable_owned, truncate_ms,
 };
+use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig,
     NewRun, PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
@@ -80,8 +81,8 @@ use adam_core::{
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
 use futures::TryStreamExt;
+use jiff::SignedDuration;
 use mongodb::bson::{self, Bson, Document, doc};
 use mongodb::error::{ErrorKind, WriteFailure};
 use mongodb::options::{
@@ -329,11 +330,13 @@ fn uuid(id: RunId) -> Bson {
     Bson::from(bson::Uuid::from_bytes(id.0.into_bytes()))
 }
 
-fn date(t: DateTime<Utc>) -> Bson {
-    Bson::DateTime(bson::DateTime::from_millis(t.timestamp_millis()))
+fn date(t: Timestamp) -> Bson {
+    // `truncate_ms` floors as chrono's `timestamp_millis` did; jiff's `as_millisecond` would
+    // truncate toward zero for a pre-1970 cutoff, one millisecond off the old bytes.
+    Bson::DateTime(bson::DateTime::from_millis(truncate_ms(t).as_millisecond()))
 }
 
-fn opt_date(t: Option<DateTime<Utc>>) -> Bson {
+fn opt_date(t: Option<Timestamp>) -> Bson {
     t.map(date).unwrap_or(Bson::Null)
 }
 
@@ -360,7 +363,7 @@ fn body_id(run: RunId, generation: Uuid, idx: u32) -> String {
 
 /// How long a superseded body generation stays readable before the next commit of its run collects
 /// it.
-const BODY_GC_GRACE: chrono::Duration = chrono::Duration::hours(1);
+const BODY_GC_GRACE: SignedDuration = SignedDuration::from_hours(1);
 
 /// How old a foreign attempt's body row must be before a commit may collect it.
 ///
@@ -369,7 +372,7 @@ const BODY_GC_GRACE: chrono::Duration = chrono::Duration::hours(1);
 /// longer than the runtime's default 30 s lease. A row older than it belongs to an attempt that
 /// died between its insert and its CAS; nothing else will collect it, because the head it never
 /// wrote does not name it and the run may not be terminal.
-const BODY_ORPHAN_GRACE: chrono::Duration = chrono::Duration::minutes(5);
+const BODY_ORPHAN_GRACE: SignedDuration = SignedDuration::from_mins(5);
 
 /// One row as the document `adam_body` holds.
 fn body_doc(
@@ -377,7 +380,7 @@ fn body_doc(
     generation: Uuid,
     writer: Uuid,
     row: &BodyRow,
-    written_at: DateTime<Utc>,
+    written_at: Timestamp,
 ) -> StoreResult<Document> {
     let idx = i32::try_from(row.idx).map_err(|_| {
         StoreError::InvalidInput(format!("body index {} exceeds i32::MAX", row.idx))
@@ -427,7 +430,7 @@ struct BodyPlan {
     start: usize,
     writer: Uuid,
     rows: Vec<BodyRow>,
-    written_at: DateTime<Utc>,
+    written_at: Timestamp,
 }
 
 /// Whether a stored foreign row is the row this attempt would write at the same index: the
@@ -561,14 +564,12 @@ fn get_uuid(d: &Document, field: &str) -> StoreResult<Option<RunId>> {
     }
 }
 
-fn get_date(d: &Document, field: &str) -> StoreResult<Option<DateTime<Utc>>> {
+fn get_date(d: &Document, field: &str) -> StoreResult<Option<Timestamp>> {
     match d.get(field) {
         None | Some(Bson::Null) => Ok(None),
-        Some(Bson::DateTime(t)) => Utc
-            .timestamp_millis_opt(t.timestamp_millis())
-            .single()
+        Some(Bson::DateTime(t)) => Timestamp::from_millisecond(t.timestamp_millis())
             .map(Some)
-            .ok_or_else(|| bad(field)),
+            .map_err(|_| bad(field)),
         Some(_) => Err(bad(field)),
     }
 }
@@ -591,6 +592,13 @@ fn get_u64(d: &Document, field: &str) -> StoreResult<u64> {
 }
 
 fn run_from_doc(d: &Document) -> StoreResult<RunRecord> {
+    let state = bson_to_json(d.get("state").ok_or_else(|| bad("state"))?)?;
+    run_from_doc_with_state(d, state)
+}
+
+/// [`run_from_doc`] with the `state` already decoded: a projection may carry the head instead of
+/// the state, and the record's own fields are the same either way.
+fn run_from_doc_with_state(d: &Document, state: Value) -> StoreResult<RunRecord> {
     let status = get_str(d, "status")?.ok_or_else(|| bad("status"))?;
     Ok(RunRecord {
         id: get_uuid(d, "_id")?.ok_or_else(|| bad("_id"))?,
@@ -598,7 +606,7 @@ fn run_from_doc(d: &Document) -> StoreResult<RunRecord> {
         conversation_id: get_str(d, "conversation_id")?,
         parent_id: get_uuid(d, "parent_id")?,
         status: RunStatus::parse(&status).ok_or_else(|| bad("status"))?,
-        state: bson_to_json(d.get("state").ok_or_else(|| bad("state"))?)?,
+        state,
         wake_at: get_date(d, "wake_at")?,
         version: get_u64(d, "version")?,
         created_at: get_date(d, "created_at")?.ok_or_else(|| bad("created_at"))?,
@@ -631,7 +639,7 @@ struct CommitContext {
     agent: String,
     conversation_id: Option<String>,
     parent_id: Option<RunId>,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     /// The v5 head, when one was written; a commit that appends reads its `body` generation.
     head: Option<serde_json::Value>,
     /// The version the head was written at; a stale head names no current generation.
@@ -934,28 +942,35 @@ impl Store for MongoStore {
     }
 
     async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
+        // One projected read: the head and the record's own fields, never the whole state. The
+        // `state` member is not in the projection, so a current head costs the head's bytes and
+        // nothing of a transcript a v4 run may still carry there.
         let found = self
             .runs
             .find_one(doc! { "_id": uuid(id) })
+            .projection(doc! {
+                "_id": 1, "agent": 1, "conversation_id": 1, "parent_id": 1, "status": 1,
+                "wake_at": 1, "version": 1, "created_at": 1, "updated_at": 1,
+                "head": 1, "head_version": 1
+            })
             .await
             .map_err(classify)?;
         let Some(doc) = found else {
             return Ok(None);
         };
-        let mut rec = run_from_doc(&doc)?;
+        let version = get_u64(&doc, "version")?;
         // A missing or null `head_version` is a run no commit has written a head for; a head
         // written at an older version was superseded by a commit that did not rebuild it, and is
-        // stale. Either way the whole state is served, and the next step re-splits.
-        let head_version = match doc.get("head_version") {
-            None | Some(Bson::Null) => None,
-            Some(_) => Some(get_u64(&doc, "head_version")?),
+        // stale. A `"head": null` is not a head either. Either way the whole state is served,
+        // which is the rare path and pays the full document.
+        let current = match doc.get("head_version") {
+            None | Some(Bson::Null) => false,
+            Some(_) => get_u64(&doc, "head_version")? == version,
         };
-        if head_version == Some(rec.version)
-            && let Some(head) = doc.get("head")
-        {
-            rec.state = bson_to_json(head)?;
+        if current && let Some(head @ Bson::Document(_)) = doc.get("head") {
+            return run_from_doc_with_state(&doc, bson_to_json(head)?).map(Some);
         }
-        Ok(Some(rec))
+        self.load_run(id).await
     }
 
     async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
@@ -1294,7 +1309,7 @@ impl Store for MongoStore {
         worker: &str,
         scope: ClaimScope,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>> {
@@ -1391,7 +1406,7 @@ impl Store for MongoStore {
         &self,
         id: RunId,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
     ) -> StoreResult<bool> {
         let now = truncate_ms(now);
@@ -1417,7 +1432,7 @@ impl Store for MongoStore {
         Ok(())
     }
 
-    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         let found = self
             .runs
             .find_one(doc! { "_id": uuid(id) })
@@ -1557,7 +1572,7 @@ impl Store for MongoStore {
         &self,
         agents: &[String],
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<PushRecord>> {
@@ -1639,11 +1654,13 @@ impl Store for MongoStore {
         }
     }
 
-    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64> {
         // `updated_at < before` at millisecond precision, rounding `before` up so
-        // a sub-millisecond cutoff selects the same runs as in the other stores.
-        let mut cutoff = before.timestamp_millis();
-        if !before.timestamp_subsec_nanos().is_multiple_of(1_000_000) {
+        // a sub-millisecond cutoff selects the same runs as in the other stores. The floor is
+        // `truncate_ms`'s (chrono's `timestamp_millis` rule), so a cutoff before 1970 rounds the
+        // same way too.
+        let mut cutoff = truncate_ms(before).as_millisecond();
+        if before.subsec_nanosecond() % 1_000_000 != 0 {
             cutoff += 1;
         }
         let finished = doc! {
@@ -1715,7 +1732,7 @@ impl Store for MongoStore {
         &self,
         run: RunId,
         keep_generation: Uuid,
-        before: DateTime<Utc>,
+        before: Timestamp,
     ) -> StoreResult<u64> {
         MongoStore::gc_body(self, run, keep_generation, before).await
     }
@@ -1788,7 +1805,7 @@ impl Store for MongoStore {
         }
     }
 
-    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_blobs(&self, before: Timestamp) -> StoreResult<u64> {
         self.sweep_blobs(before).await
     }
 }
@@ -1986,7 +2003,7 @@ impl MongoStore {
         &self,
         run: RunId,
         keep_generation: Uuid,
-        before: DateTime<Utc>,
+        before: Timestamp,
     ) -> StoreResult<u64> {
         let deleted = self
             .body
@@ -2005,7 +2022,7 @@ impl MongoStore {
     /// Candidates are paged by `_id` (the digest) so a batch that is entirely referenced still
     /// moves the cursor: a digest a surviving run names is kept, however old it is, and a shared
     /// digest is deleted only with the last run that references it.
-    async fn sweep_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn sweep_blobs(&self, before: Timestamp) -> StoreResult<u64> {
         let mut total = 0;
         let mut last: Option<String> = None;
         loop {
@@ -2257,6 +2274,23 @@ mod round_trip_tests {
             entry,
             "the stored entry is the first one"
         );
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+
+    /// BSON dates are milliseconds; a value before 1970 floors, as chrono's `timestamp_millis`
+    /// did. `date` is the one encoder a raw `purge_blobs` cutoff reaches without `truncate_ms`
+    /// first, so its own rule is pinned here.
+    #[test]
+    fn date_floors_before_the_epoch() {
+        let at: Timestamp = "1969-12-31T23:59:59.999500Z".parse().expect("a timestamp");
+        let Bson::DateTime(stored) = date(at) else {
+            panic!("a timestamp is stored as a BSON date");
+        };
+        assert_eq!(stored.timestamp_millis(), -1);
     }
 }
 
@@ -2917,7 +2951,7 @@ mod body_loser_tests {
             .await
             .expect("create");
         let generation = Uuid::new_v4();
-        let old = now() - BODY_ORPHAN_GRACE - chrono::Duration::minutes(1);
+        let old = now() - BODY_ORPHAN_GRACE - SignedDuration::from_mins(1);
         let rows = [0_u32, 1]
             .into_iter()
             .map(|idx| {
@@ -3465,6 +3499,252 @@ mod body_loser_tests {
             head.get("artifacts").is_none(),
             "the head's artifacts are not transferred on every commit"
         );
+        clean(&store, &prefix).await;
+    }
+
+    /// A current head is served from one projected read: the `state` a v4 run may still carry
+    /// (here 12 MB) is not part of the answer, and the record's own fields are right.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_current_head_is_served_without_the_state() {
+        let Some((store, prefix)) = store().await else {
+            return;
+        };
+        let agent = format!("head-{}", Uuid::now_v7().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({"small": true})))
+            .await
+            .expect("create");
+        let generation = Uuid::new_v4();
+        let digest = BlobId::from_hex(&"a".repeat(64)).expect("a digest");
+        let big = json!({"v": 1, "agent": {"big": "x".repeat(12 * 1024 * 1024)}});
+        let committed = store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, big)
+                    .head(head(generation, 0, &digest))
+                    .body(BodyWrite {
+                        generation: Some(generation),
+                        rows: Vec::new(),
+                        writer: Uuid::new_v4(),
+                    }),
+            )
+            .await
+            .expect("commit");
+
+        let served = store
+            .load_head(run.id)
+            .await
+            .expect("load")
+            .expect("the run");
+        assert_eq!(served.id, run.id);
+        assert_eq!(served.agent, agent);
+        assert_eq!(served.status, RunStatus::Runnable);
+        assert_eq!(served.version, committed.version);
+        assert_eq!(served.state["v"], 5, "the head is served");
+        assert_eq!(served.state["body"]["len"], 0);
+        assert!(
+            served.state.get("big").is_none(),
+            "the v4 state's bytes are not in the answer"
+        );
+        let bytes = serde_json::to_vec(&served.state).expect("json").len();
+        assert!(bytes < 2 * 1024, "the head is small: {bytes} bytes");
+        clean(&store, &prefix).await;
+    }
+
+    /// A stale head (a headless commit since) is not served: the second, full read returns the
+    /// whole state, 12 MB of it included.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_head_reads_the_whole_state() {
+        let Some((store, prefix)) = store().await else {
+            return;
+        };
+        let agent = format!("stale-{}", Uuid::now_v7().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .expect("create");
+        let generation = Uuid::new_v4();
+        let digest = BlobId::from_hex(&"a".repeat(64)).expect("a digest");
+        let with_head = store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                    .head(head(generation, 1, &digest))
+                    .body(BodyWrite {
+                        generation: Some(generation),
+                        rows: vec![BodyRow {
+                            idx: 0,
+                            message: json!("one"),
+                        }],
+                        writer: Uuid::new_v4(),
+                    }),
+            )
+            .await
+            .expect("commit");
+        // A headless commit: the head stays at the previous version, the state moves on.
+        let big = json!({"v": 1, "agent": {"big": "x".repeat(12 * 1024 * 1024)}});
+        let stale = store
+            .commit_run(
+                run.id,
+                with_head.version,
+                RunUpdate::new(RunStatus::Parked, big.clone()),
+            )
+            .await
+            .expect("the headless commit");
+
+        let served = store
+            .load_head(run.id)
+            .await
+            .expect("load")
+            .expect("the run");
+        assert_eq!(served.version, stale.version);
+        assert_eq!(served.status, RunStatus::Parked);
+        assert_eq!(served.state, big, "the whole state is served");
+        clean(&store, &prefix).await;
+    }
+
+    /// `"head": null` is not a head, even at the current version: the whole state is served.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_null_head_falls_back_to_the_whole_state() {
+        let Some((store, prefix)) = store().await else {
+            return;
+        };
+        let agent = format!("null-head-{}", Uuid::now_v7().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({"start": true})))
+            .await
+            .expect("create");
+        let generation = Uuid::new_v4();
+        let digest = BlobId::from_hex(&"a".repeat(64)).expect("a digest");
+        let state = json!({"v": 1, "agent": {"turn": 1}});
+        let committed = store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, state.clone())
+                    .head(head(generation, 0, &digest))
+                    .body(BodyWrite {
+                        generation: Some(generation),
+                        rows: Vec::new(),
+                        writer: Uuid::new_v4(),
+                    }),
+            )
+            .await
+            .expect("commit");
+        // The document a hand-written or migrated run can hold: the version says the head is
+        // current, but the head itself is null.
+        store
+            .runs
+            .update_one(
+                doc! { "_id": uuid(run.id) },
+                doc! { "$set": { "head": Bson::Null } },
+            )
+            .await
+            .expect("the null head");
+
+        let served = store
+            .load_head(run.id)
+            .await
+            .expect("load")
+            .expect("the run");
+        assert_eq!(served.version, committed.version);
+        assert_eq!(served.state, state, "the whole state, not null");
+        clean(&store, &prefix).await;
+    }
+
+    /// The current-head path is one projected `find`: `state` is never asked for, so a v4 state a
+    /// run still carries is not transferred. The driver's command monitor is the witness.
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_head_projects_the_head_and_never_the_state() {
+        use std::sync::{Arc, Mutex};
+
+        use mongodb::Client;
+        use mongodb::event::EventHandler;
+        use mongodb::event::command::CommandEvent;
+        use mongodb::options::ClientOptions;
+
+        let Some(uri) = adam_core::testing::test_env("ADAM_TEST_MONGODB_URI") else {
+            return;
+        };
+        let db = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
+        let prefix = format!("head_proj_{}_", &Uuid::new_v4().simple().to_string()[..12]);
+        let seen: Arc<Mutex<Vec<Document>>> = Arc::default();
+        let recorder = seen.clone();
+        let mut options = ClientOptions::parse(&uri).await.expect("options");
+        options.command_event_handler = Some(EventHandler::callback(move |event| {
+            if let CommandEvent::Started(started) = event {
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(started.command);
+            }
+        }));
+        let client = Client::with_options(options).expect("client");
+        let store = MongoStore::new(client.database(&db))
+            .with_collection_prefix(&prefix)
+            .expect("prefix");
+        store.migrate().await.expect("migrate");
+
+        let agent = format!("proj-{}", Uuid::now_v7().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({"small": true})))
+            .await
+            .expect("create");
+        let generation = Uuid::new_v4();
+        let digest = BlobId::from_hex(&"a".repeat(64)).expect("a digest");
+        let big = json!({"v": 1, "agent": {"big": "x".repeat(12 * 1024 * 1024)}});
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, big)
+                    .head(head(generation, 0, &digest))
+                    .body(BodyWrite {
+                        generation: Some(generation),
+                        rows: Vec::new(),
+                        writer: Uuid::new_v4(),
+                    }),
+            )
+            .await
+            .expect("commit");
+
+        seen.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let served = store
+            .load_head(run.id)
+            .await
+            .expect("load")
+            .expect("the run");
+        assert_eq!(served.state["v"], 5, "the head is served");
+
+        // Take the guard, copy what the assertions need, and release it before the await below
+        // (the command handler locks the same mutex).
+        let (finds, state, head, head_version) = {
+            let commands = seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let runs = format!("{prefix}runs");
+            let finds: Vec<&Document> = commands
+                .iter()
+                .filter(|c| c.get_str("find").ok() == Some(runs.as_str()))
+                .collect();
+            let projection = finds
+                .first()
+                .and_then(|c| c.get_document("projection").ok());
+            (
+                finds.len(),
+                projection.and_then(|p| p.get_i32("state").ok()),
+                projection.and_then(|p| p.get_i32("head").ok()),
+                projection.and_then(|p| p.get_i32("head_version").ok()),
+            )
+        };
+        assert_eq!(finds, 1, "one find for the current head");
+        assert_eq!(state, None, "state is never asked for");
+        assert_eq!(head, Some(1));
+        assert_eq!(head_version, Some(1));
         clean(&store, &prefix).await;
     }
 }

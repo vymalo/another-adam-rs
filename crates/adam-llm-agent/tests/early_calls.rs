@@ -352,7 +352,7 @@ impl Harness {
     }
 
     /// One task on a fresh runtime, to its end.
-    async fn run(&self, agent: LlmAgent, message: &str) -> (RunId, RunView) {
+    async fn run(&self, agent: LlmAgent, message: &str) -> (Runtime, RunId, RunView) {
         let rt = self.runtime(agent, Duration::from_secs(10));
         let run = rt
             .start("llm", user_message(message), None)
@@ -361,7 +361,7 @@ impl Harness {
         let worker = Worker::spawn(&rt);
         let view = wait_terminal(&rt, run).await;
         worker.stop().await;
-        (run, view)
+        (rt, run, view)
     }
 
     async fn journal(&self, run: RunId) -> Vec<(u64, String)> {
@@ -446,12 +446,14 @@ async fn wait_terminal(rt: &Runtime, run: RunId) -> RunView {
     }
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
-fn tool_answers(view: &RunView) -> Vec<(String, bool)> {
-    conversation(view)
+async fn tool_answers(rt: &Runtime, view: &RunView) -> Vec<(String, bool)> {
+    conversation(rt, view)
+        .await
         .messages
         .iter()
         .filter_map(|m| match m {
@@ -484,7 +486,7 @@ async fn a_call_starts_before_the_stream_ends() {
     ]);
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (run, view) = timeout(Duration::from_secs(20), h.run(agent, "go"))
+    let (_rt, run, view) = timeout(Duration::from_secs(20), h.run(agent, "go"))
         .await
         .expect("the call started while the model was still writing");
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
@@ -561,7 +563,7 @@ async fn a_call_that_asks_to_follow_the_ones_before_it_does_not_start_early() {
     ]);
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (run, view) = h.run(agent, "go").await;
+    let (_rt, run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     assert_eq!(log.starts("c1"), 1);
     assert_waited_for_the_turn(&h, run, "c1");
@@ -586,7 +588,7 @@ async fn a_tool_that_declares_nothing_does_not_start_early() {
     ]);
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (run, view) = h.run(agent, "go").await;
+    let (_rt, run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     assert_waited_for_the_turn(&h, run, "c1");
 }
@@ -608,7 +610,7 @@ async fn a_call_that_repeats_the_one_before_it_does_not_start_early() {
     ]);
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (run, view) = h.run(agent, "go").await;
+    let (_rt, run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     // The first call may start early; the second repeats its key, which the doom loop needs the
     // result of, so it waits for the turn.
@@ -646,7 +648,7 @@ async fn a_call_that_conflicts_with_an_earlier_refused_call_waits_for_it() {
     ]);
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (run, view) = h.run(agent, "go").await;
+    let (_rt, run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     let events = log.events.lock().unwrap().clone();
     let start = |id: &str| {
@@ -785,7 +787,7 @@ async fn a_transient_failure_of_an_early_call_stops_new_starts() {
     h.script(turn(vec![retry, c2.clone()]));
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (run, view) = h.run(agent, "go").await;
+    let (_rt, run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     // c2 runs at the failed try's turn (the segment starts it beside the failed c1) and again on
     // the retry; what matters is that it never started beside the stream, after c1's failure.
@@ -831,7 +833,7 @@ async fn the_limit_bounds_the_calls_that_start_beside_the_stream() {
     ]);
     h.script(answer("done"));
     let agent = h.agent(2, |b| b.tool(Probe::new(&log, &began)));
-    let (run, view) = h.run(agent, "go").await;
+    let (_rt, run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     let events = h.sink.events_for(run);
     let words = events
@@ -885,7 +887,7 @@ async fn a_busy_stream_still_takes_a_finished_call() {
     h.script(steps);
     h.script(answer("done"));
     let agent = h.agent(2, |b| b.tool(Probe::new(&log, &began)));
-    let (run, view) = h.run(agent, "go").await;
+    let (_rt, run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     let events = h.sink.events_for(run);
     let words = events
@@ -922,7 +924,7 @@ async fn a_stream_error_ends_the_started_call_and_the_retry_runs_it_again() {
     h.script(turn(vec![c1]));
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (run, view) = h.run(agent, "go").await;
+    let (_rt, run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     assert_eq!(log.starts("c1"), 2, "the retry ran the call again");
     assert_eq!(log.ends("c1"), 2, "the failed try's call ended");
@@ -1021,11 +1023,11 @@ async fn a_doom_loop_refusal_is_not_started_early() {
     h.script(turn(vec![c4.clone()]));
     h.script(answer("I will answer with what I know"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (run, view) = h.run(agent, "go").await;
+    let (rt, run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     assert_eq!(log.starts("c3"), 0, "a refusal does not run");
     assert_eq!(log.starts("c4"), 0);
-    let answers = tool_answers(&view);
+    let answers = tool_answers(&rt, &view).await;
     assert!(
         answers[2]
             .0
@@ -1093,11 +1095,11 @@ async fn a_turn_over_max_tool_calls_starts_nothing() {
                 ..adam_llm_agent::Limits::default()
             })
     });
-    let (run, view) = h.run(agent, "go").await;
+    let (rt, run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     assert_eq!(log.starts("c3"), 0, "nothing starts over the limit");
     assert_eq!(log.starts("c4"), 0);
-    let answers = tool_answers(&view);
+    let answers = tool_answers(&rt, &view).await;
     assert_eq!(answers.len(), 4);
     assert!(
         answers[2].0.starts_with("not run:") && answers[2].1,
@@ -1151,7 +1153,7 @@ async fn a_turn_that_goes_over_max_tool_calls_keeps_the_early_call_it_started() 
                 ..adam_llm_agent::Limits::default()
             })
     });
-    let (run, view) = h.run(agent, "go").await;
+    let (rt, run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     assert_eq!(
         log.starts("c1"),
@@ -1159,7 +1161,7 @@ async fn a_turn_that_goes_over_max_tool_calls_keeps_the_early_call_it_started() 
         "the call that fit started early; its result is dropped with the turn's"
     );
     assert_eq!(log.starts("c2"), 0, "the call over the limit did not start");
-    let answers = tool_answers(&view);
+    let answers = tool_answers(&rt, &view).await;
     assert_eq!(answers.len(), 2);
     assert!(
         answers
@@ -1192,10 +1194,10 @@ async fn the_journal_is_the_sequential_journal_whatever_the_limit() {
         h.script(turn(calls));
         h.script(answer("done"));
         let agent = h.agent(limit, |b| b.tool(Probe::new(&log, &began)));
-        let (run, view) = h.run(agent, "go").await;
+        let (rt, run, view) = h.run(agent, "go").await;
         assert_eq!(view.status, RunStatus::Done, "limit {limit}: {view:?}");
         journals.push(h.journal(run).await);
-        answers.push(tool_answers(&view));
+        answers.push(tool_answers(&rt, &view).await);
     }
     assert_eq!(journals[0], journals[1]);
     assert_eq!(answers[0], answers[1]);
@@ -1242,7 +1244,7 @@ async fn a_solo_batch_that_is_not_the_turn_is_dropped_and_the_call_runs_again() 
     ]);
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (_, view) = h.run(agent, "go").await;
+    let (_rt, _, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     assert_eq!(
         log.starts("c1"),
@@ -1292,13 +1294,13 @@ async fn a_segment_batch_that_is_not_the_turn_is_dropped_whole() {
     h.script(steps);
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (_, view) = h.run(agent, "go").await;
+    let (rt, _, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     assert_eq!(log.starts("c1"), 2, "the batch was dropped whole");
     assert_eq!(log.starts("c2"), 2);
     assert_eq!(log.args("c1").expect("the call ran")["tag"], "turn-c1");
     assert_eq!(
-        tool_answers(&view),
+        tool_answers(&rt, &view).await,
         [("ok:c1".to_owned(), false), ("ok:c2".to_owned(), false)]
     );
 }
@@ -1327,10 +1329,10 @@ async fn a_call_that_asks_although_it_declared_independent_is_told_to_run_alone(
     ]);
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (_, view) = h.run(agent, "go").await;
+    let (rt, _, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     assert_eq!(
-        tool_answers(&view),
+        tool_answers(&rt, &view).await,
         [(
             "this tool cannot run alongside others: call it alone".to_owned(),
             true
@@ -1359,7 +1361,7 @@ async fn an_early_call_is_not_run_again_at_the_turn() {
     ]);
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (run, view) = h.run(agent, "go").await;
+    let (rt, run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     assert_eq!(log.starts("c1"), 1, "the early call ran once");
     assert_eq!(log.starts("c2"), 1);
@@ -1372,7 +1374,7 @@ async fn an_early_call_is_not_run_again_at_the_turn() {
         ["model:0", "tool:c1", "tool:c2", "model:1"]
     );
     assert_eq!(
-        tool_answers(&view),
+        tool_answers(&rt, &view).await,
         [("ok:c1".to_owned(), false), ("ok:c2".to_owned(), false)]
     );
 }
@@ -1388,7 +1390,7 @@ async fn a_turn_that_does_not_stream_starts_nothing_early() {
     h.script(turn(vec![c1]));
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)).stream_text(false));
-    let (run, view) = h.run(agent, "go").await;
+    let (_rt, run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     assert_eq!(log.starts("c1"), 1);
     let events = h.sink.events_for(run);
