@@ -41,11 +41,17 @@ fn as_doubles(value: &Value) -> Value {
 fn from_the_screen(text: &str, references: &[&str]) -> Message {
     let lock: Value = serde_json::from_str(LOCK).unwrap();
     let document: Value = serde_json::from_str(FIXTURE).unwrap();
+    let digest = adam_ui::catalog_digest(&document).unwrap();
+    assert_eq!(
+        lock["digest"],
+        digest.as_str(),
+        "the subset's lock is its digest"
+    );
     let metadata = json!({
         UI_CATALOG_EXTENSION: {
             "catalogId": CATALOG_ID, "version": lock["version"].as_f64().unwrap(),
-            "digest": lock["digest"], "inline": true},
-        "a2uiClientCapabilities": {"v0.9.1": {
+            "digest": digest, "inline": true},
+        "a2uiRendererCapabilities": {"1.0": {
             "supportedCatalogIds": [CATALOG_ID],
             "inlineCatalogs": [as_doubles(&document)]}},
     });

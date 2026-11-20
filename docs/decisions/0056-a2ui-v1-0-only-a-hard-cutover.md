@@ -160,3 +160,18 @@ the card.
 * **Fold every surface into one `createSurface` with inline `components`.** Valid, but a change of shape on both
   sides for no gain in R1 (decision 3).
 * **Link the schemas instead of vendoring them.** A test cannot fetch over the network, and a link moves.
+
+*Amended (2026-11-20).* Decision 8 recorded the SHA-256 of `common_types.json` wrongly: at commit `b4f91c2` it is
+`sha256:c4e78305…6430dc`, and the `…f51c56` written there is the hash of `agent_to_renderer_list.json` (verified at
+`b4f91c2`, 2026-11-20, against the raw files of `a2ui-project/a2ui`). Only the six files the tests read are vendored, and
+they live in `crates/adam-ui/tests/a2ui-v1_0/` with their `UPSTREAM`. Also by the owner (2026-11-20): reading the
+renderer's capabilities moves from slice A2 to A1 (decision 9's split), as slice A1c.
+
+*Amended (2026-11-20, built).* Slices A1 and A2 are built. They merge into `main` in one pull request
+([#251](https://github.com/vymalo/another-adam-rs/pull/251)), not through a branch `a2ui-v1`, because this
+repository's work goes through one branch per session; `main` still never holds half of the cutover. Decision 4 as
+built: a data part none of whose messages says `"version": "1.0"` is read as any other data part (its JSON as text); a
+`1.0` message that is no action (a `createSurface`, say) says nothing. Decision 5 as built: the offer is the message's
+own, so a context too large to keep deletes it (`adam_llm_agent::PER_MESSAGE_CONTEXT_KEYS`), a `catalogId` of more than
+256 bytes (the contract's limit) is left out of it, and a form is asked again on a surface, or a catalog read again, only
+for a catalog this turn's offer lists.

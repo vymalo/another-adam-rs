@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use adam_a2a_runtime::{CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
+use adam_a2a_runtime::{CONTEXT_A2UI_RENDERER, CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
 use adam_llm_agent::{ToolCtx, ToolError, ToolOutput};
 use adam_mcp::McpPolicy;
 use adam_runtime::NoopSink;
@@ -20,6 +20,8 @@ const V7: &str = include_str!("fixtures/catalog-v7.json");
 const V7_LOCK: &str = include_str!("fixtures/catalog-v7.lock.json");
 const V8: &str = include_str!("fixtures/catalog-v8.json");
 const V8_LOCK: &str = include_str!("fixtures/catalog-v8.lock.json");
+const V9: &str = include_str!("fixtures/catalog-v9.json");
+const V9_LOCK: &str = include_str!("fixtures/catalog-v9.lock.json");
 const V6: &str = include_str!("fixtures/catalog-v6.json");
 const V6_LOCK: &str = include_str!("fixtures/catalog-v6.lock.json");
 const V5: &str = include_str!("fixtures/catalog-v5.json");
@@ -36,13 +38,17 @@ struct Screen {
 
 fn screen(document: &str, lock: &str) -> Screen {
     let lock: Value = serde_json::from_str(lock).unwrap();
+    // The published catalogs of versions 2 to 8 have no `protocolVersion`; the screen sends them as
+    // `ui-catalog/v2` documents (the digest is of what is sent).
+    let mut document: Value = serde_json::from_str(document).unwrap();
+    document["protocolVersion"] = json!("1.0");
     Screen {
-        document: serde_json::from_str(document).unwrap(),
         claimed: Claimed {
             catalog_id: CATALOG_ID.to_owned(),
             version: u32::try_from(lock["version"].as_u64().unwrap()).unwrap(),
-            digest: lock["digest"].as_str().unwrap().to_owned(),
+            digest: adam_ui::catalog_digest(&document).unwrap(),
         },
+        document,
     }
 }
 
@@ -55,10 +61,6 @@ fn v6() -> Screen {
 fn v5() -> Screen {
     screen(V5, V5_LOCK)
 }
-fn v2() -> Screen {
-    screen(V2, V2_LOCK)
-}
-
 /// Every whole number as a double, as an A2A server hands the metadata of a message over.
 fn as_doubles(value: &Value) -> Value {
     match value {
@@ -77,6 +79,7 @@ fn context(screen: &Screen) -> Map<String, Value> {
     let c = &screen.claimed;
     json!({
         CONTEXT_UI_REF: {"catalogId": c.catalog_id, "version": c.version, "digest": c.digest},
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]},
         CONTEXT_UI_CATALOG: {
             "catalogId": c.catalog_id, "version": c.version, "digest": c.digest,
             "catalog": as_doubles(&screen.document)},
@@ -171,13 +174,14 @@ fn every_catalog_fixture_hashes_to_its_lock_and_to_upstream() {
             )
         })
         .collect();
-    assert_eq!(upstream.len(), 6);
+    assert_eq!(upstream.len(), 7);
     for (file, document, lock) in [
         ("catalog-v2.json", V2, V2_LOCK),
         ("catalog-v5.json", V5, V5_LOCK),
         ("catalog-v6.json", V6, V6_LOCK),
         ("catalog-v7.json", V7, V7_LOCK),
         ("catalog-v8.json", V8, V8_LOCK),
+        ("catalog-v9.json", V9, V9_LOCK),
     ] {
         let digest = catalog_digest(&serde_json::from_str(document).unwrap()).unwrap();
         let lock: Value = serde_json::from_str(lock).unwrap();
@@ -545,34 +549,6 @@ async fn a_screen_of_version_6_gets_the_nearest_form_and_no_new_type() {
             "{help}"
         );
     }
-}
-
-#[tokio::test]
-async fn a_screen_of_version_2_asks_what_fits_and_otherwise_the_form_is_words() {
-    // A yes or no and a short scale are radio buttons, which that screen has.
-    let (_, root) = form(
-        &v2(),
-        json!({"question": "Q", "choices": [
-            {"id": "ship", "question": "Delete it?", "type": "confirm", "default": "no"},
-            {"id": "nps", "question": "How good?", "type": "scale", "to": 5}]}),
-    )
-    .await;
-    assert_eq!(root["questions"][0]["options"][0]["value"], "yes");
-    assert_eq!(root["questions"][1]["options"].as_array().unwrap().len(), 5);
-    assert!(root["questions"][0].get("type").is_none());
-    // A scale of 11 points is more options than that screen takes, and a number is a typed answer:
-    // both go as words.
-    let text = words(
-        Some(&v2()),
-        json!({"question": "Q", "choices": [{"id": "n", "question": "How good?", "type": "scale", "to": 10, "from": 0}]}),
-    )
-    .await;
-    assert!(
-        text.contains("1. How good? (a whole number from 0 to 10)"),
-        "{text}"
-    );
-    let text = words(Some(&v2()), five()).await;
-    assert!(text.contains("2. What is the monthly budget?"), "{text}");
 }
 
 #[tokio::test]

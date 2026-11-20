@@ -236,7 +236,7 @@ send_message() {
 # typed `no` is never a no (bin/adam-coder/src/tools/consent.rs), so a refusal goes through the form.
 send_form_answer() {
   send_parts "$1" "$(jq -cn --arg surface "$2" --arg value "$3" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '[{
-    data: [{version: "v0.9.1", action: {
+    data: [{version: "1.0", action: {
       name: "answer", surfaceId: $surface, sourceComponentId: "root", timestamp: $ts,
       context: {answers: [{id: "consent", values: [$value]}]}}}],
     mediaType: "application/a2ui+json",

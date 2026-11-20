@@ -1,5 +1,6 @@
 {
   "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat",
+  "protocolVersion": "1.0",
   "components": {
     "Text": {
       "type": "object",

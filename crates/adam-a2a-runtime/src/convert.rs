@@ -858,7 +858,7 @@ mod tests {
     }
 
     fn ui() -> Value {
-        json!([{"version": "v0.9.1", "createSurface": {"surfaceId": "s", "catalogId": "c"}}])
+        json!([{"version": "1.0", "createSurface": {"surfaceId": "s", "catalogId": "c"}}])
     }
 
     fn parked_with(ui: Option<Value>) -> RunView {

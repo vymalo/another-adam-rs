@@ -266,6 +266,55 @@ async fn a_message_sent_while_a_tool_runs_is_read_at_the_next_model_turn() {
     }
 }
 
+/// What the renderer offers is the message's own, a steered one included: a message read into the
+/// running turn replaces the offer (or, saying none, deletes it; or, too large to keep its context,
+/// deletes it too), so what the run draws on its next step follows the newest message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_steered_message_replaces_the_renderer_offer_of_the_running_turn() {
+    const OFFER: &str = "vymalo.a2ui.renderer";
+    let offer = |id: &str| json!({"catalogIds": [id]});
+    let big = || json!("x".repeat(adam_llm_agent::MAX_CONTEXT_BYTES));
+    let cases: [(&str, Value, Option<Value>); 4] = [
+        ("a new offer", json!({OFFER: offer("D")}), Some(offer("D"))),
+        ("none", json!({OFFER: null}), None),
+        ("no entry at all", json!({"other": 1}), Some(offer("C"))),
+        ("too large, none", json!({OFFER: null, "big": big()}), None),
+    ];
+    for (what, context, expected) in cases {
+        for (backend, store) in stores().await {
+            let rig = Rig::new();
+            rig.mock
+                .push_tool_calls(vec![gate_call("c1")])
+                .push_text("done");
+            let gate = Arc::new(Gate::default());
+            let rt = rig.runtime(
+                &store,
+                rig.mock.clone(),
+                Some(GateTool { gate: gate.clone() }),
+            );
+            let start = Inbound::new(
+                "message",
+                json!({"text": "go", "context": {OFFER: offer("C")}}),
+            );
+            let run = rt.start(&rig.name, start, None).await.unwrap();
+            let worker = spawn_worker(&rt);
+            gate.wait_reached().await;
+            let steered = Inbound::new("message", json!({"text": "again", "context": context}))
+                .with_id("m-offer");
+            rt.deliver(run, steered).await.unwrap();
+            gate.release.notify_one();
+            let done = wait_done(&rt, run).await;
+            stop(worker).await;
+            let state = conversation(&rt, &done).await;
+            assert_eq!(
+                state.context.get(OFFER),
+                expected.as_ref(),
+                "{backend}: {what}"
+            );
+        }
+    }
+}
+
 /// A message sent while the model writes its final answer is answered: the answer is not the last
 /// word, the run takes another turn, and the second answer reflects the message. The run never
 /// finishes with the first one.

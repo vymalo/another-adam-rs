@@ -155,9 +155,9 @@ docker compose --profile app up -d --build --wait postgres mock-openai mock-gith
 |---|---|
 | `sh dev/coder-e2e.sh` | one task ends in a pushed branch and one pull request; the `checks`, `branch` and `pull_request` artifacts; GitHub read over MCP with the coder's credentials of each call. Variants: `SCENARIO=files` (the coder reads a file first), `scratch` (no repository named, then published), `second-repo` and `create-repo` (each with `ANSWER=yes` or `no`: consent is asked and honoured), `GITHUB_AUTH=app` (with `-f dev/compose.github-app.yaml`) |
 | `sh dev/greeting-e2e.sh` | "hi" gets a greeting built from the folder's persona lines, streamed, and its one model call reported over `usage/v1` (the task carries the totals); the same task goes on to a pull request; a restart on an edited folder changes the answer |
-| `sh dev/coder-choices-e2e.sh` | three questions asked as one A2UI form, one action answers them; a screen that cannot read it gets the options as text |
+| `sh dev/coder-choices-e2e.sh` | three questions asked as one A2UI form, one action answers them; a screen that cannot read it gets the options as text (the screen's capabilities are `a2uiRendererCapabilities["1.0"]` and its catalog is catalog 9, a `ui-catalog/v2` document) |
 | `sh dev/agent-e2e.sh` | the general agent answers "hi" in role; a restart on an edited folder changes the card and the answer |
-| `sh dev/agent-cards-e2e.sh` | the researcher folder answers with a surface of cards and a graph on a screen that has them, words only on one that has not |
+| `sh dev/agent-cards-e2e.sh` | the researcher folder answers with a surface of cards and a graph on a screen that has them, words only on one that has not (catalog 9, and the checklist subset, which has no `Cards`) |
 | `sh dev/painter-e2e.sh` | the painter folder: the instructions of its image MCP server reach the model, the picture is a shared `image/png` file the words name, and the server's prompt is the command `images__scene` (it starts `mock-image-mcp` and restarts `agent` on a copy of the folder with `AGENT_MCP_ALLOW_INSECURE=true`) |
 
 How the scripted models and mocks work, and how to change a script: [the local stack](../reference/dev-stack.md).

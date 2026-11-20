@@ -7,7 +7,7 @@
 //! the contract refuses is refused here before anything is drawn, on every screen and with no
 //! catalog, naming the block and the member: a component off the closed list of seven, more than 4 in
 //! a question or 8 in a form, a member missing, of the wrong type or past a limit of its component
-//! (`blocks.rs` holds the table, a test holds it equal to the catalog of version 8), an `Image` with
+//! (`blocks.rs` holds the table, a test holds it equal to the catalog of version 9), an `Image` with
 //! no `alt`, a `Chart` series with other than one value per label.
 //!
 //! A control or format character in any text of a block (a zero-width or bidirectional one among them)

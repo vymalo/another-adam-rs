@@ -12,10 +12,10 @@
 #   docker compose --profile app up -d --build --wait postgres mock-openai mock-github git-server coder
 #
 # Steps:
-#   1. The card lists the extensions that make this work: A2UI v0.9.1 (taking the catalog inline),
-#      ui-catalog/v1 and thread-tools/v1.
+#   1. The card lists the extensions that make this work: A2UI v1.0 (taking the catalog inline),
+#      ui-catalog/v2 and thread-tools/v1.
 #   2. SendStreamingMessage "[mock:choices] set up the project" with the catalog in the message's metadata
-#      (what the orchestrator sends: ui-catalog/v1 {version, digest, inline}, and the catalog in the A2UI
+#      (what the orchestrator sends: ui-catalog/v2 {version, digest, inline}, and the catalog in the A2UI
 #      capabilities): the task ends TASK_STATE_INPUT_REQUIRED, the status message is the question as text and
 #      an `application/a2ui+json` data part: createSurface under the screen's catalogId, and one Choices
 #      with the three questions (db, auth, deploy).
@@ -32,8 +32,8 @@
 # Environment (defaults match compose.yaml on one machine):
 #   CODER_URL     http://127.0.0.1:${CODER_PORT:-8080}
 #   CODER_TOKEN   dev-token
-#   CATALOG_FILE  crates/adam-ui/tests/fixtures/catalog-v2.json        the screen's catalog (a copy of the web's)
-#   CATALOG_LOCK  crates/adam-ui/tests/fixtures/catalog-v2.lock.json   its {version, digest}
+#   CATALOG_FILE  crates/adam-ui/tests/fixtures/catalog-v9.json        the screen's catalog (a `ui-catalog/v2` document)
+#   CATALOG_LOCK  crates/adam-ui/tests/fixtures/catalog-v9.lock.json   its {version, digest}
 #   TIMEOUT       120   seconds to wait for a task to stop
 #
 # Needs curl and jq. Run from anywhere: the script moves to the repository root.
@@ -45,8 +45,8 @@ coder=${CODER_URL:-http://127.0.0.1:${CODER_PORT:-8080}}
 coder=${coder%/}
 token=${CODER_TOKEN:-dev-token}
 timeout=${TIMEOUT:-120}
-catalog_file=${CATALOG_FILE:-crates/adam-ui/tests/fixtures/catalog-v2.json}
-catalog_lock=${CATALOG_LOCK:-crates/adam-ui/tests/fixtures/catalog-v2.lock.json}
+catalog_file=${CATALOG_FILE:-crates/adam-ui/tests/fixtures/catalog-v9.json}
+catalog_lock=${CATALOG_LOCK:-crates/adam-ui/tests/fixtures/catalog-v9.lock.json}
 
 for f in "$catalog_file" "$catalog_lock"; do
   if [ ! -f "$f" ]; then
@@ -62,9 +62,9 @@ bad() { echo "FAIL $1"; fail=1; }
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-ui_uri=https://agents.vymalo.com/a2a/extensions/ui-catalog/v1
+ui_uri=https://agents.vymalo.com/a2a/extensions/ui-catalog/v2
 tools_uri=https://agents.vymalo.com/a2a/extensions/thread-tools/v1
-a2ui_uri=https://a2ui.org/a2a-extension/a2ui/v0.9.1
+a2ui_uri=https://a2ui.org/a2a-extension/a2ui/v1.0
 catalog_id=$(jq -r '.catalogId' "$catalog_file")
 version=$(jq -r '.version' "$catalog_lock")
 digest=$(jq -r '.digest' "$catalog_lock")
@@ -106,7 +106,7 @@ first_message() {
         extensions: [$a2ui, $ui],
         metadata: ({
           ($ui): {catalogId: $catalogId, version: $version, digest: $digest, inline: $inline},
-          a2uiClientCapabilities: {"v0.9.1": ({supportedCatalogIds: [$catalogId]}
+          a2uiRendererCapabilities: {"1.0": ({supportedCatalogIds: [$catalogId]}
             + (if $inline then {inlineCatalogs: [$catalog[0]]} else {} end))}})}}}'
 }
 
@@ -171,7 +171,7 @@ if [ -n "$task" ] && [ -n "$surface_id" ]; then
       params: {message: {
         messageId: $id, taskId: $task, contextId: $ctx, role: "ROLE_USER",
         parts: [{
-          data: [{version: "v0.9.1", action: {
+          data: [{version: "1.0", action: {
             name: "answer", surfaceId: $surface, sourceComponentId: "root", timestamp: $ts,
             context: {answers: [
               {id: "db", values: ["pg"]}, {id: "auth", values: ["keycloak"]}, {id: "deploy", values: ["compose"]}]}}}],
