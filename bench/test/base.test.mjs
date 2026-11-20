@@ -48,6 +48,26 @@ test('the base script makes a bare repository on main, with one commit that link
   assert.equal(fs.readlinkSync(path.join(tree, 'node_modules')), path.join(app, 'node_modules'));
 });
 
+/** A repository as a task image holds it when it has a submodule (openlibrary's `vendor/infogami`) and a nested repository of its own. */
+function appRepoWithNested(t) {
+  const app = appRepo(t);
+  const lib = initRepo(t);
+  commitFiles(lib, { 'lib.js': 'lib\n' }, 'lib');
+  git(app, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'vendor/infogami');
+  git(app, 'commit', '-q', '-m', 'add the submodule');
+  return app;
+}
+
+test('the marker tree is the tree the host rebuilds from the tar of `tree`, also for a repository with a submodule', async (t) => {
+  const app = appRepoWithNested(t);
+  const produced = runBase(t, app);
+  const marker = parseBaseMarker(fs.readFileSync(path.join(produced.out, BASE_MARKER), 'utf8'));
+  const stack = fakeStack(produced, []);
+  const base = await makeHostBase({ stack, slot: 1, task: loadTask(makeTask(tmp(t), 'demo-nested')), hostRoot: tmp(t) });
+  assert.equal(base.tree, marker.tree, 'the container and the host name one tree');
+  assert.equal(marker.commit, produced.sha);
+});
+
 test('the base script refuses a path that is not plain', () => {
   assert.throws(() => baseScript({ workdir: '/app; rm -rf /' }), /plain/);
   assert.throws(() => baseScript({ workdir: '/app', out: '/out $(x)' }), /plain/);

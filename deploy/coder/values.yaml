@@ -7,7 +7,7 @@ image:
   # Bumped on every green build of main by .github/workflows/coder.yml
   # (`sha-<first 7 of the commit>`). A plain key so the workflow can edit it.
   # sha-0000000 is the placeholder that exists before the first build.
-  tag: sha-49589de
+  tag: sha-419847c
   pullPolicy: IfNotPresent
 
 # The image package may be private; name a pull secret here if so.
@@ -389,6 +389,16 @@ runPods:
   toolsImage:
     repository: ""
     tag: ""
+  # The images a repository may name for its own run pod (ADR 0052, the tool `use_repository_environment`):
+  # each entry is a prefix the image must start with, and it must end with `/` (a registry path) or `:`
+  # (a tag), so that a bare host cannot admit a look-alike (`ghcr.io` admitting `ghcr.io.evil.com`).
+  # The `run` container of a run pod may then use such an image; the init containers keep the exact
+  # list of `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages`. Empty (the
+  # default): the tool is never offered, RUN_POD_REPOSITORY_IMAGES is not rendered, and nothing of it
+  # changes. The chart renders the value into the coder and into the admission policy, so the policy
+  # is the control that holds whatever the coder says.
+  repositoryImages:
+    allowedPrefixes: []
   # The container of the template the commands run in (RUN_POD_CONTAINER).
   container: run
   # What a run pod may use. The memory limit is the 2Gi the owner approved on 2026-10-05; it is also what the quota

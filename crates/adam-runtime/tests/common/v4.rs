@@ -2,9 +2,10 @@
 //! still decode.
 //!
 //! It is deliberately a **copy**, not the runtime's `Envelope`: a member added to the real one
-//! does not appear here, so this fixture says what a v4 process reads. The expand release writes
-//! this shape beside the v5 head; the contract release (S3) writes the head alone and inverts the
-//! test to assert the documented failure, which is the compatibility boundary made executable.
+//! does not appear here, so this fixture says what a v4 process reads. The expand release wrote
+//! this shape beside the v5 head; the contract release writes the tombstone (`state = null`) and
+//! the head, so this fixture rejects what a new run stores, and a pre-contract run still decodes —
+//! the compatibility boundary made executable.
 
 #![allow(dead_code)] // one case includes this module; the other cases do not use it
 

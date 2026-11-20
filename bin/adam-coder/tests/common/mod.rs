@@ -1511,6 +1511,11 @@ pub struct FakeEnvironment {
     pub sealed: Mutex<Vec<(String, Vec<String>)>>,
     /// `seal` fails with this, once set.
     pub seal_fails: Mutex<Option<fn() -> EnvError>>,
+    /// The image each run was set to, as the tool asked (`set_image`).
+    pub images: Mutex<Vec<(String, Option<String>)>>,
+    /// What `repository_image_prefixes` says: `None` for an environment that is not run pods, `Some`
+    /// (possibly empty) for one that is.
+    pub prefixes: Option<Vec<String>>,
 }
 
 /// The session of a [`FakeEnvironment`].
@@ -1548,6 +1553,19 @@ impl FakeEnvironment {
     /// A fake with nothing held, no steps, and nothing failing. `root` is the workspace root of the
     /// fixture, for [`released`](Self::released).
     pub fn new(root: Option<&Path>) -> Arc<Self> {
+        Self::build(root, None)
+    }
+
+    /// A fake that says it runs a run's commands in run pods, with these image prefixes
+    /// (`RUN_POD_REPOSITORY_IMAGES`): what `use_repository_environment` is offered with.
+    pub fn in_run_pods(root: Option<&Path>, prefixes: &[&str]) -> Arc<Self> {
+        Self::build(
+            root,
+            Some(prefixes.iter().map(|prefix| (*prefix).to_owned()).collect()),
+        )
+    }
+
+    fn build(root: Option<&Path>, prefixes: Option<Vec<String>>) -> Arc<Self> {
         let session = Arc::new(FakeSession::default());
         session
             .extra_env
@@ -1570,6 +1588,8 @@ impl FakeEnvironment {
             ensure_fails_after_rebuild: Mutex::new(None),
             sealed: Mutex::new(Vec::new()),
             seal_fails: Mutex::new(None),
+            images: Mutex::new(Vec::new()),
+            prefixes,
         })
     }
 }
@@ -1648,6 +1668,18 @@ impl Environment for FakeEnvironment {
             Some(fail) => Err(fail()),
             None => Ok(()),
         }
+    }
+
+    async fn set_image(&self, run: &str, image: Option<&str>) -> Result<(), EnvError> {
+        self.images
+            .lock()
+            .unwrap()
+            .push((run.to_owned(), image.map(str::to_owned)));
+        Ok(())
+    }
+
+    fn repository_image_prefixes(&self) -> Option<&[String]> {
+        self.prefixes.as_deref()
     }
 }
 

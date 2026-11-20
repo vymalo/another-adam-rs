@@ -130,7 +130,7 @@ test('OpenCode\'s driver writes the shared text byte for byte beside the stateme
   const workRoot = path.join(tmp(t), 'work', '1');
   const containers = new FakeContainers();
   const agent = new OpenCodeAgent({ pins: PINS, home: tmp(t), contextWindow: 131072, sharedPrompt: text, fetchBinary: async () => ({ path: process.execPath, cached: true, integrity: PINS.opencode.integrity, version: PINS.opencode.version }), pollMs: 5 });
-  const stack = { slotDir: () => slotDir, workRoot: () => workRoot, workDir: async () => {}, extractTree: async () => {}, readFiles: async () => ({ files: new Map(), refused: [] }) };
+  const stack = { slotDir: () => slotDir, ensureGlibc: async () => path.join(slotDir, 'glibc'), workRoot: () => workRoot, workDir: async () => {}, extractTree: async () => {}, readFiles: async () => ({ files: new Map(), refused: [] }) };
   const ctx = { run: 'r1', attempt: 1, slot: 1, task: loadTask(makeTask(tmp(t), 'demo-1')), base: { dir: '/h', sha: 'a'.repeat(40), slug: 'demo-1-aaaaaa', workdir: '/app', containerRepo: '/work/bench-base/base.git' }, stack, containers, meter: { token: 'abcdefabcdefabcdefabcdef', baseUrl: 'http://meter-1:8090/r/abcdefabcdefabcdefabcdef/v1', refusal: () => null }, paths: { run: tmp(t), scratch: tmp(t) }, limits: { minutes: 1, steps: 10, cancelGraceSeconds: 1, limitMs: 60000, cancelGraceMs: 1000 }, contextWindow: 131072, log: () => {} };
   await agent.prepare(ctx);
   assert.equal(fs.readFileSync(path.join(slotDir, 'in-r1-a1', SHARED_PROMPT_FILE), 'utf8'), text);

@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { test } from 'node:test';
 import { CALLS_PER_RUN } from '../lib/agent-script.mjs';
-import { LedgerError } from '../lib/ledger.mjs';
+import { LedgerError, resumeActions } from '../lib/ledger.mjs';
 import { buildBlocks, specsOf } from '../lib/plan.mjs';
-import { HarnessCrash, regradeInvalid, runPlan } from '../lib/runner.mjs';
+import { HarnessCrash, regradeInvalid, runDirName, runPlan } from '../lib/runner.mjs';
+import { PermanentError } from '../lib/errors.mjs';
 import { runSchedule } from '../lib/schedule.mjs';
 import { PER_CALL, fixture, newTracker } from './runnerfix.mjs';
 
@@ -269,4 +272,28 @@ test('H-run-never-pulls: every run makes its task image present on its own slot,
   const specs = specsOf(buildBlocks({ tasks: Object.values(f.tasks).slice(0, 1), agents: ['adam'], arms: ['max'], seed: '1' }));
   await runSchedule({ deps, specs, slots: 1 });
   assert.deepEqual(order, [`pull 1 ${specs[0].task.id}`, 'base']);
+});
+
+test('a prepare failure that a retry cannot change is tried once and is final; a transient one is tried again', async (t) => {
+  const stderr = 'fatal: detected dubious ownership in repository at \'/work/bench-base/base.git\'\nfatal: Could not read from remote repository.\n';
+  let transient = 0;
+  const f = await fixture(t, { capUSD: 100, taskNames: ['hello-1', 'fix-add-1'], agentOver: { fail: { prepare: (run) => (run.startsWith('hello-1') ? new PermanentError('the clone for OpenCode failed (exit 128): fatal: detected dubious ownership', { stderr: `${stderr}token=stack-secret-value\n` }) : run.startsWith('fix-add-1') && ++transient <= 1) } } });
+  const specs = plan(f).filter((s) => ['hello-1', 'fix-add-1'].includes(s.task.id) && s.agent === 'opencode');
+  const res = await runSchedule({ deps: f.deps(), specs, slots: 1 });
+  const folded = f.ledger.fold();
+  const hello = folded.get(specs.find((s) => s.task.id === 'hello-1').run);
+  const fix = folded.get(specs.find((s) => s.task.id === 'fix-add-1').run);
+  assert.equal(hello.state, 'Failed_infra');
+  assert.equal(hello.final, true);
+  assert.equal(hello.attempt, 1, 'the permanent failure was not attempted again');
+  assert.equal(fix.state, 'Done', 'a transient failure is retried and succeeds');
+  assert.equal(fix.attempt, 2);
+  assert.ok(res.passes >= 2);
+  assert.equal(resumeActions(folded).find((a) => a.run === hello.run).action, 'give-up');
+  // the whole of what the command said is kept in the run's directory, with the key taken out
+  const kept = fs.readFileSync(path.join(f.home, 'runs', runDirName(hello.run, 1), 'prepare-stderr.txt'), 'utf8');
+  assert.match(kept, /fatal: detected dubious ownership in repository at '\/work\/bench-base\/base\.git'/);
+  assert.match(kept, /Could not read from remote repository/);
+  assert.ok(!kept.includes('stack-secret-value'));
+  assert.match(kept, /token=\[redacted\]/);
 });

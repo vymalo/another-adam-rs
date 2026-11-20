@@ -4,9 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { InfraError } from '../lib/agents/common.mjs';
-import { MODEL, OpenCodeAgent, opencodeConfig, opencodeEnv, opencodeExportScript, opencodeInput, opencodeRunScript, parseEvents } from '../lib/agents/opencode.mjs';
+import { MODEL, OpenCodeAgent, opencodeConfig, opencodeEnv, containerName, opencodeCloneScript, opencodeExportScript, opencodeInput, opencodeRunScript, parseEvents } from '../lib/agents/opencode.mjs';
 import { FakeContainers } from '../lib/containers.mjs';
 import { IntegrityError } from '../lib/npm.mjs';
+import { runId, RUN_ID_MAX } from '../lib/plan.mjs';
 import { PINS } from '../lib/pins.mjs';
 import { RUNTIME } from '../lib/runtime.mjs';
 import { createScriptedModel } from '../lib/scripted-model.mjs';
@@ -96,10 +97,17 @@ const EVENTS = [
 ];
 const jsonl = (events) => `${events.map((e) => JSON.stringify(e)).join('\n')}\n`;
 
+test('OpenCode\'s input counts its cached tokens, as adam\'s and the meter\'s do, and cached is a part of it', () => {
+  // the pilot's real numbers: 7,488 plain input and 43,904 cache reads, which the meter would count as 51,392 input
+  const r = parseEvents(jsonl([{ type: 'step_finish', sessionID: 'ses_abc123XYZ', part: { tokens: { input: 7488, output: 10, reasoning: 0, cache: { write: 0, read: 43904 } } } }]));
+  assert.deepEqual(r.selfReported, { input: 51392, output: 10, cached: 43904, calls: 1 });
+  assert.ok(r.selfReported.cached <= r.selfReported.input);
+});
+
 test('the events give the session, the steps and what OpenCode says it used', () => {
   const r = parseEvents(jsonl(EVENTS));
   assert.equal(r.sessionId, 'ses_abc123XYZ');
-  assert.deepEqual(r.selfReported, { input: 150, output: 20, cached: 47, calls: 2 });
+  assert.deepEqual(r.selfReported, { input: 199, output: 20, cached: 47, calls: 2 });
   assert.equal(r.errors, 0);
 });
 
@@ -120,9 +128,11 @@ function setup(t, { runResult = { exitCode: 0 }, outFiles = null, refused = [], 
   const containers = new FakeContainers({ onRun: (spec) => (spec.script.includes(' run --standalone ') ? runResult : { exitCode: 0 }) });
   const slotDir = path.join(home, 'slots', '2'); // as Stack.slotDir: a directory of the harness's own home
   const workRoot = path.join(home, 'work', '2');
+  const glibcDir = path.join(home, 'glibc'); // as Stack.ensureGlibc
   fs.mkdirSync(workRoot, { recursive: true });
   const stack = {
     slotDir: () => slotDir,
+    ensureGlibc: async () => glibcDir,
     workRoot: () => workRoot,
     coderContainers: () => ({ listContainers: async () => [{ image: task.image.ref, imageId: 'f'.repeat(64), labels: {}, names: ['coder-2'] }] }),
     workDir: async (slot, dir, o) => stackCalls.push(['workDir', slot, dir, Boolean(o?.remove)]),
@@ -246,10 +256,11 @@ test('run: the container of the task image by digest, as uid 10001, the binary r
   assert.equal(mounts['/work'].source, workRoot);
   assert.equal(result.exit, 'done');
   assert.equal(result.sessionId, 'ses_abc123XYZ');
-  assert.deepEqual(result.selfReported, { input: 150, output: 20, cached: 47, calls: 2 });
+  assert.deepEqual(result.selfReported, { input: 199, output: 20, cached: 47, calls: 2 });
   assert.equal(result.record.limits, 'runtime');
+  assert.ok(!mounts['/lib64/ld-linux-x86-64.so.2'], 'an image with its own loader is run as it is: nothing of the harness\'s glibc is mounted');
   const exp = containers.runs.find((s) => s.script.includes('session export'));
-  assert.match(exp.script, /session export --standalone 'ses_abc123XYZ'/);
+  assert.match(exp.script, /\/opt\/bench\/opencode session export --standalone 'ses_abc123XYZ'/);
   assert.equal(exp.network, 'none');
   assert.equal(JSON.parse(exp.input).provider.bench.options.baseURL, URL);
 });
@@ -559,4 +570,99 @@ test('the real OpenCode puts the shared prompt file in the system prompt it send
   assert.equal(ran.status, 0, fs.readFileSync(path.join(out, 'stderr.txt'), 'utf8').slice(-600));
   const system = model.requests[0].body.messages.filter((m) => m.role === 'system').map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join('\n');
   assert.ok(system.includes(marker), 'the file named in `instructions` is in the system prompt');
+});
+
+const LONGEST = [
+  'instance_element-hq__element-web-1077729a19c0ce902e713cf6fab42c91fb7907f1-vnan',
+  'instance_ansible__ansible-5f4e332e3762999d94af27746db29ff1729252c1-v0f01c69f1e2528b935359cfe578530722bca2c59',
+  'instance_internetarchive__openlibrary-0dc5b20fa186f9714f8a838178597e69f549d026-v2d9a6c849c60ed19fd0858ce9e40b7cc8e096e59',
+  'instance_gravitational__teleport-e6895d8934f6e484341034869901145fbc025e72-vce94f93ad1030e3136852817f2423c1b3ac37bc4',
+];
+
+test('every run id the plan makes is accepted by the OpenCode script, the container name and the ledger, at the longest', () => {
+  for (const task of [...LONGEST, 'x'.repeat(300)]) {
+    for (const prefix of ['', 'pilot.']) {
+      const id = runId(task, 'opencode', 'default', { prefix });
+      assert.ok(id.length <= RUN_ID_MAX);
+      const title = `${id}-a12`;
+      assert.doesNotThrow(() => opencodeRunScript({ ...paths, run: title }), id);
+      const name = containerName(id, 12);
+      assert.match(name, /^[A-Za-z0-9][A-Za-z0-9_.-]{0,60}$/, 'room is left for the -x of the export container');
+      assert.ok(`${name}-x`.length <= 63);
+    }
+  }
+  assert.ok(runId('x'.repeat(300), 'opencode', 'default', { prefix: 'pilot.' }).length === RUN_ID_MAX, 'the longest id is the maximum, not less');
+});
+
+test('two long run ids that differ only at their end never share a container name', () => {
+  const a = runId(LONGEST[1], 'opencode', 'default');
+  const b = runId(LONGEST[1], 'opencode', 'other');
+  assert.notEqual(containerName(a, 1), containerName(b, 1));
+  assert.notEqual(containerName(a, 1), containerName(a, 2));
+  assert.equal(containerName('r1', 1), 'adam-bench-oc-r1-a1');
+});
+
+test('the clone for OpenCode names safe.directory in a global file, as the pusher does', () => {
+  const script = opencodeCloneScript({ repo: '/work/bench-base/base.git', dir: '/work/workspaces/oc-r1-a1/demo' });
+  assert.match(script, /GIT_CONFIG_GLOBAL=\/tmp\/bench-gitconfig/);
+  assert.doesNotMatch(script, /GIT_CONFIG_COUNT/);
+  assert.throws(() => opencodeCloneScript({ repo: '/work/a b', dir: '/work/x' }), /plain/);
+});
+
+// ---- a task image without glibc (Alpine, musl): the binary starts through the harness's own loader ----
+
+test('a task image with its own loader is run as it is; one without (musl) gets the harness\'s glibc mounted read-only at the places glibc looks, and no variable carries it', async (t) => {
+  const own = setup(t);
+  await own.agent.prepare(own.ctx);
+  await own.agent.run(own.ctx);
+  const ownSpec = own.containers.runs.find((x) => x.script.includes(' run --standalone '));
+  assert.ok(!ownSpec.mounts.some((m) => m.target === '/lib64/ld-linux-x86-64.so.2'));
+
+  // a container that finds no loader: `test -e /lib64/ld-linux-x86-64.so.2` exits 1
+  const s = setup(t);
+  const base = s.containers.onRun;
+  s.containers.onRun = (spec, i) => (spec.script === 'test -e /lib64/ld-linux-x86-64.so.2' ? { exitCode: 1 } : base(spec, i));
+  let asked = 0;
+  s.ctx.stack.ensureGlibc = async () => (asked += 1, '/h/glibc');
+  await s.agent.prepare(s.ctx);
+  await s.agent.run(s.ctx);
+  const specs = s.containers.runs.filter((x) => x.script.includes(' run --standalone ') || x.script.includes('session export'));
+  assert.equal(specs.length, 2, 'the run and the export');
+  for (const spec of specs) {
+    const m = Object.fromEntries(spec.mounts.map((x) => [x.target, x]));
+    assert.deepEqual(m['/lib64/ld-linux-x86-64.so.2'], { source: '/h/glibc/ld-linux-x86-64.so.2', target: '/lib64/ld-linux-x86-64.so.2', readOnly: true });
+    for (const f of ['libc.so.6', 'libgcc_s.so.1', 'libstdc++.so.6', 'libnss_files.so.2', 'libnss_dns.so.2', 'libresolv.so.2']) assert.deepEqual(m[`/usr/lib/x86_64-linux-gnu/${f}`], { source: `/h/glibc/${f}`, target: `/usr/lib/x86_64-linux-gnu/${f}`, readOnly: true }, f);
+    assert.ok(spec.mounts.filter((x) => x.target !== '/work' && x.target !== '/bench/out').every((x) => x.readOnly), 'nothing of it is writable');
+    assert.ok(!JSON.stringify(spec.env).match(/LD_/), 'no variable carries the libraries: the agent\'s tools never see them');
+  }
+  assert.equal(asked, 1, 'the runtime is copied out of the coder image once, and only for an image that needs it');
+  // the answer is remembered for the image: a second attempt does not ask again
+  const before = s.containers.runs.filter((x) => x.script.startsWith('test -e')).length;
+  await s.agent.prepare(s.ctx);
+  assert.equal(s.containers.runs.filter((x) => x.script.startsWith('test -e')).length, before);
+});
+
+test('an image that cannot run a shell for the loader test is infrastructure of reason runtime, found in prepare', async (t) => {
+  const s = setup(t);
+  const base = s.containers.onRun;
+  s.containers.onRun = (spec, i) => (spec.script === 'test -e /lib64/ld-linux-x86-64.so.2' ? { exitCode: 127, stderr: 'exec: sh: not found' } : base(spec, i));
+  await assert.rejects(s.agent.prepare(s.ctx), (e) => e.reason === 'runtime' && /could not run a shell/.test(e.message));
+});
+
+test('a container that does not start: the shell\'s own message (in stderr.txt, not on the container\'s stderr) is in the error, in the run\'s directory and in the error\'s stderr', async (t) => {
+  const said = 'sh: /opt/bench/opencode: not found\n';
+  const s = setup(t, { runResult: { exitCode: 127, stderr: '' }, outFiles: [['stderr.txt', Buffer.from(said)]] });
+  await s.agent.prepare(s.ctx);
+  await assert.rejects(s.agent.run(s.ctx), (e) => {
+    assert.ok(e instanceof InfraError && e.reason === 'runtime');
+    assert.match(e.message, /did not start \(exit 127\): sh: \/opt\/bench\/opencode: not found/);
+    assert.match(e.stderr, /opencode: not found/, 'the runner writes it to prepare-stderr.txt');
+    return true;
+  });
+  assert.equal(fs.readFileSync(path.join(s.ctx.paths.run, 'opencode', 'stderr.txt'), 'utf8'), said);
+  // the run token is taken out of it
+  const leaky = setup(t, { runResult: { exitCode: 126, stderr: '' }, outFiles: [['stderr.txt', Buffer.from(`boom ${TOKEN}\n`)]] });
+  await leaky.agent.prepare(leaky.ctx);
+  await assert.rejects(leaky.agent.run(leaky.ctx), (e) => !e.message.includes(TOKEN) && !e.stderr.includes(TOKEN));
+  assert.ok(!fs.readFileSync(path.join(leaky.ctx.paths.run, 'opencode', 'stderr.txt'), 'utf8').includes(TOKEN));
 });

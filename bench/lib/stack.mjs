@@ -17,6 +17,8 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { HostContainers, buildRunArgs, dockerEnv } from './containers.mjs';
+import { GLIBC_FILES, GLIBC_LIB_DIR } from './glibc.mjs';
+import { summarize, withStderr } from './errors.mjs';
 import { PINS, coderRef } from './pins.mjs';
 import { RUNTIME, runtimeLimits, runtimeUser } from './runtime.mjs';
 import { extractEntries, parseTar, pickFiles } from './tarstream.mjs';
@@ -29,6 +31,8 @@ export class StackError extends Error {
 }
 
 export const SLOTS = 2;
+/** The pusher's scratch directory on the slot's work volume (compose.yaml mounts it at /scratch). */
+export const PUSHER_SCRATCH = '/work/pusher-scratch';
 export const COMPOSE_TIMEOUT_MS = 2 * 60 * 1000;
 export const DEFAULT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const SAFE_VALUE = /^[^\n\r\0$"'\\]*$/;
@@ -272,8 +276,8 @@ export class Stack {
     const r = await this.exec('docker', this.composeArgs(args), { env: this.composeEnv(), input, timeoutMs });
     this.log({ event: 'compose', verb: args[0], exit: r.exitCode });
     if (r.exitCode !== 0 || r.timedOut) {
-      const why = redact(r.stderr.trim().split('\n').slice(-3).join(' | '), this.secrets);
-      throw new StackError(`docker compose ${args[0]} ${r.timedOut ? 'timed out' : `failed (exit ${r.exitCode})`}: ${why}`);
+      const full = redact(r.stderr, this.secrets);
+      throw withStderr(new StackError(`docker compose ${args[0]} ${r.timedOut ? 'timed out' : `failed (exit ${r.exitCode})`}: ${summarize(full)}`), full);
     }
     return r.stdout;
   }
@@ -442,7 +446,15 @@ export class Stack {
 
   /** A base repository of the slot's work directory on the git server, pushed by a one-shot container with no secret. */
   async pushBase(slot, script) {
-    await this.compose(['run', '--rm', '-T', '--no-deps', this.slotService('pusher', slot), script], { timeoutMs: 5 * 60 * 1000 });
+    // The pusher's scratch repository is on the work volume (compose.yaml), made here as the harness's own directory and
+    // removed after, whatever the push did.
+    await this.workDir(slot, PUSHER_SCRATCH, { remove: true });
+    await this.workDir(slot, PUSHER_SCRATCH);
+    try {
+      await this.compose(['run', '--rm', '-T', '--no-deps', this.slotService('pusher', slot), script], { timeoutMs: 5 * 60 * 1000 });
+    } finally {
+      await this.workDir(slot, PUSHER_SCRATCH, { remove: true }).catch(() => {});
+    }
   }
 
   /** Remove a run's repository from the git server. */
@@ -468,6 +480,33 @@ export class Stack {
         fs.chmodSync(path.join(dir, f), 0o755);
       } catch {
         throw new StackError(`the coder's ${f} could not be copied out of ${this.coderImage}: pull the image and retry`);
+      }
+    }
+    fs.writeFileSync(marker, `${this.coderImage}\n`);
+    return dir;
+  }
+
+  /**
+   * The glibc runtime the pinned OpenCode binary needs (its loader and the libraries), copied out of the pinned coder image
+   * once (never run there): mounted read-only in every OpenCode container, it starts the binary in a task image that has no
+   * glibc of its own (Alpine). Not part of `ensureCoderFiles`: the coder's binaries are static and adam never needs it.
+   */
+  async ensureGlibc() {
+    const dir = path.join(this.stackDir, 'glibc');
+    const marker = path.join(dir, '.image');
+    try {
+      if (fs.readFileSync(marker, 'utf8').trim() === this.coderImage) return dir;
+    } catch {
+      // not made yet
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+    await this.host().extract(this.coderImage, GLIBC_FILES.map((f) => `${GLIBC_LIB_DIR}/${f}`), dir, { follow: true });
+    for (const f of GLIBC_FILES) {
+      try {
+        fs.chmodSync(path.join(dir, f), f.startsWith('ld-') ? 0o755 : 0o644);
+      } catch {
+        throw new StackError(`the glibc runtime ${f} could not be copied out of ${this.coderImage}: pull the image and retry`);
       }
     }
     fs.writeFileSync(marker, `${this.coderImage}\n`);

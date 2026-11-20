@@ -164,6 +164,42 @@ The values you will actually set:
 
 Render-time guards stop a bad combination at `helm template`, not at rollout (`templates/_validate.tpl`).
 
+## The contract release: a one-time window
+
+ADR 0055 shipped in two releases. The **expand** release (S0–S2b) writes the whole v4 `state`
+beside the head, so a v4 process and a v5 one can both step a run; the **contract** release (S3)
+writes `state = null` (the tombstone), the head and the body, and every read serves the head. A v4
+process that touches a converted run **fails it**: its `Envelope::decode` refuses a head, so it
+commits the run `Failed` with `state = null`, no head and the version bumped. The run is **terminal**
+and stays so (`sched_at` is `None` for a failed run, so no worker claims it): the contract's reads
+serve its head, and `start_continuing` (or `start_with_id_continuing`) can carry it into a new run;
+nothing resumes it in place. There is no fence inside a v4 binary that would make it refuse first.
+
+So the rollout from an expand-release image to a contract-release image is a **deploy boundary**, not
+an ordinary `helm upgrade`:
+
+1. Confirm no process still runs an expand-release image against this database — the front and every
+   worker. With the default chart (one StatefulSet, one replica) `RollingUpdate` deletes the pod
+   before it creates the next, so the old image is gone before the new one starts. With
+   `topology: split` the front is a **Deployment** whose default `maxSurge: 1` starts the v5 pod and
+   waits for it to be Ready **before** it terminates the v4 one: scale it out of the way first,
+   `kubectl -n another-agentic-system scale deploy <fullname>-front --replicas=0` (the chart names it
+   `<fullname>-front`: `coder-front` for a release named `coder`). The `helm upgrade` in step 2
+   re-applies `front.replicas` and brings the front back on the new image, so there is nothing to
+   scale up by hand; the manual scale is only the "before" half. A deployment that ran
+   more than one worker, or a pinned old image somewhere else, must be scaled to zero the same way.
+2. Roll the new image (`helm upgrade --install …`). The store's `migrate()` runs first and is
+   idempotent; PostgreSQL's schema is version 6.
+3. Do not roll back to the expand release after a run has committed under the contract: its `state`
+   is `null` and only a v5 binary reads it. A rollback is safe only for runs the contract has not
+   converted.
+
+Do **not** merge the contract and roll it in one step when your deployment renders this chart from
+`main`: the merge bumps `image.tag`, so the roll would follow the merge by itself. Pin `image.tag`
+(and digest) in your own values **before** merging, merge, then move the pin by hand after the old
+processes are gone — the chart's bump is a convenience for a deployment that does not need the
+boundary.
+
 ## Verify
 
 * The pods are `Ready` (probes hit `/healthz`; the GitHub MCP sidecar starts first).
@@ -197,6 +233,15 @@ repositories **read-only** and each worktree's own directory in it, and no Secre
 [ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md), proposed): `git commit` and anything else that writes the
 mirror fails in the pod, the coder commits. The template must mount the work claim once, whole, at `WORKSPACE_ROOT` (the
 chart's does; a hand-written one that does not stops the coder, exit 78).
+
+**A repository's own image, if you allow its registry.** `runPods.repositoryImages.allowedPrefixes` is empty by default: the
+run pods use the template's image, and the coder never offers `use_repository_environment`
+([ADR 0052](../decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)). Name one or more
+prefixes (each ends with `/` for a registry path, `ghcr.io/acme/`, or `:` for a tag, `ghcr.io/acme/tool:`) and a repository
+whose `devcontainer.json` names such an image may move its run pod to it. The chart renders `RUN_POD_REPOSITORY_IMAGES` and
+admits a prefixed image **for the `run` container alone**; the init containers keep the exact list. The pod's user, mounts,
+resources, network and runtime class do not move, and a configuration that only builds (a Dockerfile, features) or uses Compose
+is refused in words. A bare host is refused, because `ghcr.io` would admit `ghcr.io.evil.com`; so are `*` and `${...}`.
 
 **The coder's own git runs in a sandbox container.** `git` runs the programs a repository's configuration names (a clean
 filter, an fsmonitor), and some repositories are a run's own, so with run pods the chart adds a second container to the coder

@@ -119,6 +119,9 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      (no ExternalSecret: a run pod reads no Secret, ADR 0038), and refuses `replicaCount` above 1 on per-pod `ReadWriteOnce` volumes and a policy
      switched off without `runPods.admissionPolicy.disableAcknowledged`. The image ships `adam-kube-exec` and
      `/opt/adam/bin/adam-exec` for the pod's init container (no `opencode`, ADR 0038) (chart README, "Run pods").
+     A repository may bring its own `devcontainer.json`: with `runPods.repositoryImages.allowedPrefixes` (empty by
+     default) the coder offers `use_repository_environment` and the policy admits an image under a prefix for the `run`
+     container alone (ADR 0052, `docs/decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md`).
 5. **Change the chart with its guards.** Render-time validation is in
    `deploy/coder/templates/_validate.tpl`; the default render is pinned by
    `deploy/coder/tests/golden/combined.yaml`; `deploy/coder/tests/render-check.sh` asserts the

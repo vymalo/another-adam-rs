@@ -33,9 +33,11 @@ accept the poll latency.
 * `Store::blob_stored(id)`: one `find_one` on `_id` in `adam_blob`, so a split that names a file an
   earlier commit uploaded does not send its bytes again.
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
-  state, and returning it would convert the document back on every transition. `load_run`, the claim
-  and the listings return the stored state; `journal_put` returns the stored payload (the loop
-  decodes the step's outcome from it).
+  state, and returning it would convert the document back on every transition. `load_run`,
+  `load_head`, the claim, `open_run_for_conversation` and the listings answer the **contract
+  document**: the current head when `head_version == version`, the stored `state` otherwise (ADR 0055,
+  the contract release). `journal_put` returns the stored payload (the loop decodes the step's
+  outcome from it).
 * `run_header` is one `find_one` projected to the header and `lease_until`: the state is never read,
   so a reader that only needs the run's own bookkeeping (a cancel watch, a parent check) pays for one
   small document.
@@ -136,9 +138,11 @@ before.
 A run document gains `head` (the v5 document the runtime writes beside `state`) and `head_version`
 (the version the head was written at). Nothing is rewritten by the migration: a version 4 document
 has neither field, and `{head_version: null}` matches a missing field, as `owner` did for version 2.
-A commit that writes a head sets both; a commit that does not (a delivery, a cancel, a park) leaves
-both alone, so the head becomes stale (`head_version < version`) and `load_head` serves the whole
-`state` instead.
+A commit that writes a head sets both. In the contract release every commit of a v5 run writes the
+head — a delivery, a cancel and a park re-encode the one they read — so it stays current; a v4
+commit (a process of the expand release) leaves both alone, so the head becomes stale
+(`head_version < version`) and every read serves the whole `state` — unless the state is the
+tombstone (a pre-S3 process failed a converted run), in which case the head is served.
 
 `<prefix>body` holds the transcript, **append-only per generation**: `_id =
 "<run>:<generation>:<idx>"`, `run_id`, `generation` and `writer` (binary UUIDs), `idx` (int),
@@ -165,7 +169,8 @@ more than an hour ago are deleted. A commit that loses the CAS deletes the rows 
 `writer` added (but never a row or digest the winner's head names), so a loser cannot poison the
 next append. `load_head` is one **projected** `find_one` (the head and the record's own fields,
 never `state`) when `head_version == version`; a stale, absent or null head falls back to a second,
-full read that serves the whole state.
+full read, which serves the state when it is a v4 envelope and the head when the state is the
+tombstone (a run a pre-S3 process failed).
 
 `purge_finished` deletes the purged runs' body rows with their journal and references. The body
 methods are **defaulted** on `Store`; `RunUpdate` gained the public fields `head` and `body`, so a

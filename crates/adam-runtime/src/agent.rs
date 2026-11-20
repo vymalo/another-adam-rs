@@ -295,16 +295,17 @@ pub trait Agent: Send + Sync + 'static {
 
     /// Split `state` into the small part a run's head keeps and its transcript, oldest first.
     ///
-    /// `None` (the default) keeps the whole state in the head: today's behaviour, unoptimised. A
-    /// state that splits is written twice in the expand release — the full `state` and the head
-    /// beside it — and the runtime checks on every commit that
-    /// [`join`](Self::join)`(split(s).0, split(s).1)` re-encodes to `s`; a split that does not is
-    /// refused, and the run stays in the v4 format rather than gaining a head that does not
-    /// reconstruct it.
+    /// `None` (the default) keeps the whole state in the head: today's behaviour, unoptimised. The
+    /// runtime checks on every commit that [`join`](Self::join)`(split(s).0, split(s).1)`
+    /// re-encodes to `s`; a split that does not is refused, and the run stays in the v4 format
+    /// rather than gaining a head that does not reconstruct it. **A v5 run must split**: a
+    /// successful step that returns `None` on a run whose head is current is a refused split, so
+    /// the commit demotes the run to the whole v4 state (it does not write the transcript into the
+    /// head, which the next join would discard).
     ///
     /// **A wrapper that delegates [`init`](Self::init) must delegate this too** (and
-    /// [`join`](Self::join), and [`init_continuing`](Self::init_continuing)), or its runs silently
-    /// stay in the v4 format.
+    /// [`join`](Self::join), and [`init_continuing`](Self::init_continuing)): a new run of a wrapper
+    /// that does not silently stays in the v4 format, and a run that is already v5 is demoted to it.
     fn split(&self, state: &Self::State) -> Option<(Self::State, Vec<Value>)> {
         let _ = state;
         None
@@ -379,8 +380,8 @@ pub trait AgentStarter: Send + Sync + 'static {
     /// does, or a run it starts is never split. The default is [`Agent::split`]'s: no split.
     ///
     /// **A wrapper that delegates [`init`](Self::init) must delegate this too** (and
-    /// [`join`](Self::join), and [`init_continuing`](Self::init_continuing)), or its runs silently
-    /// stay in the v4 format.
+    /// [`join`](Self::join), and [`init_continuing`](Self::init_continuing)): a new run of a wrapper
+    /// that does not silently stays in the v4 format, and a run that is already v5 is demoted to it.
     fn split(&self, state: &Self::State) -> Option<(Self::State, Vec<Value>)> {
         let _ = state;
         None

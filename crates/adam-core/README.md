@@ -51,7 +51,13 @@ let run = store
 ```
 
 `create_run` and `commit_run` return the record **without its state** (`state` is `null`): the caller
-supplied it, and the state is the largest member of the record. Read the run for the stored state.
+supplied it, and the state is the largest member of the record. Read the run for its document — and
+note **what that document is**: in the contract release the reads that return a record
+(`load_run`, `load_head`, `claim_due`, `open_run_for_conversation`, `list_runs`) answer the v5
+**head** for a run whose head is current, not the whole agent state. A consumer that decoded
+`RunRecord::state` as the agent state must use `Runtime::state(run)` (the joined state) or
+`Runtime::view(run).state` (the head) from `adam-runtime`, or join the head with
+`body_list(run, generation)` itself.
 Of the run writes, `journal_put` is the exception: it returns the payload it stored, which is what the
 loop decodes the step's outcome from (a store may have replaced a NUL in it,
 [ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)); the push
@@ -133,17 +139,21 @@ same sweep. A digest shared by several runs survives until the last one is purge
 
 ## Transcripts: the head and the body
 
-The expand release of [ADR 0055](../../docs/decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md)
-adds the types and the **defaulted** methods a store needs to keep a run's transcript apart from its
-head; `state` is still the whole envelope a worker steps, and the observer reads the head
-(`Runtime::view` is one `load_head`, no body).
+The contract release of [ADR 0055](../../docs/decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md)
+keeps a run's transcript apart from its head: the runtime writes the head, the rows and — for a store
+that keeps bodies — the tombstone (`state = null`) on every commit, and **every read that returns a
+record answers the same document**: the head when `head_version == version`, the whole `state`
+otherwise. `load_run`, `load_head`, `claim_due`, `open_run_for_conversation` and `list_runs` all
+follow that rule; `Runtime::view` is one `load_head` and no body, and `Runtime::state` joins the head
+with the generation it names. A store that keeps no bodies is not written the contract: the runtime
+keeps the whole v4 `state` for it, exactly as before.
 
 | Method | What |
 |---|---|
 | `keeps_bodies()` | whether the store keeps a transcript beside the head (`body_list`, `RunUpdate::body`). `false` (the default) means `RunUpdate::state` is the whole run, exactly as before |
 | `body_list(run, generation)` | the rows of one generation, ordered by `idx`; empty when it does not exist. A store that keeps none answers empty |
 | `gc_body(run, keep_generation, before)` | delete the superseded generations of `run` written before `before`; returns how many rows. The generation a head names is never collected. A store that keeps none answers `0` |
-| `load_head(id)` | the run as an **observer** reads it: its `state` is the v5 head when the store has a current one (`head_version == version`), and the whole state otherwise. Defaults to `load_run`, so a store that keeps no head answers exactly as it does today. `Runtime::view` reads it and never a body; `Runtime::state` joins the head with the generation it names (`body_list`) |
+| `load_head(id)` | the run as an **observer** reads it: its `state` is the v5 head when the store has a current one (`head_version == version`), and the whole state otherwise (a v4 run, or a head a **v4** commit did not rebuild; a tombstoned run — `state = null` — serves its head). Defaults to `load_run`, which answers the same document in the contract release, so a store that keeps no head answers exactly as it does today. `Runtime::view` reads it and never a body; `Runtime::state` joins the head with the generation it names (`body_list`) |
 
 `BodyRow { idx, message }` is one row; `BodyWrite { generation, rows, writer }` is what a commit
 writes. A generation is **append-only**: `generation: None` appends `rows[old_len..]` to the current
@@ -152,13 +162,18 @@ the whole transcript under `new`. `writer` is the attempt's id: a commit that lo
 the rows (and references) that writer added, so a loser cannot poison the next append. The head names
 `{generation, len}`; the store resolves the generation and patches the head.
 
-`RunUpdate` gained two public fields: `head: Option<Value>` (the v5 head this commit writes; `None`
-leaves the stored head and its version alone, so a delivery or a cancel keeps the format it read) and
+`RunUpdate` gained two public fields: `head: Option<Value>` (the v5 head this commit writes; the
+runtime also passes it for a delivery, a cancel or a park, which re-encode the head they read, so the
+head stays current) and
 `body: Option<BodyWrite>` (the rows this commit writes; `None` writes none). **A hand-built
 `RunUpdate { .. }` literal stops compiling**: add `head: None, body: None` or use
 `RunUpdate::new(..)`, which keeps its signature and sets both, and the `.head(..)` / `.body(..)`
 builders. A commit that writes rows writes them **before** the CAS, and an adapter checks that all
 of them landed: a head must never name a generation that is missing a row.
+
+`commit_run` stores `state` as it is given: the runtime writes `null` (the tombstone) for a commit
+that writes a head to a store that keeps bodies, and the whole v4 state otherwise, so a store that
+keeps no bodies keeps today's bytes exactly. A store does not decide the format.
 
 `purge_finished` keeps its signature and extends its contract: a run's body rows go with it.
 

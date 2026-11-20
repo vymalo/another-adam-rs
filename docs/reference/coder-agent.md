@@ -759,6 +759,7 @@ list and fails for a tool that has neither a limit nor a place on the `QUICK_TOO
 |---|---|
 | `run_command`, `run`, `run_checks` | making the environment ready (devcontainer: `DEVCONTAINER_UP_TIMEOUT_SECS` + `DEVCONTAINER_SETUP_TIMEOUT_SECS`; run pods: `RUN_POD_WAIT_SECS` + `RUN_POD_READY_TIMEOUT_SECS`; none in the coder's own container) + `CHECK_TIMEOUT_SECS` + 30 s (a call's own `timeout` is at most `CHECK_TIMEOUT_SECS`, so it always fits under this) |
 | `rebuild_environment` | making the environment ready + 30 s |
+| `use_repository_environment` | making the environment ready (the pull is inside `RUN_POD_READY_TIMEOUT_SECS`) + 30 s: the source declares it (`RepositoryEnvironmentSource`, ADR 0052) |
 | `start_command` | making the environment ready + the longest wait (120 s) + 30 s |
 | `stop_command` | making the environment ready (for a command this worker does not hold) + 60 s + 30 s: the process is waited for up to 20 s |
 | `list_commands` | making the environment ready (only when a worker that is gone left a command to settle) + 30 s (`find::DEADLINE`) + 30 s |

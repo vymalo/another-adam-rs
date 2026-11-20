@@ -1132,6 +1132,49 @@ check "coder: shrinks to a 1Gi limit while run pods are on" sts_of '^           
 check "coder: ... and the 6Gi of resources is not rendered" nosts 'memory: 6Gi'
 check "coder: the DATABASE_URL and the secrets stay in the coder" sts_of 'name: GITHUB_TOKEN'
 
+# A repository's own image (ADR 0052, `use_repository_environment`): off by default, and then nothing of it renders;
+# with a prefix, the coder is told it and the admission policy admits a prefixed image for the `run` container alone
+# (the init containers keep the exact list). The chart's render is a contract the platform reads: with the value
+# empty it is byte-identical, and this section is what says so.
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 > "$out"
+check "repository images: off by default, nothing of it renders" lacks 'RUN_POD_REPOSITORY_IMAGES|startsWith|repositoryImages'
+helm_rp > "$out"
+check "repository images: run pods on and no prefix, nothing of it renders" lacks 'RUN_POD_REPOSITORY_IMAGES|startsWith'
+check "repository images: ... and the run-pods render is unchanged" cmp -s "$out" "$rp_golden"
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 --set runPods.enabled=false \
+  --set 'runPods.repositoryImages.allowedPrefixes={ghcr.io/acme/}' > "$out"
+check "repository images: run pods off renders nothing of it, even with a prefix" \
+  lacks 'RUN_POD_REPOSITORY_IMAGES|startsWith'
+
+helm_rp --set 'runPods.repositoryImages.allowedPrefixes={ghcr.io/acme/,registry.example:5000/team/}' > "$out"
+check "repository images: RUN_POD_REPOSITORY_IMAGES is the prefixes, comma-joined" \
+  [ "$(doc StatefulSet | env_value RUN_POD_REPOSITORY_IMAGES)" = "ghcr.io/acme/,registry.example:5000/team/" ]
+check "repository images: ... rendered once" count 'name: RUN_POD_REPOSITORY_IMAGES' 1
+check "repository images: the policy admits a prefix for the run container alone" \
+  policy_has coder-coder-ns-run-pods "c.name == 'run'"
+check "repository images: ... the first prefix is a startsWith" \
+  policy_has coder-coder-ns-run-pods "c.image.startsWith('ghcr.io/acme/')"
+check "repository images: ... and the second" \
+  policy_has coder-coder-ns-run-pods "c.image.startsWith('registry.example:5000/team/')"
+check "repository images: the exact list is still there, so the init containers keep it" \
+  policy_has coder-coder-ns-run-pods "ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-8c297d3"
+check "repository images: the tools image is in the exact list too" \
+  policy_has coder-coder-ns-run-pods "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"
+check "repository images: the prefix branch names the run container, never an init container" \
+  policy_has coder-coder-ns-run-pods "(c.name == 'run' && (c.image.startsWith"
+helm_rp --set config.role=control-plane --set 'runPods.repositoryImages.allowedPrefixes={ghcr.io/acme/}' > "$out"
+check "repository images: a control plane gets none of it" lacks 'RUN_POD_REPOSITORY_IMAGES|startsWith'
+helm_rp --set topology=split --set 'runPods.repositoryImages.allowedPrefixes={ghcr.io/acme/}' > "$out"
+check "repository images: split, the worker has it" dhas StatefulSet 'name: RUN_POD_REPOSITORY_IMAGES'
+check "repository images: split, the front has none" dlacks Deployment 'RUN_POD_REPOSITORY_IMAGES|startsWith'
+for bad in 'ghcr.io' 'ghcr.io/acme' '*' 'ghcr.io/acme/*' '${OWNER}/'; do
+  check "repository images: $bad is refused (it would admit a look-alike)" \
+    fails helm_rp --set-string "runPods.repositoryImages.allowedPrefixes={$bad}"
+done
+check "repository images: config.extraEnv may not set RUN_POD_REPOSITORY_IMAGES with a prefix" \
+  fails helm_rp --set 'runPods.repositoryImages.allowedPrefixes={ghcr.io/acme/}' \
+    --set-string config.extraEnv.RUN_POD_REPOSITORY_IMAGES=x
+
 # The git sandbox (ADR 0041, open decision 6; issue #118): the container of the coder pod in which the coder's local git
 # runs, because git runs what a repository's configuration names and a run controls some repositories. What makes it a
 # sandbox is what it does not have, so these checks are about absence: no Secret, no variable of a secret, no service-account

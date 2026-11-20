@@ -333,6 +333,11 @@ impl CoderAgent {
                 env.notes.clone(),
                 env.settings.max_access_tier,
             ))
+            // A repository's own image, offered only when the run is in run pods, a prefix is
+            // allowed and a writable slot has a configuration (ADR 0052 decision 4).
+            .tool_source(crate::tools::environment::RepositoryEnvironmentSource::new(
+                env.clone(),
+            ))
             .state(env.clone())
             // Where `read_output` and the long results of MCP servers keep what they hold.
             .state(Arc::new(adam_llm_agent::KeptStore(env.kept.clone())))

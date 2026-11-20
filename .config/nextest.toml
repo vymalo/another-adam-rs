@@ -35,9 +35,9 @@ slow-timeout = { period = "60s", terminate-after = 15 }
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/blob_|purge|push_configs_go_with_their_run|measure_the_transcript_write|events_and_durable_artifacts|a_run_continues_a_finished_run_from_a_start_only_front/)'
+filter = 'test(/blob_|purge|push_configs_go_with_their_run|measure_the_transcript_write|measure_the_headless_transcript|events_and_durable_artifacts|a_run_continues_a_finished_run_from_a_start_only_front/)'
 test-group = "store-global-sweeps"
 
 [[profile.ci.overrides]]
-filter = 'test(/blob_|purge|push_configs_go_with_their_run|measure_the_transcript_write|events_and_durable_artifacts|a_run_continues_a_finished_run_from_a_start_only_front/)'
+filter = 'test(/blob_|purge|push_configs_go_with_their_run|measure_the_transcript_write|measure_the_headless_transcript|events_and_durable_artifacts|a_run_continues_a_finished_run_from_a_start_only_front/)'
 test-group = "store-global-sweeps"

@@ -27,8 +27,8 @@ use serde_json::Value;
 
 use crate::mounts::WorkspaceMounts;
 use crate::names::{
-    INSTANCE_LABEL, MANAGED_BY, MANAGED_BY_LABEL, MOUNTS_ANNOTATION, RUN_ID_ANNOTATION, RUN_LABEL,
-    WORKER_ANNOTATION, run_hash,
+    INSTANCE_LABEL, MANAGED_BY, MANAGED_BY_LABEL, MOUNTS_ANNOTATION, REPOSITORY_IMAGE_ANNOTATION,
+    RUN_ID_ANNOTATION, RUN_LABEL, WORKER_ANNOTATION, run_hash,
 };
 use crate::quantity;
 
@@ -181,13 +181,15 @@ impl PodTemplate {
 
     /// The pod of `run`: the template with its name, namespace, labels and annotations filled in, and
     /// the run container's mount of the workspace volume replaced by `mounts`. Nothing else of the
-    /// template changes.
+    /// template changes. `image` is the repository's image when the run chose one (ADR 0052): the run
+    /// container's image, and the annotation that records the choice; `None` keeps the template's.
     pub fn render(
         &self,
         run: &str,
         name: &str,
         at: Placement<'_>,
         mounts: &WorkspaceMounts,
+        image: Option<&str>,
     ) -> Pod {
         let mut pod = self.pod.clone();
         let meta = &mut pod.metadata;
@@ -201,6 +203,9 @@ impl PodTemplate {
         annotations.insert(RUN_ID_ANNOTATION.to_owned(), run.to_owned());
         annotations.insert(WORKER_ANNOTATION.to_owned(), at.worker.to_owned());
         annotations.insert(MOUNTS_ANNOTATION.to_owned(), mounts.encode());
+        if let Some(image) = image {
+            annotations.insert(REPOSITORY_IMAGE_ANNOTATION.to_owned(), image.to_owned());
+        }
         let whole = self.workspace.path.to_string_lossy();
         if let Some(container) = pod
             .spec
@@ -208,6 +213,9 @@ impl PodTemplate {
             .flat_map(|spec| spec.containers.iter_mut())
             .find(|c| c.name == self.container)
         {
+            if let Some(image) = image {
+                container.image = Some(image.to_owned());
+            }
             let volume_mounts = container.volume_mounts.get_or_insert_with(Vec::new);
             if let Some(index) = volume_mounts
                 .iter()
@@ -253,7 +261,12 @@ fn check(pod: &Pod, container: &str) -> Result<(), String> {
             return Err(format!("the label {key} is the coder's to set"));
         }
     }
-    for key in [RUN_ID_ANNOTATION, WORKER_ANNOTATION, MOUNTS_ANNOTATION] {
+    for key in [
+        RUN_ID_ANNOTATION,
+        WORKER_ANNOTATION,
+        MOUNTS_ANNOTATION,
+        REPOSITORY_IMAGE_ANNOTATION,
+    ] {
         if meta
             .annotations
             .as_ref()
@@ -683,7 +696,7 @@ spec:
         let t = template();
         let run = "018f3a2b-7c1d-7000-8000-000000000001";
         let mounts = one_worktree();
-        let pod = t.render(run, "adam-run-abc", placement(), &mounts);
+        let pod = t.render(run, "adam-run-abc", placement(), &mounts, None);
         assert_eq!(pod.metadata.name.as_deref(), Some("adam-run-abc"));
         assert_eq!(pod.metadata.namespace.as_deref(), Some("coder-ns"));
         let labels = pod.metadata.labels.clone().unwrap();
@@ -818,6 +831,64 @@ spec:
         );
     }
 
+    /// ADR 0052: a run that chose a repository's image gets a pod whose run container runs it, and
+    /// the pod records the choice in an annotation; with `None` the template's image stays and no
+    /// annotation is added.
+    #[test]
+    fn a_repository_image_replaces_the_run_containers_image_and_is_recorded() {
+        let t = template();
+        let mounts = one_worktree();
+        let run = "018f3a2b-7c1d-7000-8000-000000000001";
+        let pod = t.render(
+            run,
+            "adam-run-abc",
+            placement(),
+            &mounts,
+            Some("ghcr.io/acme/dev:1"),
+        );
+        let spec = pod.spec.clone().unwrap();
+        assert_eq!(
+            spec.containers
+                .iter()
+                .find(|c| c.name == "run")
+                .unwrap()
+                .image
+                .as_deref(),
+            Some("ghcr.io/acme/dev:1")
+        );
+        assert_eq!(
+            spec.init_containers.as_ref().unwrap()[0].image.as_deref(),
+            Some("ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"),
+            "the init container keeps the deployment's image: it copies adam-exec"
+        );
+        let annotations = pod.metadata.annotations.unwrap();
+        assert_eq!(
+            annotations["adam.vymalo.com/repository-image"],
+            "ghcr.io/acme/dev:1"
+        );
+        let plain = t.render(run, "adam-run-abc", placement(), &mounts, None);
+        assert!(
+            !plain
+                .metadata
+                .annotations
+                .unwrap()
+                .contains_key("adam.vymalo.com/repository-image"),
+            "no choice, no annotation"
+        );
+        assert_eq!(
+            plain
+                .spec
+                .unwrap()
+                .containers
+                .iter()
+                .find(|c| c.name == "run")
+                .unwrap()
+                .image
+                .as_deref(),
+            Some("ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-8c297d3")
+        );
+    }
+
     #[test]
     fn a_run_without_worktrees_mounts_only_its_own_directory() {
         let t = template();
@@ -828,7 +899,7 @@ spec:
             &[],
         )
         .unwrap();
-        let pod = t.render("r1", "adam-run-r1", placement(), &mounts);
+        let pod = t.render("r1", "adam-run-r1", placement(), &mounts, None);
         let work: Vec<_> = mounts_of(&pod)
             .into_iter()
             .filter(|m| m.name == "work")
@@ -862,7 +933,7 @@ spec:
             &[],
         )
         .unwrap();
-        let pod = t.render("r1", "adam-run-r1", placement(), &mounts);
+        let pod = t.render("r1", "adam-run-r1", placement(), &mounts, None);
         assert!(mounts_of(&pod).iter().any(|m| {
             m.mount_path == "/work/coder-1/workspaces/r1"
                 && m.sub_path.as_deref() == Some("coder-1/workspaces/r1")
@@ -894,6 +965,12 @@ spec:
                 "  annotations: {adam.vymalo.com/workspace-mounts: x}"
             ))
             .contains("adam.vymalo.com/workspace-mounts")
+        );
+        assert!(
+            refused(&with(
+                "  annotations: {adam.vymalo.com/repository-image: x}"
+            ))
+            .contains("adam.vymalo.com/repository-image")
         );
         assert!(
             refused(&with(

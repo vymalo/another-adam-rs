@@ -20,8 +20,9 @@
 //! binds the agent with the screen's tools of an embedded agent and starts the worker. Then
 //! [`Engine::send`] starts or continues a conversation, [`Engine::steer`] and [`Engine::answer`]
 //! reach a run that works or waits, [`Engine::cancel`] ends one, and [`Engine::list`] and
-//! [`Engine::get`] read them. No A2A type is in a signature: inside, every call is the code the
-//! A2A server calls (`RuntimeTaskBackend`).
+//! [`Engine::get`] read them. [`Engine::events`] follows a run's events to its end, bounded in
+//! memory however slowly it is read ([`RunEvents`]). No A2A type is in a signature: inside, every
+//! call is the code the A2A server calls (`RuntimeTaskBackend`).
 //!
 //! **The embedded set.** The dependencies are the crates an embedded agent needs, each with its
 //! server parts turned off (`adam-a2a-runtime` without `push`, `adam-ui` without `thread-tools`,
@@ -50,10 +51,12 @@ pub use adam_ui;
 
 mod engine;
 mod error;
+mod events;
 mod types;
 
 pub use engine::{Engine, EngineBuilder, Limits};
 pub use error::EngineError;
+pub use events::{EngineEvent, RunEvents, WithheldFile};
 pub use types::{
     ConversationId, DEFAULT_PAGE_SIZE, Delivered, ListQuery, MAX_PAGE_SIZE, Page, RunInfo,
     RunState, Say, Turn,

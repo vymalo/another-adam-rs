@@ -25,7 +25,21 @@ export function stackRepoUrl(slug) {
 
 const GIT_URL_RE = /^http:\/\/(127\.0\.0\.1|localhost):\d{1,5}\/bench\/[a-z0-9][a-z0-9-]{0,80}\.git$/;
 const PUSH_URL_RE = /^http:\/\/git-server:8080\/bench\/[a-z0-9][a-z0-9-]{0,80}\.git$/;
+/** Where the pusher makes its scratch repository: the slot's work volume, mounted by compose.yaml (`pusher-N`). */
+export const PUSH_SCRATCH = '/scratch';
 const PLAIN_PATH = /^\/[A-Za-z0-9._/@+=-]*$/;
+
+/**
+ * The lines that let a git in a container read a repository another user wrote (the base is written by the task image's
+ * default user, often root, and read as uid 10001): `safe.directory` is honoured from a global file, which is what these
+ * lines make, and not from `-c` or `GIT_CONFIG_COUNT`, which the git of a task image (2.39) ignores for the `upload-pack` a local
+ * fetch or clone starts: it answers "fatal: detected dubious ownership" and the caller sees only "Could not read from remote
+ * repository". Only this one setting is in the file, and the container has no secret.
+ */
+export const SAFE_DIRECTORY_LINES = [
+  "printf '[safe]\\n\\tdirectory = *\\n' > /tmp/bench-gitconfig",
+  'export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/tmp/bench-gitconfig GIT_TERMINAL_PROMPT=0 HOME=/tmp',
+];
 
 /**
  * The shell a one-shot container of the stack runs to put the base on the git server. The base repository was written
@@ -36,12 +50,14 @@ export function pushScript({ base, url }) {
   if (!PLAIN_PATH.test(base) || !PUSH_URL_RE.test(url)) throw new Error('the base or the address is not plain');
   return [
     'set -eu',
-    'export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 HOME=/tmp',
-    'P=$(mktemp -d)',
+    ...SAFE_DIRECTORY_LINES,
+    // The scratch repository is as large as the base: it goes on the disk-backed scratch volume, never in /tmp (a small tmpfs).
+    `P=$(mktemp -d ${PUSH_SCRATCH}/push.XXXXXX)`,
+    "trap 'rm -rf \"$P\"' EXIT",
     'git init -q "$P"',
     // The base may have been made by another uid (a task image whose default user is root): the repository is the
     // harness's own, and this git runs in a container with no secret, so its ownership is not a question here.
-    `git -c safe.directory='*' -C "$P" fetch -q ${base} refs/heads/main`,
+    `git -C "$P" fetch -q ${base} refs/heads/main`,
     `git -C "$P" push -q --force ${url} FETCH_HEAD:refs/heads/main`,
   ].join('\n');
 }

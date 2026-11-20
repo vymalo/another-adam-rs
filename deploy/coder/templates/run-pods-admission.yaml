@@ -39,8 +39,20 @@ spec:
       message: "a run pod carries the labels app.kubernetes.io/managed-by=adam-coder and adam.vymalo.com/run"
     - expression: {{ printf "has(object.spec.priorityClassName) && object.spec.priorityClassName == '%s'" $class | quote }}
       message: {{ printf "a run pod has the priority class %s, which the quota is scoped to" $class | quote }}
-    - expression: {{ printf "variables.containers.all(c, c.image in [%s])" (include "coder.runPodAllowedImages" . | trim | splitList "\n" | join "', '" | printf "'%s'") | quote }}
+    {{- $exact := include "coder.runPodAllowedImages" . | trim | splitList "\n" | join "', '" | printf "'%s'" -}}
+    {{- $prefixes := include "coder.runPodRepositoryImages" . -}}
+    {{- if $prefixes }}
+    {{- /* ADR 0052: the run container alone may use an image that starts with an allowed prefix; the init containers keep the exact list. */ -}}
+    {{- $starts := list -}}
+    {{- range splitList "," $prefixes -}}
+    {{- $starts = append $starts (printf "c.image.startsWith('%s')" .) -}}
+    {{- end }}
+    - expression: {{ printf "variables.containers.all(c, c.image in [%s] || (c.name == '%s' && (%s)))" $exact $.Values.runPods.container (join " || " $starts) | quote }}
+      message: {{ printf "a run pod uses only the images the chart allows, or (the run container alone) an image under one of the repository prefixes %s" $prefixes | quote }}
+    {{- else }}
+    - expression: {{ printf "variables.containers.all(c, c.image in [%s])" $exact | quote }}
       message: "a run pod uses only the images the chart allows"
+    {{- end }}
     {{- if gt (len $claims) 1 }}
     - expression: {{ printf "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName in ['%s']))" (join "', '" $claims) | quote }}
       message: {{ printf "a run pod mounts only emptyDir volumes and the claims %s: no hostPath, no Secret, no other claim" (join " and " $claims) | quote }}

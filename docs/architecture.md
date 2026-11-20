@@ -914,12 +914,14 @@ Six tables (PostgreSQL and SQLite) or collections (MongoDB), prefixed `adam_` by
 the schema version: `push` holds A2A push-notification configurations (schema version 3), `blob`
 and `run_blob` hold a run's file bytes and the digests it references (schema version 5, part 1), and
 `body` holds a run's transcript beside the `head` and `head_version` of a run (schema version 5,
-part 2). The adapters keep them: MongoDB in the run document and the `adam_body` collection,
-PostgreSQL in `runs.head`/`runs.head_version` and the `adam_body` table, written in the same
-transaction as the CAS; SQLite in the same columns as PostgreSQL, in one `BEGIN IMMEDIATE`
-transaction. `state` is JSONB in Postgres, a real BSON document in MongoDB and JSON text in SQLite;
-in the expand release it is still the complete v4 envelope. A SQLite file is opened by one process
-and holds no cross-process signals ([store adapters](reference/store-adapters.md#sqlite)).
+part 2; version 6 on PostgreSQL). The adapters keep them: MongoDB in the run document and the
+`adam_body` collection, PostgreSQL in `runs.head`/`runs.head_version` and the `adam_body` table,
+written in the same transaction as the CAS; SQLite in the same columns as PostgreSQL, in one
+`BEGIN IMMEDIATE` transaction. `state` is JSONB in Postgres, a real BSON document in MongoDB and
+JSON text in SQLite; in the **contract release** it is the tombstone (`null`) for a run whose head
+is current, and the whole v4 envelope only for a run that has not split yet (ADR 0055). A SQLite
+file is opened by one process and holds no cross-process signals
+([store adapters](reference/store-adapters.md#sqlite)).
 
 ```mermaid
 erDiagram
@@ -935,7 +937,7 @@ erDiagram
         text conversation_id "null: no conversation"
         uuid parent_id "null: not a child run"
         text status "runnable, parked, done, failed"
-        jsonb state "the Envelope"
+        jsonb state "the Envelope, or null (the tombstone)"
         jsonb head "the v5 head"
         bigint head_version "the version the head was written at"
         timestamptz wake_at
@@ -1015,7 +1017,7 @@ index; closed runs get `~<run id>`), `lease_token`, the listing indexes `adam_li
 `adam_journal` with `_id = "<run>:<seq>"`, the push configs in `adam_push` with
 `_id = "<run>:<config id>"`, the blobs in `adam_blob` with `_id` = the digest, the digests a run
 references in `adam_run_blob` with `_id = "<run>:<digest>"`, and the transcript in `adam_body` with
-`_id = "<run>:<commit>:<idx>"`. A version 4 run document has neither `head` nor `head_version`
+`_id = "<run>:<generation>:<idx>"`. A version 4 run document has neither `head` nor `head_version`
 (`{head_version: null}` matches a missing field). How each adapter keeps its promises: [store adapters](reference/store-adapters.md).
 
 What `state` holds (JSON, versioned `v`; the layout is private to the runtime,
@@ -1030,19 +1032,27 @@ What `state` holds (JSON, versioned `v`; the layout is private to the runtime,
 | `output`, `error` | the result of a `Done` run; the reason of a `Failed` one |
 | `artifacts` | artifacts emitted so far, committed with their transitions |
 
-A **file artifact's** bytes are also written to the blob table under their SHA-256
-(`adam_runtime::blob_id`) and the commit references the digest (`RunUpdate::blobs`); the state keeps
-the bytes too until the contract release, so a reader of the old format still reads a run
-([ADR 0055](decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md)).
+A **file artifact's** bytes are written to the blob table under their SHA-256
+(`adam_runtime::blob_id`) and the commit references the digest (`RunUpdate::blobs`); a v4 state also
+keeps the bytes, so a reader of the old format still reads a run, while a v5 head names them by
+digest and size ([ADR 0055](decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md)).
 
-### The head and the body (schema version 5, part 2)
+### The head and the body (schema version 5, part 2; the contract release)
 
-The expand release writes a **head** and a **body generation** beside `state`: the steps write both
-(S2a), and the observer reads the head (S2b). `Runtime::view` is one `Store::load_head` and no body;
-`Runtime::state` is the one full-state read, joining the head and the generation it names: the head names a **prefix** (`len`) of the generation, and the rows past it — a lost CAS's extras not yet cleaned up — are ignored, so only a short or non-contiguous prefix is `Corrupt`. The
-worker, `load_run`, `claim_due` and `list_runs` still read the whole state until S3. The adapters
-keep both: MongoDB in the run document and the `adam_body` collection, PostgreSQL in `runs.head`/
-`runs.head_version` and the `adam_body` table. A PostgreSQL commit that writes a head or a body is
+Every commit writes a **head**, the **body rows** it appends and — for a store that keeps bodies —
+the **tombstone** as `state`. `Runtime::view` is one `Store::load_head` and no body; `Runtime::state`
+is the one full-state read, joining the head and the generation it names: the head names a
+**prefix** (`len`) of the generation, and the rows past it — a lost CAS's extras not yet cleaned up
+— are ignored, so only a short or non-contiguous prefix is `Corrupt`.
+
+`Store::load_run`, `load_head`, `claim_due`, `open_run_for_conversation` and `list_runs` answer the
+**same document**: the head when `head_version == version`, the whole `state` otherwise (a v4 run, or
+a head a later commit did not rebuild). A tombstoned run whose head is behind the version serves the
+head, the only readable document. The step path joins the head and the rows the claim read; a
+delivery, a cancel and a `park_again` write the head they read, so the head stays current and the
+next split appends to the same generation. The adapters keep the head and the body: MongoDB in the
+run document and the `adam_body` collection, PostgreSQL in `runs.head`/`runs.head_version` and the
+`adam_body` table. A PostgreSQL commit that writes a head or a body is
 one transaction — the run row locked `FOR UPDATE`, the version check, the rows, the refs and the CAS
 — so a foreign attempt's duplicate slot is resolved inside it (identical: adopted; older than the
 5-minute orphan grace: collected and retried once; live and different: `Conflict`). SQLite does the
@@ -1052,40 +1062,51 @@ reference, and a `body` member naming one generation; the rows are the messages.
 
 | Where | What it holds |
 |---|---|
-| `state` (`v: 1`) | the whole run, unchanged in the expand release: the shape a v4 process steps |
+| `state` (`v: 1`, or `null`) | the whole run for a v4 run; `null` — the tombstone — for a run whose head is current |
 | `head` (`v: 5`) | `agent` without its messages, `inbox`, `seq`, `attempt`, `rev`, `output`, `error`, `artifacts` (files by `digest` and `size`), `deadline`, `limit_secs`, `remaining_secs`, `agent_wake`, `hb`, and `body: {generation, len}` |
-| `adam_body` | one row per message, keyed `(run_id, generation, idx)`, with `written_at` for the GC (MongoDB now) |
+| `adam_body` | one row per message, keyed `(run_id, generation, idx)`, with `written_at` for the GC |
 
 A generation is **append-only**: a normal commit writes only the rows after the old head's `len` and
 keeps the generation; a compaction (the transcript no longer starts with the old one) writes all rows
-under a new generation. The delta win holds across **splitting** commits, not across headless ones: a
-`deliver`, `cancel`, `park_again` or failed commit writes no head, so the next split sees a stale
-`head_version` and compacts until S3, where those paths write the head they read; the commit's win (no
-full `state`) arrives at S3. Measured with a delivery between every step: 50 × 10 KB writes 12.7 MB
-of body rows (1,275 rows, 50 generations) against ~0.5 MB of deltas for consecutive splits. The store writes the rows **before** the CAS with the attempt's `writer`,
+under a new generation. The delta win now holds across **every** commit of a v5 run: the contract
+release's `deliver`, `cancel`, `park_again` and failed commits write the head they read, so the next
+split appends instead of compacting. (The expand release's headless commits measured 12.7 MB of body
+rows for 50 × 10 KB against ~0.5 MB of deltas; the `measure_the_headless_transcript` test keeps that
+line as the comparison.) The store writes the rows **before** the CAS with the attempt's `writer`,
 checks that all of them landed, and a commit that loses deletes its own rows and refs, so a loser
 cannot poison the next append. A duplicate slot is resolved by content and age: an identical foreign
 row is adopted, a differing one older than the 5-minute orphan grace is collected and the insert
 retried once, and a live attempt's differing row is a `Conflict` (ADR 0055). The grace is far longer
 than the insert→CAS gap of a live attempt (milliseconds; the default lease is 30 s), so it
-distinguishes a dead attempt from a live one without trusting the lease. The runtime reconstructs `join(head, rows)` before every commit and
-refuses a split that does not equal the state, which keeps a bad split at `state` only. A commit that
-does not split (a delivery, a cancel, a park) leaves the stored head and its version alone;
-`load_head` serves the head only when `head_version == version`. A **stale** head is not an error:
-the whole state is served, and the next step re-splits and rewrites the head. `Runtime::view`
+distinguishes a dead attempt from a live one without trusting the lease. The runtime reconstructs
+`join(head, rows)` before every commit and
+refuses a split that does not equal the state, which keeps a bad split at `state` only. A **stale**
+head is not an error: the state is served when it is the v4 envelope a v4 commit wrote, and the next
+step re-splits and rewrites the head; a **tombstoned** run (`state = null`, the head behind the
+version — a pre-S3 process failed a converted run) serves the head, so it stays readable.
+`Runtime::view`
 decodes either document (`Stored`: `v: 1` or `v: 5`), so an observer of a v4 run and of a v5 one
 gets the same `RunView` shape; `RunView.state` is the agent's **head** and `RunView.artifacts` is a
 `Vec<ArtifactRef>`, a file by reference. `Runtime::state` joins the head and
 `body_list(run, generation)` (one body read, the only full-state read), and
-`Runtime::artifact_bytes` fetches a file's blob once into a bounded, shared cache. **The contract
-release (S3) stops writing `state`**; until then, the expand release pays for both representations.
+`Runtime::artifact_bytes` fetches a file's blob once into a bounded, shared cache.
+
+A store that keeps no bodies ([`Store::keeps_bodies`](../crates/adam-core/README.md)) is not written
+the contract: the runtime keeps the whole v4 `state` for it and writes no head, exactly as before. A
+run's format is per run: a pre-contract run keeps its v4 `state` and reads as before forever if it
+never commits again, and its first commit under the contract splits it. **A v4 process cannot step a
+converted run**: `Envelope::decode` refuses a head, the run is committed `Failed`, and that is why
+the contract is a separate deploy (see [deploy the coder](guides/deploy-the-coder.md)).
 
 `Conversation` (`crates/adam-llm-agent/src/conversation.rs`) has `messages`, `turns`, `tool_calls`,
 `usage`, `pending_calls`, `pending_wait` (a question for the user, a child run or a remote task),
 `deferred`, `artifacts`, `announced`, `source_notes`, `continued_from`, `omitted_turns`, `context` and
 `read_ids`. Every field has a serde default, so older state still loads. Its `split` puts `messages`
 in the body and everything else in the head; `Agent::split`/`join` default to no split, and a wrapper
-that delegates `init` must delegate them too, or its runs stay in the v4 format.
+that delegates `init` must delegate them too: a new run of a wrapper that does not stays in the v4
+format, and a **v5 run must split** — a successful step that returns `None` on a current head is a
+refused split, so the commit demotes the run to the whole v4 state (a demotion re-reads the head's
+file digests, so the files keep their bytes) rather than writing the transcript into the head.
 
 Not stored, by design: `RunEvent`s (`Status`, `Progress`, `Step`, `TextDelta`, `ReasoningDelta`,
 `Custom`, `Artifact`) are live and may be lost (a short in-memory replay per run covers a late subscriber, see

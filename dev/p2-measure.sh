@@ -1,6 +1,8 @@
 #!/bin/sh
 # What a transcript-shaped run costs, on disk and on the wire: 50 commits, each appending a 10 KB
-# message, before and after the P2 slices. S0 records the baseline; S3 shows the drop.
+# message, before and after the P2 slices. S0 records the baseline; S3 shows the drop: the contract
+# writes the head and the body delta (the `body` table/collection) instead of the whole state in
+# `runs`.
 #
 # The workload is `counting::measure_transcript_write` (crates/adam-store-testkit/src/counting.rs),
 # run by the `measure_the_transcript_write` test in each adapter's test file: one run, 50 commits,
@@ -125,6 +127,10 @@ pg_runs_total() {
     pg_sql "SELECT coalesce(pg_total_relation_size(to_regclass('${prefix}runs')), 0)"
 }
 
+pg_body() {
+    pg_sql "SELECT coalesce(pg_total_relation_size(to_regclass('${prefix}body')), 0)"
+}
+
 pg_wal() {
     pg_sql "SELECT wal_bytes FROM pg_stat_wal" 2>/dev/null || true
 }
@@ -150,8 +156,11 @@ mongo_eval() {
     esac
 }
 
-mongo_size() {
-    mongo_eval "print(db.getCollectionNames().includes('$1') ? db.getCollection('$1').stats().size : 0)"
+mongo_storage() {
+    # The bytes allocated to the collection, free space included: the retained-size counterpart of
+    # `pg_total_relation_size`. The workload purges its run when it is done, so `size` (live
+    # documents) reads 0 and this is the number that keeps the bytes the run wrote.
+    mongo_eval "print(db.getCollectionNames().includes('$1') ? db.getCollection('$1').stats().storageSize : 0)"
 }
 
 mongo_written() {
@@ -193,13 +202,15 @@ measure_postgres() {
         fail=1
         return
     fi
-    header "postgres $(host_of "$ADAM_TEST_POSTGRES_URL"), tables ${prefix}runs, ${prefix}journal"
+    header "postgres $(host_of "$ADAM_TEST_POSTGRES_URL"), tables ${prefix}runs, ${prefix}body, ${prefix}journal"
     runs_before=$(pg_runs)
+    body_before=$(pg_body)
     journal_before=$(pg_journal)
     total_before=$(pg_runs_total)
     wal_before=$(pg_wal)
     workload adam-store-postgres
     runs_after=$(pg_runs)
+    body_after=$(pg_body)
     journal_after=$(pg_journal)
     total_after=$(pg_runs_total)
     wal_after=$(pg_wal)
@@ -207,13 +218,15 @@ measure_postgres() {
     [ -n "$wal_before" ] || wal_before=n/a
     [ -n "$wal_after" ] || wal_after=n/a
     runs_delta=$(delta "$runs_before" "$runs_after")
+    body_delta=$(delta "$body_before" "$body_after")
     total_delta=$(delta "$total_before" "$total_after")
     row "pg_relation_size(${prefix}runs)" "$runs_before" "$runs_after" "$runs_delta"
+    row "pg_total_relation_size(${prefix}body)" "$body_before" "$body_after" "$body_delta"
     row "pg_relation_size(${prefix}journal)" "$journal_before" "$journal_after" "$(delta "$journal_before" "$journal_after")"
     row "pg_total_relation_size(${prefix}runs)" "$total_before" "$total_after" "$total_delta"
     row "pg_stat_wal.wal_bytes (PG 14+)" "$wal_before" "$wal_after" "$(delta "$wal_before" "$wal_after")"
-    if [ "$runs_delta" = 0 ] && [ "$total_delta" = 0 ]; then
-        echo "  warning: neither the relation nor its total grew; check the table prefix and the database" >&2
+    if [ "$runs_delta" = 0 ] && [ "$total_delta" = 0 ] && [ "$body_delta" = 0 ]; then
+        echo "  warning: neither the runs relation, its total nor the body grew; check the table prefix and the database" >&2
     fi
     echo "  counting store: ${logical:-the workload printed no line}"
 }
@@ -228,25 +241,29 @@ measure_mongo() {
         fail=1
         return
     fi
-    header "mongo $(host_of "$ADAM_TEST_MONGODB_URI")/$mongo_db, collections ${mongo_prefix}runs, ${mongo_prefix}journal"
-    runs_before=$(mongo_size "${mongo_prefix}runs")
-    journal_before=$(mongo_size "${mongo_prefix}journal")
+    header "mongo $(host_of "$ADAM_TEST_MONGODB_URI")/$mongo_db, collections ${mongo_prefix}runs, ${mongo_prefix}body, ${mongo_prefix}journal"
+    runs_before=$(mongo_storage "${mongo_prefix}runs")
+    body_before=$(mongo_storage "${mongo_prefix}body")
+    journal_before=$(mongo_storage "${mongo_prefix}journal")
     written_before=$(mongo_written)
     workload adam-store-mongodb
-    runs_after=$(mongo_size "${mongo_prefix}runs")
-    journal_after=$(mongo_size "${mongo_prefix}journal")
+    runs_after=$(mongo_storage "${mongo_prefix}runs")
+    body_after=$(mongo_storage "${mongo_prefix}body")
+    journal_after=$(mongo_storage "${mongo_prefix}journal")
     written_after=$(mongo_written)
     runs_delta=$(delta "$runs_before" "$runs_after")
+    body_delta=$(delta "$body_before" "$body_after")
     journal_delta=$(delta "$journal_before" "$journal_after")
-    row "collStats(${mongo_prefix}runs).size" "$runs_before" "$runs_after" "$runs_delta"
-    row "collStats(${mongo_prefix}journal).size" "$journal_before" "$journal_after" "$journal_delta"
+    row "collStats(${mongo_prefix}runs).storageSize" "$runs_before" "$runs_after" "$runs_delta"
+    row "collStats(${mongo_prefix}body).storageSize" "$body_before" "$body_after" "$body_delta"
+    row "collStats(${mongo_prefix}journal).storageSize" "$journal_before" "$journal_after" "$journal_delta"
     bm_before=$(printf '%s' "$written_before" | cut -d' ' -f1)
     bm_after=$(printf '%s' "$written_after" | cut -d' ' -f1)
     log_before=$(printf '%s' "$written_before" | cut -d' ' -f2)
     log_after=$(printf '%s' "$written_after" | cut -d' ' -f2)
     row "wiredTiger block-manager bytes written" "$bm_before" "$bm_after" "$(delta "$bm_before" "$bm_after")"
     row "wiredTiger log bytes written" "$log_before" "$log_after" "$(delta "$log_before" "$log_after")"
-    if [ "$runs_delta" = 0 ] && [ "$journal_delta" = 0 ]; then
+    if [ "$runs_delta" = 0 ] && [ "$body_delta" = 0 ] && [ "$journal_delta" = 0 ]; then
         echo "  warning: no collection grew; check the collection prefix and the database" >&2
     fi
     echo "  counting store: ${logical:-the workload printed no line}"

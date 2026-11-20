@@ -132,7 +132,7 @@ The states and their transitions are `TRANSITIONS` in `bench/lib/ledger.mjs`, wh
 harness that drives a run through them is `lib/runner.mjs`. **Resume** reads the
 ledger (`resumeActions`): a `Done` or `StoppedByCap` run is never repeated, a `NotStarted` one is planned again by a start with room under the cap; a run that was
 `Reserved`, `Preparing`, `Running`, `Collecting` or `Interrupted` starts again from scratch; a `Grading` run is
-graded again and never run again; a `Failed_infra` run is retried twice and then given up. A run is allowed
+graded again and never run again; a `Failed_infra` run is retried twice and then given up, **unless its failure cannot change on a retry** (a clone the task image's git cannot read, a base that does not match its marker twice, a run id a driver refuses: `PermanentError` in `lib/errors.mjs`): that one is `final` at once and is left out like the third interruption. A run is allowed
 **at most two interruptions**: the third time it ends `Failed_infra` for good (`final`), so an interrupted run is not paid
 for on every restart. The report lists such a run among those left out, with its wasted spend.
 
@@ -163,6 +163,7 @@ for on every restart. The report lists such a run among those left out, with its
 | `bench/lib/npm.mjs` | OpenCode's binary from npm, checked against its integrity before anything is written |
 | `bench/lib/a2a.mjs` | the A2A client (the bearer in a private field) and `driveTask`: poll, the one nudge, cancel |
 | `bench/lib/gitops.mjs` | the host's other git: list the pushed branches (isolated), the agent folder of a revision, the script a container pushes the base with |
+| `bench/lib/glibc.mjs` | the glibc runtime the OpenCode binary needs in a musl task image: which images lack the loader, the read-only mounts that give it |
 | `bench/lib/stack.mjs`, `bench/compose.yaml`, `bench/lib/relay.mjs` | the stack, the host containers the harness starts (the coder, the arms, the grading), the relays |
 | `bench/lib/tarstream.mjs` | what a container wrote, as a tar stream parsed with limits |
 | `bench/lib/classify.mjs` | infrastructure told apart from the agent, from the meter's record |
@@ -408,7 +409,7 @@ environment. So one principle holds everywhere:
 | OpenCode's stream, stderr and export | `Stack.readFiles`: the three names only, a size cap, and a link, FIFO or device in their place is refused, logged and kept out |
 | the exit status of OpenCode | the container runtime's (`docker run`'s status and its time-out), never a file the agent could write |
 | the reward of a grading | read without following a link or blocking (`O_NOFOLLOW`, `O_NONBLOCK`), only if it is a regular file of at most 16 bytes |
-| the base of a task | made in the slot's work directory by the task image for each run, because `/work/bench-base` is shared by every task; the host builds its own repository from a tar of the tree once per (task, image, workdir) and reuses it (under `$BENCH_HOME`); adam's copy is pushed to the git server by a one-shot container with no secret |
+| the base of a task | made in the slot's work directory by the task image for each run, because `/work/bench-base` is shared by every task; the host builds its own repository from a tar of the tree once per (task, image, workdir) and reuses it (under `$BENCH_HOME`); adam's copy is pushed to the git server by a one-shot container with no secret. The marker's tree is computed from `tree` itself in a repository of its own, with the host's git options, because the clone's `HEAD^{tree}` tracks a submodule that `tree` holds as an empty directory (openlibrary, teleport). The base is written by the task image's user (often root) and read as uid 10001: the readers name `safe.directory` in a global file (`SAFE_DIRECTORY_LINES`), since the git of a task image ignores `-c` and `GIT_CONFIG_COUNT` for a local clone and answers "Could not read from remote repository" |
 | the pushed branches | `git ls-remote` of an `http://` address on the loopback, run in a new empty directory that is not a repository, with discovery stopped and only plain http allowed |
 | the environment of a host git | an allow-list (`PATH`, locale, temp directory); the model's key, a proxy and any credential are not in it. The clone and the fetch of the upstream tasks run in it too (`lib/upstream.mjs`), so an upstream cannot see the key |
 | the environment of a `docker` child | the same allow-list everywhere (`lib/containers.mjs` `dockerEnv`): `PATH`, `HOME`, `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`, `XDG_RUNTIME_DIR`, `TMPDIR`, `SSL_CERT_FILE`, `SSL_CERT_DIR`. Every entry is a path or a flag, never a secret; a proxy variable is not in it, because it can carry a password. The stack's compose calls and host containers, `bench tasks` and every probe of `bench doctor` use it, so the model's key and the rest of the harness's environment cannot reach a container with `-e`, a crash dump or `ps e` |
@@ -428,7 +429,7 @@ the git sandbox, the pusher): no other image is added to the dev stack's postgre
 | `gitbox-1`, `gitbox-2` | `adam-git-sandbox` of the same image: no network, no secret, a read-only root, an in-memory `/tmp`, the slot's work directory; the coder's git runs there (`GIT_SANDBOX_SOCKET`), so what a repository's configuration names cannot read a secret or reach the network |
 | `meter-1`, `meter-2` | TCP relays with one fixed target, the harness's meter on the host |
 | `pub-coder-1`, `pub-coder-2`, `pub-git` | TCP relays that publish a coder's A2A port and the git server on the loopback |
-| `pusher-1`, `pusher-2` | one-shot containers that put a run's base on the git server |
+| `pusher-1`, `pusher-2` | one-shot containers that put a run's base on the git server: no secret, a read-only root, the base read-only; the scratch repository it builds (a whole copy of the base, 2 GB for a large one) is in `pusher-scratch` of the slot's work directory, on disk, made and removed by the harness around each push, never in a tmpfs (a 256 MB `/tmp` was full for element-web: "No space left on device"); its `/tmp` (16 MB) holds only the one-line git configuration. `gitbox`'s 64 MB `/tmp` holds no repository: git keeps its temporary packs in the repository, which is on the work volume |
 
 The coder, the OpenCode arm and the grading are **host containers** the harness starts with `docker run`: the coder from
 the task image, with `--env-file` (mode 0600), `--user 10001:10001`, the runtime's limits, its binaries and agent folder
@@ -526,6 +527,19 @@ integrity **before anything is written**, extracted and mounted read-only at `/o
 cd <clone> && opencode run --standalone --format json --model bench/bench-model --auto --title <run> < instruction.md
 ```
 
+**The binary is a glibc executable** (interpreter `/lib64/ld-linux-x86-64.so.2`; it also needs libstdc++, libgcc_s and glibc's resolver
+modules), so a task image on **musl** (Alpine: the SWE-bench Pro teleport images) cannot start it: its shell says
+`/opt/bench/opencode: not found` and the container exits 127 (reproduced 2026-11-20 in the teleport image). In prepare the driver
+asks each image once whether `/lib64/ld-linux-x86-64.so.2` exists (`lacksLoader`, `lib/glibc.mjs`); where it does not, the run
+and export containers get the glibc runtime of the pinned coder image (`Stack.ensureGlibc`: the loader and nine libraries copied
+once with `docker cp -L` into `$BENCH_HOME/stack/glibc`) mounted **read-only at the places glibc looks**
+(`glibcMounts`). Nothing else changes: no environment variable, no loader invoked by hand (OpenCode starts its private server
+from its own `execPath`, which a hand-invoked loader breaks), and an image that has glibc is run exactly as before. *Verified
+2026-11-20* with the pinned binary, uid 10001, in the teleport image: the whole run script ran the scripted task to the end,
+with the meter's name resolved from `/etc/hosts`. When a start fails (exit 125, 126, 127 and no events), the shell's own
+message goes to the pipe that becomes `stderr.txt`, not to the container's stderr: the driver reads it from there, keeps
+`runs/<run>-a<n>/opencode/stderr.txt`, puts it in the error and in `prepare-stderr.txt`.
+
 `OPENCODE_CONFIG_CONTENT` (`opencodeConfig`), **given on stdin** and read into the variable by the script (it holds the run's token, which is then on no command line): the provider `bench` (`@ai-sdk/openai-compatible`) at the meter's address with a
 dummy key, the model's limits (context from the configuration, output 8192), the same model for the small calls,
 `agent.build.steps` 200, `autoupdate` off, `share` off, and the permission
@@ -575,7 +589,7 @@ tag `v2.3.0` (`raw.githubusercontent.com/anomalyco/opencode/v2.3.0`) and its `CH
 of them; the container's time limit (50 minutes) is the only bound, as for adam, and a run that is killed at it is
 `timeout`. Turning subagents off would take away a tool that adam has too (its `explorer` and `reviewer`) and the report
 would compare a handicapped agent. The cost is the same as for adam: the meter counts every call of every session. OpenCode's
-own stream shows the main session only, so `selfReported` is lower than the meter's when subagents work; the export has them.
+own stream shows the main session only, so `selfReported` is lower than the meter's when subagents work; the export has them. `selfReported.input` is every input token, the cached ones included, as the meter's and adam's are (OpenCode's own `tokens.input` leaves the cache reads and writes out, so the driver adds them back); `cached` is a part of it. The meter's cost is the source of truth.
 The refusal of a call is retried by OpenCode, so the harness watches the meter and ends the container itself (`budget_hit`). The end
 of a run, at the time limit or on a refusal, is the same for both agents: a polite stop (OpenCode: SIGTERM; adam: `CancelTask`), the
 configured cancel grace, then a forced stop. OpenCode's stderr is capped at 1 MiB inside the container.
@@ -731,7 +745,7 @@ which the agent made no model call, in which more than two calls (or the last on
 task's image (adam), in which the coder reported an external cause, or that could not be stopped, is `Failed_infra` (tried
 again, then left out of the rates), never a fail. Grading runs as a host container of the task image, on the `verifier` network. `runPlan` first reads the ledger (`resumeActions`), so a start after a kill runs what is left: a `Done` run is not
 repeated, an interrupted one starts again from scratch (its first attempt's spend stays as waste), a `Grading` one is graded
-again from its saved patch. The patch is written to `runs/<run>-a<n>/model.patch` under the results directory before grading. A
+again from its saved patch. When a step of a run fails in the infrastructure, the full stderr of the command (capped at 64 KiB, the run's secrets taken out) is `runs/<run>-a<n>/prepare-stderr.txt`, and the ledger line keeps one short summary that includes git's `fatal:` line. The patch is written to `runs/<run>-a<n>/model.patch` under the results directory before grading. A
 verifier that needs the internet gets the `egress` network for the window of its grading. `runPlan` is one run at a time; the blocks and the slots are `lib/schedule.mjs` ("Pilot and run").
 
 ## Pilot and run
@@ -800,7 +814,9 @@ deletes the file first, so an old yes never covers a new pilot.
 * **Blocks (`lib/plan.mjs`).** A block is one task through all four cells (two agents, two arms). The tasks are shuffled with the
   seed of the configuration (`tasks.seed`); the cells of a block follow a cyclic Latin square, so in each round of four blocks
   every cell stands at every position once. A run id is `<task>.<agent>.<arm>`: a plain id is kept, any other is sanitised, cut
-  and given a short hash of the whole id, and `.agent.arm` is never cut; two runs with one id are an error. A task's `source` is
+  and given a short hash of the whole id, and `.agent.arm` is never cut; two runs with one id are an error. The longest run id is
+  `RUN_ID_MAX` (128, in `lib/plan.mjs`), which the ledger and the OpenCode driver accept; a container name, which Docker
+  limits to 63, is derived from the id by a hash and never refused. A task's `source` is
   `public`, `own`, or `own-self` (an own task from `tasks.selfRepo`, adam-rs itself), and the report keeps the three apart.
 * **The pilot is not part of the results.** It is the first blocks of the plan, as runs with the prefix `pilot.` and the phase
   `pilot`, under the configuration's per-run budget. `bench run` runs **every block again** under the confirmed budget of each arm;
@@ -868,15 +884,17 @@ error or another architecture means the image cannot run it. **The probe runs th
 `bench/pins.json` still names the build before ADR 0053 decision 11's static one: in a Debian bookworm task image those
 fail on glibc (`GLIBC_2.38` and `GLIBC_2.39` not found) and the image is **refused for both arms**, until slice 6b moves
 the pin. The static build (musl) starts in bookworm (probed by hand: exit 78), so once the pin moves the image's C library
-stops being the question; an image that cannot run the binary at all is refused for both arms. The probe is the coder's
-alone: the OpenCode binary is linked to glibc, so an image that starts a static coder but cannot run OpenCode (Alpine) is
-not refused by it. The output names the distribution and the error. With
+stops being the question; an image that cannot run the binary at all is refused for both arms. A second row, `opencode in task image <id>`, starts the pinned OpenCode binary there (`--version`, uid 10001, no network)
+the way a run does: an image without glibc (Alpine) gets the harness's runtime mounted and the row says so; one where the binary
+still does not start is a **failure** (its runs would be `Failed_infra`, found before a paid run). It needs the verified binary
+(fetched from npm into `$BENCH_HOME/opencode/<version>`) and the coder image; without them the row is a warning, "not probed".
+The output names the distribution and the error. With
 `--start` it brings the stack up and runs a container of the coder image on the host, for each slot and for the grading,
 and asks the runtime whether it takes the arms' limits (a refusal is a warning: both arms still get the same setting).
 Compose 2.24 or newer and an x64 machine are required. The exit is 1 when a check fails, which includes a task image the
 coder cannot start in. Every `docker` child it starts gets the same allow-list as the stack (`dockerEnv` in
 `lib/containers.mjs`), never the model's key (`bench/test/doctor.test.mjs`): the compose plugin, the daemon query and
-the image inspection, the two probes of each task image, and with `--start` the stack's compose calls, the coder's files
+the image inspection, the probes of each task image, and with `--start` the stack's compose calls, the coder's files
 extracted from the image, the host containers and the limit probe. The `ip` child that finds the meter's address gets it
 too.
 

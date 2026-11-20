@@ -216,7 +216,7 @@ paths are the same in every environment, so the file tools and all git work stay
 |---|---|---|
 | `Local` | the coder's own container | the default |
 | `DevContainer` | the first slot's `devcontainer.json` (a default image when it has none), on a rootless Podman service, never the host's Docker socket | `DEVCONTAINER_RUNTIME=podman` (off by default; off on Kubernetes) |
-| `KubeEnvironment` | a Kubernetes pod of the run's own, made from a template the deployment mounts | `RUN_ENVIRONMENT=kubernetes` (refused with `podman`) |
+| `KubeEnvironment` | a Kubernetes pod of the run's own, made from a template the deployment mounts; the run container's image may be the repository's own ([below](#a-repositorys-own-image-adr-0052)) | `RUN_ENVIRONMENT=kubernetes` (refused with `podman`) |
 
 It is chosen when the binary is composed, not by a plugin. A failure to make the environment is a result
 for the model (no check cycle is used); a secret is never in a description, only the names to hide.
@@ -372,3 +372,70 @@ stateDiagram-v2
 
 See also the [`adam-workspace` README](../../crates/adam-workspace/README.md#where-a-runs-processes-run-the-environment-port)
 and [the coder README](../../bin/adam-coder/README.md#where-the-processes-of-a-run-run).
+
+### A repository's own image (ADR 0052)
+
+A repository may bring a `devcontainer.json` that names an image, and a deployment may allow its registry. The tool
+`use_repository_environment { repo?, config?, off? }` is a **source's**, not one of the coder's fixed tools: it is offered
+only when the commands run in run pods, `RUN_POD_REPOSITORY_IMAGES` names at least one prefix, and a **writable** slot of the
+run holds a configuration. Otherwise it is withheld, and a call to it is refused with the reason. A reference is never the
+slot: it is read-only and the pod mounts it read-only.
+
+```mermaid
+sequenceDiagram
+    participant M as model
+    participant T as use_repository_environment
+    participant R as devcontainer reader (adam-workspace)
+    participant K as KubeEnvironment
+    participant A as API server and admission policy
+    participant P as run pod (the repository's image)
+    M->>T: use_repository_environment with repo or config
+    T->>R: read the slot's devcontainer.json
+    R-->>T: the image (customizations.adam.image, else image), or a refusal in words
+    T->>T: check the prefixes of RUN_POD_REPOSITORY_IMAGES
+    T->>K: set_image(run, image), then ensure
+    K->>A: DELETE the pod made with another image, POST it from the template with the image
+    A-->>K: admitted: the run container may use a prefix
+    K-->>T: the session, with the image the pod runs
+    T-->>M: the image, the file, the keys that were ignored
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Withheld: not run pods, or no prefix allowed
+    [*] --> Withheld: run pods and a prefix, no configuration in a writable slot
+    Withheld --> Offered: a writable slot gets a configuration
+    Offered --> Offered: a call refused in words
+    Offered --> Withheld: that slot is gone or its file was removed
+    Offered --> InUse: a call succeeds, the pod runs the repository's image
+    InUse --> InUse: another slot or file is chosen
+    InUse --> Offered: off is true
+    InUse --> Withheld: its file is removed (the pod keeps the image)
+    InUse --> [*]: the run ends
+    Offered --> [*]
+    Withheld --> [*]
+```
+
+| The configuration has | The image of the run pod |
+|---|---|
+| `customizations.adam.image` | that image, whatever else the file says |
+| `image`, and no `build` and no `features` | `image` |
+| `build.dockerfile` or `features` | refused: this coder runs no container engine; publish one image in the repository's CI and name it in `customizations.adam.image`, or replace the build by `image` |
+| `dockerComposeFile` | refused: name one image |
+| an image outside the prefixes (naming them), a path (`./x`, `../x`, `/x`) or a `${...}` variable | refused in words |
+
+The pod is the deployment's: its user, mounts, resources, network and runtime class do not move. The result lists the keys
+that ask for them (`privileged`, `capAdd`, `securityOpt`, `runArgs`, `mounts`, `init`, `forwardPorts`, `appPort`,
+`workspaceMount`, `workspaceFolder`, `remoteUser`, `containerUser`, `updateRemoteUserUID`, `hostRequirements`) as ignored.
+**This slice runs no lifecycle command** (`onCreateCommand`, `postCreateCommand` and the others) and sets no `containerEnv` or
+`remoteEnv`: they are listed as ignored too. It also does not report the digest the node pulled, does not reset the run when
+the file changes, and does not add the one step ADR 0052 decision 4 gives a run whose slot has a configuration where the tool
+cannot work. An image without `/bin/sh` is not recognised before its first command fails.
+
+The choice is recorded in the pod's `adam.vymalo.com/repository-image` annotation and in the coder's memory, **not in the
+run's metadata**: a coder that restarts keeps it while the pod exists, and the idle sweep keeps it in the same process, but a
+pod the sweep deleted before a restart, or a new run of the conversation, starts again on the deployment's image. `off: true`
+puts the run back on the deployment's image, and a pod with a command running is not replaced until it ends. If the slot's
+file is gone the tool is withheld, so `off` is not available then: the run keeps its image until it ends. The admission policy
+is the control: the `run` container may use an image that starts with an allowed prefix, and the init containers keep the
+exact list. The deployment's value and its refusals: [the chart README](../../deploy/coder/README.md#run-pods).

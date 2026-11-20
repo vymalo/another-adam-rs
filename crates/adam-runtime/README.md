@@ -33,7 +33,7 @@ over A2A).
 | `SandboxUsage`, `SandboxEntry`, `SandboxEnvironment`, `MAX_SANDBOX_ENTRIES` | the time a run's commands ran in a sandbox (a run pod), one `SandboxEntry` per shape (`cpu_millis`, `memory_bytes`, `commands`, `milliseconds`), at most 8, and the environment they ran in; what a tool reports (`ToolCtx::report_sandbox` in `adam-llm-agent`), what the agent keeps in its state next to the totals, and what the A2A server writes as `sandbox`; see *Usage* |
 | `child_run_id`, `ChildStatus`, `ChildStarter`, `RUN_FINISHED_KIND`, `CHILD_REPORTED_KIND` | child runs: the id a parent derives for the child of a call, the payload of the finished message (also what `Ctx::child_status` returns), and the message's `Inbound::kind` (`adam.run.finished`, or `adam.child.reported` for a session round). `ChildStarter` also reads and acts on **the sessions of the run's conversation** (slice 2, below): `session_conversation()`, `start_round`, `session`, `sessions`, `steer`, `cancel_round`, `round_state`, `round_record` (the same with the round's status); `session_idle_ttl()` and `start_in_parent_conversation(id, agent, input)` (a timer run of a session, parked until it may expire, in a conversation made from the session's parent one and unique to the timer, which a run in it still reads as its parent's: `Runtime::start_child_in`); `SessionView::cleanup_rounds` and `countable_rounds()` (the rounds a limit counts: the closing rounds of a session that stays open only cancel what the round before left, and are not counted) |
 | `session_conversation_id`, `session_conversation_prefix`, `parse_session_conversation_id`, `SessionState`, `RoundOutcome`, `SessionSummary`, `ReportRound`, `SessionList`, `SessionView`, `SessionHeader`, `SESSION_STATE_KEY`, `SESSION_CLOSE_KIND`, `SESSION_CLOSE_ROUND_KEY`, `closing_round_payload`, `SessionSummary::started_outside_a_run`, `SessionView::started_outside_a_run`, `Runtime::session_view` | child sessions (ADR 0045): the conversation id the rounds of a session share, what `list_sessions` and `session_view` return, the header a round's agent keeps in its state under `session`, the message that asks a working round to be the session's last, and the first message of a round that only closes its session (`closing_round_payload(&header)`, `{close_session: true, session: header}`, which `subagent_close` and the A2A front both build). `started_outside_a_run` is true for a round that is **its own parent** (`start_child_continuing(id, id, ..)`: a person started it, no run of an agent did): no run's end cancels it and none waits for it, the A2A front's `by: person` (`adam-a2a-runtime`, *Child sessions*). The two methods are additions; no trait changes |
-| `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events: `Status` (after a commit, and `Status(Runnable, "claimed")` once, when a worker first takes a run), `Progress`, `Step`, `TextDelta`, `ReasoningDelta`, `Usage`, `Custom`, `Artifact`. `BroadcastSink::subscribe_run(run)` starts with the run's recent events: see *A late subscriber* |
+| `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events: `Status` (after a commit, and `Status(Runnable, "claimed")` once, when a worker first takes a run), `Progress`, `Step`, `TextDelta`, `ReasoningDelta`, `Usage`, `Custom`, `Artifact`. `BroadcastSink::subscribe_run(run)` starts with the run's recent events: see *A late subscriber*. Its `RunSubscription::recv` skips the events a slow subscriber lost (and logs it); `recv_or_lag` says it instead, `Received::Lagged(skipped)` (the sink's events, every run's, so an upper bound on the run's), then the newest events the channel kept |
 | `REPLAY_EVENTS_PER_RUN`, `REPLAY_MAX_AGE`, `REPLAY_MAX_RUNS`, `REPLAY_MAX_BYTES` | the bounds of `BroadcastSink`'s replay: 64 events per run, none older than 30 s, 64 runs, and 16 MiB in all (an estimate of the heap the events hold; past it the globally oldest events go first) |
 | `Artifact`, `ArtifactFile`, `ArtifactFileError`, `MAX_ARTIFACT_FILE_BYTES`, `MAX_ARTIFACT_FILENAME_BYTES`, `MAX_RUN_FILE_BYTES` | an output of the run, in two forms: a JSON artifact (`Artifact::new(name, mime_type, data)`) and a **file artifact** (`Artifact::file(name, media_type, filename, bytes)`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)), whose `file` holds the filename and the bytes and whose `data` is `null`. `Artifact` and `ArtifactFile` are `#[non_exhaustive]`; `Artifact::file_sha256()` is the SHA-256 of a file's bytes as 64 lower-case hex digits (`None` for a JSON artifact): the name the person's screen keeps the file under, which an `ask_user` option names as its picture. `RunEvent::Artifact` has a `file` member too. **An artifact may have an id** (`Artifact::id`, `Artifact::with_id`, `RunEvent::Artifact::id`; absent from artifacts journaled before, `None` by default): a thing that changes while the run works (a plan) is **one** artifact. At commit (`worker.rs`, `add_artifact`) an artifact with an id the run already holds **replaces** it in place, keeping its position; one with no id, or an id no artifact has, is added after the others. No `Store` change: the list is part of the envelope the worker already writes. **A file artifact has no id and is never replaced nor replaces anything** (`with_id` leaves a file without one, and the commit drops an id on a file and keeps both). The id is the artifact's identity within the run: a later artifact of the run with the same id replaces it, **whichever tool made it**, so ids belong to what a tool replaces on purpose (a surface, data). **Breaking:** `Artifact` gains a public field `id` and `RunEvent::Artifact` a member `id`, so a constructor of either outside this crate (`RunEvent::Artifact { name, .. }`) must name it (or use `Artifact::new` and `From<Artifact>`), and an exhaustive pattern on the variant must add `..`; the serde forms are additive. Journaled as `{"filename", "bytes": "<base64>"}`, and an artifact journaled before the file form existed has no `file` and reads as it did. `Artifact::file` refuses a file over **4 MiB** (`MAX_ARTIFACT_FILE_BYTES`), a filename that is not a name (empty, a path, a `:`, control characters, over 255 bytes) and a media type that is not `type/subtype`; `Debug` prints a file's size, never its bytes. A run keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files: the runtime keeps what it is given, and the agent loop (`adam-llm-agent`) enforces it. Journal cost: the bytes, as base64 (a third more), are in the journal entry of the step that made the file and in every commit of the run's state after it, which is why the caps are what they are. The journal entry is written with the tool's whole result, **before** the loop applies the run's cap, so a tool that returns several files it did not choose bounds its result by what the run may still share (`ReceivedFiles`, `ToolCtx::files_left`): one entry then stays within the run's 6 MiB (about 8 MiB of base64), under MongoDB's 16 MiB document |
 | `SystemLine`, `is_system_line(line)`, `safe_file_name(name)` | the lines the system writes into a person's message about a picture, a file or a link (`[image not shown: ...]`, `[attached: ...]`, `[linked: ...]`, `src/lines.rs`): one place builds them and one recognises them, so a reader of the person's words (the coder's rule about the repositories a task named) skips them whatever a sender put in a name or a link. A name a line prints is a file name and nothing else: letters, digits, `.`, `_` and `-`, every other character `_`, at most 64 |
@@ -62,54 +62,68 @@ at-least-once (a crash between the effect and its journal write runs it
 again): keep effects idempotent. The lifecycle and guarantees are in the crate
 docs (`src/lib.rs`) and the [architecture](../../docs/architecture.md#the-mental-model).
 
-## The shadow: the head and the body
+## The head and the body (the contract release)
 
-ADR 0055's expand release writes a run's **head** and its **body** beside the complete v4 `state`:
-the steps write both (S2a), and an observer reads the head (S2b). `Runtime::view` is one
-`load_head` call and never a body; `Runtime::state` is the one full-state read, joining the head and
-the generation it names. The worker still reads the full state through `load_run`, and a run's `state`
-is still the whole envelope a v4 process steps, so a mixed fleet is safe.
+ADR 0055's contract release makes a run's **head** and its **body** the run: every commit writes the
+head, the rows it appends and — for a store that keeps bodies — the **tombstone** (`state = null`).
+`Runtime::view` is one `load_head` call and never a body; `Runtime::state` is the one full-state
+read, joining the head and the generation it names. The worker reads the head through `load_run`
+(the store answers the head when `head_version == version`), joins the rows its claim read, steps,
+and writes the next head. A store that keeps no bodies (`Store::keeps_bodies() == false`) is not
+written the contract: the runtime keeps the whole v4 `state` for it and no head, as before. A v4 run
+keeps its whole state until its first commit under the contract, which splits it.
 
 * `Agent::split(&state)` returns `Some((head, rows))` when the agent's state has a transcript worth
   keeping apart, and `None` (the default) when it does not. `Agent::join(head, rows)` is its inverse,
   and the invariant is `join(split(s).0, split(s).1)` re-encodes to `s`. A wrapper that delegates
-  `init` **must delegate `split` and `join` too**, or its runs silently stay in the v4 format.
+  `init` **must delegate `split` and `join` too**: a new run of a wrapper that does not silently
+  stays in the v4 format, and a **v5 run must split** — a successful step that returns `None` on a
+  current head is a refused split, and the commit demotes the run to the whole v4 state (the
+  demotion re-reads the head's file digests, so an inherited file keeps its bytes).
 * The split is taken **inside the erased step** (`src/erased.rs`), where the typed state already
   exists: the state is deserialized once, and the rows are the agent's own values.
 * A step commit that splits writes the head (`v: 5`: the agent's head, the envelope's other members,
   file artifacts **by reference** — `file.digest` and `file.size`, never the bytes — and
-  `body: {generation, len}`) and the rows, beside the full `state`. The generation is the current
+  `body: {generation, len}`), the rows, and the tombstone as `state`. The generation is the current
   one for an append, or a new one for a first split or a compaction; the `writer` UUID is chosen once
   per step attempt, so a CAS retry of that attempt writes no duplicate row and a commit that loses
   deletes its own rows and refs.
-* A commit that does not split (`deliver`, `cancel`, `park_again`, a run whose state is unreadable)
-  writes no head: it re-encodes the format it read, and the stored head becomes stale
-  (`head_version < version`), which `Store::load_head` reads as "serve the state".
+* A commit that does not split (`deliver`, `cancel`, `park_again`, a failed transition) writes the
+  head it read, with this commit's members and its transcript set unchanged, and the tombstone: the
+  head stays current, so the next step appends to the same generation. A run whose state cannot be
+  read is stored as it is (a head stays a head beside the tombstone; a v4 state stays whole) and the
+  run is failed. A head becomes **stale** only when a v4 process commits over it
+  (`head_version < version`, the expand release's mixed fleet): the reads then serve the whole
+  `state` when it is the v4 envelope that commit wrote, and the head when it is the tombstone (a
+  pre-S3 process failed a converted run); the next step re-splits.
 * **The reconstruction check** runs before every commit that splits: `join(head, rows)` is compared
   with the state about to be written, and a mismatch writes `state` only, logs an error, and leaves
   the run v4. A bad split can never produce a head that does not reconstruct its state.
 * The body is **append-only per generation**: a normal commit writes only the rows after the old
   head's `len` and keeps the generation; a compaction (the new transcript does not start with the
-  previous one) writes all rows under a new generation. The delta win holds across **splitting**
-  commits: a headless commit (`deliver`, `cancel`, `park_again`, a failed transition) writes no head,
-  so the next split compacts until S3, where those paths write the head they read; the `head_version`
-  gate stays, because a v4 step may have changed the transcript. Measured with a delivery between
-  every step: 50 × 10 KB writes 12.7 MB of body rows (1,275 rows, 50 generations) against ~0.5 MB of
-  deltas for consecutive splits. The head names `{generation, len}`. The store
+  previous one) writes all rows under a new generation. The delta win now holds across **every**
+  commit of a v5 run, because the headless paths write the head they read; the `head_version` gate
+  stays, because a v4 step may have changed the transcript. The expand release's headless path
+  measured 12.7 MB of body rows for 50 × 10 KB (1,275 rows, 50 generations) against ~0.5 MB of
+  deltas for consecutive splits; the contract writes 524,320 logical bytes for the same workload
+  (ADR 0055's S3 amendment). The head names `{generation, len}`. The store
   resolves the generation, writes the rows before the CAS with the attempt's `writer`, checks that
   all of them landed, and a commit that loses deletes its own rows and refs, so a head never names a
   partial generation and a loser cannot poison the next append. Every file artifact the head will
   name is uploaded first: a failed put refuses the head, and the commit writes the state only.
-* `tests/common/v4.rs` is a frozen copy of the v4 envelope; the suite decodes every `state` written
-  and asserts a v5 head is **not** one. The contract release (S3) inverts that assertion.
+* `tests/common/v4.rs` is a frozen copy of the v4 envelope. The contract release **inverts** its
+  test: the tombstone and a v5 head are not v4 envelopes, and a pre-contract run's state still
+  decodes. The suite also proves a cancel and a `park_again` write the head they read and the
+  tombstone.
 
 ### The read path
 
-* `Runtime::view` reads the lease and then `Store::load_head` (one query on Memory and MongoDB;
-  PostgreSQL answers with the trait default until its half lands), and decodes the record as
-  `Stored`: `v: 1` is the v4 envelope, `v: 5` the head. A stale head
-  (`head_version != version`, left by a `deliver`, a `cancel` or a `park`) is not an error:
-  `load_head` serves the whole state, which decodes as `Stored::Full`, and the next step re-splits.
+* `Runtime::view` reads the lease and then `Store::load_head` (one query on Memory, MongoDB and
+  PostgreSQL), and decodes the record as `Stored`: `v: 1` is the v4 envelope, `v: 5` the head. A
+  stale head (`head_version != version`) is not an error: when the state is the v4 envelope a v4
+  commit wrote, that state is served (it decodes as `Stored::Full`) and the next step re-splits;
+  when the state is the tombstone — a run a pre-S3 process failed, with the head behind the version
+  — the **head** is served, so the run stays readable.
 * `RunView.state` is the agent's **head** for a v5 run and the whole agent state for a v4 one. The
   pointers a front reads — `pending_wait`, `pending_question`, `question`, `usage_totals`,
   `sandbox_usage`, `context`, `session` — are in the head. `RunView.artifacts` is a
@@ -124,12 +138,13 @@ is still the whole envelope a v4 process steps, so a mixed fleet is safe.
   answers its own bytes. A missing blob is `Ok(None)`: that artifact cannot be served, and the run
   is intact.
 * `start_continuing`/`prior_state` join a v5 prior run (one body read), and `cancel` hands
-  `Agent::on_cancelled` the joined state. `view_from_record` builds the same view from a record a
-  caller already holds (a listing), which in the expand release carries the full v4 state.
+  `Agent::on_cancelled` the joined state. `Ctx::child_state` and `ChildStarter::round_state` join
+  too, so the child's or round's agent must be registered on the runtime that reads it (an agent or
+  a starter: both have `join`). `view_from_record` builds the same view from a record a caller
+  already holds (a listing), which now carries the head.
 
-The cost is stated: in the expand release a step writes the whole state **and** the head **and** the
-rows, so bytes written per commit go up until S3 stops writing `state`; the read side pays for the
-head, and for the whole state only where there is no current one.
+The contract release removes the double write: a commit of a v5 run writes the head and the delta
+only. The read side pays for the head, and for the whole state only where there is no current one.
 
 ## A message that arrives while a run finishes
 
@@ -365,6 +380,9 @@ live events, with no gap and no duplicate (`emit` records and sends, `subscribe_
   one report with its `input`), a text piece or a progress line from being lost to a race. A process that has no sink
   to a run's events (another process without `adam-notify-postgres`) replays nothing; with it, the events of other
   processes arrive through `BroadcastSink::emit` too and are replayed like local ones.
+* **A slow subscriber loses the oldest live events**, past the channel's capacity (`BroadcastSink::new(capacity)`, 1024 by default):
+  `recv` skips the loss, `recv_or_lag` returns `Received::Lagged(n)` first, so a consumer can read the durable run then
+  (as `adam-engine`'s event stream does).
 * **A repeat is possible, so a consumer must tolerate it:** subscribing to a run again within 30 seconds delivers its recent
   events again. A step is a snapshot of its `id`'s state, and a text piece carries its `offset`; both are safe to see twice
   (see `adam-a2a-runtime`, *Steps* and *Streamed text*).
@@ -610,7 +628,7 @@ whole claim passes follow: `FaultyStore::claimed` says the store handed the run 
 against PostgreSQL and against MongoDB when their variables are set. `tests/step_all.rs` runs steps that finish in
 reverse at the seqs of the sequential journal, and `ctx.rs` has the reservation cases (consecutive seqs, a wrong name
 takes nothing, a replay after a crash runs only the unrecorded steps, a gap is filled, `step_all` timing and limit). Unit
-tests sit in `src/cancel.rs`, `erased.rs` (an override reaches an agent and a starter, the default is `init`, a prior state that does not decode falls back to `init`), `child.rs` (the id derivation is pinned by a golden value, the notice payload), `ctx.rs` (`emit_for` reaches the other run and records no artifact, `child_state` reads the run's own children only), `events.rs`, `file.rs` (images by their first bytes, a claim that stands and every way the bytes overrule it, the extension table, the shared line and its sizes, `ReceivedFiles`: names, types, the caps, refusals), `usage.rs` (a report within its bounds, totals one entry per provider and model and at most 32), `step.rs` (the words of the kinds, states and icons are the contract's, a step is made within its bounds on a character boundary, the serde shape leaves out what a step does not say), `notify.rs` and `retry.rs`, and the
+tests sit in `src/cancel.rs`, `erased.rs` (an override reaches an agent and a starter, the default is `init`, a prior state that does not decode falls back to `init`), `child.rs` (the id derivation is pinned by a golden value, the notice payload), `ctx.rs` (`emit_for` reaches the other run and records no artifact, `child_state` reads the run's own children only), `events.rs` (the replay's bounds; `recv_or_lag` says a lag and how many events it lost, after the replay), `file.rs` (images by their first bytes, a claim that stands and every way the bytes overrule it, the extension table, the shared line and its sizes, `ReceivedFiles`: names, types, the caps, refusals), `usage.rs` (a report within its bounds, totals one entry per provider and model and at most 32), `step.rs` (the words of the kinds, states and icons are the contract's, a step is made within its bounds on a character boundary, the serde shape leaves out what a step does not say), `notify.rs` and `retry.rs`, and the
 class tables of `AgentError` and `RuntimeError` in `src/agent.rs`
 (`class_table`, `from_classified_maps_retryable_to_transient_and_keeps_the_hint`,
 `a_message_never_repeats_its_source`, `the_default_continuation_is_init_and_ignores_the_prior_state`) and `src/runtime.rs` (`error_tests`, and `defaults`: the worker's idle poll is 250 ms and a step's cancel watch 1 s, set separately).
@@ -619,20 +637,25 @@ Two cases pin the header path: `a_header_is_one_store_call` (`Runtime::header` i
 nor the lease beside it) and `the_cancel_watch_polls_at_its_own_interval` (a 2.5 s step at a 1 s cancel interval reads the
 header about twice, not once per 20 ms worker poll; the watch reads no state at all).
 
-Five cases pin the shadow's writes: `a_step_that_splits_writes_the_head_and_the_body_beside_the_state` (the first commit
-writes a `v: 5` head and starts a generation, the done commit appends to it, one generation holds the transcript, and
-`state` is still the whole v4 envelope), `a_split_that_does_not_reconstruct_the_state_writes_the_state_only` (a
-deliberately wrong split is refused: no head, no rows, the run stays v4), `every_state_written_is_a_v4_envelope_and_a_head_is_not_one`
-(the frozen `tests/common/v4.rs` decodes every state a create, a step, a delivery and a finish wrote, and rejects the
-head), `a_pre_e_file_artifact_is_uploaded_before_the_head_names_it` (a run created directly with a file artifact in its
-state but no blob uploads and references its digest on the first commit, and the head names it) and
-`a_split_whose_file_is_not_stored_writes_the_state_only` (a failed `put_blob` refuses the head, and the commit writes the
-state only).
+Seven cases pin the contract's writes: `a_step_that_splits_writes_the_head_and_the_body_and_the_tombstone` (the first
+commit writes a `v: 5` head and starts a generation, the done commit appends to it, one generation holds the transcript,
+and `state` is `null`), `a_split_that_does_not_reconstruct_the_state_writes_the_state_only` (a deliberately wrong split
+is refused: no head, no rows, the run stays v4), `a_refused_split_on_a_v5_run_writes_the_whole_state_and_no_head` (the
+same on a run that is already v5: the run demotes instead of writing the transcript into a head),
+`a_contract_run_writes_the_tombstone_and_a_pre_contract_state_still_reads` (the frozen `tests/common/v4.rs` rejects the
+tombstone and a v5 head, and a seeded v4 run still decodes), `a_v5_run_whose_split_is_none_demotes_to_the_whole_state`
+(a step whose `split` returns `None` on a v5 run is a refused split), `a_refused_split_keeps_the_inherited_files_bytes`
+(the demotion re-reads the head's file digests, so the v4 state carries the bytes) and
+`a_failed_transition_keeps_its_artifact_in_the_head` (a permanent failure's artifact is named by the carried head);
+`a_pre_e_file_artifact_is_uploaded_before_the_head_names_it` and
+`a_split_whose_file_is_not_stored_writes_the_state_only` pin the upload gate, and
+`a_store_that_keeps_no_bodies_never_gets_a_head` pins the `keeps_bodies` gate.
 
 Eight cases here pin the read path, and two in `adam-a2a-runtime`: `the_view_reads_the_head_and_the_state_joins_the_body`
 (a 50-message run of 10 KB turns: the view is one `load_head`, no `load_run`, no `body_list`, and less than 2 KB of state;
 `Runtime::state` is one `load_head`, one `body_list` and all 50 messages), `a_stale_head_falls_back_to_the_whole_state`
-(a delivery leaves the head stale: the view is the whole state, no body is read, and the next step rewrites the head),
+(a **v4 commit** — what a process of the expand release writes — leaves the head stale: the view is the whole state, no
+body is read, and the next step rewrites the head; a delivery writes the head it read and does not stale it),
 `a_v4_runs_view_is_the_whole_state` (a run that never split serves its whole agent state, and `Runtime::state` reads no
 body), `state_re_reads_a_moved_head_and_joins_its_new_generation` (a compaction between the first `load_head` and
 `body_list`: one re-read, the new head and generation, every message), `state_is_corrupt_when_the_body_is_short_twice`

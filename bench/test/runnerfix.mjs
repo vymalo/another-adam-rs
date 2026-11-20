@@ -25,7 +25,8 @@ export class FakeAgent {
 
   async prepare(ctx) {
     this.log.push(['prepare', ctx.run]);
-    if (this.fail.prepare?.(ctx.run)) throw new Error('the environment did not start');
+    const failure = this.fail.prepare?.(ctx.run);
+    if (failure) throw failure instanceof Error ? failure : new Error('the environment did not start');
   }
 
   async run(ctx) {
@@ -106,6 +107,7 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
     containers: () => slotContainers,
     graderContainers: () => grading,
     ports: { git: 1 },
+    secrets: new Set(['stack-secret-value']),
     meterHost: (slot) => `meter-${slot}`,
     resetWork: async (slot, options) => {
       resets.push(slot);
