@@ -448,6 +448,13 @@ stateDiagram-v2
   (`catalog-v5.json`: `Column` and `Text`; `checklist-subset-v6.json`: a `Checklist` with no `dropped` and no `note`, so a dropped item
   is left out and counted and a long note is cut inside the label limit; `checklist-subset-v8.json`: a `Checklist` that allows both),
   and the specs, pinned byte for byte.
+* `tests/a2ui_schemas.rs` (ADR 0056, decision 8): the six A2UI v1.0 JSON schemas are vendored byte for byte in
+  `tests/a2ui-v1_0/` (`UPSTREAM` names the commit and each file's SHA-256 and a test holds every file to it;
+  `tools/check-vendored-catalogs.sh` compares them with upstream in CI). Catalog 9 (`tests/fixtures/catalog-v9.json`, the
+  `json catalog-9` block of [`ui-catalog-v2.md`](https://github.com/vymalo/another-agentic-system/blob/66db4ee5c885c12f28367a4c623f9c97c38e0930/docs/api/ui-catalog-v2.md))
+  is pinned by bytes and digest, equals catalog 8 plus `protocolVersion`, and validates against `catalog_definition.json`;
+  the digest vector of `ui-catalog/v2` is pinned. The test validator is the workspace's `jsonschema`, offline, with the
+  schemas in a registry.
 * `tests/ask_v7.rs`, `tests/ask_answers.rs` and `src/ask/vectors.rs`: the five kinds against the published catalogs of
   versions 7, 6, 5 and 2 (byte copies, `tests/fixtures/UPSTREAM`; `tools/check-vendored-catalogs.sh` compares them, and the vectors, with
   the published files in CI): the contract's own example form is a valid instance and a golden file

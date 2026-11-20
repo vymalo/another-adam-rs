@@ -7,6 +7,12 @@ version and digest). `UPSTREAM` names the repository, the path and the commit of
 with the published ones. To move one, copy the file at the new commit, recompute its digest (`catalog_digest`), and change the
 file, its lock and `UPSTREAM` together.
 
+`catalog-v9.json` is not a file of the web: it is the body of the ```` ```json catalog-9 ```` block of
+`docs/api/ui-catalog-v2.md` at the commit `UPSTREAM` names (35,143 bytes; catalog 8 with `"protocolVersion": "1.0"`; canonical
+digest `sha256:5f174ee9…`). From `ui-catalog/v2` a catalog document is `{catalogId, protocolVersion, components}`; versions 2 to 8
+have no `protocolVersion` and stay as they were published. `tests/a2ui_schemas.rs` validates catalog 9 against the vendored
+`catalog_definition.json` (`tests/a2ui-v1_0/`, see its `UPSTREAM`) and pins its bytes and digest.
+
 `choices-v7-vectors.json` is **not a copy**: it holds the `json` blocks of `docs/api/ui-catalog-v1.md` (version 7) that a
 receiver of an answer is tested with, under the keys `vectors` (133 cases), `wholeAnswers`, `invalidQuestions`, `surfaces`,
 `questions` and `answers`. `UPSTREAM` says which commit of the page they were read at, and `tools/check-vendored-catalogs.sh` reads the blocks from the page at that commit again and compares them with the file value by value (CI, job `docs`). `src/ask/vectors.rs` runs every case.

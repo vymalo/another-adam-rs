@@ -160,3 +160,9 @@ the card.
 * **Fold every surface into one `createSurface` with inline `components`.** Valid, but a change of shape on both
   sides for no gain in R1 (decision 3).
 * **Link the schemas instead of vendoring them.** A test cannot fetch over the network, and a link moves.
+
+*Amended (2026-11-20).* Decision 8 recorded the SHA-256 of `common_types.json` wrongly: at commit `b4f91c2` it is
+`sha256:c4e78305…6430dc`, and the `…f51c56` written there is the hash of `agent_to_renderer_list.json` (verified at
+`b4f91c2`, 2026-11-20, against the raw files of `a2ui-project/a2ui`). Only the six files the tests read are vendored, and
+they live in `crates/adam-ui/tests/a2ui-v1_0/` with their `UPSTREAM`. Also by the owner (2026-11-20): reading the
+renderer's capabilities moves from slice A2 to A1 (decision 9's split), as slice A1c.
