@@ -290,6 +290,11 @@ fn firing(spec: &ScheduleSpec, due: Timestamp, missed: u64) -> Inbound {
     });
     Inbound::new(
         FIRING_KIND,
-        json!({ "text": spec.prompt(), "schedule": trigger }),
+        json!({
+            "text": spec.prompt(),
+            "schedule": trigger,
+            // Nobody answers a firing, nor its children, which inherit the key (ADR 0060).
+            "context": { adam_runtime::UNATTENDED_CONTEXT_KEY: true },
+        }),
     )
 }

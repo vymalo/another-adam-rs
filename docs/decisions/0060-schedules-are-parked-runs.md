@@ -15,9 +15,15 @@ firing or a session's; `next_due` is built as `ScheduleSpec::due_after`.
 scheduler of an agent is registered as `<agent>/adam.schedule`, not `adam.schedule` (decision 1): a worker claims
 the runs of the agents it registered, and agents that share one database must each step their own schedulers, or a
 worker of one fires another's schedule into an agent it does not know. Slice 6 is split: the coder runs schedules
-(6a, the component shared as `adam_schedule::reconcile_until_stopped`); reconciling on a dev reload (6b) is not built. Nobody answers a firing (6c, built): in an `adam.schedule:`
-conversation a tool that asks the person is answered that nothing can be asked, and the coder ends a firing that would
-wait for the person `Failed`.
+(6a, the component shared as `adam_schedule::reconcile_until_stopped`); reconciling on a dev reload (6b) is not built. Nobody answers a firing, so one that asks stays waiting until it is
+cancelled; ending an unattended run instead of asking (6c) is not built either.
+
+*Amended* (2026-11-20, slice 6c): nobody answers a firing, so none waits for a person. A firing's first message
+carries `adam.unattended: true` in its context (`adam_runtime::UNATTENDED_CONTEXT_KEY`), a protected key its child
+runs inherit; in such a run, or one in an `adam.schedule:` conversation, a tool that asks the person is answered that
+nothing can be asked (`adam_llm_agent::UNATTENDED`) and the model goes on, and the coder ends a firing that would wait
+(a final question, or work it owes) `Failed`, naming why and quoting the end of its answer. Firings that parked
+before this change still wait.
 
 ## Context
 

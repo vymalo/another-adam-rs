@@ -1390,7 +1390,10 @@ impl Agent for CoderAgent {
                                 None => Transition::Done { state, output },
                             }
                         } else if asks_the_person(&output) || owes_delivery(&notes, &slots).await {
-                            if adam_llm_agent::is_unattended(ctx.conversation_id()) {
+                            if adam_llm_agent::is_unattended(
+                                ctx.conversation_id(),
+                                Some(&state.context),
+                            ) {
                                 // Nobody answers a firing of a schedule (ADR 0060): a run that
                                 // would wait for the person ends, saying what it needed.
                                 Transition::Fail {
@@ -1422,10 +1425,13 @@ fn unattended_ending(output: &Value) -> String {
         .or_else(|| output.as_str())
         .unwrap_or_default()
         .trim();
-    let said: String = said.chars().take(500).collect();
+    // The end of the answer: a question is its last paragraph, and the run's failure is bounded.
+    let count = said.chars().count();
+    let tail: String = said.chars().skip(count.saturating_sub(1_500)).collect();
+    let cut = if count > 1_500 { "…" } else { "" };
     format!(
         "a schedule started this run and nobody answers it, so it stopped where it would have waited \
-         for the person (a question, or work left undelivered); its last words: {said}"
+         for the person (a question, or work left undelivered); its last words: {cut}{tail}"
     )
 }
 
@@ -1815,8 +1821,14 @@ mod tests {
             text.ends_with("its last words: Tests pass. Open the PR?"),
             "{text}"
         );
-        let long = unattended_ending(&json!({"text": "x".repeat(2_000)}));
-        assert!(long.len() < 800, "{}", long.len());
+        // A long answer keeps its end, where the question is.
+        let long =
+            unattended_ending(&json!({"text": format!("{}Shall I open it?", "x".repeat(3_000))}));
+        assert!(
+            long.ends_with("Shall I open it?") && long.contains('…'),
+            "{long}"
+        );
+        assert!(long.chars().count() < 1_800, "{}", long.chars().count());
         assert!(unattended_ending(&json!(null)).ends_with("its last words: "));
     }
 

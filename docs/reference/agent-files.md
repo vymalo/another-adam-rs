@@ -338,8 +338,8 @@ sequenceDiagram
   non-empty body (the prompt of each run), and `timezone` (default `UTC`); they belong to the root agent. Read and
   checked here; `adam-agent` and the coder run them (their READMEs, "schedules/"). A firing is the prompt as a person's message,
   sent to the agent directly: a `/command` in it is not expanded, and nobody answers it: a tool that asks the person
-  (`ask_user`) is answered that nothing can be asked, and the model goes on (the coder ends a firing that would wait,
-  `Failed`). Write the prompt so that the agent need not ask.
+  (`ask_user`) is answered that nothing can be asked, and the model goes on, in the firing and in its subagents (the coder
+  ends a firing that would wait, `Failed`). Write the prompt so that the agent need not ask.
   * `cron`: five fields, minute, hour, day of month, month, day of week, evaluated. `*`, lists, ranges, steps
     (`*/15`, `1-30/2`, and `5/15` for `5-59/15`), `JAN`-`DEC`, `SUN`-`SAT` (any case), `0` and `7` for Sunday, `?` as
     `*`. When both day fields are restricted (neither starts with `*` or `?`), a day matches either. A field out of

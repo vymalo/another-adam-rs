@@ -103,13 +103,17 @@ pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
 /// behind it, which is a limit on what it may ask for.
 pub const CALLER_CONTEXT_KEY: &str = "vymalo.caller";
 
-/// The context keys that carry a **limit on the agent**: the access tier the person picked, and
-/// who the message was sent for. A message always sets them, even when the rest of its context is
+/// The context keys that carry a **limit on the agent**: the access tier the person picked, who the
+/// message was sent for, and that nobody answers the run (`adam_runtime::UNATTENDED_CONTEXT_KEY`). A message always sets them, even when the rest of its context is
 /// over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large catalog next to a `plan` tier would
 /// lift the limit), and a child run starts with the ones its parent has
 /// ([`ToolCtx::start_child`](crate::ToolCtx::start_child)). Each value is at most
 /// [`MAX_PROTECTED_VALUE_BYTES`]; a larger one is ignored.
-pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[ACCESS_TIER_CONTEXT_KEY, CALLER_CONTEXT_KEY];
+pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[
+    ACCESS_TIER_CONTEXT_KEY,
+    CALLER_CONTEXT_KEY,
+    adam_runtime::UNATTENDED_CONTEXT_KEY,
+];
 
 /// The context key under which a message says what its renderer offers this turn (A2UI v1.0
 /// `a2uiRendererCapabilities`): `{"catalogIds": [...]}`.

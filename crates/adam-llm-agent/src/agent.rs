@@ -212,9 +212,14 @@ const NOT_ALONGSIDE: &str = "this tool cannot run alongside others: call it alon
 pub const UNATTENDED: &str = "nobody answers this run: a schedule started it, not a person, so nothing \
 can be asked. Do what you can without asking, and say in your final answer what is still needed";
 
-/// Whether a run in `conversation_id` is a firing of a schedule, which nobody answers.
-pub fn is_unattended(conversation_id: Option<&str>) -> bool {
+/// Whether nobody answers a run: a firing of a schedule (its conversation is under
+/// `adam.schedule:`), or a child of one (its context carries `adam_runtime::UNATTENDED_CONTEXT_KEY`,
+/// which the scheduler sets and children inherit).
+pub fn is_unattended(conversation_id: Option<&str>, context: Option<&Map<String, Value>>) -> bool {
     conversation_id.is_some_and(|c| c.starts_with(adam_runtime::SCHEDULE_CONVERSATION_PREFIX))
+        || context.is_some_and(|c| {
+            c.get(adam_runtime::UNATTENDED_CONTEXT_KEY) == Some(&Value::Bool(true))
+        })
 }
 
 /// Whether a result reports the rounds of sessions: only a call that runs alone may.
@@ -3516,6 +3521,7 @@ impl LlmAgent {
                         &unjournaled,
                         files_kept(&state.artifacts),
                         Some(live),
+                        is_unattended(ctx.conversation_id(), Some(&state.context)),
                     )
                     .await?
                 }
@@ -4004,6 +4010,7 @@ impl LlmAgent {
                     &unjournaled,
                     files_used,
                     Some(live),
+                    is_unattended(ctx.conversation_id(), context.map(|c| c.as_ref())),
                 )
                 .await;
         }
@@ -4035,8 +4042,18 @@ impl LlmAgent {
         let work = self.step_work(call, self.source_note(notes, &call.name), prepared);
         let outcome: Result<ToolOutput, ToolError> =
             ctx.step(&format!("tool:{}", call.id), move || work).await?;
-        self.conclude(ctx, notes, call, outcome, &unjournaled, files_used, None)
-            .await
+        let unattended = is_unattended(ctx.conversation_id(), context.map(|c| c.as_ref()));
+        self.conclude(
+            ctx,
+            notes,
+            call,
+            outcome,
+            &unjournaled,
+            files_used,
+            None,
+            unattended,
+        )
+        .await
     }
 
     /// What the call's recorded outcome means for the run: the message that answers it, its artifacts
@@ -4053,6 +4070,7 @@ impl LlmAgent {
         unjournaled: &Mutex<SandboxUsage>,
         files_used: u64,
         live: Option<Live>,
+        unattended: bool,
     ) -> Result<(ToolResult, SandboxUsage), AgentError> {
         let silent = self
             .source_note(notes, &call.name)
@@ -4170,12 +4188,21 @@ impl LlmAgent {
                 | ToolError::AwaitRemote { .. },
             ) if live.is_some() => ToolResult::error(&call.id, NOT_ALONGSIDE.to_owned()),
             // Nobody answers a firing of a schedule: the question is refused, and the model goes on.
-            Err(ToolError::NeedsInput { question, .. }) if is_unattended(ctx.conversation_id()) => {
-                say(ctx, silent, end(StepState::Failed)).await;
-                ToolResult::error(
-                    &call.id,
-                    format!("{UNATTENDED}. The question was: {question}"),
+            Err(ToolError::NeedsInput { question, .. }) if unattended => {
+                let reason = format!("{UNATTENDED}. The question was: {question}");
+                say(
+                    ctx,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        StepState::Failed,
+                        Some((&reason, true)),
+                        notes,
+                    ),
                 )
+                .await;
+                ToolResult::error(&call.id, backstop(&reason, &call.name, false).into_owned())
             }
             Err(ToolError::NeedsInput { question, ui }) => {
                 say(ctx, silent, end(StepState::Waiting)).await;

@@ -1109,6 +1109,51 @@ async fn ask_user_parks_and_an_a2a_follow_up_resumes(store: DynStore) {
     );
 }
 
+// ----------------------------------------------- a firing of a schedule
+
+/// A firing of a schedule that stops where a person's run would wait, on a question, ends `Failed`
+/// naming why and quoting the question: nobody answers it (ADR 0060). Started the way the scheduler
+/// starts one, on the runtime, in the firing's conversation and with its context.
+async fn a_firing_that_stops_on_a_question_fails_instead_of_waiting(store: DynStore) {
+    let fx = Fixture::new().await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Which repository, which base branch and what is the task?");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let run = RunId::new();
+    let first = adam_runtime::Inbound::new(
+        "message",
+        serde_json::json!({
+            "text": "Do the nightly chores.",
+            "context": { adam_runtime::UNATTENDED_CONTEXT_KEY: true },
+        }),
+    );
+    server
+        .coder
+        .runtime
+        .start_with_id(
+            run,
+            AGENT_NAME,
+            first,
+            Some("adam.schedule:coder/nightly@2026-12-24T17:00:00Z"),
+        )
+        .await
+        .unwrap();
+    let done = wait_for(&server.coder.runtime, run, "the firing to end", |v| {
+        v.status.is_terminal()
+    })
+    .await;
+    worker.stop().await;
+    assert_eq!(done.status, RunStatus::Failed, "{done:?}");
+    assert!(!done.waiting);
+    let error = done.error.unwrap_or_default();
+    assert!(
+        error.contains("nobody answers it") && error.contains("what is the task?"),
+        "{error}"
+    );
+    assert_eq!(mock.requests().len(), 1, "the model is not asked again");
+}
+
 // ----------------------------------------------- a stop with nothing delivered
 
 /// The owner's report: the person typed "Hi", the model answered in plain text without calling
@@ -5429,6 +5474,7 @@ macro_rules! coder_suite {
                 a_scratch_project_is_published_to_the_repository_the_person_names,
                 ask_user_parks_and_an_a2a_follow_up_resumes,
                 a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run,
+                a_firing_that_stops_on_a_question_fails_instead_of_waiting,
                 a_question_is_answered_from_a_look_around_and_costs_no_check_cycles,
                 an_answer_that_asks_nothing_completes_the_task,
                 work_left_in_a_worktree_is_not_finished_by_a_statement,

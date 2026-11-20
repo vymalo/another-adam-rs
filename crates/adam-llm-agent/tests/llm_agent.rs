@@ -1611,11 +1611,31 @@ async fn needs_input_in_a_firing_of_a_schedule_is_refused_and_the_run_goes_on() 
         )),
         "nothing is asked of a person"
     );
-    assert!(adam_llm_agent::is_unattended(Some(
-        "adam.schedule:llm/nightly@x"
-    )));
-    assert!(!adam_llm_agent::is_unattended(Some("token-1:chat")));
-    assert!(!adam_llm_agent::is_unattended(None));
+    // The asking call's step failed, saying why.
+    let ended: Vec<_> = h
+        .events(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::Step(step) if step.id == "tool:c1" => Some(step.state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ended.last(), Some(&StepState::Failed), "{ended:?}");
+    let ctx = |v: serde_json::Value| v.as_object().cloned().unwrap();
+    assert!(adam_llm_agent::is_unattended(
+        Some("adam.schedule:llm/nightly@x"),
+        None
+    ));
+    assert!(adam_llm_agent::is_unattended(
+        None,
+        Some(&ctx(json!({ "adam.unattended": true })))
+    ));
+    assert!(!adam_llm_agent::is_unattended(
+        None,
+        Some(&ctx(json!({ "adam.unattended": "yes" })))
+    ));
+    assert!(!adam_llm_agent::is_unattended(Some("token-1:chat"), None));
+    assert!(!adam_llm_agent::is_unattended(None, None));
 }
 
 #[tokio::test]
