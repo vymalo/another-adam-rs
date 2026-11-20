@@ -69,8 +69,11 @@ context; a send to one names its latest run in `referenceTaskIds`, which the bac
 
 **Not yet** (the next pull requests of slice 4): the example embedder; the proof that a killed process resumes its run,
 which needs the durable store of slice 3 (today `a_dropped_engine_resumes_its_run` proves it in memory, below); a way
-to read a file artifact's bytes (`RunInfo` carries no artifacts yet, and an event carries none, below). Approvals are
-slice 5: today a run waits only on a question, and `answer` answers it.
+to read a file artifact's bytes (`RunInfo` carries no artifacts yet, and an event carries none, below). The backend is
+given the engine's ring too, and its A2A streaming path (`TaskBackend::subscribe`) builds a file part from a live
+event's bytes: the engine never calls it, and a future caller that streams a task through it must read files from the
+store, since the ring withholds them. Approvals are slice 5: today a run waits only on a question, and `answer`
+answers it.
 
 ## A run's events
 
@@ -92,11 +95,16 @@ while let Some(event) = events.next().await {
 
 * **The store is the truth** (rule 5: a notification is never the truth). A live event is a prompt: a `Status` makes the
   stream read the run, and `Ended` is that read; with no event for 2 s it reads the run anyway, so an end nobody
-  announced is not missed. `Ended` is the last item, and the stream ends after it.
+  announced is not missed.
+* **How it ends.** With `Ended`, the last item; or with one `Err`, then nothing: `EngineError::Stopped` (`Rejected`)
+  once the worker has stopped and the run has not ended (after `shutdown`, at once rather than at a poll; when every
+  `Engine` is dropped; when the worker failed), since nothing would step it; `NotFound` if the run is gone; or the
+  store's error when a read fails. Call `events` again on a live engine to go on.
 * **Bounded whatever the reader does.** The runtime emits into one ring (`tokio::sync::broadcast`) of `event_capacity`
   events, every run's, one copy shared by every reader. A reader that does not keep up holds nothing more: the ring
   overwrites its oldest events, and the reader learns it on its next read, `Behind { skipped }` (how many events of the
-  engine it missed, every run's, so at most that many of this run's), then at once `Snapshot(RunInfo)` read from the
+  engine it missed, **every run's**: a quiet run beside busy ones can get `Behind` with none of its own events lost), then
+  at once `Snapshot(RunInfo)` read from the
   store, or `Ended` if the run is over. The live events after a `Snapshot` may have been emitted before it: take a text
   piece by its `offset` and a step by its `id`. A stream holds besides the run's recent events it started with (the
   runtime's replay: at most `REPLAY_EVENTS_PER_RUN`, 64, of the run, within its 16 MiB for every run, see
@@ -105,14 +113,17 @@ while let Some(event) = events.next().await {
   `Behind`, then `Ended` with the whole output.
 * **What an event weighs.** A text piece is at most 1 KiB (`MAX_TEXT_DELTA_BYTES`), a step's end about 12 KiB of input and
   output. **A file artifact's bytes are taken out** before the event enters the ring (the engine's sink; a file can be
-  4 MiB): its `name`, `mime_type` and `filename` are kept and `bytes` is empty, and the file is durable with the run.
+  4 MiB): its `name`, `mime_type` and `filename` are kept, `bytes` is empty, and `data` (`null` for a file in the
+  runtime's own events) says what was withheld, `{"withheld": {"bytes": <len>, "sha256": "<hex>"}}`, which
+  `WithheldFile::of(&event)` reads (`len`, and the `sha256` that `Artifact::file_sha256` gives). Every file of an
+  engine's events says it, an empty one too (`len` 0), so a stripped file is never taken for an empty one. The file is
+  durable with the run.
   Not bounded by the engine: a `Custom` event's payload and a JSON artifact's `data`, which are what the agent's tools
   make.
 * **Unknown and ended runs.** `events` of a run the engine does not have is `NotFound`, at the call. A run that has
-  already ended gives `Ended` at once and nothing else. A failed read of the store is an `Err` item, and ends the stream:
-  call `events` again.
+  already ended gives `Ended` at once and nothing else.
 * **It does not keep the engine alive.** Drop every `Engine` and the worker stops as a killed process would; an open
-  stream ends then, with no `Ended`.
+  stream ends then, with `Stopped`.
 
 ## The crates it is built from
 
@@ -127,7 +138,8 @@ re-exports them:
 | [`adam-runtime`](../adam-runtime/README.md), [`adam-llm-agent`](../adam-llm-agent/README.md), [`adam-core`](../adam-core/README.md), [`adam-agent-fs`](../adam-agent-fs/README.md), [`adam-model`](../adam-model/README.md), [`adam-error`](../adam-error/README.md) | nothing: they have no server parts |
 
 It also depends on `a2a-lf` (the A2A types, data only: ADR 0047's confirmed decision 1), `tokio` (`rt`, `sync`,
-`time`), `futures` (the `Stream` of a run's events), `async-trait` (the engine's event sink), `thiserror` and `uuid`.
+`time`), `futures` (the `Stream` of a run's events), `async-trait` (the engine's event sink), `serde_json` (what a
+withheld file says), `thiserror` and `uuid`.
 
 ## The dependency check
 
@@ -176,20 +188,29 @@ every wait is bounded by `tokio::time::timeout`:
 * `a_slow_reader_stays_bounded`: a ring of 16 and a reply of 256 KiB (256 pieces); the reader reads only after the run
   is done, and gets at most `REPLAY_EVENTS_PER_RUN + 16` live events, `Behind { skipped > 0 }`, then `Ended` with the
   whole output read from the store;
+* `a_reader_behind_a_running_run_gets_a_snapshot`: the same ring, a reply of many pieces and then a question; the
+  reader reads once the run waits, gets `Behind`, then a `Snapshot` (`Waiting`, the question), and after the answer
+  follows the run live to `Ended(Done)`;
 * `events_of_an_unknown_run_and_of_a_finished_one`: `NotFound` at the call, and `Ended` alone;
+* `a_stream_ends_stopped_after_shutdown`: a stream on a waiting run, and one opened after `shutdown`, end with
+  `Stopped`, under a second, not at a poll;
 * `a_dropped_engine_resumes_its_run`, the in-memory stand-in for a killed process: two engines over one `MemoryStore`
   (`Arc`), engine A (a lease of 300 ms) dropped while its run's second model call is in flight (its worker aborted, its
-  open stream ended with no `Ended`), and engine B finishing the run once A's lease runs out; B's model is called once,
-  and its request ends with the result of the tool A's committed step called, so the committed step is kept and not
-  run again. PR 4 of the slice adds the real proof: a process killed with `SIGKILL` over the SQLite store of slice 3,
+  open stream ended with `Stopped`), and engine B, its script written before its worker starts, finishing the run once
+  A's lease runs out; B's model is called once, its request holds the tool's result once and ends with it, and B's
+  stream, opened while B's first model call waits at a gate (so it starts with all B did since it claimed the run),
+  shows the tool's step never run again: the committed step is kept. PR 4 of the slice adds the real proof: a process killed with `SIGKILL` over the SQLite store of slice 3,
   and another process finishing its run;
 * `start_refuses_what_it_cannot_build` (a zero lease and a ring of 0 or over 65 536 too; it passes alone and with
   `--features adam-assembly/mcp,adam-assembly/remote`, the set CI's workspace build unifies) and `start_outside_a_tokio_runtime_is_refused`: fail
   closed.
 
 In `src/`: `a_name_the_environment_has_is_refused_by_the_engines_default` (slice 2's proof),
-`the_sink_keeps_file_bytes_out_of_the_ring` (the chat agent's tools make no file, so the stripping is tested on the
-sink: a file's event reaches a reader with its name and no bytes, every other event as it was), and
+`the_sink_keeps_file_bytes_out_of_the_ring` and `a_withheld_file_says_its_length_and_digest` (a file's event reaches a
+reader with its name, its length and SHA-256 and no bytes, an empty file says it is one, every other event is as it
+was), `the_engines_runtime_withholds_file_bytes_from_the_ring_only` (the chat agent's tools make no file, so a stub agent
+makes one on the runtime `start` builds, `runtime_with_ring`: the ring has the bytes withheld, the committed record has
+them all), and
 `every_backend_refusal_keeps_its_class` and `a_refusal_for_the_state_says_the_state_it_read` (the races a test cannot
 make happen on cue).
 

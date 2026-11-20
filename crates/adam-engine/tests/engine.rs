@@ -12,10 +12,10 @@ use adam_engine::adam_assembly::{AgentDef, Error as AssemblyError};
 use adam_engine::adam_core::{DynStore, MemoryStore, RunId};
 use adam_engine::adam_error::{Classify, ErrorClass};
 use adam_engine::adam_model::{
-    DynModel, Message as ModelMessage, MockModel, ModelClient, ModelDelta, ModelError,
+    ContentPart, DynModel, Message as ModelMessage, MockModel, ModelClient, ModelDelta, ModelError,
     ModelRequest, ModelResponse, ToolCall,
 };
-use adam_engine::adam_runtime::{REPLAY_EVENTS_PER_RUN, RunEvent};
+use adam_engine::adam_runtime::{REPLAY_EVENTS_PER_RUN, RunEvent, StepState};
 use adam_engine::{
     ConversationId, Delivered, Engine, EngineError, EngineEvent, Limits, ListQuery, RunEvents,
     RunInfo, RunState, Say, default_secrets,
@@ -112,12 +112,19 @@ impl Rig {
     }
 
     async fn with_limits(hold_on: Option<usize>, limits: Limits) -> Self {
-        Self::on_store(Arc::new(MemoryStore::new()), hold_on, limits).await
+        Self::on_store(Arc::new(MemoryStore::new()), hold_on, limits, |_| {}).await
     }
 
-    /// An engine over `store`, which another engine may share.
-    async fn on_store(store: DynStore, hold_on: Option<usize>, limits: Limits) -> Self {
+    /// An engine over `store`, which another engine may share, its model's replies written by
+    /// `script` before the worker starts: a run already in the store may be claimed at once.
+    async fn on_store(
+        store: DynStore,
+        hold_on: Option<usize>,
+        limits: Limits,
+        script: impl FnOnce(&MockModel),
+    ) -> Self {
         let mock = Arc::new(MockModel::new());
+        script(&mock);
         let gate = Arc::new(Gate::default());
         let model: DynModel = Arc::new(GateModel {
             inner: mock.clone(),
@@ -738,16 +745,38 @@ fn plan() -> ToolCall {
     }
 }
 
-/// Every item of `events` until it ends, each read within `WAIT`.
-async fn read_to_the_end(events: &mut RunEvents) -> Vec<EngineEvent> {
+/// Every item of `events` until it ends, each read within `WAIT`, and the error it ended with.
+async fn read_all(events: &mut RunEvents) -> (Vec<EngineEvent>, Option<EngineError>) {
     let mut got = Vec::new();
     loop {
         match timeout(WAIT, events.next()).await {
-            Ok(Some(item)) => got.push(item.expect("no error on the stream")),
-            Ok(None) => return got,
+            Ok(Some(Ok(event))) => got.push(event),
+            Ok(Some(Err(error))) => {
+                let after = timeout(WAIT, events.next()).await.expect("the stream ends");
+                assert!(after.is_none(), "an item after the error: {after:?}");
+                return (got, Some(error));
+            }
+            Ok(None) => return (got, None),
             Err(_) => panic!("the stream neither said more nor ended; so far: {got:?}"),
         }
     }
+}
+
+/// Every item of `events` until it ends, none an error.
+async fn read_to_the_end(events: &mut RunEvents) -> Vec<EngineEvent> {
+    let (got, error) = read_all(events).await;
+    assert!(error.is_none(), "{error:?} after {got:?}");
+    got
+}
+
+/// The stream ended on `Stopped`, and said no `Ended` before it.
+fn assert_stopped(got: &[EngineEvent], error: Option<EngineError>) {
+    let error = error.unwrap_or_else(|| panic!("the stream ended with no error after {got:?}"));
+    assert!(matches!(error, EngineError::Stopped), "{error:?}");
+    assert!(
+        !got.iter().any(|e| matches!(e, EngineEvent::Ended(_))),
+        "{got:?}"
+    );
 }
 
 /// The text pieces among `events`, joined.
@@ -894,15 +923,18 @@ async fn events_of_an_unknown_run_and_of_a_finished_one() {
 
 /// The in-memory stand-in for a killed process: engine A is dropped while its run's second model
 /// call is in flight, and engine B, over the same store, finishes the run once A's lease runs out.
-/// The step A committed is kept: B's model is called once, for the step after it.
+/// The step A committed is kept: B's model is called once, for the step after it, and the tool that
+/// step called is not run again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dropped_engine_resumes_its_run() {
     let store = Arc::new(MemoryStore::new());
     let mut limits = Limits::default();
     limits.lease_ttl = Duration::from_millis(300);
 
-    let a = Rig::on_store(store.clone(), Some(1), limits).await;
-    a.mock.push_tool_calls(vec![plan()]).push_text("never said");
+    let a = Rig::on_store(store.clone(), Some(1), limits, |mock| {
+        mock.push_tool_calls(vec![plan()]).push_text("never said");
+    })
+    .await;
     let turn = a.engine.send(None, Say::new("plan it")).await.unwrap();
     a.gate.wait_reached().await;
     let mut a_events = a.engine.events(turn.run).await.unwrap();
@@ -912,22 +944,39 @@ async fn a_dropped_engine_resumes_its_run() {
         engine,
     } = a;
     drop(engine);
-    // A stream does not keep the engine alive: it ends with it, without an `Ended`.
-    let heard = read_to_the_end(&mut a_events).await;
-    assert!(
-        !heard.iter().any(|e| matches!(e, EngineEvent::Ended(_))),
-        "{heard:?}"
-    );
+    // A stream does not keep the engine alive: it ends with it, `Stopped`.
+    let (heard, error) = read_all(&mut a_events).await;
+    assert_stopped(&heard, error);
     assert_eq!(
         a_mock.requests().len(),
         1,
         "A's second call never reached its model"
     );
 
-    let b = Rig::on_store(store, None, limits).await;
-    b.mock.push_text("finished by B");
-    let done = b.wait(turn.run, RunState::Done).await;
-    assert_eq!(done.output.as_deref(), Some("finished by B"));
+    // B's first model call waits at its gate: everything B did since it claimed the run is in the
+    // replay its stream starts with, so a tool B ran again would be seen.
+    let b = Rig::on_store(store, Some(0), limits, |mock| {
+        mock.push_text("finished by B");
+    })
+    .await;
+    b.gate.wait_reached().await;
+    let mut b_events = b.engine.events(turn.run).await.unwrap();
+    b.gate.release.notify_one();
+    let heard = read_to_the_end(&mut b_events).await;
+    let tool_runs = heard
+        .iter()
+        .filter(|e| {
+            matches!(e, EngineEvent::Live(RunEvent::Step(step))
+                if step.id == "tool:plan-1" && step.state == StepState::Running)
+        })
+        .count();
+    assert_eq!(tool_runs, 0, "B ran A's tool again: {heard:?}");
+    match heard.last() {
+        Some(EngineEvent::Ended(done)) => {
+            assert_eq!(done.output.as_deref(), Some("finished by B"));
+        }
+        other => panic!("B's stream ended on {other:?}"),
+    }
 
     let requests = b.mock.requests();
     assert_eq!(
@@ -940,10 +989,101 @@ async fn a_dropped_engine_resumes_its_run() {
         messages.contains(&ModelMessage::user_text("plan it")),
         "{messages:?}"
     );
+    let results = messages
+        .iter()
+        .filter(|m| matches!(m, ModelMessage::Tool { call_id, .. } if call_id == "plan-1"))
+        .count();
+    assert_eq!(results, 1, "the tool ran once: {messages:?}");
     let last = messages.last().expect("a message");
     assert!(
         matches!(last, ModelMessage::Tool { call_id, is_error: false, .. } if call_id == "plan-1"),
         "B continued from A's committed step, the plan's result: {last:?}"
     );
     b.stop().await;
+}
+
+/// After `shutdown`, a stream on a run that has not ended ends with `Stopped` at once, and so does
+/// one opened after it: nothing would step the run, so nothing is polled for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_ends_stopped_after_shutdown() {
+    let rig = Rig::new(None).await;
+    rig.mock.push_tool_calls(vec![ask("Shall I go on?")]);
+    let turn = rig.engine.send(None, Say::new("start")).await.unwrap();
+    rig.wait(turn.run, RunState::Waiting).await;
+    let mut before = rig.engine.events(turn.run).await.unwrap();
+
+    timeout(WAIT, rig.engine.shutdown())
+        .await
+        .expect("the worker stops")
+        .unwrap();
+    let started = std::time::Instant::now();
+    let (got, error) = read_all(&mut before).await;
+    assert_stopped(&got, error);
+    let mut after = rig.engine.events(turn.run).await.unwrap();
+    let (got, error) = read_all(&mut after).await;
+    assert_stopped(&got, error);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the streams ended at once, not at a poll: {:?}",
+        started.elapsed()
+    );
+}
+
+/// A reader that falls behind a run that is still going gets `Behind`, then a `Snapshot` of the run
+/// as it is, then follows it live to `Ended`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_behind_a_running_run_gets_a_snapshot() {
+    let mut limits = Limits::default();
+    limits.event_capacity = 16;
+    let rig = Rig::with_limits(Some(0), limits).await;
+    // Many pieces of text, then a question: the run waits, and has not ended.
+    let long = "1234567\n".repeat(16 * 1024);
+    let mut asking = ModelResponse::tool_calls(vec![ask("Shall I go on?")]);
+    if let ModelMessage::Assistant { content, .. } = &mut asking.message {
+        *content = vec![ContentPart::text(long)];
+    }
+    rig.mock.push_response(asking).push_text("done");
+    let turn = rig
+        .engine
+        .send(None, Say::new("write, then ask"))
+        .await
+        .unwrap();
+    rig.gate.wait_reached().await;
+    let mut events = rig.engine.events(turn.run).await.unwrap();
+    rig.gate.release.notify_one();
+    rig.wait(turn.run, RunState::Waiting).await;
+
+    let mut got = Vec::new();
+    let snapshot = loop {
+        let event = timeout(WAIT, events.next())
+            .await
+            .expect("an item")
+            .expect("the stream goes on")
+            .expect("no error");
+        if let EngineEvent::Snapshot(info) = &event {
+            break info.clone();
+        }
+        assert!(
+            !matches!(event, EngineEvent::Ended(_)),
+            "the run has not ended: {got:?}"
+        );
+        got.push(event);
+    };
+    assert!(
+        matches!(got.last(), Some(EngineEvent::Behind { skipped }) if *skipped > 0),
+        "a Snapshot follows Behind: {got:?}"
+    );
+    assert_eq!(snapshot.state, RunState::Waiting);
+    assert_eq!(snapshot.question.as_deref(), Some("Shall I go on?"));
+
+    rig.engine.answer(turn.run, Say::new("yes")).await.unwrap();
+    let rest = read_to_the_end(&mut events).await;
+    match rest.last() {
+        Some(EngineEvent::Ended(info)) => {
+            assert_eq!(info.state, RunState::Done);
+            assert_eq!(info.output.as_deref(), Some("done"));
+        }
+        other => panic!("the stream ended on {other:?}"),
+    }
+    rig.stop().await;
 }

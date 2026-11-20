@@ -13,7 +13,7 @@ use adam_assembly::AgentDef;
 use adam_core::{DynSecretSource, DynStore, RunId};
 use adam_llm_agent::DEFAULT_MAX_PARALLEL;
 use adam_model::DynModel;
-use adam_runtime::{BroadcastSink, Runtime, RuntimeError};
+use adam_runtime::{BroadcastSink, Runtime, RuntimeBuilder, RuntimeError};
 use adam_ui::Ui;
 use tokio::sync::{RwLock, RwLockReadGuard, oneshot, watch};
 use tokio::task::AbortHandle;
@@ -149,13 +149,12 @@ impl EngineBuilder {
             .map_err(|e| EngineError::Agent(Box::new(e)))?;
         store.migrate().await.map_err(EngineError::Store)?;
 
-        let events = BroadcastSink::new(limits.event_capacity);
-        let runtime = assembly
-            .register(Runtime::builder(store))
-            .event_sink(EngineSink(events.clone()))
-            .concurrency(limits.concurrency)
-            .lease_ttl(limits.lease_ttl)
-            .build();
+        let (runtime, events) =
+            runtime_with_ring(assembly.register(Runtime::builder(store)), &limits);
+        // The backend is given the same ring, for the A2A path that streams a task
+        // (`TaskBackend::subscribe`), whose file parts are built from a live event's bytes. The engine
+        // never calls that path: an artifact in this ring has its bytes withheld, so a caller that
+        // streams a task through this backend must read files from the store.
         let backend = RuntimeTaskBackend::new(runtime.clone(), events.clone(), name.clone());
 
         let (stop, stopped) = oneshot::channel::<()>();
@@ -199,9 +198,24 @@ impl EngineBuilder {
     }
 }
 
+/// The runtime `builder` builds (its agents registered) within `limits`, and the ring its events go
+/// to: through [`EngineSink`], which withholds a file artifact's bytes.
+pub(crate) fn runtime_with_ring(
+    builder: RuntimeBuilder,
+    limits: &Limits,
+) -> (Runtime, BroadcastSink) {
+    let events = BroadcastSink::new(limits.event_capacity);
+    let runtime = builder
+        .event_sink(EngineSink(events.clone()))
+        .concurrency(limits.concurrency)
+        .lease_ttl(limits.lease_ttl)
+        .build();
+    (runtime, events)
+}
+
 /// How the worker task ended.
 #[derive(Clone)]
-enum Ended {
+pub(crate) enum Ended {
     Clean,
     Failed(Arc<RuntimeError>),
     Aborted,
@@ -450,7 +464,9 @@ impl Engine {
     /// [`Snapshot`](crate::EngineEvent::Snapshot) read from the store.
     ///
     /// The subscription is made when this returns, so a reader may read later: what it missed in
-    /// between is either in the ring or said by `Behind`.
+    /// between is either in the ring or said by `Behind`. Once the worker has stopped
+    /// ([`shutdown`](Self::shutdown), or every engine dropped) with the run unfinished, the stream
+    /// ends with [`EngineError::Stopped`].
     ///
     /// # Errors
     ///
@@ -467,6 +483,7 @@ impl Engine {
             run,
             subscription,
             Arc::downgrade(&self.shared),
+            self.shared.worker.ended.clone(),
             info,
         ))
     }
@@ -651,4 +668,126 @@ fn message(say: &Say) -> Message {
     let mut message = Message::new(Role::User, vec![Part::text(say.text.clone())]);
     message.message_id = say.id.clone();
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use adam_core::{MemoryStore, RunStatus};
+    use adam_runtime::{Agent, AgentError, Artifact, Ctx, Inbound, RunEvent, Transition};
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::WithheldFile;
+
+    const FILE: &[u8] = b"the bytes of the file, kept with the run";
+
+    /// One step: it makes a file, and is done.
+    struct MakesAFile;
+
+    #[async_trait]
+    impl Agent for MakesAFile {
+        type State = Value;
+
+        fn name(&self) -> &str {
+            "maker"
+        }
+
+        fn init(&self, _: Inbound) -> Result<Value, AgentError> {
+            Ok(Value::Null)
+        }
+
+        async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Transition<Value>, AgentError> {
+            let file = Artifact::file("notes", "text/plain", "notes.txt", FILE.to_vec())
+                .map_err(AgentError::permanent)?;
+            ctx.emit(file.into()).await;
+            Ok(Transition::Done {
+                state,
+                output: json!("made"),
+            })
+        }
+    }
+
+    /// The engine's runtime puts a file's event into its ring with the bytes withheld, while the
+    /// run's committed record keeps every byte.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_engines_runtime_withholds_file_bytes_from_the_ring_only() {
+        let store: DynStore = Arc::new(MemoryStore::new());
+        store.migrate().await.unwrap();
+        let (runtime, ring) = runtime_with_ring(
+            Runtime::builder(store).agent(MakesAFile),
+            &Limits::default(),
+        );
+        let run = runtime
+            .start("maker", Inbound::new("message", json!({})), None)
+            .await
+            .unwrap();
+        let mut reader = ring.subscribe_run(run);
+        let (stop, stopped) = oneshot::channel::<()>();
+        let worker = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime
+                    .run_worker(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+            })
+        };
+
+        let event = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let event = reader.recv().await.expect("the ring is open");
+                if matches!(event, RunEvent::Artifact { .. }) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the file's event");
+        let RunEvent::Artifact {
+            file: Some(file), ..
+        } = &event
+        else {
+            panic!("not a file: {event:?}");
+        };
+        assert!(
+            file.bytes.is_empty(),
+            "{} bytes in the ring",
+            file.bytes.len()
+        );
+        let sha256 = Artifact::file("notes", "text/plain", "notes.txt", FILE.to_vec())
+            .unwrap()
+            .file_sha256()
+            .unwrap();
+        assert_eq!(
+            WithheldFile::of(&event),
+            Some(WithheldFile {
+                len: FILE.len() as u64,
+                sha256
+            })
+        );
+
+        let view = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let view = runtime.view(run).await.unwrap().expect("the run");
+                if view.status == RunStatus::Done {
+                    return view;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the run is done");
+        let kept = view.artifacts[0].file.as_ref().expect("a file");
+        let bytes = runtime
+            .artifact_bytes(kept)
+            .await
+            .unwrap()
+            .expect("its bytes");
+        assert_eq!(&*bytes, FILE, "the record keeps the whole file");
+
+        let _ = stop.send(());
+        worker.await.unwrap().unwrap();
+    }
 }
