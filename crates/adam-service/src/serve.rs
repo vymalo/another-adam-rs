@@ -35,8 +35,9 @@ use adam_core::{ClaimScope, DynStore, StoreError};
 use adam_error::BoxError;
 use adam_host::{Host, HostError, Placement};
 use adam_notify_postgres::PgNotify;
+use adam_postgres::PgConfig;
 use adam_runtime::{BroadcastSink, Runtime, RuntimeBuilder};
-use adam_store_postgres::PgStore;
+use adam_store_postgres::{PgStore, pool_size_from_env};
 use secrecy::ExposeSecret as _;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -455,15 +456,21 @@ async fn run(
     }
     // The store connects lazily so that the process's own configuration is checked before it
     // depends on the database: a mistake of the binary is exit 78 whether or not Postgres answers.
-    let pg =
-        PgStore::connect_lazy(config.database_url.expose_secret()).map_err(ServeError::Connect)?;
+    // `DATABASE_URL` is parsed once: the store and the notification listener share the parse, and
+    // its TLS connector.
+    let pg_config =
+        PgConfig::parse(config.database_url.expose_secret()).map_err(ServeError::Connect)?;
+    let pool_size = pool_size_from_env().map_err(ServeError::Connect)?;
+    let pg = PgStore::from_config(pg_config.clone(), pool_size).map_err(ServeError::Connect)?;
     let pool = pg.pool().clone();
     let store: DynStore = Arc::new(pg.clone());
 
     // Events and wake-up/cancel signals cross processes over `NOTIFY` on the store's own pool. The
-    // listener (`notify.run`) is a host component below; the runtime only holds the two halves.
+    // listener (`notify.run`) opens its own connection from the same config; the runtime only
+    // holds the two halves.
     let broadcast = BroadcastSink::default();
-    let notify = PgNotify::new(pool, broadcast.clone()).local_only(config.notify_local_only);
+    let notify =
+        PgNotify::new(pool, pg_config, broadcast.clone()).local_only(config.notify_local_only);
     let push_events = broadcast.clone();
     let live = LiveSignals {
         broadcast,

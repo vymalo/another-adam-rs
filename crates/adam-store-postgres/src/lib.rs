@@ -38,6 +38,15 @@
 //!   change, so a retried put is one no-op.
 //!
 //! No transaction is held open while agent code runs.
+//!
+//! # Driver
+//!
+//! The statements, the tables and the wire bytes are the ones `sqlx` wrote; only the driver
+//! changed ([ADR 0053](../../docs/decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)).
+//! Statements are prepared once per connection (`prepare_cached`), time columns bind
+//! `adam_core::time::Timestamp` directly through `postgres-types`' `with-jiff-0_2`, and the
+//! migration and the notification listener take a connection out of the pool (`Object::take`)
+//! so a session lock or a `LISTEN` never returns to it.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -46,18 +55,17 @@ use std::time::Duration;
 use adam_core::store::{add_ttl, now, sched_at, storable, truncate_ms};
 use adam_core::time::Timestamp;
 use adam_core::{
-    BlobId, ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun,
-    PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
+    BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig,
+    NewRun, PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
     RunUpdate, Store, StoreError, StoreResult,
 };
 use adam_error::ErrorClass;
+use adam_postgres::{PgConfig, classify, classify_pool};
 use async_trait::async_trait;
+use deadpool_postgres::{ClientWrapper, Object, Pool};
 use serde_json::Value;
-use sqlx::encode::IsNull;
-use sqlx::error::BoxDynError;
-use sqlx::postgres::{PgArgumentBuffer, PgConnection, PgPool, PgPoolOptions, PgRow, PgValueRef};
-use sqlx::types::Json;
-use sqlx::{AssertSqlSafe, Connection, Decode, Encode, Executor, Postgres, Row, Type};
+use tokio_postgres::Row;
+use tokio_postgres::types::{FromSql, ToSql};
 use uuid::Uuid;
 
 /// Current schema version written to the `<prefix>meta` table.
@@ -73,7 +81,20 @@ use uuid::Uuid;
 /// * 5, part 1: file bytes out of the run. `adam_blob` holds content-addressed bytes and
 ///   `adam_run_blob` the digests each run references (`ON DELETE CASCADE`); the upgrade is
 ///   metadata-only (two new tables and their indexes, no rewrite of `runs`).
-pub const SCHEMA_VERSION: i32 = 5;
+/// * 5, part 2 (schema version 6): the head and the append-only body. `runs.head` is the v5 head
+///   and `runs.head_version` the version it was written at (a head a later commit did not rebuild
+///   is stale and is not served); `adam_body` holds one row per transcript message, keyed
+///   `(run_id, generation, idx)`, `ON DELETE CASCADE`. The upgrade is metadata-only.
+pub const SCHEMA_VERSION: i32 = 6;
+
+/// How old a foreign attempt's body row must be before a commit may collect it: the insert→CAS gap
+/// is milliseconds, and the runtime's default lease is 30 s, so five minutes separates a dead
+/// attempt from a live one.
+const BODY_ORPHAN_GRACE: jiff::SignedDuration = jiff::SignedDuration::from_mins(5);
+
+/// How old a superseded body generation must be before a commit collects it: a reader that opened
+/// the old head keeps a grace period, and the generation a head names is never collected.
+const BODY_GC_GRACE: jiff::SignedDuration = jiff::SignedDuration::from_hours(1);
 
 /// Purge deletes in batches of this many runs (plus their journals).
 const PURGE_BATCH: i64 = 500;
@@ -84,10 +105,11 @@ pub const DEFAULT_POOL_SIZE: u32 = 16;
 
 /// The smallest pool `ADAM_PG_POOL_SIZE` or [`PgStore::connect_with_pool_size`] accepts.
 ///
-/// Two, not one: `adam-service` builds its `adam-notify-postgres` listener on the store's own
-/// pool, and `PgListener::connect_with(&pool)` holds one connection for the process's life. A
-/// one-connection pool hands that connection to the listener, and every store query then waits
-/// out sqlx's acquire timeout — for ever, while startup succeeded and the pod reports Ready.
+/// Two, not one: a one-connection pool serializes every store call behind whichever query is
+/// running, and a migration that holds the connection (the session advisory lock) would leave a
+/// healthy process unable to answer. The `adam-notify-postgres` listener has its own connection
+/// and does not take one from the pool, but the floor is kept so a deployment that sets one does
+/// not silently lose that headroom.
 ///
 /// Two is the floor, not a size to run: [`DEFAULT_POOL_SIZE`] (16) is the intended size.
 pub const MIN_POOL_SIZE: u32 = 2;
@@ -111,7 +133,7 @@ const RUN_HEADER_COLUMNS: &str = "id, agent, conversation_id, parent_id, status,
 /// A [`Store`] backed by PostgreSQL (12+).
 #[derive(Clone, Debug)]
 pub struct PgStore {
-    pool: PgPool,
+    pool: Pool,
     sql: Sql,
 }
 
@@ -126,18 +148,9 @@ impl PgStore {
     /// [`MAX_POOL_SIZE`]), whatever the environment says. Call [`Store::migrate`] before first
     /// use.
     pub async fn connect_with_pool_size(url: &str, max_connections: u32) -> StoreResult<Self> {
-        if !(MIN_POOL_SIZE..=MAX_POOL_SIZE).contains(&max_connections) {
-            return Err(StoreError::InvalidInput(format!(
-                "pool size {max_connections} is out of range ({MIN_POOL_SIZE} to {MAX_POOL_SIZE}): \
-                 a one-connection pool cannot serve the notify listener and a query at the same time"
-            )));
-        }
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            .connect(url)
-            .await
-            .map_err(classify)?;
-        Ok(Self::from_pool(pool))
+        let store = Self::connect_lazy_with_pool_size(url, max_connections)?;
+        store.ping().await?;
+        Ok(store)
     }
 
     /// Like [`connect`](Self::connect), with the same [`ADAM_PG_POOL_SIZE`](pool_size_from_env)
@@ -145,23 +158,41 @@ impl PgStore {
     /// own configuration before it depends on the database builds on this, then calls
     /// [`ping`](Self::ping). Fails on a URL the driver cannot parse or a pool size out of range.
     pub fn connect_lazy(url: &str) -> StoreResult<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(pool_size_from_env()?)
-            .connect_lazy(url)
-            .map_err(classify)?;
+        Self::connect_lazy_with_pool_size(url, pool_size_from_env()?)
+    }
+
+    /// [`connect_lazy`](Self::connect_lazy) with an explicit pool size.
+    fn connect_lazy_with_pool_size(url: &str, max_connections: u32) -> StoreResult<Self> {
+        let config = PgConfig::parse(url)?;
+        Self::from_config(config, max_connections)
+    }
+
+    /// Use an already parsed [`PgConfig`], e.g. the one `adam-service` parses once for the store
+    /// and the notification listener. Opens no connection.
+    pub fn from_config(config: PgConfig, max_connections: u32) -> StoreResult<Self> {
+        if !(MIN_POOL_SIZE..=MAX_POOL_SIZE).contains(&max_connections) {
+            return Err(StoreError::InvalidInput(format!(
+                "pool size {max_connections} is out of range ({MIN_POOL_SIZE} to {MAX_POOL_SIZE}): \
+                 a one-connection pool cannot serve the notify listener and a query at the same time"
+            )));
+        }
+        let pool = config.pool(max_connections as usize)?;
         Ok(Self::from_pool(pool))
     }
 
     /// Open a connection now, to learn whether the database answers.
     pub async fn ping(&self) -> StoreResult<()> {
-        self.pool.acquire().await.map(drop).map_err(classify)
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client.prepare_cached("SELECT 1").await.map_err(classify)?;
+        client.query_one(&stmt, &[]).await.map_err(classify)?;
+        Ok(())
     }
 
     /// Use an existing pool, e.g. the one your app already has.
     ///
-    /// Sizing is the caller's: a pool of one connection cannot serve an `adam-notify-postgres`
-    /// listener and a store query at the same time (see [`MIN_POOL_SIZE`]).
-    pub fn from_pool(pool: PgPool) -> Self {
+    /// Sizing is the caller's: a pool of one connection serializes every store call (see
+    /// [`MIN_POOL_SIZE`]).
+    pub fn from_pool(pool: Pool) -> Self {
         Self::build(pool, "adam_".to_owned())
     }
 
@@ -183,11 +214,12 @@ impl PgStore {
         Ok(Self::build(self.pool, prefix.to_owned()))
     }
 
-    pub fn pool(&self) -> &PgPool {
+    /// The pool this store uses, e.g. to build the notification publisher on it.
+    pub fn pool(&self) -> &Pool {
         &self.pool
     }
 
-    fn build(pool: PgPool, prefix: String) -> Self {
+    fn build(pool: Pool, prefix: String) -> Self {
         let sql = Sql::new(&prefix);
         Self { pool, sql }
     }
@@ -197,17 +229,27 @@ impl PgStore {
     /// Steady-state starts take no table lock (even a no-op `ALTER TABLE` or `CREATE INDEX IF NOT
     /// EXISTS` does), which is why a start cannot deadlock with live traffic: a current schema
     /// returns before any DDL.
-    async fn migrate_locked(&self, conn: &mut PgConnection) -> StoreResult<()> {
-        let meta_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-            .bind(&self.sql.meta_table)
-            .fetch_one(&mut *conn)
+    async fn migrate_locked(&self, client: &mut ClientWrapper) -> StoreResult<()> {
+        let stmt = client
+            .prepare_cached("SELECT to_regclass($1) IS NOT NULL")
             .await
             .map_err(classify)?;
+        let meta_exists: bool = client
+            .query_one(&stmt, &[&self.sql.meta_table])
+            .await
+            .map_err(classify)
+            .and_then(|row| decode_at(&row, 0))?;
         if meta_exists {
-            let stored: Option<String> = sqlx::query_scalar(safe(&self.sql.schema_version))
-                .fetch_optional(&mut *conn)
+            let stmt = client
+                .prepare_cached(&self.sql.schema_version)
                 .await
                 .map_err(classify)?;
+            let stored: Option<String> = client
+                .query_opt(&stmt, &[])
+                .await
+                .map_err(classify)?
+                .map(|row| decode_at(&row, 0))
+                .transpose()?;
             let stored = stored.and_then(|v| v.parse::<i32>().ok());
             if stored >= Some(SCHEMA_VERSION) {
                 return Ok(());
@@ -216,25 +258,33 @@ impl PgStore {
             // one, and the non-concurrent pair would hold `ACCESS EXCLUSIVE` on `runs` for the
             // whole build. A version 4 database already has it.
             if stored.is_none_or(|v| v < 4) {
-                self.upgrade_listing_index(conn).await?;
+                self.upgrade_listing_index(client).await?;
             }
             // Schema version 5, part 1: the blob tables. Their own step, so a version 4 start does
             // not re-check the listing index and a version 5 start does neither.
             if stored == Some(4) {
-                self.upgrade_blobs(conn).await?;
+                self.upgrade_blobs(client).await?;
+            }
+            // Schema version 5, part 2 (schema version 6): the head columns and the body table.
+            // Gated on the version, not on the blob step: a database stamped 5 already has the
+            // blob tables but no head or body.
+            if stored.is_none_or(|v| v < 6) {
+                self.upgrade_body(client).await?;
             }
         }
-        let mut tx = conn.begin().await.map_err(classify)?;
+        let tx = client.transaction().await.map_err(classify)?;
         // Serialize concurrent migrations; CREATE .. IF NOT EXISTS alone can still race on the
         // catalog. Re-entrant for this session, which already holds the session lock; a migrator of
         // an older release takes only this lock, so it is excluded too.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(&self.sql.migrate_lock)
-            .execute(&mut *tx)
+        let stmt = tx
+            .prepare_cached("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .await
+            .map_err(classify)?;
+        tx.execute(&stmt, &[&self.sql.migrate_lock])
             .await
             .map_err(classify)?;
         for stmt in &self.sql.migrate {
-            tx.execute(safe(stmt)).await.map_err(classify)?;
+            tx.batch_execute(stmt).await.map_err(classify)?;
         }
         tx.commit().await.map_err(classify)
     }
@@ -253,34 +303,46 @@ impl PgStore {
     /// rebuilt rather than kept. The old index is dropped only after the new one is valid, so a
     /// listing always has one; the new index has the same key columns, and an older release does
     /// not name an index, so its queries keep using it across a rolling upgrade.
-    async fn upgrade_listing_index(&self, conn: &mut PgConnection) -> StoreResult<()> {
-        let runs: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-            .bind(&self.sql.runs_table)
-            .fetch_one(&mut *conn)
+    async fn upgrade_listing_index(&self, client: &mut ClientWrapper) -> StoreResult<()> {
+        let stmt = client
+            .prepare_cached("SELECT to_regclass($1) IS NOT NULL")
             .await
             .map_err(classify)?;
+        let runs: bool = client
+            .query_one(&stmt, &[&self.sql.runs_table])
+            .await
+            .map_err(classify)
+            .and_then(|row| decode_at(&row, 0))?;
         if !runs {
             // A fresh database: the transaction below creates the table and the index.
             return Ok(());
         }
-        let valid: Option<bool> = sqlx::query_scalar(safe(&self.sql.listing_index_state))
-            .bind(&self.sql.listing_index)
-            .fetch_optional(&mut *conn)
+        let stmt = client
+            .prepare_cached(&self.sql.listing_index_state)
             .await
             .map_err(classify)?;
+        let valid: Option<bool> = client
+            .query_opt(&stmt, &[&self.sql.listing_index])
+            .await
+            .map_err(classify)?
+            .map(|row| decode_at(&row, 0))
+            .transpose()?;
         if valid == Some(false) {
             // A concurrent build that failed leaves an INVALID index, and `IF NOT EXISTS` would
             // keep it for ever: drop it and build again.
-            conn.execute(safe(&self.sql.drop_listing_index))
+            client
+                .batch_execute(&self.sql.drop_listing_index)
                 .await
                 .map_err(classify)?;
         }
         if valid != Some(true) {
-            conn.execute(safe(&self.sql.create_listing_index))
+            client
+                .batch_execute(&self.sql.create_listing_index)
                 .await
                 .map_err(classify)?;
         }
-        conn.execute(safe(&self.sql.drop_v3_listing_index))
+        client
+            .batch_execute(&self.sql.drop_v3_listing_index)
             .await
             .map_err(classify)?;
         Ok(())
@@ -295,32 +357,54 @@ impl PgStore {
     /// index nor pays for its `CONCURRENTLY` inspection.
     ///
     /// Idempotent: `IF NOT EXISTS` everywhere, so a crash between statements re-runs cleanly.
-    async fn upgrade_blobs(&self, conn: &mut PgConnection) -> StoreResult<()> {
-        let mut tx = conn.begin().await.map_err(classify)?;
+    async fn upgrade_blobs(&self, client: &mut ClientWrapper) -> StoreResult<()> {
+        let tx = client.transaction().await.map_err(classify)?;
         // The same advisory lock the migration transaction takes: re-entrant for this session,
         // which holds the session lock already, and it still excludes a migrator of another
         // release.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(&self.sql.migrate_lock)
-            .execute(&mut *tx)
+        let stmt = tx
+            .prepare_cached("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .await
+            .map_err(classify)?;
+        tx.execute(&stmt, &[&self.sql.migrate_lock])
             .await
             .map_err(classify)?;
         for stmt in &self.sql.migrate_blobs {
-            tx.execute(safe(stmt)).await.map_err(classify)?;
+            tx.batch_execute(stmt).await.map_err(classify)?;
+        }
+        tx.commit().await.map_err(classify)
+    }
+
+    /// Schema version 5 part 2 (schema version 6): the head columns and the body table.
+    ///
+    /// Metadata-only: two nullable columns on `runs` (`ADD COLUMN` without a default is a catalog
+    /// change) and one new table with its index and a foreign key. Idempotent everywhere.
+    async fn upgrade_body(&self, client: &mut ClientWrapper) -> StoreResult<()> {
+        let tx = client.transaction().await.map_err(classify)?;
+        let stmt = tx
+            .prepare_cached("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .await
+            .map_err(classify)?;
+        tx.execute(&stmt, &[&self.sql.migrate_lock])
+            .await
+            .map_err(classify)?;
+        for stmt in &self.sql.migrate_body {
+            tx.batch_execute(stmt).await.map_err(classify)?;
         }
         tx.commit().await.map_err(classify)
     }
 
     fn map_write_err(
         &self,
-        err: sqlx::Error,
+        err: tokio_postgres::Error,
         run: RunId,
         agent: &str,
         conversation: Option<&str>,
     ) -> StoreError {
-        if let Some(db) = err.as_database_error() {
+        if let Some(db) = err.as_db_error() {
+            let code = db.code().code();
             let constraint = db.constraint().unwrap_or_default();
-            if db.code().as_deref() == Some("23505") {
+            if code == "23505" {
                 if constraint == self.sql.open_conversation_index {
                     return StoreError::ConversationBusy {
                         agent: agent.to_owned(),
@@ -331,10 +415,10 @@ impl PgStore {
                     return StoreError::AlreadyExists(run);
                 }
             }
-            if db.code().as_deref() == Some("23503") {
+            if code == "23503" {
                 return StoreError::NotFound(run);
             }
-            if matches!(db.code().as_deref(), Some("22P05" | "22021")) {
+            if matches!(code, "22P05" | "22021") {
                 return StoreError::InvalidInput(
                     "PostgreSQL cannot store a character of this value (a NUL in JSONB, or a \
                      character the database encoding cannot hold): a NUL is a bug, since \
@@ -351,9 +435,7 @@ impl PgStore {
 /// [`MAX_POOL_SIZE`].
 ///
 /// Unset means [`DEFAULT_POOL_SIZE`]. The pool is **per process**: a deployment of N replicas opens
-/// up to N × this many connections, and an `adam-notify-postgres` listener holds one of them for
-/// the process's lifetime — which is why one connection is refused, not accepted: it would leave
-/// no connection for a query. A value that is not an integer in range is
+/// up to N × this many connections. A value that is not an integer in range is
 /// [`StoreError::InvalidInput`], not a silent fallback: a typo must not change capacity without
 /// saying so.
 pub fn pool_size_from_env() -> StoreResult<u32> {
@@ -382,47 +464,6 @@ fn pool_size_from_text(raw: &str) -> StoreResult<u32> {
     Ok(size)
 }
 
-/// Decide what a driver error means to the caller and box it as the source.
-///
-/// * Connection loss, pool exhaustion, restarts, deadlocks and serialization failures may
-///   succeed later: `Transient` (a retry by the runtime).
-/// * A row that cannot be decoded is stored data that breaks an invariant: `Corrupt`. It
-///   must not be retried forever (a poisoned row would be re-leased for ever).
-/// * A rejected statement or a bad connection string is a bug or a mistake that repeating
-///   cannot cure: `Internal` and `Invalid`.
-///
-/// SQLSTATE classes are from the PostgreSQL manual, Appendix A (unverified from memory:
-/// `08` connection exception, `40001` serialization failure, `40P01` deadlock, `53`
-/// insufficient resources, `57P01`..`57P03` shutdown and start-up).
-pub(crate) fn classify(err: sqlx::Error) -> StoreError {
-    use sqlx::Error as E;
-    let class = match &err {
-        E::Io(_)
-        | E::Tls(_)
-        | E::PoolTimedOut
-        | E::PoolClosed
-        | E::WorkerCrashed
-        | E::Protocol(_) => ErrorClass::Transient,
-        E::Database(db) => match db.code().as_deref() {
-            Some(code)
-                if code.starts_with("08")
-                    || code.starts_with("53")
-                    || matches!(code, "40001" | "40P01" | "57P01" | "57P02" | "57P03") =>
-            {
-                ErrorClass::Transient
-            }
-            _ => ErrorClass::Internal,
-        },
-        E::Decode(_) | E::ColumnDecode { .. } | E::ColumnNotFound(_) => ErrorClass::Corrupt,
-        E::Configuration(_) => ErrorClass::Invalid,
-        _ => ErrorClass::Internal,
-    };
-    StoreError::Backend {
-        class,
-        source: Box::new(err),
-    }
-}
-
 /// SQL text with table names baked in, built once per store.
 #[derive(Clone, Debug)]
 struct Sql {
@@ -431,6 +472,9 @@ struct Sql {
     migrate: Vec<Arc<str>>,
     /// Schema version 5 part 1's DDL: the blob tables, run on their own in `upgrade_blobs`.
     migrate_blobs: Vec<Arc<str>>,
+    /// Schema version 5 part 2's DDL (schema version 6): the head columns and the body table, run
+    /// on their own in `upgrade_body`.
+    migrate_body: Vec<Arc<str>>,
     /// The meta table's name with the prefix, bound to `to_regclass` before it is read.
     meta_table: String,
     /// The runs table's name with the prefix, checked before the listing index is built.
@@ -446,9 +490,17 @@ struct Sql {
     schema_version: Arc<str>,
     insert_run: Arc<str>,
     load_run: Arc<str>,
+    load_head: Arc<str>,
     run_header: Arc<str>,
     load_version: Arc<str>,
     commit_run: Arc<str>,
+    commit_run_head: Arc<str>,
+    commit_context: Arc<str>,
+    body_insert: Arc<str>,
+    body_conflicts: Arc<str>,
+    body_collect: Arc<str>,
+    body_list: Arc<str>,
+    gc_body: Arc<str>,
     open_run: Arc<str>,
     journal_get: Arc<str>,
     journal_insert: Arc<str>,
@@ -495,6 +547,30 @@ impl Sql {
         // this list on its own for a version 4 one.
         let blob = format!("{p}blob");
         let run_blob = format!("{p}run_blob");
+        // Schema version 5, part 2 (schema version 6): the head is a column on `runs` (written by
+        // the commit that built it, with its version); the body is one row per message of one
+        // generation, keyed by position.
+        let body = format!("{p}body");
+        let migrate_body: Vec<Arc<str>> = [
+            format!("ALTER TABLE {runs} ADD COLUMN IF NOT EXISTS head JSONB"),
+            format!("ALTER TABLE {runs} ADD COLUMN IF NOT EXISTS head_version BIGINT"),
+            format!(
+                "CREATE TABLE IF NOT EXISTS {body} (
+                    run_id      UUID        NOT NULL REFERENCES {runs} (id) ON DELETE CASCADE,
+                    generation  UUID        NOT NULL,
+                    idx         INTEGER     NOT NULL CHECK (idx >= 0),
+                    message     JSONB       NOT NULL,
+                    writer      UUID        NOT NULL,
+                    written_at  TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (run_id, generation, idx)
+                )"
+            ),
+            // The body GC: superseded generations written before the cutoff.
+            format!("CREATE INDEX IF NOT EXISTS {p}body_written ON {body} (written_at)"),
+        ]
+        .into_iter()
+        .map(Arc::from)
+        .collect();
         let migrate_blobs: Vec<Arc<str>> = [
             format!(
                 "CREATE TABLE IF NOT EXISTS {blob} (
@@ -541,6 +617,8 @@ impl Sql {
                     lease_owner     TEXT,
                     lease_until     TIMESTAMPTZ,
                     owner           TEXT,
+                    head            JSONB,
+                    head_version    BIGINT,
                     created_at      TIMESTAMPTZ NOT NULL,
                     updated_at      TIMESTAMPTZ NOT NULL,
                     CONSTRAINT {runs_pkey} PRIMARY KEY (id)
@@ -621,6 +699,7 @@ impl Sql {
         .map(Arc::from)
         .collect();
         migrate.extend(migrate_blobs.iter().cloned());
+        migrate.extend(migrate_body.iter().cloned());
         // Record the version, and raise it from an older one. Never lower it: a process
         // running an older release must not undo a newer one's migration.
         migrate.push(Arc::from(format!(
@@ -631,6 +710,7 @@ impl Sql {
         Self {
             migrate,
             migrate_blobs,
+            migrate_body,
             meta_table: meta.clone(),
             runs_table: runs.clone(),
             migrate_lock: format!("adam-rs:migrate:{p}"),
@@ -662,6 +742,15 @@ impl Sql {
                  RETURNING {RUN_METADATA_COLUMNS}"
             )),
             load_run: Arc::from(format!("SELECT {RUN_COLUMNS} FROM {runs} WHERE id = $1")),
+            // The observer's read: the head when it is current, the whole state otherwise. Never a
+            // body row; `Runtime::state` joins the head and its generation when it needs them.
+            load_head: Arc::from(format!(
+                "SELECT id, agent, conversation_id, parent_id, status,
+                        CASE WHEN head_version = version AND head IS NOT NULL THEN head ELSE state
+                        END AS state,
+                        wake_at, version, created_at, updated_at
+                   FROM {runs} WHERE id = $1"
+            )),
             run_header: Arc::from(format!(
                 "SELECT {RUN_HEADER_COLUMNS} FROM {runs} WHERE id = $1"
             )),
@@ -672,6 +761,43 @@ impl Sql {
                         version = version + 1, updated_at = $7
                   WHERE id = $1 AND version = $2
                  RETURNING {RUN_METADATA_COLUMNS}"
+            )),
+            commit_run_head: Arc::from(format!(
+                "UPDATE {runs}
+                    SET status = $3, state = $4, wake_at = $5, sched_at = $6,
+                        version = version + 1, updated_at = $7, head = $8, head_version = $9
+                  WHERE id = $1 AND version = $2
+                 RETURNING {RUN_METADATA_COLUMNS}"
+            )),
+            // The run row is locked for the length of a commit that writes a head, a body or
+            // refs: the version check, the foreign-writer check and the CAS are one transaction.
+            commit_context: Arc::from(format!(
+                "SELECT version, agent, conversation_id, head, head_version
+                   FROM {runs} WHERE id = $1 FOR UPDATE"
+            )),
+            // The rows of one append; `ON CONFLICT DO NOTHING` makes a retry idempotent, and a
+            // conflict is resolved by `body_conflicts` inside the same transaction.
+            body_insert: Arc::from(format!(
+                "INSERT INTO {body} (run_id, generation, idx, message, writer, written_at)
+                 SELECT $1, $2, idx, message, $5, $6
+                   FROM unnest($3::int[], $4::jsonb[]) AS t(idx, message)
+                 ON CONFLICT (run_id, generation, idx) DO NOTHING"
+            )),
+            body_conflicts: Arc::from(format!(
+                "SELECT idx, message, written_at FROM {body}
+                  WHERE run_id = $1 AND generation = $2 AND idx >= $3 AND idx < $4
+                    AND writer <> $5"
+            )),
+            body_collect: Arc::from(format!(
+                "DELETE FROM {body} WHERE run_id = $1 AND generation = $2 AND idx = ANY($3)
+                  AND writer <> $4"
+            )),
+            body_list: Arc::from(format!(
+                "SELECT idx, message FROM {body} WHERE run_id = $1 AND generation = $2
+                  ORDER BY idx"
+            )),
+            gc_body: Arc::from(format!(
+                "DELETE FROM {body} WHERE run_id = $1 AND generation <> $2 AND written_at < $3"
             )),
             open_run: Arc::from(format!(
                 "SELECT {RUN_COLUMNS} FROM {runs}
@@ -871,13 +997,6 @@ fn scope_sql(scope: Scope, text: &str, bound: &str) -> String {
     }
 }
 
-/// Every statement is built once in [`Sql::new`] from constant text plus the
-/// table prefix, which [`PgStore::with_table_prefix`] restricts to
-/// `[a-z0-9_]`. Values always go through bind parameters.
-fn safe(sql: &Arc<str>) -> AssertSqlSafe<Arc<str>> {
-    AssertSqlSafe(Arc::clone(sql))
-}
-
 /// The first text above every text that starts with `prefix` in the "C" collation (byte order):
 /// the prefix and the highest code point. Any text with the prefix is below it, and the
 /// `starts_with` of the statement makes the bound's looseness harmless.
@@ -891,83 +1010,147 @@ fn to_i64(n: u64, what: &str) -> StoreResult<i64> {
     i64::try_from(n).map_err(|_| StoreError::InvalidInput(format!("{what} {n} exceeds i64::MAX")))
 }
 
-/// A [`Timestamp`] as PostgreSQL's `TIMESTAMPTZ`.
-///
-/// sqlx 0.9 has no jiff support, so this delegates to its chrono support: the column type, the
-/// encoded value and the bytes on the wire are exactly what the store wrote before ADR 0057.
-/// **Temporary:** when the store moves from sqlx to tokio-postgres, `postgres-types`'s
-/// `with-jiff-0_2` feature does this natively (the same `TIMESTAMPTZ`, microseconds since 2000,
-/// the same bytes as `with-chrono-0_4`), and this bridge is deleted with sqlx's `chrono` feature.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct PgTime(Timestamp);
+/// A [`Timestamp`] as the driver binds it: `postgres-types`' `with-jiff-0_2` maps
+/// `jiff::Timestamp` to `TIMESTAMPTZ` (microseconds since 2000, the bytes chrono wrote), so the
+/// store converts at the edge instead of carrying a bridge type of its own.
+fn sql_time(t: Timestamp) -> jiff::Timestamp {
+    t.0
+}
 
-impl Type<Postgres> for PgTime {
-    fn type_info() -> sqlx::postgres::PgTypeInfo {
-        <chrono::DateTime<chrono::Utc> as Type<Postgres>>::type_info()
+/// How a commit that wrote a head, a body or refs ended, before its error is mapped (a driver
+/// error needs the connection back before it can be looked up).
+enum CommitOutcome {
+    Written(Row, Option<BodyPlan>),
+    Missing,
+    Conflict(u64),
+    Rejected(tokio_postgres::Error),
+}
+
+/// The rows one commit writes and where they go, resolved inside its transaction.
+struct BodyPlan {
+    generation: Uuid,
+    start: usize,
+    writer: Uuid,
+    rows: Vec<BodyRow>,
+    written_at: Timestamp,
+}
+
+/// Resolve the generation and the rows a commit writes, and patch the head it carries.
+fn plan_body(
+    head: &mut Option<Value>,
+    current_head: Option<&Value>,
+    head_version: Option<i64>,
+    expected: i64,
+    body: BodyWrite,
+    written_at: Timestamp,
+) -> StoreResult<BodyPlan> {
+    let BodyWrite {
+        generation,
+        rows,
+        writer,
+    } = body;
+    // The rows are a transcript: index `i` is the message at `i`. A wrong index would write the
+    // wrong offset while the head's `len` still matched.
+    for (position, row) in rows.iter().enumerate() {
+        let position = u32::try_from(position)
+            .map_err(|_| StoreError::InvalidInput("a transcript is longer than u32".into()))?;
+        if row.idx != position {
+            return Err(StoreError::InvalidInput(format!(
+                "body row {position} has index {}",
+                row.idx
+            )));
+        }
     }
+    let current = if head_version == Some(expected) {
+        current_head.and_then(head_body)
+    } else {
+        None
+    };
+    let target = generation
+        .or(current.map(|(generation, _)| generation))
+        .unwrap_or_else(Uuid::new_v4);
+    // A new generation writes the whole transcript; an append writes only the rows after the
+    // head's `len`. The runtime guarantees the rows start with the old transcript.
+    let start = match (generation, current) {
+        (Some(_), _) | (None, None) => 0,
+        (None, Some((_, len))) => usize::try_from(len)
+            .map_err(|_| StoreError::InvalidInput("body length exceeds usize".into()))?,
+    };
+    if start > rows.len() {
+        return Err(StoreError::InvalidInput(format!(
+            "the body append starts at {start}, past the {} rows given",
+            rows.len()
+        )));
+    }
+    let len = u32::try_from(rows.len())
+        .map_err(|_| StoreError::InvalidInput("a transcript is longer than u32".into()))?;
+    if let Some(head) = head.as_mut() {
+        set_head_body(head, target, len)?;
+    }
+    Ok(BodyPlan {
+        generation: target,
+        start,
+        writer,
+        rows,
+        written_at,
+    })
+}
 
-    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
-        <chrono::DateTime<chrono::Utc> as Type<Postgres>>::compatible(ty)
+/// The generation and length a v5 head names, if it names one.
+fn head_body(head: &Value) -> Option<(Uuid, u64)> {
+    let body = head.get("body")?;
+    let generation = body.get("generation")?.as_str()?.parse().ok()?;
+    let len = body.get("len")?.as_u64()?;
+    Some((generation, len))
+}
+
+/// Patch a v5 head's `body` to the generation and length its commit writes.
+fn set_head_body(head: &mut Value, generation: Uuid, len: u32) -> StoreResult<()> {
+    let body = head
+        .get_mut("body")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| StoreError::InvalidInput("a v5 head must carry a body object".into()))?;
+    body.insert(
+        "generation".to_owned(),
+        Value::String(generation.to_string()),
+    );
+    body.insert("len".to_owned(), Value::from(len));
+    Ok(())
+}
+
+/// One column of a row, by name. A failure here is stored data that breaks an invariant (or a
+/// schema the store does not expect): `Corrupt`, never retried for ever.
+fn decode<'a, T: FromSql<'a>>(row: &'a Row, column: &str) -> StoreResult<T> {
+    row.try_get(column).map_err(corrupt_source)
+}
+
+/// One column of a row, by position (an expression without a name).
+fn decode_at<'a, T: FromSql<'a>>(row: &'a Row, index: usize) -> StoreResult<T> {
+    row.try_get(index).map_err(corrupt_source)
+}
+
+fn corrupt_source(err: tokio_postgres::Error) -> StoreError {
+    StoreError::Backend {
+        class: ErrorClass::Corrupt,
+        source: Box::new(err),
     }
 }
 
-impl Encode<'_, Postgres> for PgTime {
-    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
-        Encode::<Postgres>::encode(chrono_of(self.0)?, buf)
-    }
-}
-
-impl<'r> Decode<'r, Postgres> for PgTime {
-    fn decode(value: PgValueRef<'r>) -> Result<Self, BoxDynError> {
-        let at = <chrono::DateTime<chrono::Utc> as Decode<Postgres>>::decode(value)?;
-        Ok(Self(timestamp_of(at)?))
-    }
-}
-
-/// `t` as chrono's UTC datetime, the driver type. chrono counts a fractional second as a
-/// non-negative part of the second before it; jiff keeps the fraction's sign.
-fn chrono_of(t: Timestamp) -> Result<chrono::DateTime<chrono::Utc>, BoxDynError> {
-    let mut second = t.as_second();
-    let mut nanosecond = t.subsec_nanosecond();
-    if nanosecond < 0 {
-        second = second
-            .checked_sub(1)
-            .ok_or("timestamp out of range for PostgreSQL")?;
-        nanosecond += 1_000_000_000;
-    }
-    let nanosecond = u32::try_from(nanosecond)?;
-    chrono::DateTime::from_timestamp(second, nanosecond)
-        .ok_or_else(|| format!("timestamp {t} is out of range for PostgreSQL").into())
-}
-
-/// chrono's UTC datetime as a [`Timestamp`], failing outside jiff's range (PostgreSQL's
-/// `TIMESTAMPTZ` reaches further).
-fn timestamp_of(at: chrono::DateTime<chrono::Utc>) -> Result<Timestamp, BoxDynError> {
-    let nanosecond = i32::try_from(at.timestamp_subsec_nanos())?;
-    jiff::Timestamp::new(at.timestamp(), nanosecond)
-        .map(Timestamp)
-        .map_err(|e| format!("PostgreSQL returned {at}, out of range for jiff: {e}").into())
-}
-
-fn run_from_row(row: &PgRow) -> StoreResult<RunRecord> {
+fn run_from_row(row: &Row) -> StoreResult<RunRecord> {
     let mut run = run_metadata_from_row(row)?;
-    let Json(state): Json<Value> = row.try_get("state").map_err(classify)?;
-    run.state = state;
+    run.state = decode(row, "state")?;
     Ok(run)
 }
 
 /// A row of [`RUN_HEADER_COLUMNS`]: the record's metadata and its lease, never `state`.
-fn run_header_from_row(row: &PgRow) -> StoreResult<RunHeader> {
-    let status: String = row.try_get("status").map_err(classify)?;
-    let version: i64 = row.try_get("version").map_err(classify)?;
+fn run_header_from_row(row: &Row) -> StoreResult<RunHeader> {
+    let status: String = decode(row, "status")?;
+    let version: i64 = decode(row, "version")?;
     Ok(RunHeader {
-        id: RunId(row.try_get::<Uuid, _>("id").map_err(classify)?),
-        agent: row.try_get("agent").map_err(classify)?,
-        conversation_id: row.try_get("conversation_id").map_err(classify)?,
-        parent_id: row
-            .try_get::<Option<Uuid>, _>("parent_id")
-            .map_err(classify)?
-            .map(RunId),
+        id: RunId(decode(row, "id")?),
+        agent: decode(row, "agent")?,
+        conversation_id: decode(row, "conversation_id")?,
+        parent_id: decode::<Option<Uuid>>(row, "parent_id")?.map(RunId),
         status: RunStatus::parse(&status)
             .ok_or_else(|| StoreError::Corrupt(format!("unknown run status {status:?}")))?,
         wake_at: opt_time(row, "wake_at")?,
@@ -981,17 +1164,14 @@ fn run_header_from_row(row: &PgRow) -> StoreResult<RunHeader> {
 
 /// A row of [`RUN_METADATA_COLUMNS`]: the record a write returns, whose `state` is
 /// [`Value::Null`].
-fn run_metadata_from_row(row: &PgRow) -> StoreResult<RunRecord> {
-    let status: String = row.try_get("status").map_err(classify)?;
-    let version: i64 = row.try_get("version").map_err(classify)?;
+fn run_metadata_from_row(row: &Row) -> StoreResult<RunRecord> {
+    let status: String = decode(row, "status")?;
+    let version: i64 = decode(row, "version")?;
     Ok(RunRecord {
-        id: RunId(row.try_get::<Uuid, _>("id").map_err(classify)?),
-        agent: row.try_get("agent").map_err(classify)?,
-        conversation_id: row.try_get("conversation_id").map_err(classify)?,
-        parent_id: row
-            .try_get::<Option<Uuid>, _>("parent_id")
-            .map_err(classify)?
-            .map(RunId),
+        id: RunId(decode(row, "id")?),
+        agent: decode(row, "agent")?,
+        conversation_id: decode(row, "conversation_id")?,
+        parent_id: decode::<Option<Uuid>>(row, "parent_id")?.map(RunId),
         status: RunStatus::parse(&status)
             .ok_or_else(|| StoreError::Corrupt(format!("unknown run status {status:?}")))?,
         state: Value::Null,
@@ -1003,35 +1183,30 @@ fn run_metadata_from_row(row: &PgRow) -> StoreResult<RunRecord> {
     })
 }
 
-fn time(row: &PgRow, column: &str) -> StoreResult<Timestamp> {
-    Ok(row.try_get::<PgTime, _>(column).map_err(classify)?.0)
+fn time(row: &Row, column: &str) -> StoreResult<Timestamp> {
+    decode::<jiff::Timestamp>(row, column).map(Timestamp)
 }
 
-fn opt_time(row: &PgRow, column: &str) -> StoreResult<Option<Timestamp>> {
-    Ok(row
-        .try_get::<Option<PgTime>, _>(column)
-        .map_err(classify)?
-        .map(|t| t.0))
+fn opt_time(row: &Row, column: &str) -> StoreResult<Option<Timestamp>> {
+    decode::<Option<jiff::Timestamp>>(row, column).map(|at| at.map(Timestamp))
 }
 
-fn push_from_row(row: &PgRow) -> StoreResult<PushRecord> {
-    let state: String = row.try_get("state").map_err(classify)?;
-    let version: i64 = row.try_get("version").map_err(classify)?;
-    let attempts: i32 = row.try_get("attempts").map_err(classify)?;
-    let Json(config): Json<Value> = row.try_get("config").map_err(classify)?;
-    let Json(cursor): Json<Value> = row.try_get("cursor").map_err(classify)?;
+fn push_from_row(row: &Row) -> StoreResult<PushRecord> {
+    let state: String = decode(row, "state")?;
+    let version: i64 = decode(row, "version")?;
+    let attempts: i32 = decode(row, "attempts")?;
     Ok(PushRecord {
-        run: RunId(row.try_get::<Uuid, _>("run_id").map_err(classify)?),
-        id: row.try_get("id").map_err(classify)?,
-        agent: row.try_get("agent").map_err(classify)?,
-        owner: row.try_get("owner").map_err(classify)?,
-        config,
-        cursor,
+        run: RunId(decode(row, "run_id")?),
+        id: decode(row, "id")?,
+        agent: decode(row, "agent")?,
+        owner: decode(row, "owner")?,
+        config: decode(row, "config")?,
+        cursor: decode(row, "cursor")?,
         state: PushState::parse(&state)
             .ok_or_else(|| StoreError::Corrupt(format!("unknown push state {state:?}")))?,
         attempts: u32::try_from(attempts)
             .map_err(|_| StoreError::Corrupt(format!("negative attempts {attempts}")))?,
-        last_error: row.try_get("last_error").map_err(classify)?,
+        last_error: decode(row, "last_error")?,
         next_attempt_at: time(row, "next_attempt_at")?,
         version: u64::try_from(version)
             .map_err(|_| StoreError::Corrupt(format!("negative version {version}")))?,
@@ -1040,14 +1215,13 @@ fn push_from_row(row: &PgRow) -> StoreResult<PushRecord> {
     })
 }
 
-fn entry_from_row(row: &PgRow) -> StoreResult<JournalEntry> {
-    let seq: i64 = row.try_get("seq").map_err(classify)?;
-    let Json(payload): Json<Value> = row.try_get("payload").map_err(classify)?;
+fn entry_from_row(row: &Row) -> StoreResult<JournalEntry> {
+    let seq: i64 = decode(row, "seq")?;
     Ok(JournalEntry {
         seq: u64::try_from(seq).map_err(|_| StoreError::Corrupt(format!("negative seq {seq}")))?,
-        name: row.try_get("name").map_err(classify)?,
-        ok: row.try_get("ok").map_err(classify)?,
-        payload,
+        name: decode(row, "name")?,
+        ok: decode(row, "ok")?,
+        payload: decode(row, "payload")?,
         recorded_at: time(row, "recorded_at")?,
     })
 }
@@ -1060,58 +1234,99 @@ impl Store for PgStore {
         // opens its transaction on it too. The transaction's own `pg_advisory_xact_lock` is
         // re-entrant for this session and still excludes a migrator of an older release, which
         // takes only that lock.
-        let mut conn = self.pool.acquire().await.map_err(classify)?;
-        // A session lock lives as long as its connection. Close this one on drop rather than
-        // returning it to the pool, so an error or a panic cannot leave the lock held on a
-        // connection another task would reuse; the close releases it.
-        conn.close_on_drop();
-        sqlx::query("SELECT pg_advisory_lock(hashtext($1))")
-            .bind(&self.sql.migrate_lock)
-            .execute(&mut *conn)
+        let object = self.pool.get().await.map_err(classify_pool)?;
+        // A session lock lives as long as its connection. Take the connection out of the pool
+        // rather than returning it, so an error or a panic cannot leave the lock held on a
+        // connection another task would reuse; dropping it closes the connection and releases the
+        // lock.
+        let mut client = Object::take(object);
+        let stmt = client
+            .prepare_cached("SELECT pg_advisory_lock(hashtext($1))")
             .await
             .map_err(classify)?;
-        self.migrate_locked(&mut conn).await
+        client
+            .execute(&stmt, &[&self.sql.migrate_lock])
+            .await
+            .map_err(classify)?;
+        self.migrate_locked(&mut client).await
     }
 
     async fn create_run(&self, new: NewRun) -> StoreResult<RunRecord> {
         let t = now();
         let wake_at = new.wake_at.map(truncate_ms);
+        let parent = new.parent_id.map(|p| p.0);
+        let sched = sched_at(new.status, wake_at, t);
+        let (t, wake_at, sched) = (sql_time(t), wake_at.map(sql_time), sched.map(sql_time));
+        let status = new.status.as_str();
         let state = storable(&new.state);
-        let row = sqlx::query(safe(&self.sql.insert_run))
-            .bind(new.id.0)
-            .bind(&new.agent)
-            .bind(&new.conversation_id)
-            .bind(new.parent_id.map(|p| p.0))
-            .bind(new.status.as_str())
-            .bind(Json(state.as_ref()))
-            .bind(wake_at.map(PgTime))
-            .bind(sched_at(new.status, wake_at, t).map(PgTime))
-            .bind(PgTime(t))
-            .fetch_one(&self.pool)
+        let params: &[&(dyn ToSql + Sync)] = &[
+            &new.id.0,
+            &new.agent,
+            &new.conversation_id,
+            &parent,
+            &status,
+            state.as_ref(),
+            &wake_at,
+            &sched,
+            &t,
+        ];
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.insert_run)
             .await
-            .map_err(|e| {
-                self.map_write_err(e, new.id, &new.agent, new.conversation_id.as_deref())
-            })?;
+            .map_err(classify)?;
+        let row = client.query_one(&stmt, params).await.map_err(|e| {
+            self.map_write_err(e, new.id, &new.agent, new.conversation_id.as_deref())
+        })?;
         run_metadata_from_row(&row)
     }
 
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
-        let row = sqlx::query(safe(&self.sql.load_run))
-            .bind(id.0)
-            .fetch_optional(&self.pool)
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.load_run)
             .await
             .map_err(classify)?;
-        row.as_ref().map(run_from_row).transpose()
+        client
+            .query_opt(&stmt, &[&id.0])
+            .await
+            .map_err(classify)?
+            .as_ref()
+            .map(run_from_row)
+            .transpose()
+    }
+
+    async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
+        // One statement: the head when it is current, the whole state otherwise. Never a body
+        // row, which is the read win of the v5 view.
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.load_head)
+            .await
+            .map_err(classify)?;
+        client
+            .query_opt(&stmt, &[&id.0])
+            .await
+            .map_err(classify)?
+            .as_ref()
+            .map(run_from_row)
+            .transpose()
     }
 
     async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
         // One statement over the primary key: the header columns and the lease, never `state`.
-        let row = sqlx::query(safe(&self.sql.run_header))
-            .bind(id.0)
-            .fetch_optional(&self.pool)
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.run_header)
             .await
             .map_err(classify)?;
-        row.as_ref().map(run_header_from_row).transpose()
+        client
+            .query_opt(&stmt, &[&id.0])
+            .await
+            .map_err(classify)?
+            .as_ref()
+            .map(run_header_from_row)
+            .transpose()
     }
 
     async fn commit_run(
@@ -1125,89 +1340,46 @@ impl Store for PgStore {
         let RunUpdate {
             status,
             state,
-            head: _,
-            body: _,
+            head,
+            body,
             blobs,
             wake_at,
         } = update;
         let wake_at = wake_at.map(truncate_ms);
-        let state = storable(&state);
-        let query = sqlx::query(safe(&self.sql.commit_run))
-            .bind(id.0)
-            .bind(expected)
-            .bind(status.as_str())
-            .bind(Json(state.as_ref()))
-            .bind(wake_at.map(PgTime))
-            .bind(sched_at(status, wake_at, t).map(PgTime))
-            .bind(PgTime(t));
-        // A commit with references is one transaction: a commit that loses the CAS writes no ref,
-        // and a commit that wins has all of them. A run with no file bytes keeps the single
-        // statement it always was (no BEGIN/COMMIT round trips on the common path).
-        let mut tx = if blobs.is_empty() {
-            None
-        } else {
-            Some(self.pool.begin().await.map_err(classify)?)
-        };
-        let result = match tx.as_mut() {
-            None => query.fetch_optional(&self.pool).await,
-            Some(tx) => query.fetch_optional(&mut **tx).await,
-        };
-        let row = match result {
-            Ok(row) => row,
-            Err(err) => {
-                if let Some(tx) = tx {
-                    tx.rollback().await.map_err(classify)?;
-                }
-                if err.as_database_error().and_then(|e| e.code()).as_deref() == Some("23505") {
-                    // The only unique index an UPDATE can trip is the open-conversation
-                    // one; look the run up to report which conversation is busy.
-                    let run = self.load_run(id).await?.ok_or(StoreError::NotFound(id))?;
-                    return Err(self.map_write_err(
-                        err,
-                        id,
-                        &run.agent,
-                        run.conversation_id.as_deref(),
-                    ));
-                }
-                return Err(self.map_write_err(err, id, "", None));
-            }
-        };
-        let Some(row) = row else {
-            // Nothing was written: the version moved, or the run is gone.
-            if let Some(tx) = tx {
-                tx.rollback().await.map_err(classify)?;
-            }
-            let actual: Option<i64> = sqlx::query_scalar(safe(&self.sql.load_version))
-                .bind(id.0)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(classify)?;
-            return match actual {
-                None => Err(StoreError::NotFound(id)),
-                Some(actual) => Err(StoreError::Conflict {
-                    run: id,
-                    expected: expected as u64,
-                    actual: actual as u64,
-                }),
+        let sched = sched_at(status, wake_at, t);
+        let (t_sql, wake_at_sql, sched_sql) =
+            (sql_time(t), wake_at.map(sql_time), sched.map(sql_time));
+        let status_sql = status.as_str();
+        let state_sql = storable(&state);
+        let params: &[&(dyn ToSql + Sync)] = &[
+            &id.0,
+            &expected,
+            &status_sql,
+            state_sql.as_ref(),
+            &wake_at_sql,
+            &sched_sql,
+            &t_sql,
+        ];
+        // A commit that writes no head, no body row and no reference is the single statement it
+        // always was: the headless commit (a delivery, a cancel, a park) pays no BEGIN.
+        if head.is_none() && body.is_none() && blobs.is_empty() {
+            // The connection is given back before a helper that needs another one runs: a pool
+            // whose every connection is held by a commit waiting for a second one deadlocks.
+            let result = {
+                let client = self.pool.get().await.map_err(classify_pool)?;
+                let stmt = client
+                    .prepare_cached(&self.sql.commit_run)
+                    .await
+                    .map_err(classify)?;
+                client.query_opt(&stmt, params).await
             };
-        };
-        if let Some(mut tx) = tx {
-            // One statement for the set; a digest named twice in one commit is one row.
-            let mut seen = HashSet::new();
-            let digests: Vec<String> = blobs
-                .iter()
-                .filter(|digest| seen.insert(digest.as_str()))
-                .map(|digest| digest.as_str().to_owned())
-                .collect();
-            sqlx::query(safe(&self.sql.commit_blobs))
-                .bind(id.0)
-                .bind(&digests)
-                .execute(&mut *tx)
-                .await
-                .map_err(classify)?;
-            tx.commit().await.map_err(classify)?;
+            return match result {
+                Ok(row) => self.finish_commit(row, id, expected as u64).await,
+                Err(err) => Err(self.commit_error(err, id).await?),
+            };
         }
-        run_metadata_from_row(&row)
+        self.commit_parts(id, expected, params, head, body, &blobs, t)
+            .await
     }
 
     async fn open_run_for_conversation(
@@ -1215,41 +1387,62 @@ impl Store for PgStore {
         agent: &str,
         conversation_id: &str,
     ) -> StoreResult<Option<RunRecord>> {
-        let row = sqlx::query(safe(&self.sql.open_run))
-            .bind(agent)
-            .bind(conversation_id)
-            .fetch_optional(&self.pool)
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.open_run)
             .await
             .map_err(classify)?;
-        row.as_ref().map(run_from_row).transpose()
+        client
+            .query_opt(&stmt, &[&agent, &conversation_id])
+            .await
+            .map_err(classify)?
+            .as_ref()
+            .map(run_from_row)
+            .transpose()
     }
 
     async fn journal_get(&self, run: RunId, seq: u64) -> StoreResult<Option<JournalEntry>> {
         let Ok(seq) = i64::try_from(seq) else {
             return Ok(None);
         };
-        let row = sqlx::query(safe(&self.sql.journal_get))
-            .bind(run.0)
-            .bind(seq)
-            .fetch_optional(&self.pool)
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.journal_get)
             .await
             .map_err(classify)?;
-        row.as_ref().map(entry_from_row).transpose()
+        client
+            .query_opt(&stmt, &[&run.0, &seq])
+            .await
+            .map_err(classify)?
+            .as_ref()
+            .map(entry_from_row)
+            .transpose()
     }
 
     async fn journal_put(&self, run: RunId, entry: JournalEntry) -> StoreResult<JournalEntry> {
         let seq = to_i64(entry.seq, "journal seq")?;
         let payload = storable(&entry.payload);
-        let inserted = sqlx::query(safe(&self.sql.journal_insert))
-            .bind(run.0)
-            .bind(seq)
-            .bind(&entry.name)
-            .bind(entry.ok)
-            .bind(Json(payload.as_ref()))
-            .bind(PgTime(truncate_ms(entry.recorded_at)))
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| self.map_write_err(e, run, "", None))?;
+        let recorded_at = sql_time(truncate_ms(entry.recorded_at));
+        let params: &[&(dyn ToSql + Sync)] = &[
+            &run.0,
+            &seq,
+            &entry.name,
+            &entry.ok,
+            payload.as_ref(),
+            &recorded_at,
+        ];
+        // The connection is given back before `journal_get`, which needs one of its own.
+        let inserted = {
+            let client = self.pool.get().await.map_err(classify_pool)?;
+            let stmt = client
+                .prepare_cached(&self.sql.journal_insert)
+                .await
+                .map_err(classify)?;
+            client
+                .query_opt(&stmt, params)
+                .await
+                .map_err(|e| self.map_write_err(e, run, "", None))
+        }?;
         if let Some(row) = inserted {
             return entry_from_row(&row);
         }
@@ -1269,11 +1462,12 @@ impl Store for PgStore {
     }
 
     async fn journal_list(&self, run: RunId) -> StoreResult<Vec<JournalEntry>> {
-        let rows = sqlx::query(safe(&self.sql.journal_list))
-            .bind(run.0)
-            .fetch_all(&self.pool)
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.journal_list)
             .await
             .map_err(classify)?;
+        let rows = client.query(&stmt, &[&run.0]).await.map_err(classify)?;
         rows.iter().map(entry_from_row).collect()
     }
 
@@ -1297,21 +1491,18 @@ impl Store for PgStore {
             ClaimScope::Pinned => &self.sql.claim_due_pinned,
         };
         let busy: Vec<Uuid> = busy.iter().map(|id| id.0).collect();
-        let rows = sqlx::query(safe(statement))
-            .bind(agents)
-            .bind(PgTime(now))
-            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .bind(worker)
-            .bind(PgTime(until))
-            .bind(busy)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(classify)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let (now_sql, until_sql) = (sql_time(now), sql_time(until));
+        let params: &[&(dyn ToSql + Sync)] =
+            &[&agents, &now_sql, &limit, &worker, &until_sql, &busy];
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client.prepare_cached(statement).await.map_err(classify)?;
+        let rows = client.query(&stmt, params).await.map_err(classify)?;
         // RETURNING order is unspecified; restore the claim order.
         let mut claimed = rows
             .iter()
             .map(|row| {
-                let sched: PgTime = row.try_get("sched_at").map_err(classify)?;
+                let sched = time(row, "sched_at")?;
                 Ok((sched, run_from_row(row)?))
             })
             .collect::<StoreResult<Vec<_>>>()?;
@@ -1334,38 +1525,45 @@ impl Store for PgStore {
         ttl: Duration,
     ) -> StoreResult<bool> {
         let now = truncate_ms(now);
-        let done = sqlx::query(safe(&self.sql.renew_lease))
-            .bind(id.0)
-            .bind(worker)
-            .bind(PgTime(now))
-            .bind(PgTime(add_ttl(now, ttl)))
-            .execute(&self.pool)
+        let until = add_ttl(now, ttl);
+        let (now_sql, until_sql) = (sql_time(now), sql_time(until));
+        let params: &[&(dyn ToSql + Sync)] = &[&id.0, &worker, &now_sql, &until_sql];
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.renew_lease)
             .await
             .map_err(classify)?;
-        Ok(done.rows_affected() == 1)
+        let done = client.execute(&stmt, params).await.map_err(classify)?;
+        Ok(done == 1)
     }
 
     async fn release_lease(&self, id: RunId, worker: &str) -> StoreResult<()> {
-        sqlx::query(safe(&self.sql.release_lease))
-            .bind(id.0)
-            .bind(worker)
-            .execute(&self.pool)
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.release_lease)
+            .await
+            .map_err(classify)?;
+        client
+            .execute(&stmt, &[&id.0, &worker])
             .await
             .map_err(classify)?;
         Ok(())
     }
 
     async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
-        let row = sqlx::query(safe(&self.sql.lease_until))
-            .bind(id.0)
-            .fetch_optional(&self.pool)
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.lease_until)
             .await
             .map_err(classify)?;
-        let until = row
-            .map(|r| r.try_get::<Option<PgTime>, _>("lease_until"))
+        client
+            .query_opt(&stmt, &[&id.0])
+            .await
+            .map_err(classify)?
+            .as_ref()
+            .map(|row| opt_time(row, "lease_until"))
             .transpose()
-            .map_err(classify)?;
-        Ok(until.flatten().map(|t| t.0))
+            .map(Option::flatten)
     }
 
     async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
@@ -1377,18 +1575,23 @@ impl Store for PgStore {
             .statuses
             .as_ref()
             .map(|s| s.iter().map(|s| s.as_str().to_owned()).collect());
-        let rows = sqlx::query(safe(statement))
-            .bind(&query.agent)
-            .bind(statuses)
-            .bind(query.updated_since.map(truncate_ms).map(PgTime))
-            .bind(query.after.map(|(at, _)| PgTime(truncate_ms(at))))
-            .bind(query.after.map(|(_, id)| id.0))
-            .bind(i64::try_from(query.limit).unwrap_or(i64::MAX))
-            .bind(scope)
-            .bind(upper)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(classify)?;
+        let updated_since = query.updated_since.map(truncate_ms).map(sql_time);
+        let after = query.after.map(|(at, _)| sql_time(truncate_ms(at)));
+        let after_id = query.after.map(|(_, id)| id.0);
+        let limit = i64::try_from(query.limit).unwrap_or(i64::MAX);
+        let params: &[&(dyn ToSql + Sync)] = &[
+            &query.agent,
+            &statuses,
+            &updated_since,
+            &after,
+            &after_id,
+            &limit,
+            &scope,
+            &upper,
+        ];
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client.prepare_cached(statement).await.map_err(classify)?;
+        let rows = client.query(&stmt, params).await.map_err(classify)?;
         rows.iter().map(run_from_row).collect()
     }
 
@@ -1403,52 +1606,62 @@ impl Store for PgStore {
             .statuses
             .as_ref()
             .map(|s| s.iter().map(|s| s.as_str().to_owned()).collect());
-        let count: i64 = sqlx::query_scalar(safe(statement))
-            .bind(&query.agent)
-            .bind(statuses)
-            .bind(query.updated_since.map(truncate_ms).map(PgTime))
-            .bind(scope)
-            .bind(upper)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(classify)?;
+        let updated_since = query.updated_since.map(truncate_ms).map(sql_time);
+        let params: &[&(dyn ToSql + Sync)] =
+            &[&query.agent, &statuses, &updated_since, &scope, &upper];
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client.prepare_cached(statement).await.map_err(classify)?;
+        let row = client.query_one(&stmt, params).await.map_err(classify)?;
+        let count: i64 = decode_at(&row, 0)?;
         u64::try_from(count).map_err(|_| StoreError::Corrupt(format!("negative count {count}")))
     }
 
     async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord> {
         let config = storable(&new.config);
         let cursor = storable(&new.cursor);
-        let row = sqlx::query(safe(&self.sql.push_put))
-            .bind(new.run.0)
-            .bind(&new.id)
-            .bind(&new.agent)
-            .bind(&new.owner)
-            .bind(Json(config.as_ref()))
-            .bind(Json(cursor.as_ref()))
-            .bind(PgTime(now()))
-            .fetch_one(&self.pool)
+        let created = sql_time(now());
+        let params: &[&(dyn ToSql + Sync)] = &[
+            &new.run.0,
+            &new.id,
+            &new.agent,
+            &new.owner,
+            config.as_ref(),
+            cursor.as_ref(),
+            &created,
+        ];
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.push_put)
+            .await
+            .map_err(classify)?;
+        let row = client
+            .query_one(&stmt, params)
             .await
             .map_err(|e| self.map_write_err(e, new.run, &new.agent, None))?;
         push_from_row(&row)
     }
 
     async fn push_list(&self, run: RunId) -> StoreResult<Vec<PushRecord>> {
-        let rows = sqlx::query(safe(&self.sql.push_list))
-            .bind(run.0)
-            .fetch_all(&self.pool)
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.push_list)
             .await
             .map_err(classify)?;
+        let rows = client.query(&stmt, &[&run.0]).await.map_err(classify)?;
         rows.iter().map(push_from_row).collect()
     }
 
     async fn push_delete(&self, run: RunId, id: &str) -> StoreResult<bool> {
-        let done = sqlx::query(safe(&self.sql.push_delete))
-            .bind(run.0)
-            .bind(id)
-            .execute(&self.pool)
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.push_delete)
             .await
             .map_err(classify)?;
-        Ok(done.rows_affected() == 1)
+        let done = client
+            .execute(&stmt, &[&run.0, &id])
+            .await
+            .map_err(classify)?;
+        Ok(done == 1)
     }
 
     async fn push_claim_due(
@@ -1463,15 +1676,16 @@ impl Store for PgStore {
             return Ok(Vec::new());
         }
         let now = truncate_ms(now);
-        let rows = sqlx::query(safe(&self.sql.push_claim))
-            .bind(agents)
-            .bind(PgTime(now))
-            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .bind(worker)
-            .bind(PgTime(add_ttl(now, ttl)))
-            .fetch_all(&self.pool)
+        let until = add_ttl(now, ttl);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let (now_sql, until_sql) = (sql_time(now), sql_time(until));
+        let params: &[&(dyn ToSql + Sync)] = &[&agents, &now_sql, &limit, &worker, &until_sql];
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.push_claim)
             .await
             .map_err(classify)?;
+        let rows = client.query(&stmt, params).await.map_err(classify)?;
         // RETURNING order is unspecified; restore the claim order.
         let mut claimed = rows
             .iter()
@@ -1494,33 +1708,48 @@ impl Store for PgStore {
             StoreError::InvalidInput(format!("attempts {} exceeds i32::MAX", progress.attempts))
         })?;
         let cursor = storable(&progress.cursor);
-        let row = sqlx::query(safe(&self.sql.push_commit))
-            .bind(run.0)
-            .bind(id)
-            .bind(to_i64(expected, "version")?)
-            .bind(progress.state.as_str())
-            .bind(Json(cursor.as_ref()))
-            .bind(attempts)
-            .bind(&progress.last_error)
-            .bind(PgTime(truncate_ms(progress.next_attempt_at)))
-            .bind(PgTime(now()))
-            .fetch_optional(&self.pool)
+        let expected = to_i64(expected, "version")?;
+        let state = progress.state.as_str();
+        let next_attempt_at = sql_time(truncate_ms(progress.next_attempt_at));
+        let updated = sql_time(now());
+        let params: &[&(dyn ToSql + Sync)] = &[
+            &run.0,
+            &id,
+            &expected,
+            &state,
+            cursor.as_ref(),
+            &attempts,
+            &progress.last_error,
+            &next_attempt_at,
+            &updated,
+        ];
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.push_commit)
+            .await
+            .map_err(classify)?;
+        let row = client
+            .query_opt(&stmt, params)
             .await
             .map_err(|e| self.map_write_err(e, run, "", None))?;
         if let Some(row) = row {
             return push_from_row(&row);
         }
-        let actual: Option<i64> = sqlx::query_scalar(safe(&self.sql.push_version))
-            .bind(run.0)
-            .bind(id)
-            .fetch_optional(&self.pool)
+        let stmt = client
+            .prepare_cached(&self.sql.push_version)
             .await
             .map_err(classify)?;
+        let actual: Option<i64> = client
+            .query_opt(&stmt, &[&run.0, &id])
+            .await
+            .map_err(classify)?
+            .map(|row| decode_at(&row, 0))
+            .transpose()?;
         match actual {
             None => Err(StoreError::NotFound(run)),
             Some(actual) => Err(StoreError::Conflict {
                 run,
-                expected,
+                expected: expected as u64,
                 actual: actual as u64,
             }),
         }
@@ -1528,23 +1757,70 @@ impl Store for PgStore {
 
     async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64> {
         let mut total = 0;
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.purge)
+            .await
+            .map_err(classify)?;
+        let before_sql = sql_time(before);
         loop {
-            let done = sqlx::query(safe(&self.sql.purge))
-                .bind(agent)
-                .bind(PgTime(before))
-                .bind(PURGE_BATCH)
-                .execute(&self.pool)
+            let done = client
+                .execute(&stmt, &[&agent, &before_sql, &PURGE_BATCH])
                 .await
                 .map_err(classify)?;
-            total += done.rows_affected();
-            if done.rows_affected() < PURGE_BATCH as u64 {
+            total += done;
+            if done < PURGE_BATCH as u64 {
                 break;
             }
         }
         // The run's refs cascaded with it; a digest no surviving run references and that was
         // written before the cutoff goes in the same sweep.
-        self.sweep_blobs(before).await?;
+        self.sweep_blobs(&client, before).await?;
         Ok(total)
+    }
+
+    fn keeps_bodies(&self) -> bool {
+        true
+    }
+
+    async fn body_list(&self, run: RunId, generation: Uuid) -> StoreResult<Vec<BodyRow>> {
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.body_list)
+            .await
+            .map_err(classify)?;
+        let rows = client
+            .query(&stmt, &[&run.0, &generation])
+            .await
+            .map_err(classify)?;
+        rows.iter()
+            .map(|row| {
+                let idx: i32 = decode_at(row, 0)?;
+                Ok(BodyRow {
+                    idx: u32::try_from(idx)
+                        .map_err(|_| StoreError::Corrupt(format!("negative body index {idx}")))?,
+                    message: decode_at(row, 1)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn gc_body(
+        &self,
+        run: RunId,
+        keep_generation: Uuid,
+        before: Timestamp,
+    ) -> StoreResult<u64> {
+        let before = sql_time(before);
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.gc_body)
+            .await
+            .map_err(classify)?;
+        client
+            .execute(&stmt, &[&run.0, &keep_generation, &before])
+            .await
+            .map_err(classify)
     }
 
     fn keeps_blobs(&self) -> bool {
@@ -1554,57 +1830,358 @@ impl Store for PgStore {
     async fn put_blob(&self, id: &BlobId, bytes: &[u8]) -> StoreResult<()> {
         // Idempotent: `ON CONFLICT DO NOTHING` keeps the first bytes of a digest, and the CHECK on
         // `size` refuses a row whose two columns disagree.
-        sqlx::query(safe(&self.sql.put_blob))
-            .bind(id.as_str())
-            .bind(bytes)
-            .bind(to_i64(bytes.len() as u64, "blob size")?)
-            .bind(PgTime(now()))
-            .execute(&self.pool)
+        let size = to_i64(bytes.len() as u64, "blob size")?;
+        let created = sql_time(now());
+        let params: &[&(dyn ToSql + Sync)] = &[&id.as_str(), &bytes, &size, &created];
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.put_blob)
             .await
             .map_err(classify)?;
+        client.execute(&stmt, params).await.map_err(classify)?;
         Ok(())
     }
 
     async fn blob_stored(&self, id: &BlobId) -> StoreResult<bool> {
-        let row = sqlx::query(safe(&self.sql.blob_exists))
-            .bind(id.as_str())
-            .fetch_one(&self.pool)
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.blob_exists)
             .await
             .map_err(classify)?;
-        row.try_get("exists").map_err(classify)
+        let row = client
+            .query_one(&stmt, &[&id.as_str()])
+            .await
+            .map_err(classify)?;
+        decode(&row, "exists")
     }
 
     async fn get_blob(&self, id: &BlobId) -> StoreResult<Option<Vec<u8>>> {
-        let row = sqlx::query(safe(&self.sql.get_blob))
-            .bind(id.as_str())
-            .fetch_optional(&self.pool)
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.get_blob)
             .await
             .map_err(classify)?;
-        row.map(|row| row.try_get("bytes").map_err(classify))
+        client
+            .query_opt(&stmt, &[&id.as_str()])
+            .await
+            .map_err(classify)?
+            .as_ref()
+            .map(|row| decode(row, "bytes"))
             .transpose()
     }
 
     async fn purge_blobs(&self, before: Timestamp) -> StoreResult<u64> {
-        self.sweep_blobs(before).await
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        self.sweep_blobs(&client, before).await
     }
 }
 
 impl PgStore {
     /// Delete unreferenced blobs older than `before` in batches; returns how many.
-    async fn sweep_blobs(&self, before: Timestamp) -> StoreResult<u64> {
+    async fn sweep_blobs(&self, client: &Object, before: Timestamp) -> StoreResult<u64> {
+        let stmt = client
+            .prepare_cached(&self.sql.purge_blobs)
+            .await
+            .map_err(classify)?;
+        let before = sql_time(before);
         let mut total = 0;
         loop {
-            let done = sqlx::query(safe(&self.sql.purge_blobs))
-                .bind(PgTime(before))
-                .bind(PURGE_BATCH)
-                .execute(&self.pool)
+            let done = client
+                .execute(&stmt, &[&before, &PURGE_BATCH])
                 .await
                 .map_err(classify)?;
-            total += done.rows_affected();
-            if done.rows_affected() < PURGE_BATCH as u64 {
+            total += done;
+            if done < PURGE_BATCH as u64 {
                 return Ok(total);
             }
         }
+    }
+
+    /// The row a failed commit writes no version for: the version moved, or the run is gone.
+    async fn commit_conflict(&self, id: RunId, expected: u64) -> StoreResult<RunRecord> {
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.load_version)
+            .await
+            .map_err(classify)?;
+        let actual: Option<i64> = client
+            .query_opt(&stmt, &[&id.0])
+            .await
+            .map_err(classify)?
+            .map(|row| decode_at(&row, 0))
+            .transpose()?;
+        match actual {
+            None => Err(StoreError::NotFound(id)),
+            Some(actual) => Err(StoreError::Conflict {
+                run: id,
+                expected,
+                actual: actual as u64,
+            }),
+        }
+    }
+
+    /// The row a winning commit returned, or the version conflict it did not.
+    async fn finish_commit(
+        &self,
+        row: Option<Row>,
+        id: RunId,
+        expected: u64,
+    ) -> StoreResult<RunRecord> {
+        match row {
+            Some(row) => run_metadata_from_row(&row),
+            None => self.commit_conflict(id, expected).await,
+        }
+    }
+
+    /// A commit that writes a head, a body row or a blob reference: one transaction, with the
+    /// version check, the foreign-writer check and the CAS inside it.
+    ///
+    /// The run row is locked (`FOR UPDATE`) first, so two commits of one run serialize exactly
+    /// where the CAS would serialize them, and a commit that writes nothing never opens the
+    /// transaction (see [`commit_run`](Store::commit_run)).
+    // The arguments are the update's own fields plus the statement's bound parameters: bundling
+    // them in a struct would only move the same list one line down.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_parts(
+        &self,
+        id: RunId,
+        expected: i64,
+        params: &[&(dyn ToSql + Sync)],
+        mut head: Option<Value>,
+        body: Option<BodyWrite>,
+        blobs: &[BlobId],
+        t: Timestamp,
+    ) -> StoreResult<RunRecord> {
+        let mut client = self.pool.get().await.map_err(classify_pool)?;
+        let outcome: StoreResult<CommitOutcome> = async {
+            let tx = client.transaction().await.map_err(classify)?;
+            let stmt = tx
+                .prepare_cached(&self.sql.commit_context)
+                .await
+                .map_err(classify)?;
+            let Some(row) = tx.query_opt(&stmt, &[&id.0]).await.map_err(classify)? else {
+                tx.rollback().await.map_err(classify)?;
+                return Ok(CommitOutcome::Missing);
+            };
+            let version: i64 = decode_at(&row, 0)?;
+            if version != expected {
+                tx.rollback().await.map_err(classify)?;
+                return Ok(CommitOutcome::Conflict(version as u64));
+            }
+            let current_head: Option<Value> = decode_at(&row, 3)?;
+            let head_version: Option<i64> = decode_at(&row, 4)?;
+            let plan = match body {
+                Some(body) => Some(plan_body(
+                    &mut head,
+                    current_head.as_ref(),
+                    head_version,
+                    expected,
+                    body,
+                    t,
+                )?),
+                None => None,
+            };
+            if let Some(plan) = &plan {
+                self.write_body(&tx, id, plan, expected).await?;
+            }
+            if !blobs.is_empty() {
+                // One statement for the set; a digest named twice in one commit is one row.
+                let mut seen = HashSet::new();
+                let digests: Vec<String> = blobs
+                    .iter()
+                    .filter(|digest| seen.insert(digest.as_str()))
+                    .map(|digest| digest.as_str().to_owned())
+                    .collect();
+                let stmt = tx
+                    .prepare_cached(&self.sql.commit_blobs)
+                    .await
+                    .map_err(classify)?;
+                tx.execute(&stmt, &[&id.0, &digests])
+                    .await
+                    .map_err(classify)?;
+            }
+            let head_sql = head.as_ref().map(storable);
+            let head_version = expected + 1;
+            let statement = if head_sql.is_some() {
+                &self.sql.commit_run_head
+            } else {
+                &self.sql.commit_run
+            };
+            let stmt = tx.prepare_cached(statement).await.map_err(classify)?;
+            let result = match &head_sql {
+                Some(head) => {
+                    let head_params: &[&(dyn ToSql + Sync)] = &[
+                        params[0],
+                        params[1],
+                        params[2],
+                        params[3],
+                        params[4],
+                        params[5],
+                        params[6],
+                        head.as_ref(),
+                        &head_version,
+                    ];
+                    tx.query_opt(&stmt, head_params).await
+                }
+                None => tx.query_opt(&stmt, params).await,
+            };
+            let row = match result {
+                Ok(row) => row,
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    return Ok(CommitOutcome::Rejected(err));
+                }
+            };
+            // The version check above and the row lock make this unreachable, but a CAS that
+            // matched nothing must roll back rather than commit rows no head will ever name.
+            let Some(row) = row else {
+                tx.rollback().await.map_err(classify)?;
+                return Ok(CommitOutcome::Conflict(expected as u64));
+            };
+            tx.commit().await.map_err(classify)?;
+            Ok(CommitOutcome::Written(row, plan))
+        }
+        .await;
+        // The connection is given back before a helper that needs another one runs.
+        drop(client);
+        match outcome? {
+            CommitOutcome::Written(row, plan) => {
+                // The superseded generations are collected only after the CAS: a commit that lost
+                // names nothing, so it has nothing to supersede.
+                if let Some(plan) = plan {
+                    let _ = self.gc_body(id, plan.generation, t - BODY_GC_GRACE).await;
+                }
+                run_metadata_from_row(&row)
+            }
+            CommitOutcome::Missing => Err(StoreError::NotFound(id)),
+            CommitOutcome::Conflict(actual) => Err(StoreError::Conflict {
+                run: id,
+                expected: expected as u64,
+                actual,
+            }),
+            CommitOutcome::Rejected(err) => Err(self.commit_error(err, id).await?),
+        }
+    }
+
+    /// Write the rows of one body plan inside the commit's transaction, resolving a slot another
+    /// writer left: an identical message is adopted, one older than [`BODY_ORPHAN_GRACE`] is
+    /// collected (once), anything else is a `Conflict`.
+    async fn write_body(
+        &self,
+        tx: &deadpool_postgres::Transaction<'_>,
+        id: RunId,
+        plan: &BodyPlan,
+        expected: i64,
+    ) -> StoreResult<()> {
+        let rows = &plan.rows[plan.start..];
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let from = i32::try_from(plan.start)
+            .map_err(|_| StoreError::InvalidInput("body start exceeds i32".into()))?;
+        let to = i32::try_from(plan.rows.len())
+            .map_err(|_| StoreError::InvalidInput("a transcript is longer than i32".into()))?;
+        let idx = rows
+            .iter()
+            .map(|row| {
+                i32::try_from(row.idx).map_err(|_| {
+                    StoreError::InvalidInput(format!("body index {} exceeds i32::MAX", row.idx))
+                })
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        let messages: Vec<Value> = rows
+            .iter()
+            .map(|row| storable(&row.message).into_owned())
+            .collect();
+        let written_at = sql_time(plan.written_at);
+        let insert = tx
+            .prepare_cached(&self.sql.body_insert)
+            .await
+            .map_err(classify)?;
+        // One retry: the first pass may collect an orphaned attempt's rows and insert again. A
+        // second duplicate is a live attempt (or an insert that cannot be completed).
+        for pass in 0..2 {
+            tx.execute(
+                &insert,
+                &[
+                    &id.0,
+                    &plan.generation,
+                    &idx,
+                    &messages,
+                    &plan.writer,
+                    &written_at,
+                ],
+            )
+            .await
+            .map_err(classify)?;
+            let stmt = tx
+                .prepare_cached(&self.sql.body_conflicts)
+                .await
+                .map_err(classify)?;
+            let conflicts = tx
+                .query(&stmt, &[&id.0, &plan.generation, &from, &to, &plan.writer])
+                .await
+                .map_err(classify)?;
+            if conflicts.is_empty() {
+                return Ok(());
+            }
+            let cutoff = plan.written_at - BODY_ORPHAN_GRACE;
+            let mut orphans = Vec::new();
+            for row in &conflicts {
+                let index: i32 = decode_at(row, 0)?;
+                let message: Value = decode_at(row, 1)?;
+                let at: jiff::Timestamp = decode_at(row, 2)?;
+                let position = usize::try_from(index)
+                    .map_err(|_| StoreError::Corrupt(format!("negative body index {index}")))?;
+                let row_expected = plan.rows.get(position).ok_or_else(|| {
+                    StoreError::Corrupt(format!("body row {index} is outside the transcript"))
+                })?;
+                if message == *storable(&row_expected.message) {
+                    // Another attempt wrote the same message at this slot: adopting it is
+                    // indistinguishable from our own row, and the CAS decides whose head names it.
+                    continue;
+                }
+                if Timestamp(at) < cutoff {
+                    orphans.push(index);
+                } else {
+                    // A live attempt's differing row: the append cannot be completed.
+                    return Err(StoreError::Conflict {
+                        run: id,
+                        expected: expected as u64,
+                        actual: expected as u64,
+                    });
+                }
+            }
+            if orphans.is_empty() {
+                return Ok(());
+            }
+            if pass == 1 {
+                return Err(StoreError::Corrupt(format!(
+                    "body generation {} of run {id}: a collected slot is still occupied",
+                    plan.generation
+                )));
+            }
+            let stmt = tx
+                .prepare_cached(&self.sql.body_collect)
+                .await
+                .map_err(classify)?;
+            tx.execute(&stmt, &[&id.0, &plan.generation, &orphans, &plan.writer])
+                .await
+                .map_err(classify)?;
+        }
+        Ok(())
+    }
+
+    /// A failed `commit_run`: a unique violation is the open-conversation index, and the run tells
+    /// which conversation is busy; anything else is the driver's error.
+    async fn commit_error(&self, err: tokio_postgres::Error, id: RunId) -> StoreResult<StoreError> {
+        if err.code().map(|code| code.code()) == Some("23505") {
+            // The only unique index an UPDATE can trip is the open-conversation one; look the
+            // run up to report which conversation is busy.
+            let run = self.load_run(id).await?.ok_or(StoreError::NotFound(id))?;
+            return Ok(self.map_write_err(err, id, &run.agent, run.conversation_id.as_deref()));
+        }
+        Ok(self.map_write_err(err, id, "", None))
     }
 }
 
@@ -1612,61 +2189,6 @@ impl PgStore {
 mod tests {
     use super::*;
     use adam_error::Classify;
-    use sqlx::error::BoxDynError;
-
-    fn boxed(msg: &'static str) -> BoxDynError {
-        msg.into()
-    }
-
-    fn class_of(err: sqlx::Error) -> ErrorClass {
-        classify(err).class()
-    }
-
-    #[test]
-    fn driver_errors_are_classified_by_what_they_mean() {
-        let io = || std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-        // Exhaustive over the variants we decide on; the rest fall through to Internal.
-        let table: Vec<(sqlx::Error, ErrorClass)> = vec![
-            (sqlx::Error::Io(io()), ErrorClass::Transient),
-            (sqlx::Error::Tls(boxed("handshake")), ErrorClass::Transient),
-            (sqlx::Error::PoolTimedOut, ErrorClass::Transient),
-            (sqlx::Error::PoolClosed, ErrorClass::Transient),
-            (sqlx::Error::WorkerCrashed, ErrorClass::Transient),
-            (
-                sqlx::Error::Protocol("bad frame".into()),
-                ErrorClass::Transient,
-            ),
-            (sqlx::Error::Decode(boxed("bad utf8")), ErrorClass::Corrupt),
-            (
-                sqlx::Error::ColumnDecode {
-                    index: "version".into(),
-                    source: boxed("mismatched types"),
-                },
-                ErrorClass::Corrupt,
-            ),
-            (sqlx::Error::ColumnNotFound("x".into()), ErrorClass::Corrupt),
-            (
-                sqlx::Error::Configuration(boxed("bad url")),
-                ErrorClass::Invalid,
-            ),
-            (sqlx::Error::RowNotFound, ErrorClass::Internal),
-            (
-                sqlx::Error::Encode(boxed("bad value")),
-                ErrorClass::Internal,
-            ),
-        ];
-        for (err, want) in table {
-            let shown = err.to_string();
-            assert_eq!(class_of(err), want, "{shown}");
-        }
-    }
-
-    #[test]
-    fn a_corrupt_row_is_not_retryable() {
-        let e = classify(sqlx::Error::Decode(boxed("bad")));
-        assert!(!e.is_retryable());
-        assert!(e.class().should_alert());
-    }
 
     #[test]
     fn the_pool_size_is_validated_and_defaults_to_sixteen() {
@@ -1702,10 +2224,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_store_keeps_blobs_and_bodies() {
+        let pg = PgConfig::parse("postgres://u@h/d").expect("a URL");
+        let store = PgStore::from_pool(pg.pool(1).expect("a lazy pool"));
+        assert!(Store::keeps_blobs(&store));
+        assert!(Store::keeps_bodies(&store));
+    }
+
     #[tokio::test]
     async fn a_pool_size_out_of_range_is_refused_before_connecting() {
-        // No server is needed: the size is checked before a connection is attempted. One is
-        // refused too: the notify listener holds a connection for the process's life.
+        // No server is needed: the size is checked before a connection is attempted.
         for size in [0, 1, MAX_POOL_SIZE + 1] {
             let err = PgStore::connect_with_pool_size("postgres://example.invalid/db", size)
                 .await
@@ -1715,6 +2244,78 @@ mod tests {
                 "{size}: {err:?}"
             );
         }
+    }
+
+    /// The live statements are the checked-in schema fixture, whitespace-normalised, so a change
+    /// to `Sql::new` cannot silently stop being the schema a database already has.
+    /// `ADAM_WRITE_FIXTURE=1` rewrites the fixture instead of comparing (the migration is the
+    /// source of truth; the fixture is what a database built by this release already has).
+    /// `tests/fixtures/schema-v5.sql` stays: it is the pre-#361 schema the upgrade test applies.
+    #[test]
+    fn the_statements_equal_the_version_6_fixture() {
+        let sql = Sql::new("adam_");
+        assert!(
+            sql.migrate.len() > 4,
+            "the fixture must hold the whole migration"
+        );
+        let mut generated = String::from(
+            "-- The schema version 6 that adam-store-postgres emits.\n\
+             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_6_fixture\n",
+        );
+        generated.push_str(&sql.migrate.join(";\n\n"));
+        generated.push_str(";\n");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v6.sql");
+        if std::env::var_os("ADAM_WRITE_FIXTURE").is_some() {
+            std::fs::write(path, &generated).expect("write the fixture");
+        }
+        let fixture = include_str!("../tests/fixtures/schema-v6.sql");
+        assert_eq!(
+            normalise(&(sql.migrate.join("; ") + ";")),
+            normalise(fixture)
+        );
+    }
+
+    /// Whitespace runs collapse to one space; comment lines are dropped.
+    fn normalise(sql: &str) -> String {
+        let without_comments = sql
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        without_comments
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[tokio::test]
+    async fn sqlstates_are_classified_against_a_real_server() {
+        let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let config = PgConfig::parse(&url).expect("url");
+        let pool = config.pool(1).expect("pool");
+        let client = pool.get().await.expect("connect");
+        for (state, want) in [
+            ("40001", ErrorClass::Transient), // serialization failure
+            ("40P01", ErrorClass::Transient), // deadlock
+            ("08006", ErrorClass::Transient), // connection failure
+            ("53300", ErrorClass::Transient), // too many connections
+            ("57P01", ErrorClass::Transient), // admin shutdown
+            ("42601", ErrorClass::Internal),  // syntax error
+            ("23514", ErrorClass::Internal),  // check violation
+        ] {
+            let stmt =
+                format!("DO $$ BEGIN RAISE EXCEPTION 'boom' USING ERRCODE = '{state}'; END $$");
+            let err = client.batch_execute(&stmt).await.expect_err("it raises");
+            assert_eq!(classify(err).class(), want, "SQLSTATE {state}");
+        }
+        // A real syntax error on a raw query, not a raised one.
+        let err = client
+            .batch_execute("SELEC 1")
+            .await
+            .expect_err("syntax error");
+        assert_eq!(classify(err).class(), ErrorClass::Internal);
     }
 
     /// The version 3 -> 4 listing index is rebuilt without taking `runs` from live traffic: a
@@ -1727,11 +2328,8 @@ mod tests {
         let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
             return;
         };
-        let pool = PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&url)
-            .await
-            .unwrap();
+        let config = PgConfig::parse(&url).expect("url");
+        let pool = config.pool(4).expect("pool");
         let p = format!(
             "adam_online_{}_",
             &Uuid::new_v4().simple().to_string()[..12]
@@ -1750,28 +2348,28 @@ mod tests {
             ),
             format!("UPDATE {p}meta SET value = '3' WHERE key = 'schema_version'"),
         ] {
-            sqlx::query(AssertSqlSafe(stmt))
-                .execute(&pool)
+            pool.get()
+                .await
+                .unwrap()
+                .batch_execute(&stmt)
                 .await
                 .unwrap();
         }
 
         // A writer holds its table lock open. A concurrent build runs beside it; a non-concurrent
         // one queues for `ACCESS EXCLUSIVE`/`SHARE` and a write queues behind it.
-        let mut writer = pool.begin().await.unwrap();
-        sqlx::query(AssertSqlSafe(format!(
-            "LOCK TABLE {p}runs IN ROW EXCLUSIVE MODE"
-        )))
-        .execute(&mut *writer)
-        .await
-        .unwrap();
+        let mut writer = pool.get().await.unwrap();
+        let tx = writer.transaction().await.unwrap();
+        tx.batch_execute(&format!("LOCK TABLE {p}runs IN ROW EXCLUSIVE MODE"))
+            .await
+            .unwrap();
 
         let upgrade = {
             let store = store.clone();
             let pool = pool.clone();
             tokio::spawn(async move {
-                let mut conn = pool.acquire().await.expect("a connection");
-                store.upgrade_listing_index(&mut conn).await
+                let mut client = Object::take(pool.get().await.expect("a connection"));
+                store.upgrade_listing_index(&mut client).await
             })
         };
         // Wait until the build holds its `SHARE UPDATE EXCLUSIVE` lock on `runs`: from then on the
@@ -1779,15 +2377,17 @@ mod tests {
         // asks for `SHARE`/`ACCESS EXCLUSIVE` instead, so this wait times out and the test fails.)
         let build_started = async {
             loop {
-                let held: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM pg_locks
-                      WHERE locktype = 'relation' AND relation = to_regclass($1)
-                        AND mode = 'ShareUpdateExclusiveLock' AND granted",
-                )
-                .bind(format!("{p}runs"))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+                let client = pool.get().await.unwrap();
+                let held: i64 = client
+                    .query_one(
+                        "SELECT count(*) FROM pg_locks
+                          WHERE locktype = 'relation' AND relation = to_regclass($1)
+                            AND mode = 'ShareUpdateExclusiveLock' AND granted",
+                        &[&format!("{p}runs")],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
                 if held > 0 {
                     return;
                 }
@@ -1798,14 +2398,13 @@ mod tests {
             .await
             .expect("the upgrade never took its ShareUpdateExclusiveLock on runs");
         let probe = Uuid::new_v4();
+        let client = pool.get().await.unwrap();
         tokio::time::timeout(
             Duration::from_secs(2),
-            sqlx::query(AssertSqlSafe(format!(
+            client.batch_execute(&format!(
                 "INSERT INTO {p}runs (id, agent, status, state, version, created_at, updated_at)
-                 VALUES ($1, 'probe', 'runnable', '{{}}'::jsonb, 1, now(), now())"
-            )))
-            .bind(probe)
-            .execute(&pool),
+                 VALUES ('{probe}', 'probe', 'runnable', '{{}}'::jsonb, 1, now(), now())"
+            )),
         )
         .await
         .expect("a write waited for the listing-index upgrade")
@@ -1816,81 +2415,43 @@ mod tests {
         );
 
         // The build waits for the writer's transaction to end, not the other way round.
-        writer.rollback().await.unwrap();
+        tx.rollback().await.unwrap();
         upgrade.await.unwrap().expect("the listing index upgrade");
-        let written: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT count(*) FROM {p}runs WHERE id = $1"
-        )))
-        .bind(probe)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let client = pool.get().await.unwrap();
+        let written: i64 = client
+            .query_one(
+                &format!("SELECT count(*) FROM {p}runs WHERE id = $1"),
+                &[&probe],
+            )
+            .await
+            .unwrap()
+            .get(0);
         assert_eq!(written, 1, "the write landed beside the build");
 
-        let valid: Option<bool> = sqlx::query_scalar(
-            "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
-        )
-        .bind(format!("{p}runs_list_status"))
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
+        let valid: Option<bool> = client
+            .query_opt(
+                "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+                &[&format!("{p}runs_list_status")],
+            )
+            .await
+            .unwrap()
+            .map(|row| row.get(0));
         assert_eq!(valid, Some(true), "the new index is valid");
-        let old: Option<String> = sqlx::query_scalar(
-            "SELECT indexdef FROM pg_indexes
-              WHERE schemaname = current_schema() AND indexname = $1",
-        )
-        .bind(format!("{p}runs_list"))
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
+        let old: Option<String> = client
+            .query_opt(
+                "SELECT indexdef FROM pg_indexes
+                  WHERE schemaname = current_schema() AND indexname = $1",
+                &[&format!("{p}runs_list")],
+            )
+            .await
+            .unwrap()
+            .map(|row| row.get(0));
         assert_eq!(old, None, "the version 3 index was dropped");
 
         for table in ["push", "journal", "runs", "meta"] {
-            let _ = sqlx::query(AssertSqlSafe(format!(
-                "DROP TABLE IF EXISTS {p}{table} CASCADE"
-            )))
-            .execute(&pool)
-            .await;
+            let _ = client
+                .batch_execute(&format!("DROP TABLE IF EXISTS {p}{table} CASCADE"))
+                .await;
         }
-    }
-
-    /// Provoke a server-side error with a chosen SQLSTATE.
-    async fn raise(pool: &PgPool, sqlstate: &str) -> sqlx::Error {
-        let stmt =
-            format!("DO $$ BEGIN RAISE EXCEPTION 'boom' USING ERRCODE = '{sqlstate}'; END $$");
-        match sqlx::query(AssertSqlSafe(stmt)).execute(pool).await {
-            Ok(_) => panic!("statement should have failed"),
-            Err(e) => e,
-        }
-    }
-
-    #[tokio::test]
-    async fn sqlstates_are_classified_against_a_real_server() {
-        let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
-            return;
-        };
-        let pool = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .unwrap();
-        for (state, want) in [
-            ("40001", ErrorClass::Transient), // serialization failure
-            ("40P01", ErrorClass::Transient), // deadlock
-            ("08006", ErrorClass::Transient), // connection failure
-            ("53300", ErrorClass::Transient), // too many connections
-            ("57P01", ErrorClass::Transient), // admin shutdown
-            ("42601", ErrorClass::Internal),  // syntax error
-            ("23514", ErrorClass::Internal),  // check violation
-        ] {
-            assert_eq!(
-                class_of(raise(&pool, state).await),
-                want,
-                "SQLSTATE {state}"
-            );
-        }
-        // A real syntax error on a raw query, not a raised one.
-        let err = sqlx::query("SELEC 1").execute(&pool).await.unwrap_err();
-        assert_eq!(class_of(err), ErrorClass::Internal);
     }
 }

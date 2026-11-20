@@ -13,11 +13,11 @@ ignore = [
     # 2026-11-19 in the advisory-db checkout at commit 3157b0e258782691). Accepted by the owner on
     # 2026-11-17. adam-rs's own code moved to jiff (ADR 0057, 2026-11-19); what remains is the A2A
     # crates it builds on (`a2a-lf`, `a2a-server-lf` and `a2a-pb`, so `adam-a2a` and
-    # `adam-a2a-runtime` keep the types `TaskStatus`, `TaskQuery` and `PageToken`) and the
-    # PostgreSQL bridge (`adam-store-postgres`, whose sqlx `chrono` feature and private `PgTime` are
-    # temporary: sqlx 0.9 has no jiff support). Review by 2027-02-17, or at once if an advisory
+    # `adam-a2a-runtime` keep the types `TaskStatus`, `TaskQuery` and `PageToken`). The PostgreSQL
+    # store no longer maps through chrono: it moved to `tokio-postgres` and `with-jiff-0_2`
+    # (ADR 0053 decision 1, amended 2026-11-20). Review by 2027-02-17, or at once if an advisory
     # names a vulnerability in chrono.
-    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; advisory date 2026-09-14, accepted 2026-11-17, adam-rs's own code moved to jiff (ADR 0057); what remains is a2a-lf/a2a-server-lf/a2a-pb, sqlx's chrono feature and the PostgreSQL bridge, review by 2027-02-17" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; advisory date 2026-09-14, accepted 2026-11-17, adam-rs's own code moved to jiff (ADR 0057); what remains is a2a-lf/a2a-server-lf/a2a-pb, review by 2027-02-17" },
 ]
 
 [licenses]
@@ -55,18 +55,14 @@ wrappers = [
     # The A2A boundary: `TaskStatus`, `TaskQuery` and `PageToken` are the SDK's types.
     "adam-a2a",
     "adam-a2a-runtime",
-    # sqlx 0.9 has no jiff support; the store maps `Timestamp` through a private `PgTime`.
-    "adam-store-postgres",
     # The A2A protocol crates `adam-a2a` builds on.
     "a2a-lf",
     "a2a-pb",
     "a2a-server-lf",
     "pbjson-types",
-    # Already in the tree and outside adam's own code: the MCP client, JSON Schema and sqlx's drivers.
+    # Already in the tree and outside adam's own code: the MCP client and JSON Schema.
     "rmcp",
     "schemars",
-    "sqlx-core",
-    "sqlx-postgres",
 ]
 
 [sources]

@@ -6,6 +6,11 @@
 //! old rows, a new head, one version up) and collects the old generation, or it collects the old
 //! generation alone; either way it returns the **old** record, so the `body_list` the caller makes
 //! next finds the set short. The second `load_head` passes through to the inner store.
+//!
+//! [`MovingHead::appending`] is the other direction: it **appends** to the generation on each of
+//! the first two `load_head` calls and answers the record from before the append, so the
+//! `body_list` the caller makes next finds **more** rows than the head names — a later commit,
+//! which must not be read as a corrupt head.
 
 #![allow(dead_code)] // one test binary includes this module
 
@@ -31,6 +36,9 @@ pub struct MovingHead {
     /// Whether the first `load_head` commits a compaction (a new generation) before collecting the
     /// old one. `false`: it collects the old one and leaves the head where it was.
     compact: bool,
+    /// `Some(n)`: append `n` rows to the current generation on each of the first two `load_head`
+    /// calls, answering the record from before the append (see [`MovingHead::appending`]).
+    grow: Option<usize>,
     loads: AtomicUsize,
 }
 
@@ -47,6 +55,22 @@ impl MovingHead {
             run,
             first: Mutex::new(Some((first, generation))),
             compact,
+            grow: None,
+            loads: AtomicUsize::new(0),
+        }
+    }
+
+    /// A wrapper that **appends** `extra` rows to the run's current generation on each of its first
+    /// two `load_head` calls (a new head each time, one version up), and answers the record from
+    /// before that append. The `body_list` the caller makes after each `load_head` therefore finds
+    /// more rows than the head names: a commit that landed between the two reads.
+    pub fn appending(inner: DynStore, run: RunId, extra: usize) -> Self {
+        Self {
+            inner,
+            run,
+            first: Mutex::new(None),
+            compact: false,
+            grow: Some(extra),
             loads: AtomicUsize::new(0),
         }
     }
@@ -61,6 +85,47 @@ impl MovingHead {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
+    }
+
+    /// Append `extra` rows to the current generation, then answer the record from before it.
+    async fn grow(&self, id: RunId, extra: usize) -> StoreResult<Option<RunRecord>> {
+        let before = self.inner.load_head(id).await?.expect("the run");
+        let generation = generation_of(&before);
+        let mut rows = self.inner.body_list(id, generation).await?;
+        let start = rows.len();
+        for i in 0..extra {
+            let idx = u32::try_from(start + i).expect("a short transcript");
+            rows.push(BodyRow {
+                idx,
+                message: json!(format!("appended {idx}")),
+            });
+        }
+        let len = u32::try_from(rows.len()).expect("a short transcript");
+        let head = json!({
+            "v": 5,
+            "agent": before.state["agent"].clone(),
+            "body": {"generation": null, "len": len},
+        });
+        let state = json!({
+            "v": 1,
+            "agent": before.state["agent"].clone(),
+            "inbox": [], "seq": 0, "attempt": 0, "rev": 0,
+            "output": null, "error": null, "artifacts": [],
+        });
+        self.inner
+            .commit_run(
+                id,
+                before.version,
+                RunUpdate::new(before.status, state)
+                    .head(head)
+                    .body(BodyWrite {
+                        generation: None,
+                        rows,
+                        writer: Uuid::new_v4(),
+                    }),
+            )
+            .await?;
+        Ok(Some(before))
     }
 }
 
@@ -82,7 +147,14 @@ impl Store for MovingHead {
         if id != self.run {
             return self.inner.load_head(id).await;
         }
-        if self.loads.fetch_add(1, SeqCst) > 0 {
+        let call = self.loads.fetch_add(1, SeqCst);
+        if let Some(extra) = self.grow {
+            if call > 1 {
+                return self.inner.load_head(id).await;
+            }
+            return self.grow(id, extra).await;
+        }
+        if call > 0 {
             return self.inner.load_head(id).await;
         }
         let Some((first, generation)) = self.first() else {

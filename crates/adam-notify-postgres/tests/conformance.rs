@@ -13,20 +13,17 @@
 
 use adam_notify_postgres::PgNotify;
 use adam_notify_testkit::{Pair, Side};
+use adam_postgres::PgConfig;
 use adam_runtime::BroadcastSink;
-use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 async fn side(url: &str, prefix: &str) -> Side {
     // Each #[tokio::test] has its own runtime, so each side has its own small
     // pool; the listener takes one connection of it.
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(url)
-        .await
-        .expect("connect");
+    let pg = PgConfig::parse(url).expect("DATABASE_URL");
+    let pool = pg.pool(4).expect("pool");
     let local = BroadcastSink::default();
-    let notify = PgNotify::new(pool, local.clone())
+    let notify = PgNotify::new(pool, pg, local.clone())
         .with_channel_prefix(prefix)
         .expect("prefix")
         // An ambient NOTIFY_LOCAL_ONLY must not change what this suite checks.
@@ -102,12 +99,9 @@ async fn items_queued_at_stop_are_drained() {
     let listening = side(&url, &prefix).await;
     let mut on_listening = listening.notifier.subscribe();
 
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("connect");
-    let stopping = PgNotify::new(pool, BroadcastSink::default())
+    let pg = PgConfig::parse(&url).expect("DATABASE_URL");
+    let pool = pg.pool(4).expect("pool");
+    let stopping = PgNotify::new(pool, pg, BroadcastSink::default())
         .with_channel_prefix(&prefix)
         .expect("prefix")
         // The ambient environment must not decide what this test measures.

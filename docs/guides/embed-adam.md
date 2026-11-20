@@ -24,8 +24,11 @@ agent made of files, do not embed: [Write an agent](write-an-agent.md).
    adam-runtime = { git = "https://github.com/vymalo/another-adam-rs", rev = "<same sha>" }
    ```
 
-2. **One TLS backend per process.** `adam-store-postgres` and `adam-notify-postgres` default to `tls-rustls`; if
-   your workspace selects another `sqlx` backend, use `default-features = false` on both.
+2. **TLS is built in.** `adam-store-postgres` and `adam-notify-postgres` use `rustls` on `aws-lc-rs`; the
+   `DATABASE_URL` chooses the mode (`sslmode`, `sslrootcert`, `sslcert`, `sslkey`). There are no TLS Cargo
+   features any more (`sqlx` left with
+   [ADR 0053](../decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)): a
+   consumer that set `tls-rustls` or `tls-native-tls` removes the line.
 3. **Configuration is the host's.** `adam-host` never reads the environment. With `adam-service` the variables
    are those of [Environment](../reference/environment.md#both-binaries-adam-service); a host of your own owns its names.
 4. **Map a failed `serve` to an exit code** with `adam_service::exit_code` (78 configuration, 69 dependency down,
