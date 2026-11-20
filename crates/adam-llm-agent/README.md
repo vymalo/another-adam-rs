@@ -38,7 +38,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `spec_for::<A>(name, description)`, `ToolSpecExt::for_args` | feature `schema`: the `ToolSpec` of a tool whose arguments are `A: JsonSchema` |
 | `ToolError::from_classified(&e)` | a retryable `Classify` error becomes `Transient`, any other `Permanent`, with the whole source chain as the message |
 | `__private` | feature `schema`, `#[doc(hidden)]`: the paths `#[tool]` generates code against (`serde`, `schemars`, `async_trait`, `spec_for`, `parse_args`, ...). Not API: it changes with the macro |
-| `ToolSource`, `DynToolSource`, `SourceCtx`, `LlmAgentBuilder::tool_source`, `MAX_SOURCE_TOOLS` | tools the agent learns about while it runs: a source reads the run with `SourceCtx` (`run_id`, `root_run_id`, `conversation_id`, `context` and `task`: the words the run was started with, the same text at every turn and at every call, `Conversation::task`); it lists its tools at every model turn (`specs(&SourceCtx)`, or `listing` for the tools **and their notes**), may rewrite how the tools of that turn are described (`refine(&SourceCtx, &mut [ToolSpec])`, default: nothing), may add words to the agent's instructions for the turn (`instructions(&SourceCtx) -> Option<String>`, default: nothing), **holds tools back** (`withhold(&SourceCtx, tools: &[&str]) -> Vec<Withheld>`, default: none: the tools of `tools` it names, the agent's own and the MCP servers' included, are not shown to the model on that turn, and a call to one is refused with the `Withheld::reason` when it would run) and answers the calls to them (`call(&ToolCtx, name, args) -> Option<..>`), see *Context and tool sources* |
+| `ToolSource`, `DynToolSource`, `SourceCtx`, `LlmAgentBuilder::tool_source`, `MAX_SOURCE_TOOLS` | tools the agent learns about while it runs: a source reads the run with `SourceCtx` (`run_id`, `root_run_id`, `conversation_id`, `context`, `task`: the words the run was started with, the same text at every turn and at every call, `Conversation::task`, and `loaded_servers`: the MCP servers the run loaded during itself, `Conversation::loaded_servers`); it lists its tools at every model turn (`specs(&SourceCtx)`, or `listing` for the tools **and their notes**), may rewrite how the tools of that turn are described (`refine(&SourceCtx, &mut [ToolSpec])`, default: nothing), may add words to the agent's instructions for the turn (`instructions(&SourceCtx) -> Option<String>`, default: nothing), **holds tools back** (`withhold(&SourceCtx, tools: &[&str]) -> Vec<Withheld>`, default: none: the tools of `tools` it names, the agent's own and the MCP servers' included, are not shown to the model on that turn, and a call to one is refused with the `Withheld::reason` when it would run), **appends the tools the run has loaded** (`appended(&SourceCtx) -> Vec<ToolSpec>`, default: none: put **after every other tool** of the turn, in the source's order, so the tools array grows by a suffix and never by an insertion) and answers the calls to them (`call(&ToolCtx, name, args) -> Option<..>`), see *Context and tool sources* |
 | `Listing`, `ToolNote`, `Conversation::source_notes` | what a source says about a tool it lists: the system behind it **reports each call as a step itself** (`reports_step`, so the agent reports none), how long a call may run (`timeout_ms`) and what its step is called (`label`); kept in the run's state with the model's answer, so a later call, on another worker, reads it without listing again |
 | `Conversation::context`, `merge_context`, `drop_expired_context`, `MAX_CONTEXT_BYTES` | what the messages of the run say about their sender, merged key by key (`null` deletes), bounded, with expiring entries; see *Context and tool sources* |
 | `SessionTools`, `SessionAgent`, `SESSION_TOOLS`, `SUBAGENT_START` .. `SUBAGENT_LIST`, `MAX_OPEN_SESSIONS`, `MAX_SESSION_ROUNDS`, `LlmAgentBuilder::session_agents` | the five tools that run a subagent in the background as a session (ADR 0045), and the wait a turn makes for the sessions it started: see *Child sessions* |
@@ -111,7 +111,7 @@ the conversation of the run before:
 |---|---|
 | **Carried** | the history, oldest first, and the user messages that were waiting behind an owed tool result (`deferred`), in arrival order; then the new user message |
 | **Answered** | the tool calls of a last assistant message that did not all get a result: a run that ended mid-turn (a cancel, a limit, a question nobody answered) leaves them, and a provider rejects a call without a result. Each owed call gets an error result, `STOPPED_BY_THE_PERSON`, after the results that did arrive: the model keeps what it asked for and is told which calls did not finish. The run state cannot tell a cancel from another ending, so a run that failed gets the same text. So `pending_calls` and `pending_wait` are always empty: a continued run never answers a question or a child run of the run before, and never runs a stopped call. The side effects of the calls are not undone |
-| **Reset** | `turns`, `shortenings` (the turns are this run's own), `tool_calls`, `usage`, `usage_totals` and `sandbox_usage` (`Limits` are per run, and a new task counts its tokens afresh), `root_run` and `root_step`, `artifacts` (the final output lists what this run produced), `kept_outputs` (the texts a run keeps are the run's own) and `rounds_started` (a task counts its own rounds, ADR 0045); the `session` header of a round is carried |
+| **Reset** | `turns`, `shortenings` and `tools_appended` (the turns are this run's own), `tool_calls`, `usage`, `usage_totals` and `sandbox_usage` (`Limits` are per run, and a new task counts its tokens afresh), `root_run` and `root_step`, `artifacts` (the final output lists what this run produced), `kept_outputs` (the texts a run keeps are the run's own) and `rounds_started` (a task counts its own rounds, ADR 0045); the `session` header of a round is carried. **`loaded_servers` is carried**, so the first request offers the tools the run before ended with |
 | **Recorded** | `continued_from: Option<RunId>`, not written while `None`; `omitted_turns: u32`, not written while zero |
 | **Bounded** | over `MAX_CARRIED_BYTES` (256 KiB of JSON), in this order and only as far as needed: **(1) the tool outputs of the turns older than the newest are shortened**, oldest first, each keeping its head and ending in the `TRUNCATION_MARKER_PREFIX` marker (the same truncation a run does to its own history over `max_history_tokens`, with the same floor and pointer rules); **(2) whole old turns are dropped** (a turn is a user message and what follows it up to the next), one marker standing in for them; **(3) the newest prior turn's tool outputs are shortened, last**. Never dropped: **the first user message of the chain** (the task; kept verbatim as the first text part of the first message) and the **newest prior turn**. A newest turn whose own text is over the cap is carried over it. The waiting messages and the new one are counted, never cut |
 | **The marker** | the **second text part of the first user message**, starting with `OMITTED_MARKER_PREFIX` and naming the number of turns; `omitted_turns` (not the text) is what says the part is a marker, so a user message that merely starts with the prefix is an ordinary one. It is always the second part: before anything is dropped, a first message that has several parts (`[task, next]`, from a run that ended before the model answered) is reduced to its task, and the rest becomes a user message of its own (a turn like any other), then merged behind the marker. A rule that reads what the user said should read user messages part by part and skip that part (`Conversation::is_omission_marker`) |
@@ -201,6 +201,15 @@ a source's, an MCP server's), are taken out of what the model is shown on that t
 would run**, inside the journaled step of the call, with the `reason` as its error result. The two moments read the run's context
 as it is then, so a limit a message sets (the coder's access tier) holds from the next model turn and the next call, and a replay
 reads nothing. It is a limit on what the agent may do, not a description: `refine` only rewrites text.
+
+A source can also **append the tools the run has already been given** (`ToolSource::appended`, default none): the tools
+of a system the run loaded **during itself**, in the order it loaded them, which the loop puts after every other tool of
+the turn, whatever place they would have had in the agent's own list or in the source's listing. That is what keeps a load
+from breaking the cached prefix in the middle: the request before stays a byte prefix of the one after it, which grows by a
+suffix (ADR 0044, decision 1). The order is the source's and is never sorted, so a second load follows the first; the source
+must also stop holding the tool back (`withhold`), or the loop would take the appended copy out again. `adam-assembly`'s
+`McpSelect` is the one source that uses it: a server the run loads with `use_server` is appended from the next call on
+([`adam-assembly`](../adam-assembly/README.md#a-server-loaded-only-when-the-task-asks-when)).
 
 A source can also **refine** the description of the tools the model is about to be shown (`ToolSource::refine`): after
 every source has listed, each gets the turn's tools, the agent's own first, and may rewrite a `description` from what it
@@ -900,6 +909,7 @@ changes; everything else only appends):
 | A recorded compaction: the request after it is the first of a new prefix (the summary request itself extends the one before it and is no model turn) | `compact_if_due`, the turns in `Conversation::compactions` |
 | The closing turn: appended to the request only, never kept, so a run reopened after it does not start with that request | `model_turn` (`CLOSING_TURN`) |
 | A source's tools change: its listing, `refine` (the `show` description once the conversation's catalog is held), `withhold` (the access tier) | `offered`, `refined`, `withheld` in `src/source.rs` |
+| **A load during the run** (`use_server`): the loaded server's tools are appended and its instructions follow the prompt, so the head grows by a suffix and the next request re-reads the whole prompt. The only recorded head break that is not a shortening or a compaction | `appended_by` in `src/source.rs`, the turns in `Conversation::tools_appended` |
 | The cap pushes a tool out when a new one sorts before it | `offered` (`MAX_SOURCE_TOOLS`) |
 | What a source adds to the instructions: the agents a person mentioned, the access tier | `instructed` |
 | **Time**: a credential in the run's context that expires changes what sources offer and instruct, so `system` and `tools` can change with time alone | `Conversation::drop_expired_context` |
@@ -912,13 +922,15 @@ are the only way they move.
 answer to a question, a re-asked answer (a recorded answer that predates a message the run has since
 read is dropped and the model answers again with the message at the end), a session's report (the
 `wait_<turn>` call is added to the model's own message before that message is ever sent back, and the
-report is its result), and the pages read with `read_output`.
+report is its result), the pages read with `read_output`, and a server loaded with `use_server` (its
+tools are appended and its instructions follow the prompt; the head changes, but only by a suffix).
 
 **Fixed order.** The agent's own tools are in registration order. Each source's tools are **sorted by
 name before** the cap and the name clashes are applied (`offered`): the sort decides which tools
 survive `MAX_SOURCE_TOOLS` and which of two same-named tools of one source is offered (the first of
 them in the listing), so neither depends on the order a server lists in (across reconnects, that order
-is *unverified*).
+is *unverified*). What a source appends (`appended`) is **not sorted and not capped**: it goes after
+everything, in the order the run loaded it, because it must be a suffix.
 
 **Cache key.** The loop sets `ModelRequest::prompt_cache_key` on every request of a run that has a
 conversation id: the first 32 hex digits of the SHA-256 of the id, so every run of a conversation has
@@ -929,15 +941,18 @@ sent is the client's choice (`MODEL_PROMPT_CACHE_KEY`, `adam-service`).
 
 * **Breaking:** `ModelRequest` has a new public field (`prompt_cache_key`) and `Conversation` one
   (`shortenings`): struct literals need them. Behaviour: the stored history is shortened in place, and
-  a source's tools are offered by name.
+  a source's tools are offered by name. The load during a run adds public fields to `Conversation`
+  (`loaded_servers`, `tools_appended`), `ToolOutput` (`loaded_servers`), `SourceCtx` and `ToolCtx`
+  (`loaded_servers`, `task`), and a provided method to `ToolSource` (`appended`, additive).
 
 Proof: `tests/prefix.rs`, `a_session_report_keeps_the_prefix` and
 `the_start_result_survives_a_history_far_over_budget` in `tests/sessions.rs`, the tests of
 `src/history.rs`. The rule the test holds: `system`, `tools` and `tool_choice` are the same bytes in every
 request that is not a summary request; a summary request (`tool_choice: none`, its last message ends with
 `COMPACTION_TURN`) extends the request before it; the requests that do not extend the one before are exactly
-the recorded shortenings and the recorded compactions; every request after a compaction extends the first one
-after it.
+the recorded shortenings, the recorded compactions and the recorded `tools_appended`; every request after a compaction
+extends the first one after it. At a `tools_appended` turn the head may grow, and only by a suffix: `tools` starts with
+the array before it, `system` starts with the prompt before it, and the messages still start with the ones before.
 
 ## Images in (ADR 0044)
 

@@ -354,6 +354,11 @@ pub(crate) fn step_id(call_id: &str) -> String {
 }
 
 /// What [`Tool::poll_remote`] found. Journaled, hence serializable.
+//
+// A `ToolOutput` is the run's own record of a call (the history, the journal and the step all hold
+// one), so a poll answers with it by value; boxing it would make every tool that polls allocate for
+// a result it already owns. The enum is the size of the result it carries.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RemotePoll {
     /// The task is over: this is the tool result (an error result if it failed).
@@ -465,6 +470,19 @@ pub struct ToolOutput {
     /// Absent from a journal written before it existed, and not written while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageRef>,
+    /// The MCP servers the run has loaded, as this result says: **the whole list**, in the order
+    /// they were loaded. The loop makes it the run's list
+    /// ([`Conversation::loaded_servers`](crate::Conversation::loaded_servers)) when the result is
+    /// not an error, in the same commit as the result, and records the turn of the next request in
+    /// [`Conversation::tools_appended`](crate::Conversation::tools_appended); a replay takes the
+    /// list from the journal. A server named here stops being withheld
+    /// from the next model call on, and its tools are **appended** to the tools array, never
+    /// inserted ([ADR 0044](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md),
+    /// decision 1). Only `use_server` (`adam-assembly`) sets it. Never read from an error result.
+    ///
+    /// Absent from a journal written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_servers: Vec<String>,
     /// The bytes of [`images`](Self::images), for the run to keep **in its own state**: only when
     /// the agent has no [`ImageStore`](crate::ImageStore) ([`keep_image`](crate::keep_image) says
     /// which). Journaled with the result, like [`kept`](Self::kept), so a replay keeps the same
@@ -519,6 +537,9 @@ impl ToolOutput {
                 }
             }
         }
+        for server in &mut self.loaded_servers {
+            clean_text(server);
+        }
         for artifact in &mut self.artifacts {
             clean_text(&mut artifact.name);
             if let Some(mime) = &mut artifact.mime_type {
@@ -547,6 +568,7 @@ impl ToolOutput {
             reported: Vec::new(),
             pinned: false,
             images: Vec::new(),
+            loaded_servers: Vec::new(),
             kept_images: Box::default(),
         }
     }
@@ -567,6 +589,7 @@ impl ToolOutput {
             reported: Vec::new(),
             pinned: false,
             images: Vec::new(),
+            loaded_servers: Vec::new(),
             kept_images: Box::default(),
         }
     }
@@ -581,6 +604,18 @@ impl ToolOutput {
             all.push(*kept);
             self.kept_images = all.into_boxed_slice();
         }
+        self
+    }
+
+    /// Say which MCP servers the run has loaded ([`loaded_servers`](Self::loaded_servers)): the
+    /// whole list, in the order they were loaded. The loop makes it the run's list, and the next
+    /// model call is the first whose tools array has the loaded servers' tools appended.
+    #[must_use]
+    pub fn with_loaded_servers(
+        mut self,
+        servers: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.loaded_servers = servers.into_iter().map(Into::into).collect();
         self
     }
 
@@ -836,6 +871,11 @@ pub struct ToolCtx {
     kept: Arc<BTreeMap<String, String>>,
     /// The conversation's plan as the call starts ([`plan`](Self::plan)).
     plan: Option<Arc<Plan>>,
+    /// The MCP servers the run has loaded as the call starts
+    /// ([`loaded_servers`](Self::loaded_servers)).
+    loaded_servers: Arc<[String]>,
+    /// The words the run was started with ([`task`](Self::task)).
+    task: Option<Arc<str>>,
     /// What scrubs secrets out of a text ([`scrub`](Self::scrub)); `None` scrubs nothing.
     scrub: Option<Scrubber>,
     /// What the call needs to admit images ([`keep_image`](crate::keep_image)); `None` for a
@@ -891,6 +931,8 @@ impl ToolCtx {
             files_left: Arc::new(std::sync::atomic::AtomicU64::new(MAX_RUN_FILE_BYTES as u64)),
             sandbox: Arc::default(),
             plan: None,
+            loaded_servers: Arc::default(),
+            task: None,
             scrub: None,
             kept_left: Arc::default(),
             kept: Arc::default(),
@@ -1018,12 +1060,43 @@ impl ToolCtx {
         self
     }
 
+    /// Say which MCP servers the run has loaded as this call starts
+    /// ([`loaded_servers`](Self::loaded_servers)); the agent loop does it for every call.
+    #[must_use]
+    pub fn with_loaded_servers(mut self, servers: impl Into<Arc<[String]>>) -> Self {
+        self.loaded_servers = servers.into();
+        self
+    }
+
+    /// Say what the run was started with ([`task`](Self::task)); the agent loop does it for every
+    /// call.
+    #[must_use]
+    pub fn with_task(mut self, task: Option<Arc<str>>) -> Self {
+        self.task = task;
+        self
+    }
+
     /// The conversation's plan as this call starts: the one a tool before it in the same turn left,
     /// since calls run one after the other. `None` while there is none. Return the new plan with
     /// [`ToolOutput::with_plan`]; this value is a copy, and changing nothing here changes nothing
     /// there.
     pub fn plan(&self) -> Option<&Plan> {
         self.plan.as_deref()
+    }
+
+    /// The MCP servers the run has loaded as this call starts, in the order it loaded them
+    /// ([`Conversation::loaded_servers`](crate::Conversation::loaded_servers)): the whole list,
+    /// not a change. A tool that loads one (`use_server`) reads it to refuse a second load, and a
+    /// source that withholds a server's tools reads
+    /// [`SourceCtx::loaded_servers`](crate::SourceCtx::loaded_servers) instead.
+    pub fn loaded_servers(&self) -> &[String] {
+        &self.loaded_servers
+    }
+
+    /// The words the run was started with ([`Conversation::task`](crate::Conversation::task)):
+    /// the first part of its first message, the same text at every call of the run.
+    pub fn task(&self) -> Option<&str> {
+        self.task.as_deref()
     }
 
     /// Say how many bytes the run may still keep in its own state and what it keeps there:
