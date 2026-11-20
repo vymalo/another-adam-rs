@@ -480,9 +480,10 @@ async fn parent_run_calls_mcp_tool_on_memory_and_postgres() {
         let journal = store.journal_list(run).await.unwrap();
         let entry = journal.iter().find(|e| e.name == "tool:c1");
         assert!(entry.is_some_and(|e| e.ok), "{backend}: {journal:?}");
+        // The joined state, not the view's head: the tool result is in the transcript.
+        let joined = rt.state(run).await.expect("state").expect("the run");
         let everything = format!(
-            "{journal:?}{:?}{:?}{:?}{debug_def}{assembly:?}{:?}",
-            view.state,
+            "{journal:?}{joined:?}{:?}{:?}{debug_def}{assembly:?}{:?}",
             view.output,
             sink.events(),
             assembly.info(),

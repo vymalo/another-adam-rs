@@ -501,12 +501,10 @@ async fn a_remote_subagent_is_called_polled_and_its_answer_comes_back() {
             "{backend}: {:?}",
             tool_entry.payload
         );
-        let everything = format!(
-            "{journal:?}{:?}{:?}{:?}",
-            view.state,
-            view.output,
-            sink.events()
-        );
+        // The joined state, not the view's head: the tool result (and anything it leaked) is in
+        // the transcript.
+        let joined = rt.state(run).await.expect("state").expect("the run");
+        let everything = format!("{journal:?}{joined:?}{:?}{:?}", view.output, sink.events());
         assert!(!everything.contains(TOKEN), "{backend}: the token leaked");
     }
 }

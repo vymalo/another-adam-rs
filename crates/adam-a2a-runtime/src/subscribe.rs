@@ -170,9 +170,9 @@ fn droppable(item: &Result<TaskEvent, BackendError>) -> bool {
 /// file's bytes themselves) and the metadata around them, with a fixed cost for the event's own
 /// fields. A bound on what the queue holds, not a measurement of it.
 ///
-/// A file artifact's raw part is exactly the `FileRef::size` its head declared, so the charge of a
-/// file event is known before its bytes are fetched; an artifact whose blob is gone has no event
-/// to charge.
+/// A file artifact's raw part holds exactly the `FileRef::size` its head declared, so the charge
+/// of a file event is that size; the queue measures the built event (after the fetch), it is not
+/// given the ref beforehand. An artifact whose blob is gone has no event to charge.
 fn item_bytes(item: &Result<TaskEvent, BackendError>) -> usize {
     let event = match item {
         Ok(TaskEvent::Snapshot(task)) => task_bytes(task),
@@ -540,7 +540,7 @@ impl Tracker {
                 artifact.file = file.map(|file| FileRef::inline(file.filename, file.bytes));
                 artifact.id = id;
                 match self.admit(&artifact) {
-                    Some(_) => crate::convert::artifact_of(&artifact, None)
+                    Some(id) => crate::convert::artifact_of_with(&artifact, id, None)
                         .map(|served| vec![self.artifact_event(served)])
                         .unwrap_or_default(),
                     None => Vec::new(),

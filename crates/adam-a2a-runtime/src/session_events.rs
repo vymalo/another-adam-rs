@@ -829,6 +829,11 @@ mod tests {
             3,
             "the seed reads one view per session"
         );
+        assert_eq!(
+            faulty.calls(Method::LoadRun),
+            0,
+            "a view reads the head, not the whole state"
+        );
         for listing in 0..10 {
             let events = tracker
                 .refresh(&backend, &caller, "task-1", context, 1, &working())

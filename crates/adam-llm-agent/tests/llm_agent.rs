@@ -3485,10 +3485,10 @@ async fn a_nul_in_a_tools_output_is_the_replacement_character_in_the_journal_and
         _ => None,
     });
     assert_eq!(said, Some("before\u{FFFD}after"));
+    let joined = serde_json::to_string(&state).expect("the joined state is JSON");
     assert!(
-        !view.state.to_string().contains("\\u0000"),
-        "no NUL in the state: {}",
-        view.state
+        !joined.contains("\\u0000"),
+        "no NUL in the joined state: {joined}"
     );
 
     let entry = h
@@ -4004,10 +4004,13 @@ async fn with_a_store_in_the_state_the_text_is_not_in_the_run() {
     let worker = spawn_worker(&rt);
     let view = wait_done(&rt, run).await;
     worker.stop().await;
-    assert!(conversation(&rt, &view).await.kept_outputs.is_empty());
+    let joined = conversation(&rt, &view).await;
+    assert!(joined.kept_outputs.is_empty());
     assert!(tool_texts(&rt, &view).await[0].starts_with("[kept as o-"));
     assert!(
-        !view.state.to_string().contains("row-006999"),
+        !serde_json::to_string(&joined)
+            .expect("the joined state is JSON")
+            .contains("row-006999"),
         "nothing of the text but the first page is in the run's state"
     );
 }

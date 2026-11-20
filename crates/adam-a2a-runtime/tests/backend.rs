@@ -241,6 +241,19 @@ impl Agent for Scripted {
                 ))
                 .await;
             }
+            if text.contains("[big]") {
+                // A 4 MiB inline file: the v4 path serves it from the state, with no blob read.
+                ctx.emit(RunEvent::from(
+                    RunArtifact::file(
+                        "big",
+                        "application/octet-stream",
+                        "big.bin",
+                        vec![0x5a_u8; 4 * 1024 * 1024],
+                    )
+                    .unwrap(),
+                ))
+                .await;
+            }
             state["phase"] = json!(1);
             return Ok(Transition::Continue(state));
         }
@@ -789,6 +802,55 @@ async fn a_blob_backed_artifact_is_fetched_once_across_ten_polls() {
     );
     assert_eq!(counting.calls(Method::LoadRun), 0);
     assert_eq!(counting.calls(Method::BodyList), 0, "a task reads no body");
+}
+
+/// A v4 run carries a file's bytes inline; `GetTask` serves them whole, with no blob read and no
+/// body read. (The backend's own hook, a unit test, proves it never calls `artifact_bytes` for an
+/// inline file.)
+#[tokio::test]
+async fn a_four_mib_inline_file_is_served_whole_without_a_blob_read() {
+    use a2a::PartContent;
+    use adam_store_testkit::counting::CountingStore;
+
+    let counting = Arc::new(CountingStore::new(Arc::new(MemoryStore::new())));
+    let rig = Rig::over(counting.clone());
+    let task = rig
+        .backend
+        .submit(alice(), user("[big] draw it"), None, None)
+        .await
+        .expect("submit");
+    let run = RunId(task.id.parse().unwrap());
+    let worker = rig.worker();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let view = rig.runtime.view(run).await.unwrap().unwrap();
+        if view.status == adam_core::RunStatus::Done {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out: {view:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    worker.stop().await;
+
+    counting.reset();
+    let task = rig.backend.get(&alice(), &task.id).await.unwrap().unwrap();
+    let big = task
+        .artifacts
+        .as_ref()
+        .and_then(|artifacts| artifacts.iter().find(|a| a.name.as_deref() == Some("big")))
+        .expect("the file is on the task");
+    assert_eq!(
+        big.parts[0].content,
+        PartContent::Raw(vec![0x5a_u8; 4 * 1024 * 1024]),
+        "the whole file, byte for byte"
+    );
+    assert_eq!(big.parts[0].filename.as_deref(), Some("big.bin"));
+    assert_eq!(
+        counting.calls(Method::GetBlob),
+        0,
+        "an inline file reads no blob"
+    );
+    assert_eq!(counting.calls(Method::BodyList), 0);
 }
 
 /// An artifact with an id of its own is one artifact however often it changes: the task lists it

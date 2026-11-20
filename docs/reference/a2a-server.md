@@ -558,8 +558,9 @@ A task's `artifacts` are the run's committed artifacts (`RunView::artifacts`), r
 file is a `FileRef`: a v4 run carries its bytes inline, a v5 run names a blob by content address and
 size. The backend fetches a blob with `Runtime::artifact_bytes` once per address and caches it in the
 runtime (32 MiB, least recently used first), so ten `GetTask` polls, a subscription's snapshot and an
-artifact event transfer the head and no file after the first read; the queue charge of a file event
-is its `FileRef.size`, known before the fetch. A blob that is gone (purged once no run referenced
+artifact event transfer the head and no file after the first read; the queue charges a file
+event's raw part, whose length is the `FileRef.size` the head declared (the fetch happens first,
+so the queue is not charged from the ref). A blob that is gone (purged once no run referenced
 it) leaves that artifact out of the task, and the run is intact. A JSON artifact carries its data; an
 artifact with an id is listed once, holding the newest.
 
