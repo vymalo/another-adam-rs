@@ -775,7 +775,23 @@ impl Walk<'_> {
             let triggered: Vec<crate::mcp_select::Triggered> = triggers
                 .iter()
                 .map(|(server, keywords)| {
-                    let tools = mcp_by_server.get(server).cloned().unwrap_or_default();
+                    // Only the tools this agent selected: a load may not offer a tool the agent
+                    // was never given (its `tools:` narrowed the server's list).
+                    let specs = mcp_by_server
+                        .get(server)
+                        .map(|names| {
+                            names
+                                .iter()
+                                .filter(|name| tools.iter().any(|(selected, _)| selected == *name))
+                                .filter_map(|name| {
+                                    own_mcp
+                                        .iter()
+                                        .find(|(named, _)| named == name)
+                                        .map(|(_, tool)| tool.spec())
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     let instructions = self.mcp.get(&name).and_then(|given| {
                         given
                             .instructions
@@ -786,11 +802,33 @@ impl Walk<'_> {
                     crate::mcp_select::Triggered::new(
                         server.clone(),
                         keywords.clone(),
-                        tools,
+                        specs,
                         instructions,
                     )
                 })
                 .collect();
+            // The fallback: one fixed tool that loads a triggered server during the run, present
+            // from the first request whatever the task, so the tool list is the same bytes until
+            // something is loaded.
+            if tools
+                .iter()
+                .any(|(tool, _)| tool == crate::use_server::USE_SERVER)
+            {
+                return Err(Error::ReservedToolName {
+                    origin: origin.clone(),
+                    tool: crate::use_server::USE_SERVER.to_owned(),
+                });
+            }
+            let declared: Vec<String> = mcp::declared(manifest)
+                .map(|config| config.servers.keys().cloned().collect())
+                .unwrap_or_default();
+            tools.push((
+                crate::use_server::USE_SERVER.to_owned(),
+                Arc::new(crate::use_server::UseServer::new(
+                    declared,
+                    triggered.clone(),
+                )),
+            ));
             sources.push(Arc::new(crate::mcp_select::McpSelect::new(triggered)));
         }
         // An agent that has an MCP tool can get a long result that is kept and paged: it reads the

@@ -6,11 +6,19 @@
 //! does not mention one of its keywords, and its instructions are added to the prompt by this
 //! source only when it is loaded.
 //!
-//! The decision is made from the task alone ([`SourceCtx::task`]), which is the same text at every
-//! turn and at every call of a run, so the tools array is the same bytes from the run's first
-//! request to its last (ADR 0044, decision 1). It is **recomputed** rather than stored: the run's
-//! state already holds the task, and a stored field would be a second place where the same decision
-//! lives (a resumed or continued run reads the same first message, so it decides identically).
+//! The decision is made from the task ([`SourceCtx::task`]), which is the same text at every turn
+//! and at every call of a run, so the tools array is the same bytes from the run's first request to
+//! its last (ADR 0044, decision 1). It is **recomputed** rather than stored: the run's state already
+//! holds the task, and a stored field would be a second place where the same decision lives (a
+//! resumed or continued run reads the same first message, so it decides identically).
+//!
+//! A task that matches nothing is not the end of the run's options: the model may call `use_server`
+//! ([`crate::use_server`]) to load one triggered server. That is the fallback, and it costs one full
+//! re-prefill: the server is added to the run's state ([`SourceCtx::loaded_servers`]), its
+//! instructions are added to the prompt by this source from the next turn on, and its tools are
+//! offered by [`ToolSource::appended`] **after every other tool** of the turn, never inserted, so
+//! the request before stays a byte prefix of the one after it. The turns where that happened are
+//! recorded by the loop (`Conversation::tools_appended`).
 
 use adam_llm_agent::{SourceCtx, ToolCtx, ToolError, ToolOutput, ToolSource, Withheld};
 use adam_model::ToolSpec;
@@ -24,6 +32,7 @@ use async_trait::async_trait;
 const MAX_INSTRUCTIONS_BYTES: usize = 8 * 1024;
 
 /// One server of an agent's `mcp.json` that declares `when`.
+#[derive(Clone)]
 pub(crate) struct Triggered {
     /// The server's name, as its tools and the prompt's headings name it.
     pub(crate) server: String,
@@ -31,9 +40,11 @@ pub(crate) struct Triggered {
     pub(crate) keywords: Vec<String>,
     /// The words folded for matching, in the same order.
     folded: Vec<String>,
-    /// The tools the binding gave this server: the one table `bind` built, never a name parsed
-    /// again here.
-    pub(crate) tools: Vec<String>,
+    /// The tools of this server that **this agent selected**, in the order the binding connected
+    /// them: the one table `bind` built, never a name parsed again here, narrowed by the agent's
+    /// `tools:`. A server that offered none (an `optional` server that was not reachable, or a
+    /// selection that matches nothing) has none.
+    pub(crate) specs: Vec<ToolSpec>,
     /// What the server said about itself when it initialized, heading included; `None` when it
     /// said nothing or the file turned it off.
     pub(crate) instructions: Option<String>,
@@ -43,7 +54,7 @@ impl Triggered {
     pub(crate) fn new(
         server: String,
         keywords: Vec<String>,
-        tools: Vec<String>,
+        specs: Vec<ToolSpec>,
         instructions: Option<String>,
     ) -> Self {
         let folded = keywords.iter().map(|word| word.to_lowercase()).collect();
@@ -51,8 +62,32 @@ impl Triggered {
             server,
             keywords,
             folded,
-            tools,
+            specs,
             instructions,
+        }
+    }
+
+    /// The names of its tools, in the order it connected them.
+    pub(crate) fn tools(&self) -> impl Iterator<Item = &str> + '_ {
+        self.specs.iter().map(|spec| spec.name.as_str())
+    }
+
+    /// Whether it gave the run anything to load: a server that offered no tool cannot be loaded.
+    pub(crate) fn available(&self) -> bool {
+        !self.specs.is_empty()
+    }
+
+    /// Whether a run whose task is `task` loads it from the start: any keyword is held by the task,
+    /// ignoring case. No task (a message with no words) matches nothing.
+    pub(crate) fn matches(&self, task: Option<&str>) -> bool {
+        match task {
+            Some(task) => {
+                let task = task.to_lowercase();
+                self.folded
+                    .iter()
+                    .any(|word| !word.is_empty() && task.contains(word.as_str()))
+            }
+            None => false,
         }
     }
 }
@@ -67,18 +102,14 @@ impl McpSelect {
         Self { servers }
     }
 
-    /// Whether each server is loaded for a run whose task is `task`: any keyword is held by the
-    /// task, ignoring case. No task (a message with no words) loads none of them.
-    fn loaded(&self, task: Option<&str>) -> Vec<bool> {
-        let task = task.map(str::to_lowercase);
+    /// Whether each server is loaded for this turn: the task matched its keywords, or the run
+    /// loaded it during itself ([`SourceCtx::loaded_servers`]).
+    fn loaded(&self, ctx: &SourceCtx) -> Vec<bool> {
+        let during = ctx.loaded_servers();
         self.servers
             .iter()
-            .map(|server| match &task {
-                Some(task) => server
-                    .folded
-                    .iter()
-                    .any(|word| !word.is_empty() && task.contains(word.as_str())),
-                None => false,
+            .map(|server| {
+                server.matches(ctx.task()) || during.iter().any(|name| name == &server.server)
             })
             .collect()
     }
@@ -129,7 +160,7 @@ impl ToolSource for McpSelect {
     }
 
     async fn instructions(&self, ctx: &SourceCtx) -> Option<String> {
-        let loaded = self.loaded(ctx.task());
+        let loaded = self.loaded(ctx);
         let sections: Vec<(String, String)> = self
             .servers
             .iter()
@@ -147,19 +178,32 @@ impl ToolSource for McpSelect {
     }
 
     async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
-        let loaded = self.loaded(ctx.task());
+        let loaded = self.loaded(ctx);
         let mut held = Vec::new();
         for (server, loaded) in self.servers.iter().zip(loaded) {
             if loaded {
                 continue;
             }
-            for tool in &server.tools {
-                if tools.contains(&tool.as_str()) {
-                    held.push(Withheld::new(tool.clone(), reason(server, tool)));
+            for tool in server.tools() {
+                if tools.contains(&tool) {
+                    held.push(Withheld::new(tool, reason(server, tool)));
                 }
             }
         }
         held
+    }
+
+    /// The tools of the servers the run loaded during itself, in the order it loaded them: the
+    /// loop puts them after every other tool of the turn, so the array grows by a suffix and the
+    /// request before stays a byte prefix of the one after it.
+    async fn appended(&self, ctx: &SourceCtx) -> Vec<ToolSpec> {
+        let mut out = Vec::new();
+        for name in ctx.loaded_servers() {
+            if let Some(server) = self.servers.iter().find(|server| &server.server == name) {
+                out.extend(server.specs.iter().cloned());
+            }
+        }
+        out
     }
 
     async fn call(
@@ -179,6 +223,14 @@ mod tests {
 
     use super::*;
 
+    fn spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.to_owned(),
+            description: format!("the {name} tool"),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
     fn triggered(
         server: &str,
         keywords: &[&str],
@@ -188,7 +240,7 @@ mod tests {
         Triggered::new(
             server.to_owned(),
             keywords.iter().map(|word| (*word).to_owned()).collect(),
-            tools.iter().map(|tool| (*tool).to_owned()).collect(),
+            tools.iter().map(|tool| spec(tool)).collect(),
             instructions.map(str::to_owned),
         )
     }
@@ -212,6 +264,16 @@ mod tests {
 
     fn ctx(task: Option<&str>) -> SourceCtx {
         SourceCtx::detached(Map::<String, Value>::new()).with_task(task)
+    }
+
+    /// A context of a run that has loaded `loaded` during itself.
+    fn ctx_loaded(task: Option<&str>, loaded: &[&str]) -> SourceCtx {
+        ctx(task).with_loaded_servers(
+            loaded
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[tokio::test]
@@ -379,6 +441,75 @@ mod tests {
         assert!(
             source.instructions(&ctx(Some("neither"))).await.is_none(),
             "nothing loaded, nothing added"
+        );
+    }
+
+    /// A server the run loaded during itself stops being withheld, and its tools are what the
+    /// source appends: the loop puts them after every other tool of the turn.
+    #[tokio::test]
+    async fn a_server_the_run_loaded_is_not_withheld_and_is_appended() {
+        let source = source();
+        let ctx = ctx_loaded(Some("fix a typo"), &["docs"]);
+        let held = source
+            .withhold(&ctx, &["linear__list_issues", "docs__search", "docs__read"])
+            .await;
+        assert_eq!(
+            held.iter().map(|h| h.tool.as_str()).collect::<Vec<_>>(),
+            ["linear__list_issues"],
+            "only the server the run did not load is held back"
+        );
+        let appended = source.appended(&ctx).await;
+        assert_eq!(
+            appended
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            ["docs__search", "docs__read"],
+            "the loaded server's tools, in the order it connected them"
+        );
+        assert!(
+            source.appended(&ctx_loaded(None, &[])).await.is_empty(),
+            "nothing loaded, nothing appended"
+        );
+    }
+
+    /// The order is the run's, not the file's: a second load follows the first.
+    #[tokio::test]
+    async fn the_appended_tools_follow_the_order_the_run_loaded_them() {
+        let source = source();
+        let appended = source
+            .appended(&ctx_loaded(None, &["docs", "linear"]))
+            .await;
+        assert_eq!(
+            appended
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            ["docs__search", "docs__read", "linear__list_issues"]
+        );
+    }
+
+    /// A loaded server's instructions reach the prompt, as they do when the task loads it.
+    #[tokio::test]
+    async fn the_instructions_of_a_server_the_run_loaded() {
+        let source = source();
+        let text = source
+            .instructions(&ctx_loaded(Some("fix a typo"), &["docs"]))
+            .await
+            .expect("the loaded server said something");
+        assert!(text.contains("docs words"), "{text}");
+        assert!(!text.contains("linear words"), "{text}");
+    }
+
+    /// A server with no tools has nothing to append, even if a state names it.
+    #[tokio::test]
+    async fn a_server_that_offered_no_tools_appends_nothing() {
+        let source = McpSelect::new(vec![triggered("quiet", &["quiet"], &[], None)]);
+        assert!(
+            source
+                .appended(&ctx_loaded(None, &["quiet"]))
+                .await
+                .is_empty()
         );
     }
 
