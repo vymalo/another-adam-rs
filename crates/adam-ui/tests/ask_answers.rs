@@ -1213,36 +1213,22 @@ async fn what_is_carried_into_the_form_asked_again_is_something_that_form_accept
 }
 
 #[tokio::test]
-async fn the_form_asked_again_on_a_screen_without_a_description_keeps_the_description_in_its_words()
-{
+async fn the_form_asked_again_says_the_description_once() {
     let args = json!({"question": "Sure?", "description": "Because of the data.",
         "choices": [{"id": "ok", "question": "Go?", "type": "confirm"}]});
     let wrong = json!({"answers": [{"id": "ok", "values": ["maybe"]}]});
-    let say = |refusal: adam_llm_agent::Refusal| refusal.question;
-    // Version 2's Choices has no description: it is the second line of the question.
-    let v2 = screen(
-        include_str!("fixtures/catalog-v2.json"),
-        include_str!("fixtures/catalog-v2.lock.json"),
-    );
-    let (tool, args2, ui) = asked_on(&v2, args.clone()).await;
-    let AnswerCheck::Refuse(refusal) =
-        tool.read_answer("c1", &args2, Some(&ui), &payload("ask-c1", wrong.clone()))
-    else {
-        panic!("not refused")
-    };
-    assert_eq!(
-        say(refusal),
-        "The answer to \"ok\" (\"Go?\") was not used (not_offered): the answer is neither yes nor no.\n\
-         Sure?\nBecause of the data."
-    );
-    // Version 7's has one, and the words are not said twice.
+    // The screen's Choices has a description: it is not also said in the words.
     let (tool, args7, ui) = asked_on(&screen(V7, V7_LOCK), args).await;
     let AnswerCheck::Refuse(refusal) =
         tool.read_answer("c1", &args7, Some(&ui), &payload("ask-c1", wrong))
     else {
         panic!("not refused")
     };
-    assert!(say(refusal).ends_with("the answer is neither yes nor no.\nSure?"));
+    assert!(
+        refusal
+            .question
+            .ends_with("the answer is neither yes nor no.\nSure?")
+    );
 }
 
 // ---- a yes or no said in words ----

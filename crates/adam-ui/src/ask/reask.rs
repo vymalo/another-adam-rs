@@ -14,9 +14,7 @@ use serde_json::{Value, json};
 
 use super::answer::{Check, FormSpec, Rule, Verdict, check_answer, whole};
 use super::shown;
-use super::{
-    Args, Form, Kind, MAX_LONG_TEXT, MAX_TEXT, clipped, kinds, lead_with_description, normalize,
-};
+use super::{Args, Form, Kind, MAX_LONG_TEXT, MAX_TEXT, clipped, kinds, normalize};
 use crate::surface::{A2UI_VERSION, ask_attempt, ask_retry_surface_id};
 
 /// The longest words of a question quoted back to the person.
@@ -308,15 +306,8 @@ fn ask_again(
         ),
     };
     let mut asked = ui.clone();
-    let folded = form.description.is_some()
-        && root_of(ui).is_some_and(|root| root.get("description").is_none());
-    let lead = if folded {
-        lead_with_description(question, form)
-    } else {
-        question.to_owned()
-    };
     // What the form shows and the screen could not draw is still said, in the same words.
-    let lead = format!("{lead}{}", shown::undrawn_words(form, ui));
+    let lead = format!("{question}{}", shown::undrawn_words(form, ui));
     let attempt = surface_of(ui)
         .and_then(|surface| ask_attempt(&surface))
         .map_or(1, |n| n + 1);

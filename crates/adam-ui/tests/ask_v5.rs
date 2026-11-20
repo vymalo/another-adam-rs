@@ -16,8 +16,6 @@ use serde_json::{Map, Value, json};
 const CATALOG_ID: &str = "https://agents.vymalo.com/a2ui/catalogs/chat";
 const V5: &str = include_str!("fixtures/catalog-v5.json");
 const V5_LOCK: &str = include_str!("fixtures/catalog-v5.lock.json");
-const V2: &str = include_str!("fixtures/catalog-v2.json");
-const V2_LOCK: &str = include_str!("fixtures/catalog-v2.lock.json");
 const SHA_A: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
 const SHA_B: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -45,10 +43,6 @@ fn screen(document: &str, lock: &str) -> Screen {
 
 fn v5() -> Screen {
     screen(V5, V5_LOCK)
-}
-
-fn v2() -> Screen {
-    screen(V2, V2_LOCK)
 }
 
 /// Every whole number as a double, as an A2A server hands the metadata of a message over.
@@ -268,56 +262,6 @@ async fn the_models_mistakes_in_a_form_come_back_before_the_catalog_is_asked() {
     )
     .await;
     assert!(url.contains("never a URL"), "{url}");
-}
-
-// ---- an older screen ----
-
-#[tokio::test]
-async fn a_screen_of_version_2_gets_the_subset_it_has_and_the_description_in_the_text() {
-    let call = json!({
-        "question": "Which database?",
-        "title": "Before I start",
-        "description": "The tables depend on it.",
-        "freeInput": true,
-        "choices": [{"id": "db", "question": "Which one?", "help": "Where the data lives",
-            "options": [{"label": "Postgres", "recommended": true, "icon": "git", "description": "default"}, "SQLite"],
-            "default": "Postgres"}]
-    });
-    let (question, root) = form(&v2(), call).await;
-    assert_eq!(question, "Which database?\nThe tables depend on it.");
-    assert_eq!(
-        root,
-        json!({
-            "id": "root", "component": "Choices", "title": "Before I start",
-            "questions": [{"id": "db", "question": "Which one? (Where the data lives)",
-                "options": [{"value": "postgres", "label": "Postgres (recommended)", "description": "default"},
-                            {"value": "sqlite", "label": "SQLite"}]}],
-            "action": {"event": {"name": "answer"}}
-        })
-    );
-}
-
-#[tokio::test]
-async fn a_screen_of_version_2_cannot_take_a_typed_answer_so_the_form_is_words() {
-    let text = words(Some(&v2()), migration()).await;
-    assert!(
-        text.starts_with(
-            "A few things I need before I write the migration.\nThe tables depend on the database and on where this runs.\n"
-        ),
-        "{text}"
-    );
-    assert!(
-        text.contains("\n3. What is the project called? (One word) (answer in a few words)"),
-        "{text}"
-    );
-    assert!(
-        text.contains("\n   a) Postgres - Relational, the default (recommended) (default)"),
-        "{text}"
-    );
-    assert!(
-        text.ends_with("Anything else I should know? (optional: add it to your reply)"),
-        "{text}"
-    );
 }
 
 #[tokio::test]

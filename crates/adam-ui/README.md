@@ -92,7 +92,7 @@ inbound function reads a screen's action as JSON text.
   screen lacks is asked as the nearest version 6 form: `confirm` and `scale` as radio buttons (`yes`, `no`; one option per
   point, the ends carrying their words), `number` and `date` as a `text` question whose `help` says the unit, the bounds and
   the format, `rank` as a `text` question whose `help` numbers the options (when they do not fit in 300 characters the whole form
-  goes as words). On a screen of version 2 to 4 a form that has a typed question goes as words. As words each kind reads
+  goes as words). As words each kind reads
   `(yes: "Delete it" / no: "Keep it"; the safe answer is no)`, `(a number from 0 to 1000 EUR, in steps of 0.5)`,
   `(a whole number from 0 "Not at all" to 10 "Certainly")`, `(a day, YYYY-MM-DD, from 2026-12-01 to 2026-12-31)` and, for a
   rank, the options numbered and "answer with their numbers in order".
@@ -169,11 +169,8 @@ inbound function reads a screen's action as JSON text.
   asks, in words the model can act on (`question \`db\` has 13 options; a radio or checkbox question needs 2 to 12 (use
   type "select" for up to 50)`). With a screen that has the `Choices` component, the question carries a surface:
   `createSurface` under the screen's `catalogId` and one `Choices` as the root, **checked against the catalog's schema**
-  (what is wrong comes back to the model with its place, `(at /questions/0/question)`). **Which members are sent depends on the
-  catalog the run received:** from **version 5** all of them; on version 2 to 4 the subset that screen has (the title, radio
-  buttons and checkboxes of at most 8 options, `allowOther`, `required`, the button's words; a `help` goes after the question,
-  a recommended option is marked in its label, a list or a deck is a list of radio buttons or checkboxes, and the
-  `description` goes in the text the person reads first) and, when a question needs more than that (a typed answer), words.
+  (what is wrong comes back to the model with its place, `(at /questions/0/question)`). **Every member is sent**
+  (a `ui-catalog/v2` catalog starts at version 9, so there is no older `Choices` to fold the form into; a catalog whose `Choices` cannot take it is refused by the schema check and the model is told).
   The person answers all the questions with one action, which comes back as this call's result:
   `The person answered through the interface (form ask-<call id>):` and one line per question, `- db: pg`, with typed words as
   `text: "..."` and a last line `Note: "..."` ([`adam-a2a-runtime`](../adam-a2a-runtime/README.md)). The `default` of a typed
@@ -479,7 +476,7 @@ stateDiagram-v2
 * `tests/ask_v7.rs`, `tests/ask_answers.rs` and `src/ask/vectors.rs`: the five kinds against the published catalogs of
   versions 7, 6, 5 and 2 (byte copies, `tests/fixtures/UPSTREAM`; `tools/check-vendored-catalogs.sh` compares them, and the vectors, with
   the published files in CI): the contract's own example form is a valid instance and a golden file
-  (`tests/golden/ask_form_v7.json`), the nearest older form on versions 6 and 5, words on version 2 and with no catalog,
+  (`tests/golden/ask_form_v7.json`), the nearest older form on versions 6 and 5, words with no catalog,
   the models' mistakes in words; a whole agent behind A2A that refuses an answer, asks again on `ask-<id>.r1` with the
   right answers as defaults, never wakes the model, and reads words unchecked; each rule of the catalog; and the
   catalog's **133 conformance vectors** and its whole-answer, invalid-question and surface blocks

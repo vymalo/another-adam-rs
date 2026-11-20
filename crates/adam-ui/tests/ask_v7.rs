@@ -61,10 +61,6 @@ fn v6() -> Screen {
 fn v5() -> Screen {
     screen(V5, V5_LOCK)
 }
-fn v2() -> Screen {
-    screen(V2, V2_LOCK)
-}
-
 /// Every whole number as a double, as an A2A server hands the metadata of a message over.
 fn as_doubles(value: &Value) -> Value {
     match value {
@@ -553,34 +549,6 @@ async fn a_screen_of_version_6_gets_the_nearest_form_and_no_new_type() {
             "{help}"
         );
     }
-}
-
-#[tokio::test]
-async fn a_screen_of_version_2_asks_what_fits_and_otherwise_the_form_is_words() {
-    // A yes or no and a short scale are radio buttons, which that screen has.
-    let (_, root) = form(
-        &v2(),
-        json!({"question": "Q", "choices": [
-            {"id": "ship", "question": "Delete it?", "type": "confirm", "default": "no"},
-            {"id": "nps", "question": "How good?", "type": "scale", "to": 5}]}),
-    )
-    .await;
-    assert_eq!(root["questions"][0]["options"][0]["value"], "yes");
-    assert_eq!(root["questions"][1]["options"].as_array().unwrap().len(), 5);
-    assert!(root["questions"][0].get("type").is_none());
-    // A scale of 11 points is more options than that screen takes, and a number is a typed answer:
-    // both go as words.
-    let text = words(
-        Some(&v2()),
-        json!({"question": "Q", "choices": [{"id": "n", "question": "How good?", "type": "scale", "to": 10, "from": 0}]}),
-    )
-    .await;
-    assert!(
-        text.contains("1. How good? (a whole number from 0 to 10)"),
-        "{text}"
-    );
-    let text = words(Some(&v2()), five()).await;
-    assert!(text.contains("2. What is the monthly budget?"), "{text}");
 }
 
 #[tokio::test]

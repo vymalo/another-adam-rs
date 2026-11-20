@@ -11,10 +11,9 @@
 //! read, the options are listed in the question's text and the answer is free text: the tool
 //! degrades, it never fails the run.
 //!
-//! The screen's catalog says what it can draw: from catalog **version 5** the form is sent whole;
-//! on version 2 to 4 it is sent as the subset that screen has (no types beyond radio buttons and
-//! checkboxes, at most 8 options, the description folded into the question's text) and, when a
-//! question needs more than that (a typed answer), as text.
+//! The screen's catalog says what it can draw: the form is sent whole, with the kinds the screen's
+//! `Choices` lacks asked as the nearest older form or, when none fits, as text. A `ui-catalog/v2`
+//! catalog starts at version 9, so there is no older component to fold the form into.
 //!
 //! A question may `show` what it asks about (catalog version 8): see `ask/shown.rs`.
 
@@ -53,20 +52,13 @@ const MIN_OPTIONS: usize = 2;
 const MAX_OPTIONS: usize = 12;
 const MAX_SELECT_OPTIONS: usize = 50;
 const MAX_DECK_IMAGES: usize = 16;
-/// The most options a screen of catalog version 2 to 4 takes in a question.
-const V4_MAX_OPTIONS: usize = 8;
 /// The most characters of a typed answer's default: what the answer may be.
 const MAX_TEXT: usize = 500;
 const MAX_LONG_TEXT: usize = 2000;
 /// The longest label of an option on a screen that has no "recommended" mark of its own.
 const MAX_LABEL: usize = 120;
-/// The longest question: the component's limit.
-const MAX_QUESTION: usize = 300;
 /// The longest option value: the component's pattern says 64.
 const MAX_VALUE: usize = 64;
-/// The first catalog version whose `Choices` has the title, description, types, pictures and the
-/// free box (`docs/api/ui-catalog-v1.md` of `vymalo/another-agentic-system`, "Version 5").
-const CATALOG_V5: u32 = 5;
 /// The name of the action a Choices sends.
 const ANSWER_ACTION: &str = "answer";
 
@@ -825,77 +817,6 @@ fn clipped(text: &str, max: usize) -> String {
     out
 }
 
-/// The `Choices` instance for a screen of catalog version 2 to 4, or `None` when the form needs more
-/// than that screen has (a typed answer, an option list longer than it takes).
-///
-/// What the old component has is kept: the title, the questions with radio buttons or checkboxes,
-/// the options' labels and descriptions, `allowOther`, `required` and the button's words. The rest is
-/// left out or folded in: a question's `help` goes after its text, a recommended option is marked in
-/// its label, a deck or a list is a list of radio buttons or checkboxes. The description goes in
-/// the question the person reads first (the caller's job).
-fn choices_instance_v4(form: &Form) -> Option<Value> {
-    let fits = form.questions.iter().all(|q| {
-        !q.kind().is_typed() && !q.kind().is_extended() && q.options.len() <= V4_MAX_OPTIONS
-    });
-    if !fits {
-        return None;
-    }
-    let questions: Vec<Value> = form
-        .questions
-        .iter()
-        .map(|q| {
-            let options: Vec<Value> = q
-                .options
-                .iter()
-                .map(|o| {
-                    let label = if o.recommended {
-                        format!("{} (recommended)", clipped(&o.label, MAX_LABEL - 14))
-                    } else {
-                        o.label.clone()
-                    };
-                    let mut option = Map::new();
-                    option.insert("value".into(), json!(o.value));
-                    option.insert("label".into(), json!(label));
-                    if let Some(description) = &o.description {
-                        option.insert("description".into(), json!(description));
-                    }
-                    Value::Object(option)
-                })
-                .collect();
-            let text = match &q.help {
-                Some(help) => clipped(&format!("{} ({help})", q.question), MAX_QUESTION),
-                None => q.question.clone(),
-            };
-            let mut question = Map::new();
-            question.insert("id".into(), json!(q.id));
-            question.insert("question".into(), json!(text));
-            question.insert("options".into(), Value::Array(options));
-            if q.takes_several() {
-                question.insert("multiple".into(), json!(true));
-            }
-            if let Some(other) = q.allow_other {
-                question.insert("allowOther".into(), json!(other));
-            }
-            if let Some(required) = q.required {
-                question.insert("required".into(), json!(required));
-            }
-            Value::Object(question)
-        })
-        .collect();
-    let mut component = Map::new();
-    component.insert("id".into(), json!("root"));
-    component.insert("component".into(), json!("Choices"));
-    if let Some(title) = &form.title {
-        component.insert("title".into(), json!(title));
-    }
-    component.insert("questions".into(), Value::Array(questions));
-    if let Some(label) = &form.submit_label {
-        component.insert("submitLabel".into(), json!(label));
-    }
-    component.insert("action".into(), json!({"event": {"name": ANSWER_ACTION}}));
-    Some(Value::Object(component))
-}
-
 /// What marks option number `m` (from 0) of `total`: a letter, else a number.
 fn marker(m: usize, total: usize) -> String {
     if total <= 26 {
@@ -967,15 +888,6 @@ fn as_text(question: &str, form: &Form) -> String {
         text.push_str(&format!("\n\n{label} (optional: add it to your reply)"));
     }
     text
-}
-
-/// The question the person reads first, on a screen that cannot draw the description: the question,
-/// then the description.
-fn lead_with_description(question: &str, form: &Form) -> String {
-    match &form.description {
-        Some(description) => format!("{question}\n{description}"),
-        None => question.to_owned(),
-    }
 }
 
 /// `ask_user`. Made by [`Ui::tools`](crate::Ui::tools).
@@ -1156,22 +1068,7 @@ impl Tool for AskUser {
                     Some(arranged) => (&arranged.form, arranged.words.as_str()),
                     None => (&drawn, ""),
                 };
-                // The whole form for a screen that has it; else what that screen has, or words.
-                let (instance, lead) = if catalog.version() >= CATALOG_V5 {
-                    (choices_instance(drawn), question)
-                } else if let Some(instance) = choices_instance_v4(drawn) {
-                    tracing::debug!(
-                        version = catalog.version(),
-                        "the screen's Choices is older than version 5; the form is sent as that screen has it"
-                    );
-                    (instance, lead_with_description(&question, drawn))
-                } else {
-                    tracing::debug!(
-                        version = catalog.version(),
-                        "the form needs more than the screen's Choices has; it goes in the text"
-                    );
-                    return in_words(&question, &form);
-                };
+                let instance = choices_instance(drawn);
                 if let Err(problem) = catalog.validate(&instance) {
                     return Ok(ToolOutput::error(format!(
                         "the choices do not fit the screen's Choices component: {problem}"
@@ -1188,7 +1085,10 @@ impl Tool for AskUser {
                 {
                     return Ok(ToolOutput::error(problem));
                 }
-                Err(ToolError::needs_input_with_ui(format!("{lead}{words}"), ui))
+                Err(ToolError::needs_input_with_ui(
+                    format!("{question}{words}"),
+                    ui,
+                ))
             }
             Resolved::Found(_) => {
                 tracing::debug!("the screen has no Choices component; the options go in the text");
@@ -1587,51 +1487,6 @@ mod tests {
                 "action": {"event": {"name": "answer"}}
             })
         );
-    }
-
-    #[test]
-    fn a_screen_of_version_4_gets_what_it_has() {
-        let form = normalize(args(json!({
-            "question": "q", "title": "Before I start", "description": "Why I ask.",
-            "freeInput": true, "submitLabel": "Go",
-            "choices": [
-                {"id": "db", "question": "Which database?", "help": "Where the data lives", "type": "select",
-                 "options": [{"label": "Postgres", "recommended": true, "icon": "git"}, "SQLite"], "default": "Postgres"},
-                {"id": "env", "question": "Environments?", "type": "multiple", "min": 1, "options": ["Dev", "Prod"]}
-            ]
-        })))
-        .unwrap();
-        assert_eq!(
-            choices_instance_v4(&form).unwrap(),
-            json!({
-                "id": "root", "component": "Choices", "title": "Before I start",
-                "questions": [
-                    {"id": "db", "question": "Which database? (Where the data lives)",
-                     "options": [{"value": "postgres", "label": "Postgres (recommended)"}, {"value": "sqlite", "label": "SQLite"}]},
-                    {"id": "env", "question": "Environments?", "multiple": true,
-                     "options": [{"value": "dev", "label": "Dev"}, {"value": "prod", "label": "Prod"}]}
-                ],
-                "submitLabel": "Go",
-                "action": {"event": {"name": "answer"}}
-            })
-        );
-        assert_eq!(
-            lead_with_description("q", &form),
-            "q\nWhy I ask.",
-            "the description goes in the text the person reads first"
-        );
-    }
-
-    #[test]
-    fn a_screen_of_version_4_cannot_take_a_typed_answer_or_a_long_list() {
-        assert!(
-            choices_instance_v4(&v5_form()).is_none(),
-            "a typed question"
-        );
-        let long = normalize(args(json!({"question": "q", "choices": [
-            {"question": "Which?", "type": "select", "options": (0..9).map(|n| format!("Option {n}")).collect::<Vec<_>>()}]})))
-        .unwrap();
-        assert!(choices_instance_v4(&long).is_none(), "more than 8 options");
     }
 
     #[test]
