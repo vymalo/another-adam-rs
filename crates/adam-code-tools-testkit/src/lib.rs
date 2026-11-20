@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use adam_code_tools::git::GitAt;
 use adam_code_tools::{CodeWorkspace, DynCodeWorkspace, Intent, Outcome, Place, Redactor};
-use adam_llm_agent::{ToolCtx, ToolOutput};
+use adam_llm_agent::{ToolCtx, ToolError, ToolOutput};
 use adam_runtime::CollectingSink;
 use adam_workspace::SlotDir;
 use async_trait::async_trait;
@@ -121,6 +121,38 @@ pub mod cases {
             h.secret.len()
         );
     }
+
+    /// What follows a write ([`after_write`](adam_code_tools::CodeWorkspace::after_write)) on the
+    /// writable place, twice: each call is `Ok`, its text is empty or starts with a space or a line
+    /// break (it is appended to a sentence), and none holds the secret.
+    pub async fn a_write_is_followed_by_the_hook(h: &Harness) {
+        let place = match h
+            .workspace
+            .place(&h.ctx, Some(&h.writable), Intent::Write)
+            .await
+        {
+            Ok(place) => place,
+            Err(answer) => panic!("a write of {:?}: {answer:?}", h.writable),
+        };
+        let paths = ["conformance-after-write.txt".to_owned()];
+        for call in 1..=2 {
+            let tail = match h.workspace.after_write(&h.ctx, &place, &paths).await {
+                Ok(tail) => tail,
+                Err(e) => panic!("call {call}: {e:?}"),
+            };
+            assert!(
+                tail.is_empty() || tail.starts_with(' ') || tail.starts_with('\n'),
+                "call {call}: {tail:?}"
+            );
+            // The hook is given nothing that holds the secret: this guards an implementation that
+            // writes a secret of its own into the text. A failure says the secret's length, not it.
+            assert!(
+                !tail.contains(&h.secret),
+                "call {call}: the text holds the harness's secret ({} bytes)",
+                h.secret.len()
+            );
+        }
+    }
 }
 
 /// One `#[tokio::test]` per case of [`cases`], each over a harness built by `$harness` (an
@@ -133,6 +165,7 @@ macro_rules! code_workspace_conformance {
         $crate::code_workspace_conformance!(@case $harness, an_unknown_name_is_an_answer_for_the_model);
         $crate::code_workspace_conformance!(@case $harness, a_read_only_place_is_never_given_for_a_write);
         $crate::code_workspace_conformance!(@case $harness, the_redactor_scrubs_the_secret);
+        $crate::code_workspace_conformance!(@case $harness, a_write_is_followed_by_the_hook);
     };
     (@case $harness:expr, $case:ident) => {
         #[tokio::test]
@@ -226,5 +259,15 @@ impl CodeWorkspace for DirWorkspace {
 
     fn redactor(&self) -> &Redactor {
         &self.redactor
+    }
+
+    /// Nothing follows a write here.
+    async fn after_write(
+        &self,
+        _ctx: &ToolCtx,
+        _place: &Place,
+        _paths: &[String],
+    ) -> Result<String, ToolError> {
+        Ok(String::new())
     }
 }
