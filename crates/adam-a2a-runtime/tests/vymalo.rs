@@ -509,3 +509,41 @@ async fn the_offer_of_one_message_is_deleted_by_the_next_that_has_none() {
     stop.send(()).unwrap();
     handle.await.unwrap();
 }
+
+/// At most 32 ids are kept, in order: the number is the contract's, written here and not read from the constant.
+#[test]
+fn the_offer_keeps_the_first_32_ids_and_no_more() {
+    let ids: Vec<String> = (0..33)
+        .map(|n| format!("https://example.test/c{n}"))
+        .collect();
+    let kept = |ids: &[String]| {
+        let m = renderer_message("hi", json!({"1.0": {"supportedCatalogIds": ids}}));
+        vymalo_inbound(&m).unwrap().payload["context"][CONTEXT_A2UI_RENDERER]["catalogIds"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(kept(&ids[..32]).len(), 32);
+    let cut = kept(&ids);
+    assert_eq!(cut.len(), 32);
+    assert_eq!(cut[31], "https://example.test/c31");
+}
+
+/// A part that says A2UI and holds a 1.0 message beside one of another version is a 1.0 part: it is no
+/// action and says nothing, and the other version's message is not read as text either.
+#[test]
+fn a_part_with_a_1_0_message_and_an_older_one_says_nothing() {
+    let mut part = Part::data(json!([
+        {"version": "1.0", "createSurface": {"surfaceId": "s", "catalogId": CATALOG_ID}},
+        {"version": "0.9", "action": {"name": "answer", "surfaceId": "ask-1"}}
+    ]))
+    .with_media_type(A2UI_MEDIA_TYPE);
+    part.metadata = Some(HashMap::from([(
+        "mimeType".to_owned(),
+        json!(A2UI_MEDIA_TYPE),
+    )]));
+    let message = Message::new(Role::User, vec![Part::text("hi"), part]);
+    let inbound = vymalo_inbound(&message).unwrap();
+    assert_eq!(inbound.payload["text"], "hi");
+    assert!(inbound.payload.get("form").is_none());
+}

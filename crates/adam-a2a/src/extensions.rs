@@ -529,6 +529,19 @@ mod tests {
         );
     }
 
+    /// The A2UI v1.0 URIs, written out (the test above compares with the constants themselves).
+    #[test]
+    fn the_a2ui_v1_0_ids_are_spelled_out() {
+        assert_eq!(
+            A2UI_BASIC_CATALOG_V1_0,
+            "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"
+        );
+        assert_eq!(
+            ExtensionConfig::a2ui_v1_0().params["supportedCatalogIds"],
+            json!(["https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"])
+        );
+    }
+
     #[test]
     fn the_a2ui_entry_declares_inline_catalogs_and_the_basic_one() {
         let e = ExtensionConfig::a2ui_v1_0();

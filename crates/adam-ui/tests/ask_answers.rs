@@ -719,6 +719,33 @@ async fn a_form_is_asked_again_on_a_surface_only_when_this_turns_offer_lists_its
     }
 }
 
+/// An interface that creates no surface names no catalog, so no offer can list it: words, even when the
+/// turn's renderer offers a catalog.
+#[tokio::test]
+async fn an_interface_that_creates_no_surface_is_asked_again_in_words() {
+    let (tool, args, mut ui) = asked_with_v7().await;
+    let catalog_id = ui[0]["createSurface"]["catalogId"].clone();
+    let mut p = payload(
+        "ask-c1",
+        json!({"answers": with("budget", json!(["1500"]))}),
+    );
+    p["context"] = json!({"vymalo.a2ui.renderer": {"catalogIds": [catalog_id]}});
+    let refuse = |ui: &Value| match tool.read_answer("c1", &args, Some(ui), &p) {
+        AnswerCheck::Refuse(refusal) => refusal,
+        other => panic!("refused: {other:?}"),
+    };
+    assert!(
+        refuse(&ui).ui.is_some(),
+        "the control: with its createSurface"
+    );
+    ui.as_array_mut()
+        .unwrap()
+        .retain(|m| m.get("createSurface").is_none());
+    let words = refuse(&ui);
+    assert!(words.ui.is_none());
+    assert_eq!(words.rule, "above_max");
+}
+
 #[tokio::test]
 async fn a_form_with_no_answer_to_judge_is_accepted_as_it_came() {
     let (tool, args, ui) = asked_with_v7().await;

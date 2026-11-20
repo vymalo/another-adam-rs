@@ -414,6 +414,8 @@ stateDiagram-v2
 ## Tests
 
 * `tests/offer.rs`: what the renderer offers in the message of this turn (`vymalo.a2ui.renderer`) decides whether a tool draws: no entry, a null one, another id or an empty list is words everywhere; the offer is merged as the conversation merges it, so a second message with no capabilities, or with a context too large to keep, is in words too, and a refetched or re-asked catalog must be one the offer lists.
+* `tests/offer_edges.rs`: which catalog is current at its edges: the inline catalog's own claim when no reference came, a claim that is not the reference, version 0, an empty `catalogId` or digest, and a catalog read again under an id the turn did not offer (`NotOffered`, nothing kept).
+* `tests/catalog_limits.rs`: the limits of a catalog at their edges, written as numbers and not read from the constants: exactly 64 KiB and one byte more, 64 components and 65, 32 levels of nesting and 33, the largest safe integer and the next.
 * `tests/embedded.rs`: `Ui::embedded` uses an inline catalog, never asks an endpoint a message names (and its `source()` offers and calls nothing), and `Ui::screen` describes `show` once the catalog is held and names the mentioned agents, with no tool.
 
 * `src/catalog.rs`: the known-answer vector (canonical form and digest), whole doubles hashing as integers, what the
