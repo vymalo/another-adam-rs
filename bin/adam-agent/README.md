@@ -196,7 +196,7 @@ same way; every problem is reported at once at startup):
 | `ADAM_AGENT_DIR` | the agent folder; **required by every role**, and an existing directory (exit 78 naming the variable otherwise) | required |
 | `ADAM_EXTRA_MCP_FILE` | roles that run workers: a file of extra MCP servers in the shape of `mcp.json`, added to the folder's own before they connect (an existing file, else exit 78; a name the folder already has is refused, exit 78). Same parser, `${VAR}`, `tools`, `optional` and policy as `mcp.json`; the variables it names are scrubbed from the tool-call steps like the folder's own (`redact::step_io_named`). See [`adam-assembly`](../../crates/adam-assembly/README.md#extra-mcp-servers-adam_extra_mcp_file) | unset: only the folder's servers |
 | `ROLE` | what this process runs: `all`, `control-plane` or `worker` (see [Roles](#roles)) | `all` |
-| `DATABASE_URL` | Postgres for the run store | required |
+| `DATABASE_URL` | the run store: `postgres://`/`postgresql://`, `mongodb://`/`mongodb+srv://` or `sqlite://<path>` (one file, one process, `ROLE=all` only) | required |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required by `all` and `control-plane` |
 | `A2A_PUSH_ALLOWED_URLS` | turns A2A push notifications **on** and names the webhooks they may reach: comma-separated URL prefixes or hosts ([`adam-service`](../../crates/adam-service/README.md#environment)); a client's webhook that matches none, is not `https` or is a private address is refused | unset: off, the card says so |
