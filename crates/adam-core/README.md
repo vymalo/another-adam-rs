@@ -171,9 +171,9 @@ and every adapter normalizes to it so they behave the same. The newtype's serde 
 with `Z` and chrono's `AutoSi` digits (0, 3, 6 or 9, the shortest exact one), which is what a
 state or a push cursor written before the migration holds: jiff's own serde trims every trailing
 zero and would change those bytes. `Timestamp` derefs to `jiff::Timestamp`; adding a
-`jiff::SignedDuration` saturates at `Timestamp::MAX`/`MIN`. `truncate_ms` truncates toward zero
-for a pre-1970 value with a fractional millisecond (chrono floored it); nothing adam-rs stores is
-written before 1970.
+`jiff::SignedDuration` saturates at `Timestamp::MAX`/`MIN`. `truncate_ms` floors, as chrono's
+`timestamp_millis` did, so a pre-1970 value with a fractional millisecond stores the same
+millisecond it stored before the migration.
 
 ## Errors
 

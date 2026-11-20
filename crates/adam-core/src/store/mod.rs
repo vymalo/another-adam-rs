@@ -56,6 +56,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::time::{Timestamp, span_of};
+use jiff::Timestamp as JiffTimestamp;
 
 pub use push::{NewPushConfig, PushProgress, PushRecord, PushState};
 pub use query::{ConversationScope, RunQuery};
@@ -837,17 +838,29 @@ pub fn sched_at(
     }
 }
 
-/// Truncate to millisecond precision (see the module docs on time).
+/// Truncate to millisecond precision, flooring as chrono's `timestamp_millis` did: a value before
+/// 1970 with a fractional millisecond becomes the millisecond below (`-0.5 ms` is `-1 ms`, never
+/// `0`), so the stored value is the one the framework wrote before ADR 0057. A value after 1970 is
+/// floored too, which is the same as truncating there.
 ///
-/// A value before 1970 with a fractional millisecond truncates **toward zero**, while chrono's
-/// `timestamp_millis` floored it: the two differ by one millisecond only there, and nothing
-/// adam-rs stores is written before 1970. A value after 1970 is floored, as before.
+/// Works in whole milliseconds rather than through `Timestamp::from_millisecond`: jiff's
+/// `as_millisecond` truncates toward zero, and jiff's `from_millisecond` rejects the last 999 ms
+/// of its own range, so `truncate_ms(Timestamp::MAX)` must not go through the raw constructor.
 #[allow(
     clippy::expect_used,
     reason = "a millisecond count taken from a Timestamp is always representable"
 )]
 pub fn truncate_ms(t: Timestamp) -> Timestamp {
-    Timestamp::from_millisecond(t.as_millisecond()).expect("millisecond timestamp in range")
+    let fraction = i64::from(t.subsec_nanosecond()).div_euclid(1_000_000);
+    let millis = t
+        .as_second()
+        .checked_mul(1_000)
+        .and_then(|whole| whole.checked_add(fraction))
+        .expect("a timestamp's milliseconds fit in i64");
+    let second = millis.div_euclid(1_000);
+    let nanosecond = i32::try_from(millis.rem_euclid(1_000) * 1_000_000)
+        .expect("a millisecond is under a second");
+    Timestamp(JiffTimestamp::new(second, nanosecond).expect("the instant is in jiff's range"))
 }
 
 /// Current time, truncated to milliseconds.
@@ -1082,6 +1095,55 @@ mod tests {
         assert_eq!(
             adam_error::report(&e),
             "storage backend error: driver said no"
+        );
+    }
+
+    /// chrono's `timestamp_millis` floored; jiff's `as_millisecond` truncates toward zero, so a
+    /// pre-1970 value with a fractional millisecond must be corrected by one, or the stored
+    /// millisecond changes (ADR 0057). The top of jiff's range must not panic either: jiff's
+    /// `from_millisecond` rejects its own last 999 ms.
+    #[test]
+    fn truncate_ms_floors_before_the_epoch() {
+        let at = |text: &str| text.parse::<Timestamp>().expect("a timestamp");
+        for (input, want) in [
+            ("1969-12-31T23:59:59.999999999Z", -1),
+            ("1969-12-31T23:59:59.999500000Z", -1),
+            ("1969-12-31T23:59:59.999Z", -1),
+            ("1969-12-31T23:59:59.500Z", -500),
+            ("1969-12-31T23:59:59Z", -1_000),
+            ("1970-01-01T00:00:00Z", 0),
+            ("1970-01-01T00:00:00.000999999Z", 0),
+            ("2026-01-02T03:04:05.120500000Z", 1_767_323_045_120),
+        ] {
+            assert_eq!(truncate_ms(at(input)).as_millisecond(), want, "{input}");
+        }
+
+        // The ends of the range, where `Timestamp::from_millisecond` cannot round-trip MAX.
+        assert_eq!(truncate_ms(Timestamp::MIN), Timestamp::MIN);
+        assert_eq!(
+            truncate_ms(Timestamp::MAX),
+            Timestamp(
+                JiffTimestamp::new(Timestamp::MAX.as_second(), 999_000_000).expect("in range")
+            )
+        );
+        // A lease TTL too large for the range saturates instead of panicking.
+        let now = at("2026-01-02T03:04:05Z");
+        assert_eq!(add_ttl(now, Duration::MAX), truncate_ms(Timestamp::MAX));
+    }
+
+    /// `add_ttl` truncates the sum, not the TTL: a sub-millisecond lease is a whole millisecond,
+    /// and a base before 1970 floors with it.
+    #[test]
+    fn add_ttl_truncates_the_sum_to_the_millisecond() {
+        let now = "2026-01-02T03:04:05Z".parse::<Timestamp>().unwrap();
+        assert_eq!(
+            add_ttl(now, Duration::from_micros(1_500)),
+            "2026-01-02T03:04:05.001Z".parse().unwrap()
+        );
+        let before = "1969-12-31T23:59:59.999500Z".parse::<Timestamp>().unwrap();
+        assert_eq!(
+            add_ttl(before, Duration::from_micros(1_000)),
+            "1970-01-01T00:00:00Z".parse().unwrap()
         );
     }
 }

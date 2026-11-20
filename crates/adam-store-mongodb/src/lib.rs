@@ -260,7 +260,9 @@ fn uuid(id: RunId) -> Bson {
 }
 
 fn date(t: Timestamp) -> Bson {
-    Bson::DateTime(bson::DateTime::from_millis(t.as_millisecond()))
+    // `truncate_ms` floors as chrono's `timestamp_millis` did; jiff's `as_millisecond` would
+    // truncate toward zero for a pre-1970 cutoff, one millisecond off the old bytes.
+    Bson::DateTime(bson::DateTime::from_millis(truncate_ms(t).as_millisecond()))
 }
 
 fn opt_date(t: Option<Timestamp>) -> Bson {
@@ -1260,10 +1262,10 @@ impl Store for MongoStore {
 
     async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64> {
         // `updated_at < before` at millisecond precision, rounding `before` up so
-        // a sub-millisecond cutoff selects the same runs as in the other stores. As in
-        // `truncate_ms`, a cutoff before 1970 with a fractional millisecond rounds the other
-        // way; nothing adam-rs stores is written before 1970.
-        let mut cutoff = before.as_millisecond();
+        // a sub-millisecond cutoff selects the same runs as in the other stores. The floor is
+        // `truncate_ms`'s (chrono's `timestamp_millis` rule), so a cutoff before 1970 rounds the
+        // same way too.
+        let mut cutoff = truncate_ms(before).as_millisecond();
         if before.subsec_nanosecond() % 1_000_000 != 0 {
             cutoff += 1;
         }
@@ -1624,6 +1626,23 @@ mod round_trip_tests {
             entry,
             "the stored entry is the first one"
         );
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+
+    /// BSON dates are milliseconds; a value before 1970 floors, as chrono's `timestamp_millis`
+    /// did. `date` is the one encoder a raw `purge_blobs` cutoff reaches without `truncate_ms`
+    /// first, so its own rule is pinned here.
+    #[test]
+    fn date_floors_before_the_epoch() {
+        let at: Timestamp = "1969-12-31T23:59:59.999500Z".parse().expect("a timestamp");
+        let Bson::DateTime(stored) = date(at) else {
+            panic!("a timestamp is stored as a BSON date");
+        };
+        assert_eq!(stored.timestamp_millis(), -1);
     }
 }
 

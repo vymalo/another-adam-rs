@@ -41,8 +41,20 @@ impl Timestamp {
     /// # Errors
     ///
     /// [`jiff::Error`] when the value is outside [`Timestamp::MIN`] and [`Timestamp::MAX`].
+    ///
+    /// jiff's own `from_millisecond` rejects the last 999 ms of its range (a
+    /// `Timestamp::from_millisecond` at `Timestamp::MAX.as_millisecond()` fails although the instant
+    /// is `Timestamp::MAX` truncated); those are built from their second and remainder instead, so
+    /// a millisecond a store keeps round-trips at the ends of the range too.
     pub fn from_millisecond(millisecond: i64) -> Result<Self, jiff::Error> {
-        JiffTimestamp::from_millisecond(millisecond).map(Self)
+        if let Ok(at) = JiffTimestamp::from_millisecond(millisecond) {
+            return Ok(Self(at));
+        }
+        let second = millisecond.div_euclid(1_000);
+        let rest = millisecond.rem_euclid(1_000);
+        JiffTimestamp::from_second(second)?
+            .checked_add(SignedDuration::from_millis(rest))
+            .map(Self)
     }
 
     /// The instant `second` seconds after the Unix epoch.
@@ -252,6 +264,25 @@ mod tests {
             start - (start + SignedDuration::from_secs(5)),
             SignedDuration::from_secs(-5)
         );
+    }
+
+    /// A millisecond at either end of jiff's range round-trips, including the last 999 ms that
+    /// jiff's own `from_millisecond` refuses (a store decodes those).
+    #[test]
+    fn a_millisecond_at_the_ends_of_the_range_round_trips() {
+        for millisecond in [
+            Timestamp::MIN.as_millisecond(),
+            Timestamp::MAX.as_millisecond(),
+            0,
+            -1,
+            -500,
+            1_767_323_045_120,
+        ] {
+            let at = Timestamp::from_millisecond(millisecond).expect("in range");
+            assert_eq!(at.as_millisecond(), millisecond, "{millisecond}");
+        }
+        assert!(Timestamp::from_millisecond(i64::MAX).is_err());
+        assert!(Timestamp::from_millisecond(i64::MIN).is_err());
     }
 
     #[test]

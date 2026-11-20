@@ -642,6 +642,28 @@ mod tests {
         }
     }
 
+    /// The A2A `TaskStatus` JSON keeps chrono's bytes: the SDK type is unchanged, and the bridge
+    /// from adam's `Timestamp` produces the same instant and the same `AutoSi` digits.
+    #[test]
+    fn a_task_status_serializes_chronos_bytes() {
+        let mut v = view(RunStatus::Parked);
+        // A different creation instant: the status reports the last update, not the creation.
+        v.created_at = "2020-05-06T07:08:09Z".parse().expect("a timestamp");
+        v.updated_at = "2026-01-02T03:04:05.120Z".parse().expect("a timestamp");
+        let status = status_of(&v, &prompt());
+        let timestamp = status.timestamp.expect("a status timestamp");
+        assert_eq!(
+            timestamp.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+            "2026-01-02T03:04:05.120Z"
+        );
+        assert_eq!(timestamp.timestamp_millis(), 1_767_323_045_120);
+        let json = serde_json::to_string(&status).expect("serialises");
+        assert!(
+            json.contains(r#""timestamp":"2026-01-02T03:04:05.120Z""#),
+            "{json}"
+        );
+    }
+
     #[test]
     fn states_follow_the_documented_table() {
         let mut v = view(RunStatus::Runnable);

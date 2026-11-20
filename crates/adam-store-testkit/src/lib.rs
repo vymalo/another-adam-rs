@@ -576,6 +576,42 @@ pub mod cases {
             .await
             .unwrap();
         assert_eq!(entry.recorded_at, truncate_ms(entry.recorded_at));
+
+        // Before 1970, chrono's floor (not jiff's toward zero): -0.5 ms is -1 ms, never 0.
+        let before: Timestamp = "1969-12-31T23:59:59.999500Z".parse().unwrap();
+        let floored: Timestamp = "1969-12-31T23:59:59.999Z".parse().unwrap();
+        let old = store
+            .create_run(
+                NewRun::new(&agent, json!({}))
+                    .status(RunStatus::Parked)
+                    .wake_at(before),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old.wake_at, Some(floored), "floored, never toward zero");
+        assert_eq!(
+            store.load_run(old.id).await.unwrap().unwrap().wake_at,
+            Some(floored),
+            "the pre-1970 value decodes"
+        );
+
+        // The top of jiff's range: a millisecond count jiff's own `from_millisecond` refuses,
+        // which every adapter must still round-trip (it is the "never" sentinel).
+        let capped = truncate_ms(Timestamp::MAX);
+        let last = store
+            .create_run(
+                NewRun::new(&agent, json!({}))
+                    .status(RunStatus::Parked)
+                    .wake_at(Timestamp::MAX),
+            )
+            .await
+            .unwrap();
+        assert_eq!(last.wake_at, Some(capped));
+        assert_eq!(
+            store.load_run(last.id).await.unwrap().unwrap().wake_at,
+            Some(capped),
+            "the end of jiff's range decodes"
+        );
     }
 
     pub async fn state_roundtrip(store: DynStore) {

@@ -40,9 +40,9 @@ whole second, `.120`, `.100`, `.123`, `.123456`, `.123456700`, `.123456789` and 
 `Sub<Timestamp>` is a `SignedDuration`, which is what a backoff or a deadline comparison needs. `span_of` turns a
 `std::time::Duration` into a `SignedDuration`, saturating; it replaces every `chrono::Duration::from_std(..).unwrap_or(MAX)`.
 
-`truncate_ms` floors after 1970, as chrono's `timestamp_millis` did; before 1970 with a fractional millisecond
-jiff's `as_millisecond` truncates toward zero instead of flooring, one millisecond of difference that nothing
-adam-rs stores can hit (documented on the function).
+`truncate_ms` floors, as chrono's `timestamp_millis` did, before 1970 too: jiff's `as_millisecond`
+truncates toward zero, so the function corrects a negative value with a fractional millisecond by
+one, and a stored millisecond is the one the framework wrote before this decision.
 
 Durations are `jiff::SignedDuration`, never `Span`: a `Span` carries calendar units, and adding one with a day unit
 to a `Timestamp` panics. Sentinels: `DateTime::<Utc>::MAX_UTC` becomes `Timestamp::MAX`; the `u64::MAX` timeout of
@@ -96,7 +96,10 @@ S1's `purge_blobs` — and the merge converted them with the rest, so the public
 * A timestamp is one type end to end (`Store`, runtime, agent, session, push), and its arithmetic saturates rather
   than panicking, as before.
 * The bytes of every stored run state, journal payload and push cursor are unchanged: a deployment can roll this
-  out beside an older build without a migration, and a state written by either decodes in the other.
+  out beside an older build without a migration, and a state written by either decodes in the other. The one
+  exception is the old `DateTime::MAX_UTC` sentinel (decision 1), reachable only through an absurd
+  `Duration::MAX` timeout or TTL: it is now `Timestamp::MAX`, which is a different instant but the same
+  "end of time".
 * `Timestamp` is a new public type of `adam-core` and appears in the `Store` trait: a new required type for
   implementers, documented in `docs/reference/store-adapters.md` and the crate READMEs.
 
@@ -113,8 +116,11 @@ S1's `purge_blobs` — and the merge converted them with the rest, so the public
 
 ## Tests
 
-`adam-core` pins each byte shape and a round trip; `adam-runtime` pins a `.120` envelope deadline and a
-`now_journaled` journal payload; `adam-a2a` pins a `.120` push cursor; the store testkit pins a `.120` instant and
-truncation below a millisecond on every adapter; the existing pins (`conversation.rs`'s `2026-01-02T03:04:05Z`,
-`envelope.rs`, the store suites) pass unchanged. The database suites run with `ADAM_TEST_REQUIRE_DB=1`, so a skip
-is a failure.
+`adam-core` pins each byte shape and a round trip; `adam-a2a` compares every `AutoSi` width against a
+real `chrono::DateTime<Utc>` value, reads the old digit widths, `+00:00` and lowercase `t`/`z`, and pins
+`truncate_ms` against chrono's `timestamp_millis`; `adam-runtime` pins a `.120` envelope deadline and a
+`now_journaled` journal payload; `adam-a2a` pins a `.120` push cursor and a `TaskStatus`'s JSON; the
+store testkit pins a `.120` instant, a truncation below a millisecond, a pre-1970 floor and the top of
+jiff's range on every adapter. The existing pins (`conversation.rs`'s `2026-01-02T03:04:05Z`,
+`envelope.rs`, the store suites) pass unchanged. The database suites run with `ADAM_TEST_REQUIRE_DB=1`,
+so a skip is a failure.
