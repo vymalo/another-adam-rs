@@ -8135,8 +8135,6 @@ async fn state_is_corrupt_when_the_body_is_short_twice() {
 /// `None` for a blob that is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn artifact_bytes_serves_an_inline_file_and_a_blob() {
-    use adam_core::Store;
-
     let store: DynStore = Arc::new(MemoryStore::new());
     let rt = Runtime::builder(store.clone()).build();
 
