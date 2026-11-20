@@ -592,7 +592,7 @@ fn compile(pattern: &str, literal: bool) -> Result<regex::bytes::Regex, String> 
 }
 
 /// The search of a candidate list, for the tests that race it: the page of `pattern` over `paths`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 pub fn search_files_in(
     root: &SlotDir,
     paths: &[String],
