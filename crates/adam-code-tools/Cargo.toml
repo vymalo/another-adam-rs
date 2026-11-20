@@ -30,6 +30,8 @@ tokio = { workspace = true, features = ["io-util", "process"] }
 tracing.workspace = true
 
 [dev-dependencies]
+# `test-util`: the git sandbox server of `apply_patch`'s tests.
+adam-workspace = { path = "../adam-workspace", version = "0.1.0", default-features = false, features = ["test-util"] }
 proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

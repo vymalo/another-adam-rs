@@ -1,11 +1,12 @@
 //! `adam_code_tools::files`' write tools over a workspace that is not the coder's: what they write,
 //! when they call `after_write` (once per successful write, never for a refused one), what an `Err`
-//! of the hook does, and that a place the workspace wrongly gives for a write is refused.
+//! of the hook does, and that a place the workspace wrongly gives for a write is refused. The same
+//! for `apply_patch`, in a git repository the test makes.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::sync::Mutex;
 
-use adam_code_tools::files::{edit_file, write_file};
+use adam_code_tools::files::{apply_patch, edit_file, write_file};
 use adam_code_tools::{CodeWorkspace, Intent, Outcome, Place, Redactor};
 use adam_code_tools_testkit::{DirWorkspace, detached_ctx};
 use adam_llm_agent::{ToolCtx, ToolError};
@@ -192,6 +193,82 @@ async fn a_read_only_place_given_for_a_write_is_refused_and_nothing_is_written()
     assert_eq!(
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
         "one\n"
+    );
+    assert!(ws.calls().is_empty());
+}
+
+/// A git repository with `a.txt` (`one\ntwo\n`), for `apply_patch`.
+fn repository() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+    dir
+}
+
+const PATCH: &str = "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n";
+
+#[tokio::test]
+async fn a_patch_is_applied_and_calls_the_hook_once_with_the_paths_it_changed() {
+    let dir = repository();
+    let ws = Recording::over(dir.path());
+    let ctx = detached_ctx();
+
+    let out = apply_patch(&ws, &ctx, PATCH.into(), None).await.unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        out.content,
+        "Applied the patch to 1 file(s): a.txt. And then."
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "one\nthree\n"
+    );
+    assert_eq!(ws.calls(), vec![vec!["a.txt".to_owned()]]);
+}
+
+#[tokio::test]
+async fn a_patch_that_does_not_apply_is_an_error_result_and_does_not_call_the_hook() {
+    let dir = repository();
+    std::fs::write(dir.path().join("a.txt"), "other\n").unwrap();
+    let ws = Recording::over(dir.path());
+    let ctx = detached_ctx();
+
+    let out = apply_patch(&ws, &ctx, PATCH.into(), None).await.unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("the patch does not apply"),
+        "{}",
+        out.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "other\n"
+    );
+    assert!(ws.calls().is_empty(), "{:?}", ws.calls());
+}
+
+#[tokio::test]
+async fn a_patch_to_a_read_only_place_is_refused_and_nothing_is_changed() {
+    let dir = repository();
+    let mut ws = Recording::over(dir.path());
+    ws.gives_read_only = true;
+    let ctx = detached_ctx();
+
+    let out = apply_patch(&ws, &ctx, PATCH.into(), None).await.unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("can be read, not written"),
+        "{}",
+        out.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "one\ntwo\n"
     );
     assert!(ws.calls().is_empty());
 }
