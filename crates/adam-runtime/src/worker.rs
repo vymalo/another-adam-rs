@@ -14,13 +14,14 @@ use serde_json::Value;
 use tokio::task::{JoinHandle, JoinSet};
 
 use adam_core::{
-    BlobId, BodyRow, BodyWrite, Lease, RunId, RunRecord, RunStatus, RunUpdate, StoreError,
-    StoreResult,
+    BlobId, BodyRow, BodyWrite, DynStore, Lease, RunId, RunRecord, RunStatus, RunUpdate,
+    StoreError, StoreResult,
 };
 use adam_error::{Classify, ErrorClass, report};
 use uuid::Uuid;
 
 use crate::agent::{AgentError, Transition};
+use crate::blob::blob_id;
 use crate::cancel::CancelToken;
 use crate::child::news_since;
 use crate::ctx::{Ctx, CtxOutcome, CtxParts};
@@ -550,10 +551,12 @@ async fn transition(
             tracing::error!(run = %run, error = %e, "failing run with unreadable state");
             // The document is unreadable, so it is stored as it is — except a head, which stays
             // the head and keeps the tombstone for its state: it was readable, its body was not.
-            let update = if matches!(Stored::decode(run, &rec.state), Ok(Stored::Head(_))) {
-                RunUpdate::new(RunStatus::Failed, Value::Null).head(rec.state)
-            } else {
-                RunUpdate::new(RunStatus::Failed, rec.state)
+            // A store that keeps no bodies gets the head as its state and no head.
+            let update = match Stored::decode(run, &rec.state) {
+                Ok(Stored::Head(_)) if inner.store.keeps_bodies() => {
+                    RunUpdate::new(RunStatus::Failed, Value::Null).head(rec.state)
+                }
+                _ => RunUpdate::new(RunStatus::Failed, rec.state),
             };
             if let Ok(committed) = inner.store.commit_run(run, rec.version, update).await {
                 inner
@@ -635,7 +638,15 @@ async fn transition(
     // The step consumed the agent state. A failure commits the state the run already had, which is
     // the record's own `agent` member: read, and copied, only then. `agent` is required by
     // `Envelope` (it has no serde default), so a record that lacks it never decodes to here.
-    let plan = plan(inner, run, &env, rec.state.get("agent"), outcome, result);
+    let plan = plan(
+        inner,
+        run,
+        &env,
+        rec.state.get("agent"),
+        base_head.is_some(),
+        outcome,
+        result,
+    );
     let Plan::Commit(mut next) = plan else {
         return false;
     };
@@ -736,6 +747,32 @@ async fn transition(
             next.split_refused = true;
         }
     }
+    // A demotion writes the whole state, and a v4 state must carry a file's **bytes**: the head the
+    // run read names them by digest and size only, so re-read them. A missing blob refuses the
+    // demotion (the run is left as it is and retried) rather than writing zero-byte files.
+    if next.split_refused
+        && let Some(base) = &base_head
+    {
+        let mut artifacts = merged_artifacts(&env, &next);
+        match inline_inherited_files(&inner.store, base, &mut artifacts).await {
+            Ok(true) => next.head_artifacts = Some(artifacts),
+            Ok(false) => {
+                tracing::error!(
+                    run = %run,
+                    "an inherited file's bytes are not stored; the run is left as it is and retried"
+                );
+                return false;
+            }
+            Err(e) => {
+                tracing::error!(
+                    run = %run,
+                    error = %report(&e),
+                    "reading an inherited file failed; the run is left as it is and retried"
+                );
+                return false;
+            }
+        }
+    }
     // One writer per step attempt: the commit's CAS retries reuse it, so a retry of the same
     // attempt is idempotent and a lost CAS deletes exactly the rows this attempt inserted.
     let body_writer = Uuid::new_v4();
@@ -812,6 +849,7 @@ fn plan(
     run: RunId,
     base: &Envelope,
     base_agent: Option<&Value>,
+    v5: bool,
     out: CtxOutcome,
     result: Result<Stepped, AgentError>,
 ) -> Plan {
@@ -822,28 +860,34 @@ fn plan(
         read,
         artifacts,
     } = out;
-    // Starting point for a transition that made progress.
-    let progressed = |status, wake_at, agent, output, error, split| Next {
-        status,
-        wake_at,
-        agent,
-        output,
-        error,
-        attempt: 0,
-        seq,
-        consumed,
-        artifacts: artifacts.clone(),
-        retry_detail: None,
-        reopen,
-        read: read.clone(),
-        split,
-        generation: None,
-        split_refused: false,
-        head_artifacts: None,
-        shadow_blobs: Vec::new(),
-        shadow_files: Vec::new(),
-        deadline: base.deadline,
-        remaining_secs: base.remaining_secs,
+    // Starting point for a transition that made progress. A v5 run's step must split: its state is
+    // the head plus the body, and a step that writes no head would put the whole state in the head,
+    // which the next join discards. Such a step is a **refused split**: the run demotes to the
+    // whole state (a v4 run, whose `split` is `None`, is unaffected).
+    let progressed = |status, wake_at, agent, output, error, split: Option<(Value, Vec<Value>)>| {
+        let split_refused = v5 && split.is_none();
+        Next {
+            status,
+            wake_at,
+            agent,
+            output,
+            error,
+            attempt: 0,
+            seq,
+            consumed,
+            artifacts: artifacts.clone(),
+            retry_detail: None,
+            reopen,
+            read: read.clone(),
+            split,
+            generation: None,
+            split_refused,
+            head_artifacts: None,
+            shadow_blobs: Vec::new(),
+            shadow_files: Vec::new(),
+            deadline: base.deadline,
+            remaining_secs: base.remaining_secs,
+        }
     };
     // Starting point for a failure that ends the run: state untouched.
     let failed = |error: String| Next {
@@ -1002,9 +1046,11 @@ async fn park_again(inner: &Inner, rec: RunRecord, env: &Envelope, now: Timestam
     if let Some(deadline) = env.deadline {
         wake = wake.min(deadline + span_of(DEADLINE_SKEW));
     }
+    let keeps_bodies = inner.store.keeps_bodies();
     let mut update = match Stored::decode(rec.id, &rec.state) {
         Ok(Stored::Head(head)) => match head.encode() {
-            Ok(head) => RunUpdate::new(RunStatus::Parked, Value::Null).head(head),
+            Ok(head) if keeps_bodies => RunUpdate::new(RunStatus::Parked, Value::Null).head(head),
+            Ok(head) => RunUpdate::new(RunStatus::Parked, head),
             Err(e) => {
                 tracing::warn!(run = %rec.id, error = %report(&e), "the head does not encode; parking a watched run again is skipped");
                 return;
@@ -1069,7 +1115,12 @@ fn build_update(
         },
         _ => wake_at,
     };
-    let artifacts = merged_artifacts(cur, next);
+    // A commit that ran an upload pass (a split, or a demotion that inlined the inherited files)
+    // carries its list; otherwise the artifacts are the run's plus this transition's.
+    let artifacts = match &next.head_artifacts {
+        Some(artifacts) => artifacts.clone(),
+        None => merged_artifacts(cur, next),
+    };
     // `next` and `cur` are borrowed for the whole retry loop, which builds this update again from
     // them after a lost CAS race, so the envelope owns copies of what it keeps. Moving them would
     // leave a retry with `null`.
@@ -1095,10 +1146,12 @@ fn build_update(
     };
     let mut update = RunUpdate::new(status, Value::Null);
     update.wake_at = wake_at;
+    // `keeps_bodies` is the gate: a store that keeps none is never handed a head or a row — the
+    // whole state is written instead, and the run stays v4 (ADR 0055).
     match (&next.split, base_head) {
-        // A step that splits: the head, the rows it names, and — for a store that keeps bodies —
-        // the tombstone instead of the whole state (ADR 0055, the contract release).
-        (Some((head, rows)), _) => {
+        // A step that splits: the head, the rows it names, and the tombstone instead of the whole
+        // state (ADR 0055, the contract release).
+        (Some((head, rows)), _) if keeps_bodies => {
             let len = u32::try_from(rows.len())
                 .map_err(|_| StoreError::InvalidInput("a transcript is longer than u32".into()))?;
             let head = Head::of(
@@ -1127,25 +1180,56 @@ fn build_update(
                 rows,
                 writer: body_writer,
             });
-            update.state = if keeps_bodies {
-                Value::Null
-            } else {
-                env.encode()?
-            };
+            update.state = Value::Null;
         }
         // A v5 run whose transition did not split (a failure, a retry): the head it read, with
         // this commit's members, and the transcript set unchanged. The state stays the tombstone.
         // A refused split is the exception: the state is the whole new state, and a head carrying
         // it would put the transcript back in the head, so the run demotes to v4 instead.
         (None, Some(_)) if next.split_refused => update.state = env.encode()?,
-        (None, Some(base)) => {
-            update.head = Some(base.carried(&env).encode()?);
+        (None, Some(base)) if keeps_bodies => {
+            update.head = Some(base.carried(&env, &next.artifacts).encode()?);
             update.state = Value::Null;
         }
-        // A v4 run that did not split: the whole state, as it always was.
-        (None, None) => update.state = env.encode()?,
+        // A v5 document on a store that keeps no bodies (a third-party store that persists a head
+        // but has not opted in): the head stays the state, and no head or row is written.
+        (None, Some(base)) => {
+            update.state = base.carried(&env, &next.artifacts).encode()?;
+        }
+        // A v4 run that did not split, or a split for a store that keeps no bodies: the whole
+        // state, as it always was.
+        (_, None) | (Some(_), _) => update.state = env.encode()?,
     }
     Ok(update)
+}
+
+/// Inline the bytes of every file a v5 head names into `artifacts`, so a demoted v4 state carries
+/// them: a head names a file by digest and size, and a v4 state must carry the bytes.
+///
+/// The inherited files come first, in the head's artifact order (a step's own files are appended
+/// after them), so the references pair positionally. `false` when a blob is missing or its bytes
+/// are not the digest the head names: the demotion cannot be written, and the run is left as it is
+/// (it is retried when its lease expires).
+async fn inline_inherited_files(
+    store: &DynStore,
+    base: &HeadParts,
+    artifacts: &mut [Artifact],
+) -> StoreResult<bool> {
+    let mut refs = base.file_refs().into_iter();
+    for artifact in artifacts.iter_mut() {
+        let Some(file) = artifact.file.as_mut() else {
+            continue;
+        };
+        let Some((digest, _)) = refs.next() else {
+            // The rest are this step's own files, whose bytes it already carries.
+            break;
+        };
+        match store.get_blob(&digest).await? {
+            Some(bytes) if blob_id(&bytes) == digest => file.bytes = bytes,
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 /// The artifacts of the state this commit writes: the ones the run already had, plus this

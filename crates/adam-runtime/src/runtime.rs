@@ -196,8 +196,9 @@ pub struct RunView {
     /// file it does not serve.
     pub artifacts: Vec<ArtifactRef>,
     /// The agent's **head**: its state without the transcript for a v5 run. It is the whole agent
-    /// state for a v4 run, and for a v5 run whose head is stale (a delivery, a cancel or a park
-    /// since the last step), because there is no current head to serve. The pointers a front
+    /// state for a v4 run, and for a run whose stored state is the v4 envelope a v4 commit wrote
+    /// after the head (the head is stale, so the state is served); a run a pre-S3 process failed
+    /// has the tombstone as its state and the head is served. The pointers a front
     /// reads — `pending_wait`, `pending_question`, `question`, `usage_totals`, `sandbox_usage`,
     /// `context`, `session` — are in the head.
     ///
@@ -253,9 +254,9 @@ impl RunView {
 /// compares it against [`Runtime::now`], so the result agrees with [`Runtime::view`]. An
 /// unreadable state is [`RuntimeError::Corrupt`].
 ///
-/// A record from [`Store::list_runs`](adam_core::Store::list_runs) carries the whole v4 state in
-/// the expand release, so its view is the v4 one; a record read with
-/// [`Store::load_head`](adam_core::Store::load_head) may carry a v5 head.
+/// A record from [`Store::list_runs`](adam_core::Store::list_runs) carries what
+/// [`Store::load_run`](adam_core::Store::load_run) would answer — the current head for a v5 run,
+/// the whole state otherwise — so its view is the same one [`Runtime::view`] builds.
 ///
 /// # Errors
 ///
@@ -711,20 +712,19 @@ impl Inner {
 /// a v5 head stays the head, and a store that keeps bodies keeps the tombstone as its state; a v4
 /// envelope stays the whole state (ADR 0055, the contract release).
 ///
-/// A head is only ever written by a store that keeps bodies, so the tombstone is the state there.
-/// The fallback for a store that reports it keeps none is the head itself, which keeps the run
-/// readable instead of destroying it.
+/// A store that reports it keeps no bodies is never handed a head (the gate is
+/// [`Store::keeps_bodies`](adam_core::Store::keeps_bodies)): the head becomes its `state`, which is
+/// the document its own read decodes.
 fn carried(store: &DynStore, stored: &Stored) -> Result<(Option<Value>, Value), RuntimeError> {
     match stored {
         Stored::Full(envelope) => Ok((None, envelope.encode()?)),
         Stored::Head(head) => {
             let head = head.encode()?;
-            let state = if store.keeps_bodies() {
-                Value::Null
+            if store.keeps_bodies() {
+                Ok((Some(head), Value::Null))
             } else {
-                head.clone()
-            };
-            Ok((Some(head), state))
+                Ok((None, head))
+            }
         }
     }
 }
@@ -1720,8 +1720,9 @@ impl Runtime {
     ///
     /// One read of the run's head when the store has a current one
     /// ([`Store::load_head`](adam_core::Store::load_head)), and the whole state when it does not (a
-    /// v4 run, or a head a v4 commit left stale). No body is read: a head-only view is the read
-    /// win of ADR 0055.
+    /// v4 run, or a head a v4 commit left stale). A tombstoned run whose head is behind the version
+    /// — a pre-S3 process failed it — serves the head. No body is read: a head-only view is the
+    /// read win of ADR 0055.
     ///
     /// Polled: the span is `debug` so a control plane at `info` pays nothing per poll.
     #[tracing::instrument(level = "debug", skip(self))]

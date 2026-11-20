@@ -259,12 +259,13 @@ impl HeadParts {
     }
 
     /// The head a commit that does not split writes: these transcript set and artifacts, with
-    /// `env`'s own members — the status the commit carries is on the record, not here.
+    /// `env`'s own members — the status the commit carries is on the record, not here — and the
+    /// transition's own `added` artifacts merged in (a failed transition keeps what it emitted).
     ///
     /// The generation is named explicitly: the store patches it only for a commit that writes rows,
     /// and a head that names none is unreadable. The head these came from is current (a stale one
     /// is served as the state, not the head), so its generation is the run's.
-    pub(crate) fn carried(&self, env: &Envelope) -> Head {
+    pub(crate) fn carried(&self, env: &Envelope, added: &[Artifact]) -> Head {
         Head {
             v: VERSION,
             agent: env.agent.clone(),
@@ -274,7 +275,7 @@ impl HeadParts {
             rev: env.rev,
             output: env.output.clone(),
             error: env.error.clone(),
-            artifacts: self.artifacts.clone(),
+            artifacts: merge_head_artifacts(&self.artifacts, added),
             deadline: env.deadline,
             limit_secs: env.limit_secs,
             remaining_secs: env.remaining_secs,
@@ -283,6 +284,38 @@ impl HeadParts {
             body: self.body,
         }
     }
+}
+
+/// The head's artifacts with `added` merged in the way a step's commit merges them: an artifact
+/// whose id a JSON artifact of the head has replaces it in place, and a file is appended (a file
+/// is content-addressed and never replaces anything). A file's reference comes from its bytes.
+fn merge_head_artifacts(base: &[HeadArtifact], added: &[Artifact]) -> Vec<HeadArtifact> {
+    let mut artifacts = base.to_vec();
+    for artifact in added {
+        let file = artifact.file.as_ref().map(|file| HeadFile {
+            filename: file.filename.clone(),
+            digest: blob_id(&file.bytes),
+            size: u64::try_from(file.bytes.len()).unwrap_or(u64::MAX),
+        });
+        let head = HeadArtifact {
+            // A file has no identity: it is never replaced, and an id on one is dropped.
+            id: file.is_none().then(|| artifact.id.clone()).flatten(),
+            name: artifact.name.clone(),
+            mime_type: artifact.mime_type.clone(),
+            data: artifact.data.clone(),
+            file,
+        };
+        if let Some(id) = &head.id
+            && let Some(held) = artifacts
+                .iter_mut()
+                .find(|held| held.file.is_none() && held.id.as_deref() == Some(id.as_str()))
+        {
+            *held = head;
+            continue;
+        }
+        artifacts.push(head);
+    }
+    artifacts
 }
 
 /// The head's artifacts as the runtime's [`Artifact`], with a file's bytes empty: see

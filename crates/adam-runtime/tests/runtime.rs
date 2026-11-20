@@ -7615,6 +7615,10 @@ struct TranscriptAgent {
     park_at: Option<u32>,
     /// Drop the last row: a split that does not reconstruct the state it was taken from.
     wrong: bool,
+    /// Do not split at all: a v5 run whose agent stopped declaring a split.
+    stop_splitting: bool,
+    /// Fail the step at this turn, after emitting an artifact (`None`: never).
+    fail_at: Option<u32>,
     /// A file artifact the first step emits, for the blob gate.
     file: Option<Artifact>,
     /// Replace the transcript on the second step: a compaction, not an append.
@@ -7631,6 +7635,8 @@ impl TranscriptAgent {
             steps,
             park_at: None,
             wrong: false,
+            stop_splitting: false,
+            fail_at: None,
             file: None,
             compact: false,
             padding: 0,
@@ -7664,6 +7670,9 @@ impl Agent for TranscriptAgent {
     }
 
     fn split(&self, state: &Transcript) -> Option<(Transcript, Vec<Value>)> {
+        if self.stop_splitting {
+            return None;
+        }
         let mut head = state.clone();
         let mut rows: Vec<Value> = std::mem::take(&mut head.messages)
             .into_iter()
@@ -7705,6 +7714,17 @@ impl Agent for TranscriptAgent {
         state
             .messages
             .push(format!("turn {}{}", state.turns, "x".repeat(self.padding)));
+        if self.fail_at == Some(state.turns) {
+            // A permanent error after an artifact: the transition commits the state it had (a
+            // carried head for a v5 run), and the artifact must survive with it.
+            ctx.emit(RunEvent::from(Artifact::new(
+                "failure-note",
+                None,
+                json!({"at": state.turns}),
+            )))
+            .await;
+            return Err(AgentError::permanent("boom"));
+        }
         if self.park_at == Some(state.turns) {
             return Ok(Transition::Park {
                 state,
@@ -8159,21 +8179,30 @@ async fn a_park_again_writes_the_head_it_read_and_the_tombstone() {
     wait_for(&rt, child, "parked again", |v| v.version > version).await;
     worker.stop().await;
 
+    // The runtime's wake and a commit can race a concurrent claim, so a CAS retry can commit the
+    // same park-again twice: every attempt is the same document, and at least one landed.
     let commits = recording.commits();
-    assert_eq!(commits.len(), 1, "one park-again commit");
-    let again = &commits[0];
-    assert_eq!(again.state, Value::Null, "the state is the tombstone");
-    assert!(again.body.is_none(), "parking again writes no row");
-    let head = again
-        .head
-        .as_ref()
-        .expect("parking again writes the head it read");
-    assert_eq!(head["v"], 5);
+    assert!(!commits.is_empty(), "the run was parked again");
+    for again in &commits {
+        assert_eq!(again.state, Value::Null, "the state is the tombstone");
+        assert!(again.body.is_none(), "parking again writes no row");
+        let head = again
+            .head
+            .as_ref()
+            .expect("parking again writes the head it read");
+        assert_eq!(head["v"], 5);
+        assert_eq!(
+            head["body"]["generation"], generation,
+            "the same generation"
+        );
+        assert_eq!(head["body"]["len"], len);
+    }
+    let served = inner.load_run(child).await.unwrap().unwrap();
     assert_eq!(
-        head["body"]["generation"], generation,
-        "the same generation"
+        served.version,
+        version + u64::try_from(commits.len()).unwrap(),
+        "each commit advanced the version once"
     );
-    assert_eq!(head["body"]["len"], len);
 }
 
 /// A v5 run whose split is refused writes the whole state and **no head**: a head must never carry
@@ -8218,6 +8247,184 @@ async fn a_refused_split_on_a_v5_run_writes_the_whole_state_and_no_head() {
     // The stored run serves that state: the head the first step wrote is stale.
     let loaded = inner.load_run(run).await.unwrap().unwrap();
     assert_eq!(loaded.state["v"], 1, "the head is not served");
+}
+
+/// A v5 run whose agent stops declaring a split (a successful step with `split() == None`) is a
+/// **refused split**: the commit writes the whole state and no head, so the transcript is not
+/// written into a head the next join would discard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_v5_run_whose_split_is_none_demotes_to_the_whole_state() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let recording = Arc::new(common::recording::RecordingStore::new(inner.clone()));
+    let store: DynStore = recording.clone();
+    let mut agent = TranscriptAgent::new(&uniq("no-split"), 2);
+    agent.park_at = Some(1);
+    let rt = transcript_runtime(&store, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_waiting(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(
+        inner.load_head(run).await.unwrap().unwrap().state["v"],
+        5,
+        "the first step split"
+    );
+
+    // The same agent name, a build whose `split` returns None: its step must not write a head
+    // whose `agent` is the whole state.
+    let mut plain = TranscriptAgent::new(&agent.name, 2);
+    plain.stop_splitting = true;
+    let rt = transcript_runtime(&store, &plain);
+    recording.reset();
+    rt.deliver(run, late()).await.expect("deliver");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let commits = recording.commits();
+    let demoted = commits
+        .iter()
+        .find(|update| update.head.is_none() && update.body.is_none())
+        .expect("the step that did not split writes the state only");
+    assert_eq!(demoted.state["v"], 1, "the whole state, in the v4 format");
+    assert_eq!(
+        demoted.state["agent"]["messages"].as_array().unwrap().len(),
+        3,
+        "the transcript, the step's message included, is in the state"
+    );
+    // And the run reads as v4: the head the first step wrote is stale, not served.
+    let served = inner.load_run(run).await.unwrap().unwrap();
+    assert_eq!(served.state["v"], 1);
+    assert_eq!(
+        served.state["agent"]["messages"].as_array().unwrap().len(),
+        3
+    );
+}
+
+/// A refused split on a v5 run that inherited a file keeps the file's **bytes** in the demoted v4
+/// state: a head names a file by digest and size, and a v4 state must carry the bytes, so the
+/// demotion re-reads them from the blob store rather than inlining zero bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_split_keeps_the_inherited_files_bytes() {
+    use base64::Engine as _;
+
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let recording = Arc::new(common::recording::RecordingStore::new(inner.clone()));
+    let store: DynStore = recording.clone();
+    let file =
+        Artifact::file("chart", "image/svg+xml", "chart.svg", SVG.to_vec()).expect("a small file");
+    let mut agent = TranscriptAgent::new(&uniq("keep-file"), 2).with_file(file);
+    agent.park_at = Some(1);
+    let rt = transcript_runtime(&store, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_waiting(&rt, run).await;
+    worker.stop().await;
+    let head = inner.load_head(run).await.unwrap().unwrap().state;
+    assert_eq!(head["v"], 5);
+    assert!(
+        head["artifacts"][0]["file"]["digest"].is_string(),
+        "the head names the file by digest: {:?}",
+        head["artifacts"]
+    );
+
+    // A build whose split does not reconstruct the state: the step demotes the run, and the
+    // demoted state must carry the file's bytes, not the empty bytes the head's reference implies.
+    let mut broken = TranscriptAgent::new(&agent.name, 2);
+    broken.wrong = true;
+    let rt = transcript_runtime(&store, &broken);
+    rt.deliver(run, late()).await.expect("deliver");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let record = inner.load_run(run).await.unwrap().unwrap();
+    assert_eq!(record.state["v"], 1, "the run demoted to the whole state");
+    let encoded = record.state["artifacts"][0]["file"]["bytes"]
+        .as_str()
+        .expect("the file's bytes are in the state");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("base64");
+    assert_eq!(
+        bytes, SVG,
+        "the inherited file's bytes survived the demotion"
+    );
+}
+
+/// A store that keeps no bodies is never handed a head or a row: the runtime writes the whole
+/// state for it, whatever the agent's split declares.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_that_keeps_no_bodies_never_gets_a_head() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let recording =
+        Arc::new(common::recording::RecordingStore::new(inner.clone()).without_bodies());
+    let store: DynStore = recording.clone();
+    let agent = TranscriptAgent::new(&uniq("no-bodies"), 2);
+    let rt = transcript_runtime(&store, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let commits = recording.commits();
+    assert!(!commits.is_empty());
+    for update in &commits {
+        assert!(
+            update.head.is_none() && update.body.is_none(),
+            "a store that keeps no bodies gets no head and no row"
+        );
+        assert!(
+            !update.state.is_null(),
+            "and the whole state instead of the tombstone"
+        );
+        assert_eq!(update.state["v"], 1, "the v4 format");
+    }
+    let record = inner.load_run(run).await.unwrap().unwrap();
+    assert_eq!(record.state["v"], 1);
+    assert_eq!(
+        record.state["agent"]["messages"].as_array().unwrap().len(),
+        3
+    );
+}
+
+/// A permanent failure on a v5 run keeps the transition's artifact: the carried head names it, so
+/// the view shows it and the reference the commit records is one a head names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_transition_keeps_its_artifact_in_the_head() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let recording = Arc::new(common::recording::RecordingStore::new(inner.clone()));
+    let store: DynStore = recording.clone();
+    let mut agent = TranscriptAgent::new(&uniq("fail-artifact"), 2);
+    agent.park_at = Some(1);
+    agent.fail_at = Some(2);
+    let rt = transcript_runtime(&store, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_waiting(&rt, run).await;
+    rt.deliver(run, late()).await.expect("deliver");
+    let failed = wait_failed(&rt, run).await;
+    worker.stop().await;
+
+    assert!(
+        failed
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.name == "failure-note"),
+        "the view carries the failed transition's artifact: {:?}",
+        failed.artifacts
+    );
+    let record = inner.load_run(run).await.unwrap().unwrap();
+    assert_eq!(record.state["v"], 5, "the head stayed the run");
+    assert!(
+        record.state["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|artifact| artifact["name"] == "failure-note"),
+        "and the head names it: {:?}",
+        record.state["artifacts"]
+    );
 }
 
 /// A run that never split is v4: its view is the whole agent state, and `Runtime::state` reads no
