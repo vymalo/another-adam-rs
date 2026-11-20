@@ -1,5 +1,5 @@
 //! The screen's catalog: the components the person's screen can draw, as the web defines them
-//! (`docs/api/ui-catalog-v1.md` of `vymalo/another-agentic-system`).
+//! ([`ui-catalog-v2`](https://github.com/vymalo/another-agentic-system/blob/66db4ee5c885c12f28367a4c623f9c97c38e0930/docs/api/ui-catalog-v2.md), at `66db4ee5`).
 //!
 //! The document is an A2UI inline catalog, `{catalogId, components: {<Name>: <JSON Schema>}}`. Its
 //! **digest** is `sha256:` and the lowercase hex of SHA-256 over its canonical JSON: object keys
@@ -467,7 +467,7 @@ mod tests {
 
     use super::*;
 
-    /// The known-answer vector of `ui-catalog/v2` (v1's vector with `protocolVersion`, `sha256:a237e931…` there; computed 2026-10-01 with Python's `json.dumps(
+    /// The known-answer vector of `ui-catalog/v2` (v1's vector with `protocolVersion`, `sha256:a237e931…` there; computed 2026-11-19 with Python's `json.dumps(
     /// sort_keys=True, separators=(',', ':'), ensure_ascii=False)` and SHA-256): the web, the
     /// orchestrator and adam-rs all pin it.
     fn vector() -> Value {

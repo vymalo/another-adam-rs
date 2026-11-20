@@ -9,7 +9,7 @@ use std::sync::Arc;
 use a2a::{Message, Part, Role};
 use adam_a2a::UI_CATALOG_EXTENSION;
 use adam_a2a_runtime::{CONTEXT_A2UI_RENDERER, CONTEXT_UI_CATALOG, CONTEXT_UI_REF, vymalo_inbound};
-use adam_llm_agent::{ToolCtx, ToolError, ToolOutput};
+use adam_llm_agent::{Conversation, MAX_CONTEXT_BYTES, ToolCtx, ToolError, ToolOutput};
 use adam_mcp::McpPolicy;
 use adam_runtime::NoopSink;
 use adam_ui::{Ui, catalog_digest};
@@ -205,26 +205,67 @@ async fn an_id_only_in_the_inline_catalogs_draws() {
     assert!(drew(&ui, &context_of(&message)).await);
 }
 
+/// The context of the run after its messages, merged as the conversation merges them (a `null` deletes a
+/// key; a context over the limit is dropped, but for the keys that are the message's own).
+fn after(contexts: impl IntoIterator<Item = Map<String, Value>>) -> Map<String, Value> {
+    let mut conversation = Conversation::new("t");
+    for context in contexts {
+        conversation.merge_context(&context);
+    }
+    conversation.context
+}
+
+fn with_capabilities(text: &str, ids: &[&str]) -> Message {
+    message(
+        text,
+        Some(json!({"1.0": {"supportedCatalogIds": ids, "inlineCatalogs": [catalog()]}})),
+    )
+}
+
+/// A context that is over the limit by itself.
+fn too_large(mut context: Map<String, Value>) -> Map<String, Value> {
+    context.insert("big".into(), json!("x".repeat(MAX_CONTEXT_BYTES)));
+    context
+}
+
 #[tokio::test]
 async fn a_second_turn_with_no_capabilities_is_in_words() {
     let ui = Ui::new(McpPolicy::default());
     let id = catalog_id();
-    let first = message(
-        "one",
-        Some(json!({"1.0": {"supportedCatalogIds": [id], "inlineCatalogs": [catalog()]}})),
-    );
-    assert!(drew(&ui, &context_of(&first)).await);
-    // The second message names the catalog and has no capabilities (the old keys do not count).
-    let second = message("two", None);
-    assert!(!drew(&ui, &context_of(&second)).await);
+    let first = context_of(&with_capabilities("one", &[&id]));
+    assert!(drew(&ui, &after([first.clone()])).await);
+    // The second message names the catalog and has no capabilities: merged after the first, the offer
+    // of the first is gone (the old keys do not count either).
+    let second = context_of(&message("two", None));
+    assert!(!drew(&ui, &after([first.clone(), second])).await);
     let old = message(
         "three",
         Some(json!({"v0.9.1": {"supportedCatalogIds": [catalog_id()]}})),
     );
-    let mut context = context_of(&old);
-    assert_eq!(context[CONTEXT_A2UI_RENDERER], Value::Null);
-    assert!(!drew(&ui, &context).await);
-    // Merged as the conversation does it, a null deletes the key: the same.
-    context.remove(CONTEXT_A2UI_RENDERER);
-    assert!(!drew(&ui, &context).await);
+    let old = context_of(&old);
+    assert_eq!(old[CONTEXT_A2UI_RENDERER], Value::Null);
+    assert!(!drew(&ui, &after([first, old])).await);
+}
+
+/// A second message whose context is too large to keep is dropped but for the limits the person set; the
+/// first message's offer must not stand for it, whatever the second said.
+#[tokio::test]
+async fn a_second_turn_whose_context_overflows_is_in_words() {
+    let ui = Ui::new(McpPolicy::default());
+    let id = catalog_id();
+    let first = context_of(&with_capabilities("one", &[&id]));
+    assert!(drew(&ui, &after([first.clone()])).await);
+    // No capabilities, and a context too large.
+    let none = too_large(context_of(&message("two", None)));
+    let merged = after([first.clone(), none]);
+    assert!(!merged.contains_key(CONTEXT_A2UI_RENDERER));
+    assert!(!drew(&ui, &merged).await);
+    // Another offer, and a context too large: neither the old nor the new offer stands.
+    let other = too_large(context_of(&with_capabilities(
+        "two",
+        &["https://example.test/other"],
+    )));
+    let merged = after([first, other]);
+    assert!(!merged.contains_key(CONTEXT_A2UI_RENDERER));
+    assert!(!drew(&ui, &merged).await);
 }

@@ -6,7 +6,8 @@
 # commit its `UPSTREAM` names. A catalog line with a fourth field (the path of a page) is the body of the page's
 # `json catalog-<n>` block at that commit, not a file. Needs curl, node and
 # the network (CI, job `docs`). `UI_CATALOG_CONTRACT=<file>` reads the contract page from a file
-# instead of fetching it.
+# instead of fetching it; `UI_CATALOG_CONTRACT_V2=<file>` does the same for the `ui-catalog-v2` page that
+# the catalogs from version 9 are read from.
 set -eu
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
