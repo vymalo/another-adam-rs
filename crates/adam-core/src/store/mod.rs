@@ -647,21 +647,27 @@ pub trait Store: Send + Sync + 'static {
     /// a later commit did not rebuild. The contract release (ADR 0055): the head is the run, and
     /// `state` is the tombstone a body store keeps (`null`). A store that keeps no bodies answers
     /// the whole state, as before.
+    ///
+    /// A **tombstoned** run whose head is behind the version — what a pre-S3 process leaves when it
+    /// fails a converted run (`state = null`, no head, the version bumped) — serves the head: it is
+    /// the only readable document, and serving it is the one-line repair.
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>>;
 
     /// The run as an **observer** reads it: its `state` is the v5 head when the store has a current
     /// one (`head_version == version`), and the whole state otherwise.
     ///
     /// Defaults to [`load_run`](Self::load_run), so a store that keeps no head answers exactly as it
-    /// does today. A head that a later commit did not rebuild (a delivery, a cancel, a park) is
-    /// stale and is **not** served: the whole state is, and the next step re-splits and rewrites the
-    /// head. `Runtime::view` reads this and never a body; `Runtime::state` joins the head with the
-    /// rows of the generation it names.
+    /// does today. A head a **v4 commit** wrote over is stale and is **not** served: the state is
+    /// (a v4 envelope), and the next step re-splits and rewrites the head. A **tombstoned** run
+    /// whose head is behind the version — a pre-S3 process failed it — serves the head (see
+    /// [`load_run`](Self::load_run)). `Runtime::view` reads this and never a body;
+    /// `Runtime::state` joins the head with the rows of the generation it names.
     ///
     /// In the contract release a store that keeps bodies answers the same document from
     /// [`load_run`](Self::load_run), [`claim_due`](Self::claim_due),
     /// [`open_run_for_conversation`](Self::open_run_for_conversation) and
-    /// [`list_runs`](Self::list_runs): the head is the run.
+    /// [`list_runs`](Self::list_runs): the head is the run, and a tombstoned run with a head behind
+    /// the version serves the head (see [`load_run`](Self::load_run)).
     async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
         self.load_run(id).await
     }
@@ -676,8 +682,8 @@ pub trait Store: Send + Sync + 'static {
     /// The lease is read **before** the record, as the runtime's `view` does: a claim that lands
     /// between the two reads then reads as not yet, and a step that committed and released is read
     /// with the version it committed. A reader that needs the state as well reads
-    /// [`load_head`](Self::load_head) (the observer's read, the head or the whole state) or
-    /// [`load_run`](Self::load_run) (the whole state) instead.
+    /// [`load_head`](Self::load_head) or [`load_run`](Self::load_run) instead: in the contract
+    /// release they answer the same document, the head when it is current.
     async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
         let lease_until = self.lease_until(id).await?;
         let Some(rec) = self.load_run(id).await? else {

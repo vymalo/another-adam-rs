@@ -200,6 +200,8 @@ macro_rules! body_conformance {
             body_a_stale_version_is_a_conflict,
             body_a_first_split_writes_the_whole_transcript,
             body_every_read_serves_the_current_head, body_a_stale_head_serves_the_state,
+            body_a_tombstoned_run_with_a_stale_head_serves_the_head,
+            body_a_head_that_is_json_null_is_not_a_head,
             body_the_same_transcript_committed_again_adds_no_row, body_purge_removes_the_rows,
             body_a_non_contiguous_index_is_refused,
             body_an_unknown_generation_is_empty,
@@ -473,6 +475,84 @@ pub mod cases {
             vec![json!("one"), json!("two")],
             "a v4 commit writes no rows: the generation the stale head named is intact"
         );
+    }
+
+    /// A run a **pre-S3 process** failed is `state = null` (the tombstone), no head, and the version
+    /// bumped, so its head is behind the version: the head is the only readable document, and every
+    /// read serves it — the one-line repair, not a `Corrupt` run.
+    pub async fn body_a_tombstoned_run_with_a_stale_head_serves_the_head(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let conversation = format!("testkit-tombstone-{}", Uuid::new_v4().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({"turn": 0})).conversation(conversation.clone()))
+            .await
+            .unwrap();
+        let generation = Uuid::new_v4();
+        let version = store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, Value::Null)
+                    .head(head_doc(2))
+                    .body(rows(Some(generation), Uuid::new_v4(), &["one", "two"])),
+            )
+            .await
+            .unwrap()
+            .version;
+        // What a pre-S3 worker commits for a run it cannot decode: the tombstone, no head, Failed.
+        store
+            .commit_run(
+                run.id,
+                version,
+                RunUpdate::new(RunStatus::Failed, Value::Null),
+            )
+            .await
+            .unwrap();
+
+        let loaded = store.load_run(run.id).await.unwrap().unwrap();
+        assert_eq!(loaded.state["v"], 5, "the head is the run");
+        assert_eq!(generation_of(&loaded.state), generation);
+        assert_eq!(
+            store.load_head(run.id).await.unwrap().unwrap().state,
+            loaded.state,
+            "`load_head` agrees"
+        );
+        let query = RunQuery::new(&agent, ConversationScope::Exact(conversation), 10);
+        let listed = store.list_runs(&query).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, loaded.state, "and the listing");
+        assert_eq!(
+            messages(&store.body_list(run.id, generation).await.unwrap()),
+            vec![json!("one"), json!("two")],
+            "the body set the head names is intact"
+        );
+    }
+
+    /// A head that is JSON `null` is not a head, whatever `head_version` says: the state is served.
+    pub async fn body_a_head_that_is_json_null_is_not_a_head(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let conversation = format!("testkit-null-head-{}", Uuid::new_v4().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({"turn": 0})).conversation(conversation.clone()))
+            .await
+            .unwrap();
+        let state = json!({"turn": 1});
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, state.clone()).head(Value::Null),
+            )
+            .await
+            .unwrap();
+        for (what, rec) in every_read(&store, &agent, &conversation, run.id).await {
+            assert_eq!(
+                rec.state, state,
+                "{what} serves the state: a null head is not a head"
+            );
+        }
     }
 
     pub async fn blob_round_trip(store: DynStore) {

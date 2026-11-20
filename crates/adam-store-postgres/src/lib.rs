@@ -124,13 +124,20 @@ const PUSH_COLUMNS: &str = "run_id, id, agent, owner, config, cursor, state, att
 /// did not rebuild). No read here touches a body row; `Runtime::state` joins the head with the
 /// generation it names.
 ///
+/// A **tombstoned** run whose head is behind the version (a pre-S3 process failed a converted run
+/// with `state = null`, no head and the version bumped) serves the head: it is the only readable
+/// document, and serving it is the one-line repair. `jsonb_typeof(head) = 'object'` is the test for
+/// "a head": a JSONB `null` is not one.
+///
 /// `prefix` is the table alias a statement needs (`""` for a plain `SELECT`, `"r."` for the
 /// `UPDATE ... FROM` of a claim).
 fn served_columns(prefix: &str) -> String {
     let p = prefix;
     format!(
         "{p}id, {p}agent, {p}conversation_id, {p}parent_id, {p}status, \
-         CASE WHEN {p}head_version = {p}version AND {p}head IS NOT NULL THEN {p}head ELSE {p}state \
+         CASE WHEN jsonb_typeof({p}head) = 'object' \
+                   AND ({p}head_version = {p}version OR {p}state = 'null'::jsonb) \
+              THEN {p}head ELSE {p}state \
          END AS state, \
          {p}wake_at, {p}version, {p}created_at, {p}updated_at"
     )

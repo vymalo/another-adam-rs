@@ -599,6 +599,10 @@ fn run_from_doc(d: &Document) -> StoreResult<RunRecord> {
 /// The run as a reader sees it in the contract release (ADR 0055): the current head when the
 /// document has one (`head_version == version`), the stored `state` otherwise. The head is stored
 /// beside the state on the same document, so a read that already has the document pays nothing.
+///
+/// A **tombstoned** run whose head is behind the version (a pre-S3 process failed a converted run
+/// with `state = null`, no head and the version bumped) serves the head: it is the only readable
+/// document, and serving it is the one-line repair. A head that is BSON `null` is not a head.
 fn served_from_doc(d: &Document) -> StoreResult<RunRecord> {
     let version = get_u64(d, "version")?;
     // A missing or null `head_version` is a run no commit has written a head for; a head written
@@ -607,7 +611,10 @@ fn served_from_doc(d: &Document) -> StoreResult<RunRecord> {
         None | Some(Bson::Null) => false,
         Some(_) => get_u64(d, "head_version")? == version,
     };
-    if current && let Some(head @ Bson::Document(_)) = d.get("head") {
+    let tombstoned = matches!(d.get("state"), Some(Bson::Null));
+    if (current || tombstoned)
+        && let Some(head @ Bson::Document(_)) = d.get("head")
+    {
         return run_from_doc_with_state(d, bson_to_json(head)?);
     }
     run_from_doc(d)

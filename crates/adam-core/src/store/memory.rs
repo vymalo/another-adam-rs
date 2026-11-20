@@ -59,7 +59,8 @@ struct Slot {
     /// Set by the first [`ClaimScope::Pinned`] claim; never cleared.
     owner: Option<String>,
     /// The v5 head last written by a commit, and the version it was written at. A commit that
-    /// writes no head leaves both alone, so a stale head is never served.
+    /// writes no head leaves both alone, so a stale head is served only as the repair of a
+    /// tombstoned run (`state = null`), never over a v4 state.
     head: Option<serde_json::Value>,
     head_version: Option<u64>,
 }
@@ -89,10 +90,18 @@ impl Inner {
     ///
     /// The contract release (ADR 0055): every read that returns a record — `load_run`, `load_head`,
     /// `claim_due`, `open_run_for_conversation` and `list_runs` — answers through this.
+    ///
+    /// A **tombstoned** run whose head is behind the version (a pre-S3 process failed a converted
+    /// run with `state = null`, no head and the version bumped) serves the head: it is the only
+    /// readable document, and serving it is the one-line repair. A head that is JSON `null` is not
+    /// a head.
     fn served(slot: &Slot) -> RunRecord {
         let mut rec = slot.run.clone();
-        if slot.head_version == Some(rec.version)
+        let current = slot.head_version == Some(rec.version);
+        let tombstoned = rec.state.is_null();
+        if (current || tombstoned)
             && let Some(head) = &slot.head
+            && head.is_object()
         {
             rec.state = head.clone();
         }
@@ -792,8 +801,8 @@ mod tests {
     }
 
     /// The head a commit writes is served by `load_head` at the version it was written at; a commit
-    /// that writes no head (a delivery, a cancel, a park) leaves it stale, and `load_head` falls
-    /// back to the whole state.
+    /// that writes no head leaves it stale, and `load_head` serves the state it wrote — the whole
+    /// v4 state, or the head itself when the state is the tombstone.
     #[tokio::test]
     async fn a_head_round_trips_and_a_headless_commit_makes_it_stale() {
         let store = MemoryStore::new();
