@@ -5,10 +5,11 @@
 //! this measures what they ask it to do while it works. The question it answers is the one a
 //! transcript asks: how much does one more commit write, and how much does one read transfer? It
 //! counts calls per [`Method`] and sums the `serde_json` bytes of the `state` of every
-//! [`RunRecord`] the store returns, and of every [`RunUpdate::state`] a successful commit writes. A
+//! [`RunRecord`] the store returns, and of every document a successful commit writes: its `state`,
+//! its head and the body rows it appends. A
 //! record returned without its state (`create_run` and `commit_run` echo none) counts zero, and so
-//! does a state that is `null`. A store's own encoding (JSONB, BSON) may differ by a few bytes; a
-//! bound is about the ratio, not the encoding.
+//! does a state that is `null` (the contract's tombstone). A store's own encoding (JSONB, BSON) may
+//! differ by a few bytes; a bound is about the ratio, not the encoding.
 //!
 //! ```
 //! # tokio_test_block(async {
@@ -58,7 +59,11 @@ struct Counts {
     calls: HashMap<Method, u64>,
     state_bytes_read: u64,
     state_bytes_written: u64,
+    commit_bytes: u64,
     max_commit_bytes: u64,
+    /// The `body.len` of the last head each run's successful commit wrote: the rows a later append
+    /// adds are the ones past it.
+    body_len: HashMap<RunId, u32>,
 }
 
 /// Wraps a store and counts calls and state bytes; every call passes through untouched.
@@ -106,13 +111,24 @@ impl CountingStore {
     /// The bytes of [`RunUpdate::state`] written by the commits that **succeeded** since the last
     /// reset. A commit that failed (a stale version, a lost connection) wrote no state and is not
     /// counted.
+    ///
+    /// The contract release writes the tombstone for a store that keeps bodies, so this is `0` for
+    /// those commits; [`commit_bytes`](Self::commit_bytes) is what they wrote.
     pub fn state_bytes_written(&self) -> u64 {
         self.counts().state_bytes_written
     }
 
-    /// The largest state payload handed to [`Store::commit_run`] since the last reset: the last
-    /// state of a transcript, when every commit carries the whole thing. It is the serialized
-    /// `serde_json` size, not the bytes an adapter wrote to disk.
+    /// The bytes of the documents a **succeeded** commit handed the store since the last reset: its
+    /// `state`, its head, and the body rows it appends (the rows after the last head's `len`, or
+    /// all of them for a new generation). What an adapter persists for one commit, in serialized
+    /// `serde_json` bytes.
+    pub fn commit_bytes(&self) -> u64 {
+        self.counts().commit_bytes
+    }
+
+    /// The largest commit (as [`commit_bytes`](Self::commit_bytes) counts one) since the last
+    /// reset: the last state of a transcript, when every commit carries the whole thing. It is the
+    /// serialized `serde_json` size, not the bytes an adapter wrote to disk.
     pub fn max_commit_bytes(&self) -> u64 {
         self.counts().max_commit_bytes
     }
@@ -140,10 +156,11 @@ impl CountingStore {
         self.counts().state_bytes_read += bytes;
     }
 
-    fn wrote(&self, bytes: u64) {
+    fn wrote(&self, state: u64, total: u64) {
         let mut counts = self.counts();
-        counts.state_bytes_written += bytes;
-        counts.max_commit_bytes = counts.max_commit_bytes.max(bytes);
+        counts.state_bytes_written += state;
+        counts.commit_bytes += total;
+        counts.max_commit_bytes = counts.max_commit_bytes.max(total);
     }
 }
 
@@ -158,16 +175,24 @@ fn state_bytes(state: &Value) -> u64 {
         .len() as u64
 }
 
+/// The `body.len` a v5 head names, whether or not the store has resolved its generation yet (the
+/// runtime leaves `generation` `null` and the store fills it).
+fn head_len(head: &Value) -> Option<u32> {
+    u32::try_from(head.get("body")?.get("len")?.as_u64()?).ok()
+}
+
 /// What one [`measure_transcript_write`] run measured, in serialized `serde_json` bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Measurement {
     /// How many commits succeeded (50 when the workload ran to the end).
     pub commits: usize,
-    /// The sum of every successful commit's [`RunUpdate::state`].
+    /// The sum of every successful commit's persisted documents: its state, its head and the body
+    /// rows it appended ([`CountingStore::commit_bytes`]).
     pub total_written: u64,
-    /// The largest [`RunUpdate::state`] a commit was handed.
+    /// The largest commit, counted as [`total_written`](Self::total_written) counts one.
     pub max_commit: u64,
-    /// What the `load_run` after the first commit transferred.
+    /// What the `load_run` after the first commit transferred: the head for a store that keeps
+    /// bodies (the state is the tombstone).
     pub first_read: u64,
     /// What the `load_run` after the last commit transferred.
     pub final_read: u64,
@@ -180,6 +205,8 @@ impl Measurement {
 
     /// The one line `dev/p2-measure.sh` parses and a test prints:
     /// `p2-measure: commits=50 total_written=13290322 max_commit=521202 first_read=10434 final_read=521202`.
+    /// The contract release prints the same fields with the head-and-delta numbers (the pre-contract
+    /// line above is S0's baseline).
     pub fn report(&self) -> String {
         format!(
             "p2-measure: commits={} total_written={} max_commit={} first_read={} final_read={}",
@@ -197,20 +224,21 @@ impl fmt::Display for Measurement {
 /// The bytes of each message [`measure_transcript_write`] appends.
 const MESSAGE_BYTES: usize = 10 * 1024;
 
-/// Measure what a transcript-shaped run costs today: one run, [`Measurement::COMMITS`] commits,
-/// each appending a 10 KB message, the last one leaving the run [`RunStatus::Done`], and the run
-/// purged afterwards so repeated measurements do not accumulate.
+/// Measure what a transcript-shaped run costs **in the contract release**: one run,
+/// [`Measurement::COMMITS`] commits, each appending a 10 KB message, the last one leaving the run
+/// [`RunStatus::Done`], and the run purged afterwards so repeated measurements do not accumulate.
 ///
-/// **This is a measurement, not a conformance case.** The bytes it sums are the caller's
-/// [`RunUpdate::state`], which a wrapper sees before the store does: on its own the number says
-/// what the runtime handed over, not what an adapter wrote. It asserts nothing; the
-/// `transcript_measurement!` test prints [`Measurement::report`] and asserts only that the workload
-/// ran. S3 rewrites this workload to commit a head and a body, then adds the `< 50 × 20 KB` and
-/// `max < 20 KB` assertions to that test.
+/// Each commit writes the v5 shape the runtime writes for a store that keeps bodies: the tombstone
+/// as its `state`, a small head, and the body rows — of which the store appends only the delta
+/// (the rows after the current head's `len`), so the cost is linear, not quadratic. The counter
+/// ([`CountingStore::commit_bytes`]) is what an adapter persists for one commit.
 ///
-/// The measured baseline, on Memory, PostgreSQL and MongoDB (identical state JSON):
-/// `p2-measure: commits=50 total_written=13290322 max_commit=521202 first_read=10434
-/// final_read=521202`. The disk side is `dev/p2-measure.sh`; both numbers are recorded in
+/// **This is a measurement, not a conformance case.** It asserts nothing; the
+/// `transcript_measurement!` test prints [`Measurement::report`] and asserts the S0 bound
+/// (`total < 50 × 20 KB`, `max < 20 KB`). The pre-contract baseline, on Memory, PostgreSQL and
+/// MongoDB (identical state JSON): `p2-measure: commits=50 total_written=13290322
+/// max_commit=521202 first_read=10434 final_read=521202` — 12× over the bound. The disk side is
+/// `dev/p2-measure.sh`; both numbers are recorded in
 /// [ADR 0055](../../../docs/decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md).
 ///
 /// # Panics
@@ -227,7 +255,7 @@ pub async fn measure_transcript_write(store: DynStore) -> Measurement {
         .await
         .expect("create the measured run");
 
-    let mut messages = Vec::with_capacity(Measurement::COMMITS);
+    let mut messages: Vec<Value> = Vec::with_capacity(Measurement::COMMITS);
     let mut version = run.version;
     let mut commits = 0;
     let mut first_read = 0;
@@ -236,12 +264,35 @@ pub async fn measure_transcript_write(store: DynStore) -> Measurement {
             "role": "assistant",
             "text": message_text(MESSAGE_BYTES, turn as u64),
         }));
+        let len = u32::try_from(messages.len()).expect("a short transcript");
         let status = if turn + 1 == Measurement::COMMITS {
             RunStatus::Done
         } else {
             RunStatus::Runnable
         };
-        let update = RunUpdate::new(status, json!({"messages": messages}));
+        // The shape the runtime commits for a body store: the tombstone, a head naming the whole
+        // transcript (`generation: null` lets the store resolve the current one), and the rows —
+        // the store appends the delta after the head it has.
+        let head = json!({
+            "v": 5,
+            "agent": {"turns": turn + 1},
+            "body": {"generation": null, "len": len},
+        });
+        let rows: Vec<adam_core::BodyRow> = messages
+            .iter()
+            .enumerate()
+            .map(|(idx, message)| adam_core::BodyRow {
+                idx: u32::try_from(idx).expect("a short transcript"),
+                message: message.clone(),
+            })
+            .collect();
+        let update = RunUpdate::new(status, Value::Null)
+            .head(head)
+            .body(adam_core::BodyWrite {
+                generation: None,
+                rows,
+                writer: Uuid::new_v4(),
+            });
         version = store
             .commit_run(run.id, version, update)
             .await
@@ -255,7 +306,7 @@ pub async fn measure_transcript_write(store: DynStore) -> Measurement {
     let final_read = read_state_bytes(&store, run.id).await;
     let measured = Measurement {
         commits,
-        total_written: store.state_bytes_written(),
+        total_written: store.commit_bytes(),
         max_commit: store.max_commit_bytes(),
         first_read,
         final_read,
@@ -319,7 +370,9 @@ impl fmt::Display for HeadlessMeasurement {
 /// **A measurement, not a conformance case.** It asserts that each split wrote the whole
 /// transcript under a new generation (that is the path being measured) and prints
 /// [`HeadlessMeasurement::report`]; the `headless_measurement!` test asserts only that the workload
-/// ran. S3 changes the numbers, not the test.
+/// ran. The contract release makes `deliver`, `cancel` and `park_again` write the head they read,
+/// so the runtime no longer takes this path: the line is the expand release's cost, kept as the
+/// comparison that says what S3 removed.
 ///
 /// # Panics
 ///
@@ -505,9 +558,27 @@ impl Store for CountingStore {
         update: RunUpdate,
     ) -> StoreResult<RunRecord> {
         self.call(Method::CommitRun);
-        let written = state_bytes(&update.state);
+        // What this commit hands the store: the state, the head, and the body rows it appends (a
+        // new generation writes all of them; an append writes the ones after the last head's len).
+        let state = state_bytes(&update.state);
+        let head = update.head.as_ref().map_or(0, state_bytes);
+        let rows = update.body.as_ref().map_or(0, |body| {
+            let start = match body.generation {
+                Some(_) => 0,
+                None => self.counts().body_len.get(&id).copied().unwrap_or(0) as usize,
+            };
+            body.rows
+                .iter()
+                .skip(start)
+                .map(|row| state_bytes(&row.message))
+                .sum()
+        });
+        let next_len = update.head.as_ref().and_then(head_len);
         let record = self.inner.commit_run(id, expected_version, update).await?;
-        self.wrote(written);
+        self.wrote(state, state + head + rows);
+        if let Some(len) = next_len {
+            self.counts().body_len.insert(id, len);
+        }
         self.read(&record);
         Ok(record)
     }
@@ -848,6 +919,51 @@ mod tests {
         assert_eq!(store.state_bytes_written(), before);
         assert_eq!(store.max_commit_bytes(), large_bytes);
         assert_eq!(store.calls(Method::CommitRun), 3);
+    }
+
+    #[tokio::test]
+    async fn a_commit_counts_the_head_and_only_the_body_delta() {
+        let store = counting();
+        let run = create(&store).await;
+        store.reset();
+        let head =
+            |len: u32| json!({"v": 5, "agent": {}, "body": {"generation": null, "len": len}});
+        let row = |idx: u32| adam_core::BodyRow {
+            idx,
+            message: json!({"text": "x".repeat(100)}),
+        };
+        let write = |len: u32, rows: Vec<adam_core::BodyRow>| {
+            RunUpdate::new(RunStatus::Runnable, Value::Null)
+                .head(head(len))
+                .body(adam_core::BodyWrite {
+                    generation: None,
+                    rows,
+                    writer: Uuid::new_v4(),
+                })
+        };
+        // A first split writes the whole transcript.
+        store
+            .commit_run(run.id, 1, write(1, vec![row(0)]))
+            .await
+            .expect("the first split");
+        let first = store.commit_bytes();
+        assert_eq!(
+            first,
+            state_bytes(&head(1)) + state_bytes(&json!({"text": "x".repeat(100)})),
+            "the tombstone writes nothing; the head and the row are the commit"
+        );
+        assert_eq!(store.state_bytes_written(), 0, "the state is the tombstone");
+
+        // An append writes the head and the rows past the head's len, not the whole transcript.
+        store
+            .commit_run(run.id, 2, write(2, vec![row(0), row(1)]))
+            .await
+            .expect("the append");
+        assert_eq!(
+            store.commit_bytes() - first,
+            state_bytes(&head(2)) + state_bytes(&json!({"text": "x".repeat(100)})),
+            "the row the first split wrote is not written again"
+        );
     }
 
     #[tokio::test]

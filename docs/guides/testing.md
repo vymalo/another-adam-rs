@@ -116,11 +116,12 @@ lease expiry and takeover, renew and release, pinned claims (an owned run never 
 racing), one open run per conversation including a 16-way race, listing and counting (scoped, ordered, keyset
 pages, filters), push configurations, and purging.
 
-The write cost of a transcript-shaped run is measured, not asserted: `counting::measure_transcript_write`
-commits a 10 KB message 50 times through `CountingStore` and prints the bytes; `transcript_measurement!`
-emits the `measure_the_transcript_write` test in each adapter's test file, and `dev/p2-measure.sh` quotes the
-disk side. The baseline is in [ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md);
-S3 rewrites the workload to commit a head and a body, then asserts the bound.
+The write cost of a transcript-shaped run is measured **and asserted**: `counting::measure_transcript_write`
+commits a 10 KB message 50 times through `CountingStore` in the contract shape (the tombstone, a head and the
+body delta); `transcript_measurement!` emits the `measure_the_transcript_write` test in each adapter's test
+file, which prints the bytes and asserts the S0 bound (under `50 × 20 KB` in all, under `20 KB` per commit),
+and `dev/p2-measure.sh` quotes the disk side. The before/after numbers are in
+[ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md).
 
 ## Adding a backend
 
@@ -161,6 +162,6 @@ Exit and assertion details are in each script's header.
 | chart render guarantees | `sh deploy/coder/tests/render-check.sh` (also kubeconform and golden renders in CI), `sh deploy/coder/tests/bump-tag-test.sh` |
 | image smoke tests | `sh docker/coder/test/container-smoke.sh <image>`, `sh docker/coder/test/agent-smoke.sh <image>`; with `EXPECT_REVISION=<commit>` (the image's `ADAM_BUILD_REVISION`) they also check the card's version and `build/v1`. Both run `docker/coder/test/http-smoke.sh`, which also checks the card's two interfaces, that `/docs` and `/openapi.json` are public and that the HTTP+JSON binding needs the token |
 | shell scripts | `shellcheck deploy/coder/bump-tag.sh deploy/coder/tests/*.sh docker/coder/test/*.sh dev/*.sh` |
-| the transcript write measurement | `cargo test -p adam-store-testkit -p adam-store-postgres -p adam-store-mongodb measure_the_transcript_write -- --exact --nocapture` prints one `p2-measure:` line per adapter; the baseline is in [ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md) |
-| what a transcript-shaped run costs | `ADAM_TEST_POSTGRES_URL=... ADAM_TEST_MONGODB_URI=... sh dev/p2-measure.sh` runs the 50-commit measurement against the stack and prints `pg_relation_size`/`pg_total_relation_size`, the `pg_stat_wal` delta, `collStats` sizes and the WiredTiger block-manager and log deltas; a store whose variable is unset is skipped, so it is a no-op without the databases |
+| the transcript write measurement | `cargo test -p adam-store-testkit -p adam-store-postgres -p adam-store-mongodb measure_the_transcript_write -- --exact --nocapture` prints one `p2-measure:` line per adapter and asserts the S0 bound (under `50 × 20 KB` in all, under `20 KB` per commit); the before/after numbers are in [ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md) |
+| what a transcript-shaped run costs | `ADAM_TEST_POSTGRES_URL=... ADAM_TEST_MONGODB_URI=... sh dev/p2-measure.sh` runs the 50-commit measurement against the stack and prints `pg_relation_size`/`pg_total_relation_size` of `runs` and `body`, the `pg_stat_wal` delta, `collStats` storage sizes and the WiredTiger block-manager and log deltas; a store whose variable is unset is skipped, so it is a no-op without the databases. Use a fresh database for absolute sizes |
 | a model mock's streamed twin | `cargo test -p adam-model-openai --test wiremock_compose` (plays every script both ways) |

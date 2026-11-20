@@ -37,6 +37,8 @@ pub struct RecordingStore {
     conflict_next: AtomicBool,
     /// Whether the wrapper reports that it keeps blobs (the inner store still does).
     keeps_blobs: bool,
+    /// Whether the wrapper reports that it keeps bodies (the inner store still does).
+    keeps_bodies: bool,
 }
 
 impl RecordingStore {
@@ -47,12 +49,20 @@ impl RecordingStore {
             attempts: Mutex::new(Vec::new()),
             conflict_next: AtomicBool::new(false),
             keeps_blobs: true,
+            keeps_bodies: true,
         }
     }
 
     /// Report that this store keeps no blobs, as a store without the blob methods would.
     pub fn without_blobs(mut self) -> Self {
         self.keeps_blobs = false;
+        self
+    }
+
+    /// Report that this store keeps no bodies, as a third-party store that has not opted in
+    /// (ADR 0055): the runtime must never hand it a head or a row.
+    pub fn without_bodies(mut self) -> Self {
+        self.keeps_bodies = false;
         self
     }
 
@@ -272,7 +282,7 @@ impl Store for RecordingStore {
     }
 
     fn keeps_bodies(&self) -> bool {
-        self.inner.keeps_bodies()
+        self.keeps_bodies
     }
 
     async fn body_list(&self, run: RunId, generation: Uuid) -> StoreResult<Vec<BodyRow>> {
