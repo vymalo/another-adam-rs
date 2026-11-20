@@ -15,6 +15,10 @@ pub use adam_assembly::{LiveAssembly, LiveBuilder, ReloadError, Reloaded};
 pub use adam_core as core;
 pub use adam_error as error;
 pub use adam_llm_agent::*;
+// `adam_llm_agent` also exports an `ArtifactRef` (the model's reference: id, name, media type,
+// byte count), which this glob re-exports as `adam::ArtifactRef`. The runtime's view type is
+// `adam_runtime::ArtifactRef` (a file is a `FileRef`), reachable as `adam::runtime::ArtifactRef`.
+// They are different types; do not conflate them.
 // `mcp.json` tools, only with the feature `mcp`: the MCP client (`McpPolicy`, `Env`,
 // `McpServers`) that `AgentDef::connect_mcp` uses.
 #[cfg(feature = "mcp")]

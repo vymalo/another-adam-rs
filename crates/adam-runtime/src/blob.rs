@@ -7,12 +7,114 @@
 //! release**: a failed upload is logged and the commit goes on, because the run's state still
 //! carries the bytes. The contract release gates a run's head on the upload instead.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use adam_core::{BlobId, DynStore};
 use sha2::{Digest as _, Sha256};
 
 use crate::events::{Artifact, ArtifactFile};
+
+/// The most bytes [`BlobCache`] keeps: 32 MiB, eight of the largest artifact a run may carry.
+pub(crate) const MAX_CACHED_ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
+
+/// The file bytes a reader has fetched, by content address, least recently used first.
+///
+/// A view carries a file by reference, so a poll of a run whose file a subscriber already read
+/// must not read the blob again: the cache answers it. It is bounded by
+/// [`MAX_CACHED_ARTIFACT_BYTES`] and never caches a blob larger than the whole budget. A blob is
+/// immutable and content-addressed, so an entry cannot be stale; the cost of the bound is a
+/// re-read, never a wrong byte.
+///
+/// The bound is in **bytes, not entries**: many tiny blobs can fill the map with many entries, and
+/// [`get`](Self::get)/[`put`](Self::put) scan the order deque linearly. A run's file artifacts are
+/// at most a handful (the artifact bounds), so the scan is short in practice; a store of millions of
+/// one-byte blobs would not be.
+#[derive(Default)]
+pub(crate) struct BlobCache {
+    entries: HashMap<BlobId, Arc<[u8]>>,
+    order: VecDeque<BlobId>,
+    bytes: usize,
+}
+
+impl BlobCache {
+    /// The bytes of `id` if they are cached, marked most recently used.
+    pub(crate) fn get(&mut self, id: &BlobId) -> Option<Arc<[u8]>> {
+        let bytes = self.entries.get(id)?.clone();
+        if let Some(at) = self.order.iter().position(|held| held == id) {
+            self.order.remove(at);
+        }
+        self.order.push_back(id.clone());
+        Some(bytes)
+    }
+
+    /// Keep `bytes` under `id`, evicting the least recently used entries over the bound.
+    pub(crate) fn put(&mut self, id: BlobId, bytes: Arc<[u8]>) {
+        if bytes.len() > MAX_CACHED_ARTIFACT_BYTES {
+            return;
+        }
+        if let Some(old) = self.entries.insert(id.clone(), bytes.clone()) {
+            self.bytes = self.bytes.saturating_sub(old.len());
+            if let Some(at) = self.order.iter().position(|held| held == &id) {
+                self.order.remove(at);
+            }
+        }
+        self.bytes += bytes.len();
+        self.order.push_back(id);
+        while self.bytes > MAX_CACHED_ARTIFACT_BYTES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(gone) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(gone.len());
+            }
+        }
+    }
+
+    /// How many entries are cached (a test's view of the bound).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn id(n: u8) -> BlobId {
+        BlobId::from_sha256(&[n; 32])
+    }
+
+    fn bytes(n: usize) -> Arc<[u8]> {
+        Arc::from(vec![0_u8; n])
+    }
+
+    #[test]
+    fn the_cache_is_bounded_and_least_recently_used_first() {
+        let quarter = MAX_CACHED_ARTIFACT_BYTES / 4;
+        let mut cache = BlobCache::default();
+        for n in 0..4 {
+            cache.put(id(n), bytes(quarter));
+        }
+        assert_eq!(cache.len(), 4, "four quarters fit");
+        // A read makes the first the most recent, so the second is the one evicted.
+        assert!(cache.get(&id(0)).is_some());
+        cache.put(id(4), bytes(quarter));
+        assert_eq!(cache.len(), 4);
+        assert!(cache.get(&id(0)).is_some(), "the read entry stayed");
+        assert!(cache.get(&id(1)).is_none(), "the least recently used went");
+        assert!(cache.get(&id(4)).is_some(), "the new entry is there");
+    }
+
+    #[test]
+    fn a_blob_larger_than_the_whole_budget_is_not_cached() {
+        let mut cache = BlobCache::default();
+        cache.put(id(9), bytes(MAX_CACHED_ARTIFACT_BYTES + 1));
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get(&id(9)).is_none());
+    }
+}
 
 /// The content address of `bytes`: their SHA-256 as 64 lower-case hexadecimal digits.
 pub fn blob_id(bytes: &[u8]) -> BlobId {

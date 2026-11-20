@@ -647,9 +647,8 @@ pub trait Store: Send + Sync + 'static {
     /// Defaults to [`load_run`](Self::load_run), so a store that keeps no head answers exactly as it
     /// does today. A head that a later commit did not rebuild (a delivery, a cancel, a park) is
     /// stale and is **not** served: the whole state is, and the next step re-splits and rewrites the
-    /// head. The expand release (S2a) writes and verifies the head but serves the full state: the
-    /// read path (`Runtime::view`) does not call this method yet, and neither does anything that
-    /// steps a run. Tests call it to prove the stored head round-trips.
+    /// head. `Runtime::view` reads this and never a body; `Runtime::state` joins the head with the
+    /// rows of the generation it names.
     async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
         self.load_run(id).await
     }
@@ -664,7 +663,8 @@ pub trait Store: Send + Sync + 'static {
     /// The lease is read **before** the record, as the runtime's `view` does: a claim that lands
     /// between the two reads then reads as not yet, and a step that committed and released is read
     /// with the version it committed. A reader that needs the state as well reads
-    /// [`load_run`](Self::load_run) instead.
+    /// [`load_head`](Self::load_head) (the observer's read, the head or the whole state) or
+    /// [`load_run`](Self::load_run) (the whole state) instead.
     async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
         let lease_until = self.lease_until(id).await?;
         let Some(rec) = self.load_run(id).await? else {

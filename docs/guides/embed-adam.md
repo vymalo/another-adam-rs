@@ -9,9 +9,9 @@ agent made of files, do not embed: [Write an agent](write-an-agent.md).
 | You want | Depend on | Entry point |
 |---|---|---|
 | a folder's agent inside your process | `adam-agent` (also a library, `publish = false`) and `adam-service` | `adam_agent::agents(def, card, workers)` then `adam_service::serve(&ServiceConfig, agents, shutdown)` ([`adam-agent` README](../../bin/adam-agent/README.md#library)) |
-| your own agent with Rust tools | the `adam` facade | `use adam::prelude::*`: `#[tool]`, `tools!`, `LlmAgent`; `adam::include_agent!()`; features `macros` (default), `a2a`, `mcp`, `dev` ([`adam` README](../../crates/adam/README.md)) |
+| your own agent with Rust tools | the `adam` facade | `use adam::prelude::*`: `#[tool]`, `tools!`, `LlmAgent`; `adam::include_agent!()`; features `macros` and `remote` (default), `a2a`, `mcp`, `dev` ([`adam` README](../../crates/adam/README.md)) |
 | only the process plumbing | `adam-host` | `Role` and `Host`: register components with `.control_plane(name, f)` and `.worker(name, f)`; `Host::run(shutdown)` starts what the role runs and stops the control plane before the workers ([README](../../crates/adam-host/README.md)) |
-| adam inside an application, with no server and nothing on the network of its own (a desktop or a phone) | `adam-engine` | the embedded set only for now ([ADR 0047](../decisions/0047-adam-rs-can-be-embedded-in-an-application.md) slice 1; the API is slice 4): turn off `adam-a2a`'s `server`, `adam-a2a-runtime`'s `push` and `adam-ui`'s `thread-tools` on anything else you depend on, or Cargo turns them back on ([README](../../crates/adam-engine/README.md)) |
+| adam inside an application, with no server and nothing on the network of its own (a desktop or a phone) | `adam-engine` | the embedded set only for now ([ADR 0047](../decisions/0047-adam-rs-can-be-embedded-in-an-application.md) slice 1; the API is slice 4): turn off `adam-a2a`'s `server`, `adam-a2a-runtime`'s `push`, `adam-assembly`'s `remote` (`adam`'s too) and `adam-ui`'s `thread-tools` on anything else you depend on, or Cargo turns them back on ([README](../../crates/adam-engine/README.md)) |
 | a different database | implement `Store` | [Store adapters](../reference/store-adapters.md) |
 
 ## Steps

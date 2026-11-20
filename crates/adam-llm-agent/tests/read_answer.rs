@@ -160,8 +160,9 @@ async fn started() -> Rig {
     }
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 async fn until(rt: &Runtime, run: RunId, what: &str, ok: impl Fn(&RunView) -> bool) -> RunView {
@@ -178,8 +179,11 @@ async fn until(rt: &Runtime, run: RunId, what: &str, ok: impl Fn(&RunView) -> bo
 
 fn asking_again(attempt: u64) -> impl Fn(&RunView) -> bool {
     move |view: &RunView| {
+        // `pending_wait` is in the head: a predicate decodes the head, not the joined state.
+        let head: Conversation =
+            serde_json::from_value(view.state.clone()).expect("the head is a Conversation");
         matches!(
-            conversation(view).pending_wait,
+            head.pending_wait,
             Some(PendingWait::Question(q))
                 if q.ui.as_ref().is_some_and(|ui| ui[0]["attempt"] == attempt)
         )
@@ -202,7 +206,7 @@ async fn a_refused_answer_keeps_the_run_parked_on_the_new_question_and_the_model
 
     rt.deliver(rig.run, user_message("nope")).await.unwrap();
     let view = until(rt, rig.run, "asked again", asking_again(1)).await;
-    let state = conversation(&view);
+    let state = conversation(&rig.rt, &view).await;
     let Some(PendingWait::Question(q)) = &state.pending_wait else {
         panic!("not parked on a question: {:?}", state.pending_wait);
     };
@@ -244,7 +248,7 @@ async fn a_refused_answer_keeps_the_run_parked_on_the_new_question_and_the_model
     let done = until(rt, rig.run, "done", |v| v.status == RunStatus::Done).await;
     let _ = stop.send(());
     worker.await.unwrap().unwrap();
-    let state = conversation(&done);
+    let state = conversation(&rig.rt, &done).await;
     assert!(
         state.messages.contains(&Message::tool_result("c1", "ok")),
         "{:?}",
@@ -316,7 +320,7 @@ async fn a_tool_may_end_the_question_and_the_model_reads_an_error_and_goes_on() 
     let done = until(&rig.rt, rig.run, "done", |v| v.status == RunStatus::Done).await;
     let _ = stop.send(());
     worker.await.unwrap();
-    let state = conversation(&done);
+    let state = conversation(&rig.rt, &done).await;
     assert_eq!(
         state
             .messages
@@ -343,7 +347,8 @@ async fn a_tool_may_say_what_the_answer_reads_as() {
     let _ = stop.send(());
     worker.await.unwrap();
     assert!(
-        conversation(&done)
+        conversation(&rig.rt, &done)
+            .await
             .messages
             .contains(&Message::tool_result("c1", "read as a value"))
     );
@@ -371,7 +376,7 @@ async fn messages_that_arrive_together_are_read_in_turn_and_a_copy_of_one_is_rea
     let done = until(&rig.rt, rig.run, "done", |v| v.status == RunStatus::Done).await;
     let _ = stop.send(());
     worker.await.unwrap();
-    let state = conversation(&done);
+    let state = conversation(&rig.rt, &done).await;
     assert_eq!(
         refusals(&rig.sink, rig.run),
         [json!({"call_id": "c1", "question": "q1", "rule": "not_ok"})],
@@ -431,7 +436,10 @@ async fn a_run_that_is_loaded_again_refuses_from_the_question_it_stored() {
     until(&second, run, "done", |v| v.status == RunStatus::Done).await;
     let _ = stop.send(());
     worker.await.unwrap();
-    let Some(PendingWait::Question(q)) = conversation(&view).pending_wait else {
+    // The view is a snapshot: its head carries the question the run was parked on.
+    let head: Conversation =
+        serde_json::from_value(view.state.clone()).expect("the head is a Conversation");
+    let Some(PendingWait::Question(q)) = head.pending_wait else {
         panic!("not parked on a question")
     };
     assert_eq!(q.question, "\"still not\" was refused (\"n\"). which?");
@@ -491,7 +499,7 @@ async fn an_answer_with_a_picture_gives_the_result_its_image() {
         let done = until(&rt, run, "done", |v| v.status == RunStatus::Done).await;
         let _ = stop.send(());
         worker.await.unwrap();
-        let state = conversation(&done);
+        let state = conversation(&rt, &done).await;
         let result = state
             .messages
             .iter()

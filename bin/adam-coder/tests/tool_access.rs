@@ -736,7 +736,8 @@ async fn run_real(turns: Vec<Vec<ToolCall>>) -> (Arc<Trace>, BTreeMap<String, St
     let _ = stop.send(());
     worker.await.unwrap().unwrap();
     assert_eq!(view.status, RunStatus::Done, "{view:#?}");
-    let conversation: adam_llm_agent::Conversation = serde_json::from_value(view.state).unwrap();
+    let state = rt.state(run).await.unwrap().expect("the run");
+    let conversation: adam_llm_agent::Conversation = serde_json::from_value(state).unwrap();
     let mut answers = BTreeMap::new();
     for message in &conversation.messages {
         if let adam_model::Message::Tool {

@@ -32,11 +32,10 @@ command (`tools::shell`), its sandbox meter (`tools::sandbox`), the tools' acces
 `Redactor`, `GitAt` with the file listing (`tools::gitcli`, whose git writes and restores stay here) and the paths' confinement
 (`tools::files::confine`). These paths re-export the library, so nothing that names them changes. The first tools on the
 port are `list_files`, `find_files` and `search_files`, then `read_file` and `read_files`, then `write_file` and
-`edit_file`: `tools::find` and `tools::files` still declare them (their descriptions are what the model reads, pinned by
+`edit_file`, then `apply_patch`: `tools::find` and `tools::files` still declare them (their descriptions are what the model reads, pinned by
 `tests/tool_specs.rs`) and `adam_code_tools::find` and `adam_code_tools::files` do them. What follows a write (the check
 epoch moved, "Run the checks again before you commit.", the note of a published scratch project) is the coder's
-`CodeWorkspace::after_write` in `src/tools/workspace.rs`, pinned by `tests/write_results.rs`. `apply_patch` is still the
-coder's, and moves next. `Redactor::from_config` is the
+`CodeWorkspace::after_write` in `src/tools/workspace.rs`, pinned by `tests/write_results.rs`. `Redactor::from_config` is the
 coder's own trait, `RedactorFromConfig`, re-exported at the crate root.
 
 ```mermaid
@@ -518,7 +517,7 @@ conversation pushed) lives in
 
 ### Reading and changing files itself
 
-`read_file`, `write_file`, `edit_file` and `apply_patch` (declared in `src/tools/files.rs`; the code of all but `apply_patch` is `adam_code_tools::files`) read and change files of the worktree in this
+`read_file`, `write_file`, `edit_file` and `apply_patch` (declared in `src/tools/files.rs`; their code is `adam_code_tools::files`) read and change files of the worktree in this
 process, and the instructions say when to use which: small, well-located changes yourself (`edit_file` for a few lines,
 `apply_patch` for several changes at once), a broad multi-file change is many such calls, file by file (ADR 0038: until the workers of ADR 0037 exist). The model chooses every path, so the paths are the point.
 
@@ -2669,7 +2668,7 @@ database of its own, so the role needs `CREATEDB`):
   `commits_ahead`) of a scratch project whose configuration runs a program as a clean filter and of a worktree: the program runs under
   the server and reads the server's environment and not the coder's, the commands are in the server's log, the copy of the index is
   made in `staging/private/` and removed, and with the sandbox gone the answers are unknown and the program did not run here;
-  `src/tools/files.rs` (`apply_sandbox_tests`) applies a patch through it (its input crosses; a patch that does not apply is git's
+  `crates/adam-code-tools/src/files.rs` (`apply_sandbox_tests`) applies a patch through it (its input crosses; a patch that does not apply is git's
   verdict); `src/config.rs` and `src/repos.rs` read `GIT_SANDBOX_SOCKET` (absolute, blank is unset) and hand it to the workspaces.
 
 * `tests/references.rs` (ADR 0044 slice 13): the read tools in a reference (the first read, under `plan`, checks it out;
@@ -2894,7 +2893,7 @@ database of its own, so the role needs `CREATEDB`):
   the paths outside the slot refused, **git unavailable fails closed**, and a timeout is an error that stops the blocking work;
   `files.rs` `swap_tests` `search_does_not_follow_a_slot_swapped_after_the_check`.
 * `src/tools/files.rs` (unit), `crates/adam-code-tools/src/files.rs` (unit: the read tools' paging, `read_files`' pages and
-  closest paths, the writes and the edits, moved there with them), `tests/write_results.rs` (the exact answer of
+  closest paths, the writes and the edits, the paths and modes `apply_patch` reads from git, moved there with them), `tests/write_results.rs` (the exact answer of
   `write_file`, `edit_file` and `apply_patch`, with the note of a published scratch project, and the check epoch each moves)
   and `tests/tools.rs`: the file tools. `confine` has a case each for `../`, an absolute path,
   `.git/x` and `.GIT/x`, a symlink to a file outside, a symlinked directory outside, a write through a symlink that

@@ -122,8 +122,9 @@ async fn wait_finished(rt: &Runtime, run: RunId) -> RunView {
     }
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).unwrap()
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 async fn run_to_end(rt: &Runtime, run: RunId) -> RunView {
@@ -187,7 +188,7 @@ async fn the_time_of_commands_is_counted_per_shape_in_the_runs_state() {
     let view = run_to_end(&rt, run).await;
     assert_eq!(view.status, RunStatus::Done, "{view:#?}");
 
-    let usage = conversation(&view).sandbox_usage;
+    let usage = conversation(&rt, &view).await.sandbox_usage;
     assert_eq!(usage.environment(), Some(SandboxEnvironment::Kubernetes));
     let [small, big] = usage.entries() else {
         panic!("two shapes: {usage:?}");
@@ -238,7 +239,7 @@ async fn a_command_whose_call_ended_in_an_error_is_counted_too() {
     let run = rt.start("llm", user_message("go"), None).await.unwrap();
     let view = run_to_end(&rt, run).await;
     assert_eq!(view.status, RunStatus::Done, "{view:#?}");
-    let usage = conversation(&view).sandbox_usage;
+    let usage = conversation(&rt, &view).await.sandbox_usage;
     assert_eq!(usage.entries().len(), 1, "{usage:?}");
     assert_eq!(usage.entries()[0].milliseconds, 700);
 }
@@ -263,7 +264,7 @@ async fn a_try_that_failed_transiently_is_not_counted_twice() {
     let run = rt.start("llm", user_message("go"), None).await.unwrap();
     let view = run_to_end(&rt, run).await;
     assert_eq!(view.status, RunStatus::Done, "{view:#?}");
-    let usage = conversation(&view).sandbox_usage;
+    let usage = conversation(&rt, &view).await.sandbox_usage;
     assert_eq!(usage.entries().len(), 1, "{usage:?}");
     assert_eq!(
         (usage.entries()[0].commands, usage.entries()[0].milliseconds),
@@ -318,7 +319,7 @@ async fn a_replayed_call_counts_what_its_record_holds() {
     mock.push_text("done");
     let view = run_to_end(&rt, run).await;
     assert_eq!(view.status, RunStatus::Done, "{view:#?}");
-    let usage = conversation(&view).sandbox_usage;
+    let usage = conversation(&rt, &view).await.sandbox_usage;
     assert_eq!(usage.entries().len(), 1, "{usage:?}");
     assert_eq!(
         (usage.entries()[0].commands, usage.entries()[0].milliseconds),
@@ -361,7 +362,7 @@ async fn a_subagents_commands_are_counted_with_its_parent() {
     let view = run_to_end(&rt, run).await;
     assert_eq!(view.status, RunStatus::Done, "{view:#?}");
 
-    let usage = conversation(&view).sandbox_usage;
+    let usage = conversation(&rt, &view).await.sandbox_usage;
     let [shared, other] = usage.entries() else {
         panic!("two shapes: {usage:?}");
     };

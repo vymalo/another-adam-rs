@@ -480,9 +480,10 @@ async fn parent_run_calls_mcp_tool_on_memory_and_postgres() {
         let journal = store.journal_list(run).await.unwrap();
         let entry = journal.iter().find(|e| e.name == "tool:c1");
         assert!(entry.is_some_and(|e| e.ok), "{backend}: {journal:?}");
+        // The joined state, not the view's head: the tool result is in the transcript.
+        let joined = rt.state(run).await.expect("state").expect("the run");
         let everything = format!(
-            "{journal:?}{:?}{:?}{:?}{debug_def}{assembly:?}{:?}",
-            view.state,
+            "{journal:?}{joined:?}{:?}{:?}{debug_def}{assembly:?}{:?}",
             view.output,
             sink.events(),
             assembly.info(),
@@ -698,7 +699,7 @@ async fn the_files_of_a_server_with_files_true_are_artifacts_of_the_run() {
             name.starts_with("screenshot-") && name.ends_with(".png"),
             "{backend}: {name}"
         );
-        let hash = view.artifacts[0].file_sha256().unwrap();
+        let hash = view.artifacts[0].file.as_ref().expect("a file").digest();
         assert_eq!(
             last_tool_result(&model.requests()[1], "c1"),
             (
@@ -713,7 +714,11 @@ async fn the_files_of_a_server_with_files_true_are_artifacts_of_the_run() {
             "{backend}"
         );
         let file = view.artifacts[0].file.as_ref().unwrap();
-        assert_eq!(file.bytes, adam_mcp_testkit::PNG, "{backend}");
+        // The bytes are the file's, whether the run carries them inline (v4) or by blob (v5).
+        assert_eq!(file.size, adam_mcp_testkit::PNG.len() as u64, "{backend}");
+        assert_eq!(file.digest(), adam_runtime::blob_id(adam_mcp_testkit::PNG));
+        let bytes = rt.artifact_bytes(file).await.unwrap().expect("the bytes");
+        assert_eq!(&bytes[..], adam_mcp_testkit::PNG, "{backend}");
         assert!(
             sink.events_for(run).iter().any(|event| matches!(
                 event,

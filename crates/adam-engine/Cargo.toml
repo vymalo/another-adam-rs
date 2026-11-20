@@ -14,6 +14,7 @@ rust-version.workspace = true
 [dependencies]
 adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.1.0", default-features = false }
 adam-agent-fs.workspace = true
+adam-assembly = { path = "../adam-assembly", version = "0.1.0", default-features = false }
 adam-core.workspace = true
 adam-error.workspace = true
 adam-llm-agent.workspace = true

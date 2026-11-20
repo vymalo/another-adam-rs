@@ -83,7 +83,7 @@ impl Rig {
     }
 
     /// Run one message to its end.
-    async fn run(&self, agent: &LlmAgent, text: &str) -> (RunId, RunView) {
+    async fn run(&self, agent: &LlmAgent, text: &str) -> (Runtime, RunId, RunView) {
         let rt = self.runtime(agent);
         let run = rt
             .start("llm", user_message(text), None)
@@ -110,7 +110,7 @@ impl Rig {
         };
         let _ = stop.send(());
         worker.await.expect("worker task").expect("worker result");
-        (run, view)
+        (rt, run, view)
     }
 
     /// The step reports of the run: `(id, state)`.
@@ -126,8 +126,9 @@ impl Rig {
     }
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 /// A source with two tools: `relay__search`, whose system reports its own steps and may take 125 s,
@@ -219,7 +220,7 @@ async fn a_tool_whose_system_reports_its_steps_gets_none_of_the_agents_and_the_o
             call("c2", "plain", json!({})),
         ])
         .push_text("done");
-    let (run, view) = rig.run(&agent, "go").await;
+    let (rt, run, view) = rig.run(&agent, "go").await;
 
     // The agent reported the step of `plain` (running, then completed) and nothing for the relayed
     // call: the orchestration layer reports that one.
@@ -231,7 +232,7 @@ async fn a_tool_whose_system_reports_its_steps_gets_none_of_the_agents_and_the_o
         ]
     );
     // The call still ran, and its result is the model's.
-    let messages = conversation(&view).messages;
+    let messages = conversation(&rt, &view).await.messages;
     assert!(messages.contains(&Message::tool_result("c1", "relay__search-out")));
     assert!(messages.contains(&Message::tool_result("c2", "plain-out")));
     assert_eq!(view.output.expect("output")["text"], "done");
@@ -258,7 +259,7 @@ async fn the_notes_are_the_latest_listings_and_are_in_the_state_for_a_later_tran
     rig.mock
         .push_tool_calls(vec![call("c1", "relay__search", json!({}))])
         .push_text("done");
-    let (_, view) = rig.run(&agent, "go").await;
+    let (_rt, _, view) = rig.run(&agent, "go").await;
     // Only the one meaningful note of a listed tool is kept, as written to the durable state.
     assert_eq!(
         view.state["source_notes"],
@@ -285,7 +286,7 @@ async fn an_agents_own_tool_wins_the_name_and_keeps_its_step() {
     rig.mock
         .push_tool_calls(vec![call("c1", "relay__search", json!({}))])
         .push_text("done");
-    let (run, _) = rig.run(&agent, "go").await;
+    let (_rt, run, _) = rig.run(&agent, "go").await;
     assert_eq!(
         rig.steps(run),
         [
@@ -325,7 +326,7 @@ async fn a_source_tool_with_a_titled_note_is_drawn_under_its_title() {
     rig.mock
         .push_tool_calls(vec![call("c1", "turn_output", json!({}))])
         .push_text("done");
-    let (run, view) = rig.run(&agent, "go").await;
+    let (_rt, run, view) = rig.run(&agent, "go").await;
     let labels: Vec<String> = rig
         .sink
         .events_for(run)
@@ -365,7 +366,7 @@ async fn a_source_without_notes_leaves_every_call_a_step_as_before() {
     rig.mock
         .push_tool_calls(vec![call("c1", "relay__search", json!({}))])
         .push_text("done");
-    let (run, view) = rig.run(&agent, "go").await;
+    let (_rt, run, view) = rig.run(&agent, "go").await;
     assert_eq!(
         rig.steps(run),
         [
@@ -392,7 +393,7 @@ async fn a_retried_step_sees_the_same_run_and_call_id_and_the_same_note() {
     rig.mock
         .push_tool_calls(vec![call("c1", "relay__search", json!({}))])
         .push_text("done");
-    let (run, view) = rig.run(&agent, "go").await;
+    let (_rt, run, view) = rig.run(&agent, "go").await;
 
     assert_eq!(
         faulty.injected(Method::JournalPut),
