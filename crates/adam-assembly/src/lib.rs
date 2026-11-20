@@ -147,6 +147,7 @@ mod dev;
 mod error;
 mod folder;
 mod mcp;
+mod mcp_select;
 mod remote;
 mod remote_session;
 mod scrub;

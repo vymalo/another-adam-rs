@@ -284,6 +284,9 @@ struct CallFacts {
     kept_left: usize,
     /// What the run admits as images from now on: the gate for this model and what the history holds.
     images: ImageGate,
+    /// The words the run was started with (`Conversation::task`), for a source that decides from
+    /// them: the same text at every turn and at every call.
+    task: Option<Arc<str>>,
 }
 
 /// What the calls of a turn that starts while the model writes need from the run, owned: taken
@@ -298,6 +301,7 @@ struct EarlyFacts {
     files_used: u64,
     images: ImageGate,
     output_cut: bool,
+    task: Option<Arc<str>>,
     turn: crate::early::Turn,
     /// The committed `repeats` of the run, for the doom-loop decision of the first call.
     repeats: Option<Repeats>,
@@ -444,6 +448,7 @@ impl<'a> Early<'a> {
             kept: Arc::clone(&self.facts.kept),
             kept_left: self.facts.kept_left,
             images: self.facts.images.clone(),
+            task: self.facts.task.clone(),
         };
         let mut prepared = self.agent.prepare(
             &self.facts.ctx,
@@ -1908,6 +1913,7 @@ impl LlmAgent {
                 ctx.conversation_id().map(str::to_owned),
                 context.cloned().unwrap_or_default(),
             )
+            .with_task(state.task())
         });
         let turn = state.turns;
         let seen = state.messages.len();
@@ -1959,6 +1965,7 @@ impl LlmAgent {
             files_used: files_kept(&state.artifacts),
             images: self.image_gate(state),
             output_cut: state.output_cut,
+            task: state.task().map(Arc::from),
             turn: crate::early::Turn {
                 limit: self.max_parallel,
                 closing,
@@ -2478,6 +2485,7 @@ impl LlmAgent {
                 ctx.conversation_id().map(str::to_owned),
                 Arc::new(state.context.clone()),
             )
+            .with_task(state.task())
         });
         let run = ctx.run_id();
         let cancel = ctx.cancel_token();
@@ -3062,6 +3070,7 @@ impl LlmAgent {
                         kept: Arc::clone(&state.kept_outputs),
                         kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
                         images: self.image_gate(state),
+                        task: state.task().map(Arc::from),
                     },
                     started,
                 )
@@ -3353,6 +3362,7 @@ impl LlmAgent {
                 kept: Arc::clone(&state.kept_outputs),
                 kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
                 images: self.image_gate(state),
+                task: state.task().map(Arc::from),
             };
             let mut one = self.prepare(&facts_of_ctx, context, root, &notes, call, facts);
             match &first {
@@ -3810,6 +3820,7 @@ impl LlmAgent {
             kept,
             kept_left,
             images,
+            task,
             ..
         } = facts;
         let note = self.source_note(notes, &call.name);
@@ -3834,7 +3845,8 @@ impl LlmAgent {
                     root.0.unwrap_or(ctx.run),
                     ctx.conversation_id.clone(),
                     context.cloned().unwrap_or_default(),
-                ),
+                )
+                .with_task(task.as_deref()),
             )
         });
         Prepared {

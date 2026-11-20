@@ -11,7 +11,7 @@ use adam_agent_fs::{
     ManifestSource, McpConfig, ModelRef, SkillSelection, Strictness, Subagent, ToolList,
 };
 use adam_llm_agent::{
-    DynTool, Limits, LlmStarter, SESSION_TOOLS, SessionAgent, SessionTools, ToolSet,
+    DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionAgent, SessionTools, ToolSet,
 };
 use adam_runtime::{RuntimeBuilder, SessionLimits};
 use secrecy::SecretString;
@@ -489,7 +489,7 @@ impl AgentDef {
                 name,
                 config.clone(),
                 servers.tools(),
-                servers.instructions(),
+                servers.instructions_by_server(),
                 servers.prompt_commands(),
             ));
         }
@@ -625,6 +625,10 @@ impl AgentDef {
     }
 }
 
+/// The MCP tools of one agent: the tools `bind` may offer, and the names each server gave — from
+/// the same check that ties a tool to its server ([`Walk::mcp_tools`]).
+type McpTools = (Vec<(String, DynTool)>, BTreeMap<String, Vec<String>>);
+
 /// One local agent, bound: its rendered prompt and its tools. The model comes later.
 #[derive(Clone)]
 pub(crate) struct Node {
@@ -650,6 +654,13 @@ pub(crate) struct Node {
     /// The agents that work the rounds of a session on a remote subagent, one per remote subagent
     /// of the root; empty for any other agent.
     pub(crate) round_agents: Vec<RemoteRoundAgent>,
+    /// The `mcp.json` servers whose `when` loads them only when a run's task matches: the server
+    /// and its keywords, in name order. [`AgentInfo::when`](crate::AgentInfo::when) carries them, so
+    /// a definition that differs only in a `when` compares unequal to one that does not.
+    pub(crate) when: Vec<(String, Vec<String>)>,
+    /// Sources this agent alone has, added at [`BoundDef::build`](crate::BoundDef): the
+    /// `mcp.json` servers whose `when` loads them only when a run's task matches.
+    pub(crate) sources: Vec<DynToolSource>,
 }
 
 /// A remote (A2A) subagent, found on the way: what [`Assembly::remotes`](crate::Assembly::remotes) lists.
@@ -718,8 +729,9 @@ impl Walk<'_> {
         parent: Option<usize>,
     ) -> Result<(), Error> {
         let origin = Origin::new(name.clone(), manifest.path.clone());
-        // The agent's own MCP tools, checked, then chosen from with the registered ones.
-        let own_mcp = self.mcp_tools(manifest, &name)?;
+        // The agent's own MCP tools, checked, then chosen from with the registered ones. The
+        // grouping by server comes from the same loop that decides which server a tool belongs to.
+        let (own_mcp, mcp_by_server) = self.mcp_tools(manifest, &name)?;
         let catalog = self.catalog.with(&own_mcp);
         let mut tools = resolve_tools(
             &origin,
@@ -731,11 +743,55 @@ impl Walk<'_> {
             refuse_asking_tools(&origin, &tools)?;
         }
         let mut prompt = render_prompt(&origin, manifest, self.values.get(&name))?;
+        // The servers whose `when` loads them only when the run's task mentions a keyword: their
+        // tools are withheld by the source below and their instructions do not go into the prompt.
+        let triggers: Vec<(String, Vec<String>)> = mcp::declared(manifest)
+            .into_iter()
+            .flat_map(|config| config.servers.iter())
+            .filter_map(|(server, entry)| {
+                entry
+                    .when()
+                    .map(|when| (server.clone(), when.keywords.clone()))
+            })
+            .collect();
         // What the agent's MCP servers said about themselves, once, here: the prompt is the same
-        // for every model call of the process, so the cached prefix holds.
-        if let Some(given) = self.mcp.get(&name).filter(|g| !g.instructions.is_empty()) {
-            prompt.push_str("\n\n");
-            prompt.push_str(&given.instructions);
+        // for every model call of the process, so the cached prefix holds. A triggered server's
+        // section comes from `McpSelect` at a turn, and only when the run loads it.
+        if let Some(given) = self.mcp.get(&name) {
+            let eager: Vec<(String, String)> = given
+                .instructions
+                .iter()
+                .filter(|(server, _)| !triggers.iter().any(|(triggered, _)| triggered == server))
+                .cloned()
+                .collect();
+            let text = crate::mcp_select::join_sections(&eager);
+            if !text.is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(&text);
+            }
+        }
+        let mut sources: Vec<DynToolSource> = Vec::new();
+        if !triggers.is_empty() {
+            let triggered: Vec<crate::mcp_select::Triggered> = triggers
+                .iter()
+                .map(|(server, keywords)| {
+                    let tools = mcp_by_server.get(server).cloned().unwrap_or_default();
+                    let instructions = self.mcp.get(&name).and_then(|given| {
+                        given
+                            .instructions
+                            .iter()
+                            .find(|(named, _)| named == server)
+                            .map(|(_, text)| text.clone())
+                    });
+                    crate::mcp_select::Triggered::new(
+                        server.clone(),
+                        keywords.clone(),
+                        tools,
+                        instructions,
+                    )
+                })
+                .collect();
+            sources.push(Arc::new(crate::mcp_select::McpSelect::new(triggered)));
         }
         // An agent that has an MCP tool can get a long result that is kept and paged: it reads the
         // rest with `read_output` (a folder agent keeps it in the run's state, up to 4 MiB).
@@ -796,6 +852,8 @@ impl Walk<'_> {
             preloaded,
             session_agents,
             round_agents,
+            when: triggers,
+            sources,
         });
         for sub in &manifest.subagents {
             match sub {
@@ -815,11 +873,7 @@ impl Walk<'_> {
 impl Walk<'_> {
     /// The MCP tools of one agent: what was connected or supplied for it, checked against its own
     /// `mcp.json` and the registered tools. Empty when it has no servers.
-    fn mcp_tools(
-        &self,
-        manifest: &AgentManifest,
-        name: &str,
-    ) -> Result<Vec<(String, DynTool)>, Error> {
+    fn mcp_tools(&self, manifest: &AgentManifest, name: &str) -> Result<McpTools, Error> {
         let declared = mcp::declared(manifest);
         let servers: Vec<String> = declared
             .map(|config| config.servers.keys().cloned().collect())
@@ -827,7 +881,7 @@ impl Walk<'_> {
         let origin = Origin::new(name, mcp::file_of(manifest));
         let Some(given) = self.mcp.get(name) else {
             return if servers.is_empty() {
-                Ok(Vec::new())
+                Ok((Vec::new(), BTreeMap::new()))
             } else {
                 Err(Error::McpNotConnected { origin, servers })
             };
@@ -836,20 +890,22 @@ impl Walk<'_> {
             return Err(Error::McpChanged { origin });
         }
         let mut entries: Vec<(String, DynTool)> = Vec::new();
+        let mut by_server: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for tool in &given.tools {
             let tool_name = tool.spec().name;
-            let belongs = servers.iter().any(|server| {
+            // The one place a tool is tied to its server: the name check below and the grouping
+            // the selector reads come from this find.
+            let Some(server) = servers.iter().find(|server| {
                 tool_name
                     .strip_prefix(server.as_str())
                     .is_some_and(|rest| rest.starts_with("__"))
-            });
-            if !belongs {
+            }) else {
                 return Err(Error::McpForeignTool {
                     origin,
                     tool: tool_name,
                     servers,
                 });
-            }
+            };
             if entries.iter().any(|(n, _)| *n == tool_name) {
                 return Err(Error::DuplicateTool { tool: tool_name });
             }
@@ -859,6 +915,10 @@ impl Walk<'_> {
                     tool: tool_name,
                 });
             }
+            by_server
+                .entry(server.clone())
+                .or_default()
+                .push(tool_name.clone());
             entries.push((tool_name, Arc::clone(tool)));
         }
         if entries.is_empty() && !servers.is_empty() {
@@ -870,7 +930,7 @@ impl Walk<'_> {
                 "the agent's mcp.json lists servers, and it has no MCP tool"
             );
         }
-        Ok(entries)
+        Ok((entries, by_server))
     }
 }
 

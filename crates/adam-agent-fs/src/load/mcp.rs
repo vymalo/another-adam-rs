@@ -5,8 +5,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::diagnostic::{Diagnostic, Sink};
+use crate::invisible::is_format_or_control;
 use crate::schema::{
-    McpConfig, McpServer, McpSettings, RawMcp, RawServer, RemoteKind, scan_references,
+    MAX_WHEN_KEYWORD_CHARS, MAX_WHEN_KEYWORDS, McpConfig, McpServer, McpSettings, McpWhen, RawMcp,
+    RawServer, RemoteKind, scan_references,
 };
 
 /// The longest model-facing tool name (`<server>__<tool>`) providers accept, as the plan sets
@@ -159,6 +161,13 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
         prompts: raw.prompts.unwrap_or(true),
         parallel: raw.parallel.unwrap_or(true),
     };
+    let when = match when_of(sink, name, raw.when.as_ref()) {
+        Ok(when) => when,
+        Err(message) => {
+            fail(sink, message);
+            None
+        }
+    };
     let command = raw.command.as_deref().map(str::trim);
     let url = raw.url.as_deref().map(str::trim);
     let server = match (declared, command, url) {
@@ -176,6 +185,7 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
                 optional: raw.optional.unwrap_or(false),
                 files: raw.files.unwrap_or(false),
                 settings,
+                when,
             }
         }
         (Declared::Unset, None, Some(_)) => {
@@ -243,6 +253,7 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
                 optional: raw.optional.unwrap_or(false),
                 files: raw.files.unwrap_or(false),
                 settings,
+                when,
             }
         }
     };
@@ -369,4 +380,90 @@ fn warn_literal_url(sink: &mut Sink<'_>, server: &str, url: &str) {
             ),
         );
     }
+}
+
+/// `when` as the file writes it.
+///
+/// `Ok(None)` is no `when` (the server is eager), `Ok(Some(..))` a validated trigger, `Err(message)` a
+/// refused key (the caller reports it and leaves the server out, as for any other key error).
+/// Unknown members are warnings, and `paths` says why it is not supported in this version.
+fn when_of(
+    sink: &mut Sink<'_>,
+    server: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<Option<McpWhen>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(object) = value.as_object() else {
+        return Err(format!(
+            "server `{server}`: `when` must be an object with a `keywords` list"
+        ));
+    };
+    for key in object.keys() {
+        match key.as_str() {
+            "keywords" => {}
+            "paths" => sink.warn(
+                None,
+                format!(
+                    "server `{server}`: `when.paths` is not supported in this version and is \
+                     ignored: a path glob has nothing to match before the first model call (the \
+                     coder has no checkout until `prepare_workspace` runs); use `when.keywords`"
+                ),
+            ),
+            other => sink.warn(
+                None,
+                format!("server `{server}`: unknown `when` key `{other}` is ignored"),
+            ),
+        }
+    }
+    let Some(keywords) = object.get("keywords") else {
+        return Err(format!("server `{server}`: `when` needs a `keywords` list"));
+    };
+    let Some(list) = keywords.as_array() else {
+        return Err(format!(
+            "server `{server}`: `when.keywords` must be a list of words"
+        ));
+    };
+    if list.is_empty() {
+        return Err(format!(
+            "server `{server}`: `when.keywords` is empty, so the server would never load; \
+             leave `when` out to load it for every run"
+        ));
+    }
+    if list.len() > MAX_WHEN_KEYWORDS {
+        return Err(format!(
+            "server `{server}`: `when.keywords` holds {} words (at most {MAX_WHEN_KEYWORDS})",
+            list.len()
+        ));
+    }
+    let mut words = Vec::with_capacity(list.len());
+    for item in list {
+        let Some(word) = item.as_str() else {
+            return Err(format!(
+                "server `{server}`: `when.keywords` must hold strings"
+            ));
+        };
+        let word = word.trim();
+        if word.is_empty() {
+            return Err(format!(
+                "server `{server}`: `when.keywords` holds an empty word"
+            ));
+        }
+        if word.chars().count() > MAX_WHEN_KEYWORD_CHARS {
+            return Err(format!(
+                "server `{server}`: the keyword `{}` is longer than \
+                 {MAX_WHEN_KEYWORD_CHARS} characters",
+                word.chars().take(32).collect::<String>()
+            ));
+        }
+        if word.chars().any(is_format_or_control) {
+            return Err(format!(
+                "server `{server}`: a keyword holds a control or format character; write \
+                 visible words"
+            ));
+        }
+        words.push(word.to_owned());
+    }
+    Ok(Some(McpWhen { keywords: words }))
 }

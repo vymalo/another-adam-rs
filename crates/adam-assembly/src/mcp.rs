@@ -61,10 +61,12 @@ pub(crate) struct AgentMcp {
     /// this crate knows.
     pub(crate) config: Option<McpConfig>,
     pub(crate) tools: ToolSet,
-    /// What its servers said about themselves, ready to append to its instructions (empty for
-    /// tools supplied by hand). Read once, when the servers were connected, so the prompt of the
-    /// agent never changes during the process.
-    pub(crate) instructions: String,
+    /// What its servers said about themselves, by server, heading included, ready to append to its
+    /// instructions (empty for tools supplied by hand). Read once, when the servers were
+    /// connected, so the prompt of the agent never changes during the process. A server with a
+    /// `when` contributes its section to a run only when the run loads it
+    /// ([`mcp_select`](crate::mcp_select)).
+    pub(crate) instructions: Vec<(String, String)>,
     /// The prompts of its servers as commands (the root's are served; a subagent's are not).
     pub(crate) prompts: Prompts,
 }
@@ -80,7 +82,14 @@ impl std::fmt::Debug for AgentMcp {
                     .map(|c| c.servers.keys().collect::<Vec<_>>()),
             )
             .field("tools", &self.tools)
-            .field("instructions", &self.instructions.len())
+            .field(
+                "instructions",
+                &self
+                    .instructions
+                    .iter()
+                    .map(|(_, text)| text.len())
+                    .sum::<usize>(),
+            )
             .field("prompts", &self.prompts.len())
             .finish()
     }
@@ -104,7 +113,7 @@ impl McpBinding {
             AgentMcp {
                 config,
                 tools,
-                instructions: String::new(),
+                instructions: Vec::new(),
                 prompts: Vec::new(),
             },
         );
@@ -117,7 +126,7 @@ impl McpBinding {
         agent: impl Into<String>,
         config: McpConfig,
         tools: ToolSet,
-        instructions: String,
+        instructions: Vec<(String, String)>,
         prompts: Prompts,
     ) {
         self.agents.insert(

@@ -3,8 +3,8 @@
 //! with a worker, as in `context_and_sources.rs`.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
@@ -287,4 +287,75 @@ async fn a_source_that_holds_nothing_back_changes_nothing() {
     handle.await.expect("worker task").expect("worker result");
     assert_eq!(names_of(&h.mock.requests()[0]), ["write", "extra"]);
     assert_eq!(writes.load(SeqCst), 1);
+}
+
+/// One look at the task: the moment (`turn` or `call`), and the task.
+type Seen = Arc<Mutex<Vec<(&'static str, Option<String>)>>>;
+
+/// Records the task it sees at each moment: the turn (`specs`) and the call (`withhold`).
+struct Tasked(Seen);
+
+#[async_trait]
+impl ToolSource for Tasked {
+    async fn specs(&self, ctx: &SourceCtx) -> Vec<ToolSpec> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(("turn", ctx.task().map(str::to_owned)));
+        Vec::new()
+    }
+    async fn withhold(&self, ctx: &SourceCtx, _tools: &[&str]) -> Vec<Withheld> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(("call", ctx.task().map(str::to_owned)));
+        Vec::new()
+    }
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        None
+    }
+}
+
+/// A source reads the run's task at the turn and at the call, and it is the same text: what it
+/// offers is decided from the first message before the first model call, and does not move.
+#[tokio::test]
+async fn a_source_reads_the_same_task_at_the_turn_and_at_the_call() {
+    let h = Harness::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let agent = h
+        .agent()
+        .tool(Counted("read", Arc::new(AtomicUsize::new(0))))
+        .tool_source(Tasked(Arc::clone(&seen)))
+        .build();
+    h.mock
+        .push_tool_calls(vec![call("c1", "read")])
+        .push_text("done");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("do the thing"), None)
+        .await
+        .expect("start");
+    let (stop, handle) = spawn_worker(&rt);
+    wait_for(&rt, run, |v| v.status == RunStatus::Done).await;
+    let _ = stop.send(());
+    handle.await.expect("worker task").expect("worker result");
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter().any(|(moment, _)| *moment == "turn"),
+        "the source was asked at the turn"
+    );
+    assert!(
+        seen.iter().any(|(moment, _)| *moment == "call"),
+        "the source was asked at the call"
+    );
+    assert!(
+        seen.iter()
+            .all(|(_, task)| task.as_deref() == Some("do the thing")),
+        "the turn and the call see the same task: {seen:?}"
+    );
 }
