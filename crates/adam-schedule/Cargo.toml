@@ -19,7 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-# `reconcile_until_stopped`: a stop cuts the reconcile and its backoff short.
+# `reconcile_until_stopped`: `select!` on the stop, and the backoff's sleep.
 tokio = { workspace = true, features = ["macros", "time"] }
 tokio-util.workspace = true
 tracing.workspace = true
