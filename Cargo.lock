@@ -735,6 +735,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-schedule"
+version = "0.1.0"
+dependencies = [
+ "adam-agent-fs",
+ "adam-core",
+ "adam-runtime",
+ "jiff",
+ "sha2 0.10.9",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "adam-service"
 version = "0.1.0"
 dependencies = [

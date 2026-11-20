@@ -37,7 +37,7 @@ pub(crate) const MAX_COMMIT_RETRIES: usize = 16;
 
 /// Why a [`Runtime`] call failed.
 ///
-/// Decide from [`Classify::class`]: `UnknownAgent` and `WrongAgent` are `Invalid`, `NotFound` is `NotFound`,
+/// Decide from [`Classify::class`]: `UnknownAgent`, `WrongAgent` and `ForeignConversation` are `Invalid`, `NotFound` is `NotFound`,
 /// `Finished` and `ConversationBusy` are `Rejected`, `Corrupt` is `Corrupt`, `Contended` is
 /// `Conflict`, and `Agent` and `Store` carry the class of the error they wrap.
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +74,14 @@ pub enum RuntimeError {
         /// Agent name.
         agent: String,
         /// Conversation id.
+        conversation_id: String,
+    },
+    /// A [`RunStarter`](crate::RunStarter) was asked for a conversation outside its namespace.
+    #[error(
+        "a step may start runs only in `adam.schedule:` conversations, not {conversation_id:?}"
+    )]
+    ForeignConversation {
+        /// The conversation it was asked for.
         conversation_id: String,
     },
     /// A session round was refused because what it names does not fit the session (ADR 0045): the
@@ -128,9 +136,10 @@ impl RuntimeError {
 impl Classify for RuntimeError {
     fn class(&self) -> ErrorClass {
         match self {
-            Self::UnknownAgent(_) | Self::WrongAgent { .. } | Self::InvalidSession { .. } => {
-                ErrorClass::Invalid
-            }
+            Self::UnknownAgent(_)
+            | Self::WrongAgent { .. }
+            | Self::InvalidSession { .. }
+            | Self::ForeignConversation { .. } => ErrorClass::Invalid,
             Self::NotFound(_) => ErrorClass::NotFound,
             Self::Finished { .. } | Self::ConversationBusy { .. } | Self::TooManyRounds { .. } => {
                 ErrorClass::Rejected
@@ -1845,6 +1854,7 @@ mod error_tests {
             RuntimeError::Finished { .. } => ErrorClass::Rejected,
             RuntimeError::ConversationBusy { .. } => ErrorClass::Rejected,
             RuntimeError::InvalidSession { .. } => ErrorClass::Invalid,
+            RuntimeError::ForeignConversation { .. } => ErrorClass::Invalid,
             RuntimeError::TooManyRounds { .. } => ErrorClass::Rejected,
             RuntimeError::Corrupt { .. } => ErrorClass::Corrupt,
             RuntimeError::Contended(_) => ErrorClass::Conflict,
@@ -1888,6 +1898,9 @@ mod error_tests {
             RuntimeError::Store(StoreError::NotFound(run)),
             RuntimeError::InvalidSession { reason: "x".into() },
             RuntimeError::TooManyRounds { runs: 2, max: 1 },
+            RuntimeError::ForeignConversation {
+                conversation_id: "token-1:chat".into(),
+            },
         ];
         for e in &samples {
             assert_eq!(e.class(), expected(e), "{e}");
@@ -1899,7 +1912,7 @@ mod error_tests {
             retryable,
             [
                 false, false, false, false, false, false, true, false, true, true, true, false,
-                false, false
+                false, false, false
             ]
         );
         assert_eq!(samples[8].retry_after(), Some(Duration::from_secs(3)));

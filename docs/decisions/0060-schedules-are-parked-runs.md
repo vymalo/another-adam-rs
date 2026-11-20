@@ -5,6 +5,10 @@ Status: **Accepted** (2026-11-20). Roadmap item 5 ("running schedules") is taken
 recorded). This ADR is the design; it is built in the slices below. Number 0059 is reserved for another decision being
 written at the same time.
 
+*Amended* (2026-11-20, slice 3): the schedule's name is escaped in both conversation ids (`%`,
+`/` and `@` as `%25`, `%2F` and `%40`), so a name cannot make one schedule's conversation another's
+firing or a session's; `next_due` is built as `ScheduleSpec::due_after`.
+
 ## Context
 
 An agent folder may hold `schedules/<name>.md`: frontmatter `cron:` and `timezone:`, the body a prompt
