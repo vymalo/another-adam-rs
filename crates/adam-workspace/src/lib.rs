@@ -58,6 +58,7 @@
 
 mod code_host;
 mod credentials;
+pub mod devcontainer;
 mod environment;
 mod error;
 mod git;

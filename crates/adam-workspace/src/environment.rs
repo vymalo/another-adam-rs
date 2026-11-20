@@ -417,6 +417,40 @@ pub trait Environment: Send + Sync + 'static {
         let _ = workspace;
         Ok(())
     }
+
+    /// Set or clear the image a run's commands run in (ADR 0052 decision 7), for a repository that
+    /// brings its own `devcontainer.json`. `None` puts the run back on the deployment's image.
+    ///
+    /// The default refuses: only an environment that runs a run in a pod of its own has an image of
+    /// the run's to choose (the caller's own container and a devcontainer do not), so every outside
+    /// implementation compiles unchanged and says why a call cannot work.
+    ///
+    /// An implementation records the choice where the run's state is and makes the pod again when it
+    /// differs from the pod that is there; the choice is the conversation's, and the caller reads it
+    /// again on every [`ensure`](Self::ensure).
+    ///
+    /// # Errors
+    ///
+    /// [`EnvError::Refused`] when this environment has no image of a run's to choose, or the image is
+    /// empty.
+    async fn set_image(&self, run: &str, image: Option<&str>) -> Result<(), EnvError> {
+        let _ = (run, image);
+        Err(EnvError::Refused(
+            "this environment has no image of a run's to choose: only run pods do".to_owned(),
+        ))
+    }
+
+    /// The image prefixes this environment allows a repository to name, when it runs a run's
+    /// commands in a pod of its own: `Some` for run pods (the list may be empty, which allows no
+    /// repository image), `None` for an environment that has no run pod image to move (the caller's
+    /// own container, a devcontainer).
+    ///
+    /// The default is `None`. The tool that offers a repository's own image is offered only where
+    /// this is `Some` with a prefix, and the deployment's admission policy is the control that
+    /// holds whatever this says.
+    fn repository_image_prefixes(&self) -> Option<&[String]> {
+        None
+    }
 }
 
 /// A run's view of its environment.
@@ -690,6 +724,14 @@ impl Environment for HidingEnvironment {
     async fn seal(&self, workspace: &RunWorkspace) -> Result<(), EnvError> {
         self.inner.seal(workspace).await
     }
+
+    async fn set_image(&self, run: &str, image: Option<&str>) -> Result<(), EnvError> {
+        self.inner.set_image(run, image).await
+    }
+
+    fn repository_image_prefixes(&self) -> Option<&[String]> {
+        self.inner.repository_image_prefixes()
+    }
 }
 
 struct HidingSession {
@@ -869,6 +911,8 @@ mod tests {
     struct Sealing {
         sealed: std::sync::Mutex<Vec<String>>,
         refuses: std::sync::atomic::AtomicBool,
+        images: std::sync::Mutex<Vec<(String, Option<String>)>>,
+        prefixes: Vec<String>,
     }
 
     #[async_trait]
@@ -896,6 +940,18 @@ mod tests {
             }
             Ok(())
         }
+
+        async fn set_image(&self, run: &str, image: Option<&str>) -> Result<(), EnvError> {
+            self.images
+                .lock()
+                .unwrap()
+                .push((run.to_owned(), image.map(str::to_owned)));
+            Ok(())
+        }
+
+        fn repository_image_prefixes(&self) -> Option<&[String]> {
+            (!self.prefixes.is_empty()).then_some(self.prefixes.as_slice())
+        }
     }
 
     #[tokio::test]
@@ -903,6 +959,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         Local.seal(&a_run(dir.path())).await.unwrap();
         assert!(Local.held_runs().await.unwrap().is_empty());
+    }
+
+    /// ADR 0052 decision 7: the image of a run is the port's, and the default says no, so every
+    /// outside implementation compiles unchanged and a call that cannot work says why.
+    #[tokio::test]
+    async fn local_has_no_image_of_a_run_to_choose_and_no_prefixes() {
+        let error = Local
+            .set_image("run-1", Some("ghcr.io/acme/dev:1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, EnvError::Refused(_)), "{error}");
+        assert!(error.to_string().contains("only run pods"), "{error}");
+        assert_eq!(Local.repository_image_prefixes(), None);
+    }
+
+    #[tokio::test]
+    async fn a_hiding_environment_forwards_the_image_and_the_prefixes_of_the_environment_it_wraps()
+    {
+        let inner = Arc::new(Sealing {
+            prefixes: vec!["ghcr.io/acme/".to_owned()],
+            ..Sealing::default()
+        });
+        let env = HidingEnvironment::new(inner.clone(), ["MCP_SECRET"]);
+        assert_eq!(
+            env.repository_image_prefixes(),
+            Some(["ghcr.io/acme/".to_owned()].as_slice())
+        );
+        env.set_image("run-1", Some("ghcr.io/acme/dev:1"))
+            .await
+            .unwrap();
+        env.set_image("run-1", None).await.unwrap();
+        assert_eq!(
+            *inner.images.lock().unwrap(),
+            [
+                ("run-1".to_owned(), Some("ghcr.io/acme/dev:1".to_owned())),
+                ("run-1".to_owned(), None),
+            ]
+        );
     }
 
     #[tokio::test]
