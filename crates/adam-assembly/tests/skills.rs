@@ -458,7 +458,11 @@ async fn the_model_loads_a_skill_then_reads_one_of_its_files() {
     )]);
     model.push_text("Done.");
     let assembly = assemble(def_of(&dir), model.clone());
-    let view = run(&assembly, "coder").await;
+    let rt = runtime(&assembly);
+    let worker = spawn_worker(&rt);
+    let run = rt.start("coder", user_message("go"), None).await.unwrap();
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
     assert_eq!(view.output.as_ref().unwrap()["text"], "Done.");
 
     let requests = model.requests();
@@ -511,8 +515,9 @@ async fn the_model_loads_a_skill_then_reads_one_of_its_files() {
     assert!(!is_error);
     assert_eq!(file, "# Guide\nUse the guide.\n[end: 2 lines]");
 
-    // Both results are in the conversation the run keeps.
-    let conversation: Conversation = serde_json::from_value(view.state).unwrap();
+    // Both results are in the conversation the run keeps: the head and its body, joined.
+    let state = rt.state(run).await.unwrap().expect("the run");
+    let conversation: Conversation = serde_json::from_value(state).unwrap();
     let texts: Vec<String> = conversation.messages.iter().map(Message::text).collect();
     assert!(texts.contains(&loaded));
     assert!(texts.contains(&file));

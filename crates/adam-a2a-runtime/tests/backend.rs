@@ -544,7 +544,7 @@ async fn a_new_task_is_a_run_and_streams_snapshot_progress_artifact_completed() 
 /// record reads where the 250 ms fallback of both loops cost tens.
 ///
 /// What the counters see is what crosses the `FaultyStore` seam: the stream's `view` calls
-/// (`LoadRun`) and the watch's `run_header` calls (`RunHeader`). The reads a store's own default
+/// (`LoadHead`) and the watch's `run_header` calls (`RunHeader`). The reads a store's own default
 /// `run_header` makes inside itself are below the wrapper and are not counted here.
 #[tokio::test]
 async fn a_stream_reads_the_run_once_per_commit_not_once_per_poll() {
@@ -562,14 +562,14 @@ async fn a_stream_reads_the_run_once_per_commit_not_once_per_poll() {
         .expect("submit");
     let mut events = rig.backend.subscribe(&alice(), &task.id);
     let _snapshot = next(&mut events).await;
-    let before_loads = faulty.calls(Method::LoadRun);
+    let before_loads = faulty.calls(Method::LoadHead);
     let before_headers = faulty.calls(Method::RunHeader);
     let worker = rig.worker();
     let events = rest(&mut events).await;
     worker.stop().await;
 
     assert_eq!(label(events.last().unwrap()), "status:Completed");
-    let loads = faulty.calls(Method::LoadRun) - before_loads;
+    let loads = faulty.calls(Method::LoadHead) - before_loads;
     let headers = faulty.calls(Method::RunHeader) - before_headers;
     // Five steps commit five times: one poll each, plus the first tick of the interval (which
     // `tokio::time::interval` fires at once) and the tick at 2 s. The 250 ms fallback would be
@@ -682,6 +682,113 @@ async fn a_shared_file_is_a_raw_part_in_the_stream_and_in_the_task() {
         .find(|a| a.name.as_deref() == Some("logo"))
         .expect("the file is on the task");
     assert_eq!(kept, &streamed[0], "the same artifact, id included");
+}
+
+/// An artifact of a v5 run is served from its blob, once: ten polls of the finished task read the
+/// head ten times, no state and no body, and fetch the file once (the runtime's cache answers the
+/// rest).
+#[tokio::test]
+async fn a_blob_backed_artifact_is_fetched_once_across_ten_polls() {
+    use a2a::PartContent;
+    use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
+    use adam_model::{ToolCall, ToolSpec};
+    use adam_store_testkit::counting::CountingStore;
+
+    struct Chart;
+
+    #[async_trait]
+    impl Tool for Chart {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "chart".into(),
+                description: "draws the chart".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            let file = RunArtifact::file("logo", "image/svg+xml", "logo.svg", SVG.to_vec())
+                .expect("a file");
+            Ok(ToolOutput::text("drew it").with_artifact(file))
+        }
+    }
+
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let counting = Arc::new(CountingStore::new(inner.clone()));
+    let model = Arc::new(MockModel::new());
+    model
+        .push_tool_calls(vec![ToolCall {
+            id: "c1".into(),
+            name: "chart".into(),
+            arguments: json!({}),
+            ..Default::default()
+        }])
+        .push_text("done");
+    let agent = LlmAgent::builder("llm", model, "test-model")
+        .tool(Chart)
+        .build();
+    let runtime = Runtime::builder(counting.clone())
+        .agent(agent)
+        .event_sink(BroadcastSink::default())
+        .poll_interval(Duration::from_millis(10))
+        .build();
+    let backend = RuntimeTaskBackend::new(runtime.clone(), BroadcastSink::default(), "llm")
+        .with_poll_interval(Duration::from_millis(10));
+    let task = backend
+        .submit(alice(), user("draw it"), None, None)
+        .await
+        .expect("submit");
+    let run = RunId(task.id.parse().unwrap());
+    let worker = spawn_worker(runtime.clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    // Wait on the view, not the task: a task read fetches the file, and the ten polls below must
+    // include the first fetch.
+    loop {
+        let view = runtime.view(run).await.unwrap().unwrap();
+        if view.status == adam_core::RunStatus::Done {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out: {view:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    worker.stop().await;
+
+    // The run is v5: its view is the head, with no message in it.
+    let view = runtime.view(run).await.unwrap().unwrap();
+    assert_eq!(
+        view.state["messages"].as_array().map(Vec::len),
+        Some(0),
+        "a splitting agent's head keeps no message"
+    );
+
+    counting.reset();
+    let mut first_id = None;
+    for poll in 0..10 {
+        let task = backend.get(&alice(), &task.id).await.unwrap().unwrap();
+        let logo = task
+            .artifacts
+            .as_ref()
+            .and_then(|artifacts| artifacts.iter().find(|a| a.name.as_deref() == Some("logo")))
+            .unwrap_or_else(|| panic!("poll {poll} has the file: {task:?}"));
+        assert_eq!(logo.parts[0].content, PartContent::Raw(SVG.to_vec()));
+        assert_eq!(logo.parts[0].filename.as_deref(), Some("logo.svg"));
+        match &first_id {
+            Some(id) => assert_eq!(&logo.artifact_id, id, "one id across polls"),
+            None => first_id = Some(logo.artifact_id.clone()),
+        }
+    }
+    assert_eq!(
+        counting.calls(Method::GetBlob),
+        1,
+        "ten polls fetched the file once"
+    );
+    assert_eq!(
+        counting.calls(Method::LoadHead),
+        10,
+        "one head per poll, and no state"
+    );
+    assert_eq!(counting.calls(Method::LoadRun), 0);
+    assert_eq!(counting.calls(Method::BodyList), 0, "a task reads no body");
 }
 
 /// An artifact with an id of its own is one artifact however often it changes: the task lists it
@@ -1451,7 +1558,7 @@ async fn a_repeated_submission_reads_the_run_once() {
         .unwrap();
     let before = (
         counting.calls(Method::LeaseUntil),
-        counting.calls(Method::LoadRun),
+        counting.calls(Method::LoadHead),
     );
     let retry = rig
         .backend
@@ -1462,7 +1569,7 @@ async fn a_repeated_submission_reads_the_run_once() {
     assert_eq!(
         (
             counting.calls(Method::LeaseUntil) - before.0,
-            counting.calls(Method::LoadRun) - before.1,
+            counting.calls(Method::LoadHead) - before.1,
         ),
         (1, 1),
         "one view for the repeat, not two"
@@ -1482,7 +1589,7 @@ async fn a_get_reads_the_run_once() {
         .unwrap();
     let before = (
         counting.calls(Method::LeaseUntil),
-        counting.calls(Method::LoadRun),
+        counting.calls(Method::LoadHead),
     );
     let read = rig.backend.get(&alice(), &task.id).await.unwrap().unwrap();
     // The submission carries the message it started with; a read does not (the handler adds it).
@@ -1492,7 +1599,7 @@ async fn a_get_reads_the_run_once() {
     assert_eq!(
         (
             counting.calls(Method::LeaseUntil) - before.0,
-            counting.calls(Method::LoadRun) - before.1,
+            counting.calls(Method::LoadHead) - before.1,
         ),
         (1, 1),
         "one view for the task"

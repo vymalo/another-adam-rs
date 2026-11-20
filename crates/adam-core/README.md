@@ -134,14 +134,15 @@ same sweep. A digest shared by several runs survives until the last one is purge
 
 The expand release of [ADR 0055](../../docs/decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md)
 adds the types and the **defaulted** methods a store needs to keep a run's transcript apart from its
-head; `state` is still the whole envelope, and the runtime reads neither in this slice.
+head; `state` is still the whole envelope a worker steps, and the observer reads the head
+(`Runtime::view` is one `load_head`, no body).
 
 | Method | What |
 |---|---|
 | `keeps_bodies()` | whether the store keeps a transcript beside the head (`body_list`, `RunUpdate::body`). `false` (the default) means `RunUpdate::state` is the whole run, exactly as before |
 | `body_list(run, generation)` | the rows of one generation, ordered by `idx`; empty when it does not exist. A store that keeps none answers empty |
 | `gc_body(run, keep_generation, before)` | delete the superseded generations of `run` written before `before`; returns how many rows. The generation a head names is never collected. A store that keeps none answers `0` |
-| `load_head(id)` | the run as an **observer** reads it: its `state` is the v5 head when the store has a current one (`head_version == version`), and the whole state otherwise. Defaults to `load_run`, so a store that keeps no head answers exactly as it does today. Nothing in the runtime calls it in the expand release: the tests do, and the read path (S2b) will |
+| `load_head(id)` | the run as an **observer** reads it: its `state` is the v5 head when the store has a current one (`head_version == version`), and the whole state otherwise. Defaults to `load_run`, so a store that keeps no head answers exactly as it does today. `Runtime::view` reads it and never a body; `Runtime::state` joins the head with the generation it names (`body_list`) |
 
 `BodyRow { idx, message }` is one row; `BodyWrite { generation, rows, writer }` is what a commit
 writes. A generation is **append-only**: `generation: None` appends `rows[old_len..]` to the current

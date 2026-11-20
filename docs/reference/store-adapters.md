@@ -52,8 +52,9 @@ is uploaded once. A store that keeps no blobs leaves the bytes in the state, exa
 gains the field: add `blobs: Vec::new()` or use `RunUpdate::new`.
 
 `keeps_bodies` / `body_list` / `gc_body` keep a run's **transcript** beside its head (ADR 0055). The
-expand release writes a v5 head and an append-only body generation beside the full v4 `state`, and
-serves neither: the runtime reads `state` exactly as before. A generation is `(run, generation, idx)`;
+expand release writes a v5 head and an append-only body generation beside the full v4 `state`; the
+observer reads the head (`Runtime::view` is one `load_head` and no body), while the worker and the
+contract release still read `state` through `load_run`. A generation is `(run, generation, idx)`;
 `RunUpdate.body` is `{generation, rows, writer}`, where `generation: None` appends the rows after the
 head's `len` and `Some(new)` is a compaction. A duplicate slot is this attempt's retry when the row's
 `writer` is this attempt. A row another attempt wrote is adopted when its message is the one this
@@ -63,7 +64,12 @@ insert retried once; a live attempt with a different message is a `Conflict`. Th
 across splitting commits: a headless commit (`deliver`, `cancel`, `park_again`, a failed one) makes
 the next split a compaction until S3, which writes the head those paths read. A commit with `head: None` leaves the stored head and
 its `head_version` alone (a delivery, a cancel or a park keeps the format it read), and `load_head`
-serves the head only when `head_version == version`. A store that keeps no bodies
+serves the head only when `head_version == version`. `load_head` is the observer's read
+(`Runtime::view`): an adapter that overrides it answers in one projected read — MongoDB now, the
+PostgreSQL half after #361 — and the trait default is `load_run`, so a store that keeps no head
+answers exactly as before. A `head_version != version` is **stale**, not corrupt: the whole state is
+served, and the next step re-splits and rewrites the head. That comparison is the whole mixed-fleet
+story in the read direction. A store that keeps no bodies
 (`keeps_bodies()` is `false`, the default) answers `body_list` empty and ignores both fields, exactly
 as before. **A hand-built `RunUpdate { .. }` literal stops compiling**: add `head: None, body: None`
 or use `RunUpdate::new`.
@@ -92,7 +98,7 @@ cron tick across all replicas. A second message on a conversation that has an op
 | Blob GC | `DELETE .. WHERE created_at < $cutoff AND NOT EXISTS (a run_blob row)`, in batches; run references cascade with the run. The sweep and a commit's ref insert are **not one transaction**: under `READ COMMITTED` an uncommitted ref is invisible, so a sweep can collect a blob a commit is about to name; the PostgreSQL follow-up (after #361) closes it with one data-modifying CTE | the same sweep in a loop; run references are deleted with the run. Its find-then-delete has the same uncommitted-ref window, closed by the insert, completeness check, then CAS ([ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md), decision 3) |
 | Blob references deleted with their run | `ON DELETE CASCADE` | deleted by the purge before the run document |
 | Transcript rows (schema version 5, part 2): a commit's delta, `body_list`, `gc_body` | **deferred**: the PostgreSQL store keeps `keeps_bodies() == false`, writes no row and answers `body_list` empty (the columns, the `adam_body` table and the one-transaction CTE are the PostgreSQL follow-up, after #361) | a generation is append-only: one unordered `insertMany` of the rows after the old head's `len` **before** the CAS, the completeness check (`inserted + duplicate_keys == rows.len()`, a write-concern error aborts), and a lost CAS deletes the attempt's `writer` rows and refs. A duplicate foreign slot is adopted when its message matches, collected after the 5-minute orphan grace, else a `Conflict`. A compaction writes all rows under a new generation; the old one is collected an hour later (`gc_body`) |
-| The head (schema version 5, part 2): `head`, `head_version`, `load_head` | **deferred**: the trait default (`load_head` = `load_run`) answers, and a commit's `head` is ignored | `head` and `head_version` on the run document; the store patches the head's `body` to `{generation, len}`; `load_head` serves the head only when `head_version == version`, else the whole state; a headless commit leaves both alone |
+| The head (schema version 5, part 2): `head`, `head_version`, `load_head` | **deferred**: the trait default (`load_head` = `load_run`) answers, so `Runtime::view` serves the whole state and reads no body; a commit's `head` is ignored | `head` and `head_version` on the run document; the store patches the head's `body` to `{generation, len}`; `load_head` serves the head only when `head_version == version`, else the whole state (the stale-head fallback); a headless commit leaves both alone. `Runtime::view` reads it, one query and no body |
 | Body rows deleted with their run | — | deleted by the purge with the journal and the references |
 | `run_header`: a run without its state, with its lease | one primary-key statement selecting the header columns and `lease_until`, never `state` | one `find_one` projected to the header and `lease_until` |
 | Transactions | none held across calls; a commit that names blobs opens one for its two statements | none (single-document writes only) |

@@ -154,10 +154,9 @@ impl Arm {
             return;
         };
         let view = rt.view(run).await.expect("view").expect("run exists");
-        self.committed
-            .lock()
-            .unwrap()
-            .push(conversation(&view).compactions.len());
+        // Not while holding the lock: the join reads the store.
+        let compactions = conversation(rt, &view).await.compactions.len();
+        self.committed.lock().unwrap().push(compactions);
     }
 
     fn armed(&self) {
@@ -339,7 +338,7 @@ impl Rig {
     async fn finish(&self, run: RunId) -> (Vec<ModelRequest>, Conversation) {
         let view = self.work(run).await;
         assert_eq!(view.status, RunStatus::Done, "{view:#?}");
-        (self.mock.requests(), conversation(&view))
+        (self.mock.requests(), conversation(&self.rt, &view).await)
     }
 }
 
@@ -355,8 +354,9 @@ async fn wait_terminal(rt: &Runtime, run: RunId) -> RunView {
     }
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 fn is_summary(request: &ModelRequest) -> bool {
@@ -1091,7 +1091,7 @@ async fn a_summary_that_cannot_be_made_after_a_rejection_fails_the_run_with_its_
     let error = view.error.clone().expect("an error");
     assert!(error.contains("the model alias is unknown"), "{error}");
     assert!(error.contains("Invalid"), "{error}");
-    let state = conversation(&view);
+    let state = conversation(&rig.rt, &view).await;
     assert!(state.compactions.is_empty(), "the history was not dropped");
     assert_eq!(state.messages.len(), 9);
     assert_eq!(rig.mock.requests().len(), 6, "no third try");
@@ -1232,7 +1232,7 @@ async fn a_shortening_leaves_the_estimate_to_start_again() {
     let run = rig.start().await;
     let view = rig.work(run).await;
     assert_eq!(view.status, RunStatus::Failed, "{view:#?}");
-    let state = conversation(&view);
+    let state = conversation(&rig.rt, &view).await;
     assert_eq!(state.shortenings.len(), 1, "{state:#?}");
     assert_eq!(state.last_prompt, None);
 }
@@ -1429,11 +1429,13 @@ async fn an_open_session_is_still_waited_for_after_its_start_was_cut() {
     // The parent has compacted, answered, and now waits for the session instead of ending.
     let parked = wait_for(&family.rt, parent, "parked on the session", |v| {
         v.status == RunStatus::Parked
-            && !conversation(v).compactions.is_empty()
-            && conversation(v).pending_wait.is_some()
+            && v.state["compactions"]
+                .as_array()
+                .is_some_and(|c| !c.is_empty())
+            && v.state.get("pending_wait").is_some_and(|w| !w.is_null())
     })
     .await;
-    let state = conversation(&parked);
+    let state = conversation(&family.rt, &parked).await;
     assert!(
         state.compactions[0].sessions,
         "the cut took the start with it"
@@ -1449,7 +1451,7 @@ async fn an_open_session_is_still_waited_for_after_its_start_was_cut() {
     let done = wait_for(&family.rt, parent, "done", |v| v.status == RunStatus::Done).await;
     let _ = stop.send(());
     worker.await.unwrap();
-    let state = conversation(&done);
+    let state = conversation(&family.rt, &done).await;
     assert!(
         state
             .messages
@@ -1482,7 +1484,7 @@ async fn a_subagent_compacts_against_its_own_budget() {
     let _ = stop.send(());
     worker.await.unwrap();
     assert!(
-        conversation(&done).compactions.is_empty(),
+        conversation(&family.rt, &done).await.compactions.is_empty(),
         "the parent did not compact"
     );
     let child = family
@@ -1491,7 +1493,7 @@ async fn a_subagent_compacts_against_its_own_budget() {
         .await
         .unwrap()
         .expect("the child's run");
-    let child = conversation(&child);
+    let child = conversation(&family.rt, &child).await;
     assert_eq!(child.compactions.len(), 1, "the child compacted itself");
     assert!(child.messages[0].text().contains("CHILD SUMMARY"));
 }

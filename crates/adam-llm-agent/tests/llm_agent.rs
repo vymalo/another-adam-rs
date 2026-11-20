@@ -18,9 +18,9 @@ use adam_model::{
     ModelRequest, ModelResponse, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_runtime::{
-    Agent, AgentStarter, CancelToken, Clock, CollectingSink, Inbound, ManualClock, RetryPolicy,
-    RunEvent, RunView, Runtime, RuntimeBuilder, StepEvent, StepIcon, StepKind, StepOutput,
-    StepState,
+    Agent, AgentStarter, ArtifactRef, CancelToken, Clock, CollectingSink, Inbound, ManualClock,
+    RetryPolicy, RunEvent, RunView, Runtime, RuntimeBuilder, StepEvent, StepIcon, StepKind,
+    StepOutput, StepState,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -242,8 +242,9 @@ fn output_of(view: &RunView) -> Option<Value> {
     output
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 fn custom(kind: &str, payload: Value) -> RunEvent {
@@ -353,7 +354,7 @@ async fn model_calls_tool_a_then_b_then_answers() {
         Message::tool_result("c2", "b-out"),
         Message::assistant_text("all done"),
     ];
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert_eq!(state.messages, expected);
     assert_eq!((state.turns, state.tool_calls), (3, 2));
     assert!(state.pending_calls.is_empty() && state.pending_wait.is_none());
@@ -410,7 +411,7 @@ async fn parallel_calls_in_one_message_run_in_order() {
     let view = wait_done(&rt, run).await;
     worker.stop().await;
 
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert_eq!(state.messages[2], Message::tool_result("c1", "a-out"));
     assert_eq!(state.messages[3], Message::tool_result("c2", "b-out"));
     assert_eq!(state.usage.input_tokens, 5);
@@ -464,7 +465,7 @@ async fn messages_delivered_mid_run_join_the_history() {
         requests[0].messages,
         vec![Message::user_text("first"), Message::user_text("second")]
     );
-    assert_eq!(conversation(&view).messages.len(), 5);
+    assert_eq!(conversation(&rt, &view).await.messages.len(), 5);
 }
 
 // ---------------------------------------------------------------------------
@@ -499,7 +500,7 @@ async fn unknown_tool_and_tool_errors_go_back_to_the_model() {
     let view = wait_done(&rt, run).await;
     worker.stop().await;
 
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     let results = &state.messages[2..5];
     let mut unknown = String::new();
     match &results[0] {
@@ -584,7 +585,7 @@ async fn artifacts_progress_and_context_reach_observers() {
     );
     assert_eq!(
         view.artifacts,
-        vec![Artifact::new(
+        vec![ArtifactRef::new(
             "report.md",
             Some("text/markdown".into()),
             json!("# hi")
@@ -667,7 +668,11 @@ async fn a_shared_file_is_an_artifact_and_its_bytes_never_reach_the_model() {
     // The file is the run's artifact, whole.
     assert_eq!(view.artifacts.len(), 1);
     let file = view.artifacts[0].file.as_ref().expect("a file artifact");
-    assert_eq!((file.filename.as_str(), &file.bytes), ("chart.png", &bytes));
+    assert_eq!(file.filename, "chart.png");
+    assert_eq!(file.size, bytes.len() as u64);
+    assert_eq!(file.digest(), adam_runtime::blob_id(&bytes));
+    let served = rt.artifact_bytes(file).await.unwrap().expect("the bytes");
+    assert_eq!(&served[..], &bytes[..], "the view's file is the run's file");
     assert_eq!(view.artifacts[0].mime_type.as_deref(), Some("image/png"));
 
     // The model read the line the tool wrote, in the history and in its next request.
@@ -678,7 +683,7 @@ async fn a_shared_file_is_an_artifact_and_its_bytes_never_reach_the_model() {
         "{second}"
     );
     assert!(!second.contains(&b64[..64]), "the bytes are in the request");
-    let history = serde_json::to_string(&conversation(&view).messages).unwrap();
+    let history = serde_json::to_string(&conversation(&rt, &view).await.messages).unwrap();
     assert!(
         !history.contains(&b64[..64]),
         "the bytes are in the history"
@@ -751,7 +756,7 @@ async fn a_run_may_share_only_so_many_bytes_of_files() {
     const { assert!(4 * 1024 * 1024 * 2 > MAX_RUN_FILE_BYTES) };
     let names: Vec<_> = view.artifacts.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(names, ["f0"], "the second file was not kept");
-    let history = conversation(&view).messages;
+    let history = conversation(&rt, &view).await.messages;
     let told = history
         .iter()
         .filter_map(|m| match m {
@@ -877,7 +882,7 @@ async fn transient_tool_error_retries_the_step() {
     assert_eq!(*attempts.lock().expect("lock"), vec![0, 1]);
     assert_eq!(view.output.clone().expect("output")["text"], "ok");
     assert_eq!(
-        conversation(&view).messages[2],
+        conversation(&rt, &view).await.messages[2],
         Message::tool_result("c1", "finally")
     );
     assert!(
@@ -1588,7 +1593,7 @@ async fn needs_input_parks_and_the_answer_becomes_the_tool_result() {
     assert_eq!(parked.status, RunStatus::Parked);
     assert!(parked.waiting);
     assert_eq!(
-        conversation(&parked).pending_wait,
+        conversation(&rt, &parked).await.pending_wait,
         Some(PendingWait::Question(PendingQuestion {
             call_id: "c1".into(),
             tool: "ask".into(),
@@ -1655,7 +1660,7 @@ async fn needs_input_parks_and_the_answer_becomes_the_tool_result() {
         .collect();
     assert_eq!(ended, [Some(StepOutput::new("prod", false))]);
     assert_eq!(echo_calls.load(SeqCst), 1);
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert!(state.pending_wait.is_none() && state.pending_calls.is_empty());
     assert_eq!(state.messages[2], Message::tool_result("c1", "prod"));
     assert_eq!(state.messages[3], Message::tool_result("c2", "echo-out"));
@@ -1698,7 +1703,7 @@ async fn extra_user_messages_wait_behind_the_owed_tool_results() {
     let view = wait_done(&rt, run).await;
     worker.stop().await;
 
-    let messages = conversation(&view).messages;
+    let messages = conversation(&rt, &view).await.messages;
     assert_eq!(messages[2], Message::tool_result("c1", "prod"));
     assert_eq!(messages[3], Message::tool_result("c2", "echo-out"));
     assert_eq!(messages[4], Message::user_text("and be quick"));
@@ -1732,7 +1737,8 @@ async fn an_unreadable_message_does_not_answer_the_question() {
     })
     .await;
     assert!(
-        conversation(&rt.view(run).await.unwrap().unwrap())
+        conversation(&rt, &rt.view(run).await.unwrap().unwrap())
+            .await
             .pending_wait
             .is_some()
     );
@@ -1741,7 +1747,7 @@ async fn an_unreadable_message_does_not_answer_the_question() {
     let view = wait_done(&rt, run).await;
     worker.stop().await;
     assert_eq!(
-        conversation(&view).messages[2],
+        conversation(&rt, &view).await.messages[2],
         Message::tool_result("c1", "yes")
     );
 }
@@ -1859,7 +1865,7 @@ async fn a_run_at_max_turns_ends_with_a_limited_answer() {
             "limit": "max_turns"
         }))
     );
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert_eq!(state.turns, 3);
     assert!(
         state
@@ -1898,7 +1904,7 @@ async fn a_closing_turn_that_calls_tools_anyway_keeps_only_its_text() {
 
     assert_eq!(a_calls.load(SeqCst), 2, "the stray call never runs");
     assert_eq!(view.output.as_ref().expect("output")["text"], "summary");
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert!(state.pending_calls.is_empty());
     let Some(Message::Assistant { tool_calls, .. }) = state.messages.last() else {
         panic!("{:?}", state.messages)
@@ -1934,7 +1940,7 @@ async fn a_closing_turn_with_no_words_fails_naming_the_limit() {
 async fn held_at_the_closing_answer<F, Fut>(
     mock: &Arc<MockModel>,
     during: F,
-) -> (RunView, Arc<MockModel>)
+) -> (Runtime, RunView, Arc<MockModel>)
 where
     F: FnOnce(Runtime, RunId) -> Fut,
     Fut: std::future::Future<Output = ()>,
@@ -1965,7 +1971,7 @@ where
     })
     .await;
     worker.stop().await;
-    (view, mock.clone())
+    (rt, view, mock.clone())
 }
 
 fn closing_script() -> Arc<MockModel> {
@@ -1980,7 +1986,7 @@ fn closing_script() -> Arc<MockModel> {
 async fn a_message_after_the_closing_answer_gets_a_closing_turn_of_its_own() {
     let mock = closing_script();
     mock.push_text("second closing words");
-    let (view, mock) = held_at_the_closing_answer(&mock, |rt, run| async move {
+    let (_rt, view, mock) = held_at_the_closing_answer(&mock, |rt, run| async move {
         rt.deliver(run, user_message("one more thing"))
             .await
             .expect("deliver");
@@ -2009,7 +2015,7 @@ async fn a_message_after_the_closing_answer_gets_a_closing_turn_of_its_own() {
 async fn a_reopen_with_nothing_new_re_finishes_identically() {
     let mock = closing_script();
     mock.push_text("must never be asked for");
-    let (view, mock) = held_at_the_closing_answer(&mock, |rt, run| async move {
+    let (rt, view, mock) = held_at_the_closing_answer(&mock, |rt, run| async move {
         // A message the loop cannot read reopens the run and adds nothing to the history.
         rt.deliver(
             run,
@@ -2021,7 +2027,7 @@ async fn a_reopen_with_nothing_new_re_finishes_identically() {
     .await;
 
     assert_eq!(mock.requests().len(), 3, "no fourth model call");
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     let kept = state
         .limit
         .as_ref()
@@ -2154,7 +2160,7 @@ async fn max_tool_calls_ends_the_run_limited_across_turns() {
     let output = view.output.clone().expect("output");
     assert_eq!(output["limit"], "max_tool_calls");
     assert_eq!(output["text"], "two calls made");
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     let Message::Tool {
         content, is_error, ..
     } = &state.messages[6]
@@ -2192,7 +2198,7 @@ async fn max_tool_calls_answers_an_oversized_turn_not_run_and_then_closes() {
     let view = wait_done(&rt, run).await;
     worker.stop().await;
     assert_eq!(a_calls.load(SeqCst), 0);
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     for (i, id) in ["c1", "c2", "c3"].into_iter().enumerate() {
         let Message::Tool {
             call_id,
@@ -2281,7 +2287,7 @@ async fn invalid_tool_arguments_are_an_error_result_and_the_run_completes() {
         0,
         "a call that is not JSON never runs"
     );
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     let Message::Tool {
         call_id,
         content,
@@ -2351,7 +2357,7 @@ async fn invalid_tool_arguments_count_against_max_tool_calls() {
             .expect("error")
             .contains("max_tool_calls = 2")
     );
-    assert_eq!(conversation(&view).tool_calls, 2);
+    assert_eq!(conversation(&rt, &view).await.tool_calls, 2);
 }
 
 #[tokio::test]
@@ -2382,7 +2388,7 @@ async fn a_replayed_invalid_call_calls_no_model_and_answers_the_same() {
     let view = wait_done(&rt, run).await;
     worker.stop().await;
     assert_eq!(h.mock.requests().len(), 1, "turn 0 was recorded");
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert!(
         matches!(&state.messages[2], Message::Tool { content, is_error: true, .. } if content.contains("{oops"))
     );
@@ -2437,7 +2443,7 @@ async fn history_truncates_old_tool_outputs_and_keeps_the_newest() {
 
     // The stored history is what was sent: shortened once, at the turn that did it (ADR 0044
     // slice 4); the newest output is whole.
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert_eq!(
         state.messages[2].text(),
         old,
@@ -2558,7 +2564,7 @@ async fn crash_between_a_tool_and_the_next_model_call_does_not_repeat_the_tool()
         output_of(&view),
         Some(json!({"text": "finished", "artifacts": []}))
     );
-    let messages = conversation(&view).messages;
+    let messages = conversation(&rt_b, &view).await.messages;
     assert_eq!(messages[2], Message::tool_result("c1", "a-out"));
 }
 
@@ -2613,7 +2619,7 @@ async fn crash_mid_step_replays_the_journal_instead_of_repeating_effects() {
         2,
         "the recorded model turn is replayed"
     );
-    let messages = conversation(&view).messages;
+    let messages = conversation(&rt_b, &view).await.messages;
     assert_eq!(messages[2], Message::tool_result("c1", "a-out"));
     assert_eq!(messages[3], Message::tool_result("c2", "b-out"));
     assert_eq!(view.output.expect("output")["text"], "both done");
@@ -2715,7 +2721,7 @@ async fn call_ids_a_client_made_up_are_journaled_and_a_resumed_run_keeps_them() 
     let view = wait_done(&rt_b, run).await;
     survivor.stop().await;
 
-    let messages = conversation(&view).messages;
+    let messages = conversation(&rt_b, &view).await.messages;
     // The calls the model made are the ones the first model call made up, and so are their results.
     let Message::Assistant { tool_calls, .. } = &messages[1] else {
         panic!("{messages:?}")
@@ -2780,7 +2786,7 @@ async fn registering_a_tool_twice_keeps_the_last_and_one_spec() {
     worker.stop().await;
     assert_eq!(h.mock.requests()[0].tools.len(), 1);
     assert_eq!(
-        conversation(&view).messages[2],
+        conversation(&rt, &view).await.messages[2],
         Message::tool_result("c1", "second")
     );
     assert_eq!(adam_runtime::Agent::name(&agent), "llm");
@@ -2884,7 +2890,7 @@ async fn a_new_run_continues_a_finished_one_and_the_model_sees_the_earlier_messa
         .await
         .expect("start");
     let first_view = wait_done(&rt, first).await;
-    let earlier = conversation(&first_view).messages;
+    let earlier = conversation(&rt, &first_view).await.messages;
     assert_eq!(earlier.len(), 4);
 
     let second = RunId::new();
@@ -2908,7 +2914,7 @@ async fn a_new_run_continues_a_finished_one_and_the_model_sees_the_earlier_messa
     expected.push(Message::user_text("second task"));
     assert_eq!(requests.last().unwrap().messages, expected);
 
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert_eq!(state.continued_from, Some(first));
     assert_eq!((state.turns, state.tool_calls), (1, 0));
     assert_eq!(
@@ -2921,7 +2927,9 @@ async fn a_new_run_continues_a_finished_one_and_the_model_sees_the_earlier_messa
     );
     // The first run is as it was.
     assert_eq!(
-        conversation(&rt.view(first).await.unwrap().unwrap()).messages,
+        conversation(&rt, &rt.view(first).await.unwrap().unwrap())
+            .await
+            .messages,
         earlier
     );
 }
@@ -2961,7 +2969,7 @@ async fn a_start_only_front_continues_and_a_worker_steps() {
             .await
             .unwrap()
     );
-    let started = conversation(&front.view(second).await.unwrap().unwrap());
+    let started = conversation(&front, &front.view(second).await.unwrap().unwrap()).await;
     assert_eq!(
         started.messages,
         [
@@ -2994,7 +3002,7 @@ async fn a_run_cancelled_on_a_question_continues_without_the_stale_wait() {
         .await
         .expect("start");
     let parked = wait_waiting(&rt, first).await;
-    assert!(conversation(&parked).pending_wait.is_some());
+    assert!(conversation(&rt, &parked).await.pending_wait.is_some());
     rt.cancel(first, "changed my mind").await.unwrap();
 
     let second = RunId::new();
@@ -3009,7 +3017,7 @@ async fn a_run_cancelled_on_a_question_continues_without_the_stale_wait() {
         .await
         .unwrap()
     );
-    let started = conversation(&rt.view(second).await.unwrap().unwrap());
+    let started = conversation(&rt, &rt.view(second).await.unwrap().unwrap()).await;
     assert!(started.pending_wait.is_none() && started.pending_calls.is_empty());
     // The model keeps its call, is told it was stopped, and the new message follows.
     assert_eq!(
@@ -3392,7 +3400,7 @@ async fn a_calls_step_carries_its_input_and_output_scrubbed_and_cut() {
     // What the model was told is its own business: the model got the raw result (the tools
     // scrub for the model, the step for the observer).
     assert_eq!(
-        conversation(&view).messages[2],
+        conversation(&rt, &view).await.messages[2],
         Message::tool_result("c1", format!("found {SECRET}"))
     );
     // A result of 20 KiB is cut to 8 KiB, head and tail, marked as an error; the secret is gone.
@@ -3471,7 +3479,7 @@ async fn a_nul_in_a_tools_output_is_the_replacement_character_in_the_journal_and
     let view = wait_done(&rt, run).await;
     worker.stop().await;
 
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     let said = state.messages.iter().find_map(|m| match m {
         Message::Tool { content, .. } => Some(content.as_str()),
         _ => None,
@@ -3625,7 +3633,7 @@ async fn tool_result_of_tool(tool: impl Tool) -> (String, String) {
     let view = wait_done(&rt, run).await;
     worker.stop().await;
     let sent = h.mock.requests()[1].messages[2].text();
-    let kept = conversation(&view).messages[2].text();
+    let kept = conversation(&rt, &view).await.messages[2].text();
     (sent, kept)
 }
 
@@ -3758,7 +3766,10 @@ async fn replay_gives_the_same_cut_bytes() {
 
     let whole = "é".repeat(400_000);
     let expected = adam_llm_agent::paging::backstop(&whole, "bulky", false);
-    assert_eq!(conversation(&view).messages[2].text(), expected.as_ref());
+    assert_eq!(
+        conversation(&rt_b, &view).await.messages[2].text(),
+        expected.as_ref()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3808,8 +3819,9 @@ fn assert_prefix_holds(requests: &[adam_model::ModelRequest]) {
     }
 }
 
-fn tool_texts(view: &RunView) -> Vec<String> {
-    conversation(view)
+async fn tool_texts(rt: &Runtime, view: &RunView) -> Vec<String> {
+    conversation(rt, view)
+        .await
         .messages
         .iter()
         .filter(|m| matches!(m, adam_model::Message::Tool { .. }))
@@ -3844,9 +3856,9 @@ async fn a_long_result_is_kept_in_the_state_and_read_back_whole_page_by_page() {
     let view = wait_done(&rt, run).await;
     worker.stop().await;
 
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert_eq!(state.kept_outputs.get(&id), Some(&text));
-    let texts = tool_texts(&view);
+    let texts = tool_texts(&rt, &view).await;
     assert_eq!(texts.len(), 4);
     let head = format!("[kept as {id}: 7000 lines; read_output {{\"id\":\"{id}\"}} reads it]\n");
     assert!(texts[0].starts_with(&head), "{}", &texts[0][..120]);
@@ -3911,7 +3923,7 @@ async fn kept_output_survives_a_replay() {
     survivor.stop().await;
     let id = adam_llm_agent::output_id(&run.to_string(), "c1");
     assert_eq!(
-        conversation(&view).kept_outputs.get(&id),
+        conversation(&rt_b, &view).await.kept_outputs.get(&id),
         Some(&text),
         "the recorded result carried the kept text across the crash"
     );
@@ -3935,8 +3947,8 @@ async fn a_result_over_the_runs_room_is_not_kept_and_says_so() {
     let worker = spawn_worker(&rt);
     let view = wait_done(&rt, run).await;
     worker.stop().await;
-    assert!(conversation(&view).kept_outputs.is_empty());
-    let shown = &tool_texts(&view)[0];
+    assert!(conversation(&rt, &view).await.kept_outputs.is_empty());
+    let shown = &tool_texts(&rt, &view).await[0];
     assert!(
         shown.contains("[not kept: a run keeps at most 4 MiB of long results here"),
         "{}",
@@ -3961,7 +3973,7 @@ async fn read_output_says_what_is_wrong_with_the_id() {
     let worker = spawn_worker(&rt);
     let view = wait_done(&rt, run).await;
     worker.stop().await;
-    let said = tool_texts(&view);
+    let said = tool_texts(&rt, &view).await;
     assert!(said[0].contains("is not an output id"), "{}", said[0]);
     assert!(
         said[1].contains("no kept output `o-0123456789abcdef` in this run"),
@@ -3992,8 +4004,8 @@ async fn with_a_store_in_the_state_the_text_is_not_in_the_run() {
     let worker = spawn_worker(&rt);
     let view = wait_done(&rt, run).await;
     worker.stop().await;
-    assert!(conversation(&view).kept_outputs.is_empty());
-    assert!(tool_texts(&view)[0].starts_with("[kept as o-"));
+    assert!(conversation(&rt, &view).await.kept_outputs.is_empty());
+    assert!(tool_texts(&rt, &view).await[0].starts_with("[kept as o-"));
     assert!(
         !view.state.to_string().contains("row-006999"),
         "nothing of the text but the first page is in the run's state"
@@ -4055,7 +4067,7 @@ async fn the_runs_four_mib_is_a_bound_and_every_id_the_model_was_shown_reads() {
     let worker = spawn_worker(&rt);
     let view = wait_done(&rt, run).await;
     worker.stop().await;
-    let said = tool_texts(&view);
+    let said = tool_texts(&rt, &view).await;
     assert!(
         said[0].starts_with(&format!("[kept as {first}:")),
         "{}",
@@ -4071,7 +4083,7 @@ async fn the_runs_four_mib_is_a_bound_and_every_id_the_model_was_shown_reads() {
         "the second names no id: it is not kept"
     );
     assert!(said[2].contains("[end: "), "{}", said[2]);
-    assert_eq!(conversation(&view).kept_outputs.len(), 1);
+    assert_eq!(conversation(&rt, &view).await.kept_outputs.len(), 1);
 }
 
 #[tokio::test]
@@ -4100,12 +4112,12 @@ async fn a_long_line_is_kept_folded_and_reassembles_from_its_pages() {
     let worker = spawn_worker(&rt);
     let view = wait_done(&rt, run).await;
     worker.stop().await;
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     // What the state keeps is the prepared text (folded), not the raw one.
     let kept = state.kept_outputs.get(&id).unwrap();
     assert!(kept.lines().all(|l| l.chars().count() <= 2000));
     assert_eq!(kept.replace('\n', ""), text.replace('\n', ""));
-    let said = tool_texts(&view);
+    let said = tool_texts(&rt, &view).await;
     let page = &said[1];
     let body = page.rsplit_once('\n').unwrap().0;
     assert_eq!(body.replace('\n', ""), text.replace('\n', ""));
@@ -4130,7 +4142,7 @@ async fn an_error_result_never_puts_a_text_in_the_state() {
     let worker = spawn_worker(&rt);
     let view = wait_done(&rt, run).await;
     worker.stop().await;
-    assert!(conversation(&view).kept_outputs.is_empty());
+    assert!(conversation(&rt, &view).await.kept_outputs.is_empty());
 }
 
 /// With a keeper in the state, what the model is shown of the first page is made from what the
@@ -4158,7 +4170,7 @@ async fn the_first_page_is_made_from_what_the_keeper_kept() {
     let worker = spawn_worker(&rt);
     let view = wait_done(&rt, run).await;
     worker.stop().await;
-    let shown = &tool_texts(&view)[0];
+    let shown = &tool_texts(&rt, &view).await[0];
     assert!(!shown.contains(secret), "{}", &shown[..200]);
     assert!(shown.contains("first line [redacted]"), "{}", &shown[..200]);
 }

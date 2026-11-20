@@ -562,6 +562,29 @@ async fn wait_for(
     }
 }
 
+/// Like [`wait_for`], but `pred` sees the joined state too (one body read per poll): for a
+/// condition on the transcript, which the head does not carry.
+async fn wait_for_state(
+    rt: &Runtime,
+    run: RunId,
+    what: &str,
+    pred: impl Fn(&RunView, &Conversation) -> bool,
+) -> RunView {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let view = rt.view(run).await.expect("view").expect("run exists");
+        let state = conversation(rt, &view).await;
+        if pred(&view, &state) {
+            return view;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}; last view: {view:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// The session `session` of `conversation` once `pred` holds of it.
 async fn session_until(
     rt: &Runtime,
@@ -593,7 +616,12 @@ async fn wait_waiting_on_a_session(rt: &Runtime, run: RunId) -> RunView {
     wait_for(rt, run, "parked on a session", |v| {
         v.status == RunStatus::Parked
             && v.wake_at.is_some()
-            && matches!(conversation(v).pending_wait, Some(PendingWait::Session(_)))
+            && matches!(
+                serde_json::from_value::<Conversation>(v.state.clone())
+                    .expect("the head is a Conversation")
+                    .pending_wait,
+                Some(PendingWait::Session(_))
+            )
     })
     .await
 }
@@ -604,8 +632,9 @@ async fn reached(n: &Notify, what: &str) {
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 /// The tool results the history holds, in order.
@@ -672,7 +701,7 @@ fn conv_id() -> String {
 
 /// The state of the parent after it finished (or while it waits), as a `Conversation`.
 async fn state_of(rt: &Runtime, run: RunId) -> Conversation {
-    conversation(&rt.view(run).await.unwrap().unwrap())
+    conversation(rt, &rt.view(run).await.unwrap().unwrap()).await
 }
 
 /// The id of the call the loop invents for the report of the round `round` (`report_<32 hex>`).
@@ -760,7 +789,7 @@ mod cases {
         // started: a start never parks the parent.
         reached(&rig.child_gate.reached, "the child's model call").await;
         let parked = wait_waiting_on_a_session(&rt, parent).await;
-        let state = conversation(&parked);
+        let state = conversation(&rt, &parked).await;
         let results = tool_results(&state);
         let started = as_json(&result_of(&results, "c1").1);
         assert_eq!(started["session"], session.to_string());
@@ -909,7 +938,7 @@ mod cases {
         let worker = spawn_worker(&rt);
         reached(&rig.child_gate.reached, "the child's model call").await;
         let parked = wait_waiting_on_a_session(&rt, parent).await;
-        let results = tool_results(&conversation(&parked));
+        let results = tool_results(&conversation(&rt, &parked).await);
         let working = &result_of(&results, "c2").1;
         assert!(working.contains("round 1, working"), "{working}");
         assert!(working.contains("report: none yet"), "{working}");
@@ -943,7 +972,7 @@ mod cases {
         reached(&rig.child_gate.reached, "the child's model call").await;
         let parked = wait_waiting_on_a_session(&rt, parent).await;
         assert!(matches!(
-            conversation(&parked).pending_wait,
+            conversation(&rt, &parked).await.pending_wait,
             Some(PendingWait::Session(PendingSession { ref call_id, .. })) if call_id == "c2"
         ));
         assert_eq!(
@@ -1073,10 +1102,8 @@ mod cases {
         let worker = spawn_worker(&rt);
         reached(&rig.child_gate.reached, "the child's model call").await;
         // The send is answered while the round is held.
-        wait_for(&rt, parent, "the steer to be answered", |v| {
-            tool_results(&conversation(v))
-                .iter()
-                .any(|(id, _, _)| id == "c2")
+        wait_for_state(&rt, parent, "the steer to be answered", |_, state| {
+            tool_results(state).iter().any(|(id, _, _)| id == "c2")
         })
         .await;
         rig.child_gate.release.notify_one();
@@ -1269,10 +1296,8 @@ mod cases {
             .push_text("the third finished");
         let worker = spawn_worker(&rt);
         reached(&rig.child_gate.reached, "the third child").await;
-        wait_for(&rt, parent, "the listings", |v| {
-            tool_results(&conversation(v))
-                .iter()
-                .any(|(id, _, _)| id == "c10")
+        wait_for_state(&rt, parent, "the listings", |_, state| {
+            tool_results(state).iter().any(|(id, _, _)| id == "c10")
         })
         .await;
         rig.child_gate.release.notify_one();
@@ -1886,7 +1911,7 @@ mod cases {
             .await
             .unwrap();
         for run in [session, list.sessions[0].latest_run] {
-            let c = conversation(&rt.view(run).await.unwrap().unwrap());
+            let c = conversation(&rt, &rt.view(run).await.unwrap().unwrap()).await;
             assert_eq!(
                 c.context.get(adam_llm_agent::ACCESS_TIER_CONTEXT_KEY),
                 Some(&json!({"tier": "plan"})),
@@ -2551,7 +2576,7 @@ mod cases {
         reached(&rig.child_gate.reached, "round two").await;
         let parked = wait_waiting_on_a_session(&rt, second).await;
         assert!(matches!(
-            &conversation(&parked).pending_wait,
+            &conversation(&rt, &parked).await.pending_wait,
             Some(PendingWait::Session(PendingSession { call_id, tool, session: s }))
                 if call_id == "wait_1" && tool == "subagent_read" && *s == session
         ));
@@ -2940,12 +2965,14 @@ mod cases {
         reached(&rig.child_gate.reached, "the second round").await;
         let parked = wait_for(&rt, parent, "parked on the second round", |v| {
             matches!(
-                conversation(v).pending_wait,
+                serde_json::from_value::<Conversation>(v.state.clone())
+                    .expect("the head is a Conversation")
+                    .pending_wait,
                 Some(PendingWait::Session(ref wait)) if wait.call_id == "c4"
             )
         })
         .await;
-        let state = conversation(&parked);
+        let state = conversation(&rt, &parked).await;
         assert_eq!(
             tokens(&state),
             (100, 10),
@@ -3667,7 +3694,7 @@ mod cases {
         .await;
         worker.stop().await;
         assert_eq!(done.status, RunStatus::Done, "{done:?}");
-        let replayed = conversation(&done);
+        let replayed = conversation(&again_rt, &done).await;
         assert_eq!(tokens(&replayed), (100, 10), "counted once");
         assert!(replayed.rounds_started.is_empty());
         // The answer that predated the message was dropped, and the model answered again.
@@ -4236,7 +4263,7 @@ mod cases {
         .await;
         worker.stop().await;
         assert_eq!(done.status, RunStatus::Done, "{done:?}");
-        let replayed = conversation(&done);
+        let replayed = conversation(&again_rt, &done).await;
         assert!(
             report_calls(&replayed.messages).is_empty(),
             "the stale answer's reports were not appended: {:?}",

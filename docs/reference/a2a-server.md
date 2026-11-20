@@ -552,6 +552,17 @@ The states that are lines: `StandIn` is written once into the history (the recor
 
 Code: `crates/adam-a2a-runtime/src/files_in.rs`, `crates/adam-llm-agent/src/images.rs`, `crates/adam-model-openai/src/wire.rs`.
 
+## The artifacts of a run
+
+A task's `artifacts` are the run's committed artifacts (`RunView::artifacts`), read from the head. A
+file is a `FileRef`: a v4 run carries its bytes inline, a v5 run names a blob by content address and
+size. The backend fetches a blob with `Runtime::artifact_bytes` once per address and caches it in the
+runtime (32 MiB, least recently used first), so ten `GetTask` polls, a subscription's snapshot and an
+artifact event transfer the head and no file after the first read; the queue charge of a file event
+is its `FileRef.size`, known before the fetch. A blob that is gone (purged once no run referenced
+it) leaves that artifact out of the task, and the run is intact. A JSON artifact carries its data; an
+artifact with an id is listed once, holding the newest.
+
 ## Streamed text
 
 A model turn streams by default (`LlmAgentBuilder::stream_text`): the journaled step `model:<turn>` calls

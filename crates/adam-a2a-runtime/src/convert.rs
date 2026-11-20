@@ -7,7 +7,7 @@ use a2a::{Artifact, Message, Part, Role, Task, TaskState, TaskStatus};
 use adam_a2a::A2UI_MEDIA_TYPE;
 use adam_a2a::REPLACEABLE_ARTIFACT;
 use adam_core::RunStatus;
-use adam_runtime::{Inbound, RunView};
+use adam_runtime::{ArtifactRef, FileSource, Inbound, RunView};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -238,8 +238,15 @@ pub(crate) fn status_key(status: &TaskStatus) -> StatusKey {
 
 /// The whole task, from the durable record only. A task that ended or waits for its caller carries
 /// the `usage/v1` totals its agent keeps, whoever reads it (see `usage`).
-pub(crate) fn task_from_view(view: &RunView, context_id: &str, prompt: &PromptFn) -> Task {
-    let artifacts: Vec<Artifact> = view.artifacts.iter().map(artifact_of).collect();
+///
+/// `artifacts` are the run's artifacts already resolved for the wire (`artifact_of`): a file's
+/// bytes are fetched by the caller, once per blob, never by this mapping.
+pub(crate) fn task_from_view(
+    view: &RunView,
+    context_id: &str,
+    prompt: &PromptFn,
+    artifacts: Vec<Artifact>,
+) -> Task {
     let status = status_of(view, prompt);
     let settled = status.state.is_terminal()
         || matches!(
@@ -272,30 +279,41 @@ pub(crate) fn task_from_view(view: &RunView, context_id: &str, prompt: &PromptFn
 /// URL, so a client shows a link where it would otherwise show JSON. The data
 /// part is unchanged, and the artifact id does not depend on the extra part.
 ///
-/// **A file is a file.** A file artifact ([`adam_runtime::Artifact::file`]) becomes one A2A `raw`
-/// part (`Part.raw` of the A2A v1 `a2a.proto`: the bytes, base64 in JSON) with the `mediaType`
-/// and the `filename`, and nothing else: no extension is needed, a plain A2A client gets a
-/// standard artifact. The artifact id is derived from the file's digest, not from its bytes
-/// serialized, so it costs one pass over them.
-pub fn artifact_of(artifact: &adam_runtime::Artifact) -> Artifact {
-    artifact_of_with(artifact, artifact_id(artifact))
+/// **A file is a file.** A file artifact ([`adam_runtime::ArtifactRef::file`]) becomes one A2A
+/// `raw` part (`Part.raw` of the A2A v1 `a2a.proto`: the bytes, base64 in JSON) with the
+/// `mediaType` and the `filename`, and nothing else: no extension is needed, a plain A2A client
+/// gets a standard artifact. The artifact id is derived from the file's digest, not from its bytes
+/// serialized, so it costs one pass over them, and it is the same id a v4 run's inline copy has.
+///
+/// `bytes` is the fetched blob for a [`FileSource::Blob`]; an inline file ignores it. `None` for a
+/// blob that is gone answers `None`: that artifact cannot be served, and the run is intact.
+pub fn artifact_of(artifact: &ArtifactRef, bytes: Option<Arc<[u8]>>) -> Option<Artifact> {
+    artifact_of_with(artifact, artifact_id(artifact), bytes)
 }
 
 /// [`artifact_of`] for a caller that already derived the id ([`ArtifactIds`] caches it).
-pub(crate) fn artifact_of_with(artifact: &adam_runtime::Artifact, id: String) -> Artifact {
+pub(crate) fn artifact_of_with(
+    artifact: &ArtifactRef,
+    id: String,
+    bytes: Option<Arc<[u8]>>,
+) -> Option<Artifact> {
     if let Some(file) = &artifact.file {
-        let mut part = Part::raw(file.bytes.clone()).with_filename(file.filename.clone());
+        let held: Arc<[u8]> = match &file.source {
+            FileSource::Inline(bytes) => Arc::from(bytes.as_slice()),
+            FileSource::Blob(_) => bytes?,
+        };
+        let mut part = Part::raw(held.to_vec()).with_filename(file.filename.clone());
         if let Some(mime) = &artifact.mime_type {
             part = part.with_media_type(mime.clone());
         }
-        return Artifact {
+        return Some(Artifact {
             artifact_id: id,
             name: Some(artifact.name.clone()),
             description: None,
             parts: vec![part],
             metadata: None,
             extensions: None,
-        };
+        });
     }
     let part = match &artifact.data {
         Value::String(s) => Part::text(s.clone()),
@@ -317,7 +335,7 @@ pub(crate) fn artifact_of_with(artifact: &adam_runtime::Artifact, id: String) ->
     if let Some(url) = link_of(&artifact.data) {
         parts.push(Part::url(url));
     }
-    Artifact {
+    Some(Artifact {
         artifact_id: id,
         name: Some(artifact.name.clone()),
         description: None,
@@ -327,7 +345,7 @@ pub(crate) fn artifact_of_with(artifact: &adam_runtime::Artifact, id: String) ->
             .is_some()
             .then(|| HashMap::from([(REPLACEABLE_ARTIFACT.to_owned(), json!(true))])),
         extensions: None,
-    }
+    })
 }
 
 /// The `url` of an object-shaped artifact, when it is an absolute `http(s)` URL.
@@ -339,13 +357,13 @@ fn link_of(data: &Value) -> Option<&str> {
     (!rest.is_empty() && !url.chars().any(char::is_whitespace)).then_some(url)
 }
 
-/// The A2A id of a run artifact: the id it was given ([`adam_runtime::Artifact::id`]), else the
+/// The A2A id of a run artifact: the id it was given ([`adam_runtime::ArtifactRef::id`]), else the
 /// content-derived `<name>-<12 hex digits>`.
 ///
 /// An artifact with an id of its own is **one artifact however often it changes**: the run holds
 /// the newest, the task lists it once, and the stream sends each change under that id with no
 /// `append`, which in A2A replaces the artifact with that id on the client.
-pub fn artifact_id(artifact: &adam_runtime::Artifact) -> String {
+pub fn artifact_id(artifact: &ArtifactRef) -> String {
     artifact.id.clone().unwrap_or_else(|| derived_id(artifact))
 }
 
@@ -359,7 +377,7 @@ pub(crate) struct Mapped {
 }
 
 impl Mapped {
-    fn of(artifact: &adam_runtime::Artifact) -> Self {
+    fn of(artifact: &ArtifactRef) -> Self {
         let content = derived_id(artifact);
         Self {
             id: artifact.id.clone().unwrap_or_else(|| content.clone()),
@@ -398,14 +416,14 @@ struct Held {
     id: Option<String>,
     name: String,
     mime_type: Option<String>,
-    /// `null` for a file ([`adam_runtime::Artifact::file`]).
+    /// `null` for a file ([`adam_runtime::ArtifactRef::file`]).
     data: Value,
     /// A file's filename and length.
-    file: Option<(String, usize)>,
+    file: Option<(String, u64)>,
 }
 
 impl Held {
-    fn of(artifact: &adam_runtime::Artifact) -> Self {
+    fn of(artifact: &ArtifactRef) -> Self {
         Self {
             id: artifact.id.clone(),
             name: artifact.name.clone(),
@@ -414,11 +432,11 @@ impl Held {
             file: artifact
                 .file
                 .as_ref()
-                .map(|file| (file.filename.clone(), file.bytes.len())),
+                .map(|file| (file.filename.clone(), file.size)),
         }
     }
 
-    fn is(&self, artifact: &adam_runtime::Artifact) -> bool {
+    fn is(&self, artifact: &ArtifactRef) -> bool {
         self.id == artifact.id
             && self.name == artifact.name
             && self.mime_type == artifact.mime_type
@@ -427,14 +445,14 @@ impl Held {
                 == artifact
                     .file
                     .as_ref()
-                    .map(|file| (file.filename.as_str(), file.bytes.len()))
+                    .map(|file| (file.filename.as_str(), file.size))
     }
 }
 
 impl ArtifactIds {
     /// The id of `artifact`, at position `at` in the run's list, from the entry of the last poll
     /// when it is the same artifact.
-    pub(crate) fn mapped(&mut self, at: usize, artifact: &adam_runtime::Artifact) -> Mapped {
+    pub(crate) fn mapped(&mut self, at: usize, artifact: &ArtifactRef) -> Mapped {
         #[cfg(test)]
         work::asked();
         if let Some(Some(entry)) = self.entries.get(at)
@@ -465,25 +483,26 @@ impl ArtifactIds {
 /// sent under that id** (one entry per id, however often it changes, and a change back to an earlier
 /// content is a change); an artifact with no id has its content-derived id for a slot, and is said
 /// once.
-pub(crate) fn artifact_slot(artifact: &adam_runtime::Artifact) -> (String, String) {
+pub(crate) fn artifact_slot(artifact: &ArtifactRef) -> (String, String) {
     let mapped = Mapped::of(artifact);
     (mapped.id, mapped.content)
 }
 
 /// Content-derived artifact id: `<name>-<12 hex digits>`.
 ///
-/// For a file the digest covers its filename and the digest of its bytes, so two files that differ
-/// by one byte have two ids and the same file twice has one.
-fn derived_id(artifact: &adam_runtime::Artifact) -> String {
+/// For a file the digest covers its filename and the digest of its bytes (the blob's id, or the
+/// SHA-256 of the inline bytes), so two files that differ by one byte have two ids, the same file
+/// twice has one, and a v4 inline copy and a v5 blob copy of one file have the same id.
+fn derived_id(artifact: &ArtifactRef) -> String {
     let digest = match &artifact.file {
         Some(file) => {
-            let bytes = sha(&file.bytes);
-            let held = (
-                &artifact.name,
-                &artifact.mime_type,
-                &file.filename,
-                hex(&bytes),
-            );
+            // An inline file is hashed here (and counted, for the polls that must not hash); a
+            // blob's id is already its digest.
+            let digest = match &file.source {
+                FileSource::Inline(bytes) => hex(&sha(bytes)),
+                FileSource::Blob(id) => id.as_str().to_owned(),
+            };
+            let held = (&artifact.name, &artifact.mime_type, &file.filename, digest);
             #[cfg(test)]
             work::serialised();
             sha(&serde_json::to_vec(&held).unwrap_or_default())
@@ -572,7 +591,7 @@ pub(crate) fn decode_conversation(conversation: &str) -> Option<(String, String)
 
 #[cfg(test)]
 mod tests {
-    use adam_runtime::Artifact as RunArtifact;
+    use adam_runtime::{ArtifactRef, FileRef};
     use chrono::Utc;
 
     use super::*;
@@ -600,6 +619,11 @@ mod tests {
 
     fn prompt() -> PromptFn {
         Arc::new(default_prompt)
+    }
+
+    /// The A2A artifact of a run artifact that needs no blob (a JSON one, or an inline file).
+    fn served(artifact: &ArtifactRef) -> Artifact {
+        artifact_of(artifact, None).expect("an inline or JSON artifact is served")
     }
 
     #[test]
@@ -831,7 +855,7 @@ mod tests {
 
     #[test]
     fn an_a2ui_artifact_is_marked_in_both_spellings() {
-        let artifact = artifact_of(&RunArtifact::new("ui", Some(A2UI_MEDIA_TYPE.into()), ui()));
+        let artifact = served(&ArtifactRef::new("ui", Some(A2UI_MEDIA_TYPE.into()), ui()));
         let part = &artifact.parts[0];
         assert_eq!(part.media_type.as_deref(), Some(A2UI_MEDIA_TYPE));
         assert_eq!(
@@ -840,7 +864,7 @@ mod tests {
         );
         assert_eq!(part.content, a2a::PartContent::Data(ui()));
         // Any other artifact carries no part metadata.
-        let other = artifact_of(&RunArtifact::new(
+        let other = served(&ArtifactRef::new(
             "d",
             Some("application/json".into()),
             json!({"k": 1}),
@@ -850,21 +874,21 @@ mod tests {
 
     #[test]
     fn artifacts_map_to_text_or_data_parts_with_stable_ids() {
-        let text = RunArtifact::new(
+        let text = ArtifactRef::new(
             "pull request",
             Some("text/uri-list".into()),
             json!("https://example.com/pr/1"),
         );
-        let a = artifact_of(&text);
+        let a = served(&text);
         assert_eq!(a.name.as_deref(), Some("pull request"));
         assert_eq!(a.parts[0].as_text(), Some("https://example.com/pr/1"));
         assert_eq!(a.parts[0].media_type.as_deref(), Some("text/uri-list"));
-        assert_eq!(a.artifact_id, artifact_of(&text).artifact_id);
+        assert_eq!(a.artifact_id, served(&text).artifact_id);
         assert!(a.artifact_id.starts_with("pull-request-"));
 
-        let data = RunArtifact::new("d", None, json!({"k": "v"}));
+        let data = ArtifactRef::new("d", None, json!({"k": "v"}));
         assert!(matches!(
-            artifact_of(&data).parts[0].content,
+            served(&data).parts[0].content,
             a2a::PartContent::Data(_)
         ));
         assert_ne!(artifact_id(&data), artifact_id(&text));
@@ -875,8 +899,8 @@ mod tests {
     #[test]
     fn a_file_artifact_is_one_raw_part_with_its_type_and_filename() {
         let svg = b"<svg xmlns='http://www.w3.org/2000/svg'/>";
-        let file = RunArtifact::file("logo", "image/svg+xml", "logo.svg", svg.to_vec()).unwrap();
-        let a = artifact_of(&file);
+        let file = ArtifactRef::file("logo", "image/svg+xml", "logo.svg", svg.to_vec()).unwrap();
+        let a = served(&file);
         assert_eq!(a.name.as_deref(), Some("logo"));
         assert!(a.artifact_id.starts_with("logo-"));
         assert_eq!(a.parts.len(), 1);
@@ -903,7 +927,7 @@ mod tests {
     #[test]
     fn a_files_id_follows_its_name_type_and_bytes() {
         let make = |name: &str, filename: &str, bytes: &[u8]| {
-            RunArtifact::file(name, "text/plain", filename, bytes.to_vec()).unwrap()
+            ArtifactRef::file(name, "text/plain", filename, bytes.to_vec()).unwrap()
         };
         let one = make("report", "r.txt", b"one");
         assert_eq!(
@@ -919,16 +943,23 @@ mod tests {
             artifact_id(&make("report", "s.txt", b"one"))
         );
         assert!(artifact_id(&one).starts_with("report-"));
+
+        // A v4 run's inline file and a v5 head's blob of the same bytes are one artifact.
+        let file = one.file.as_ref().expect("a file");
+        let blob = FileRef::blob(file.filename.clone(), file.size, file.digest());
+        let mut head = ArtifactRef::new("report", Some("text/plain".into()), Value::Null);
+        head.file = Some(blob);
+        assert_eq!(artifact_id(&head), artifact_id(&one));
     }
 
     #[test]
     fn a_link_in_the_data_is_also_a_url_part_after_the_data_part() {
-        let pr = RunArtifact::new(
+        let pr = ArtifactRef::new(
             "pull_request",
             Some("application/json".into()),
             json!({"url": "https://github.com/octo/widgets/pull/7", "number": "7"}),
         );
-        let a = artifact_of(&pr);
+        let a = served(&pr);
         assert_eq!(a.parts.len(), 2);
         assert_eq!(
             a.parts[0].content,
@@ -953,7 +984,7 @@ mod tests {
 
     #[test]
     fn only_an_absolute_http_url_in_an_object_is_a_link() {
-        let parts = |data: Value| artifact_of(&RunArtifact::new("x", None, data)).parts.len();
+        let parts = |data: Value| served(&ArtifactRef::new("x", None, data)).parts.len();
         assert_eq!(parts(json!({"url": "http://example.com/a"})), 2);
         for not_a_link in [
             json!({"url": "ftp://example.com/a"}),

@@ -295,7 +295,7 @@ impl Harness {
     }
 
     /// Run one task to its end on a fresh runtime.
-    async fn run(&self, limit: usize, text: &str, log: &Arc<Log>) -> (RunId, RunView) {
+    async fn run(&self, limit: usize, text: &str, log: &Arc<Log>) -> (Runtime, RunId, RunView) {
         let agent = self.agent(limit, |b| b.tool(Probe::new(log)));
         let rt = self.runtime(agent, Duration::from_secs(10));
         let run = rt
@@ -305,7 +305,7 @@ impl Harness {
         let worker = Worker::spawn(&rt);
         let view = wait_terminal(&rt, run).await;
         worker.stop().await;
-        (run, view)
+        (rt, run, view)
     }
 
     async fn journal(&self, run: RunId) -> Vec<(u64, String)> {
@@ -375,12 +375,14 @@ async fn wait_terminal(rt: &Runtime, run: RunId) -> RunView {
     }
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
-fn tool_answers(view: &RunView) -> Vec<(String, bool)> {
-    conversation(view)
+async fn tool_answers(rt: &Runtime, view: &RunView) -> Vec<(String, bool)> {
+    conversation(rt, view)
+        .await
         .messages
         .iter()
         .filter_map(|m| match m {
@@ -418,7 +420,7 @@ async fn four_calls_take_the_time_of_one_and_at_a_limit_of_one_the_time_of_four(
         h.mock.push_tool_calls(turn(4, 1_000, "independent"));
         h.mock.push_text("done");
         let started = tokio::time::Instant::now();
-        let (_, view) = h.run(limit, "go", &log).await;
+        let (_rt, _, view) = h.run(limit, "go", &log).await;
         let took = started.elapsed().as_millis();
         assert_eq!(view.status, RunStatus::Done);
         assert!(
@@ -435,7 +437,7 @@ async fn four_calls_overlap_on_the_real_clock() {
     let log = Arc::new(Log::default());
     h.mock.push_tool_calls(turn(4, 400, "independent"));
     h.mock.push_text("done");
-    let (_, view) = h.run(10, "go", &log).await;
+    let (_rt, _, view) = h.run(10, "go", &log).await;
     assert_eq!(view.status, RunStatus::Done);
     assert_eq!(log.max_running(), 4, "the four calls were running at once");
 }
@@ -446,7 +448,7 @@ async fn calls_over_the_limit_queue_and_start_in_call_order() {
     let log = Arc::new(Log::default());
     h.mock.push_tool_calls(turn(5, 100, "independent"));
     h.mock.push_text("done");
-    let (_, view) = h.run(2, "go", &log).await;
+    let (rt, _, view) = h.run(2, "go", &log).await;
     assert_eq!(view.status, RunStatus::Done);
     assert_eq!(log.max_running(), 2);
     let starts: Vec<String> = log
@@ -462,7 +464,7 @@ async fn calls_over_the_limit_queue_and_start_in_call_order() {
         ["start:c1", "start:c2", "start:c3", "start:c4", "start:c5"]
     );
     assert_eq!(
-        tool_answers(&view).len(),
+        tool_answers(&rt, &view).await.len(),
         5,
         "no call was refused for the queue"
     );
@@ -474,7 +476,7 @@ async fn a_tool_that_declares_nothing_runs_alone_at_any_limit() {
     let log = Arc::new(Log::default());
     h.mock.push_tool_calls(turn(3, 50, "undeclared"));
     h.mock.push_text("done");
-    let (_, view) = h.run(10, "go", &log).await;
+    let (_rt, _, view) = h.run(10, "go", &log).await;
     assert_eq!(view.status, RunStatus::Done);
     assert_eq!(log.max_running(), 1, "the default is Alone");
 }
@@ -493,7 +495,7 @@ async fn conflicting_calls_keep_the_models_order_and_the_others_run_beside_them(
         call("r2", "probe", json!({"ms": 10, "use": "r:files/b"})),
     ]);
     h.mock.push_text("done");
-    let (_, view) = h.run(10, "go", &log).await;
+    let (_rt, _, view) = h.run(10, "go", &log).await;
     assert_eq!(view.status, RunStatus::Done);
     assert!(
         log.position("end:w1") < log.position("start:r1"),
@@ -515,9 +517,9 @@ async fn results_come_back_in_call_order_whatever_order_the_calls_finish_in() {
         call("c3", "probe", json!({"ms": 100, "use": "independent"})),
     ]);
     h.mock.push_text("done");
-    let (run, view) = h.run(10, "go", &log).await;
+    let (rt, run, view) = h.run(10, "go", &log).await;
     assert_eq!(
-        tool_answers(&view),
+        tool_answers(&rt, &view).await,
         [
             ("ok:c1".to_owned(), false),
             ("ok:c2".to_owned(), false),
@@ -558,10 +560,10 @@ async fn the_journal_is_the_sequential_journal_whatever_the_limit() {
             call("c5", "probe", json!({"ms": 1, "use": "independent"})),
         ]);
         h.mock.push_text("done");
-        let (run, view) = h.run(limit, "go", &log).await;
+        let (rt, run, view) = h.run(limit, "go", &log).await;
         assert_eq!(view.status, RunStatus::Done);
         journals.push(h.journal(run).await);
-        answers.push(tool_answers(&view));
+        answers.push(tool_answers(&rt, &view).await);
     }
     assert_eq!(journals[0], journals[1]);
     assert_eq!(journals[0], journals[2]);
@@ -670,7 +672,7 @@ async fn crash_with_hang(first_limit: usize, second_limit: usize, hanging: &str)
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     Replayed {
         journal: h.journal(run).await,
-        answers: tool_answers(&view),
+        answers: tool_answers(&rt, &view).await,
         starts: ["c1", "c2", "c3"].map(|id| log.starts(id)).to_vec(),
         ends: ["c1", "c2", "c3"].map(|id| log.ends(id)).to_vec(),
     }
@@ -723,7 +725,7 @@ async fn a_journal_written_at_one_limit_replays_at_the_other_and_equals_an_unint
             call("c3", "probe", json!({"ms": 5, "use": "independent"})),
         ]);
         h.mock.push_text("done");
-        let (run, _) = h.run(1, "go", &log).await;
+        let (_rt, run, _) = h.run(1, "go", &log).await;
         h.journal(run).await
     };
     for (first, second) in [(1, 10), (10, 1)] {
@@ -861,7 +863,7 @@ async fn a_transient_failure_stops_new_starts_waits_for_the_running_calls_and_re
         "the failed try waited for the call that was running"
     );
     assert!(log.position("end:c1") < log.position("start:c3"));
-    assert_eq!(tool_answers(&view).len(), 4);
+    assert_eq!(tool_answers(&rt, &view).await.len(), 4);
 }
 
 #[tokio::test(start_paused = true)]
@@ -887,9 +889,9 @@ async fn three_identical_calls_in_one_turn_are_refused_as_today() {
             ),
         ]);
         h.mock.push_text("I will answer with what I know");
-        let (_, view) = h.run(limit, "go", &log).await;
+        let (rt, _, view) = h.run(limit, "go", &log).await;
         assert_eq!(view.status, RunStatus::Done);
-        let got = tool_answers(&view);
+        let got = tool_answers(&rt, &view).await;
         assert_eq!(got.len(), 5);
         assert_eq!(got[1], ("same".to_owned(), false));
         assert_eq!(got[2], ("same".to_owned(), false));
@@ -932,8 +934,13 @@ async fn the_limit_on_tool_calls_is_counted_as_before() {
             0,
             "a turn over the limit has none of its calls run"
         );
-        assert_eq!(tool_answers(&view).len(), 4);
-        assert!(tool_answers(&view).iter().all(|(_, error)| *error));
+        assert_eq!(tool_answers(&rt, &view).await.len(), 4);
+        assert!(
+            tool_answers(&rt, &view)
+                .await
+                .iter()
+                .all(|(_, error)| *error)
+        );
     }
 }
 
@@ -976,7 +983,7 @@ async fn a_question_in_the_middle_of_a_turn_runs_alone_and_the_rest_runs_after_t
     worker.stop().await;
     assert_eq!(view.status, RunStatus::Done);
     assert_eq!(
-        tool_answers(&view),
+        tool_answers(&rt, &view).await,
         [
             ("ok:c1".to_owned(), false),
             ("prod".to_owned(), false),
@@ -1000,9 +1007,9 @@ async fn a_call_that_asks_though_it_declared_nothing_of_the_kind_is_told_to_run_
         call("c3", "probe", json!({"ms": 10, "use": "independent"})),
     ]);
     h.mock.push_text("done");
-    let (run, view) = h.run(10, "go", &log).await;
+    let (rt, run, view) = h.run(10, "go", &log).await;
     assert_eq!(view.status, RunStatus::Done, "the run did not park");
-    let answers = tool_answers(&view);
+    let answers = tool_answers(&rt, &view).await;
     assert_eq!(answers[0], ("ok:c1".to_owned(), false));
     assert_eq!(
         answers[1],
@@ -1044,7 +1051,7 @@ async fn a_file_the_run_has_no_room_for_is_refused_when_the_results_are_applied_
     let view = wait_terminal(&rt, run).await;
     worker.stop().await;
     assert_eq!(view.status, RunStatus::Done);
-    let answers = tool_answers(&view);
+    let answers = tool_answers(&rt, &view).await;
     assert_eq!(answers[0], ("shared".to_owned(), false));
     assert!(
         answers[1].1 && answers[1].0.contains("Not shared"),
@@ -1149,7 +1156,7 @@ async fn the_calls_of_a_source_run_together_when_the_source_says_they_share_noth
         assert_eq!(view.status, RunStatus::Done);
         assert_eq!(log.max_running(), together, "{names:?}");
         assert_eq!(
-            tool_answers(&view),
+            tool_answers(&rt, &view).await,
             [
                 (format!("{}:c1", names[0]), false),
                 (format!("{}:c2", names[1]), false)
@@ -1169,7 +1176,7 @@ async fn a_recorded_call_above_a_gap_is_not_run_again_and_the_journal_is_the_seq
         let log = Arc::new(Log::default());
         h.mock.push_tool_calls(turn(3, 5, "independent"));
         h.mock.push_text("done");
-        let (run, _) = h.run(1, "go", &log).await;
+        let (_rt, run, _) = h.run(1, "go", &log).await;
         h.journal(run).await
     };
     for second in [1usize, 10] {
@@ -1202,9 +1209,9 @@ async fn a_call_that_reports_rounds_beside_other_calls_is_told_to_run_alone() {
         ),
     ]);
     h.mock.push_text("done");
-    let (run, view) = h.run(10, "go", &log).await;
+    let (rt, run, view) = h.run(10, "go", &log).await;
     assert_eq!(view.status, RunStatus::Done);
-    let answers = tool_answers(&view);
+    let answers = tool_answers(&rt, &view).await;
     assert_eq!(answers[0], ("ok:c1".to_owned(), false));
     assert_eq!(
         answers[1],
@@ -1358,7 +1365,7 @@ async fn the_second_source_decides_when_the_first_does_not_offer_the_tool() {
     assert_eq!(view.status, RunStatus::Done);
     assert_eq!(log.max_running(), 2);
     assert_eq!(
-        tool_answers(&view),
+        tool_answers(&rt, &view).await,
         [
             ("slow_a:c1".to_owned(), false),
             ("slow_b:c2".to_owned(), false)
@@ -1389,7 +1396,7 @@ async fn a_queued_call_starts_when_any_running_call_ends() {
     ]);
     h.mock.push_text("done");
     let started = tokio::time::Instant::now();
-    let (_, view) = h.run(2, "go", &log).await;
+    let (_rt, _, view) = h.run(2, "go", &log).await;
     assert_eq!(view.status, RunStatus::Done);
     assert!(
         log.position("start:c3") < log.position("end:c1"),
@@ -1463,7 +1470,7 @@ async fn a_call_with_bad_arguments_in_a_segment_takes_no_seq() {
             ),
         ]);
         h.mock.push_text("done");
-        let (run, view) = h.run(limit, "go", &log).await;
+        let (rt, run, view) = h.run(limit, "go", &log).await;
         assert_eq!(view.status, RunStatus::Done, "limit {limit}: {view:?}");
         let journal = h.journal(run).await;
         assert!(journal.iter().all(|(_, n)| n != "tool:c2"), "{journal:?}");
@@ -1472,7 +1479,7 @@ async fn a_call_with_bad_arguments_in_a_segment_takes_no_seq() {
             (0..journal.len() as u64).collect::<Vec<_>>(),
             "contiguous seqs"
         );
-        runs.push((journal, tool_answers(&view)));
+        runs.push((journal, tool_answers(&rt, &view).await));
     }
     assert_eq!(
         runs[0], runs[1],
@@ -1598,7 +1605,7 @@ async fn a_call_with_after_previous_waits_for_every_call_before_it_and_holds_the
         ),
     ]);
     h.mock.push_text("done");
-    let (run, view) = h.run(10, "go", &log).await;
+    let (rt, run, view) = h.run(10, "go", &log).await;
     assert_eq!(view.status, RunStatus::Done);
     assert!(
         start_position(&log, "c2") < end_position(&log, "c1"),
@@ -1620,7 +1627,8 @@ async fn a_call_with_after_previous_waits_for_every_call_before_it_and_holds_the
     );
     assert_eq!(log.max_running(), 2);
     assert_eq!(
-        tool_answers(&view)
+        tool_answers(&rt, &view)
+            .await
             .iter()
             .map(|(t, _)| t.as_str())
             .collect::<Vec<_>>(),
@@ -1656,7 +1664,7 @@ async fn after_previous_never_reaches_the_tool_the_doom_loop_key_or_the_step() {
     worker.stop().await;
     assert_eq!(view.status, RunStatus::Done);
     assert_eq!(
-        tool_answers(&view),
+        tool_answers(&rt, &view).await,
         [
             ("strict:c1".to_owned(), false),
             ("strict:c2".to_owned(), false),
@@ -1685,7 +1693,8 @@ async fn after_previous_never_reaches_the_tool_the_doom_loop_key_or_the_step() {
         inputs.iter().all(|i| !i.contains("after_previous")),
         "{inputs:?}"
     );
-    let said = conversation(&view)
+    let said = conversation(&rt, &view)
+        .await
         .messages
         .iter()
         .flat_map(|m| m.tool_calls().to_vec())
@@ -1710,8 +1719,8 @@ async fn the_doom_loop_key_ignores_after_previous() {
         call("c3", "probe", json!({"use": "independent", "out": "same"})),
     ]);
     h.mock.push_text("done");
-    let (_, view) = h.run(10, "go", &log).await;
-    let answers = tool_answers(&view);
+    let (rt, _, view) = h.run(10, "go", &log).await;
+    let answers = tool_answers(&rt, &view).await;
     assert_eq!(answers[0], ("same".to_owned(), false));
     assert_eq!(answers[1], ("same".to_owned(), false));
     assert!(
@@ -1737,9 +1746,9 @@ async fn a_bad_after_previous_answers_an_error_takes_no_step_and_runs_nothing() 
             call("c3", "probe", json!({"use": "independent", "tag": 3})),
         ]);
         h.mock.push_text("done");
-        let (run, view) = h.run(limit, "go", &log).await;
+        let (rt, run, view) = h.run(limit, "go", &log).await;
         assert_eq!(view.status, RunStatus::Done);
-        let answers = tool_answers(&view);
+        let answers = tool_answers(&rt, &view).await;
         assert!(answers[1].1, "{answers:?}");
         assert!(
             answers[1].0.contains("`after_previous`")
@@ -1785,9 +1794,9 @@ async fn the_journal_and_the_answers_are_the_same_at_a_limit_of_one_and_ten_with
             ),
         ]);
         h.mock.push_text("done");
-        let (run, view) = h.run(limit, "go", &log).await;
+        let (rt, run, view) = h.run(limit, "go", &log).await;
         assert_eq!(view.status, RunStatus::Done);
-        runs.push((h.journal(run).await, tool_answers(&view)));
+        runs.push((h.journal(run).await, tool_answers(&rt, &view).await));
     }
     assert_eq!(runs[0], runs[1]);
 }
@@ -2021,7 +2030,7 @@ async fn a_source_tool_with_its_own_after_previous_keeps_it_and_the_others_still
     );
     assert_eq!(args["c2"], json!({"k": 1}), "stripped");
     assert_eq!(
-        tool_answers(&view),
+        tool_answers(&rt, &view).await,
         [
             ("mine:c1".to_owned(), false),
             ("theirs:c2".to_owned(), false)
@@ -2069,8 +2078,8 @@ async fn a_call_flagged_invalid_by_the_client_is_told_why_even_when_its_text_hol
     bad.invalid_arguments = Some(r#"{"after_previous": true}"#.into());
     h.mock.push_tool_calls(vec![bad]);
     h.mock.push_text("done");
-    let (_, view) = h.run(10, "go", &log).await;
-    let answers = tool_answers(&view);
+    let (rt, _, view) = h.run(10, "go", &log).await;
+    let answers = tool_answers(&rt, &view).await;
     assert!(answers[0].1, "{answers:?}");
     assert!(
         answers[0].0.contains("not valid JSON"),
@@ -2097,9 +2106,9 @@ async fn the_order_of_a_turn_is_not_kept_once_its_calls_are_answered() {
         ),
     ]);
     h.mock.push_text("done");
-    let (_, view) = h.run(10, "go", &log).await;
+    let (rt, _, view) = h.run(10, "go", &log).await;
     assert_eq!(view.status, RunStatus::Done);
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert!(state.pending_calls.is_empty());
     assert!(
         state.ordered_calls.is_empty(),
@@ -2327,7 +2336,7 @@ async fn a_parked_turn_keeps_its_order_in_the_snapshot_and_a_new_process_honours
         json!(["c2"]),
         "in the snapshot"
     );
-    let state = conversation(&parked);
+    let state = conversation(&rt, &parked).await;
     assert_eq!(
         state.pending_calls[1].arguments,
         json!({"ms": 200, "use": "independent", "tag": 2})
@@ -2421,7 +2430,7 @@ async fn every_after_previous_of_a_turn_is_a_barrier() {
         ),
     ]);
     h.mock.push_text("done");
-    let (_, view) = h.run(10, "go", &log).await;
+    let (_rt, _, view) = h.run(10, "go", &log).await;
     assert_eq!(view.status, RunStatus::Done);
     let events = || log.events.lock().unwrap().clone();
     assert!(
@@ -2447,9 +2456,9 @@ async fn a_bad_after_previous_is_quoted_in_the_answer() {
         json!({"use": "independent", "tag": 1, "after_previous": "yes"}),
     )]);
     h.mock.push_text("done");
-    let (_, view) = h.run(10, "go", &log).await;
+    let (rt, _, view) = h.run(10, "go", &log).await;
     assert_eq!(view.status, RunStatus::Done);
-    let answers = tool_answers(&view);
+    let answers = tool_answers(&rt, &view).await;
     assert_eq!(
         answers[0],
         (

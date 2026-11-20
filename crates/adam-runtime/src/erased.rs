@@ -23,6 +23,9 @@ pub(crate) trait ErasedStarter: Send + Sync {
         prior: &Value,
         prior_run: RunId,
     ) -> Result<Value, AgentError>;
+    /// The whole state a head and its rows reconstruct
+    /// ([`AgentStarter::join`](crate::AgentStarter::join)).
+    fn join(&self, head: Value, rows: Vec<Value>) -> Result<Value, AgentError>;
 }
 
 /// What stepping a run needs on top of starting it.
@@ -100,6 +103,10 @@ impl<A: Agent> ErasedStarter for Erased<A> {
             None => self.init(input),
         }
     }
+
+    fn join(&self, head: Value, rows: Vec<Value>) -> Result<Value, AgentError> {
+        ErasedAgent::join(self, head, rows)
+    }
 }
 
 /// A start-only registration: no `step`.
@@ -124,6 +131,17 @@ impl<S: AgentStarter> ErasedStarter for StarterOnly<S> {
             Some(state) => encode(&self.0.init_continuing(input, &state, prior_run)?),
             None => self.init(input),
         }
+    }
+
+    fn join(&self, head: Value, rows: Vec<Value>) -> Result<Value, AgentError> {
+        let head: S::State = serde_json::from_value(head).map_err(|e| {
+            AgentError::permanent(format!(
+                "a run's head does not decode as {:?}'s state",
+                self.0.name()
+            ))
+            .with_source(e)
+        })?;
+        encode(&self.0.join(head, rows)?)
     }
 }
 

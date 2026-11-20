@@ -698,7 +698,7 @@ async fn the_files_of_a_server_with_files_true_are_artifacts_of_the_run() {
             name.starts_with("screenshot-") && name.ends_with(".png"),
             "{backend}: {name}"
         );
-        let hash = view.artifacts[0].file_sha256().unwrap();
+        let hash = view.artifacts[0].file.as_ref().expect("a file").digest();
         assert_eq!(
             last_tool_result(&model.requests()[1], "c1"),
             (
@@ -713,7 +713,11 @@ async fn the_files_of_a_server_with_files_true_are_artifacts_of_the_run() {
             "{backend}"
         );
         let file = view.artifacts[0].file.as_ref().unwrap();
-        assert_eq!(file.bytes, adam_mcp_testkit::PNG, "{backend}");
+        // The bytes are the file's, whether the run carries them inline (v4) or by blob (v5).
+        assert_eq!(file.size, adam_mcp_testkit::PNG.len() as u64, "{backend}");
+        assert_eq!(file.digest(), adam_runtime::blob_id(adam_mcp_testkit::PNG));
+        let bytes = rt.artifact_bytes(file).await.unwrap().expect("the bytes");
+        assert_eq!(&bytes[..], adam_mcp_testkit::PNG, "{backend}");
         assert!(
             sink.events_for(run).iter().any(|event| matches!(
                 event,

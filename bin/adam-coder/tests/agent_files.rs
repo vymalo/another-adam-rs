@@ -1556,7 +1556,7 @@ async fn the_model_reads_a_long_command_back_through_the_real_coder_agent() {
         })
     };
     let deadline = Instant::now() + Duration::from_secs(60);
-    let view = loop {
+    let _view = loop {
         let view = rt.view(run).await.unwrap().expect("run exists");
         match view.status {
             RunStatus::Done => break view,
@@ -1569,7 +1569,8 @@ async fn the_model_reads_a_long_command_back_through_the_real_coder_agent() {
     let _ = stop.send(());
     worker.await.unwrap().unwrap();
 
-    let state: adam_llm_agent::Conversation = serde_json::from_value(view.state).unwrap();
+    let state = rt.state(run).await.unwrap().expect("the run");
+    let state: adam_llm_agent::Conversation = serde_json::from_value(state).unwrap();
     let said: Vec<(String, bool)> = state
         .messages
         .iter()

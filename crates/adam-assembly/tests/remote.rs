@@ -24,7 +24,7 @@ use adam_assembly::{AgentDef, Assembly, Error, RemoteAuthProblem, RemoteUrlProbl
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store};
 use adam_llm_agent::{ToolSet, user_message};
 use adam_model::{Message as ModelMessage, MockModel, ModelRequest, ToolCall};
-use adam_runtime::{CollectingSink, RetryPolicy, Runtime, child_run_id};
+use adam_runtime::{CollectingSink, FileSource, RetryPolicy, Runtime, child_run_id};
 use async_trait::async_trait;
 use axum::extract::{Request, State};
 use axum::middleware::{self, Next};
@@ -1273,7 +1273,7 @@ async fn the_files_of_a_remote_with_files_true_are_artifacts_of_the_calling_run(
                         "{name}"
                     );
                     assert_eq!(artifact.name, "page.png", "the remote artifact's own name");
-                    let hash = artifact.file_sha256().unwrap();
+                    let hash = file.digest();
                     assert_eq!(
                         text,
                         format!(
@@ -1285,7 +1285,16 @@ async fn the_files_of_a_remote_with_files_true_are_artifacts_of_the_calling_run(
                         ),
                         "{backend}"
                     );
-                    assert_eq!(file.bytes, PNG);
+                    assert_eq!(file.size, PNG.len() as u64);
+                    assert_eq!(file.digest(), adam_runtime::blob_id(PNG));
+                    match &file.source {
+                        FileSource::Inline(bytes) => assert_eq!(bytes, PNG),
+                        FileSource::Blob(id) => assert_eq!(
+                            store.get_blob(id).await.unwrap(),
+                            Some(PNG.to_vec()),
+                            "the blob the head names holds the file"
+                        ),
+                    }
                 } else {
                     assert!(
                         text.ends_with("[file `page.png` not included: 16 bytes, image/png]"),

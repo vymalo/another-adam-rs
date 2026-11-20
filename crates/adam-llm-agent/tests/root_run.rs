@@ -78,8 +78,9 @@ async fn wait_done(rt: &Runtime, run: RunId) -> RunView {
     }
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).unwrap()
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 /// `top` probes, then spawns `mid`; `mid` probes, then spawns `leaf`; `leaf` probes.
@@ -139,11 +140,15 @@ async fn a_child_of_a_child_sees_the_top_run_and_a_top_run_sees_itself() {
 
     let top = rt.start("top", user_message("go"), None).await.unwrap();
     let view = wait_done(&rt, top).await;
-    assert_eq!(conversation(&view).root_run, None, "nobody's child");
+    assert_eq!(
+        conversation(&rt, &view).await.root_run,
+        None,
+        "nobody's child"
+    );
     let mid = adam_runtime::child_run_id(top, "t2");
     let leaf = adam_runtime::child_run_id(mid, "m2");
-    let mid_state = conversation(&wait_done(&rt, mid).await);
-    let leaf_state = conversation(&wait_done(&rt, leaf).await);
+    let mid_state = conversation(&rt, &wait_done(&rt, mid).await).await;
+    let leaf_state = conversation(&rt, &wait_done(&rt, leaf).await).await;
 
     let _ = stop.send(());
     worker.await.unwrap().unwrap();
@@ -251,7 +256,7 @@ async fn a_child_starts_with_the_limits_of_its_parent_and_a_source_sees_the_root
     wait_done(&rt, top).await;
     let mid = adam_runtime::child_run_id(top, "t1");
     let leaf = adam_runtime::child_run_id(mid, "m1");
-    let leaf_state = conversation(&wait_done(&rt, leaf).await);
+    let leaf_state = conversation(&rt, &wait_done(&rt, leaf).await).await;
     let _ = stop.send(());
     worker.await.unwrap().unwrap();
 

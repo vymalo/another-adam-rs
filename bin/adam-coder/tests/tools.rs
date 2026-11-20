@@ -1698,7 +1698,9 @@ async fn a_replayed_check_emits_the_same_artifact_id() {
             .await
             .unwrap();
         assert_eq!(out.artifacts.len(), 1);
-        ids.push(adam_a2a_runtime::artifact_id(&out.artifacts[0]));
+        ids.push(adam_a2a_runtime::artifact_id(
+            &adam_runtime::ArtifactRef::inline(&out.artifacts[0]),
+        ));
         let data = checks_of(&out);
         assert_eq!(*first.get_or_insert(data.clone()), data);
     }

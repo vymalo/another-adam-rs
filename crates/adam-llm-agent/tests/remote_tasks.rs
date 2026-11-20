@@ -224,8 +224,9 @@ async fn wait_parked_since(rt: &Runtime, run: RunId, version: u64) -> RunView {
     .await
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 fn tool_results(state: &Conversation) -> Vec<(String, String, bool)> {
@@ -290,7 +291,10 @@ async fn the_run_polls_on_the_timer_until_the_task_is_over_and_starts_it_once() 
             tool,
             task,
             deadline,
-        }) = conversation(&parked).pending_wait.expect("a wait")
+        }) = conversation(&rt, &parked)
+            .await
+            .pending_wait
+            .expect("a wait")
         else {
             panic!("{backend}: not a remote wait: {:?}", parked.state);
         };
@@ -315,7 +319,7 @@ async fn the_run_polls_on_the_timer_until_the_task_is_over_and_starts_it_once() 
         worker.stop().await;
 
         assert_eq!(done.output.unwrap()["text"], "all done", "{backend}");
-        let state = conversation(&rt.view(run).await.unwrap().unwrap());
+        let state = conversation(&rt, &rt.view(run).await.unwrap().unwrap()).await;
         assert_eq!(
             tool_results(&state),
             vec![("c1".into(), "remote says 42".into(), false)],
@@ -368,7 +372,7 @@ async fn a_new_process_keeps_polling_without_starting_the_task_again() {
             "{backend}: not started again"
         );
         assert_eq!(second_polls.load(SeqCst), 1, "{backend}");
-        let state = conversation(&rt.view(run).await.unwrap().unwrap());
+        let state = conversation(&rt, &rt.view(run).await.unwrap().unwrap()).await;
         assert_eq!(
             tool_results(&state),
             vec![("c1".into(), "late answer".into(), false)],
@@ -392,7 +396,7 @@ async fn a_task_that_failed_is_an_error_result_and_the_run_goes_on() {
         rig.clock.advance(Duration::from_secs(61));
         wait_done(&rt, run).await;
         worker.stop().await;
-        let state = conversation(&rt.view(run).await.unwrap().unwrap());
+        let state = conversation(&rt, &rt.view(run).await.unwrap().unwrap()).await;
         assert_eq!(
             tool_results(&state),
             vec![(
@@ -426,7 +430,7 @@ async fn a_permanent_poll_error_is_an_error_result_and_a_transient_one_is_retrie
         rig.clock.advance(Duration::from_secs(61));
         wait_done(&rt, run).await;
         worker.stop().await;
-        let state = conversation(&rt.view(run).await.unwrap().unwrap());
+        let state = conversation(&rt, &rt.view(run).await.unwrap().unwrap()).await;
         assert_eq!(
             tool_results(&state),
             vec![("c1".into(), "the task is gone".into(), true)],
@@ -447,7 +451,7 @@ async fn a_permanent_poll_error_is_an_error_result_and_a_transient_one_is_retrie
         rig.clock.advance(Duration::from_secs(61));
         wait_done(&rt, run).await;
         worker.stop().await;
-        let state = conversation(&rt.view(run).await.unwrap().unwrap());
+        let state = conversation(&rt, &rt.view(run).await.unwrap().unwrap()).await;
         assert_eq!(
             tool_results(&state),
             vec![("c1".into(), "second try".into(), false)],
@@ -471,7 +475,8 @@ async fn a_task_that_outlives_its_timeout_is_an_error_result_without_another_loo
             v.status == RunStatus::Parked && v.wake_at.is_some()
         })
         .await;
-        let PendingWait::Remote(wait) = conversation(&parked).pending_wait.unwrap() else {
+        let PendingWait::Remote(wait) = conversation(&rt, &parked).await.pending_wait.unwrap()
+        else {
             panic!("not a remote wait");
         };
         assert!(wait.deadline.is_some(), "{backend}");
@@ -483,7 +488,7 @@ async fn a_task_that_outlives_its_timeout_is_an_error_result_without_another_loo
         wait_done(&rt, run).await;
         worker.stop().await;
         assert_eq!(polls.load(SeqCst), 1, "{backend}");
-        let state = conversation(&rt.view(run).await.unwrap().unwrap());
+        let state = conversation(&rt, &rt.view(run).await.unwrap().unwrap()).await;
         let results = tool_results(&state);
         assert_eq!(results.len(), 1, "{backend}");
         assert!(results[0].2, "{backend}: an error result");
@@ -507,7 +512,7 @@ async fn a_tool_that_cannot_be_polled_gives_an_error_result() {
         rig.clock.advance(Duration::from_secs(61));
         wait_done(&rt, run).await;
         worker.stop().await;
-        let state = conversation(&rt.view(run).await.unwrap().unwrap());
+        let state = conversation(&rt, &rt.view(run).await.unwrap().unwrap()).await;
         assert_eq!(
             tool_results(&state),
             vec![("c1".into(), "does not wait on remote tasks".into(), true)],
@@ -548,7 +553,7 @@ async fn the_default_poll_refuses_and_a_user_message_queues_behind_the_result() 
         rt.deliver(run, user_message("meanwhile")).await.unwrap();
         wait_done(&rt, run).await;
         worker.stop().await;
-        let state = conversation(&rt.view(run).await.unwrap().unwrap());
+        let state = conversation(&rt, &rt.view(run).await.unwrap().unwrap()).await;
         let results = tool_results(&state);
         assert_eq!(results.len(), 1, "{backend}");
         assert!(results[0].2 && results[0].1.contains("does not wait on remote tasks"));
@@ -597,7 +602,11 @@ async fn a_remote_result_that_carries_a_plan_sets_it_and_an_error_result_leaves_
         rig.clock.advance(Duration::from_secs(61));
         let done = wait_done(&rt, run).await;
         worker.stop().await;
-        assert_eq!(conversation(&done).plan, Some(one_item_plan()), "{backend}");
+        assert_eq!(
+            conversation(&rt, &done).await.plan,
+            Some(one_item_plan()),
+            "{backend}"
+        );
 
         // The same answer, but an error: no plan.
         let rig = Rig::new("noted");
@@ -611,7 +620,7 @@ async fn a_remote_result_that_carries_a_plan_sets_it_and_an_error_result_leaves_
         rig.clock.advance(Duration::from_secs(61));
         let done = wait_done(&rt, run).await;
         worker.stop().await;
-        assert_eq!(conversation(&done).plan, None, "{backend}");
+        assert_eq!(conversation(&rt, &done).await.plan, None, "{backend}");
         assert!(done.state.get("plan").is_none(), "{backend}");
     }
 }
@@ -657,7 +666,7 @@ async fn a_long_answer_of_a_remote_task_is_kept_when_its_view_names_an_id() {
         rig.clock.advance(Duration::from_secs(61));
         wait_done(&rt, run).await;
         worker.stop().await;
-        let state = conversation(&rt.view(run).await.unwrap().unwrap());
+        let state = conversation(&rt, &rt.view(run).await.unwrap().unwrap()).await;
         let id = adam_llm_agent::output_id(&run.to_string(), "c1");
         let shown = &tool_results(&state)[0].1;
         assert!(
