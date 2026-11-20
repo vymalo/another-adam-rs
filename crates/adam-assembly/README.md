@@ -70,7 +70,7 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 | `Assembly::prompt_commands()` (feature `mcp`) | the prompts of the **root's** MCP servers as commands (`adam_mcp::PromptCommand`), read once when the servers were connected; a subagent's give none. `adam-service` adds them to the backend and the card ([adam-mcp](../adam-mcp/README.md#prompts-as-commands)) |
 | `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `prompt` (rendered, with the skills catalog and the instructions of its MCP servers), `tools` (own, `use_server` when one of its servers has a `when`, skill tools, then one per subagent, local or remote, then the five session tools of the root when it has a subagent, local or remote: what the model is offered), `skills`, `preloaded`, `when`, `limits`: what an `LlmAgent` was made from, comparable |
 | `RemoteInfo` | a remote (`a2a:`) subagent, as data (its tool is in `AgentInfo::tools` like a local subagent's) |
-| `LiveAssembly`, `LiveBuilder`, `Watch` (feature `dev`) | dev reload: `LiveAssembly::builder(dir, model, alias)` then `tools`, `configure`, `configure_bound`, `strictness`, `default_name`, `debounce`, `connect_mcp(&McpPolicy)` (feature `mcp`), `load()`; on the handle `register(RuntimeBuilder)`, `reload()`, `watch()`, `generation()`, `last_error()`, `info()`, `retired()`, `runs_on_previous_tools()`, `dir()` |
+| `LiveAssembly`, `LiveBuilder`, `Watch` (feature `dev`) | dev reload: `LiveAssembly::builder(dir, model, alias)` then `tools`, `configure`, `configure_bound`, `strictness`, `default_name`, `debounce`, `connect_mcp(&McpPolicy)` (feature `mcp`), `load()`; on the handle `register(RuntimeBuilder)`, `reload()`, `watch()`, `generation()`, `schedules()`, `last_error()`, `info()`, `retired()`, `runs_on_previous_tools()`, `dir()` |
 | `Reloaded`, `ToolChange`, `ReloadError`, `WatchError` (feature `dev`) | what a reload did (`generation`, `changed`, `tool_changes`, `retired`), why it changed nothing (`Load(Error)` with `diagnostics()`, `NeedsRestart { added }`), why a watcher did not start |
 | `AgentFolder` | one agent read from a folder when the process starts (no feature): `AgentFolder::load(path)` gives `root`, `def` (an `AgentDef`), `warnings` and `digest`; the folder holds exactly one agent, else `Error::NotOneAgent` |
 | `extra_mcp_file_from_env`, `EXTRA_MCP_FILE_ENV` | `ADAM_EXTRA_MCP_FILE` when set and not blank, else `None`: a file of extra MCP servers (below). No feature |
@@ -354,6 +354,11 @@ turning it on brings `notify` and logs a warning at startup.
 `LiveAssembly` does what `from_source`, `bind` and `model` do at startup, keeps the recipe, and does it again
 when a file changes. Tool code is Rust and still needs a rebuild (`cargo watch`); `mcp.json` tools are connected
 once, at startup, and outlive reloads (see the paragraph on `mcp.json` below).
+`schedules()` gives the roots' schedules in force (those of the last load that swapped; a refused reload keeps
+them). `LiveAssembly` runs none: a host that runs schedules registers `adam_schedule::SchedulerAgent::new(root)` for
+each root and, when `generation()` moves, calls `adam_schedule::reconcile` with them for every root of the first load,
+`retired()` ones included (a removed root's empty list cancels its schedulers)
+([ADR 0060](../../docs/decisions/0060-schedules-are-parked-runs.md)).
 
 ```rust
 use adam::assembly::LiveAssembly; // feature `dev`

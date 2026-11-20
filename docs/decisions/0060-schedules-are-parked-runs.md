@@ -25,6 +25,11 @@ nothing can be asked (`adam_llm_agent::UNATTENDED`) and the model goes on, and t
 (a final question, or work it owes) `Failed`, naming why and quoting the end of its answer. Firings that parked
 before this change still wait.
 
+*Amended* (2026-11-20, slice 6b): a dev reload gives the schedules in force, `LiveAssembly::schedules()` (a refused
+reload keeps them), and the host that runs schedules reconciles every root of the first load with them when
+`generation()` moves, retired roots included (their empty list cancels their schedulers); `adam-assembly` neither
+registers the scheduler nor reconciles, so it stays free of `adam-schedule`.
+
 ## Context
 
 An agent folder may hold `schedules/<name>.md`: frontmatter `cron:` and `timezone:`, the body a prompt

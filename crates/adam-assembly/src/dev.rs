@@ -65,6 +65,8 @@ struct Built {
     /// startup, a reload does not replace them.
     rounds: Rounds,
     warnings: Vec<Diagnostic>,
+    /// The schedules of the roots, as the files say them now (ADR 0060).
+    schedules: Vec<adam_agent_fs::Schedule>,
 }
 
 struct Loaded {
@@ -92,11 +94,13 @@ impl Recipe {
         let package = report.into_package(self.strictness)?;
         let mut loaded = Vec::new();
         let mut rounds = Rounds::default();
+        let mut schedules = Vec::new();
         for manifest in package.agents {
             let mut def = AgentDef::from_manifest(manifest)?.resources_from(&dir)?;
             for hook in &self.defs {
                 def = hook(def);
             }
+            schedules.extend(def.manifest().schedules.iter().cloned());
             // After the hooks: the connections were made once, and a hook must not replace them.
             #[cfg(feature = "mcp")]
             if let Some(binding) = self.mcp.get(def.name()) {
@@ -121,6 +125,7 @@ impl Recipe {
             loaded,
             rounds,
             warnings,
+            schedules,
         })
     }
 
@@ -229,6 +234,9 @@ struct Registry {
     generation: u64,
     infos: Vec<AgentInfo>,
     last_error: Option<Arc<ReloadError>>,
+    /// The schedules of the version in force: replaced by a reload that swaps, kept by one that
+    /// is refused.
+    schedules: Vec<adam_agent_fs::Schedule>,
 }
 
 impl Registry {
@@ -518,6 +526,7 @@ impl LiveBuilder {
             loaded,
             rounds,
             warnings,
+            schedules,
         } = self.recipe.build()?;
         for warning in &warnings {
             tracing::warn!(%warning, "agent file warning");
@@ -547,6 +556,7 @@ impl LiveBuilder {
                     generation: 1,
                     infos,
                     last_error: None,
+                    schedules,
                 }),
                 serial: Mutex::new(()),
             }),
@@ -689,14 +699,22 @@ impl LiveAssembly {
         let _serial = lock(&self.shared.serial);
         let outcome = match self.shared.recipe.build() {
             Ok(Built {
-                loaded, warnings, ..
+                loaded,
+                warnings,
+                schedules,
+                ..
             }) => {
                 for warning in &warnings {
                     tracing::warn!(%warning, "agent file warning");
                 }
-                lock(&self.shared.registry)
+                let mut registry = lock(&self.shared.registry);
+                let installed = registry
                     .install(loaded)
-                    .map_err(|added| ReloadError::NeedsRestart { added })
+                    .map_err(|added| ReloadError::NeedsRestart { added });
+                if installed.is_ok() {
+                    registry.schedules = schedules;
+                }
+                installed
             }
             Err(error) => Err(ReloadError::Load(error)),
         };
@@ -758,6 +776,20 @@ impl LiveAssembly {
             stop: tx,
             thread: Some(thread),
         })
+    }
+
+    /// The schedules of the roots in force (ADR 0060): those of the first load, then of each
+    /// reload that swapped (a refused reload keeps them). `LiveAssembly` runs none of them: a host
+    /// that runs schedules registers `adam_schedule::SchedulerAgent::new(root)` for each root on
+    /// its runtime, and after a reload (when [`generation`](Self::generation) moves) calls
+    /// `adam_schedule::reconcile` with these **for every root of the first load**, the
+    /// [`retired`](Self::retired) ones included: a root a reload removed has none here, and its
+    /// empty list cancels its schedulers (a reload cannot add a root, so the set is the startup one).
+    /// `reconcile` is idempotent, so a reload between reading the generation and these is harmless;
+    /// it can still refuse a schedule the loader took (`ReconcileError::Schedule`), and the
+    /// scheduler runs then stay as they were.
+    pub fn schedules(&self) -> Vec<adam_agent_fs::Schedule> {
+        lock(&self.shared.registry).schedules.clone()
     }
 
     /// The number of loads that succeeded: `1` after startup, and one more for each reload that
