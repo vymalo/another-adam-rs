@@ -23,6 +23,10 @@ import { PINS, coderRef } from './pins.mjs';
 import { runPlan } from './runner.mjs';
 import { readSharedPrompt } from './shared-prompt.mjs';
 import { createScriptedModel } from './scripted-model.mjs';
+import { AGENT_NAMES, makeDrivers } from './variants.mjs';
+
+// Every variant, so the dry run proves each one end to end with the scripted model.
+const DRYRUN_AGENTS = AGENT_NAMES;
 import { Stack } from './stack.mjs';
 import { loadTask } from './task.mjs';
 
@@ -86,7 +90,13 @@ const lines = (text) => process.stdout.write(`${text}\n`);
 
 /** Everything a phase needs: scripted model, meter, ledger, the stack up, the images built, the drivers. */
 async function startHarness({ env, home, name, raw, killSpec = null }) {
-  const model = createScriptedModel({ script: 'agents', expectKey: DRYRUN_KEY });
+  // BENCH_DRYRUN_REQUESTS_DIR (optional): every request body the scripted model gets is written there, one file each,
+  // so the size of what each agent sends (system prompt, tools, messages) can be measured. Bodies only: no headers.
+  const dumpDir = env.BENCH_DRYRUN_REQUESTS_DIR ? path.join(env.BENCH_DRYRUN_REQUESTS_DIR, name) : null;
+  if (dumpDir) fs.mkdirSync(dumpDir, { recursive: true });
+  let dumped = 0;
+  const onRequest = dumpDir ? (r) => fs.writeFileSync(path.join(dumpDir, `${String(++dumped).padStart(4, '0')}.json`), typeof r.body === 'string' ? r.body : JSON.stringify(r.body)) : null;
+  const model = createScriptedModel({ script: 'agents', expectKey: DRYRUN_KEY, onRequest });
   const modelAt = await model.listen();
   const config = normalizeConfig({ ...raw, endpoint: modelAt.url });
   const dir = path.join(home, 'dryrun', name);
@@ -138,10 +148,7 @@ async function startHarness({ env, home, name, raw, killSpec = null }) {
     stack,
     config,
     home: dir, // results of this phase; the shared home above is what the stack mounts
-    agents: {
-      adam: new AdamAgent({ pins: PINS, home, repoDir: REPO_DIR, contextWindow: config.contextWindow }),
-      opencode: new OpenCodeAgent({ pins: PINS, home, contextWindow: config.contextWindow, sharedPrompt: await readSharedPrompt({ repoDir: REPO_DIR, revision: PINS.coder.revision }) }),
-    },
+    agents: makeDrivers({ make: { adam: AdamAgent, opencode: OpenCodeAgent }, prompts: { owner: await readSharedPrompt({ repoDir: REPO_DIR, revision: PINS.coder.revision }), work: await readSharedPrompt({ repoDir: REPO_DIR, revision: PINS.coder.revision, profile: 'work' }) }, agents: DRYRUN_AGENTS, common: { pins: PINS, home, repoDir: REPO_DIR, contextWindow: config.contextWindow } }),
   };
   const close = async () => {
     await meter.close();
@@ -171,10 +178,10 @@ async function phaseGrades(env, home) {
   const h = await startHarness({ env, home, name: 'grades', raw: dryRunConfig({ endpoint: 'http://127.0.0.1:1/v1' }) });
   try {
     const envOk = await phaseEnvCheck(h);
-    await runPlan({ deps: h.deps, plan: specs(h.tasks, ['adam', 'opencode']) });
+    await runPlan({ deps: h.deps, plan: specs(h.tasks, DRYRUN_AGENTS) });
     const folded = h.ledger.fold();
-    const runs = specs(h.tasks, ['adam', 'opencode']).map((s) => ({ run: s.run, agent: s.agent }));
-    return report([...checkGrades(folded, { agents: ['adam', 'opencode'], arm: 'max' }), ...checkCost(folded, { runs, prices: h.config.prices, modelRequests: h.model.requests.length })], lines) && envOk;
+    const runs = specs(h.tasks, DRYRUN_AGENTS).map((s) => ({ run: s.run, agent: s.agent }));
+    return report([...checkGrades(folded, { agents: DRYRUN_AGENTS, arm: 'max' }), ...checkCost(folded, { runs, prices: h.config.prices, modelRequests: h.model.requests.length })], lines) && envOk;
   } finally {
     await h.close();
   }
@@ -186,7 +193,7 @@ async function phaseBudget(env, home) {
   const reserved = 34;
   const h = await startHarness({ env, home, name: 'budget', raw: dryRunConfig({ endpoint: 'http://127.0.0.1:1/v1', prices: DEAR, perRunBudgetUSD: reserved }) });
   try {
-    await runPlan({ deps: h.deps, plan: specs(h.tasks, ['adam', 'opencode']).filter((s) => s.task.id === 'hello') });
+    await runPlan({ deps: h.deps, plan: specs(h.tasks, DRYRUN_AGENTS).filter((s) => s.task.id === 'hello') });
     return report(checkBudgetHit(h.ledger.fold(), { runs: ['hello-adam-max', 'hello-opencode-max'], reservedMicro: reserved * 1_000_000 }), lines);
   } finally {
     await h.close();
@@ -197,7 +204,7 @@ async function phaseBudget(env, home) {
 async function resumeStart(env, home, killSpec) {
   const h = await startHarness({ env, home, name: 'resume', raw: dryRunConfig({ endpoint: 'http://127.0.0.1:1/v1' }), killSpec });
   try {
-    await runPlan({ deps: h.deps, plan: specs(h.tasks, ['opencode']) });
+    await runPlan({ deps: h.deps, plan: specs(h.tasks, ['opencode-prompt']) });
   } finally {
     await h.close();
   }

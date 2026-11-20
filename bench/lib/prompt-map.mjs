@@ -75,10 +75,10 @@ const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
  * The template with the table applied, in one pass: { mapped, applied }. `applied` lists, for each substitution, its id, where it was in
  * the template (`at`, `length`) and in the mapped text (`mappedAt`, `mappedLength`), and the original and replacement text.
  */
-export function applyMap(template) {
+export function applyMap(template, spans = SPANS) {
   const edits = [];
   const count = (text, needle) => text.split(needle).length - 1;
-  for (const s of SPANS) {
+  for (const s of spans) {
     // A `find` may list the spellings of the same sentence in two revisions (re-wrapped lines): the one found exactly once is used.
     const finds = s.find === undefined ? [] : Array.isArray(s.find) ? s.find : [s.find];
     const found = finds.find((f) => count(template, f) === 1);
@@ -115,6 +115,18 @@ export function applyMap(template) {
   mapped += template.slice(from);
   return { mapped, applied };
 }
+
+/**
+ * The `work` profile (bench/README.md, "Agent variants") also gives OpenCode the "Helpers" section: adam's two subagents are, for OpenCode,
+ * its one `subagent` tool, so the section's body is rewritten to say the same advice about it.
+ */
+export const HELPERS_SPAN = Object.freeze({
+  id: 'helpers-subagent',
+  kind: 'rewrite',
+  from: 'Your subagents are `explorer`',
+  through: 'say exactly this.',
+  to: 'Your `subagent` tool starts a helper. Use one for where and how questions about a repository (file paths and line numbers) on a large or unfamiliar repository before you plan, and one to review your change against the base branch once, before you finish, on a change that is not trivial. A helper edits nothing and gives advice: you decide. A small, clear change needs neither.',
+});
 
 /** What is left of a text when the substitutions are cut out: used to show that nothing but the table changed. */
 export function withoutSubstitutions(text, applied, side) {

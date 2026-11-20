@@ -42,10 +42,8 @@ export function ranTaskImage(containers, task) {
 }
 
 export class AdamAgent {
-  name = 'adam';
-
-  constructor({ pins, home, repoDir, contextWindow, drive = driveTask, heads = lsRemoteHeads, newBearer = () => crypto.randomBytes(24).toString('base64url'), makeClient = (o) => new A2AClient(o), ensureFolder = ensureAgentFolder, now = Date.now, sleep }) {
-    Object.assign(this, { pins, home, repoDir, contextWindow, drive, heads, newBearer, makeClient, ensureFolder, now, sleep });
+  constructor({ name = 'adam', variant = 'full', pins, home, repoDir, contextWindow, drive = driveTask, heads = lsRemoteHeads, newBearer = () => crypto.randomBytes(24).toString('base64url'), makeClient = (o) => new A2AClient(o), ensureFolder = ensureAgentFolder, now = Date.now, sleep }) {
+    Object.assign(this, { name, variant, pins, home, repoDir, contextWindow, drive, heads, newBearer, makeClient, ensureFolder, now, sleep });
     this.agentDir = null;
     this.runs = new Map(); // run -> { client, bearer, repo }; the bearer is here and in the client, nowhere else
   }
@@ -53,8 +51,8 @@ export class AdamAgent {
   async prepare(ctx) {
     const { stack, slot, base } = ctx;
     const steps = ctx.limits.steps;
-    const dest = path.join(this.home, 'agent-folder', `${this.pins.coder.revision.slice(0, 12)}-t${steps}`);
-    this.agentDir = await this.ensureFolder({ repoDir: this.repoDir, revision: this.pins.coder.revision, dest, steps });
+    const dest = path.join(this.home, 'agent-folder', `${this.pins.coder.revision.slice(0, 12)}-t${steps}${this.variant === 'full' ? '' : `-${this.variant}`}`);
+    this.agentDir = await this.ensureFolder({ repoDir: this.repoDir, revision: this.pins.coder.revision, dest, steps, variant: this.variant });
     stack.agentDir = this.agentDir;
     const repo = runRepoName(base.slug, ctx.run, ctx.attempt);
     this.runs.set(ctx.run, { repo });

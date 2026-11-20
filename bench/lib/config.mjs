@@ -4,6 +4,9 @@
 // the repository. It names the endpoint, the model, the price table, the cap and the arms. It
 // never holds the key: the key is read from the environment variable `keyEnv` names. Every error
 // names a field and never quotes a value. A bad configuration exits with 78.
+import { AGENT_NAMES } from './variants.mjs';
+
+export const DEFAULT_AGENTS = Object.freeze(['adam', 'opencode']);
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,6 +43,7 @@ export const SCHEMA = {
   capUSD: { type: 'money', required: true, doc: 'The most the whole benchmark may spend' },
   perRunBudgetUSD: { type: 'money', required: true, doc: 'What one run reserves before it starts' },
   arms: { type: 'arms', required: true, doc: 'Named JSON fragments merged into every request of the arm' },
+  agents: { type: 'agents', optional: true, doc: 'The agent variants to run (bench/lib/variants.mjs), each in every arm; default adam and opencode' },
   keyEnv: { type: 'envName', default: 'BENCH_MODEL_API_KEY', doc: 'The environment variable that holds the key' },
   concurrency: { type: 'int', min: 1, max: 8, default: 2, doc: 'Runs at once' },
   contextWindow: { type: 'int', min: 1024, max: 100_000_000, required: true, doc: 'The model context window in tokens; both agents are given this one value' },
@@ -236,6 +240,10 @@ export function normalizeConfig(raw) {
     arms[name] = fragment;
   }
 
+  const agents = raw.agents === undefined ? [...DEFAULT_AGENTS] : raw.agents;
+  if (!Array.isArray(agents) || agents.length < 2 || new Set(agents).size !== agents.length) throw new ConfigError('agents', 'must list two or more different agent variants');
+  for (const a of agents) if (!AGENT_NAMES.includes(a)) throw new ConfigError('agents', `no agent variant ${String(a).slice(0, 40)}: ${AGENT_NAMES.join(', ')}`);
+
   const keyEnv = raw.keyEnv === undefined ? SCHEMA.keyEnv.default : raw.keyEnv;
   if (typeof keyEnv !== 'string' || !/^[A-Z_][A-Z0-9_]{0,63}$/.test(keyEnv)) throw new ConfigError('keyEnv', 'must be the NAME of an environment variable, such as BENCH_MODEL_API_KEY');
 
@@ -272,7 +280,7 @@ export function normalizeConfig(raw) {
   const timeouts = { firstByteMs: seconds('firstByteSeconds'), idleMs: seconds('idleSeconds') };
 
   const tasks = normalizeTasks(raw.tasks);
-  return { endpoint, modelId, modelLabel, prices, capMicro, perRunBudgetMicro, arms, keyEnv, concurrency, contextWindow, limits, timeouts, tasks };
+  return { endpoint, modelId, modelLabel, prices, capMicro, perRunBudgetMicro, arms, agents, keyEnv, concurrency, contextWindow, limits, timeouts, tasks };
 }
 
 /** The `tasks` block: task sources and grading. Every field optional; the commands that need one say which. */
@@ -328,6 +336,7 @@ export function describeConfig(config) {
     `model label: ${config.modelLabel}`,
     `endpoint host: ${host}`,
     `arms: ${Object.keys(config.arms).join(', ')}`,
+    `agents: ${config.agents.join(', ')}`,
     `key variable: ${config.keyEnv}`,
     `concurrency: ${config.concurrency}`,
   ].join('\n');

@@ -176,10 +176,8 @@ const sha512 = (file) => crypto.createHash('sha512').update(fs.readFileSync(file
 const text = (files, name) => (files.has(name) ? files.get(name).toString('utf8') : '');
 
 export class OpenCodeAgent {
-  name = 'opencode';
-
-  constructor({ pins, home, fetchBinary = fetchPinnedBinary, now = Date.now, contextWindow, pollMs = 10_000, sharedPrompt = null }) {
-    Object.assign(this, { pins, home, fetchBinary, now, contextWindow, pollMs, sharedPrompt });
+  constructor({ name = 'opencode', pins, home, fetchBinary = fetchPinnedBinary, now = Date.now, contextWindow, pollMs = 10_000, sharedPrompt = null }) {
+    Object.assign(this, { name, pins, home, fetchBinary, now, contextWindow, pollMs, sharedPrompt });
     this.binary = null;
     this.binarySha = null;
     this.glibcDir = null;
