@@ -779,10 +779,15 @@ impl LiveAssembly {
     }
 
     /// The schedules of the roots in force (ADR 0060): those of the first load, then of each
-    /// reload that swapped. `LiveAssembly` runs none of them: a host that runs schedules registers
-    /// `adam_schedule::SchedulerAgent::new(root)` for each root on its runtime, and after a reload
-    /// (when [`generation`](Self::generation) moves) calls `adam_schedule::reconcile` with these,
-    /// which starts, keeps and cancels the scheduler runs to match.
+    /// reload that swapped (a refused reload keeps them). `LiveAssembly` runs none of them: a host
+    /// that runs schedules registers `adam_schedule::SchedulerAgent::new(root)` for each root on
+    /// its runtime, and after a reload (when [`generation`](Self::generation) moves) calls
+    /// `adam_schedule::reconcile` with these **for every root of the first load**, the
+    /// [`retired`](Self::retired) ones included: a root a reload removed has none here, and its
+    /// empty list cancels its schedulers (a reload cannot add a root, so the set is the startup one).
+    /// `reconcile` is idempotent, so a reload between reading the generation and these is harmless;
+    /// it can still refuse a schedule the loader took (`ReconcileError::Schedule`), and the
+    /// scheduler runs then stay as they were.
     pub fn schedules(&self) -> Vec<adam_agent_fs::Schedule> {
         lock(&self.shared.registry).schedules.clone()
     }

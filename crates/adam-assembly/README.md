@@ -356,7 +356,8 @@ when a file changes. Tool code is Rust and still needs a rebuild (`cargo watch`)
 once, at startup, and outlive reloads (see the paragraph on `mcp.json` below).
 `schedules()` gives the roots' schedules in force (those of the last load that swapped; a refused reload keeps
 them). `LiveAssembly` runs none: a host that runs schedules registers `adam_schedule::SchedulerAgent::new(root)` for
-each root and, when `generation()` moves, calls `adam_schedule::reconcile` with them
+each root and, when `generation()` moves, calls `adam_schedule::reconcile` with them for every root of the first load,
+`retired()` ones included (a removed root's empty list cancels its schedulers)
 ([ADR 0060](../../docs/decisions/0060-schedules-are-parked-runs.md)).
 
 ```rust
