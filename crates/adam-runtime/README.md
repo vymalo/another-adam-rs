@@ -116,9 +116,10 @@ is still the whole envelope a v4 process steps, so a mixed fleet is safe.
   `Vec<ArtifactRef>`: a file is a `FileRef { filename, size, source }`, `FileSource::Inline` for a
   v4 run's bytes and `FileSource::Blob` for a v5 head's digest.
 * `Runtime::state(run)` is the only full-state read: the head, the `body_list(run, generation)` it
-  names, and the agent's `join`. A set whose length or indices do not match the head is re-read
-  once (the head may have moved between the two reads); a set that still does not match is
-  `Corrupt`. A v4 run answers its record with no body read.
+  names, and the agent's `join`. The head names a **prefix** of its append-only generation: rows
+  past its `len` are a later commit's (or a lost attempt's, not yet collected) and are ignored. A
+  prefix that is short or out of order is re-read once (the head may have moved between the two
+  reads); a prefix that is still short is `Corrupt`. A v4 run answers its record with no body read.
 * `Runtime::artifact_bytes(&FileRef)` fetches a blob once and caches it by content address in a
   bounded (32 MiB, least recently used first) cache shared by the runtime's clones. An inline file
   answers its own bytes. A missing blob is `Ok(None)`: that artifact cannot be served, and the run
@@ -629,14 +630,16 @@ state but no blob uploads and references its digest on the first commit, and the
 `a_split_whose_file_is_not_stored_writes_the_state_only` (a failed `put_blob` refuses the head, and the commit writes the
 state only).
 
-Six cases here pin the read path, and two in `adam-a2a-runtime`: `the_view_reads_the_head_and_the_state_joins_the_body`
+Seven cases here pin the read path, and two in `adam-a2a-runtime`: `the_view_reads_the_head_and_the_state_joins_the_body`
 (a 50-message run of 10 KB turns: the view is one `load_head`, no `load_run`, no `body_list`, and less than 2 KB of state;
 `Runtime::state` is one `load_head`, one `body_list` and all 50 messages), `a_stale_head_falls_back_to_the_whole_state`
 (a delivery leaves the head stale: the view is the whole state, no body is read, and the next step rewrites the head),
 `a_v4_runs_view_is_the_whole_state` (a run that never split serves its whole agent state, and `Runtime::state` reads no
 body), `state_re_reads_a_moved_head_and_joins_its_new_generation` (a compaction between the first `load_head` and
 `body_list`: one re-read, the new head and generation, every message), `state_is_corrupt_when_the_body_is_short_twice`
-(the version did not move, so a second short set is `Corrupt`) and `artifact_bytes_serves_an_inline_file_and_a_blob`
+(the version did not move, so a second short set is `Corrupt`), `state_reads_the_head_prefix_when_a_commit_appends_while_it_reads`
+(a commit appends past the head's `len` between the two reads: the prefix is served, the head is not re-read, no
+`Corrupt`) and `artifact_bytes_serves_an_inline_file_and_a_blob`
 (an inline file's bytes, a stored blob's bytes, and `None` for a missing blob). In `adam-a2a-runtime`,
 `a_blob_backed_artifact_is_fetched_once_across_ten_polls` (ten `GetTask` polls read the head ten times, no state and no
 body, and fetch the file's blob once) and `a_four_mib_inline_file_is_served_whole_without_a_blob_read` (a v4 file is

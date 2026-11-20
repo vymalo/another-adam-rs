@@ -8131,6 +8131,35 @@ async fn state_is_corrupt_when_the_body_is_short_twice() {
     assert_eq!(moving.loads(), 2, "one re-read, then the same short set");
 }
 
+/// A commit that **appends** to the generation between the head read and the body read (and again
+/// before the retry's body read) must not make `Runtime::state` report `Corrupt`: the generation is
+/// append-only, so the head names the first `len` rows and the extra rows are a later commit. The
+/// old exact-length check re-read the head and then found the second append, and called a valid
+/// head corrupt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_reads_the_head_prefix_when_a_commit_appends_while_it_reads() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let agent = TranscriptAgent::new(&uniq("appending"), 3);
+    let rt = transcript_runtime(&inner, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    // Every `load_head` this wrapper answers appends a row to the generation first: the head read
+    // is the record from before the append, and the `body_list` after it sees one more row.
+    let moving = Arc::new(common::moving::MovingHead::appending(inner.clone(), run, 1));
+    let store: DynStore = moving.clone();
+    let reader = transcript_runtime(&store, &agent);
+    let state = reader.state(run).await.expect("state").expect("the run");
+    assert_eq!(
+        common::moving::messages(&state).len(),
+        4,
+        "the head's transcript, not the row the later commit appended"
+    );
+    assert_eq!(moving.loads(), 1, "the head did not have to be re-read");
+}
+
 /// `Runtime::artifact_bytes` answers an inline file's own bytes, a stored blob's bytes once, and
 /// `None` for a blob that is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -34,7 +34,11 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
   a parent check) does not pay for the largest column.
 * `load_head` is one statement: the head when `head_version == version`, the whole state otherwise,
   never a body row (`Runtime::view` is one `lease_until` + one `load_head`). `body_list` reads one
-  generation in order; `gc_body` collects superseded generations older than its cutoff.
+  generation in order; `gc_body` collects superseded generations older than its cutoff. **A `Store`
+  wrapper must forward `load_head`** (as it must forward `keeps_bodies`, `body_list` and
+  `gc_body`): the trait default calls the wrapper's `load_run`, so a view through a wrapper that
+  does not delegate silently reads the whole state and loses the head. The wrappers in
+  [`adam-store-testkit`](../adam-store-testkit/README.md) forward them.
 * `commit_run` writes the head, the body rows and the blob references **in the same transaction as
   the version CAS** (the run row is locked `FOR UPDATE` first). A commit that writes none of them is
   the single `UPDATE` it always was, so a delivery or a cancel pays no `BEGIN`.

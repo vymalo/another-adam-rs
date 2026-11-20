@@ -136,7 +136,10 @@ What the pieces offer, checked on 2026-11-19:
    `Runtime::state` joins the head and one `body_list`. The upgrade gate is `stored < 6` (or
    `to_regclass('<prefix>body')`), never the blob step's `stored == Some(4)`: a database stamped 5 has the blob
    tables and no head or body. `tests/fixtures/schema-v5.sql` (the `sqlx` build) opens and upgrades to 6, and
-   `schema-v6.sql` is the current schema, compared with the live statements by a unit test.
+   `schema-v6.sql` is the current schema, compared with the live statements by a unit test. `Store::load_head`
+   and `keeps_bodies` are defaulted; **a `Store` wrapper must forward them** (with `body_list` and `gc_body`),
+   because the default `load_head` calls the wrapper's `load_run`, so a view through a wrapper that does not
+   delegate silently reads the whole state and loses the head.
 2. **`adam-store-sqlite` (new) joins the main workspace**: `rusqlite` with `bundled` SQLite, on the `rusqlite` minor that
    `cratestack-rusqlite` uses (0.41 today), so an application can link both; a CI probe resolves the two together. It is
    what ADR 0047 decision 3 asked: `store_conformance!`, one writer, each change one `BEGIN IMMEDIATE` transaction, WAL,

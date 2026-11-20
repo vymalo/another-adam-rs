@@ -253,6 +253,120 @@ async fn a_stale_commit_leaves_the_winners_head_and_generation_alone() {
     assert_eq!(store.body_list(run.id, generation).await.unwrap().len(), 1);
 }
 
+/// The orphan collector works at the head's prefix end: a dead attempt's row at `idx == the head's
+/// `len` is collected by the next append (which starts there), and the prefix the live head names is
+/// not touched. `gc_body` never collects the generation the live head names; a superseded one is
+/// collected whole, leftovers included.
+#[tokio::test]
+async fn an_orphan_at_the_prefix_end_is_collected_and_the_live_prefix_survives() {
+    let Some(url) = support::test_url() else {
+        return;
+    };
+    let (pool, store, prefix, run) = setup(&url).await;
+    let generation = Uuid::new_v4();
+    let first_writer = Uuid::new_v4();
+    store
+        .commit_run(
+            run.id,
+            run.version,
+            RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                .head(json!({"v": 5, "agent": {}, "body": {"generation": null, "len": 2}}))
+                .body(BodyWrite {
+                    generation: Some(generation),
+                    rows: rows(&["a", "b"]),
+                    writer: first_writer,
+                }),
+        )
+        .await
+        .unwrap();
+    // A dead attempt's row at the head's len, older than the 5-minute orphan grace.
+    insert_foreign(
+        &pool,
+        &prefix,
+        run.id,
+        generation,
+        2,
+        "dead attempt",
+        Uuid::new_v4(),
+        jiff::SignedDuration::from_mins(6),
+    )
+    .await;
+    // The next append starts at the head's len: it collects the orphan and writes its own row.
+    store
+        .commit_run(
+            run.id,
+            run.version + 1,
+            RunUpdate::new(RunStatus::Runnable, json!({"turn": 2}))
+                .head(json!({"v": 5, "agent": {}, "body": {"generation": null, "len": 3}}))
+                .body(BodyWrite {
+                    generation: None,
+                    rows: rows(&["a", "b", "c"]),
+                    writer: Uuid::new_v4(),
+                }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .body_list(run.id, generation)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.message)
+            .collect::<Vec<_>>(),
+        vec![json!("a"), json!("b"), json!("c")]
+    );
+    // The prefix rows kept the writer the live head's commit gave them: the append did not touch
+    // them.
+    let client = pool.get().await.unwrap();
+    let writers: Vec<Uuid> = client
+        .query(
+            &format!("SELECT writer FROM {prefix}body WHERE run_id = $1 AND idx < 2 ORDER BY idx"),
+            &[&run.id.0],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(writers, vec![first_writer, first_writer]);
+
+    // The generation the live head names is never collected, however old its rows are.
+    let cutoff = now() + jiff::SignedDuration::from_hours(1);
+    assert_eq!(store.gc_body(run.id, generation, cutoff).await.unwrap(), 0);
+    assert_eq!(store.body_list(run.id, generation).await.unwrap().len(), 3);
+
+    // A compaction supersedes it; the old generation is collected whole.
+    let second = Uuid::new_v4();
+    store
+        .commit_run(
+            run.id,
+            run.version + 2,
+            RunUpdate::new(RunStatus::Runnable, json!({"turn": 3}))
+                .head(json!({"v": 5, "agent": {}, "body": {"generation": null, "len": 1}}))
+                .body(BodyWrite {
+                    generation: Some(second),
+                    rows: rows(&["x"]),
+                    writer: Uuid::new_v4(),
+                }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.gc_body(run.id, second, cutoff).await.unwrap(),
+        3,
+        "the superseded generation, all three rows"
+    );
+    assert!(
+        store
+            .body_list(run.id, generation)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.body_list(run.id, second).await.unwrap().len(), 1);
+}
+
 /// A head a later headless commit did not rebuild is **stale**: `load_head` serves the whole state
 /// (a mixed fleet reads it as before) and the body rows stay, unread by the view.
 #[tokio::test]

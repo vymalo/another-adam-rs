@@ -1,5 +1,7 @@
--- The schema version 5 that adam-store-postgres emits, exactly as the sqlx build wrote it.
--- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_5_fixture
+-- The schema version 5 that adam-store-postgres emitted, exactly as the sqlx build wrote it.
+-- This file is frozen history: it is the schema a database made by the pre-#361 release already
+-- has, and the upgrade test applies it verbatim. It is never regenerated (the drift-checked
+-- fixture is schema-v6.sql, compared with the live statements by the unit test of that name).
 CREATE TABLE IF NOT EXISTS adam_meta (
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL

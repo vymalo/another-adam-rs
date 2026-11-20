@@ -360,8 +360,9 @@ impl Inner {
         if let Some(state) = self.join_stored(&first, &stored).await? {
             return Ok(Some((first, state)));
         }
-        // The rows do not match the head: either the generation was collected between the two
-        // reads or the head moved. Re-read the head once; a version that changed names a new set.
+        // The rows do not hold the head's prefix: the generation was collected between the two
+        // reads, or a row below the prefix is missing. Re-read the head once; a version that
+        // changed names a new set.
         let Some(second) = self.store.load_head(run).await? else {
             return Ok(None);
         };
@@ -380,7 +381,8 @@ impl Inner {
             Some(state) => Ok(Some((second, state))),
             None => Err(RuntimeError::Corrupt {
                 run,
-                reason: "the head moved and its body generation is still incomplete".into(),
+                reason: "the head moved and its body generation is still short of its prefix"
+                    .into(),
                 source: None,
             }),
         }
@@ -406,15 +408,22 @@ impl Inner {
             });
         };
         let rows = self.store.body_list(rec.id, generation).await?;
-        if rows.len() != body.len as usize
+        let len = body.len as usize;
+        // The generation is append-only, so the head names a **prefix** of it: a commit that
+        // landed between the head read and this read may have appended rows at `idx >= len` (a
+        // winner's append, or a loser's rows a store has not collected yet). They are a later
+        // commit's, not this head's, and are ignored. A row missing *below* the prefix, or a
+        // wrong index, is the mismatch the caller re-reads once.
+        if rows.len() < len
             || rows
                 .iter()
+                .take(len)
                 .enumerate()
                 .any(|(at, row)| row.idx as usize != at)
         {
             return Ok(None);
         }
-        let rows: Vec<Value> = rows.into_iter().map(|row| row.message).collect();
+        let rows: Vec<Value> = rows.into_iter().take(len).map(|row| row.message).collect();
         let had_rows = !rows.is_empty();
         let head = stored.agent();
         let joined = registered.starter().join(head.clone(), rows)?;
@@ -1654,8 +1663,10 @@ impl Runtime {
     ///
     /// A v4 run's state is whole in its record, so it is returned as it is with no body read. For
     /// a v5 run the rows the head names are read (`body_list`) and the join must reproduce the
-    /// state: a set that does not match the head's `len` is read again once, in case the head moved
-    /// between the two reads, and is [`RuntimeError::Corrupt`] if it did not.
+    /// state: the head names a **prefix** of its append-only generation, so rows past its `len` are
+    /// a later commit's and are ignored, and a prefix that is short or out of order is read again
+    /// once, in case the head moved between the two reads, and is [`RuntimeError::Corrupt`] if it
+    /// did not.
     ///
     /// The agent must be registered on this runtime (an agent or a starter: both have `join`), and
     /// its `join` must be the one its `split` wrote the head with. A registration that only starts

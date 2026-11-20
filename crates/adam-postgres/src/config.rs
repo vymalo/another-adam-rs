@@ -8,7 +8,7 @@ use std::time::Duration;
 use adam_core::{StoreError, StoreResult};
 use adam_error::ErrorClass;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime, Timeouts};
-use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
@@ -105,6 +105,11 @@ pub struct PgConfig {
     config: DriverConfig,
     tls: ClientConfig,
     mode: TlsMode,
+    /// The verifier `tls` was built with. The connector owns its own `Arc`, so production never
+    /// reads this back; a test does, to prove that the mode the URL named chose the verifier
+    /// (a swap in [`tls_config`] would otherwise be invisible to the verifier-level tests).
+    #[cfg(test)]
+    verifier: Arc<dyn ServerCertVerifier>,
 }
 
 impl fmt::Debug for PgConfig {
@@ -135,10 +140,11 @@ impl PgConfig {
         let mut session_options: Vec<String> = Vec::new();
         let mut kept: Vec<(String, String)> = Vec::new();
         if let Some(query) = url.query() {
-            for pair in query.split('&').filter(|pair| !pair.is_empty()) {
-                let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-                let key = decode(raw_key)?;
-                let value = decode(raw_value)?;
+            // `form_urlencoded`, as `sqlx`'s `Url::query_pairs` was: `+` is a space and `%XX` is
+            // decoded, in a key and in a value alike.
+            for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+                let key = key.into_owned();
+                let value = value.into_owned();
                 let lower = key.to_ascii_lowercase();
                 match lower.as_str() {
                     "sslmode" | "ssl-mode" => mode = TlsMode::parse(&value)?,
@@ -185,8 +191,14 @@ impl PgConfig {
         let mut config = DriverConfig::from_str(&cleaned)
             .map_err(|e| invalid_source("DATABASE_URL is not a PostgreSQL URL", Box::new(e)))?;
         config.ssl_mode(mode.driver_mode());
-        let tls = tls_config(mode, root_cert, client_cert, client_key)?;
-        Ok(Self { config, tls, mode })
+        let (tls, _verifier) = tls_config(mode, root_cert, client_cert, client_key)?;
+        Ok(Self {
+            config,
+            tls,
+            mode,
+            #[cfg(test)]
+            verifier: _verifier,
+        })
     }
 
     /// Build a pool of at most `max_size` connections. No connection is opened until the first
@@ -285,6 +297,13 @@ impl PgConfig {
         &self.tls
     }
 
+    /// The verifier the connector was built with, for the test that proves the parsed mode chose
+    /// it.
+    #[cfg(test)]
+    fn verifier(&self) -> &Arc<dyn ServerCertVerifier> {
+        &self.verifier
+    }
+
     /// The driver's configuration, for the tests that check what survived the URL rewrite.
     #[cfg(test)]
     fn driver(&self) -> &DriverConfig {
@@ -292,13 +311,14 @@ impl PgConfig {
     }
 }
 
-/// Build the `rustls` configuration a [`TlsMode`] asks for.
+/// Build the `rustls` configuration a [`TlsMode`] asks for, and hand back the verifier it
+/// installed (the tests check that the mode chose it).
 fn tls_config(
     mode: TlsMode,
     root_cert: Option<String>,
     client_cert: Option<String>,
     client_key: Option<String>,
-) -> StoreResult<ClientConfig> {
+) -> StoreResult<(ClientConfig, Arc<dyn ServerCertVerifier>)> {
     let provider = Arc::new(aws_lc_rs::default_provider());
     let roots = match root_cert {
         Some(path) => roots_from_file(&path)?,
@@ -316,9 +336,9 @@ fn tls_config(
             )
         })?
         .dangerous()
-        .with_custom_certificate_verifier(verifier);
-    match (client_cert, client_key) {
-        (None, None) => Ok(builder.with_no_client_auth()),
+        .with_custom_certificate_verifier(verifier.clone());
+    let config = match (client_cert, client_key) {
+        (None, None) => builder.with_no_client_auth(),
         (Some(cert), Some(key)) => {
             let certs = certificates_from_file(&cert)?;
             let key = PrivateKeyDer::from_pem_file(&key).map_err(|e| {
@@ -332,11 +352,16 @@ fn tls_config(
                     "sslcert and sslkey do not form a client identity",
                     Box::new(e),
                 )
-            })
+            })?
         }
-        (Some(_), None) => Err(invalid("sslcert is set but sslkey is not: both are needed")),
-        (None, Some(_)) => Err(invalid("sslkey is set but sslcert is not: both are needed")),
-    }
+        (Some(_), None) => {
+            return Err(invalid("sslcert is set but sslkey is not: both are needed"));
+        }
+        (None, Some(_)) => {
+            return Err(invalid("sslkey is set but sslcert is not: both are needed"));
+        }
+    };
+    Ok((config, verifier))
 }
 
 /// The certificate verifier one TLS mode asks for.
@@ -521,18 +546,6 @@ impl ServerCertVerifier for AcceptAnyVerifier {
     }
 }
 
-fn decode(text: &str) -> StoreResult<String> {
-    percent_decode_str(text)
-        .decode_utf8()
-        .map(|text| text.into_owned())
-        .map_err(|e| {
-            invalid_source(
-                "DATABASE_URL has a parameter that is not UTF-8",
-                Box::new(e),
-            )
-        })
-}
-
 /// Percent-encode one query key or value the way `tokio-postgres` decodes it: only unreserved
 /// characters stay literal, and a space is `%20` (not `+`, which the driver does not decode).
 fn encode(text: &str) -> String {
@@ -694,6 +707,17 @@ mod tests {
         assert_eq!(config.driver().get_application_name(), Some("a"));
     }
 
+    /// `sqlx` read the query with `Url::query_pairs` (`form_urlencoded`), where `+` is a space. A
+    /// URL that spells a space that way worked before this crate existed and must keep working:
+    /// `application_name=adam+coder` names the process "adam coder", not "adam+coder".
+    #[test]
+    fn a_plus_in_a_query_value_is_the_space_sqlx_read_it_as() {
+        let config =
+            parse("postgres://u@h/d?application_name=adam+coder&options=-c+search_path%3Dadam");
+        assert_eq!(config.driver().get_application_name(), Some("adam coder"));
+        assert_eq!(config.driver().get_options(), Some("-c search_path=adam"));
+    }
+
     #[test]
     fn a_client_certificate_and_a_root_certificate_are_read() {
         let config = parse(&format!(
@@ -807,6 +831,50 @@ mod tests {
             assert!(
                 verify(&*permissive, "anything.invalid").is_ok(),
                 "{mode:?} must not verify the certificate"
+            );
+        }
+    }
+
+    /// The verifier-level tests above prove each verifier; this proves `tls_config` installed the
+    /// one the parsed URL's mode names. A swap there (every mode accepting any certificate, or
+    /// `verify-ca` verifying the host name) would leave the tests above green.
+    #[test]
+    fn the_parsed_url_installs_the_verifier_its_mode_names() {
+        let ca = fixture("ca.pem");
+        let full = parse(&format!(
+            "postgres://u@h/d?sslmode=verify-full&sslrootcert={ca}"
+        ));
+        assert!(verify(&**full.verifier(), "db.example.internal").is_ok());
+        assert!(
+            verify(&**full.verifier(), "localhost").is_err(),
+            "verify-full checks the host name"
+        );
+
+        let chain = parse(&format!(
+            "postgres://u@h/d?sslmode=verify-ca&sslrootcert={ca}"
+        ));
+        assert!(
+            verify(&**chain.verifier(), "localhost").is_ok(),
+            "verify-ca does not check the host name"
+        );
+        assert!(verify(&**chain.verifier(), "db.example.internal").is_ok());
+
+        let wrong = fixture("wrong-ca.pem");
+        let chain_wrong = parse(&format!(
+            "postgres://u@h/d?sslmode=verify-ca&sslrootcert={wrong}"
+        ));
+        assert!(
+            verify(&**chain_wrong.verifier(), "db.example.internal").is_err(),
+            "verify-ca still checks the chain"
+        );
+
+        for mode in ["require", "prefer"] {
+            let permissive = parse(&format!(
+                "postgres://u@h/d?sslmode={mode}&sslrootcert={wrong}"
+            ));
+            assert!(
+                verify(&**permissive.verifier(), "anything.invalid").is_ok(),
+                "{mode} must not verify the certificate"
             );
         }
     }

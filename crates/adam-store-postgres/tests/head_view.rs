@@ -11,7 +11,7 @@ mod support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use adam_core::{DynStore, RunStatus, Store};
+use adam_core::{BodyRow, BodyWrite, DynStore, NewRun, RunStatus, RunUpdate, Store};
 use adam_runtime::{Agent, AgentError, Ctx, Inbound, Runtime, Transition};
 use adam_store_postgres::PgStore;
 use adam_store_testkit::counting::CountingStore;
@@ -41,7 +41,9 @@ impl Agent for SplitAgent {
 
     fn init(&self, _input: Inbound) -> Result<Transcript, AgentError> {
         Ok(Transcript {
-            messages: vec!["start".to_owned()],
+            // A transcript long enough that reading it would be visible: the view below is of a
+            // 50-message run (49 here plus the step's) and must read no body row of it.
+            messages: (0..49).map(|i| format!("message {i}")).collect(),
             turns: 0,
         })
     }
@@ -154,5 +156,97 @@ async fn the_view_reads_the_head_and_the_state_joins_the_body() {
     assert_eq!(counting.calls(Method::LoadHead), 1);
     assert_eq!(counting.calls(Method::BodyList), 1, "one body set");
     assert_eq!(counting.calls(Method::LoadRun), 0);
-    assert_eq!(state["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(state["messages"].as_array().unwrap().len(), 50);
+}
+
+/// The head names a **prefix** of its append-only generation. A row past the head's `len` — a
+/// loser's leftover, an orphan not yet collected, or a commit that landed between the head read and
+/// the body read — is a later commit's, not this head's: `Runtime::state` serves the prefix and
+/// does not call the head corrupt. A row missing *below* the prefix is still `Corrupt` (the
+/// runtime's own test covers that; here the store is real).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_state_serves_the_head_prefix_and_ignores_a_row_past_it() {
+    let Some(url) = support::test_url() else {
+        return;
+    };
+    let prefix = format!(
+        "adam_prefix_{}_",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let pg = PgStore::from_pool(support::pool(&url, 4))
+        .with_table_prefix(&prefix)
+        .expect("prefix");
+    pg.migrate().await.expect("migrate");
+    let name = format!(
+        "prefix-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let run = pg
+        .create_run(NewRun::new(&name, json!({})))
+        .await
+        .expect("create");
+    let generation = uuid::Uuid::new_v4();
+    let writer = uuid::Uuid::new_v4();
+    let body = |messages: &[&str]| {
+        messages
+            .iter()
+            .enumerate()
+            .map(|(idx, message)| BodyRow {
+                idx: u32::try_from(idx).expect("a short transcript"),
+                message: json!(message),
+            })
+            .collect::<Vec<_>>()
+    };
+    pg.commit_run(
+        run.id,
+        run.version,
+        RunUpdate::new(
+            RunStatus::Runnable,
+            json!({"messages": ["m0", "m1"], "turns": 1}),
+        )
+        .head(json!({"v": 5, "agent": {"messages": [], "turns": 1},
+                   "body": {"generation": null, "len": 2}}))
+        .body(BodyWrite {
+            generation: Some(generation),
+            rows: body(&["m0", "m1"]),
+            writer,
+        }),
+    )
+    .await
+    .expect("the head and its two rows");
+
+    // A row at `idx == the head's len`, as a lost attempt's or an append's would be.
+    let client = pg.pool().get().await.expect("a connection");
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {prefix}body (run_id, generation, idx, message, writer, written_at)
+                 VALUES ($1, $2, 2, $3, $4, $5)"
+            ),
+            &[
+                &run.id.0,
+                &generation,
+                &json!("later"),
+                &uuid::Uuid::new_v4(),
+                &adam_core::store::now().0,
+            ],
+        )
+        .await
+        .expect("the extra row");
+    drop(client);
+    assert_eq!(
+        pg.body_list(run.id, generation).await.expect("rows").len(),
+        3,
+        "the store returns the whole generation; the runtime cuts the prefix"
+    );
+
+    let rt = Runtime::builder(Arc::new(pg) as DynStore)
+        .agent(SplitAgent { name: name.clone() })
+        .build();
+    let state = rt.state(run.id).await.expect("state").expect("the run");
+    assert_eq!(
+        state,
+        json!({"messages": ["m0", "m1"], "turns": 1}),
+        "the head's prefix, not the row past it"
+    );
 }
