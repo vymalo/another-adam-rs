@@ -16,8 +16,9 @@ use super::ToolEnv;
 use super::project;
 
 // A block of the nested instructions fits the room the port promises (`MAX_INSTRUCTIONS_BLOCK`):
-// the text, cut at `NESTED_CAP`, and its header and footer.
-const _: () = assert!(project::NESTED_CAP + 4 * 1024 <= adam_code_tools::MAX_INSTRUCTIONS_BLOCK);
+// the text, cut at `NESTED_CAP`, and its header and footer. It is exactly that room, the room
+// `read_files` has always reserved for a block.
+const _: () = assert!(project::NESTED_CAP + 4 * 1024 == adam_code_tools::MAX_INSTRUCTIONS_BLOCK);
 
 /// A slot as a [`Place`].
 pub(crate) fn place_of(slot: Slot) -> Place {

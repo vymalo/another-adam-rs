@@ -755,7 +755,7 @@ pub async fn search_files(
 
 /// `page` with the nested project instructions `path` shows in `place` before it, as the tools
 /// put them: the block, a blank line, the page.
-async fn with_nested(
+pub(crate) async fn with_nested(
     ws: &dyn CodeWorkspace,
     ctx: &ToolCtx,
     place: &Place,
@@ -770,7 +770,7 @@ async fn with_nested(
 }
 
 /// `text` trimmed, or `None` when nothing is left.
-fn non_empty(text: &str) -> Option<&str> {
+pub(crate) fn non_empty(text: &str) -> Option<&str> {
     Some(text.trim()).filter(|s| !s.is_empty())
 }
 

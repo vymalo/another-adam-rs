@@ -4,9 +4,9 @@
 
 use adam::prelude::*;
 
+pub(super) use adam_code_tools::find::DEADLINE;
 #[cfg(test)]
 pub(super) use adam_code_tools::find::search_files_in;
-pub(super) use adam_code_tools::find::{DEADLINE, within};
 
 use super::{Outcome, ToolEnv};
 

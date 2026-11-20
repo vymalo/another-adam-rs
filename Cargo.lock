@@ -298,12 +298,14 @@ name = "adam-code-tools"
 version = "0.1.0"
 dependencies = [
  "adam-llm-agent",
+ "adam-model",
  "adam-runtime",
  "adam-workspace",
  "aho-corasick",
  "async-trait",
  "base64 0.22.1",
  "globset",
+ "proptest",
  "regex",
  "serde_json",
  "tempfile",

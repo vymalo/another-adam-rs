@@ -25,7 +25,9 @@ dev-dependency and runs the same cases: the coder's `ToolEnv` in `bin/adam-coder
 
 `tests/dir.rs` runs the cases over `DirWorkspace` with one writable and one read-only place. `tests/find.rs` runs `adam_code_tools::find`'s three tools through the port over `DirWorkspace` and a git
 repository of its own (a listing, a glob, a search that neither shows nor finds the secret, an unknown place), so the
-tools are tested over a workspace that is not the coder's.
+tools are tested over a workspace that is not the coder's. `tests/files.rs` does the same for `adam_code_tools::files`'s
+`read_file` and `read_files` (a page of a file, a missing file named with its closest path, two files in one result, a
+path that leaves the place by `..` or a symlink).
 `cargo test -p adam-code-tools-testkit` (needs `git`); nothing needs a database.
 
 ## See also
