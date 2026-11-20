@@ -34,8 +34,11 @@ const DEFAULT_EVENT_CAPACITY: usize = 256;
 /// The largest [`Limits::event_capacity`]: the channel allocates every slot at once.
 const MAX_EVENT_CAPACITY: usize = 1 << 16;
 
+/// The default of [`Limits::worker_id`].
+const DEFAULT_WORKER_ID: &str = "adam-engine";
+
 /// What the engine runs within. Set the fields on [`Limits::default`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Limits {
     /// Runs stepped at the same time (the runtime's `concurrency`). Default 4, at least 1.
@@ -50,6 +53,17 @@ pub struct Limits {
     /// ([`EngineEvent::Behind`](crate::EngineEvent::Behind)). The channel rounds it up to a power
     /// of two. Default 256; zero is refused, and so is more than 65 536.
     pub event_capacity: usize,
+    /// The id the worker writes into the leases of the runs it steps. Default `"adam-engine"`;
+    /// empty is refused.
+    ///
+    /// It is fixed, not random, so that a restarted engine finds its own leases: `start` releases
+    /// every lease this id holds (`Store::release_worker_leases`) and claims the runs the last
+    /// process was stepping at once, instead of waiting up to [`lease_ttl`](Self::lease_ttl) for
+    /// each. **Only one live engine may use an id on a store**, since the release would take the
+    /// leases of runs another live engine with the same id is stepping. The SQLite store's lock
+    /// (one process per file) enforces that for a file; two engines in one process on one
+    /// `MemoryStore` must be given different ids.
+    pub worker_id: String,
 }
 
 impl Default for Limits {
@@ -59,6 +73,7 @@ impl Default for Limits {
             max_parallel_tools: DEFAULT_MAX_PARALLEL,
             lease_ttl: Duration::from_secs(30),
             event_capacity: DEFAULT_EVENT_CAPACITY,
+            worker_id: DEFAULT_WORKER_ID.to_owned(),
         }
     }
 }
@@ -99,7 +114,9 @@ impl EngineBuilder {
         self
     }
 
-    /// Migrate the store, build the agent and start the worker on the current tokio runtime.
+    /// Migrate the store, release the leases [`Limits::worker_id`] holds in it (a restarted engine
+    /// claims its old runs at once), build the agent and start the worker on the current tokio
+    /// runtime.
     ///
     /// The agent gets the screen's tools of an embedded agent (`ask_user`, `show`, `ui_catalog`,
     /// `plan_*`, from `adam_ui::Ui::embedded`) and nothing on the network: a file that names an
@@ -109,10 +126,11 @@ impl EngineBuilder {
     ///
     /// * [`EngineError::NoRuntime`] outside a tokio runtime;
     /// * [`EngineError::Invalid`] for a zero [`Limits::lease_ttl`], an [`Limits::event_capacity`] of
-    ///   zero or over 65 536, and for an agent whose files
+    ///   zero or over 65 536, an empty [`Limits::worker_id`], and for an agent whose files
     ///   name an MCP server or a remote (`a2a:`) subagent, its subagents' included: the engine runs
     ///   neither yet, whatever features the build turns on;
-    /// * [`EngineError::Store`] when the store's migration fails;
+    /// * [`EngineError::Store`] when the store's migration or the release of the worker's leases
+    ///   fails, with the store's class;
     /// * [`EngineError::Agent`] when the agent does not bind (an unknown tool, an MCP server, a
     ///   remote subagent, a secret refused) or the model alias is refused.
     pub async fn start(self) -> Result<Engine, EngineError> {
@@ -136,6 +154,11 @@ impl EngineBuilder {
                 limits.event_capacity
             )));
         }
+        if limits.worker_id.is_empty() {
+            return Err(EngineError::Invalid(
+                "the worker's id must not be empty".to_owned(),
+            ));
+        }
         refuse_what_is_not_embedded(agent.manifest(), agent.name())?;
         let name = agent.name().to_owned();
         let ui = Ui::embedded();
@@ -148,6 +171,11 @@ impl EngineBuilder {
             .model(model, alias)
             .map_err(|e| EngineError::Agent(Box::new(e)))?;
         store.migrate().await.map_err(EngineError::Store)?;
+        // The one live engine with this id (its doc): the leases it holds are the last process's.
+        store
+            .release_worker_leases(&limits.worker_id)
+            .await
+            .map_err(EngineError::Store)?;
 
         let (runtime, events) =
             runtime_with_ring(assembly.register(Runtime::builder(store)), &limits);
@@ -209,6 +237,7 @@ pub(crate) fn runtime_with_ring(
         .event_sink(EngineSink(events.clone()))
         .concurrency(limits.concurrency)
         .lease_ttl(limits.lease_ttl)
+        .worker_id(limits.worker_id.clone())
         .build();
     (runtime, events)
 }

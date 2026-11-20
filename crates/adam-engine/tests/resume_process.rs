@@ -3,6 +3,11 @@
 //! after the run's first step is committed; the parent kills the child with `SIGKILL`, opens the
 //! same store, and its engine finishes the run without running that step again.
 //!
+//! Both halves use one worker id, [`WORKER`], and the child's lease lasts an hour: the parent finishes
+//! the run in time only because its `start` releases the leases that id holds
+//! (`Store::release_worker_leases`), which is safe because the child is dead and the store's lock
+//! lets one process open it.
+//!
 //! The store comes from [`durable_store`] alone. Until the SQLite store of ADR 0053 slice 3 lands
 //! it panics and the test is ignored. The pull request that adds the store changes the helper's
 //! body, the `#[ignore]`, and this crate's dev-dependencies (`adam-store-sqlite`): the helper is
@@ -35,8 +40,20 @@ use tokio::time::timeout;
 const CHILD: &str = "ADAM_ENGINE_TEST_RESUME_CHILD";
 const TEST: &str = "a_killed_process_resumes_its_run";
 const WAIT: Duration = Duration::from_secs(60);
-/// The child's lease: what the parent waits at most before it may claim the killed child's run.
-const CHILD_LEASE: Duration = Duration::from_secs(2);
+/// The child's lease: far longer than [`WAIT`], so the parent claims the killed child's run in time
+/// only by releasing it.
+const CHILD_LEASE: Duration = Duration::from_secs(60 * 60);
+/// The worker id of both halves (the engine's default, said here so that neither half drifts): the
+/// parent's `start` releases the leases the killed child held under it.
+const WORKER: &str = "adam-engine";
+
+/// The limits of both halves: the one worker id, and the child's lease.
+fn limits() -> Limits {
+    let mut limits = Limits::default();
+    limits.lease_ttl = CHILD_LEASE;
+    limits.worker_id = WORKER.to_owned();
+    limits
+}
 
 /// The store both processes open at `path`: it must outlive the process that wrote it.
 #[allow(clippy::unused_async)] // opening the SQLite store will await
@@ -135,15 +152,13 @@ fn child(dir: PathBuf) {
             calls: AtomicUsize::new(0),
             dir: dir.clone(),
         });
-        let mut limits = Limits::default();
-        limits.lease_ttl = CHILD_LEASE;
         let engine = Engine::builder(
             durable_store(&store_path(&dir)).await.unwrap(),
             chat(),
             model,
             "m",
         )
-        .limits(limits)
+        .limits(limits())
         .start()
         .await
         .unwrap();
@@ -198,6 +213,7 @@ fn parent() {
             model,
             "m",
         )
+        .limits(limits())
         .start()
         .await
         .unwrap();

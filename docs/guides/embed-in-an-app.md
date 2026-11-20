@@ -23,6 +23,11 @@ The calls, their refusals and their defaults: the [crate README](../../crates/ad
 
 The engine reads no environment variable and no file it was not given.
 
+**One live engine per worker id and store.** `start` releases every lease its worker id (`Limits::worker_id`, default
+`adam-engine`) holds, so a restarted application claims the runs it was stepping at once instead of waiting for their
+leases to run out. A second live engine with the same id on the same store would lose its runs: the SQLite store's
+lock allows one process per file, and two engines in one process on one `MemoryStore` need different ids.
+
 ## The example
 
 `crates/adam-engine/examples/chat` is a terminal chat: `main.rs` builds the engine, `app.rs` is the loop (a test drives

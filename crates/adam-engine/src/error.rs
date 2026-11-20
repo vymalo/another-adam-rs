@@ -65,7 +65,7 @@ pub enum EngineError {
         #[source]
         source: Option<BoxError>,
     },
-    /// The store refused or failed at `start` (its migration).
+    /// The store refused or failed at `start`: its migration, or the release of the worker's leases.
     #[error("the store failed")]
     Store(#[source] StoreError),
     /// A bug, or a failure nothing above describes.

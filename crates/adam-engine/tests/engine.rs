@@ -1,6 +1,7 @@
 //! The engine's API (ADR 0047 slice 4) over `MemoryStore` and a scripted model: send, steer,
 //! answer, cancel and list, a run's events and a slow reader of them, a dropped engine's run resumed
-//! by the next, and what `start` refuses. Every wait is bounded, so a hang fails.
+//! by the next at once, two engines with their own worker ids on one store, and what `start`
+//! refuses. Every wait is bounded, so a hang fails.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use std::time::Duration;
 
 use adam_engine::adam_agent_fs::{Dir, Strictness};
 use adam_engine::adam_assembly::{AgentDef, Error as AssemblyError};
-use adam_engine::adam_core::{DynStore, MemoryStore, RunId};
+use adam_engine::adam_core::{DynStore, MemoryStore, RunId, Store};
 use adam_engine::adam_error::{Classify, ErrorClass};
 use adam_engine::adam_model::{
     ContentPart, DynModel, Message as ModelMessage, MockModel, ModelClient, ModelDelta, ModelError,
@@ -526,7 +527,7 @@ async fn start_refuses_what_it_cannot_build() {
     let mut limits = Limits::default();
     limits.event_capacity = 0;
     let ring = Engine::builder(store.clone(), chat(), MockModel::new().into_dyn(), "m")
-        .limits(limits)
+        .limits(limits.clone())
         .start()
         .await
         .expect_err("a ring of zero events is refused");
@@ -922,16 +923,15 @@ async fn events_of_an_unknown_run_and_of_a_finished_one() {
 }
 
 /// The in-memory stand-in for a killed process: engine A is dropped while its run's second model
-/// call is in flight, and engine B, over the same store, finishes the run once A's lease runs out.
-/// The step A committed is kept: B's model is called once, for the step after it, and the tool that
-/// step called is not run again.
+/// call is in flight, and engine B, over the same store with the same (default) worker id, releases
+/// A's lease at start and finishes the run. The step A committed is kept: B's model is called once,
+/// for the step after it, and the tool that step called is not run again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dropped_engine_resumes_its_run() {
     let store = Arc::new(MemoryStore::new());
-    let mut limits = Limits::default();
-    limits.lease_ttl = Duration::from_millis(300);
+    let limits = Limits::default();
 
-    let a = Rig::on_store(store.clone(), Some(1), limits, |mock| {
+    let a = Rig::on_store(store.clone(), Some(1), limits.clone(), |mock| {
         mock.push_tool_calls(vec![plan()]).push_text("never said");
     })
     .await;
@@ -999,6 +999,109 @@ async fn a_dropped_engine_resumes_its_run() {
         matches!(last, ModelMessage::Tool { call_id, is_error: false, .. } if call_id == "plan-1"),
         "B continued from A's committed step, the plan's result: {last:?}"
     );
+    b.stop().await;
+}
+
+/// A lease far longer than any wait here: a run held by it is claimed in time only if it was
+/// released.
+const LONG_LEASE: Duration = Duration::from_secs(60 * 60);
+
+/// How long a run released at start may take to be claimed and finished: a few polls.
+const AT_ONCE: Duration = Duration::from_secs(5);
+
+/// A restarted engine releases the leases its worker id holds, so it claims the run its last
+/// process was stepping at once: A, with a lease of an hour, is dropped mid-step (its worker
+/// aborted), and B, the same default id on the same store, finishes the run within seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_engine_claims_its_old_runs_at_once() {
+    let store = Arc::new(MemoryStore::new());
+    let mut limits = Limits::default();
+    limits.lease_ttl = LONG_LEASE;
+
+    let a = Rig::on_store(store.clone(), Some(1), limits.clone(), |mock| {
+        mock.push_tool_calls(vec![plan()]).push_text("never said");
+    })
+    .await;
+    let turn = a.engine.send(None, Say::new("plan it")).await.unwrap();
+    a.gate.wait_reached().await;
+    let Rig {
+        gate: _held,
+        engine,
+        ..
+    } = a;
+    drop(engine);
+    assert!(
+        store.lease_until(turn.run).await.unwrap().is_some(),
+        "A's lease outlives A"
+    );
+
+    let b = Rig::on_store(store, None, limits, |mock| {
+        mock.push_text("finished by B");
+    })
+    .await;
+    let done = timeout(AT_ONCE, b.wait(turn.run, RunState::Done))
+        .await
+        .expect("B claims A's run at once, not when A's lease of an hour runs out");
+    assert_eq!(done.output.as_deref(), Some("finished by B"));
+    assert_eq!(b.mock.requests().len(), 1, "B stepped the run once");
+    b.stop().await;
+}
+
+/// An empty worker id would name no worker: refused before anything starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_worker_id_is_refused() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let mut limits = Limits::default();
+    limits.worker_id = String::new();
+    let error = Engine::builder(store, chat(), MockModel::new().into_dyn(), "m")
+        .limits(limits)
+        .start()
+        .await
+        .expect_err("an empty worker id is refused");
+    assert!(matches!(error, EngineError::Invalid(_)), "{error:?}");
+    assert_eq!(error.class(), ErrorClass::Invalid);
+}
+
+/// Two live engines in one process on one store, each with its own worker id: B's start releases
+/// only B's leases, so A's run, whose model call is in flight, keeps A's lease and is not stepped
+/// by B, and each engine finishes its own run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_engines_with_their_own_ids_keep_their_own_leases() {
+    let store = Arc::new(MemoryStore::new());
+    let mut limits = Limits::default();
+    limits.lease_ttl = LONG_LEASE;
+    limits.worker_id = "engine-a".to_owned();
+    let a = Rig::on_store(store.clone(), Some(0), limits.clone(), |mock| {
+        mock.push_text("said by A");
+    })
+    .await;
+    let run_a = a.engine.send(None, Say::new("to A")).await.unwrap().run;
+    a.gate.wait_reached().await;
+
+    limits.worker_id = "engine-b".to_owned();
+    let b = Rig::on_store(store.clone(), None, limits, |mock| {
+        mock.push_text("said by B");
+    })
+    .await;
+    assert!(
+        store.lease_until(run_a).await.unwrap().is_some(),
+        "B's start left A's lease"
+    );
+    let run_b = b.engine.send(None, Say::new("to B")).await.unwrap().run;
+    let done = b.wait(run_b, RunState::Done).await;
+    assert_eq!(done.output.as_deref(), Some("said by B"));
+    assert_eq!(
+        b.engine.get(run_a).await.unwrap().unwrap().state,
+        RunState::Working
+    );
+    assert!(store.lease_until(run_a).await.unwrap().is_some());
+
+    a.gate.release.notify_one();
+    let done = a.wait(run_a, RunState::Done).await;
+    assert_eq!(done.output.as_deref(), Some("said by A"));
+    assert_eq!(a.mock.requests().len(), 1, "A stepped its run once");
+    assert_eq!(b.mock.requests().len(), 1, "B stepped its own run only");
+    a.stop().await;
     b.stop().await;
 }
 

@@ -254,6 +254,9 @@ proof that a killed process resumes its run merges (PR 4):** `tests/resume_proce
 SQLite store of slice 3 (ADR 0053 slice 3) lands. Not built either: the engine sets no fixed worker id and releases no
 lease at start (the first diagram's "release this worker's leases"), so a restarted engine waits for its old leases to
 run out.
+*Amended 2026-11-20:* built. `Limits::worker_id` is fixed (default `adam-engine`, empty refused) and `start` calls
+`Store::release_worker_leases` after migrating, so a restarted engine claims its old runs at once; the id must be used by
+one live engine per store (`a_restarted_engine_claims_its_old_runs_at_once` in `crates/adam-engine/tests/engine.rs`).
 
 ## Decisions the owner confirmed
 
