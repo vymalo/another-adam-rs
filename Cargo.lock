@@ -249,6 +249,7 @@ name = "adam-agent-fs"
 version = "0.1.0"
 dependencies = [
  "adam-error",
+ "jiff",
  "proptest",
  "serde",
  "serde-saphyr 1.3.0",
@@ -2835,6 +2836,7 @@ dependencies = [
  "defmt",
  "jiff-core",
  "jiff-static",
+ "jiff-tzdb",
  "jiff-tzdb-platform",
  "log",
  "portable-atomic",

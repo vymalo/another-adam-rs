@@ -43,7 +43,7 @@ my-agent/                       # a normal Cargo package
 │   │   └── billing.md                   # `a2a: <agent-card URL>` makes it a remote subagent
 │   ├── commands/review.md      # a prompt template a message invokes by name (`/review ...`)
 │   ├── mcp.json                # {"mcpServers": {...}}; secrets only as ${VAR}
-│   └── schedules/daily.md      # frontmatter `cron:`; body = prompt (roadmap 5, sketch)
+│   └── schedules/daily.md      # frontmatter `cron:`, `at:` or `after:`; body = prompt (ADR 0060)
 └── src/
     ├── main.rs                 # adam::include_agent!(); compose store + model + tools + serve
     └── tools/weather.rs        # #[tool] async fn get_weather(...)
@@ -334,8 +334,25 @@ sequenceDiagram
   `streamable-http` or `sse` (refused at run time). A `url` without `type` is an error; `ws` is unsupported.
   The server name and each allow-listed tool must fit `<server>__<tool>` in 64 characters. A literal
   credential in a header, env value or URL is a warning (an error under `.strict()`).
-* **Schedules**: `cron` (five fields, checked for shape, not evaluated), `timezone` (default `UTC`), a
-  non-empty body; they belong to the root agent.
+* **Schedules** ([ADR 0060](../decisions/0060-schedules-are-parked-runs.md)): exactly one of three keys, a
+  non-empty body (the prompt of each run), and `timezone` (default `UTC`); they belong to the root agent. Read and
+  checked here; nothing runs them yet (ADR 0060's later slices).
+  * `cron`: five fields, minute, hour, day of month, month, day of week, evaluated. `*`, lists, ranges, steps
+    (`*/15`, `1-30/2`, and `5/15` for `5-59/15`), `JAN`-`DEC`, `SUN`-`SAT` (any case), `0` and `7` for Sunday, `?` as
+    `*`. When both day fields are restricted (neither starts with `*` or `?`), a day matches either. A field out of
+    range, a backwards range, a step of 0 or beyond the field, and a day of the month that none of the listed months has
+    (`0 9 30 2 *`) are errors; `L`, `W` and `#` are not cron here.
+  * `at`: one time, `YYYY-MM-DDTHH:MM`, optionally `:SS`, then nothing (read in `timezone`), `Z` or `±HH:MM`. A bare
+    date, a lower-case `t` or `z`, fractions of a second, the second 60, a `[zone]` annotation, an offset beyond a day,
+    `-00:00` (RFC 3339's unknown offset: write `Z`), a year after 9998 and a date that does not exist are errors. With an
+    offset, `timezone` is ignored, with a warning.
+  * `after`: one duration from when the schedule starts, whole numbers with units largest first, each once: `90s`,
+    `30m`, `2h`, `1h30m`, `1d 12h` (a day is 24 hours). Zero and more than 366 days are errors; `timezone` is ignored,
+    with a warning.
+  * `timezone` must name a zone of the IANA database that adam bundles (jiff's copy), never the host's
+    `/usr/share/zoneinfo`; `Mars/Olympus` is an error.
+  * Fields are separated by ASCII spaces and tabs only: a no-break space is not a separator.
+  * A `cron` schedule's part of the digest is what it was before `at` and `after` existed.
 * **Other**: a prompt over 30,000 characters warns (Copilot's limit, *verified 2026-09-29*); an entry that is
   not a slot (`tools/`, `channels/`) warns and points at `#[tool]`; dotfiles, `*.test.md`, `__tests__/` and
   `README.md` are never read; non-UTF-8 is an error.
@@ -1059,7 +1076,7 @@ and its only deployment step is mounting it.
 | `connections/*.ts` | `mcp.json` (MCP only) | `mcpServers` (Claude Code, SEP-2633 draft) |
 | `channels/` | code: `adam-a2a`; `card:` frontmatter | **A2A** agent card |
 | `hooks/*.ts` | `EventSink` in code | none |
-| `schedules/*.md` (`cron:`) | same | five-field cron |
+| `schedules/*.md` (`cron:`) | same, plus `at:` and `after:` | five-field cron |
 | `sandbox.ts` | later (roadmap 7) | none |
 | `lib/` | `src/` | Cargo |
 | `eve info`, `.eve/compile/*.json` | build errors and warnings, `OUT_DIR/adam_agent.rs`, `cargo adam check` | none |
