@@ -55,11 +55,11 @@ builder's source replaces whatever source the definition had.
 **Defaults** (`Limits`, `#[non_exhaustive]`: set its fields on `Limits::default()`): `concurrency` 4 runs stepped at
 once, `max_parallel_tools` 10 tool calls of one turn at once (an agent's file may lower it), `lease_ttl` 30 s (zero
 is refused), `event_capacity` 256 live events in the ring (1 to 65 536; the channel rounds it up to a power of two).
-The worker's id is the runtime's random default: the engine sets no fixed id yet. A fixed one (so that a restarted
-engine can release its own leases at once) is safe only under slice 3's lock, one process per store, and needs
-`Store::release_worker_leases`, which another change adds to `adam-core`. **Until it lands, a restarted engine waits up
-to `lease_ttl` for its own old runs**: the runs the last process was stepping are claimed again only once their leases
-run out.
+The worker's id is the runtime's random default: the engine sets no fixed id and does not call
+`Store::release_worker_leases` yet. A fixed one (so that a restarted engine releases its own leases at
+once) is safe only under slice 3's lock, one process per store. **A restarted engine therefore still
+waits up to `lease_ttl` for its own old runs**: the runs the last process was stepping are claimed
+again only once their leases run out.
 
 **Inside.** Every call is what the A2A server does for one caller: `RuntimeTaskBackend` of
 [`adam-a2a-runtime`](../adam-a2a-runtime/README.md), as the subject `adam-engine` (a steer with `steer/v1`

@@ -109,12 +109,18 @@ job of `.github/workflows/coder.yml` runs it in the built coder image**, whose w
 
 ## What the store suite covers
 
-48 cases: exact JSON round trip (unicode, `i64` bounds, floats, special keys), CAS conflicts, 16-way concurrent
+49 cases: exact JSON round trip (unicode, `i64` bounds, floats, special keys), CAS conflicts, 16-way concurrent
 commits with one winner, journal ordering, first-writer-wins and 16-way races, non-determinism detection, due
 rules, agent filtering and limits, busy runs left unclaimed, 8 workers claiming 60 runs with no double lease,
 lease expiry and takeover, renew and release, pinned claims (an owned run never goes to another worker, 4 workers
 racing), one open run per conversation including a 16-way race, listing and counting (scoped, ordered, keyset
 pages, filters), push configurations, and purging.
+
+The worker-lease suite (`worker_leases_conformance!`) adds three cases for a store that implements
+`release_worker_leases`: every run lease the worker holds goes and its runs are claimable at once,
+and its owner is not cleared; another worker's lease is untouched; and a lease the owner does not
+hold survives the owner's sweep. The method is defaulted to a no-op, so the
+suite is separate from the required `store_conformance!`.
 
 The write cost of a transcript-shaped run is measured **and asserted**: `counting::measure_transcript_write`
 commits a 10 KB message 50 times through `CountingStore` in the contract shape (the tombstone, a head and the
@@ -126,8 +132,10 @@ and `dev/p2-measure.sh` quotes the disk side. The before/after numbers are in
 ## Adding a backend
 
 Implement `Store` and add one line: `adam_store_testkit::store_conformance!(make_store);` (and
-`adam_store_testkit::blob_conformance!(make_store);` when it keeps blobs, and
-`adam_store_testkit::body_conformance!(make_store);` when it keeps bodies). A new `Notifier` runs
+`adam_store_testkit::blob_conformance!(make_store);` when it keeps blobs,
+`adam_store_testkit::body_conformance!(make_store);` when it keeps bodies, and
+`adam_store_testkit::worker_leases_conformance!(make_store);` when it implements
+`release_worker_leases`, which defaults to a no-op). A new `Notifier` runs
 `adam_notify_testkit::notifier_conformance!(make_pair);` (the Postgres one needs `ADAM_TEST_POSTGRES_URL`, a
 superuser, for its reconnect test). See [Store adapters](../reference/store-adapters.md#adding-a-backend).
 
