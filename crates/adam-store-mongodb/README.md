@@ -141,7 +141,8 @@ has neither field, and `{head_version: null}` matches a missing field, as `owner
 A commit that writes a head sets both. In the contract release every commit of a v5 run writes the
 head — a delivery, a cancel and a park re-encode the one they read — so it stays current; a v4
 commit (a process of the expand release) leaves both alone, so the head becomes stale
-(`head_version < version`) and every read serves the whole `state` instead.
+(`head_version < version`) and every read serves the whole `state` — unless the state is the
+tombstone (a pre-S3 process failed a converted run), in which case the head is served.
 
 `<prefix>body` holds the transcript, **append-only per generation**: `_id =
 "<run>:<generation>:<idx>"`, `run_id`, `generation` and `writer` (binary UUIDs), `idx` (int),

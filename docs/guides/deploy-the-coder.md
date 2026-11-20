@@ -170,9 +170,10 @@ ADR 0055 shipped in two releases. The **expand** release (S0–S2b) writes the w
 beside the head, so a v4 process and a v5 one can both step a run; the **contract** release (S3)
 writes `state = null` (the tombstone), the head and the body, and every read serves the head. A v4
 process that touches a converted run **fails it**: its `Envelope::decode` refuses a head, so it
-commits the run `Failed` with `state = null`, no head and the version bumped — the run stays readable
-(the store serves its head, which is the one-line repair), but nothing steps it until the contract
-binary claims it, and there is no fence inside a v4 binary that would make it refuse first.
+commits the run `Failed` with `state = null`, no head and the version bumped. The run is **terminal**
+and stays so (`sched_at` is `None` for a failed run, so no worker claims it): the contract's reads
+serve its head, and `start_continuing` (or `start_with_id_continuing`) can carry it into a new run;
+nothing resumes it in place. There is no fence inside a v4 binary that would make it refuse first.
 
 So the rollout from an expand-release image to a contract-release image is a **deploy boundary**, not
 an ordinary `helm upgrade`:
@@ -183,8 +184,9 @@ an ordinary `helm upgrade`:
    `topology: split` the front is a **Deployment** whose default `maxSurge: 1` starts the v5 pod and
    waits for it to be Ready **before** it terminates the v4 one: scale it out of the way first,
    `kubectl -n another-agentic-system scale deploy <fullname>-front --replicas=0` (the chart names it
-   `<fullname>-front`: `coder-front` for a release named `coder`), and scale it back after the worker
-   rolls. A deployment that ran
+   `<fullname>-front`: `coder-front` for a release named `coder`). The `helm upgrade` in step 2
+   re-applies `front.replicas` and brings the front back on the new image, so there is nothing to
+   scale up by hand; the manual scale is only the "before" half. A deployment that ran
    more than one worker, or a pinned old image somewhere else, must be scaled to zero the same way.
 2. Roll the new image (`helm upgrade --install …`). The store's `migrate()` runs first and is
    idempotent; PostgreSQL's schema is version 6.

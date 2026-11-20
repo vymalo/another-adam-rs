@@ -228,8 +228,9 @@ demotion (the run is left as it is and retried) rather than writing zero-byte fi
 
 **The deploy boundary.** A v4 process that touches a converted run fails it: `Envelope::decode`
 refuses a head, so the run is committed `Failed` with `state = null`, no head and the version bumped.
-The run stays readable — the stores serve its head when the state is the tombstone, which is the
-one-line repair — but nothing steps it until a v5 binary claims it. The contract therefore ships as
+The run is **terminal** and stays so (`sched_at` is `None` for a failed run, so no binary claims it):
+the contract's reads serve its head, and `start_continuing` can carry it into a new run; nothing
+resumes it in place. The contract therefore ships as
 its own deploy: the operator scales the coder to zero (and, with `topology: split`, the front
 Deployment, whose default `maxSurge: 1` would otherwise start the v5 front before the v4 one stops)
 and rolls, and **no v4 process runs against the database afterwards**. A rollback to the expand

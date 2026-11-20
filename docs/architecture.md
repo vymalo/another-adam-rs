@@ -911,8 +911,9 @@ the schema version: `push` holds A2A push-notification configurations (schema ve
 and `run_blob` hold a run's file bytes and the digests it references (schema version 5, part 1), and
 `body` holds a run's transcript beside the `head` and `head_version` of a run (schema version 5,
 part 2; version 6 on PostgreSQL). Both adapters keep them: MongoDB in the run document and the
-`adam_body` collection, PostgreSQL in `runs.head`/`runs.head_version` and the `adam_body` table,
-written in the same transaction as the CAS. `state` is JSONB in Postgres and a real BSON document in
+`adam_body` collection, PostgreSQL in `runs.head`/`runs.head_version` and the `adam_body` table —
+on PostgreSQL the head, the rows, the references and the CAS are one transaction, while MongoDB
+writes the rows first, checks they all landed, then CASes. `state` is JSONB in Postgres and a real BSON document in
 MongoDB; in the **contract release** it is the tombstone (`null`) for a run whose head is current,
 and the whole v4 envelope only for a run that has not split yet (ADR 0055).
 
@@ -1010,7 +1011,7 @@ index; closed runs get `~<run id>`), `lease_token`, the listing indexes `adam_li
 `adam_journal` with `_id = "<run>:<seq>"`, the push configs in `adam_push` with
 `_id = "<run>:<config id>"`, the blobs in `adam_blob` with `_id` = the digest, the digests a run
 references in `adam_run_blob` with `_id = "<run>:<digest>"`, and the transcript in `adam_body` with
-`_id = "<run>:<commit>:<idx>"`. A version 4 run document has neither `head` nor `head_version`
+`_id = "<run>:<generation>:<idx>"`. A version 4 run document has neither `head` nor `head_version`
 (`{head_version: null}` matches a missing field). How each adapter keeps its promises: [store adapters](reference/store-adapters.md).
 
 What `state` holds (JSON, versioned `v`; the layout is private to the runtime,

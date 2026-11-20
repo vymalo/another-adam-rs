@@ -38,7 +38,7 @@ trait at your rev: its doc comments are the contract.
    newest update first, by keyset), the five push-notification methods (`push_put`, `push_list`,
    `push_delete`, `push_claim_due`, `push_commit`; schema version 3) and the **defaulted** methods:
    the five blob ones (`keeps_blobs`, `blob_stored`, `put_blob`, `get_blob`, `purge_blobs`; schema
-   version 5, part 1: file bytes out of the run, content-addressed by `BlobId`) and the three body ones
+   version 5, part 1: file bytes out of the run, content-addressed by `BlobId`) and the **four** body ones
    (`load_head`, which defaults to `load_run` — so it answers the same document, the head when the
    store has a current one — `keeps_bodies`, `body_list`, `gc_body`; schema version 5, part 2: an
    append-only transcript per generation beside the head). **`keeps_bodies` is the gate**: a store
@@ -73,10 +73,11 @@ trait at your rev: its doc comments are the contract.
    ```
 
    `store_conformance!` generates one `#[tokio::test]` per case (48 at the time of writing) and
-   calls `migrate` first. `blob_conformance!` adds the nine blob cases (put/get, a 4 MiB round trip,
-   an idempotent put, an unknown id, empty bytes, a run's reference keeping a blob alive (including
-   after a commit that names a different one), a shared digest surviving until the last run is
-   purged, the cutoff, and `purge_finished`'s sweep); every
+   calls `migrate` first. `blob_conformance!` adds the **ten** blob cases (put/get, a 4 MiB round
+   trip, an idempotent put, an unknown id, empty bytes, a run's reference keeping a blob alive
+   (including after a commit that names a different one), a shared digest surviving until the last
+   run is purged, the cutoff, `purge_finished`'s sweep, and `blob_stored` reporting what is
+   stored); every
    case asserts `keeps_blobs()`, so do not give it to a store that keeps none. `body_conformance!`
    adds the **fourteen** body cases: the append-only delta, the stable generation, the compaction
    and its GC, a stale version's conflict, the first split, **every read serving the current head**

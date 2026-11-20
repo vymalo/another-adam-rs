@@ -82,8 +82,9 @@ use uuid::Uuid;
 ///   `adam_run_blob` the digests each run references (`ON DELETE CASCADE`); the upgrade is
 ///   metadata-only (two new tables and their indexes, no rewrite of `runs`).
 /// * 5, part 2 (schema version 6): the head and the append-only body. `runs.head` is the v5 head
-///   and `runs.head_version` the version it was written at (a head a later commit did not rebuild
-///   is stale and is not served); `adam_body` holds one row per transcript message, keyed
+///   and `runs.head_version` the version it was written at (a head a **v4** commit did not rebuild
+///   is stale and is not served, unless the state is the tombstone: then the head is the only
+///   readable document and it is served); `adam_body` holds one row per transcript message, keyed
 ///   `(run_id, generation, idx)`, `ON DELETE CASCADE`. The upgrade is metadata-only.
 pub const SCHEMA_VERSION: i32 = 6;
 

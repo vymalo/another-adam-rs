@@ -37,7 +37,8 @@ outcome from it.
 **Every read that returns a record answers the same document** (ADR 0055, the contract release):
 `load_run`, `load_head`, `claim_due`, `open_run_for_conversation` and `list_runs` serve the v5 **head**
 when the store has a current one (`head_version == version`), and the whole `state` otherwise — a v4
-run, or a head a later commit did not rebuild. `state` is the tombstone (`null`) for a run whose head
+run, or a head a **v4** commit did not rebuild (a tombstoned run, `state = null`, serves its head:
+it is the only readable document). `state` is the tombstone (`null`) for a run whose head
 is current, so the head is the run. A store that keeps no bodies (`keeps_bodies() == false`, the
 default) is not written the contract: the runtime keeps the whole v4 `state` for it, and its reads
 answer that, exactly as before.
@@ -69,8 +70,9 @@ gains the field: add `blobs: Vec::new()` or use `RunUpdate::new`.
 
 `keeps_bodies` / `body_list` / `gc_body` keep a run's **transcript** beside its head (ADR 0055). The
 contract release writes the head, the append-only body generation and the tombstone on every commit
-of a v5 run; the step path joins the head with the rows its claim read, and `deliver`, `cancel_run`
-and `park_again` write the head they read, so it stays current. A generation is
+of a v5 run **except a refused-split demotion** (which writes the whole v4 state and no head, so the
+transcript is never put back in a head); the step path joins the head with the rows its claim read,
+and `deliver`, `cancel_run` and `park_again` write the head they read, so it stays current. A generation is
 `(run, generation, idx)`; `RunUpdate.body` is `{generation, rows, writer}`, where `generation: None`
 appends the rows after the head's `len` and `Some(new)` is a compaction. A duplicate slot is this
 attempt's retry when the row's `writer` is this attempt. A row another attempt wrote is adopted when
@@ -126,7 +128,7 @@ cron tick across all replicas. A second message on a conversation that has an op
 | The head (schema version 5, part 2; the contract release): `head`, `head_version`, `load_head`, and every read | `head` and `head_version` columns; the store patches the head's `body` to `{generation, len}`; `load_run`, `load_head`, `claim_due`, `open_run` and the listings select one `CASE` (`head` when it is an object and either `head_version == version` or the state is the tombstone, else `state`) as `state`. `Runtime::view` reads it: one lease read and one head read, no body. A v4 commit (the expand release) leaves both alone, so the head is stale and the state is served | `head` and `head_version` on the run document; the store patches the head's `body` to `{generation, len}`; `load_run`, the claim and the listings serve the head through `served_from_doc` (the current head, else `state`), and `load_head` is one projected `find_one` (the head and the record's fields, never `state`) with a second full read only when the head is stale. `Runtime::view` reads it, one projected query and no body on the current path |
 | Body rows deleted with their run | `ON DELETE CASCADE` | deleted by the purge with the journal and the references |
 | `run_header`: a run without its state, with its lease | one primary-key statement selecting the header columns and `lease_until`, never `state` | one `find_one` projected to the header and `lease_until` |
-| Transactions | none held across calls; a commit that names blobs opens one for its two statements | none (single-document writes only) |
+| Transactions | none held across calls; a commit that writes a head, a body row or blob references is one transaction (the run row locked `FOR UPDATE`, the version check, the rows, the refs and the CAS) | none (single-document writes only): the rows are written, checked for completeness, then the CAS |
 | Cross-process signals | `LISTEN`/`NOTIFY` via `adam-notify-postgres` | none: workers poll |
 
 ## Data caveats

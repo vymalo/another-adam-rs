@@ -93,8 +93,9 @@ keeps its whole state until its first commit under the contract, which splits it
   head stays current, so the next step appends to the same generation. A run whose state cannot be
   read is stored as it is (a head stays a head beside the tombstone; a v4 state stays whole) and the
   run is failed. A head becomes **stale** only when a v4 process commits over it
-  (`head_version < version`, the expand release's mixed fleet): every read then serves the whole
-  `state`, and the next step re-splits.
+  (`head_version < version`, the expand release's mixed fleet): the reads then serve the whole
+  `state` when it is the v4 envelope that commit wrote, and the head when it is the tombstone (a
+  pre-S3 process failed a converted run); the next step re-splits.
 * **The reconstruction check** runs before every commit that splits: `join(head, rows)` is compared
   with the state about to be written, and a mismatch writes `state` only, logs an error, and leaves
   the run v4. A bad split can never produce a head that does not reconstruct its state.
