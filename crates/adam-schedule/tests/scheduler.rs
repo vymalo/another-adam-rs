@@ -15,8 +15,8 @@ use adam_runtime::{
     Agent, AgentError, Ctx, Inbound, ManualClock, Runtime, RuntimeError, Transition,
 };
 use adam_schedule::{
-    CHANGED_REASON, REMOVED_REASON, Reconciled, SCHEDULER_AGENT, SchedulerAgent, SchedulerState,
-    reconcile, trigger_of,
+    CHANGED_REASON, REMOVED_REASON, Reconciled, SchedulerAgent, SchedulerState, reconcile,
+    scheduler_agent_name, trigger_of,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -24,16 +24,16 @@ use tokio::sync::oneshot;
 
 const ROOT: &str = "coder";
 
-/// The root agent: it finishes at once with the message it was started with.
+/// A root agent: it finishes at once with the message it was started with.
 #[derive(Clone)]
-struct Root;
+struct Root(&'static str);
 
 #[async_trait]
 impl Agent for Root {
     type State = Value;
 
     fn name(&self) -> &str {
-        ROOT
+        self.0
     }
 
     fn init(&self, input: Inbound) -> Result<Value, AgentError> {
@@ -51,10 +51,15 @@ impl Agent for Root {
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 fn runtime(store: &DynStore, clock: &ManualClock) -> Runtime {
+    runtime_of(ROOT, store, clock)
+}
+
+/// The runtime of one agent's process: the agent and its scheduler.
+fn runtime_of(agent: &'static str, store: &DynStore, clock: &ManualClock) -> Runtime {
     let n = WORKERS.fetch_add(1, Ordering::SeqCst);
     Runtime::builder(store.clone())
-        .agent(SchedulerAgent)
-        .agent(Root)
+        .agent(SchedulerAgent::new(agent))
+        .agent(Root(agent))
         .worker_id(format!("w{n}"))
         .clock(clock.clone())
         .poll_interval(Duration::from_millis(10))
@@ -117,7 +122,7 @@ async fn runs(store: &DynStore, agent: &str, prefix: &str) -> Vec<RunRecord> {
 async fn schedulers(store: &DynStore, name: &str) -> Vec<RunRecord> {
     runs(
         store,
-        SCHEDULER_AGENT,
+        &scheduler_agent_name(ROOT),
         &format!("adam.schedule:{ROOT}/{name}"),
     )
     .await
@@ -441,7 +446,7 @@ async fn a_bad_schedule_changes_nothing_and_other_agents_are_left_alone() {
     // Another agent's schedules are neither started nor cancelled by this agent's reconcile.
     let mut chat = good.clone();
     chat.agent = "chat".into();
-    let r = reconcile(&rt, "chat", std::slice::from_ref(&chat))
+    let r = adam_schedule::reconcile_store(store.clone(), "chat", std::slice::from_ref(&chat))
         .await
         .unwrap();
     assert_eq!(r.started, names(&["good"]));
@@ -450,7 +455,7 @@ async fn a_bad_schedule_changes_nothing_and_other_agents_are_left_alone() {
         .await
         .unwrap();
     assert_eq!(r, Reconciled::default());
-    let chats = runs(&store, SCHEDULER_AGENT, "adam.schedule:chat/").await;
+    let chats = runs(&store, &scheduler_agent_name("chat"), "adam.schedule:chat/").await;
     assert_eq!(chats.len(), 1);
     assert!(chats[0].status.is_open());
 }
@@ -550,7 +555,7 @@ async fn a_refused_firing_is_recorded_and_the_schedule_goes_on() {
     let store: DynStore = Arc::new(MemoryStore::new());
     let clock = ManualClock::new();
     let rt = Runtime::builder(store.clone())
-        .agent(SchedulerAgent)
+        .agent(SchedulerAgent::new(ROOT))
         .worker_id("schedules-only")
         .clock(clock.clone())
         .poll_interval(Duration::from_millis(10))
@@ -655,4 +660,62 @@ async fn reconcile_store_starts_schedulers_another_runtime_steps() {
         .await
         .unwrap();
     assert_eq!(r, Reconciled::default(), "a Done one-shot is not cancelled");
+}
+
+/// Two agents share one database, each in a process of its own (another-agentic-system runs chat,
+/// researcher and browser so): each process steps its own agent's schedulers only, and every
+/// firing reaches its own agent.
+#[tokio::test]
+async fn agents_that_share_a_database_each_fire_their_own_schedules() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let clock = ManualClock::new();
+    let (coder, chat) = (
+        runtime_of(ROOT, &store, &clock),
+        runtime_of("chat", &store, &clock),
+    );
+    let mut theirs = schedule("hourly", "0 * * * *", None, "Chat report.");
+    theirs.agent = "chat".into();
+    let ours = schedule("hourly", "0 * * * *", None, "Coder report.");
+    reconcile(&coder, ROOT, std::slice::from_ref(&ours))
+        .await
+        .unwrap();
+    reconcile(&chat, "chat", std::slice::from_ref(&theirs))
+        .await
+        .unwrap();
+    let (wc, wh) = (spawn_worker(&coder), spawn_worker(&chat));
+    parked(&store, "hourly").await;
+
+    for hour in 1..=2 {
+        clock.advance(Duration::from_secs(3600));
+        until("both agents' firings", || async {
+            firings(&store, "hourly").await.len() >= hour
+                && runs(&store, "chat", "adam.schedule:chat/hourly@")
+                    .await
+                    .len()
+                    >= hour
+        })
+        .await;
+    }
+    wc.stop().await;
+    wh.stop().await;
+    for (agent, prompt) in [(ROOT, "Coder report."), ("chat", "Chat report.")] {
+        let fired = runs(&store, agent, &format!("adam.schedule:{agent}/hourly@")).await;
+        assert_eq!(fired.len(), 2, "{agent}");
+        for rec in &fired {
+            let view = coder.view(rec.id).await.unwrap().unwrap();
+            assert_eq!(view.state["payload"]["text"], prompt, "{agent}");
+        }
+        let scheduler = runs(
+            &store,
+            &scheduler_agent_name(agent),
+            &format!("adam.schedule:{agent}/"),
+        )
+        .await;
+        assert_eq!(scheduler.len(), 1, "{agent}");
+        let state = state_of(&coder, &scheduler[0]).await;
+        assert!(
+            state.fired.iter().all(|f| f.created && f.error.is_none()),
+            "{agent}: {state:?}"
+        );
+    }
 }

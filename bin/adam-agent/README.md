@@ -40,7 +40,7 @@ applies at the next start, and a restart is a deploy.
 | `skills/` | Agent Skills: a catalog the model loads from on demand (`load_skill`, `read_skill_file`) |
 | `subagents/` | assembled and **registered beside the agent** (`<name>/<subagent>`): one tool per subagent, a child run with its own prompt and tools. A subagent gets only the tools it lists, and not `ask_user` (nobody would answer it) |
 | `mcp.json` | MCP servers whose tools the agent gets, see [below](#mcp-servers-from-the-folder). Connected by the **workers** |
-| `schedules/` | run ([ADR 0060](../../docs/decisions/0060-schedules-are-parked-runs.md)): the worker roles register the `adam.schedule` agent, and a `schedules` worker component reconciles the scheduler runs with the folder at start (logged as `schedules reconciled`, with what it started, kept and cancelled); a folder with none cancels the schedulers it had. Each firing is a run of the agent with the prompt as a person's message, in a conversation of its own (`adam.schedule:<agent>/<name>@<due>`) that no A2A caller lists. `control-plane` does neither |
+| `schedules/` | run ([ADR 0060](../../docs/decisions/0060-schedules-are-parked-runs.md)): the worker roles register the agent's scheduler (`<agent>/adam.schedule`, its own, so agents that share one database never step each other's), and a `schedules` worker component reconciles the scheduler runs with the folder at start (logged as `schedules reconciled`, with what it started, kept and cancelled; a store that is not reachable yet is tried again with a backoff of up to a minute, and a stop ends it at once); a folder with none cancels the schedulers it had. Each firing is a run of the agent with the prompt as a person's message, in a conversation of its own (`adam.schedule:<agent>/<name>@<due>`) that no A2A caller lists. `control-plane` does neither |
 | `commands/` | prompt templates (`commands/<name>.md`: `description`, optional `argument-hint`, a body with `$ARGUMENTS` and `$1` to `$9`). The card lists `commands/v1` with them, and a message that names one (in its metadata, or as `/name arguments` at the start of its text) is expanded before it is stored: [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md#commands-commandsnamemd), [`a2a-server.md`](../../docs/reference/a2a-server.md#commands-commandsv1). A folder without `commands/` lists nothing |
 
 The built-in tools are the person's screen ([`adam-ui`](../../crates/adam-ui/README.md)), and the same ones
@@ -337,8 +337,11 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
 * `src/config.rs`: `ADAM_AGENT_DIR` required by every role and an existing directory, every problem at once,
   a control plane that needs no model, `MODEL_CONTEXT_WINDOW` read by the workers (a bad value is exit 78),
   `A2A_ALLOW_INSECURE_REMOTES` off by default, read by the workers and a boolean, secrets hidden from `Debug`;
-  `src/serve.rs`: the switch reaches the binding of the folder's remote subagents (off: refused; on: bound).
-* `tests/agent.rs` (in-process, over the in-memory store, scripted models): the card is the folder's, and lists the screen's three extensions, `steps/v1`, `text-stream/v1` and `usage/v1`; **a chat
+  `src/serve.rs`: the switch reaches the binding of the folder's remote subagents (off: refused; on: bound);
+  `src/agent.rs`: the `schedules` component tries a store fault again, reconciles and waits for the stop, and a stop
+  while the store keeps failing ends it at once.
+* `tests/agent.rs` (in-process, over the in-memory store, scripted models): a folder's `after: 1s` schedule fires the
+  agent with its prompt as a person's message (and a control plane has no `schedules` component); the card is the folder's, and lists the screen's three extensions, `steps/v1`, `text-stream/v1` and `usage/v1`; **a chat
   folder answers "hi" in role over A2A** (the task completes with the greeting its two persona lines give, the
   model is sent the folder's rendered prompt and the screen's and the plan's six tools only; `a_folder_agent_without_tools_offers_the_plan_tools`: a `plan_work` call keeps a plan, and `tools:` narrows them); an edited folder says the edited words; `ask_user`
   parks the run as `input-required` and the answer resumes it; a control plane starts a run that a worker over the

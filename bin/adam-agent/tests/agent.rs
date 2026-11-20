@@ -295,6 +295,9 @@ async fn a_schedule_of_the_folder_fires_the_agent() {
     .await
     .unwrap();
     assert!(format!("{agents:?}").contains("schedules"), "{agents:?}");
+    // A control plane steps nothing, so it neither registers the scheduler nor reconciles.
+    let control = build(def.clone(), None, None).await.unwrap();
+    assert!(!format!("{control:?}").contains("schedules"), "{control:?}");
     let store = store();
     let service = service_over(agents, &store);
     let done = adam_schedule::reconcile_store(store.clone(), def.name(), &schedules)
