@@ -141,6 +141,30 @@ Facts about third parties:
    20-turn history dropped the cached tokens from 5,760 to 1,536. The tools array is therefore decided before the
    first call and never appended to.
 
+   *Amended 2026-11-20 (slice 7 of "adam: a faster coder", PR B, built):* the last sentence of the amendment
+   above ("never appended to") holds for a run that loads no server during itself; the one append is below, and it is
+   recorded and paid for. A run may load a triggered server
+   **during itself**, with one fixed tool, `use_server { name }` (`crates/adam-assembly/src/use_server.rs`), which
+   the root and every local subagent with a triggered server has from its first request. The load is **state, not a
+   wire edit**: the result carries `ToolOutput::loaded_servers` (the whole list, in load order), the loop applies it
+   to `Conversation::loaded_servers` in the same commit as the result, and `McpSelect` stops withholding a server
+   whose name is in it from the **next** model call on, adding its instructions to the prompt. Its tools are offered
+   by `ToolSource::appended` and placed **after every other tool** of the request, in the order the run loaded them,
+   never inserted or reordered: the request before stays a byte prefix of the one after it, which grows by a suffix.
+   The loop records the turn where the head grew in `Conversation::tools_appended`, and the prefix test skips
+   exactly those turns while asserting the suffix; a run that never calls `use_server` records no break. The append
+   costs **one full history re-prefill** (the measurement above: the tools are rendered before the messages, so the
+   cache ends where the array grew). That cost is **recorded and counted, never silent**: the tool's result and step
+   say the next call re-reads the prompt, the added servers are journaled with the call, and the cost itself is read
+   from the **next** call's `Usage::cached_input_tokens` — no number is invented. A refused load changes nothing: an
+   unknown server, a server with no `when` (eager), one the task or the run already loaded, and one that offered no
+   tool at bind (an `optional` server that was not reachable, or an allow-list that selects nothing) are each a tool
+   result the model can act on. `Conversation::continued` carries `loaded_servers`, so a later task offers the tools
+   the run before ended with; it does not carry `tools_appended` (its first request has none before it). Breaking:
+   public fields on `Conversation` (`loaded_servers`, `tools_appended`), `ToolOutput` (`loaded_servers`), `SourceCtx`
+   and `ToolCtx` (`loaded_servers`, `task`); a provided `ToolSource::appended` (additive). The tool list of a folder
+   with a triggered server gains `use_server`, and every cached prefix of such a folder breaks once at deploy.
+
 ### Everything that reads is paged
 
 2. **One paging convention for every tool that reads.** Input: `offset` and `limit`. Output: the page, then one last line that
