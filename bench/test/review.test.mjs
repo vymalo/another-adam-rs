@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { buildReport } from '../lib/report.mjs';
-import { CRITERIA, RUBRIC, cleanPatch, mixedOrder, parseScores, readReviews, reviewRequest, reviewRuns, scoresByCell } from '../lib/review.mjs';
+import { CRITERIA, RUBRIC, SAMPLES, cleanPatch, medianScores, mixedOrder, parseScores, readReviews, reviewRequest, reviewRuns, scoresByCell } from '../lib/review.mjs';
 
 const diff = (file, body = '+x\n') => `diff --git a/${file} b/${file}\nindex 1..2 100644\n--- a/${file}\n+++ b/${file}\n@@ -1 +1 @@\n${body}`;
 const PRICES = { input: 1_000_000, cachedInput: 100_000, cacheWrite: 1_000_000, output: 2_000_000 };
@@ -26,7 +26,7 @@ test('cleanPatch cuts the files under tool caches out and counts them', () => {
 test('the request is blind: rubric, statement, files and diff, and nothing about the agent', () => {
   const body = reviewRequest({ modelId: 'm', statement: 'Fix the slug.', cleaned: cleanPatch(diff('src/slug.mjs')) });
   assert.equal(body.messages[0].content, RUBRIC);
-  assert.equal(body.reasoning_effort, 'max');
+  assert.equal(body.reasoning_effort, 'low');
   assert.match(body.messages[1].content, /Fix the slug\.[\s\S]*- src\/slug\.mjs[\s\S]*```diff/);
   assert.ok(!/adam|opencode/i.test(JSON.stringify(body)));
 });
@@ -61,15 +61,15 @@ test('reviewRuns reviews each Done patch once, writes the scores and the cost, a
   const args = { runs, statementOf: () => 'do it', patchOf: (v) => patches[v.run] ?? null, send, config: CONFIG, home, budgetMicro: 1e9 };
   const first = await reviewRuns(args);
   assert.equal(first.reviewed, 2);
-  assert.equal(sent.length, 2);
-  // 1000 input at $1/M + 100 output at $2/M = 1000 + 200 micro
-  assert.equal(first.spentMicro, 2 * 1200);
+  assert.equal(sent.length, 2 * SAMPLES, 'each patch is reviewed SAMPLES times');
+  // 1000 input at $1/M + 100 output at $2/M = 1000 + 200 micro, per sample
+  assert.equal(first.spentMicro, 2 * SAMPLES * 1200);
   const rows = readReviews(home);
   assert.deepEqual(rows.map((r) => r.run).sort(), ['r1', 'r2']);
   assert.equal(rows.find((r) => r.run === 'r2').stray, 1);
   const again = await reviewRuns(args);
   assert.equal(again.reviewed, 0, 'a run reviewed with the same patch and rubric is not sent again');
-  assert.equal(sent.length, 2);
+  assert.equal(sent.length, 2 * SAMPLES);
   patches.r1 = diff('a.py', '+changed\n');
   assert.equal((await reviewRuns(args)).reviewed, 1, 'a new patch is reviewed again');
   const capped = await reviewRuns({ ...args, home: fs.mkdtempSync(path.join(os.tmpdir(), 'review-')), budgetMicro: 10 });
@@ -84,6 +84,8 @@ test('an answer without scores is recorded as an error and left out of the means
   assert.equal(r.failed.length, 1);
   assert.equal(readReviews(home)[0].error, 'the reviewer gave no JSON object');
   assert.deepEqual(scoresByCell(readReviews(home), runs), []);
+  const retry = await reviewRuns({ runs, statementOf: () => 's', patchOf: () => diff('a'), send: async () => ANSWER(GOOD), config: CONFIG, home, budgetMicro: 1e9 });
+  assert.equal(retry.reviewed, 1, 'a failed review is tried again');
   fs.rmSync(home, { recursive: true, force: true });
 });
 
@@ -107,4 +109,13 @@ test('scoresByCell averages the latest review of each Done run per cell, and the
   ]);
   const md = buildReport([{ v: 1, t: '2026-11-20T10:00:00.000Z', kind: 'state', run: 'r1', state: 'Planned', task: 't', agent: 'adam', arm: 'max' }], { reviews: [] });
   assert.match(md, /## Quality \(blind review\)\n\nNo review yet/);
+});
+
+test('medianScores keeps the median of each score and the summary of a sample at the median overall', () => {
+  const s = (overall, tests, summary) => ({ correctness: 3, tests, design: 3, scope: 3, hygiene: 3, docs: 3, overall, summary });
+  const m = medianScores([s(2, 1, 'a'), s(4, 5, 'b'), s(3, 2, 'c')]);
+  assert.equal(m.overall, 3);
+  assert.equal(m.tests, 2);
+  assert.equal(m.summary, 'c');
+  assert.equal(medianScores([s(2, 1, 'a'), s(4, 5, 'b')]).overall, 2, 'an even count takes the lower middle');
 });

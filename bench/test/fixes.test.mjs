@@ -376,3 +376,15 @@ test('report: an invalid grade is left out of the rates and listed; a suspect pa
   assert.match(text, /R3 \| T3 \| a \/ max \| mentions-grading \| tests\/conftest\.py \| \/runs\/R3\/model\.patch/);
   assert.match(text, /cannot be made tamper-proof/);
 });
+
+test('tool caches (.mypy_cache, .pytest_cache, __pycache__, .ruff_cache) are left out of the patch, at any depth', async (t) => {
+  const { dir, bare, base } = agentTree(t);
+  for (const d of ['.mypy_cache/3.11', '.pytest_cache/v', 'pkg/__pycache__', 'sub/.ruff_cache']) {
+    fs.mkdirSync(path.join(dir, d), { recursive: true });
+    fs.writeFileSync(path.join(dir, d, 'x.json'), 'cache\n');
+  }
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'one\ntwo\n');
+  const patch = (await collectPatch({ tree: dir, baseRepo: bare, base })).toString('utf8');
+  assert.match(patch, /\+two/);
+  assert.doesNotMatch(patch, /mypy_cache|pytest_cache|__pycache__|ruff_cache/);
+});
