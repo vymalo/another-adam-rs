@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use a2a::StreamResponse;
+use adam_core::time::Timestamp;
 use adam_error::Classify;
-use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
 use tokio::sync::Notify;
 
@@ -220,7 +220,7 @@ impl PushDeliverer {
             .store
             .claim_due(
                 &self.worker,
-                Utc::now(),
+                adam_core::store::now(),
                 self.options.lease_ttl,
                 self.options.batch,
             )
@@ -266,13 +266,13 @@ impl PushDeliverer {
 
     /// The progress to record for `record` after one delivery attempt.
     async fn step(&self, record: PushRecord) -> PushProgress {
-        let now = Utc::now();
+        let now = adam_core::store::now();
         let idle = |cursor: PushCursor, state: PushState| PushProgress {
             state,
             cursor,
             attempts: 0,
             last_error: None,
-            next_attempt_at: now + to_chrono(self.options.poll_interval),
+            next_attempt_at: now + adam_core::time::span_of(self.options.poll_interval),
         };
         let gave_up = |cursor: PushCursor, reason: String| {
             tracing::warn!(task_id = %record.task_id, config_id = %record.id, reason, "push notifications abandoned for this config");
@@ -335,12 +335,12 @@ impl PushDeliverer {
         mut cursor: PushCursor,
         event: StreamResponse,
         reason: String,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> PushProgress {
         cursor.fail(event, now);
         let attempts = record.attempts.saturating_add(1);
         let since = cursor.failing_since.unwrap_or(now);
-        if now - since >= to_chrono(self.options.give_up_after) {
+        if now - since >= adam_core::time::span_of(self.options.give_up_after) {
             tracing::warn!(task_id = %record.task_id, config_id = %record.id, attempts, reason, "push notifications abandoned: the webhook kept failing");
             return PushProgress {
                 state: PushState::GaveUp,
@@ -357,10 +357,7 @@ impl PushDeliverer {
             attempts,
             last_error: Some(reason),
             next_attempt_at: now
-                + to_chrono(
-                    self.options
-                        .backoff(attempts, now.timestamp_subsec_millis()),
-                ),
+                + adam_core::time::span_of(self.options.backoff(attempts, subsec_millis(now))),
         }
     }
 
@@ -368,7 +365,7 @@ impl PushDeliverer {
         &self,
         record: &PushRecord,
         cursor: PushCursor,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> PushProgress {
         PushProgress {
             state: PushState::Active,
@@ -376,21 +373,32 @@ impl PushDeliverer {
             attempts: record.attempts,
             last_error: record.last_error.clone(),
             next_attempt_at: now
-                + to_chrono(
+                + adam_core::time::span_of(
                     self.options
-                        .backoff(record.attempts.max(1), now.timestamp_subsec_millis()),
+                        .backoff(record.attempts.max(1), subsec_millis(now)),
                 ),
         }
     }
 }
 
-fn to_chrono(d: Duration) -> chrono::Duration {
-    chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)
+/// The millisecond part of `at`, which jitters a backoff (0..1000).
+fn subsec_millis(at: Timestamp) -> u32 {
+    at.subsec_nanosecond().unsigned_abs() / 1_000_000
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The backoff's jitter is the millisecond part of the clock, as chrono's
+    /// `timestamp_subsec_millis` gave it.
+    #[test]
+    fn the_jitter_is_the_millisecond_part_of_the_clock() {
+        let at: Timestamp = "2026-01-02T03:04:05.120Z".parse().expect("a timestamp");
+        assert_eq!(subsec_millis(at), 120);
+        let whole: Timestamp = "2026-01-02T03:04:05Z".parse().expect("a timestamp");
+        assert_eq!(subsec_millis(whole), 0);
+    }
 
     #[test]
     fn backoff_doubles_and_is_capped() {

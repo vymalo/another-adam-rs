@@ -10,16 +10,19 @@ use adam_agent_fs::{
     AgentManifest, Diagnostic, EmbeddedAgent, InstructionPart, Instructions, Limits as FileLimits,
     ManifestSource, McpConfig, ModelRef, SkillSelection, Strictness, Subagent, ToolList,
 };
+use adam_core::{DynSecretSource, ProcessEnv};
 use adam_llm_agent::{
-    DynTool, Limits, LlmStarter, SESSION_TOOLS, SessionAgent, SessionTools, ToolSet,
+    DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionAgent, SessionTools, ToolSet,
 };
 use adam_runtime::{RuntimeBuilder, SessionLimits};
 use secrecy::SecretString;
 
-use crate::assembly::BoundDef;
+use crate::assembly::{BoundDef, Rounds};
 use crate::error::{Error, Origin, ToolClash};
 use crate::mcp::{self, McpBinding};
-use crate::remote::{RemoteSettings, RemoteSubagentTool};
+#[cfg(feature = "remote")]
+use crate::remote::RemoteSubagentTool;
+#[cfg(feature = "remote")]
 use crate::remote_session::{RemoteRoundAgent, RemoteRoundStarter};
 use crate::skills::{self, RunSkills, RunSkillsHandle, SkillFiles, SkillSet};
 use crate::subagent::{DEFAULT_SUBAGENT_MINUTES, SubagentTool};
@@ -78,6 +81,52 @@ impl IntoManifest for &EmbeddedAgent {
     }
 }
 
+/// How long a parent waits for a remote task before it answers the call with an error result
+/// (the default of [`AgentDef::remote_timeout`]).
+pub(crate) const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(60 * 60);
+
+/// What a deployment gives the agent files that name a secret: the bearer token of a remote
+/// subagent (`auth: bearer:VAR`) and the `${VAR}` of an `mcp.json`.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(any(feature = "remote", feature = "mcp")), allow(dead_code))]
+pub(crate) struct Secrets {
+    /// Values given in code ([`AgentDef::env`]), taken before `source`.
+    pub(crate) env: Arc<BTreeMap<String, SecretString>>,
+    /// Where a name with no value in `env` is asked: the process environment unless the host
+    /// says otherwise ([`AgentDef::secrets`], ADR 0047).
+    pub(crate) source: DynSecretSource,
+}
+
+impl Default for Secrets {
+    fn default() -> Self {
+        Self {
+            env: Arc::default(),
+            source: Arc::new(ProcessEnv),
+        }
+    }
+}
+
+/// What a deployment decides about remote (`a2a:`) subagents, given to [`AgentDef`] and used at
+/// bind. It exists without the feature `remote`, where no remote subagent binds, so the setters
+/// keep their signatures in every build.
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteSettings {
+    /// Allow `http` to hosts that are not this machine.
+    #[cfg_attr(not(feature = "remote"), allow(dead_code))]
+    pub(crate) allow_insecure: bool,
+    /// How long a parent waits for a remote task.
+    pub(crate) max_wait: Duration,
+}
+
+impl Default for RemoteSettings {
+    fn default() -> Self {
+        Self {
+            allow_insecure: false,
+            max_wait: DEFAULT_MAX_WAIT,
+        }
+    }
+}
+
 /// An agent as its files describe it, before it is tied to tools, state and a model.
 ///
 /// Made from a manifest with [`from_manifest`](Self::from_manifest) (the embedded one from
@@ -110,6 +159,8 @@ pub struct AgentDef {
     files: SkillFiles,
     /// What the deployment decides about remote (`a2a:`) subagents.
     remote: RemoteSettings,
+    /// The values and the source of the secrets the files name.
+    secrets: Secrets,
     /// The MCP tools of each agent: connected from its `mcp.json`, or supplied by hand.
     mcp: McpBinding,
     /// The skills the root's run finds on the way ([`run_skills`](Self::run_skills)).
@@ -133,6 +184,7 @@ impl AgentDef {
             values: BTreeMap::new(),
             files,
             remote: RemoteSettings::default(),
+            secrets: Secrets::default(),
             mcp: McpBinding::default(),
             run_skills: None,
             session_limits: SessionLimits::default(),
@@ -187,7 +239,7 @@ impl AgentDef {
     }
 
     /// Add the MCP servers of `extra` to the root agent's own (`mcp.json`), so that
-    /// [`connect_mcp`](Self::connect_mcp) connects both and `bind` checks the sum. The servers of
+    /// `connect_mcp` (feature `mcp`) connects both and `bind` checks the sum. The servers of
     /// subagents are untouched. A name that both have is an error and nothing is added: a file
     /// that is added over an agent can never replace one of its servers. `file` names where
     /// `extra` came from, for the diagnostic.
@@ -296,7 +348,7 @@ impl AgentDef {
     /// secret: it is not shown by `Debug`, and no error carries it.
     #[must_use]
     pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        Arc::make_mut(&mut self.remote.env).insert(name.into(), SecretString::from(value.into()));
+        Arc::make_mut(&mut self.secrets.env).insert(name.into(), SecretString::from(value.into()));
         self
     }
 
@@ -307,7 +359,7 @@ impl AgentDef {
     /// and the `${VAR}` of the `mcp.json` files (asked at `connect_mcp`, so call this first).
     #[must_use]
     pub fn secrets(mut self, source: adam_core::DynSecretSource) -> Self {
-        self.remote.secrets = source;
+        self.secrets.source = source;
         self
     }
 
@@ -392,8 +444,10 @@ impl AgentDef {
     ///
     /// A process that registers only starters holds no endpoint, so it cannot send the
     /// `CancelTask` of a remote round it cancels. The front follows a cancel of a round, or an idle expiry, of a session
-    /// on a remote helper with a closing round ([`ChildSessionAgent::remote`](adam_a2a_runtime::ChildSessionAgent::remote)),
-    /// which a worker steps and whose [`RemoteRoundAgent`] cancels the task.
+    /// on a remote helper with a closing round (`adam_a2a_runtime::ChildSessionAgent::remote`),
+    /// which a worker steps and whose `RemoteRoundAgent` cancels the task. Without the feature
+    /// `remote` a remote subagent gets no starter: [`bind`](Self::bind) refuses it
+    /// ([`Error::RemoteNotEnabled`]).
     #[must_use]
     pub fn session_starters(&self, builder: RuntimeBuilder) -> RuntimeBuilder {
         let root = &self.manifest.name;
@@ -404,9 +458,13 @@ impl AgentDef {
                 Subagent::Local(child) => {
                     builder.starter(LlmStarter::new(format!("{root}/{}", child.name)))
                 }
+                #[cfg(feature = "remote")]
                 Subagent::Remote(agent) => {
                     builder.starter(RemoteRoundStarter::new(format!("{root}/{}", agent.name)))
                 }
+                // No remote subagent binds without the feature, so none has rounds to start.
+                #[cfg(not(feature = "remote"))]
+                Subagent::Remote(_) => builder,
             })
     }
 
@@ -471,8 +529,8 @@ impl AgentDef {
     /// [`Error::Mcp`], naming the agent and its `mcp.json`, for the first server that fails.
     #[cfg(feature = "mcp")]
     pub async fn connect_mcp(mut self, policy: &adam_mcp::McpPolicy) -> Result<Self, Error> {
-        let env = adam_mcp::Env::from_values(Arc::clone(&self.remote.env))
-            .source(Arc::clone(&self.remote.secrets));
+        let env = adam_mcp::Env::from_values(Arc::clone(&self.secrets.env))
+            .source(Arc::clone(&self.secrets.source));
         let mut agents = Vec::new();
         mcp::local_agents(&self.manifest, &self.manifest.name, &mut agents);
         let mut connected = Vec::new();
@@ -489,7 +547,7 @@ impl AgentDef {
                 name,
                 config.clone(),
                 servers.tools(),
-                servers.instructions(),
+                servers.instructions_by_server(),
                 servers.prompt_commands(),
             ));
         }
@@ -540,12 +598,14 @@ impl AgentDef {
     /// [`allow_insecure_remotes`](Self::allow_insecure_remotes)) and carry no credentials
     /// ([`Error::RemoteUrl`]), and the variable of its `auth: bearer:VAR` must hold a token
     /// ([`Error::RemoteAuth`]). The token is read now and kept in memory, and the network is not
-    /// touched until the first call.
+    /// touched until the first call. Without the feature `remote` (on by default) there is no A2A
+    /// client: the subagent is refused after the name checks and before any secret is read
+    /// ([`Error::RemoteNotEnabled`]).
     ///
     /// An agent's MCP tools (`mcp.json`) come from its own directory only, and are part of the
     /// catalog `tools:` selects from, next to the registered tools (`tools: ['linear__*']`
     /// selects a server's tools; a subagent that lists none gets none). An agent whose `mcp.json`
-    /// lists servers must have been given tools ([`connect_mcp`](Self::connect_mcp) or
+    /// lists servers must have been given tools (`connect_mcp`, feature `mcp`, or
     /// [`mcp_tools`](Self::mcp_tools)): [`Error::McpNotConnected`] otherwise (fail closed). An
     /// empty set given for such an agent binds, with a warning naming the agent and its servers. The
     /// tools must come from the same `mcp.json` ([`Error::McpChanged`]), be named after its
@@ -580,6 +640,7 @@ impl AgentDef {
             values: &self.values,
             files: &self.files,
             remote: &self.remote,
+            secrets: &self.secrets,
             mcp: &self.mcp,
             run_skills: self.run_skills.as_ref(),
             session_limits: lowered_by_file(
@@ -625,6 +686,10 @@ impl AgentDef {
     }
 }
 
+/// The MCP tools of one agent: the tools `bind` may offer, and the names each server gave — from
+/// the same check that ties a tool to its server ([`Walk::mcp_tools`]).
+type McpTools = (Vec<(String, DynTool)>, BTreeMap<String, Vec<String>>);
+
 /// One local agent, bound: its rendered prompt and its tools. The model comes later.
 #[derive(Clone)]
 pub(crate) struct Node {
@@ -649,7 +714,14 @@ pub(crate) struct Node {
     pub(crate) session_agents: Vec<String>,
     /// The agents that work the rounds of a session on a remote subagent, one per remote subagent
     /// of the root; empty for any other agent.
-    pub(crate) round_agents: Vec<RemoteRoundAgent>,
+    pub(crate) round_agents: Rounds,
+    /// The `mcp.json` servers whose `when` loads them only when a run's task matches: the server
+    /// and its keywords, in name order. [`AgentInfo::when`](crate::AgentInfo::when) carries them, so
+    /// a definition that differs only in a `when` compares unequal to one that does not.
+    pub(crate) when: Vec<(String, Vec<String>)>,
+    /// Sources this agent alone has, added at [`BoundDef::build`](crate::BoundDef): the
+    /// `mcp.json` servers whose `when` loads them only when a run's task matches.
+    pub(crate) sources: Vec<DynToolSource>,
 }
 
 /// A remote (A2A) subagent, found on the way: what [`Assembly::remotes`](crate::Assembly::remotes) lists.
@@ -701,6 +773,7 @@ struct Walk<'a> {
     values: &'a BTreeMap<String, BTreeMap<String, String>>,
     files: &'a SkillFiles,
     remote: &'a RemoteSettings,
+    secrets: &'a Secrets,
     mcp: &'a McpBinding,
     /// What the root's run finds ([`AgentDef::run_skills`]); a subagent has none.
     run_skills: Option<&'a RunSkillsHandle>,
@@ -718,8 +791,9 @@ impl Walk<'_> {
         parent: Option<usize>,
     ) -> Result<(), Error> {
         let origin = Origin::new(name.clone(), manifest.path.clone());
-        // The agent's own MCP tools, checked, then chosen from with the registered ones.
-        let own_mcp = self.mcp_tools(manifest, &name)?;
+        // The agent's own MCP tools, checked, then chosen from with the registered ones. The
+        // grouping by server comes from the same loop that decides which server a tool belongs to.
+        let (own_mcp, mcp_by_server) = self.mcp_tools(manifest, &name)?;
         let catalog = self.catalog.with(&own_mcp);
         let mut tools = resolve_tools(
             &origin,
@@ -731,11 +805,55 @@ impl Walk<'_> {
             refuse_asking_tools(&origin, &tools)?;
         }
         let mut prompt = render_prompt(&origin, manifest, self.values.get(&name))?;
+        // The servers whose `when` loads them only when the run's task mentions a keyword: their
+        // tools are withheld by the source below and their instructions do not go into the prompt.
+        let triggers: Vec<(String, Vec<String>)> = mcp::declared(manifest)
+            .into_iter()
+            .flat_map(|config| config.servers.iter())
+            .filter_map(|(server, entry)| {
+                entry
+                    .when()
+                    .map(|when| (server.clone(), when.keywords.clone()))
+            })
+            .collect();
         // What the agent's MCP servers said about themselves, once, here: the prompt is the same
-        // for every model call of the process, so the cached prefix holds.
-        if let Some(given) = self.mcp.get(&name).filter(|g| !g.instructions.is_empty()) {
-            prompt.push_str("\n\n");
-            prompt.push_str(&given.instructions);
+        // for every model call of the process, so the cached prefix holds. A triggered server's
+        // section comes from `McpSelect` at a turn, and only when the run loads it.
+        if let Some(given) = self.mcp.get(&name) {
+            let eager: Vec<(String, String)> = given
+                .instructions
+                .iter()
+                .filter(|(server, _)| !triggers.iter().any(|(triggered, _)| triggered == server))
+                .cloned()
+                .collect();
+            let text = crate::mcp_select::join_sections(&eager);
+            if !text.is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(&text);
+            }
+        }
+        let mut sources: Vec<DynToolSource> = Vec::new();
+        if !triggers.is_empty() {
+            let triggered: Vec<crate::mcp_select::Triggered> = triggers
+                .iter()
+                .map(|(server, keywords)| {
+                    let tools = mcp_by_server.get(server).cloned().unwrap_or_default();
+                    let instructions = self.mcp.get(&name).and_then(|given| {
+                        given
+                            .instructions
+                            .iter()
+                            .find(|(named, _)| named == server)
+                            .map(|(_, text)| text.clone())
+                    });
+                    crate::mcp_select::Triggered::new(
+                        server.clone(),
+                        keywords.clone(),
+                        tools,
+                        instructions,
+                    )
+                })
+                .collect();
+            sources.push(Arc::new(crate::mcp_select::McpSelect::new(triggered)));
         }
         // An agent that has an MCP tool can get a long result that is kept and paged: it reads the
         // rest with `read_output` (a folder agent keeps it in the run's state, up to 4 MiB).
@@ -769,6 +887,7 @@ impl Walk<'_> {
                 mcp_tools: &mcp_names,
             },
             self.remote,
+            self.secrets,
             &mut tools,
             parent.is_none().then_some(self.session_limits),
         )?;
@@ -796,6 +915,8 @@ impl Walk<'_> {
             preloaded,
             session_agents,
             round_agents,
+            when: triggers,
+            sources,
         });
         for sub in &manifest.subagents {
             match sub {
@@ -815,11 +936,7 @@ impl Walk<'_> {
 impl Walk<'_> {
     /// The MCP tools of one agent: what was connected or supplied for it, checked against its own
     /// `mcp.json` and the registered tools. Empty when it has no servers.
-    fn mcp_tools(
-        &self,
-        manifest: &AgentManifest,
-        name: &str,
-    ) -> Result<Vec<(String, DynTool)>, Error> {
+    fn mcp_tools(&self, manifest: &AgentManifest, name: &str) -> Result<McpTools, Error> {
         let declared = mcp::declared(manifest);
         let servers: Vec<String> = declared
             .map(|config| config.servers.keys().cloned().collect())
@@ -827,7 +944,7 @@ impl Walk<'_> {
         let origin = Origin::new(name, mcp::file_of(manifest));
         let Some(given) = self.mcp.get(name) else {
             return if servers.is_empty() {
-                Ok(Vec::new())
+                Ok((Vec::new(), BTreeMap::new()))
             } else {
                 Err(Error::McpNotConnected { origin, servers })
             };
@@ -836,20 +953,22 @@ impl Walk<'_> {
             return Err(Error::McpChanged { origin });
         }
         let mut entries: Vec<(String, DynTool)> = Vec::new();
+        let mut by_server: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for tool in &given.tools {
             let tool_name = tool.spec().name;
-            let belongs = servers.iter().any(|server| {
+            // The one place a tool is tied to its server: the name check below and the grouping
+            // the selector reads come from this find.
+            let Some(server) = servers.iter().find(|server| {
                 tool_name
                     .strip_prefix(server.as_str())
                     .is_some_and(|rest| rest.starts_with("__"))
-            });
-            if !belongs {
+            }) else {
                 return Err(Error::McpForeignTool {
                     origin,
                     tool: tool_name,
                     servers,
                 });
-            }
+            };
             if entries.iter().any(|(n, _)| *n == tool_name) {
                 return Err(Error::DuplicateTool { tool: tool_name });
             }
@@ -859,6 +978,10 @@ impl Walk<'_> {
                     tool: tool_name,
                 });
             }
+            by_server
+                .entry(server.clone())
+                .or_default()
+                .push(tool_name.clone());
             entries.push((tool_name, Arc::clone(tool)));
         }
         if entries.is_empty() && !servers.is_empty() {
@@ -870,7 +993,7 @@ impl Walk<'_> {
                 "the agent's mcp.json lists servers, and it has no MCP tool"
             );
         }
-        Ok(entries)
+        Ok((entries, by_server))
     }
 }
 
@@ -944,13 +1067,15 @@ fn add_subagent_tools(
     manifest: &AgentManifest,
     taken: &Taken<'_>,
     remote: &RemoteSettings,
+    secrets: &Secrets,
     tools: &mut Vec<(String, DynTool)>,
     session_limits: Option<SessionLimits>,
-) -> Result<(Vec<String>, Vec<RemoteRoundAgent>), Error> {
+) -> Result<(Vec<String>, Rounds), Error> {
     let sessions = session_limits.is_some();
     // The subagent tools added so far, by name, with the file of the subagent that owns each.
     let mut subagents: Vec<(&str, &std::path::Path)> = Vec::new();
-    let mut rounds: Vec<RemoteRoundAgent> = Vec::new();
+    #[cfg_attr(not(feature = "remote"), allow(unused_mut))]
+    let mut rounds = Rounds::default();
     for sub in &manifest.subagents {
         let (name, file) = match sub {
             Subagent::Local(child) => (child.name.as_str(), child.path.as_path()),
@@ -993,8 +1118,9 @@ fn add_subagent_tools(
                 )
                 .with_run_limit(run_limit(child.frontmatter.limits.as_ref())),
             ),
+            #[cfg(feature = "remote")]
             Subagent::Remote(agent) => {
-                let tool = RemoteSubagentTool::bind(&sub_origin, agent, remote)?;
+                let tool = RemoteSubagentTool::bind(&sub_origin, agent, remote, secrets)?;
                 // The rounds of a session on it are runs of an agent of its own, for the root.
                 if sessions {
                     rounds.push(RemoteRoundAgent::new(
@@ -1005,12 +1131,18 @@ fn add_subagent_tools(
                 }
                 Arc::new(tool)
             }
+            // Refused before any secret is read: this build has no A2A client to call it with.
+            #[cfg(not(feature = "remote"))]
+            Subagent::Remote(_) => {
+                let _ = secrets;
+                return Err(Error::RemoteNotEnabled { origin: sub_origin });
+            }
         };
         subagents.push((name, file));
         tools.push((name.to_owned(), tool));
     }
     if !sessions || manifest.subagents.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Rounds::default()));
     }
     // The tools that run a subagent in the background: after the one tool per subagent, and named
     // so that a clash with a tool or a subagent is found now.

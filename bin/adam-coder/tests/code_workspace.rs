@@ -1,11 +1,13 @@
 //! The coder's `ToolEnv` as an `adam_code_tools::CodeWorkspace` (ADR 0047, decision 7): the
 //! conformance cases of `adam-code-tools-testkit` over a run whose workspace holds one repository.
+//! As an `adam_code_tools::CommandWorkspace`, the command cases run over the same kind of run.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
 
 use adam::agent_fs::ReferenceDef;
 use adam_code_tools::{CodeWorkspace as _, Intent, Place, Target};
+use adam_code_tools_testkit::CommandHarness;
 use adam_code_tools_testkit::{Harness, detached_ctx};
 use adam_coder::tools::named::{named_in, without_untrusted};
 use adam_coder::tools::prepare::PrepareWorkspace;
@@ -93,3 +95,18 @@ async fn a_nested_agents_md_is_shown_through_the_port() {
         None
     );
 }
+
+/// The command cases over a run that prepared the fixture's repository: its slot is where they run.
+async fn command_harness() -> CommandHarness {
+    let h = prepared(Fixture::new().await).await;
+    let fx = h.alive.downcast::<Fixture>().expect("the fixture");
+    CommandHarness {
+        workspace: fx.env.clone(),
+        ctx: h.ctx,
+        writable: h.writable,
+        secret: h.secret,
+        alive: fx,
+    }
+}
+
+adam_code_tools_testkit::command_workspace_conformance!(command_harness().await);

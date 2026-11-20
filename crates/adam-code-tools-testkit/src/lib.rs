@@ -8,18 +8,27 @@
 //! ```ignore
 //! adam_code_tools_testkit::code_workspace_conformance!(my_harness().await);
 //! ```
+//!
+//! An implementation of `adam_code_tools::CommandWorkspace` also builds a [`CommandHarness`] and
+//! runs [`command_workspace_conformance!`] over it ([`command_cases`]).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use adam_code_tools::git::GitAt;
-use adam_code_tools::{CodeWorkspace, DynCodeWorkspace, Intent, Outcome, Place, Redactor};
-use adam_llm_agent::{ToolCtx, ToolOutput};
+use adam_code_tools::sandbox::Meter;
+use adam_code_tools::{
+    CodeWorkspace, CommandLimits, CommandWorkspace, DynCodeWorkspace, DynCommandWorkspace, Intent,
+    Outcome, Place, Redactor,
+};
+use adam_llm_agent::{KeptOutputs, MemoryKept, ToolCtx, ToolError, ToolOutput};
 use adam_runtime::CollectingSink;
-use adam_workspace::SlotDir;
+use adam_workspace::{EnvSession, LocalSession, SlotDir};
 use async_trait::async_trait;
 
 /// What the cases need of an implementation.
@@ -37,6 +46,21 @@ pub struct Harness {
     pub secret: String,
     /// What must live as long as the harness (a temporary directory, a fixture); `Box::new(())`
     /// when nothing does.
+    pub alive: Box<dyn std::any::Any + Send>,
+}
+
+/// What the command cases need of an implementation of `CommandWorkspace`.
+pub struct CommandHarness {
+    /// The workspace under test.
+    pub workspace: DynCommandWorkspace,
+    /// A context the workspace answers for (its run, its state).
+    pub ctx: ToolCtx,
+    /// The name of a place a tool may write, where the commands run.
+    pub writable: String,
+    /// A value the workspace's redactor holds, at least four bytes long, with no `'` in it (the
+    /// cases put it in a shell command).
+    pub secret: String,
+    /// What must live as long as the harness; `Box::new(())` when nothing does.
     pub alive: Box<dyn std::any::Any + Send>,
 }
 
@@ -121,6 +145,38 @@ pub mod cases {
             h.secret.len()
         );
     }
+
+    /// What follows a write ([`after_write`](adam_code_tools::CodeWorkspace::after_write)) on the
+    /// writable place, twice: each call is `Ok`, its text is empty or starts with a space or a line
+    /// break (it is appended to a sentence), and none holds the secret.
+    pub async fn a_write_is_followed_by_the_hook(h: &Harness) {
+        let place = match h
+            .workspace
+            .place(&h.ctx, Some(&h.writable), Intent::Write)
+            .await
+        {
+            Ok(place) => place,
+            Err(answer) => panic!("a write of {:?}: {answer:?}", h.writable),
+        };
+        let paths = ["conformance-after-write.txt".to_owned()];
+        for call in 1..=2 {
+            let tail = match h.workspace.after_write(&h.ctx, &place, &paths).await {
+                Ok(tail) => tail,
+                Err(e) => panic!("call {call}: {e:?}"),
+            };
+            assert!(
+                tail.is_empty() || tail.starts_with(' ') || tail.starts_with('\n'),
+                "call {call}: {tail:?}"
+            );
+            // The hook is given nothing that holds the secret: this guards an implementation that
+            // writes a secret of its own into the text. A failure says the secret's length, not it.
+            assert!(
+                !tail.contains(&h.secret),
+                "call {call}: the text holds the harness's secret ({} bytes)",
+                h.secret.len()
+            );
+        }
+    }
 }
 
 /// One `#[tokio::test]` per case of [`cases`], each over a harness built by `$harness` (an
@@ -133,6 +189,7 @@ macro_rules! code_workspace_conformance {
         $crate::code_workspace_conformance!(@case $harness, an_unknown_name_is_an_answer_for_the_model);
         $crate::code_workspace_conformance!(@case $harness, a_read_only_place_is_never_given_for_a_write);
         $crate::code_workspace_conformance!(@case $harness, the_redactor_scrubs_the_secret);
+        $crate::code_workspace_conformance!(@case $harness, a_write_is_followed_by_the_hook);
     };
     (@case $harness:expr, $case:ident) => {
         #[tokio::test]
@@ -143,22 +200,264 @@ macro_rules! code_workspace_conformance {
     };
 }
 
+/// The conformance cases of a `CommandWorkspace`, each an `async fn(&CommandHarness)` that panics on
+/// a failure. A command runs through `adam_code_tools::commands::run` in the writable place, and
+/// what it printed is settled by `adam_code_tools::output::settle`, as the command tools do.
+pub mod command_cases {
+    use adam_code_tools::redact::REDACTED;
+    use adam_code_tools::sandbox::Meter;
+    use adam_code_tools::shell::{ShellOutcome, shell_spec};
+    use adam_code_tools::{Place, commands, output};
+
+    use super::{CommandHarness, Intent};
+
+    /// The writable place of the harness, for a write.
+    async fn writable(h: &CommandHarness) -> Place {
+        match h
+            .workspace
+            .place(&h.ctx, Some(&h.writable), Intent::Write)
+            .await
+        {
+            Ok(place) => place,
+            Err(answer) => panic!("a write of {:?}: {answer:?}", h.writable),
+        }
+    }
+
+    /// `command` run in the writable place within the workspace's limits; `keep`: its output is
+    /// captured, and settled.
+    async fn run(h: &CommandHarness, command: &str, keep: bool) -> ShellOutcome {
+        let place = writable(h).await;
+        let session = match h.workspace.session(&h.ctx).await {
+            Ok(session) => session,
+            Err(e) => panic!("no session: {e:?}"),
+        };
+        let limits = h.workspace.limits();
+        let spec = shell_spec(place.path(), command);
+        let mut outcome = match commands::run(
+            &*h.workspace,
+            &h.ctx,
+            &*session,
+            spec,
+            limits.timeout,
+            limits.output_tail,
+            keep,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => panic!("{command:?} did not run: {e:?}"),
+        };
+        if keep {
+            output::settle(&*h.workspace, &h.ctx, &mut outcome).await;
+        }
+        outcome
+    }
+
+    /// The secret, quoted for the shell.
+    fn quoted(h: &CommandHarness) -> String {
+        assert!(
+            !h.secret.contains('\''),
+            "the harness's secret holds a quote"
+        );
+        format!("'{}'", h.secret)
+    }
+
+    /// A command runs in the writable place: a file it writes appears there.
+    pub async fn a_command_runs_in_the_writable_place(h: &CommandHarness) {
+        const NAME: &str = "conformance-ran.txt";
+        let place = writable(h).await;
+        let written = place.path().join(NAME);
+        // A file left by an interrupted run would pass for a command that ran elsewhere.
+        let _ = std::fs::remove_file(&written);
+        let outcome = run(h, &format!("printf ran > {NAME}"), false).await;
+        assert_eq!(outcome.exit_code, Some(0), "{outcome:?}");
+        let text = std::fs::read_to_string(&written);
+        let _ = std::fs::remove_file(&written);
+        assert_eq!(text.ok().as_deref(), Some("ran"), "{}", written.display());
+    }
+
+    /// The session a command runs in is reported to the call's usage, as `session`'s contract says:
+    /// an environment the usage can name ([`Meter::of`]) is named once it is asked for.
+    pub async fn a_session_is_reported_to_the_calls_usage(h: &CommandHarness) {
+        let session = match h.workspace.session(&h.ctx).await {
+            Ok(session) => session,
+            Err(e) => panic!("no session: {e:?}"),
+        };
+        if Meter::of(&*session).is_some() {
+            assert!(
+                h.ctx.reported_sandbox().environment().is_some(),
+                "the session was not reported: {:?}",
+                h.ctx.reported_sandbox()
+            );
+        }
+    }
+
+    /// A long output that holds the secret is shown as a head and a tail and kept, both scrubbed:
+    /// the kept text read back has the redaction and never the secret.
+    pub async fn a_long_output_is_shown_and_kept_scrubbed(h: &CommandHarness) {
+        let tail = h.workspace.limits().output_tail;
+        // A line is at least 18 bytes once scrubbed (`line 1 [redacted]`), and the view is cut by
+        // the scrubbed length: four times the view.
+        let lines = tail / 4 + 100;
+        let command = format!(
+            "i=0; while [ $i -lt {lines} ]; do i=$((i+1)); printf 'line %s %s\\n' $i {}; done",
+            quoted(h)
+        );
+        let outcome = run(h, &command, true).await;
+        assert_eq!(outcome.exit_code, Some(0), "{:?}", outcome.tail);
+        assert!(outcome.truncated, "{lines} lines fit {tail} bytes");
+        // A failure says the secret's length, never the secret.
+        let leak = |what: &str, text: &str| {
+            assert!(
+                !text.contains(&h.secret),
+                "{what} holds the harness's secret ({} bytes)",
+                h.secret.len()
+            );
+        };
+        leak("the head", &outcome.head);
+        leak("the tail", &outcome.tail);
+        assert!(outcome.tail.contains(REDACTED), "{:?}", outcome.tail);
+        let Some(note) = outcome.kept.as_ref() else {
+            panic!("a long output is not kept");
+        };
+        assert_eq!(note.refused, None);
+        let view = output::section(&outcome);
+        leak("the view", &view);
+        assert!(view.contains(&note.id), "{view}");
+        let run = h.ctx.root_run_id().to_string();
+        let mut read = String::new();
+        let mut offset = 1;
+        while offset <= note.lines {
+            let page = match h
+                .workspace
+                .kept()
+                .page(
+                    &run,
+                    &note.id,
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                    500,
+                )
+                .await
+            {
+                Ok(page) => page,
+                Err(e) => panic!("the page at {offset} of {}: {e}", note.id),
+            };
+            read.push_str(&page);
+            offset += 500;
+        }
+        leak("the kept text", &read);
+        assert!(read.contains(REDACTED), "the kept text has no {REDACTED}");
+        assert!(
+            read.contains(&format!("line {lines} ")),
+            "the kept text is cut"
+        );
+    }
+
+    /// `timeout_of` refuses 0 and a timeout over the workspace's limit, and gives the limit when
+    /// none is asked for.
+    pub async fn timeout_of_keeps_to_the_limit(h: &CommandHarness) {
+        let limits = h.workspace.limits();
+        let limit = i64::try_from(limits.timeout.as_secs()).unwrap_or(i64::MAX);
+        assert_eq!(output::timeout_of(&limits, None), Ok(limits.timeout));
+        assert!(output::timeout_of(&limits, Some(0)).is_err());
+        assert!(output::timeout_of(&limits, Some(-1)).is_err());
+        assert!(output::timeout_of(&limits, Some(limit.saturating_add(1))).is_err());
+        if limit >= 1 {
+            assert_eq!(
+                output::timeout_of(&limits, Some(limit)),
+                Ok(std::time::Duration::from_secs(limits.timeout.as_secs()))
+            );
+        }
+    }
+
+    /// A short output is shown whole, scrubbed, and nothing is kept.
+    pub async fn a_short_output_is_shown_whole_scrubbed_and_not_kept(h: &CommandHarness) {
+        let outcome = run(h, &format!("printf 'short %s\\n' {}", quoted(h)), true).await;
+        assert_eq!(outcome.exit_code, Some(0), "{:?}", outcome.tail);
+        assert!(!outcome.truncated);
+        assert!(outcome.kept.is_none(), "{:?}", outcome.kept);
+        assert_eq!(outcome.tail, format!("short {REDACTED}\n"));
+    }
+}
+
+/// One `#[tokio::test]` per case of [`command_cases`], each over a [`CommandHarness`] built by
+/// `$harness` (an expression, awaited inside the test when it is a future).
+#[macro_export]
+macro_rules! command_workspace_conformance {
+    ($harness:expr) => {
+        $crate::command_workspace_conformance!(@case $harness, a_command_runs_in_the_writable_place);
+        $crate::command_workspace_conformance!(@case $harness, a_session_is_reported_to_the_calls_usage);
+        $crate::command_workspace_conformance!(@case $harness, a_long_output_is_shown_and_kept_scrubbed);
+        $crate::command_workspace_conformance!(@case $harness, timeout_of_keeps_to_the_limit);
+        $crate::command_workspace_conformance!(@case $harness, a_short_output_is_shown_whole_scrubbed_and_not_kept);
+    };
+    (@case $harness:expr, $case:ident) => {
+        #[tokio::test]
+        async fn $case() {
+            let harness = $harness;
+            $crate::command_cases::$case(&harness).await;
+        }
+    };
+}
+
 /// A workspace of named directories, for the tests of the tools and as the reference
 /// implementation of the cases. A place is found by its name; with no name, the only place that may
 /// be written, if there is exactly one (as the coder finds a slot).
-#[derive(Debug, Default)]
+///
+/// Its commands run in this process's own environment ([`LocalSession`]), within
+/// [`DEFAULT_LIMITS`] unless [`with_limits`](Self::with_limits), and a long output is kept in
+/// memory ([`MemoryKept`]), scrubbed by the workspace's redactor.
 pub struct DirWorkspace {
     places: Vec<Place>,
     redactor: Redactor,
+    limits: CommandLimits,
+    kept: MemoryKept,
+}
+
+/// The limits of a [`DirWorkspace`]'s commands unless it is given others: 30 seconds, and 16 KiB of
+/// output shown.
+pub const DEFAULT_LIMITS: CommandLimits = CommandLimits {
+    timeout: Duration::from_secs(30),
+    output_tail: 16 * 1024,
+};
+
+impl fmt::Debug for DirWorkspace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirWorkspace")
+            .field("places", &self.places)
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for DirWorkspace {
+    fn default() -> Self {
+        Self::new::<&str>([])
+    }
 }
 
 impl DirWorkspace {
     /// A workspace with no place, whose redactor holds `secrets`.
     pub fn new<S: AsRef<str>>(secrets: impl IntoIterator<Item = S>) -> Self {
+        let redactor = Redactor::new(secrets);
+        // A clone shares the secrets: one added later is scrubbed from what is kept too.
+        let scrubber = redactor.clone();
+        let kept = MemoryKept::new()
+            .with_margin(redactor.margin())
+            .scrubbing(move |text| scrubber.scrub(text).into_owned());
         Self {
             places: Vec::new(),
-            redactor: Redactor::new(secrets),
+            redactor,
+            limits: DEFAULT_LIMITS,
+            kept,
         }
+    }
+
+    /// The same workspace, whose commands run within `limits`.
+    #[must_use]
+    pub fn with_limits(mut self, limits: CommandLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Add the directory `dir` as a place named `name` that tools may write; `git` is discovered
@@ -226,5 +525,34 @@ impl CodeWorkspace for DirWorkspace {
 
     fn redactor(&self) -> &Redactor {
         &self.redactor
+    }
+
+    /// Nothing follows a write here.
+    async fn after_write(
+        &self,
+        _ctx: &ToolCtx,
+        _place: &Place,
+        _paths: &[String],
+    ) -> Result<String, ToolError> {
+        Ok(String::new())
+    }
+}
+
+#[async_trait]
+impl CommandWorkspace for DirWorkspace {
+    async fn session(&self, ctx: &ToolCtx) -> Result<Arc<dyn EnvSession>, ToolError> {
+        let session = LocalSession::shared();
+        if let Some(meter) = Meter::of(&*session) {
+            meter.report_session(ctx);
+        }
+        Ok(session)
+    }
+
+    fn limits(&self) -> CommandLimits {
+        self.limits
+    }
+
+    fn kept(&self) -> &dyn KeptOutputs {
+        &self.kept
     }
 }

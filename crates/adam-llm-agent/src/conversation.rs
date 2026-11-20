@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use adam_core::RunId;
+use adam_core::time::Timestamp;
 use adam_model::{Message, ToolCall, Usage};
 use adam_runtime::{
     AgentError, Inbound, SESSION_STATE_KEY, SandboxUsage, SessionHeader, UsageTotals,
 };
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -181,7 +181,7 @@ pub struct PendingRemote {
     /// When the agent gives up waiting and answers the call with an error result, if the tool
     /// asked for a limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline: Option<DateTime<Utc>>,
+    pub deadline: Option<Timestamp>,
 }
 
 /// A tool call that waits for the round of a child session to end ([ADR 0045]).
@@ -617,7 +617,7 @@ pub struct Conversation {
     /// (nothing records that it was). Absent from state written before it existed, and not written
     /// while `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chain_started: Option<DateTime<Utc>>,
+    pub chain_started: Option<Timestamp>,
 }
 
 /// How many rounds a run remembers having reported ([`Conversation::reported_rounds`]): the oldest
@@ -653,12 +653,12 @@ fn is_zero(n: &u32) -> bool {
 }
 
 /// Whether `value` is an object whose `expiresAt` (RFC 3339) is not after `now`.
-fn has_expired(value: &Value, now: DateTime<Utc>) -> bool {
+fn has_expired(value: &Value, now: Timestamp) -> bool {
     value
         .get("expiresAt")
         .and_then(Value::as_str)
-        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-        .is_some_and(|at| at.with_timezone(&Utc) <= now)
+        .and_then(|at| at.parse::<Timestamp>().ok())
+        .is_some_and(|at| at <= now)
 }
 
 /// The most serialized JSON, in bytes, of messages that a continued conversation carries from the
@@ -934,6 +934,21 @@ impl Conversation {
         }
     }
 
+    /// The task the run was started with: the words of the first part of its first message.
+    ///
+    /// It is the same text at every step of the run and in a run that continues it: a compaction
+    /// keeps it first (the second part is the marker, the third the person's later words), and a
+    /// continued run carries its first message. `None` when the first message has no words (a
+    /// round that only closes a session, or an image with no text); `Some("")` when the person sent
+    /// an empty one.
+    #[must_use]
+    pub fn task(&self) -> Option<&str> {
+        match self.messages.first() {
+            Some(Message::User { content }) => Some(content.first().map_or("", |p| p.as_text())),
+            _ => None,
+        }
+    }
+
     /// The head and the transcript rows of this state: what
     /// [`Agent::split`](adam_runtime::Agent::split) declares.
     ///
@@ -1029,7 +1044,7 @@ impl Conversation {
     /// `expiresAt` that is an RFC 3339 time not after `now`. An entry with no `expiresAt`, or one
     /// that does not parse, stays. Returns how many were removed; the agent calls it at the start
     /// of every step.
-    pub fn drop_expired_context(&mut self, now: DateTime<Utc>) -> usize {
+    pub fn drop_expired_context(&mut self, now: Timestamp) -> usize {
         let before = self.context.len();
         self.context.retain(|_, value| !has_expired(value, now));
         before - self.context.len()
@@ -1304,7 +1319,7 @@ mod tests {
     fn the_start_of_the_chain_is_carried_and_a_fresh_run_has_none() {
         let mut state = Conversation::new("go");
         assert_eq!(state.chain_started, None);
-        let at = Utc::now();
+        let at = Timestamp::now();
         state.chain_started = Some(at);
         assert_eq!(
             state.continued("next", RunId::new()).chain_started,
@@ -1493,6 +1508,77 @@ mod tests {
         assert!(state.sent_images.contains(&"a".repeat(64)));
         let carried = state.continued("next", RunId::new());
         assert_eq!(carried.sent_images, state.sent_images);
+    }
+
+    /// The task is the first part of the first message, and a continued run carries it: a source
+    /// that decides from it decides the same in both.
+    #[test]
+    fn the_task_is_the_first_part_of_the_first_message() {
+        assert_eq!(
+            Conversation::new("fix the linear ticket").task(),
+            Some("fix the linear ticket")
+        );
+        assert_eq!(Conversation::new("").task(), Some(""));
+        // A message with only an image has no words.
+        let image = Message::User {
+            content: vec![adam_model::ContentPart::Image(adam_model::ImageRef {
+                sha256: "a".repeat(64),
+                media_type: "image/png".into(),
+                bytes: 3,
+                width: 1,
+                height: 1,
+                name: None,
+                origin: adam_model::ImageOrigin::Person,
+            })],
+        };
+        let conversation = Conversation {
+            messages: vec![image],
+            ..Conversation::default()
+        };
+        assert_eq!(conversation.task(), Some(""));
+        // A compaction keeps the task as the first part (the marker follows it); a continued run
+        // carries the message.
+        let compacted = Conversation {
+            messages: vec![Message::User {
+                content: vec![
+                    adam_model::ContentPart::text("the task"),
+                    adam_model::ContentPart::text("[marker]"),
+                ],
+            }],
+            ..Conversation::default()
+        };
+        assert_eq!(compacted.task(), Some("the task"));
+        let next = compacted.continued("something else", RunId::new());
+        assert_eq!(next.task(), Some("the task"));
+        assert_eq!(Conversation::default().task(), None);
+        // A first message that is not the person's words is no task at all: a round that opens on
+        // a result, or on the model's own message, loads nothing that asks for a task.
+        for first in [
+            Message::tool_result("c1", "a result"),
+            Message::assistant_text("the model spoke first"),
+        ] {
+            let conversation = Conversation {
+                messages: vec![first],
+                ..Conversation::default()
+            };
+            assert_eq!(conversation.task(), None);
+        }
+        // The keyword in a later message is not the task: the first part of the first message is.
+        let mut later = Conversation::new("fix the typo");
+        later.messages.push(Message::assistant_text("done"));
+        later.messages.push(Message::user_text("now read the docs"));
+        assert_eq!(later.task(), Some("fix the typo"));
+        // A first message with several text parts: the first is the task, the rest are not.
+        let several = Conversation {
+            messages: vec![Message::User {
+                content: vec![
+                    adam_model::ContentPart::text("fix the typo"),
+                    adam_model::ContentPart::text("and read the docs"),
+                ],
+            }],
+            ..Conversation::default()
+        };
+        assert_eq!(several.task(), Some("fix the typo"));
     }
 
     /// A continuing task starts with no kept output: its history names ids it cannot read.

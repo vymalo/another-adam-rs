@@ -31,8 +31,15 @@ needs no model or GitHub configuration.
 command (`tools::shell`), its sandbox meter (`tools::sandbox`), the tools' access scopes (`tools::access`), the
 `Redactor`, `GitAt` with the file listing (`tools::gitcli`, whose git writes and restores stay here) and the paths' confinement
 (`tools::files::confine`). These paths re-export the library, so nothing that names them changes. The first tools on the
-port are `list_files`, `find_files` and `search_files`: `tools::find` still declares them (their descriptions are what the
-model reads, pinned by `tests/tool_specs.rs`) and `adam_code_tools::find` does them. `Redactor::from_config` is the
+port are `list_files`, `find_files` and `search_files`, then `read_file` and `read_files`, then `write_file` and
+`edit_file`, then `apply_patch`: `tools::find` and `tools::files` still declare them (their descriptions are what the model reads, pinned by
+`tests/tool_specs.rs`) and `adam_code_tools::find` and `adam_code_tools::files` do them. What follows a write (the check
+epoch moved, "Run the checks again before you commit.", the note of a published scratch project) is the coder's
+`CodeWorkspace::after_write` in `src/tools/workspace.rs`, pinned by `tests/write_results.rs`. The commands have their port,
+`CommandWorkspace`, which `ToolEnv` implements in the same file (the run's environment, `CHECK_TIMEOUT_SECS` and
+`CHECK_OUTPUT_TAIL_BYTES`, the kept files): `ToolEnv::run` and what a command shows and keeps (`tools::output`) are
+`adam_code_tools::commands` and `adam_code_tools::output`, while `run_command` and `run` are still declared and done here,
+pinned by `tests/command_results.rs`. `Redactor::from_config` is the
 coder's own trait, `RedactorFromConfig`, re-exported at the crate root.
 
 ```mermaid
@@ -515,7 +522,7 @@ conversation pushed) lives in
 
 ### Reading and changing files itself
 
-`read_file`, `write_file`, `edit_file` and `apply_patch` (`src/tools/files.rs`) read and change files of the worktree in this
+`read_file`, `write_file`, `edit_file` and `apply_patch` (declared in `src/tools/files.rs`; their code is `adam_code_tools::files`) read and change files of the worktree in this
 process, and the instructions say when to use which: small, well-located changes yourself (`edit_file` for a few lines,
 `apply_patch` for several changes at once), a broad multi-file change is many such calls, file by file (ADR 0038: until the workers of ADR 0037 exist). The model chooses every path, so the paths are the point.
 
@@ -685,7 +692,7 @@ whole. **The next offset is that of the first item not shown**, never `offset + 
 following the final line reads every item once. An offset past the end, an offset of 0 and a limit below 1 are error results. A negative `offset`
 on `read_file` reaches back at most 10,000 lines and 8 MiB of text (more is an error that says to read forward).
 
-**`read_files` is one call for several files, and has bounds of its own** (ADR 0044's goal: a turn spent per file while a repository is discovered): `read_files { paths, repo? }` takes 1 to 16 paths, in the model's order, and answers each one behind a line that names it (`== <path> ==`), then its numbered lines, its **first page at most 400 lines or 8 KiB** (the first line is always shown, as a page of `read_file` always has one). A page that was cut ends with `[more: N lines left; next page: read_file path=<path> offset=K]`, so the follow-up is `read_file` and no new offset convention is learnt; a file that was fully shown ends with `[end: N lines]` (and `; no newline at the end of the file`), as `read_file` does. **The whole result is at most 32 KiB**: a file it had no room for is one line, `[not shown: read it alone with read_file path=<path>]`, and the lines of the files after it are reserved before a page is shown, so the cap always holds. A file that does not exist, is a directory, is not a regular file, is binary (a NUL), is not UTF-8 or is over `read_file`'s 512 MiB is **one line that says why**, and the other files are still shown: only a bad argument (0 or more than 16 paths, or paths over 8 KiB together) is an error result for the whole call. The directory's project instructions are shown once, before the first file of it, through the same `project::with_nested` machinery; the block is reserved before the page is claimed, so one that is claimed is always shown. It is not a paged tool (`Tool::paged` is false, and it takes no `offset`): the loop's 64 KiB backstop never sees it. Code: `read_files`, `page_in`, `read_one` in `src/tools/files.rs`; tests: `tests/tools.rs`.
+**`read_files` is one call for several files, and has bounds of its own** (ADR 0044's goal: a turn spent per file while a repository is discovered): `read_files { paths, repo? }` takes 1 to 16 paths, in the model's order, and answers each one behind a line that names it (`== <path> ==`), then its numbered lines, its **first page at most 400 lines or 8 KiB** (the first line is always shown, as a page of `read_file` always has one). A page that was cut ends with `[more: N lines left; next page: read_file path=<path> offset=K]`, so the follow-up is `read_file` and no new offset convention is learnt; a file that was fully shown ends with `[end: N lines]` (and `; no newline at the end of the file`), as `read_file` does. **The whole result is at most 32 KiB**: a file it had no room for is one line, `[not shown: read it alone with read_file path=<path>]`, and the lines of the files after it are reserved before a page is shown, so the cap always holds. A file that does not exist, is a directory, is not a regular file, is binary (a NUL), is not UTF-8 or is over `read_file`'s 512 MiB is **one line that says why**, and the other files are still shown: only a bad argument (0 or more than 16 paths, or paths over 8 KiB together) is an error result for the whole call. The directory's project instructions are shown once, before the first file of it, through the same project-instructions machinery (`CodeWorkspace::nested_instructions`); the block is reserved before the page is claimed, so one that is claimed is always shown. It is not a paged tool (`Tool::paged` is false, and it takes no `offset`): the loop's 64 KiB backstop never sees it. Code: `read_files`, `page_in`, `read_one` in `crates/adam-code-tools/src/files.rs`; tests: `tests/tools.rs`.
 
 **A page cannot be forged.** A name is bytes, and is printed escaped in all three tools: `\\`, `\n`, `\r`, `\t`, any other control character and any
 byte that is not UTF-8 as `\xNN` (as git quotes a path), and a **leading `[` as `\x5b`**, so no line of a page but the final one starts with `[` (a
@@ -2119,7 +2126,7 @@ holds it. `NotesStore::update` is how a call changes the run's notes (a lock per
 `run_checks`, `commit_and_push` and `open_pull_request` run alone and read the notes once and write them once.
 `write_file` and `edit_file` rename a new file over the old, so a read beside them sees one whole file.
 Tests: `tests/tool_access.rs`, `concurrent_updates_of_one_run_keep_every_change` in `src/tools/notes.rs`,
-`a_read_beside_a_write_or_an_edit_sees_a_whole_file` in `src/tools/files.rs`.
+`a_read_beside_a_write_or_an_edit_sees_a_whole_file` in `crates/adam-code-tools/src/files.rs`.
 
 ### Retry safety
 
@@ -2666,7 +2673,7 @@ database of its own, so the role needs `CREATEDB`):
   `commits_ahead`) of a scratch project whose configuration runs a program as a clean filter and of a worktree: the program runs under
   the server and reads the server's environment and not the coder's, the commands are in the server's log, the copy of the index is
   made in `staging/private/` and removed, and with the sandbox gone the answers are unknown and the program did not run here;
-  `src/tools/files.rs` (`apply_sandbox_tests`) applies a patch through it (its input crosses; a patch that does not apply is git's
+  `crates/adam-code-tools/src/files.rs` (`apply_sandbox_tests`) applies a patch through it (its input crosses; a patch that does not apply is git's
   verdict); `src/config.rs` and `src/repos.rs` read `GIT_SANDBOX_SOCKET` (absolute, blank is unset) and hand it to the workspaces.
 
 * `tests/references.rs` (ADR 0044 slice 13): the read tools in a reference (the first read, under `plan`, checks it out;
@@ -2890,9 +2897,12 @@ database of its own, so the role needs `CREATEDB`):
   a second, a pattern over 1000 bytes or a compiled size over 1 MiB refused, a symlink out of the slot not searched, files over 4 MiB counted),
   the paths outside the slot refused, **git unavailable fails closed**, and a timeout is an error that stops the blocking work;
   `files.rs` `swap_tests` `search_does_not_follow_a_slot_swapped_after_the_check`.
-* `src/tools/files.rs` (unit) and `tests/tools.rs`: the file tools. `confine` has a case each for `../`, an absolute path,
-  `.git/x` and `.GIT/x`, a symlink to a file outside, a symlinked directory outside, a write through a symlink that
-  stays inside, a link into `.git`, a directory and a file in the wrong place; `read_file` (a page of 2,000 lines and its
+* `src/tools/files.rs` (unit), `crates/adam-code-tools/src/files.rs` (unit: the read tools' paging, `read_files`' pages and
+  closest paths, the writes and the edits, the paths and modes `apply_patch` reads from git, moved there with them), `tests/write_results.rs` (the exact answer of
+  `write_file`, `edit_file` and `apply_patch`, with the note of a published scratch project, and the check epoch each moves)
+  and `tests/tools.rs`: the file tools. `confine`'s cases (`../`, an absolute path, `.git/x` and `.GIT/x`, a symlink to a
+  file outside, a symlinked directory outside, a write through a symlink that stays inside, a link into `.git`, a
+  directory and a file in the wrong place) are `adam-code-tools`' (`src/confine.rs`, moved there with it); `read_file` (a page of 2,000 lines and its
   `[more: ...]` line, a negative offset, the 50 KiB cap, a long line cut, `start_line` and `end_line` as aliases, a missing file's closest paths,
   no newline at the end, a binary file, a directory; the properties `prop_paging_reassembles_the_file` and `prop_same_call_same_bytes`),
   `write_file` (parents, replace, the mode kept, nothing left behind, the 1 MiB limit, the progress line), and
@@ -3009,7 +3019,7 @@ database of its own, so the role needs `CREATEDB`):
   ref, configuration, a rewritten `.git` file: each undone with the files it made), `run_respects_the_timeout_the_cwd_rule_and_a_missing_tool`,
   `run_works_in_a_scratch_project_and_keeps_what_git_ignores`, `edit_file_*` (once and everywhere, the closest region of a miss,
   two places refused, the path rules), `share_file_notes_what_was_shared_once` and
-  `scratch_work_gets_five_check_cycles_and_a_repository_three`; `src/tools/files.rs` the closest-region cases (indentation, a
+  `scratch_work_gets_five_check_cycles_and_a_repository_three`; `crates/adam-code-tools/src/files.rs` the closest-region cases (indentation, a
   changed word, CRLF, a long region, nothing alike); `src/agent.rs` `only_shared_scratch_work_with_no_repository_delivers_without_a_pull_request`
   and `each_kind_of_work_has_its_own_budget_in_the_verdict`; `tests/e2e.rs` (per store)
   `a_scratch_run_that_made_and_shared_a_file_completes_without_a_pull_request` (`run` makes a file, `share_file` hands it

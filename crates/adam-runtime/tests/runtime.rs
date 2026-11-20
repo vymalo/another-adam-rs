@@ -22,10 +22,10 @@ use std::time::{Duration, Instant};
 use adam_core::{ClaimScope, DynStore, JournalEntry, MemoryStore, NewRun, RunId, RunStatus};
 use adam_runtime::{
     Agent, AgentError, AgentStarter, Artifact, BroadcastSink, CHILD_REPORTED_KIND, ChildStatus,
-    Classify, Clock, CollectingSink, Ctx, Inbound, LocalNotifier, MAX_RETRY_AFTER, ManualClock,
-    RUN_FINISHED_KIND, RetryPolicy, RoundOutcome, RunEvent, RunView, Runtime, RuntimeBuilder,
-    RuntimeError, SessionState, Transition, child_run_id, parse_session_conversation_id,
-    session_conversation_id,
+    Classify, Clock, CollectingSink, Ctx, FileSource, Inbound, LocalNotifier, MAX_RETRY_AFTER,
+    ManualClock, RUN_FINISHED_KIND, RetryPolicy, RoundOutcome, RunEvent, RunView, Runtime,
+    RuntimeBuilder, RuntimeError, SessionState, Transition, child_run_id,
+    parse_session_conversation_id, session_conversation_id,
 };
 use adam_store_testkit::counting::CountingStore;
 use adam_store_testkit::fault::{FaultyStore, Method};
@@ -245,22 +245,22 @@ impl Worker {
 /// timestamps the store stamps in real time (a new run is due at its
 /// `updated_at`) are never in its future.
 #[derive(Clone)]
-struct FrozenClock(Arc<Mutex<chrono::DateTime<chrono::Utc>>>);
+struct FrozenClock(Arc<Mutex<adam_core::time::Timestamp>>);
 
 impl FrozenClock {
     fn new() -> Self {
-        let start = adam_core::store::now() + chrono::Duration::minutes(1);
+        let start = adam_core::store::now() + jiff::SignedDuration::from_mins(1);
         Self(Arc::new(Mutex::new(start)))
     }
 
     fn advance(&self, by: Duration) {
-        let by = chrono::Duration::from_std(by).expect("in range");
+        let by = jiff::SignedDuration::try_from(by).expect("in range");
         *self.0.lock().expect("lock") += by;
     }
 }
 
 impl Clock for FrozenClock {
-    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+    fn now(&self) -> adam_core::time::Timestamp {
         *self.0.lock().expect("lock")
     }
 }
@@ -398,7 +398,7 @@ impl Hold {
     }
 }
 
-const WAIT: chrono::Duration = chrono::Duration::seconds(60);
+const WAIT: jiff::SignedDuration = jiff::SignedDuration::from_secs(60);
 
 /// A small file for the artifact tests.
 const SVG: &[u8] = b"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'/>";
@@ -598,11 +598,8 @@ fn child_with_child(
 }
 
 /// Two instants of a clock that is the wall clock plus an offset are the same within a second or two.
-fn near(a: chrono::DateTime<chrono::Utc>, b: chrono::DateTime<chrono::Utc>) {
-    assert!(
-        (a - b).num_milliseconds().abs() < 2_000,
-        "{a} is not near {b}"
-    );
+fn near(a: adam_core::time::Timestamp, b: adam_core::time::Timestamp) {
+    assert!((a - b).as_millis().abs() < 2_000, "{a} is not near {b}");
 }
 
 /// A child that parks on a timer of `minutes` minutes, and does so again at each wake.
@@ -613,7 +610,7 @@ fn child_parked_on_a_timer(name: &str, minutes: i64) -> FnAgent {
             async move {
                 Ok(Transition::Park {
                     state,
-                    wake_at: Some(ctx.now() + chrono::Duration::minutes(minutes)),
+                    wake_at: Some(ctx.now() + jiff::SignedDuration::from_mins(minutes)),
                 })
             }
             .boxed()
@@ -1441,7 +1438,7 @@ mod cases {
                         if phase(&state) == 0 {
                             return Ok(Transition::Park {
                                 state: json!({"phase": 1}),
-                                wake_at: Some(ctx.now() + chrono::Duration::milliseconds(500)),
+                                wake_at: Some(ctx.now() + jiff::SignedDuration::from_millis(500)),
                             });
                         }
                         Ok(Transition::Done {
@@ -1502,7 +1499,7 @@ mod cases {
                         if phase(&state) == 0 {
                             return Ok(Transition::Park {
                                 state: json!({"phase": 1}),
-                                wake_at: Some(ctx.now() + chrono::Duration::hours(1)),
+                                wake_at: Some(ctx.now() + jiff::SignedDuration::from_hours(1)),
                             });
                         }
                         Ok(Transition::Done {
@@ -1580,7 +1577,7 @@ mod cases {
         // After each failed try the run waits, runnable, for its backoff to
         // pass. Time is frozen, so `wake_at - now` is exactly that backoff,
         // and the run cannot be tried again before the test advances time.
-        let mut delays: Vec<i64> = Vec::new();
+        let mut delays: Vec<i128> = Vec::new();
         for failed_tries in 1..=2u32 {
             let v = wait_for(&rt, run, "a retry is scheduled", |v| {
                 v.attempt == failed_tries && v.wake_at.is_some()
@@ -1593,8 +1590,8 @@ mod cases {
                 failed_tries as usize,
                 "not tried again before its backoff has passed"
             );
-            delays.push(delay.num_milliseconds());
-            clock.advance(delay.to_std().expect("a backoff in the future"));
+            delays.push(delay.as_millis());
+            clock.advance(std::time::Duration::try_from(delay).expect("a backoff in the future"));
         }
         let last = wait_for(&rt, run, "gave up", |v| v.status == RunStatus::Failed).await;
         worker.stop().await;
@@ -2773,9 +2770,12 @@ mod cases {
         let chart = &view.artifacts[1];
         assert_eq!(chart.mime_type.as_deref(), Some("image/svg+xml"));
         let file = chart.file.as_ref().expect("the file");
+        assert_eq!(file.filename, "chart.svg");
+        assert_eq!(file.size, SVG.len() as u64);
         assert_eq!(
-            (file.filename.as_str(), file.bytes.as_slice()),
-            ("chart.svg", SVG)
+            file.source,
+            FileSource::Inline(SVG.to_vec()),
+            "a run with no head carries its file's bytes inline"
         );
         // The step that made it also put its bytes under their digest (ADR 0055): a store that
         // keeps blobs answers them by id, and the digest is the one `blob_id` computes.
@@ -3030,7 +3030,7 @@ mod cases {
         })
         .await;
         let wake_at = scheduled.wake_at.expect("a retry carries a timer");
-        let thirty = chrono::Duration::seconds(30);
+        let thirty = jiff::SignedDuration::from_secs(30);
         assert!(wake_at >= t0 + thirty, "hint ignored: wake_at {wake_at}");
         assert!(
             wake_at <= clock.now() + thirty,
@@ -3038,9 +3038,10 @@ mod cases {
         );
 
         // 5 s before the hint is up: several polls later, still not stepped.
-        let gap = (wake_at - clock.now() - chrono::Duration::seconds(5))
-            .to_std()
-            .expect("the timer is in the future");
+        let gap = std::time::Duration::try_from(
+            wake_at - clock.now() - jiff::SignedDuration::from_secs(5),
+        )
+        .expect("the timer is in the future");
         clock.advance(gap);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(count(&steps), 1, "stepped before the hint elapsed");
@@ -3109,7 +3110,7 @@ mod cases {
         let worker = spawn_worker(&rt);
         let scheduled = wait_for(&rt, run, "the retry to be scheduled", |v| v.attempt == 1).await;
         let wake_at = scheduled.wake_at.expect("timer");
-        let twenty = chrono::Duration::seconds(20);
+        let twenty = jiff::SignedDuration::from_secs(20);
         assert!(wake_at >= t0 + twenty, "backoff was shortened: {wake_at}");
         assert!(
             wake_at <= clock.now() + twenty,
@@ -3153,7 +3154,7 @@ mod cases {
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
         let scheduled = wait_for(&rt, run, "the retry to be scheduled", |v| v.attempt == 1).await;
-        let cap = chrono::Duration::from_std(MAX_RETRY_AFTER).expect("cap fits");
+        let cap = jiff::SignedDuration::try_from(MAX_RETRY_AFTER).expect("cap fits");
         let wake_at = scheduled.wake_at.expect("timer");
         assert!(wake_at >= t0 + cap, "capped too low: {wake_at}");
         assert!(wake_at <= clock.now() + cap, "not capped: {wake_at}");
@@ -3207,7 +3208,7 @@ mod cases {
         let worker = spawn_worker(&rt);
         // Each failure schedules a retry at least 5 s away (the hint, not the
         // 10-50 ms policy). Nothing steps before the test moves the clock.
-        let hint = chrono::Duration::seconds(5);
+        let hint = jiff::SignedDuration::from_secs(5);
         for attempt in 1..3 {
             let scheduled = wait_for(&rt, run, "the retry to be scheduled", |v| {
                 v.attempt == attempt
@@ -3672,7 +3673,7 @@ mod cases {
         let run = rt.start(&name, inbound(), None).await.expect("recovered");
 
         // view, deliver, cancel: reads and writes both
-        faults.fail(Method::LoadRun, 1);
+        faults.fail(Method::LoadHead, 1);
         retryable(rt.view(run).await.expect_err("outage"));
         faults.fail(Method::LoadRun, 1);
         retryable(rt.deliver(run, inbound()).await.expect_err("outage"));
@@ -4948,7 +4949,7 @@ mod cases {
         let parent = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
         let limit = Duration::from_secs(30 * 60);
-        let deadline = clock.now() + chrono::Duration::minutes(30);
+        let deadline = clock.now() + jiff::SignedDuration::from_mins(30);
 
         let parked = child_run_id(parent, "parked");
         rt.start_child_within(parent, parked, &parked_name, inbound(), Some(limit))
@@ -4965,7 +4966,7 @@ mod cases {
         let stored = store.load_run(parked).await.unwrap().unwrap();
         near(
             stored.wake_at.unwrap(),
-            clock.now() + chrono::Duration::seconds(60),
+            clock.now() + jiff::SignedDuration::from_secs(60),
         );
         assert!(
             deadline > stored.wake_at.unwrap(),
@@ -5179,7 +5180,7 @@ mod cases {
         let purged = store
             .purge_finished(
                 &parent_name,
-                chrono::Utc::now() + chrono::Duration::hours(1),
+                adam_core::store::now() + jiff::SignedDuration::from_hours(1),
             )
             .await
             .unwrap();
@@ -5301,7 +5302,7 @@ mod cases {
                         steps.fetch_add(1, SeqCst);
                         Ok(Transition::Park {
                             state,
-                            wake_at: Some(ctx.now() + chrono::Duration::minutes(50)),
+                            wake_at: Some(ctx.now() + jiff::SignedDuration::from_mins(50)),
                         })
                     }
                     .boxed()
@@ -5327,7 +5328,7 @@ mod cases {
         .unwrap();
         let worker = spawn_worker(&rt);
         wait_for(&rt, child, "parked", |v| v.status == RunStatus::Parked).await;
-        let deadline = start + chrono::Duration::seconds(1800);
+        let deadline = start + jiff::SignedDuration::from_secs(1800);
 
         // Five seconds before the deadline a wake is due that the deadline did not set.
         clock.advance(Duration::from_secs(1795));
@@ -5352,7 +5353,7 @@ mod cases {
         let rec = store.load_run(child).await.unwrap().unwrap();
         near(
             rec.wake_at.unwrap(),
-            deadline + chrono::Duration::seconds(1),
+            deadline + jiff::SignedDuration::from_secs(1),
         );
         assert_eq!(count(&steps), 1, "the agent was not stepped");
         assert_eq!(rec.version, version + 2, "and there was no loop");
@@ -5409,7 +5410,7 @@ mod cases {
         let retrying = wait_for(&rt, child, "retry scheduled", |v| v.attempt == 1).await;
         near(
             retrying.wake_at.unwrap(),
-            start + chrono::Duration::seconds(1800),
+            start + jiff::SignedDuration::from_secs(1800),
         );
         clock.advance(Duration::from_secs(31 * 60));
         let ended = wait_failed(&rt, child).await;
@@ -5435,7 +5436,7 @@ mod cases {
                         steps.fetch_add(1, SeqCst);
                         Ok(Transition::Park {
                             state,
-                            wake_at: Some(ctx.now() + chrono::Duration::minutes(20)),
+                            wake_at: Some(ctx.now() + jiff::SignedDuration::from_mins(20)),
                         })
                     }
                     .boxed()
@@ -5800,7 +5801,10 @@ mod cases {
         back_worker.stop().await;
 
         let purged = dynamic
-            .purge_finished(&child_name, chrono::Utc::now() + chrono::Duration::hours(1))
+            .purge_finished(
+                &child_name,
+                adam_core::store::now() + jiff::SignedDuration::from_hours(1),
+            )
             .await
             .expect("purge");
         assert!(purged >= 1);
@@ -5964,7 +5968,10 @@ mod cases {
                 .unwrap()
         );
         let purged = store
-            .purge_finished(&name, chrono::Utc::now() + chrono::Duration::hours(1))
+            .purge_finished(
+                &name,
+                adam_core::store::now() + jiff::SignedDuration::from_hours(1),
+            )
             .await
             .expect("purge");
         assert!(purged >= 2, "purged {purged}");
@@ -7610,6 +7617,9 @@ struct TranscriptAgent {
     file: Option<Artifact>,
     /// Replace the transcript on the second step: a compaction, not an append.
     compact: bool,
+    /// Pad every step's message with this many bytes, so a full state is too large to pass a
+    /// head-sized bound.
+    padding: usize,
 }
 
 impl TranscriptAgent {
@@ -7621,11 +7631,17 @@ impl TranscriptAgent {
             wrong: false,
             file: None,
             compact: false,
+            padding: 0,
         }
     }
 
     fn with_file(mut self, file: Artifact) -> Self {
         self.file = Some(file);
+        self
+    }
+
+    fn with_padding(mut self, bytes: usize) -> Self {
+        self.padding = bytes;
         self
     }
 }
@@ -7684,7 +7700,9 @@ impl Agent for TranscriptAgent {
             state.messages.push("compacted".into());
         }
         state.turns += 1;
-        state.messages.push(format!("turn {}", state.turns));
+        state
+            .messages
+            .push(format!("turn {}{}", state.turns, "x".repeat(self.padding)));
         if self.park_at == Some(state.turns) {
             return Ok(Transition::Park {
                 state,
@@ -7903,14 +7921,16 @@ async fn every_state_written_is_a_v4_envelope_and_a_head_is_not_one() {
     );
 }
 
-/// The read path is unchanged in the expand release: a view reads the state, never the head and
-/// never the body.
+/// The read path of the expand release: a view reads the head, never the state and never a body;
+/// `Runtime::state` is the one full-state read, one body set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_view_reads_the_state_and_never_the_head() {
+async fn the_view_reads_the_head_and_the_state_joins_the_body() {
     let inner: DynStore = Arc::new(MemoryStore::new());
     let counting = Arc::new(CountingStore::new(inner.clone()));
     let store: DynStore = counting.clone();
-    let agent = TranscriptAgent::new(&uniq("view"), 2);
+    // 49 turns after the start: a 50-message transcript, each turn 10 KB, so the whole state is
+    // far larger than the head and a full-state read cannot pass the bound below.
+    let agent = TranscriptAgent::new(&uniq("view"), 49).with_padding(10 * 1024);
     let rt = transcript_runtime(&store, &agent);
     let run = rt.start(&agent.name, inbound(), None).await.expect("start");
     let worker = spawn_worker(&rt);
@@ -7920,21 +7940,229 @@ async fn the_view_reads_the_state_and_never_the_head() {
     counting.reset();
     let view = rt.view(run).await.expect("view").expect("the run");
     assert_eq!(counting.calls(Method::LeaseUntil), 1);
-    assert_eq!(counting.calls(Method::LoadRun), 1);
+    assert_eq!(counting.calls(Method::LoadHead), 1);
     assert_eq!(
-        counting.calls(Method::LoadHead),
+        counting.calls(Method::LoadRun),
         0,
-        "the view does not read the head in S2a"
+        "the view never reads the whole state"
     );
-    assert_eq!(counting.calls(Method::BodyList), 0, "and it reads no body");
+    assert_eq!(counting.calls(Method::BodyList), 0, "and never a body row");
+    assert!(
+        counting.state_bytes_read() < 2 * 1024,
+        "the head is small: {} bytes",
+        counting.state_bytes_read()
+    );
+    assert!(
+        view.state["messages"].as_array().unwrap().is_empty(),
+        "the head keeps no message: {:?}",
+        view.state
+    );
+    assert_eq!(view.state["turns"], 49);
+
+    // The one full-state read: the head and the generation it names, joined.
+    counting.reset();
+    let state = rt.state(run).await.expect("state").expect("the run");
+    assert_eq!(counting.calls(Method::LoadHead), 1);
+    assert_eq!(counting.calls(Method::BodyList), 1, "one body set");
+    assert_eq!(counting.calls(Method::LoadRun), 0);
+    assert_eq!(
+        state["messages"].as_array().unwrap().len(),
+        50,
+        "every message is back"
+    );
+    assert_eq!(state["turns"], 49);
+    assert_eq!(state["messages"][0], json!("start"));
+    assert!(
+        state["messages"][49]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("turn 49"),
+        "the last message is back"
+    );
+    let joined = serde_json::to_vec(&state).expect("the joined state is JSON");
+    assert!(
+        joined.len() > 400 * 1024,
+        "the joined state is large ({} bytes), so the head's bound is not a small-state accident",
+        joined.len()
+    );
+}
+
+/// A head a headless commit left stale is not an error: `load_head` serves the whole state, and
+/// the next step re-splits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_head_falls_back_to_the_whole_state() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let counting = Arc::new(CountingStore::new(inner.clone()));
+    let store: DynStore = counting.clone();
+    let mut agent = TranscriptAgent::new(&uniq("stale"), 2);
+    agent.park_at = Some(1);
+    let rt = transcript_runtime(&store, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_waiting(&rt, run).await;
+    worker.stop().await;
+
+    // A delivery writes no head: the stored one is now stale.
+    rt.deliver(run, late()).await.expect("deliver");
+    counting.reset();
+    let view = rt.view(run).await.expect("view").expect("the run");
+    assert_eq!(counting.calls(Method::LoadHead), 1);
+    assert_eq!(counting.calls(Method::BodyList), 0, "no head is served");
+    assert_eq!(
+        view.state["messages"].as_array().unwrap().len(),
+        2,
+        "the whole state is served when the head is stale"
+    );
+    assert_eq!(view.state["turns"], 1);
+    // And the one full-state read agrees, with no body read: the state is already whole.
+    counting.reset();
+    let state = rt.state(run).await.expect("state").expect("the run");
+    assert_eq!(state, view.state);
+    assert_eq!(counting.calls(Method::BodyList), 0);
+
+    // The next step re-splits and rewrites the head.
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    let served = inner.load_head(run).await.expect("load").expect("the run");
+    assert_eq!(served.state["v"], 5, "the step rewrote the head");
+}
+
+/// A run that never split is v4: its view is the whole agent state, and `Runtime::state` reads no
+/// body because there is none to join.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_v4_runs_view_is_the_whole_state() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let counting = Arc::new(CountingStore::new(inner.clone()));
+    let store: DynStore = counting.clone();
+    // A split that does not reconstruct the state is refused, so the run stays v4.
+    let mut agent = TranscriptAgent::new(&uniq("v4"), 2);
+    agent.wrong = true;
+    let rt = transcript_runtime(&store, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    counting.reset();
+    let view = rt.view(run).await.expect("view").expect("the run");
+    assert_eq!(counting.calls(Method::LoadHead), 1);
+    assert_eq!(counting.calls(Method::BodyList), 0);
     assert_eq!(
         view.state["messages"].as_array().unwrap().len(),
         3,
-        "the whole agent state is served"
+        "a v4 view is the whole agent state"
     );
-    // The head exists and is current; the runtime simply did not ask for it.
-    let served = inner.load_head(run).await.expect("load").expect("the run");
-    assert_eq!(served.state["v"], 5);
+    counting.reset();
+    let state = rt.state(run).await.expect("state").expect("the run");
+    assert_eq!(state, view.state);
+    assert_eq!(counting.calls(Method::BodyList), 0);
+}
+
+/// A head that moves between `load_head` and `body_list` is re-read once: the new head and its new
+/// generation join to every message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_re_reads_a_moved_head_and_joins_its_new_generation() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let agent = TranscriptAgent::new(&uniq("moving"), 3);
+    let rt = transcript_runtime(&inner, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let first = inner.load_head(run).await.expect("load").expect("the run");
+    let generation = common::moving::generation_of(&first);
+    let moving = Arc::new(common::moving::MovingHead::new(
+        inner.clone(),
+        run,
+        first,
+        generation,
+        true,
+    ));
+    let store: DynStore = moving.clone();
+    let reader = transcript_runtime(&store, &agent);
+    let state = reader.state(run).await.expect("state").expect("the run");
+    assert_eq!(
+        common::moving::messages(&state).len(),
+        4,
+        "the new generation joins every message"
+    );
+    assert_eq!(moving.loads(), 2, "the head was read twice");
+    let current = inner.load_head(run).await.expect("load").expect("the run");
+    let new_generation = common::moving::generation_of(&current);
+    assert_ne!(new_generation, generation, "a compaction started a new one");
+    assert_eq!(
+        inner
+            .body_list(run, new_generation)
+            .await
+            .expect("the new generation")
+            .len(),
+        4,
+        "the new generation holds the whole transcript"
+    );
+}
+
+/// A body set that is short on both reads is `Corrupt`, not data loss: the version did not move, so
+/// the retry cannot help.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_is_corrupt_when_the_body_is_short_twice() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let agent = TranscriptAgent::new(&uniq("corrupt"), 3);
+    let rt = transcript_runtime(&inner, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let first = inner.load_head(run).await.expect("load").expect("the run");
+    let generation = common::moving::generation_of(&first);
+    let moving = Arc::new(common::moving::MovingHead::new(
+        inner.clone(),
+        run,
+        first,
+        generation,
+        false,
+    ));
+    let store: DynStore = moving.clone();
+    let reader = transcript_runtime(&store, &agent);
+    let error = reader.state(run).await.expect_err("the body is gone");
+    assert!(matches!(error, RuntimeError::Corrupt { .. }), "{error:?}");
+    assert_eq!(moving.loads(), 2, "one re-read, then the same short set");
+}
+
+/// `Runtime::artifact_bytes` answers an inline file's own bytes, a stored blob's bytes once, and
+/// `None` for a blob that is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn artifact_bytes_serves_an_inline_file_and_a_blob() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let rt = Runtime::builder(store.clone()).build();
+
+    let inline = adam_runtime::FileRef::inline("a.bin", vec![7_u8; 4]);
+    assert_eq!(
+        &rt.artifact_bytes(&inline)
+            .await
+            .expect("inline bytes")
+            .expect("an inline file is always there")[..],
+        &[7_u8; 4]
+    );
+
+    let digest = adam_runtime::blob_id(b"blob");
+    store.put_blob(&digest, b"blob").await.expect("put");
+    let blob = adam_runtime::FileRef::blob("b.bin", 4, digest);
+    assert_eq!(
+        &rt.artifact_bytes(&blob)
+            .await
+            .expect("blob bytes")
+            .expect("the blob is there")[..],
+        b"blob"
+    );
+
+    let gone = adam_runtime::FileRef::blob("c.bin", 4, adam_runtime::blob_id(b"gone"));
+    assert!(
+        rt.artifact_bytes(&gone).await.expect("the read").is_none(),
+        "a missing blob is None, not an empty file"
+    );
 }
 
 /// A run created with a file artifact in its state but no blob (a pre-E run; the runtime's start

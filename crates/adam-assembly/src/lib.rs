@@ -109,6 +109,11 @@
 //! [`AgentDef::env`]) and fails closed; the URL must be https unless it is local
 //! ([`AgentDef::allow_insecure_remotes`]); the token is never logged or journaled. See the README.
 //!
+//! Remote subagents need the feature `remote`, on by default: it brings the A2A client, an HTTP
+//! client and TLS. A build without it (an application that embeds adam, ADR 0047) carries none of
+//! them, and [`AgentDef::bind`] refuses a subagent file with `a2a:` ([`Error::RemoteNotEnabled`])
+//! before any secret is read.
+//!
 //! # Run-time folders
 //!
 //! [`AgentFolder::load`] reads the one agent of a folder when the process starts (no feature):
@@ -127,7 +132,7 @@
 //!
 //! # MCP tools
 //!
-//! With the feature `mcp` (off by default), [`AgentDef::connect_mcp`] connects to the servers of each
+//! With the feature `mcp` (off by default), `AgentDef::connect_mcp` connects to the servers of each
 //! agent's own `mcp.json` (the root's, and each local subagent's) with `adam-mcp` and keeps their
 //! tools, named `<server>__<tool>`, for that agent alone: [`AgentDef::bind`] adds them to the
 //! catalog `tools:` selects from, and refuses an agent whose `mcp.json` lists servers that were not
@@ -147,7 +152,10 @@ mod dev;
 mod error;
 mod folder;
 mod mcp;
+mod mcp_select;
+#[cfg(feature = "remote")]
 mod remote;
+#[cfg(feature = "remote")]
 mod remote_session;
 mod scrub;
 mod skills;
@@ -169,6 +177,7 @@ pub use folder::{
     AGENT_DIR_ENV, AgentFolder, EXTRA_MCP_FILE_ENV, agent_dir, agent_dir_from_env,
     extra_mcp_file_from_env,
 };
+#[cfg(feature = "remote")]
 pub use remote_session::{RemoteRoundAgent, RemoteRoundStarter};
 pub use skills::{
     LOAD_SKILL, READ_SKILL_FILE, RunSkills, SkillError, SkillFiles, run_skills_conformance,
@@ -205,3 +214,12 @@ mod dev_is_off {}
 /// ```
 #[cfg(not(feature = "mcp"))]
 mod mcp_is_off {}
+
+/// Without the feature `remote` there is no A2A client: the round agents of remote sessions do
+/// not exist, and `bind` refuses an `a2a:` subagent (`Error::RemoteNotEnabled`).
+///
+/// ```compile_fail,E0432
+/// use adam_assembly::RemoteRoundAgent;
+/// ```
+#[cfg(not(feature = "remote"))]
+mod remote_is_off {}

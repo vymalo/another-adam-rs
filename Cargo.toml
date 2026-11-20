@@ -71,6 +71,9 @@ http = "1"
 # Parses the request head of the egress proxy (adam-egress); already in the tree under hyper.
 httparse = "1"
 httpdate = "1"
+# The instant adam-rs stores and sends (ADR 0057). `serde` is what the stored run state needs;
+# nothing here uses a time zone, so no tzdb is built or read.
+jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }
 # Reads a repository's devcontainer.json (JSON with comments and trailing commas), as serde_json values
 # (adam-devcontainer).
 jsonc-parser = { version = "0.34", features = ["serde"] }

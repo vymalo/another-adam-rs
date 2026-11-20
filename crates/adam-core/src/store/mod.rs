@@ -51,10 +51,12 @@ use std::time::Duration;
 
 use adam_error::{BoxError, Classify, ErrorClass};
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
+
+use crate::time::{Timestamp, span_of};
+use jiff::Timestamp as JiffTimestamp;
 
 pub use push::{NewPushConfig, PushProgress, PushRecord, PushState};
 pub use query::{ConversationScope, RunQuery};
@@ -209,7 +211,7 @@ pub struct NewRun {
     pub parent_id: Option<RunId>,
     pub status: RunStatus,
     pub state: Value,
-    pub wake_at: Option<DateTime<Utc>>,
+    pub wake_at: Option<Timestamp>,
 }
 
 impl NewRun {
@@ -246,7 +248,7 @@ impl NewRun {
         self
     }
 
-    pub fn wake_at(mut self, at: DateTime<Utc>) -> Self {
+    pub fn wake_at(mut self, at: Timestamp) -> Self {
         self.wake_at = Some(truncate_ms(at));
         self
     }
@@ -321,7 +323,7 @@ pub struct RunUpdate {
     /// once no run references them ([`Store::purge_blobs`]). Empty by default, so a caller that
     /// stores no blobs behaves exactly as before.
     pub blobs: Vec<BlobId>,
-    pub wake_at: Option<DateTime<Utc>>,
+    pub wake_at: Option<Timestamp>,
 }
 
 impl RunUpdate {
@@ -357,7 +359,7 @@ impl RunUpdate {
         self
     }
 
-    pub fn wake_at(mut self, at: DateTime<Utc>) -> Self {
+    pub fn wake_at(mut self, at: Timestamp) -> Self {
         self.wake_at = Some(truncate_ms(at));
         self
     }
@@ -372,15 +374,15 @@ pub struct RunRecord {
     pub parent_id: Option<RunId>,
     pub status: RunStatus,
     pub state: Value,
-    pub wake_at: Option<DateTime<Utc>>,
+    pub wake_at: Option<Timestamp>,
     /// Starts at 1 on creation and increases by exactly 1 per successful commit.
     pub version: u64,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 impl RunRecord {
-    pub fn sched_at(&self) -> Option<DateTime<Utc>> {
+    pub fn sched_at(&self) -> Option<Timestamp> {
         sched_at(self.status, self.wake_at, self.updated_at)
     }
 }
@@ -409,23 +411,23 @@ pub struct RunHeader {
     /// Lifecycle status.
     pub status: RunStatus,
     /// Timer: when a parked run wakes, or a runnable run becomes due.
-    pub wake_at: Option<DateTime<Utc>>,
+    pub wake_at: Option<Timestamp>,
     /// Starts at 1 on creation and increases by exactly 1 per successful commit.
     pub version: u64,
     /// When the run was created.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Last commit time.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     /// When the lease on the run ends, or `None` if it has none (never claimed, or released).
     /// A lease that ran out is still reported: whether it still counts is for the caller's clock
     /// (see [`claimed`](Self::claimed)).
-    pub lease_until: Option<DateTime<Utc>>,
+    pub lease_until: Option<Timestamp>,
 }
 
 impl RunHeader {
     /// Whether a worker holds an unexpired lease on the run: it is being stepped right now,
     /// though nothing has been committed yet. [`claimed`] is the rule; this is it for a header.
-    pub fn claimed(&self, now: DateTime<Utc>) -> bool {
+    pub fn claimed(&self, now: Timestamp) -> bool {
         claimed(self.status, self.lease_until, now)
     }
 }
@@ -436,7 +438,7 @@ impl RunHeader {
 /// The one rule of [`RunHeader::claimed`], a runtime view's `claimed`, and a listing that builds a
 /// view from a record it already has: only a runnable run is being stepped, whatever lease a parked
 /// or finished one still carries, and a lease that ran out (the worker died) does not count.
-pub fn claimed(status: RunStatus, lease_until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+pub fn claimed(status: RunStatus, lease_until: Option<Timestamp>, now: Timestamp) -> bool {
     status == RunStatus::Runnable && lease_until.is_some_and(|until| until > now)
 }
 
@@ -464,7 +466,7 @@ pub enum ClaimScope {
 pub struct Lease {
     pub run: RunRecord,
     pub worker: String,
-    pub until: DateTime<Utc>,
+    pub until: Timestamp,
 }
 
 /// The recorded outcome of one `ctx.step(..)`.
@@ -477,7 +479,7 @@ pub struct JournalEntry {
     pub ok: bool,
     /// Serialized step output (or error).
     pub payload: Value,
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
 }
 
 impl JournalEntry {
@@ -645,9 +647,8 @@ pub trait Store: Send + Sync + 'static {
     /// Defaults to [`load_run`](Self::load_run), so a store that keeps no head answers exactly as it
     /// does today. A head that a later commit did not rebuild (a delivery, a cancel, a park) is
     /// stale and is **not** served: the whole state is, and the next step re-splits and rewrites the
-    /// head. The expand release (S2a) writes and verifies the head but serves the full state: the
-    /// read path (`Runtime::view`) does not call this method yet, and neither does anything that
-    /// steps a run. Tests call it to prove the stored head round-trips.
+    /// head. `Runtime::view` reads this and never a body; `Runtime::state` joins the head with the
+    /// rows of the generation it names.
     async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
         self.load_run(id).await
     }
@@ -662,7 +663,8 @@ pub trait Store: Send + Sync + 'static {
     /// The lease is read **before** the record, as the runtime's `view` does: a claim that lands
     /// between the two reads then reads as not yet, and a step that committed and released is read
     /// with the version it committed. A reader that needs the state as well reads
-    /// [`load_run`](Self::load_run) instead.
+    /// [`load_head`](Self::load_head) (the observer's read, the head or the whole state) or
+    /// [`load_run`](Self::load_run) (the whole state) instead.
     async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
         let lease_until = self.lease_until(id).await?;
         let Some(rec) = self.load_run(id).await? else {
@@ -767,7 +769,7 @@ pub trait Store: Send + Sync + 'static {
         worker: &str,
         scope: ClaimScope,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>>;
@@ -778,7 +780,7 @@ pub trait Store: Send + Sync + 'static {
         &self,
         id: RunId,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
     ) -> StoreResult<bool>;
 
@@ -792,7 +794,7 @@ pub trait Store: Send + Sync + 'static {
     /// for the caller to say against its own clock (a claim treats `until <= now` as free). This is
     /// how a reader that is not a worker (the A2A server, which may run in another process) learns
     /// that a worker is stepping a run: see `RunView::claimed` in `adam-runtime`.
-    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>>;
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>>;
 
     /// The runs `query` selects, ordered by `updated_at` descending and then `id` descending, one
     /// page of at most `query.limit`: the keyset page that starts strictly after `query.after`.
@@ -831,7 +833,7 @@ pub trait Store: Send + Sync + 'static {
         &self,
         agents: &[String],
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<PushRecord>>;
@@ -871,7 +873,7 @@ pub trait Store: Send + Sync + 'static {
     /// minute (`adam-runtime`), and fails when the parent is `Failed`; a parent that is missing is
     /// treated as unknown and cancels nothing, so a failed parent purged before its children saw it
     /// leaves them running to their own limits.
-    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64>;
+    async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64>;
 
     /// Whether this store keeps a run's transcript beside its head ([`body_list`](Self::body_list),
     /// [`RunUpdate::body`]). `false` (the default) means `RunUpdate::state` is the whole run, as
@@ -899,7 +901,7 @@ pub trait Store: Send + Sync + 'static {
         &self,
         run: RunId,
         keep_generation: Uuid,
-        before: DateTime<Utc>,
+        before: Timestamp,
     ) -> StoreResult<u64> {
         let _ = (run, keep_generation, before);
         Ok(0)
@@ -948,7 +950,7 @@ pub trait Store: Send + Sync + 'static {
     ///
     /// The explicit knob for a host that reclaims bytes without purging runs;
     /// [`purge_finished`](Self::purge_finished) sweeps the same set with its own cutoff.
-    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_blobs(&self, before: Timestamp) -> StoreResult<u64> {
         let _ = before;
         Ok(0)
     }
@@ -962,9 +964,9 @@ pub type DynStore = Arc<dyn Store>;
 /// Every store persists this value so claiming is one indexed range scan.
 pub fn sched_at(
     status: RunStatus,
-    wake_at: Option<DateTime<Utc>>,
-    updated_at: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    wake_at: Option<Timestamp>,
+    updated_at: Timestamp,
+) -> Option<Timestamp> {
     match status {
         RunStatus::Runnable => Some(wake_at.unwrap_or(updated_at)),
         RunStatus::Parked => wake_at,
@@ -972,20 +974,34 @@ pub fn sched_at(
     }
 }
 
-/// Truncate to millisecond precision (see the module docs on time).
+/// Truncate to millisecond precision, flooring as chrono's `timestamp_millis` did: a value before
+/// 1970 with a fractional millisecond becomes the millisecond below (`-0.5 ms` is `-1 ms`, never
+/// `0`), so the stored value is the one the framework wrote before ADR 0057. A value after 1970 is
+/// floored too, which is the same as truncating there.
+///
+/// Works in whole milliseconds rather than through `Timestamp::from_millisecond`: jiff's
+/// `as_millisecond` truncates toward zero, and jiff's `from_millisecond` rejects the last 999 ms
+/// of its own range, so `truncate_ms(Timestamp::MAX)` must not go through the raw constructor.
 #[allow(
     clippy::expect_used,
-    reason = "a millisecond count taken from a DateTime is always representable"
+    reason = "a millisecond count taken from a Timestamp is always representable"
 )]
-pub fn truncate_ms(t: DateTime<Utc>) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(t.timestamp_millis())
-        .single()
-        .expect("millisecond timestamp in range")
+pub fn truncate_ms(t: Timestamp) -> Timestamp {
+    let fraction = i64::from(t.subsec_nanosecond()).div_euclid(1_000_000);
+    let millis = t
+        .as_second()
+        .checked_mul(1_000)
+        .and_then(|whole| whole.checked_add(fraction))
+        .expect("a timestamp's milliseconds fit in i64");
+    let second = millis.div_euclid(1_000);
+    let nanosecond = i32::try_from(millis.rem_euclid(1_000) * 1_000_000)
+        .expect("a millisecond is under a second");
+    Timestamp(JiffTimestamp::new(second, nanosecond).expect("the instant is in jiff's range"))
 }
 
 /// Current time, truncated to milliseconds.
-pub fn now() -> DateTime<Utc> {
-    truncate_ms(Utc::now())
+pub fn now() -> Timestamp {
+    truncate_ms(Timestamp::now())
 }
 
 /// The `(generation, len)` a v5 head's `body` names, or `None` when it has none yet: a head the
@@ -1093,12 +1109,8 @@ fn replace_nul(value: &mut Value) {
 }
 
 /// `now + ttl`, truncated to milliseconds.
-pub fn add_ttl(now: DateTime<Utc>, ttl: Duration) -> DateTime<Utc> {
-    let ttl = chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX);
-    truncate_ms(
-        now.checked_add_signed(ttl)
-            .unwrap_or(DateTime::<Utc>::MAX_UTC),
-    )
+pub fn add_ttl(now: Timestamp, ttl: Duration) -> Timestamp {
+    truncate_ms(now + span_of(ttl))
 }
 
 /// A single-field key for stores that enforce "one open run per conversation"
@@ -1184,7 +1196,7 @@ mod tests {
             _worker: &str,
             _scope: ClaimScope,
             _busy: &[RunId],
-            _now: DateTime<Utc>,
+            _now: Timestamp,
             _ttl: Duration,
             _limit: usize,
         ) -> StoreResult<Vec<Lease>> {
@@ -1195,7 +1207,7 @@ mod tests {
             &self,
             _id: RunId,
             _worker: &str,
-            _now: DateTime<Utc>,
+            _now: Timestamp,
             _ttl: Duration,
         ) -> StoreResult<bool> {
             unimplemented!("the defaults under test never renew a lease")
@@ -1205,7 +1217,7 @@ mod tests {
             unimplemented!("the defaults under test never release a lease")
         }
 
-        async fn lease_until(&self, _id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+        async fn lease_until(&self, _id: RunId) -> StoreResult<Option<Timestamp>> {
             unimplemented!("the defaults under test never read a lease")
         }
 
@@ -1233,7 +1245,7 @@ mod tests {
             &self,
             _agents: &[String],
             _worker: &str,
-            _now: DateTime<Utc>,
+            _now: Timestamp,
             _ttl: Duration,
             _limit: usize,
         ) -> StoreResult<Vec<PushRecord>> {
@@ -1250,7 +1262,7 @@ mod tests {
             unimplemented!("the defaults under test never commit a push config")
         }
 
-        async fn purge_finished(&self, _agent: &str, _before: DateTime<Utc>) -> StoreResult<u64> {
+        async fn purge_finished(&self, _agent: &str, _before: Timestamp) -> StoreResult<u64> {
             unimplemented!("the defaults under test never purge")
         }
     }
@@ -1428,6 +1440,55 @@ mod tests {
         assert_eq!(
             adam_error::report(&e),
             "storage backend error: driver said no"
+        );
+    }
+
+    /// chrono's `timestamp_millis` floored; jiff's `as_millisecond` truncates toward zero, so a
+    /// pre-1970 value with a fractional millisecond must be corrected by one, or the stored
+    /// millisecond changes (ADR 0057). The top of jiff's range must not panic either: jiff's
+    /// `from_millisecond` rejects its own last 999 ms.
+    #[test]
+    fn truncate_ms_floors_before_the_epoch() {
+        let at = |text: &str| text.parse::<Timestamp>().expect("a timestamp");
+        for (input, want) in [
+            ("1969-12-31T23:59:59.999999999Z", -1),
+            ("1969-12-31T23:59:59.999500000Z", -1),
+            ("1969-12-31T23:59:59.999Z", -1),
+            ("1969-12-31T23:59:59.500Z", -500),
+            ("1969-12-31T23:59:59Z", -1_000),
+            ("1970-01-01T00:00:00Z", 0),
+            ("1970-01-01T00:00:00.000999999Z", 0),
+            ("2026-01-02T03:04:05.120500000Z", 1_767_323_045_120),
+        ] {
+            assert_eq!(truncate_ms(at(input)).as_millisecond(), want, "{input}");
+        }
+
+        // The ends of the range, where `Timestamp::from_millisecond` cannot round-trip MAX.
+        assert_eq!(truncate_ms(Timestamp::MIN), Timestamp::MIN);
+        assert_eq!(
+            truncate_ms(Timestamp::MAX),
+            Timestamp(
+                JiffTimestamp::new(Timestamp::MAX.as_second(), 999_000_000).expect("in range")
+            )
+        );
+        // A lease TTL too large for the range saturates instead of panicking.
+        let now = at("2026-01-02T03:04:05Z");
+        assert_eq!(add_ttl(now, Duration::MAX), truncate_ms(Timestamp::MAX));
+    }
+
+    /// `add_ttl` truncates the sum, not the TTL: a sub-millisecond lease is a whole millisecond,
+    /// and a base before 1970 floors with it.
+    #[test]
+    fn add_ttl_truncates_the_sum_to_the_millisecond() {
+        let now = "2026-01-02T03:04:05Z".parse::<Timestamp>().unwrap();
+        assert_eq!(
+            add_ttl(now, Duration::from_micros(1_500)),
+            "2026-01-02T03:04:05.001Z".parse().unwrap()
+        );
+        let before = "1969-12-31T23:59:59.999500Z".parse::<Timestamp>().unwrap();
+        assert_eq!(
+            add_ttl(before, Duration::from_micros(1_000)),
+            "1970-01-01T00:00:00Z".parse().unwrap()
         );
     }
 }

@@ -23,14 +23,14 @@
 
 use a2a::{Task, TaskState};
 use adam_a2a::{BackendError, Caller, PageToken, TaskPage, TaskQuery};
+use adam_core::time::Timestamp;
 use adam_core::{ConversationScope, RunId, RunQuery, RunRecord, RunStatus};
 use adam_runtime::{RunView, RuntimeError, view_from_record};
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::backend::{RuntimeTaskBackend, map_err};
 use crate::child_sessions::{ContextKind, kind_of};
-use crate::convert::{decode_conversation, encode_conversation, task_from_view};
+use crate::convert::{chrono_of, decode_conversation, encode_conversation, timestamp_of};
 
 /// The most runs one page reads while looking for matches that need their state read. A filter
 /// that matches rarely returns a short page and a token instead of reading a whole history.
@@ -55,7 +55,7 @@ fn narrowing(state: Option<&TaskState>) -> (Option<Vec<RunStatus>>, bool) {
 
 impl RuntimeTaskBackend {
     /// The record as a task: of its root context, or a round of the session being listed.
-    fn shaped(
+    async fn shaped(
         &self,
         rec: &RunRecord,
         view: RunView,
@@ -64,11 +64,14 @@ impl RuntimeTaskBackend {
         match session {
             Some((session, parent)) => {
                 let context = adam_runtime::session_conversation_id(parent, session.id);
-                Some(self.listed_round(session, &context, parent, rec, view))
+                Some(
+                    self.listed_round(session, &context, parent, rec, view)
+                        .await,
+                )
             }
             None => {
                 let (_, context) = decode_conversation(rec.conversation_id.as_deref()?)?;
-                Some(task_from_view(&view, &context, &self.prompt))
+                Some(self.task_of(&view, &context).await)
             }
         }
     }
@@ -126,7 +129,7 @@ impl RuntimeTaskBackend {
             .transpose()?
             .map(|t| {
                 Uuid::parse_str(&t.id)
-                    .map(|id| (t.updated_at, RunId(id)))
+                    .map(|id| (timestamp_of(t.updated_at), RunId(id)))
                     .map_err(|_| BackendError::InvalidParams("invalid page token".to_owned()))
             })
             .transpose()?;
@@ -145,7 +148,7 @@ impl RuntimeTaskBackend {
         let (statuses, exact) = narrowing(query.status.as_ref());
         let mut runs = RunQuery::new(agent, scope, 0);
         runs.statuses = statuses;
-        runs.updated_since = query.status_timestamp_after;
+        runs.updated_since = query.status_timestamp_after.map(timestamp_of);
         if runs.statuses.as_ref().is_some_and(Vec::is_empty) {
             return Ok(TaskPage::default());
         }
@@ -157,7 +160,7 @@ impl RuntimeTaskBackend {
 
         let want = query.page_size + 1;
         let batch = want.clamp(50, 200);
-        let mut found: Vec<(Task, DateTime<Utc>, RunId)> = Vec::new();
+        let mut found: Vec<(Task, Timestamp, RunId)> = Vec::new();
         let mut cursor = after;
         let mut scanned = 0usize;
         let mut exhausted = false;
@@ -206,7 +209,7 @@ impl RuntimeTaskBackend {
                     }
                     Err(e) => return Err(map_err(e)),
                 };
-                let Some(task) = self.shaped(&rec, view, session.as_ref()) else {
+                let Some(task) = self.shaped(&rec, view, session.as_ref()).await else {
                     continue;
                 };
                 if !exact
@@ -243,7 +246,7 @@ impl RuntimeTaskBackend {
         let next = more
             .then_some(position)
             .flatten()
-            .map(|(at, id)| PageToken::encode(caller, query, at, &id.to_string()));
+            .map(|(at, id)| PageToken::encode(caller, query, chrono_of(at), &id.to_string()));
         Ok(TaskPage::new(
             found.into_iter().map(|(task, _, _)| task).collect(),
             next,

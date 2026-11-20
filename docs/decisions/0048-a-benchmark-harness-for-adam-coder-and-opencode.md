@@ -465,3 +465,41 @@ clone path, the six `test/user/emails.js` tests that send a validation e-mail fa
   fails is exit 98: `infra` in a check, `invalid` in a run, never a fail. No proxy and no key reach a verifier.
 
 *Unverified:* that the two NodeBB tasks (`04998908`, `05f22361`) are kept on the owner's host, and the time a copy adds.
+
+**Amended 2026-11-20 (decided by the owner): the check grades at `/app`; the agent path is an attribute.** On the owner's
+machine with real SWE-bench Pro images, NodeBB `05f22361`'s gold passes 173 of 173 at `/app`. On the clone path all 173
+tests pass too, but the task's own `/tests/parser.py` (line 69, `re.compile(r'^(?:/app/)?(.*)$')`) strips only a literal
+`/app/` prefix, so the test names do not match and the grader reports "Required tests that passed: 0". `/tests` is the task's
+read-only mount and its tooling assumes `/app`; grading of agents' patches already runs at `/app` in a fresh container, and both
+arms work at the same agent path. The amendments above that drop a task whose gold fails at the clone path are superseded:
+
+* **A public or own task is kept when the gold passes 3/3 and the empty patch fails 3/3 at `/app`**, the real grading path, as
+  upstream does. The drop reasons are those of the `/app` runs: `gold-fails`, `gold-flaky`, `gold-does-not-apply`,
+  `empty-passes`, `empty-flaky`, `no-gold-patch`, `infra`. `gold-fails-at-app` is gone.
+* **The run at the agents' working path becomes a recorded attribute**, `agentPath`: `pass`, `fail` or `not-run`, with a reason
+  (`agentPathReason`), in `check.json` and in the lock beside each task. It is one gold run, made only for a kept task, so a
+  task costs at most 7 grading runs and a dropped one fewer. It is carried into the ledger's `Planned` record, and `bench report`
+  counts the tasks by it and rates the runs by it. It never drops a task and is the same for both arms.
+* **Resume:** a verdict with no `agentPath` was made under the old rule and is checked again (the old data has no empty-patch run
+  at `/app`, and a clone-path drop cannot be told from an `/app` one); `select` does not take it either.
+
+The egress probe of a `public` verifier and the removal of a dropped task's image are unchanged.
+
+*Unverified:* the new check on real images (the two NodeBB tasks should now be kept, `05f22361` with `agentPath: fail`).
+
+**Amended 2026-11-20: just-in-time images.** On the owner's machine the kept SWE-bench Pro images are 2 to 3.5 GB each, so a
+check that keeps every kept task's image needs 200 GB or more for 80 and stops at about 40 to 50. Images are pinned by digest in
+the lock, so a pull is exact and safe to repeat:
+
+* **`tasks check` removes the image of a kept task too**, once its verdict and `imageDigest` are in `check.json` (the dropped
+  task's image as before; never the workspace image, the coder, or an own task's image, which cannot be pulled). `--keep-images`
+  keeps the kept tasks' images.
+* **`pilot`, `run` and `regrade` pull a public task's image by digest before its first run and remove it after the last run of
+  that image in the pass**, counted over the queue (a block's arms are consecutive in the plan, in either slot), so an image two
+  tasks share stays until both are done and an image a running run uses is never removed. A pull failure is `Failed_infra`
+  (`image_pull`), never a fail; a failed removal is printed and harmless. Pulls and removals go through `dockerEnv`.
+* **The doctor's disk floor** is the coder plus the largest task image plus a 10 GB margin (at least 20 GB) when this is on,
+  not the sum of the kept images; `--keep-images` gives the earlier rule.
+
+The cost is a pull per task per start (the pilot and the run each pull their blocks) and the time of it, in the pull window of
+the slot, not in the run's own time. *Unverified:* on real registries and a real daemon (the tests use the fakes).

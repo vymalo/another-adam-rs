@@ -126,6 +126,7 @@ pub struct SourceCtx {
     root_run: RunId,
     conversation_id: Option<String>,
     context: Arc<Map<String, Value>>,
+    task: Option<Arc<str>>,
 }
 
 impl SourceCtx {
@@ -140,7 +141,18 @@ impl SourceCtx {
             root_run,
             conversation_id,
             context,
+            task: None,
         }
+    }
+
+    /// This context with the run's task: the words of the first part of its first message
+    /// ([`Conversation::task`](crate::Conversation::task)), the same text at every turn and at every
+    /// call of the run. The agent sets it on every context it makes; a source reads it with
+    /// [`task`](Self::task). A test may set it on a [`detached`](Self::detached) context.
+    #[must_use]
+    pub fn with_task(mut self, task: Option<&str>) -> Self {
+        self.task = task.map(Arc::from);
+        self
     }
 
     /// A context detached from any run, for unit-testing a source: a fresh run id, no
@@ -180,6 +192,16 @@ impl SourceCtx {
     /// The whole inbound context.
     pub fn context_map(&self) -> &Map<String, Value> {
         &self.context
+    }
+
+    /// The words the run was started with: the first part of its first message
+    /// ([`Conversation::task`](crate::Conversation::task)), the same text at every turn and at every
+    /// call of the run, and in a run that continues it. `None` when the first message has no words.
+    ///
+    /// A source that loads something only when the task asks for it (an MCP server's `when`) reads
+    /// this, so what it offers is decided before the run's first model call and never moves.
+    pub fn task(&self) -> Option<&str> {
+        self.task.as_deref()
     }
 }
 

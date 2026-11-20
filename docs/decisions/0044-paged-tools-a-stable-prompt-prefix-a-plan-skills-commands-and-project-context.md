@@ -126,6 +126,20 @@ Facts about third parties:
    * **Cache markers.** No gateway is assumed (answer 5), so a marker for providers that cache only at marked points is a
      setting of its own, off by default, built when a deployment names the provider. That any gateway passes one through is
      *unverified*.
+   *Amended 2026-11-19 (slice 7 of "adam: a faster coder", PR A, built):* a server of `mcp.json` may say
+   `"when": { "keywords": ["..."] }`; its tools are then **decided from the task before the run's first model call**
+   (any keyword held by the task, ignoring case; a server with no `when` is eager) and withheld at every turn of a run
+   that does not load it, with a call to one refused by the existing withheld-tools path. The rule above holds: the
+   task is the first part of the run's first message, the same text at every turn, so the tools array is the same bytes
+   for the whole run, and a run that continues another carries that message and selects the same servers. The decision is
+   **recomputed from the state**, not stored. A triggered server's instructions are withheld too (they are added by the
+   source only when the run loads the server), and the bound stays 8 KiB for the eager set and for the loaded set. No
+   `paths` in this version: the coder has no checkout before its first model call, so a path glob would have nothing to
+   match; `when.paths` is ignored with a warning. The shape comes from the measurement that opened slice 7 of the
+   epic (2026-11-19, recorded in the epic and not in this repository, so *unverified* here): the gateway caches the
+   longest common prefix in 128-token blocks and renders the tools before the messages, so appending one tool to a
+   20-turn history dropped the cached tokens from 5,760 to 1,536. The tools array is therefore decided before the
+   first call and never appended to.
 
 ### Everything that reads is paged
 

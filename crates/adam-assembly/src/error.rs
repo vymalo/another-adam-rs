@@ -465,6 +465,18 @@ pub enum Error {
         /// Why.
         problem: RemoteUrlProblem,
     },
+    /// A subagent file has `a2a:`, which makes it a remote subagent, and this build has no A2A
+    /// client: adam-assembly was built without its feature `remote` (on by default). Refused at
+    /// [`AgentDef::bind`](crate::AgentDef::bind) before any secret is read, so the agent never
+    /// starts without a tool its files promise (fail closed).
+    #[error(
+        "{origin}: `a2a:` makes this a remote subagent, but this build has no A2A client: enable \
+         the feature `remote` of adam-assembly (on by default), or remove the file"
+    )]
+    RemoteNotEnabled {
+        /// The remote subagent and its file.
+        origin: Origin,
+    },
     /// An agent's `mcp.json` lists MCP servers and nothing was connected for it: the tools of those
     /// servers would be missing, and an agent must not start without tools its files promise (fail
     /// closed).
@@ -531,7 +543,7 @@ pub enum Error {
         known: Vec<String>,
     },
     /// The MCP servers of an agent could not be connected. Only
-    /// [`AgentDef::connect_mcp`](crate::AgentDef::connect_mcp) (feature `mcp`) makes it, but the
+    /// `AgentDef::connect_mcp` (feature `mcp`) makes it, but the
     /// variant is always there, so that the feature adds no variant to this exhaustive enum and a
     /// `match` that compiles with the feature compiles without it.
     #[error("{origin}: {source}")]
@@ -805,6 +817,7 @@ mod tests {
                 url: "http://billing.example.com/".into(),
                 problem: RemoteUrlProblem::Insecure,
             },
+            Error::RemoteNotEnabled { origin: o.clone() },
             Error::McpNotConnected {
                 origin: o.clone(),
                 servers: vec!["linear".into(), "fs".into()],

@@ -224,7 +224,7 @@ impl PushStore for PutFails {
     async fn claim_due(
         &self,
         worker: &str,
-        now: chrono::DateTime<chrono::Utc>,
+        now: adam_core::time::Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> Result<Vec<adam_a2a::push::PushRecord>, adam_a2a::push::PushStoreError> {
@@ -817,7 +817,7 @@ async fn stopping_the_loop_lets_the_request_in_flight_finish_and_release_its_lea
     let claimed = store
         .claim_due(
             "next-instance",
-            chrono::Utc::now(),
+            adam_core::store::now(),
             Duration::from_secs(60),
             8,
         )

@@ -11,6 +11,30 @@ use serde_json::Value;
 
 use super::names::is_env_name;
 
+/// The most keywords a `when` may hold.
+pub const MAX_WHEN_KEYWORDS: usize = 16;
+
+/// The longest keyword a `when` may hold, in characters.
+pub const MAX_WHEN_KEYWORD_CHARS: usize = 64;
+
+/// `when` (an adam extension): the condition under which a server's tools are offered to the
+/// model.
+///
+/// The tools of a server with a `when` are loaded only when the run's task mentions one of
+/// [`keywords`](Self::keywords), ignoring case. The test is made once, before the run's first model
+/// call, and never again: the tools a model is shown do not change during a run (ADR 0044,
+/// decision 1). A server without `when` is loaded for every run, as before the key existed.
+///
+/// There are no paths in this version: the coder has no checkout before its first model call
+/// (`prepare_workspace` is a tool), so a path glob would have nothing to match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct McpWhen {
+    /// The words, any one of which loads the server's tools when the task holds it, ignoring case:
+    /// 1 to [`MAX_WHEN_KEYWORDS`], each 1 to [`MAX_WHEN_KEYWORD_CHARS`] characters, no control or
+    /// format character.
+    pub keywords: Vec<String>,
+}
+
 /// The transport of a remote MCP server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RemoteKind {
@@ -50,6 +74,11 @@ pub enum McpServer {
         /// before they existed.
         #[serde(skip_serializing_if = "McpSettings::is_default")]
         settings: McpSettings,
+        /// `when` (an adam extension): the server's tools are loaded only when the run's task
+        /// mentions one of its keywords. Left out of the JSON when absent, so the digest of a
+        /// folder that does not use it is the one it had before the key existed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        when: Option<McpWhen>,
     },
     /// A server reached over the network (`type` and `url`).
     Remote {
@@ -76,6 +105,11 @@ pub enum McpServer {
         /// before they existed.
         #[serde(skip_serializing_if = "McpSettings::is_default")]
         settings: McpSettings,
+        /// `when` (an adam extension): the server's tools are loaded only when the run's task
+        /// mentions one of its keywords. Left out of the JSON when absent, so the digest of a
+        /// folder that does not use it is the one it had before the key existed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        when: Option<McpWhen>,
     },
 }
 
@@ -147,6 +181,14 @@ impl McpServer {
     pub fn tools(&self) -> Option<&[String]> {
         match self {
             Self::Stdio { tools, .. } | Self::Remote { tools, .. } => tools.as_deref(),
+        }
+    }
+
+    /// `when` (an adam extension): the server's tools are loaded only when the run's task mentions
+    /// one of its keywords. `None` loads them for every run.
+    pub fn when(&self) -> Option<&McpWhen> {
+        match self {
+            Self::Stdio { when, .. } | Self::Remote { when, .. } => when.as_ref(),
         }
     }
 
@@ -344,6 +386,7 @@ pub(crate) struct RawServer {
     pub(crate) instructions: Option<bool>,
     pub(crate) prompts: Option<bool>,
     pub(crate) parallel: Option<bool>,
+    pub(crate) when: Option<Value>,
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, Value>,
 }

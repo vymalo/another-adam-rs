@@ -41,12 +41,13 @@ use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
     PushRecord, RunHeader, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreResult,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -265,7 +266,7 @@ pub async fn measure_transcript_write(store: DynStore) -> Measurement {
     store
         .purge_finished(
             &agent,
-            adam_core::store::now() + chrono::Duration::minutes(1),
+            adam_core::store::now() + jiff::SignedDuration::from_mins(1),
         )
         .await
         .expect("purge the measured run");
@@ -415,7 +416,7 @@ pub async fn measure_headless_transcript(store: DynStore) -> HeadlessMeasurement
     store
         .purge_finished(
             &agent,
-            adam_core::store::now() + chrono::Duration::minutes(1),
+            adam_core::store::now() + SignedDuration::from_mins(1),
         )
         .await
         .expect("purge the measured run");
@@ -528,7 +529,7 @@ impl Store for CountingStore {
         &self,
         run: RunId,
         keep_generation: Uuid,
-        before: DateTime<Utc>,
+        before: Timestamp,
     ) -> StoreResult<u64> {
         self.call(Method::GcBody);
         self.inner.gc_body(run, keep_generation, before).await
@@ -576,7 +577,7 @@ impl Store for CountingStore {
         worker: &str,
         scope: ClaimScope,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>> {
@@ -593,7 +594,7 @@ impl Store for CountingStore {
         &self,
         id: RunId,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
     ) -> StoreResult<bool> {
         self.call(Method::RenewLease);
@@ -605,7 +606,7 @@ impl Store for CountingStore {
         self.inner.release_lease(id, worker).await
     }
 
-    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         self.call(Method::LeaseUntil);
         self.inner.lease_until(id).await
     }
@@ -641,7 +642,7 @@ impl Store for CountingStore {
         &self,
         agents: &[String],
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<PushRecord>> {
@@ -664,7 +665,7 @@ impl Store for CountingStore {
             .await
     }
 
-    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64> {
         self.call(Method::PurgeFinished);
         self.inner.purge_finished(agent, before).await
     }
@@ -683,7 +684,7 @@ impl Store for CountingStore {
         self.inner.get_blob(id).await
     }
 
-    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_blobs(&self, before: Timestamp) -> StoreResult<u64> {
         self.call(Method::PurgeBlobs);
         self.inner.purge_blobs(before).await
     }
@@ -724,7 +725,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let cutoff = adam_core::store::now() + chrono::Duration::hours(1);
+        let cutoff = adam_core::store::now() + SignedDuration::from_hours(1);
         assert_eq!(
             store.gc_body(run.id, Uuid::new_v4(), cutoff).await.unwrap(),
             1,

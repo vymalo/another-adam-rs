@@ -2,7 +2,7 @@
 //!
 //! Its layout is private to the runtime. Current version: 1.
 
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -52,7 +52,7 @@ pub(crate) struct Envelope {
     /// runs, and a parked run is woken at it. Absent from state written before it existed, and
     /// not written while `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline: Option<DateTime<Utc>>,
+    pub deadline: Option<Timestamp>,
     /// The limit [`deadline`](Self::deadline) was set from, in seconds: what the failure says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_secs: Option<u64>,
@@ -65,7 +65,7 @@ pub(crate) struct Envelope {
     /// stored `wake_at` of a watched run can be earlier, so that the runtime looks at the run's
     /// parent and deadline in between.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_wake: Option<DateTime<Utc>>,
+    pub agent_wake: Option<Timestamp>,
     /// The runtime set the wake of this parked run (it works for a parent or has a deadline): a claim
     /// that is not the agent's own wake only looks at the parent and the deadline, and parks again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -93,12 +93,8 @@ impl Envelope {
     }
 
     /// Give the run a time limit of `within`, counted from `now`.
-    pub fn with_limit(mut self, now: DateTime<Utc>, within: std::time::Duration) -> Self {
-        let span = chrono::Duration::from_std(within).unwrap_or(chrono::Duration::MAX);
-        self.deadline = Some(
-            now.checked_add_signed(span)
-                .unwrap_or(DateTime::<Utc>::MAX_UTC),
-        );
+    pub fn with_limit(mut self, now: Timestamp, within: std::time::Duration) -> Self {
+        self.deadline = Some(now + adam_core::time::span_of(within));
         self.limit_secs = Some(within.as_secs());
         self
     }
@@ -177,19 +173,55 @@ mod tests {
 
     #[test]
     fn a_deadline_survives_the_round_trip() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let env = Envelope::new(serde_json::json!({}))
             .with_limit(now, std::time::Duration::from_secs(1800));
         let back = Envelope::decode(RunId::new(), &env.encode().unwrap()).unwrap();
-        assert_eq!(back.deadline, Some(now + chrono::Duration::seconds(1800)));
+        assert_eq!(
+            back.deadline,
+            Some(now + jiff::SignedDuration::from_secs(1800))
+        );
         assert_eq!(back.limit_secs, Some(1800));
+    }
+
+    /// A deadline at `.120` keeps chrono's three digits in the stored state: jiff's own serde
+    /// would write `.12`, and a state written by either build must re-encode to itself.
+    #[test]
+    fn a_deadline_at_a_fraction_of_a_millisecond_keeps_its_bytes() {
+        let at: Timestamp = "2026-01-02T03:04:05.120Z".parse().expect("a timestamp");
+        let env =
+            Envelope::new(serde_json::json!({})).with_limit(at, std::time::Duration::from_secs(60));
+        let state = env.encode().expect("encodes");
+        assert_eq!(state["deadline"], "2026-01-02T03:05:05.120Z");
+        let back = Envelope::decode(RunId::new(), &state).expect("decodes");
+        assert_eq!(
+            back.deadline,
+            Some(at + jiff::SignedDuration::from_secs(60))
+        );
+        assert_eq!(
+            back.encode().expect("encodes again")["deadline"],
+            "2026-01-02T03:05:05.120Z"
+        );
+    }
+
+    /// A time limit too large for a signed duration saturates at the end of jiff's range instead
+    /// of overflowing: the run still parks with a deadline far in the future.
+    #[test]
+    fn a_time_limit_too_large_for_jiff_parks_at_the_end_of_time() {
+        let now = Timestamp::from_second(1_700_000_000).expect("in range");
+        let env = Envelope::new(serde_json::json!({})).with_limit(now, std::time::Duration::MAX);
+        assert_eq!(env.deadline, Some(Timestamp::MAX));
+        assert_eq!(env.limit_secs, Some(u64::MAX));
+        let back =
+            Envelope::decode(RunId::new(), &env.encode().expect("encodes")).expect("decodes");
+        assert_eq!(back.deadline, Some(Timestamp::MAX));
     }
 
     /// The state is decoded from a borrow and re-encoded as it was: every member, in the order the
     /// encoder writes them, with no key added or dropped.
     #[test]
     fn decode_then_encode_gives_the_same_bytes_back() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut env = Envelope::new(serde_json::json!({
             "messages": [
                 {"role": "user", "text": "hi"},

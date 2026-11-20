@@ -10,6 +10,7 @@ pub mod store;
 // supported API.
 #[doc(hidden)]
 pub mod testing;
+pub mod time;
 
 pub use secrets::{DynSecretSource, NoSecrets, ProcessEnv, SecretError, SecretSource};
 pub use store::memory::MemoryStore;
@@ -19,3 +20,4 @@ pub use store::{
     RunRecord, RunStatus, RunUpdate, Store, StoreError, StoreResult, claimed, head_body,
     set_head_body, storable, storable_owned, storable_text,
 };
+pub use time::Timestamp;

@@ -35,6 +35,18 @@ catalog a message carries (`Ui::embedded`) and `Ui::screen`, a source that adds 
 `adam-engine` does not depend on `adam-assembly` yet; and the check on Windows and macOS, which is slice 8's runner.
 The model's credentials are ADR 0058's port: the host gives `ModelCredentials`, so the engine reads no key.
 
+*Amended 2026-11-20: slice 1b is built.* `adam-assembly` has the feature `remote`, on by default, which gates the remote
+(`a2a:`) subagents and the A2A client, `reqwest` and `url` they need; `a2a` turns it on. Without it `bind` refuses an
+`a2a:` subagent with the new `Error::RemoteNotEnabled`, before any secret is read; `env`, `secrets`,
+`allow_insecure_remotes`, `remote_timeout` and `connect_mcp` keep their signatures and behaviour. `adam` passes it on
+(`remote`, in its defaults, over `adam-assembly` without defaults), and `adam-agent-fixture` takes `adam` without
+defaults, so the dev-dependency cycle no longer turns `remote` on in `adam-assembly`'s own test builds; `check.sh`
+asserts that with `cargo tree -e features`, builds `adam-assembly` with and without it (its doctests, `dev` and `mcp`
+included), and its self-test turns `adam-assembly/remote` back on and finds `reqwest`, and plants the fixture's leak
+and fails. A crate that takes `adam` with `default-features = false` loses remote subagents unless it adds `remote`. `adam-engine` now depends on `adam-assembly` without defaults. With
+that, **decision 2's feature set is complete**: `server`, `push`, `remote` and `thread-tools`. The check on Windows and
+macOS is still slice 8's runner.
+
 ## Context
 
 A program that links adam-rs today takes `adam-service` (an HTTP server, Postgres, an OpenAI client, configuration read
@@ -101,6 +113,17 @@ workspace as it is.
    **extends** it and takes a `Place` from the same `place()`, so a command and a file tool find a place and refuse a
    write the same way. Its guard (record what a command changed, undo it) is the workspace's: the person's directory
    records and undoes nothing. The conformance cases are `adam-code-tools-testkit`.
+   *Built 2026-11-20 (step 5b):* the commands' port, `adam_code_tools::commands::CommandWorkspace`, extends
+   `CodeWorkspace` with three required methods: `session` (where a command runs; the implementation reports it to the
+   call's usage), `limits` (`CommandLimits`: the timeout and the bytes of output shown) and `kept` (the `KeptOutputs` a long
+   output is kept in). It is additive: an implementation of `CodeWorkspace` alone is unchanged. The plumbing that
+   `run_command` and `run` share moved with it: `commands::run` (the body of the coder's `ToolEnv::run`, which now
+   delegates), `environment_error`, `run_error` and `cancelled`, and the coder's `tools::output` whole as `adam_code_tools::output`
+   (`settle` over the port, `timeout_of` over `CommandLimits`), behind thin wrappers in the coder, so no call site changed.
+   `ToolEnv` and the testkit's `DirWorkspace` (a local session, settable limits, `MemoryKept`) implement it and pass
+   `command_workspace_conformance!`; the pins of `tests/command_results.rs` and `tests/write_results.rs` pass unchanged.
+   `session_error` and its advice to call `rebuild_environment` stay the coder's. **Not yet:** the guard (what a command
+   changed, and its undo) and the tools themselves, step 5c; the trait's methods grow then.
 8. **Commands run as the person unless a sandbox says otherwise.** A local sandbox is an `Environment`: first a process
    tree that can be killed, then the operating system's own confinement where there is one. `describe` says what is not
    protected.
@@ -155,7 +178,9 @@ is still `Runnable`: at the next start the engine releases its own leases and th
   2026-11-19 under decision 7), each with a default that keeps
   today's behaviour, and each with a testkit. A consumer that sets `default-features = false` on the four split crates
   loses what the features gate; with the defaults nothing changes.
-* **Rule 3.** No closed enum changes.
+* **Rule 3.** No closed enum changes. *Amended 2026-11-20 (slice 1b):* one, stated: `adam_assembly::Error` gains
+  `RemoteNotEnabled { origin }`, in every build, so a `match` on it without `_` breaks (the `adam-assembly` README says
+  so under **Breaking**).
 * **Rule 4.** The engine reads no environment variable and no file it was not given. An agent folder is embedded with
   `include_agent!` or named by the host.
 * **Platforms.** Linux and macOS first for the tools and the sandbox. Windows builds the engine from the first slice and

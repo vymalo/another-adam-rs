@@ -440,7 +440,7 @@ impl Janitor {
                     .map_or(record.updated_at, |run| {
                         run.updated_at.max(record.updated_at)
                     })
-                    .timestamp_millis(),
+                    .as_millisecond(),
             ))
         }
         .await;
@@ -582,8 +582,9 @@ enum Standing {
     NotARun,
     /// The run is `runnable` or `parked`.
     Open,
-    /// The run is finished, or the store does not know it (`None`).
-    Over(Option<RunRecord>),
+    /// The run is finished, or the store does not know it (`None`). Boxed: the record is much
+    /// larger than the other variants, and the sweep allocates one per directory.
+    Over(Option<Box<RunRecord>>),
 }
 
 /// What the store says of `run`.
@@ -592,7 +593,7 @@ async fn standing(store: &dyn Store, run: &str) -> Result<Standing, StoreError> 
         return Ok(Standing::NotARun);
     };
     Ok(match store.load_run(id).await? {
-        Some(record) if record.status.is_terminal() => Standing::Over(Some(record)),
+        Some(record) if record.status.is_terminal() => Standing::Over(Some(Box::new(record))),
         Some(_) => Standing::Open,
         None => Standing::Over(None),
     })

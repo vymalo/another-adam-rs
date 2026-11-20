@@ -10,7 +10,7 @@
 //! generation: `{"generation": "<uuid>", "len": <rows>}`. The body rows are
 //! `(run, generation, idx)` in the store.
 
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -18,6 +18,7 @@ use uuid::Uuid;
 use adam_core::{BlobId, RunId, StoreError};
 
 use crate::agent::Inbound;
+use crate::artifact_ref::{ArtifactRef, FileRef};
 use crate::blob::blob_id;
 use crate::envelope::{Envelope, VERSION as FULL_VERSION};
 use crate::events::Artifact;
@@ -100,7 +101,7 @@ pub(crate) struct Head {
     pub artifacts: Vec<HeadArtifact>,
     /// When the run must have finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline: Option<DateTime<Utc>>,
+    pub deadline: Option<Timestamp>,
     /// The limit the deadline was set from, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_secs: Option<u64>,
@@ -109,7 +110,7 @@ pub(crate) struct Head {
     pub remaining_secs: Option<u64>,
     /// When the agent itself asked to be woken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_wake: Option<DateTime<Utc>>,
+    pub agent_wake: Option<Timestamp>,
     /// The runtime set the wake of this parked run.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hb: bool,
@@ -162,10 +163,6 @@ impl Head {
 
     /// Decode `state` as a v5 head; [`RuntimeError::Corrupt`] for another version or a document
     /// that does not decode.
-    #[allow(
-        dead_code,
-        reason = "S2a writes and verifies the head; S2b's read path decodes it"
-    )]
     pub(crate) fn decode(run: RunId, state: &Value) -> Result<Self, RuntimeError> {
         let corrupt = |reason: String| RuntimeError::Corrupt {
             run,
@@ -219,6 +216,20 @@ fn head_artifact(
     }
 }
 
+/// A head artifact as a view carries it: a file by content address, never its bytes. Consumes the
+/// head artifact, so a poll does not clone its members.
+fn head_artifact_ref(artifact: HeadArtifact) -> ArtifactRef {
+    ArtifactRef {
+        id: artifact.id,
+        name: artifact.name,
+        mime_type: artifact.mime_type,
+        data: artifact.data,
+        file: artifact
+            .file
+            .map(|file| FileRef::blob(file.filename, file.size, file.digest)),
+    }
+}
+
 /// The two documents a run's `state` can be in the expand release: the v4 envelope, or the v5
 /// head. Every commit path re-encodes the variant it read.
 #[derive(Clone, Debug, PartialEq)]
@@ -229,13 +240,6 @@ pub(crate) enum Stored {
     Head(Head),
 }
 
-// S2a writes and verifies the head but reads neither; the read path (S2b) is what calls these.
-// The allow covers this enum and its methods; `Head::decode`, the one callee outside it, carries
-// its own allow.
-#[allow(
-    dead_code,
-    reason = "S2a writes and verifies the head; S2b's read path decodes and serves it"
-)]
 impl Stored {
     /// Decode `state` as the variant its `v` names.
     pub(crate) fn decode(run: RunId, state: &Value) -> Result<Self, RuntimeError> {
@@ -274,10 +278,19 @@ impl Stored {
     }
 
     /// The failure reason, in the variant's own document.
+    #[cfg(test)]
     pub(crate) fn error(&self) -> Option<&str> {
         match self {
             Self::Full(envelope) => envelope.error.as_deref(),
             Self::Head(head) => head.error.as_deref(),
+        }
+    }
+
+    /// The failure reason, to set it (a cancel).
+    pub(crate) fn error_mut(&mut self) -> &mut Option<String> {
+        match self {
+            Self::Full(envelope) => &mut envelope.error,
+            Self::Head(head) => &mut head.error,
         }
     }
 
@@ -289,6 +302,57 @@ impl Stored {
             Self::Head(head) => &head.agent,
         }
     }
+
+    /// The body generation a `Head` names; `None` for a `Full` state, whose transcript is in it.
+    pub(crate) fn body(&self) -> Option<&BodyRef> {
+        match self {
+            Self::Full(_) => None,
+            Self::Head(head) => Some(&head.body),
+        }
+    }
+
+    /// The members a [`RunView`](crate::RunView) takes, moved out of the document (a file's bytes
+    /// are moved, not cloned, for a v4 run).
+    pub(crate) fn into_parts(self) -> ViewParts {
+        match self {
+            Self::Full(envelope) => ViewParts {
+                agent: envelope.agent,
+                inbox: envelope.inbox,
+                attempt: envelope.attempt,
+                output: envelope.output,
+                error: envelope.error,
+                artifacts: envelope
+                    .artifacts
+                    .into_iter()
+                    .map(ArtifactRef::from)
+                    .collect(),
+                agent_wake: envelope.agent_wake,
+                hb: envelope.hb,
+            },
+            Self::Head(head) => ViewParts {
+                agent: head.agent,
+                inbox: head.inbox,
+                attempt: head.attempt,
+                output: head.output,
+                error: head.error,
+                artifacts: head.artifacts.into_iter().map(head_artifact_ref).collect(),
+                agent_wake: head.agent_wake,
+                hb: head.hb,
+            },
+        }
+    }
+}
+
+/// The members a view takes from a stored document.
+pub(crate) struct ViewParts {
+    pub agent: Value,
+    pub inbox: Vec<Inbound>,
+    pub attempt: u32,
+    pub output: Value,
+    pub error: Option<String>,
+    pub artifacts: Vec<ArtifactRef>,
+    pub agent_wake: Option<Timestamp>,
+    pub hb: bool,
 }
 
 #[cfg(test)]
@@ -341,6 +405,30 @@ mod tests {
         // And it round-trips through the JSON a store keeps.
         let encoded = head.encode().expect("encodes");
         assert_eq!(Head::decode(RunId::new(), &encoded).expect("decodes"), head);
+    }
+
+    /// The head's deadline and agent wake are `adam_core::time::Timestamp`s: a `.120` instant
+    /// keeps chrono's three digits (jiff's own serde would write `.12`), because the head is the
+    /// v5 form of the v4 envelope's stored bytes.
+    #[test]
+    fn a_head_deadline_keeps_chronos_bytes() {
+        let at: Timestamp = "2026-01-02T03:04:05.120Z".parse().expect("a timestamp");
+        let mut env = Envelope::new(json!({}));
+        env.deadline = Some(at);
+        env.agent_wake = Some(at);
+        let head = Head::of(&env, json!({}), 0, &[], &[]);
+        let value = head.encode().expect("encodes");
+        assert_eq!(value["deadline"].as_str(), Some("2026-01-02T03:04:05.120Z"));
+        assert_eq!(
+            value["agent_wake"].as_str(),
+            Some("2026-01-02T03:04:05.120Z")
+        );
+        assert_eq!(
+            Head::decode(RunId::new(), &value)
+                .expect("decodes")
+                .deadline,
+            Some(at)
+        );
     }
 
     /// The head's file references are paired **positionally** with the upload pass, and only a

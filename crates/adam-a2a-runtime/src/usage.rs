@@ -299,7 +299,7 @@ mod tests {
     }
 
     fn view_with(state: Value) -> RunView {
-        let now = chrono::Utc::now();
+        let now = adam_core::store::now();
         RunView {
             id: adam_core::RunId::new(),
             agent: "a".into(),

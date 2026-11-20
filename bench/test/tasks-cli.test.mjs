@@ -6,6 +6,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { ConfigError } from '../lib/config.mjs';
 import { FakeContainers } from '../lib/containers.mjs';
+import { PINS } from '../lib/pins.mjs';
 import { runTasks } from '../lib/tasks-cli.mjs';
 import { UpstreamError, fetchUpstream, parseSums, taskChecksum, verifySums } from '../lib/upstream.mjs';
 import { commitFiles, git, initRepo, lines, SHA } from './gitfix.mjs';
@@ -133,7 +134,10 @@ test('check, then select: the lock holds ids, checksums and digests only, and dr
   const lock = JSON.parse(fs.readFileSync(path.join(s.repoTasks, 'public.lock.json'), 'utf8'));
   assert.deepEqual(lock.tasks.map((x) => x.id), [up.ids[0], up.ids[1]], 'the devcontainer task and the failing task are dropped');
   assert.deepEqual(Object.keys(lock).sort(), ['schema', 'seed', 'source', 'tasks', 'upstreamCommit']);
-  assert.deepEqual(Object.keys(lock.tasks[0]).sort(), ['checksum', 'id', 'image', 'repo']);
+  assert.deepEqual(Object.keys(lock.tasks[0]).sort(), ['agentPath', 'checksum', 'id', 'image', 'repo']);
+  assert.equal(lock.tasks[0].agentPath, 'pass');
+  assert.equal(results[`public/${up.ids[0]}`].agentPath, 'pass');
+  assert.equal(results[`public/${up.ids[3]}`].agentPath, 'not-run', 'a dropped task has no agent-path run');
   assert.equal(lock.seed, 'seed-one');
   assert.equal(lock.tasks[0].image, `sha256:${sha(up.ids[0])}`);
   const text = fs.readFileSync(path.join(s.repoTasks, 'public.lock.json'), 'utf8');
@@ -334,7 +338,7 @@ test('check resumes from check.json: a recorded verdict is not run again and the
 });
 
 
-test('check removes the image of a dropped task right after its verdict, and never one a kept task or the workspace image uses', async (t) => {
+test('check --keep-images removes the image of a dropped task right after its verdict, and never one a kept task or the workspace image uses', async (t) => {
   const ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2', 'instance_Org__Beta-bbbbbbb1', 'instance_Org__Beta-bbbbbbb2'];
   const bad = new Set([ids[0], ids[2], ids[3]]);
   const shared = `sha256:${sha('shared')}`;
@@ -344,7 +348,7 @@ test('check removes the image of a dropped task right after its verdict, and nev
   const up = upstream(t, ids, failing(bad));
   const s = setup(t, { tasks: { ...publicCfg(up).tasks, workspaceImage: `registry.example.test/workspace@${workspace}` } });
   const rt = walkRuntime({ ids, digestFor });
-  assert.equal(await s.run(['check', '--all'], () => rt), 0);
+  assert.equal(await s.run(['check', '--all', '--keep-images'], () => rt), 0);
   const removed = rt.removed.join('\n');
   assert.match(removed, new RegExp(`${IMAGE}@sha256:${sha(ids[2])}`), 'a dropped task\'s image is removed by digest');
   assert.match(removed, new RegExp(`${IMAGE}:${ids[2].slice(-8)}`), 'and by tag');
@@ -353,6 +357,43 @@ test('check removes the image of a dropped task right after its verdict, and nev
   assert.equal(removed.includes(workspace), false, 'the workspace (coder) image stays');
   assert.equal(removed.includes(`:${ids[1].slice(-8)}`), false, 'a kept task\'s image stays');
   assert.equal(removed.includes(`:${ids[3].slice(-8)}`), false);
+});
+
+test('check removes the image of a kept task too, once its digest is in check.json, never the workspace image or the coder\'s', async (t) => {
+  const ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2', 'instance_Org__Beta-bbbbbbb1', 'instance_Org__Beta-bbbbbbb2'];
+  const workspace = `sha256:${sha('workspace')}`;
+  const digestFor = (id) => (id === ids[3] ? workspace : id === ids[2] ? PINS.coder.digest : `sha256:${sha(id)}`);
+  const up = upstream(t, ids, failing(new Set([ids[0]])));
+  const s = setup(t, { tasks: { ...publicCfg(up).tasks, workspaceImage: `registry.example.test/workspace@${workspace}` } });
+  const rt = walkRuntime({ ids, digestFor });
+  const recordedAtRemoval = {};
+  const remove = rt.removeImage;
+  rt.removeImage = async (ref) => {
+    const digest = /@(sha256:[0-9a-f]{64})$/.exec(ref)?.[1];
+    if (digest) recordedAtRemoval[digest] = Object.values(checkJson(s)).some((r) => r.imageDigest === digest && r.ok !== undefined);
+    return remove(ref);
+  };
+  assert.equal(await s.run(['check', '--all'], () => rt), 0);
+  const removed = rt.removed.join('\n');
+  assert.match(removed, new RegExp(`${IMAGE}@sha256:${sha(ids[1])}`), 'a kept task\'s image is removed by digest');
+  assert.match(removed, new RegExp(`${IMAGE}:${ids[1].slice(-8)}`), 'and by tag');
+  assert.match(removed, new RegExp(`${IMAGE}@sha256:${sha(ids[0])}`), 'and a dropped task\'s, as before');
+  assert.equal(removed.includes(workspace), false, 'the workspace image stays');
+  assert.equal(removed.includes(PINS.coder.digest), false, 'the coder image stays');
+  assert.equal(recordedAtRemoval[`sha256:${sha(ids[1])}`], true, 'the digest was in check.json before the image went');
+  const kept = checkJson(s)[`public/${ids[1]}`];
+  assert.equal(kept.ok, true);
+  assert.equal(kept.imageDigest, `sha256:${sha(ids[1])}`);
+});
+
+test('check --keep-images keeps the images of the kept tasks', async (t) => {
+  const ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2'];
+  const up = upstream(t, ids);
+  const s = setup(t, publicCfg(up));
+  const rt = walkRuntime({ ids });
+  assert.equal(await s.run(['check', '--all', '--keep-images'], () => rt), 0);
+  assert.deepEqual(rt.removed, []);
+  assert.match(s.outLines.join('\n'), /2 kept, 0 dropped/);
 });
 
 test('a failed image removal is logged and does not change the verdict', async (t) => {
@@ -388,4 +429,63 @@ test('check --only runs exactly the named tasks, again, whatever the target', as
   const rt = walkRuntime({ ids });
   assert.equal(await s.run(['check', '--only', ids[2]], () => rt), 0);
   assert.deepEqual(rt.checkedIds(), [ids[2]]);
+});
+
+// ---- the grading path is /app; the clone path is an attribute (owner's decision, 2026-11-20) ----
+
+/** Gold and empty answer as a good task does at /app; the gold's clone-path run answers `atClone`. */
+function pathRuntime({ ids, atClone = () => '0' }) {
+  const rt = walkRuntime({ ids });
+  rt.onRun = (spec) => {
+    if (!spec.mounts) return { exitCode: 0, stdout: 'devcontainer=no\n' };
+    const model = spec.mounts.find((m) => m.target === '/patch/model.patch');
+    const id = ids.find((x) => spec.image.endsWith(sha(x)));
+    const clone = spec.script.includes('/work/workspaces/bench/slot');
+    const bad = model && fs.readFileSync(model.source, 'utf8').includes('FAIL');
+    const reward = clone ? atClone(id) : model && !bad ? '1' : '0';
+    fs.writeFileSync(path.join(spec.mounts.find((m) => m.target === '/logs/verifier').source, 'reward.txt'), `${reward}\n`);
+    return { exitCode: 0 };
+  };
+  return rt;
+}
+
+test('a task that fails only at the clone path is kept, recorded agentPath fail and carried into the lock; the others say pass or not-run', async (t) => {
+  const ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2', 'instance_Org__Alpha-aaaaaaa3'];
+  const up = upstream(t, ids, failing(new Set([ids[2]])));
+  const s = setup(t, publicCfg(up));
+  const rt = pathRuntime({ ids, atClone: (id) => (id === ids[1] ? '0' : '1') });
+  assert.equal(await s.run(['check'], () => rt), 0);
+  const r = checkJson(s);
+  assert.deepEqual([r[`public/${ids[0]}`].ok, r[`public/${ids[0]}`].agentPath], [true, 'pass']);
+  assert.deepEqual([r[`public/${ids[1]}`].ok, r[`public/${ids[1]}`].agentPath, r[`public/${ids[1]}`].agentPathReason], [true, 'fail', 'tests-fail']);
+  assert.deepEqual([r[`public/${ids[2]}`].ok, r[`public/${ids[2]}`].reason, r[`public/${ids[2]}`].agentPath], [false, 'gold-fails', 'not-run']);
+  assert.match(s.outLines.join('\n'), new RegExp(`${ids[1]}: kept \\(agent path: fail, tests-fail\\)`));
+  assert.match(s.outLines.join('\n'), /2 kept, 1 dropped/);
+  assert.equal(await s.run(['select', '--source', 'public']), 0);
+  const lock = JSON.parse(fs.readFileSync(path.join(s.repoTasks, 'public.lock.json'), 'utf8'));
+  assert.deepEqual(Object.fromEntries(lock.tasks.map((x) => [x.id, x.agentPath])), { [ids[0]]: 'pass', [ids[1]]: 'fail' });
+});
+
+test('resume: a verdict from before the rule (no agentPath) is checked again; a verdict with one is not', async (t) => {
+  const ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2'];
+  const up = upstream(t, ids);
+  const s = setup(t, publicCfg(up));
+  assert.equal(await s.run(['check'], () => pathRuntime({ ids, atClone: () => '1' })), 0);
+  const results = checkJson(s);
+  // as an old check wrote them: the clone path was the rule, and a clone-path failure was a drop
+  delete results[`public/${ids[0]}`].agentPath;
+  delete results[`public/${ids[0]}`].agentPathReason;
+  results[`public/${ids[1]}`] = { ...results[`public/${ids[1]}`], ok: false, reason: 'gold-fails' };
+  delete results[`public/${ids[1]}`].agentPath;
+  delete results[`public/${ids[1]}`].agentPathReason;
+  fs.writeFileSync(path.join(s.home, 'tasks', 'check.json'), JSON.stringify(results));
+  assert.equal(await s.run(['select', '--source', 'public']), 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(s.repoTasks, 'public.lock.json'), 'utf8')).tasks.length, 0, 'an old verdict is not selectable');
+  const again = pathRuntime({ ids, atClone: () => '1' });
+  assert.equal(await s.run(['check'], () => again), 0);
+  assert.deepEqual(again.checkedIds().sort(), [...ids].sort(), 'both are run again: the old data has no empty run at /app');
+  assert.equal(checkJson(s)[`public/${ids[1]}`].ok, true, 'the task dropped for a clone-path reason is now kept');
+  const third = pathRuntime({ ids });
+  assert.equal(await s.run(['check'], () => third), 0);
+  assert.deepEqual(third.checkedIds(), [], 'a new verdict is resumed');
 });

@@ -408,8 +408,9 @@ async fn notified(n: &Notify, what: &str) {
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 fn custom(kind: &str, payload: Value) -> RunEvent {
@@ -496,7 +497,7 @@ mod cases {
             done.output.expect("output")["text"],
             "the reviewer approved"
         );
-        let state = conversation(&rt.view(parent).await.unwrap().unwrap());
+        let state = conversation(&rt, &rt.view(parent).await.unwrap().unwrap()).await;
         assert_eq!(
             tool_results(&state),
             vec![("c1".into(), "child says 42".into(), false)]
@@ -557,7 +558,7 @@ mod cases {
         let parked = wait_parked_on_timer(&rt, parent).await;
         assert!(!parked.waiting, "waiting on a child is not input-required");
         assert!(matches!(
-            conversation(&parked).pending_wait,
+            conversation(&rt, &parked).await.pending_wait,
             Some(PendingWait::Run(PendingRun { ref call_id, ref tool, .. })) if call_id == "c1" && tool == "sub"
         ));
 
@@ -566,14 +567,14 @@ mod cases {
             .expect("deliver");
         // The parent wakes, looks, finds the child busy and parks again with the message queued.
         wait_for(&rt, parent, "the message absorbed", |v| {
-            v.pending_inbox == 0 && conversation(v).deferred.len() == 1
+            v.pending_inbox == 0 && v.state["deferred"].as_array().is_some_and(|d| d.len() == 1)
         })
         .await;
         gate.release.notify_one();
         let done = wait_done(&rt, parent).await;
         worker.stop().await;
 
-        let messages = conversation(&done).messages;
+        let messages = conversation(&rt, &done).await.messages;
         assert_eq!(messages[2], Message::tool_result("c1", "late answer"));
         assert_eq!(messages[3], Message::user_text("and be quick"));
         assert_eq!(rig.parent_mock.requests().len(), 2);
@@ -626,7 +627,7 @@ mod cases {
         let done = wait_done(&front, parent).await;
         front_worker.stop().await;
 
-        let state = conversation(&done.clone());
+        let state = conversation(&front, &done).await;
         assert_eq!(
             tool_results(&state),
             vec![
@@ -686,7 +687,7 @@ mod cases {
         let done = wait_done(&front, parent).await;
         front_worker.stop().await;
         assert_eq!(done.output.expect("output")["text"], "recovered");
-        let state = conversation(&front.view(parent).await.unwrap().unwrap());
+        let state = conversation(&front, &front.view(parent).await.unwrap().unwrap()).await;
         assert_eq!(
             tool_results(&state),
             vec![("c1".into(), "child says 42".into(), false)]
@@ -726,7 +727,7 @@ mod cases {
         let done = wait_done(&front, parent).await;
         front_worker.stop().await;
         assert_eq!(done.output.expect("output")["text"], "recovered");
-        let state = conversation(&front.view(parent).await.unwrap().unwrap());
+        let state = conversation(&front, &front.view(parent).await.unwrap().unwrap()).await;
         assert_eq!(
             tool_results(&state),
             vec![("c1".into(), "child says 42".into(), false)]
@@ -790,7 +791,7 @@ mod cases {
             "the model is not asked again"
         );
         assert_eq!(
-            tool_results(&conversation(&end)),
+            tool_results(&conversation(&front, &end).await),
             vec![("c1".into(), "child says 42".into(), false)]
         );
     }
@@ -838,7 +839,9 @@ mod cases {
         for request in &requests {
             assert!(!format!("{:?}", request.messages).contains("REPORT-TEXT-XYZ"));
         }
-        assert!(!format!("{:?}", conversation(&end).messages).contains("REPORT-TEXT-XYZ"));
+        assert!(
+            !format!("{:?}", conversation(&rt, &end).await.messages).contains("REPORT-TEXT-XYZ")
+        );
     }
 
     /// The same report already in the inbox when the step starts is dropped before it can become
@@ -871,7 +874,9 @@ mod cases {
         let requests = rig.parent_mock.requests();
         assert_eq!(requests.len(), 1);
         assert!(!format!("{:?}", requests[0].messages).contains("REPORT-TEXT-XYZ"));
-        assert!(!format!("{:?}", conversation(&end).messages).contains("REPORT-TEXT-XYZ"));
+        assert!(
+            !format!("{:?}", conversation(&rt, &end).await.messages).contains("REPORT-TEXT-XYZ")
+        );
     }
 
     /// A failing child is an error result: the model sees why and the run goes on.
@@ -891,7 +896,8 @@ mod cases {
         worker.stop().await;
 
         assert_eq!(done.output.expect("output")["text"], "I will fix it myself");
-        let results = tool_results(&conversation(&rt.view(parent).await.unwrap().unwrap()));
+        let results =
+            tool_results(&conversation(&rt, &rt.view(parent).await.unwrap().unwrap()).await);
         assert_eq!(results.len(), 1);
         let (id, content, is_error) = &results[0];
         assert_eq!(id, "c1");
@@ -930,7 +936,7 @@ mod cases {
         worker.stop().await;
         assert_eq!(done.output.expect("output")["text"], "ok, no review");
         assert_eq!(
-            tool_results(&conversation(&rt.view(parent).await.unwrap().unwrap())),
+            tool_results(&conversation(&rt, &rt.view(parent).await.unwrap().unwrap()).await),
             vec![(
                 "c1".into(),
                 "the run failed: cancelled: not needed".into(),
@@ -1022,7 +1028,7 @@ mod cases {
             v.pending_inbox == 0 && v.status == RunStatus::Parked && v.version > 3
         })
         .await;
-        let state = conversation(&view);
+        let state = conversation(&rt, &view).await;
         assert!(matches!(state.pending_wait, Some(PendingWait::Run(_))));
         assert!(tool_results(&state).is_empty(), "no result yet");
         assert!(state.deferred.is_empty(), "nor user text");
@@ -1032,7 +1038,7 @@ mod cases {
         wait_done(&rt, parent).await;
         worker.stop().await;
         assert_eq!(
-            tool_results(&conversation(&rt.view(parent).await.unwrap().unwrap())),
+            tool_results(&conversation(&rt, &rt.view(parent).await.unwrap().unwrap()).await),
             vec![("c1".into(), "the real answer".into(), false)]
         );
     }
@@ -1065,7 +1071,7 @@ mod cases {
 
         assert_eq!(done.output.expect("output")["text"], "early bird");
         assert_eq!(
-            tool_results(&conversation(&rt.view(parent).await.unwrap().unwrap())),
+            tool_results(&conversation(&rt, &rt.view(parent).await.unwrap().unwrap()).await),
             vec![("c1".into(), "child says 42".into(), false)]
         );
         assert_eq!(rig.parent_mock.requests().len(), 2);
@@ -1106,7 +1112,7 @@ mod cases {
         assert_eq!(rig.spawned.load(SeqCst), 2, "the tool ran on both attempts");
         assert_eq!(rig.child_mock.requests().len(), 1, "but one child ran");
         assert_eq!(
-            tool_results(&conversation(&rt.view(parent).await.unwrap().unwrap())),
+            tool_results(&conversation(&rt, &rt.view(parent).await.unwrap().unwrap()).await),
             vec![("c1".into(), "child says 42".into(), false)]
         );
         assert!(
@@ -1146,7 +1152,8 @@ mod cases {
         // The new timer is one interval from the clock's now, not from the old timer.
         let until = second.wake_at.unwrap() - rig.clock.now();
         assert!(
-            until > chrono::Duration::seconds(3) && until <= chrono::Duration::seconds(5),
+            until > jiff::SignedDuration::from_secs(3)
+                && until <= jiff::SignedDuration::from_secs(5),
             "one interval from now, got {until}"
         );
         assert_eq!(
@@ -1186,7 +1193,7 @@ mod cases {
         dynamic
             .purge_finished(
                 &rig.child_name,
-                chrono::Utc::now() + chrono::Duration::hours(1),
+                adam_core::store::now() + jiff::SignedDuration::from_hours(1),
             )
             .await
             .expect("purge");
@@ -1195,7 +1202,7 @@ mod cases {
         wait_done(&front, parent).await;
         front_worker.stop().await;
         assert_eq!(
-            tool_results(&conversation(&front.view(parent).await.unwrap().unwrap())),
+            tool_results(&conversation(&front, &front.view(parent).await.unwrap().unwrap()).await),
             vec![(
                 "c1".into(),
                 "the run failed: the child run no longer exists".into(),
@@ -1264,7 +1271,7 @@ mod cases {
             "answered once"
         );
         assert_eq!(
-            tool_results(&conversation(&after)),
+            tool_results(&conversation(&b, &after).await),
             vec![("c1".into(), "child says 42".into(), false)]
         );
         assert_eq!(rig.spawned.load(SeqCst), 1, "the tool ran once");
@@ -1303,7 +1310,7 @@ mod cases {
         let view = rt.view(run).await.unwrap().unwrap();
         assert!(view.waiting);
         assert_eq!(
-            conversation(&view).pending_wait,
+            conversation(&rt, &view).await.pending_wait,
             Some(PendingWait::Question(adam_llm_agent::PendingQuestion {
                 call_id: "c1".into(),
                 tool: "ask".into(),
@@ -1327,7 +1334,7 @@ mod cases {
             rig.parent_mock.requests()[0].messages.last(),
             Some(&Message::tool_result("c1", "prod"))
         );
-        let state = conversation(&done);
+        let state = conversation(&rt, &done).await;
         assert_eq!(state.pending_wait, None);
         assert!(
             done.state.get("pending_question").is_none(),
@@ -1391,7 +1398,7 @@ mod cases {
         worker.stop().await;
         assert_eq!(ran.load(SeqCst), 0, "the recorded result was replayed");
         assert_eq!(
-            conversation(&view).pending_wait,
+            conversation(&rt, &view).await.pending_wait,
             Some(PendingWait::Question(adam_llm_agent::PendingQuestion {
                 call_id: "c1".into(),
                 tool: "ask".into(),

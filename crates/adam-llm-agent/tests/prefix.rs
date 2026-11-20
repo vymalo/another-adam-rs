@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store as _};
 use adam_llm_agent::{
     COMPACTION_TURN, Conversation, ImageStore, InboundImage, Limits, LlmAgent, LlmAgentBuilder,
-    MAX_SOURCE_TOOLS, MemoryImages, ReadOutput, Tool, ToolCtx, ToolError, ToolOutput, ToolSource,
-    keep_image, user_message, user_message_with_images,
+    MAX_SOURCE_TOOLS, MemoryImages, ReadOutput, SourceCtx, Tool, ToolCtx, ToolError, ToolOutput,
+    ToolSource, Withheld, keep_image, user_message, user_message_with_images,
 };
 use adam_model::{
     DynModel, ImageLimits, ImageOrigin, InputModalities, Message, MockModel, ModelClient,
@@ -327,6 +327,18 @@ impl Rig {
         self.start_in(None).await
     }
 
+    /// Start a run whose task is `task`, not the `go` of [`start`](Self::start): a source that
+    /// selects from the task reads this text.
+    async fn start_task(&self, task: &str) -> RunId {
+        let run = self
+            .rt
+            .start("llm", user_message(task), None)
+            .await
+            .expect("start");
+        *self.arm.run.lock().unwrap() = Some(run);
+        run
+    }
+
     /// A failed commit is retried after a backoff of the runtime's clock, which only this moves.
     fn ticker(&self) -> tokio::task::JoinHandle<()> {
         let clock = self.clock.clone();
@@ -360,7 +372,7 @@ impl Rig {
         let _ = stop.send(());
         worker.await.expect("worker task");
         assert_eq!(view.status, RunStatus::Done, "{view:#?}");
-        (self.mock.requests(), conversation(&view))
+        (self.mock.requests(), conversation(&self.rt, &view).await)
     }
 }
 
@@ -376,8 +388,9 @@ async fn wait_terminal(rt: &Runtime, run: RunId) -> RunView {
     }
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 fn head(request: &ModelRequest) -> String {
@@ -637,7 +650,7 @@ async fn a_message_that_arrives_before_a_replay_does_not_move_the_cut() {
     let _ = stop.send(());
     worker.await.expect("worker task");
     assert_eq!(view.status, RunStatus::Done, "{view:#?}");
-    let (requests, state) = (rig.mock.requests(), conversation(&view));
+    let (requests, state) = (rig.mock.requests(), conversation(&rig.rt, &view).await);
     assert_eq!(requests.len(), 6, "{requests:#?}");
     // The first try's request (3) has no message and no cut; the replay answered from the journal,
     // which asked nothing; the model answers again at request 4, the first with the message, and
@@ -806,7 +819,8 @@ async fn the_closing_request_extends_the_one_before_and_its_turn_is_not_kept() {
         Some(adam_llm_agent::CLOSING_TURN.to_owned())
     );
     assert!(
-        !conversation(&view)
+        !conversation(&rt, &view)
+            .await
             .messages
             .iter()
             .any(|m| m.text() == adam_llm_agent::CLOSING_TURN),
@@ -1883,7 +1897,10 @@ async fn a_refusal_with_no_new_image_fails_the_run() {
     );
     // The person's picture was carried by a request that got through: it was not touched.
     assert_eq!(requests.len(), 2);
-    assert_eq!(images_of(&conversation(&view).messages).len(), 1);
+    assert_eq!(
+        images_of(&conversation(&rig.rt, &view).await.messages).len(),
+        1
+    );
 }
 
 /// A lost commit after the refusal replays the same decision: the same lines, the same requests.
@@ -2158,4 +2175,138 @@ async fn the_summary_after_a_rejection_describes_images_and_sends_none() {
     assert!(described.contains("[image: me.png (png"), "{described}");
     // The request the provider rejected did carry them.
     assert!(!requests[at - 1].image_data.is_empty());
+}
+
+/// A source that decides once, from the run, what it offers: `big` is loaded only when the run's
+/// context says so, and the context does not change. The tools array is the same bytes at every
+/// request, so the prefix a provider cached still holds (ADR 0044, decision 1).
+struct TaskGate;
+
+#[async_trait]
+impl ToolSource for TaskGate {
+    async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
+        let loaded = ctx
+            .context("load")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if loaded {
+            return Vec::new();
+        }
+        tools
+            .iter()
+            .filter(|tool| **tool == "big")
+            .map(|tool| Withheld::new(*tool, "big is not loaded for this run"))
+            .collect()
+    }
+
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        None
+    }
+}
+
+/// A tool a source holds back from the start stays held back: the head of every request is the
+/// same bytes, whatever the run does with the tools it was shown.
+#[tokio::test]
+async fn a_tool_a_source_holds_back_from_the_start_keeps_the_head_of_every_request() {
+    let rig = Rig::new(100_000, |b| b.tool_source(TaskGate));
+    rig.mock
+        .push_tool_calls(vec![call("c0", "handle", json!({}))])
+        .push_tool_calls(vec![call("c1", "handle", json!({}))])
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, _) = rig.finish(run).await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(breaks(&requests), Vec::<u32>::new());
+    assert_eq!(
+        requests[0]
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>(),
+        ["handle"],
+        "the held-back tool is not shown, and the head does not move"
+    );
+}
+
+/// A source that loads a tool only when the run's task asks for it, as an `mcp.json` server's
+/// `when` does: the task is read from the state, so a replay selects the same.
+struct TaskSelects;
+
+#[async_trait]
+impl ToolSource for TaskSelects {
+    async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
+        let loads = ctx
+            .task()
+            .is_some_and(|task| task.to_lowercase().contains("big"));
+        if loads {
+            return Vec::new();
+        }
+        tools
+            .iter()
+            .filter(|tool| **tool == "big")
+            .map(|tool| Withheld::new(*tool, "big is not loaded for this run"))
+            .collect()
+    }
+
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        None
+    }
+}
+
+/// A tool a source selects from the task is the same tool after a lost commit: the task is the
+/// first message of the journaled state, so the replayed request is the one the run would have
+/// made (a selection stored only in memory would drop `big` here).
+#[tokio::test]
+async fn a_task_selected_tool_survives_a_lost_commit() {
+    fn push_script(mock: &MockModel) {
+        mock.push_tool_calls(vec![big("c0", 10)])
+            .push_tool_calls(vec![call("c1", "handle", json!({}))])
+            .push_text("done");
+    }
+    let baseline = {
+        let rig = Rig::new(100_000, |b| b.tool_source(TaskSelects));
+        push_script(&rig.mock);
+        let run = rig.start_task("use big please").await;
+        rig.finish(run).await
+    };
+    assert!(
+        baseline.0[0].tools.iter().any(|t| t.name == "big"),
+        "the task loads `big` in the baseline"
+    );
+    for call in [0, 1] {
+        let rig = Rig::new(100_000, |b| b.tool_source(TaskSelects));
+        push_script(&rig.mock);
+        rig.lose_the_commit_after_call(call, false);
+        let run = rig.start_task("use big please").await;
+        let (requests, state) = rig.finish(run).await;
+        let label = format!("lost commit after call {call}");
+        assert_eq!(rig.store.injected(Method::CommitRun), 1, "{label}");
+        assert_eq!(state.messages, baseline.1.messages, "{label}");
+        assert_eq!(requests.len(), baseline.0.len(), "{label}");
+        for (got, want) in requests.iter().zip(&baseline.0) {
+            assert_eq!(
+                serde_json::to_string(got).unwrap(),
+                serde_json::to_string(want).unwrap(),
+                "{label}"
+            );
+        }
+    }
 }

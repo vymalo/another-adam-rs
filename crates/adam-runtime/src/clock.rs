@@ -4,13 +4,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 
 /// Where the runtime reads "now" from: claiming due runs, computing retry
 /// backoff, [`Ctx::now`](crate::Ctx::now).
 pub trait Clock: Send + Sync + 'static {
     /// The current time, at millisecond precision.
-    fn now(&self) -> DateTime<Utc>;
+    fn now(&self) -> Timestamp;
 }
 
 /// Shared clock handle.
@@ -21,7 +21,7 @@ pub type DynClock = Arc<dyn Clock>;
 pub struct SystemClock;
 
 impl Clock for SystemClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> Timestamp {
         adam_core::store::now()
     }
 }
@@ -61,12 +61,8 @@ impl ManualClock {
 }
 
 impl Clock for ManualClock {
-    fn now(&self) -> DateTime<Utc> {
-        let offset = chrono::Duration::milliseconds(self.offset_ms.load(Ordering::SeqCst));
-        adam_core::store::truncate_ms(
-            Utc::now()
-                .checked_add_signed(offset)
-                .unwrap_or(DateTime::<Utc>::MAX_UTC),
-        )
+    fn now(&self) -> Timestamp {
+        let offset = jiff::SignedDuration::from_millis(self.offset_ms.load(Ordering::SeqCst));
+        adam_core::store::truncate_ms(Timestamp::now() + offset)
     }
 }

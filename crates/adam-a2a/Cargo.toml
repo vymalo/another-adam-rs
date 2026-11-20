@@ -30,6 +30,7 @@ server = [
 test-util = ["dep:tokio-stream"]
 
 [dependencies]
+adam-core.workspace = true
 adam-error.workspace = true
 a2a-lf.workspace = true
 # Signs the agent card (ES256, EdDSA) and reads the PEM of its key; already in the tree under rustls.
@@ -62,6 +63,7 @@ url.workspace = true
 utoipa-swagger-ui = { workspace = true, optional = true }
 
 [dev-dependencies]
+jiff.workspace = true
 # Turns on `test-util` for this crate's own tests.
 adam-a2a = { path = ".", features = ["test-util"] }
 a2a-client-lf.workspace = true

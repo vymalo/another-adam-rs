@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 use adam_assembly::{AgentDef, Error};
 use adam_error::{Classify, ErrorClass};
-use adam_llm_agent::ToolSet;
+use adam_llm_agent::{ToolSet, user_message};
 use adam_mcp::McpPolicy;
 use adam_mcp_testkit::TestHttpServer;
-use adam_model::MockModel;
+use adam_model::{MockModel, ModelRequest};
 use common::instructions;
 
 const OWN_TOKEN: &str = "own-tok-51d0b7e2-secret";
@@ -90,6 +90,75 @@ async fn extra_servers_are_connected_beside_the_agents_own() {
         !tools.contains(&"websearch__pid".to_owned()),
         "the allow-list applies: {tools:?}"
     );
+}
+
+/// `when` in the deployment's extra file is the same loader and the same selector: the server is
+/// withheld from a run whose task does not mention it, and loaded when it does.
+#[tokio::test]
+async fn a_when_in_the_extra_file_selects_the_extra_server() {
+    let added = TestHttpServer::start_scripted(
+        None,
+        adam_mcp_testkit::Script {
+            instructions: Some("Extra words.".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let file = extra(&format!(
+        r#"{{"mcpServers": {{"websearch": {{"type": "http", "url": "{}", "tools": ["echo"],
+            "when": {{"keywords": ["web"]}}}}}}}}"#,
+        added.url()
+    ));
+    let def = common::def(&[(
+        "agent/instructions.md",
+        &instructions("name: root", "You are the root."),
+    )]);
+    let (def, warnings) = def.with_extra_mcp_file(&file.path).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let def = def.connect_mcp(&McpPolicy::default()).await.unwrap();
+    let model = Arc::new(MockModel::new());
+    model.push_text("done").push_text("done");
+    let assembly = def
+        .bind(ToolSet::new())
+        .unwrap()
+        .model(model.clone(), "default")
+        .unwrap();
+    let prompt = assembly.info()[0].prompt.clone();
+    assert!(
+        !prompt.contains("Extra words."),
+        "the extra server's instructions are withheld at bind: {prompt}"
+    );
+    let rt = common::runtime(&assembly);
+    let worker = common::spawn_worker(&rt);
+    let run = rt
+        .start("root", user_message("fix a typo"), None)
+        .await
+        .unwrap();
+    common::wait_done(&rt, run).await;
+    let run = rt
+        .start("root", user_message("search the web"), None)
+        .await
+        .unwrap();
+    common::wait_done(&rt, run).await;
+    worker.stop().await;
+    let names = |request: &ModelRequest| -> Vec<String> {
+        request.tools.iter().map(|t| t.name.clone()).collect()
+    };
+    let requests = model.requests();
+    assert!(
+        !names(&requests[0]).iter().any(|n| n == "websearch__echo"),
+        "{:?}",
+        names(&requests[0])
+    );
+    assert!(
+        names(&requests[1]).iter().any(|n| n == "websearch__echo"),
+        "{:?}",
+        names(&requests[1])
+    );
+    let first = common::plain(&requests[0].system).unwrap();
+    assert!(!first.contains("Extra words."), "{first}");
+    let second = common::plain(&requests[1].system).unwrap();
+    assert!(second.contains("Extra words."), "{second}");
 }
 
 #[tokio::test]

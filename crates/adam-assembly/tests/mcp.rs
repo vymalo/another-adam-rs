@@ -480,9 +480,10 @@ async fn parent_run_calls_mcp_tool_on_memory_and_postgres() {
         let journal = store.journal_list(run).await.unwrap();
         let entry = journal.iter().find(|e| e.name == "tool:c1");
         assert!(entry.is_some_and(|e| e.ok), "{backend}: {journal:?}");
+        // The joined state, not the view's head: the tool result is in the transcript.
+        let joined = rt.state(run).await.expect("state").expect("the run");
         let everything = format!(
-            "{journal:?}{:?}{:?}{:?}{debug_def}{assembly:?}{:?}",
-            view.state,
+            "{journal:?}{joined:?}{:?}{:?}{debug_def}{assembly:?}{:?}",
             view.output,
             sink.events(),
             assembly.info(),
@@ -698,7 +699,7 @@ async fn the_files_of_a_server_with_files_true_are_artifacts_of_the_run() {
             name.starts_with("screenshot-") && name.ends_with(".png"),
             "{backend}: {name}"
         );
-        let hash = view.artifacts[0].file_sha256().unwrap();
+        let hash = view.artifacts[0].file.as_ref().expect("a file").digest();
         assert_eq!(
             last_tool_result(&model.requests()[1], "c1"),
             (
@@ -713,7 +714,11 @@ async fn the_files_of_a_server_with_files_true_are_artifacts_of_the_run() {
             "{backend}"
         );
         let file = view.artifacts[0].file.as_ref().unwrap();
-        assert_eq!(file.bytes, adam_mcp_testkit::PNG, "{backend}");
+        // The bytes are the file's, whether the run carries them inline (v4) or by blob (v5).
+        assert_eq!(file.size, adam_mcp_testkit::PNG.len() as u64, "{backend}");
+        assert_eq!(file.digest(), adam_runtime::blob_id(adam_mcp_testkit::PNG));
+        let bytes = rt.artifact_bytes(file).await.unwrap().expect("the bytes");
+        assert_eq!(&bytes[..], adam_mcp_testkit::PNG, "{backend}");
         assert!(
             sink.events_for(run).iter().any(|event| matches!(
                 event,
@@ -1158,4 +1163,94 @@ async fn an_mcp_tool_with_its_own_after_previous_keeps_it_and_the_agent_builds()
         json!({"after_previous": "the server's own"}),
         "the argument reached the server"
     );
+}
+
+/// A `mcp.json` of two servers, each with an allow-list of `echo`.
+fn two_servers(linear: &str, docs: &str) -> String {
+    format!(
+        r#"{{"mcpServers": {{
+            "linear": {{"type": "http", "url": "{linear}",
+                        "headers": {{"Authorization": "Bearer ${{LINEAR_TOKEN}}"}},
+                        "tools": ["echo"]}},
+            "docs": {{"type": "http", "url": "{docs}",
+                      "headers": {{"Authorization": "Bearer ${{DOCS_TOKEN}}"}},
+                      "tools": ["echo"], "when": {{"keywords": ["docs", "documentation"]}}}}
+        }}}}"#
+    )
+}
+
+/// A server whose `when` does not match the task is not loaded: its tools are absent and **its
+/// instructions do not reach the prompt**, at bind or at any turn. When the task does match, both
+/// come back, and the head of the request stays the same bytes across its turns.
+#[tokio::test]
+async fn a_triggered_servers_tools_and_instructions_come_only_when_the_task_matches() {
+    let linear = TestHttpServer::start_scripted(
+        Some(TOKEN),
+        adam_mcp_testkit::Script {
+            instructions: Some("Linear words.".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let docs = TestHttpServer::start_scripted(
+        Some("docs-token"),
+        adam_mcp_testkit::Script {
+            instructions: Some("Docs words.".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let root = uniq("root");
+    let files = root_files(
+        &root,
+        "tools: ['linear__echo', 'docs__echo']",
+        &two_servers(&linear.url(), &docs.url()),
+    );
+    let def = def_of(&files)
+        .env("LINEAR_TOKEN", TOKEN)
+        .env("DOCS_TOKEN", "docs-token")
+        .connect_mcp(&policy())
+        .await
+        .unwrap();
+    let model = Arc::new(MockModel::new());
+    model.push_text("done").push_text("done");
+    let assembly = assemble(def, &model);
+    let prompt = assembly.info()[0].prompt.clone();
+    assert!(prompt.contains("Linear words."), "{prompt}");
+    assert!(
+        !prompt.contains("Docs words."),
+        "the triggered server's instructions are not in the prompt at bind: {prompt}"
+    );
+
+    let rt = common::runtime(&assembly);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start(&root, user_message("fix a typo"), None)
+        .await
+        .unwrap();
+    wait_done(&rt, run).await;
+    let run = rt
+        .start(&root, user_message("read the docs"), None)
+        .await
+        .unwrap();
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    let tools: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(!tools.contains(&"docs__echo"), "{tools:?}");
+    assert!(tools.contains(&"linear__echo"), "{tools:?}");
+    let system = plain(&requests[0].system).unwrap();
+    assert!(!system.contains("Docs words."), "{system}");
+    assert!(system.contains("Linear words."), "{system}");
+
+    let tools: Vec<&str> = requests[1].tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(tools.contains(&"docs__echo"), "{tools:?}");
+    let system = plain(&requests[1].system).unwrap();
+    assert!(
+        system.contains("Docs words."),
+        "a loaded server's instructions reach the prompt: {system}"
+    );
+    assert!(system.contains("Linear words."), "{system}");
 }

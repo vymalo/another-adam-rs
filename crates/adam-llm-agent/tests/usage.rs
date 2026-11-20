@@ -92,8 +92,9 @@ async fn wait_finished(rt: &Runtime, run: RunId) -> RunView {
     }
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).unwrap()
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 fn reports(sink: &CollectingSink, run: RunId) -> Vec<UsageEvent> {
@@ -177,7 +178,7 @@ async fn every_model_call_is_reported_once_with_its_tokens_and_counted_in_the_to
     );
     assert_eq!(reports[1].usage, Usage::new(42_000, 20));
 
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     let want = Usage::new(83_250, 832)
         .with_reasoning_tokens(300)
         .with_cached_input_tokens(38_000);
@@ -210,7 +211,7 @@ async fn a_call_without_usage_is_reported_with_zeros_and_no_provider() {
     assert_eq!(reports[0].usage, Usage::default());
     assert_eq!(reports[0].provider, None);
     assert_eq!(reports[0].context_window, None);
-    let totals = conversation(&view).usage_totals;
+    let totals = conversation(&rt, &view).await.usage_totals;
     assert_eq!(totals.entries().len(), 1);
     assert_eq!(totals.entries()[0].usage, Usage::default());
 }
@@ -304,7 +305,7 @@ async fn a_subagents_calls_are_reported_on_the_task_under_the_roots_step_and_cou
     ids.dedup();
     assert_eq!(ids.len(), 5, "unique within the task");
 
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert_eq!(state.usage, Usage::new(300, 30), "its own calls");
     let totals = state.usage_totals.entries();
     assert_eq!(totals.len(), 2, "{totals:#?}");
@@ -312,14 +313,14 @@ async fn a_subagents_calls_are_reported_on_the_task_under_the_roots_step_and_cou
     assert_eq!(totals[0].usage, Usage::new(330, 33));
     assert_eq!(totals[1].model, "small");
     assert_eq!(totals[1].usage, Usage::new(1, 1).with_reasoning_tokens(1));
-    let mid_state = conversation(&rt.view(mid).await.unwrap().unwrap());
+    let mid_state = conversation(&rt, &rt.view(mid).await.unwrap().unwrap()).await;
     assert_eq!(mid_state.root_step.as_deref(), Some("tool:t1"));
     assert_eq!(
         mid_state.usage_totals.entries().len(),
         2,
         "the mid counts its leaf"
     );
-    let leaf_state = conversation(&rt.view(leaf).await.unwrap().unwrap());
+    let leaf_state = conversation(&rt, &rt.view(leaf).await.unwrap().unwrap()).await;
     assert_eq!(
         leaf_state.root_step.as_deref(),
         Some("tool:t1"),
@@ -410,7 +411,7 @@ async fn a_call_made_again_after_a_transient_failure_is_another_call() {
         "the same turn, tried again"
     );
     assert_ne!(reports[0].call, reports[1].call, "another call, another id");
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert_eq!(state.usage_totals.entries()[0].usage, Usage::new(50, 5));
     // The history is the one of the try that was kept.
     assert!(matches!(

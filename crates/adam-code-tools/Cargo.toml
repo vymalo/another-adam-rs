@@ -9,11 +9,14 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-# `GitAt::plain` and `GitAt::refused`, for the tests of a crate that uses the tools.
+# `GitAt::plain`, `GitAt::refused`, `find::search_files_in` and `files::{read_in, write_in, edit_in}`, for the tests of a crate
+# that uses the tools.
 test-util = []
 
 [dependencies]
+adam-error.workspace = true
 adam-llm-agent.workspace = true
+adam-model.workspace = true
 adam-runtime.workspace = true
 # Without `github`: the GitHub code host and App credentials are the coder's, and bring `reqwest`.
 adam-workspace = { path = "../adam-workspace", version = "0.1.0", default-features = false }
@@ -28,6 +31,9 @@ tokio = { workspace = true, features = ["io-util", "process"] }
 tracing.workspace = true
 
 [dev-dependencies]
+# `test-util`: the git sandbox server of `apply_patch`'s tests.
+adam-workspace = { path = "../adam-workspace", version = "0.1.0", default-features = false, features = ["test-util"] }
+proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 

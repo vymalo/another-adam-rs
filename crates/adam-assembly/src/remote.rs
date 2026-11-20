@@ -8,7 +8,6 @@
 //! call needs it.
 
 use adam_llm_agent::ToolAccess;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +20,7 @@ use a2a_client::jsonrpc::JsonRpcTransportFactory;
 use a2a_client::rest::RestTransportFactory;
 use a2a_client::{A2AClient, A2AClientFactory, Transport};
 use adam_agent_fs::{RemoteAgent, RemoteAuth};
-use adam_core::{DynSecretSource, ProcessEnv, SecretError};
+use adam_core::SecretError;
 use adam_llm_agent::{
     RemotePoll, StepIcon, StepKind, StepStyle, Tool, ToolCtx, ToolError, ToolOutput,
 };
@@ -33,12 +32,9 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 use url::{Host, Url};
 
+use crate::def::{RemoteSettings, Secrets};
 use crate::error::{Error, Origin, RemoteAuthProblem, RemoteUrlProblem};
 use crate::subagent::{subagent_spec, title_of};
-
-/// How long a parent waits for a remote task before it answers the call with an error result
-/// (the default of [`AgentDef::remote_timeout`](crate::AgentDef::remote_timeout)).
-pub(crate) const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(60 * 60);
 
 /// The most bytes of a remote agent's answer that reach the model. What comes back is text a
 /// stranger wrote, and it goes into a context window: it is cut here, on a character boundary,
@@ -55,62 +51,34 @@ pub(crate) const STEER_EXTENSION_URI: &str = "https://agents.vymalo.com/a2a/exte
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// What a deployment decides about remote subagents, given to
-/// [`AgentDef`](crate::AgentDef) and used at bind.
-#[derive(Debug, Clone)]
-pub(crate) struct RemoteSettings {
-    /// Values for environment variables, taken before `secrets`.
-    pub(crate) env: Arc<BTreeMap<String, SecretString>>,
-    /// Where a name with no value in `env` is asked: the process environment unless the host
-    /// says otherwise (ADR 0047).
-    pub(crate) secrets: DynSecretSource,
-    /// Allow `http` to hosts that are not this machine.
-    pub(crate) allow_insecure: bool,
-    /// How long a parent waits for a remote task.
-    pub(crate) max_wait: Duration,
-}
-
-impl Default for RemoteSettings {
-    fn default() -> Self {
-        Self {
-            env: Arc::default(),
-            secrets: Arc::new(ProcessEnv),
-            allow_insecure: false,
-            max_wait: DEFAULT_MAX_WAIT,
-        }
+/// The token of `bearer:var`: the value given in code, else the secret source. Trimmed, and
+/// refused when it could not be sent as a bearer token.
+fn token(secrets: &Secrets, origin: &Origin, var: &str) -> Result<SecretString, Error> {
+    let fail = |problem| Error::RemoteAuth {
+        origin: origin.clone(),
+        var: var.to_owned(),
+        problem,
+    };
+    let raw = match secrets.env.get(var) {
+        Some(value) => value.expose_secret().to_owned(),
+        None => match secrets.source.secret(var) {
+            Ok(value) => value.expose_secret().to_owned(),
+            Err(SecretError::Missing) => return Err(fail(RemoteAuthProblem::Missing)),
+            Err(SecretError::NotUnicode) => return Err(fail(RemoteAuthProblem::NotAToken)),
+            // `Refused`, and any reason added later: not given (fail closed).
+            Err(_) => return Err(fail(RemoteAuthProblem::Refused)),
+        },
+    };
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(fail(RemoteAuthProblem::Empty));
     }
-}
-
-impl RemoteSettings {
-    /// The token of `bearer:var`: the value given in code, else the secret source. Trimmed, and
-    /// refused when it could not be sent as a bearer token.
-    fn token(&self, origin: &Origin, var: &str) -> Result<SecretString, Error> {
-        let fail = |problem| Error::RemoteAuth {
-            origin: origin.clone(),
-            var: var.to_owned(),
-            problem,
-        };
-        let raw = match self.env.get(var) {
-            Some(value) => value.expose_secret().to_owned(),
-            None => match self.secrets.secret(var) {
-                Ok(value) => value.expose_secret().to_owned(),
-                Err(SecretError::Missing) => return Err(fail(RemoteAuthProblem::Missing)),
-                Err(SecretError::NotUnicode) => return Err(fail(RemoteAuthProblem::NotAToken)),
-                // `Refused`, and any reason added later: not given (fail closed).
-                Err(_) => return Err(fail(RemoteAuthProblem::Refused)),
-            },
-        };
-        let token = raw.trim();
-        if token.is_empty() {
-            return Err(fail(RemoteAuthProblem::Empty));
-        }
-        // A bearer token is printable ASCII (RFC 6750 `b64token`, and the opaque tokens that
-        // follow it): anything else would be an invalid header value at the first call.
-        if !token.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(fail(RemoteAuthProblem::NotAToken));
-        }
-        Ok(SecretString::from(token.to_owned()))
+    // A bearer token is printable ASCII (RFC 6750 `b64token`, and the opaque tokens that
+    // follow it): anything else would be an invalid header value at the first call.
+    if !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(fail(RemoteAuthProblem::NotAToken));
     }
+    Ok(SecretString::from(token.to_owned()))
 }
 
 /// Whether `url` points at this machine: `localhost`, a `*.localhost` name, or a loopback address.
@@ -184,6 +152,7 @@ impl RemoteEndpoint {
         origin: &Origin,
         agent: &RemoteAgent,
         settings: &RemoteSettings,
+        secrets: &Secrets,
     ) -> Result<Self, Error> {
         let refuse = |url: String, problem| Error::RemoteUrl {
             origin: origin.clone(),
@@ -207,7 +176,7 @@ impl RemoteEndpoint {
             return Err(refuse(printable, RemoteUrlProblem::Insecure));
         }
         let token = match &agent.auth {
-            Some(RemoteAuth::Bearer { env }) => Some(settings.token(origin, env)?),
+            Some(RemoteAuth::Bearer { env }) => Some(token(secrets, origin, env)?),
             None => None,
         };
         Ok(Self {
@@ -560,8 +529,9 @@ impl RemoteSubagentTool {
         origin: &Origin,
         agent: &RemoteAgent,
         settings: &RemoteSettings,
+        secrets: &Secrets,
     ) -> Result<Self, Error> {
-        let endpoint = Arc::new(RemoteEndpoint::bind(origin, agent, settings)?);
+        let endpoint = Arc::new(RemoteEndpoint::bind(origin, agent, settings, secrets)?);
         let description = [agent.description.trim(), agent.note.trim()]
             .into_iter()
             .filter(|part| !part.is_empty())
@@ -793,19 +763,47 @@ mod tests {
         }
     }
 
-    fn settings(vars: &[(&str, &str)]) -> RemoteSettings {
-        RemoteSettings {
-            env: Arc::new(
-                vars.iter()
-                    .map(|(k, v)| ((*k).to_owned(), SecretString::from((*v).to_owned())))
-                    .collect(),
-            ),
-            ..RemoteSettings::default()
+    /// What a deployment gives a remote subagent at bind: its rules and its secrets.
+    #[derive(Default)]
+    struct Given {
+        settings: RemoteSettings,
+        secrets: Secrets,
+    }
+
+    fn settings(vars: &[(&str, &str)]) -> Given {
+        Given {
+            secrets: Secrets {
+                env: Arc::new(
+                    vars.iter()
+                        .map(|(k, v)| ((*k).to_owned(), SecretString::from((*v).to_owned())))
+                        .collect(),
+                ),
+                ..Secrets::default()
+            },
+            ..Given::default()
         }
     }
 
-    fn url_problem(url: &str, settings: &RemoteSettings) -> Option<RemoteUrlProblem> {
-        match RemoteSubagentTool::bind(&origin(), &agent(url, None), settings) {
+    fn insecure() -> Given {
+        Given {
+            settings: RemoteSettings {
+                allow_insecure: true,
+                ..RemoteSettings::default()
+            },
+            ..Given::default()
+        }
+    }
+
+    fn bind(
+        origin: &Origin,
+        agent: &RemoteAgent,
+        given: &Given,
+    ) -> Result<RemoteSubagentTool, Error> {
+        RemoteSubagentTool::bind(origin, agent, &given.settings, &given.secrets)
+    }
+
+    fn url_problem(url: &str, settings: &Given) -> Option<RemoteUrlProblem> {
+        match bind(&origin(), &agent(url, None), settings) {
             Err(Error::RemoteUrl { problem, .. }) => Some(problem),
             Ok(_) => None,
             Err(other) => panic!("{other}"),
@@ -839,10 +837,7 @@ mod tests {
                 "{bad}"
             );
         }
-        let lax = RemoteSettings {
-            allow_insecure: true,
-            ..RemoteSettings::default()
-        };
+        let lax = insecure();
         assert_eq!(url_problem("http://billing.example.com/card", &lax), None);
     }
 
@@ -857,7 +852,7 @@ mod tests {
             url_problem("nonsense", &s),
             Some(RemoteUrlProblem::Unparseable)
         );
-        let Err(Error::RemoteUrl { url, problem, .. }) = RemoteSubagentTool::bind(
+        let Err(Error::RemoteUrl { url, problem, .. }) = bind(
             &origin(),
             &agent("https://user:hunter2@example.com/card?key=abc#frag", None),
             &s,
@@ -872,7 +867,7 @@ mod tests {
     fn the_token_comes_from_the_settings_and_is_checked_without_ever_being_shown() {
         let a = agent("https://billing.example.com/card", Some("BILLING_TOKEN"));
         let good = settings(&[("BILLING_TOKEN", "  s3cret-token \n")]);
-        let tool = RemoteSubagentTool::bind(&origin(), &a, &good).unwrap();
+        let tool = bind(&origin(), &a, &good).unwrap();
         assert_eq!(
             tool.endpoint.token.as_ref().unwrap().expose_secret(),
             "s3cret-token",
@@ -889,16 +884,14 @@ mod tests {
             ("tab\there", RemoteAuthProblem::NotAToken),
             ("caf\u{e9}", RemoteAuthProblem::NotAToken),
         ] {
-            let error =
-                RemoteSubagentTool::bind(&origin(), &a, &settings(&[("BILLING_TOKEN", value)]))
-                    .unwrap_err();
+            let error = bind(&origin(), &a, &settings(&[("BILLING_TOKEN", value)])).unwrap_err();
             let Error::RemoteAuth { var, problem, .. } = &error else {
                 panic!("{error}");
             };
             assert_eq!((var.as_str(), *problem), ("BILLING_TOKEN", expected));
             assert!(!error.to_string().contains(value.trim()) || value.trim().is_empty());
         }
-        let missing = RemoteSubagentTool::bind(
+        let missing = bind(
             &origin(),
             &agent(
                 "https://billing.example.com/card",
@@ -920,11 +913,14 @@ mod tests {
     fn a_source_that_refuses_every_name_refuses_a_token_the_process_has() {
         // `PATH` is in every process environment, and a refusing source still does not give it.
         let a = agent("https://billing.example.com/card", Some("PATH"));
-        let refusing = RemoteSettings {
-            secrets: Arc::new(adam_core::NoSecrets),
-            ..settings(&[])
+        let refusing = Given {
+            secrets: Secrets {
+                source: Arc::new(adam_core::NoSecrets),
+                ..Secrets::default()
+            },
+            ..Given::default()
         };
-        let error = RemoteSubagentTool::bind(&origin(), &a, &refusing).unwrap_err();
+        let error = bind(&origin(), &a, &refusing).unwrap_err();
         let Error::RemoteAuth { var, problem, .. } = &error else {
             panic!("{error}");
         };
@@ -939,11 +935,9 @@ mod tests {
             "{error}"
         );
         // A value given in code is given: the source is asked only for the others.
-        let given = RemoteSettings {
-            secrets: Arc::new(adam_core::NoSecrets),
-            ..settings(&[("PATH", "tok")])
-        };
-        let tool = RemoteSubagentTool::bind(&origin(), &a, &given).unwrap();
+        let mut given = settings(&[("PATH", "tok")]);
+        given.secrets.source = Arc::new(adam_core::NoSecrets);
+        let tool = bind(&origin(), &a, &given).unwrap();
         assert_eq!(tool.endpoint.token.as_ref().unwrap().expose_secret(), "tok");
     }
 
@@ -951,7 +945,7 @@ mod tests {
     fn the_spec_has_the_shape_of_a_subagent_and_the_note_extends_the_description() {
         let mut a = agent("https://billing.example.com/card", None);
         a.note = "  Send invoice numbers.  ".into();
-        let tool = RemoteSubagentTool::bind(&origin(), &a, &settings(&[])).unwrap();
+        let tool = bind(&origin(), &a, &settings(&[])).unwrap();
         let spec = tool.spec();
         assert_eq!(spec.name, "billing");
         assert_eq!(
@@ -966,7 +960,7 @@ mod tests {
     #[test]
     fn a_token_goes_only_to_the_origin_it_was_configured_for() {
         let a = agent("https://billing.example.com/card", Some("T"));
-        let with = RemoteSubagentTool::bind(&origin(), &a, &settings(&[("T", "x")])).unwrap();
+        let with = bind(&origin(), &a, &settings(&[("T", "x")])).unwrap();
         assert!(
             with.endpoint
                 .interface_is_safe("https://billing.example.com/rpc")
@@ -993,7 +987,7 @@ mod tests {
         );
         assert!(!with.endpoint.interface_is_safe("not a url"));
         // Without a token the origin may differ, but not the transport rules.
-        let without = RemoteSubagentTool::bind(
+        let without = bind(
             &origin(),
             &agent("https://billing.example.com/card", None),
             &settings(&[]),
@@ -1013,7 +1007,7 @@ mod tests {
         assert!(!without.endpoint.interface_is_safe("http://127.0.0.1:1/rpc"));
         assert!(!without.endpoint.interface_is_safe("https://localhost/rpc"));
         assert!(!without.endpoint.interface_is_safe("http://[::1]:1/rpc"));
-        let local = RemoteSubagentTool::bind(
+        let local = bind(
             &origin(),
             &agent("http://127.0.0.1:8080/card", None),
             &settings(&[]),
@@ -1036,11 +1030,8 @@ mod tests {
     /// client to plain http on another host, with or without a token.
     #[test]
     fn allowed_plain_http_is_never_a_downgrade_nor_another_host() {
-        let lax = RemoteSettings {
-            allow_insecure: true,
-            ..RemoteSettings::default()
-        };
-        let https = RemoteSubagentTool::bind(
+        let lax = insecure();
+        let https = bind(
             &origin(),
             &agent("https://browser.example.com/card", None),
             &lax,
@@ -1061,7 +1052,7 @@ mod tests {
                 .endpoint
                 .interface_is_safe("https://api.example.net/rpc")
         );
-        let http = RemoteSubagentTool::bind(
+        let http = bind(
             &origin(),
             &agent("http://browser.agents.svc:8080/card", None),
             &lax,
@@ -1114,7 +1105,7 @@ mod tests {
     }
 
     fn tool() -> RemoteSubagentTool {
-        RemoteSubagentTool::bind(
+        bind(
             &origin(),
             &agent("https://billing.example.com/card", None),
             &settings(&[]),
@@ -1245,7 +1236,7 @@ mod tests {
 
         let mut a = agent("https://billing.example.com/card", None);
         a.files = true;
-        let sharing = RemoteSubagentTool::bind(&origin(), &a, &settings(&[])).unwrap();
+        let sharing = bind(&origin(), &a, &settings(&[])).unwrap();
         let Outcome::Done(out) = sharing.endpoint.outcome(&done, RUN) else {
             panic!("the task is over");
         };
@@ -1320,7 +1311,7 @@ mod tests {
         let reply = Message::new(Role::Agent, vec![Part::text("Here:"), shot.clone()]);
         let mut a = agent("https://billing.example.com/card", None);
         a.files = true;
-        let sharing = RemoteSubagentTool::bind(&origin(), &a, &settings(&[])).unwrap();
+        let sharing = bind(&origin(), &a, &settings(&[])).unwrap();
         let out = sharing.endpoint.reply(&reply, RUN);
         assert!(!out.is_error, "{}", out.content);
         let name = &out.artifacts[0].file.as_ref().unwrap().filename;
@@ -1368,7 +1359,7 @@ mod tests {
         }]);
         let mut a = agent("https://billing.example.com/card", None);
         a.files = true;
-        let tool = RemoteSubagentTool::bind(&origin(), &a, &settings(&[])).unwrap();
+        let tool = bind(&origin(), &a, &settings(&[])).unwrap();
         let Outcome::Done(out) = tool.endpoint.outcome(&done, RUN) else {
             panic!("the task is over");
         };

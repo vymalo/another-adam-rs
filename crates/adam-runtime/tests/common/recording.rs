@@ -9,12 +9,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
+use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, BodyRow, ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun,
     PushProgress, PushRecord, RunHeader, RunId, RunQuery, RunRecord, RunUpdate, Store, StoreResult,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -195,7 +195,7 @@ impl Store for RecordingStore {
         worker: &str,
         scope: ClaimScope,
         busy: &[RunId],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: std::time::Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>> {
@@ -208,7 +208,7 @@ impl Store for RecordingStore {
         &self,
         id: RunId,
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: std::time::Duration,
     ) -> StoreResult<bool> {
         self.inner.renew_lease(id, worker, now, ttl).await
@@ -218,7 +218,7 @@ impl Store for RecordingStore {
         self.inner.release_lease(id, worker).await
     }
 
-    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         self.inner.lease_until(id).await
     }
 
@@ -246,7 +246,7 @@ impl Store for RecordingStore {
         &self,
         agents: &[String],
         worker: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         ttl: std::time::Duration,
         limit: usize,
     ) -> StoreResult<Vec<PushRecord>> {
@@ -267,7 +267,7 @@ impl Store for RecordingStore {
             .await
     }
 
-    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_finished(&self, agent: &str, before: Timestamp) -> StoreResult<u64> {
         self.inner.purge_finished(agent, before).await
     }
 
@@ -291,7 +291,7 @@ impl Store for RecordingStore {
         self.inner.get_blob(id).await
     }
 
-    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+    async fn purge_blobs(&self, before: Timestamp) -> StoreResult<u64> {
         self.inner.purge_blobs(before).await
     }
 }
