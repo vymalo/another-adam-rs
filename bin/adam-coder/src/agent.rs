@@ -2423,7 +2423,7 @@ mod tests {
             "name": "answer", "surfaceId": surface, "sourceComponentId": "root",
             "timestamp": "2026-10-11T10:00:00Z", "context": {"answers": answers},
         });
-        let mut part = a2a::Part::data(json!([{"version": "v0.9.1", "action": action}]))
+        let mut part = a2a::Part::data(json!([{"version": "1.0", "action": action}]))
             .with_media_type(A2UI_MEDIA_TYPE);
         part.metadata = Some(std::collections::HashMap::from([(
             "mimeType".to_owned(),

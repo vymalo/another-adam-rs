@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use adam_a2a_runtime::{CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
+use adam_a2a_runtime::{CONTEXT_A2UI_RENDERER, CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
 use adam_llm_agent::{AnswerCheck, ToolCtx, ToolError, ToolOutput};
 use adam_mcp::McpPolicy;
 use adam_runtime::NoopSink;
@@ -22,8 +22,6 @@ const V7: &str = include_str!("fixtures/catalog-v7.json");
 const V7_LOCK: &str = include_str!("fixtures/catalog-v7.lock.json");
 const V5: &str = include_str!("fixtures/catalog-v5.json");
 const V5_LOCK: &str = include_str!("fixtures/catalog-v5.lock.json");
-const V2: &str = include_str!("fixtures/catalog-v2.json");
-const V2_LOCK: &str = include_str!("fixtures/catalog-v2.lock.json");
 const UPSTREAM: &str = include_str!("fixtures/UPSTREAM");
 const VECTORS: &str = include_str!("fixtures/choices-v8-vectors.json");
 
@@ -37,13 +35,17 @@ struct Screen {
 
 fn screen(document: &str, lock: &str) -> Screen {
     let lock: Value = serde_json::from_str(lock).unwrap();
+    // The published catalogs of versions 2 to 8 have no `protocolVersion`; the screen sends them as
+    // `ui-catalog/v2` documents (the digest is of what is sent).
+    let mut document: Value = serde_json::from_str(document).unwrap();
+    document["protocolVersion"] = json!("1.0");
     Screen {
-        document: serde_json::from_str(document).unwrap(),
         claimed: Claimed {
             catalog_id: CATALOG_ID.to_owned(),
             version: u32::try_from(lock["version"].as_u64().unwrap()).unwrap(),
-            digest: lock["digest"].as_str().unwrap().to_owned(),
+            digest: adam_ui::catalog_digest(&document).unwrap(),
         },
+        document,
     }
 }
 
@@ -56,10 +58,6 @@ fn v7() -> Screen {
 fn v5() -> Screen {
     screen(V5, V5_LOCK)
 }
-fn v2() -> Screen {
-    screen(V2, V2_LOCK)
-}
-
 fn catalog_of(screen: &Screen) -> Catalog {
     Catalog::from_document(screen.document.clone(), &screen.claimed).unwrap()
 }
@@ -68,6 +66,7 @@ fn context(screen: &Screen) -> Map<String, Value> {
     let c = &screen.claimed;
     json!({
         CONTEXT_UI_REF: {"catalogId": c.catalog_id, "version": c.version, "digest": c.digest},
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]},
         CONTEXT_UI_CATALOG: {
             "catalogId": c.catalog_id, "version": c.version, "digest": c.digest,
             "catalog": screen.document},
@@ -365,7 +364,7 @@ async fn a_screen_that_lacks_a_component_gets_its_content_in_words_in_the_questi
     let args = json!({"question": "Q", "choices": [{
         "id": "a", "question": "Which?", "options": ["A", "B"],
         "show": [{"component": "Text", "text": "Some words"}, {"component": "Callout", "tone": "error", "title": "No", "text": "Careful"}]}]});
-    let (lead, ui) = form(&v2(), args).await;
+    let (lead, ui) = form(&v5(), args).await;
     assert!(
         lead.contains("For question 1 (\"Which?\"), block 2 of 2:\nBlock 2: error - No: Careful"),
         "{lead}"
@@ -569,9 +568,14 @@ fn the_spec_is_the_same_whatever_the_screen_and_names_show() {
 
 // ---- a refused answer asks the same form again, showing the same things ----
 
+/// What the message that carries an answer says about its renderer: it offers the screen's catalog.
+fn offer() -> Value {
+    json!({"vymalo.a2ui.renderer": {"catalogIds": [CATALOG_ID]}})
+}
+
 fn budget_answer(surface: &str, value: &str) -> Value {
     json!({"text": "x", "form": {"surface": surface, "context": {
-        "answers": [{"id": "budget", "values": [value]}]}}})
+        "answers": [{"id": "budget", "values": [value]}]}}, "context": offer()})
 }
 
 fn budget_args() -> Value {
@@ -643,7 +647,7 @@ async fn a_form_whose_things_were_said_in_words_says_them_again_when_it_is_asked
         refusal.question
     );
     // A thing a screen did draw is not said a second time.
-    let (lead, ui) = form(&v2(), json!({"question": "Q", "choices": [{
+    let (lead, ui) = form(&v5(), json!({"question": "Q", "choices": [{
         "id": "budget", "question": "What is the budget?", "options": ["A", "B"],
         "show": [{"component": "Text", "text": "Plain words"}, {"component": "Callout", "title": "T", "text": "Said"}]}]})).await;
     assert!(
@@ -664,13 +668,12 @@ async fn a_form_whose_things_were_said_in_words_says_them_again_when_it_is_asked
 
 // ---- every block is checked the same way on every screen ----
 
-/// The screens a block is asked on: the version 8, 7, 5 and 2 catalogs and none.
+/// The screens a block is asked on: the version 8, 7 and 5 catalogs and none.
 fn every_screen() -> Vec<(&'static str, Option<Screen>)> {
     vec![
         ("v8", Some(v8())),
         ("v7", Some(v7())),
         ("v5", Some(v5())),
-        ("v2", Some(v2())),
         ("none", None),
     ]
 }
@@ -1170,7 +1173,7 @@ async fn defaults_carried_to_a_form_asked_again_never_make_it_larger_than_a_scre
         "{}",
         size(&ui)
     );
-    let answer = json!({"text": "x", "form": {"surface": "ask-call-1", "context": {"answers": [
+    let answer = json!({"text": "x", "context": offer(), "form": {"surface": "ask-call-1", "context": {"answers": [
         {"id": "budget", "values": ["1500"]},
         {"id": "notes", "values": [], "text": "y".repeat(1800)},
         {"id": "pick", "values": ["a"]}]}}});

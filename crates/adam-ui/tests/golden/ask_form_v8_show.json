@@ -4,7 +4,7 @@
       "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat",
       "surfaceId": "ask-call-1"
     },
-    "version": "v0.9.1"
+    "version": "1.0"
   },
   {
     "updateComponents": {
@@ -120,6 +120,6 @@
       ],
       "surfaceId": "ask-call-1"
     },
-    "version": "v0.9.1"
+    "version": "1.0"
   }
 ]

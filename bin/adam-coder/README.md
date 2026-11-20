@@ -223,7 +223,7 @@ activation the message is refused as before ([`adam-a2a-runtime`](../../crates/a
 [ADR 0016](../../docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md)).
 
 The person's screen (the orchestration layer's chat) can draw a form. The coder announces that on its card
-(`adam_ui::with_card_extensions`: A2UI v0.9.1 with `acceptsInlineCatalogs: true`, `ui-catalog/v1`,
+(`adam_ui::with_card_extensions`: A2UI v1.0 with `acceptsInlineCatalogs: true`, `ui-catalog/v2`,
 `thread-tools/v1`, `mentions/v1`, `steer/v1`; `agent_card_from` adds them, with `steps/v1`, `text-stream/v1`, `usage/v1`, `access-tier/v1` ([above](#access-tiers-what-the-person-lets-it-do-alone)), `child-sessions/v1` (added by `adam_service::serve`, not by `agent_card_from`, and only when the backend serves it: [Sessions a person opens](#sessions-a-person-opens)), `commands/v1` (the three commands of `agent/commands/`: `review`, `fix-checks` and `explain`; templates the agent expands, never part of the prompt) and `build/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
 a screen (`vymalo_inbound`, set by `Coder::new_with` and `serve`), and gives the model `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`:
 three questions at once (a database, a login, where it runs) become **one Choices surface** beside the question, with a title
@@ -240,7 +240,7 @@ sequenceDiagram
   participant C as Coder (A2A server and worker)
   participant M as Model
   participant E as Thread tools endpoint
-  S->>C: message: text, ui-catalog/v1 {version, digest}, the catalog inline or only referenced, thread-tools/v1 {url, token}
+  S->>C: message: text, ui-catalog/v2 {version, digest}, the catalog inline or only referenced, thread-tools/v1 {url, token}
   C->>E: tools/list (once per grant, and again after the 60 s TTL, with the grant)
   E-->>C: get_ui_catalog and the tools attached since
   C->>M: the coder's tools, ask_user, show, ui_catalog, plan_work, plan_check, plan_add, then the listed ones except get_ui_catalog

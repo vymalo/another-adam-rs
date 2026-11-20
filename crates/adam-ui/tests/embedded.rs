@@ -7,24 +7,32 @@
 use std::sync::Arc;
 
 use adam_a2a_runtime::{
-    CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF,
+    CONTEXT_A2UI_RENDERER, CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG,
+    CONTEXT_UI_REF,
 };
 use adam_llm_agent::{SourceCtx, ToolCtx, ToolSource as _};
 use adam_mcp_testkit::ThreadToolsServer;
 use adam_runtime::NoopSink;
-use adam_ui::{Claimed, Ui};
+use adam_ui::{Claimed, Ui, catalog_digest};
 use serde_json::{Map, Value, json};
 
 const CATALOG_ID: &str = "https://agents.vymalo.com/a2ui/catalogs/chat";
 const FIXTURE: &str = include_str!("fixtures/catalog-v2.json");
 const LOCK: &str = include_str!("fixtures/catalog-v2.lock.json");
 
+/// The catalog as a screen sends it: the published version 2 with the `ui-catalog/v2` `protocolVersion`.
+fn document() -> Value {
+    let mut document: Value = serde_json::from_str(FIXTURE).unwrap();
+    document["protocolVersion"] = json!("1.0");
+    document
+}
+
 fn claimed() -> Claimed {
     let lock: Value = serde_json::from_str(LOCK).unwrap();
     Claimed {
         catalog_id: CATALOG_ID.to_owned(),
         version: u32::try_from(lock["version"].as_u64().unwrap()).unwrap(),
-        digest: lock["digest"].as_str().unwrap().to_owned(),
+        digest: catalog_digest(&document()).unwrap(),
     }
 }
 
@@ -37,9 +45,10 @@ fn object(value: Value) -> Map<String, Value> {
 }
 
 fn inline_context(c: &Claimed) -> Map<String, Value> {
-    let document: Value = serde_json::from_str(FIXTURE).unwrap();
+    let document = document();
     object(json!({
         CONTEXT_UI_REF: reference(c),
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]},
         CONTEXT_UI_CATALOG: {
             "catalogId": c.catalog_id, "version": c.version, "digest": c.digest, "catalog": document},
     }))
@@ -49,6 +58,7 @@ fn inline_context(c: &Claimed) -> Map<String, Value> {
 fn ref_context(c: &Claimed, url: &str) -> Map<String, Value> {
     object(json!({
         CONTEXT_UI_REF: reference(c),
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]},
         CONTEXT_THREAD_TOOLS: {"url": url, "token": "tok", "expiresAt": "2999-01-01T00:00:00Z"},
     }))
 }
@@ -67,7 +77,7 @@ fn show_description(specs: &[adam_model::ToolSpec]) -> String {
 }
 
 async fn endpoint_with_catalog(c: &Claimed) -> ThreadToolsServer {
-    let document: Value = serde_json::from_str(FIXTURE).unwrap();
+    let document = document();
     let server = ThreadToolsServer::start(&["tok"]).await;
     server.set_catalog(Some((
         &c.catalog_id,
@@ -154,7 +164,10 @@ async fn the_screen_source_describes_show_once_the_catalog_is_held_and_offers_no
     let screen = ui.screen();
     // A later message names the catalog without carrying it: only a catalog this process holds can
     // describe `show`, and nobody is asked for one.
-    let named_only = SourceCtx::detached(object(json!({CONTEXT_UI_REF: reference(&c)})));
+    let named_only = SourceCtx::detached(object(json!({
+        CONTEXT_UI_REF: reference(&c),
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]},
+    })));
     let fresh = || ui.tools().into_iter().map(|t| t.spec()).collect::<Vec<_>>();
 
     assert!(screen.specs(&named_only).await.is_empty());

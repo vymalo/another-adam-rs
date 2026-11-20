@@ -4,7 +4,7 @@ use adam_a2a_runtime::ASK_SURFACE_PREFIX;
 use serde_json::{Value, json};
 
 /// The A2UI version these messages are written for.
-pub const A2UI_VERSION: &str = "v0.9.1";
+pub const A2UI_VERSION: &str = "1.0";
 
 /// A surface id made from `raw` (a model's call id, say): the characters of an identifier
 /// (`A-Z a-z 0-9 _ . : -`), anything else written as `-`, at most 64 characters.
@@ -109,7 +109,8 @@ mod tests {
         );
         assert_eq!(s[1]["updateComponents"]["surfaceId"], "ask-1");
         assert_eq!(s[1]["updateComponents"]["components"][0]["id"], "root");
-        assert_eq!(s[0]["version"], "v0.9.1");
+        assert_eq!(s[0]["version"], "1.0");
+        assert_eq!(s[1]["version"], "1.0");
     }
 
     #[test]

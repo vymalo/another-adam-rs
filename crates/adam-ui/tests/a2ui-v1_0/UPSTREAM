@@ -1,0 +1,20 @@
+# Where the files under crates/adam-ui/tests/a2ui-v1_0/ come from. The test `tests/a2ui_schemas.rs`
+# reads this file and checks every hash.
+#
+# Each file below is a byte-for-byte copy of the file at specification/v1_0/json/<file> of the repository and
+# the commit named here (Apache-2.0, the repository's LICENSE; see third-party-notices.md). They are test
+# oracles only: nothing reads them at run time.
+#
+# Never edit them here: take a new commit from upstream and replace the files, the hashes below and this line
+# together. `tools/check-vendored-catalogs.sh` compares them with upstream (CI, job `docs`).
+#
+# <file> <sha256> <path>
+repo=a2ui-project/a2ui
+commit=b4f91c26fcf62abc0720c21a65840220941d0a3f
+
+agent_to_renderer.json 2f575f783fdda0e4d175fe5d331661655e4a4901613262322792dae7e823761d specification/v1_0/json/agent_to_renderer.json
+common_types.json c4e78305be1de73eecb37f8179ba169730250611703683af291b18135a6430dc specification/v1_0/json/common_types.json
+catalog_definition.json 836a48b2deb7ae76c3b68cb4e79c2faa24cba36d4d5396474894796797364d44 specification/v1_0/json/catalog_definition.json
+renderer_capabilities.json 3ebd2889764d892df16d034643ecd9e3a3fc02f298fa05577b95d9e287e703de specification/v1_0/json/renderer_capabilities.json
+renderer_to_agent.json 58ecde02101f0f37566b5e238dc6ef6af628c3ff312fce0e17ab7670b7215465 specification/v1_0/json/renderer_to_agent.json
+agent_capabilities.json 6a4282dfb26af95a73d960572a31b91c5d5c89d1f9e54cbb8d24c599afcbc3a2 specification/v1_0/json/agent_capabilities.json

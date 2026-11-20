@@ -141,7 +141,7 @@ change of worker keeps it, and a run that continues another starts with the one 
 `MAX_CONTEXT_BYTES` (256 KiB of JSON; a message that would take it over has its context dropped, with a warning,
 and is still read for its text, **but for the keys of `PROTECTED_CONTEXT_KEYS`**, today `ACCESS_TIER_CONTEXT_KEY`
 (`vymalo.accessTier`) and `CALLER_CONTEXT_KEY` (`vymalo.caller`, who the message was sent for): a limit on the agent is never
-lost to a large context, does not count toward the bound, and a value over `MAX_PROTECTED_VALUE_BYTES` is ignored), and **an entry that is an object with an `expiresAt` (RFC 3339) is removed once
+lost to a large context, does not count toward the bound, and a value over `MAX_PROTECTED_VALUE_BYTES` is ignored; and the keys of `PER_MESSAGE_CONTEXT_KEYS`, today `RENDERER_OFFER_CONTEXT_KEY` (`vymalo.a2ui.renderer`, what the renderer offers this turn), are **deleted** then, so an earlier message's offer never stands for this one's), and **an entry that is an object with an `expiresAt` (RFC 3339) is removed once
 that time has passed**, at the start of the next step (`drop_expired_context`): a credential the sender put there
 does not stay in the store after it stops working. (A run parked for hours still holds it until it next steps.)
 

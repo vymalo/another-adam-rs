@@ -193,7 +193,7 @@ async fn the_card_is_the_one_the_folder_declares() {
     assert_eq!(
         uris,
         [
-            adam_a2a::A2UI_EXTENSION_V0_9_1,
+            adam_a2a::A2UI_EXTENSION_V1_0,
             adam_a2a::UI_CATALOG_EXTENSION,
             adam_a2a::THREAD_TOOLS_EXTENSION,
             adam_a2a::MENTIONS_EXTENSION,
@@ -1151,18 +1151,26 @@ const CATALOG_V2: (&str, &str) = (
     include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.lock.json"),
 );
 
+/// The published catalog (versions 2 to 8 have no `protocolVersion`) as a screen sends it now: a
+/// `ui-catalog/v2` document, whose digest is of what is sent.
+fn catalog_v2(published: &str) -> serde_json::Value {
+    let mut catalog: serde_json::Value = serde_json::from_str(published).unwrap();
+    catalog["protocolVersion"] = json!("1.0");
+    catalog
+}
+
 /// The message the orchestrator sends from a screen that draws `catalog` (the document and its lock),
-/// with the catalog inline: the `ui-catalog/v1` metadata and the A2UI capabilities.
+/// with the catalog inline: the `ui-catalog/v2` metadata and the A2UI capabilities.
 fn from_the_screen(text: &str, (catalog, lock): (&str, &str)) -> Message {
     let lock: serde_json::Value = serde_json::from_str(lock).unwrap();
-    let catalog: serde_json::Value = serde_json::from_str(catalog).unwrap();
+    let catalog = catalog_v2(catalog);
     let mut message = user(text);
     message.metadata = Some(
         json!({
             adam_a2a::UI_CATALOG_EXTENSION: {
-                "catalogId": CATALOG_ID, "version": lock["version"], "digest": lock["digest"],
-                "inline": true},
-            "a2uiClientCapabilities": {"v0.9.1": {
+                "catalogId": CATALOG_ID, "version": lock["version"],
+                "digest": adam_ui::catalog_digest(&catalog).unwrap(), "inline": true},
+            "a2uiRendererCapabilities": {"1.0": {
                 "supportedCatalogIds": [CATALOG_ID], "inlineCatalogs": [catalog]}},
         })
         .as_object()
@@ -1304,13 +1312,13 @@ async fn the_researcher_answers_with_cards_and_a_graph_on_a_screen_that_draws_th
         .map(|c| c["component"].as_str().unwrap())
         .collect();
     assert_eq!(kinds, ["Column", "Cards", "Mermaid"]);
-    let lock: serde_json::Value = serde_json::from_str(CATALOG_V3.1).unwrap();
+    let document = catalog_v2(CATALOG_V3.0);
     let catalog = adam_ui::Catalog::from_document(
-        serde_json::from_str(CATALOG_V3.0).unwrap(),
+        document.clone(),
         &adam_ui::Claimed {
             catalog_id: CATALOG_ID.to_owned(),
             version: 3,
-            digest: lock["digest"].as_str().unwrap().to_owned(),
+            digest: adam_ui::catalog_digest(&document).unwrap(),
         },
     )
     .unwrap();
@@ -1347,7 +1355,7 @@ async fn on_a_screen_without_cards_or_a_catalog_the_researcher_answers_in_words_
         (
             "no catalog",
             user("What is async Rust?"),
-            "this screen has no component catalog; answer in text",
+            "this screen did not offer a component catalog this turn; answer in text",
         ),
     ] {
         let (done, requests) = researcher_run(message).await;

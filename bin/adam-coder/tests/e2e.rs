@@ -3981,19 +3981,23 @@ async fn another_caller_cannot_see_or_resume_the_task(store: DynStore) {
 
 // ------------------------------------------------------- asking with choices
 
-/// The screen's catalog (the web's, version 2: Text, Column, Choices): the copy `adam-ui` pins.
-const CATALOG: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.json");
+/// The screen's catalog (the web's, version 9): the copy `adam-ui` pins.
+const CATALOG: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v9.json");
 const CATALOG_LOCK: &str =
-    include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.lock.json");
-const UI_CATALOG_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/ui-catalog/v1";
+    include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v9.lock.json");
+const UI_CATALOG_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/ui-catalog/v2";
 const THREAD_TOOLS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/thread-tools/v1";
 
-/// A first message from the person's screen: the text, the catalog's reference (`ui-catalog/v1`),
+/// A first message from the person's screen: the text, the catalog's reference (`ui-catalog/v2`),
 /// the catalog itself in the A2UI capabilities when `inline`, and the grant for the conversation's
 /// tools when there is one.
 fn from_the_screen(text: &str, inline: bool, grant: Option<serde_json::Value>) -> Message {
     let lock: serde_json::Value = serde_json::from_str(CATALOG_LOCK).unwrap();
-    let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    let mut catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    // A screen sends a `ui-catalog/v2` document: the published version 2 gets `protocolVersion`, and the
+    // digest is of what is sent.
+    catalog["protocolVersion"] = json!("1.0");
+    let digest = adam_ui::catalog_digest(&catalog).unwrap();
     let id = catalog["catalogId"].clone();
     let mut capabilities = json!({"supportedCatalogIds": [id.clone()]});
     if inline {
@@ -4001,8 +4005,8 @@ fn from_the_screen(text: &str, inline: bool, grant: Option<serde_json::Value>) -
     }
     let mut metadata = json!({
         UI_CATALOG_EXTENSION: {
-            "catalogId": id, "version": lock["version"], "digest": lock["digest"], "inline": inline},
-        "a2uiClientCapabilities": {"v0.9.1": capabilities},
+            "catalogId": id, "version": lock["version"], "digest": digest, "inline": inline},
+        "a2uiRendererCapabilities": {"1.0": capabilities},
     });
     if let Some(grant) = grant {
         metadata[THREAD_TOOLS_EXTENSION] = grant;
@@ -4021,7 +4025,7 @@ fn from_the_screen(text: &str, inline: bool, grant: Option<serde_json::Value>) -
 
 /// The person's answers through the form, as the screen sends them: one A2UI action on the task.
 fn answers_to(task: &str, surface: &str, answers: serde_json::Value) -> Message {
-    let mut part = Part::data(json!([{"version": "v0.9.1", "action": {
+    let mut part = Part::data(json!([{"version": "1.0", "action": {
         "name": "answer", "surfaceId": surface, "sourceComponentId": "root",
         "timestamp": "2026-10-01T10:00:00Z", "context": {"answers": answers}}}]))
     .with_media_type("application/a2ui+json");
@@ -4031,6 +4035,12 @@ fn answers_to(task: &str, surface: &str, answers: serde_json::Value) -> Message 
     )]));
     let mut message = Message::new(Role::User, vec![part]);
     message.task_id = Some(task.to_owned());
+    // Every message of the screen says what it offers: an answer turn that did not would be in words.
+    let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    message.metadata = Some(std::collections::HashMap::from([(
+        "a2uiRendererCapabilities".to_owned(),
+        json!({"1.0": {"supportedCatalogIds": [catalog["catalogId"].clone()]}}),
+    )]));
     message
 }
 
@@ -4209,12 +4219,14 @@ async fn the_catalog_is_read_again_over_the_thread_tools_and_their_tools_are_off
     store: DynStore,
 ) {
     let lock: serde_json::Value = serde_json::from_str(CATALOG_LOCK).unwrap();
-    let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    let mut catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    catalog["protocolVersion"] = json!("1.0");
+    let digest = adam_ui::catalog_digest(&catalog).unwrap();
     let thread = adam_mcp_testkit::ThreadToolsServer::start(&["thread-token"]).await;
     thread.set_catalog(Some((
         catalog["catalogId"].as_str().unwrap(),
         lock["version"].as_u64().unwrap(),
-        lock["digest"].as_str().unwrap(),
+        &digest,
         catalog.clone(),
     )));
     thread.add_tool(
@@ -4416,16 +4428,19 @@ async fn another_repository_joins_the_workspace_when_the_person_says_yes_on_the_
     assert_eq!(parts.len(), 2, "the question and its form: {parts:?}");
     let text = parts[0].as_text().unwrap();
     assert!(
-        text.contains("May I add the repository library")
-            && text.contains(&library_url)
-            && text.contains(
-                "The agent says why: \"the shared greeting lives in greeting.txt there\""
-            ),
+        text.contains("May I add the repository library") && text.contains(&library_url),
         "{text}"
     );
     let a2a::PartContent::Data(surface) = &parts[1].content else {
         panic!("the second part is the form: {parts:?}");
     };
+    // The screen's `Choices` has a description: the reason is drawn there, not folded into the words.
+    assert!(
+        surface
+            .to_string()
+            .contains(r#"The agent says why: \"the shared greeting lives in greeting.txt there\""#),
+        "{surface}"
+    );
     let choices = &surface[1]["updateComponents"]["components"][0];
     assert_eq!(choices["component"], "Choices");
     assert_eq!(choices["questions"][0]["id"], "consent");
