@@ -7,7 +7,7 @@
 //! process's secrets kept out of everything that leaves it ([`redact`]).
 //! The file and search tools are here ([`files`], [`find`]); the commands have their port, with the
 //! guard of a command, and the plumbing `run_command` and `run` share ([`commands`], [`output`]).
-//! `run_command` is here ([`inspect`]); `run` moves here next.
+//! `run_command` is here ([`inspect`]), and so is `run` ([`make`]).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -19,6 +19,7 @@ pub mod files;
 pub mod find;
 pub mod git;
 pub mod inspect;
+pub mod make;
 pub mod output;
 pub mod redact;
 pub mod sandbox;

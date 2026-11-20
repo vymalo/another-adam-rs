@@ -39,12 +39,13 @@ epoch moved, "Run the checks again before you commit.", the note of a published 
 `CommandWorkspace`, which `ToolEnv` implements in the same file (the run's environment, `CHECK_TIMEOUT_SECS` and
 `CHECK_OUTPUT_TAIL_BYTES`, the kept files): `ToolEnv::run` and what a command shows and keeps (`tools::output`) are
 `adam_code_tools::commands` and `adam_code_tools::output`. `run_command` is declared in `tools::inspect` and done by
-`adam_code_tools::inspect`; its guard is the coder's `SlotGuard` (`src/tools/workspace.rs`), over the worktree's
-`Snapshot`, which stays in `tools::inspect`: its refusals (the worktree cannot be read, `HEAD` off the run's branch),
-its verdicts after the command (unchanged, files changed, undone, unreadable), the note on the commands that keep running in
-the slot (`refusal_note`) and the answer to a missing tool are `ToolEnv`'s `CommandWorkspace` methods; `ToolEnv::after_run`
-(the check epoch moved, the note of a published scratch project) is there for `run`, which is still done here.
-Both are pinned by `tests/command_results.rs`. `Redactor::from_config` is the
+`adam_code_tools::inspect`, and `run` is declared in `tools::make` and done by `adam_code_tools::make`; their guard is the
+coder's `SlotGuard` (`src/tools/workspace.rs`), over the worktree's `Snapshot`, which stays in `tools::inspect`: its
+refusals (the worktree cannot be read, `HEAD` off the run's branch), its verdicts after the command (unchanged, files
+changed, undone, unreadable), the note on the commands that keep running in the slot (`refusal_note`) and the answer to a
+missing tool are `ToolEnv`'s `CommandWorkspace` methods; `ToolEnv::after_run` (the check epoch moved, the note of a
+published scratch project) follows each `run` that ran, once, before its guard is settled. `tools::gitcli::status_text`
+is `adam_code_tools::git::status_text`, re-exported. Both tools are pinned by `tests/command_results.rs`. `Redactor::from_config` is the
 coder's own trait, `RedactorFromConfig`, re-exported at the crate root.
 
 ```mermaid

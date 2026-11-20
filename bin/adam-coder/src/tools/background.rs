@@ -2041,12 +2041,6 @@ pub async fn list_commands(env: State<ToolEnv>, ctx: &ToolCtx) -> Outcome {
     Ok(ToolOutput::text(text))
 }
 
-/// `text`, a refusal in `slot`, with the commands that keep running there named when there are some.
-pub(crate) fn noted(env: &ToolEnv, ctx: &ToolCtx, slot: &Slot, mut text: String) -> String {
-    text.push_str(&slot_note(env, &ctx.root_run_id().to_string(), slot.dir()));
-    text
-}
-
 /// A line for a refusal in a slot that a background command may be writing: the commands running
 /// there (on this worker, and on others), or nothing.
 pub(crate) fn slot_note(env: &ToolEnv, run: &str, slot: &str) -> String {
