@@ -1571,6 +1571,53 @@ fn asking_tool() -> impl Tool {
     })
 }
 
+/// Nobody answers a firing of a schedule (ADR 0060): in its conversation a question is refused as
+/// the tool's result, the run goes on, and it never parks.
+#[tokio::test]
+async fn needs_input_in_a_firing_of_a_schedule_is_refused_and_the_run_goes_on() {
+    let h = Harness::new();
+    let (echo, echo_calls) = CountingTool::new("echo");
+    let agent = h.agent().tool(asking_tool()).tool(echo).build();
+    h.mock
+        .push_tool_calls(vec![
+            call("c1", "ask", json!({})),
+            call("c2", "echo", json!({})),
+        ])
+        .push_text("deployed to staging; prod needs a person's yes");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start(
+            "llm",
+            user_message("deploy"),
+            Some("adam.schedule:llm/nightly@2026-12-24T17:00:00Z"),
+        )
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert!(!view.waiting);
+    assert_eq!(echo_calls.load(SeqCst), 1, "the next call ran");
+    let second = serde_json::to_string(&h.mock.requests()[1].messages).unwrap();
+    assert!(second.contains("nobody answers this run"), "{second}");
+    assert!(
+        second.contains("The question was: which environment?"),
+        "{second}"
+    );
+    assert!(
+        !h.events(run).contains(&custom(
+            "input_required",
+            json!({"question": "which environment?", "call_id": "c1"})
+        )),
+        "nothing is asked of a person"
+    );
+    assert!(adam_llm_agent::is_unattended(Some(
+        "adam.schedule:llm/nightly@x"
+    )));
+    assert!(!adam_llm_agent::is_unattended(Some("token-1:chat")));
+    assert!(!adam_llm_agent::is_unattended(None));
+}
+
 #[tokio::test]
 async fn needs_input_parks_and_the_answer_becomes_the_tool_result() {
     let h = Harness::new();

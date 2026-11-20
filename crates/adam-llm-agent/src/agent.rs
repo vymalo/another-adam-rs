@@ -206,6 +206,17 @@ pub const MAX_PARALLEL_LIMIT: usize = 32;
 /// task, was called beside other calls: it has nowhere to park there.
 const NOT_ALONGSIDE: &str = "this tool cannot run alongside others: call it alone";
 
+/// The result a tool that asks the person gets in a run nobody answers, a firing of a schedule (a
+/// conversation under `adam.schedule:`, ADR 0060): the run cannot wait for an answer, so the model
+/// is told to go on without one.
+pub const UNATTENDED: &str = "nobody answers this run: a schedule started it, not a person, so nothing \
+can be asked. Do what you can without asking, and say in your final answer what is still needed";
+
+/// Whether a run in `conversation_id` is a firing of a schedule, which nobody answers.
+pub fn is_unattended(conversation_id: Option<&str>) -> bool {
+    conversation_id.is_some_and(|c| c.starts_with(adam_runtime::SCHEDULE_CONVERSATION_PREFIX))
+}
+
 /// Whether a result reports the rounds of sessions: only a call that runs alone may.
 fn reports_rounds(output: &ToolOutput) -> bool {
     !output.is_error && !output.reported.is_empty()
@@ -4158,6 +4169,14 @@ impl LlmAgent {
                 | ToolError::AwaitSession { .. }
                 | ToolError::AwaitRemote { .. },
             ) if live.is_some() => ToolResult::error(&call.id, NOT_ALONGSIDE.to_owned()),
+            // Nobody answers a firing of a schedule: the question is refused, and the model goes on.
+            Err(ToolError::NeedsInput { question, .. }) if is_unattended(ctx.conversation_id()) => {
+                say(ctx, silent, end(StepState::Failed)).await;
+                ToolResult::error(
+                    &call.id,
+                    format!("{UNATTENDED}. The question was: {question}"),
+                )
+            }
             Err(ToolError::NeedsInput { question, ui }) => {
                 say(ctx, silent, end(StepState::Waiting)).await;
                 ToolResult::NeedsInput { question, ui }
