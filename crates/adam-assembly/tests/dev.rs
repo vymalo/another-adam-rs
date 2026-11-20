@@ -244,6 +244,61 @@ async fn a_reload_of_unchanged_files_swaps_and_says_nothing_changed() {
     assert!(live.last_error().is_none());
 }
 
+/// The schedules in force are the files' as of the last reload that swapped, for a host to
+/// reconcile (ADR 0060): a new one appears, a changed one changes, and a refused reload keeps them.
+#[tokio::test]
+async fn the_schedules_in_force_follow_the_reloads_that_swap() {
+    let name = uniq("scheduled");
+    let dir = tempfile::tempdir().unwrap();
+    edit(dir.path(), FILE, &agent_file(&name, "", "Hello."));
+    edit(
+        dir.path(),
+        "agent/schedules/daily.md",
+        "---\ncron: \"0 9 * * *\"\n---\nDigest.\n",
+    );
+    let model = Arc::new(MockModel::new());
+    let live = builder(dir.path(), &model).load().unwrap();
+    let crons = |live: &LiveAssembly| -> Vec<(String, String, String)> {
+        live.schedules()
+            .into_iter()
+            .map(|s| (s.agent, s.name, s.cron))
+            .collect()
+    };
+    assert_eq!(
+        crons(&live),
+        [(name.clone(), "daily".into(), "0 9 * * *".into())]
+    );
+
+    edit(
+        dir.path(),
+        "agent/schedules/daily.md",
+        "---\ncron: \"30 9 * * *\"\n---\nDigest.\n",
+    );
+    edit(
+        dir.path(),
+        "agent/schedules/weekly.md",
+        "---\ncron: \"0 8 * * MON\"\n---\nStatus.\n",
+    );
+    live.reload().unwrap();
+    assert_eq!(
+        crons(&live),
+        [
+            (name.clone(), "daily".into(), "30 9 * * *".into()),
+            (name.clone(), "weekly".into(), "0 8 * * MON".into()),
+        ]
+    );
+
+    // A schedule the loader refuses fails the reload: the schedules in force stay.
+    edit(
+        dir.path(),
+        "agent/schedules/weekly.md",
+        "---\ncron: \"0 25 * * *\"\n---\nStatus.\n",
+    );
+    assert!(live.reload().is_err());
+    assert_eq!(crons(&live).len(), 2);
+    assert_eq!(crons(&live)[1].2, "0 8 * * MON");
+}
+
 // --- an invalid edit ------------------------------------------------------------------------
 
 #[tokio::test]

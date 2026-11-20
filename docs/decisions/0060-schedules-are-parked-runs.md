@@ -15,7 +15,11 @@ firing or a session's; `next_due` is built as `ScheduleSpec::due_after`.
 scheduler of an agent is registered as `<agent>/adam.schedule`, not `adam.schedule` (decision 1): a worker claims
 the runs of the agents it registered, and agents that share one database must each step their own schedulers, or a
 worker of one fires another's schedule into an agent it does not know. Slice 6 is split: the coder runs schedules
-(6a, the component shared as `adam_schedule::reconcile_until_stopped`); reconciling on a dev reload (6b) is not built. Nobody answers a firing, so one that asks stays waiting until it is
+(6a, the component shared as `adam_schedule::reconcile_until_stopped`); reconciling on a dev reload (6b) is not built.
+
+*Amended* (2026-11-20, slice 6b): a dev reload gives the schedules in force, `LiveAssembly::schedules()` (a refused
+reload keeps them), and the host that runs schedules reconciles with them when `generation()` moves; `adam-assembly`
+neither registers the scheduler nor reconciles, so it stays free of `adam-schedule`. Nobody answers a firing, so one that asks stays waiting until it is
 cancelled; ending an unattended run instead of asking (6c) is not built either.
 
 ## Context
