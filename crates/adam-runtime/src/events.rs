@@ -775,21 +775,51 @@ pub struct RunSubscription {
     rx: broadcast::Receiver<SinkEvent>,
 }
 
+/// What [`RunSubscription::recv_or_lag`] received: the run's next event, or word that events were
+/// lost. A closed enum on purpose: a new kind breaks every `match` on it.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "returned by value once per event; a box would allocate for every event"
+)]
+pub enum Received {
+    /// The run's next event.
+    Event(RunEvent),
+    /// The subscriber fell behind the sink's channel, which kept only its newest events: this many
+    /// were dropped before it read them. The count is of the sink's events, **every run's**, so it
+    /// is an upper bound on how many of this run's were lost (at least one event was). What the
+    /// run is now is in its durable record; the next receive is the oldest event the channel kept.
+    Lagged(u64),
+}
+
 impl RunSubscription {
     /// The next event of the run, or `None` once the sink is gone. The events the sink
     /// remembered when the subscription was made come first, then the live ones, each once and in
-    /// order. Events dropped because this subscriber lagged are skipped.
+    /// order. Events dropped because this subscriber lagged are skipped (logged at `warn`): a
+    /// consumer that must know uses [`recv_or_lag`](Self::recv_or_lag).
     pub async fn recv(&mut self) -> Option<RunEvent> {
+        loop {
+            match self.recv_or_lag().await? {
+                Received::Event(event) => return Some(event),
+                Received::Lagged(n) => {
+                    tracing::warn!(run = %self.run, skipped = n, "event subscriber lagged");
+                }
+            }
+        }
+    }
+
+    /// As [`recv`](Self::recv), but a lag is said instead of skipped: [`Received::Lagged`] with
+    /// how many events the subscriber missed, then the events the channel kept, in order. `None`
+    /// once the sink is gone.
+    pub async fn recv_or_lag(&mut self) -> Option<Received> {
         if let Some(event) = self.backlog.pop_front() {
-            return Some(event);
+            return Some(Received::Event(event));
         }
         loop {
             match self.rx.recv().await {
-                Ok(e) if e.run == self.run => return Some(e.event),
+                Ok(e) if e.run == self.run => return Some(Received::Event(e.event)),
                 Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(run = %self.run, skipped = n, "event subscriber lagged");
-                }
+                Err(broadcast::error::RecvError::Lagged(n)) => return Some(Received::Lagged(n)),
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
         }
@@ -1081,6 +1111,60 @@ mod tests {
                 message: "b".into()
             })
         );
+    }
+
+    /// A subscriber that falls behind is told how many events it missed, then reads the newest the
+    /// channel kept, in order; `recv` skips the same lag, and both end when the sink is gone.
+    #[tokio::test]
+    async fn recv_or_lag_says_how_many_events_a_slow_subscriber_missed() {
+        let sink = BroadcastSink::new(4);
+        let (run, other) = (RunId::new(), RunId::new());
+        let mut told = sink.subscribe_run(run);
+        let mut skipped = sink.subscribe_run(run);
+        for n in 0..8 {
+            sink.emit(run, "x", progress(n)).await;
+        }
+        // Another run's events fill the channel too: the count is the sink's.
+        sink.emit(other, "x", progress(99)).await;
+        sink.emit(run, "x", progress(8)).await;
+
+        assert_eq!(told.recv_or_lag().await, Some(Received::Lagged(6)));
+        let mut rest = Vec::new();
+        for _ in 0..3 {
+            rest.push(told.recv_or_lag().await.expect("an event"));
+        }
+        assert_eq!(
+            rest,
+            [6, 7, 8].map(|n| Received::Event(progress(n))).to_vec(),
+            "the newest the channel kept, the other run's left out"
+        );
+
+        assert_eq!(
+            skipped.recv().await,
+            Some(progress(6)),
+            "recv skips the lag"
+        );
+        drop(sink);
+        assert_eq!(told.recv_or_lag().await, None);
+        assert_eq!(skipped.recv().await, Some(progress(7)));
+        assert_eq!(skipped.recv().await, Some(progress(8)));
+        assert_eq!(skipped.recv().await, None);
+    }
+
+    /// The replay comes first through `recv_or_lag` too: a lag is only ever of the live events.
+    #[tokio::test]
+    async fn recv_or_lag_gives_the_replay_before_a_lag() {
+        let sink = BroadcastSink::new(2);
+        let run = RunId::new();
+        sink.emit(run, "x", progress(0)).await;
+        let mut sub = sink.subscribe_run(run);
+        for n in 1..=4 {
+            sink.emit(run, "x", progress(n)).await;
+        }
+        assert_eq!(sub.recv_or_lag().await, Some(Received::Event(progress(0))));
+        assert_eq!(sub.recv_or_lag().await, Some(Received::Lagged(2)));
+        assert_eq!(sub.recv_or_lag().await, Some(Received::Event(progress(3))));
+        assert_eq!(sub.recv_or_lag().await, Some(Received::Event(progress(4))));
     }
 
     fn progress(n: usize) -> RunEvent {

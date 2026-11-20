@@ -4,9 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { InfraError } from '../lib/agents/common.mjs';
-import { MODEL, OpenCodeAgent, opencodeConfig, opencodeEnv, opencodeExportScript, opencodeInput, opencodeRunScript, parseEvents } from '../lib/agents/opencode.mjs';
+import { MODEL, OpenCodeAgent, opencodeConfig, opencodeEnv, containerName, opencodeCloneScript, opencodeExportScript, opencodeInput, opencodeRunScript, parseEvents } from '../lib/agents/opencode.mjs';
 import { FakeContainers } from '../lib/containers.mjs';
 import { IntegrityError } from '../lib/npm.mjs';
+import { runId, RUN_ID_MAX } from '../lib/plan.mjs';
 import { PINS } from '../lib/pins.mjs';
 import { RUNTIME } from '../lib/runtime.mjs';
 import { createScriptedModel } from '../lib/scripted-model.mjs';
@@ -96,10 +97,17 @@ const EVENTS = [
 ];
 const jsonl = (events) => `${events.map((e) => JSON.stringify(e)).join('\n')}\n`;
 
+test('OpenCode\'s input counts its cached tokens, as adam\'s and the meter\'s do, and cached is a part of it', () => {
+  // the pilot's real numbers: 7,488 plain input and 43,904 cache reads, which the meter would count as 51,392 input
+  const r = parseEvents(jsonl([{ type: 'step_finish', sessionID: 'ses_abc123XYZ', part: { tokens: { input: 7488, output: 10, reasoning: 0, cache: { write: 0, read: 43904 } } } }]));
+  assert.deepEqual(r.selfReported, { input: 51392, output: 10, cached: 43904, calls: 1 });
+  assert.ok(r.selfReported.cached <= r.selfReported.input);
+});
+
 test('the events give the session, the steps and what OpenCode says it used', () => {
   const r = parseEvents(jsonl(EVENTS));
   assert.equal(r.sessionId, 'ses_abc123XYZ');
-  assert.deepEqual(r.selfReported, { input: 150, output: 20, cached: 47, calls: 2 });
+  assert.deepEqual(r.selfReported, { input: 199, output: 20, cached: 47, calls: 2 });
   assert.equal(r.errors, 0);
 });
 
@@ -246,7 +254,7 @@ test('run: the container of the task image by digest, as uid 10001, the binary r
   assert.equal(mounts['/work'].source, workRoot);
   assert.equal(result.exit, 'done');
   assert.equal(result.sessionId, 'ses_abc123XYZ');
-  assert.deepEqual(result.selfReported, { input: 150, output: 20, cached: 47, calls: 2 });
+  assert.deepEqual(result.selfReported, { input: 199, output: 20, cached: 47, calls: 2 });
   assert.equal(result.record.limits, 'runtime');
   const exp = containers.runs.find((s) => s.script.includes('session export'));
   assert.match(exp.script, /session export --standalone 'ses_abc123XYZ'/);
@@ -559,4 +567,41 @@ test('the real OpenCode puts the shared prompt file in the system prompt it send
   assert.equal(ran.status, 0, fs.readFileSync(path.join(out, 'stderr.txt'), 'utf8').slice(-600));
   const system = model.requests[0].body.messages.filter((m) => m.role === 'system').map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join('\n');
   assert.ok(system.includes(marker), 'the file named in `instructions` is in the system prompt');
+});
+
+const LONGEST = [
+  'instance_element-hq__element-web-1077729a19c0ce902e713cf6fab42c91fb7907f1-vnan',
+  'instance_ansible__ansible-5f4e332e3762999d94af27746db29ff1729252c1-v0f01c69f1e2528b935359cfe578530722bca2c59',
+  'instance_internetarchive__openlibrary-0dc5b20fa186f9714f8a838178597e69f549d026-v2d9a6c849c60ed19fd0858ce9e40b7cc8e096e59',
+  'instance_gravitational__teleport-e6895d8934f6e484341034869901145fbc025e72-vce94f93ad1030e3136852817f2423c1b3ac37bc4',
+];
+
+test('every run id the plan makes is accepted by the OpenCode script, the container name and the ledger, at the longest', () => {
+  for (const task of [...LONGEST, 'x'.repeat(300)]) {
+    for (const prefix of ['', 'pilot.']) {
+      const id = runId(task, 'opencode', 'default', { prefix });
+      assert.ok(id.length <= RUN_ID_MAX);
+      const title = `${id}-a12`;
+      assert.doesNotThrow(() => opencodeRunScript({ ...paths, run: title }), id);
+      const name = containerName(id, 12);
+      assert.match(name, /^[A-Za-z0-9][A-Za-z0-9_.-]{0,60}$/, 'room is left for the -x of the export container');
+      assert.ok(`${name}-x`.length <= 63);
+    }
+  }
+  assert.ok(runId('x'.repeat(300), 'opencode', 'default', { prefix: 'pilot.' }).length === RUN_ID_MAX, 'the longest id is the maximum, not less');
+});
+
+test('two long run ids that differ only at their end never share a container name', () => {
+  const a = runId(LONGEST[1], 'opencode', 'default');
+  const b = runId(LONGEST[1], 'opencode', 'other');
+  assert.notEqual(containerName(a, 1), containerName(b, 1));
+  assert.notEqual(containerName(a, 1), containerName(a, 2));
+  assert.equal(containerName('r1', 1), 'adam-bench-oc-r1-a1');
+});
+
+test('the clone for OpenCode names safe.directory in a global file, as the pusher does', () => {
+  const script = opencodeCloneScript({ repo: '/work/bench-base/base.git', dir: '/work/workspaces/oc-r1-a1/demo' });
+  assert.match(script, /GIT_CONFIG_GLOBAL=\/tmp\/bench-gitconfig/);
+  assert.doesNotMatch(script, /GIT_CONFIG_COUNT/);
+  assert.throws(() => opencodeCloneScript({ repo: '/work/a b', dir: '/work/x' }), /plain/);
 });

@@ -366,11 +366,13 @@ export function buildReport(foldedOrRecords, opts = {}) {
       rs.length,
       sum(rs.map((v) => v.tokens.input)),
       sum(rs.map((v) => v.result.selfReported.input ?? 0)),
+      sum(rs.map((v) => v.tokens.cached)),
+      sum(rs.map((v) => v.result.selfReported.cached ?? 0)),
       sum(rs.map((v) => v.tokens.output)),
       sum(rs.map((v) => v.result.selfReported.output ?? 0)),
     ]);
-    out.push('\nThe meter counts every call; an agent may count fewer (subagents, retries). The meter decides the cap.\n\n');
-    out.push(table(['Agent', 'Runs', 'Meter input', 'Reported input', 'Meter output', 'Reported output'], rows));
+    out.push('\nThe meter counts every call; an agent may count fewer (subagents, retries). The meter decides the cap. Input is every input token, the cached ones included, for the meter and for both agents (cached is a part of it); the meter\'s cost is the truth, these columns only compare counts.\n\n');
+    out.push(table(['Agent', 'Runs', 'Meter input', 'Reported input', 'Meter cached', 'Reported cached', 'Meter output', 'Reported output'], rows));
   } else {
     out.push('\nNo run recorded its own token count.\n');
   }
