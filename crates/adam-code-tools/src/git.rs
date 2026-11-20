@@ -1,5 +1,6 @@
 //! Where the tools ask `git` ([`GitAt`]) and the one question every tool asks: the files of a
-//! slot ([`list_files`]). The coder asks more of the same `GitAt` (`adam_coder`'s `tools::gitcli`).
+//! slot ([`list_files`]), and what `git status` says ([`status_text`]). The coder asks more of the
+//! same `GitAt` (`adam_coder`'s `tools::gitcli`).
 //!
 //! A question is asked **pinned** to the slot's repository as the workspace's metadata names it:
 //! never to wherever the slot's `.git` file, a `commondir` or a `gitdir` says, which a run's commands
@@ -208,6 +209,22 @@ pub async fn git_stdout(at: &GitAt, args: &[&str]) -> Option<String> {
     let out = at.command().await?.args(args).output().await.ok()?;
     out.success
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// What `git status` says, exactly as it says it (`--porcelain=v1 -z`, every untracked file): a
+/// cheap picture of the worktree that needs no commit and no index copy. Not trimmed, unlike
+/// [`git_stdout`]: an entry's status starts with a space when nothing is staged (` M a`), and that
+/// space is part of what it says.
+pub async fn status_text(at: &GitAt) -> Option<String> {
+    let out = at
+        .command()
+        .await?
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .await
+        .ok()?;
+    out.success
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Most paths [`list_files`] gives.

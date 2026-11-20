@@ -1,5 +1,6 @@
 //! The `git` questions and restores of the coder's own tools, asked at a [`GitAt`]. `GitAt`, the
-//! file listing and [`git_stdout`] are `adam_code_tools::git` (ADR 0047) and re-exported here.
+//! file listing, [`git_stdout`] and [`status_text`] are `adam_code_tools::git` (ADR 0047) and
+//! re-exported here.
 //! Asked **pinned** to the slot's repository as the coder's own metadata names it: never to wherever
 //! the slot's `.git` file, a `commondir` or a `gitdir` says, which a run's commands write. No
 //! credentials are involved.
@@ -8,7 +9,7 @@ use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 
-pub(crate) use adam_code_tools::git::{GitAt, git_stdout};
+pub(crate) use adam_code_tools::git::{GitAt, git_stdout, status_text};
 /// The commit `HEAD` points at.
 pub(crate) async fn head_sha(at: &GitAt) -> Option<String> {
     git_stdout(at, &["rev-parse", "HEAD"])
@@ -77,16 +78,6 @@ pub(crate) async fn point_head(at: &GitAt, head_ref: Option<&str>, head: &str) -
             .await
             .is_some(),
     }
-}
-
-/// What `git status` says, as it says it (`--porcelain=v1 -z`, every untracked file): a cheap
-/// picture of the worktree that needs no commit and no index copy.
-pub(crate) async fn status_text(at: &GitAt) -> Option<String> {
-    git_stdout(
-        at,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    )
-    .await
 }
 
 /// The parts of the repository that are shared with every run and that a model's command could

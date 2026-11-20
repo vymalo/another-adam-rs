@@ -92,6 +92,17 @@ async fn offered_by(
 ) -> Vec<ToolNote> {
     let (more, notes) = offered(sources, source_ctx, &request.tools).await;
     request.tools.extend(more);
+    // What a source has already given the run during itself goes at the end, after everything:
+    // a load appends to the tools array and never inserts into it, so the request before is a byte
+    // prefix of this one (ADR 0044, decision 1). The copy it had in place is taken out.
+    let appended = appended_by(sources, source_ctx).await;
+    if !appended.is_empty() {
+        let names: Vec<&str> = appended.iter().map(|spec| spec.name.as_str()).collect();
+        request
+            .tools
+            .retain(|spec| !names.contains(&spec.name.as_str()));
+        request.tools.extend(appended);
+    }
     refined(sources, source_ctx, &mut request.tools).await;
     // What a source holds back is not shown, the agent's own tools included.
     let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
@@ -172,7 +183,8 @@ fn does_work(session: &SessionSummary) -> bool {
     session.does_work()
 }
 use crate::source::{
-    DynToolSource, SourceCtx, ToolNote, ToolSource, instructed, offered, refined, withheld,
+    DynToolSource, SourceCtx, ToolNote, ToolSource, appended_by, instructed, offered, refined,
+    withheld,
 };
 use crate::state::Extensions;
 use crate::step_io::StepIo;
@@ -287,6 +299,9 @@ struct CallFacts {
     /// The words the run was started with (`Conversation::task`), for a source that decides from
     /// them: the same text at every turn and at every call.
     task: Option<Arc<str>>,
+    /// The MCP servers the run has loaded so far (`Conversation::loaded_servers`): what `use_server`
+    /// reads to refuse a second load, and what the source that withholds a server's tools reads.
+    loaded_servers: Arc<[String]>,
 }
 
 /// What the calls of a turn that starts while the model writes need from the run, owned: taken
@@ -302,6 +317,8 @@ struct EarlyFacts {
     images: ImageGate,
     output_cut: bool,
     task: Option<Arc<str>>,
+    /// The MCP servers the run has loaded as the turn starts, for the calls that read them.
+    loaded_servers: Arc<[String]>,
     turn: crate::early::Turn,
     /// The committed `repeats` of the run, for the doom-loop decision of the first call.
     repeats: Option<Repeats>,
@@ -449,6 +466,7 @@ impl<'a> Early<'a> {
             kept_left: self.facts.kept_left,
             images: self.facts.images.clone(),
             task: self.facts.task.clone(),
+            loaded_servers: Arc::clone(&self.facts.loaded_servers),
         };
         let mut prepared = self.agent.prepare(
             &self.facts.ctx,
@@ -1908,6 +1926,7 @@ impl LlmAgent {
                 context.cloned().unwrap_or_default(),
             )
             .with_task(state.task())
+            .with_loaded_servers(Arc::from(state.loaded_servers.clone()))
         });
         let turn = state.turns;
         let seen = state.messages.len();
@@ -1960,6 +1979,7 @@ impl LlmAgent {
             images: self.image_gate(state),
             output_cut: state.output_cut,
             task: state.task().map(Arc::from),
+            loaded_servers: Arc::from(state.loaded_servers.clone()),
             turn: crate::early::Turn {
                 limit: self.max_parallel,
                 closing,
@@ -2480,6 +2500,7 @@ impl LlmAgent {
                 Arc::new(state.context.clone()),
             )
             .with_task(state.task())
+            .with_loaded_servers(Arc::from(state.loaded_servers.clone()))
         });
         let run = ctx.run_id();
         let cancel = ctx.cancel_token();
@@ -2671,18 +2692,21 @@ impl LlmAgent {
             return None;
         }
         let tool = self.tool(SUBAGENT_READ)?.clone();
-        let tool_ctx = self.tool_ctx(
-            ctx,
-            context,
-            (
-                state.root_run,
-                state.root_step.as_deref(),
-                state.plan.as_ref(),
-            ),
-            &state.source_notes,
-            "report",
-            SUBAGENT_READ,
-        );
+        let tool_ctx = self
+            .tool_ctx(
+                ctx,
+                context,
+                (
+                    state.root_run,
+                    state.root_step.as_deref(),
+                    state.plan.as_ref(),
+                ),
+                &state.source_notes,
+                "report",
+                SUBAGENT_READ,
+            )
+            .with_task(state.task().map(Arc::from))
+            .with_loaded_servers(Arc::from(state.loaded_servers.clone()));
         let in_history = state
             .messages
             .iter()
@@ -3065,6 +3089,7 @@ impl LlmAgent {
                         kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
                         images: self.image_gate(state),
                         task: state.task().map(Arc::from),
+                        loaded_servers: Arc::from(state.loaded_servers.clone()),
                     },
                     started,
                 )
@@ -3077,6 +3102,7 @@ impl LlmAgent {
                     answer,
                     repeat_key,
                     plan,
+                    loaded_servers,
                     kept,
                     reported,
                     pinned,
@@ -3091,6 +3117,9 @@ impl LlmAgent {
                     record_answer(state, key, &message, repeat_key);
                     if let Some(plan) = plan {
                         state.plan = Some(*plan);
+                    }
+                    if !loaded_servers.is_empty() {
+                        state.load_servers(loaded_servers);
                     }
                     // What the call asked the run to keep, within what the run may keep: the call was
                     // told its room (`ToolCtx::kept_left`), so a result over it was never offered.
@@ -3357,6 +3386,7 @@ impl LlmAgent {
                 kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
                 images: self.image_gate(state),
                 task: state.task().map(Arc::from),
+                loaded_servers: Arc::from(state.loaded_servers.clone()),
             };
             let mut one = self.prepare(&facts_of_ctx, context, root, &notes, call, facts);
             match &first {
@@ -3486,6 +3516,7 @@ impl LlmAgent {
                 answer,
                 repeat_key,
                 plan,
+                loaded_servers,
                 kept,
                 reported,
                 pinned,
@@ -3505,6 +3536,9 @@ impl LlmAgent {
             record_answer(state, key, &message, repeat_key);
             if let Some(plan) = plan {
                 state.plan = Some(*plan);
+            }
+            if !loaded_servers.is_empty() {
+                state.load_servers(loaded_servers);
             }
             state.keep_output(kept);
             state.keep_tool_images(kept_images);
@@ -3815,6 +3849,7 @@ impl LlmAgent {
             kept_left,
             images,
             task,
+            loaded_servers,
             ..
         } = facts;
         let note = self.source_note(notes, &call.name);
@@ -3822,6 +3857,8 @@ impl LlmAgent {
         let tool_ctx = self
             .tool_ctx(ctx, context, root, notes, &call.id, &call.name)
             .with_note(note.cloned())
+            .with_task(task.clone())
+            .with_loaded_servers(Arc::clone(&loaded_servers))
             .with_files_left((MAX_RUN_FILE_BYTES as u64).saturating_sub(files_used))
             .with_kept(kept_left, kept)
             .with_images(
@@ -3840,7 +3877,8 @@ impl LlmAgent {
                     ctx.conversation_id.clone(),
                     context.cloned().unwrap_or_default(),
                 )
-                .with_task(task.as_deref()),
+                .with_task(task.as_deref())
+                .with_loaded_servers(loaded_servers),
             )
         });
         Prepared {
@@ -4037,7 +4075,7 @@ impl LlmAgent {
                     std::mem::take(&mut output.reported)
                 };
                 let pinned = output.pinned && !output.is_error;
-                let (message, artifacts, answer, plan, outcome, kept, kept_images) =
+                let (message, artifacts, answer, plan, loaded_servers, outcome, kept, kept_images) =
                     output_message(
                         ctx,
                         &call.id,
@@ -4068,6 +4106,7 @@ impl LlmAgent {
                     answer,
                     repeat_key,
                     plan,
+                    loaded_servers,
                     kept,
                     reported,
                     pinned,
@@ -4332,6 +4371,8 @@ impl LlmAgent {
                 &wait.call_id,
                 &wait.tool,
             )
+            .with_task(state.task().map(Arc::from))
+            .with_loaded_servers(Arc::from(state.loaded_servers.clone()))
             .with_files_left(
                 (MAX_RUN_FILE_BYTES as u64).saturating_sub(files_kept(&state.artifacts)),
             )
@@ -4361,7 +4402,7 @@ impl LlmAgent {
                     Self::count_rounds(ctx, state, false).await?;
                 }
                 let used = files_kept(&state.artifacts);
-                let (message, artifacts, answer, plan, outcome, kept, kept_images) =
+                let (message, artifacts, answer, plan, loaded_servers, outcome, kept, kept_images) =
                     output_message(
                         ctx,
                         &wait.call_id,
@@ -4379,6 +4420,9 @@ impl LlmAgent {
                 }
                 if let Some(plan) = plan {
                     state.plan = Some(*plan);
+                }
+                if !loaded_servers.is_empty() {
+                    state.load_servers(loaded_servers);
                 }
                 owed(state, message);
                 Ok(Some(outcome))
@@ -4456,6 +4500,7 @@ async fn output_message(
     Vec<ArtifactRef>,
     Option<Announcement>,
     Option<Box<Plan>>,
+    Vec<String>,
     StepState,
     Option<Box<KeptOutput>>,
     Vec<KeptImage>,
@@ -4506,6 +4551,11 @@ async fn output_message(
         .filter(|_| !output.is_error)
         .map(|text| Announcement { text, ends_turn });
     let plan = output.plan.take().filter(|_| !output.is_error);
+    let loaded_servers = if output.is_error {
+        Vec::new()
+    } else {
+        std::mem::take(&mut output.loaded_servers)
+    };
     // The images of a result that failed are not shown: the person's screen and the model read the
     // text, and an image nobody chose to send is not kept.
     let (images, kept_images) = if output.is_error {
@@ -4524,7 +4574,16 @@ async fn output_message(
         is_error: output.is_error,
         images,
     };
-    (message, refs, answer, plan, outcome, kept, kept_images)
+    (
+        message,
+        refs,
+        answer,
+        plan,
+        loaded_servers,
+        outcome,
+        kept,
+        kept_images,
+    )
 }
 
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
@@ -4706,6 +4765,7 @@ impl ToolResult {
             answer: None,
             repeat_key: None,
             plan: None,
+            loaded_servers: Vec::new(),
             kept: None,
             reported: Vec::new(),
             pinned: false,
@@ -4724,6 +4784,8 @@ enum ToolResult {
         repeat_key: Option<String>,
         /// The plan the tool returned, from a result that is not an error.
         plan: Option<Box<Plan>>,
+        /// The MCP servers the run has loaded, from a result that is not an error: the whole list.
+        loaded_servers: Vec<String>,
         /// A long output the tool asks the run to keep in its state.
         kept: Option<Box<KeptOutput>>,
         /// The rounds of sessions whose reports the result gives, from a result that is not an

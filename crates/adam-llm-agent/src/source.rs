@@ -127,6 +127,7 @@ pub struct SourceCtx {
     conversation_id: Option<String>,
     context: Arc<Map<String, Value>>,
     task: Option<Arc<str>>,
+    loaded_servers: Arc<[String]>,
 }
 
 impl SourceCtx {
@@ -142,6 +143,7 @@ impl SourceCtx {
             conversation_id,
             context,
             task: None,
+            loaded_servers: Arc::default(),
         }
     }
 
@@ -202,6 +204,24 @@ impl SourceCtx {
     /// this, so what it offers is decided before the run's first model call and never moves.
     pub fn task(&self) -> Option<&str> {
         self.task.as_deref()
+    }
+
+    /// This context with the MCP servers the run has loaded so far, in the order it loaded them
+    /// ([`Conversation::loaded_servers`](crate::Conversation::loaded_servers)): the agent sets it
+    /// on every context it makes, from the state as it stands before the turn, so a server loaded
+    /// in the turn before is not withheld from this one. A test may set it on a
+    /// [`detached`](Self::detached) context.
+    #[must_use]
+    pub fn with_loaded_servers(mut self, servers: impl Into<Arc<[String]>>) -> Self {
+        self.loaded_servers = servers.into();
+        self
+    }
+
+    /// The MCP servers the run has loaded so far, in the order it loaded them: a source that
+    /// withholds a server's tools (an MCP server's `when`) stops withholding it once its name is
+    /// here, and offers its tools from [`appended`](ToolSource::appended) instead.
+    pub fn loaded_servers(&self) -> &[String] {
+        &self.loaded_servers
     }
 }
 
@@ -268,12 +288,41 @@ pub trait ToolSource: Send + Sync + 'static {
         Listing::new(self.specs(ctx).await)
     }
 
+    /// The tools this source's system has given the run **during itself**, in the order it loaded
+    /// them, to be offered **after every other tool** of the turn: a load appends to the tools array
+    /// and never inserts into it, so the request before stays a byte prefix of the one after it
+    /// (ADR 0044, decision 1). A tool named here is taken out of the place it would have had (the
+    /// agent's own list, or this source's listing) and put at the end; the source must therefore
+    /// also stop withholding it from [`withhold`](Self::withhold). The order is the source's and is
+    /// never sorted: the second load follows the first.
+    ///
+    /// Read inside the journaled step of the model call, from the run's state
+    /// ([`SourceCtx::loaded_servers`]), so a replay offers the same array. The default is none,
+    /// which is what a source written before this method existed offers.
+    async fn appended(&self, ctx: &SourceCtx) -> Vec<ToolSpec> {
+        let _ = ctx;
+        Vec::new()
+    }
+
     /// Words to add to the agent's instructions on this turn, when the run's context calls for them
     /// (the agents a person mentioned, for instance). `None`, the default, adds nothing. Like
     /// [`specs`](Self::specs) it runs only when the model is really called, inside the journaled
     /// step: text for the model to read, never what a call does. The agent appends what the
     /// sources say, in their order, after its own instructions, each part set apart by a blank line.
     async fn instructions(&self, ctx: &SourceCtx) -> Option<String> {
+        let _ = ctx;
+        None
+    }
+
+    /// Words this source adds to the agent's instructions **during** the run, after everything
+    /// [`instructions`](Self::instructions) says: the words of a system the run loaded during
+    /// itself ([`SourceCtx::loaded_servers`]), which must follow the prompt and never be inserted
+    /// into it, or the request before would stop being a byte prefix of the one after (ADR 0044,
+    /// decision 1). `adam-assembly`'s `McpSelect` offers a server loaded with `use_server` here, so
+    /// its section comes after the agents a person mentioned, the access tier and references.
+    /// `None`, the default, adds nothing, which is what a source written before this method
+    /// existed offers.
+    async fn appended_instructions(&self, ctx: &SourceCtx) -> Option<String> {
         let _ = ctx;
         None
     }
@@ -419,6 +468,20 @@ fn keep_notes(notes: &mut Vec<ToolNote>, from: Vec<ToolNote>, kept: &[ToolSpec])
     }
 }
 
+/// The tools the sources say the run has loaded during itself, in their order, each name once: the
+/// suffix the tools array of this turn grows by, never an insertion.
+pub(crate) async fn appended_by(sources: &[DynToolSource], ctx: &SourceCtx) -> Vec<ToolSpec> {
+    let mut out: Vec<ToolSpec> = Vec::new();
+    for source in sources {
+        for spec in source.appended(ctx).await {
+            if !out.iter().any(|one| one.name == spec.name) {
+                out.push(spec);
+            }
+        }
+    }
+    out
+}
+
 /// What `sources` hold back of `tools` on this turn, in order: the names, each once, with the first
 /// reason. A name a source answers that is not among `tools` is not kept.
 pub(crate) async fn withheld(
@@ -438,11 +501,20 @@ pub(crate) async fn withheld(
 }
 
 /// What the sources add to the agent's instructions for this turn, in order, as one text (blank-line
-/// separated); `None` when none says anything.
+/// separated); `None` when none says anything. What a source gave the run **during** itself
+/// ([`ToolSource::appended_instructions`]) goes after everything else, the way its tools do: a load
+/// appends to the prompt and never inserts into it.
 pub(crate) async fn instructed(sources: &[DynToolSource], ctx: &SourceCtx) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for source in sources {
         if let Some(text) = source.instructions(ctx).await
+            && !text.trim().is_empty()
+        {
+            parts.push(text.trim().to_owned());
+        }
+    }
+    for source in sources {
+        if let Some(text) = source.appended_instructions(ctx).await
             && !text.trim().is_empty()
         {
             parts.push(text.trim().to_owned());

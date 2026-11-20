@@ -344,12 +344,11 @@ async fn run_keeps_what_a_command_writes_and_lists_the_changes() {
         "mkdir -p out && echo made > out/a.txt && echo more >> README.md && echo rendered";
     let made = rig.make(json!({ "command": command })).await;
     assert!(!made.is_error);
-    // The first line of `git status` has lost its leading space (` M` reads `M`): the status is
-    // read through `git_stdout`, which trims. Pinned as it is today.
+    // As `git status` lists them: a change not staged keeps its leading space, first or not.
     assert_eq!(
         made.content,
         format!(
-            "$ {command}\nexit code 0\n--- output ---\nrendered\n{CHANGES}M README.md\n?? out/a.txt\n\
+            "$ {command}\nexit code 0\n--- output ---\nrendered\n{CHANGES} M README.md\n?? out/a.txt\n\
              {CHECK_AGAIN}"
         )
     );
@@ -913,7 +912,7 @@ async fn run_cuts_a_long_list_of_changes_and_says_when_git_lists_none() {
     );
 
     // An edit of the run's put back as `HEAD` has it: the tree changed, and `git status` lists
-    // nothing. (The note says the files are ignored, which they are not; pinned as it is.)
+    // nothing, and the note says why it may be: ignored, or back as `HEAD` has them.
     let rig = Rig::prepared().await;
     std::fs::write(rig.worktree().join("README.md"), "edited\n").unwrap();
     let command = "printf 'widgets\\n' > README.md";
@@ -923,7 +922,7 @@ async fn run_cuts_a_long_list_of_changes_and_says_when_git_lists_none() {
         none.content,
         format!(
             "$ {command}\nexit code 0\n--- output ---\n\n{CHANGES}(nothing that git lists: the \
-             files it changed are ignored by the project)\n{CHECK_AGAIN}"
+             files it changed are ignored by the project, or are back as HEAD has them)\n{CHECK_AGAIN}"
         )
     );
     assert_eq!(

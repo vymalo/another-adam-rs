@@ -44,6 +44,18 @@ guard kept are said, with `changed files: ...`; an undone or unreadable look is 
 guard (a blank command, a timeout, an unknown place, a `cwd` outside it) have no note and take no guard; a missing tool is
 the workspace's answer with `the workspace lacks a tool`, or the command's result when it has none; the command is scrubbed
 and a failed one carries its repeat key; and `after_run` is never called.
+`tests/run.rs` does the same for `adam_code_tools::make::run`, the guard taken for a `Make`: files the guard saw change are
+listed from `git status` (in a repository the test makes: exactly as git lists them, the first entry with its leading
+space; with nothing listed in a repository, said as files ignored or back as `HEAD` has them; with no repository, that git
+could not say) with the text of `after_run`
+after them and `changed files: ...`; an unchanged run says git sees no change, and an unwatched one is the result alone,
+both with `ran: ...`; a run that touched git (`undid a change to git made by: ...`) or after which git could not be read
+(`could not check git after: ...; undid it`) is refused with the note, restored or not, and without the text of
+`after_run`; a refusal of the guard is the answer with the note and nothing runs; the refusals before the guard (also a
+place that may only be read) have no note, take no guard and call no `after_run`; for every run that ran, the calls are
+the guard, `after_run` once, then `settle`, in that order; a failing `after_run` is the tool's error once the guard is
+settled; a missing tool is the workspace's answer or the result; the command is scrubbed and a failed
+one carries its repeat key.
 `cargo test -p adam-code-tools-testkit` (needs `git`); nothing needs a database.
 
 ## See also

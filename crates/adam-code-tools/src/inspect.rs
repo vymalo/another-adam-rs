@@ -125,7 +125,12 @@ const KEPT_BY_THE_WORKSPACE: &str =
     "(the command changed files here, and this workspace does not undo them: they stay)\n";
 
 /// A refusal of the guard, with the workspace's note.
-fn noted(ws: &dyn CommandWorkspace, ctx: &ToolCtx, place: &Place, mut text: String) -> String {
+pub(crate) fn noted(
+    ws: &dyn CommandWorkspace,
+    ctx: &ToolCtx,
+    place: &Place,
+    mut text: String,
+) -> String {
     text.push_str(&ws.refusal_note(ctx, place));
     text
 }
@@ -147,7 +152,8 @@ fn changed_the_worktree(command: &str, outcome: &ShellOutcome, restored: bool) -
 }
 
 /// The command, how it ended, and the tail of its output. A non-zero exit is said plainly: for a
-/// command that only looks, it is an answer ("no such file"), not a failure.
+/// command that only looks, it is an answer ("no such file"), not a failure. `run`
+/// ([`make::run`](crate::make::run)) starts its result with it too.
 pub fn render(command: &str, outcome: &ShellOutcome) -> String {
     let how = if outcome.timed_out {
         "timed out (the command was killed)".to_owned()

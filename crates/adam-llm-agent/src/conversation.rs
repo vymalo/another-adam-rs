@@ -346,6 +346,24 @@ pub struct Conversation {
     /// while empty, so a run that never shortens writes the bytes it always did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shortenings: Vec<u32>,
+    /// The MCP servers the run has loaded **during itself**, in the order it loaded them: a server
+    /// whose `when` the task did not match, loaded by a call to `use_server`. A server here stops
+    /// being withheld from the next model call on, and its tools are **appended** to the tools
+    /// array, never inserted, so the request before stays a byte prefix of the one after it (ADR
+    /// 0044, decision 1); the turns where the array grew are
+    /// [`tools_appended`](Self::tools_appended). A run that continues this one carries the list, so
+    /// its first request offers the tools the run before offered. Absent from state written before
+    /// it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_servers: Vec<String>,
+    /// The turns (the value of [`turns`](Self::turns) when the model was asked) at whose request the
+    /// tools array grew by a server the run loaded ([`loaded_servers`](Self::loaded_servers)): the
+    /// only requests whose head (`system` and `tools`) is not the one before, beside
+    /// [`shortenings`](Self::shortenings) and [`compactions`](Self::compactions), and the only ones
+    /// where it may grow (by a suffix). A run that never loads a server records none. Absent from
+    /// state written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_appended: Vec<u32>,
     /// Model calls made so far.
     #[serde(default)]
     pub turns: u32,
@@ -1103,6 +1121,24 @@ impl Conversation {
         self.continued_within(text, from, MAX_CARRIED_BYTES)
     }
 
+    /// The run has loaded the MCP servers `servers`
+    /// ([`ToolOutput::loaded_servers`](crate::ToolOutput::loaded_servers)): each one it did not have
+    /// is added, in the order given, and the turn of the next model call — the first whose tools
+    /// array grows — is recorded, once however many servers that turn loaded. A list that adds
+    /// nothing records nothing, so a replayed step applies the same list to the state without a
+    /// second entry.
+    pub(crate) fn load_servers(&mut self, servers: Vec<String>) {
+        let before = self.loaded_servers.len();
+        for server in servers {
+            if !self.loaded_servers.contains(&server) {
+                self.loaded_servers.push(server);
+            }
+        }
+        if self.loaded_servers.len() > before && !self.tools_appended.contains(&self.turns) {
+            self.tools_appended.push(self.turns);
+        }
+    }
+
     /// The model has been given the reports of `rounds`: remember them, each once, the oldest
     /// given up past [`MAX_REPORTED_ROUNDS`].
     pub(crate) fn note_reported(&mut self, rounds: &[RunId]) {
@@ -1264,6 +1300,10 @@ impl Conversation {
             context: self.context.clone(),
             plan: self.plan.clone(),
             session: self.session.clone(),
+            // The servers the run loaded are still loaded: its first request must offer the tools
+            // the run before ended with, or the array would lose them. The turns the array grew at
+            // are not carried: this run has no request before its first.
+            loaded_servers: self.loaded_servers.clone(),
             // What code wrote into the marker (pinned results, pointers, skills, the sessions line)
             // comes along as one record, so that a compaction of this run writes it again. The
             // record does not count against this run's `MAX_COMPACTIONS`.
