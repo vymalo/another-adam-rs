@@ -84,6 +84,10 @@ name = "plan_run"
 required-features = ["thread-tools"]
 
 [[test]]
+name = "offer"
+required-features = ["thread-tools"]
+
+[[test]]
 name = "tools"
 required-features = ["thread-tools"]
 

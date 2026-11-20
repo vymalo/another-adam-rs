@@ -150,7 +150,7 @@ fn from_the_screen(text: &str, screen: &Screen) -> Message {
         UI_CATALOG_EXTENSION: {
             "catalogId": c.catalog_id, "version": f64::from(c.version), "digest": c.digest,
             "inline": true},
-        "a2uiClientCapabilities": {"v0.9.1": {
+        "a2uiRendererCapabilities": {"1.0": {
             "supportedCatalogIds": [CATALOG_ID],
             "inlineCatalogs": [as_doubles(&screen.document)]}},
     });
@@ -470,6 +470,7 @@ async fn asked_on(screen: &Screen, args: Value) -> (adam_llm_agent::DynTool, Val
     let c = &screen.claimed;
     let context = json!({
         "vymalo.ui.ref": {"catalogId": c.catalog_id, "version": c.version, "digest": c.digest},
+        "vymalo.a2ui.renderer": {"catalogIds": [c.catalog_id]},
         "vymalo.ui.catalog": {
             "catalogId": c.catalog_id, "version": c.version, "digest": c.digest,
             "catalog": as_doubles(&screen.document)},

@@ -14,11 +14,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use adam_a2a::A2UI_MEDIA_TYPE;
-use adam_a2a_runtime::{CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
+use a2a::{Message, Part, Role};
+use adam_a2a::{A2UI_MEDIA_TYPE, UI_CATALOG_EXTENSION};
+use adam_a2a_runtime::{CONTEXT_A2UI_RENDERER, CONTEXT_UI_CATALOG, CONTEXT_UI_REF, vymalo_inbound};
 use adam_llm_agent::{ToolCtx, ToolError};
 use adam_runtime::NoopSink;
-use adam_ui::{Ui, catalog_digest};
+use adam_ui::{Ui, canonical_json, catalog_digest};
 use jsonschema::{Registry, Resource};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -172,6 +173,11 @@ fn catalog_nine_is_the_published_catalog_and_validates_against_catalog_definitio
         "f6ee69d833ab968ff25ece454f5ad163858bbfa0f8f0d6468f7cb2a0011ebbed"
     );
     let catalog = catalog_nine();
+    // The canonical form is 19,413 UTF-8 bytes (S1 corrected the page's count): 19,411 code points,
+    // for it holds one "…".
+    let canonical = canonical_json(&catalog).unwrap();
+    assert_eq!(canonical.len(), 19_413, "UTF-8 bytes");
+    assert_eq!(canonical.chars().count(), 19_411, "code points");
     let digest = catalog_digest(&catalog).unwrap();
     assert_eq!(
         digest,
@@ -295,10 +301,14 @@ fn screen_context() -> serde_json::Map<String, Value> {
         "catalogId": catalog["catalogId"], "version": 9, "digest": catalog_digest(&catalog).unwrap()});
     let mut inline = reference.clone();
     inline["catalog"] = catalog;
-    json!({CONTEXT_UI_REF: reference, CONTEXT_UI_CATALOG: inline})
-        .as_object()
-        .cloned()
-        .unwrap()
+    json!({
+        CONTEXT_UI_REF: reference,
+        CONTEXT_UI_CATALOG: inline,
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [catalog_nine()["catalogId"]]},
+    })
+    .as_object()
+    .cloned()
+    .unwrap()
 }
 
 async fn call(name: &str, args: Value) -> Result<adam_llm_agent::ToolOutput, ToolError> {
@@ -366,4 +376,41 @@ async fn fresh_ask_show_and_plan_output_validates_against_agent_to_renderer() {
     .unwrap();
     assert_eq!(plan.artifacts.len(), 1);
     assert_valid_surface(&validator, "plan_work", &plan.artifacts[0].data);
+}
+
+/// The capabilities the orchestrator sends (catalog 9 inline, under `"1.0"`) are what
+/// `renderer_capabilities.json` describes, and `vymalo_inbound` turns them into the ref, the inline
+/// catalog and the offer, the only things a tool reads.
+#[test]
+fn the_capabilities_the_orchestrator_sends_validate_and_become_the_ref_the_catalog_and_the_offer() {
+    let catalog = catalog_nine();
+    let id = catalog["catalogId"].clone();
+    let capabilities = json!({"1.0": {"supportedCatalogIds": [id], "inlineCatalogs": [catalog]}});
+    let validator = validator_for(&schema("renderer_capabilities.json"), &catalog);
+    let found = errors(&validator, &capabilities);
+    assert!(found.is_empty(), "{found:#?}");
+    // the validator is not vacuous
+    assert!(!errors(&validator, &json!({"1.0": {"inlineCatalogs": []}})).is_empty());
+    assert!(!errors(&validator, &json!({"v1.0": {"supportedCatalogIds": []}})).is_empty());
+
+    let digest = catalog_digest(&catalog).unwrap();
+    let mut message = Message::new(Role::User, vec![Part::text("hello")]);
+    message.metadata = Some(
+        json!({
+            UI_CATALOG_EXTENSION: {"catalogId": id, "version": 9.0, "digest": digest, "inline": true},
+            "a2uiRendererCapabilities": capabilities,
+        })
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect(),
+    );
+    let context = vymalo_inbound(&message).unwrap().payload["context"].clone();
+    assert_eq!(
+        context[CONTEXT_UI_REF],
+        json!({"catalogId": id, "version": 9, "digest": digest})
+    );
+    assert_eq!(context[CONTEXT_UI_CATALOG]["catalog"], catalog);
+    assert_eq!(context[CONTEXT_A2UI_RENDERER], json!({"catalogIds": [id]}));
 }

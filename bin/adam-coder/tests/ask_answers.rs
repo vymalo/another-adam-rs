@@ -38,6 +38,8 @@ fn screen_of(document: &str, lock: &str) -> Map<String, Value> {
     json!({
         adam_a2a_runtime::CONTEXT_UI_REF: claimed,
         adam_a2a_runtime::CONTEXT_UI_CATALOG: inline,
+        adam_a2a_runtime::CONTEXT_A2UI_RENDERER: {
+            "catalogIds": ["https://agents.vymalo.com/a2ui/catalogs/chat"]},
     })
     .as_object()
     .cloned()

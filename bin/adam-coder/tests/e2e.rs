@@ -4006,7 +4006,7 @@ fn from_the_screen(text: &str, inline: bool, grant: Option<serde_json::Value>) -
     let mut metadata = json!({
         UI_CATALOG_EXTENSION: {
             "catalogId": id, "version": lock["version"], "digest": digest, "inline": inline},
-        "a2uiClientCapabilities": {"v0.9.1": capabilities},
+        "a2uiRendererCapabilities": {"1.0": capabilities},
     });
     if let Some(grant) = grant {
         metadata[THREAD_TOOLS_EXTENSION] = grant;

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use adam_a2a::A2UI_MEDIA_TYPE;
-use adam_a2a_runtime::{CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
+use adam_a2a_runtime::{CONTEXT_A2UI_RENDERER, CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
 use adam_core::RunId;
 use adam_llm_agent::{Plan, PlanStatus, ToolCtx, ToolOutput};
 use adam_mcp::McpPolicy;
@@ -53,6 +53,7 @@ impl Fixture {
         let reference = json!({"catalogId": claimed.catalog_id, "version": claimed.version, "digest": claimed.digest});
         json!({
             CONTEXT_UI_REF: reference,
+            CONTEXT_A2UI_RENDERER: {"catalogIds": [claimed.catalog_id]},
             CONTEXT_UI_CATALOG: {
                 "catalogId": claimed.catalog_id, "version": claimed.version, "digest": claimed.digest,
                 "catalog": document},
@@ -707,6 +708,7 @@ fn changed(base: &Fixture, edit: impl FnOnce(&mut Value)) -> Map<String, Value> 
     let version = lock["version"].as_u64().unwrap();
     json!({
         CONTEXT_UI_REF: {"catalogId": CATALOG_ID, "version": version, "digest": digest},
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [CATALOG_ID]},
         CONTEXT_UI_CATALOG: {
             "catalogId": CATALOG_ID, "version": version, "digest": digest, "catalog": document},
     })

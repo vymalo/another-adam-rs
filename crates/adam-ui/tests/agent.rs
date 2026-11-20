@@ -134,11 +134,11 @@ fn from_the_screen(text: &str, grant: Value, inline: bool) -> Message {
         UI_CATALOG_EXTENSION: {
             "catalogId": c.catalog_id, "version": f64::from(c.version), "digest": c.digest,
             "inline": inline},
-        "a2uiClientCapabilities": {"v0.9.1": {"supportedCatalogIds": [CATALOG_ID]}},
+        "a2uiRendererCapabilities": {"1.0": {"supportedCatalogIds": [CATALOG_ID]}},
         THREAD_TOOLS_EXTENSION: grant,
     });
     if inline {
-        metadata["a2uiClientCapabilities"]["v0.9.1"]["inlineCatalogs"] =
+        metadata["a2uiRendererCapabilities"]["1.0"]["inlineCatalogs"] =
             json!([as_doubles(&document())]);
     }
     let mut message = Message::new(Role::User, vec![Part::text(text)]);

@@ -51,7 +51,7 @@ fn from_the_screen(text: &str, references: &[&str]) -> Message {
         UI_CATALOG_EXTENSION: {
             "catalogId": CATALOG_ID, "version": lock["version"].as_f64().unwrap(),
             "digest": digest, "inline": true},
-        "a2uiClientCapabilities": {"v0.9.1": {
+        "a2uiRendererCapabilities": {"1.0": {
             "supportedCatalogIds": [CATALOG_ID],
             "inlineCatalogs": [as_doubles(&document)]}},
     });

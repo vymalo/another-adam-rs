@@ -237,7 +237,7 @@ fn root_only(ctx: &ToolCtx) -> Result<(), ToolOutput> {
 async fn screen(state: &UiState, ctx: &ToolCtx) -> Option<Arc<Catalog>> {
     match state.resolve(ctx.context_map()).await {
         Resolved::Found(catalog) => Some(catalog),
-        Resolved::NoCatalog | Resolved::Unreadable(_) => None,
+        Resolved::NoCatalog | Resolved::NotOffered | Resolved::Unreadable(_) => None,
     }
 }
 

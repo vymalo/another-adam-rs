@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use adam_a2a_runtime::{CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
+use adam_a2a_runtime::{
+    CONTEXT_A2UI_RENDERER, CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF,
+};
 use adam_llm_agent::{ToolCtx, ToolError, ToolOutput};
 use adam_mcp::McpPolicy;
 use adam_mcp_testkit::ThreadToolsServer;
@@ -60,6 +62,7 @@ fn reference(c: &Claimed) -> Value {
 fn inline_context(document: &Value, c: &Claimed) -> Map<String, Value> {
     json!({
         CONTEXT_UI_REF: reference(c),
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]},
         CONTEXT_UI_CATALOG: {
             "catalogId": c.catalog_id, "version": c.version, "digest": c.digest,
             "catalog": as_doubles(document)},
@@ -71,7 +74,7 @@ fn inline_context(document: &Value, c: &Claimed) -> Map<String, Value> {
 
 /// The context of a message that only said which catalog is current, with a grant for the endpoint.
 fn ref_context(c: &Claimed, grant: Option<(&str, &str, &str)>) -> Map<String, Value> {
-    let mut context = json!({CONTEXT_UI_REF: reference(c)})
+    let mut context = json!({CONTEXT_UI_REF: reference(c), CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]}})
         .as_object()
         .cloned()
         .unwrap();
@@ -692,8 +695,16 @@ async fn show_and_ui_catalog_say_to_answer_in_text_when_there_is_no_catalog_to_r
     for (what, context, expected) in [
         (
             "none",
-            Map::new(),
+            json!({CONTEXT_A2UI_RENDERER: {"catalogIds": [CATALOG_ID]}})
+                .as_object()
+                .cloned()
+                .unwrap(),
             "this screen has no component catalog; answer in text",
+        ),
+        (
+            "not offered",
+            Map::new(),
+            "this screen did not offer a component catalog this turn; answer in text",
         ),
         (
             "unreadable",

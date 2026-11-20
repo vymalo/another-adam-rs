@@ -258,6 +258,14 @@ inbound function reads a screen's action as JSON text.
   from other parties, never instructions. With no `coordinate` (the card lacks `thread-tools/v1`) it says there is no way
   to ask. **Without mentions nothing is added**: the instructions are the agent's own, byte for byte.
 
+**The gate: what the renderer offers this turn.** A tool draws only a catalog that the message of *this turn* offered:
+`vymalo_inbound` keeps `a2uiRendererCapabilities["1.0"]` (its `supportedCatalogIds` and the ids of its `inlineCatalogs`) as
+`vymalo.a2ui.renderer` `{catalogIds}`, and sets it to `null` on a message without that entry. Without the entry, or when it
+does not list the current `catalogId`, `ask_user` asks in words, `show` and `ui_catalog` return an error result that says to
+answer in text and `plan_work` draws no surface. The check comes first: a catalog this process holds in its cache, one the
+message carries and one the thread tools could give are not used (nor asked for). Only `a2uiRendererCapabilities["1.0"]` is
+read; a client that sends the v0.9 keys offers nothing.
+
 None of them fails a run. With no catalog, or one that cannot be read, `show` and `ui_catalog` return an error result
 that says to answer in text; with no grant, or an expired or refused one, the source offers nothing and a call says
 the tools are gone.
@@ -347,10 +355,12 @@ sequenceDiagram
     participant R as Run (Conversation::context)
     participant T as Tool (ask_user, show, ui_catalog)
     participant E as Thread tools (get_ui_catalog)
-    S->>A: message: ui-catalog/v1 {version, digest, inline}, A2UI capabilities with an inline catalog, thread-tools/v1 {url, token, expiresAt}
-    A->>R: context: vymalo.ui.ref, vymalo.ui.catalog (doubles written back as integers), vymalo.threadTools
+    S->>A: message: ui-catalog/v1 {version, digest, inline}, a2uiRendererCapabilities["1.0"] (with an inline catalog), thread-tools/v1 {url, token, expiresAt}
+    A->>R: context: vymalo.ui.ref, vymalo.ui.catalog (doubles written back as integers), vymalo.a2ui.renderer {catalogIds}, vymalo.threadTools
     T->>R: ctx.context_map()
-    alt this process holds the digest, or the message carried that catalog
+    alt the renderer did not offer the catalogId this turn
+        T->>T: nothing is drawn: words, or an error result that says to answer in text
+    else this process holds the digest, or the message carried that catalog
         T->>T: the catalog (the digest of the document is checked)
     else stale: not held, not inline
         T->>E: get_ui_catalog (once, Bearer token)
@@ -361,6 +371,8 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
+    [*] --> NotOffered: no renderer entry this turn, or it does not list the catalogId
+    NotOffered --> Text: the tools answer in text
     [*] --> Unknown: no ui-catalog metadata
     [*] --> Inline: the message carried the catalog
     [*] --> Stale: the digest is not one this process holds

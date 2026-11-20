@@ -6259,6 +6259,7 @@ fn screen_with(document: &str, lock: &str) -> serde_json::Map<String, Value> {
     json!({
         adam_a2a_runtime::CONTEXT_UI_REF: claimed,
         adam_a2a_runtime::CONTEXT_UI_CATALOG: inline,
+        adam_a2a_runtime::CONTEXT_A2UI_RENDERER: {"catalogIds": [catalog_id]},
     })
     .as_object()
     .cloned()

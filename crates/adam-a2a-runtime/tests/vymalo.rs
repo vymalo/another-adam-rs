@@ -14,8 +14,9 @@ use adam_a2a::{
     UI_CATALOG_EXTENSION,
 };
 use adam_a2a_runtime::{
-    CONTEXT_CALLER, CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF,
-    RuntimeTaskBackend, UNREADABLE_CALLER, asked_by_an_agent, vymalo_inbound,
+    CONTEXT_A2UI_RENDERER, CONTEXT_CALLER, CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS,
+    CONTEXT_UI_CATALOG, CONTEXT_UI_REF, RuntimeTaskBackend, UNREADABLE_CALLER, asked_by_an_agent,
+    vymalo_inbound,
 };
 use adam_core::{DynStore, MemoryStore, RunId};
 use adam_llm_agent::{Conversation, LlmAgent, Tool, ToolCtx, ToolError, ToolOutput};
@@ -152,7 +153,7 @@ async fn a_messages_extensions_reach_the_run_as_its_context() {
     let rig = Rig::new();
     let metadata = json!({
         UI_CATALOG_EXTENSION: {"catalogId": CATALOG_ID, "version": 2.0, "digest": DIGEST, "inline": true},
-        "a2uiClientCapabilities": {"v0.9.1": {
+        "a2uiRendererCapabilities": {"1.0": {
             "supportedCatalogIds": [CATALOG_ID],
             "inlineCatalogs": [{"catalogId": CATALOG_ID, "components": {"Text": {"maxLength": 4000.0}}}]}},
         THREAD_TOOLS_EXTENSION: {
@@ -179,6 +180,10 @@ async fn a_messages_extensions_reach_the_run_as_its_context() {
         4000
     );
     assert!(context[CONTEXT_UI_CATALOG]["catalog"]["components"]["Text"]["maxLength"].is_i64());
+    assert_eq!(
+        context[CONTEXT_A2UI_RENDERER],
+        json!({"catalogIds": [CATALOG_ID]})
+    );
     assert_eq!(context[CONTEXT_THREAD_TOOLS]["token"], "a.b.c");
     // A token whose claims cannot be read says the message is nobody's.
     assert_eq!(
@@ -380,4 +385,109 @@ async fn a_question_with_an_interface_is_input_required_with_text_and_a_2ui_part
             "The person answered through the interface (form ask-1):\n- db: pg"
         ))
     );
+}
+
+fn renderer_message(text: &str, capabilities: Value) -> Message {
+    with_metadata(
+        Message::new(Role::User, vec![Part::text(text)]),
+        json!({"a2uiRendererCapabilities": capabilities}),
+    )
+}
+
+/// Only `a2uiRendererCapabilities["1.0"]` is read: the old keys and the draft `"v1.0"` say nothing.
+#[test]
+fn only_the_renderer_capabilities_under_1_0_are_read() {
+    let offer = json!({"supportedCatalogIds": [CATALOG_ID], "inlineCatalogs": []});
+    let context = |metadata: Value| {
+        let m = with_metadata(Message::new(Role::User, vec![Part::text("hi")]), metadata);
+        vymalo_inbound(&m).unwrap().payload["context"].clone()
+    };
+    let read = context(json!({"a2uiRendererCapabilities": {"1.0": offer}}));
+    assert_eq!(
+        read[CONTEXT_A2UI_RENDERER],
+        json!({"catalogIds": [CATALOG_ID]})
+    );
+    for ignored in [
+        json!({"a2uiClientCapabilities": {"v0.9.1": offer}}),
+        json!({"a2uiClientCapabilities": {"v0.9": offer}}),
+        json!({"a2uiRendererCapabilities": {"v1.0": offer}}),
+        json!({"a2uiRendererCapabilities": {"1.0": "nope"}}),
+    ] {
+        assert_eq!(
+            context(ignored.clone())[CONTEXT_A2UI_RENDERER],
+            Value::Null,
+            "{ignored}"
+        );
+    }
+}
+
+/// The offer is the supported ids and the inline catalogs' ids, once each, of non-empty strings.
+#[test]
+fn the_offer_is_the_union_of_the_supported_and_the_inline_ids_deduplicated() {
+    let m = renderer_message(
+        "hi",
+        json!({"1.0": {
+            "supportedCatalogIds": ["a", "", 7, "b", "a", null],
+            "inlineCatalogs": [{"catalogId": "c"}, {"catalogId": "a"}, {"catalogId": ""}, {"x": 1}, "d"]}}),
+    );
+    let context = vymalo_inbound(&m).unwrap().payload["context"].clone();
+    assert_eq!(
+        context[CONTEXT_A2UI_RENDERER],
+        json!({"catalogIds": ["a", "b", "c"]})
+    );
+}
+
+#[test]
+fn the_offer_is_bounded() {
+    let mut ids: Vec<String> = (0..200)
+        .map(|n| format!("https://example.test/c{n}"))
+        .collect();
+    ids.insert(0, "y".repeat(10_000));
+    let m = renderer_message("hi", json!({"1.0": {"supportedCatalogIds": ids}}));
+    let kept = vymalo_inbound(&m).unwrap().payload["context"][CONTEXT_A2UI_RENDERER]["catalogIds"]
+        .as_array()
+        .unwrap()
+        .clone();
+    // The over-long id is left out and the list is cut.
+    assert_eq!(kept.len(), adam_a2a_runtime::MAX_OFFERED_CATALOG_IDS);
+    assert_eq!(kept[0], "https://example.test/c0");
+}
+
+/// The offer is the message's own: a task that continues it with a message that has no capabilities
+/// does not draw with the earlier offer.
+#[tokio::test]
+async fn the_offer_of_one_message_is_deleted_by_the_next_that_has_none() {
+    let rig = Rig::new();
+    rig.model.push_text("ok").push_text("ok again");
+    let (stop, handle) = rig.worker();
+
+    let first = renderer_message("one", json!({"1.0": {"supportedCatalogIds": [CATALOG_ID]}}));
+    let one = rig
+        .backend
+        .submit(alice(), first, None, Some("ctx-offer".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.state(&one).await.context[CONTEXT_A2UI_RENDERER],
+        json!({"catalogIds": [CATALOG_ID]})
+    );
+    wait_task(&rig, &one.id, TaskState::Completed).await;
+
+    let mut second = Message::new(Role::User, vec![Part::text("two")]);
+    second.reference_task_ids = Some(vec![one.id.clone()]);
+    let two = rig
+        .backend
+        .submit(alice(), second, None, Some("ctx-offer".into()))
+        .await
+        .unwrap();
+    assert!(
+        !rig.state(&two)
+            .await
+            .context
+            .contains_key(CONTEXT_A2UI_RENDERER),
+        "a stale offer must not carry into a later turn"
+    );
+    wait_task(&rig, &two.id, TaskState::Completed).await;
+    stop.send(()).unwrap();
+    handle.await.unwrap();
 }

@@ -1170,7 +1170,7 @@ fn from_the_screen(text: &str, (catalog, lock): (&str, &str)) -> Message {
             adam_a2a::UI_CATALOG_EXTENSION: {
                 "catalogId": CATALOG_ID, "version": lock["version"],
                 "digest": adam_ui::catalog_digest(&catalog).unwrap(), "inline": true},
-            "a2uiClientCapabilities": {"v0.9.1": {
+            "a2uiRendererCapabilities": {"1.0": {
                 "supportedCatalogIds": [CATALOG_ID], "inlineCatalogs": [catalog]}},
         })
         .as_object()
@@ -1355,7 +1355,7 @@ async fn on_a_screen_without_cards_or_a_catalog_the_researcher_answers_in_words_
         (
             "no catalog",
             user("What is async Rust?"),
-            "this screen has no component catalog; answer in text",
+            "this screen did not offer a component catalog this turn; answer in text",
         ),
     ] {
         let (done, requests) = researcher_run(message).await;

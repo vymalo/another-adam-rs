@@ -1194,7 +1194,7 @@ impl Tool for AskUser {
                 tracing::debug!("the screen has no Choices component; the options go in the text");
                 in_words(&question, &form)
             }
-            Resolved::NoCatalog => in_words(&question, &form),
+            Resolved::NoCatalog | Resolved::NotOffered => in_words(&question, &form),
             Resolved::Unreadable(reason) => {
                 tracing::debug!(%reason, "the screen's components could not be read; the options go in the text");
                 in_words(&question, &form)

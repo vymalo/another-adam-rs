@@ -7,7 +7,8 @@
 use std::sync::Arc;
 
 use adam_a2a_runtime::{
-    CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF,
+    CONTEXT_A2UI_RENDERER, CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG,
+    CONTEXT_UI_REF,
 };
 use adam_llm_agent::{SourceCtx, ToolCtx, ToolSource as _};
 use adam_mcp_testkit::ThreadToolsServer;
@@ -47,6 +48,7 @@ fn inline_context(c: &Claimed) -> Map<String, Value> {
     let document = document();
     object(json!({
         CONTEXT_UI_REF: reference(c),
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]},
         CONTEXT_UI_CATALOG: {
             "catalogId": c.catalog_id, "version": c.version, "digest": c.digest, "catalog": document},
     }))
@@ -56,6 +58,7 @@ fn inline_context(c: &Claimed) -> Map<String, Value> {
 fn ref_context(c: &Claimed, url: &str) -> Map<String, Value> {
     object(json!({
         CONTEXT_UI_REF: reference(c),
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]},
         CONTEXT_THREAD_TOOLS: {"url": url, "token": "tok", "expiresAt": "2999-01-01T00:00:00Z"},
     }))
 }
@@ -161,7 +164,10 @@ async fn the_screen_source_describes_show_once_the_catalog_is_held_and_offers_no
     let screen = ui.screen();
     // A later message names the catalog without carrying it: only a catalog this process holds can
     // describe `show`, and nobody is asked for one.
-    let named_only = SourceCtx::detached(object(json!({CONTEXT_UI_REF: reference(&c)})));
+    let named_only = SourceCtx::detached(object(json!({
+        CONTEXT_UI_REF: reference(&c),
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]},
+    })));
     let fresh = || ui.tools().into_iter().map(|t| t.spec()).collect::<Vec<_>>();
 
     assert!(screen.specs(&named_only).await.is_empty());

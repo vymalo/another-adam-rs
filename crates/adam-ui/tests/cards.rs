@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use adam_a2a_runtime::{CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
+use adam_a2a_runtime::{CONTEXT_A2UI_RENDERER, CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
 use adam_llm_agent::{ToolCtx, ToolOutput};
 use adam_mcp::McpPolicy;
 use adam_runtime::NoopSink;
@@ -62,6 +62,7 @@ fn inline_context() -> Map<String, Value> {
     let c = claimed();
     json!({
         CONTEXT_UI_REF: {"catalogId": c.catalog_id, "version": c.version, "digest": c.digest},
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]},
         CONTEXT_UI_CATALOG: {
             "catalogId": c.catalog_id, "version": c.version, "digest": c.digest,
             "catalog": as_doubles(&document())},
@@ -203,6 +204,7 @@ async fn the_list_of_components_is_one_short_line_each_and_bounded() {
     let catalog = Catalog::from_document(document.clone(), &c).unwrap();
     let context = json!({
         CONTEXT_UI_REF: {"catalogId": c.catalog_id, "version": c.version, "digest": c.digest},
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]},
         CONTEXT_UI_CATALOG: {
             "catalogId": c.catalog_id, "version": c.version, "digest": c.digest,
             "catalog": as_doubles(&document)},

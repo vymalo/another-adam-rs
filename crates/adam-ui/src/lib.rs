@@ -33,6 +33,11 @@
 //! again with `get_ui_catalog` over the thread tools (once; the digest of what it gets is checked).
 //! The diagrams are in the [README](https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-ui/README.md#how-a-catalog-reaches-a-tool).
 //!
+//! A tool draws only what the renderer offered **in the message of this turn**
+//! (`a2uiRendererCapabilities["1.0"]`, kept as `vymalo.a2ui.renderer`): without that entry, or with
+//! one that does not list the current `catalogId`, it answers as it does with no catalog. A later
+//! message with no capabilities draws nothing, whatever an earlier turn offered.
+//!
 //! Nothing here fails a run: with no catalog, or one that cannot be read, `ask_user` puts the options
 //! in the question's text, `show` and `ui_catalog` return an error result that says to answer in text,
 //! and with no grant (or an expired one) the thread tools offer nothing.
