@@ -4,15 +4,19 @@
 //!
 //! `CommandWorkspace` extends [`CodeWorkspace`]: a command finds its place with the same
 //! [`place`](CodeWorkspace::place) as a file tool. What it adds is where a command runs (a
-//! [session](CommandWorkspace::session)), its [limits](CommandWorkspace::limits) and where a long
-//! output is [kept](CommandWorkspace::kept) ([`output::settle`](crate::output::settle)).
+//! [session](CommandWorkspace::session)), its [limits](CommandWorkspace::limits), where a long
+//! output is [kept](CommandWorkspace::kept) ([`output::settle`](crate::output::settle)), and the
+//! [guard](CommandWorkspace::guard) of a command: what it changed and, where the workspace owns the
+//! place, its undo. The person's directory owns nothing, so its guard watches nothing
+//! ([`Unwatched`]) and undoes nothing.
 //!
-//! The trait is **additive**: an implementation of `CodeWorkspace` alone is unchanged. Step 5c adds
-//! the guard (what a command changed, and its undo, which the person's directory never does) and
-//! moves the tools here; its methods grow then.
+//! `guard` and [`after_run`](CommandWorkspace::after_run) are **required** methods (step 5c-1): a
+//! breaking change for every implementation of the trait (the coder's and the testkit's
+//! `DirWorkspace`, the only ones then).
 //!
 //! [ADR 0047]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,8 +27,8 @@ use async_trait::async_trait;
 
 use crate::redact::Redactor;
 use crate::sandbox::Meter;
-use crate::shell::{self, RunError, ShellOutcome};
-use crate::workspace::CodeWorkspace;
+use crate::shell::{self, MissingTool, RunError, ShellOutcome};
+use crate::workspace::{CodeWorkspace, Place};
 
 /// The bounds of one command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +61,123 @@ pub trait CommandWorkspace: CodeWorkspace {
     /// secrets. Run `adam_llm_agent::kept_outputs_conformance` over it; the command cases here
     /// do not reach that path.
     fn kept(&self) -> &dyn KeptOutputs;
+
+    /// The guard of one command in `place`, taken before it runs and [settled](CommandGuard::settle)
+    /// after it: what the command changed, held to `guarding`.
+    ///
+    /// **Required.** `Err` is the refusal the model is told, and nothing runs: the place cannot be
+    /// watched, so what a command changes there could not be undone. The tool appends
+    /// [`refusal_note`](Self::refusal_note) to it. A workspace that watches nothing returns
+    /// [`Unwatched`].
+    async fn guard(
+        &self,
+        ctx: &ToolCtx,
+        place: &Place,
+        guarding: Guarding,
+    ) -> Result<Box<dyn CommandGuard>, String>;
+
+    /// After a command that makes things (`run`) ran in `place`, before its guard is settled: what
+    /// the workspace does. Returns text the tool appends to its result when the command changed
+    /// files: empty, or starting with '\n'. `run_command`, which only looks, never calls it.
+    ///
+    /// **Required**, as [`after_write`](CodeWorkspace::after_write) is. The coder moves its run's
+    /// check epoch (a check may read a file the command made, ignored ones included) and, in a
+    /// scratch project that was published, says that the change does not reach the repository.
+    ///
+    /// # Errors
+    ///
+    /// A [`ToolError`] when what follows cannot be done or recorded: the tool returns it, and
+    /// nothing is undone. **A known gap**, kept from the coder's `run`: the guard is then dropped
+    /// unsettled, so a command that also changed git keeps that change. Step 5c-2, which moves
+    /// `run`, decides whether to settle first.
+    async fn after_run(&self, ctx: &ToolCtx, place: &Place) -> Result<String, ToolError>;
+
+    /// A note the tool appends to a refusal of its guard (one from [`guard`](Self::guard), or a
+    /// command [undone](Settled::Undone)): empty (the default), or starting with '\n'. The coder
+    /// names the commands that keep running in the slot, which write in it and are not undone.
+    fn refusal_note(&self, _ctx: &ToolCtx, _place: &Place) -> String {
+        String::new()
+    }
+
+    /// What the model is told of a command the shell could not find (`missing`), run in the first of
+    /// `dirs` within `place` (the second is the place's root), in `session`. `None` (the default):
+    /// the tool answers as for any other command, with what it printed.
+    ///
+    /// # Errors
+    ///
+    /// A [`ToolError`] when the answer cannot be made or recorded.
+    async fn missing_tool_answer(
+        &self,
+        _ctx: &ToolCtx,
+        _place: &Place,
+        _missing: &MissingTool,
+        _dirs: &[&Path],
+        _session: &dyn EnvSession,
+    ) -> Result<Option<String>, ToolError> {
+        Ok(None)
+    }
+}
+
+/// What a command is held to by its [guard](CommandWorkspace::guard).
+///
+/// Closed on purpose (rule 3): a new kind of command must be thought through by every workspace,
+/// so it fails to compile in each until it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Guarding {
+    /// It looks (`run_command`): it may change nothing, files included.
+    Look,
+    /// It makes things (`run`): it may change files, and nothing of git.
+    Make,
+}
+
+/// What a [guard](CommandGuard) found once the command ended.
+///
+/// `#[non_exhaustive]`, unlike [`Guarding`]: a workspace may come to report more (a guard that
+/// records what changed in a person's directory without undoing it, slice 7), and the tools give
+/// any verdict they do not know the answer of [`Unwatched`](Settled::Unwatched).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Settled {
+    /// Nothing the guard watches changed.
+    Unchanged,
+    /// Files changed, as a [`Make`](Guarding::Make) may, and they stay.
+    FilesChanged,
+    /// The command changed what it was held to leave alone, and it was undone; `restored`: the
+    /// place is exactly as it was.
+    Undone {
+        /// The place is exactly as it was.
+        restored: bool,
+    },
+    /// The place could not be read after the command, so whether it changed is not known: it was
+    /// undone, to be safe; `restored`: the place is exactly as it was.
+    Unreadable {
+        /// The place is exactly as it was.
+        restored: bool,
+    },
+    /// The guard watches nothing ([`Unwatched`]): nothing is known, nothing was undone.
+    Unwatched,
+}
+
+/// The guard of one command: taken before it runs, settled once after.
+///
+/// A guard dropped without being settled **undoes nothing**: a tool that returns between the two
+/// (the command did not run, or a hook failed) leaves the place as the command left it.
+#[async_trait]
+pub trait CommandGuard: Send {
+    /// Compare the place with what it was, and undo what the command was not allowed to change.
+    async fn settle(self: Box<Self>) -> Settled;
+}
+
+/// A guard that watches nothing: what a workspace that never undoes gives (the person's own
+/// directory, the testkit's `DirWorkspace`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Unwatched;
+
+#[async_trait]
+impl CommandGuard for Unwatched {
+    async fn settle(self: Box<Self>) -> Settled {
+        Settled::Unwatched
+    }
 }
 
 /// A shared [`CommandWorkspace`].

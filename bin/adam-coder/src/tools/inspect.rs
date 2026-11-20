@@ -23,17 +23,21 @@
 //! it is documented as looking only. `run` keeps files, ignored ones included, and does bump it.
 //!
 //! A command the shell cannot find is reported as a missing toolchain, as for `run_checks` (see
-//! [`missing_tool`]).
+//! [`missing_tool`](super::shell::missing_tool)).
+//!
+//! The coder declares the tool here and its logic is `adam_code_tools::inspect` (ADR 0047), over
+//! the run's slots (`ToolEnv` as a `CommandWorkspace`): the guard is the coder's `SlotGuard`, over
+//! the `Snapshot` that stays here.
 
 use adam::prelude::*;
 
-use super::checks::missing_tool_answer;
 use super::gitcli::{
     GitAt, RepoState, SnapshotError, git_stdout, head_ref, point_head, repo_state,
     restore_configuration_only, restore_repo_state, restore_worktree, status_text, working_tree_id,
 };
-use super::shell::{ShellOutcome, missing_tool, resolve_cwd, shell_spec};
-use super::{Outcome, ToolEnv, non_empty, output, run_error};
+use super::{Outcome, ToolEnv};
+
+pub(super) use adam_code_tools::inspect::render;
 
 /// Look around in your worktree with a shell command: `git branch -r`, `git log --oneline`,
 /// `ls`, `cat README.md`, `grep -rn name src`. It runs in the workspace's environment (the
@@ -57,97 +61,7 @@ pub async fn run_command(
     /// Seconds before the command is killed; at most the deployment's limit, which is also the default. Example: {"command":"npm test","timeout":120}
     timeout: Option<i64>,
 ) -> Outcome {
-    let Some(command) = non_empty(&command) else {
-        return Ok(ToolOutput::error("command is required"));
-    };
-    let timeout = match output::timeout_of(&env, timeout) {
-        Ok(timeout) => timeout,
-        Err(reason) => return Ok(ToolOutput::error(reason)),
-    };
-    // A repository's worktree or a scratch project: both are looked at the same way.
-    let slot = match env.slot_to_read(ctx, repo.as_deref()).await {
-        Ok(slot) => slot,
-        Err(outcome) => return outcome,
-    };
-    let dir = match resolve_cwd(slot.path(), cwd.as_deref().and_then(non_empty)) {
-        Ok(dir) => dir,
-        Err(reason) => return Ok(ToolOutput::error(reason)),
-    };
-
-    // Where it runs; made before the worktree is looked at, since it may take a while.
-    let environment = env.session(ctx).await?;
-
-    // What the worktree is before the command: nothing it does may change it.
-    let before = match Snapshot::of_slot(&slot).await {
-        Ok(before) => before,
-        Err(e) => {
-            return Ok(ToolOutput::error(super::background::noted(
-                &env,
-                ctx,
-                &slot,
-                cannot_snapshot(
-                    e,
-                    "Nothing was run, because a command that might change the worktree cannot be \
-                     undone.",
-                ),
-            )));
-        }
-    };
-    if let Some(refusal) = before.refusal() {
-        return Ok(ToolOutput::error(super::background::noted(
-            &env, ctx, &slot, refusal,
-        )));
-    }
-
-    let redactor = &env.redactor;
-    let shown = redactor.scrub(command).into_owned();
-    ctx.emit_progress(format!("running: {shown}")).await;
-    let mut outcome = env
-        .run(
-            ctx,
-            &*environment,
-            shell_spec(&dir, command),
-            timeout,
-            env.settings.check_output_tail,
-            true,
-        )
-        .await
-        .map_err(|e| run_error(redactor, &e))?;
-    output::settle(&env, ctx, &mut outcome).await;
-
-    // No bump of `ChecksNotes::epoch` here (see the module): this tool is for looking, and its
-    // guard does not cover ignored files; `run` is the tool that keeps what it changes.
-
-    // Did it change anything it should not have?
-    let after = Snapshot::of_slot(&slot).await.ok();
-    if after.as_ref() != Some(&before) {
-        let restored = before.restore(&slot).await;
-        ctx.emit_progress(format!("undid a change made by: {shown}"))
-            .await;
-        let said = changed_the_worktree(&shown, &outcome, restored);
-        return Ok(ToolOutput::error(super::background::noted(
-            &env, ctx, &slot, said,
-        )));
-    }
-
-    if let Some(missing) = missing_tool(&outcome, command) {
-        ctx.emit_progress("the workspace lacks a tool".to_owned())
-            .await;
-        let said = missing_tool_answer(
-            &env,
-            ctx,
-            &missing,
-            &[dir.as_path(), slot.path()],
-            &environment.describe().kind,
-        )
-        .await?;
-        return Ok(ToolOutput::error(said));
-    }
-    let mut output = ToolOutput::text(render(&shown, &outcome));
-    if let Some(key) = outcome.repeat_key() {
-        output = output.with_repeat_key(key);
-    }
-    Ok(output)
+    adam_code_tools::inspect::run_command(&*env, ctx, command, cwd, repo, timeout).await
 }
 
 /// What a command must leave as it found it: `HEAD` and the branch, the files of the worktree,
@@ -394,38 +308,6 @@ pub(super) fn cannot_snapshot(error: SnapshotError, not_done: &str) -> String {
     )
 }
 
-/// What the model is told when its command changed the worktree.
-fn changed_the_worktree(command: &str, outcome: &ShellOutcome, restored: bool) -> String {
-    let what = if restored {
-        "The change was undone: the worktree is exactly as it was."
-    } else {
-        "The change could not be fully undone (HEAD and the branch are back, but the files \
-         may differ): run `git status` with run_command to see the worktree before you go on."
-    };
-    format!(
-        "`{command}` changed the worktree (files, HEAD, the branch, a ref or the git \
-         configuration), and run_command is for looking around only. {what} To make something with a command use `run`; to change code use write_file, edit_file or apply_patch. Output of the \
-         command, for what it is worth:\n{}",
-        outcome.tail
-    )
-}
-
-/// The command, how it ended, and the tail of its output. A non-zero exit is said plainly: for a
-/// command that only looks, it is an answer ("no such file"), not a failure.
-pub(super) fn render(command: &str, outcome: &ShellOutcome) -> String {
-    let how = if outcome.timed_out {
-        "timed out (the command was killed)".to_owned()
-    } else {
-        match outcome.exit_code {
-            Some(code) => format!("exit code {code}"),
-            None => "killed by a signal".to_owned(),
-        }
-    };
-    let mut text = format!("$ {command}\n{how}\n");
-    text.push_str(&output::section(outcome));
-    text
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,16 +368,6 @@ mod tests {
         );
     }
 
-    fn outcome(code: Option<i32>, tail: &str, timed_out: bool, truncated: bool) -> ShellOutcome {
-        ShellOutcome {
-            exit_code: code,
-            timed_out,
-            tail: tail.to_owned(),
-            truncated,
-            ..ShellOutcome::default()
-        }
-    }
-
     /// A git directory whose name holds a newline is not split in two: the split is at the last
     /// line, which is `HEAD`.
     #[tokio::test]
@@ -531,34 +403,5 @@ mod tests {
         let plain = cannot_snapshot(SnapshotError::Unreadable, "Nothing was run.");
         assert!(plain.contains("cannot be read"), "{plain}");
         assert!(!plain.contains("2.42"), "{plain}");
-    }
-
-    #[test]
-    fn a_result_says_how_the_command_ended_without_calling_it_a_failure() {
-        let ok = render("ls", &outcome(Some(0), "a\nb\n", false, false));
-        assert_eq!(ok, "$ ls\nexit code 0\n--- output ---\na\nb\n");
-        let no = render(
-            "cat x",
-            &outcome(Some(1), "cat: x: No such file", false, false),
-        );
-        assert!(no.contains("exit code 1") && !no.contains("FAILED"), "{no}");
-        assert!(no.ends_with("No such file\n"), "{no}");
-        let cut = render("yes", &outcome(Some(0), "y\n", false, true));
-        assert!(cut.contains("output truncated: the last 2 bytes"), "{cut}");
-        let slow = render("sleep 9", &outcome(None, "", true, false));
-        assert!(slow.contains("timed out"), "{slow}");
-        let sig = render("x", &outcome(None, "", false, false));
-        assert!(sig.contains("killed by a signal"), "{sig}");
-    }
-
-    #[test]
-    fn the_refusal_says_what_happened_and_where_changes_go() {
-        let said = changed_the_worktree("touch a", &outcome(Some(0), "out", false, false), true);
-        assert!(
-            said.contains("exactly as it was") && said.contains("apply_patch"),
-            "{said}"
-        );
-        let unsure = changed_the_worktree("touch a", &outcome(Some(0), "", false, false), false);
-        assert!(unsure.contains("could not be fully undone"), "{unsure}");
     }
 }
