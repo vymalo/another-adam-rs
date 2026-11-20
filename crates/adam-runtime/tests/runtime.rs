@@ -8176,6 +8176,50 @@ async fn a_park_again_writes_the_head_it_read_and_the_tombstone() {
     assert_eq!(head["body"]["len"], len);
 }
 
+/// A v5 run whose split is refused writes the whole state and **no head**: a head must never carry
+/// the transcript, so the run demotes to v4 and the next step tries again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_split_on_a_v5_run_writes_the_whole_state_and_no_head() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let recording = Arc::new(common::recording::RecordingStore::new(inner.clone()));
+    let store: DynStore = recording.clone();
+    let mut agent = TranscriptAgent::new(&uniq("demote"), 2);
+    agent.park_at = Some(1);
+    let rt = transcript_runtime(&store, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_waiting(&rt, run).await;
+    worker.stop().await;
+    let head = inner.load_head(run).await.unwrap().unwrap().state;
+    assert_eq!(head["v"], 5, "the first step split");
+
+    // The same agent name, a build whose split does not reconstruct the state: it steps the parked
+    // run and the commit must demote it, not put the transcript back in the head.
+    let mut broken = TranscriptAgent::new(&agent.name, 2);
+    broken.wrong = true;
+    let rt = transcript_runtime(&store, &broken);
+    recording.reset();
+    rt.deliver(run, late()).await.expect("deliver");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let commits = recording.commits();
+    let refused = commits
+        .iter()
+        .find(|update| update.head.is_none() && update.body.is_none() && !update.state.is_null())
+        .expect("the refused split writes the state only");
+    assert_eq!(refused.state["v"], 1, "the whole state, in the v4 format");
+    assert_eq!(
+        refused.state["agent"]["messages"].as_array().unwrap().len(),
+        3,
+        "the transcript is in the state"
+    );
+    // The stored run serves that state: the head the first step wrote is stale.
+    let loaded = inner.load_run(run).await.unwrap().unwrap();
+    assert_eq!(loaded.state["v"], 1, "the head is not served");
+}
+
 /// A run that never split is v4: its view is the whole agent state, and `Runtime::state` reads no
 /// body because there is none to join.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

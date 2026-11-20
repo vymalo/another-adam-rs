@@ -490,6 +490,11 @@ struct Next {
     /// `Some(new)` when this commit starts a body generation (a first split or a compaction);
     /// `None` appends to the current one. Filled in `transition`, after the split is checked.
     generation: Option<Uuid>,
+    /// The split was refused (it did not reconstruct the state, or a file's bytes were not stored).
+    /// The commit writes the whole state and **no head**, even for a v5 run: a head must never
+    /// carry the transcript, so a run whose split cannot be written demotes to v4 and the next step
+    /// tries again.
+    split_refused: bool,
     /// The merged artifacts the split's upload pass saw, in artifact order: `Head::of` pairs its
     /// file references with **this** list, so a retried envelope cannot shift them.
     head_artifacts: Option<Vec<Artifact>>,
@@ -648,6 +653,7 @@ async fn transition(
                      (the run stays v4)"
                 );
                 next.split = None;
+                next.split_refused = true;
             }
             Err(e) => {
                 tracing::error!(
@@ -656,6 +662,7 @@ async fn transition(
                     "the split's head does not join; writing the state only (the run stays v4)"
                 );
                 next.split = None;
+                next.split_refused = true;
             }
         }
     }
@@ -726,6 +733,7 @@ async fn transition(
                 "a file artifact's bytes are not stored; writing the state only (the run stays v4)"
             );
             next.split = None;
+            next.split_refused = true;
         }
     }
     // One writer per step attempt: the commit's CAS retries reuse it, so a retry of the same
@@ -830,6 +838,7 @@ fn plan(
         read: read.clone(),
         split,
         generation: None,
+        split_refused: false,
         head_artifacts: None,
         shadow_blobs: Vec::new(),
         shadow_files: Vec::new(),
@@ -852,6 +861,7 @@ fn plan(
         read: Vec::new(),
         split: None,
         generation: None,
+        split_refused: false,
         head_artifacts: None,
         shadow_blobs: Vec::new(),
         shadow_files: Vec::new(),
@@ -895,6 +905,7 @@ fn plan(
                 read: Vec::new(),
                 split: None,
                 generation: None,
+                split_refused: false,
                 head_artifacts: None,
                 shadow_blobs: Vec::new(),
                 shadow_files: Vec::new(),
@@ -1124,6 +1135,9 @@ fn build_update(
         }
         // A v5 run whose transition did not split (a failure, a retry): the head it read, with
         // this commit's members, and the transcript set unchanged. The state stays the tombstone.
+        // A refused split is the exception: the state is the whole new state, and a head carrying
+        // it would put the transcript back in the head, so the run demotes to v4 instead.
+        (None, Some(_)) if next.split_refused => update.state = env.encode()?,
         (None, Some(base)) => {
             update.head = Some(base.carried(&env).encode()?);
             update.state = Value::Null;
