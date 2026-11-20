@@ -41,6 +41,7 @@ mod load;
 mod manifest;
 mod schema;
 mod source;
+mod when;
 
 #[cfg(feature = "build")]
 mod buildscript;
@@ -72,6 +73,7 @@ pub use schema::{
     read_references_leniently, split_env_references,
 };
 pub use source::{Dir, ManifestSource};
+pub use when::{AFTER_MAX, At, Cron, When, WhenError, parse_after, parse_at};
 
 #[cfg(feature = "build")]
 pub use buildscript::{Build, BuildError, Emitted, build};

@@ -766,7 +766,94 @@ fn cases() -> Vec<Case> {
             "schedule without cron",
             vec![("agent/schedules/a.md", "---\ntimezone: UTC\n---\nGo.\n")],
             Error,
-            "needs `cron`",
+            "needs one of `cron`, `at` or `after`",
+        ),
+        with_root(
+            "schedule with a blank cron",
+            vec![("agent/schedules/a.md", "---\ncron: \"  \"\n---\nGo.\n")],
+            Error,
+            "needs one of `cron`, `at` or `after`",
+        ),
+        with_root(
+            "schedule with cron and at",
+            vec![(
+                "agent/schedules/a.md",
+                "---\ncron: \"0 9 * * *\"\nat: 2026-12-24T18:00\n---\nGo.\n",
+            )],
+            Error,
+            "has `cron` and `at`",
+        ),
+        with_root(
+            "schedule with at and after",
+            vec![(
+                "agent/schedules/a.md",
+                "---\nat: 2026-12-24T18:00\nafter: 30m\n---\nGo.\n",
+            )],
+            Error,
+            "has `at` and `after`",
+        ),
+        with_root(
+            "schedule with a cron that never fires",
+            vec![(
+                "agent/schedules/a.md",
+                "---\ncron: \"0 9 30 2 *\"\n---\nGo.\n",
+            )],
+            Error,
+            "never fires",
+        ),
+        with_root(
+            "schedule with a cron item out of range",
+            vec![(
+                "agent/schedules/a.md",
+                "---\ncron: \"0 25 * * *\"\n---\nGo.\n",
+            )],
+            Error,
+            "`cron: 0 25 * * *` has the hour item `25`, which is outside 0-23",
+        ),
+        with_root(
+            "schedule with an at that is no time",
+            vec![("agent/schedules/a.md", "---\nat: tomorrow\n---\nGo.\n")],
+            Error,
+            "`at: tomorrow` is not a time",
+        ),
+        with_root(
+            "schedule with an at on a day that does not exist",
+            vec![(
+                "agent/schedules/a.md",
+                "---\nat: 2026-02-30T09:00\n---\nGo.\n",
+            )],
+            Error,
+            "is not a valid date and time",
+        ),
+        with_root(
+            "schedule with an after that is no duration",
+            vec![("agent/schedules/a.md", "---\nafter: soon\n---\nGo.\n")],
+            Error,
+            "`after: soon` is not a duration",
+        ),
+        with_root(
+            "schedule with a zero after",
+            vec![("agent/schedules/a.md", "---\nafter: 0m\n---\nGo.\n")],
+            Error,
+            "is zero",
+        ),
+        with_root(
+            "schedule with a time zone and an after",
+            vec![(
+                "agent/schedules/a.md",
+                "---\nafter: 30m\ntimezone: Europe/Berlin\n---\nGo.\n",
+            )],
+            Warning,
+            "`timezone: Europe/Berlin` is ignored: `after` counts from when the schedule starts",
+        ),
+        with_root(
+            "schedule with a time zone and an at with its offset",
+            vec![(
+                "agent/schedules/a.md",
+                "---\nat: 2026-12-24T18:00Z\ntimezone: Europe/Berlin\n---\nGo.\n",
+            )],
+            Warning,
+            "`timezone: Europe/Berlin` is ignored: `at` names its offset",
         ),
         with_root(
             "schedule with a four-field cron",
@@ -869,6 +956,70 @@ fn cases() -> Vec<Case> {
             "commands belong to the root agent",
         ),
     ]
+}
+
+#[test]
+fn schedules_take_cron_at_or_after() {
+    let dir = write(&[
+        ("agent/instructions.md", ROOT),
+        (
+            "agent/schedules/daily.md",
+            "---\ncron: \"0 9 * * MON-FRI\"\ntimezone: Europe/Berlin\n---\nDigest.\n",
+        ),
+        (
+            "agent/schedules/eve.md",
+            "---\nat: 2026-12-24T18:00\ntimezone: Europe/Berlin\n---\nGreet.\n",
+        ),
+        (
+            "agent/schedules/launch.md",
+            "---\nat: \"2026-12-24T18:00:00+01:00\"\n---\nLaunch.\n",
+        ),
+        (
+            "agent/schedules/soon.md",
+            "---\nafter: 1h30m\n---\nFollow up.\n",
+        ),
+    ]);
+    let report = load(dir.path());
+    assert!(report.diagnostics.is_empty(), "{:#?}", report.diagnostics);
+    let root = &report.package.agents[0];
+    let got: Vec<_> = root
+        .schedules
+        .iter()
+        .map(|s| {
+            (
+                s.name.as_str(),
+                s.cron.as_str(),
+                s.at.as_deref(),
+                s.after.as_deref(),
+                s.timezone.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("daily", "0 9 * * MON-FRI", None, None, "Europe/Berlin"),
+            ("eve", "", Some("2026-12-24T18:00"), None, "Europe/Berlin"),
+            ("launch", "", Some("2026-12-24T18:00:00+01:00"), None, "UTC"),
+            ("soon", "", None, Some("1h30m"), "UTC"),
+        ]
+    );
+    let when: Vec<_> = root.schedules.iter().map(|s| s.when().unwrap()).collect();
+    assert!(
+        matches!(when[0], adam_agent_fs::When::Cron(c) if c.day_of_week(1) && !c.day_of_week(0))
+    );
+    assert!(matches!(
+        when[1],
+        adam_agent_fs::When::At(adam_agent_fs::At::Civil(_))
+    ));
+    assert!(matches!(
+        when[2],
+        adam_agent_fs::When::At(adam_agent_fs::At::Instant(_))
+    ));
+    assert_eq!(
+        when[3],
+        adam_agent_fs::When::After(std::time::Duration::from_secs(5_400))
+    );
 }
 
 #[test]
