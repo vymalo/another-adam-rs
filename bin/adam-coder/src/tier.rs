@@ -111,6 +111,7 @@ pub fn known(tool: &str) -> Option<AccessTier> {
         | "list_commands"
         | "share_file"
         | "rebuild_environment"
+        | "use_repository_environment"
         | "ask_user"
         | "show"
         | "ui_catalog"
@@ -330,6 +331,7 @@ mod tests {
             ("plan_work", Plan),
             ("plan_check", Plan),
             ("plan_add", Plan),
+            ("use_repository_environment", Plan),
             ("explorer", Plan),
             ("write_file", Edits),
             ("edit_file", Edits),

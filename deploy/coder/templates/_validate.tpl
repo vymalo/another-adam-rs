@@ -235,6 +235,19 @@ from service.yaml, which every render contains, so they always run.
 {{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" (toString $rp.container)) -}}
 {{- fail (printf "runPods.container must be a container name (lowercase letters, digits and -), got %q" (toString $rp.container)) -}}
 {{- end -}}
+{{- /* ADR 0052: the image prefixes a repository's devcontainer.json may name (use_repository_environment). */ -}}
+{{- $repositoryPrefixes := default (list) (default dict $rp.repositoryImages).allowedPrefixes -}}
+{{- if not (kindIs "slice" $repositoryPrefixes) -}}
+{{- fail (printf "runPods.repositoryImages.allowedPrefixes must be a list of image prefixes, got %q" (toString $repositoryPrefixes)) -}}
+{{- end -}}
+{{- range $prefix := $repositoryPrefixes -}}
+{{- if or (not (kindIs "string" $prefix)) (not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._/:@-]*[/:]$" (trim (toString $prefix)))) -}}
+{{- fail (printf "runPods.repositoryImages.allowedPrefixes entry %q is not an image prefix: end it with `/` (a registry path such as ghcr.io/acme/) or `:` (a tag such as ghcr.io/acme/tool:), and name no `*` or ${...} variable; a bare host or repository name would admit a look-alike (ghcr.io would admit ghcr.io.evil.com)" (toString $prefix)) -}}
+{{- end -}}
+{{- end -}}
+{{- if and (include "coder.runPodRepositoryImages" .) (hasKey .Values.config.extraEnv "RUN_POD_REPOSITORY_IMAGES") -}}
+{{- fail "config.extraEnv sets RUN_POD_REPOSITORY_IMAGES while runPods.repositoryImages.allowedPrefixes is set: the chart renders it from the value, into the coder and the admission policy" -}}
+{{- end -}}
 {{- if not (get (get $rp.resources "limits" | default dict) "memory") -}}
 {{- fail "runPods.resources.limits.memory is required: the quota counts it, and a pod without a memory limit is refused by it" -}}
 {{- end -}}

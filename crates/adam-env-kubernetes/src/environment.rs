@@ -35,7 +35,10 @@ use tokio::sync::Mutex;
 use crate::cluster::{clip, env_error, is_already_exists, is_not_found};
 use crate::exec::{ClusterExec, ExitStatus, PodExec};
 use crate::mounts::WorkspaceMounts;
-use crate::names::{MOUNTS_ANNOTATION, RUN_ID_ANNOTATION, WORKER_ANNOTATION, pod_name, selector};
+use crate::names::{
+    MOUNTS_ANNOTATION, REPOSITORY_IMAGE_ANNOTATION, RUN_ID_ANNOTATION, WORKER_ANNOTATION, pod_name,
+    selector,
+};
 use crate::session::KubeSession;
 use crate::settings::Settings;
 use crate::template::{Placement, PodTemplate};
@@ -82,6 +85,10 @@ pub(crate) struct Inner {
     locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
     /// When a command last used the pod of a run, in this process.
     used: StdMutex<HashMap<String, Instant>>,
+    /// The image each run chose, when one did (`use_repository_environment`, ADR 0052): `Some(None)`
+    /// is a run sent back to the deployment's image. The pod's annotation is the durable record;
+    /// this is what this process has read or been told.
+    images: StdMutex<HashMap<String, Option<String>>>,
 }
 
 impl Inner {
@@ -103,7 +110,18 @@ impl Inner {
         )
     }
 
+    /// What this process holds of a run that is over: its lock, its clock and its image choice.
     fn forget(&self, run: &str) {
+        self.forget_pod(run);
+        self.images
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(run);
+    }
+
+    /// What this process holds of a run whose pod is gone and whose run is not (the idle sweep):
+    /// the image choice is the run's and outlives the pod, so it stays.
+    fn forget_pod(&self, run: &str) {
         self.locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -112,6 +130,23 @@ impl Inner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(run);
+    }
+
+    /// The image this process knows `run` chose: `Some(None)` is the deployment's image, and `None`
+    /// is "not read yet" (a run this process has not made a pod for).
+    fn wanted_image(&self, run: &str) -> Option<Option<String>> {
+        self.images
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(run)
+            .cloned()
+    }
+
+    fn remember_image(&self, run: &str, image: Option<String>) {
+        self.images
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(run.to_owned(), image);
     }
 
     /// Say that the watch of the run pod cannot be kept: the first one at `warn`, so a missing
@@ -279,6 +314,7 @@ impl KubeEnvironment {
                 epoch,
                 locks: StdMutex::default(),
                 used: StdMutex::default(),
+                images: StdMutex::default(),
             }),
         }
     }
@@ -321,6 +357,9 @@ impl KubeEnvironment {
         let settings = &inner.settings;
         let mut reporter = Reporter::new(progress);
         let deadline = Instant::now() + settings.ready_timeout;
+        // The image the run chose, when this process knows it: `None` is "not read yet", and the
+        // pod's annotation is then the record (a coder that restarted finds the choice there).
+        let mut wanted = inner.wanted_image(run);
         // The pod's `resourceVersion` as of the last read (or create): the watch resumes from it,
         // so it delivers the *next* change and not the state this loop already has.
         let mut resource_version: Option<String> = None;
@@ -338,10 +377,30 @@ impl KubeEnvironment {
                             "the pod {name} belongs to another run (the names of two runs collided); release it first"
                         )));
                     }
+                    let pod_image =
+                        annotation(&pod, REPOSITORY_IMAGE_ANNOTATION).map(str::to_owned);
+                    if wanted.is_none() {
+                        // A pod this process did not make holds the choice: it is the record.
+                        inner.remember_image(run, pod_image.clone());
+                        wanted = Some(pod_image.clone());
+                    }
+                    let image_changed = wanted.as_ref().is_some_and(|w| *w != pod_image);
                     if pod.metadata.deletion_timestamp.is_some() {
                         reporter.running("the run's earlier pod is going away".to_owned());
                     } else if ended(&pod) {
                         reporter.running("the pod ended; making another".to_owned());
+                        inner.delete(name).await?;
+                    } else if image_changed {
+                        let why = match wanted.as_ref().and_then(|w| w.as_deref()) {
+                            Some(image) => {
+                                format!("the run's image is {image}, which its pod does not run")
+                            }
+                            None => "the run is back on the deployment's image".to_owned(),
+                        };
+                        if is_ready(&pod) {
+                            self.free_to_replace(name, &why).await?;
+                        }
+                        reporter.running(format!("making the pod again: {why}"));
                         inner.delete(name).await?;
                     } else if let Some(mount) =
                         mounts.missing_from(annotation(&pod, MOUNTS_ANNOTATION))
@@ -358,9 +417,9 @@ impl KubeEnvironment {
                         reporter.completed(format!(
                             "ready in {} s{}",
                             reporter.started.elapsed().as_secs(),
-                            inner
-                                .template
-                                .image()
+                            pod_image
+                                .as_deref()
+                                .or_else(|| inner.template.image())
                                 .map(|image| format!(", image {image}"))
                                 .unwrap_or_default()
                         ));
@@ -374,7 +433,8 @@ impl KubeEnvironment {
                 }
                 None => {
                     reporter.running(format!("requesting the pod {name}"));
-                    let wanted = inner.template.render(
+                    let chosen = wanted.as_ref().and_then(|w| w.as_deref());
+                    let wanted_pod = inner.template.render(
                         run,
                         name,
                         Placement {
@@ -383,8 +443,9 @@ impl KubeEnvironment {
                             worker: &settings.worker,
                         },
                         mounts,
+                        chosen,
                     );
-                    match inner.pods.create(&PostParams::default(), &wanted).await {
+                    match inner.pods.create(&PostParams::default(), &wanted_pod).await {
                         Ok(created) => {
                             resource_version = created.metadata.resource_version.clone();
                         }
@@ -395,6 +456,10 @@ impl KubeEnvironment {
                             reporter.failed(error.to_string());
                             return Err(error);
                         }
+                    }
+                    if wanted.is_none() {
+                        inner.remember_image(run, None);
+                        wanted = Some(None);
                     }
                 }
             }
@@ -498,6 +563,14 @@ impl KubeEnvironment {
     /// the pod: it ends with it. A pod whose `adam-exec` has no `active-fg` (made by an older image)
     /// is asked `active` instead, which counts every command, as it always did.
     async fn free_for_new_mount(&self, name: &str, missing: &str) -> Result<(), EnvError> {
+        let why =
+            format!("the run's workspace has {missing} as it is now, which its pod does not mount");
+        self.free_to_replace(name, &why).await
+    }
+
+    /// The pod is up and something the run needs now (a mount, another image) is not in it: it may be
+    /// made again only when nothing runs in it. Otherwise the caller waits.
+    async fn free_to_replace(&self, name: &str, why: &str) -> Result<(), EnvError> {
         let busy = match self.busy_with(name, "active-fg").await {
             Err(_) => self.busy_with(name, "active").await,
             answered => answered,
@@ -505,10 +578,10 @@ impl KubeEnvironment {
         match busy {
             Ok(false) => Ok(()),
             Ok(true) => Err(EnvError::Unavailable(format!(
-                "the run's workspace has {missing} as it is now, which its pod does not mount, and a command is running in the pod; the pod is made again when it ends"
+                "{why}, and a command is running in the pod; the pod is made again when it ends"
             ))),
             Err(e) => Err(EnvError::Unavailable(format!(
-                "the run's workspace has {missing} as it is now, which its pod does not mount, and the pod cannot be asked whether a command is running: {e}"
+                "{why}, and the pod cannot be asked whether a command is running: {e}"
             ))),
         }
     }
@@ -591,7 +664,7 @@ impl KubeEnvironment {
             match inner.delete(&name).await {
                 Ok(()) => {
                     tracing::info!(%run, pod = %name, idle_secs = idle.as_secs(), "deleted an idle run pod; the next command makes another");
-                    inner.forget(&run);
+                    inner.forget_pod(&run);
                     deleted.push(run);
                 }
                 Err(e) => {
@@ -751,12 +824,14 @@ impl Environment for KubeEnvironment {
         let lock = self.inner.lock_of(&run);
         let _held = lock.lock().await;
         let mounts = self.inner.template.mounts_for(workspace).await?;
-        self.ready_pod(&run, &name, &mounts, progress).await?;
+        let pod = self.ready_pod(&run, &name, &mounts, progress).await?;
+        let image = annotation(&pod, REPOSITORY_IMAGE_ANNOTATION).map(str::to_owned);
         self.inner.touch(&run);
         Ok(Arc::new(KubeSession {
             inner: Arc::clone(&self.inner),
             run,
             pod: name,
+            image,
             run_dir: PathBuf::from(workspace.path()),
         }))
     }
@@ -788,6 +863,30 @@ impl Environment for KubeEnvironment {
         let _ = use_default;
         self.release(run).await?;
         Ok(true)
+    }
+
+    /// Record the image the run chose (`use_repository_environment`, ADR 0052): the next `ensure`
+    /// makes the pod again when the pod that is there runs another one. The pod's annotation is the
+    /// record, so a coder that restarts reads the choice back from it; this process remembers it
+    /// until then.
+    async fn set_image(&self, run: &str, image: Option<&str>) -> Result<(), EnvError> {
+        if image.is_some_and(|image| image.trim().is_empty()) {
+            return Err(EnvError::Refused("the image is empty".to_owned()));
+        }
+        let image = image.map(|image| image.trim().to_owned());
+        // The lock of `ensure` and `release`: a pod that is being made is not compared with a
+        // choice that changed under it.
+        let lock = self.inner.lock_of(run);
+        let _held = lock.lock().await;
+        self.inner.remember_image(run, image);
+        Ok(())
+    }
+
+    /// The prefixes the deployment allows a repository image to start with
+    /// (`RUN_POD_REPOSITORY_IMAGES`): `Some`, empty when it allows none, because a run pod can move
+    /// to another image at all.
+    fn repository_image_prefixes(&self) -> Option<&[String]> {
+        Some(self.inner.settings.repository_images.as_slice())
     }
 
     /// Delete the run's pod when it lacks a mount the workspace needs now (a slot added since it was

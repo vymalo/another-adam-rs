@@ -198,6 +198,15 @@ repositories **read-only** and each worktree's own directory in it, and no Secre
 mirror fails in the pod, the coder commits. The template must mount the work claim once, whole, at `WORKSPACE_ROOT` (the
 chart's does; a hand-written one that does not stops the coder, exit 78).
 
+**A repository's own image, if you allow its registry.** `runPods.repositoryImages.allowedPrefixes` is empty by default: the
+run pods use the template's image, and the coder never offers `use_repository_environment`
+([ADR 0052](../decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)). Name one or more
+prefixes (each ends with `/` for a registry path, `ghcr.io/acme/`, or `:` for a tag, `ghcr.io/acme/tool:`) and a repository
+whose `devcontainer.json` names such an image may move its run pod to it. The chart renders `RUN_POD_REPOSITORY_IMAGES` and
+admits a prefixed image **for the `run` container alone**; the init containers keep the exact list. The pod's user, mounts,
+resources, network and runtime class do not move, and a configuration that only builds (a Dockerfile, features) or uses Compose
+is refused in words. A bare host is refused, because `ghcr.io` would admit `ghcr.io.evil.com`; so are `*` and `${...}`.
+
 **The coder's own git runs in a sandbox container.** `git` runs the programs a repository's configuration names (a clean
 filter, an fsmonitor), and some repositories are a run's own, so with run pods the chart adds a second container to the coder
 pod, `git-sandbox`, in which the `git status`, `git add`, `git diff` and `git commit` of the coder run

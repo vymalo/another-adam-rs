@@ -34,6 +34,12 @@ pub const WORKER_ANNOTATION: &str = "adam.vymalo.com/worker";
 /// slot added since needs a mount the pod does not have ([`WorkspaceMounts`](crate::WorkspaceMounts)).
 pub const MOUNTS_ANNOTATION: &str = "adam.vymalo.com/workspace-mounts";
 
+/// The repository image the pod runs (`use_repository_environment`, ADR 0052), when the run is not
+/// on the deployment's image. The pod is the record of the choice: a coder that restarts finds it
+/// here, and [`ensure`](adam_workspace::Environment::ensure) makes the pod again when the choice and
+/// the pod differ.
+pub const REPOSITORY_IMAGE_ANNOTATION: &str = "adam.vymalo.com/repository-image";
+
 /// How many hex digits of the run's hash name the pod: 48 bits, so a collision needs about 16
 /// million runs alive at once, and the annotation catches it.
 const HASH_DIGITS: usize = 12;

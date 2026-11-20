@@ -28,6 +28,9 @@ pub(crate) struct KubeSession {
     pub(crate) inner: Arc<Inner>,
     pub(crate) run: String,
     pub(crate) pod: String,
+    /// The image the pod runs: the repository's when the run chose one (ADR 0052), else the
+    /// template's.
+    pub(crate) image: Option<String>,
     /// `<root>/workspaces/<run>`: where every cwd is.
     pub(crate) run_dir: PathBuf,
 }
@@ -43,7 +46,10 @@ impl KubeSession {
 #[async_trait]
 impl EnvSession for KubeSession {
     fn describe(&self) -> EnvDescription {
-        let image = self.inner.template.image().map(str::to_owned);
+        let image = self
+            .image
+            .clone()
+            .or_else(|| self.inner.template.image().map(str::to_owned));
         EnvDescription {
             summary: match &image {
                 Some(image) => format!("the run's own pod {}, image {image}", self.pod),

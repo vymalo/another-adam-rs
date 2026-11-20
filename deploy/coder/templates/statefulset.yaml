@@ -310,6 +310,11 @@ spec:
               value: {{ .Values.runPods.idleSecs | quote }}
             - name: RUN_POD_WAIT_SECS
               value: {{ .Values.runPods.waitSecs | quote }}
+            {{- with include "coder.runPodRepositoryImages" . }}
+            {{- /* ADR 0052: the image prefixes a repository's devcontainer.json may name (use_repository_environment). */}}
+            - name: RUN_POD_REPOSITORY_IMAGES
+              value: {{ . | quote }}
+            {{- end }}
             {{- /* The git sandbox container below: the coder's git commands that carry no credential run there, and are never run here instead. */}}
             - name: GIT_SANDBOX_SOCKET
               value: {{ include "coder.gitSandboxSocket" . | quote }}

@@ -68,6 +68,7 @@
 //! | `RUN_POD_READY_TIMEOUT_SECS` | how long a pod may take to be ready: scheduling, pulling the image, starting | `300` |
 //! | `RUN_POD_IDLE_SECS` | how long no command may have used a pod before it is deleted (the next command makes another; the files are on the volume); `0` keeps it until the run ends | `900` |
 //! | `RUN_POD_WAIT_SECS` | how long a run waits, trying again with a growing pause, for a pod the cluster cannot give now (the quota is used up, no node has room), before the tool fails | `600` |
+//! | `RUN_POD_REPOSITORY_IMAGES` | with `kubernetes`: the image prefixes a repository's `devcontainer.json` may name (`use_repository_environment`, ADR 0052), comma- or space-separated; each ends with `/` (a registry path) or `:` (a tag), never a bare host. Empty: the tool is never offered and the run pods use the template's image | empty |
 //! | `ADAM_EXTRA_MCP_FILE` | roles that run workers: a file of extra MCP servers, in the shape of `mcp.json`, added to the agent's own (the folder's, or the embedded copy's) before they connect; it must be an existing file, and a server name the agent already has is refused at startup (exit 78). A variable it names as `${VAR}` is hidden from every process the coder starts and its value is redacted from tool output, like the `mcp.json`'s own | unset: only the agent's own servers |
 //! | `ADAM_REFERENCES_FILE` | roles that run workers: a file of references, `{"references": [{"name", "url", "branch"?, "description"}]}`: repositories the agent may **read** beside the one it works on and never write, **added** to the `references:` of the agent's own files; it must be an existing file of valid references, and a name the agent already declares is refused at startup (exit 78). See [`tools::references`](crate::tools::references) | unset: only the agent's own references |
 //! | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the coder's instructions, card, skills and subagents, read once at startup by every role ([`AgentFiles`](crate::AgentFiles)); it must exist | unset: the copy embedded in the binary |
@@ -299,6 +300,9 @@ pub struct RunPodsConfig {
     pub idle: Option<Duration>,
     /// `RUN_POD_WAIT_SECS`.
     pub wait: Duration,
+    /// `RUN_POD_REPOSITORY_IMAGES`: the image prefixes a repository may name (ADR 0052); empty
+    /// allows none, and then `use_repository_environment` is never offered.
+    pub repository_images: Vec<String>,
 }
 
 /// Where a pod finds the namespace it runs in.
@@ -316,6 +320,9 @@ impl RunPodsConfig {
         settings.exec_client.clone_from(&self.exec_binary);
         settings.ready_timeout = self.ready_timeout;
         settings.idle = self.idle;
+        settings
+            .repository_images
+            .clone_from(&self.repository_images);
         settings
     }
 
@@ -385,6 +392,9 @@ impl RunPodsConfig {
         let ready = parse_or(get, "RUN_POD_READY_TIMEOUT_SECS", 300u64, problems).max(1);
         let idle = parse_or(get, "RUN_POD_IDLE_SECS", 900u64, problems);
         let wait = parse_or(get, "RUN_POD_WAIT_SECS", 600u64, problems);
+        let repository_images = get("RUN_POD_REPOSITORY_IMAGES")
+            .map(|raw| parse_repository_images(&raw, problems))
+            .unwrap_or_default();
         if problems.len() > before {
             return None;
         }
@@ -399,8 +409,36 @@ impl RunPodsConfig {
             ready_timeout: Duration::from_secs(ready),
             idle: (idle > 0).then(|| Duration::from_secs(idle)),
             wait: Duration::from_secs(wait),
+            repository_images,
         })
     }
+}
+
+/// `RUN_POD_REPOSITORY_IMAGES`: the prefixes a repository's image may start with. Each must end
+/// with `/` (a registry path) or `:` (a tag), so that a bare host cannot admit a look-alike
+/// (`ghcr.io` admitting `ghcr.io.evil.com`); no `*` and no `${...}` variable.
+fn parse_repository_images(raw: &str, problems: &mut Vec<String>) -> Vec<String> {
+    let mut prefixes: Vec<String> = Vec::new();
+    for entry in raw
+        .split([',', ' ', '\t', '\r', '\n'])
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let well_formed = !entry.contains(['*', '$'])
+            && !entry.contains(char::is_whitespace)
+            && (entry.ends_with('/') || entry.ends_with(':'));
+        if !well_formed {
+            problems.push(format!(
+                "RUN_POD_REPOSITORY_IMAGES entry {entry:?} is not an image prefix: end it with `/` \
+                 (a registry path) or `:` (a tag), and name no `*` or `${{...}}` variable; a bare \
+                 host or repository name would admit a look-alike (ghcr.io would admit \
+                 ghcr.io.evil.com)"
+            ));
+        } else if !prefixes.contains(&entry.to_owned()) {
+            prefixes.push(entry.to_owned());
+        }
+    }
+    prefixes
 }
 
 impl RunEnvironment {
@@ -3042,6 +3080,7 @@ mod tests {
         assert_eq!(pods.ready_timeout, Duration::from_secs(300));
         assert_eq!(pods.idle, Some(Duration::from_secs(900)));
         assert_eq!(pods.wait, Duration::from_secs(600));
+        assert!(pods.repository_images.is_empty(), "none allowed by default");
         // A pod is waited for (a slot) and then made ready.
         let dc = devcontainer_of(&owned_full());
         assert_eq!(
@@ -3055,6 +3094,7 @@ mod tests {
         assert_eq!(settings.instance, "coder");
         assert_eq!(settings.worker, "coder-0");
         assert_eq!(settings.idle, Some(Duration::from_secs(900)));
+        assert!(settings.repository_images.is_empty());
     }
 
     #[test]
@@ -3066,6 +3106,10 @@ mod tests {
         vars.insert("RUN_POD_READY_TIMEOUT_SECS", "600".into());
         vars.insert("RUN_POD_IDLE_SECS", "0".into());
         vars.insert("RUN_POD_WAIT_SECS", "30".into());
+        vars.insert(
+            "RUN_POD_REPOSITORY_IMAGES",
+            " ghcr.io/acme/,registry.example:5000/team/ ghcr.io/acme/ ".into(),
+        );
         let RunEnvironment::Kubernetes(pods) =
             parse_dc(&vars).unwrap().worker.unwrap().run_environment
         else {
@@ -3076,6 +3120,51 @@ mod tests {
         assert_eq!(pods.ready_timeout, Duration::from_secs(600));
         assert_eq!(pods.idle, None, "0 keeps a pod until its run ends");
         assert_eq!(pods.wait, Duration::from_secs(30));
+        assert_eq!(
+            pods.repository_images,
+            ["ghcr.io/acme/", "registry.example:5000/team/"],
+            "trimmed, split on commas and spaces, once each"
+        );
+        assert_eq!(
+            pods.settings("coder-0").repository_images,
+            ["ghcr.io/acme/", "registry.example:5000/team/"]
+        );
+    }
+
+    #[test]
+    fn a_repository_image_prefix_must_name_a_path_or_a_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in [
+            "ghcr.io",
+            "ghcr.io/acme",
+            "*",
+            "${OWNER}/x/",
+            "ghcr.io/acme/*",
+        ] {
+            let mut vars = kubernetes_vars(dir.path());
+            vars.insert("RUN_POD_REPOSITORY_IMAGES", bad.into());
+            let problems = kube_problems(&vars);
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains("RUN_POD_REPOSITORY_IMAGES") && p.contains(bad)),
+                "{bad}: {problems:?}"
+            );
+        }
+        // A tag or a digest prefix is one: it pins the repository, not a look-alike.
+        for good in [
+            "ghcr.io/acme/",
+            "ghcr.io/acme/tool:",
+            "ghcr.io/acme/tool@sha256:",
+        ] {
+            let mut vars = kubernetes_vars(dir.path());
+            vars.insert("RUN_POD_REPOSITORY_IMAGES", good.into());
+            let parsed = parse_dc(&vars).unwrap_or_else(|e| panic!("{good}: {:?}", e.problems));
+            let RunEnvironment::Kubernetes(pods) = parsed.worker.unwrap().run_environment else {
+                panic!("{good}: kubernetes was asked for");
+            };
+            assert_eq!(pods.repository_images, [good]);
+        }
     }
 
     #[test]
