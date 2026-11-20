@@ -17,6 +17,10 @@
 //!   `kind-iso-a` at `/work/workspaces/kind-iso-a/r` whose directory in the mirror is the second path, a
 //!   worktree of the same mirror for the run `kind-iso-b` with a file `private.txt` in it,
 //!   `/work/meta/kind-iso-b/r.json`, and another mirror at `/work/git/example.test/p/other.git`.
+//! * optionally `ADAM_TEST_KUBE_REPOSITORY_IMAGE` and `ADAM_TEST_KUBE_REPOSITORY_PREFIX`, which turn on
+//!   the repository-image scenario (ADR 0052): an image the chart's admission policy admits under the
+//!   prefix, with a marker at `/etc/adam-repository-image` that the deployment's image does not have.
+//!   `kind-run-pods.sh` builds and loads both.
 //!
 //! The template's `/work` must be a volume the pod's user can write, and its image must have `sh`,
 //! `env`, `cat` and `sleep` and carry `adam-exec` at `/opt/adam/bin` (the chart's init container); the
@@ -275,6 +279,7 @@ async fn against_a_real_cluster() {
     };
     // One after the other: the quota counts every pod of the namespace.
     commands_run_in_the_runs_own_pod(&cluster).await;
+    a_repository_image_moves_the_run_and_a_build_is_refused(&cluster).await;
     kill_stops_what_the_client_started(&cluster).await;
     an_idle_pod_is_deleted_and_a_busy_one_is_not(&cluster).await;
     release_and_held_runs(&cluster).await;
@@ -444,6 +449,114 @@ async fn commands_run_in_the_runs_own_pod(c: &Cluster) {
     env.release(&run_id).await.unwrap();
 }
 
+/// ADR 0052: a run whose repository names an image (the chart's policy admits it under a prefix) moves
+/// its pod to it, a configuration that only builds is refused in words and leaves the pod as it was,
+/// and `off` goes back to the deployment's image.
+async fn a_repository_image_moves_the_run_and_a_build_is_refused(c: &Cluster) {
+    let Some(image) = std::env::var("ADAM_TEST_KUBE_REPOSITORY_IMAGE")
+        .ok()
+        .filter(|image| !image.trim().is_empty())
+    else {
+        eprintln!(
+            "skipped the repository image scenario: ADAM_TEST_KUBE_REPOSITORY_IMAGE is not set"
+        );
+        return;
+    };
+    let prefix =
+        std::env::var("ADAM_TEST_KUBE_REPOSITORY_PREFIX").unwrap_or_else(|_| image.clone());
+    eprintln!("--- repository image");
+    let run = c.run_id("repo-image");
+    let ws = c.workspaces().run(&run).unwrap();
+    // The coder's checkout is the host's here (the volume is the pod's): the reader reads a directory of
+    // its own, and what the pod mounts is the run's directory.
+    let checkout = std::env::temp_dir().join(format!("adam-repository-image-{run}"));
+    let config = checkout.join(".devcontainer");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("devcontainer.json"),
+        serde_json::json!({"customizations": {"adam": {"image": image}}}).to_string(),
+    )
+    .unwrap();
+    let found = adam_workspace::devcontainer::read(&checkout, None).unwrap();
+    assert_eq!(found.image(std::slice::from_ref(&prefix)).unwrap(), image);
+
+    let env = c.environment(c.settings());
+    env.set_image(&run, Some(&image)).await.unwrap();
+    let session = env.ensure(&ws, &NoProgress).await.unwrap();
+    let (code, out) = c
+        .exec_in(&run, &["cat", "/etc/adam-repository-image"])
+        .await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.trim(), "repository");
+    assert_eq!(run_image(c, &run).await.as_deref(), Some(image.as_str()));
+    assert_eq!(
+        c.pods()
+            .get(&pod_name(&run))
+            .await
+            .unwrap()
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("adam.vymalo.com/repository-image"))
+            .map(String::as_str),
+        Some(image.as_str())
+    );
+    assert!(
+        session.describe().summary.contains(&image),
+        "{}",
+        session.describe().summary
+    );
+
+    // A configuration that only builds its image is refused in words, and the pod is the repository's.
+    let build = checkout.join("build-only");
+    std::fs::create_dir_all(build.join(".devcontainer")).unwrap();
+    std::fs::write(
+        build.join(".devcontainer/devcontainer.json"),
+        r#"{"build": {"dockerfile": "Dockerfile"}}"#,
+    )
+    .unwrap();
+    let found = adam_workspace::devcontainer::read(&build, None).unwrap();
+    let refused = found.image(std::slice::from_ref(&prefix)).unwrap_err();
+    assert!(matches!(refused, EnvError::Refused(_)), "{refused}");
+    assert!(
+        refused.to_string().contains("builds its image"),
+        "{refused}"
+    );
+    env.ensure(&ws, &NoProgress).await.unwrap();
+    assert_eq!(
+        run_image(c, &run).await.as_deref(),
+        Some(image.as_str()),
+        "the refused configuration left the pod alone"
+    );
+    std::fs::remove_dir_all(&checkout).unwrap();
+
+    // off: the deployment's image again.
+    env.set_image(&run, None).await.unwrap();
+    env.ensure(&ws, &NoProgress).await.unwrap();
+    assert_eq!(
+        run_image(c, &run).await,
+        c.template().image().map(str::to_owned),
+        "back on the deployment's image"
+    );
+    env.release(&run).await.unwrap();
+}
+
+/// The image of the run container of the pod of `run`.
+async fn run_image(c: &Cluster, run: &str) -> Option<String> {
+    c.pods()
+        .get(&pod_name(run))
+        .await
+        .unwrap()
+        .spec
+        .unwrap()
+        .containers
+        .iter()
+        .find(|containers| containers.name == "run")
+        .unwrap()
+        .image
+        .clone()
+}
+
 async fn kill_stops_what_the_client_started(c: &Cluster) {
     eprintln!("--- kill");
     let env = c.environment(c.settings());
@@ -587,7 +700,7 @@ async fn the_admission_policy_refuses_everything_but_the_intended_pod(c: &Cluste
     let good = |run: &str| {
         let run_dir = PathBuf::from(format!("/work/workspaces/{run}"));
         let mounts = WorkspaceMounts::plan(template.workspace_path(), &run_dir, &[], &[]).unwrap();
-        template.render(run, &pod_name(run), placement, &mounts)
+        template.render(run, &pod_name(run), placement, &mounts, None)
     };
     let accepted = c.run_id("adm-ok");
     pods.create(&PostParams::default(), &good(&accepted))
@@ -901,6 +1014,7 @@ async fn a_run_pod_sees_only_its_own_run(c: &Cluster) {
             worker: &c.worker,
         },
         &mounts,
+        None,
     );
     let pods = c.pods();
     // A leftover of an earlier attempt is not this attempt's pod.

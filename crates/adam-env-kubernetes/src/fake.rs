@@ -999,6 +999,7 @@ mod tests {
                 worker: "coder-1",
             },
             &mounts,
+            None,
         );
         theirs.status = Some(ready_status());
         lock(&other.api).pods.insert(pod_name(RUN), theirs);
@@ -1197,6 +1198,210 @@ mod tests {
         assert!(fx.pod_names().is_empty());
         fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
         assert_eq!(fx.pod_names().len(), 1);
+    }
+
+    // ----- the run's image (ADR 0052) -------------------------------------------------------------
+
+    /// The image of the pod's run container.
+    fn run_image(fx: &Fixture, pod: &str) -> Option<String> {
+        lock(&fx.api).pods[pod]
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers
+            .iter()
+            .find(|c| c.name == "run")
+            .unwrap()
+            .image
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn a_run_that_chose_an_image_has_its_pod_made_again_with_it() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.exec.lock().unwrap().active = Some(0);
+        assert_eq!(fx.requests("POST"), 1);
+        let pod = pod_name(RUN);
+        let template_image = run_image(&fx, &pod).unwrap();
+
+        fx.env
+            .set_image(RUN, Some("ghcr.io/acme/dev:1"))
+            .await
+            .unwrap();
+        let steps = Steps::default();
+        let session = fx.env.ensure(&ws, &steps).await.unwrap();
+
+        assert_eq!(
+            (fx.requests("POST"), fx.requests("DELETE")),
+            (2, 1),
+            "the old pod is deleted and the new one made"
+        );
+        assert_eq!(run_image(&fx, &pod).as_deref(), Some("ghcr.io/acme/dev:1"));
+        assert_eq!(
+            fx.annotation(&pod, "adam.vymalo.com/repository-image")
+                .as_deref(),
+            Some("ghcr.io/acme/dev:1"),
+            "the pod records the choice"
+        );
+        // The init container keeps the deployment's image: it copies adam-exec.
+        assert_eq!(
+            lock(&fx.api).pods[&pod]
+                .spec
+                .as_ref()
+                .unwrap()
+                .init_containers
+                .as_ref()
+                .unwrap()[0]
+                .image
+                .as_deref(),
+            Some("ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234")
+        );
+        assert_eq!(
+            session.describe().kind,
+            adam_workspace::EnvKind::Kubernetes {
+                pod: pod.clone(),
+                image: Some("ghcr.io/acme/dev:1".to_owned()),
+            }
+        );
+        assert!(steps.0.lock().unwrap().iter().any(|s| {
+            s.detail.as_deref().is_some_and(|d| {
+                d.contains("making the pod again") && d.contains("ghcr.io/acme/dev:1")
+            })
+        }));
+        // The pod that was made is the pod now: nothing more to replace.
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (2, 1));
+        assert_ne!(template_image, "ghcr.io/acme/dev:1");
+    }
+
+    #[tokio::test]
+    async fn going_back_to_the_deployment_image_replaces_the_pods_image_again() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.exec.lock().unwrap().active = Some(0);
+        let pod = pod_name(RUN);
+        let template_image = run_image(&fx, &pod).unwrap();
+        fx.env
+            .set_image(RUN, Some("ghcr.io/acme/dev:1"))
+            .await
+            .unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!(fx.requests("DELETE"), 1);
+
+        fx.env.set_image(RUN, None).await.unwrap();
+        let session = fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!(
+            (fx.requests("POST"), fx.requests("DELETE")),
+            (3, 2),
+            "made again, on the deployment's image"
+        );
+        assert_eq!(run_image(&fx, &pod), Some(template_image.clone()));
+        assert_eq!(
+            fx.annotation(&pod, "adam.vymalo.com/repository-image"),
+            None,
+            "no choice, no annotation"
+        );
+        assert_eq!(
+            session.describe().kind,
+            adam_workspace::EnvKind::Kubernetes {
+                pod,
+                image: Some(template_image),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pod_that_runs_a_command_is_not_replaced_for_another_image() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        let pod = pod_name(RUN);
+        let template_image = run_image(&fx, &pod).unwrap();
+        fx.env
+            .set_image(RUN, Some("ghcr.io/acme/dev:1"))
+            .await
+            .unwrap();
+
+        fx.exec.lock().unwrap().active = Some(1);
+        let error = fx
+            .env
+            .ensure(&ws, &Steps::default())
+            .await
+            .err()
+            .expect("a command runs");
+        assert!(matches!(error, EnvError::Unavailable(_)), "{error}");
+        assert_eq!(error.class(), ErrorClass::Transient);
+        assert!(
+            error.to_string().contains("command is running")
+                && error.to_string().contains("ghcr.io/acme/dev:1"),
+            "{error}"
+        );
+        assert_eq!(fx.requests("DELETE"), 0, "the command is not killed");
+        assert_eq!(run_image(&fx, &pod), Some(template_image.clone()));
+
+        // A pod that cannot be asked is waited for too.
+        fx.exec.lock().unwrap().active = None;
+        let error = fx
+            .env
+            .ensure(&ws, &Steps::default())
+            .await
+            .err()
+            .expect("cannot ask");
+        assert!(matches!(error, EnvError::Unavailable(_)), "{error}");
+        assert_eq!(fx.requests("DELETE"), 0);
+
+        // The command ends: the pod is made again, with the image.
+        fx.exec.lock().unwrap().active = Some(0);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (2, 1));
+        assert_eq!(run_image(&fx, &pod).as_deref(), Some("ghcr.io/acme/dev:1"));
+    }
+
+    /// The pod's annotation is the durable record: a coder that restarts with nothing in its memory
+    /// finds the pod another worker made and keeps the repository's image instead of replacing it
+    /// with the deployment's.
+    #[tokio::test]
+    async fn a_pod_another_worker_made_with_a_repository_image_is_adopted() {
+        let other = fixture(settings());
+        let ws = other.ws(RUN);
+        let mounts = other.env.inner.template.mounts_for(&ws).await.unwrap();
+        let mut theirs = other.env.inner.template.render(
+            RUN,
+            &pod_name(RUN),
+            crate::template::Placement {
+                namespace: "coder",
+                instance: "coder",
+                worker: "coder-1",
+            },
+            &mounts,
+            Some("ghcr.io/acme/dev:1"),
+        );
+        theirs.status = Some(ready_status());
+        lock(&other.api).pods.insert(pod_name(RUN), theirs);
+
+        let session = other.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!(
+            (other.requests("POST"), other.requests("DELETE")),
+            (0, 0),
+            "the pod is the choice: it is kept"
+        );
+        assert_eq!(
+            session.describe().kind,
+            adam_workspace::EnvKind::Kubernetes {
+                pod: pod_name(RUN),
+                image: Some("ghcr.io/acme/dev:1".to_owned()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_image_is_refused() {
+        let fx = fixture(settings());
+        let error = fx.env.set_image(RUN, Some("  ")).await.unwrap_err();
+        assert!(matches!(error, EnvError::Refused(_)), "{error}");
     }
 
     #[tokio::test]

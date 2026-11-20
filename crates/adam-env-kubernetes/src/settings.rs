@@ -60,6 +60,10 @@ pub struct Settings {
     /// The environment variables `adam-kube-exec` is started with, besides nothing: see
     /// [`CLIENT_ENV`]. [`Settings::new`] reads those names from the process.
     pub client_env: BTreeMap<String, String>,
+    /// The image prefixes a repository may name (`RUN_POD_REPOSITORY_IMAGES`, chart
+    /// `runPods.repositoryImages.allowedPrefixes`): empty allows none, and then the coder never
+    /// offers a repository's own image (ADR 0052). The admission policy is the control that holds.
+    pub repository_images: Vec<String>,
 }
 
 impl Settings {
@@ -90,6 +94,7 @@ impl Settings {
                         .map(|value| ((*name).to_owned(), value))
                 })
                 .collect(),
+            repository_images: Vec::new(),
         }
     }
 }
