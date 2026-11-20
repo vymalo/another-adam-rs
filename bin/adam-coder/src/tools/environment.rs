@@ -31,10 +31,15 @@
 //! allowed prefixes is refused too. The pod's user, mounts, resources, network and runtime class do
 //! not move, and the keys that ask for them are listed in the result as ignored.
 //!
-//! The choice is the conversation's: the pod's `adam.vymalo.com/repository-image` annotation records
-//! it, so a coder that restarts keeps it, and `off: true` (or the file being gone, which withholds
-//! the tool) is the way back. Lifecycle commands, `containerEnv` and `remoteEnv` are **not** run or
-//! set by this slice: they are listed as ignored, and the result says so.
+//! The choice is the conversation's while the pod exists: the pod's
+//! `adam.vymalo.com/repository-image` annotation records it, and the coder keeps it in memory across
+//! an idle sweep, so a restarted coder reads it back from the pod. It is **not** in the run's
+//! metadata: a pod the idle sweep deleted before a restart, or a new run of the conversation, starts
+//! again on the deployment's image. `off: true` is the way back; a run whose file is gone has the
+//! tool withheld, so it keeps its image until it ends. Lifecycle commands, `containerEnv` and
+//! `remoteEnv` are **not** run or set by this slice and are listed as ignored in the result; the
+//! digest the node pulled is not reported, and a changed file does not reset the run (ADR 0052
+//! decision 5's file-changed reset is not in this slice).
 
 use std::sync::Arc;
 use std::time::Duration;

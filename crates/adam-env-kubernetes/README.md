@@ -137,10 +137,12 @@ none and its line is what it always was, so a pod made for it is not made again 
 A run pod's run container runs the template's image unless the run chose another (`use_repository_environment`, ADR 0052).
 `set_image(run, Some(image))` records the choice, `None` goes back; `ensure` compares it with the pod's
 `adam.vymalo.com/repository-image` annotation (absent: the template's image), deletes a pod that runs another image when no
-command runs in it, and makes it again from the template with the image. The annotation is the durable record: a coder that
-restarts with nothing in memory reads the choice back from the pod, and a pod another worker made is kept. The init containers
-keep the template's image (`adam-exec` is copied from the coder's), and nothing else of the template moves: user, mounts,
-resources, network and runtime class are the deployment's.
+command runs in it, and makes it again from the template with the image. The annotation is the record while the pod exists: a coder that
+restarts with nothing in memory reads the choice back from the pod, a pod another worker made is kept, and the idle sweep keeps
+the choice in the coder's memory so the pod it makes next uses it. A coder restarted after the pod was swept starts again on the
+template's image: the run's metadata record is not in this slice. The init containers keep the template's image (`adam-exec` is
+copied from the coder's), and nothing else of the template moves: user, mounts, resources, network and runtime class are the
+deployment's.
 
 ### `seal`
 

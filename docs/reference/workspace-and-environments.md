@@ -406,9 +406,11 @@ stateDiagram-v2
     [*] --> Withheld: run pods and a prefix, no configuration in a writable slot
     Withheld --> Offered: a writable slot gets a configuration
     Offered --> Offered: a call refused in words
+    Offered --> Withheld: that slot is gone or its file was removed
     Offered --> InUse: a call succeeds, the pod runs the repository's image
     InUse --> InUse: another slot or file is chosen
-    InUse --> Offered: off is true, or the pod was replaced
+    InUse --> Offered: off is true
+    InUse --> Withheld: its file is removed (the pod keeps the image)
     InUse --> [*]: the run ends
     Offered --> [*]
     Withheld --> [*]
@@ -420,14 +422,20 @@ stateDiagram-v2
 | `image`, and no `build` and no `features` | `image` |
 | `build.dockerfile` or `features` | refused: this coder runs no container engine; publish one image in the repository's CI and name it in `customizations.adam.image`, or replace the build by `image` |
 | `dockerComposeFile` | refused: name one image |
-| an image outside the prefixes, a path (`./x`, `../x`, `/x`) or a `${...}` variable | refused, naming the prefixes |
+| an image outside the prefixes (naming them), a path (`./x`, `../x`, `/x`) or a `${...}` variable | refused in words |
 
 The pod is the deployment's: its user, mounts, resources, network and runtime class do not move. The result lists the keys
 that ask for them (`privileged`, `capAdd`, `securityOpt`, `runArgs`, `mounts`, `init`, `forwardPorts`, `appPort`,
 `workspaceMount`, `workspaceFolder`, `remoteUser`, `containerUser`, `updateRemoteUserUID`, `hostRequirements`) as ignored.
 **This slice runs no lifecycle command** (`onCreateCommand`, `postCreateCommand` and the others) and sets no `containerEnv` or
-`remoteEnv`: they are listed as ignored too. The choice is recorded in the pod's `adam.vymalo.com/repository-image`
-annotation, so a coder that restarts keeps it; `off: true` puts the run back on the deployment's image, and a pod with a
-command running is not replaced until it ends. The admission policy is the control: the `run` container may use an image
-that starts with an allowed prefix, and the init containers keep the exact list. The deployment's value and its refusals:
-[the chart README](../../deploy/coder/README.md#run-pods).
+`remoteEnv`: they are listed as ignored too. It also does not report the digest the node pulled, does not reset the run when
+the file changes, and does not add the one step ADR 0052 decision 4 gives a run whose slot has a configuration where the tool
+cannot work. An image without `/bin/sh` is not recognised before its first command fails.
+
+The choice is recorded in the pod's `adam.vymalo.com/repository-image` annotation and in the coder's memory, **not in the
+run's metadata**: a coder that restarts keeps it while the pod exists, and the idle sweep keeps it in the same process, but a
+pod the sweep deleted before a restart, or a new run of the conversation, starts again on the deployment's image. `off: true`
+puts the run back on the deployment's image, and a pod with a command running is not replaced until it ends. If the slot's
+file is gone the tool is withheld, so `off` is not available then: the run keeps its image until it ends. The admission policy
+is the control: the `run` container may use an image that starts with an allowed prefix, and the init containers keep the
+exact list. The deployment's value and its refusals: [the chart README](../../deploy/coder/README.md#run-pods).
