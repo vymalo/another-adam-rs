@@ -46,7 +46,8 @@ the workspace's answer with `the workspace lacks a tool`, or the command's resul
 and a failed one carries its repeat key; and `after_run` is never called.
 `tests/run.rs` does the same for `adam_code_tools::make::run`, the guard taken for a `Make`: files the guard saw change are
 listed from `git status` (in a repository the test makes: exactly as git lists them, the first entry with its leading
-space; with no repository, nothing listed, and said as files ignored or back as `HEAD` has them) with the text of `after_run`
+space; with nothing listed in a repository, said as files ignored or back as `HEAD` has them; with no repository, that git
+could not say) with the text of `after_run`
 after them and `changed files: ...`; an unchanged run says git sees no change, and an unwatched one is the result alone,
 both with `ran: ...`; a run that touched git (`undid a change to git made by: ...`) or after which git could not be read
 (`could not check git after: ...; undid it`) is refused with the note, restored or not, and without the text of

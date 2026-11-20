@@ -202,6 +202,10 @@ const NOT_LISTED: &str = "--- the worktree now differs from HEAD in (git status;
                           it changed are ignored by the project, or are back as HEAD has them)\nThe \
                           files changed, so run the \
                           project's checks again before you commit.\n";
+const NO_STATUS: &str = "--- the worktree now differs from HEAD in (git status; files the \
+                         project ignores are kept too) ---\n(git could not say which files \
+                         changed)\nThe files changed, so run the project's checks again before \
+                         you commit.\n";
 const RESTORED: &str =
     "Everything it did was undone, its files included: the worktree is exactly as it was.";
 const NOT_RESTORED: &str = "It could not be fully undone (HEAD and the branch are back, but the \
@@ -233,8 +237,8 @@ async fn files_that_changed_are_listed_with_the_text_of_after_run() {
     let dir = tempfile::tempdir().unwrap();
     let (out, said, ws) = make(dir.path(), Ok(Settled::FilesChanged), "echo hi").await;
     assert!(!out.is_error, "{}", out.content);
-    // No repository here: `git status` says nothing, so nothing is listed.
-    assert_eq!(out.content, format!("{RENDERED}{NOT_LISTED}{PUBLISHED}"));
+    // No repository here: git has no answer, and the note says so.
+    assert_eq!(out.content, format!("{RENDERED}{NO_STATUS}{PUBLISHED}"));
     assert_eq!(said, ["running: echo hi", "changed files: echo hi"]);
     assert_eq!(ws.calls(), RAN);
 }
@@ -283,6 +287,21 @@ async fn the_files_listed_are_what_git_status_says() {
             format!("changed files: {command}")
         ]
     );
+    assert_eq!(ws.calls(), RAN);
+}
+
+/// In a repository where git lists nothing (the command put a file back as `HEAD` has it), files
+/// that changed are said to be ignored or back as `HEAD` has them.
+#[tokio::test]
+async fn files_that_changed_with_none_listed_are_said_ignored_or_back_as_head() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    git(dir.path(), &["add", "a.txt"]);
+    git(dir.path(), &["commit", "-qm", "a"]);
+    let (out, _said, ws) = make(dir.path(), Ok(Settled::FilesChanged), "echo hi").await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(out.content, format!("{RENDERED}{NOT_LISTED}{PUBLISHED}"));
     assert_eq!(ws.calls(), RAN);
 }
 
