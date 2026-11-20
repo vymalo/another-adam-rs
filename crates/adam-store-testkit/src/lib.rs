@@ -2832,6 +2832,9 @@ pub mod cases {
             let agent = agent.clone();
             tokio::spawn(async move {
                 let mut mine = Vec::new();
+                // A store whose claim ignores the lease never runs dry: bound the loop so that bug
+                // fails the case instead of hanging the suite.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
                 loop {
                     let got = store
                         .push_claim_due(
@@ -2846,6 +2849,10 @@ pub mod cases {
                     if got.is_empty() {
                         return mine;
                     }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the claim loop never ran dry: a config is leased again and again"
+                    );
                     mine.extend(got.into_iter().map(|r| r.id));
                 }
             })

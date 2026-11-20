@@ -1,6 +1,8 @@
 # adam-store-postgres
 
-`adam_core::Store` on PostgreSQL 12+ through `sqlx`.
+`adam_core::Store` on PostgreSQL 12+ through `tokio-postgres`, pooled by `deadpool-postgres`
+([ADR 0053](../../docs/decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md),
+decision 1: the driver changed, the schema and the statements did not).
 
 ## Where it sits
 
@@ -16,10 +18,13 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `PgStore::connect_with_pool_size(url, n)`: the same with an explicit size (2 to 65535).
 * `PgStore::connect_lazy(url)`: the same `ADAM_PG_POOL_SIZE` pool, opening no connection until first use, and `ping()` opens one, for a process that
   checks its own configuration before it needs the database (`adam-service`'s `serve`).
-* `PgStore::from_pool(pool)`: reuse your application's `PgPool`.
+* `PgStore::from_config(config, n)`: an already parsed [`adam-postgres`](../adam-postgres/README.md)
+  `PgConfig` (what `adam-service` does, so `DATABASE_URL` is parsed once for the store and the
+  notification listener), opening no connection.
+* `PgStore::from_pool(pool)`: reuse your application's `deadpool_postgres::Pool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
-* `PgStore::pool()`, `SCHEMA_VERSION` (5).
+* `PgStore::pool()`, `SCHEMA_VERSION` (6).
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
   state, and the state is the largest column, so a `RETURNING` that echoed it would parse it back on
   every transition. `load_run`, the claim and the listings return the stored state; `journal_put`
@@ -27,6 +32,16 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `run_header` is one statement over the primary key that selects the header columns and
   `lease_until`, never `state`: a reader that only needs the run's own bookkeeping (a cancel watch,
   a parent check) does not pay for the largest column.
+* `load_head` is one statement: the head when `head_version == version`, the whole state otherwise,
+  never a body row (`Runtime::view` is one `lease_until` + one `load_head`). `body_list` reads one
+  generation in order; `gc_body` collects superseded generations older than its cutoff. **A `Store`
+  wrapper must forward `load_head`** (as it must forward `keeps_bodies`, `body_list` and
+  `gc_body`): the trait default calls the wrapper's `load_run`, so a view through a wrapper that
+  does not delegate silently reads the whole state and loses the head. The wrappers in
+  [`adam-store-testkit`](../adam-store-testkit/README.md) forward them.
+* `commit_run` writes the head, the body rows and the blob references **in the same transaction as
+  the version CAS** (the run row is locked `FOR UPDATE` first). A commit that writes none of them is
+  the single `UPDATE` it always was, so a delivery or a cancel pays no `BEGIN`.
 * The `Store` implementation: call `migrate()` once at boot (idempotent, safe
   from every replica). On a schema that is already current it runs no DDL and takes no table
   lock, so a start cannot deadlock with live traffic (see "Schema version 3").
@@ -55,24 +70,22 @@ the same value in every backend ([ADR 0051](../../docs/decisions/0051-a-nul-is-s
 The guarantee table is in the [store adapters reference](../../docs/reference/store-adapters.md#how-each-adapter-keeps-the-contract).
 
 Time columns (`wake_at`, `sched_at`, `lease_until`, `created_at`, `updated_at`, `recorded_at` and
-the push scheduling fields) are `TIMESTAMPTZ`. sqlx 0.9 has no jiff support, so the adapter maps
-`adam_core::time::Timestamp` through a private `PgTime` that encodes and decodes as sqlx's
-`chrono::DateTime<Utc>`: the column type and the bytes on the wire are unchanged
-([ADR 0057](../../docs/decisions/0057-time-is-jiff-with-the-bytes-chrono-wrote.md)). `chrono` is
-a dependency of this crate only, for that bridge. The bridge is temporary: when the store moves from sqlx to
-tokio-postgres, `postgres-types`'s `with-jiff-0_2` feature does this natively (the same `TIMESTAMPTZ`,
-microseconds since 2000, the same bytes as `with-chrono-0_4`), and it goes with sqlx's `chrono` feature.
+the push scheduling fields) are `TIMESTAMPTZ`. `adam_core::time::Timestamp` is a `jiff::Timestamp`
+newtype, and `postgres-types`' `with-jiff-0_2` feature binds it natively: microseconds since 2000,
+the same bytes chrono wrote ([ADR 0057](../../docs/decisions/0057-time-is-jiff-with-the-bytes-chrono-wrote.md)).
+There is no bridge type: the store converts at the edge (`t.0` to bind, `Timestamp(at)` to read).
 
 ## Pool
 
 `connect` sizes the pool from `ADAM_PG_POOL_SIZE` (2 to 65535, default 16) and
 `connect_with_pool_size` from its argument; `from_pool` uses the pool you pass. The pool is **per
-process**: N replicas open up to N × the size against one server, and an `adam-notify-postgres`
-listener holds one connection for the process's lifetime. **One is refused, not accepted**: with a
-single connection the listener takes it and every store query waits out sqlx's acquire timeout, for
-ever, while startup succeeded and the pod reports Ready. Two is the floor (one for the listener, one
-for queries); the default leaves room for concurrency. A value that is not an integer in range fails
-the connect with `InvalidInput`; it never falls back to 16 silently.
+process**: N replicas open up to N × the size against one server. **One is refused, not accepted**:
+a one-connection pool serializes every store call behind whichever query is running, and a
+migration holds its connection for the length of the schema check, so a healthy process could not
+answer. The `adam-notify-postgres` listener now opens its own connection and does not take one from
+the pool, but the floor stays: two is one for a long statement and one for everything else, and the
+default leaves room for concurrency. A value that is not an integer in range fails the connect with
+`InvalidInput`; it never falls back to 16 silently.
 
 ## Schema version 3: the push table
 
@@ -142,22 +155,25 @@ keeps the earlier ones — so **a hand-built `RunUpdate { .. }` literal stops co
 **defaulted** on `Store`, so a store of your own that keeps no blobs still compiles and behaves as
 before.
 
-## Schema version 5, part 2: the head and the body (deferred)
+## Schema version 5, part 2 (schema version 6): the head and the body
 
-The head and the body are **not** in this store yet: `PgStore` keeps `keeps_bodies() == false`,
-writes no `head`/`head_version` and no `<prefix>body`, and answers `body_list` empty. `load_head` is
-the trait default (`load_run`), so an observer reads the whole v4 `state`, and `commit_run` ignores
-`RunUpdate.head`/`body` (its destructure names and drops them). The columns, the `adam_body` table
-and the one-transaction CTE are the PostgreSQL follow-up after #361.
+`<prefix>runs.head` is the v5 head and `<prefix>runs.head_version` the version it was written at;
+`<prefix>body` is one row per transcript message, keyed `(run_id, generation, idx)`, with the
+`writer` and `written_at` the duplicate rule needs, `ON DELETE CASCADE`. `SCHEMA_VERSION` is 6. The
+upgrade from a version 5 database is its own step gated on `stored < 6` (not on the blob step: a
+database stamped 5 already has the blob tables but no head or body) and is metadata-only: two
+nullable columns and one table.
 
-When that half lands, its upgrade gate must be `stored < 6` (or a check of
-`to_regclass('<prefix>body')`), **not** `stored == Some(4)`: a database stamped 5 by S1/S2a already
-has the blob tables but no head or body, so a gate on the blob step would skip the new columns
-silently. The follow-up bumps `SCHEMA_VERSION` to 6. It also applies the body duplicate rule the
-MongoDB half implements (ADR 0055, S2a amendment 6): an identical foreign row is adopted, a differing
-one older than the 5-minute orphan grace is collected and the insert retried once, and a live
-attempt's differing row is a `Conflict` — all inside the one transaction that writes the rows, the
-refs and the CAS.
+`commit_run` with a head, a body or blob references is **one transaction**: the run row is locked
+`FOR UPDATE`, the version is checked, the rows after the head's `len` are inserted
+(`INSERT .. SELECT unnest(..) ON CONFLICT DO NOTHING`), the slots another writer owns are read
+(an identical message is adopted; one older than the 5-minute orphan grace is collected and the
+insert retried once; a live attempt's differing row is a `Conflict`), the refs are inserted, the CAS
+runs, and the commit ends. The head's `body` is patched to the resolved `{generation, len}`. The
+superseded generation is collected after the CAS, an hour of grace. A commit that loses writes
+nothing (the transaction rolls back), so a loser cannot poison the next append. `load_head` serves
+the head only when `head_version == version`; a stale head is not corrupt, the whole state is served
+and the next split rewrites it.
 
 ## Schema version and the owner column
 
@@ -176,16 +192,20 @@ index does the range scan and the owner is a filter on those rows.
 
 Failures are `adam_core::StoreError` (see [`adam-core`](../adam-core/README.md#errors)
 and [`adam-error`](../adam-error/README.md)). A driver error becomes
-`StoreError::Backend { class, source }`, with the `sqlx` error as the source
-and this adapter's choice of class:
+`StoreError::Backend { class, source }`, with the `tokio_postgres::Error` as the source
+and this adapter's choice of class ([`adam-postgres`](../adam-postgres/README.md) owns the mapping):
 
 | Driver error | Class |
 |---|---|
-| I/O, TLS, protocol, pool timed out or closed, worker crashed | `Transient` |
+| I/O, TLS, a closed connection, a pool wait timeout or a closed pool | `Transient` |
 | database error with SQLSTATE class `08` or `53`, or `40001`, `40P01`, `57P01`, `57P02`, `57P03` | `Transient` |
 | a value or column that cannot be decoded, a missing column | `Corrupt` |
-| bad connection configuration | `Invalid` |
+| a bad connection string, a missing certificate file | `Invalid` |
 | any other database error (a rejected statement) and anything else | `Internal` |
+
+One documented change from the `sqlx` mapping: `sqlx`'s `Protocol` and `WorkerCrashed` were
+`Transient`; `tokio-postgres` has no equivalent, so what is not a database error, a closed
+connection or an I/O/TLS failure is `Internal`.
 
 A poisoned row is therefore `Corrupt`, not retryable and alerting, so the
 runtime fails that run instead of re-leasing it for ever. The adapter's own
@@ -193,18 +213,28 @@ checks are `InvalidInput` (an integer above `i64::MAX`, a bad table prefix) and 
 journal entry that vanished). *Unverified:* the SQLSTATE codes are from the
 PostgreSQL manual's error-code appendix, recalled from memory, not re-checked.
 
-## Features
+## TLS
 
-| Feature | Default | Effect |
-|---|---|---|
-| `tls-rustls` | yes | `sqlx/tls-rustls` |
-| `tls-native-tls` | no | `sqlx/tls-native-tls` |
+There are no Cargo features: TLS is always `rustls` on `aws-lc-rs`, and `DATABASE_URL` chooses the
+mode (`sslmode`, `sslrootcert`, `sslcert`, `sslkey`; see
+[`adam-postgres`](../adam-postgres/README.md#tls)). The old `tls-rustls`/`tls-native-tls` features
+are gone with `sqlx`; a consumer that set them must remove the line.
 
 ## Tests
 
 `tests/conformance.rs` runs the shared suite against a real server.
 `tests/errors.rs` checks the classes: an undecodable row is `Corrupt` and not
-retryable (needs the server), and an unreachable server is `Transient` (offline).
+retryable, a unique violation stays `AlreadyExists`, a lost connection and a
+serialization failure are `Transient`, a bad statement is `Internal` (needs the
+server), and an unreachable server is `Transient` (offline).
+`tests/fixtures/schema-v5.sql` is the schema exactly as the `sqlx` build emitted it: `tests/fixture.rs`
+applies it with `batch_execute`, opens the store and takes a create/load round trip with **no
+migration**, then migrates to 6 and commits a head and a body. `tests/fixtures/schema-v6.sql` is the
+current schema; a unit test (`the_statements_equal_the_version_6_fixture`) compares the live
+statements with it whitespace-normalised, so they cannot drift; `ADAM_WRITE_FIXTURE=1` regenerates it.
+`tests/body_writers.rs` writes a foreign body row directly and proves the three resolutions (adopted,
+collected after the orphan grace, `Conflict`), and `tests/head_view.rs` counts the calls
+`Runtime::view` makes (one lease, one head, no body) and `Runtime::state`'s (one head, one body).
 `tests/migrate.rs` builds a version 1 schema by hand with a legacy run, migrates it and checks the
 column, the version row, that the run survived and that pinning works on it; it also checks that an
 older release does not lower the version. A version 2 schema migrates to the current one and gets the
@@ -214,9 +244,10 @@ finishes while another connection holds `ROW EXCLUSIVE` locks on `runs` and `pus
 DDL). A unit test
 (`the_listing_index_upgrade_does_not_wait_for_live_traffic`) holds a writer's lock open and writes
 beside the upgrade, which fails if the rebuild ever queues for `AccessExclusiveLock` again.
-Unit tests in `src/lib.rs` cover the driver-error table and the pool-size rule, and one of them
-(`sqlstates_are_classified_against_a_real_server`) provokes real SQLSTATEs
-when the server variable is set.
+`tests/time.rs` proves the wire: a `TIMESTAMPTZ` is microseconds since 2000 (read as PostgreSQL's
+own `i64`), a `NULL` stays `NULL`, an out-of-range value is `Corrupt`, and a sub-millisecond cutoff
+keeps its microseconds. Unit tests in `src/lib.rs` cover the pool-size rule and provoke real
+SQLSTATEs when the server variable is set.
 
 | Variable | Meaning |
 |---|---|

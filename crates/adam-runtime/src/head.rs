@@ -28,7 +28,9 @@ use crate::runtime::RuntimeError;
 pub(crate) const VERSION: u32 = 5;
 
 /// The body generation a head names: the rows are `(run, generation, idx)` in the store, and `len`
-/// is the integrity check a reader makes against `body_list(run, generation).len()`.
+/// is the integrity check a reader makes against the **prefix** of
+/// `body_list(run, generation)` — the first `len` rows. A generation is append-only, so rows past
+/// `len` are a later commit's (or a lost attempt's, not yet collected) and are not this head's.
 ///
 /// The runtime leaves `generation` `null`: only the store sees the current head, so it resolves the
 /// generation an append belongs to (the current one, or a new one for a first split or a

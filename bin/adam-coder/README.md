@@ -2774,8 +2774,8 @@ database of its own, so the role needs `CREATEDB`):
   `DEVCONTAINER_RUNTIME=podman` and a service that does not answer, the worker starts, writes the tools directory
   (`adam-exec` alone, even with `OPENCODE_BINARY` set), says so, and stops cleanly; the three removed variables are logged once each, by name; Postgres unreachable at boot
   (a clear "connecting to Postgres: ..." chain in exactly one `adam-coder failed`
-  line, exit 69, nothing on stderr, no password, no panic; sqlx retries the
-  connection for its 30 s acquire timeout first); with Postgres: the card and
+  line, exit 69, nothing on stderr, no password, no panic; deadpool retries the
+  connection for its 30 s create timeout first); with Postgres: the card and
   `/healthz`, a clean exit 0 on SIGTERM, `MAX_PARALLEL_TOOL_CALLS` at 1 and at 2 read in the model's request (the
   `after_previous` property and sentence absent and present), and
   SIGTERM in the middle of a check (the process waits for the step,
