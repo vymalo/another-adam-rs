@@ -386,7 +386,13 @@ impl Inner {
         }
     }
 
-    /// The joined state of one record, or `None` when the body set does not match the head.
+    /// The joined state of one record, or `None` when the head's prefix is not whole.
+    ///
+    /// The head names a **prefix** of its generation's rows (`body.len`), not the whole
+    /// generation: a commit that lost its CAS leaves its extra rows (`idx >= body.len`) in the
+    /// generation until its `delete_loser` runs, or the orphan grace collects them. Those rows are
+    /// not part of the head's state and are ignored; a prefix that is short or has a hole is what
+    /// `None` is for.
     async fn join_stored(
         &self,
         rec: &RunRecord,
@@ -405,8 +411,18 @@ impl Inner {
                 source: None,
             });
         };
-        let rows = self.store.body_list(rec.id, generation).await?;
-        if rows.len() != body.len as usize
+        let len = body.len as usize;
+        let mut rows = self.store.body_list(rec.id, generation).await?;
+        let extra = rows.iter().filter(|row| row.idx as usize >= len).count();
+        if extra > 0 {
+            rows.retain(|row| (row.idx as usize) < len);
+            tracing::debug!(
+                run = %rec.id,
+                extra,
+                "a lost attempt's body rows past the head's prefix are not part of its state"
+            );
+        }
+        if rows.len() != len
             || rows
                 .iter()
                 .enumerate()
@@ -1653,8 +1669,11 @@ impl Runtime {
     /// [`join`](crate::Agent::join). This is the only read of a v5 run's transcript.
     ///
     /// A v4 run's state is whole in its record, so it is returned as it is with no body read. For
-    /// a v5 run the rows the head names are read (`body_list`) and the join must reproduce the
-    /// state: a set that does not match the head's `len` is read again once, in case the head moved
+    /// a v5 run the head names a **prefix** of its generation's rows (`len`), not the whole
+    /// generation: a commit that lost its CAS leaves its extra rows in the generation until its
+    /// cleanup or the orphan grace collects them, so the generation can hold more. The prefix is
+    /// read (`body_list`), the rows past it are ignored, and the join must reproduce the state from
+    /// `0..len`: a prefix that is short or has a hole is read again once, in case the head moved
     /// between the two reads, and is [`RuntimeError::Corrupt`] if it did not.
     ///
     /// The agent must be registered on this runtime (an agent or a starter: both have `join`), and
