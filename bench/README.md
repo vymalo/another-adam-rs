@@ -318,15 +318,18 @@ change's added lines is in your statement. An `Interface` section is exempt: it 
   (public) walks the tasks in the order `select` uses (`selectionOrder` in `lib/select.mjs`: a seeded shuffle in each
   repository, then rounds that take one task of every repository; `--seed`, default the configuration's) and stops as soon
   as 80 are kept (`--total N` changes the target). A repository that already has 9 kept is skipped for the rest of the walk.
-  A walk that ends before the target says `shortfall: N of 80 kept`. The image of a task dropped by its verdict is removed
-  at once (`docker image rm`, by digest and by tag), unless a task kept so far, the workspace image or the pinned coder
-  uses that digest; a removal that fails is printed (`image not removed`) and the verdict stands. The kept tasks' images
-  stay: a run needs them. A re-run continues from `check.json`: a verdict recorded for the task as it is now (same checksum;
+  A walk that ends before the target says `shortfall: N of 80 kept`. **The image of every checked public task is removed
+  as soon as its verdict and image digest are in `check.json`** (`docker image rm`, by digest and by tag), kept or dropped, so
+  80 kept tasks never sit on the disk together (the images are 2 to 3.5 GB each, 200 GB or more for 80); `run` pulls each by
+  the digest the lock holds, just in time (see "Task images just in time" below). The workspace image and the pinned coder are
+  never removed, nor are own task images (built here, they cannot be pulled again); a dropped task's image whose digest a task
+  kept so far uses stays; a removal that fails is printed (`image not removed`) and the verdict stands. `--keep-images`
+  keeps the images of the kept tasks, as before (a dropped task's image is still removed). A re-run continues from `check.json`: a verdict recorded for the task as it is now (same checksum;
   an `infra` result is not a verdict) is not run again, and the walk goes on in the same order. **A verdict with no
   `agentPath` was made under the earlier rule** (the clone path decided, and the empty patch ran only there), so it is run
   again, and `select` does not take it: the old data has no empty run at `/app`, and a task dropped for a clone-path reason
   cannot be told from one that fails at `/app`. `--all` walks every task
-  (an audit; it still resumes and still removes the images of dropped tasks), `--only ID,ID` runs just those again.
+  (an audit; it still resumes and still removes the images), `--only ID,ID` runs just those again.
 
 * `bench tasks select` keeps the checked tasks without a `.devcontainer`, whose check still fits the task (a result carries
   the task's checksum and image digest and is ignored when either has changed). For the public source
@@ -830,6 +833,17 @@ deletes the file first, so an old yes never covers a new pilot.
   shared side of one lock and a window the exclusive side, so no grading of an agent's patch ever has a route out and
   two windows never overlap. An own task's image is built where `bench tasks build` ran, in the host's store; a start
   checks that every own image is there **before anything is spent**, and a regrade makes the task's image present first.
+* **Task images just in time (2026-11-20).** A public task's image is on the disk only while its runs happen. Before a task's
+  first run in a pass the harness pulls it **by digest** (the lock's) if it is not in the host's store, once however many slots
+  ask; the reference carries the digest, so a present image is the pinned one. When the last run of an image in the pass ends,
+  every queued run of it done and none open (a block's arms run back to back, in whatever slot; two tasks that share an image
+  hold it until the last run of either), the schedule calls `releaseImage` and the image is removed (`docker image rm`, no
+  force). It is never removed while a run uses it, never for the coder, the workspace image or an own task, and a removal that
+  fails is printed (`image not removed`) and changes nothing. A pull that fails is `Failed_infra` with the reason `image_pull`
+  for that run (tried again, never a fail). `bench pilot` and `bench run` are separate starts: the pilot releases its blocks'
+  images when it ends and `run` pulls them again. `regrade` pulls and releases the same way. **`--keep-images`** (on `pilot`,
+  `run`, `regrade`, `doctor`, and `tasks check`) keeps every image, as before. Pulls and removals go through `dockerEnv`: no model
+  key and no proxy variable reaches `docker`.
 * **The end.** `report.md` has, for each agent and arm, the resolve rate with its Wilson interval and how many runs of the cell are
   left out, the paired differences, cost per run, per **resolved** task, and per resolved task with every run of the cell (waste
   included), the spend on unsolved runs, tokens (input, cached, cache write, output), the cache-hit rate (cached over input, all
@@ -843,7 +857,11 @@ plugin, whether the daemon is rootless, free disk (in `$BENCH_HOME` and in
 Docker's root) and the coder image by digest. **Disk rule (changed 2026-11-19; before it counted free space alone).** An image already
 on the machine is space the run does not need to find: the check **passes when `free + the size (docker's .Size) of the coder image and of
 each selected task image that is present` is at least 20 GB** (a failure under 20 GB), and warns under 100 GB on the same sum (so 8 GB free with a 12 GB coder
-image present passes, 8 GB free with none present fails). A task image's size includes its shared base, so a few shared layers
+image present passes, 8 GB free with none present fails). **Just in time (the default; `--keep-images` gives the rule above):**
+the floor is the coder image plus the largest task image plus 10 GB of margin (the layers being unpacked, the bases, the
+results), never under 20 GB, and only the coder counts as present, because task images are removed after their runs; it uses
+the sizes found here, else 12 GB for the coder and 3.5 GB for a task image, and warns under the floor plus 30 GB
+(about 25.5 GB and 55.5 GB with nothing measured). A task image's size includes its shared base, so a few shared layers
 are counted more than once. The failure says both numbers. **For each selected task image** it runs the coder's binary with no
 configuration as uid 10001 in that image: exit 78 means the coder starts (it refuses an empty configuration), a loader
 error or another architecture means the image cannot run it. **The probe runs the binaries of the pinned coder image**, and

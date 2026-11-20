@@ -10,6 +10,10 @@
 //     free when it closes. A block that does not fit with nothing to wait for ends the schedule.
 // Starting is one at a time, in order, and the check and the first reservation run with no `await` between them.
 //
+// Task images are just in time: when the last run of an image in this pass has ended (every queued run of it, whatever the
+// task, and none open), `deps.releaseImage(task)` is called, so the image is gone before a later block's is pulled. A release
+// that fails is harmless. A pass that stops at the cap releases the images it pulled for blocks that did not finish.
+//
 // A harness crash (HarnessCrash, a test's stand-in for a kill) ends the schedule: every worker stops taking specs, and the first
 // crash is thrown after the workers have settled.
 import { resumeActions } from './ledger.mjs';
@@ -43,6 +47,21 @@ export async function runSchedule({ deps, specs, slots, onOutcome = () => {} }) 
     passes++;
     let active = 0;
     const waiters = [];
+    // Runs of an image that are queued or running; an image is released when its count reaches zero.
+    const imageOf = (spec) => spec.task?.image?.ref ?? null;
+    const open = new Map();
+    const touched = new Map(); // ref -> a task that uses it
+    for (const spec of queue) {
+      const r = imageOf(spec);
+      if (r) open.set(r, (open.get(r) ?? 0) + 1);
+    }
+    const release = async (r) => {
+      try {
+        await deps.releaseImage?.(touched.get(r));
+      } catch {
+        // a failed removal is told by the release itself and never changes a run
+      }
+    };
     const wake = () => waiters.splice(0).forEach((resolve) => resolve());
 
     // Starting is one at a time, in the order of the specs: a run that waits for budget is not passed by the next one.
@@ -75,7 +94,8 @@ export async function runSchedule({ deps, specs, slots, onOutcome = () => {} }) 
         if (held.get(key) === 0 && ![...queue].some((q) => (q.block ?? q.run) === key)) held.delete(key);
         active++;
         maxActive = Math.max(maxActive, active);
-        return { running: advance({ deps, spec: { ...spec, slot }, folded }) };
+        if (imageOf(spec)) touched.set(imageOf(spec), spec.task);
+        return { spec, running: advance({ deps, spec: { ...spec, slot }, folded }) };
       });
       gate = turn.then(
         () => {},
@@ -105,6 +125,11 @@ export async function runSchedule({ deps, specs, slots, onOutcome = () => {} }) 
           crash ??= e;
         } finally {
           active--;
+          const r = started.spec ? imageOf(started.spec) : null;
+          if (r) {
+            open.set(r, open.get(r) - 1);
+            if (open.get(r) === 0 && !crash) await release(r);
+          }
           wake();
         }
       }
@@ -113,6 +138,8 @@ export async function runSchedule({ deps, specs, slots, onOutcome = () => {} }) 
     const failed = results.find((r) => r.status === 'rejected');
     if (failed) throw failed.reason;
     if (crash) break;
+    // Blocks that were not started (the cap) leave their images where they are: the ones pulled are released now.
+    for (const [r, n] of open) if (n > 0 && touched.has(r)) await release(r);
     // What failed in the infrastructure is tried again, at most as often as the ledger allows.
     const left = resumeActions(deps.ledger.fold()).filter((a) => a.action === 'retry' && specs.some((s) => s.run === a.run));
     if (left.length === 0) break;

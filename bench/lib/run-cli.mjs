@@ -29,7 +29,7 @@ import { buildReport } from './report.mjs';
 import { advance, regradeInvalid } from './runner.mjs';
 import { runSchedule } from './schedule.mjs';
 import { SLOTS, Stack } from './stack.mjs';
-import { fetchPublic, paths, readJson } from './tasks-cli.mjs';
+import { digestOfRef, fetchPublic, paths, readJson } from './tasks-cli.mjs';
 import { listTasks } from './task.mjs';
 import { loadOwnSpecs, ownChecksum, ownImageTag } from './own.mjs';
 import { taskChecksum } from './upstream.mjs';
@@ -99,7 +99,7 @@ export function loadSelected(config, p) {
  * The real harness: the stack, the meter, the ledger and the two drivers. Needs the container services; unverified here.
  * Whatever fails after the meter listens, or after the stack starts, closes the meter and brings the stack down.
  */
-export async function realHarness({ env, config, log, sharedPrompt, inject = {} }) {
+export async function realHarness({ env, config, log, notice = log, keepImages = false, sharedPrompt, inject = {} }) {
   if (typeof sharedPrompt !== 'string' || sharedPrompt === '') throw new Error('the shared system prompt is required: both agents are given the same one');
   const { load = loadSelected, makeStack = (o) => new Stack(o), makeMeter = createMeter } = inject;
   const home = benchHome(env);
@@ -130,13 +130,33 @@ export async function realHarness({ env, config, log, sharedPrompt, inject = {} 
     // particular container, so the promise is keyed by the image and never by the slot that asked. `once` keeps the
     // in-flight promise, so two slots preparing the same task at once pull it once.
     const first = once();
+    // A public task's image is pulled just before its first run, by the digest the lock holds, and released after its last
+    // (`releaseImage`, called by the schedule). `docker pull` goes through the containers' `dockerEnv`: no key, no proxy.
     const pullImage = (slot, task) =>
       first(task.image.ref, async () => {
         const containers = stack.containers(slot);
         if (await containers.hasImage(task.image.ref)) return;
         if (task.source === 'own') throw new SelectionError(`the own task image ${task.image.ref} is not in the host's store: build it with bench tasks build`);
-        await stack.pullWindow(slot, () => containers.pull(task.image.ref));
+        try {
+          await stack.pullWindow(slot, () => containers.pull(task.image.ref));
+        } catch (e) {
+          // The network or the registry, never the agent: the run is infrastructure and is tried again.
+          throw Object.assign(new Error(`could not pull ${task.image.ref}: ${e.message}`), { reason: 'image_pull' });
+        }
       });
+    // Never the coder, the workspace image or an own image (built here, not pullable); a failed removal is told and harmless.
+    const keepDigests = new Set([digestOfRef(config.tasks?.workspaceImage), PINS.coder.digest].filter(Boolean));
+    const releaseImage = async (task) => {
+      if (keepImages || task.source === 'own') return;
+      const r = task.image.ref;
+      if (keepDigests.has(task.image.digest ?? digestOfRef(r))) return;
+      try {
+        await stack.containers(1).removeImage(r);
+      } catch (e) {
+        notice?.(`${task.id}: image not removed (${e.message})`);
+      }
+      first.forget(r);
+    };
     const pullGraderImage = (task) => pullImage(1, task);
     // Before any money is spent: every own image is in the host's store.
     for (const task of tasks.filter((t) => t.source === 'own')) {
@@ -153,6 +173,7 @@ export async function realHarness({ env, config, log, sharedPrompt, inject = {} 
       home,
       pullImage,
       pullGraderImage,
+      releaseImage,
       log,
       agents: {
         adam: new AdamAgent({ pins: PINS, home, repoDir: REPO_DIR, contextWindow: config.contextWindow }),
@@ -199,7 +220,8 @@ const setupRecord = (config, ctx) => ({
 const progress = (out) => (o) => out(`${o.run}: ${o.state}${o.pass === undefined ? '' : o.pass ? ' (solved)' : ' (not solved)'}`);
 
 async function cmdPilot(argv, ctx) {
-  const { values } = parseArgs({ args: argv, options: { blocks: { type: 'string' } }, allowPositionals: false });
+  const { values } = parseArgs({ args: argv, options: { blocks: { type: 'string' }, 'keep-images': { type: 'boolean' } }, allowPositionals: false });
+  ctx.keepImages = values['keep-images'] === true;
   const count = values.blocks === undefined ? PILOT_BLOCKS : Number(values.blocks);
   const least = Math.ceil(MIN_PER_ARM / AGENTS.length);
   if (!Number.isInteger(count) || count < least || count > 100) {
@@ -210,7 +232,7 @@ async function cmdPilot(argv, ctx) {
   if (blockMicro > ctx.config.capMicro) throw new BudgetError(`the cap (${formatUSD(ctx.config.capMicro)}) cannot hold one block of ${cells} runs at ${formatUSD(ctx.config.perRunBudgetMicro)} each: raise the cap or lower perRunBudgetUSD`);
   const file = proposalFile(ctx.home);
   fs.rmSync(file, { force: true }); // a new pilot invalidates any earlier confirmation
-  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, sharedPrompt: ctx.sharedPrompt });
+  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, notice: ctx.out, keepImages: ctx.keepImages, sharedPrompt: ctx.sharedPrompt });
   try {
     const plan = plans(harness, ctx.config);
     if (count > plan.blocks.length) throw new SelectionError(`--blocks ${count} is more than the ${plan.blocks.length} selected tasks`);
@@ -251,10 +273,11 @@ async function cmdConfirm(argv, ctx) {
 }
 
 async function cmdRun(argv, ctx) {
-  parseArgs({ args: argv, options: {}, allowPositionals: false });
+  const { values } = parseArgs({ args: argv, options: { 'keep-images': { type: 'boolean' } }, allowPositionals: false });
+  ctx.keepImages = values['keep-images'] === true;
   // Nothing is started, not even the stack, before the owner's confirmation is checked.
   const perArm = requireConfirmed(readJson(proposalFile(ctx.home), null), { config: ctx.config, fingerprint: ctx.fingerprint });
-  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, sharedPrompt: ctx.sharedPrompt });
+  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, notice: ctx.out, keepImages: ctx.keepImages, sharedPrompt: ctx.sharedPrompt });
   try {
     const { blocks, specs } = plans(harness, ctx.config);
     const { ledger } = harness.deps;
@@ -280,29 +303,48 @@ async function cmdRun(argv, ctx) {
 }
 
 /** Grade again the runs a regrade left in `Grading` (a kill, or a grader that failed again): from the saved patch, the agent is never run. */
-export async function regradeStranded({ deps, specs }) {
+export async function regradeStranded({ deps, specs, release = false }) {
   const folded = deps.ledger.fold();
   const out = [];
-  for (const spec of specs) if (folded.get(spec.run)?.state === 'Grading') out.push(await advance({ deps, spec: { ...spec, slot: 1 }, folded }));
+  const todo = specs.filter((s) => folded.get(s.run)?.state === 'Grading');
+  for (const [i, spec] of todo.entries()) {
+    out.push(await advance({ deps, spec: { ...spec, slot: 1 }, folded }));
+    if (release) await releaseUnlessNeeded(deps, spec, todo.slice(i + 1));
+  }
   return out;
 }
 
+/** A regrade pulls the task's image to grade; it is released after the last regrade that uses it. */
+async function releaseUnlessNeeded(deps, spec, later) {
+  const r = spec.task?.image?.ref;
+  if (!r || later.some((s) => s.task?.image?.ref === r)) return;
+  try {
+    await deps.releaseImage?.(spec.task);
+  } catch {
+    // harmless
+  }
+}
+
 async function cmdRegrade(argv, ctx) {
-  parseArgs({ args: argv, options: {}, allowPositionals: false });
-  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, sharedPrompt: ctx.sharedPrompt });
+  const { values } = parseArgs({ args: argv, options: { 'keep-images': { type: 'boolean' } }, allowPositionals: false });
+  ctx.keepImages = values['keep-images'] === true;
+  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, notice: ctx.out, keepImages: ctx.keepImages, sharedPrompt: ctx.sharedPrompt });
   try {
     const plan = plans(harness, ctx.config);
     const specs = [...plan.allPilotSpecs, ...plan.specs];
     harness.deps.digest = ctx.fingerprint.digest;
-    const stranded = await regradeStranded({ deps: harness.deps, specs });
+    const before = harness.deps.ledger.fold();
+    const strandedSpecs = specs.filter((s) => before.get(s.run)?.state === 'Grading');
+    const stranded = await regradeStranded({ deps: harness.deps, specs: strandedSpecs, release: true });
     for (const o of stranded) progress(ctx.out)(o);
     const folded = harness.deps.ledger.fold();
     const todo = specs.filter((s) => folded.get(s.run)?.state === 'Done' && folded.get(s.run).result?.invalid === true);
     ctx.out(`regrade: ${stranded.length} run(s) left in Grading, ${todo.length} run(s) whose grading failed in the infrastructure`);
-    for (const spec of todo) {
+    for (const [i, spec] of todo.entries()) {
       const o = await regradeInvalid({ deps: harness.deps, spec });
       progress(ctx.out)(o);
       if (o.reason) ctx.out(`  ${o.reason}`);
+      await releaseUnlessNeeded(harness.deps, spec, todo.slice(i + 1));
     }
     return 0;
   } finally {

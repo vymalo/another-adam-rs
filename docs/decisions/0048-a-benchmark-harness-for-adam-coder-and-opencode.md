@@ -487,3 +487,19 @@ The egress probe of a `public` verifier and the removal of a dropped task's imag
 
 *Unverified:* the new check on real images (the two NodeBB tasks should now be kept, `05f22361` with `agentPath: fail`).
 
+**Amended 2026-11-20: just-in-time images.** On the owner's machine the kept SWE-bench Pro images are 2 to 3.5 GB each, so a
+check that keeps every kept task's image needs 200 GB or more for 80 and stops at about 40 to 50. Images are pinned by digest in
+the lock, so a pull is exact and safe to repeat:
+
+* **`tasks check` removes the image of a kept task too**, once its verdict and `imageDigest` are in `check.json` (the dropped
+  task's image as before; never the workspace image, the coder, or an own task's image, which cannot be pulled). `--keep-images`
+  keeps the kept tasks' images.
+* **`pilot`, `run` and `regrade` pull a public task's image by digest before its first run and remove it after the last run of
+  that image in the pass**, counted over the queue (a block's arms are consecutive in the plan, in either slot), so an image two
+  tasks share stays until both are done and an image a running run uses is never removed. A pull failure is `Failed_infra`
+  (`image_pull`), never a fail; a failed removal is printed and harmless. Pulls and removals go through `dockerEnv`.
+* **The doctor's disk floor** is the coder plus the largest task image plus a 10 GB margin (at least 20 GB) when this is on,
+  not the sum of the kept images; `--keep-images` gives the earlier rule.
+
+The cost is a pull per task per start (the pilot and the run each pull their blocks) and the time of it, in the pull window of
+the slot, not in the run's own time. *Unverified:* on real registries and a real daemon (the tests use the fakes).
