@@ -40,7 +40,12 @@ pub(crate) fn chrono_of(at: Timestamp) -> chrono::DateTime<chrono::Utc> {
 /// chrono's UTC datetime as a [`Timestamp`] (the A2A types' own timestamps, on the way in).
 pub(crate) fn timestamp_of(at: chrono::DateTime<chrono::Utc>) -> Timestamp {
     let nanosecond = i32::try_from(at.timestamp_subsec_nanos()).unwrap_or(0);
-    Timestamp(jiff::Timestamp::new(at.timestamp(), nanosecond).unwrap_or(jiff::Timestamp::MAX))
+    match jiff::Timestamp::new(at.timestamp(), nanosecond) {
+        Ok(at) => Timestamp(at),
+        // Out of jiff's range: saturate on the side the instant is on, not always upward.
+        Err(_) if at.timestamp() < 0 => Timestamp(jiff::Timestamp::MIN),
+        Err(_) => Timestamp(jiff::Timestamp::MAX),
+    }
 }
 
 /// Extracts the question a run that is waiting for input asks its caller.
@@ -324,11 +329,13 @@ pub(crate) fn artifact_of_with(
     bytes: Option<Arc<[u8]>>,
 ) -> Option<Artifact> {
     if let Some(file) = &artifact.file {
-        let held: Arc<[u8]> = match &file.source {
-            FileSource::Inline(bytes) => Arc::from(bytes.as_slice()),
-            FileSource::Blob(_) => bytes?,
-        };
-        let mut part = Part::raw(held.to_vec()).with_filename(file.filename.clone());
+        // An inline file is copied once, into the part; a blob's fetched `Arc` is copied once,
+        // because `Part::raw` owns a `Vec`.
+        let mut part = match &file.source {
+            FileSource::Inline(bytes) => Part::raw(bytes.clone()),
+            FileSource::Blob(_) => Part::raw(bytes?.to_vec()),
+        }
+        .with_filename(file.filename.clone());
         if let Some(mime) = &artifact.mime_type {
             part = part.with_media_type(mime.clone());
         }
@@ -664,6 +671,19 @@ mod tests {
             let at: Timestamp = text.parse().expect("a timestamp");
             assert_eq!(timestamp_of(chrono_of(at)), at, "{text}");
         }
+    }
+
+    /// An instant outside jiff's range saturates on its own side, not always upward.
+    #[test]
+    fn an_out_of_range_chrono_instant_saturates_on_its_side() {
+        assert_eq!(
+            timestamp_of(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+            Timestamp::MIN
+        );
+        assert_eq!(
+            timestamp_of(chrono::DateTime::<chrono::Utc>::MAX_UTC),
+            Timestamp::MAX
+        );
     }
 
     /// The A2A `TaskStatus` JSON keeps chrono's bytes: the SDK type is unchanged, and the bridge

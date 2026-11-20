@@ -67,8 +67,10 @@ its `head_version` alone (a delivery, a cancel or a park keeps the format it rea
 serves the head only when `head_version == version`. `load_head` is the observer's read (`Runtime::view`). MongoDB overrides it with one **projected**
 `find_one` that carries the head and the record's own fields, never `state`: a current head
 transfers only the head, and a v4 state the run still carries (a transcript, file bytes) is not
-read. A stale or absent head is the **rare path**: the store then reads the whole document
-(`load_run`) and serves the state — the `state` bytes are read only there. The trait default is
+read. A stale or absent head takes the second, full read (`load_run`) and serves the state — the
+`state` bytes are read only there. That is not rare in every deployment: it is the path of a run
+before its first split, of an agent whose `split` returns `None` (it never writes a head), and of a
+**cancelled** run, whose stale head is permanent because no step re-splits it. The trait default is
 `load_run`, so a store that keeps no head (PostgreSQL, until its half lands after #361) answers the
 whole state exactly as before, and its view is the whole state. A `head_version != version` is
 **stale**, not corrupt: the whole state is served, and the next step re-splits and rewrites the

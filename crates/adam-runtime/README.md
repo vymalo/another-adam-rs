@@ -629,13 +629,18 @@ state but no blob uploads and references its digest on the first commit, and the
 `a_split_whose_file_is_not_stored_writes_the_state_only` (a failed `put_blob` refuses the head, and the commit writes the
 state only).
 
-Three cases here pin the read path, and one in `adam-a2a-runtime`: `the_view_reads_the_head_and_the_state_joins_the_body` (a 50-message run: the view is one
-`load_head`, no `load_run`, no `body_list`, and less than 2 KB of state; `Runtime::state` is one `load_head`, one
-`body_list` and all 50 messages), `a_stale_head_falls_back_to_the_whole_state` (a delivery leaves the head stale: the view
-is the whole state, no body is read, and the next step rewrites the head) and `a_v4_runs_view_is_the_whole_state` (a run
-that never split serves its whole agent state, and `Runtime::state` reads no body). `a_blob_backed_artifact_is_fetched_once_across_ten_polls`
-(in `adam-a2a-runtime`) pins the cache: ten `GetTask` polls read the head ten times, no state and no body, and fetch the
-file's blob once.
+Six cases here pin the read path, and two in `adam-a2a-runtime`: `the_view_reads_the_head_and_the_state_joins_the_body`
+(a 50-message run of 10 KB turns: the view is one `load_head`, no `load_run`, no `body_list`, and less than 2 KB of state;
+`Runtime::state` is one `load_head`, one `body_list` and all 50 messages), `a_stale_head_falls_back_to_the_whole_state`
+(a delivery leaves the head stale: the view is the whole state, no body is read, and the next step rewrites the head),
+`a_v4_runs_view_is_the_whole_state` (a run that never split serves its whole agent state, and `Runtime::state` reads no
+body), `state_re_reads_a_moved_head_and_joins_its_new_generation` (a compaction between the first `load_head` and
+`body_list`: one re-read, the new head and generation, every message), `state_is_corrupt_when_the_body_is_short_twice`
+(the version did not move, so a second short set is `Corrupt`) and `artifact_bytes_serves_an_inline_file_and_a_blob`
+(an inline file's bytes, a stored blob's bytes, and `None` for a missing blob). In `adam-a2a-runtime`,
+`a_blob_backed_artifact_is_fetched_once_across_ten_polls` (ten `GetTask` polls read the head ten times, no state and no
+body, and fetch the file's blob once) and `a_four_mib_inline_file_is_served_whole_without_a_blob_read` (a v4 file is
+served byte for byte with no blob read).
 
 | Variable | Meaning |
 |---|---|
