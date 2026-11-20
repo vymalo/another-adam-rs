@@ -1,6 +1,6 @@
 ---
 name: adam-embed
-description: "Host adam-rs agents inside your own Rust program: depend on the adam crates by git rev, choose between serving a folder (adam_agent::agents plus adam_service::serve) and your own agent with #[tool] and include_agent!, run roles with the adam-host supervisor. Use for 'embed adam', 'run an adam agent in our binary', 'add a #[tool]', 'agent-local feature'."
+description: "Host adam-rs agents inside your own Rust program: depend on the adam crates by git rev, choose between serving a folder (adam_agent::agents plus adam_service::serve) and your own agent with #[tool] and include_agent!, run roles with the adam-host supervisor, or embed adam in an application with no server (adam-engine). Use for 'embed adam', 'run an adam agent in our binary', 'add a #[tool]', 'agent-local feature', 'adam in a desktop or phone app'."
 ---
 
 # Embed adam-rs in your own process
@@ -78,6 +78,33 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
    dependency down, 71 OS, 70 internal) so a supervisor can tell restartable from not.
 6. **Cargo features you do not need stay off** (`dev`, `mcp`): a release build must not watch
    files or start MCP processes unless it opts in.
+
+## In an application: `adam-engine`
+
+For an application (a desktop or a phone app) that runs adam itself, with no server, no protocol and nothing on
+the network of its own (ADR 0047, `docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md`:
+https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), depend on
+`crates/adam-engine` instead of the crates above. The human guide is `docs/guides/embed-in-an-app.md`:
+https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.md.
+
+* **The host gives everything**: `Engine::builder(store, agent, model, alias)` takes a `DynStore`
+  (`adam_core::MemoryStore` until the SQLite store of ADR 0053 slice 3 lands), an `AgentDef` (`AgentFolder::load` or
+  `include_agent!`), a `DynModel` with its credentials (the engine links no model client) and, with `.secrets(..)`,
+  a `SecretSource` (the default refuses every name). The engine reads no environment variable.
+* **Then** `start().await?`, `send`, `steer`, `answer`, `cancel`, `list`, `get`, `events` and `shutdown`; decide from
+  `EngineError`'s class (`adam_error::Classify`), and match `RunState` and `EngineEvent` with a `_` arm (both
+  `#[non_exhaustive]`). `events(run)` is bounded: a slow reader gets `Behind`, then a `Snapshot` read from the store.
+* **Keep the embedded set**: anything else you depend on takes `adam-a2a` without `server`, `adam-a2a-runtime` without
+  `push`, `adam-assembly` (and `adam`) without `remote`, and `adam-ui` without `thread-tools`, or Cargo turns them back
+  on. adam-rs checks the engine's own tree with `tools/embedded-deps/check.sh`
+  (https://github.com/vymalo/another-adam-rs/blob/main/tools/embedded-deps/check.sh); in yours,
+  `cargo tree -e features -i adam-assembly` shows what turns `remote` back on. Your own model client may bring an HTTP
+  client and TLS: that is the host's choice, not adam's.
+* **The worked example** is `crates/adam-engine/examples/chat` (`main.rs` builds the engine, `app.rs` is the loop a
+  test drives): https://github.com/vymalo/another-adam-rs/tree/main/crates/adam-engine/examples/chat. The API and its
+  refusals: https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-engine/README.md.
+* **Not yet**: a durable store (so a killed application loses its runs), approvals, the file and command tools, MCP
+  servers and remote subagents (`start` refuses an agent that names them).
 
 ## Verify
 

@@ -2,7 +2,8 @@
 
 adam-rs is a library first ([ADR 0001](../decisions/0001-library-first-host-roles.md)): a host binary composes
 crates, and the shipped `adam-agent` and `adam-coder` are two such compositions. If you only need to serve an
-agent made of files, do not embed: [Write an agent](write-an-agent.md).
+agent made of files, do not embed: [Write an agent](write-an-agent.md). This page is about a server program; for adam
+inside an application, with no server at all (a desktop or a phone), read [Embed adam in an application](embed-in-an-app.md).
 
 ## Pick a level
 
@@ -11,7 +12,7 @@ agent made of files, do not embed: [Write an agent](write-an-agent.md).
 | a folder's agent inside your process | `adam-agent` (also a library, `publish = false`) and `adam-service` | `adam_agent::agents(def, card, workers)` then `adam_service::serve(&ServiceConfig, agents, shutdown)` ([`adam-agent` README](../../bin/adam-agent/README.md#library)) |
 | your own agent with Rust tools | the `adam` facade | `use adam::prelude::*`: `#[tool]`, `tools!`, `LlmAgent`; `adam::include_agent!()`; features `macros` and `remote` (default), `a2a`, `mcp`, `dev` ([`adam` README](../../crates/adam/README.md)) |
 | only the process plumbing | `adam-host` | `Role` and `Host`: register components with `.control_plane(name, f)` and `.worker(name, f)`; `Host::run(shutdown)` starts what the role runs and stops the control plane before the workers ([README](../../crates/adam-host/README.md)) |
-| adam inside an application, with no server and nothing on the network of its own (a desktop or a phone) | `adam-engine` | `Engine::builder(store, agent, model, alias).start().await?`, then `send`, `steer`, `answer`, `cancel`, `list`, `get` and `shutdown`, with no A2A type in a signature ([ADR 0047](../decisions/0047-adam-rs-can-be-embedded-in-an-application.md) slice 4; the stream of events and the SQLite store are still to come): the host gives the store, the model and the secrets. Turn off `adam-a2a`'s `server`, `adam-a2a-runtime`'s `push`, `adam-assembly`'s `remote` (`adam`'s too) and `adam-ui`'s `thread-tools` on anything else you depend on, or Cargo turns them back on ([README](../../crates/adam-engine/README.md)) |
+| adam inside an application, with no server and nothing on the network of its own (a desktop or a phone) | `adam-engine` | `Engine::builder(store, agent, model, alias).start().await?`, then `send`, `steer`, `answer`, `cancel`, `list`, `get`, `events` and `shutdown`, with no A2A type in a signature ([ADR 0047](../decisions/0047-adam-rs-can-be-embedded-in-an-application.md) slice 4; the SQLite store is still to come): the host gives the store, the model and the secrets ([Embed adam in an application](embed-in-an-app.md)). Turn off `adam-a2a`'s `server`, `adam-a2a-runtime`'s `push`, `adam-assembly`'s `remote` (`adam`'s too) and `adam-ui`'s `thread-tools` on anything else you depend on, or Cargo turns them back on ([README](../../crates/adam-engine/README.md)) |
 | a different database | implement `Store` | [Store adapters](../reference/store-adapters.md) |
 
 ## Steps

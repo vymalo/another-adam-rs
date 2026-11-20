@@ -91,6 +91,10 @@ workspace as it is.
    refuses a second process (fail closed) and lets the engine release its own leases at start, so a killed application
    resumes its runs at once. It lives in this repository in **a Cargo workspace of its own**, with its own CI job, so the
    two SQLite bindings never share a dependency graph. adam owns its file and its schema; the host refers to a run by id.
+   *Amended 2026-11-20:* the words "built on cratestack" and "a Cargo workspace of its own" here, "The SQLite store on
+   cratestack, in its own workspace" in slice 3's row and "in a workspace of its own" in confirmed decision 2 are what the
+   amendment of 2026-11-19 changed: by [ADR 0053](0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md),
+   `adam-store-sqlite` is plain `rusqlite` in **the main workspace**, still in this repository. The text is kept as written.
 4. **The model client is the host's.** The embedded set links no model client and reads no key.
 5. **Secrets are a port.** A `SecretSource` trait replaces the direct reads of the process environment (a remote
    subagent's bearer, MCP variables). The process environment stays the default of a server; the engine's default
@@ -238,6 +242,18 @@ is still `Runnable`: at the next start the engine releases its own leases and th
 | 10 | adam-rs as an ACP agent (added 2026-11-16): an adapter over `adam-engine` on stdio | a scripted ACP client starts a session, prompts, answers a permission request and cancels | 4, 5 |
 
 Slices 1 to 8 and 10 need nothing of what is left of ADR 0044.
+
+*Built 2026-11-20 (slice 4, PRs 1–3):* `adam-engine`'s API, `Engine::builder`, `start`, `send`, `steer`, `answer`,
+`cancel`, `list`, `get` and `shutdown`, over `RuntimeTaskBackend` with no A2A type in a signature (#240); a run's events,
+`events`, with a slow reader kept bounded, a file's bytes withheld from the ring, and a dropped engine's run resumed by
+the next over the same `MemoryStore` (#242); and an example embedder, `crates/adam-engine/examples/chat`, a terminal chat
+over a folder agent whose model client (`adam-model-openai`) is a dev-dependency, so the embedded check is unchanged,
+driven by `tests/example.rs`, with the guide `docs/guides/embed-in-an-app.md` (PR 3). **Slice 4 is not done until the
+proof that a killed process resumes its run merges (PR 4):** `tests/resume_process.rs` (a child process killed with
+`SIGKILL`, its run finished by the next without its committed step running again) is written and ignored until the
+SQLite store of slice 3 (ADR 0053 slice 3) lands. Not built either: the engine sets no fixed worker id and releases no
+lease at start (the first diagram's "release this worker's leases"), so a restarted engine waits for its old leases to
+run out.
 
 ## Decisions the owner confirmed
 
