@@ -24,6 +24,16 @@ const PROBE = runtimeLimits(RUNTIME);
  */
 export const MIN_FREE_GB = 20;
 export const WARN_FREE_GB = 100;
+/**
+ * Just in time (the default; `--keep-images` turns it off) a task image is on the disk only while its runs happen, so the floor is
+ * the coder image plus the largest task image plus a margin for the layers being unpacked, the bases and the results: the sizes
+ * measured here when the images are present, else 12 GB for the coder and 3.5 GB for a task image (SWE-bench Pro images are 2 to
+ * 3.5 GB). It is never under MIN_FREE_GB, and it warns under the floor plus JIT_WARN_ROOM_GB. Only the coder counts as present.
+ */
+export const JIT_CODER_GB = 12;
+export const JIT_TASK_GB = 3.5;
+export const JIT_MARGIN_GB = 10;
+export const JIT_WARN_ROOM_GB = 30;
 const GB = 1024 ** 3;
 
 /**
@@ -85,7 +95,7 @@ export async function osRelease({ containers, image, timeoutMs = 60_000 }) {
  * @param {object} [o.env]      the environment to read (default: the stack's `baseEnv`, or `process.env` without a stack)
  * @returns {Promise<{checks: object[], exitCode: number}>}
  */
-export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfsSync, nodeVersion = process.versions.node, arch = process.arch, stack = null, start = false, slots = 2, tasks = [], taskError = null, containers = null, env = null }) {
+export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfsSync, nodeVersion = process.versions.node, arch = process.arch, stack = null, start = false, slots = 2, tasks = [], taskError = null, containers = null, env = null, justInTime = false }) {
   // A stack carries the environment it was built with (`baseEnv`), which is what its compose calls and host containers
   // already use. The doctor's own docker calls must use the same one, never the ambient environment: a caller that
   // injects a stack (the tests do, and `bench doctor` builds it from `main`'s env) would otherwise get two lists.
@@ -142,13 +152,23 @@ export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfs
   const ref = coderRef(pins);
   const image = await run('docker', ['image', 'inspect', '--format', '{{json .RepoDigests}}', ref]);
   let presentBytes = 0;
+  let coderBytes = 0;
+  let largestTaskBytes = 0;
   for (const imageRef of [ref, ...tasks.map((t) => t.image?.ref ?? t.image?.name)]) {
     if (!imageRef) continue;
     const size = await run('docker', ['image', 'inspect', '--format', '{{.Size}}', imageRef]);
     const bytes = size.exitCode === 0 ? Number(size.stdout.trim()) : 0;
-    if (Number.isFinite(bytes) && bytes > 0) presentBytes += bytes;
+    if (Number.isFinite(bytes) && bytes > 0) {
+      presentBytes += bytes;
+      if (imageRef === ref) coderBytes = bytes;
+      else largestTaskBytes = Math.max(largestTaskBytes, bytes);
+    }
   }
-  const presentGb = presentBytes / GB;
+  // Just in time only the coder is a standing cost: the task images that are here are removed after their runs.
+  const presentGb = (justInTime ? coderBytes : presentBytes) / GB;
+  const jitFloorGb = Math.max(MIN_FREE_GB, (coderBytes > 0 ? coderBytes / GB : JIT_CODER_GB) + (largestTaskBytes > 0 ? largestTaskBytes / GB : JIT_TASK_GB) + JIT_MARGIN_GB);
+  const floorGb = justInTime ? jitFloorGb : MIN_FREE_GB;
+  const warnGb = justInTime ? jitFloorGb + JIT_WARN_ROOM_GB : WARN_FREE_GB;
 
   // Disk: the images are in Docker's root once (the coder image is the big one), and the results are in $BENCH_HOME.
   const dirs = [['results ($BENCH_HOME)', home], ...(info?.DockerRootDir ? [['Docker root', info.DockerRootDir]] : [])];
@@ -162,8 +182,8 @@ export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfs
     }
     const name = `free disk, ${label}`;
     if (freeGb === null) checks.push(warn(name, `${dir} cannot be read`, 'create it, or run as a user that can read it'));
-    else if (freeGb + presentGb < MIN_FREE_GB) checks.push(fail(name, `${freeGb.toFixed(1)} GB free in ${dir} and ${presentGb.toFixed(1)} GB of the images already present, less than ${MIN_FREE_GB}`, 'free disk space; the dry run needs about 20 GB (images already present count) and the full run about 100 GB'));
-    else if (freeGb + presentGb < WARN_FREE_GB) checks.push(warn(name, `${freeGb.toFixed(0)} GB free in ${dir}${presentGb > 0 ? ` and ${presentGb.toFixed(0)} GB of images already present` : ''}`, `about ${WARN_FREE_GB} GB is comfortable for the 100 task images`));
+    else if (freeGb + presentGb < floorGb) checks.push(fail(name, `${freeGb.toFixed(1)} GB free in ${dir} and ${presentGb.toFixed(1)} GB of the ${justInTime ? 'coder image' : 'images'} already present, less than ${justInTime ? `${floorGb.toFixed(1)} (the coder, the largest task image and a margin; task images just in time)` : MIN_FREE_GB}`, justInTime ? `free disk space; with task images just in time the run needs the coder, one task image at a time and ${JIT_MARGIN_GB} GB of margin` : 'free disk space; the dry run needs about 20 GB (images already present count) and the full run about 100 GB'));
+    else if (freeGb + presentGb < warnGb) checks.push(warn(name, `${freeGb.toFixed(0)} GB free in ${dir}${presentGb > 0 ? ` and ${presentGb.toFixed(0)} GB of images already present` : ''}${justInTime ? ' (task images just in time)' : ''}`, justInTime ? `about ${warnGb.toFixed(0)} GB is comfortable: the coder, a task image at a time and room for the results` : `about ${WARN_FREE_GB} GB is comfortable for the 100 task images`));
     else checks.push(ok(name, `${freeGb.toFixed(0)} GB free`));
   }
 

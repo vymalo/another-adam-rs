@@ -1033,7 +1033,7 @@ the bytes too until the contract release, so a reader of the old format still re
 
 The expand release writes a **head** and a **body generation** beside `state`: the steps write both
 (S2a), and the observer reads the head (S2b). `Runtime::view` is one `Store::load_head` and no body;
-`Runtime::state` is the one full-state read, joining the head and the generation it names. The
+`Runtime::state` is the one full-state read, joining the head and the generation it names: the head names a **prefix** (`len`) of the generation, and the rows past it — a lost CAS's extras not yet cleaned up — are ignored, so only a short or non-contiguous prefix is `Corrupt`. The
 worker, `load_run`, `claim_due` and `list_runs` still read the whole state until S3. Both adapters
 keep both: MongoDB in the run document and the `adam_body` collection, PostgreSQL in `runs.head`/
 `runs.head_version` and the `adam_body` table. A PostgreSQL commit that writes a head or a body is

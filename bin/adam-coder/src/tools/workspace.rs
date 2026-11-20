@@ -5,11 +5,18 @@
 //! [`ToolEnv::slot_to_write`] do, named by its directory, read-only when it is a reference, and
 //! carrying the [`Slot`] itself, so the coder's own answers (the nested project instructions, what
 //! follows a write) work on what was found.
+//!
+//! The same `ToolEnv` is the commands' [`CommandWorkspace`]: the run's environment, the deployment's
+//! limits (`CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES`) and the coder's kept files.
+
+use std::sync::Arc;
 
 use adam_code_tools::git::GitAt;
-use adam_code_tools::{CodeWorkspace, Intent, Outcome, Place, Redactor, Target};
-use adam_llm_agent::{ToolCtx, ToolError};
-use adam_workspace::Slot;
+use adam_code_tools::{
+    CodeWorkspace, CommandLimits, CommandWorkspace, Intent, Outcome, Place, Redactor, Target,
+};
+use adam_llm_agent::{KeptOutputs, ToolCtx, ToolError};
+use adam_workspace::{EnvSession, Slot};
 use async_trait::async_trait;
 
 use super::project;
@@ -91,5 +98,23 @@ impl CodeWorkspace for ToolEnv {
             scratch::push_published_note(&mut tail, slot);
         }
         Ok(tail)
+    }
+}
+
+#[async_trait]
+impl CommandWorkspace for ToolEnv {
+    async fn session(&self, ctx: &ToolCtx) -> Result<Arc<dyn EnvSession>, ToolError> {
+        ToolEnv::session(self, ctx).await
+    }
+
+    fn limits(&self) -> CommandLimits {
+        CommandLimits {
+            timeout: self.settings.check_timeout,
+            output_tail: self.settings.check_output_tail,
+        }
+    }
+
+    fn kept(&self) -> &dyn KeptOutputs {
+        &*self.kept
     }
 }

@@ -163,6 +163,18 @@ commit" language is superseded.
    (`(run, generation, writer, idx)`, the head naming its writer) in S2b/S3 remove the shared slot
    and this adoption heuristic. An older binary that still wedges one is cancelled by an operator.
 
+*Amended 2026-11-20 (S2b)*: **the head names a prefix of its generation's rows, not the whole
+generation.**
+
+A commit inserts its rows before its CAS (decision 3). A commit that loses leaves them in the
+generation until its `delete_loser` runs — normally one round trip later, and until the orphan grace
+(decision 6) if the process died in between. A reader that reads the head and then the rows can
+therefore see the winner's head beside a generation that also holds the loser's extra rows at
+`idx >= len`. `Runtime::state` joins `0..len` and ignores the rows past it (a `debug` log carries the
+count); a prefix that is short or not contiguous `0..len` is still `Corrupt`, because that is the
+damage the head's `len` catches. This is a read rule only: the writes, the loser's cleanup and the
+next append's foreign-slot check (decision 6) are unchanged.
+
 ## Consequences
 
 * The **body's** quadratic write is gone across splitting commits: a split writes one message plus a

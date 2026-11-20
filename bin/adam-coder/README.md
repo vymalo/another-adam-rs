@@ -35,7 +35,11 @@ port are `list_files`, `find_files` and `search_files`, then `read_file` and `re
 `edit_file`, then `apply_patch`: `tools::find` and `tools::files` still declare them (their descriptions are what the model reads, pinned by
 `tests/tool_specs.rs`) and `adam_code_tools::find` and `adam_code_tools::files` do them. What follows a write (the check
 epoch moved, "Run the checks again before you commit.", the note of a published scratch project) is the coder's
-`CodeWorkspace::after_write` in `src/tools/workspace.rs`, pinned by `tests/write_results.rs`. `Redactor::from_config` is the
+`CodeWorkspace::after_write` in `src/tools/workspace.rs`, pinned by `tests/write_results.rs`. The commands have their port,
+`CommandWorkspace`, which `ToolEnv` implements in the same file (the run's environment, `CHECK_TIMEOUT_SECS` and
+`CHECK_OUTPUT_TAIL_BYTES`, the kept files): `ToolEnv::run` and what a command shows and keeps (`tools::output`) are
+`adam_code_tools::commands` and `adam_code_tools::output`, while `run_command` and `run` are still declared and done here,
+pinned by `tests/command_results.rs`. `Redactor::from_config` is the
 coder's own trait, `RedactorFromConfig`, re-exported at the crate root.
 
 ```mermaid
@@ -2895,9 +2899,9 @@ database of its own, so the role needs `CREATEDB`):
 * `src/tools/files.rs` (unit), `crates/adam-code-tools/src/files.rs` (unit: the read tools' paging, `read_files`' pages and
   closest paths, the writes and the edits, the paths and modes `apply_patch` reads from git, moved there with them), `tests/write_results.rs` (the exact answer of
   `write_file`, `edit_file` and `apply_patch`, with the note of a published scratch project, and the check epoch each moves)
-  and `tests/tools.rs`: the file tools. `confine` has a case each for `../`, an absolute path,
-  `.git/x` and `.GIT/x`, a symlink to a file outside, a symlinked directory outside, a write through a symlink that
-  stays inside, a link into `.git`, a directory and a file in the wrong place; `read_file` (a page of 2,000 lines and its
+  and `tests/tools.rs`: the file tools. `confine`'s cases (`../`, an absolute path, `.git/x` and `.GIT/x`, a symlink to a
+  file outside, a symlinked directory outside, a write through a symlink that stays inside, a link into `.git`, a
+  directory and a file in the wrong place) are `adam-code-tools`' (`src/confine.rs`, moved there with it); `read_file` (a page of 2,000 lines and its
   `[more: ...]` line, a negative offset, the 50 KiB cap, a long line cut, `start_line` and `end_line` as aliases, a missing file's closest paths,
   no newline at the end, a binary file, a directory; the properties `prop_paging_reassembles_the_file` and `prop_same_call_same_bytes`),
   `write_file` (parents, replace, the mode kept, nothing left behind, the 1 MiB limit, the progress line), and

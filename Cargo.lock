@@ -301,6 +301,7 @@ dependencies = [
 name = "adam-code-tools"
 version = "0.1.0"
 dependencies = [
+ "adam-error",
  "adam-llm-agent",
  "adam-model",
  "adam-runtime",
