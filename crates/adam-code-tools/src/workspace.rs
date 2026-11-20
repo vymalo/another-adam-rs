@@ -9,8 +9,9 @@
 //!
 //! The commands (`run_command`, `run`) need more of the workspace (a session to run in, a guard that
 //! records what a command changed and, where the workspace owns the place, undoes it). They get a
-//! port that extends this one and takes a [`Place`] from the same [`CodeWorkspace::place`], so a
-//! command and a file tool find a place and refuse a write the same way.
+//! port that extends this one, [`CommandWorkspace`](crate::commands::CommandWorkspace), and takes a
+//! [`Place`] from the same [`CodeWorkspace::place`], so a command and a file tool find a place and
+//! refuse a write the same way.
 //!
 //! [`CodeWorkspace::after_write`] is a **required** method, added when `write_file` and `edit_file`
 //! moved here: a breaking change for every implementation (the coder's and the testkit's
