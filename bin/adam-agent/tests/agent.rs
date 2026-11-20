@@ -272,6 +272,67 @@ async fn a_folder_serves_its_commands() {
     );
 }
 
+/// A folder's schedule runs (ADR 0060): the worker runtime `agents` registers steps the scheduler,
+/// and a firing reaches the agent as a person's message whose text is the schedule's prompt.
+#[tokio::test]
+async fn a_schedule_of_the_folder_fires_the_agent() {
+    let folder = assistant();
+    let path = folder.path().join("agent/schedules/soon.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "---\nafter: 1s\n---\nSay what is due.\n").unwrap();
+    let def = def_of(&folder);
+    let schedules = def.manifest().schedules.clone();
+    assert_eq!(schedules.len(), 1);
+
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Nothing is due.");
+    let dynamic: DynModel = mock.clone();
+    let agents = build(
+        def.clone(),
+        None,
+        Some(worker(dynamic, McpPolicy::default())),
+    )
+    .await
+    .unwrap();
+    assert!(format!("{agents:?}").contains("schedules"), "{agents:?}");
+    let store = store();
+    let service = service_over(agents, &store);
+    let done = adam_schedule::reconcile_store(store.clone(), def.name(), &schedules)
+        .await
+        .unwrap();
+    assert_eq!(done.started, ["soon"]);
+    let worker = Worker::start(&service);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let fired = loop {
+        let runs = store
+            .list_runs(&adam_core::RunQuery::new(
+                def.name(),
+                adam_core::ConversationScope::Prefix(format!("adam.schedule:{}/soon@", def.name())),
+                10,
+            ))
+            .await
+            .unwrap();
+        if let Some(run) = runs
+            .into_iter()
+            .find(|r| r.status == adam_core::RunStatus::Done)
+        {
+            break run;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the schedule did not fire"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    worker.stop().await;
+    let trigger = adam_schedule::trigger_of(fired.conversation_id.as_deref().unwrap()).unwrap();
+    assert_eq!(trigger.name, "soon");
+    assert_eq!(
+        mock.requests()[0].messages[0],
+        adam_model::Message::user_text("Say what is due.")
+    );
+}
+
 /// The card of a folder says which build answers and which files it runs, in `build/v1`: the digest
 /// is the folder's own (the one the startup line logs), and the extension is optional.
 #[tokio::test]

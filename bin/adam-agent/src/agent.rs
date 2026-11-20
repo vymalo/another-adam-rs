@@ -203,6 +203,7 @@ pub async fn agents(
     // The helpers a person may start a session with (`child-sessions/v1`), from the folder alone and
     // with the effective limits, so every role that serves A2A lists and serves the same.
     let sessions = def.child_sessions();
+    let schedules = def.manifest().schedules.clone();
     let (agents, commands, card) = match workers {
         Some(parts) => {
             let assembly = assemble_limited(
@@ -219,8 +220,28 @@ pub async fn agents(
             let (commands, listed) =
                 adam_service::with_prompt_commands(commands, assembly.prompt_commands());
             let card = card.map(|card| adam_service::card_with_commands(card, &listed));
+            let root = name.clone();
             (
-                Agents::new(name, move |builder| assembly.register(builder)).options(parts.options),
+                // The scheduler steps the folder's schedules beside the agent (ADR 0060), and the
+                // `schedules` component makes the scheduler runs match the folder at start: with none,
+                // it cancels what schedules a folder dropped.
+                Agents::new(name, move |builder| {
+                    assembly
+                        .register(builder)
+                        .agent(adam_schedule::SchedulerAgent)
+                })
+                .options(parts.options)
+                .worker_component("schedules", move |store, stop| async move {
+                    let done = adam_schedule::reconcile_store(store, &root, &schedules).await?;
+                    tracing::info!(
+                        started = ?done.started,
+                        kept = ?done.kept,
+                        cancelled = ?done.cancelled,
+                        "schedules reconciled"
+                    );
+                    stop.cancelled().await;
+                    Ok(())
+                }),
                 commands,
                 card,
             )

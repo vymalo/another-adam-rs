@@ -214,6 +214,7 @@ dependencies = [
  "adam-model",
  "adam-postgres",
  "adam-runtime",
+ "adam-schedule",
  "adam-service",
  "adam-store-postgres",
  "adam-ui",
