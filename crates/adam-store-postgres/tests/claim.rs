@@ -31,10 +31,7 @@ async fn a_run_claim_skips_a_row_another_transaction_holds() {
         .with_table_prefix(&prefix)
         .unwrap();
     store.migrate().await.unwrap();
-    let agent = format!(
-        "lock-{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..12]
-    );
+    let agent = format!("lock-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     let first = store
         .create_run(NewRun::new(&agent, json!({"n": 1})))
         .await
@@ -96,10 +93,7 @@ async fn a_push_claim_skips_a_row_another_transaction_holds() {
         .with_table_prefix(&prefix)
         .unwrap();
     store.migrate().await.unwrap();
-    let agent = format!(
-        "lock-{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..12]
-    );
+    let agent = format!("lock-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     let run = store
         .create_run(NewRun::new(&agent, json!({})))
         .await

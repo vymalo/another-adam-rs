@@ -123,6 +123,20 @@ What the pieces offer, checked on 2026-11-19:
    `Protocol` and `WorkerCrashed` were `Transient`, `tokio-postgres` has no equivalent, so what is not a database error,
    a closed connection or an I/O/TLS failure is `Internal`; a unique violation, a serialization failure, a lost
    connection and a bad statement keep their classes.
+
+   *Amended 2026-11-20, second part (the head and the body, ADR 0055):* `SCHEMA_VERSION` is 6 and `PgStore`
+   keeps bodies (`keeps_bodies() == true`). `runs.head`/`runs.head_version` hold the v5 head and the version it
+   was written at; `adam_body` holds `(run_id, generation, idx) -> (message, writer, written_at)` and cascades
+   with the run. A commit that writes a head, a body or blob references is **one transaction**: the run row
+   locked `FOR UPDATE`, the version check, the rows after the head's `len`
+   (`INSERT .. SELECT unnest(..) ON CONFLICT DO NOTHING`), the refs, the CAS; a foreign slot is resolved inside
+   it (identical message adopted, older than the 5-minute orphan grace collected and retried once, live and
+   different `Conflict`). `load_head` is one `SELECT` that serves the head when `head_version == version` and
+   the whole state otherwise, so `Runtime::view` on Postgres is one `lease_until` + one `load_head` and no body;
+   `Runtime::state` joins the head and one `body_list`. The upgrade gate is `stored < 6` (or
+   `to_regclass('<prefix>body')`), never the blob step's `stored == Some(4)`: a database stamped 5 has the blob
+   tables and no head or body. `tests/fixtures/schema-v5.sql` (the `sqlx` build) opens and upgrades to 6, and
+   `schema-v6.sql` is the current schema, compared with the live statements by a unit test.
 2. **`adam-store-sqlite` (new) joins the main workspace**: `rusqlite` with `bundled` SQLite, on the `rusqlite` minor that
    `cratestack-rusqlite` uses (0.41 today), so an application can link both; a CI probe resolves the two together. It is
    what ADR 0047 decision 3 asked: `store_conformance!`, one writer, each change one `BEGIN IMMEDIATE` transaction, WAL,

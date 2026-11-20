@@ -1,17 +1,18 @@
-//! A database built by the previous (`sqlx`) release opens with no migration.
+//! A database built by the previous (`sqlx`) release opens with no migration, and the upgrade to
+//! schema version 6 adds the head and the body.
 //!
-//! `tests/fixtures/schema-v5.sql` is the schema exactly as that release emitted it. This applies
-//! it with `batch_execute` into a database of its own, then opens the store **without calling
-//! `migrate`** and takes a create/load round trip: the tables, the statements and the version row
-//! are the ones the new driver reads.
+//! `tests/fixtures/schema-v5.sql` is the schema exactly as that release emitted it. This applies it
+//! with `batch_execute` into a database of its own, opens the store **without calling `migrate`**
+//! and takes a create/load round trip, then migrates to version 6 and commits a head and a body.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod support;
 
-use adam_core::{NewRun, Store};
+use adam_core::{BodyRow, BodyWrite, NewRun, RunStatus, RunUpdate, Store};
 use adam_postgres::PgConfig;
 use adam_store_postgres::{PgStore, SCHEMA_VERSION};
 use serde_json::json;
+use uuid::Uuid;
 
 async fn admin(server: &str) -> tokio_postgres::Client {
     PgConfig::parse(server)
@@ -28,7 +29,7 @@ fn with_database(server: &str, database: &str) -> String {
 }
 
 #[tokio::test]
-async fn a_sqlx_migrated_database_opens_and_round_trips_without_a_migration() {
+async fn a_sqlx_migrated_database_opens_and_upgrades_to_the_head_and_body() {
     let Some(server) = support::test_url() else {
         return;
     };
@@ -61,7 +62,7 @@ async fn a_sqlx_migrated_database_opens_and_round_trips_without_a_migration() {
         .await
         .expect("the version row")
         .get(0);
-    assert_eq!(version, SCHEMA_VERSION.to_string());
+    assert_eq!(version, "5");
     drop(client);
 
     // No `migrate`: the fixture is what the old release left behind.
@@ -79,8 +80,54 @@ async fn a_sqlx_migrated_database_opens_and_round_trips_without_a_migration() {
     assert_eq!(loaded.state, json!({"turn": 1}));
     assert_eq!(loaded.conversation_id.as_deref(), Some("c:1"));
 
-    // And the migration the new build would run is a no-op on it.
-    store.migrate().await.expect("migrate an up-to-date schema");
+    // The upgrade is the migration the new build runs: metadata only, the run survives.
+    store.migrate().await.expect("migrate a version 5 schema");
+    let version: String = {
+        let client = store.pool().get().await.expect("a connection");
+        client
+            .query_one(
+                "SELECT value FROM adam_meta WHERE key = 'schema_version'",
+                &[],
+            )
+            .await
+            .expect("the version row")
+            .get(0)
+    };
+    assert_eq!(version, SCHEMA_VERSION.to_string());
+    assert_eq!(version, "6");
+
+    // And the head and the body work on the upgraded database.
+    let generation = Uuid::new_v4();
+    let writer = Uuid::new_v4();
+    let rows: Vec<BodyRow> = ["one", "two"]
+        .iter()
+        .enumerate()
+        .map(|(idx, message)| BodyRow {
+            idx: u32::try_from(idx).expect("a short transcript"),
+            message: json!(message),
+        })
+        .collect();
+    store
+        .commit_run(
+            run.id,
+            run.version,
+            RunUpdate::new(RunStatus::Runnable, json!({"turn": 2}))
+                .head(json!({"v": 5, "agent": {}, "body": {"generation": null, "len": 2}}))
+                .body(BodyWrite {
+                    generation: Some(generation),
+                    rows,
+                    writer,
+                }),
+        )
+        .await
+        .expect("commit a head and a body");
+    let head = store
+        .load_head(run.id)
+        .await
+        .expect("load the head")
+        .expect("the run exists");
+    assert_eq!(head.state["body"]["generation"], generation.to_string());
+    assert_eq!(store.body_list(run.id, generation).await.unwrap().len(), 2);
 
     store.pool().close();
     let cleaner = admin(&server).await;

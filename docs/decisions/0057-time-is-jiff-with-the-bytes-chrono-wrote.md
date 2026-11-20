@@ -3,7 +3,10 @@
 Status: **Accepted** (2026-11-19). The follow-up of the RUSTSEC-2026-0543 acceptance (`deny.toml`): `chrono` is
 unmaintained, and adam-rs's own code moves to `jiff` while the A2A types it builds on (`a2a-lf`, and therefore
 `adam-a2a`'s card, task and page types) still use `chrono`. Supersedes no decision; [ADR 0047](0047-adam-rs-can-be-embedded-in-an-application.md)'s
-note that sqlx is built with its `chrono` feature stays true (decision 4).
+note that sqlx is built with its `chrono` feature stays true (decision 4). *(Amended 2026-11-20: decision 3's
+PostgreSQL bridge is gone — the store moved to `tokio-postgres` and binds jiff through `postgres-types`'
+`with-jiff-0_2`, the same bytes, and `chrono` left the store; see [ADR 0053](0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)
+decision 1's amendment. The decision itself — jiff, with chrono's bytes — is unchanged.)*
 
 ## Context
 
@@ -62,13 +65,16 @@ contract. `adam-a2a` gains a dependency on `adam-core` for that type.
   keeps `chrono` and sqlx's `chrono` feature, with a private `PgTime(Timestamp)` implementing `Type<Postgres>`
   (`TIMESTAMPTZ`), `Encode` and `Decode` by delegating to `chrono::DateTime<Utc>`. The column type and the encoded
   value are exactly what the store wrote before this decision. It is the only crate that keeps chrono for a driver.
+  *Amended 2026-11-20:* this bridge was temporary, as the paragraph said; the store now binds `jiff::Timestamp`
+  through `postgres-types`' `with-jiff-0_2` and `chrono` left its tree (ADR 0053 decision 1, amended).
 * **MongoDB.** No newtype: `Bson::DateTime::from_millis(t.as_millisecond())` and `Timestamp::from_millisecond(..)`.
   The crate drops chrono.
 
 ### 4. `deny.toml`
 
-The RUSTSEC-2026-0543 ignore stays: `a2a-lf`, `a2a-server-lf` and `a2a-pb`, sqlx's `chrono` feature and the
-PostgreSQL bridge keep chrono in the graph, and removing the ignore makes `cargo deny check` red. Its reason says
+The RUSTSEC-2026-0543 ignore stays: `a2a-lf`, `a2a-server-lf` and `a2a-pb` keep chrono in the graph, and removing
+the ignore makes `cargo deny check` red. *(Amended 2026-11-20: sqlx's `chrono` feature and the PostgreSQL bridge are
+gone; the A2A crates are what remain.)* Its reason says
 the migration landed and names what remains; the review date stays 2027-02-17. A `[bans]` rule denies a direct `chrono` dependency outside the allowed wrappers, so a new
 crate that reaches for chrono fails the check rather than arriving silently.
 

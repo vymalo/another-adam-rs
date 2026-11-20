@@ -24,7 +24,7 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `PgStore::from_pool(pool)`: reuse your application's `deadpool_postgres::Pool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
-* `PgStore::pool()`, `SCHEMA_VERSION` (5).
+* `PgStore::pool()`, `SCHEMA_VERSION` (6).
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
   state, and the state is the largest column, so a `RETURNING` that echoed it would parse it back on
   every transition. `load_run`, the claim and the listings return the stored state; `journal_put`
@@ -32,6 +32,12 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `run_header` is one statement over the primary key that selects the header columns and
   `lease_until`, never `state`: a reader that only needs the run's own bookkeeping (a cancel watch,
   a parent check) does not pay for the largest column.
+* `load_head` is one statement: the head when `head_version == version`, the whole state otherwise,
+  never a body row (`Runtime::view` is one `lease_until` + one `load_head`). `body_list` reads one
+  generation in order; `gc_body` collects superseded generations older than its cutoff.
+* `commit_run` writes the head, the body rows and the blob references **in the same transaction as
+  the version CAS** (the run row is locked `FOR UPDATE` first). A commit that writes none of them is
+  the single `UPDATE` it always was, so a delivery or a cancel pays no `BEGIN`.
 * The `Store` implementation: call `migrate()` once at boot (idempotent, safe
   from every replica). On a schema that is already current it runs no DDL and takes no table
   lock, so a start cannot deadlock with live traffic (see "Schema version 3").
@@ -145,22 +151,25 @@ keeps the earlier ones — so **a hand-built `RunUpdate { .. }` literal stops co
 **defaulted** on `Store`, so a store of your own that keeps no blobs still compiles and behaves as
 before.
 
-## Schema version 5, part 2: the head and the body (deferred)
+## Schema version 5, part 2 (schema version 6): the head and the body
 
-The head and the body are **not** in this store yet: `PgStore` keeps `keeps_bodies() == false`,
-writes no `head`/`head_version` and no `<prefix>body`, and answers `body_list` empty. `load_head` is
-the trait default (`load_run`), so an observer reads the whole v4 `state`, and `commit_run` ignores
-`RunUpdate.head`/`body` (its destructure names and drops them). The columns, the `adam_body` table
-and the one-transaction CTE are the PostgreSQL follow-up after #361.
+`<prefix>runs.head` is the v5 head and `<prefix>runs.head_version` the version it was written at;
+`<prefix>body` is one row per transcript message, keyed `(run_id, generation, idx)`, with the
+`writer` and `written_at` the duplicate rule needs, `ON DELETE CASCADE`. `SCHEMA_VERSION` is 6. The
+upgrade from a version 5 database is its own step gated on `stored < 6` (not on the blob step: a
+database stamped 5 already has the blob tables but no head or body) and is metadata-only: two
+nullable columns and one table.
 
-When that half lands, its upgrade gate must be `stored < 6` (or a check of
-`to_regclass('<prefix>body')`), **not** `stored == Some(4)`: a database stamped 5 by S1/S2a already
-has the blob tables but no head or body, so a gate on the blob step would skip the new columns
-silently. The follow-up bumps `SCHEMA_VERSION` to 6. It also applies the body duplicate rule the
-MongoDB half implements (ADR 0055, S2a amendment 6): an identical foreign row is adopted, a differing
-one older than the 5-minute orphan grace is collected and the insert retried once, and a live
-attempt's differing row is a `Conflict` — all inside the one transaction that writes the rows, the
-refs and the CAS.
+`commit_run` with a head, a body or blob references is **one transaction**: the run row is locked
+`FOR UPDATE`, the version is checked, the rows after the head's `len` are inserted
+(`INSERT .. SELECT unnest(..) ON CONFLICT DO NOTHING`), the slots another writer owns are read
+(an identical message is adopted; one older than the 5-minute orphan grace is collected and the
+insert retried once; a live attempt's differing row is a `Conflict`), the refs are inserted, the CAS
+runs, and the commit ends. The head's `body` is patched to the resolved `{generation, len}`. The
+superseded generation is collected after the CAS, an hour of grace. A commit that loses writes
+nothing (the transaction rolls back), so a loser cannot poison the next append. `load_head` serves
+the head only when `head_version == version`; a stale head is not corrupt, the whole state is served
+and the next split rewrites it.
 
 ## Schema version and the owner column
 
@@ -214,11 +223,14 @@ are gone with `sqlx`; a consumer that set them must remove the line.
 retryable, a unique violation stays `AlreadyExists`, a lost connection and a
 serialization failure are `Transient`, a bad statement is `Internal` (needs the
 server), and an unreachable server is `Transient` (offline).
-`tests/fixtures/schema-v5.sql` is the schema exactly as the `sqlx` build emitted it, applied with
-`batch_execute` by `tests/fixture.rs`: a database made by the previous release opens and takes a
-create/load round trip with **no migration**. A unit test
-(`the_statements_equal_the_version_5_fixture`) compares the live statements with the fixture
-whitespace-normalised, so they cannot drift; `ADAM_WRITE_FIXTURE=1` regenerates the fixture.
+`tests/fixtures/schema-v5.sql` is the schema exactly as the `sqlx` build emitted it: `tests/fixture.rs`
+applies it with `batch_execute`, opens the store and takes a create/load round trip with **no
+migration**, then migrates to 6 and commits a head and a body. `tests/fixtures/schema-v6.sql` is the
+current schema; a unit test (`the_statements_equal_the_version_6_fixture`) compares the live
+statements with it whitespace-normalised, so they cannot drift; `ADAM_WRITE_FIXTURE=1` regenerates it.
+`tests/body_writers.rs` writes a foreign body row directly and proves the three resolutions (adopted,
+collected after the orphan grace, `Conflict`), and `tests/head_view.rs` counts the calls
+`Runtime::view` makes (one lease, one head, no body) and `Runtime::state`'s (one head, one body).
 `tests/migrate.rs` builds a version 1 schema by hand with a legacy run, migrates it and checks the
 column, the version row, that the run survived and that pinning works on it; it also checks that an
 older release does not lower the version. A version 2 schema migrates to the current one and gets the

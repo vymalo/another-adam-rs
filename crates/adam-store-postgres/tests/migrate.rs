@@ -111,7 +111,7 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
     store.migrate().await.unwrap();
     assert!(has_owner_column(&pool, &p).await, "the column was added");
     assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
-    assert_eq!(SCHEMA_VERSION, 5);
+    assert_eq!(SCHEMA_VERSION, 6);
     // The push table exists now (a missing table would be a backend error).
     assert!(
         store
@@ -459,6 +459,10 @@ async fn a_version_4_schema_gets_the_blob_tables_and_keeps_its_runs() {
     assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
     assert!(has_table(&pool, &format!("{p}blob")).await);
     assert!(has_table(&pool, &format!("{p}run_blob")).await);
+    assert!(
+        has_table(&pool, &format!("{p}body")).await,
+        "the body table"
+    );
     assert_eq!(
         index_valid(&pool, &format!("{p}runs_list_status")).await,
         Some(true),
@@ -481,6 +485,66 @@ async fn a_version_4_schema_gets_the_blob_tables_and_keeps_its_runs() {
             .unwrap(),
         0,
         "the blob sweep runs against an empty table"
+    );
+
+    drop_tables(&pool, &p).await;
+}
+
+/// Schema version 5 has the blob tables and the whole state, but no head and no body: the upgrade
+/// to 6 adds the two columns and the table, and the run survives.
+#[tokio::test]
+async fn a_version_5_schema_gets_the_head_and_the_body_and_keeps_its_runs() {
+    let Some(url) = support::test_url() else {
+        return;
+    };
+    let pool = support::pool(&url, 2);
+    let p = format!(
+        "adam_mig_{}_",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let store = PgStore::from_pool(pool.clone())
+        .with_table_prefix(&p)
+        .unwrap();
+    store.migrate().await.unwrap();
+    let agent = format!("v5-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let run = store
+        .create_run(NewRun::new(&agent, json!({"turn": 1})))
+        .await
+        .unwrap();
+
+    // Back to version 5: no head columns, no body table.
+    support::exec(&pool, &format!("DROP TABLE {p}body")).await;
+    support::exec(
+        &pool,
+        &format!("ALTER TABLE {p}runs DROP COLUMN head, DROP COLUMN head_version"),
+    )
+    .await;
+    support::exec(
+        &pool,
+        &format!("UPDATE {p}meta SET value = '5' WHERE key = 'schema_version'"),
+    )
+    .await;
+    assert!(!has_table(&pool, &format!("{p}body")).await);
+
+    store.migrate().await.unwrap();
+    assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
+    assert!(has_table(&pool, &format!("{p}body")).await);
+    assert!(
+        support::scalar::<bool>(
+            &pool,
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                             WHERE table_name = $1 AND column_name = 'head')",
+            &[&format!("{p}runs")],
+        )
+        .await,
+        "the head column"
+    );
+    // The run survived, and its whole state is still served (no head yet).
+    let loaded = store.load_run(run.id).await.unwrap().expect("the run");
+    assert_eq!(loaded.state, json!({"turn": 1}));
+    assert_eq!(
+        store.load_head(run.id).await.unwrap().unwrap().state,
+        json!({"turn": 1})
     );
 
     drop_tables(&pool, &p).await;

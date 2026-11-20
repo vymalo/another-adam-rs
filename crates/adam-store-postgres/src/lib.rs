@@ -55,8 +55,8 @@ use std::time::Duration;
 use adam_core::store::{add_ttl, now, sched_at, storable, truncate_ms};
 use adam_core::time::Timestamp;
 use adam_core::{
-    BlobId, ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun,
-    PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
+    BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig,
+    NewRun, PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
     RunUpdate, Store, StoreError, StoreResult,
 };
 use adam_error::ErrorClass;
@@ -81,7 +81,20 @@ use uuid::Uuid;
 /// * 5, part 1: file bytes out of the run. `adam_blob` holds content-addressed bytes and
 ///   `adam_run_blob` the digests each run references (`ON DELETE CASCADE`); the upgrade is
 ///   metadata-only (two new tables and their indexes, no rewrite of `runs`).
-pub const SCHEMA_VERSION: i32 = 5;
+/// * 5, part 2 (schema version 6): the head and the append-only body. `runs.head` is the v5 head
+///   and `runs.head_version` the version it was written at (a head a later commit did not rebuild
+///   is stale and is not served); `adam_body` holds one row per transcript message, keyed
+///   `(run_id, generation, idx)`, `ON DELETE CASCADE`. The upgrade is metadata-only.
+pub const SCHEMA_VERSION: i32 = 6;
+
+/// How old a foreign attempt's body row must be before a commit may collect it: the insert→CAS gap
+/// is milliseconds, and the runtime's default lease is 30 s, so five minutes separates a dead
+/// attempt from a live one.
+const BODY_ORPHAN_GRACE: jiff::SignedDuration = jiff::SignedDuration::from_mins(5);
+
+/// How old a superseded body generation must be before a commit collects it: a reader that opened
+/// the old head keeps a grace period, and the generation a head names is never collected.
+const BODY_GC_GRACE: jiff::SignedDuration = jiff::SignedDuration::from_hours(1);
 
 /// Purge deletes in batches of this many runs (plus their journals).
 const PURGE_BATCH: i64 = 500;
@@ -252,6 +265,12 @@ impl PgStore {
             if stored == Some(4) {
                 self.upgrade_blobs(client).await?;
             }
+            // Schema version 5, part 2 (schema version 6): the head columns and the body table.
+            // Gated on the version, not on the blob step: a database stamped 5 already has the
+            // blob tables but no head or body.
+            if stored.is_none_or(|v| v < 6) {
+                self.upgrade_body(client).await?;
+            }
         }
         let tx = client.transaction().await.map_err(classify)?;
         // Serialize concurrent migrations; CREATE .. IF NOT EXISTS alone can still race on the
@@ -356,6 +375,25 @@ impl PgStore {
         tx.commit().await.map_err(classify)
     }
 
+    /// Schema version 5 part 2 (schema version 6): the head columns and the body table.
+    ///
+    /// Metadata-only: two nullable columns on `runs` (`ADD COLUMN` without a default is a catalog
+    /// change) and one new table with its index and a foreign key. Idempotent everywhere.
+    async fn upgrade_body(&self, client: &mut ClientWrapper) -> StoreResult<()> {
+        let tx = client.transaction().await.map_err(classify)?;
+        let stmt = tx
+            .prepare_cached("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .await
+            .map_err(classify)?;
+        tx.execute(&stmt, &[&self.sql.migrate_lock])
+            .await
+            .map_err(classify)?;
+        for stmt in &self.sql.migrate_body {
+            tx.batch_execute(stmt).await.map_err(classify)?;
+        }
+        tx.commit().await.map_err(classify)
+    }
+
     fn map_write_err(
         &self,
         err: tokio_postgres::Error,
@@ -434,6 +472,9 @@ struct Sql {
     migrate: Vec<Arc<str>>,
     /// Schema version 5 part 1's DDL: the blob tables, run on their own in `upgrade_blobs`.
     migrate_blobs: Vec<Arc<str>>,
+    /// Schema version 5 part 2's DDL (schema version 6): the head columns and the body table, run
+    /// on their own in `upgrade_body`.
+    migrate_body: Vec<Arc<str>>,
     /// The meta table's name with the prefix, bound to `to_regclass` before it is read.
     meta_table: String,
     /// The runs table's name with the prefix, checked before the listing index is built.
@@ -449,9 +490,17 @@ struct Sql {
     schema_version: Arc<str>,
     insert_run: Arc<str>,
     load_run: Arc<str>,
+    load_head: Arc<str>,
     run_header: Arc<str>,
     load_version: Arc<str>,
     commit_run: Arc<str>,
+    commit_run_head: Arc<str>,
+    commit_context: Arc<str>,
+    body_insert: Arc<str>,
+    body_conflicts: Arc<str>,
+    body_collect: Arc<str>,
+    body_list: Arc<str>,
+    gc_body: Arc<str>,
     open_run: Arc<str>,
     journal_get: Arc<str>,
     journal_insert: Arc<str>,
@@ -498,6 +547,30 @@ impl Sql {
         // this list on its own for a version 4 one.
         let blob = format!("{p}blob");
         let run_blob = format!("{p}run_blob");
+        // Schema version 5, part 2 (schema version 6): the head is a column on `runs` (written by
+        // the commit that built it, with its version); the body is one row per message of one
+        // generation, keyed by position.
+        let body = format!("{p}body");
+        let migrate_body: Vec<Arc<str>> = [
+            format!("ALTER TABLE {runs} ADD COLUMN IF NOT EXISTS head JSONB"),
+            format!("ALTER TABLE {runs} ADD COLUMN IF NOT EXISTS head_version BIGINT"),
+            format!(
+                "CREATE TABLE IF NOT EXISTS {body} (
+                    run_id      UUID        NOT NULL REFERENCES {runs} (id) ON DELETE CASCADE,
+                    generation  UUID        NOT NULL,
+                    idx         INTEGER     NOT NULL CHECK (idx >= 0),
+                    message     JSONB       NOT NULL,
+                    writer      UUID        NOT NULL,
+                    written_at  TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (run_id, generation, idx)
+                )"
+            ),
+            // The body GC: superseded generations written before the cutoff.
+            format!("CREATE INDEX IF NOT EXISTS {p}body_written ON {body} (written_at)"),
+        ]
+        .into_iter()
+        .map(Arc::from)
+        .collect();
         let migrate_blobs: Vec<Arc<str>> = [
             format!(
                 "CREATE TABLE IF NOT EXISTS {blob} (
@@ -544,6 +617,8 @@ impl Sql {
                     lease_owner     TEXT,
                     lease_until     TIMESTAMPTZ,
                     owner           TEXT,
+                    head            JSONB,
+                    head_version    BIGINT,
                     created_at      TIMESTAMPTZ NOT NULL,
                     updated_at      TIMESTAMPTZ NOT NULL,
                     CONSTRAINT {runs_pkey} PRIMARY KEY (id)
@@ -624,6 +699,7 @@ impl Sql {
         .map(Arc::from)
         .collect();
         migrate.extend(migrate_blobs.iter().cloned());
+        migrate.extend(migrate_body.iter().cloned());
         // Record the version, and raise it from an older one. Never lower it: a process
         // running an older release must not undo a newer one's migration.
         migrate.push(Arc::from(format!(
@@ -634,6 +710,7 @@ impl Sql {
         Self {
             migrate,
             migrate_blobs,
+            migrate_body,
             meta_table: meta.clone(),
             runs_table: runs.clone(),
             migrate_lock: format!("adam-rs:migrate:{p}"),
@@ -665,6 +742,15 @@ impl Sql {
                  RETURNING {RUN_METADATA_COLUMNS}"
             )),
             load_run: Arc::from(format!("SELECT {RUN_COLUMNS} FROM {runs} WHERE id = $1")),
+            // The observer's read: the head when it is current, the whole state otherwise. Never a
+            // body row; `Runtime::state` joins the head and its generation when it needs them.
+            load_head: Arc::from(format!(
+                "SELECT id, agent, conversation_id, parent_id, status,
+                        CASE WHEN head_version = version AND head IS NOT NULL THEN head ELSE state
+                        END AS state,
+                        wake_at, version, created_at, updated_at
+                   FROM {runs} WHERE id = $1"
+            )),
             run_header: Arc::from(format!(
                 "SELECT {RUN_HEADER_COLUMNS} FROM {runs} WHERE id = $1"
             )),
@@ -675,6 +761,43 @@ impl Sql {
                         version = version + 1, updated_at = $7
                   WHERE id = $1 AND version = $2
                  RETURNING {RUN_METADATA_COLUMNS}"
+            )),
+            commit_run_head: Arc::from(format!(
+                "UPDATE {runs}
+                    SET status = $3, state = $4, wake_at = $5, sched_at = $6,
+                        version = version + 1, updated_at = $7, head = $8, head_version = $9
+                  WHERE id = $1 AND version = $2
+                 RETURNING {RUN_METADATA_COLUMNS}"
+            )),
+            // The run row is locked for the length of a commit that writes a head, a body or
+            // refs: the version check, the foreign-writer check and the CAS are one transaction.
+            commit_context: Arc::from(format!(
+                "SELECT version, agent, conversation_id, head, head_version
+                   FROM {runs} WHERE id = $1 FOR UPDATE"
+            )),
+            // The rows of one append; `ON CONFLICT DO NOTHING` makes a retry idempotent, and a
+            // conflict is resolved by `body_conflicts` inside the same transaction.
+            body_insert: Arc::from(format!(
+                "INSERT INTO {body} (run_id, generation, idx, message, writer, written_at)
+                 SELECT $1, $2, idx, message, $5, $6
+                   FROM unnest($3::int[], $4::jsonb[]) AS t(idx, message)
+                 ON CONFLICT (run_id, generation, idx) DO NOTHING"
+            )),
+            body_conflicts: Arc::from(format!(
+                "SELECT idx, message, written_at FROM {body}
+                  WHERE run_id = $1 AND generation = $2 AND idx >= $3 AND idx < $4
+                    AND writer <> $5"
+            )),
+            body_collect: Arc::from(format!(
+                "DELETE FROM {body} WHERE run_id = $1 AND generation = $2 AND idx = ANY($3)
+                  AND writer <> $4"
+            )),
+            body_list: Arc::from(format!(
+                "SELECT idx, message FROM {body} WHERE run_id = $1 AND generation = $2
+                  ORDER BY idx"
+            )),
+            gc_body: Arc::from(format!(
+                "DELETE FROM {body} WHERE run_id = $1 AND generation <> $2 AND written_at < $3"
             )),
             open_run: Arc::from(format!(
                 "SELECT {RUN_COLUMNS} FROM {runs}
@@ -894,6 +1017,107 @@ fn sql_time(t: Timestamp) -> jiff::Timestamp {
     t.0
 }
 
+/// How a commit that wrote a head, a body or refs ended, before its error is mapped (a driver
+/// error needs the connection back before it can be looked up).
+enum CommitOutcome {
+    Written(Row, Option<BodyPlan>),
+    Missing,
+    Conflict(u64),
+    Rejected(tokio_postgres::Error),
+}
+
+/// The rows one commit writes and where they go, resolved inside its transaction.
+struct BodyPlan {
+    generation: Uuid,
+    start: usize,
+    writer: Uuid,
+    rows: Vec<BodyRow>,
+    written_at: Timestamp,
+}
+
+/// Resolve the generation and the rows a commit writes, and patch the head it carries.
+fn plan_body(
+    head: &mut Option<Value>,
+    current_head: Option<&Value>,
+    head_version: Option<i64>,
+    expected: i64,
+    body: BodyWrite,
+    written_at: Timestamp,
+) -> StoreResult<BodyPlan> {
+    let BodyWrite {
+        generation,
+        rows,
+        writer,
+    } = body;
+    // The rows are a transcript: index `i` is the message at `i`. A wrong index would write the
+    // wrong offset while the head's `len` still matched.
+    for (position, row) in rows.iter().enumerate() {
+        let position = u32::try_from(position)
+            .map_err(|_| StoreError::InvalidInput("a transcript is longer than u32".into()))?;
+        if row.idx != position {
+            return Err(StoreError::InvalidInput(format!(
+                "body row {position} has index {}",
+                row.idx
+            )));
+        }
+    }
+    let current = if head_version == Some(expected) {
+        current_head.and_then(head_body)
+    } else {
+        None
+    };
+    let target = generation
+        .or(current.map(|(generation, _)| generation))
+        .unwrap_or_else(Uuid::new_v4);
+    // A new generation writes the whole transcript; an append writes only the rows after the
+    // head's `len`. The runtime guarantees the rows start with the old transcript.
+    let start = match (generation, current) {
+        (Some(_), _) | (None, None) => 0,
+        (None, Some((_, len))) => usize::try_from(len)
+            .map_err(|_| StoreError::InvalidInput("body length exceeds usize".into()))?,
+    };
+    if start > rows.len() {
+        return Err(StoreError::InvalidInput(format!(
+            "the body append starts at {start}, past the {} rows given",
+            rows.len()
+        )));
+    }
+    let len = u32::try_from(rows.len())
+        .map_err(|_| StoreError::InvalidInput("a transcript is longer than u32".into()))?;
+    if let Some(head) = head.as_mut() {
+        set_head_body(head, target, len)?;
+    }
+    Ok(BodyPlan {
+        generation: target,
+        start,
+        writer,
+        rows,
+        written_at,
+    })
+}
+
+/// The generation and length a v5 head names, if it names one.
+fn head_body(head: &Value) -> Option<(Uuid, u64)> {
+    let body = head.get("body")?;
+    let generation = body.get("generation")?.as_str()?.parse().ok()?;
+    let len = body.get("len")?.as_u64()?;
+    Some((generation, len))
+}
+
+/// Patch a v5 head's `body` to the generation and length its commit writes.
+fn set_head_body(head: &mut Value, generation: Uuid, len: u32) -> StoreResult<()> {
+    let body = head
+        .get_mut("body")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| StoreError::InvalidInput("a v5 head must carry a body object".into()))?;
+    body.insert(
+        "generation".to_owned(),
+        Value::String(generation.to_string()),
+    );
+    body.insert("len".to_owned(), Value::from(len));
+    Ok(())
+}
+
 /// One column of a row, by name. A failure here is stored data that breaks an invariant (or a
 /// schema the store does not expect): `Corrupt`, never retried for ever.
 fn decode<'a, T: FromSql<'a>>(row: &'a Row, column: &str) -> StoreResult<T> {
@@ -1072,6 +1296,23 @@ impl Store for PgStore {
             .transpose()
     }
 
+    async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
+        // One statement: the head when it is current, the whole state otherwise. Never a body
+        // row, which is the read win of the v5 view.
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.load_head)
+            .await
+            .map_err(classify)?;
+        client
+            .query_opt(&stmt, &[&id.0])
+            .await
+            .map_err(classify)?
+            .as_ref()
+            .map(run_from_row)
+            .transpose()
+    }
+
     async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
         // One statement over the primary key: the header columns and the lease, never `state`.
         let client = self.pool.get().await.map_err(classify_pool)?;
@@ -1099,29 +1340,29 @@ impl Store for PgStore {
         let RunUpdate {
             status,
             state,
-            head: _,
-            body: _,
+            head,
+            body,
             blobs,
             wake_at,
         } = update;
         let wake_at = wake_at.map(truncate_ms);
         let sched = sched_at(status, wake_at, t);
-        let (t, wake_at, sched) = (sql_time(t), wake_at.map(sql_time), sched.map(sql_time));
-        let status = status.as_str();
-        let state = storable(&state);
+        let (t_sql, wake_at_sql, sched_sql) =
+            (sql_time(t), wake_at.map(sql_time), sched.map(sql_time));
+        let status_sql = status.as_str();
+        let state_sql = storable(&state);
         let params: &[&(dyn ToSql + Sync)] = &[
             &id.0,
             &expected,
-            &status,
-            state.as_ref(),
-            &wake_at,
-            &sched,
-            &t,
+            &status_sql,
+            state_sql.as_ref(),
+            &wake_at_sql,
+            &sched_sql,
+            &t_sql,
         ];
-        // A commit with references is one transaction: a commit that loses the CAS writes no ref,
-        // and a commit that wins has all of them. A run with no file bytes keeps the single
-        // statement it always was (no BEGIN/COMMIT round trips on the common path).
-        if blobs.is_empty() {
+        // A commit that writes no head, no body row and no reference is the single statement it
+        // always was: the headless commit (a delivery, a cancel, a park) pays no BEGIN.
+        if head.is_none() && body.is_none() && blobs.is_empty() {
             // The connection is given back before a helper that needs another one runs: a pool
             // whose every connection is held by a commit waiting for a second one deadlocks.
             let result = {
@@ -1137,47 +1378,8 @@ impl Store for PgStore {
                 Err(err) => Err(self.commit_error(err, id).await?),
             };
         }
-        let result = {
-            let mut client = self.pool.get().await.map_err(classify_pool)?;
-            let tx = client.transaction().await.map_err(classify)?;
-            let stmt = tx
-                .prepare_cached(&self.sql.commit_run)
-                .await
-                .map_err(classify)?;
-            match tx.query_opt(&stmt, params).await {
-                Ok(None) => {
-                    tx.rollback().await.map_err(classify)?;
-                    Ok(None)
-                }
-                Ok(Some(row)) => {
-                    // One statement for the set; a digest named twice in one commit is one row.
-                    let mut seen = HashSet::new();
-                    let digests: Vec<String> = blobs
-                        .iter()
-                        .filter(|digest| seen.insert(digest.as_str()))
-                        .map(|digest| digest.as_str().to_owned())
-                        .collect();
-                    let stmt = tx
-                        .prepare_cached(&self.sql.commit_blobs)
-                        .await
-                        .map_err(classify)?;
-                    tx.execute(&stmt, &[&id.0, &digests])
-                        .await
-                        .map_err(classify)?;
-                    tx.commit().await.map_err(classify)?;
-                    Ok(Some(row))
-                }
-                Err(err) => {
-                    let _ = tx.rollback().await;
-                    Err(err)
-                }
-            }
-        };
-        match result {
-            Ok(Some(row)) => run_metadata_from_row(&row),
-            Ok(None) => self.commit_conflict(id, expected as u64).await,
-            Err(err) => Err(self.commit_error(err, id).await?),
-        }
+        self.commit_parts(id, expected, params, head, body, &blobs, t)
+            .await
     }
 
     async fn open_run_for_conversation(
@@ -1577,6 +1779,50 @@ impl Store for PgStore {
         Ok(total)
     }
 
+    fn keeps_bodies(&self) -> bool {
+        true
+    }
+
+    async fn body_list(&self, run: RunId, generation: Uuid) -> StoreResult<Vec<BodyRow>> {
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.body_list)
+            .await
+            .map_err(classify)?;
+        let rows = client
+            .query(&stmt, &[&run.0, &generation])
+            .await
+            .map_err(classify)?;
+        rows.iter()
+            .map(|row| {
+                let idx: i32 = decode_at(row, 0)?;
+                Ok(BodyRow {
+                    idx: u32::try_from(idx)
+                        .map_err(|_| StoreError::Corrupt(format!("negative body index {idx}")))?,
+                    message: decode_at(row, 1)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn gc_body(
+        &self,
+        run: RunId,
+        keep_generation: Uuid,
+        before: Timestamp,
+    ) -> StoreResult<u64> {
+        let before = sql_time(before);
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.gc_body)
+            .await
+            .map_err(classify)?;
+        client
+            .execute(&stmt, &[&run.0, &keep_generation, &before])
+            .await
+            .map_err(classify)
+    }
+
     fn keeps_blobs(&self) -> bool {
         true
     }
@@ -1687,6 +1933,245 @@ impl PgStore {
         }
     }
 
+    /// A commit that writes a head, a body row or a blob reference: one transaction, with the
+    /// version check, the foreign-writer check and the CAS inside it.
+    ///
+    /// The run row is locked (`FOR UPDATE`) first, so two commits of one run serialize exactly
+    /// where the CAS would serialize them, and a commit that writes nothing never opens the
+    /// transaction (see [`commit_run`](Store::commit_run)).
+    // The arguments are the update's own fields plus the statement's bound parameters: bundling
+    // them in a struct would only move the same list one line down.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_parts(
+        &self,
+        id: RunId,
+        expected: i64,
+        params: &[&(dyn ToSql + Sync)],
+        mut head: Option<Value>,
+        body: Option<BodyWrite>,
+        blobs: &[BlobId],
+        t: Timestamp,
+    ) -> StoreResult<RunRecord> {
+        let mut client = self.pool.get().await.map_err(classify_pool)?;
+        let outcome: StoreResult<CommitOutcome> = async {
+            let tx = client.transaction().await.map_err(classify)?;
+            let stmt = tx
+                .prepare_cached(&self.sql.commit_context)
+                .await
+                .map_err(classify)?;
+            let Some(row) = tx.query_opt(&stmt, &[&id.0]).await.map_err(classify)? else {
+                tx.rollback().await.map_err(classify)?;
+                return Ok(CommitOutcome::Missing);
+            };
+            let version: i64 = decode_at(&row, 0)?;
+            if version != expected {
+                tx.rollback().await.map_err(classify)?;
+                return Ok(CommitOutcome::Conflict(version as u64));
+            }
+            let current_head: Option<Value> = decode_at(&row, 3)?;
+            let head_version: Option<i64> = decode_at(&row, 4)?;
+            let plan = match body {
+                Some(body) => Some(plan_body(
+                    &mut head,
+                    current_head.as_ref(),
+                    head_version,
+                    expected,
+                    body,
+                    t,
+                )?),
+                None => None,
+            };
+            if let Some(plan) = &plan {
+                self.write_body(&tx, id, plan, expected).await?;
+            }
+            if !blobs.is_empty() {
+                // One statement for the set; a digest named twice in one commit is one row.
+                let mut seen = HashSet::new();
+                let digests: Vec<String> = blobs
+                    .iter()
+                    .filter(|digest| seen.insert(digest.as_str()))
+                    .map(|digest| digest.as_str().to_owned())
+                    .collect();
+                let stmt = tx
+                    .prepare_cached(&self.sql.commit_blobs)
+                    .await
+                    .map_err(classify)?;
+                tx.execute(&stmt, &[&id.0, &digests])
+                    .await
+                    .map_err(classify)?;
+            }
+            let head_sql = head.as_ref().map(storable);
+            let head_version = expected + 1;
+            let statement = if head_sql.is_some() {
+                &self.sql.commit_run_head
+            } else {
+                &self.sql.commit_run
+            };
+            let stmt = tx.prepare_cached(statement).await.map_err(classify)?;
+            let result = match &head_sql {
+                Some(head) => {
+                    let head_params: &[&(dyn ToSql + Sync)] = &[
+                        params[0],
+                        params[1],
+                        params[2],
+                        params[3],
+                        params[4],
+                        params[5],
+                        params[6],
+                        head.as_ref(),
+                        &head_version,
+                    ];
+                    tx.query_opt(&stmt, head_params).await
+                }
+                None => tx.query_opt(&stmt, params).await,
+            };
+            let row = match result {
+                Ok(row) => row,
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    return Ok(CommitOutcome::Rejected(err));
+                }
+            };
+            // The version check above and the row lock make this unreachable, but a CAS that
+            // matched nothing must roll back rather than commit rows no head will ever name.
+            let Some(row) = row else {
+                tx.rollback().await.map_err(classify)?;
+                return Ok(CommitOutcome::Conflict(expected as u64));
+            };
+            tx.commit().await.map_err(classify)?;
+            Ok(CommitOutcome::Written(row, plan))
+        }
+        .await;
+        // The connection is given back before a helper that needs another one runs.
+        drop(client);
+        match outcome? {
+            CommitOutcome::Written(row, plan) => {
+                // The superseded generations are collected only after the CAS: a commit that lost
+                // names nothing, so it has nothing to supersede.
+                if let Some(plan) = plan {
+                    let _ = self.gc_body(id, plan.generation, t - BODY_GC_GRACE).await;
+                }
+                run_metadata_from_row(&row)
+            }
+            CommitOutcome::Missing => Err(StoreError::NotFound(id)),
+            CommitOutcome::Conflict(actual) => Err(StoreError::Conflict {
+                run: id,
+                expected: expected as u64,
+                actual,
+            }),
+            CommitOutcome::Rejected(err) => Err(self.commit_error(err, id).await?),
+        }
+    }
+
+    /// Write the rows of one body plan inside the commit's transaction, resolving a slot another
+    /// writer left: an identical message is adopted, one older than [`BODY_ORPHAN_GRACE`] is
+    /// collected (once), anything else is a `Conflict`.
+    async fn write_body(
+        &self,
+        tx: &deadpool_postgres::Transaction<'_>,
+        id: RunId,
+        plan: &BodyPlan,
+        expected: i64,
+    ) -> StoreResult<()> {
+        let rows = &plan.rows[plan.start..];
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let from = i32::try_from(plan.start)
+            .map_err(|_| StoreError::InvalidInput("body start exceeds i32".into()))?;
+        let to = i32::try_from(plan.rows.len())
+            .map_err(|_| StoreError::InvalidInput("a transcript is longer than i32".into()))?;
+        let idx = rows
+            .iter()
+            .map(|row| {
+                i32::try_from(row.idx).map_err(|_| {
+                    StoreError::InvalidInput(format!("body index {} exceeds i32::MAX", row.idx))
+                })
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        let messages: Vec<Value> = rows
+            .iter()
+            .map(|row| storable(&row.message).into_owned())
+            .collect();
+        let written_at = sql_time(plan.written_at);
+        let insert = tx
+            .prepare_cached(&self.sql.body_insert)
+            .await
+            .map_err(classify)?;
+        // One retry: the first pass may collect an orphaned attempt's rows and insert again. A
+        // second duplicate is a live attempt (or an insert that cannot be completed).
+        for pass in 0..2 {
+            tx.execute(
+                &insert,
+                &[
+                    &id.0,
+                    &plan.generation,
+                    &idx,
+                    &messages,
+                    &plan.writer,
+                    &written_at,
+                ],
+            )
+            .await
+            .map_err(classify)?;
+            let stmt = tx
+                .prepare_cached(&self.sql.body_conflicts)
+                .await
+                .map_err(classify)?;
+            let conflicts = tx
+                .query(&stmt, &[&id.0, &plan.generation, &from, &to, &plan.writer])
+                .await
+                .map_err(classify)?;
+            if conflicts.is_empty() {
+                return Ok(());
+            }
+            let cutoff = plan.written_at - BODY_ORPHAN_GRACE;
+            let mut orphans = Vec::new();
+            for row in &conflicts {
+                let index: i32 = decode_at(row, 0)?;
+                let message: Value = decode_at(row, 1)?;
+                let at: jiff::Timestamp = decode_at(row, 2)?;
+                let position = usize::try_from(index)
+                    .map_err(|_| StoreError::Corrupt(format!("negative body index {index}")))?;
+                let row_expected = plan.rows.get(position).ok_or_else(|| {
+                    StoreError::Corrupt(format!("body row {index} is outside the transcript"))
+                })?;
+                if message == *storable(&row_expected.message) {
+                    // Another attempt wrote the same message at this slot: adopting it is
+                    // indistinguishable from our own row, and the CAS decides whose head names it.
+                    continue;
+                }
+                if Timestamp(at) < cutoff {
+                    orphans.push(index);
+                } else {
+                    // A live attempt's differing row: the append cannot be completed.
+                    return Err(StoreError::Conflict {
+                        run: id,
+                        expected: expected as u64,
+                        actual: expected as u64,
+                    });
+                }
+            }
+            if orphans.is_empty() {
+                return Ok(());
+            }
+            if pass == 1 {
+                return Err(StoreError::Corrupt(format!(
+                    "body generation {} of run {id}: a collected slot is still occupied",
+                    plan.generation
+                )));
+            }
+            let stmt = tx
+                .prepare_cached(&self.sql.body_collect)
+                .await
+                .map_err(classify)?;
+            tx.execute(&stmt, &[&id.0, &plan.generation, &orphans, &plan.writer])
+                .await
+                .map_err(classify)?;
+        }
+        Ok(())
+    }
+
     /// A failed `commit_run`: a unique violation is the open-conversation index, and the run tells
     /// which conversation is busy; anything else is the driver's error.
     async fn commit_error(&self, err: tokio_postgres::Error, id: RunId) -> StoreResult<StoreError> {
@@ -1740,14 +2225,11 @@ mod tests {
     }
 
     #[test]
-    fn the_store_keeps_blobs_but_not_bodies_yet() {
+    fn the_store_keeps_blobs_and_bodies() {
         let pg = PgConfig::parse("postgres://u@h/d").expect("a URL");
         let store = PgStore::from_pool(pg.pool(1).expect("a lazy pool"));
         assert!(Store::keeps_blobs(&store));
-        assert!(
-            !Store::keeps_bodies(&store),
-            "the PostgreSQL body half is the follow-up after #361"
-        );
+        assert!(Store::keeps_bodies(&store));
     }
 
     #[tokio::test]
@@ -1765,27 +2247,28 @@ mod tests {
     }
 
     /// The live statements are the checked-in schema fixture, whitespace-normalised, so a change
-    /// to `Sql::new` cannot silently stop being the schema a `sqlx`-built database already has.
+    /// to `Sql::new` cannot silently stop being the schema a database already has.
     /// `ADAM_WRITE_FIXTURE=1` rewrites the fixture instead of comparing (the migration is the
-    /// source of truth; the fixture is what a database built by an earlier release already has).
+    /// source of truth; the fixture is what a database built by this release already has).
+    /// `tests/fixtures/schema-v5.sql` stays: it is the pre-#361 schema the upgrade test applies.
     #[test]
-    fn the_statements_equal_the_version_5_fixture() {
+    fn the_statements_equal_the_version_6_fixture() {
         let sql = Sql::new("adam_");
         assert!(
             sql.migrate.len() > 4,
             "the fixture must hold the whole migration"
         );
         let mut generated = String::from(
-            "-- The schema version 5 that adam-store-postgres emits, exactly as the sqlx build wrote it.\n\
-             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_5_fixture\n",
+            "-- The schema version 6 that adam-store-postgres emits.\n\
+             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_6_fixture\n",
         );
         generated.push_str(&sql.migrate.join(";\n\n"));
         generated.push_str(";\n");
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v5.sql");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v6.sql");
         if std::env::var_os("ADAM_WRITE_FIXTURE").is_some() {
             std::fs::write(path, &generated).expect("write the fixture");
         }
-        let fixture = include_str!("../tests/fixtures/schema-v5.sql");
+        let fixture = include_str!("../tests/fixtures/schema-v6.sql");
         assert_eq!(
             normalise(&(sql.migrate.join("; ") + ";")),
             normalise(fixture)

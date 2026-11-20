@@ -21,6 +21,9 @@ uuid.workspace = true
 
 [dev-dependencies]
 adam-error.workspace = true
+adam-runtime.workspace = true
+async-trait.workspace = true
+serde.workspace = true
 url.workspace = true
 adam-store-testkit.workspace = true
 jiff.workspace = true

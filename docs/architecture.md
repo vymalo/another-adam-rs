@@ -909,11 +909,11 @@ never shown as `submitted` again. A front that holds only the starter claims not
 Six tables (PostgreSQL) or collections (MongoDB), prefixed `adam_` by default, plus a `meta` table with
 the schema version: `push` holds A2A push-notification configurations (schema version 3), `blob`
 and `run_blob` hold a run's file bytes and the digests it references (schema version 5, part 1), and
-`body` holds a run's transcript beside the `head` and `head_version` of a run document (schema version
-5, part 2). **The head and the body are MongoDB's now**: the PostgreSQL columns, `adam_body` and
-`body_list` are the follow-up after #361, and `PgStore` keeps `keeps_bodies() == false` until then.
-`state` is JSONB in Postgres and a real BSON document in MongoDB; in the expand release it is still
-the complete v4 envelope.
+`body` holds a run's transcript beside the `head` and `head_version` of a run (schema version 5,
+part 2). Both adapters keep them: MongoDB in the run document and the `adam_body` collection,
+PostgreSQL in `runs.head`/`runs.head_version` and the `adam_body` table, written in the same
+transaction as the CAS. `state` is JSONB in Postgres and a real BSON document in MongoDB; in the
+expand release it is still the complete v4 envelope.
 
 ```mermaid
 erDiagram
@@ -930,7 +930,7 @@ erDiagram
         uuid parent_id "null: not a child run"
         text status "runnable, parked, done, failed"
         jsonb state "the Envelope"
-        jsonb head "the v5 head (MongoDB now; PostgreSQL after #361)"
+        jsonb head "the v5 head"
         bigint head_version "the version the head was written at"
         timestamptz wake_at
         timestamptz sched_at "derived: when it is due"
@@ -1034,9 +1034,12 @@ the bytes too until the contract release, so a reader of the old format still re
 The expand release writes a **head** and a **body generation** beside `state`: the steps write both
 (S2a), and the observer reads the head (S2b). `Runtime::view` is one `Store::load_head` and no body;
 `Runtime::state` is the one full-state read, joining the head and the generation it names. The
-worker, `load_run`, `claim_due` and `list_runs` still read the whole state until S3. MongoDB keeps
-both now; the PostgreSQL half is the follow-up after #361, and `PgStore` keeps `keeps_bodies() ==
-false` until then, so its `load_head` is the trait default and its view is the whole state.
+worker, `load_run`, `claim_due` and `list_runs` still read the whole state until S3. Both adapters
+keep both: MongoDB in the run document and the `adam_body` collection, PostgreSQL in `runs.head`/
+`runs.head_version` and the `adam_body` table. A PostgreSQL commit that writes a head or a body is
+one transaction — the run row locked `FOR UPDATE`, the version check, the rows, the refs and the CAS
+— so a foreign attempt's duplicate slot is resolved inside it (identical: adopted; older than the
+5-minute orphan grace: collected and retried once; live and different: `Conflict`).
 The head is the envelope with `v: 5`, `agent` reduced to the agent's head, file artifacts by
 reference, and a `body` member naming one generation; the rows are the messages.
 
