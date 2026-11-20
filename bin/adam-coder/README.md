@@ -31,8 +31,10 @@ needs no model or GitHub configuration.
 command (`tools::shell`), its sandbox meter (`tools::sandbox`), the tools' access scopes (`tools::access`), the
 `Redactor`, `GitAt` with the file listing (`tools::gitcli`, whose git writes and restores stay here) and the paths' confinement
 (`tools::files::confine`). These paths re-export the library, so nothing that names them changes. The first tools on the
-port are `list_files`, `find_files` and `search_files`: `tools::find` still declares them (their descriptions are what the
-model reads, pinned by `tests/tool_specs.rs`) and `adam_code_tools::find` does them. `Redactor::from_config` is the
+port are `list_files`, `find_files` and `search_files`, then `read_file` and `read_files`: `tools::find` and
+`tools::files` still declare them (their descriptions are what the model reads, pinned by `tests/tool_specs.rs`) and
+`adam_code_tools::find` and `adam_code_tools::files` do them. The write tools (`write_file`, `edit_file`, `apply_patch`)
+are still the coder's, and move next. `Redactor::from_config` is the
 coder's own trait, `RedactorFromConfig`, re-exported at the crate root.
 
 ```mermaid
@@ -514,7 +516,7 @@ conversation pushed) lives in
 
 ### Reading and changing files itself
 
-`read_file`, `write_file`, `edit_file` and `apply_patch` (`src/tools/files.rs`) read and change files of the worktree in this
+`read_file`, `write_file`, `edit_file` and `apply_patch` (declared in `src/tools/files.rs`; the read tools' code is `adam_code_tools::files`) read and change files of the worktree in this
 process, and the instructions say when to use which: small, well-located changes yourself (`edit_file` for a few lines,
 `apply_patch` for several changes at once), a broad multi-file change is many such calls, file by file (ADR 0038: until the workers of ADR 0037 exist). The model chooses every path, so the paths are the point.
 
@@ -684,7 +686,7 @@ whole. **The next offset is that of the first item not shown**, never `offset + 
 following the final line reads every item once. An offset past the end, an offset of 0 and a limit below 1 are error results. A negative `offset`
 on `read_file` reaches back at most 10,000 lines and 8 MiB of text (more is an error that says to read forward).
 
-**`read_files` is one call for several files, and has bounds of its own** (ADR 0044's goal: a turn spent per file while a repository is discovered): `read_files { paths, repo? }` takes 1 to 16 paths, in the model's order, and answers each one behind a line that names it (`== <path> ==`), then its numbered lines, its **first page at most 400 lines or 8 KiB** (the first line is always shown, as a page of `read_file` always has one). A page that was cut ends with `[more: N lines left; next page: read_file path=<path> offset=K]`, so the follow-up is `read_file` and no new offset convention is learnt; a file that was fully shown ends with `[end: N lines]` (and `; no newline at the end of the file`), as `read_file` does. **The whole result is at most 32 KiB**: a file it had no room for is one line, `[not shown: read it alone with read_file path=<path>]`, and the lines of the files after it are reserved before a page is shown, so the cap always holds. A file that does not exist, is a directory, is not a regular file, is binary (a NUL), is not UTF-8 or is over `read_file`'s 512 MiB is **one line that says why**, and the other files are still shown: only a bad argument (0 or more than 16 paths, or paths over 8 KiB together) is an error result for the whole call. The directory's project instructions are shown once, before the first file of it, through the same `project::with_nested` machinery; the block is reserved before the page is claimed, so one that is claimed is always shown. It is not a paged tool (`Tool::paged` is false, and it takes no `offset`): the loop's 64 KiB backstop never sees it. Code: `read_files`, `page_in`, `read_one` in `src/tools/files.rs`; tests: `tests/tools.rs`.
+**`read_files` is one call for several files, and has bounds of its own** (ADR 0044's goal: a turn spent per file while a repository is discovered): `read_files { paths, repo? }` takes 1 to 16 paths, in the model's order, and answers each one behind a line that names it (`== <path> ==`), then its numbered lines, its **first page at most 400 lines or 8 KiB** (the first line is always shown, as a page of `read_file` always has one). A page that was cut ends with `[more: N lines left; next page: read_file path=<path> offset=K]`, so the follow-up is `read_file` and no new offset convention is learnt; a file that was fully shown ends with `[end: N lines]` (and `; no newline at the end of the file`), as `read_file` does. **The whole result is at most 32 KiB**: a file it had no room for is one line, `[not shown: read it alone with read_file path=<path>]`, and the lines of the files after it are reserved before a page is shown, so the cap always holds. A file that does not exist, is a directory, is not a regular file, is binary (a NUL), is not UTF-8 or is over `read_file`'s 512 MiB is **one line that says why**, and the other files are still shown: only a bad argument (0 or more than 16 paths, or paths over 8 KiB together) is an error result for the whole call. The directory's project instructions are shown once, before the first file of it, through the same project-instructions machinery (`CodeWorkspace::nested_instructions`); the block is reserved before the page is claimed, so one that is claimed is always shown. It is not a paged tool (`Tool::paged` is false, and it takes no `offset`): the loop's 64 KiB backstop never sees it. Code: `read_files`, `page_in`, `read_one` in `crates/adam-code-tools/src/files.rs`; tests: `tests/tools.rs`.
 
 **A page cannot be forged.** A name is bytes, and is printed escaped in all three tools: `\\`, `\n`, `\r`, `\t`, any other control character and any
 byte that is not UTF-8 as `\xNN` (as git quotes a path), and a **leading `[` as `\x5b`**, so no line of a page but the final one starts with `[` (a
@@ -2889,7 +2891,8 @@ database of its own, so the role needs `CREATEDB`):
   a second, a pattern over 1000 bytes or a compiled size over 1 MiB refused, a symlink out of the slot not searched, files over 4 MiB counted),
   the paths outside the slot refused, **git unavailable fails closed**, and a timeout is an error that stops the blocking work;
   `files.rs` `swap_tests` `search_does_not_follow_a_slot_swapped_after_the_check`.
-* `src/tools/files.rs` (unit) and `tests/tools.rs`: the file tools. `confine` has a case each for `../`, an absolute path,
+* `src/tools/files.rs` (unit), `crates/adam-code-tools/src/files.rs` (unit: the read tools' paging, `read_files`' pages and
+  closest paths, moved there with them) and `tests/tools.rs`: the file tools. `confine` has a case each for `../`, an absolute path,
   `.git/x` and `.GIT/x`, a symlink to a file outside, a symlinked directory outside, a write through a symlink that
   stays inside, a link into `.git`, a directory and a file in the wrong place; `read_file` (a page of 2,000 lines and its
   `[more: ...]` line, a negative offset, the 50 KiB cap, a long line cut, `start_line` and `end_line` as aliases, a missing file's closest paths,
