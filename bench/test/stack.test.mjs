@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { GLIBC_FILES } from '../lib/glibc.mjs';
 import { PINS, coderRef } from '../lib/pins.mjs';
 import { RUNTIME } from '../lib/runtime.mjs';
 import { Stack, StackError, coderEnvironment, redact, secretsOf, serviceNames } from '../lib/stack.mjs';
@@ -628,4 +629,28 @@ test('compose: the pusher keeps a read-only root and the base read-only, and its
     assert.ok(!tmpfs.includes('/scratch'));
     assert.ok(!(s.environment && Object.keys(s.environment).some((k) => /KEY|TOKEN|SECRET/.test(k))));
   }
+});
+
+test('ensureGlibc copies the loader and the libraries out of the pinned coder image once, following links, and marks the directory', async (t) => {
+  const seen = [];
+  const { stack } = makeStack(t, {
+    exec: async (file, args) => {
+      seen.push(args);
+      if (args[0] === 'cp') fs.writeFileSync(args[args.length - 1], '');
+      return { exitCode: 0, stdout: 'id\n', stderr: '' };
+    },
+  });
+  const dir = await stack.ensureGlibc();
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['.image', ...GLIBC_FILES].sort());
+  assert.equal((fs.statSync(path.join(dir, 'ld-linux-x86-64.so.2')).mode & 0o111) !== 0, true, 'the loader is executable');
+  assert.equal(fs.readFileSync(path.join(dir, '.image'), 'utf8').trim(), coderRef(PINS));
+  const cps = seen.filter((a) => a[0] === 'cp');
+  assert.equal(cps.length, GLIBC_FILES.length);
+  for (const a of cps) {
+    assert.equal(a[1], '-L', 'a symbolic link is copied as the file it names');
+    assert.match(a[2], /^adam-bench-extract-[0-9a-f]+:\/usr\/lib\/x86_64-linux-gnu\/[A-Za-z0-9._+-]+$/);
+  }
+  assert.ok(!seen.some((a) => a[0] === 'run' || a[0] === 'start'), 'the image is never run');
+  assert.equal(await stack.ensureGlibc(), dir, 'a second call copies nothing');
+  assert.equal(seen.filter((a) => a[0] === 'cp').length, GLIBC_FILES.length);
 });

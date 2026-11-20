@@ -163,6 +163,7 @@ for on every restart. The report lists such a run among those left out, with its
 | `bench/lib/npm.mjs` | OpenCode's binary from npm, checked against its integrity before anything is written |
 | `bench/lib/a2a.mjs` | the A2A client (the bearer in a private field) and `driveTask`: poll, the one nudge, cancel |
 | `bench/lib/gitops.mjs` | the host's other git: list the pushed branches (isolated), the agent folder of a revision, the script a container pushes the base with |
+| `bench/lib/glibc.mjs` | the glibc runtime the OpenCode binary needs in a musl task image: which images lack the loader, the read-only mounts that give it |
 | `bench/lib/stack.mjs`, `bench/compose.yaml`, `bench/lib/relay.mjs` | the stack, the host containers the harness starts (the coder, the arms, the grading), the relays |
 | `bench/lib/tarstream.mjs` | what a container wrote, as a tar stream parsed with limits |
 | `bench/lib/classify.mjs` | infrastructure told apart from the agent, from the meter's record |
@@ -526,6 +527,19 @@ integrity **before anything is written**, extracted and mounted read-only at `/o
 cd <clone> && opencode run --standalone --format json --model bench/bench-model --auto --title <run> < instruction.md
 ```
 
+**The binary is a glibc executable** (interpreter `/lib64/ld-linux-x86-64.so.2`; it also needs libstdc++, libgcc_s and glibc's resolver
+modules), so a task image on **musl** (Alpine: the SWE-bench Pro teleport images) cannot start it: its shell says
+`/opt/bench/opencode: not found` and the container exits 127 (reproduced 2026-11-20 in the teleport image). In prepare the driver
+asks each image once whether `/lib64/ld-linux-x86-64.so.2` exists (`lacksLoader`, `lib/glibc.mjs`); where it does not, the run
+and export containers get the glibc runtime of the pinned coder image (`Stack.ensureGlibc`: the loader and nine libraries copied
+once with `docker cp -L` into `$BENCH_HOME/stack/glibc`) mounted **read-only at the places glibc looks**
+(`glibcMounts`). Nothing else changes: no environment variable, no loader invoked by hand (OpenCode starts its private server
+from its own `execPath`, which a hand-invoked loader breaks), and an image that has glibc is run exactly as before. *Verified
+2026-11-20* with the pinned binary, uid 10001, in the teleport image: the whole run script ran the scripted task to the end,
+with the meter's name resolved from `/etc/hosts`. When a start fails (exit 125, 126, 127 and no events), the shell's own
+message goes to the pipe that becomes `stderr.txt`, not to the container's stderr: the driver reads it from there, keeps
+`runs/<run>-a<n>/opencode/stderr.txt`, puts it in the error and in `prepare-stderr.txt`.
+
 `OPENCODE_CONFIG_CONTENT` (`opencodeConfig`), **given on stdin** and read into the variable by the script (it holds the run's token, which is then on no command line): the provider `bench` (`@ai-sdk/openai-compatible`) at the meter's address with a
 dummy key, the model's limits (context from the configuration, output 8192), the same model for the small calls,
 `agent.build.steps` 200, `autoupdate` off, `share` off, and the permission
@@ -870,15 +884,17 @@ error or another architecture means the image cannot run it. **The probe runs th
 `bench/pins.json` still names the build before ADR 0053 decision 11's static one: in a Debian bookworm task image those
 fail on glibc (`GLIBC_2.38` and `GLIBC_2.39` not found) and the image is **refused for both arms**, until slice 6b moves
 the pin. The static build (musl) starts in bookworm (probed by hand: exit 78), so once the pin moves the image's C library
-stops being the question; an image that cannot run the binary at all is refused for both arms. The probe is the coder's
-alone: the OpenCode binary is linked to glibc, so an image that starts a static coder but cannot run OpenCode (Alpine) is
-not refused by it. The output names the distribution and the error. With
+stops being the question; an image that cannot run the binary at all is refused for both arms. A second row, `opencode in task image <id>`, starts the pinned OpenCode binary there (`--version`, uid 10001, no network)
+the way a run does: an image without glibc (Alpine) gets the harness's runtime mounted and the row says so; one where the binary
+still does not start is a **failure** (its runs would be `Failed_infra`, found before a paid run). It needs the verified binary
+(fetched from npm into `$BENCH_HOME/opencode/<version>`) and the coder image; without them the row is a warning, "not probed".
+The output names the distribution and the error. With
 `--start` it brings the stack up and runs a container of the coder image on the host, for each slot and for the grading,
 and asks the runtime whether it takes the arms' limits (a refusal is a warning: both arms still get the same setting).
 Compose 2.24 or newer and an x64 machine are required. The exit is 1 when a check fails, which includes a task image the
 coder cannot start in. Every `docker` child it starts gets the same allow-list as the stack (`dockerEnv` in
 `lib/containers.mjs`), never the model's key (`bench/test/doctor.test.mjs`): the compose plugin, the daemon query and
-the image inspection, the two probes of each task image, and with `--start` the stack's compose calls, the coder's files
+the image inspection, the probes of each task image, and with `--start` the stack's compose calls, the coder's files
 extracted from the image, the host containers and the limit probe. The `ip` child that finds the meter's address gets it
 too.
 

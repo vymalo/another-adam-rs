@@ -17,6 +17,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { HostContainers, buildRunArgs, dockerEnv } from './containers.mjs';
+import { GLIBC_FILES, GLIBC_LIB_DIR } from './glibc.mjs';
 import { summarize, withStderr } from './errors.mjs';
 import { PINS, coderRef } from './pins.mjs';
 import { RUNTIME, runtimeLimits, runtimeUser } from './runtime.mjs';
@@ -479,6 +480,33 @@ export class Stack {
         fs.chmodSync(path.join(dir, f), 0o755);
       } catch {
         throw new StackError(`the coder's ${f} could not be copied out of ${this.coderImage}: pull the image and retry`);
+      }
+    }
+    fs.writeFileSync(marker, `${this.coderImage}\n`);
+    return dir;
+  }
+
+  /**
+   * The glibc runtime the pinned OpenCode binary needs (its loader and the libraries), copied out of the pinned coder image
+   * once (never run there): mounted read-only in every OpenCode container, it starts the binary in a task image that has no
+   * glibc of its own (Alpine). Not part of `ensureCoderFiles`: the coder's binaries are static and adam never needs it.
+   */
+  async ensureGlibc() {
+    const dir = path.join(this.stackDir, 'glibc');
+    const marker = path.join(dir, '.image');
+    try {
+      if (fs.readFileSync(marker, 'utf8').trim() === this.coderImage) return dir;
+    } catch {
+      // not made yet
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+    await this.host().extract(this.coderImage, GLIBC_FILES.map((f) => `${GLIBC_LIB_DIR}/${f}`), dir, { follow: true });
+    for (const f of GLIBC_FILES) {
+      try {
+        fs.chmodSync(path.join(dir, f), f.startsWith('ld-') ? 0o755 : 0o644);
+      } catch {
+        throw new StackError(`the glibc runtime ${f} could not be copied out of ${this.coderImage}: pull the image and retry`);
       }
     }
     fs.writeFileSync(marker, `${this.coderImage}\n`);
