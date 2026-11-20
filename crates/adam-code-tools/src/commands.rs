@@ -87,7 +87,9 @@ pub trait CommandWorkspace: CodeWorkspace {
     /// # Errors
     ///
     /// A [`ToolError`] when what follows cannot be done or recorded: the tool returns it, and
-    /// nothing is undone.
+    /// nothing is undone. **A known gap**, kept from the coder's `run`: the guard is then dropped
+    /// unsettled, so a command that also changed git keeps that change. Step 5c-2, which moves
+    /// `run`, decides whether to settle first.
     async fn after_run(&self, ctx: &ToolCtx, place: &Place) -> Result<String, ToolError>;
 
     /// A note the tool appends to a refusal of its guard (one from [`guard`](Self::guard), or a
@@ -117,6 +119,9 @@ pub trait CommandWorkspace: CodeWorkspace {
 }
 
 /// What a command is held to by its [guard](CommandWorkspace::guard).
+///
+/// Closed on purpose (rule 3): a new kind of command must be thought through by every workspace,
+/// so it fails to compile in each until it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Guarding {
     /// It looks (`run_command`): it may change nothing, files included.
@@ -126,6 +131,10 @@ pub enum Guarding {
 }
 
 /// What a [guard](CommandGuard) found once the command ended.
+///
+/// `#[non_exhaustive]`, unlike [`Guarding`]: a workspace may come to report more (a guard that
+/// records what changed in a person's directory without undoing it, slice 7), and the tools give
+/// any verdict they do not know the answer of [`Unwatched`](Settled::Unwatched).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Settled {
@@ -154,7 +163,7 @@ pub enum Settled {
 /// A guard dropped without being settled **undoes nothing**: a tool that returns between the two
 /// (the command did not run, or a hook failed) leaves the place as the command left it.
 #[async_trait]
-pub trait CommandGuard: Send + Sync {
+pub trait CommandGuard: Send {
     /// Compare the place with what it was, and undo what the command was not allowed to change.
     async fn settle(self: Box<Self>) -> Settled;
 }

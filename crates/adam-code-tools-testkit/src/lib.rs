@@ -463,11 +463,21 @@ pub mod command_cases {
                 .filter(|out| out.status.success())
                 .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
         };
-        if git(&["rev-parse", "--verify", "--quiet", "HEAD"]).is_none() {
+        // A place with no repository has no git to change: nothing to check. One with a `.git`
+        // that git cannot read (no commit, an unsafe directory) cannot be checked either, and says
+        // so instead of passing unchecked.
+        if !dir.join(".git").exists() {
             return;
         }
+        assert!(
+            git(&["rev-parse", "--verify", "--quiet", "HEAD"]).is_some(),
+            "git cannot read HEAD in {}: the case needs a place with a commit",
+            dir.display()
+        );
         let settled = guarded(h, Guarding::Make, &format!("git branch {BRANCH}")).await;
-        let listed = git(&["branch", "--list", BRANCH]).unwrap_or_default();
+        let Some(listed) = git(&["branch", "--list", BRANCH]) else {
+            panic!("git cannot list the branches of {}", dir.display());
+        };
         if !listed.is_empty() {
             let _ = git(&["branch", "-D", BRANCH]);
         }

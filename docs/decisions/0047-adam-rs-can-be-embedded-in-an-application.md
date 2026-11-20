@@ -132,7 +132,11 @@ workspace as it is.
    `DirWorkspace` implement it here. The coder's guard, `SlotGuard`, wraps the worktree's `Snapshot`, which stays the
    coder's; the person's directory is never undone, so `DirWorkspace`'s guard is `Unwatched`. The coder's `#[tool]`
    declaration is unchanged and delegates; the pins of `tests/command_results.rs` and `tests/tool_specs.rs` pass
-   unchanged. **Not yet:** `run`, step 5c-2.
+   unchanged. Three answers differ, each only where no workspace goes today: "the workspace lacks a tool" is shown
+   after the workspace answers, so not at all when the coder's notes cannot be updated; a place that carries no `Slot`
+   is refused, so a coder command never runs unguarded; and a look that reports `FilesChanged` (none does) says the
+   files stay. **Not yet:** `run`, step 5c-2, which also decides whether a failing `after_run` should settle the guard
+   first (today, as in the coder, a change to git then stays).
 8. **Commands run as the person unless a sandbox says otherwise.** A local sandbox is an `Environment`: first a process
    tree that can be killed, then the operating system's own confinement where there is one. `describe` says what is not
    protected.
