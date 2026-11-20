@@ -110,16 +110,23 @@ impl Inner {
         )
     }
 
+    /// What this process holds of a run that is over: its lock, its clock and its image choice.
     fn forget(&self, run: &str) {
+        self.forget_pod(run);
+        self.images
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(run);
+    }
+
+    /// What this process holds of a run whose pod is gone and whose run is not (the idle sweep):
+    /// the image choice is the run's and outlives the pod, so it stays.
+    fn forget_pod(&self, run: &str) {
         self.locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(run);
         self.used
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(run);
-        self.images
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(run);
@@ -657,7 +664,7 @@ impl KubeEnvironment {
             match inner.delete(&name).await {
                 Ok(()) => {
                     tracing::info!(%run, pod = %name, idle_secs = idle.as_secs(), "deleted an idle run pod; the next command makes another");
-                    inner.forget(&run);
+                    inner.forget_pod(&run);
                     deleted.push(run);
                 }
                 Err(e) => {

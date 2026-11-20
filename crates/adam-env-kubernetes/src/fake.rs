@@ -1277,6 +1277,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_repository_image_replaces_the_pod_again() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.exec.lock().unwrap().active = Some(0);
+        fx.env
+            .set_image(RUN, Some("ghcr.io/acme/dev:1"))
+            .await
+            .unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.env
+            .set_image(RUN, Some("ghcr.io/acme/dev:2"))
+            .await
+            .unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!(
+            (fx.requests("POST"), fx.requests("DELETE")),
+            (3, 2),
+            "the pod is made again for the second image too"
+        );
+        assert_eq!(
+            run_image(&fx, &pod_name(RUN)).as_deref(),
+            Some("ghcr.io/acme/dev:2")
+        );
+    }
+
+    #[tokio::test]
     async fn going_back_to_the_deployment_image_replaces_the_pods_image_again() {
         let fx = fixture(settings());
         let ws = fx.ws(RUN);
@@ -1494,6 +1521,33 @@ mod tests {
         assert_eq!(
             commands[0].1,
             ["/opt/adam/bin/adam-exec", "active"].map(str::to_owned)
+        );
+    }
+
+    /// ADR 0052: the image choice is the run's, not the pod's. The idle sweep deletes the pod, and
+    /// the next command must make another with the same image, not the template's.
+    #[tokio::test]
+    async fn an_idle_pod_swept_keeps_the_runs_image_choice() {
+        let fx = fixture(idle_settings(Duration::from_millis(30)));
+        let ws = fx.ws(RUN);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.env
+            .set_image(RUN, Some("ghcr.io/acme/dev:1"))
+            .await
+            .unwrap();
+        fx.exec.lock().unwrap().active = Some(0);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        let pod = pod_name(RUN);
+        assert_eq!(run_image(&fx, &pod).as_deref(), Some("ghcr.io/acme/dev:1"));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(fx.env.reap_idle().await.unwrap(), [RUN.to_owned()]);
+        assert!(fx.pod_names().is_empty());
+        // The run comes back: its repository image, not the deployment's.
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!(
+            run_image(&fx, &pod).as_deref(),
+            Some("ghcr.io/acme/dev:1"),
+            "the choice is the run's and outlives its pod"
         );
     }
 
