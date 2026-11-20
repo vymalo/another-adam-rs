@@ -283,3 +283,16 @@ spec:
 {{ . }}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The image prefixes a repository may name for the run container (`runPods.repositoryImages.allowedPrefixes`,
+ADR 0052), trimmed and once each, comma-joined: the coder's RUN_POD_REPOSITORY_IMAGES, and what the admission
+policy admits for the run container alone. Empty: nothing is rendered.
+*/}}
+{{- define "coder.runPodRepositoryImages" -}}
+{{- $prefixes := list -}}
+{{- range (default (list) (default dict .Values.runPods.repositoryImages).allowedPrefixes) -}}
+{{- $prefixes = append $prefixes (trim (toString .)) -}}
+{{- end -}}
+{{- join "," ($prefixes | uniq) -}}
+{{- end -}}

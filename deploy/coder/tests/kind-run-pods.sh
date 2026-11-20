@@ -120,6 +120,10 @@ say "the image of the run pods, of the proxy and of the coder pod, loaded into k
 docker build -q -f docker/coder/test/run-pod.Dockerfile --build-context "egress=$work/egress" \
   --build-context "gitsandbox=$work/gitsandbox" -t "$image:$tag" .
 kind load docker-image "$image:$tag" --name "$kind_name"
+say "the repository's image: the same image with a marker (the run pod moves to it, ADR 0052)"
+printf 'FROM %s:%s\nRUN printf "repository\\n" > /etc/adam-repository-image\n' "$image" "$tag" \
+  | docker build -q -t "$image:repo" -
+kind load docker-image "$image:repo" --name "$kind_name"
 
 say "the namespace, the volume the run pods mount at /work, and the model key's Secret"
 kubectl create namespace "$namespace" --dry-run=client -o yaml | kubectl apply -f -
@@ -145,6 +149,7 @@ helm template coder deploy/coder --namespace "$namespace" \
   --set runPods.enabled=true \
   --set runPods.image.repository="$image" --set runPods.image.tag="$tag" --set runPods.image.digest= \
   --set runPods.image.pullPolicy=IfNotPresent \
+  --set 'runPods.repositoryImages.allowedPrefixes={adam-run-test:}' \
   --set workspace.placement=shared --set workspace.sharedVolume.existingClaim=work-test \
   --set runPods.quota.pods=4 \
   > "$work/all.yaml"
@@ -268,6 +273,8 @@ ADAM_TEST_KUBE_WORKER=ci-0 \
 ADAM_TEST_KUBE_QUOTA_PODS=4 \
 ADAM_TEST_KUBE_ISOLATION_MIRROR=/work/git/example.test/o/r.git \
 ADAM_TEST_KUBE_ISOLATION_ADMIN="$isolation_admin" \
+ADAM_TEST_KUBE_REPOSITORY_IMAGE="$image:repo" \
+ADAM_TEST_KUBE_REPOSITORY_PREFIX="$image:" \
 ADAM_TEST_STDIO_SILENCE_SECS="${ADAM_TEST_STDIO_SILENCE_SECS:-90}" \
 ADAM_TEST_REQUIRE_KUBERNETES=1 \
   cargo test --locked -p adam-env-kubernetes --test cluster -- --nocapture || status=$?
