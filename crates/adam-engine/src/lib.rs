@@ -55,7 +55,8 @@ mod types;
 pub use engine::{Engine, EngineBuilder, Limits};
 pub use error::EngineError;
 pub use types::{
-    ConversationId, DEFAULT_PAGE_SIZE, ListQuery, MAX_PAGE_SIZE, Page, RunInfo, RunState, Say, Turn,
+    ConversationId, DEFAULT_PAGE_SIZE, Delivered, ListQuery, MAX_PAGE_SIZE, Page, RunInfo,
+    RunState, Say, Turn,
 };
 
 use std::sync::Arc;

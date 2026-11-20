@@ -162,11 +162,29 @@ pub struct Turn {
     pub conversation: ConversationId,
     /// The run that has the message.
     pub run: RunId,
-    /// `true` when the message started `run`; `false` when the conversation had a run that was
-    /// still open and the message was delivered to it (it reads it at its next step).
-    pub started: bool,
+    /// What the message did.
+    pub delivered: Delivered,
     /// The run as it was when the message was accepted.
     pub info: RunInfo,
+}
+
+/// What a [`send`](crate::Engine::send) did with its message. A closed enum: a new way of
+/// delivering a message breaks a `match` on purpose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Delivered {
+    /// It started the first run of a new conversation.
+    Started,
+    /// It started a new run that continues the conversation's latest, which had ended.
+    Continued,
+    /// It went to the conversation's open run, which was working when the engine looked just
+    /// before (or a run started meanwhile): the run reads it at its next step.
+    Steered,
+    /// It went to the conversation's open run, which was waiting for an answer when the engine
+    /// looked just before: it is that answer.
+    Answered,
+    /// The same `Say` (its id) had already started this run: nothing was written. A `Say` that
+    /// went to an open run is delivered again instead, and the agent reads it once.
+    Repeated,
 }
 
 /// Which runs [`list`](crate::Engine::list) answers.

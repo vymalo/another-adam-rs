@@ -1,11 +1,14 @@
 //! [`EngineError`]: what an engine call can fail with, and its class.
 
+use std::sync::Arc;
+
 use adam_a2a::BackendError;
 use adam_core::{RunId, StoreError};
 use adam_error::{BoxError, Classify, ErrorClass};
 use adam_runtime::RuntimeError;
 
 use crate::RunState;
+use crate::engine::Expected;
 
 /// Why an [`Engine`](crate::Engine) call failed. Decide from [`Classify::class`], never from the
 /// variant: a new variant only needs a class.
@@ -16,7 +19,7 @@ use crate::RunState;
 /// | `NoRuntime`, `Invalid` | `Invalid` |
 /// | `NotFound` | `NotFound` |
 /// | `NotWaiting`, `Finished`, `Stopped` | `Rejected` |
-/// | `Unavailable` | `Transient` |
+/// | `Unavailable` (a store that is down, or a run whose state moved under the call: try again) | `Transient` |
 /// | `Store` | the store's own |
 /// | `Internal` | `Internal` |
 #[derive(Debug, thiserror::Error)]
@@ -120,8 +123,33 @@ impl EngineError {
         }
     }
 
+    /// The refusal of a call that the backend refused for the run's state, from `read`, the run's
+    /// state read after the refusal (`Ok(None)`: the run is gone): an ended run is `Finished`, a
+    /// run gone is `NotFound`, an answer to a run that works is `NotWaiting`, and a state that
+    /// would have taken the call (it moved under it) is `Unavailable`, worth trying again.
+    pub(crate) fn by_state(
+        run: RunId,
+        read: Result<Option<RunState>, EngineError>,
+        expected: Expected,
+    ) -> Self {
+        match read {
+            Err(error) => error,
+            Ok(None) => Self::NotFound(format!("run {run}")),
+            Ok(Some(state)) if state.is_terminal() => Self::Finished { run },
+            Ok(Some(state @ (RunState::Submitted | RunState::Working)))
+                if expected == Expected::Waiting =>
+            {
+                Self::NotWaiting { run, state }
+            }
+            Ok(Some(_)) => Self::Unavailable {
+                message: "the run's state changed under the call".to_owned(),
+                source: None,
+            },
+        }
+    }
+
     /// The worker's end, at [`shutdown`](crate::Engine::shutdown).
-    pub(crate) fn of_runtime(err: RuntimeError) -> Self {
+    pub(crate) fn of_runtime(err: Arc<RuntimeError>) -> Self {
         if err.is_retryable() {
             Self::Unavailable {
                 message: "the worker".to_owned(),
@@ -153,6 +181,43 @@ mod tests {
             EngineError::Store(source) => source.class(),
             EngineError::Internal { .. } => ErrorClass::Internal,
         }
+    }
+
+    /// The races a test cannot make happen on cue: the state read after a refusal decides.
+    #[test]
+    fn a_refusal_for_the_state_says_the_state_it_read() {
+        let run = RunId::new();
+        let by = |read, expected| EngineError::by_state(run, Ok(read), expected);
+        for ended in [RunState::Done, RunState::Failed, RunState::Cancelled] {
+            for expected in [Expected::Waiting, Expected::Open] {
+                let e = by(Some(ended), expected);
+                assert!(matches!(e, EngineError::Finished { .. }), "{e:?}");
+                assert_eq!(e.class(), ErrorClass::Rejected);
+            }
+        }
+        for gone in [Expected::Waiting, Expected::Open] {
+            let e = by(None, gone);
+            assert!(matches!(e, EngineError::NotFound(_)), "{e:?}");
+        }
+        for state in [RunState::Submitted, RunState::Working] {
+            let e = by(Some(state), Expected::Waiting);
+            assert!(
+                matches!(e, EngineError::NotWaiting { state: s, .. } if s == state),
+                "{e:?}"
+            );
+            assert_eq!(e.class(), ErrorClass::Rejected);
+            // A steer or a cancel would have been taken: the state moved, try again.
+            assert_eq!(
+                by(Some(state), Expected::Open).class(),
+                ErrorClass::Transient
+            );
+        }
+        assert_eq!(
+            by(Some(RunState::Waiting), Expected::Waiting).class(),
+            ErrorClass::Transient
+        );
+        let down = EngineError::by_state(run, Err(EngineError::internal("x")), Expected::Open);
+        assert_eq!(down.class(), ErrorClass::Internal);
     }
 
     #[test]

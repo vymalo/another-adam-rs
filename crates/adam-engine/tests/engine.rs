@@ -15,7 +15,8 @@ use adam_engine::adam_model::{
     ModelRequest, ModelResponse, ToolCall,
 };
 use adam_engine::{
-    ConversationId, Engine, EngineError, ListQuery, RunInfo, RunState, Say, default_secrets,
+    ConversationId, Delivered, Engine, EngineError, Limits, ListQuery, RunInfo, RunState, Say,
+    default_secrets,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -24,6 +25,9 @@ use tokio::sync::Notify;
 use tokio::time::timeout;
 
 const WAIT: Duration = Duration::from_secs(20);
+
+const SEARCH_MCP: &str =
+    r#"{"mcpServers": {"search": {"type": "http", "url": "https://search.example.com/mcp"}}}"#;
 
 const CHAT: &str = "---\nname: chat\ndescription: Talks with the person.\n---\nYou chat.\n";
 
@@ -101,6 +105,10 @@ struct Rig {
 
 impl Rig {
     async fn new(hold_on: Option<usize>) -> Self {
+        Self::with_limits(hold_on, Limits::default()).await
+    }
+
+    async fn with_limits(hold_on: Option<usize>, limits: Limits) -> Self {
         let mock = Arc::new(MockModel::new());
         let gate = Arc::new(Gate::default());
         let model: DynModel = Arc::new(GateModel {
@@ -111,6 +119,7 @@ impl Rig {
         });
         let store: DynStore = Arc::new(MemoryStore::new());
         let engine = Engine::builder(store, chat(), model, "m")
+            .limits(limits)
             .start()
             .await
             .expect("the chat agent starts");
@@ -161,7 +170,7 @@ async fn send_starts_then_continues() {
         .send(None, Say::new("hi, I am Ada"))
         .await
         .unwrap();
-    assert!(first.started);
+    assert_eq!(first.delivered, Delivered::Started);
     let done = rig.wait(first.run, RunState::Done).await;
     assert_eq!(done.output.as_deref(), Some("hello, Ada"));
     assert_eq!(done.conversation, first.conversation);
@@ -171,7 +180,11 @@ async fn send_starts_then_continues() {
         .send(Some(&first.conversation), Say::new("what did I say?"))
         .await
         .unwrap();
-    assert!(second.started, "the first run ended: a new one starts");
+    assert_eq!(
+        second.delivered,
+        Delivered::Continued,
+        "the first run ended"
+    );
     assert_ne!(second.run, first.run);
     assert_eq!(second.conversation, first.conversation);
     let done = rig.wait(second.run, RunState::Done).await;
@@ -396,6 +409,13 @@ async fn shutdown_refuses_new_work_and_reads_go_on() {
         .unwrap_err();
     assert!(matches!(refused, EngineError::Stopped), "{refused:?}");
     assert_eq!(refused.class(), ErrorClass::Rejected);
+    for refused in [
+        rig.engine.steer(turn.run, Say::new("more")).await,
+        rig.engine.answer(turn.run, Say::new("yes")).await,
+    ] {
+        let refused = refused.unwrap_err();
+        assert!(matches!(refused, EngineError::Stopped), "{refused:?}");
+    }
     assert_eq!(
         rig.engine.get(turn.run).await.unwrap().unwrap().state,
         RunState::Done
@@ -412,8 +432,9 @@ async fn refused(def: AgentDef, alias: &str) -> EngineError {
         .expect_err("start refuses it")
 }
 
-/// `start` fails closed: an empty model alias, a tool nobody registered, an MCP server (no MCP
-/// client is linked) and a remote subagent (no A2A client either) build no engine.
+/// `start` fails closed: an empty model alias, a tool nobody registered, an MCP server and a
+/// remote subagent (no MCP or A2A client is linked, whatever features the build unifies) build no
+/// engine.
 #[tokio::test]
 async fn start_refuses_what_it_cannot_build() {
     let alias = refused(chat(), "").await;
@@ -435,16 +456,13 @@ async fn start_refuses_what_it_cannot_build() {
     let mcp = refused(
         agent(&[
             ("agent/instructions.md", CHAT),
-            (
-                "agent/mcp.json",
-                r#"{"mcpServers": {"search": {"type": "http", "url": "https://search.example.com/mcp"}}}"#,
-            ),
+            ("agent/mcp.json", SEARCH_MCP),
         ]),
         "m",
     )
     .await;
     assert!(
-        matches!(&mcp, EngineError::Agent(e) if matches!(**e, AssemblyError::McpNotConnected { .. })),
+        matches!(&mcp, EngineError::Invalid(why) if why.contains("runs no MCP server")),
         "{mcp:?}"
     );
 
@@ -460,10 +478,38 @@ async fn start_refuses_what_it_cannot_build() {
     )
     .await;
     assert!(
-        matches!(&remote, EngineError::Agent(e) if matches!(**e, AssemblyError::RemoteNotEnabled { .. })),
+        matches!(&remote, EngineError::Invalid(why) if why.contains("runs no remote subagent")),
         "{remote:?}"
     );
-    for error in [&alias, &tool, &mcp, &remote] {
+
+    // A local subagent's own `mcp.json` is refused too.
+    let nested = refused(
+        agent(&[
+            ("agent/instructions.md", CHAT),
+            (
+                "agent/subagents/researcher/instructions.md",
+                "---\ndescription: Researches.\n---\nYou research.\n",
+            ),
+            ("agent/subagents/researcher/mcp.json", SEARCH_MCP),
+        ]),
+        "m",
+    )
+    .await;
+    assert!(
+        matches!(&nested, EngineError::Invalid(why) if why.contains("chat/researcher")),
+        "{nested:?}"
+    );
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let mut limits = Limits::default();
+    limits.lease_ttl = Duration::ZERO;
+    let lease = Engine::builder(store, chat(), MockModel::new().into_dyn(), "m")
+        .limits(limits)
+        .start()
+        .await
+        .expect_err("a lease of zero is refused");
+    assert!(matches!(lease, EngineError::Invalid(_)), "{lease:?}");
+
+    for error in [&alias, &tool, &mcp, &remote, &nested, &lease] {
         assert_eq!(error.class(), ErrorClass::Invalid, "{error}");
     }
     assert_eq!(format!("{:?}", default_secrets()), "SecretSource(none)");
@@ -479,4 +525,183 @@ fn start_outside_a_tokio_runtime_is_refused() {
     let error = started.expect_err("no runtime");
     assert!(matches!(error, EngineError::NoRuntime), "{error:?}");
     assert_eq!(error.class(), ErrorClass::Invalid);
+}
+
+/// A `send` to a conversation whose run works steers it, and the same `Say` twice is read once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_to_a_working_run_steers_it() {
+    let rig = Rig::new(Some(0)).await;
+    rig.mock
+        .push_text("a draft in English")
+        .push_text("une réponse en français");
+    let turn = rig
+        .engine
+        .send(None, Say::new("write a line"))
+        .await
+        .unwrap();
+    rig.gate.wait_reached().await;
+
+    let again = Say::with_id("steer-1", "in French, please");
+    for _ in 0..2 {
+        let steered = rig
+            .engine
+            .send(Some(&turn.conversation), again.clone())
+            .await
+            .unwrap();
+        assert_eq!(steered.delivered, Delivered::Steered);
+        assert_eq!(steered.run, turn.run);
+    }
+    rig.gate.release.notify_one();
+
+    let done = rig.wait(turn.run, RunState::Done).await;
+    assert_eq!(done.output.as_deref(), Some("une réponse en français"));
+    let requests = rig.mock.requests();
+    assert_eq!(requests.len(), 2);
+    let steer = ModelMessage::user_text("in French, please");
+    assert_eq!(
+        requests[1].messages.iter().filter(|m| **m == steer).count(),
+        1,
+        "the message is read once"
+    );
+    rig.stop().await;
+}
+
+/// A `send` to a conversation whose run waits is its answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_to_a_waiting_run_answers_it() {
+    let rig = Rig::new(None).await;
+    rig.mock
+        .push_tool_calls(vec![ask("Which colour?")])
+        .push_text("blue it is");
+    let turn = rig
+        .engine
+        .send(None, Say::new("pick for me"))
+        .await
+        .unwrap();
+    rig.wait(turn.run, RunState::Waiting).await;
+
+    let answered = rig
+        .engine
+        .send(Some(&turn.conversation), Say::new("blue"))
+        .await
+        .unwrap();
+    assert_eq!(answered.delivered, Delivered::Answered);
+    assert_eq!(answered.run, turn.run);
+    let done = rig.wait(turn.run, RunState::Done).await;
+    assert_eq!(done.output.as_deref(), Some("blue it is"));
+    rig.stop().await;
+}
+
+/// A `Say` sent again after it started a run starts nothing and says so, in a new conversation and
+/// in one it continued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_say_starts_nothing() {
+    let rig = Rig::new(None).await;
+    rig.mock.push_text("hello").push_text("again");
+    let hello = Say::new("hi");
+    let first = rig.engine.send(None, hello.clone()).await.unwrap();
+    rig.wait(first.run, RunState::Done).await;
+    let repeat = rig.engine.send(None, hello).await.unwrap();
+    assert_eq!(repeat.delivered, Delivered::Repeated);
+    assert_eq!(repeat.run, first.run);
+    assert_eq!(repeat.info.state, RunState::Done);
+
+    let next = Say::new("and?");
+    let second = rig
+        .engine
+        .send(Some(&first.conversation), next.clone())
+        .await
+        .unwrap();
+    assert_eq!(second.delivered, Delivered::Continued);
+    rig.wait(second.run, RunState::Done).await;
+    let repeat = rig
+        .engine
+        .send(Some(&first.conversation), next)
+        .await
+        .unwrap();
+    assert_eq!(repeat.delivered, Delivered::Repeated);
+    assert_eq!(repeat.run, second.run);
+
+    assert_eq!(rig.engine.list(ListQuery::new()).await.unwrap().total, 2);
+    assert_eq!(rig.mock.requests().len(), 2, "no message was read twice");
+    rig.stop().await;
+}
+
+/// A steer to a run that ended is refused for its state; an unknown run is `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_steer_to_an_ended_run_is_refused() {
+    let rig = Rig::new(None).await;
+    rig.mock.push_text("done");
+    let turn = rig.engine.send(None, Say::new("hi")).await.unwrap();
+    rig.wait(turn.run, RunState::Done).await;
+    let late = rig
+        .engine
+        .steer(turn.run, Say::new("wait"))
+        .await
+        .unwrap_err();
+    assert!(matches!(late, EngineError::Finished { .. }), "{late:?}");
+    assert_eq!(late.class(), ErrorClass::Rejected);
+    assert_eq!(rig.engine.get(RunId::new()).await.unwrap(), None);
+    rig.stop().await;
+}
+
+/// A `shutdown` dropped before it is done (a timeout around it) aborts the worker: the step in
+/// flight stops, its lease is not renewed, and the run is free to be claimed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_shutdown_stops_the_worker() {
+    let mut limits = Limits::default();
+    limits.lease_ttl = Duration::from_millis(300);
+    let rig = Rig::with_limits(Some(0), limits).await;
+    rig.mock.push_text("never said");
+    let turn = rig.engine.send(None, Say::new("hi")).await.unwrap();
+    rig.gate.wait_reached().await;
+    assert_eq!(
+        rig.engine.get(turn.run).await.unwrap().unwrap().state,
+        RunState::Working
+    );
+
+    let gave_up = timeout(Duration::from_millis(50), rig.engine.shutdown()).await;
+    assert!(gave_up.is_err(), "the step in flight holds the worker");
+    // No worker renews the lease any more: it runs out and the run reads as not taken.
+    rig.wait(turn.run, RunState::Submitted).await;
+    // A later shutdown hears that the worker is gone.
+    timeout(WAIT, rig.engine.shutdown())
+        .await
+        .expect("the worker is gone")
+        .unwrap();
+}
+
+/// Two shutdowns at once both return only once the worker has stopped: after the step in flight
+/// committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_shutdowns_both_wait_for_the_worker() {
+    let rig = Rig::new(Some(0)).await;
+    rig.mock.push_text("finished in time");
+    let turn = rig.engine.send(None, Say::new("hi")).await.unwrap();
+    rig.gate.wait_reached().await;
+
+    let shutdowns: Vec<_> = (0..2)
+        .map(|_| {
+            let engine = rig.engine.clone();
+            tokio::spawn(async move { engine.shutdown().await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        shutdowns.iter().all(|s| !s.is_finished()),
+        "neither returns while the step is in flight"
+    );
+    rig.gate.release.notify_one();
+    for shutdown in shutdowns {
+        timeout(WAIT, shutdown)
+            .await
+            .expect("the worker stops")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rig.engine.get(turn.run).await.unwrap().unwrap().state,
+            RunState::Done,
+            "the step committed before the shutdown returned"
+        );
+    }
 }
