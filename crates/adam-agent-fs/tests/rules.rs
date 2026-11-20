@@ -871,6 +871,15 @@ fn cases() -> Vec<Case> {
             "not an IANA time zone",
         ),
         with_root(
+            "schedule with a time zone that does not exist",
+            vec![(
+                "agent/schedules/a.md",
+                "---\ncron: \"0 9 * * *\"\ntimezone: Mars/Olympus\n---\nGo.\n",
+            )],
+            Error,
+            "`timezone: Mars/Olympus` is not an IANA time zone",
+        ),
+        with_root(
             "schedule with an empty prompt",
             vec![("agent/schedules/a.md", "---\ncron: \"0 9 * * *\"\n---\n")],
             Error,
@@ -1023,6 +1032,31 @@ fn schedules_take_cron_at_or_after() {
 }
 
 #[test]
+fn two_schedule_keys_are_refused_at_the_second_in_the_file() {
+    for (front, line) in [
+        ("after: 5m\ncron: \"0 9 * * *\"\n", 3),
+        ("after: 5m\nat: 2026-12-24T18:00\n", 3),
+        (
+            "cron: \"0 9 * * *\"\ntimezone: UTC\nat: 2026-12-24T18:00\n",
+            4,
+        ),
+    ] {
+        let dir = write(&[
+            ("agent/instructions.md", ROOT),
+            ("agent/schedules/a.md", &format!("---\n{front}---\nGo.\n")),
+        ]);
+        let report = load(dir.path());
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "{front}: {:#?}",
+            report.diagnostics
+        );
+        assert_eq!(report.diagnostics[0].line, Some(line), "{front}");
+    }
+}
+
+#[test]
 fn every_invalid_directory_produces_exactly_one_diagnostic() {
     let mut failures = Vec::new();
     for (rule, files, severity, needle) in cases() {
@@ -1108,7 +1142,10 @@ fn the_valid_fixture_has_no_diagnostic_and_reads_completely() {
     assert_eq!(names, ["LINEAR_API_TOKEN", "MCP_LOG_LEVEL"]);
 
     let schedules: Vec<_> = coder.schedules.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(schedules, ["daily-digest", "team/weekly"]);
+    assert_eq!(
+        schedules,
+        ["daily-digest", "follow-up", "launch", "team/weekly"]
+    );
     assert_eq!(coder.schedules[0].timezone, "Europe/Berlin");
     assert_eq!(coder.schedules[1].timezone, "UTC");
 

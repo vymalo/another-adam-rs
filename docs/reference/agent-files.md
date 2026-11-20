@@ -343,12 +343,15 @@ sequenceDiagram
     range, a backwards range, a step of 0 or beyond the field, and a day of the month that none of the listed months has
     (`0 9 30 2 *`) are errors; `L`, `W` and `#` are not cron here.
   * `at`: one time, `YYYY-MM-DDTHH:MM`, optionally `:SS`, then nothing (read in `timezone`), `Z` or `±HH:MM`. A bare
-    date, a lower-case `t` or `z`, fractions of a second, a `[zone]` annotation, an offset beyond a day and a date that
-    does not exist are errors. With an offset, `timezone` is ignored, with a warning.
+    date, a lower-case `t` or `z`, fractions of a second, the second 60, a `[zone]` annotation, an offset beyond a day,
+    `-00:00` (RFC 3339's unknown offset: write `Z`), a year after 9998 and a date that does not exist are errors. With an
+    offset, `timezone` is ignored, with a warning.
   * `after`: one duration from when the schedule starts, whole numbers with units largest first, each once: `90s`,
     `30m`, `2h`, `1h30m`, `1d 12h` (a day is 24 hours). Zero and more than 366 days are errors; `timezone` is ignored,
     with a warning.
-  * `timezone` is checked for its spelling here, and as a zone where schedules run.
+  * `timezone` must name a zone of the IANA database that adam bundles (jiff's copy), never the host's
+    `/usr/share/zoneinfo`; `Mars/Olympus` is an error.
+  * Fields are separated by ASCII spaces and tabs only: a no-break space is not a separator.
   * A `cron` schedule's part of the digest is what it was before `at` and `after` existed.
 * **Other**: a prompt over 30,000 characters warns (Copilot's limit, *verified 2026-09-29*); an entry that is
   not a slot (`tools/`, `channels/`) warns and points at `#[tool]`; dotfiles, `*.test.md`, `__tests__/` and

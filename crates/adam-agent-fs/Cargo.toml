@@ -15,7 +15,8 @@ build = []
 
 [dependencies]
 adam-error.workspace = true
-jiff.workspace = true
+# The bundled time-zone database, read by name, never the system's (ADR 0060, decision 6).
+jiff = { workspace = true, features = ["tzdb-bundle-always"] }
 serde.workspace = true
 serde-saphyr.workspace = true
 serde_json.workspace = true

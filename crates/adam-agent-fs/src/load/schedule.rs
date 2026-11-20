@@ -8,7 +8,7 @@ use crate::diagnostic::Sink;
 use crate::frontmatter::{clean_body, key_line};
 use crate::manifest::Schedule;
 use crate::schema::ScheduleFrontmatter;
-use crate::when::{At, Cron, When, parse_after, parse_at};
+use crate::when::{At, Cron, When, parse_after, parse_at, time_zone};
 
 /// Read one schedule. `name` is the path-derived name (`a/b`), `owner` the agent it belongs to.
 pub(crate) fn parse_schedule(
@@ -29,21 +29,18 @@ pub(crate) fn parse_schedule(
 
     let mut ok = true;
     let (cron, at, after) = (given(&fm.cron), given(&fm.at), given(&fm.after));
-    let named: Vec<&str> = [("cron", cron), ("at", at), ("after", after)]
-        .into_iter()
-        .filter_map(|(key, v)| v.map(|_| key))
+    let keys = [("cron", cron), ("at", at), ("after", after)];
+    let named: Vec<(&str, &str)> = keys
+        .iter()
+        .filter_map(|&(k, v)| v.map(|v| (k, v)))
         .collect();
     let when = match named.as_slice() {
         [] => {
             sink.error(Some(1), "a schedule needs one of `cron`, `at` or `after`");
             None
         }
-        [_] => {
-            let (key, value) = [("cron", cron), ("at", at), ("after", after)]
-                .into_iter()
-                .find_map(|(key, v)| v.map(|v| (key, v)))
-                .unwrap_or_default();
-            let parsed = match key {
+        [(key, value)] => {
+            let parsed = match *key {
                 "cron" => Cron::parse(value).map(When::Cron),
                 "at" => parse_at(value).map(When::At),
                 _ => parse_after(value).map(When::After),
@@ -56,12 +53,15 @@ pub(crate) fn parse_schedule(
                 }
             }
         }
-        [_, second, ..] => {
+        _ => {
+            // Point at the key that comes last in the file: the one that made it two.
+            let line = named.iter().filter_map(|(k, _)| key_line(&split, k)).max();
+            let names: Vec<&str> = named.iter().map(|(k, _)| *k).collect();
             sink.error(
-                key_line(&split, second),
+                line,
                 format!(
                     "a schedule takes one of `cron`, `at` or `after`, and this one has `{}`",
-                    named.join("` and `")
+                    names.join("` and `")
                 ),
             );
             None
@@ -69,10 +69,10 @@ pub(crate) fn parse_schedule(
     };
     ok &= when.is_some();
     let timezone = fm.timezone.as_deref().map_or("UTC", str::trim);
-    if !is_zone_like(timezone) {
+    if let Err(why) = time_zone(timezone) {
         sink.error(
             key_line(&split, "timezone"),
-            format!("`timezone: {timezone}` is not an IANA time zone name such as `Europe/Berlin`"),
+            format!("`timezone: {timezone}` {why}"),
         );
         ok = false;
     } else if fm.timezone.is_some() {
@@ -118,23 +118,4 @@ pub(crate) fn parse_schedule(
 /// A key's value, trimmed; `None` when absent or blank.
 fn given(value: &Option<String>) -> Option<&str> {
     value.as_deref().map(str::trim).filter(|v| !v.is_empty())
-}
-
-fn is_zone_like(zone: &str) -> bool {
-    !zone.is_empty()
-        && zone.len() <= 64
-        && zone
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn zones() {
-        assert!(is_zone_like("UTC") && is_zone_like("Europe/Berlin") && is_zone_like("Etc/GMT+1"));
-        assert!(!is_zone_like("") && !is_zone_like("Mars Base"));
-    }
 }

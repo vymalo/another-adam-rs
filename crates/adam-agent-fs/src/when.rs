@@ -1,11 +1,26 @@
 //! When a schedule fires: the three forms of `schedules/<name>.md` (ADR 0060, decision 4), parsed
-//! here and evaluated by `adam-schedule`. Nothing here reads a clock or a time-zone database.
+//! here and evaluated by `adam-schedule`. Nothing here reads a clock; a `timezone` is looked up by
+//! name in jiff's bundled database, never the system's (decision 6).
 
 use std::fmt;
 use std::time::Duration;
 
 /// The longest `after`: a one-shot further out than this belongs in `at`.
 pub const AFTER_MAX: Duration = Duration::from_secs(366 * 24 * 60 * 60);
+
+/// The zone `name` (`UTC`, `Europe/Berlin`) in jiff's bundled copy of the IANA database, so every
+/// host reads the same rules whatever its `/usr/share/zoneinfo` holds.
+pub fn time_zone(name: &str) -> Result<jiff::tz::TimeZone, WhenError> {
+    let spelled = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'/' | b'_' | b'-' | b'+'));
+    spelled
+        .then(|| jiff::tz::TimeZoneDatabase::bundled().get(name).ok())
+        .flatten()
+        .ok_or_else(|| WhenError::new("is not an IANA time zone name such as `Europe/Berlin`"))
+}
 
 /// Why a `cron`, `at` or `after` value is refused; the text completes "`key: value` …".
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -66,6 +81,14 @@ pub fn parse_at(text: &str) -> Result<At, WhenError> {
     } else {
         16
     };
+    if civil_end == 19 && b[17..19] == *b"60" {
+        return Err(WhenError::new(
+            "has the second 60: a schedule cannot name a leap second",
+        ));
+    }
+    if &b[0..4] > b"9998".as_slice() {
+        return Err(WhenError::new("is after the year 9998"));
+    }
     let (civil, offset) = text.split_at(civil_end);
     let civil: jiff::civil::DateTime = civil
         .parse()
@@ -85,6 +108,11 @@ pub fn parse_at(text: &str) -> Result<At, WhenError> {
                 || !o[1..3].iter().chain(&o[4..6]).all(u8::is_ascii_digit)
             {
                 return Err(WhenError::new(SHAPE));
+            }
+            if offset == "-00:00" {
+                return Err(WhenError::new(
+                    "has the offset `-00:00`, which RFC 3339 keeps for an unknown offset: write `Z`",
+                ));
             }
             let (h, m) = (two(&o[1..3]), two(&o[4..6]));
             if h > 23 || m > 59 {
@@ -107,7 +135,7 @@ fn instant(civil: jiff::civil::DateTime, offset_seconds: i32) -> Result<At, When
     offset
         .to_timestamp(civil)
         .map(At::Instant)
-        .map_err(|e| WhenError::new(format!("is out of range: {e}")))
+        .map_err(|_| WhenError::new("is out of range"))
 }
 
 /// Parse an `after`: whole numbers with a unit, largest first, each unit once: `90s`, `30m`, `2h`,
@@ -118,7 +146,7 @@ pub fn parse_after(text: &str) -> Result<Duration, WhenError> {
     let units: [(u8, u64); 4] = [(b'd', 86_400), (b'h', 3_600), (b'm', 60), (b's', 1)];
     let mut next_unit = 0;
     let mut total: u64 = 0;
-    let mut rest = text.trim_start();
+    let mut rest = text.trim_ascii_start();
     if rest.is_empty() {
         return Err(WhenError::new(SHAPE));
     }
@@ -144,7 +172,7 @@ pub fn parse_after(text: &str) -> Result<Duration, WhenError> {
             .and_then(|s| total.checked_add(s))
             .ok_or_else(|| WhenError::new("is too long"))?;
         next_unit += i + 1;
-        rest = rest[n_len + 1..].trim_start();
+        rest = rest[n_len + 1..].trim_ascii_start();
     }
     let after = Duration::from_secs(total);
     if after.is_zero() {
@@ -219,10 +247,10 @@ const FIELDS: [Field; 5] = [
 ];
 
 impl Cron {
-    /// Parse five whitespace-separated fields. A day-of-month that no listed month has (`30 2`) is
+    /// Parse five fields separated by ASCII spaces or tabs. A day-of-month that no listed month has (`30 2`) is
     /// refused, since the schedule could never fire.
     pub fn parse(text: &str) -> Result<Self, WhenError> {
-        let fields: Vec<&str> = text.split_whitespace().collect();
+        let fields: Vec<&str> = text.split_ascii_whitespace().collect();
         if fields.len() != 5 {
             return Err(WhenError::new(format!(
                 "has {} fields; a schedule takes five (minute hour day-of-month month day-of-week)",
@@ -414,6 +442,14 @@ mod tests {
         assert_eq!(listed(&cron("5/20 1-10/3 * * *"), 0), [5, 25, 45]);
         assert_eq!(listed(&cron("5/20 1-10/3 * * *"), 1), [1, 4, 7, 10]);
         assert_eq!(listed(&cron("? ? ? ? ?"), 0).len(), 60);
+        // Bounds: a one-value range, a step equal to the field's largest value, names with steps.
+        assert_eq!(listed(&cron("7-7 * * * *"), 0), [7]);
+        assert_eq!(listed(&cron("*/59 * * * *"), 0), [0, 59]);
+        assert_eq!(listed(&cron("0 */23 * * *"), 1), [0, 23]);
+        assert_eq!(listed(&cron("0 0 */31 * *"), 2), [1]);
+        assert_eq!(listed(&cron("0 0 * JAN-DEC/3 *"), 3), [1, 4, 7, 10]);
+        assert_eq!(listed(&cron("0 0 * FEB/5 *"), 3), [2, 7, 12]);
+        assert_eq!(listed(&cron("0 0 * * MON-FRI/2"), 4), [1, 3, 5]);
     }
 
     #[test]
@@ -422,6 +458,9 @@ mod tests {
         assert_eq!(listed(&cron("0 0 * * 5-7"), 4), [0, 5, 6]);
         assert_eq!(listed(&cron("0 0 * * sun"), 4), [0]);
         assert_eq!(listed(&cron("0 0 * * *"), 4), [0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(listed(&cron("0 0 * * */7"), 4), [0]);
+        assert_eq!(listed(&cron("0 0 * * 0-7/7"), 4), [0]);
+        assert_eq!(listed(&cron("0 0 * * SUN-SAT"), 4), [0, 1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -434,6 +473,11 @@ mod tests {
         assert!(both.date(6, 1, 5) && !both.date(6, 2, 5) && !both.date(6, 1, 4));
         let dom_only = cron("0 0 13 * *");
         assert!(dom_only.date(6, 13, 2) && !dom_only.date(6, 14, 2));
+        // `?` is a star too.
+        let qmark = cron("0 0 13 * ?");
+        assert!(qmark.date(6, 13, 2) && !qmark.date(6, 7, 5));
+        let qmark = cron("0 0 ? * FRI");
+        assert!(qmark.date(6, 7, 5) && !qmark.date(6, 13, 2));
         let month = cron("0 0 * JUN *");
         assert!(month.date(6, 1, 0) && !month.date(7, 1, 0));
     }
@@ -445,6 +489,8 @@ mod tests {
         assert!(!cron("*/15 * * * *").is_time_of_day());
         assert!(!cron("0 * * * *").is_time_of_day());
         assert!(!cron("0 */2 * * *").is_time_of_day());
+        assert!(!cron("0 ? * * *").is_time_of_day());
+        assert!(!cron("? 9 * * *").is_time_of_day());
     }
 
     #[test]
@@ -472,6 +518,16 @@ mod tests {
             ("0 9 +1 * *", "`+1`"),
             ("0 9 30 2 *", "never fires"),
             ("0 9 31 4,6 *", "never fires"),
+            ("0 9 31 4,6 ?", "never fires"),
+            ("0\u{a0}9 * * *", "has 4 fields"),
+            ("0 9 * * *\u{3000}", "`*\u{3000}`"),
+            ("0 9 * * 7-6", "runs backwards"),
+            ("*/0 9 * * *", "step that is not 1-59"),
+            ("0 */24 * * *", "step that is not 1-23"),
+            ("0 9 * * */8", "step that is not 1-7"),
+            ("*-5 9 * * *", "`*-5`"),
+            ("** 9 * * *", "`**`"),
+            ("0 9 * * 1,", "item ``"),
         ] {
             let err = Cron::parse(text).unwrap_err().to_string();
             assert!(err.contains(want), "{text}: {err}");
@@ -519,9 +575,34 @@ mod tests {
             ("2026-12-24T24:00", "not a valid date"),
             ("tomorrow", "is not a time"),
             ("", "is not a time"),
+            ("2026-12-31T23:59:60Z", "leap second"),
+            ("2026-12-24T18:00-00:00", "unknown offset"),
+            ("9999-01-01T00:00", "after the year 9998"),
+            ("9999-12-31T23:59Z", "after the year 9998"),
+            ("2026-12-24T18:00\u{a0}", "is not a time"),
+            ("２026-12-24T18:00", "is not a time"),
         ] {
             let err = parse_at(text).unwrap_err().to_string();
             assert!(err.contains(want), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn time_zones_come_from_the_bundled_database() {
+        assert!(time_zone("UTC").is_ok());
+        assert!(time_zone("Europe/Berlin").is_ok());
+        assert!(time_zone("America/Argentina/Buenos_Aires").is_ok());
+        assert!(time_zone("Etc/GMT+1").is_ok());
+        for bad in [
+            "",
+            "Mars/Olympus",
+            "Mars Base",
+            "Europe/Berlin\u{a0}",
+            "../etc/passwd",
+            "UTC\n",
+        ] {
+            let err = time_zone(bad).unwrap_err().to_string();
+            assert!(err.contains("is not an IANA time zone"), "{bad:?}: {err}");
         }
     }
 
@@ -534,6 +615,7 @@ mod tests {
         assert_eq!(secs("1h30m"), 5_400);
         assert_eq!(secs("1d 12h"), 129_600);
         assert_eq!(secs("366d"), AFTER_MAX.as_secs());
+        assert_eq!(secs(" 1h\t30m "), 5_400);
     }
 
     #[test]
@@ -552,6 +634,9 @@ mod tests {
             ("367d", "longer than 366 days"),
             ("99999999999999999999s", "too long"),
             ("999999999999999999d", "too long"),
+            ("1d\u{3000}1h", "is not a duration"),
+            ("1h\u{a0}", "is not a duration"),
+            ("1ｈ", "is not a duration"),
         ] {
             let err = parse_after(text).unwrap_err().to_string();
             assert!(err.contains(want), "{text}: {err}");
