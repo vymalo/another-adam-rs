@@ -254,9 +254,16 @@ proof that a killed process resumes its run merges (PR 4):** `tests/resume_proce
 SQLite store of slice 3 (ADR 0053 slice 3) lands. Not built either: the engine sets no fixed worker id and releases no
 lease at start (the first diagram's "release this worker's leases"), so a restarted engine waits for its old leases to
 run out.
-*Amended 2026-11-20:* built. `Limits::worker_id` is fixed (default `adam-engine`, empty refused) and `start` calls
-`Store::release_worker_leases` after migrating, so a restarted engine claims its old runs at once; the id must be used by
-one live engine per store (`a_restarted_engine_claims_its_old_runs_at_once` in `crates/adam-engine/tests/engine.rs`).
+*Amended 2026-11-20:* built, and opt-in. `Limits::worker_id` is `None` by default: a random id at every start and no
+release, so a restart still waits for its old leases. With `Some(id)` (`Some("")` refused) the host promises that no
+other live engine uses `id` on the store, and `start` calls `Store::release_worker_leases(id)` after migrating, so the
+restarted engine claims its old runs at once. Not the default because a fixed default id would let two engines on one
+shared store (two windows, one engine per agent, two installs on one database) release each other's live leases, and
+both renew under the same id, so a run would be stepped twice. Additive: `start` refuses a second live engine of the
+same process with the same id on the same store (`EngineError::WorkerIdInUse`, a new variant); other processes it
+cannot see, and the SQLite lock that would cover them for a file comes with slice 3. `Limits` lost `Copy`. The proofs:
+`a_restarted_engine_claims_its_old_runs_at_once`, `two_default_engines_on_one_store_do_not_take_each_others_leases` and
+`a_second_live_engine_with_the_same_id_is_refused` in `crates/adam-engine/tests/engine.rs`.
 
 ## Decisions the owner confirmed
 

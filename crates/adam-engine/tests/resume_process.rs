@@ -3,10 +3,10 @@
 //! after the run's first step is committed; the parent kills the child with `SIGKILL`, opens the
 //! same store, and its engine finishes the run without running that step again.
 //!
-//! Both halves use one worker id, [`WORKER`], and the child's lease lasts an hour: the parent finishes
-//! the run in time only because its `start` releases the leases that id holds
-//! (`Store::release_worker_leases`), which is safe because the child is dead and the store's lock
-//! lets one process open it.
+//! Both halves set one fixed worker id, [`WORKER`], and the child's lease lasts an hour: the parent
+//! finishes the run in time only because its `start` releases the leases that id holds
+//! (`Store::release_worker_leases`). The promise a fixed id makes holds: the child is dead before
+//! the parent opens the store, and the store is this test's alone.
 //!
 //! The store comes from [`durable_store`] alone. Until the SQLite store of ADR 0053 slice 3 lands
 //! it panics and the test is ignored. The pull request that adds the store changes the helper's
@@ -43,15 +43,15 @@ const WAIT: Duration = Duration::from_secs(60);
 /// The child's lease: far longer than [`WAIT`], so the parent claims the killed child's run in time
 /// only by releasing it.
 const CHILD_LEASE: Duration = Duration::from_secs(60 * 60);
-/// The worker id of both halves (the engine's default, said here so that neither half drifts): the
-/// parent's `start` releases the leases the killed child held under it.
-const WORKER: &str = "adam-engine";
+/// The fixed worker id of both halves: the parent's `start` releases the leases the killed child held
+/// under it.
+const WORKER: &str = "resume-test";
 
 /// The limits of both halves: the one worker id, and the child's lease.
 fn limits() -> Limits {
     let mut limits = Limits::default();
     limits.lease_ttl = CHILD_LEASE;
-    limits.worker_id = WORKER.to_owned();
+    limits.worker_id = Some(WORKER.to_owned());
     limits
 }
 

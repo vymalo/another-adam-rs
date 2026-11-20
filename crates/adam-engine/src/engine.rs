@@ -1,6 +1,7 @@
 //! [`Engine`] and [`EngineBuilder`]: the runtime and its worker on the host's tokio runtime, and
 //! every call through the code the A2A server calls.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
@@ -34,9 +35,6 @@ const DEFAULT_EVENT_CAPACITY: usize = 256;
 /// The largest [`Limits::event_capacity`]: the channel allocates every slot at once.
 const MAX_EVENT_CAPACITY: usize = 1 << 16;
 
-/// The default of [`Limits::worker_id`].
-const DEFAULT_WORKER_ID: &str = "adam-engine";
-
 /// What the engine runs within. Set the fields on [`Limits::default`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -53,17 +51,29 @@ pub struct Limits {
     /// ([`EngineEvent::Behind`](crate::EngineEvent::Behind)). The channel rounds it up to a power
     /// of two. Default 256; zero is refused, and so is more than 65 536.
     pub event_capacity: usize,
-    /// The id the worker writes into the leases of the runs it steps. Default `"adam-engine"`;
-    /// empty is refused.
+    /// The id the worker writes into the leases of the runs it steps. Default `None`; `Some("")`
+    /// is refused.
     ///
-    /// It is fixed, not random, so that a restarted engine finds its own leases: `start` releases
-    /// every lease this id holds (`Store::release_worker_leases`) and claims the runs the last
-    /// process was stepping at once, instead of waiting up to [`lease_ttl`](Self::lease_ttl) for
-    /// each. **Only one live engine may use an id on a store**, since the release would take the
-    /// leases of runs another live engine with the same id is stepping. The SQLite store's lock
-    /// (one process per file) enforces that for a file; two engines in one process on one
-    /// `MemoryStore` must be given different ids.
-    pub worker_id: String,
+    /// * `None`: a random id at every start, and nothing released. Engines that share a store never
+    ///   take each other's leases, and a restarted engine waits up to
+    ///   [`lease_ttl`](Self::lease_ttl) for the runs its last process was stepping.
+    /// * `Some(id)`: **the host promises that no other live engine, in any process, uses `id` on
+    ///   this store.** `start` then releases every lease `id` holds
+    ///   (`Store::release_worker_leases`), so the runs the last process was stepping are claimed at
+    ///   once. Set one only for a store no other engine shares: the application's own SQLite file
+    ///   (when slice 3 lands, its lock will allow one process per file) or a store per install.
+    ///   Broken, the promise costs a run stepped twice, its tools run twice: the release takes the
+    ///   leases of the runs the other engine is stepping, and both renew under the same id.
+    ///
+    /// Within one process `start` refuses a second live engine with the same id on the same store
+    /// ([`EngineError::WorkerIdInUse`]); it cannot see other processes. The id is free again once
+    /// the first engine's worker task has ended: when [`Engine::shutdown`] returns, or shortly
+    /// after the last `Engine` is dropped (its worker is aborted, which takes effect at the task's
+    /// next poll). A step the worker spawned is aborted with it and not waited for, so a tool that
+    /// ignores cancellation (blocking code, a task of its own) can still run after the id is free;
+    /// a host that restarts in the same process calls `shutdown` first, which lets the steps in
+    /// flight finish.
+    pub worker_id: Option<String>,
 }
 
 impl Default for Limits {
@@ -73,7 +83,7 @@ impl Default for Limits {
             max_parallel_tools: DEFAULT_MAX_PARALLEL,
             lease_ttl: Duration::from_secs(30),
             event_capacity: DEFAULT_EVENT_CAPACITY,
-            worker_id: DEFAULT_WORKER_ID.to_owned(),
+            worker_id: None,
         }
     }
 }
@@ -114,9 +124,9 @@ impl EngineBuilder {
         self
     }
 
-    /// Migrate the store, release the leases [`Limits::worker_id`] holds in it (a restarted engine
-    /// claims its old runs at once), build the agent and start the worker on the current tokio
-    /// runtime.
+    /// Migrate the store, release the leases a fixed [`Limits::worker_id`] holds in it (a restarted
+    /// engine claims its old runs at once), build the agent and start the worker on the current
+    /// tokio runtime.
     ///
     /// The agent gets the screen's tools of an embedded agent (`ask_user`, `show`, `ui_catalog`,
     /// `plan_*`, from `adam_ui::Ui::embedded`) and nothing on the network: a file that names an
@@ -126,9 +136,11 @@ impl EngineBuilder {
     ///
     /// * [`EngineError::NoRuntime`] outside a tokio runtime;
     /// * [`EngineError::Invalid`] for a zero [`Limits::lease_ttl`], an [`Limits::event_capacity`] of
-    ///   zero or over 65 536, an empty [`Limits::worker_id`], and for an agent whose files
+    ///   zero or over 65 536, a [`Limits::worker_id`] of `Some("")`, and for an agent whose files
     ///   name an MCP server or a remote (`a2a:`) subagent, its subagents' included: the engine runs
     ///   neither yet, whatever features the build turns on;
+    /// * [`EngineError::WorkerIdInUse`] when another live engine of this process uses the same
+    ///   [`Limits::worker_id`] on the same store;
     /// * [`EngineError::Store`] when the store's migration or the release of the worker's leases
     ///   fails, with the store's class;
     /// * [`EngineError::Agent`] when the agent does not bind (an unknown tool, an MCP server, a
@@ -154,7 +166,7 @@ impl EngineBuilder {
                 limits.event_capacity
             )));
         }
-        if limits.worker_id.is_empty() {
+        if limits.worker_id.as_deref() == Some("") {
             return Err(EngineError::Invalid(
                 "the worker's id must not be empty".to_owned(),
             ));
@@ -171,11 +183,21 @@ impl EngineBuilder {
             .model(model, alias)
             .map_err(|e| EngineError::Agent(Box::new(e)))?;
         store.migrate().await.map_err(EngineError::Store)?;
-        // The one live engine with this id (its doc): the leases it holds are the last process's.
-        store
-            .release_worker_leases(&limits.worker_id)
-            .await
-            .map_err(EngineError::Store)?;
+        // Held until the worker task has ended, so a second engine of this process with the same id
+        // on this store is refused before its release could take this one's leases.
+        let claim = match &limits.worker_id {
+            Some(id) => {
+                let claim = IdClaim::take(&store, id)?;
+                // The one live engine with this id (the host's promise): what it holds is the last
+                // process's.
+                store
+                    .release_worker_leases(id)
+                    .await
+                    .map_err(EngineError::Store)?;
+                Some(claim)
+            }
+            None => None,
+        };
 
         let (runtime, events) =
             runtime_with_ring(assembly.register(Runtime::builder(store)), &limits);
@@ -204,6 +226,8 @@ impl EngineBuilder {
                 Err(joined) if joined.is_cancelled() => Ended::Aborted,
                 Err(joined) => Ended::Panicked(joined.to_string()),
             };
+            // The worker's future is dropped by now: the id is free before `shutdown` returns.
+            drop(claim);
             let _ = said.send(Some(how));
         });
         let caller = Caller::new(SUBJECT);
@@ -233,13 +257,44 @@ pub(crate) fn runtime_with_ring(
     limits: &Limits,
 ) -> (Runtime, BroadcastSink) {
     let events = BroadcastSink::new(limits.event_capacity);
-    let runtime = builder
+    let builder = builder
         .event_sink(EngineSink(events.clone()))
         .concurrency(limits.concurrency)
-        .lease_ttl(limits.lease_ttl)
-        .worker_id(limits.worker_id.clone())
-        .build();
+        .lease_ttl(limits.lease_ttl);
+    // `None` keeps the runtime's default, a random id.
+    let builder = match &limits.worker_id {
+        Some(id) => builder.worker_id(id.clone()),
+        None => builder,
+    };
+    let runtime = builder.build();
     (runtime, events)
+}
+
+/// The fixed worker ids the live engines of this process use, each with the address of its store:
+/// the store lives while the entry does (the worker holds it), so an address is not reused under it.
+static LIVE_IDS: Mutex<BTreeSet<(usize, String)>> = Mutex::new(BTreeSet::new());
+
+/// A fixed worker id on a store, taken by one live engine of this process; given back on drop.
+struct IdClaim((usize, String));
+
+impl IdClaim {
+    fn take(store: &DynStore, id: &str) -> Result<Self, EngineError> {
+        let key = (Arc::as_ptr(store).cast::<()>().addr(), id.to_owned());
+        let mut live = LIVE_IDS.lock().unwrap_or_else(PoisonError::into_inner);
+        if !live.insert(key.clone()) {
+            return Err(EngineError::WorkerIdInUse { id: id.to_owned() });
+        }
+        Ok(Self(key))
+    }
+}
+
+impl Drop for IdClaim {
+    fn drop(&mut self) {
+        LIVE_IDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
+    }
 }
 
 /// How the worker task ended.
