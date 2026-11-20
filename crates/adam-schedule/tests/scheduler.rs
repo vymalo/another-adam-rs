@@ -330,6 +330,12 @@ async fn two_processes_fire_each_due_time_once() {
     assert_eq!(dues.len(), 3, "no due time fired twice");
     let open = schedulers(&store, "hourly").await;
     assert_eq!(open.iter().filter(|r| r.status.is_open()).count(), 1);
+    // The scheduler itself fired three times and moved on each time.
+    let open_rec = open.iter().find(|r| r.status.is_open()).unwrap();
+    let state = state_of(&a, open_rec).await;
+    assert_eq!(state.fired.len(), 3);
+    assert_eq!(state.last_due, dues.last().copied());
+    assert!(state.fired.iter().all(|f| f.created && f.error.is_none()));
     wa.stop().await;
     wb.stop().await;
 }
@@ -433,21 +439,20 @@ async fn a_bad_schedule_changes_nothing_and_other_agents_are_left_alone() {
     assert!(schedulers(&store, "good").await.is_empty());
 
     // Another agent's schedules are neither started nor cancelled by this agent's reconcile.
-    reconcile(&rt, ROOT, std::slice::from_ref(&good))
-        .await
-        .unwrap();
     let mut chat = good.clone();
     chat.agent = "chat".into();
-    let r = reconcile(&rt, ROOT, &[chat]).await.unwrap();
-    assert_eq!(
-        r,
-        Reconciled {
-            cancelled: names(&["good"]),
-            ..Reconciled::default()
-        }
-    );
-    let r = reconcile(&rt, "chat", &[]).await.unwrap();
+    let r = reconcile(&rt, "chat", std::slice::from_ref(&chat))
+        .await
+        .unwrap();
+    assert_eq!(r.started, names(&["good"]));
+    // Given only the chat's schedule, the coder's reconcile does nothing: it is not its agent's.
+    let r = reconcile(&rt, ROOT, std::slice::from_ref(&chat))
+        .await
+        .unwrap();
     assert_eq!(r, Reconciled::default());
+    let chats = runs(&store, SCHEDULER_AGENT, "adam.schedule:chat/").await;
+    assert_eq!(chats.len(), 1);
+    assert!(chats[0].status.is_open());
 }
 
 #[tokio::test]
@@ -472,5 +477,155 @@ async fn a_message_wakes_a_scheduler_without_firing() {
     })
     .await;
     assert!(firings(&store, "daily").await.is_empty());
+    // And it stays parked: the message was taken, so it does not wake it again and again.
+    let settled = schedulers(&store, "daily").await.remove(0).version;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let later = schedulers(&store, "daily").await.remove(0);
+    assert_eq!((later.version, later.status), (settled, RunStatus::Parked));
+    // The message is read and gone, not left pending in the run.
+    assert_eq!(rt.view(later.id).await.unwrap().unwrap().pending_inbox, 0);
+    worker.stop().await;
+}
+
+#[tokio::test]
+async fn a_removed_schedule_added_back_unchanged_starts_again() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let clock = ManualClock::new();
+    let rt = runtime(&store, &clock);
+    let daily = schedule("daily", "0 9 * * *", None, "Digest.");
+    reconcile(&rt, ROOT, std::slice::from_ref(&daily))
+        .await
+        .unwrap();
+    let r = reconcile(&rt, ROOT, &[]).await.unwrap();
+    assert_eq!(r.cancelled, names(&["daily"]));
+    // The same spec as the cancelled run: a cancelled scheduler is never kept.
+    let r = reconcile(&rt, ROOT, std::slice::from_ref(&daily))
+        .await
+        .unwrap();
+    assert_eq!(
+        r,
+        Reconciled {
+            started: names(&["daily"]),
+            ..Reconciled::default()
+        }
+    );
+    let runs = schedulers(&store, "daily").await;
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs.iter().filter(|r| r.status.is_open()).count(), 1);
+}
+
+#[tokio::test]
+async fn an_at_that_passed_before_the_scheduler_started_fires_late_once() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let clock = ManualClock::new();
+    let rt = runtime(&store, &clock);
+    let worker = spawn_worker(&rt);
+    let mut past = schedule("launch", "", None, "Announce.");
+    past.at = Some("2020-01-01T00:00:00Z".into());
+    reconcile(&rt, ROOT, std::slice::from_ref(&past))
+        .await
+        .unwrap();
+    until("the scheduler to end", || async {
+        schedulers(&store, "launch")
+            .await
+            .first()
+            .is_some_and(|r| r.status == RunStatus::Done)
+    })
+    .await;
+    let fired = firings(&store, "launch").await;
+    assert_eq!(fired.len(), 1);
+    let due = trigger_of(fired[0].conversation_id.as_deref().unwrap())
+        .unwrap()
+        .due;
+    assert_eq!(due.0.to_string(), "2020-01-01T00:00:00Z");
+    let state = state_of(&rt, &schedulers(&store, "launch").await[0]).await;
+    assert_eq!(state.fired.len(), 1);
+    worker.stop().await;
+}
+
+/// A runtime that cannot start the root agent: the scheduler records the refusal and goes on to
+/// the next due time; it does not fail.
+#[tokio::test]
+async fn a_refused_firing_is_recorded_and_the_schedule_goes_on() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let clock = ManualClock::new();
+    let rt = Runtime::builder(store.clone())
+        .agent(SchedulerAgent)
+        .worker_id("schedules-only")
+        .clock(clock.clone())
+        .poll_interval(Duration::from_millis(10))
+        .build();
+    let worker = spawn_worker(&rt);
+    let hourly = schedule("hourly", "0 * * * *", None, "Report.");
+    reconcile(&rt, ROOT, std::slice::from_ref(&hourly))
+        .await
+        .unwrap();
+    parked(&store, "hourly").await;
+    for hour in 1..=2 {
+        clock.advance(Duration::from_secs(3600));
+        until("the refusal to be recorded", || async {
+            let rec = schedulers(&store, "hourly").await.remove(0);
+            rec.status == RunStatus::Parked
+                && serde_json::from_value::<SchedulerState>(
+                    rt.view(rec.id).await.unwrap().unwrap().state,
+                )
+                .unwrap()
+                .fired
+                .len()
+                    == hour
+        })
+        .await;
+    }
+    let rec = schedulers(&store, "hourly").await.remove(0);
+    let state = state_of(&rt, &rec).await;
+    assert!(state.fired.iter().all(|f| !f.created), "{state:?}");
+    let error = state.fired[0].error.as_deref().unwrap_or_default();
+    assert!(error.contains("unknown agent"), "{error}");
+    assert!(firings(&store, "hourly").await.is_empty());
+    worker.stop().await;
+}
+
+/// A start the store fails with a retryable error is tried again soon, and fires once.
+#[tokio::test]
+async fn a_firing_the_store_fails_is_tried_again_and_fires_once() {
+    let memory: DynStore = Arc::new(MemoryStore::new());
+    let faulty = Arc::new(adam_store_testkit::fault::FaultyStore::new(memory));
+    let store: DynStore = faulty.clone();
+    let clock = ManualClock::new();
+    let rt = runtime(&store, &clock);
+    let worker = spawn_worker(&rt);
+    let hourly = schedule("hourly", "0 * * * *", None, "Report.");
+    reconcile(&rt, ROOT, std::slice::from_ref(&hourly))
+        .await
+        .unwrap();
+    parked(&store, "hourly").await;
+    let state = state_of(&rt, &schedulers(&store, "hourly").await[0]).await;
+    let spec = adam_schedule::ScheduleSpec::from_schedule(&hourly).unwrap();
+    let due = spec.due_after(state.anchor, state.anchor).unwrap();
+    let run = adam_schedule::fired_run_id(ROOT, "hourly", due);
+    // Only the firing creates a run from here on: fail the next one.
+    faulty.fail(adam_store_testkit::fault::Method::CreateRun, 1);
+
+    clock.advance(Duration::from_secs(3600));
+    until("the failed try", || async {
+        faulty.injected(adam_store_testkit::fault::Method::CreateRun) == 1
+    })
+    .await;
+    parked(&store, "hourly").await;
+    assert!(firings(&store, "hourly").await.is_empty());
+    clock.advance(adam_schedule::FIRE_RETRY + Duration::from_secs(1));
+    until("the firing", || async {
+        !firings(&store, "hourly").await.is_empty()
+    })
+    .await;
+    parked(&store, "hourly").await;
+
+    let fired = firings(&store, "hourly").await;
+    assert_eq!(fired.len(), 1);
+    assert_eq!(fired[0].id, run);
+    let state = state_of(&rt, &schedulers(&store, "hourly").await[0]).await;
+    assert_eq!(state.fired.len(), 1);
+    assert!(state.fired[0].created && state.fired[0].error.is_none());
+    assert_eq!(state.last_due, Some(due));
     worker.stop().await;
 }

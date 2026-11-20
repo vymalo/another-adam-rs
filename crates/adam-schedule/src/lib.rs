@@ -7,7 +7,9 @@
 //! [`fired_conversation_id`] name the run a due time starts, the same on every replica, and
 //! [`trigger_of`] reads the trigger back from that run's conversation.
 //!
-//! Nothing here reads a clock or a store: the caller passes the instants.
+//! The evaluation reads no clock and no store: the caller passes the instants. [`SchedulerAgent`]
+//! fires schedules as parked runs, and [`reconcile`] reads the store and the runtime's clock to
+//! make an agent's scheduler runs match its schedules.
 //!
 //! [ADR 0060]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0060-schedules-are-parked-runs.md
 
@@ -20,8 +22,8 @@ mod reconcile;
 
 pub use adam_agent_fs::{At, Cron, When};
 pub use agent::{
-    FIRING_KIND, FIRINGS_KEPT, Firing, SCHEDULER_AGENT, SCHEDULER_START_KIND, ScheduleRecord,
-    SchedulerAgent, SchedulerState,
+    FIRE_RETRY, FIRING_KIND, FIRINGS_KEPT, Firing, SCHEDULER_AGENT, SCHEDULER_START_KIND,
+    ScheduleRecord, SchedulerAgent, SchedulerState,
 };
 pub use due::{Due, MISSED_MAX};
 pub use ids::{Trigger, fired_conversation_id, fired_run_id, schedule_conversation_id, trigger_of};

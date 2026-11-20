@@ -79,7 +79,18 @@ pub async fn reconcile(
         );
     }
 
-    let mut latest = latest_by_conversation(runtime, agent).await?;
+    let latest = latest_by_conversation(runtime, agent).await?;
+    apply(runtime, agent, &expected, latest).await
+}
+
+/// The rules of [`reconcile`] over a listing read before: a listing gone stale (another process
+/// started a scheduler since) is what the `ConversationBusy` branch mends.
+async fn apply(
+    runtime: &Runtime,
+    agent: &str,
+    expected: &BTreeMap<String, (&Schedule, ScheduleSpec)>,
+    mut latest: BTreeMap<String, RunRecord>,
+) -> Result<Reconciled, ReconcileError> {
     let mut done = Reconciled::default();
 
     for (conversation, rec) in &latest {
@@ -89,22 +100,23 @@ pub async fn reconcile(
         }
     }
 
-    for (conversation, (schedule, spec)) in &expected {
+    for (conversation, (schedule, spec)) in expected {
         for attempt in 0..=BUSY_RETRIES {
-            let current = latest.get(conversation).map(|rec| (rec, hash_of(rec)));
-            match current {
-                Some((rec, Some(hash)))
-                    if hash == spec.hash()
-                        && (rec.status.is_open() || rec.status == RunStatus::Done) =>
+            if let Some(rec) = latest.get(conversation) {
+                let hash = hash_of(rec);
+                let same = hash.as_deref() == Some(spec.hash());
+                // A finished run whose state cannot be read is kept, not started again: a fired
+                // one-shot would fire twice.
+                if (same && (rec.status.is_open() || rec.status == RunStatus::Done))
+                    || (hash.is_none() && rec.status == RunStatus::Done)
                 {
                     done.kept.push(schedule.name.clone());
                     break;
                 }
-                Some((rec, _)) if rec.status.is_open() => {
+                if rec.status.is_open() {
                     runtime.cancel(rec.id, CHANGED_REASON).await?;
                     done.cancelled.push(schedule.name.clone());
                 }
-                _ => {}
             }
             let state = SchedulerState::new(schedule, spec, runtime.now());
             let payload = serde_json::to_value(&state).map_err(|e| {
@@ -144,11 +156,17 @@ pub async fn reconcile(
     Ok(done)
 }
 
-/// The spec hash a scheduler run's state carries, `None` when the state is not a scheduler's.
+/// The spec hash a scheduler run's state carries, `None` when it has none: only the field is read,
+/// so a later release that adds fields to the state does not make every run unreadable.
 fn hash_of(rec: &RunRecord) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Hash {
+        hash: String,
+    }
     let view = view_from_record(rec.clone(), false).ok()?;
-    let state: SchedulerState = serde_json::from_value(view.state).ok()?;
-    Some(state.hash)
+    serde_json::from_value::<Hash>(view.state)
+        .ok()
+        .map(|h| h.hash)
 }
 
 /// The schedule name of a scheduler conversation of `agent`, for reporting.
@@ -160,33 +178,60 @@ fn name_of(conversation: &str, agent: &str) -> String {
         .unwrap_or_else(|| conversation.to_owned())
 }
 
-/// The latest scheduler run of each conversation of `agent`: the one updated last.
+/// The scheduler run that decides for each conversation of `agent`: its open one (the store keeps
+/// at most one), else the one created last.
 async fn latest_by_conversation(
     runtime: &Runtime,
     agent: &str,
 ) -> Result<BTreeMap<String, RunRecord>, RuntimeError> {
     let prefix = format!("{SCHEDULE_CONVERSATION_PREFIX}{agent}/");
     let mut out: BTreeMap<String, RunRecord> = BTreeMap::new();
-    let mut query = RunQuery::new(SCHEDULER_AGENT, ConversationScope::Prefix(prefix), PAGE);
+    for rec in list(runtime, ConversationScope::Prefix(prefix)).await? {
+        let Some(conversation) = rec.conversation_id.clone() else {
+            continue;
+        };
+        let replace = out
+            .get(&conversation)
+            .is_none_or(|seen| decides_over(&rec, seen));
+        if replace {
+            out.insert(conversation, rec);
+        }
+    }
+    Ok(out)
+}
+
+/// The scheduler run that decides for one conversation.
+async fn latest_in(
+    runtime: &Runtime,
+    conversation: &str,
+) -> Result<Option<RunRecord>, RuntimeError> {
+    let mut latest: Option<RunRecord> = None;
+    for rec in list(runtime, ConversationScope::Exact(conversation.to_owned())).await? {
+        if latest.as_ref().is_none_or(|seen| decides_over(&rec, seen)) {
+            latest = Some(rec);
+        }
+    }
+    Ok(latest)
+}
+
+/// Whether `rec` decides over `seen`: an open run over a finished one, else the one created last.
+fn decides_over(rec: &RunRecord, seen: &RunRecord) -> bool {
+    match (rec.status.is_open(), seen.status.is_open()) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => (rec.created_at, rec.id) > (seen.created_at, seen.id),
+    }
+}
+
+/// Every scheduler run in `scope`, all pages.
+async fn list(runtime: &Runtime, scope: ConversationScope) -> Result<Vec<RunRecord>, RuntimeError> {
+    let mut query = RunQuery::new(SCHEDULER_AGENT, scope, PAGE);
+    let mut out = Vec::new();
     loop {
         let page = runtime.store().list_runs(&query).await?;
         let last = page.last().map(|r| (r.updated_at, r.id));
         let full = page.len() == PAGE;
-        for rec in page {
-            let Some(conversation) = rec.conversation_id.clone() else {
-                continue;
-            };
-            // A firing's conversation is the root agent's, never the scheduler's.
-            if conversation.contains('@') {
-                continue;
-            }
-            match out.get(&conversation) {
-                Some(seen) if (seen.updated_at, seen.id) >= (rec.updated_at, rec.id) => {}
-                _ => {
-                    out.insert(conversation, rec);
-                }
-            }
-        }
+        out.extend(page);
         match (full, last) {
             (true, Some(last)) => query.after = Some(last),
             _ => break,
@@ -195,33 +240,89 @@ async fn latest_by_conversation(
     Ok(out)
 }
 
-/// The latest scheduler run of one conversation.
-async fn latest_in(
-    runtime: &Runtime,
-    conversation: &str,
-) -> Result<Option<RunRecord>, RuntimeError> {
-    let mut query = RunQuery::new(
-        SCHEDULER_AGENT,
-        ConversationScope::Exact(conversation.to_owned()),
-        PAGE,
-    );
-    let mut latest: Option<RunRecord> = None;
-    loop {
-        let page = runtime.store().list_runs(&query).await?;
-        let last = page.last().map(|r| (r.updated_at, r.id));
-        let full = page.len() == PAGE;
-        for rec in page {
-            if latest
-                .as_ref()
-                .is_none_or(|seen| (seen.updated_at, seen.id) < (rec.updated_at, rec.id))
-            {
-                latest = Some(rec);
-            }
-        }
-        match (full, last) {
-            (true, Some(last)) => query.after = Some(last),
-            _ => break,
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use adam_core::{DynStore, MemoryStore};
+
+    use super::*;
+    use crate::SchedulerAgent;
+
+    fn record(status: RunStatus, created_at: &str) -> RunRecord {
+        let at = adam_core::time::Timestamp(created_at.parse().unwrap());
+        RunRecord {
+            id: RunId::new(),
+            agent: SCHEDULER_AGENT.into(),
+            conversation_id: Some("adam.schedule:coder/daily".into()),
+            parent_id: None,
+            status,
+            state: serde_json::Value::Null,
+            wake_at: None,
+            version: 1,
+            created_at: at,
+            updated_at: at,
         }
     }
-    Ok(latest)
+
+    /// The open run decides even when a finished one looks newer: processes' clocks differ.
+    #[test]
+    fn the_open_run_decides_over_a_finished_one() {
+        let open = record(RunStatus::Parked, "2026-11-20T10:00:00Z");
+        let done = record(RunStatus::Done, "2026-11-20T11:00:00Z");
+        let failed = record(RunStatus::Failed, "2026-11-20T12:00:00Z");
+        assert!(decides_over(&open, &done) && decides_over(&open, &failed));
+        assert!(!decides_over(&done, &open) && !decides_over(&failed, &open));
+        // Between finished runs, the one created last.
+        assert!(decides_over(&failed, &done) && !decides_over(&done, &failed));
+    }
+
+    /// Another process starts the scheduler after this one listed: the start is refused with
+    /// `ConversationBusy`, the conversation is read again, and the other's run is kept.
+    #[tokio::test]
+    async fn a_start_refused_as_busy_reads_again_and_keeps_the_other() {
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let rt = Runtime::builder(store).agent(SchedulerAgent).build();
+        let schedule = Schedule {
+            name: "daily".into(),
+            cron: "0 9 * * *".into(),
+            at: None,
+            after: None,
+            timezone: "UTC".into(),
+            agent: "coder".into(),
+            prompt: "Go.".into(),
+            path: PathBuf::new(),
+        };
+        let stale = latest_by_conversation(&rt, "coder").await.unwrap();
+        assert!(stale.is_empty());
+        let other = reconcile(&rt, "coder", std::slice::from_ref(&schedule))
+            .await
+            .unwrap();
+        assert_eq!(other.started, ["daily"]);
+
+        let spec = ScheduleSpec::from_schedule(&schedule).unwrap();
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            schedule_conversation_id("coder", "daily"),
+            (&schedule, spec),
+        );
+        let done = apply(&rt, "coder", &expected, stale).await.unwrap();
+        assert_eq!(
+            done,
+            Reconciled {
+                kept: vec!["daily".to_owned()],
+                ..Reconciled::default()
+            }
+        );
+        let open = list(
+            &rt,
+            ConversationScope::Prefix("adam.schedule:coder/".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(open.len(), 1);
+        assert!(open[0].status.is_open());
+    }
 }

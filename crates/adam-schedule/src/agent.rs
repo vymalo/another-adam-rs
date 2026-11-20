@@ -31,6 +31,11 @@ pub const FIRING_KIND: &str = "message";
 /// The firings a scheduler's state keeps, newest last.
 pub const FIRINGS_KEPT: usize = 20;
 
+/// How long a scheduler waits before it tries a start again that failed with a retryable error
+/// (the store unavailable, contention). It never fails for one: nothing would start it again
+/// before the next worker start.
+pub const FIRE_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A schedule as the scheduler keeps it: the fields of the file, so a restart evaluates the same
 /// schedule whatever the folder holds by then.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,8 +95,14 @@ pub struct Firing {
     /// The due times skipped before it (decision 3).
     pub missed: u64,
     /// Whether this scheduler created the run; `false` when it already existed (another
-    /// scheduler of the schedule fired the due time first, or a replay found it).
+    /// scheduler of the schedule fired the due time first, or a replay found it), or when the
+    /// start was refused.
     pub created: bool,
+    /// Why the start was refused, when it was: a refusal no retry mends (an agent this runtime
+    /// does not know, a first message it refuses). The due time is not fired, and the schedule
+    /// goes on to the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// The state of a scheduler run.
@@ -163,7 +174,13 @@ impl Agent for SchedulerAgent {
         let spec = ScheduleSpec::from_schedule(&state.schedule.to_schedule())
             .map_err(AgentError::permanent)?;
         let now = ctx.now_journaled().await?;
-        let since = state.last_due.unwrap_or(state.anchor);
+        // A one-shot that has not fired is due whenever its time is, even before the anchor: an
+        // `at` that passed while nothing ran fires late, once (decision 3).
+        let since = match state.last_due {
+            Some(last) => last,
+            None if spec.is_one_shot() => Timestamp::MIN,
+            None => state.anchor,
+        };
 
         if let Some(Due { at, missed }) = spec.latest_due(since, now, state.anchor) {
             let run = fired_run_id(spec.agent(), spec.name(), at);
@@ -182,10 +199,28 @@ impl Agent for SchedulerAgent {
                         })
                 })
                 .await?;
-            let created = match started {
-                Ok(created) => created,
-                Err(e) if e.retryable => return Err(AgentError::transient(e.message)),
-                Err(e) => return Err(AgentError::permanent(e.message)),
+            let (created, error) = match started {
+                Ok(created) => (created, None),
+                Err(e) if e.retryable => {
+                    // Try again soon, from a fresh transition that reads the clock again; the due
+                    // time is not consumed, so a later one may replace it (and count it missed).
+                    tracing::warn!(schedule = spec.name(), error = %e.message, "a firing will be tried again");
+                    let wake_at = adam_core::time::Timestamp(
+                        now.0
+                            .checked_add(
+                                jiff::SignedDuration::try_from(FIRE_RETRY).unwrap_or_default(),
+                            )
+                            .unwrap_or(now.0),
+                    );
+                    return Ok(Transition::Park {
+                        state,
+                        wake_at: Some(wake_at),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(schedule = spec.name(), error = %e.message, "a firing was refused");
+                    (false, Some(e.message))
+                }
             };
             state.last_due = Some(at);
             state.fired.push(Firing {
@@ -193,13 +228,13 @@ impl Agent for SchedulerAgent {
                 run,
                 missed,
                 created,
+                error,
             });
             let drop_count = state.fired.len().saturating_sub(FIRINGS_KEPT);
             state.fired.drain(..drop_count);
         }
 
-        let after = state.last_due.unwrap_or(state.anchor);
-        match spec.due_after(after, state.anchor) {
+        match spec.due_after(state.last_due.unwrap_or(since), state.anchor) {
             Some(next) => Ok(Transition::Park {
                 state,
                 wake_at: Some(next),

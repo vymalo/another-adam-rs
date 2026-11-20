@@ -741,6 +741,7 @@ dependencies = [
  "adam-agent-fs",
  "adam-core",
  "adam-runtime",
+ "adam-store-testkit",
  "async-trait",
  "jiff",
  "serde",
@@ -748,6 +749,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
