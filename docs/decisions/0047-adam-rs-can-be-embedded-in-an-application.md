@@ -41,8 +41,9 @@ The model's credentials are ADR 0058's port: the host gives `ModelCredentials`, 
 `allow_insecure_remotes`, `remote_timeout` and `connect_mcp` keep their signatures and behaviour. `adam` passes it on
 (`remote`, in its defaults, over `adam-assembly` without defaults), and `adam-agent-fixture` takes `adam` without
 defaults, so the dev-dependency cycle no longer turns `remote` on in `adam-assembly`'s own test builds; `check.sh`
-asserts that with `cargo tree -e features`, builds `adam-assembly` with and without it, and its self-test turns
-`adam-assembly/remote` back on and finds `reqwest`. `adam-engine` now depends on `adam-assembly` without defaults. With
+asserts that with `cargo tree -e features`, builds `adam-assembly` with and without it (its doctests, `dev` and `mcp`
+included), and its self-test turns `adam-assembly/remote` back on and finds `reqwest`, and plants the fixture's leak
+and fails. A crate that takes `adam` with `default-features = false` loses remote subagents unless it adds `remote`. `adam-engine` now depends on `adam-assembly` without defaults. With
 that, **decision 2's feature set is complete**: `server`, `push`, `remote` and `thread-tools`. The check on Windows and
 macOS is still slice 8's runner.
 

@@ -871,11 +871,13 @@ place each:
   with a real `notify` watcher on a temp directory (a burst of writes, a broken file, the fix) and a stop by
   drop. Unit tests in `dev.rs`: the pin bookkeeping of a slot, the event filter, the directory rules.
 * Without the features the API does not exist: `compile_fail` doctests in `lib.rs` (and in `adam`) for `dev` and
-  for `mcp`, and in `lib.rs` for `remote` (`RemoteRoundAgent`), which run when the crate is tested without the feature.
+  for `mcp`, and in `lib.rs` for `remote` (`RemoteRoundAgent`), which run when the crate is tested without the feature
+  (`tools/embedded-deps/check.sh` runs the doctests with no default feature, and builds and tests `dev` and `mcp` each
+  without `remote`).
 * `tests/no_remote.rs` (only **without** the feature `remote`: `cargo test -p adam-assembly --no-default-features`,
   which `tools/embedded-deps/check.sh` runs): an `a2a:` subagent is `Error::RemoteNotEnabled` naming the subagent and
   its file and the feature, class `Invalid`, with a secret source that counts and is never asked; with `NoSecrets` and a
-  value from `env` the same; the root without the file binds. `tests/remote.rs`, `tests/remote_sessions.rs` and
+  value from `env` the same; a subagent named like a tool is still `SubagentToolClash` (the name checks come first); the root without the file binds. `tests/remote.rs`, `tests/remote_sessions.rs` and
   `tests/fixture.rs` need `remote` (`required-features`; the fixture has an `a2a:` subagent), as do `tests/dev.rs`
   (with `dev`) and the fixture's tests in `tests/skills.rs` and `tests/subagents.rs`.
 * `tests/card.rs` (feature `a2a`): the card of the fixture against `tests/golden/card.json`

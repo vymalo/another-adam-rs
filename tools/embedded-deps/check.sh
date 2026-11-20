@@ -9,7 +9,8 @@
 #                                             it adds each to adam-engine's manifest in this working tree,
 #                                             expects a failure naming it, and puts the files back; and on
 #                                             a gate turned back on (adam-ui/thread-tools, adam-a2a-runtime/push,
-#                                             adam-assembly/remote)
+#                                             adam-assembly/remote); and on the fixture taking adam with its
+#                                             defaults, which turns adam-assembly/remote on in its own tests
 #
 # The forbidden crates: an HTTP server or client, the A2A SDK's server and client, a database driver,
 # the Kubernetes client, a TLS stack (the host has its own), the MCP client.
@@ -89,14 +90,25 @@ features() {
     echo "embedded-deps: $crate, only $feature"
     cargo clippy --locked -q -p "$crate" --no-default-features --features "$feature" --all-targets -- -D warnings
   done
+  # adam-assembly's doctests prove the remote API is gone without the feature (`compile_fail`), and
+  # its other features each have a path of their own without `remote` (dev reload, MCP tools).
+  echo "embedded-deps: adam-assembly, doctests with no default feature"
+  cargo test --locked -q -p adam-assembly --no-default-features --doc
+  for feature in dev mcp; do
+    echo "embedded-deps: adam-assembly, only $feature (no remote)"
+    cargo clippy --locked -q -p adam-assembly --no-default-features --features "$feature" --all-targets -- -D warnings
+    cargo test --locked -q -p adam-assembly --no-default-features --features "$feature" --lib --tests
+  done
   echo "embedded-deps: adam-engine"
   cargo clippy --locked -q -p adam-engine -- -D warnings
 }
 
 BACKUP=
+FIXTURE=crates/adam-agent-fixture/Cargo.toml
 restore() {
   [ -n "$BACKUP" ] || return 0
   cp "$BACKUP/Cargo.toml" crates/adam-engine/Cargo.toml
+  cp "$BACKUP/fixture.toml" "$FIXTURE"
   cp "$BACKUP/Cargo.lock" Cargo.lock
   rm -rf "$BACKUP"
   BACKUP=
@@ -106,6 +118,7 @@ self_test() {
   local manifest=crates/adam-engine/Cargo.toml backup
   backup=$(mktemp -d)
   cp "$manifest" Cargo.lock "$backup/"
+  cp "$FIXTURE" "$backup/fixture.toml"
   # On any exit (a failed step under `set -e`, Ctrl-C), never leave a planted manifest behind.
   BACKUP=$backup
   trap restore EXIT INT TERM
@@ -132,6 +145,19 @@ self_test() {
     grep -q "holds $crate" <<<"$out" || { echo "embedded-deps self-test: $feature did not bring $crate: $out" >&2; return 1; }
     echo "embedded-deps self-test: $feature turned on fails the check ($crate)"
   done
+  # The leak `gates_stay_off` exists for: the fixture taking `adam` with its defaults turns
+  # `adam-assembly/remote` on in adam-assembly's own tests.
+  sed 's|^adam = { path = "../adam", default-features = false }$|adam = { path = "../adam" }|' \
+    "$backup/fixture.toml" >"$FIXTURE"
+  grep -qx 'adam = { path = "../adam" }' "$FIXTURE" || { echo "embedded-deps self-test: could not plant the leak" >&2; return 1; }
+  if out=$(gates_stay_off 2>&1); then
+    echo "embedded-deps self-test: the fixture's leak was not found" >&2
+    return 1
+  fi
+  grep -q 'adam-assembly.s own build without defaults has remote on' <<<"$out" ||
+    { echo "embedded-deps self-test: the failure does not name adam-assembly's remote: $out" >&2; return 1; }
+  cp "$backup/fixture.toml" "$FIXTURE"
+  echo "embedded-deps self-test: a dependency that turns a gate back on fails the check"
 }
 
 case "${1:-all}" in

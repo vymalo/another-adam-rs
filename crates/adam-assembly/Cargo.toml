@@ -13,7 +13,7 @@ default = ["remote"]
 # The root agent's A2A side: `Assembly::card` (its `card:` frontmatter as an `adam_a2a::AgentCardConfig`),
 # and `child-sessions/v1`: `AgentDef::child_sessions` and `session_starters`, `Assembly::child_sessions`.
 # It needs `remote`: the state of a round on a remote subagent holds an A2A request.
-a2a = ["remote", "dep:adam-a2a", "dep:adam-a2a-runtime", "dep:url"]
+a2a = ["remote", "dep:adam-a2a", "dep:adam-a2a-runtime"]
 # Dev reload: watch the agent directory and swap the agents when a file changes (`LiveAssembly`).
 # Off by default, so a release build cannot watch and reload prompts unless it opts in (reading a
 # folder once, at startup, needs no feature: `AgentFolder`). The only feature that brings `notify`.
@@ -27,8 +27,8 @@ mcp = ["dep:adam-mcp"]
 remote = ["dep:a2a-client-lf", "dep:a2a-lf", "dep:reqwest", "dep:url"]
 
 [dependencies]
-# The A2A client behind remote subagents (`a2a:`): the feature `remote`, independent of the feature
-# `a2a` (the server-side card), so a remote subagent binds the same way with or without it.
+# The A2A client behind remote subagents (`a2a:`): the feature `remote`, which the feature `a2a` (the
+# server-side card) turns on, so a remote subagent binds the same way with or without `a2a`.
 a2a-client-lf = { workspace = true, optional = true }
 a2a-lf = { workspace = true, optional = true }
 adam-a2a = { path = "../adam-a2a", version = "0.1.0", optional = true }

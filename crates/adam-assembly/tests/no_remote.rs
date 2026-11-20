@@ -14,7 +14,7 @@ use adam_error::{Classify, ErrorClass};
 use adam_llm_agent::ToolSet;
 use secrecy::SecretString;
 
-use common::{def, instructions};
+use common::{def, instructions, tools};
 
 /// A source that counts the names it is asked for and gives none.
 #[derive(Default)]
@@ -65,6 +65,26 @@ fn an_a2a_subagent_is_refused_at_bind_before_any_secret_is_read() {
     .bind(ToolSet::new())
     .unwrap_err();
     assert!(matches!(error, Error::RemoteNotEnabled { .. }), "{error}");
+}
+
+#[test]
+fn a_name_clash_is_still_refused_as_a_clash_first() {
+    // The refusal comes after the name checks: the file's real mistake is reported, as it is in a
+    // build with the feature. A root with no `tools:` has every registered tool, `billing` among them.
+    let root = instructions("name: coder", "You are the root.");
+    let asked = Arc::new(Counting::default());
+    let error = def(&[
+        ("agent/instructions.md", root.as_str()),
+        ("agent/subagents/billing.md", BILLING),
+    ])
+    .secrets(asked.clone())
+    .bind(tools(&["billing"]))
+    .unwrap_err();
+    assert!(
+        matches!(&error, Error::SubagentToolClash { tool, .. } if tool == "billing"),
+        "{error}"
+    );
+    assert_eq!(asked.0.load(Ordering::SeqCst), 0, "no secret is asked for");
 }
 
 #[test]
