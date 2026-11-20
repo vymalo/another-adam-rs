@@ -83,6 +83,23 @@ pub async fn reconcile(
     apply(runtime, agent, &expected, latest).await
 }
 
+/// [`reconcile`] on a runtime of its own over `store`, with only [`SchedulerAgent`](crate::SchedulerAgent)
+/// registered: what a binary's worker component calls at start, given the store the service
+/// connected. The runtime only starts and cancels scheduler runs, so it needs no other agent; the
+/// runtime that steps them must register [`SchedulerAgent`](crate::SchedulerAgent) too.
+///
+/// # Errors
+///
+/// As [`reconcile`].
+pub async fn reconcile_store(
+    store: adam_core::DynStore,
+    agent: &str,
+    schedules: &[Schedule],
+) -> Result<Reconciled, ReconcileError> {
+    let runtime = Runtime::builder(store).agent(crate::SchedulerAgent).build();
+    reconcile(&runtime, agent, schedules).await
+}
+
 /// The rules of [`reconcile`] over a listing read before: a listing gone stale (another process
 /// started a scheduler since) is what the `ConversationBusy` branch mends.
 async fn apply(

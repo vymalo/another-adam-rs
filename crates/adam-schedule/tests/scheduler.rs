@@ -629,3 +629,30 @@ async fn a_firing_the_store_fails_is_tried_again_and_fires_once() {
     assert_eq!(state.last_due, Some(due));
     worker.stop().await;
 }
+
+/// What a binary's component does at start: reconcile over the store alone, while the runtime that
+/// steps the schedulers is another one.
+#[tokio::test]
+async fn reconcile_store_starts_schedulers_another_runtime_steps() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let clock = ManualClock::new();
+    let soon = schedule("soon", "", Some("1m"), "Go.");
+    let r = adam_schedule::reconcile_store(store.clone(), ROOT, std::slice::from_ref(&soon))
+        .await
+        .unwrap();
+    assert_eq!(r.started, names(&["soon"]));
+    let rt = runtime(&store, &clock);
+    let worker = spawn_worker(&rt);
+    parked(&store, "soon").await;
+    clock.advance(Duration::from_secs(120));
+    until("the firing", || async {
+        !firings(&store, "soon").await.is_empty()
+    })
+    .await;
+    worker.stop().await;
+    // Removing every schedule cancels the scheduler: the component runs with none, too.
+    let r = adam_schedule::reconcile_store(store.clone(), ROOT, &[])
+        .await
+        .unwrap();
+    assert_eq!(r, Reconciled::default(), "a Done one-shot is not cancelled");
+}
