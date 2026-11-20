@@ -38,11 +38,6 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
 
    Take only the crates you use (`crates/adam-host`, `adam-core`, `adam-runtime`, `adam-a2a`,
    `adam-a2a-runtime`, `adam-store-postgres`, `adam-notify-postgres`, `adam-service`, `adam`).
-   **Moving across ADR 0055's S3 is a deploy boundary, not a bump**: the contract release writes
-   `state = null` and every read serves the head, and a pre-S3 process that touches a converted run
-   fails it. Scale every process of the old rev to zero before the new one starts, and do not roll
-   back past a converted run. The details are `adam-upgrade`'s S3 row and
-   `docs/guides/deploy-the-coder.md` ("The contract release: a one-time window").
 2. **TLS is built in.** `adam-store-postgres` and `adam-notify-postgres` use `rustls` on
    `aws-lc-rs`, and `DATABASE_URL` chooses the mode (`sslmode`, `sslrootcert`, `sslcert`,
    `sslkey`). There are no TLS Cargo features: the `tls-rustls`/`tls-native-tls` features left with
@@ -64,11 +59,8 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
    * **A wrapper agent must delegate the split.** `adam_runtime::Agent` has provided `split`/`join`
      methods (and so does `AgentStarter`) that let a run keep its transcript in an append-only body
      beside a small head; the default keeps the whole state in the head, the v4 format. An agent of
-     yours that wraps another and delegates `init`/`step` must delegate `split`/`join` too: a new run
-     then stays in the v4 format (unoptimised), and — worse — a wrapper that stops splitting on a run
-     that is already v5 is a **refused split**: the step's commit demotes the run to the whole v4
-     state, so it loses the append-only transcript (the same trap as `init_continuing`, with a
-     larger cost).
+     yours that wraps another and delegates `init`/`step` must delegate `split`/`join` too, or its
+     runs silently stay in the v4 format (the same trap as `init_continuing`).
    * **Only the process plumbing**: `adam-host` (`Role`, `Host`): register every component
      (`.control_plane(name, f)`, `.worker(name, f)`), `Host::run(shutdown)` starts the ones the
      role runs and stops the control plane before the workers (`crates/adam-host/README.md`).
