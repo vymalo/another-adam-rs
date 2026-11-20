@@ -373,3 +373,73 @@ fn the_hash_covers_every_field_of_the_file() {
     moved.path = PathBuf::from("elsewhere.md");
     assert_eq!(hash(&moved), h);
 }
+
+#[test]
+fn the_cap_boundary_still_fires_the_last_due_time() {
+    // Exactly MISSED_MAX + 1 due times in (since, now]: the last one fires, and the rest count.
+    let minutely = cron("* * * * *", "UTC");
+    let start = at("2026-01-01T00:00:00Z");
+    let mins = i64::try_from(MISSED_MAX + 1).unwrap();
+    let now = Timestamp(
+        start
+            .0
+            .checked_add(jiff::SignedDuration::from_mins(mins))
+            .unwrap(),
+    );
+    assert_eq!(
+        minutely.latest_due(start, now, Timestamp::UNIX_EPOCH),
+        Some(Due {
+            at: now,
+            missed: MISSED_MAX
+        })
+    );
+}
+
+#[test]
+fn an_interval_sees_the_minutes_a_45_minute_change_makes() {
+    // Pacific/Chatham: 02:45 +12:45 becomes 03:45 +13:45 on 27 September 2026, so hour 3 that day
+    // is 03:45-03:59, which is 14:00Z-14:14Z on the 26th.
+    let spec = cron("*/15 3 * * *", "Pacific/Chatham");
+    assert_eq!(
+        spec.due_after(at("2026-09-26T12:00:00Z"), Timestamp::UNIX_EPOCH),
+        Some(at("2026-09-26T14:00:00Z"))
+    );
+}
+
+#[test]
+fn due_times_only_move_forward_across_a_change_at_midnight() {
+    // America/St_Johns fell back at 00:01 on 7 November 2010, so the next day began before the
+    // instant a skip came from.
+    for expr in ["0 * * * 0", "*/30 * * * *", "0 * 7 11 *"] {
+        let spec = cron(expr, "America/St_Johns");
+        let mut cursor = at("2010-11-06T00:00:00Z");
+        for _ in 0..80 {
+            let due = spec
+                .due_after(cursor, Timestamp::UNIX_EPOCH)
+                .expect("a due time");
+            assert!(due > cursor, "{expr}: {due:?} after {cursor:?}");
+            cursor = due;
+        }
+        // And the walk over them ends.
+        assert!(
+            spec.latest_due(
+                at("2010-11-06T00:00:00Z"),
+                at("2010-11-09T00:00:00Z"),
+                Timestamp::UNIX_EPOCH
+            )
+            .is_some()
+        );
+    }
+}
+
+#[test]
+fn a_time_of_day_a_gap_moves_past_midnight_is_found() {
+    // America/Nuuk springs forward at 01:00Z, 23:00 on the Saturday (-02:00) to 00:00 on the
+    // Sunday (-01:00): Saturday 23:30 does not exist and fires at Sunday 00:30, 01:30Z, which a
+    // search that began on Sunday's date would miss.
+    let spec = cron("30 23 * * *", "America/Nuuk");
+    assert_eq!(
+        spec.due_after(at("2026-03-29T01:10:00Z"), Timestamp::UNIX_EPOCH),
+        Some(at("2026-03-29T01:30:00Z"))
+    );
+}

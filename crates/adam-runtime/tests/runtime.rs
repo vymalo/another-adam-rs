@@ -2389,15 +2389,19 @@ mod cases {
     /// `Ctx::run_starter` starts root runs from a step, idempotently, and only in `adam.schedule:`
     /// conversations (ADR 0060, decision 2).
     pub async fn a_step_starts_root_runs_only_in_schedule_conversations(store: DynStore) {
-        const FIRED: &str = "adam.schedule:a/daily@2026-12-24T18:00:00Z";
         let name = uniq("starter");
+        // Unique per case, so a run a crashed case left on a shared database cannot make this busy.
+        let fired_conv = format!("adam.schedule:{name}/daily@2026-12-24T18:00:00Z");
+        let scheduler_conv = format!("adam.schedule:{name}/daily");
         let fired = RunId::new();
         let agent_name = name.clone();
+        let conv = fired_conv.clone();
         let agent = fn_agent(
             &name,
             step_fn(move |ctx, state| {
                 let starter = ctx.run_starter();
                 let name = agent_name.clone();
+                let conv = conv.clone();
                 async move {
                     if state["role"] == "fired" {
                         return Ok(Transition::Done {
@@ -2408,21 +2412,27 @@ mod cases {
                     let input = || Inbound::new("start", json!({"role": "fired"}));
                     let fail = |e: RuntimeError| AgentError::permanent(e.to_string());
                     let first = starter
-                        .start_with_id(fired, &name, input(), FIRED)
+                        .start_with_id(fired, &name, input(), &conv)
                         .await
                         .map_err(fail)?;
                     let again = starter
-                        .start_with_id(fired, &name, input(), FIRED)
+                        .start_with_id(fired, &name, input(), &conv)
                         .await
                         .map_err(fail)?;
-                    let foreign = starter
-                        .start_with_id(RunId::new(), &name, input(), "token-1:chat")
-                        .await;
-                    let refused = matches!(
-                        &foreign,
-                        Err(e @ RuntimeError::ForeignConversation { conversation_id })
-                            if conversation_id == "token-1:chat" && e.class() == adam_runtime::ErrorClass::Invalid
-                    );
+                    // Not under the prefix: a person's conversation, the prefix inside another one,
+                    // and the namespace's name without its separator.
+                    let mut refused = true;
+                    for other in ["token-1:chat", "token-1:adam.schedule:x", "adam.schedule"] {
+                        let foreign = starter
+                            .start_with_id(RunId::new(), &name, input(), other)
+                            .await;
+                        refused &= matches!(
+                            &foreign,
+                            Err(e @ RuntimeError::ForeignConversation { conversation_id })
+                                if conversation_id == other
+                                    && e.class() == adam_runtime::ErrorClass::Invalid
+                        );
+                    }
                     Ok(Transition::Done {
                         state,
                         output: json!([first, again, refused]),
@@ -2437,7 +2447,7 @@ mod cases {
             .start(
                 &name,
                 Inbound::new("start", json!({"role": "scheduler"})),
-                Some("adam.schedule:a/daily"),
+                Some(scheduler_conv.as_str()),
             )
             .await
             .expect("start");
@@ -2445,7 +2455,10 @@ mod cases {
         assert_eq!(done.output, Some(json!([true, false, true])));
         let fired_view = wait_done(&rt, fired).await;
         assert_eq!(fired_view.agent, name);
-        assert_eq!(fired_view.conversation_id.as_deref(), Some(FIRED));
+        assert_eq!(
+            fired_view.conversation_id.as_deref(),
+            Some(fired_conv.as_str())
+        );
         assert_eq!(fired_view.output, Some(json!("fired")));
         // The refused start wrote nothing: the agent has the scheduler's run and the fired one.
         let runs = store

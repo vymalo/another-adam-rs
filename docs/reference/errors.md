@@ -106,7 +106,7 @@ flowchart LR
     AgentError -->|NonDeterminism| Corrupt
     StoreError -.->|"Store(e)"| AgentError
 
-    RuntimeError -->|UnknownAgent| Invalid
+    RuntimeError -->|"UnknownAgent, WrongAgent, InvalidSession, ForeignConversation"| Invalid
     RuntimeError -->|NotFound| NotFound
     RuntimeError -->|"Finished, ConversationBusy"| Rejected
     RuntimeError -->|Corrupt| Corrupt

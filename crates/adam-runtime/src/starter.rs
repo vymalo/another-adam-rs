@@ -15,6 +15,9 @@ pub const SCHEDULE_CONVERSATION_PREFIX: &str = "adam.schedule:";
 /// [`SCHEDULE_CONVERSATION_PREFIX`], so a step can neither open a run in a person's conversation
 /// nor deliver into one (as [`ChildStarter`](crate::ChildStarter) is bound to its parent).
 ///
+/// The namespace is a convention: a custom authenticator whose subject is `adam.schedule` would
+/// map that subject's conversations into it, so none should be given that subject.
+///
 /// It is transient: a step gets a new one, and holding on to it past the step keeps the runtime
 /// alive.
 #[derive(Clone)]

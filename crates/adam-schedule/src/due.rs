@@ -59,7 +59,8 @@ impl ScheduleSpec {
         let mut seen: u64 = 0;
         let mut cursor = since;
         while let Some(due) = self.due_after(cursor, anchor) {
-            if due > now {
+            // `due_after` moves forward; a zone database that broke that must not spin here.
+            if due > now || due <= cursor {
                 break;
             }
             seen += 1;
@@ -67,7 +68,8 @@ impl ScheduleSpec {
             cursor = due;
             if seen > MISSED_MAX {
                 // Too many to walk: find the latest from just before `now`.
-                let at = self.latest_before(cursor, now, anchor)?;
+                // The 10 001st may itself be the last one due.
+                let at = self.latest_before(cursor, now, anchor).unwrap_or(cursor);
                 return Some(Due {
                     at,
                     missed: MISSED_MAX,
@@ -91,7 +93,10 @@ impl ScheduleSpec {
             let start = now.0.checked_sub(SignedDuration::from_hours(hours)).ok()?;
             let mut cursor = Timestamp(start).max(floor);
             let mut latest = None;
-            while let Some(due) = self.due_after(cursor, anchor).filter(|d| *d <= now) {
+            while let Some(due) = self
+                .due_after(cursor, anchor)
+                .filter(|d| *d <= now && *d > cursor)
+            {
                 latest = Some(due);
                 cursor = due;
             }
@@ -147,6 +152,18 @@ fn time_of_day_after(cron: &Cron, zone: &TimeZone, after: Instant) -> Option<Ins
     None
 }
 
+/// Where a skip from `t` towards `to` lands: never past the zone's next transition, whose new
+/// offset can make minutes valid that the skip assumed away (Pacific/Chatham moves at 02:45), and
+/// never back (a fall-back across midnight puts the next day's start before `t`).
+fn jump(zone: &TimeZone, t: Instant, to: Instant) -> Option<Instant> {
+    let to = match zone.following(t).next() {
+        Some(transition) => to.min(transition.timestamp()),
+        None => to,
+    };
+    let floor = t.checked_add(SignedDuration::from_mins(1)).ok()?;
+    Some(to.max(floor))
+}
+
 fn interval_after(cron: &Cron, zone: &TimeZone, after: Instant) -> Option<Instant> {
     // The next whole minute of the instant line: every zone in use today has whole-minute offsets.
     let mut t = Instant::from_second((after.as_second().div_euclid(60) + 1) * 60).ok()?;
@@ -160,11 +177,12 @@ fn interval_after(cron: &Cron, zone: &TimeZone, after: Instant) -> Option<Instan
         if !date_matches(cron, z.date()) {
             // To the start of the next civil day.
             let next = z.date().tomorrow().ok()?.to_zoned(zone.clone()).ok()?;
-            t = next.timestamp();
+            t = jump(zone, t, next.timestamp())?;
         } else if !cron.hour(hour) {
-            t = t
+            let next_hour = t
                 .checked_add(SignedDuration::from_mins(60 - i64::from(minute)))
                 .ok()?;
+            t = jump(zone, t, next_hour)?;
         } else if !cron.minute(minute) {
             t = t.checked_add(SignedDuration::from_mins(1)).ok()?;
         } else {
