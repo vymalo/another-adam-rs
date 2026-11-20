@@ -27,14 +27,16 @@ engine.shutdown().await?;
 | `cancel(run)` | ends the run `Cancelled`; a cancelled run is answered as it is | `Finished` for a run that ended otherwise; `NotFound` |
 | `list(ListQuery)` | a `Page<RunInfo>` of the engine's runs, the most recently updated first, by cursor (`page_size`, at most 100, default 50; `conversation`; `after(token)`) | `Invalid` for a token of another query |
 | `get(run)` | the `RunInfo`, or `None` | |
+| `events(run)` | `RunEvents`, a `futures::Stream` of `Result<EngineEvent, EngineError>`: the run's recent events, then the live ones, then `Ended` once the store says the run has ended; a run that has already ended gives `Ended` at once. See [A run's events](#a-runs-events) | `NotFound` for a run the engine does not have, refused at the call (the stream would have nothing to say) |
 | `shutdown()` | waits for the messages being written, then nothing new is claimed and the steps in flight finish and commit; it returns once the worker has stopped, and so does every concurrent or later call; every clone stops; reads and `cancel` still work. Dropping a `shutdown` before it is done (a timeout around it) aborts the worker, and so does dropping the last engine, as a killed process would: the runs are claimed again once their leases run out | what the worker ended with |
 
 The types are the engine's own: `Say { id, text }` (the id makes a send idempotent: the same `Say` again reaches
 the run its first attempt started), `Turn { conversation, run, delivered, info }`, `Delivered` (`Started`, `Continued`, `Steered`, `Answered`,
 `Repeated`: a closed enum, so a new way of delivering breaks a `match` on purpose), `RunInfo { run, conversation,
 state, question, output, error }`, `RunState` (`Submitted`, `Working`, `Waiting`, `Done`, `Failed`, `Cancelled`),
-`ConversationId`, `ListQuery`, `Page<T>`, `Limits` and `EngineError`, which implements `adam_error::Classify`:
-decide from the class. No A2A or driver type is in a signature.
+`ConversationId`, `ListQuery`, `Page<T>`, `Limits`, `EngineEvent`, `RunEvents` and `EngineError`, which implements
+`adam_error::Classify`: decide from the class. No A2A or driver type is in a signature: a live event is adam's own
+`adam_runtime::RunEvent`.
 
 **`RunState` is `#[non_exhaustive]`** because slice 5's approvals may add a state (a run that waits for the person's
 yes to a tool call): match it with a `_` arm.
@@ -52,8 +54,12 @@ builder's source replaces whatever source the definition had.
 
 **Defaults** (`Limits`, `#[non_exhaustive]`: set its fields on `Limits::default()`): `concurrency` 4 runs stepped at
 once, `max_parallel_tools` 10 tool calls of one turn at once (an agent's file may lower it), `lease_ttl` 30 s (zero
-is refused). The worker's id is the runtime's random default: the engine sets no fixed id yet. A fixed one (so that
-a restarted engine can release its own leases at once) is safe only under slice 3's lock, one process per store.
+is refused), `event_capacity` 256 live events in the ring (1 to 65 536; the channel rounds it up to a power of two).
+The worker's id is the runtime's random default: the engine sets no fixed id yet. A fixed one (so that a restarted
+engine can release its own leases at once) is safe only under slice 3's lock, one process per store, and needs
+`Store::release_worker_leases`, which another change adds to `adam-core`. **Until it lands, a restarted engine waits up
+to `lease_ttl` for its own old runs**: the runs the last process was stepping are claimed again only once their leases
+run out.
 
 **Inside.** Every call is what the A2A server does for one caller: `RuntimeTaskBackend` of
 [`adam-a2a-runtime`](../adam-a2a-runtime/README.md), as the subject `adam-engine` (a steer with `steer/v1`
@@ -61,9 +67,52 @@ activated), so follow-ups, steering, answers and continuations have one implemen
 context; a send to one names its latest run in `referenceTaskIds`, which the backend continues once it has ended.
 `answer` sends the plain follow-up, which the backend takes only from a waiting run.
 
-**Not yet** (the next pull requests of slice 4): a stream of a run's events with a bound on a slow reader; the
-example embedder; the proof that a killed process resumes its run, which needs the durable store of slice 3.
-Approvals are slice 5: today a run waits only on a question, and `answer` answers it.
+**Not yet** (the next pull requests of slice 4): the example embedder; the proof that a killed process resumes its run,
+which needs the durable store of slice 3 (today `a_dropped_engine_resumes_its_run` proves it in memory, below); a way
+to read a file artifact's bytes (`RunInfo` carries no artifacts yet, and an event carries none, below). Approvals are
+slice 5: today a run waits only on a question, and `answer` answers it.
+
+## A run's events
+
+```rust
+use futures::StreamExt;
+use adam_engine::EngineEvent;
+
+let mut events = engine.events(turn.run).await?;          // subscribed when this returns
+while let Some(event) = events.next().await {
+    match event? {
+        EngineEvent::Live(event) => show(event),           // adam_runtime::RunEvent: a step, a text piece, ...
+        EngineEvent::Behind { skipped } => {}             // the reader lost live events; a fresh read follows
+        EngineEvent::Snapshot(info) => redraw(info),       // the run as the store has it now
+        EngineEvent::Ended(info) => done(info),            // the last item: Done, Failed or Cancelled
+        _ => {}                                            // EngineEvent is #[non_exhaustive]
+    }
+}
+```
+
+* **The store is the truth** (rule 5: a notification is never the truth). A live event is a prompt: a `Status` makes the
+  stream read the run, and `Ended` is that read; with no event for 2 s it reads the run anyway, so an end nobody
+  announced is not missed. `Ended` is the last item, and the stream ends after it.
+* **Bounded whatever the reader does.** The runtime emits into one ring (`tokio::sync::broadcast`) of `event_capacity`
+  events, every run's, one copy shared by every reader. A reader that does not keep up holds nothing more: the ring
+  overwrites its oldest events, and the reader learns it on its next read, `Behind { skipped }` (how many events of the
+  engine it missed, every run's, so at most that many of this run's), then at once `Snapshot(RunInfo)` read from the
+  store, or `Ended` if the run is over. The live events after a `Snapshot` may have been emitted before it: take a text
+  piece by its `offset` and a step by its `id`. A stream holds besides the run's recent events it started with (the
+  runtime's replay: at most `REPLAY_EVENTS_PER_RUN`, 64, of the run, within its 16 MiB for every run, see
+  [`adam-runtime`](../adam-runtime/README.md#a-late-subscriber)) and at most two items. So a reader that reads only
+  after its run is over gets at most `REPLAY_EVENTS_PER_RUN + event_capacity` live events (80 with a ring of 16), then
+  `Behind`, then `Ended` with the whole output.
+* **What an event weighs.** A text piece is at most 1 KiB (`MAX_TEXT_DELTA_BYTES`), a step's end about 12 KiB of input and
+  output. **A file artifact's bytes are taken out** before the event enters the ring (the engine's sink; a file can be
+  4 MiB): its `name`, `mime_type` and `filename` are kept and `bytes` is empty, and the file is durable with the run.
+  Not bounded by the engine: a `Custom` event's payload and a JSON artifact's `data`, which are what the agent's tools
+  make.
+* **Unknown and ended runs.** `events` of a run the engine does not have is `NotFound`, at the call. A run that has
+  already ended gives `Ended` at once and nothing else. A failed read of the store is an `Err` item, and ends the stream:
+  call `events` again.
+* **It does not keep the engine alive.** Drop every `Engine` and the worker stops as a killed process would; an open
+  stream ends then, with no `Ended`.
 
 ## The crates it is built from
 
@@ -77,8 +126,8 @@ re-exports them:
 | [`adam-assembly`](../adam-assembly/README.md) | `remote`: no remote (`a2a:`) subagents, so no A2A client, HTTP client or TLS; `bind` refuses one with `Error::RemoteNotEnabled` ([Without remote subagents](../adam-assembly/README.md#without-remote-subagents-feature-remote)) |
 | [`adam-runtime`](../adam-runtime/README.md), [`adam-llm-agent`](../adam-llm-agent/README.md), [`adam-core`](../adam-core/README.md), [`adam-agent-fs`](../adam-agent-fs/README.md), [`adam-model`](../adam-model/README.md), [`adam-error`](../adam-error/README.md) | nothing: they have no server parts |
 
-It also depends on `a2a-lf` (the A2A types, data only: ADR 0047's confirmed decision 1), `tokio` (`rt`, `sync`),
-`thiserror` and `uuid`.
+It also depends on `a2a-lf` (the A2A types, data only: ADR 0047's confirmed decision 1), `tokio` (`rt`, `sync`,
+`time`), `futures` (the `Stream` of a run's events), `async-trait` (the engine's event sink), `thiserror` and `uuid`.
 
 ## The dependency check
 
@@ -122,11 +171,25 @@ every wait is bounded by `tokio::time::timeout`:
 * `shutdown_refuses_new_work_and_reads_go_on` (a send, a steer and an answer are `Stopped`);
 * `a_dropped_shutdown_stops_the_worker`: a timed-out `shutdown` aborts the worker, so the run's lease runs out;
   `concurrent_shutdowns_both_wait_for_the_worker`;
-* `start_refuses_what_it_cannot_build` (a zero lease too; it passes alone and with
+* `events_follow_a_run_to_its_end`: a reader that keeps up hears the tool's step and the text live, then `Ended(Done)`
+  with the output, once, and nothing after it;
+* `a_slow_reader_stays_bounded`: a ring of 16 and a reply of 256 KiB (256 pieces); the reader reads only after the run
+  is done, and gets at most `REPLAY_EVENTS_PER_RUN + 16` live events, `Behind { skipped > 0 }`, then `Ended` with the
+  whole output read from the store;
+* `events_of_an_unknown_run_and_of_a_finished_one`: `NotFound` at the call, and `Ended` alone;
+* `a_dropped_engine_resumes_its_run`, the in-memory stand-in for a killed process: two engines over one `MemoryStore`
+  (`Arc`), engine A (a lease of 300 ms) dropped while its run's second model call is in flight (its worker aborted, its
+  open stream ended with no `Ended`), and engine B finishing the run once A's lease runs out; B's model is called once,
+  and its request ends with the result of the tool A's committed step called, so the committed step is kept and not
+  run again. PR 4 of the slice adds the real proof: a process killed with `SIGKILL` over the SQLite store of slice 3,
+  and another process finishing its run;
+* `start_refuses_what_it_cannot_build` (a zero lease and a ring of 0 or over 65 536 too; it passes alone and with
   `--features adam-assembly/mcp,adam-assembly/remote`, the set CI's workspace build unifies) and `start_outside_a_tokio_runtime_is_refused`: fail
   closed.
 
-In `src/`: `a_name_the_environment_has_is_refused_by_the_engines_default` (slice 2's proof) and
+In `src/`: `a_name_the_environment_has_is_refused_by_the_engines_default` (slice 2's proof),
+`the_sink_keeps_file_bytes_out_of_the_ring` (the chat agent's tools make no file, so the stripping is tested on the
+sink: a file's event reaches a reader with its name and no bytes, every other event as it was), and
 `every_backend_refusal_keeps_its_class` and `a_refusal_for_the_state_says_the_state_it_read` (the races a test cannot
 make happen on cue).
 
