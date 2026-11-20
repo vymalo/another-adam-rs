@@ -4,7 +4,11 @@ The `Store` port ([`adam-core`](../../crates/adam-core/README.md)) is the durabl
 leases, A2A push-notification configs and their delivery progress, a run's file bytes (blobs), a run's
 transcript (body), and the listing of a caller's runs. Two adapters ship, and every adapter must pass
 the same conformance suite ([`adam-store-testkit`](../../crates/adam-store-testkit/README.md)). The
-model they implement is in [Architecture](../architecture.md#the-mental-model); the schema is in
+PostgreSQL one runs on `tokio-postgres`, pooled by `deadpool-postgres`, with `rustls` on `aws-lc-rs`;
+`sqlx` left the workspace with
+[ADR 0053](../decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)
+decision 1, and the schema and statements did not change. The model they implement is in
+[Architecture](../architecture.md#the-mental-model); the schema is in
 [Data: the run store](../architecture.md#data-the-run-store).
 
 ## Using a store
@@ -37,9 +41,13 @@ adapters override it with one projected read that never touches the state, and t
 `run_header_matches_the_record` proves an implementation agrees with the two reads.
 
 `PgStore::connect` sizes its pool from `ADAM_PG_POOL_SIZE` (2 to 65535, default 16, per process;
-one is refused because the `adam-notify-postgres` listener holds a connection for the process's
-life); `connect_with_pool_size` takes the size explicitly, and `from_pool` uses the pool you pass. A
-value that is not an integer in range fails the connect rather than falling back to 16.
+one is refused because it serializes every store call, and a migration holds its connection); 
+`connect_with_pool_size` takes the size explicitly, `from_config` takes an already parsed
+[`adam-postgres`](../../crates/adam-postgres/README.md) `PgConfig` (what `adam-service` does, so
+`DATABASE_URL` is parsed once for the store and the notification listener), and `from_pool` uses the
+`deadpool_postgres::Pool` you pass. A value that is not an integer in range fails the connect rather
+than falling back to 16. TLS comes from `DATABASE_URL` (`sslmode`, `sslrootcert`, `sslcert`,
+`sslkey`); there are no Cargo features for it any more.
 
 `keeps_blobs` / `blob_stored` / `put_blob` / `get_blob` / `purge_blobs` keep a file artifact's bytes
 **out of the run's state**, content-addressed by `BlobId` (their SHA-256, 64 lower-case hex; the digest is
@@ -74,7 +82,7 @@ cron tick across all replicas. A second message on a conversation that has an op
 
 ## How each adapter keeps the contract
 
-| Guarantee | PostgreSQL 12+ (`sqlx`) | MongoDB 5.0+ (standalone is enough) |
+| Guarantee | PostgreSQL 12+ (`tokio-postgres`) | MongoDB 5.0+ (standalone is enough) |
 |---|---|---|
 | Commit CAS | `UPDATE .. WHERE version = $n RETURNING` | `findOneAndUpdate({_id, version: n}, {$inc: {version: 1}})` |
 | Journal first-writer-wins | `INSERT .. ON CONFLICT DO NOTHING`, read winner | `insertOne` on `_id = "<run>:<seq>"`; a duplicate key means an earlier writer won, and their entry is read back |
@@ -114,7 +122,8 @@ cron tick across all replicas. A second message on a conversation that has an op
   return no state, and a read returns the stored one.
 * **Time** is `adam_core::time::Timestamp` (ADR 0057), a `jiff::Timestamp` whose serde bytes are the ones
   `chrono::DateTime<Utc>` wrote. Every store truncates it to milliseconds; PostgreSQL keeps it in `TIMESTAMPTZ`
-  through sqlx's chrono support and MongoDB in a BSON date, so the stored value is the same in every backend.
+  through `postgres-types`' `with-jiff-0_2` (microseconds since 2000, the bytes chrono wrote) and MongoDB in
+  a BSON date, so the stored value is the same in every backend.
   Lease expiry uses the `now` the caller passes in: keep worker clocks in sync (NTP) and lease TTLs well above
   the expected skew.
 

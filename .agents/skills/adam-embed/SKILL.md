@@ -38,10 +38,10 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
 
    Take only the crates you use (`crates/adam-host`, `adam-core`, `adam-runtime`, `adam-a2a`,
    `adam-a2a-runtime`, `adam-store-postgres`, `adam-notify-postgres`, `adam-service`, `adam`).
-2. **One TLS backend per process.** `adam-store-postgres` and `adam-notify-postgres` default to
-   the feature `tls-rustls` (`sqlx/tls-rustls`); `tls-native-tls` is the other. If your workspace
-   selects another sqlx TLS backend, set `default-features = false` on both crates, as the consumer
-   does in `orchestrator/Cargo.toml`.
+2. **TLS is built in.** `adam-store-postgres` and `adam-notify-postgres` use `rustls` on
+   `aws-lc-rs`, and `DATABASE_URL` chooses the mode (`sslmode`, `sslrootcert`, `sslcert`,
+   `sslkey`). There are no TLS Cargo features: the `tls-rustls`/`tls-native-tls` features left with
+   `sqlx` (ADR 0053, decision 1), so a consumer that set them removes the line.
 3. **Pick the composition level:**
    * **A folder's agent in your process**: `bin/adam-agent` is also a library (`adam_agent`):
      `adam_agent::agents(def, card, workers)` returns the `Agents` for

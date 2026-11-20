@@ -106,6 +106,23 @@ What the pieces offer, checked on 2026-11-19:
    the tables `sqlx` made are the tables `tokio-postgres` reads. The adapter parses the URL parameters `tokio-postgres`
    does not (`sslmode=verify-ca` and `verify-full`, `sslrootcert`, `sslcert`, `sslkey`) and configures `rustls` with them,
    so every `DATABASE_URL` that works today works after.
+
+   *Amended 2026-11-20 (slice 2, #361):* built. Both crates run on `tokio-postgres` 0.7.18, `deadpool-postgres` 0.14.2
+   and `tokio-postgres-rustls` 0.14.0, `sqlx` is out of `Cargo.lock`, and the `clippy-default` job runs
+   `if cargo tree --workspace --locked -i sqlx; then exit 1; fi` (an absent package exits 101). The URL handling lives in
+   the new `adam-postgres` crate, `PgConfig`: it strips the TLS keys and the `sqlx` aliases, maps `sslmode` to the
+   driver's `disable|prefer|require`, and for the two verifying modes installs a `rustls` verifier — `verify-ca` checks
+   the chain only, `verify-full` the chain and the host name — with roots from `sslrootcert` (else the Mozilla roots) and
+   an optional client certificate from `sslcert`+`sslkey`; the provider is always `aws-lc-rs`, named explicitly because
+   the tree also compiles `ring` (through `mongodb`). The breaking signatures (Rule 2):
+   `PgStore::from_pool(deadpool_postgres::Pool)`, `PgStore::pool() -> &deadpool_postgres::Pool`,
+   `PgStore::from_config(PgConfig, u32)`, and `PgNotify::new(deadpool_postgres::Pool, PgConfig, BroadcastSink)` — the
+   listener owns a connection of its own, because deadpool drives a pooled client as the `Connection` future, which
+   drops notifications. `adam_core::time::Timestamp` binds through `postgres-types`' `with-jiff-0_2`, so the `PgTime`
+   bridge of [ADR 0057](0057-time-is-jiff-with-the-bytes-chrono-wrote.md) is deleted. One error class changes: `sqlx`'s
+   `Protocol` and `WorkerCrashed` were `Transient`, `tokio-postgres` has no equivalent, so what is not a database error,
+   a closed connection or an I/O/TLS failure is `Internal`; a unique violation, a serialization failure, a lost
+   connection and a bad statement keep their classes.
 2. **`adam-store-sqlite` (new) joins the main workspace**: `rusqlite` with `bundled` SQLite, on the `rusqlite` minor that
    `cratestack-rusqlite` uses (0.41 today), so an application can link both; a CI probe resolves the two together. It is
    what ADR 0047 decision 3 asked: `store_conformance!`, one writer, each change one `BEGIN IMMEDIATE` transaction, WAL,

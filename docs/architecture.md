@@ -257,8 +257,8 @@ flowchart LR
 
     subgraph svc["adam-service: serve(ServiceConfig, Agents, shutdown)"]
         direction LR
-        pg["PgStore::connect_lazy, then ping + migrate()<br/>as DynStore"]
-        pgn["PgNotify::new(store pool, BroadcastSink)<br/>LiveSignals: PgEventSink + PgNotifier"]
+        pg["PgConfig::parse once, PgStore::from_config (lazy),<br/>then ping + migrate() as DynStore"]
+        pgn["PgNotify::new(store pool, PgConfig, BroadcastSink)<br/>LiveSignals: PgEventSink + PgNotifier"]
         service["Service::new_with(register(Runtime::builder(store)), name, options, live)"]
         rtm["Runtime<br/>PgEventSink as EventSink, PgNotifier as Notifier"]
         bk["RuntimeTaskBackend"]
@@ -1123,7 +1123,7 @@ sequenceDiagram
 * **Size.** PostgreSQL rejects a payload of 8000 bytes or more, so nothing over 7 999 is sent. An
   oversize `Status` loses the tail of its detail; an oversize `Step` crosses without its input and
   output; any other oversize event is dropped.
-* **One pooled connection** held by the listener: no transaction-mode pooler in front of it.
+* **One connection of its own** held by the listener (outside the pool): no transaction-mode pooler in front of it.
 * **MongoDB has no equivalent** on a standalone `mongod`, so it keeps polling.
 
 The listener's lifecycle (`listen_loop` in `crates/adam-notify-postgres/src/lib.rs`). A `Resync` tells
@@ -1136,9 +1136,7 @@ stateDiagram-v2
     Connecting --> Listening: connected and LISTEN active, Resync broadcast
     Connecting --> Reconnecting: connect or LISTEN failed
     Listening --> Listening: notification dispatched
-    Listening --> Resyncing: try_recv returned None, sqlx reconnected and listened again
-    Resyncing --> Listening: Resync broadcast
-    Listening --> Reconnecting: try_recv failed
+    Listening --> Reconnecting: the connection ended (poll_message returned None or an error)
     Reconnecting --> Connecting: after the backoff, 100 ms doubling to 10 s
     Connecting --> [*]: stop, or the pool is closed
     Listening --> [*]: stop, or the pool is closed
