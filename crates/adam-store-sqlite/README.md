@@ -23,11 +23,12 @@ store.migrate().await?;
 let store: DynStore = Arc::new(store);
 ```
 
-`open` takes an exclusive advisory lock on `<path>.lock` (an exclusive `flock`), so a second
-process on the same file is refused with `StoreError::InvalidInput` and a message that names the
-lock. The operating system releases the lock when the process exits, **including a `SIGKILL`**;
-`migrate` then clears every lease it finds, because the lock proves no other process is alive. A
-killed process's runs are therefore claimable at once, without waiting for a lease to expire.
+`open` takes an exclusive advisory lock on `<path>.lock` (an exclusive `flock`, named after the
+file's real path so a symlink and its target share it), so a second process on the same file is
+refused with `StoreError::InvalidInput` and a message that names the lock. The operating system
+releases the lock when the process exits, **including a `SIGKILL`**; `migrate` then clears every
+lease it finds, because the lock proves no other process is alive. A killed process's runs are
+therefore claimable at once, without waiting for a lease to expire.
 
 `sqlite://` with `ROLE=worker` or `ROLE=control-plane` is refused by `adam-service` (exit 78): a
 split deployment needs a store several processes share. Use `ROLE=all`, Postgres, MongoDB or the
@@ -44,9 +45,10 @@ WAL, and is not durable.
   characters), so two stores can share a file (they still share the one process lock).
 * `path()`: the file. `ping()`: `SELECT 1`. `SCHEMA_VERSION` (1).
 * The `Store` implementation: `create_run` and `commit_run` return the record with `state` set to
-  `null`; `load_run`, the claim and the listings return the stored state; `journal_put` returns the
-  stored payload. `run_header` is one projected read, `load_head` is one read whose `state` is the
-  head when `head_version == version` and the whole state otherwise.
+  `null`; `load_run`, `load_head`, `claim_due`, `open_run_for_conversation` and the listings return
+  the same document — the head when `head_version == version` (or when the state is the tombstone),
+  the whole state otherwise; `journal_put` returns the stored payload. `run_header` is one projected
+  read.
 * `keeps_blobs()` and `keeps_bodies()` are `true`: the five blob methods and the three body
   methods are implemented, and the crate passes `blob_conformance!` and `body_conformance!`.
 
@@ -101,9 +103,9 @@ source:
 | a constraint this adapter did not map, a misuse, anything else | `Internal` |
 
 The adapter's own refusals are `InvalidInput` (the lock, a newer schema, a bad prefix, a body index
-that is not its position) and `Corrupt` (an unknown status, a negative version, a row that
-vanished). A unique violation on a create is `AlreadyExists` or `ConversationBusy`; a foreign-key
-violation is `NotFound`.
+that is not its position) and `Corrupt` (a file that is not a SQLite database, an unknown status, a
+negative version, a row that vanished). A unique violation on a create is `AlreadyExists` or
+`ConversationBusy`; a foreign-key violation is `NotFound`.
 
 ## Tests
 
@@ -112,7 +114,8 @@ violation is `NotFound`.
   variable; the suite never skips).
 * `tests/process.rs`: a second process is refused, and a child killed with `SIGKILL` leaves a run
   this process can claim at once after `migrate`.
-* `tests/schema.rs`: a file stamped with a newer schema is refused and left untouched.
+* `tests/schema.rs`: a file stamped with a newer schema is refused and left untouched, an older one
+  upgrades, and a file that is not a SQLite database is `Corrupt`.
 
 ```sh
 cargo test -p adam-store-sqlite

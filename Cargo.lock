@@ -817,7 +817,6 @@ dependencies = [
  "rusqlite",
  "rustix",
  "serde_json",
- "tempfile",
  "tokio",
  "uuid",
 ]

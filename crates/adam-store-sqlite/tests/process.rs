@@ -144,6 +144,44 @@ fn a_second_process_is_refused_and_a_killed_ones_leases_are_claimable() {
     let _ = std::fs::remove_file(lock_of(&database));
 }
 
+/// A second name for one database file (a symlink, or a path with `..`) takes the same lock: the
+/// lock is on the file's real path, not on the spelling of the `DATABASE_URL`.
+#[cfg(unix)]
+#[test]
+fn a_second_name_for_the_same_file_is_refused() {
+    let database = unique("symlink-target");
+    let link = unique("symlink-name");
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let first = runtime.block_on(async {
+        let store = SqliteStore::open(&database).expect("open the file");
+        store.migrate().await.expect("migrate");
+        store
+    });
+    std::os::unix::fs::symlink(&database, &link).expect("a symlink to the database");
+
+    let refused =
+        SqliteStore::open(&link).expect_err("a second name for the same file must be refused");
+    assert!(
+        matches!(refused, StoreError::InvalidInput(_)),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("already open by another process"),
+        "{refused}"
+    );
+
+    // Once the first store is closed, the link opens the same file.
+    drop(first);
+    let second = SqliteStore::open(&link).expect("the link opens once the file is free");
+    drop(second);
+
+    let _ = std::fs::remove_file(&database);
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_file(lock_of(&database));
+}
+
 /// The child half of [`a_second_process_is_refused_and_a_killed_ones_leases_are_claimable`].
 /// Ignored, so only the parent's re-execution runs it.
 #[cfg(unix)]

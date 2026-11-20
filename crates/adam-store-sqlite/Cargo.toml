@@ -21,7 +21,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 adam-store-testkit.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

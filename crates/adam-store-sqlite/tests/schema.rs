@@ -68,3 +68,59 @@ fn a_newer_schema_is_refused_and_the_file_is_left_alone() {
 
     let _ = std::fs::remove_file(&database);
 }
+
+/// A file a previous release stamped with an older version is upgraded in place: the DDL is
+/// idempotent and the stamp moves to [`SCHEMA_VERSION`].
+#[test]
+fn an_older_schema_is_upgraded_in_place() {
+    let database = unique("older-schema");
+    {
+        let conn = rusqlite::Connection::open(&database).expect("a raw connection");
+        conn.execute_batch(
+            "CREATE TABLE adam_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO adam_meta (key, value) VALUES ('schema_version', '0');",
+        )
+        .expect("stamp an older version");
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    runtime.block_on(async {
+        let store = SqliteStore::open(&database).expect("open the older file");
+        store.migrate().await.expect("an older schema upgrades");
+    });
+    assert_eq!(
+        read_version(&database),
+        SCHEMA_VERSION.to_string(),
+        "the upgrade stamps this binary's version"
+    );
+
+    let _ = std::fs::remove_file(&database);
+}
+
+/// A file that is not a SQLite database is a **corrupt** store (exit 70), not a configuration
+/// mistake (exit 78): the bytes are damaged, and no `DATABASE_URL` fixes them.
+#[test]
+fn a_corrupt_file_is_refused_as_corrupt() {
+    let database = unique("corrupt");
+    std::fs::write(
+        &database,
+        b"this is not a SQLite database, and the header says so: ".repeat(8),
+    )
+    .expect("write a corrupt file");
+
+    let error = SqliteStore::open(&database).expect_err("a corrupt file must be refused");
+    assert_eq!(error.class(), ErrorClass::Corrupt, "{error:?}");
+    assert!(
+        error.to_string().contains("not a database"),
+        "the message says what is wrong: {error}"
+    );
+
+    let _ = std::fs::remove_file(&database);
+    let _ = std::fs::remove_file(lock_of(&database));
+}
+
+fn lock_of(path: &Path) -> PathBuf {
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    PathBuf::from(lock)
+}

@@ -20,6 +20,10 @@
 //! `<prefix>meta` (the schema version). One open run per conversation is a partial unique index,
 //! and a listing pages on `(updated_at, id)` with a keyset.
 //!
+//! A reader sees the **head** when it is current (`head_version = version`, or the state is the
+//! tombstone) and the whole state otherwise (ADR 0055): `load_run`, `load_head`, `claim_due`,
+//! `open_run_for_conversation` and `list_runs` answer that one document.
+//!
 //! # Concurrency
 //!
 //! Every call runs on a blocking thread ([`tokio::task::spawn_blocking`]) and takes the one
@@ -75,7 +79,11 @@ const BODY_GC_GRACE: jiff::SignedDuration = jiff::SignedDuration::from_hours(1);
 /// Purge deletes in batches of this many runs.
 const PURGE_BATCH: i64 = 500;
 
-const RUN_COLUMNS: &str = "id, agent, conversation_id, parent_id, status, state, wake_at, version, created_at, updated_at";
+const RUN_COLUMNS: &str = "id, agent, conversation_id, parent_id, status, \
+    CASE WHEN json_type(head) = 'object' \
+              AND (head_version = version OR state = 'null') \
+         THEN head ELSE state END AS state, \
+    wake_at, version, created_at, updated_at";
 const RUN_METADATA_COLUMNS: &str =
     "id, agent, conversation_id, parent_id, status, wake_at, version, created_at, updated_at";
 const RUN_HEADER_COLUMNS: &str = "id, agent, conversation_id, parent_id, status, wake_at, version, created_at, updated_at, lease_until";
@@ -124,21 +132,21 @@ impl SqliteStore {
             Connection::open(path)
         }
         .map_err(|e| {
-            StoreError::InvalidInput(format!(
-                "opening the SQLite database {}: {e}",
-                path.display()
-            ))
+            let what = format!("opening the SQLite database {}: {e}", path.display());
+            opening_error(e, what)
         })?;
         // A foreign key is what deletes a run's journal, push configurations, body rows and blob
         // references with it, and what refuses a journal entry or push configuration of no run.
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
             .map_err(|e| {
-                StoreError::InvalidInput(format!("setting the pragmas of {}: {e}", path.display()))
+                let what = format!("setting the pragmas of {}: {e}", path.display());
+                opening_error(e, what)
             })?;
         if !memory {
             conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
                 .map_err(|e| {
-                    StoreError::InvalidInput(format!("putting {} in WAL mode: {e}", path.display()))
+                    let what = format!("putting {} in WAL mode: {e}", path.display());
+                    opening_error(e, what)
                 })?;
         }
         Ok(Self {
@@ -220,11 +228,37 @@ fn valid_prefix(prefix: &str) -> bool {
         && !prefix.starts_with(|c: char| c.is_ascii_digit())
 }
 
-/// The lock path of a database file: `<path>.lock`.
+/// The lock path of a database file: `<path>.lock`, named after the file's **real** path when it
+/// can be resolved, so two names for one file (a symlink, `..`, a relative and an absolute path)
+/// take one lock. The file may not exist yet: the parent directory is resolved then.
 fn lock_path(path: &Path) -> PathBuf {
-    let mut lock = path.as_os_str().to_os_string();
+    let resolved = std::fs::canonicalize(path).or_else(|_| {
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        std::fs::canonicalize(parent).map(|parent| match path.file_name() {
+            Some(name) => parent.join(name),
+            None => parent,
+        })
+    });
+    let base = resolved.unwrap_or_else(|_| path.to_path_buf());
+    let mut lock = base.as_os_str().to_os_string();
     lock.push(".lock");
     PathBuf::from(lock)
+}
+
+/// The error of opening a file or setting its pragmas: a file that is not a database is a
+/// **corrupt** store (`Corrupt`, exit 70), not a configuration mistake (exit 78); every other
+/// refusal is the path or a pragma the process cannot use (`InvalidInput`).
+fn opening_error(err: rusqlite::Error, what: String) -> StoreError {
+    match classify(err) {
+        StoreError::Backend {
+            class: ErrorClass::Corrupt,
+            ..
+        } => StoreError::Corrupt(what),
+        _ => StoreError::InvalidInput(what),
+    }
 }
 
 /// Take an exclusive advisory lock on `<path>.lock`, or say who holds it.
@@ -567,14 +601,7 @@ impl Store for SqliteStore {
         self.blocking(move |conn, sql| {
             query_optional(
                 conn,
-                &format!(
-                    "SELECT id, agent, conversation_id, parent_id, status,
-                            CASE WHEN head_version = version AND head IS NOT NULL
-                                 THEN head ELSE state END AS state,
-                            wake_at, version, created_at, updated_at
-                       FROM {} WHERE id = ?",
-                    sql.runs
-                ),
+                &format!("SELECT {RUN_COLUMNS} FROM {} WHERE id = ?", sql.runs),
                 &[Value::Text(id.to_string())],
                 run_from_row,
             )
