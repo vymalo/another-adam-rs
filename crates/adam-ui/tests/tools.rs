@@ -537,6 +537,38 @@ async fn a_catalog_whose_digest_is_not_what_was_announced_is_never_used() {
     assert_eq!(server.catalog_requests().len(), 1);
 }
 
+/// The endpoint gives a well-formed catalog of **another id** than the one this turn's renderer offers:
+/// it is not used (the offer decides, not the endpoint), and nothing is kept.
+#[tokio::test]
+async fn a_catalog_that_was_read_again_must_be_one_the_renderer_offered() {
+    let c = claimed();
+    let mut other = document();
+    other["catalogId"] = json!("https://example.test/another-catalog");
+    let other_claimed = Claimed {
+        catalog_id: "https://example.test/another-catalog".to_owned(),
+        version: c.version,
+        digest: catalog_digest(&other).unwrap(),
+    };
+    let server = endpoint_with_catalog(&other, &other_claimed).await;
+    let ui = ui();
+    let (question, interface) = needs_input(
+        tool(&ui, "ask_user")
+            .call(
+                &ctx(
+                    "ask_user",
+                    "c1",
+                    ref_context(&c, Some((&server.url("t1"), "tok", future()))),
+                ),
+                three_questions(),
+            )
+            .await,
+    );
+    assert_eq!(server.catalog_requests().len(), 1, "it was asked");
+    assert!(interface.is_none(), "drawn with a catalog nobody offered");
+    assert!(question.contains("1. Which database?"));
+    assert!(ui.cache().is_empty());
+}
+
 #[tokio::test]
 async fn a_process_that_has_the_digest_needs_neither_the_message_nor_the_endpoint() {
     let c = claimed();

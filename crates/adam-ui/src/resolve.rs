@@ -232,6 +232,14 @@ impl UiState {
                 return Resolved::Unreadable(error);
             }
         };
+        // The renderer's offer decides, not the endpoint: a catalog of an id this turn did not offer is
+        // never drawn with, whatever it hashes to.
+        if !offered_ids(context)
+            .is_some_and(|ids| ids.contains(&fetched.claimed.catalog_id.as_str()))
+        {
+            tracing::warn!("the endpoint's catalog is not one the renderer offered this turn");
+            return Resolved::NotOffered;
+        }
         let Some(document) = fetched.document else {
             return Resolved::Unreadable(
                 "the endpoint said the catalog is unchanged, but this process holds none".into(),
