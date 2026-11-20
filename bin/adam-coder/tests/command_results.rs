@@ -8,14 +8,15 @@ mod common;
 
 use std::sync::Arc;
 
+use adam_coder::tools::background::{StartCommand, StopCommand};
 use adam_coder::tools::inspect::RunCommand;
 use adam_coder::tools::make::Run;
 use adam_coder::tools::named::{named_in, without_untrusted};
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::scratch::{PublishScratch, StartScratch};
-use adam_llm_agent::{Tool, ToolCtx, ToolOutput};
+use adam_llm_agent::{KeptStore, Tool, ToolCtx, ToolOutput, output_id_of};
 use adam_runtime::{CollectingSink, RunEvent};
-use common::Fixture;
+use common::{Fixture, GITHUB_TOKEN};
 use serde_json::{Value, json};
 
 /// What `run_command` says after it undid a change, up to the command's output.
@@ -55,11 +56,25 @@ struct Rig {
 
 impl Rig {
     async fn new() -> Self {
-        let fx = Fixture::new().await;
+        Self::from(Fixture::new().await)
+    }
+
+    fn from(fx: Fixture) -> Self {
         let sink = CollectingSink::new();
-        let ctx =
-            ToolCtx::detached("tool", "call-1", Arc::new(sink.clone())).with_state(fx.env.clone());
+        let ctx = Self::ctx_of(&fx, "call-1", &sink);
         Self { fx, sink, ctx }
+    }
+
+    /// A call `call` of a run, as the agent makes it: the tools and the kept outputs.
+    fn ctx_of(fx: &Fixture, call: &str, sink: &CollectingSink) -> ToolCtx {
+        ToolCtx::detached("tool", call, Arc::new(sink.clone()))
+            .with_state(fx.env.clone())
+            .with_state(Arc::new(KeptStore(fx.env.kept.clone())))
+    }
+
+    /// Another call of the same run, whose progress is not this rig's.
+    fn other_call(&self, call: &str) -> ToolCtx {
+        Self::ctx_of(&self.fx, call, &CollectingSink::new()).with_root_run(self.ctx.run_id())
     }
 
     /// The person says `text`: what the agent records in the run notes before each step.
@@ -127,9 +142,21 @@ impl Rig {
         self.call(&RunCommand, args, 0).await
     }
 
-    /// `run` with `args`, which ran: the epoch moved by one, refused or not.
+    /// `run` with `args`, whose command ran: the epoch moved by exactly one, whether the answer is
+    /// a result or a refusal that came after the command (git touched or unreadable, a missing tool).
     async fn make(&self, args: Value) -> ToolOutput {
         self.call(&Run, args, 1).await
+    }
+
+    /// `run` with `args`, refused before its command ran (no slot, a reference, a bad argument, a
+    /// worktree that cannot be snapshotted or whose `HEAD` is not the run's): the epoch did not move.
+    async fn make_refused(&self, args: Value) -> ToolOutput {
+        self.call(&Run, args, 0).await
+    }
+
+    /// The run's own branch, `agent/...`.
+    fn own_branch(&self) -> String {
+        common::git(&self.worktree(), &["symbolic-ref", "--short", "HEAD"])
     }
 }
 
@@ -176,7 +203,7 @@ async fn run_command_that_outlives_its_timeout_is_killed_and_says_so() {
 #[tokio::test]
 async fn run_command_undoes_and_refuses_a_change_to_a_tracked_file() {
     let rig = Rig::prepared().await;
-    let command = "sed -i 's/widgets/gadgets/' README.md";
+    let command = "printf 'gadgets\\n' > README.md";
     let out = rig.look(json!({ "command": command })).await;
     assert!(out.is_error);
     assert_eq!(out.content, undone_look(command));
@@ -511,4 +538,447 @@ async fn run_in_a_scratch_project_adds_the_published_note_once_published() {
         ]
     );
     assert_eq!(rig.epoch().await, 2);
+}
+
+// ------------------------------------------------ both: what every answer shares
+
+/// A secret of the process is scrubbed from the `$` line, the output and the progress lines, short
+/// output included.
+#[tokio::test]
+async fn both_tools_scrub_a_secret_from_the_command_the_output_and_the_progress() {
+    let rig = Rig::prepared().await;
+    let command = format!("echo {GITHUB_TOKEN}");
+    let looked = rig.look(json!({ "command": command })).await;
+    assert!(!looked.is_error);
+    assert_eq!(
+        looked.content,
+        "$ echo [redacted]\nexit code 0\n--- output ---\n[redacted]\n"
+    );
+    let made = rig.make(json!({ "command": command })).await;
+    assert!(!made.is_error);
+    assert_eq!(
+        made.content,
+        "$ echo [redacted]\nexit code 0\n--- output ---\n[redacted]\n(git sees no change in the \
+         worktree; files the project ignores are kept too, and are not listed)\n"
+    );
+    assert_eq!(
+        rig.progress(),
+        [
+            "running: echo [redacted]",
+            "running: echo [redacted]",
+            "ran: echo [redacted]",
+        ]
+    );
+}
+
+/// The repeat key says how a command ended (`exit:<code>`, `timeout`, `signal`) and is not set for
+/// a command that passed, nor for a refusal.
+#[tokio::test]
+async fn both_tools_give_the_repeat_key_of_how_the_command_ended() {
+    let rig = Rig::prepared().await;
+    const NO_CHANGE: &str = "(git sees no change in the worktree; files the project ignores are \
+                             kept too, and are not listed)\n";
+    let cases = [
+        (json!({"command": "true"}), "$ true\nexit code 0\n", None),
+        (
+            json!({"command": "exit 3"}),
+            "$ exit 3\nexit code 3\n",
+            Some("exit:3"),
+        ),
+        (
+            json!({"command": "sleep 60", "timeout": 2}),
+            "$ sleep 60\ntimed out (the command was killed)\n",
+            Some("timeout"),
+        ),
+        (
+            json!({"command": "kill -KILL $$"}),
+            "$ kill -KILL $$\nkilled by a signal\n",
+            Some("signal"),
+        ),
+    ];
+    for (args, said, key) in &cases {
+        let looked = rig.look(args.clone()).await;
+        assert!(!looked.is_error, "{args}");
+        assert_eq!(
+            looked.content,
+            format!("{said}--- output ---\n\n"),
+            "{args}"
+        );
+        assert_eq!(
+            looked.repeat_key.as_deref().map(String::as_str),
+            *key,
+            "{args}"
+        );
+        let made = rig.make(args.clone()).await;
+        assert!(!made.is_error, "{args}");
+        assert_eq!(
+            made.content,
+            format!("{said}--- output ---\n\n{NO_CHANGE}"),
+            "{args}"
+        );
+        assert_eq!(
+            made.repeat_key.as_deref().map(String::as_str),
+            *key,
+            "{args}"
+        );
+    }
+    // Refusals: before the command ran, and after it (a change undone).
+    for out in [
+        rig.look(json!({"command": " "})).await,
+        rig.make_refused(json!({"command": " "})).await,
+        rig.look(json!({"command": "echo x > README.md; exit 3"}))
+            .await,
+        rig.make(json!({"command": "git branch zz; exit 3"})).await,
+    ] {
+        assert!(out.is_error, "{}", out.content);
+        assert_eq!(out.repeat_key, None, "{}", out.content);
+    }
+}
+
+/// A refused command's output follows the refusal.
+#[tokio::test]
+async fn a_refusal_shows_what_the_command_printed() {
+    let rig = Rig::prepared().await;
+    for command in ["echo said; echo x > README.md", "echo said; git branch zz"] {
+        let out = rig.look(json!({ "command": command })).await;
+        assert!(out.is_error, "{command}");
+        assert_eq!(out.content, format!("{}said\n", undone_look(command)));
+    }
+    let command = "echo said; git branch zz";
+    let out = rig.make(json!({ "command": command })).await;
+    assert!(out.is_error);
+    assert_eq!(
+        out.content,
+        format!(
+            "`{command}` changed git (HEAD, the branch, a ref, `.git` or the git configuration), \
+             and `run` may change files and nothing of git. Everything it did was undone, its files \
+             included: the worktree is exactly as it was. Commit with commit_and_push, and run the \
+             command again without the git part. Output of the command, for what it is worth:\n\
+             said\n"
+        )
+    );
+}
+
+/// Output over `check_output_tail` (64 bytes here) is shown as its head and its tail, and kept.
+#[tokio::test]
+async fn long_output_is_shown_as_its_head_and_tail_and_kept() {
+    let rig = Rig::from(Fixture::with(|s| s.check_output_tail = 64).await);
+    rig.prepare().await;
+    // The id is made from the run's id, which is new in every test: it is the call's, computed.
+    let id = output_id_of(&rig.ctx);
+    let view = format!(
+        "$ seq 1 200\nexit code 0\n--- output: 692 bytes, head and tail shown, kept as {id} ---\n\
+         1\n2\n3\n4\n5\n6\n7\n8\n[... 632 bytes not shown ...]\n\
+         190\n191\n192\n193\n194\n195\n196\n197\n198\n199\n200\n\
+         [more: 200 lines are kept as {id}; read_output {{\"id\":\"{id}\"}} reads them page by page]\n"
+    );
+    let looked = rig.look(json!({"command": "seq 1 200"})).await;
+    assert!(!looked.is_error);
+    assert_eq!(looked.content, view);
+    let made = rig.make(json!({"command": "seq 1 200"})).await;
+    assert!(!made.is_error);
+    assert_eq!(
+        made.content,
+        format!(
+            "{view}(git sees no change in the worktree; files the project ignores are kept too, \
+             and are not listed)\n"
+        )
+    );
+}
+
+/// `run_command` answers a missing tool as `run` does, and a tool the project brings itself with
+/// the project's install command.
+#[tokio::test]
+async fn run_command_says_a_tool_is_missing_or_a_dependency_of_the_project() {
+    let rig = Rig::prepared().await;
+    let missing = rig
+        .look(json!({"command": "no-such-toolchain build"}))
+        .await;
+    assert!(missing.is_error);
+    assert_eq!(missing.content, MISSING);
+
+    let dir = rig.worktree();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"devDependencies": {"zzz-local-tool": "1"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("pnpm-lock.yaml"), "").unwrap();
+    let dependency = rig.look(json!({"command": "zzz-local-tool --run"})).await;
+    assert!(dependency.is_error);
+    assert_eq!(
+        dependency.content,
+        "`zzz-local-tool` is not on the PATH, but it is one of this project's own dependencies, \
+         which are not installed in the workspace yet: that is not a missing toolchain and not a \
+         failing check (no check cycle was used, nothing was recorded as a check). Install the \
+         project's dependencies with its own command (`pnpm install`), with run (not run_checks: \
+         that is only for the project's real checks), then run this again. Only if that fails, \
+         tell the person with ask_user."
+    );
+    assert_eq!(
+        rig.progress(),
+        [
+            "running: no-such-toolchain build",
+            "the workspace lacks a tool",
+            "running: zzz-local-tool --run",
+            "the workspace lacks a tool",
+        ]
+    );
+}
+
+/// A reference is read by `run_command` and never written by `run`.
+#[tokio::test]
+async fn a_reference_is_looked_at_and_never_made_in() {
+    let fx = Fixture::new().await;
+    let design = fx.extra_remote("design", &[("tokens.css", "--blue: #00f;\n")]);
+    let fx = fx.referencing(vec![adam::agent_fs::ReferenceDef {
+        name: "design".into(),
+        url: design.to_string_lossy().into_owned(),
+        branch: None,
+        description: "Tokens".into(),
+    }]);
+    let rig = Rig::from(fx);
+    rig.prepare().await;
+    let looked = rig
+        .look(json!({"command": "cat tokens.css", "repo": "design"}))
+        .await;
+    assert!(!looked.is_error);
+    assert_eq!(
+        looked.content,
+        "$ cat tokens.css\nexit code 0\n--- output ---\n--blue: #00f;\n"
+    );
+    let made = rig
+        .make_refused(json!({"command": "true", "repo": "design"}))
+        .await;
+    assert!(made.is_error);
+    assert_eq!(
+        made.content,
+        "`design` is a reference: it is read and never changed, so nothing is written, committed, \
+         pushed or opened there. Read it with read_file, list_files, find_files or search_files \
+         (`repo: design`). If the task needs a change to that repository, it is not a reference \
+         any more: the person names it, or you ask with request_repository, and prepare_workspace \
+         gives it a slot of its own."
+    );
+    assert_eq!(
+        rig.progress(),
+        [
+            "checking out the reference design (main)",
+            "running: cat tokens.css"
+        ]
+    );
+}
+
+/// `HEAD` off the run's own branch: neither tool runs anything.
+#[tokio::test]
+async fn a_head_off_the_runs_branch_is_refused_by_both_tools() {
+    let rig = Rig::prepared().await;
+    let own = rig.own_branch();
+    common::git(&rig.worktree(), &["checkout", "--quiet", "--detach"]);
+    let refusal = format!(
+        "HEAD of this worktree is on no branch (it is detached), not on the run's own branch \
+         {own}: something moved it (it is a file that commands of the run can write). Nothing was \
+         run, because a command that changes git could not be undone here. Do not try to move \
+         HEAD back with git; tell the person."
+    );
+    let looked = rig.look(json!({"command": "ls"})).await;
+    assert!(looked.is_error);
+    assert_eq!(looked.content, refusal);
+    let made = rig.make_refused(json!({"command": "ls"})).await;
+    assert!(made.is_error);
+    assert_eq!(made.content, refusal);
+    assert!(rig.progress().is_empty(), "{:?}", rig.progress());
+}
+
+/// A command after which git cannot be read (it deleted the run's branch) is undone by both; a
+/// worktree that cannot be read before is refused by both, and nothing runs.
+#[tokio::test]
+async fn git_that_cannot_be_read_after_or_before_the_command() {
+    let rig = Rig::prepared().await;
+    let own = rig.own_branch();
+    let command = format!("git update-ref -d refs/heads/{own}");
+    let made = rig.make(json!({ "command": command })).await;
+    assert!(made.is_error);
+    assert_eq!(
+        made.content,
+        format!(
+            "After `{command}` the state of the worktree's git could not be read, so it is not \
+             known whether the command changed git; to be safe it was treated as if it had, since \
+             `run` may change files and nothing of git. Everything it did was undone, its files \
+             included: the worktree is exactly as it was. If the command touches git (HEAD, the \
+             branch, a ref, `.git` or the git configuration), commit with commit_and_push and run \
+             it again without the git part; if it does not, try it again, and if this persists, \
+             tell the person. Output of the command, for what it is worth:\n"
+        )
+    );
+    let looked = rig.look(json!({ "command": command })).await;
+    assert!(looked.is_error);
+    assert_eq!(looked.content, undone_look(&command));
+    assert_eq!(
+        rig.progress(),
+        [
+            format!("running: {command}"),
+            format!("could not check git after: {command}; undid it"),
+            format!("running: {command}"),
+            format!("undid a change made by: {command}"),
+        ]
+    );
+
+    // Now deleted by hand: `HEAD` names nothing, and the snapshot before the command fails.
+    common::git(
+        &rig.worktree(),
+        &["update-ref", "-d", &format!("refs/heads/{own}")],
+    );
+    let looked = rig.look(json!({"command": "ls"})).await;
+    assert!(looked.is_error);
+    assert_eq!(
+        looked.content,
+        "Cannot look at the worktree: the state of the worktree cannot be read. Nothing was run, \
+         because a command that might change the worktree cannot be undone. Try again; if it \
+         persists, tell the person."
+    );
+    let made = rig.make_refused(json!({"command": "ls"})).await;
+    assert!(made.is_error);
+    assert_eq!(
+        made.content,
+        "Cannot look at the worktree: the state of the worktree cannot be read. Nothing was run, \
+         because a command that might change git cannot be undone. Try again; if it persists, tell \
+         the person."
+    );
+    assert_eq!(rig.progress().len(), 4, "nothing ran: {:?}", rig.progress());
+}
+
+/// A command that keeps running in the slot is named after every refusal.
+#[tokio::test]
+async fn a_refusal_names_the_commands_that_keep_running_in_the_slot() {
+    let rig = Rig::prepared().await;
+    let start = rig.other_call("start-1");
+    let started = StartCommand
+        .call(
+            &start,
+            json!({"command": "echo ready; sleep 630", "wait_for": "ready", "wait": 20}),
+        )
+        .await
+        .unwrap();
+    assert!(!started.is_error, "{}", started.content);
+    // Its id is made from the run's id, new in every test: computed from the call that started it.
+    let id = output_id_of(&start);
+    let note = format!(
+        "\nCommands that keep running are writing in this slot, and what they write is not undone: \
+         {id} (echo ready; sleep 630). Stop one with stop_command when it is the cause."
+    );
+
+    let looked = rig.look(json!({"command": "echo x > README.md"})).await;
+    assert!(looked.is_error);
+    assert_eq!(
+        looked.content,
+        format!("{}{note}", undone_look("echo x > README.md"))
+    );
+    let made = rig.make(json!({"command": "git branch q"})).await;
+    assert!(made.is_error);
+    assert_eq!(
+        made.content,
+        format!(
+            "`git branch q` changed git (HEAD, the branch, a ref, `.git` or the git \
+             configuration), and `run` may change files and nothing of git. Everything it did was \
+             undone, its files included: the worktree is exactly as it was. Commit with \
+             commit_and_push, and run the command again without the git part. Output of the \
+             command, for what it is worth:\n{note}"
+        )
+    );
+    // A result is not a refusal: no note.
+    let ok = rig.look(json!({"command": "true"})).await;
+    assert_eq!(ok.content, "$ true\nexit code 0\n--- output ---\n\n");
+    let stopped = StopCommand.call(&start, json!({ "id": id })).await.unwrap();
+    assert!(!stopped.is_error, "{}", stopped.content);
+}
+
+/// Over twenty changes, the list is cut and counted; a change git does not list is said.
+#[tokio::test]
+async fn run_cuts_a_long_list_of_changes_and_says_when_git_lists_none() {
+    let rig = Rig::prepared().await;
+    let command = "for i in $(seq 1 25); do echo > f$i; done";
+    let many = rig.make(json!({ "command": command })).await;
+    assert!(!many.is_error);
+    let listed: String = [
+        1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21, 22, 23, 24, 25, 3, 4,
+    ]
+    .iter()
+    .map(|i| format!("?? f{i}\n"))
+    .collect();
+    assert_eq!(
+        many.content,
+        format!(
+            "$ {command}\nexit code 0\n--- output ---\n\n{CHANGES}{listed}and 5 more\n{CHECK_AGAIN}"
+        )
+    );
+
+    // An edit of the run's put back as `HEAD` has it: the tree changed, and `git status` lists
+    // nothing. (The note says the files are ignored, which they are not; pinned as it is.)
+    let rig = Rig::prepared().await;
+    std::fs::write(rig.worktree().join("README.md"), "edited\n").unwrap();
+    let command = "printf 'widgets\\n' > README.md";
+    let none = rig.make(json!({ "command": command })).await;
+    assert!(!none.is_error);
+    assert_eq!(
+        none.content,
+        format!(
+            "$ {command}\nexit code 0\n--- output ---\n\n{CHANGES}(nothing that git lists: the \
+             files it changed are ignored by the project)\n{CHECK_AGAIN}"
+        )
+    );
+    assert_eq!(
+        rig.progress(),
+        [
+            format!("running: {command}"),
+            format!("changed files: {command}"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn run_command_looks_in_a_scratch_project() {
+    let rig = Rig::new().await;
+    let started = StartScratch
+        .call(&rig.ctx, json!({"name": "fib"}))
+        .await
+        .unwrap();
+    assert!(!started.is_error, "{}", started.content);
+    let looked = rig.look(json!({"command": "ls -a"})).await;
+    assert!(!looked.is_error);
+    assert_eq!(
+        looked.content,
+        "$ ls -a\nexit code 0\n--- output ---\n.\n..\n.git\n"
+    );
+}
+
+/// Two slots and no `repo`, and a `cwd` that does not exist: refused by both before anything runs.
+#[tokio::test]
+async fn both_tools_refuse_an_unnamed_slot_of_two_and_a_cwd_that_does_not_exist() {
+    let rig = Rig::prepared().await;
+    let started = StartScratch
+        .call(&rig.ctx, json!({"name": "fib"}))
+        .await
+        .unwrap();
+    assert!(!started.is_error, "{}", started.content);
+    let which = format!(
+        "this workspace has 2 slots: `fib` (a scratch project), `remote` ({}). Say which one with \
+         `repo` (its name, or the repository's address)",
+        rig.fx.remote_url()
+    );
+    let nowhere = "cwd `nowhere` does not exist in the worktree: No such file or directory (os \
+                   error 2)";
+    for tool in [&RunCommand as &dyn Tool, &Run] {
+        let out = rig.call(tool, json!({"command": "ls"}), 0).await;
+        assert!(out.is_error);
+        assert_eq!(out.content, which);
+        let out = rig
+            .call(
+                tool,
+                json!({"command": "ls", "cwd": "nowhere", "repo": "remote"}),
+                0,
+            )
+            .await;
+        assert!(out.is_error);
+        assert_eq!(out.content, nowhere);
+    }
 }
