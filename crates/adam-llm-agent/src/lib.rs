@@ -124,9 +124,11 @@
 //!
 //! # Observing a run
 //!
-//! `Runtime::view(run).state` deserializes into [`Conversation`]: the full
-//! history, counters, `continued_from` for a run that carries on another, and `pending_wait` while
-//! the run waits for input or for a child run.
+//! `Runtime::state(run)` deserializes into [`Conversation`]: the full history, counters,
+//! `continued_from` for a run that carries on another, and `pending_wait` while the run waits for
+//! input or for a child run. `Runtime::view(run).state` is the **head** (ADR 0055): the same
+//! `Conversation` with `messages` empty, which is what a poll of a status reads; the transcript is
+//! the body generation `Runtime::state` joins.
 //! Live progress arrives as `RunEvent`s; see [`LlmAgent`] for their shapes.
 
 #![warn(missing_docs)]

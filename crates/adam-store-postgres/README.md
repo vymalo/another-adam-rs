@@ -175,9 +175,9 @@ current, the whole state otherwise. `commit_run` with a head, a body or blob ref
 insert retried once; a live attempt's differing row is a `Conflict`), the refs are inserted, the CAS
 runs, and the commit ends. The head's `body` is patched to the resolved `{generation, len}`. The
 superseded generation is collected after the CAS, an hour of grace. A commit that loses writes
-nothing (the transaction rolls back), so a loser cannot poison the next append. `load_head` serves
-the head only when `head_version == version`; a stale head is not corrupt, the whole state is served
-and the next split rewrites it.
+nothing (the transaction rolls back), so a loser cannot poison the next append. Every read serves the head when it is current; a head behind the version is not corrupt: the state
+is served when it is the v4 envelope a v4 commit wrote (and the next split rewrites the head), and
+the head is served when the state is the tombstone (a run a pre-S3 process failed).
 
 ## Schema version and the owner column
 

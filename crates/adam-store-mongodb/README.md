@@ -168,7 +168,8 @@ more than an hour ago are deleted. A commit that loses the CAS deletes the rows 
 `writer` added (but never a row or digest the winner's head names), so a loser cannot poison the
 next append. `load_head` is one **projected** `find_one` (the head and the record's own fields,
 never `state`) when `head_version == version`; a stale, absent or null head falls back to a second,
-full read that serves the whole state.
+full read, which serves the state when it is a v4 envelope and the head when the state is the
+tombstone (a run a pre-S3 process failed).
 
 `purge_finished` deletes the purged runs' body rows with their journal and references. The body
 methods are **defaulted** on `Store`; `RunUpdate` gained the public fields `head` and `body`, so a

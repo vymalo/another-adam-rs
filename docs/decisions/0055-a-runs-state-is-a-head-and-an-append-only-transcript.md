@@ -192,9 +192,12 @@ pre-contract run still decodes.
 
 The measured drop, on the same stack and a fresh database, one run of 50 commits appending 10 KB
 each (the workload is `counting::measure_transcript_write`; `dev/p2-measure.sh` prints the disk
-side):
+side). The **Before** column is S0's workload — the whole state in `state`, which is also what the
+expand release still carried: the expand release additionally wrote the head and the body beside it,
+so its real write cost was higher than this column, not lower. The After column is the contract's
+head + body delta:
 
-| Metric | Before (expand release) | After (contract) |
+| Metric | Before (S0's workload: the whole state) | After (contract) |
 |---|---|---|
 | logical bytes written (`total_written`) | 13,290,322 | 524,320 |
 | largest commit (`max_commit`) | 521,202 | 10,521 |
@@ -209,16 +212,31 @@ side):
 The two WAL deltas are two back-to-back after runs: `pg_stat_wal` is server-wide, so a shared server
 adds its own writes, and the retained relation sizes are the stable number. The before run's body is
 empty because the old workload committed only `state`; the after run's body holds the transcript, so
-`runs + body` is 13,787,136 before and 786,432 after (17.5×). `collStats.size` reads 0 after the
+`runs + body` is 13,787,136 before and 786,432 after (17.5×). The `< 50 × 20 KB` bound the
+`transcript_measurement!` test asserts is the **wrapper's** arithmetic (the bytes a commit hands the
+store); the store's own bytes are `dev/p2-measure.sh`'s relation sizes and WAL deltas, which is why
+the PR quotes both. `collStats.size` reads 0 after the
 workload purges its run (MongoDB counts live documents), which is why the script reports
 `storageSize` and the WiredTiger counters.
 
-**The deploy boundary.** A v4 process that touches a converted run fails it (`Envelope::decode`
-refuses a head, so the run is committed `Failed`). The contract therefore ships as its own deploy:
-the operator scales the coder to zero (or relies on the default single-replica delete-then-create)
+**A split that is refused demotes, and keeps the files.** A v5 run whose step does not reconstruct
+its state (a bad `split`, a `split` that returns `None`, or a file whose bytes are not stored) writes
+the whole v4 state and no head: a head must never carry the transcript, and the next step tries
+again. Before it writes, the demotion re-reads every file the head names by digest and inlines the
+bytes into the state — a v4 state carries bytes, not references — and a missing blob refuses the
+demotion (the run is left as it is and retried) rather than writing zero-byte files.
+
+**The deploy boundary.** A v4 process that touches a converted run fails it: `Envelope::decode`
+refuses a head, so the run is committed `Failed` with `state = null`, no head and the version bumped.
+The run stays readable — the stores serve its head when the state is the tombstone, which is the
+one-line repair — but nothing steps it until a v5 binary claims it. The contract therefore ships as
+its own deploy: the operator scales the coder to zero (and, with `topology: split`, the front
+Deployment, whose default `maxSurge: 1` would otherwise start the v5 front before the v4 one stops)
 and rolls, and **no v4 process runs against the database afterwards**. A rollback to the expand
 release reads the runs the contract has not converted; a converted run's `state` is `null` and only
-a v5 binary reads it. Do not merge the contract and roll in one step.
+a v5 binary reads it. Do not merge the contract and roll in one step when the deployment renders
+this chart from `main`: the merge bumps `image.tag`; pin it in your own values first, then move the
+pin by hand.
 
 ## Consequences
 

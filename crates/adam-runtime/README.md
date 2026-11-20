@@ -76,7 +76,10 @@ keeps its whole state until its first commit under the contract, which splits it
 * `Agent::split(&state)` returns `Some((head, rows))` when the agent's state has a transcript worth
   keeping apart, and `None` (the default) when it does not. `Agent::join(head, rows)` is its inverse,
   and the invariant is `join(split(s).0, split(s).1)` re-encodes to `s`. A wrapper that delegates
-  `init` **must delegate `split` and `join` too**, or its runs silently stay in the v4 format.
+  `init` **must delegate `split` and `join` too**: a new run of a wrapper that does not silently
+  stays in the v4 format, and a **v5 run must split** — a successful step that returns `None` on a
+  current head is a refused split, and the commit demotes the run to the whole v4 state (the
+  demotion re-reads the head's file digests, so an inherited file keeps its bytes).
 * The split is taken **inside the erased step** (`src/erased.rs`), where the typed state already
   exists: the state is deserialized once, and the rows are the agent's own values.
 * A step commit that splits writes the head (`v: 5`: the agent's head, the envelope's other members,
@@ -116,9 +119,10 @@ keeps its whole state until its first commit under the contract, which splits it
 
 * `Runtime::view` reads the lease and then `Store::load_head` (one query on Memory, MongoDB and
   PostgreSQL), and decodes the record as `Stored`: `v: 1` is the v4 envelope, `v: 5` the head. A
-  stale head (`head_version != version`, left by a v4 commit in the expand release) is not an
-  error: `load_head` serves the whole state, which decodes as `Stored::Full`, and the next step
-  re-splits.
+  stale head (`head_version != version`) is not an error: when the state is the v4 envelope a v4
+  commit wrote, that state is served (it decodes as `Stored::Full`) and the next step re-splits;
+  when the state is the tombstone — a run a pre-S3 process failed, with the head behind the version
+  — the **head** is served, so the run stays readable.
 * `RunView.state` is the agent's **head** for a v5 run and the whole agent state for a v4 one. The
   pointers a front reads — `pending_wait`, `pending_question`, `question`, `usage_totals`,
   `sandbox_usage`, `context`, `session` — are in the head. `RunView.artifacts` is a
@@ -629,20 +633,25 @@ Two cases pin the header path: `a_header_is_one_store_call` (`Runtime::header` i
 nor the lease beside it) and `the_cancel_watch_polls_at_its_own_interval` (a 2.5 s step at a 1 s cancel interval reads the
 header about twice, not once per 20 ms worker poll; the watch reads no state at all).
 
-Five cases pin the shadow's writes: `a_step_that_splits_writes_the_head_and_the_body_beside_the_state` (the first commit
-writes a `v: 5` head and starts a generation, the done commit appends to it, one generation holds the transcript, and
-`state` is still the whole v4 envelope), `a_split_that_does_not_reconstruct_the_state_writes_the_state_only` (a
-deliberately wrong split is refused: no head, no rows, the run stays v4), `every_state_written_is_a_v4_envelope_and_a_head_is_not_one`
-(the frozen `tests/common/v4.rs` decodes every state a create, a step, a delivery and a finish wrote, and rejects the
-head), `a_pre_e_file_artifact_is_uploaded_before_the_head_names_it` (a run created directly with a file artifact in its
-state but no blob uploads and references its digest on the first commit, and the head names it) and
-`a_split_whose_file_is_not_stored_writes_the_state_only` (a failed `put_blob` refuses the head, and the commit writes the
-state only).
+Seven cases pin the contract's writes: `a_step_that_splits_writes_the_head_and_the_body_and_the_tombstone` (the first
+commit writes a `v: 5` head and starts a generation, the done commit appends to it, one generation holds the transcript,
+and `state` is `null`), `a_split_that_does_not_reconstruct_the_state_writes_the_state_only` (a deliberately wrong split
+is refused: no head, no rows, the run stays v4), `a_refused_split_on_a_v5_run_writes_the_whole_state_and_no_head` (the
+same on a run that is already v5: the run demotes instead of writing the transcript into a head),
+`a_contract_run_writes_the_tombstone_and_a_pre_contract_state_still_reads` (the frozen `tests/common/v4.rs` rejects the
+tombstone and a v5 head, and a seeded v4 run still decodes), `a_v5_run_whose_split_is_none_demotes_to_the_whole_state`
+(a step whose `split` returns `None` on a v5 run is a refused split), `a_refused_split_keeps_the_inherited_files_bytes`
+(the demotion re-reads the head's file digests, so the v4 state carries the bytes) and
+`a_failed_transition_keeps_its_artifact_in_the_head` (a permanent failure's artifact is named by the carried head);
+`a_pre_e_file_artifact_is_uploaded_before_the_head_names_it` and
+`a_split_whose_file_is_not_stored_writes_the_state_only` pin the upload gate, and
+`a_store_that_keeps_no_bodies_never_gets_a_head` pins the `keeps_bodies` gate.
 
 Eight cases here pin the read path, and two in `adam-a2a-runtime`: `the_view_reads_the_head_and_the_state_joins_the_body`
 (a 50-message run of 10 KB turns: the view is one `load_head`, no `load_run`, no `body_list`, and less than 2 KB of state;
 `Runtime::state` is one `load_head`, one `body_list` and all 50 messages), `a_stale_head_falls_back_to_the_whole_state`
-(a delivery leaves the head stale: the view is the whole state, no body is read, and the next step rewrites the head),
+(a **v4 commit** — what a process of the expand release writes — leaves the head stale: the view is the whole state, no
+body is read, and the next step rewrites the head; a delivery writes the head it read and does not stale it),
 `a_v4_runs_view_is_the_whole_state` (a run that never split serves its whole agent state, and `Runtime::state` reads no
 body), `state_re_reads_a_moved_head_and_joins_its_new_generation` (a compaction between the first `load_head` and
 `body_list`: one re-read, the new head and generation, every message), `state_is_corrupt_when_the_body_is_short_twice`

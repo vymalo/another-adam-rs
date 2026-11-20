@@ -34,7 +34,8 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 **A file is fetched once.** The backend resolves a view's artifacts for the wire
 (`RuntimeTaskBackend::task_of`): each file's blob is read once and cached by content address in the
 runtime (32 MiB, least recently used first), so a poll of an unchanged task reads the head and no
-file **when the head is current; a stale one serves the whole state**. `GetTask`, a subscription's
+file **when the head is current; a stale one serves the state (a v4 run) or the head (a
+tombstoned run)**. `GetTask`, a subscription's
 snapshot and a stream's artifact event all go through that cache; a missing blob is logged and left
 out of that artifact only. The status, the prompt, the usage, the tier and the sessions object read
 the same pointers from the **head**, so a poll reads no body.

@@ -169,24 +169,34 @@ Render-time guards stop a bad combination at `helm template`, not at rollout (`t
 ADR 0055 shipped in two releases. The **expand** release (S0–S2b) writes the whole v4 `state`
 beside the head, so a v4 process and a v5 one can both step a run; the **contract** release (S3)
 writes `state = null` (the tombstone), the head and the body, and every read serves the head. A v4
-process that touches a converted run **fails it** (`Envelope::decode` refuses a head, so the run is
-committed `Failed`): there is no fence inside a v4 binary that would make it refuse first.
+process that touches a converted run **fails it**: its `Envelope::decode` refuses a head, so it
+commits the run `Failed` with `state = null`, no head and the version bumped — the run stays readable
+(the store serves its head, which is the one-line repair), but nothing steps it until the contract
+binary claims it, and there is no fence inside a v4 binary that would make it refuse first.
 
 So the rollout from an expand-release image to a contract-release image is a **deploy boundary**, not
 an ordinary `helm upgrade`:
 
 1. Confirm no process still runs an expand-release image against this database — the front and every
-   worker. The default chart is one StatefulSet, one replica: its `RollingUpdate` deletes the pod
-   before it creates the next, so the old image is gone before the new one starts. A deployment that
-   ran more than one worker, or a pinned old image somewhere else, must be scaled to zero first.
+   worker. With the default chart (one StatefulSet, one replica) `RollingUpdate` deletes the pod
+   before it creates the next, so the old image is gone before the new one starts. With
+   `topology: split` the front is a **Deployment** whose default `maxSurge: 1` starts the v5 pod and
+   waits for it to be Ready **before** it terminates the v4 one: scale it out of the way first,
+   `kubectl -n another-agentic-system scale deploy <fullname>-front --replicas=0` (the chart names it
+   `<fullname>-front`: `coder-front` for a release named `coder`), and scale it back after the worker
+   rolls. A deployment that ran
+   more than one worker, or a pinned old image somewhere else, must be scaled to zero the same way.
 2. Roll the new image (`helm upgrade --install …`). The store's `migrate()` runs first and is
    idempotent; PostgreSQL's schema is version 6.
 3. Do not roll back to the expand release after a run has committed under the contract: its `state`
    is `null` and only a v5 binary reads it. A rollback is safe only for runs the contract has not
    converted.
 
-Do **not** merge the contract and roll it in one step: the merge is what makes the next image
-available, and the roll is the window.
+Do **not** merge the contract and roll it in one step when your deployment renders this chart from
+`main`: the merge bumps `image.tag`, so the roll would follow the merge by itself. Pin `image.tag`
+(and digest) in your own values **before** merging, merge, then move the pin by hand after the old
+processes are gone — the chart's bump is a convenience for a deployment that does not need the
+boundary.
 
 ## Verify
 

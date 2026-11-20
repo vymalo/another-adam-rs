@@ -930,7 +930,7 @@ erDiagram
         text conversation_id "null: no conversation"
         uuid parent_id "null: not a child run"
         text status "runnable, parked, done, failed"
-        jsonb state "the Envelope"
+        jsonb state "the Envelope, or null (the tombstone)"
         jsonb head "the v5 head"
         bigint head_version "the version the head was written at"
         timestamptz wake_at
@@ -1072,7 +1072,9 @@ than the insert→CAS gap of a live attempt (milliseconds; the default lease is 
 distinguishes a dead attempt from a live one without trusting the lease. The runtime reconstructs
 `join(head, rows)` before every commit and
 refuses a split that does not equal the state, which keeps a bad split at `state` only. A **stale**
-head is not an error: the whole state is served, and the next step re-splits and rewrites the head.
+head is not an error: the state is served when it is the v4 envelope a v4 commit wrote, and the next
+step re-splits and rewrites the head; a **tombstoned** run (`state = null`, the head behind the
+version — a pre-S3 process failed a converted run) serves the head, so it stays readable.
 `Runtime::view`
 decodes either document (`Stored`: `v: 1` or `v: 5`), so an observer of a v4 run and of a v5 one
 gets the same `RunView` shape; `RunView.state` is the agent's **head** and `RunView.artifacts` is a
@@ -1092,7 +1094,10 @@ the contract is a separate deploy (see [deploy the coder](guides/deploy-the-code
 `deferred`, `artifacts`, `announced`, `source_notes`, `continued_from`, `omitted_turns`, `context` and
 `read_ids`. Every field has a serde default, so older state still loads. Its `split` puts `messages`
 in the body and everything else in the head; `Agent::split`/`join` default to no split, and a wrapper
-that delegates `init` must delegate them too, or its runs stay in the v4 format.
+that delegates `init` must delegate them too: a new run of a wrapper that does not stays in the v4
+format, and a **v5 run must split** — a successful step that returns `None` on a current head is a
+refused split, so the commit demotes the run to the whole v4 state (a demotion re-reads the head's
+file digests, so the files keep their bytes) rather than writing the transcript into the head.
 
 Not stored, by design: `RunEvent`s (`Status`, `Progress`, `Step`, `TextDelta`, `ReasoningDelta`,
 `Custom`, `Artifact`) are live and may be lost (a short in-memory replay per run covers a late subscriber, see

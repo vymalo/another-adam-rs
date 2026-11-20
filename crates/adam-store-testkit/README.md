@@ -32,7 +32,7 @@ after a commit that names a different one), a shared
   `BLOB_SUITE` lock, which the cases that purge take too); under nextest, where each test is its own
   process, `.config/nextest.toml` puts the same cases in one single-thread group. Runs are still
   isolated by agent name. `make` is the same `async fn() -> Option<DynStore>` as above.
-* `body_conformance!(make)` generates one `#[tokio::test]` per body case (10 cases: an append writes
+* `body_conformance!(make)` generates one `#[tokio::test]` per body case (14 cases: an append writes
   only the rows after the head's `len`, so a generation holds the transcript once; the generation
   is stable across appends; a compaction starts a new generation and `gc_body` collects the old one
   with an explicit cutoff; a stale version is a `Conflict` (a real insert-then-lose race is the
@@ -41,7 +41,9 @@ after a commit that names a different one), a shared
   committed again adds no row; a non-contiguous index is refused; a purge removes the rows; an
   unknown generation is empty; a NUL in a head and in a row is stored as U+FFFD; every read serves
   the current head — `load_run`, `load_head`, `claim_due`, `open_run_for_conversation` and
-  `list_runs` — and a stale head serves the whole state). Every case asserts `keeps_bodies()`: a store that keeps none is
+  `list_runs`; a stale head serves the state; a tombstoned run whose head is behind the version
+  serves the head (the repair of a run a pre-S3 process failed); and a head that is JSON `null` is
+  not a head). Every case asserts `keeps_bodies()`: a store that keeps none is
   not given this suite. The purge and compaction cases take the `BLOB_SUITE` lock because
   `purge_finished` sweeps blobs in the same call. `make` is the same
   `async fn() -> Option<DynStore>` as above.
@@ -54,8 +56,10 @@ after a commit that names a different one), a shared
   `counting::measure_transcript_write` through `make`, prints its `p2-measure:` line and asserts the
   S0 bound — the 50 commits write under `50 × 20 KB` in all, and no commit writes over `20 KB`. The
   workload commits the contract shape (the tombstone, a head and the body rows; the store appends
-  the delta). `make` is the same `async fn() -> Option<DynStore>` as above; `None`, or a store that
-  keeps no bodies, skips it.
+  the delta). The bound is the **wrapper's** arithmetic — the bytes a commit hands the store — not
+  the adapter's: the store's own bytes are `dev/p2-measure.sh`'s relation sizes and WAL deltas, which
+  a PR quotes beside it. `make` is the same `async fn() -> Option<DynStore>` as above; `None`, or a
+  store that keeps no bodies, skips it.
 * `cases::*`: the cases as plain async functions taking a `DynStore`, for
   harnesses that do not use the macro.
 * `counting::CountingStore`: wraps a `DynStore` and counts calls per `fault::Method` and the

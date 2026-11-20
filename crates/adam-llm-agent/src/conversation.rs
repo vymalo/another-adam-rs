@@ -122,8 +122,8 @@ pub(crate) fn parse_context(payload: &Value) -> Option<&Map<String, Value>> {
 /// A tool call that asked the user a question and waits for the answer.
 ///
 /// One kind of [`PendingWait`], stored in [`Conversation::pending_wait`], so it
-/// is visible in the durable run view (`RunView::state`) while the run is
-/// parked.
+/// is visible in the durable run view (`RunView::state`, the head) while the run
+/// is parked.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingQuestion {
     /// The tool call the answer will be returned for.
@@ -323,9 +323,10 @@ pub struct LimitHit {
 /// The state of an [`LlmAgent`](crate::LlmAgent) run: the persisted history
 /// plus the bookkeeping the loop needs to resume from any commit.
 ///
-/// It is the run's durable record: `Runtime::view(run).state` deserializes into
-/// it. Every field has a serde default, so state written by an older version
-/// still loads.
+/// It is the run's durable record: `Runtime::state(run)` deserializes into
+/// it. `Runtime::view(run).state` is its **head** (ADR 0055), the same shape
+/// with `messages` empty. Every field has a serde default, so state written by
+/// an older version still loads.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Conversation {
     /// The history, oldest first. Nothing is removed from it while the run goes on, but **old tool

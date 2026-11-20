@@ -25,7 +25,11 @@ trait at your rev: its doc comments are the contract.
 ## Procedure
 
 1. **Read the trait**: `crates/adam-core/src/store/mod.rs`, `pub trait Store`: `migrate`,
-   `create_run`, `load_run`, `run_header` (a run without its state; **defaulted** to
+   `create_run`, `load_run` (**the contract's read**: the v5 head when the store has a current one,
+   `head_version == version`, and the stored `state` otherwise — a v4 run, or a head a later commit
+   did not rebuild; a **tombstoned** run whose head is behind the version, `state = null`, serves
+   the head, which is the repair of a run a pre-S3 process failed), `run_header` (a run without its
+   state; **defaulted** to
    `lease_until` + `load_run`, so overriding it is optional — override it with a projection that
    never reads the state, as both shipped adapters do, and pass `run_header_matches_the_record`),
    `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`,
@@ -35,9 +39,12 @@ trait at your rev: its doc comments are the contract.
    `push_delete`, `push_claim_due`, `push_commit`; schema version 3) and the **defaulted** methods:
    the five blob ones (`keeps_blobs`, `blob_stored`, `put_blob`, `get_blob`, `purge_blobs`; schema
    version 5, part 1: file bytes out of the run, content-addressed by `BlobId`) and the three body ones
-   (`load_head`, which defaults to `load_run` and serves the v5 head only when
-   `head_version == version`; `keeps_bodies`; `body_list`; `gc_body`; schema version 5, part 2: an
-   append-only transcript per generation beside the head). A defaulted method left out of your
+   (`load_head`, which defaults to `load_run` — so it answers the same document, the head when the
+   store has a current one — `keeps_bodies`, `body_list`, `gc_body`; schema version 5, part 2: an
+   append-only transcript per generation beside the head). **`keeps_bodies` is the gate**: a store
+   that answers `false` is never handed a head or a row — the runtime writes the whole v4 `state`
+   for it — so only return `true` once `load_run` serves the head, `commit_run` writes
+   `head`/`body` and `body_list` answers. A defaulted method left out of your
    implementation answers for your store with the trait's "I keep none" answer.
    Errors are `StoreError` (`crates/adam-core/README.md`, "Errors"): build a backend failure with
    `StoreError::unavailable(e)` (transient), `StoreError::internal(e)` or
@@ -47,7 +54,7 @@ trait at your rev: its doc comments are the contract.
    (CAS commit, first-writer-wins journal, exclusive claiming, `busy` runs never claimed,
    pinned claims and the run `owner`, one open run per conversation, journal deleted with its
    run, blob put/get and the blob GC, schema version 5 part 1, and the head and body of schema
-   version 5 part 2). Time is truncated to milliseconds
+   version 5 part 2 — schema version 6 on PostgreSQL, which stamps 6 for the same shape). Time is truncated to milliseconds
    in every store; lease expiry uses the `now` the caller passes.
 3. **Implement `Store`** in a crate of its own, depending on `adam-core` only (no driver type in
    a trait signature). Reference implementations: `crates/adam-core/src/store/memory.rs`
@@ -71,9 +78,13 @@ trait at your rev: its doc comments are the contract.
    after a commit that names a different one), a shared digest surviving until the last run is
    purged, the cutoff, and `purge_finished`'s sweep); every
    case asserts `keeps_blobs()`, so do not give it to a store that keeps none. `body_conformance!`
-   adds the six body cases (a set round-tripping in `idx` order with its head, an idempotent retry,
-   a superseded set that stays readable, a headless commit leaving the head stale, sets per run, and
-   the purge); every case asserts `keeps_bodies()`. `None` skips the
+   adds the **fourteen** body cases: the append-only delta, the stable generation, the compaction
+   and its GC, a stale version's conflict, the first split, **every read serving the current head**
+   (`load_run`, `load_head`, `claim_due`, `open_run_for_conversation`, `list_runs`), a stale head
+   serving the state, a tombstoned run serving its head (the repair), a JSON-null head not being a
+   head, the idempotent retry, the purge, a non-contiguous index, an unknown generation, and a NUL
+   stored as U+FFFD; every case asserts
+   `keeps_bodies()`. `None` skips the
    suites. Cases isolate themselves with a unique agent name, so they run in parallel on one shared
    database — **except the blob cases and the cases that purge**, which sweep every unreferenced
    blob and therefore must not overlap: keep them in one nextest test group (`.config/nextest.toml`,
@@ -147,12 +158,16 @@ trait at your rev: its doc comments are the contract.
   collected. A **write-concern** error is not a completeness answer. A commit that loses the CAS deletes the
   rows and refs its `writer` added, but never a row or digest the winner's head names — and a commit
   with no body still cleans the refs it inserted. A commit with `head: None` leaves the stored head **and its `head_version`**
-  alone; `load_head` serves the head only when `head_version == version`. Collect superseded
+  alone. Every read that returns a record serves the head when it is current; a head behind the
+  version serves the state when the state is a v4 envelope, and the head when the state is the
+  tombstone. Collect superseded
   generations after a grace period (`gc_body`, and `purge_finished` removes them with the run).
-  **Forward `gc_body`, `blob_stored` and `load_head` in every wrapper**: the trait defaults answer
-  `0`/`false`/`load_run`, so a wrapper that omits them collects nothing, re-puts every blob, and —
-  for `load_head` — answers the default, which calls the wrapper's `load_run`: the whole state, so
-  the observer loses the head silently.
+  **Forward `keeps_bodies`, `body_list`, `gc_body`, `blob_stored` and `load_head` in every
+  wrapper**: the trait defaults answer `false`/empty/`0`/`false`/`load_run`, so a wrapper that omits
+  them reports the wrong format, collects nothing, re-puts every blob, and — for `load_head` —
+  answers the default, which calls the wrapper's `load_run` (the head in the contract release, but
+  only because your `load_run` serves it; a wrapper over a store that keeps none answers the whole
+  state).
 * A transient backend error must be classified transient so the runtime retries it.
 
 ## See also

@@ -218,9 +218,10 @@ measure_postgres() {
     [ -n "$wal_before" ] || wal_before=n/a
     [ -n "$wal_after" ] || wal_after=n/a
     runs_delta=$(delta "$runs_before" "$runs_after")
+    body_delta=$(delta "$body_before" "$body_after")
     total_delta=$(delta "$total_before" "$total_after")
     row "pg_relation_size(${prefix}runs)" "$runs_before" "$runs_after" "$runs_delta"
-    row "pg_total_relation_size(${prefix}body)" "$body_before" "$body_after" "$(delta "$body_before" "$body_after")"
+    row "pg_total_relation_size(${prefix}body)" "$body_before" "$body_after" "$body_delta"
     row "pg_relation_size(${prefix}journal)" "$journal_before" "$journal_after" "$(delta "$journal_before" "$journal_after")"
     row "pg_total_relation_size(${prefix}runs)" "$total_before" "$total_after" "$total_delta"
     row "pg_stat_wal.wal_bytes (PG 14+)" "$wal_before" "$wal_after" "$(delta "$wal_before" "$wal_after")"

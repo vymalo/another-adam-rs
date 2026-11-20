@@ -51,7 +51,13 @@ let run = store
 ```
 
 `create_run` and `commit_run` return the record **without its state** (`state` is `null`): the caller
-supplied it, and the state is the largest member of the record. Read the run for the stored state.
+supplied it, and the state is the largest member of the record. Read the run for its document — and
+note **what that document is**: in the contract release the reads that return a record
+(`load_run`, `load_head`, `claim_due`, `open_run_for_conversation`, `list_runs`) answer the v5
+**head** for a run whose head is current, not the whole agent state. A consumer that decoded
+`RunRecord::state` as the agent state must use `Runtime::state(run)` (the joined state) or
+`Runtime::view(run).state` (the head) from `adam-runtime`, or join the head with
+`body_list(run, generation)` itself.
 Of the run writes, `journal_put` is the exception: it returns the payload it stored, which is what the
 loop decodes the step's outcome from (a store may have replaced a NUL in it,
 [ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)); the push
