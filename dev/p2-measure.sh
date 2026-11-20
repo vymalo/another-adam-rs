@@ -156,10 +156,6 @@ mongo_eval() {
     esac
 }
 
-mongo_size() {
-    mongo_eval "print(db.getCollectionNames().includes('$1') ? db.getCollection('$1').stats().size : 0)"
-}
-
 mongo_storage() {
     # The bytes allocated to the collection, free space included: the retained-size counterpart of
     # `pg_total_relation_size`. The workload purges its run when it is done, so `size` (live
