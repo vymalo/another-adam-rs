@@ -251,7 +251,7 @@ async fn a_database_that_is_down_is_a_connect_error_and_exit_69() {
         .await
         .unwrap_err();
     assert!(matches!(error, ServeError::Connect(_)), "{error:?}");
-    assert_eq!(error.to_string(), "connecting to Postgres");
+    assert_eq!(error.to_string(), "connecting to the store");
     assert_eq!(exit_code(&error), 69);
     assert!(
         !format!("{error:?}").contains("s3cr3tpassw0rd"),
@@ -314,6 +314,87 @@ async fn serve_runs_the_whole_agent_and_stops_on_shutdown() {
         Some(format!("{name} says: over postgres").as_str())
     );
     running.finish().await;
+}
+
+/// Role `all` over a SQLite file: the scheme picks the store, the card and `/healthz` are served,
+/// and a message is stepped end to end. No database server, no `ADAM_TEST_POSTGRES_URL`.
+#[tokio::test]
+async fn serve_runs_the_whole_agent_on_a_sqlite_file() {
+    use a2a::{GetTaskRequest, SendMessageRequest, SendMessageResponse};
+    use a2a_client::A2AClientFactory;
+    use a2a_client::agent_card::AgentCardResolver;
+    use a2a_client::auth::AuthInterceptor;
+    use std::sync::Arc;
+
+    let name = unique("serve-sqlite");
+    let dir = std::env::temp_dir().join(format!("adam-serve-sqlite-{}", RunId::new().0.simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("adam.sqlite");
+    let url = format!("sqlite://{}", database.display());
+    let (listener, port) = listen().await;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let cfg = config(&url, "all", port);
+    let agents = agents(&name, &cfg).card(AgentCardConfig::new(
+        &name,
+        "A test agent.",
+        format!("http://{addr}/").parse().unwrap(),
+        "0.0.1",
+    ));
+    let running = Running::start(listener, cfg.clone(), agents);
+    until_ok(addr, "/healthz", &running.handle).await;
+    assert_eq!(
+        status_of(addr, "/.well-known/agent-card.json").await,
+        Some(200)
+    );
+
+    let base = format!("http://{addr}");
+    let public = AgentCardResolver::new(None).resolve(&base).await.unwrap();
+    let client = A2AClientFactory::builder()
+        .with_interceptor(Arc::new(AuthInterceptor::bearer("serve-test-token")))
+        .build()
+        .create_from_card(&public)
+        .await
+        .unwrap();
+    let sent = client
+        .send_message(&SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text("over sqlite")]),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        })
+        .await
+        .unwrap();
+    let SendMessageResponse::Task(task) = sent else {
+        panic!("expected a task")
+    };
+    let mut answer = None;
+    for _ in 0..600 {
+        let got = client
+            .get_task(&GetTaskRequest {
+                id: task.id.clone(),
+                history_length: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        if got.status.state == TaskState::Completed {
+            answer = got
+                .status
+                .message
+                .as_ref()
+                .and_then(Message::text)
+                .map(str::to_owned);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        answer.as_deref(),
+        Some(format!("{name} says: over sqlite").as_str()),
+        "the worker over SQLite completed the run"
+    );
+    running.finish().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A worker serves `/healthz` and nothing else; a control plane serves A2A and steps nothing.

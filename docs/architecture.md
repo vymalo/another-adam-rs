@@ -76,6 +76,7 @@ flowchart TB
     subgraph impls["Implementations"]
         pg["adam-store-postgres"]
         mongo["adam-store-mongodb"]
+        sqlite["adam-store-sqlite"]
         openai["adam-model-openai"]
         oauth["adam-model-oauth"]
         ws["adam-workspace"]
@@ -128,6 +129,7 @@ flowchart TB
     pgn --> rt
     pg --> core
     mongo --> core
+    sqlite --> core
     openai --> model
     ws --> gitsb
     devc --> ws
@@ -137,7 +139,7 @@ flowchart TB
 | Layer | Crates | Job |
 |---|---|---|
 | Contracts | [`adam-error`](../crates/adam-error/README.md), [`adam-core`](../crates/adam-core/README.md), [`adam-model`](../crates/adam-model/README.md), [`adam-a2a`](../crates/adam-a2a/README.md), [`adam-host`](../crates/adam-host/README.md) | Error classes, the `Store` port and run types, the `ModelClient` port, the `TaskBackend` port with the A2A 1.0 server, the process `Role` and `Placement` with a supervisor. |
-| Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-model-openai`, [`adam-model-oauth`](../crates/adam-model-oauth/README.md), [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-code-tools`](../crates/adam-code-tools/README.md) (the file and command tools as a library, ADR 0047; moving out of the coder in steps), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-devcontainer`](../crates/adam-devcontainer/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
+| Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-store-sqlite`, `adam-model-openai`, [`adam-model-oauth`](../crates/adam-model-oauth/README.md), [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-code-tools`](../crates/adam-code-tools/README.md) (the file and command tools as a library, ADR 0047; moving out of the coder in steps), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-devcontainer`](../crates/adam-devcontainer/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
 | Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares. |
 | Agents and authoring | [`adam-llm-agent`](../crates/adam-llm-agent/README.md), [`adam-ui`](../crates/adam-ui/README.md), [`adam-mcp`](../crates/adam-mcp/README.md), [`adam-agent-fs`](../crates/adam-agent-fs/README.md), [`adam-assembly`](../crates/adam-assembly/README.md), [`adam-macros`](../crates/adam-macros/README.md), [`adam`](../crates/adam/README.md) | The model-and-tools loop; the screen's tools; MCP tools; the agent-folder parser; binding a folder to agents; `#[tool]`; the facade. See [Write an agent](guides/write-an-agent.md). |
 | Embedded | [`adam-engine`](../crates/adam-engine/README.md) | adam-rs in an application with no server and nothing on the network of its own ([ADR 0047](decisions/0047-adam-rs-can-be-embedded-in-an-application.md)): the embedded set, the runtime and its agent crates with `adam-a2a`'s `server`, `adam-a2a-runtime`'s `push` and `adam-ui`'s `thread-tools` off, checked by `tools/embedded-deps/check.sh`; its API is slice 4. |
@@ -165,6 +167,7 @@ classDiagram
     Store <|.. MemoryStore
     Store <|.. PgStore
     Store <|.. MongoStore
+    Store <|.. SqliteStore
     class ModelClient { <<interface>> }
     ModelClient <|.. OpenAiCompatible
     ModelClient <|.. MockModel
@@ -201,7 +204,7 @@ classDiagram
 
 | Port | Defined in | Real implementations | Doubles |
 |---|---|---|---|
-| `Store` | `adam-core` | `PgStore`, `MongoStore` | `MemoryStore` (reference), `FaultyStore` and `CountingStore` (testkit) |
+| `Store` | `adam-core` | `PgStore`, `MongoStore`, `SqliteStore` | `MemoryStore` (reference), `FaultyStore` and `CountingStore` (testkit) |
 | `ModelClient` | `adam-model` | `OpenAiCompatible` (`adam-model-openai`) | `MockModel` |
 | `ModelCredentials` | `adam-model` | `StaticBearer` (`MODEL_API_KEY`), `DeviceGrant` (`adam-model-oauth`, `MODEL_AUTH=device`); a host's own: a renewed token, a proof, an injector's tag ([ADR 0058](decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)) | `RenewingCredentials` |
 | `TaskBackend` | `adam-a2a` | `RuntimeTaskBackend` (`adam-a2a-runtime`) | `InMemoryBackend` (feature `test-util`) |
@@ -231,7 +234,8 @@ Rules the code follows:
 ## Processes and roles
 
 `adam-service`'s `serve(ServiceConfig, Agents, shutdown)` is the whole process. A binary builds its
-agent and hands over `Agents { name, card, register, options }`; `serve` connects the store, builds
+agent and hands over `Agents { name, card, register, options }`; `serve` chooses the store from
+`DATABASE_URL` (Postgres, MongoDB or SQLite), connects it, builds
 the runtime, the A2A router and the signals, and registers the components of the role with an
 `adam_host::Host`. `main` is `serve(Config::from_env(), sigterm)`.
 
@@ -257,10 +261,10 @@ flowchart LR
 
     subgraph svc["adam-service: serve(ServiceConfig, Agents, shutdown)"]
         direction LR
-        pg["PgConfig::parse once, PgStore::from_config (lazy),<br/>then ping + migrate() as DynStore"]
-        pgn["PgNotify::new(store pool, PgConfig, BroadcastSink)<br/>LiveSignals: PgEventSink + PgNotifier"]
+        pg["DATABASE_URL's scheme:<br/>PgStore (lazy, ping + migrate),<br/>SqliteStore (open + migrate) or<br/>MongoStore (connect + migrate)"]
+        pgn["Postgres only: PgNotify::new(store pool, PgConfig, BroadcastSink)<br/>LiveSignals: PgEventSink + PgNotifier<br/>SQLite: LocalNotifier; MongoDB: polling"]
         service["Service::new_with(register(Runtime::builder(store)), name, options, live)"]
-        rtm["Runtime<br/>PgEventSink as EventSink, PgNotifier as Notifier"]
+        rtm["Runtime<br/>the store's EventSink and Notifier"]
         bk["RuntimeTaskBackend"]
         router["A2aServer::router<br/>card + backend + AuthConfig"]
         cp["control-plane component a2a-server<br/>axum::serve"]
@@ -906,14 +910,16 @@ never shown as `submitted` again. A front that holds only the starter claims not
 
 ## Data: the run store
 
-Six tables (PostgreSQL) or collections (MongoDB), prefixed `adam_` by default, plus a `meta` table with
+Six tables (PostgreSQL and SQLite) or collections (MongoDB), prefixed `adam_` by default, plus a `meta` table with
 the schema version: `push` holds A2A push-notification configurations (schema version 3), `blob`
 and `run_blob` hold a run's file bytes and the digests it references (schema version 5, part 1), and
 `body` holds a run's transcript beside the `head` and `head_version` of a run (schema version 5,
-part 2). Both adapters keep them: MongoDB in the run document and the `adam_body` collection,
+part 2). The adapters keep them: MongoDB in the run document and the `adam_body` collection,
 PostgreSQL in `runs.head`/`runs.head_version` and the `adam_body` table, written in the same
-transaction as the CAS. `state` is JSONB in Postgres and a real BSON document in MongoDB; in the
-expand release it is still the complete v4 envelope.
+transaction as the CAS; SQLite in the same columns as PostgreSQL, in one `BEGIN IMMEDIATE`
+transaction. `state` is JSONB in Postgres, a real BSON document in MongoDB and JSON text in SQLite;
+in the expand release it is still the complete v4 envelope. A SQLite file is opened by one process
+and holds no cross-process signals ([store adapters](reference/store-adapters.md#sqlite)).
 
 ```mermaid
 erDiagram
@@ -1034,12 +1040,13 @@ the bytes too until the contract release, so a reader of the old format still re
 The expand release writes a **head** and a **body generation** beside `state`: the steps write both
 (S2a), and the observer reads the head (S2b). `Runtime::view` is one `Store::load_head` and no body;
 `Runtime::state` is the one full-state read, joining the head and the generation it names: the head names a **prefix** (`len`) of the generation, and the rows past it — a lost CAS's extras not yet cleaned up — are ignored, so only a short or non-contiguous prefix is `Corrupt`. The
-worker, `load_run`, `claim_due` and `list_runs` still read the whole state until S3. Both adapters
+worker, `load_run`, `claim_due` and `list_runs` still read the whole state until S3. The adapters
 keep both: MongoDB in the run document and the `adam_body` collection, PostgreSQL in `runs.head`/
 `runs.head_version` and the `adam_body` table. A PostgreSQL commit that writes a head or a body is
 one transaction — the run row locked `FOR UPDATE`, the version check, the rows, the refs and the CAS
 — so a foreign attempt's duplicate slot is resolved inside it (identical: adopted; older than the
-5-minute orphan grace: collected and retried once; live and different: `Conflict`).
+5-minute orphan grace: collected and retried once; live and different: `Conflict`). SQLite does the
+same in one `BEGIN IMMEDIATE` transaction.
 The head is the envelope with `v: 5`, `agent` reduced to the agent's head, file artifacts by
 reference, and a `body` member naming one generation; the rows are the messages.
 

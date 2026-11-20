@@ -19,8 +19,9 @@ trait at your rev: its doc comments are the contract.
 * You write a backend (SQLite, Redis, FoundationDB, ...) in your own crate or repository.
 * You bumped adam-rs and your `impl Store for ...` no longer compiles (a method was added).
 * You wrap a store (metrics, retries) and must forward every method.
-* Not for choosing between the shipped Postgres and MongoDB adapters: use one, with
-  `adam_core::DynStore` (`crates/adam-store-postgres/README.md`, `crates/adam-store-mongodb/README.md`).
+* Not for choosing between the shipped Postgres, MongoDB and SQLite adapters: use one, with
+  `adam_core::DynStore` (`crates/adam-store-postgres/README.md`, `crates/adam-store-mongodb/README.md`,
+  `crates/adam-store-sqlite/README.md`).
 
 ## Procedure
 
@@ -43,7 +44,7 @@ trait at your rev: its doc comments are the contract.
    `StoreError::unavailable(e)` (transient), `StoreError::internal(e)` or
    `StoreError::corrupt_source(e)`; callers decide from the error class, never from the variant.
 2. **Match what the existing adapters promise**: the table "How each adapter keeps the
-   contract" in `docs/reference/store-adapters.md` lists, per guarantee, how Postgres and MongoDB do it
+   contract" in `docs/reference/store-adapters.md` lists, per guarantee, how Postgres, MongoDB and SQLite do it
    (CAS commit, first-writer-wins journal, exclusive claiming, `busy` runs never claimed,
    pinned claims and the run `owner`, one open run per conversation, journal deleted with its
    run, blob put/get and the blob GC, schema version 5 part 1, and the head and body of schema
@@ -51,7 +52,8 @@ trait at your rev: its doc comments are the contract.
    in every store; lease expiry uses the `now` the caller passes.
 3. **Implement `Store`** in a crate of its own, depending on `adam-core` only (no driver type in
    a trait signature). Reference implementations: `crates/adam-core/src/store/memory.rs`
-   (`MemoryStore`), `crates/adam-store-postgres/src/lib.rs`, `crates/adam-store-mongodb/src/lib.rs`.
+   (`MemoryStore`), `crates/adam-store-postgres/src/lib.rs`, `crates/adam-store-mongodb/src/lib.rs`,
+   and `crates/adam-store-sqlite/src/lib.rs` for a store that owns a file.
 4. **Add the conformance suite** as an integration test (`tests/conformance.rs`), with
    `adam-store-testkit` as a dev-dependency:
 
@@ -104,7 +106,8 @@ trait at your rev: its doc comments are the contract.
 ## Verify
 
 * `cargo test -p <your-store-crate>` with your database variable set, and
-  `ADAM_TEST_REQUIRE_DB=1` to prove nothing skipped.
+  `ADAM_TEST_REQUIRE_DB=1` to prove nothing skipped. `cargo test -p adam-store-sqlite` needs no
+  variable: its `make_store` always answers, each case on its own file.
 * adam-rs's own adapters show the pattern: `ADAM_TEST_POSTGRES_URL=... cargo test -p adam-store-postgres`
   and `ADAM_TEST_MONGODB_URI=... cargo test -p adam-store-mongodb`. Its CI runs the suites twice
   against a database that already has the schema, to exercise `migrate()` on an existing one
@@ -153,12 +156,19 @@ trait at your rev: its doc comments are the contract.
   `0`/`false`/`load_run`, so a wrapper that omits them collects nothing, re-puts every blob, and —
   for `load_head` — answers the default, which calls the wrapper's `load_run`: the whole state, so
   the observer loses the head silently.
+* **A store that owns a file holds one process.** `adam-store-sqlite` takes an exclusive `flock` on
+  `<path>.lock` and refuses a second process with `InvalidInput`; the operating system releases it
+  on `SIGKILL`, and `migrate` then clears every lease it finds, because the lock proves no other
+  process is alive. A killed process's runs are claimable at once, not after a lease expires. Write
+  the schema version to a `meta` table and refuse a file stamped **newer** than the binary, rather
+  than reading a schema you do not know. A store like this is not for a split role: `adam-service`
+  refuses `sqlite://` with `ROLE=worker` or `control-plane` (exit 78).
 * A transient backend error must be classified transient so the runtime retries it.
 
 ## See also
 
 * `crates/adam-core/README.md`, `crates/adam-store-testkit/README.md`,
   `crates/adam-notify-testkit/README.md`, "Adding a backend" in `docs/reference/store-adapters.md`
-  and `docs/guides/testing.md`.
+  and `docs/guides/testing.md`; `crates/adam-store-sqlite/README.md` for the one-process file.
 * `adam-upgrade` (finding the trait change in the first place), `adam-embed`.
 * https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-store-testkit/README.md

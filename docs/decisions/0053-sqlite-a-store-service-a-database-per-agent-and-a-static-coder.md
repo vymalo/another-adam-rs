@@ -158,6 +158,21 @@ What the pieces offer, checked on 2026-11-19:
    Any other scheme is exit 78. `sqlite://` holds one process per file, so a `ROLE` of `control-plane` or `worker` on it is
    exit 78: a split deployment uses Postgres, MongoDB or the store service.
 
+   *Amended 2026-11-20 (slice 3, #362): built, except the store service.* `adam-store-sqlite` is in the main workspace
+   on `rusqlite` 0.41.1 with `bundled` (the minor `cratestack-rusqlite` 0.20.4 uses, so an application that links both
+   has one `libsqlite3-sys`), `SCHEMA_VERSION` 1, and passes `store_conformance!`, `blob_conformance!` and
+   `body_conformance!`; it keeps heads, bodies and blobs. It is one file, one process: `open` takes an exclusive
+   `flock` on `<path>.lock` and refuses a second process, `migrate` clears the dead predecessor's leases so a
+   `SIGKILL`ed process's runs are claimable at once, and a file stamped with a newer schema is refused. Every change is
+   one `BEGIN IMMEDIATE` transaction on a blocking thread; WAL; `LocalNotifier` in process. `adam-service` chooses the
+   adapter from `DATABASE_URL`: `postgres(ql)://`, `mongodb(+srv)://` and `sqlite://`, each behind a feature
+   (`store-postgres`, `store-mongodb`, `store-sqlite`, all on in the binaries); an unknown scheme is exit 78, and so is
+   `sqlite://` with `ROLE=worker` or `ROLE=control-plane`. MongoDB is now selected, not only a library. The probe
+   `tools/sqlite-probe` (CI job `sqlite-probe`, part of `lint`) resolves the adapter with `cratestack-sqlite` and
+   asserts one `rusqlite` and one `libsqlite3-sys`. **Not built:** `store+http://`/`store+https://` and the store
+   service of decisions 4–7. Breaking: `adam-service`'s Postgres dependencies are optional features, and
+   `ServeError::Connect`'s message is "connecting to the store", not "connecting to Postgres".
+
 ### A store service
 
 4. **`Store` is served over CrateStack RPC with CBOR**, not gRPC: CrateStack does what this needs (above) and removed its

@@ -24,6 +24,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,13 +32,20 @@ use std::time::Duration;
 use adam_a2a::push::{PushDeliverer, PushDeliveryOptions, PushSupport};
 use adam_a2a::{A2aServer, AgentCardConfig, AuthConfig, ServerOptions};
 use adam_a2a_runtime::InboundFn;
-use adam_core::{ClaimScope, DynStore, StoreError};
+use adam_core::{ClaimScope, DynStore, Store, StoreError};
 use adam_error::BoxError;
-use adam_host::{Host, HostError, Placement};
+use adam_host::{Host, HostError, Placement, Role};
+#[cfg(feature = "store-postgres")]
 use adam_notify_postgres::PgNotify;
+#[cfg(feature = "store-postgres")]
 use adam_postgres::PgConfig;
 use adam_runtime::{BroadcastSink, Runtime, RuntimeBuilder};
+#[cfg(feature = "store-mongodb")]
+use adam_store_mongodb::MongoStore;
+#[cfg(feature = "store-postgres")]
 use adam_store_postgres::{PgStore, pool_size_from_env};
+#[cfg(feature = "store-sqlite")]
+use adam_store_sqlite::SqliteStore;
 use secrecy::ExposeSecret as _;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -52,6 +60,103 @@ const SERVER_DRAIN: Duration = Duration::from_secs(10);
 /// How an agent is put on the runtime: given the builder (over the store [`serve`] connected), it
 /// returns it with the agent registered.
 pub type Register = Box<dyn FnOnce(RuntimeBuilder) -> RuntimeBuilder + Send>;
+
+/// The component that carries live events and wake-up/cancel signals across processes, when the
+/// chosen store has one: the Postgres listener. SQLite uses the in-process notifier and MongoDB
+/// has none, so both return no component.
+type StartNotify = Box<
+    dyn FnOnce(CancellationToken) -> Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The store a `DATABASE_URL` selects, before anything connects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StoreKind {
+    /// `postgres://` or `postgresql://`.
+    Postgres,
+    /// `sqlite://<path>`: one process per file.
+    Sqlite {
+        /// The file (or `:memory:`).
+        path: PathBuf,
+    },
+    /// `mongodb://` or `mongodb+srv://`.
+    Mongo {
+        /// The database name, from the URL's path (`adam` when it has none).
+        database: String,
+    },
+}
+
+/// The store [`serve`] built, with what it needs before the process starts its halves.
+struct ChosenStore {
+    store: DynStore,
+    live: LiveSignals,
+    notify: Option<StartNotify>,
+    /// The Postgres store, whose connection is opened after the process's own checks so a
+    /// misconfiguration is exit 78 whether or not the server answers.
+    #[cfg(feature = "store-postgres")]
+    postgres: Option<PgStore>,
+}
+
+impl ChosenStore {
+    /// Open the connection and migrate, for a store that connects lazily. SQLite and MongoDB were
+    /// opened and migrated when they were chosen.
+    async fn ready(&self) -> Result<(), ServeError> {
+        #[cfg(feature = "store-postgres")]
+        if let Some(pg) = &self.postgres {
+            pg.ping().await.map_err(ServeError::Connect)?;
+            Store::migrate(pg).await.map_err(ServeError::Migrate)?;
+        }
+        Ok(())
+    }
+}
+
+/// What `DATABASE_URL`'s scheme says, and whether the process's role may use it.
+///
+/// `sqlite://` holds one process per file (ADR 0053, decision 3), so a `worker` or a
+/// `control-plane` is refused: a split deployment needs Postgres, MongoDB or the store service.
+pub(crate) fn store_kind(url: &str, role: Role) -> Result<StoreKind, ServeError> {
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return Err(ServeError::UnsupportedScheme {
+            scheme: url.to_owned(),
+        });
+    };
+    match scheme.to_ascii_lowercase().as_str() {
+        "postgres" | "postgresql" => Ok(StoreKind::Postgres),
+        "sqlite" => {
+            if role != Role::All {
+                return Err(ServeError::SplitRoleOnSqlite {
+                    role: role.as_str().to_owned(),
+                });
+            }
+            let path = rest.strip_prefix("//").unwrap_or(rest);
+            if path.is_empty() {
+                return Err(ServeError::SqliteWithoutPath);
+            }
+            Ok(StoreKind::Sqlite {
+                path: PathBuf::from(path),
+            })
+        }
+        "mongodb" | "mongodb+srv" => Ok(StoreKind::Mongo {
+            database: mongo_database(url),
+        }),
+        other => Err(ServeError::UnsupportedScheme {
+            scheme: other.to_owned(),
+        }),
+    }
+}
+
+/// The database name of a MongoDB URL: its path, or `adam` when it names none.
+fn mongo_database(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            let path = url.path().trim_start_matches('/');
+            let database = path.split('/').next().unwrap_or_default();
+            (!database.is_empty()).then(|| database.to_owned())
+        })
+        .unwrap_or_else(|| "adam".to_owned())
+}
 
 /// A worker-tier component of a binary (see [`Agents::worker_component`]): given the store [`serve`]
 /// connected and the token that says "stop", the future that is the component.
@@ -242,12 +347,41 @@ impl std::fmt::Debug for Agents {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ServeError {
-    /// Postgres cannot be reached, or refuses the credentials.
-    #[error("connecting to Postgres")]
+    /// The store cannot be reached, or refuses its credentials.
+    #[error("connecting to the store")]
     Connect(#[source] StoreError),
     /// The schema cannot be migrated.
     #[error("migrating the schema")]
     Migrate(#[source] StoreError),
+    /// `DATABASE_URL`'s scheme is not one this binary knows.
+    #[error(
+        "DATABASE_URL scheme {scheme:?} is not supported: use postgres://, postgresql://, \
+         mongodb://, mongodb+srv:// or sqlite://"
+    )]
+    UnsupportedScheme {
+        /// The scheme as written.
+        scheme: String,
+    },
+    /// The binary was built without the adapter the scheme names.
+    #[error(
+        "this binary was built without the {scheme} store: rebuild it with the store-{scheme} feature"
+    )]
+    StoreNotBuilt {
+        /// The scheme as written.
+        scheme: String,
+    },
+    /// `sqlite://` with no file path.
+    #[error("DATABASE_URL sqlite:// needs a file path, e.g. sqlite:///var/lib/adam/adam.sqlite")]
+    SqliteWithoutPath,
+    /// A role that needs several processes on one store, on a file that holds one.
+    #[error(
+        "ROLE={role} cannot use sqlite://: a SQLite file is opened by one process; use \
+         postgres://, mongodb:// or the store service, or ROLE=all"
+    )]
+    SplitRoleOnSqlite {
+        /// The role as written.
+        role: String,
+    },
     /// A role that serves A2A was given no agent card: a mistake of the binary, not of the
     /// deployment, but one only a restart with other code fixes.
     #[error("no agent card was given for a role that serves A2A")]
@@ -350,6 +484,7 @@ fn a2a_features(
 }
 
 /// Drive the notifier until `stop`, and log once `LISTEN` is active.
+#[cfg(feature = "store-postgres")]
 async fn run_notify(
     notify: PgNotify,
     stop: impl Future<Output = ()> + Send,
@@ -386,6 +521,91 @@ pub fn claim_scope_for(placement: Placement) -> ClaimScope {
         ClaimScope::Pinned
     } else {
         ClaimScope::Any
+    }
+}
+
+/// Build the store `kind` names, and the signals that go with it.
+///
+/// Postgres is built lazily: the connection is opened by [`ChosenStore::ready`] after the
+/// process's own configuration is checked. SQLite opens its file and takes the process lock now,
+/// and MongoDB connects now, because both answer the store before the service is built.
+async fn choose_store(config: &ServiceConfig, kind: StoreKind) -> Result<ChosenStore, ServeError> {
+    match kind {
+        #[cfg(feature = "store-postgres")]
+        StoreKind::Postgres => {
+            let pg_config = PgConfig::parse(config.database_url.expose_secret())
+                .map_err(ServeError::Connect)?;
+            let pool_size = pool_size_from_env().map_err(ServeError::Connect)?;
+            let pg =
+                PgStore::from_config(pg_config.clone(), pool_size).map_err(ServeError::Connect)?;
+            let pool = pg.pool().clone();
+            let store: DynStore = Arc::new(pg.clone());
+            // Events and wake-up/cancel signals cross processes over `NOTIFY` on the store's own
+            // pool. The listener opens its own connection; the runtime holds the two halves.
+            let broadcast = adam_runtime::BroadcastSink::default();
+            let notify = PgNotify::new(pool, pg_config, broadcast.clone())
+                .local_only(config.notify_local_only);
+            let live = LiveSignals {
+                broadcast: broadcast.clone(),
+                sink: Arc::new(notify.event_sink()),
+                notifier: Some(Arc::new(notify.notifier())),
+            };
+            let start: StartNotify =
+                Box::new(move |stop| Box::pin(run_notify(notify, stop.cancelled_owned())));
+            Ok(ChosenStore {
+                store,
+                live,
+                notify: Some(start),
+                postgres: Some(pg),
+            })
+        }
+        #[cfg(not(feature = "store-postgres"))]
+        StoreKind::Postgres => Err(ServeError::StoreNotBuilt {
+            scheme: "postgres".into(),
+        }),
+        #[cfg(feature = "store-sqlite")]
+        StoreKind::Sqlite { path } => {
+            let store = SqliteStore::open(&path).map_err(ServeError::Connect)?;
+            store.migrate().await.map_err(ServeError::Migrate)?;
+            // One process, one file: the notifier is in-process, and there is no listener to run.
+            let broadcast = adam_runtime::BroadcastSink::default();
+            let notifier = adam_runtime::LocalNotifier::default();
+            let live = LiveSignals {
+                broadcast: broadcast.clone(),
+                sink: Arc::new(broadcast),
+                notifier: Some(Arc::new(notifier)),
+            };
+            Ok(ChosenStore {
+                store: Arc::new(store),
+                live,
+                notify: None,
+                #[cfg(feature = "store-postgres")]
+                postgres: None,
+            })
+        }
+        #[cfg(not(feature = "store-sqlite"))]
+        StoreKind::Sqlite { .. } => Err(ServeError::StoreNotBuilt {
+            scheme: "sqlite".into(),
+        }),
+        #[cfg(feature = "store-mongodb")]
+        StoreKind::Mongo { database } => {
+            let store = MongoStore::connect(config.database_url.expose_secret(), &database)
+                .await
+                .map_err(ServeError::Connect)?;
+            store.migrate().await.map_err(ServeError::Migrate)?;
+            // MongoDB has no cross-process signal: workers poll.
+            Ok(ChosenStore {
+                store: Arc::new(store),
+                live: LiveSignals::local(),
+                notify: None,
+                #[cfg(feature = "store-postgres")]
+                postgres: None,
+            })
+        }
+        #[cfg(not(feature = "store-mongodb"))]
+        StoreKind::Mongo { .. } => Err(ServeError::StoreNotBuilt {
+            scheme: "mongodb".into(),
+        }),
     }
 }
 
@@ -454,38 +674,26 @@ async fn run(
     if role.runs_control_plane() && card.is_none() {
         return Err(ServeError::NoCard);
     }
-    // The store connects lazily so that the process's own configuration is checked before it
-    // depends on the database: a mistake of the binary is exit 78 whether or not Postgres answers.
-    // `DATABASE_URL` is parsed once: the store and the notification listener share the parse, and
-    // its TLS connector.
-    let pg_config =
-        PgConfig::parse(config.database_url.expose_secret()).map_err(ServeError::Connect)?;
-    let pool_size = pool_size_from_env().map_err(ServeError::Connect)?;
-    let pg = PgStore::from_config(pg_config.clone(), pool_size).map_err(ServeError::Connect)?;
-    let pool = pg.pool().clone();
-    let store: DynStore = Arc::new(pg.clone());
-
-    // Events and wake-up/cancel signals cross processes over `NOTIFY` on the store's own pool. The
-    // listener (`notify.run`) opens its own connection from the same config; the runtime only
-    // holds the two halves.
-    let broadcast = BroadcastSink::default();
-    let notify =
-        PgNotify::new(pool, pg_config, broadcast.clone()).local_only(config.notify_local_only);
-    let push_events = broadcast.clone();
-    let live = LiveSignals {
-        broadcast,
-        sink: Arc::new(notify.event_sink()),
-        notifier: Some(Arc::new(notify.notifier())),
-    };
+    // `DATABASE_URL`'s scheme picks the store (ADR 0053, decision 3). A scheme or a role the
+    // binary cannot serve is a configuration error before anything connects.
+    let kind = store_kind(config.database_url.expose_secret(), role)?;
+    let chosen = choose_store(config, kind).await?;
+    let store = chosen.store.clone();
+    let push_events = chosen.live.broadcast.clone();
     let options = options_for(config, options);
     let workers = role.runs_workers().then_some(options.concurrency);
     let worker_id = options.worker_id.clone();
     let component_store = store.clone();
-    let service = Service::new_with(register(Runtime::builder(store)), name, &options, live)
-        .with_inbound(inbound)
-        .with_access_tiers(access_tiers)
-        .with_commands(commands)
-        .with_child_sessions(child_sessions.clone());
+    let service = Service::new_with(
+        register(Runtime::builder(store)),
+        name,
+        &options,
+        chosen.live.clone(),
+    )
+    .with_inbound(inbound)
+    .with_access_tiers(access_tiers)
+    .with_commands(commands)
+    .with_child_sessions(child_sessions.clone());
     // The card lists the extension if and only if this process serves it.
     let mut card = card;
     if role.runs_control_plane()
@@ -505,10 +713,10 @@ async fn run(
         }
     }
 
-    pg.ping().await.map_err(ServeError::Connect)?;
-    adam_core::Store::migrate(&pg)
-        .await
-        .map_err(ServeError::Migrate)?;
+    // The process's own configuration is checked; now the store may connect (Postgres) and
+    // migrate. SQLite and MongoDB were opened and migrated when they were chosen.
+    chosen.ready().await?;
+    let notify = chosen.notify;
 
     // Bind before anything runs: an address that cannot be bound fails the process at once.
     let listener = match listen {
@@ -562,18 +770,23 @@ async fn run(
     let host = if role.runs_workers() {
         let runtime = service.runtime.clone();
         let done = notify_stop.clone().drop_guard();
-        host.worker("worker", |stop| async move {
+        let host = host.worker("worker", |stop| async move {
             let _done = done;
             runtime
                 .run_worker(stop.cancelled_owned())
                 .await
                 .map_err(Into::into)
-        })
-        .worker("notify", |_| {
-            run_notify(notify, notify_stop.cancelled_owned())
-        })
+        });
+        // Postgres has a listener; SQLite's notifier is in-process and MongoDB has none.
+        match notify {
+            Some(start) => host.worker("notify", move |_| start(notify_stop)),
+            None => host,
+        }
     } else {
-        host.control_plane("notify", |stop| run_notify(notify, stop.cancelled_owned()))
+        match notify {
+            Some(start) => host.control_plane("notify", start),
+            None => host,
+        }
     };
 
     // Push notifications are delivered beside the server that accepts them, in the control plane:
@@ -621,6 +834,79 @@ mod tests {
     }
 
     #[test]
+    fn the_database_url_scheme_picks_the_store_and_refuses_a_split_sqlite_role() {
+        assert_eq!(
+            store_kind("postgres://u@h/d", Role::All).unwrap(),
+            StoreKind::Postgres
+        );
+        assert_eq!(
+            store_kind("postgresql://u@h/d", Role::All).unwrap(),
+            StoreKind::Postgres
+        );
+        assert_eq!(
+            store_kind("mongodb://h/db", Role::All).unwrap(),
+            StoreKind::Mongo {
+                database: "db".into()
+            }
+        );
+        assert_eq!(
+            store_kind("mongodb+srv://h/db?retryWrites=true", Role::All).unwrap(),
+            StoreKind::Mongo {
+                database: "db".into()
+            }
+        );
+        assert_eq!(
+            store_kind("mongodb://h", Role::All).unwrap(),
+            StoreKind::Mongo {
+                database: "adam".into()
+            }
+        );
+        assert_eq!(
+            store_kind("sqlite:///tmp/adam.sqlite", Role::All).unwrap(),
+            StoreKind::Sqlite {
+                path: "/tmp/adam.sqlite".into()
+            }
+        );
+        assert_eq!(
+            store_kind("sqlite://relative.db", Role::All).unwrap(),
+            StoreKind::Sqlite {
+                path: "relative.db".into()
+            }
+        );
+        assert_eq!(
+            store_kind("sqlite://./x.db", Role::All).unwrap(),
+            StoreKind::Sqlite {
+                path: "./x.db".into()
+            }
+        );
+
+        // A split role needs several processes on one store, which a SQLite file refuses.
+        for role in [Role::Worker, Role::ControlPlane] {
+            let error = store_kind("sqlite:///tmp/adam.sqlite", role).unwrap_err();
+            assert!(
+                matches!(&error, ServeError::SplitRoleOnSqlite { role: written } if written == role.as_str()),
+                "{role}: {error:?}"
+            );
+            assert!(error.to_string().contains("one process"), "{error}");
+            assert_eq!(crate::exit_code(&error), 78, "{role}");
+        }
+
+        // An unknown scheme is a configuration error that names the scheme and the accepted ones.
+        for url in ["mysql://h/d", "sqlite", "memory:"] {
+            let error = store_kind(url, Role::All).unwrap_err();
+            assert!(
+                matches!(&error, ServeError::UnsupportedScheme { .. }),
+                "{url}: {error:?}"
+            );
+            assert!(error.to_string().contains("postgres://"), "{error}");
+            assert_eq!(crate::exit_code(&error), 78, "{url}");
+        }
+        let error = store_kind("sqlite://", Role::All).unwrap_err();
+        assert!(matches!(error, ServeError::SqliteWithoutPath), "{error:?}");
+        assert_eq!(crate::exit_code(&error), 78);
+    }
+
+    #[test]
     fn a_placement_that_pins_runs_claims_pinned_runs_and_the_others_any() {
         for placement in Placement::VALUES {
             let want = if placement.pins_runs() {
@@ -635,7 +921,7 @@ mod tests {
     #[test]
     fn the_errors_say_the_step_and_keep_the_cause_apart() {
         let down = ServeError::Connect(StoreError::unavailable(std::io::Error::other("refused")));
-        assert_eq!(down.to_string(), "connecting to Postgres");
+        assert_eq!(down.to_string(), "connecting to the store");
         assert!(std::error::Error::source(&down).is_some());
         let bind = ServeError::Bind {
             addr: "127.0.0.1:1".parse().unwrap(),
