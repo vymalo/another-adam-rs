@@ -1390,7 +1390,19 @@ impl Agent for CoderAgent {
                                 None => Transition::Done { state, output },
                             }
                         } else if asks_the_person(&output) || owes_delivery(&notes, &slots).await {
-                            stop_as_question(ctx, state, output, !slots.is_empty()).await
+                            if adam_llm_agent::is_unattended(
+                                ctx.conversation_id(),
+                                Some(&state.context),
+                            ) {
+                                // Nobody answers a firing of a schedule (ADR 0060): a run that
+                                // would wait for the person ends, saying what it needed.
+                                Transition::Fail {
+                                    state,
+                                    error: redactor.failure_text(unattended_ending(&output)),
+                                }
+                            } else {
+                                stop_as_question(ctx, state, output, !slots.is_empty()).await
+                            }
                         } else {
                             // An answer that asks nothing, with no repository work left undelivered:
                             // the turn is over, and the person's next message starts the next one.
@@ -1402,6 +1414,25 @@ impl Agent for CoderAgent {
             other => Ok(other),
         }
     }
+}
+
+/// The failure of a firing of a schedule that ended where a person's run would wait: a question,
+/// or repository work left undelivered. It names what the run needed and quotes its last words.
+fn unattended_ending(output: &Value) -> String {
+    let said = output
+        .get("text")
+        .and_then(Value::as_str)
+        .or_else(|| output.as_str())
+        .unwrap_or_default()
+        .trim();
+    // The end of the answer: a question is its last paragraph, and the run's failure is bounded.
+    let count = said.chars().count();
+    let tail: String = said.chars().skip(count.saturating_sub(1_500)).collect();
+    let cut = if count > 1_500 { "…" } else { "" };
+    format!(
+        "a schedule started this run and nobody answers it, so it stopped where it would have waited \
+         for the person (a question, or work left undelivered); its last words: {cut}{tail}"
+    )
 }
 
 /// The boundary a failed step crosses on its way to the run's failure text and the retry note:
@@ -1780,6 +1811,25 @@ mod tests {
 
     fn said(state: &Conversation) -> Vec<String> {
         person_texts(state, &[])
+    }
+
+    #[test]
+    fn an_unattended_ending_says_why_and_quotes_the_last_words() {
+        let text = unattended_ending(&json!({"text": "  Tests pass. Open the PR?  "}));
+        assert!(text.contains("nobody answers it"), "{text}");
+        assert!(
+            text.ends_with("its last words: Tests pass. Open the PR?"),
+            "{text}"
+        );
+        // A long answer keeps its end, where the question is.
+        let long =
+            unattended_ending(&json!({"text": format!("{}Shall I open it?", "x".repeat(3_000))}));
+        assert!(
+            long.ends_with("Shall I open it?") && long.contains('…'),
+            "{long}"
+        );
+        assert!(long.chars().count() < 1_800, "{}", long.chars().count());
+        assert!(unattended_ending(&json!(null)).ends_with("its last words: "));
     }
 
     #[test]

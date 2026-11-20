@@ -135,7 +135,7 @@ pub use session::{
     SessionState, SessionSummary, SessionView, closing_round_payload,
     parse_session_conversation_id, session_conversation_id, session_conversation_prefix,
 };
-pub use starter::{RunStarter, SCHEDULE_CONVERSATION_PREFIX};
+pub use starter::{RunStarter, SCHEDULE_CONVERSATION_PREFIX, UNATTENDED_CONTEXT_KEY};
 pub use step::{
     MAX_STEP_DETAIL_CHARS, MAX_STEP_ID_BYTES, MAX_STEP_LABEL_CHARS, STEP_INPUT_MAX_BYTES,
     STEP_INPUT_STRING_MAX_CHARS, STEP_OUTPUT_MAX_BYTES, StepEvent, StepIcon, StepKind, StepOutput,

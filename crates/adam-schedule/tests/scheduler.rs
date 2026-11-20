@@ -220,6 +220,11 @@ async fn an_after_schedule_fires_once_records_its_trigger_and_ends() {
     assert_eq!(output["payload"]["text"], "Follow up.");
     assert_eq!(output["payload"]["schedule"]["name"], "soon");
     assert_eq!(output["payload"]["schedule"]["missed"], 0);
+    // Nobody answers a firing, nor its children: the key they inherit is set.
+    assert_eq!(
+        output["payload"]["context"][adam_runtime::UNATTENDED_CONTEXT_KEY],
+        true
+    );
 
     let state = state_of(&rt, &schedulers(&store, "soon").await[0]).await;
     assert_eq!(state.last_due, Some(due));

@@ -8,6 +8,12 @@ use crate::runtime::{Runtime, RuntimeError};
 /// The conversations a [`RunStarter`] may start runs in: those of schedules and their firings.
 pub const SCHEDULE_CONVERSATION_PREFIX: &str = "adam.schedule:";
 
+/// The key of a message's `context` that says **nobody answers this run**, with the value `true`:
+/// a firing of a schedule carries it (ADR 0060), and an agent's child runs inherit it with the
+/// other protected keys (`adam_llm_agent::PROTECTED_CONTEXT_KEYS`), so a subagent of a firing,
+/// which has no conversation of its own, knows it too.
+pub const UNATTENDED_CONTEXT_KEY: &str = "adam.unattended";
+
 /// The right of a step to start **root** runs, as an owned, cloneable handle.
 ///
 /// [`Ctx::run_starter`](crate::Ctx::run_starter) makes one from the runtime that is stepping the
