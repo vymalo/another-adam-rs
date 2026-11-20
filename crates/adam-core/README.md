@@ -16,7 +16,7 @@ database driver.
 
 | Item | What |
 |---|---|
-| `Store` (trait) | `migrate`, `create_run`, `load_run`, `load_head` (a run as an observer reads it: the head when it is current, else the state; defaults to `load_run`), `run_header` (a run without its state, from one projected read where the adapter can), `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs, body rows and blob references of the runs it purges, and collects unreferenced blobs), `list_runs` and `count_runs` (a caller's runs, newest update first, by keyset: `RunQuery`, `ConversationScope`), the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*), the five **blob** methods `keeps_blobs`, `blob_stored`, `put_blob`, `get_blob`, `purge_blobs` (see *File bytes*), and the three **body** methods `keeps_bodies`, `body_list`, `gc_body` (see *Transcripts*) |
+| `Store` (trait) | `migrate`, `create_run`, `load_run`, `load_head` (a run as an observer reads it: the head when it is current, else the state; defaults to `load_run`), `run_header` (a run without its state, from one projected read where the adapter can), `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `release_worker_leases` (every run lease a worker holds, so a restarted process claims its runs at once; defaults to a no-op), `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs, body rows and blob references of the runs it purges, and collects unreferenced blobs), `list_runs` and `count_runs` (a caller's runs, newest update first, by keyset: `RunQuery`, `ConversationScope`), the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*), the five **blob** methods `keeps_blobs`, `blob_stored`, `put_blob`, `get_blob`, `purge_blobs` (see *File bytes*), and the three **body** methods `keeps_bodies`, `body_list`, `gc_body` (see *Transcripts*) |
 | `DynStore` | `Arc<dyn Store>`, the handle the runtime holds |
 | `RunRecord`, `NewRun`, `RunUpdate`, `RunStatus`, `RunId` | a run and how to create or advance one |
 | `BodyRow`, `BodyWrite` | one transcript row (`idx`, `message`) and what a commit writes (`generation`, `rows`, `writer`), keyed `(run, generation, idx)` in the store (see *Transcripts*) |
@@ -84,6 +84,16 @@ about `Placement`; the host maps `Placement::pins_runs()` to `ClaimScope::Pinned
 ([`adam-host`](../adam-host/README.md)). The signature change is breaking for anyone who
 implements `Store`; the conformance cases in
 [`adam-store-testkit`](../adam-store-testkit/README.md) prove an implementation.
+
+`Store::release_worker_leases(worker)` drops every run lease `worker` holds, so a restarted process
+claims its runs at once instead of waiting for each TTL. Like `release_lease` it does not clear the
+run's owner, so a released pinned run still comes back only to the same worker, and a lease held by
+another worker is untouched. The caller must be the only live process using `worker` (in this
+repository's deployment `WORKER_ID` is the pod name): the sweep releases every lease that id holds.
+The method is **defaulted to a no-op**, so it breaks no implementer: a
+store that does not implement it waits for the TTL. `MemoryStore` implements it; the suite
+`worker_leases_conformance!` in [`adam-store-testkit`](../adam-store-testkit/README.md) proves an
+implementation.
 
 ## Listing runs
 

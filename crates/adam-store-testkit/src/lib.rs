@@ -226,6 +226,43 @@ macro_rules! body_conformance {
     };
 }
 
+/// Generate one `#[tokio::test]` per worker-lease conformance case. `$make` is a path to an
+/// `async fn() -> Option<DynStore>`, like [`store_conformance!`]: `None` skips the suite (and
+/// fails instead under `ADAM_TEST_REQUIRE_DB=1`, see `adam_core::testing`).
+///
+/// The cases prove [`Store::release_worker_leases`](adam_core::Store::release_worker_leases): every
+/// run lease the worker holds goes and its runs are claimable at once, another worker's lease is
+/// untouched, and a lease the owner does not hold survives the owner's sweep (the sweep keys on the
+/// lease holder, not the owner); the run's owner is not cleared. The method is **defaulted to a no-op**, so a store
+/// that does not implement it passes [`store_conformance!`] and must not be given this suite: give
+/// it only to a store that implements the release.
+#[macro_export]
+macro_rules! worker_leases_conformance {
+    ($make:path) => {
+        $crate::worker_leases_conformance!(@cases $make;
+            worker_leases_frees_the_workers_runs,
+            worker_leases_leaves_another_workers_lease_alone,
+            worker_leases_leaves_a_lease_the_owner_does_not_hold,
+        );
+    };
+    (@cases $make:path; $($case:ident),* $(,)?) => {
+        $(
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn $case() {
+                let Some(store) = $make().await else {
+                    $crate::skipped(&format!(
+                        "{}: store not configured",
+                        stringify!($case)
+                    ));
+                    return;
+                };
+                store.migrate().await.expect("migrate");
+                $crate::cases::$case(store).await;
+            }
+        )*
+    };
+}
+
 /// Generate the `measure_the_headless_transcript` test: run
 /// [`counting::measure_headless_transcript`] through `$make`, print its line, and assert that the
 /// workload ran.
@@ -2340,6 +2377,143 @@ pub mod cases {
         assert_eq!(
             store.lease_until(run.id).await.unwrap(),
             Some(t2 + jiff::SignedDuration::from_secs(10))
+        );
+    }
+
+    /// `release_worker_leases(worker)` drops every run lease `worker` holds, so its runs are
+    /// claimable at once instead of after the TTL. It does not clear the owner: a released pinned run still
+    /// comes back only to the same worker.
+    pub async fn worker_leases_frees_the_workers_runs(store: DynStore) {
+        let agent = agent();
+        let mut mine = Vec::new();
+        for n in 0..2 {
+            mine.push(
+                store
+                    .create_run(NewRun::new(&agent, json!({ "n": n })))
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        mine.sort();
+        let t = now() + jiff::SignedDuration::from_secs(1);
+        let ttl = Duration::from_secs(30);
+        // A pinned claim sets the owner and leases both runs to w1.
+        let mut claimed = claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 10).await;
+        claimed.sort();
+        assert_eq!(claimed, mine);
+        let until = t + jiff::SignedDuration::from_secs(30);
+        for id in &mine {
+            assert_eq!(store.lease_until(*id).await.unwrap(), Some(until));
+        }
+
+        store.release_worker_leases("w1").await.unwrap();
+        for id in &mine {
+            assert_eq!(
+                store.lease_until(*id).await.unwrap(),
+                None,
+                "the worker's lease is gone"
+            );
+        }
+        // Claimable at once, not after the TTL: another worker's unpinned claim takes them.
+        let mut taken = claim_ids_as(&store, ClaimScope::Any, &agent, "w2", t, ttl, 10).await;
+        taken.sort();
+        assert_eq!(taken, mine, "a released run is claimable at once");
+        for id in &mine {
+            store.release_lease(*id, "w2").await.unwrap();
+        }
+        // The owner is still w1: w2's pinned claim is refused and w1's succeeds.
+        assert!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w2", t, ttl, 10)
+                .await
+                .is_empty(),
+            "the release did not clear the owner"
+        );
+        let mut back = claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 10).await;
+        back.sort();
+        assert_eq!(back, mine, "the owner still gets its runs");
+    }
+
+    /// `release_worker_leases` touches only the named worker's leases: another worker's run stays
+    /// leased, unclaimable and renewable.
+    pub async fn worker_leases_leaves_another_workers_lease_alone(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let t = now() + jiff::SignedDuration::from_secs(1);
+        let ttl = Duration::from_secs(30);
+        assert_eq!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 1).await,
+            vec![run.id]
+        );
+        let until = t + jiff::SignedDuration::from_secs(30);
+
+        store.release_worker_leases("w2").await.unwrap();
+        assert_eq!(
+            store.lease_until(run.id).await.unwrap(),
+            Some(until),
+            "w1's lease is untouched"
+        );
+        assert!(
+            claim_ids_as(&store, ClaimScope::Any, &agent, "w2", t, ttl, 1)
+                .await
+                .is_empty(),
+            "the run is still leased to w1"
+        );
+        assert!(
+            store
+                .renew_lease(run.id, "w1", t + jiff::SignedDuration::from_secs(1), ttl)
+                .await
+                .unwrap(),
+            "w1 still holds it"
+        );
+    }
+
+    /// The sweep keys on the **lease holder**, not the run's owner: a run owned by w1 whose lease w2
+    /// holds survives `release_worker_leases("w1")`. This is the state an implementation that
+    /// released by owner would break.
+    pub async fn worker_leases_leaves_a_lease_the_owner_does_not_hold(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let t = now() + jiff::SignedDuration::from_secs(1);
+        let ttl = Duration::from_secs(30);
+        // w1's pinned claim makes it the owner, and its lease holder.
+        assert_eq!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 1).await,
+            vec![run.id]
+        );
+        store.release_lease(run.id, "w1").await.unwrap();
+        // w2 takes the lease; the owner stays w1.
+        assert_eq!(
+            claim_ids_as(&store, ClaimScope::Any, &agent, "w2", t, ttl, 1).await,
+            vec![run.id]
+        );
+        let until = t + jiff::SignedDuration::from_secs(30);
+        assert_eq!(store.lease_until(run.id).await.unwrap(), Some(until));
+
+        store.release_worker_leases("w1").await.unwrap();
+        assert_eq!(
+            store.lease_until(run.id).await.unwrap(),
+            Some(until),
+            "the owner holds no lease: w2's is untouched"
+        );
+        assert!(
+            store
+                .renew_lease(run.id, "w2", t + jiff::SignedDuration::from_secs(1), ttl)
+                .await
+                .unwrap(),
+            "w2 still holds the lease"
+        );
+        assert!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 1)
+                .await
+                .is_empty(),
+            "w1 owns the run but does not hold the lease"
         );
     }
 

@@ -271,6 +271,10 @@ impl Store for MovingHead {
         self.inner.release_lease(id, worker).await
     }
 
+    async fn release_worker_leases(&self, worker: &str) -> StoreResult<()> {
+        self.inner.release_worker_leases(worker).await
+    }
+
     async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         self.inner.lease_until(id).await
     }
