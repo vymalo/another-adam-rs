@@ -4,7 +4,7 @@ Status: **Accepted** (2026-11-19). The owner's decision: option 2 of the optimis
 append-only transcript, one row per message, a head-only `state`) plus option 1 (file bytes out of the
 state into a content-addressed blob store). Schema version 5. *Amended 2026-11-19 (S1, S2a)*: the blob
 half (S1) and the non-PostgreSQL shadow (S2a) are built; the body is append-only **per generation**
-(the S2a amendment below); the PostgreSQL head/body half is pending #361. It follows the I/O-layer
+(the S2a amendment below); the PostgreSQL head/body half is built in #361 (*amended 2026-11-20*). It follows the I/O-layer
 pull request, which does not change the state schema.
 
 ## Context
@@ -80,7 +80,7 @@ a later cleanup.
 |---|---|---|
 | **S0 — measure** | `CountingStore` in the testkit; the 50 × 10 KB test in today's shape, asserting `total < 50 × 20 KB` and **recorded red**; `dev/p2-measure.sh` for `pg_relation_size`, `pg_stat_wal` and Mongo `collStats` | the test fails on `main` with the recorded number; the script prints the baseline |
 | **S1 — blobs** | `BlobId`, `keeps_blobs`/`put_blob`/`get_blob`, `purge_blobs`; schema v5 part 1; the three implementations; `blob_conformance!`; the runtime uploads file artifacts and passes `RunUpdate.blobs`; `state` unchanged. The blob sweep and a commit's ref insert are **not one transaction**: an uncommitted ref is invisible to the sweep, which S2a's CTE closes (see the S1 amendment) | blob conformance on Memory/Postgres/Mongo; a 4 MiB file round-trips; the v4 fixture still decodes every `state` |
-| **S2a — the shadow** | `Agent`/`AgentStarter::split`/`join`, `Conversation`'s split, the `Head` type, schema v5 part 2, `RunUpdate.head/body`; the step path writes the head and the **delta** of an append-only generation (a compaction starts a new one); **nothing reads the head**; the non-PostgreSQL half only (the PostgreSQL head/body half is the follow-up after #361) | `split/join` conformance; the per-commit reconstruction check; the body conformance (append/compaction/lost CAS/purge); every runtime test green; the v4 fixture green |
+| **S2a — the shadow** | `Agent`/`AgentStarter::split`/`join`, `Conversation`'s split, the `Head` type, schema v5 part 2, `RunUpdate.head/body`; the step path writes the head and the **delta** of an append-only generation (a compaction starts a new one); **nothing reads the head**; the non-PostgreSQL half only (the PostgreSQL head/body half is the follow-up after #361; *amended 2026-11-20: built in #361*) | `split/join` conformance; the per-commit reconstruction check; the body conformance (append/compaction/lost CAS/purge); every runtime test green; the v4 fixture green |
 | **S2b — the view** | `load_head`, `Stored` (`v1`/`v5`), `Runtime::view` on the head, `RunView.state` = the head, `RunView.artifacts: Vec<ArtifactRef>`, `Runtime::state`/`artifact_bytes`, the A2A blob read and cache | the read-counting test; every A2A test; the write measurement still shows the old cost |
 | **S3 — contract** | `state = null` on every commit; `load_run`, `claim_due`, `open_run` and `list_runs` return the head; the step path joins; `deliver`, `cancel_run` and `park_again` write the head they read; `start_continuing`/`on_cancelled` join; the v4 fixture test inverted to assert the documented failure | the 50 × 20 KB test green; `pg_relation_size`/WAL green; the "v4 cannot read a v5 run" test |
 | **S4 — later** | drop the v4 `Envelope` read path and the `state` column, after every live run is v5 | — |
