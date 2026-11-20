@@ -117,7 +117,7 @@ impl<R: Read> Read for StopRead<'_, R> {
 }
 
 /// One page of `rel` under `root`: its lines behind their numbers and the final line of
-/// [`paging`](adam_llm_agent::paging) (see the tool).
+/// [`paging`] (see the tool).
 ///
 /// A page is **one pass** over the file and keeps only the page: the final line gives the exact
 /// number of lines left (or the file's total), so every line is counted; the lines outside the
