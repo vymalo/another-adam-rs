@@ -232,16 +232,15 @@ test('the scratch directories are removed', async (t) => {
   assert.deepEqual(fs.readdirSync(root), []);
 });
 
-test('the grading script applies the patch in the working directory; the check clones to the agents\' path', () => {
+test('the grading script applies the patch in the working directory; the check copies the tree to the agents\' path', () => {
   const pristine = gradeScript({ workdir: '/app' });
   assert.match(pristine, /cd \/app/);
   assert.match(pristine, /\[ -s \/patch\/model\.patch \]/);
-  assert.doesNotMatch(pristine, /git clone/);
+  assert.doesNotMatch(pristine, new RegExp(CLONE_PATH));
   const clone = gradeScript({ workdir: '/app', cloneTo: CLONE_PATH });
-  assert.match(clone, new RegExp(`git clone -q --no-hardlinks /app ${CLONE_PATH}`));
+  assert.match(clone, new RegExp(`cp -a /app/\\. ${CLONE_PATH}/`));
   assert.match(clone, new RegExp(`cd ${CLONE_PATH}`));
   assert.match(clone, /sed 's#\/app/);
-  assert.match(clone, /ln -s \/app/);
 });
 
 test('the sed of the check rewrites the working directory and leaves other paths alone', (t) => {
@@ -278,8 +277,8 @@ test('the check keeps a task whose gold passes three times and empty fails three
   const r = await checkTask({ containers: c, task, workRoot: tmp(t) });
   assert.deepEqual([r.ok, r.reason, r.devcontainer, r.imageDigest], [true, null, true, DIGEST]);
   assert.equal(c.runs.length, 1 + 3 + 1 + 3);
-  assert.equal(c.runs.slice(1).filter((s) => /git clone/.test(s.script)).length, 6, 'six runs from the agents\' clone path');
-  assert.equal(c.runs.filter((s) => !/git clone/.test(s.script) && s.mounts?.some((m) => m.target === '/patch/model.patch')).length, 1, 'and the gold once through the real path');
+  assert.equal(c.runs.slice(1).filter((s) => s.script.includes(CLONE_PATH)).length, 6, 'six runs from the agents\' clone path');
+  assert.equal(c.runs.filter((s) => !s.script?.includes(CLONE_PATH) && s.mounts?.some((m) => m.target === '/patch/model.patch')).length, 1, 'and the gold once through the real path');
   assert.equal(c.runs[0].network, 'none');
 });
 

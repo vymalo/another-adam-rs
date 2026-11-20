@@ -293,6 +293,33 @@ pub trait Agent: Send + Sync + 'static {
         state: Self::State,
     ) -> Result<Transition<Self::State>, AgentError>;
 
+    /// Split `state` into the small part a run's head keeps and its transcript, oldest first.
+    ///
+    /// `None` (the default) keeps the whole state in the head: today's behaviour, unoptimised. A
+    /// state that splits is written twice in the expand release — the full `state` and the head
+    /// beside it — and the runtime checks on every commit that
+    /// [`join`](Self::join)`(split(s).0, split(s).1)` re-encodes to `s`; a split that does not is
+    /// refused, and the run stays in the v4 format rather than gaining a head that does not
+    /// reconstruct it.
+    ///
+    /// **A wrapper that delegates [`init`](Self::init) must delegate this too** (and
+    /// [`join`](Self::join), and [`init_continuing`](Self::init_continuing)), or its runs silently
+    /// stay in the v4 format.
+    fn split(&self, state: &Self::State) -> Option<(Self::State, Vec<Value>)> {
+        let _ = state;
+        None
+    }
+
+    /// `head` with `rows` as its transcript: the inverse of [`split`](Self::split).
+    ///
+    /// The invariant is `join(split(s).0, split(s).1)` re-encodes to the same JSON as `s`, for
+    /// every state the agent can produce. The default returns `head` and ignores `rows`, which is
+    /// right exactly when [`split`](Self::split) is the default.
+    fn join(&self, head: Self::State, rows: Vec<Value>) -> Result<Self::State, AgentError> {
+        let _ = rows;
+        Ok(head)
+    }
+
     /// Called once after a cancel has committed `run` as `Failed` (`Runtime::cancel`, a parent
     /// that ended, a time limit, a cancel from the A2A front), with the agent state that commit
     /// holds as JSON, so an agent can tell a system it started elsewhere (a remote task) to stop.
@@ -346,6 +373,24 @@ pub trait AgentStarter: Send + Sync + 'static {
     ) -> Result<Self::State, AgentError> {
         let _ = (prior, prior_run);
         self.init(input)
+    }
+
+    /// The start-only half of [`Agent::split`]: it must return what the agent of the same name
+    /// does, or a run it starts is never split. The default is [`Agent::split`]'s: no split.
+    ///
+    /// **A wrapper that delegates [`init`](Self::init) must delegate this too** (and
+    /// [`join`](Self::join), and [`init_continuing`](Self::init_continuing)), or its runs silently
+    /// stay in the v4 format.
+    fn split(&self, state: &Self::State) -> Option<(Self::State, Vec<Value>)> {
+        let _ = state;
+        None
+    }
+
+    /// The start-only half of [`Agent::join`]: the inverse of [`split`](Self::split). The default
+    /// returns `head`, as [`Agent::join`]'s does.
+    fn join(&self, head: Self::State, rows: Vec<Value>) -> Result<Self::State, AgentError> {
+        let _ = rows;
+        Ok(head)
     }
 }
 

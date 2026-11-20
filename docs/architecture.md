@@ -906,16 +906,21 @@ never shown as `submitted` again. A front that holds only the starter claims not
 
 ## Data: the run store
 
-Five tables (PostgreSQL) or collections (MongoDB), prefixed `adam_` by default, plus a `meta` table with
-the schema version: `push` holds A2A push-notification configurations (schema version 3), and `blob`
-and `run_blob` hold a run's file bytes and the digests it references (schema version 5, part 1).
-`state` is JSONB in Postgres and a real BSON document in MongoDB.
+Six tables (PostgreSQL) or collections (MongoDB), prefixed `adam_` by default, plus a `meta` table with
+the schema version: `push` holds A2A push-notification configurations (schema version 3), `blob`
+and `run_blob` hold a run's file bytes and the digests it references (schema version 5, part 1), and
+`body` holds a run's transcript beside the `head` and `head_version` of a run document (schema version
+5, part 2). **The head and the body are MongoDB's now**: the PostgreSQL columns, `adam_body` and
+`body_list` are the follow-up after #361, and `PgStore` keeps `keeps_bodies() == false` until then.
+`state` is JSONB in Postgres and a real BSON document in MongoDB; in the expand release it is still
+the complete v4 envelope.
 
 ```mermaid
 erDiagram
     RUNS ||--o{ JOURNAL : "one entry per step (cascade delete)"
     RUNS ||--o{ PUSH : "one per webhook of a task (cascade delete)"
     RUNS ||--o{ RUN_BLOB : "the digests it references (cascade delete)"
+    RUNS ||--o{ BODY : "one row per transcript message (cascade delete)"
     BLOB |o--o{ RUN_BLOB : "the bytes, when the upload landed: a ref may name a digest with no blob row"
     RUNS |o--o{ RUNS : "parent_id: a child run"
     RUNS {
@@ -925,6 +930,8 @@ erDiagram
         uuid parent_id "null: not a child run"
         text status "runnable, parked, done, failed"
         jsonb state "the Envelope"
+        jsonb head "the v5 head (MongoDB now; PostgreSQL after #361)"
+        bigint head_version "the version the head was written at"
         timestamptz wake_at
         timestamptz sched_at "derived: when it is due"
         bigint version "starts at 1, +1 per commit"
@@ -969,6 +976,13 @@ erDiagram
         uuid run_id PK
         text digest PK
     }
+    BODY {
+        uuid run_id PK
+        uuid generation PK "the generation the head names"
+        integer idx PK "the message's position"
+        jsonb message "one message, as the agent holds it"
+        timestamptz written_at "the GC cutoff"
+    }
     META {
         text key PK
         text value "schema_version"
@@ -985,22 +999,26 @@ erDiagram
 | `push (agent, next_attempt_at, run_id, id)` where active | claiming due push configs |
 | `blob (created_at)` | blob GC: unreferenced blobs older than the cutoff |
 | `run_blob (digest)` | blob GC: does any run still reference this digest |
+| `body (run_id, generation, idx)` | reading one generation in order, and the GC's "which generations of this run" (MongoDB now; index `adam_body_generation`) |
+| `body (written_at)` | body GC: superseded generations older than the cutoff (MongoDB now) |
 
 MongoDB keeps the same fields in `adam_runs` (`_id` is the run's UUID) plus `open_key` (a plain unique
 index; closed runs get `~<run id>`), `lease_token`, the listing indexes `adam_list`
 (`(agent, conversation_id, updated_at, _id)`) and `adam_list_status`
 (`(agent, status, conversation_id, updated_at, _id)`, for a status filter), the journal in
 `adam_journal` with `_id = "<run>:<seq>"`, the push configs in `adam_push` with
-`_id = "<run>:<config id>"`, the blobs in `adam_blob` with `_id` = the digest, and the digests a run
-references in `adam_run_blob` with `_id = "<run>:<digest>"`. How each adapter keeps its promises: [store adapters](reference/store-adapters.md).
+`_id = "<run>:<config id>"`, the blobs in `adam_blob` with `_id` = the digest, the digests a run
+references in `adam_run_blob` with `_id = "<run>:<digest>"`, and the transcript in `adam_body` with
+`_id = "<run>:<commit>:<idx>"`. A version 4 run document has neither `head` nor `head_version`
+(`{head_version: null}` matches a missing field). How each adapter keeps its promises: [store adapters](reference/store-adapters.md).
 
 What `state` holds (JSON, versioned `v`; the layout is private to the runtime,
 `crates/adam-runtime/src/envelope.rs`):
 
 | Envelope field | Meaning |
 |---|---|
-| `v` | layout version (1) |
-| `agent` | the agent's own state; for an `LlmAgent`, a `Conversation` (below) |
+| `v` | layout version: `1` is this envelope, `5` the head (below) |
+| `agent` | the agent's own state; for an `LlmAgent`, a `Conversation` (below). The whole state in `v: 1`, the head without its messages in `v: 5` |
 | `inbox` | delivered, not yet read messages (`Inbound { id, kind, payload, received_at }`) |
 | `seq`, `attempt`, `rev` | next journal seq; failed tries of this transition; bumped by each worker commit |
 | `output`, `error` | the result of a `Done` run; the reason of a `Failed` one |
@@ -1011,10 +1029,45 @@ A **file artifact's** bytes are also written to the blob table under their SHA-2
 the bytes too until the contract release, so a reader of the old format still reads a run
 ([ADR 0055](decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md)).
 
+### The head and the body (schema version 5, part 2)
+
+The expand release writes a **head** and a **body generation** beside `state`, and reads neither:
+the read path (`Runtime::view`, `load_run`, `claim_due`, `list_runs`) is unchanged in this slice, and
+`Store::load_head` exists for the tests (the read path is the next slice). MongoDB keeps both now; the
+PostgreSQL half is the follow-up after #361, and `PgStore` keeps `keeps_bodies() == false` until then.
+The head is the envelope with `v: 5`, `agent` reduced to the agent's head, file artifacts by
+reference, and a `body` member naming one generation; the rows are the messages.
+
+| Where | What it holds |
+|---|---|
+| `state` (`v: 1`) | the whole run, unchanged in the expand release: the shape a v4 process steps |
+| `head` (`v: 5`) | `agent` without its messages, `inbox`, `seq`, `attempt`, `rev`, `output`, `error`, `artifacts` (files by `digest` and `size`), `deadline`, `limit_secs`, `remaining_secs`, `agent_wake`, `hb`, and `body: {generation, len}` |
+| `adam_body` | one row per message, keyed `(run_id, generation, idx)`, with `written_at` for the GC (MongoDB now) |
+
+A generation is **append-only**: a normal commit writes only the rows after the old head's `len` and
+keeps the generation; a compaction (the transcript no longer starts with the old one) writes all rows
+under a new generation. The delta win holds across **splitting** commits, not across headless ones: a
+`deliver`, `cancel`, `park_again` or failed commit writes no head, so the next split sees a stale
+`head_version` and compacts until S3, where those paths write the head they read; the commit's win (no
+full `state`) arrives at S3. Measured with a delivery between every step: 50 × 10 KB writes 12.7 MB
+of body rows (1,275 rows, 50 generations) against ~0.5 MB of deltas for consecutive splits. The store writes the rows **before** the CAS with the attempt's `writer`,
+checks that all of them landed, and a commit that loses deletes its own rows and refs, so a loser
+cannot poison the next append. A duplicate slot is resolved by content and age: an identical foreign
+row is adopted, a differing one older than the 5-minute orphan grace is collected and the insert
+retried once, and a live attempt's differing row is a `Conflict` (ADR 0055). The grace is far longer
+than the insert→CAS gap of a live attempt (milliseconds; the default lease is 30 s), so it
+distinguishes a dead attempt from a live one without trusting the lease. The runtime reconstructs `join(head, rows)` before every commit and
+refuses a split that does not equal the state, which keeps a bad split at `state` only. A commit that
+does not split (a delivery, a cancel, a park) leaves the stored head and its version alone;
+`load_head` serves the head only when `head_version == version`. **The contract release (S3) stops
+writing `state`**; until then, the expand release pays for both representations.
+
 `Conversation` (`crates/adam-llm-agent/src/conversation.rs`) has `messages`, `turns`, `tool_calls`,
 `usage`, `pending_calls`, `pending_wait` (a question for the user, a child run or a remote task),
 `deferred`, `artifacts`, `announced`, `source_notes`, `continued_from`, `omitted_turns`, `context` and
-`read_ids`. Every field has a serde default, so older state still loads.
+`read_ids`. Every field has a serde default, so older state still loads. Its `split` puts `messages`
+in the body and everything else in the head; `Agent::split`/`join` default to no split, and a wrapper
+that delegates `init` must delegate them too, or its runs stay in the v4 format.
 
 Not stored, by design: `RunEvent`s (`Status`, `Progress`, `Step`, `TextDelta`, `ReasoningDelta`,
 `Custom`, `Artifact`) are live and may be lost (a short in-memory replay per run covers a late subscriber, see

@@ -15,10 +15,10 @@ import { IMAGE, makeTask } from './taskfix.mjs';
 const sha = (text) => crypto.createHash('sha256').update(text).digest('hex');
 
 /** An upstream repository with tasks under v2/, a SHA256SUMS, and a bare copy of it standing in for the real one. */
-function upstream(t, ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2', 'instance_Org__Beta-bbbbbbb1']) {
+function upstream(t, ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2', 'instance_Org__Beta-bbbbbbb1'], over = () => ({})) {
   const work = initRepo(t);
   const root = path.join(work, 'v2');
-  for (const id of ids) makeTask(root, id, { 'environment/Dockerfile': `FROM ${IMAGE}:${id.slice(-8)}\n` });
+  for (const id of ids) makeTask(root, id, { 'environment/Dockerfile': `FROM ${IMAGE}:${id.slice(-8)}\n`, ...over(id) });
   const sums = [];
   const walk = (d) => {
     for (const e of fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
@@ -225,4 +225,167 @@ test('the local configuration refuses a bad tasks block, and an unknown subcomma
   assert.equal(await s.run(['frobnicate']), 64);
   await assert.rejects(s.run(['mine']), (e) => e instanceof ConfigError && /tasks\.clones/.test(e.message));
   await assert.rejects(s.run(['build']), (e) => e instanceof ConfigError && /workspaceImage/.test(e.message));
+});
+
+// ---- `tasks check` walks the selection order and stops at the target ----
+
+/** Tasks of several repositories: { Alpha: 12, ... } -> ids like instance_Org__Alpha-aaaa0003. A `FAIL` line in a gold patch makes its gold fail. */
+const manyIds = (spec) => Object.entries(spec).flatMap(([repo, n]) => Array.from({ length: n }, (_, i) => `instance_Org__${repo}-${repo[0].toLowerCase().repeat(4)}${String(i).padStart(4, '0')}`));
+const failing = (set) => (id) => ({ 'solution/solution.patch': set.has(id) ? `FAIL ${id}\n` : `diff --git a/x b/x\n# ${id}\n` });
+
+/** A runtime whose gold passes unless the gold patch has a FAIL line; it records what is pulled and what is removed. */
+function walkRuntime({ ids, digestFor = (id) => `sha256:${sha(id)}` }) {
+  const digests = {};
+  for (const id of ids) digests[`${IMAGE}:${id.slice(-8)}`] = digestFor(id);
+  const rt = new FakeContainers({
+    digests,
+    onRun: (spec) => {
+      if (!spec.mounts) return { exitCode: 0, stdout: 'devcontainer=no\n' };
+      const model = spec.mounts.find((m) => m.target === '/patch/model.patch');
+      const bad = model && fs.readFileSync(model.source, 'utf8').includes('FAIL');
+      fs.writeFileSync(path.join(spec.mounts.find((m) => m.target === '/logs/verifier').source, 'reward.txt'), model && !bad ? '1\n' : '0\n');
+      return { exitCode: 0 };
+    },
+  });
+  rt.removed = [];
+  rt.removeImage = async (ref) => {
+    if (rt.removeFails) throw new Error('image is in use');
+    rt.removed.push(ref);
+  };
+  // each checked task starts with one probe run (no mounts) on its image by digest
+  rt.checkedIds = () => rt.runs.filter((r) => !r.mounts).map((r) => ids.find((id) => r.image === `${IMAGE}@${digestFor(id)}`));
+  return rt;
+}
+
+const lockIds = (s) => JSON.parse(fs.readFileSync(path.join(s.repoTasks, 'public.lock.json'), 'utf8')).tasks.map((x) => x.id);
+const checkJson = (s) => JSON.parse(fs.readFileSync(path.join(s.home, 'tasks', 'check.json'), 'utf8'));
+const publicCfg = (up) => ({ tasks: { upstreamUrl: up.bare, upstreamCommit: up.commit, seed: 'seed-one' } });
+
+test('check walks in the seeded order, stops once the target is kept, and select gives what a full check would', async (t) => {
+  const ids = manyIds({ Alpha: 12, Beta: 12, Gamma: 12 });
+  const bad = new Set(ids.filter((_, i) => i % 5 === 2));
+  const up = upstream(t, ids, failing(bad));
+  const part = setup(t, publicCfg(up));
+  const rt = walkRuntime({ ids });
+  assert.equal(await part.run(['check', '--total', '10'], () => rt), 0);
+  const walked = rt.checkedIds();
+  assert.ok(walked.length >= 10 && walked.length < ids.length, `walked ${walked.length} of ${ids.length}`);
+  assert.match(part.outLines.join('\n'), /10 kept, \d+ dropped, \d+ not needed/);
+  assert.equal(await part.run(['select', '--source', 'public', '--total', '10']), 0);
+
+  const full = setup(t, publicCfg(up));
+  const rt2 = walkRuntime({ ids });
+  assert.equal(await full.run(['check', '--all'], () => rt2), 0);
+  assert.equal(rt2.checkedIds().length, ids.length, '--all walks every task');
+  assert.equal(await full.run(['select', '--source', 'public', '--total', '10']), 0);
+  assert.deepEqual(lockIds(part), lockIds(full));
+  assert.equal(lockIds(part).length, 10);
+  // the walk went in the order select uses: what it checked is a prefix of that order
+  const { selectionOrder } = await import('../lib/select.mjs');
+  const order = selectionOrder(ids.map((id) => ({ id, repo: `Org/${id.split('__')[1].split('-')[0]}` })), { seed: 'seed-one', scope: 'public' }).map((x) => x.id);
+  assert.deepEqual(walked, order.filter((id) => walked.includes(id)).slice(0, walked.length));
+  assert.deepEqual(walked.slice(0, 3).map((id) => id.split('__')[1][0]).sort(), ['A', 'B', 'G'], 'the first round takes one task of each repository');
+});
+
+test('check keeps at most 9 per repository, skips a repository that has 9, and reports the shortfall', async (t) => {
+  const ids = manyIds({ Alpha: 14, Beta: 3 });
+  const up = upstream(t, ids);
+  const s = setup(t, publicCfg(up));
+  const rt = walkRuntime({ ids });
+  assert.equal(await s.run(['check'], () => rt), 0);
+  const walked = rt.checkedIds();
+  assert.equal(walked.filter((id) => id.includes('Alpha')).length, 9, 'the tenth Alpha is never checked');
+  assert.equal(walked.filter((id) => id.includes('Beta')).length, 3);
+  const text = s.outLines.join('\n');
+  assert.match(text, /12 kept, 0 dropped, 5 not needed/);
+  assert.match(text, /shortfall: 12 of 80 kept/);
+  assert.equal(await s.run(['select', '--source', 'public']), 0);
+  assert.equal(lockIds(s).length, 12);
+});
+
+test('check resumes from check.json: a recorded verdict is not run again and the walk goes on in the same order; an infra result is', async (t) => {
+  const ids = manyIds({ Alpha: 12, Beta: 12 });
+  const up = upstream(t, ids, failing(new Set([ids[1], ids[14]])));
+  const s = setup(t, publicCfg(up));
+  const first = walkRuntime({ ids });
+  assert.equal(await s.run(['check', '--total', '4'], () => first), 0);
+  const done = first.checkedIds();
+  assert.ok(done.length >= 4);
+  // one of the recorded results is an infra failure: that is not a verdict
+  const results = checkJson(s);
+  const infraId = done[0];
+  results[`public/${infraId}`] = { ...results[`public/${infraId}`], ok: false, reason: 'infra' };
+  fs.writeFileSync(path.join(s.home, 'tasks', 'check.json'), JSON.stringify(results));
+  const second = walkRuntime({ ids });
+  assert.equal(await s.run(['check', '--total', '8'], () => second), 0);
+  const again = second.checkedIds();
+  assert.deepEqual(again.filter((id) => done.includes(id)), [infraId], 'only the infra result is run again');
+  const fresh = new Set(again.filter((id) => id !== infraId));
+  assert.ok(fresh.size > 0);
+  // a third run with the target met runs nothing
+  const third = walkRuntime({ ids });
+  assert.equal(await s.run(['check', '--total', '8'], () => third), 0);
+  assert.deepEqual(third.checkedIds(), []);
+  assert.match(s.outLines.join('\n'), /8 kept/);
+  // one walk from nothing gives the same verdicts
+  const whole = setup(t, publicCfg(up));
+  assert.equal(await whole.run(['check', '--total', '8'], () => walkRuntime({ ids })), 0);
+  assert.deepEqual(Object.keys(checkJson(whole)).sort(), Object.keys(checkJson(s)).sort());
+});
+
+
+test('check removes the image of a dropped task right after its verdict, and never one a kept task or the workspace image uses', async (t) => {
+  const ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2', 'instance_Org__Beta-bbbbbbb1', 'instance_Org__Beta-bbbbbbb2'];
+  const bad = new Set([ids[0], ids[2], ids[3]]);
+  const shared = `sha256:${sha('shared')}`;
+  const workspace = `sha256:${sha('workspace')}`;
+  // ids[1] (kept) and ids[0] (dropped) share an image; ids[3] (dropped) has the workspace image's digest
+  const digestFor = (id) => (id === ids[0] || id === ids[1] ? shared : id === ids[3] ? workspace : `sha256:${sha(id)}`);
+  const up = upstream(t, ids, failing(bad));
+  const s = setup(t, { tasks: { ...publicCfg(up).tasks, workspaceImage: `registry.example.test/workspace@${workspace}` } });
+  const rt = walkRuntime({ ids, digestFor });
+  assert.equal(await s.run(['check', '--all'], () => rt), 0);
+  const removed = rt.removed.join('\n');
+  assert.match(removed, new RegExp(`${IMAGE}@sha256:${sha(ids[2])}`), 'a dropped task\'s image is removed by digest');
+  assert.match(removed, new RegExp(`${IMAGE}:${ids[2].slice(-8)}`), 'and by tag');
+  assert.equal(removed.includes(shared), false, 'an image a kept task shares stays');
+  assert.equal(removed.includes(`:${ids[0].slice(-8)}`), false);
+  assert.equal(removed.includes(workspace), false, 'the workspace (coder) image stays');
+  assert.equal(removed.includes(`:${ids[1].slice(-8)}`), false, 'a kept task\'s image stays');
+  assert.equal(removed.includes(`:${ids[3].slice(-8)}`), false);
+});
+
+test('a failed image removal is logged and does not change the verdict', async (t) => {
+  const ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2'];
+  const up = upstream(t, ids, failing(new Set([ids[0]])));
+  const s = setup(t, publicCfg(up));
+  const rt = walkRuntime({ ids });
+  rt.removeFails = true;
+  assert.equal(await s.run(['check', '--all'], () => rt), 0);
+  assert.equal(checkJson(s)[`public/${ids[0]}`].reason, 'gold-fails');
+  assert.equal(checkJson(s)[`public/${ids[1]}`].ok, true);
+  assert.match(s.outLines.join('\n'), new RegExp(`${ids[0]}: image not removed \\(image is in use\\)`));
+});
+
+test('check --all does not stop at the target and does not skip a full repository; it still resumes', async (t) => {
+  const ids = manyIds({ Alpha: 12, Beta: 12 });
+  const up = upstream(t, ids);
+  const s = setup(t, publicCfg(up));
+  const rt = walkRuntime({ ids });
+  assert.equal(await s.run(['check', '--all', '--total', '5'], () => rt), 0);
+  assert.equal(rt.checkedIds().length, 24);
+  assert.doesNotMatch(s.outLines.join('\n'), /shortfall/);
+  const rt2 = walkRuntime({ ids });
+  assert.equal(await s.run(['check', '--all'], () => rt2), 0);
+  assert.deepEqual(rt2.checkedIds(), []);
+});
+
+test('check --only runs exactly the named tasks, again, whatever the target', async (t) => {
+  const ids = manyIds({ Alpha: 4 });
+  const up = upstream(t, ids);
+  const s = setup(t, publicCfg(up));
+  await s.run(['check', '--all'], () => walkRuntime({ ids }));
+  const rt = walkRuntime({ ids });
+  assert.equal(await s.run(['check', '--only', ids[2]], () => rt), 0);
+  assert.deepEqual(rt.checkedIds(), [ids[2]]);
 });

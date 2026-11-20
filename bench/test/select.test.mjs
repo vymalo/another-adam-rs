@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { lintStatement, splitDiff, withoutInterface } from '../lib/lint.mjs';
-import { buildLock, lockText, selectTasks } from '../lib/select.mjs';
+import { Quota, buildLock, lockText, pickInOrder, selectTasks, selectionOrder } from '../lib/select.mjs';
 
 const GOLD = `diff --git a/src/limits.rs b/src/limits.rs
 index 111..222 100644
@@ -104,4 +104,75 @@ test('the lock holds ids, checksums, image digests and the seed, nothing else', 
   assert.deepEqual(lock, { schema: 1, source: 'public', seed: '7', upstreamCommit: 'c'.repeat(40), tasks: [{ id: 'x', repo: 'r', checksum: 'h', image: 'sha256:d' }] });
   assert.equal(lockText(lock).includes('SECRET TEXT'), false);
   assert.equal(lockText(lock).includes('/somewhere'), false);
+});
+
+// ---- the selection order, shared by `tasks check` and `tasks select` (public source) ----
+
+const bigPool = (repos = 14, each = 12) => {
+  const out = [];
+  for (let r = 0; r < repos; r++) for (let i = 0; i < each; i++) out.push({ id: `r${String(r).padStart(2, '0')}-${String(i).padStart(2, '0')}`, repo: `r${String(r).padStart(2, '0')}` });
+  return out;
+};
+
+test('the selection order holds every task once, does not depend on the input order and is seeded', () => {
+  const o = { seed: 'one', scope: 'public' };
+  const order = selectionOrder(bigPool(), o);
+  assert.equal(order.length, 14 * 12);
+  assert.equal(new Set(ids(order)).size, order.length);
+  assert.deepEqual(ids(selectionOrder([...bigPool()].reverse(), o)), ids(order));
+  assert.notDeepEqual(ids(selectionOrder(bigPool(), { ...o, seed: 'two' })), ids(order));
+  assert.notDeepEqual(ids(selectionOrder(bigPool(), { ...o, scope: 'own' })), ids(order), 'the scope is part of the seed');
+});
+
+test('the selection order is stratified: the first round of it takes one task of every repository', () => {
+  const order = selectionOrder(bigPool(5, 6), { seed: 3, scope: 'public' });
+  assert.deepEqual(new Set(order.slice(0, 5).map((t) => t.repo)).size, 5);
+  assert.deepEqual(new Set(order.slice(5, 10).map((t) => t.repo)).size, 5);
+});
+
+test('a quota stops at the total, skips a full repository and says when it is done', () => {
+  const q = new Quota({ total: 3, perRepo: 2 });
+  assert.deepEqual([q.open('a'), q.done], [true, false]);
+  q.take('a');
+  q.take('a');
+  assert.equal(q.open('a'), false, 'a repository at its cap is skipped');
+  assert.equal(q.open('b'), true);
+  q.take('b');
+  assert.deepEqual([q.kept, q.done, q.open('c')], [3, true, false]);
+  assert.throws(() => new Quota({ total: 1, perRepo: 0 }), RangeError);
+});
+
+test('property: a walk that stops at the target picks exactly what a full check would, for any seed and any verdicts', () => {
+  const rows = bigPool();
+  for (let seed = 1; seed <= 40; seed++) {
+    // verdicts: a seed-dependent mix, some repositories nearly all dropped
+    const keptSet = new Set(rows.filter((t, i) => (i * 7 + seed * 13 + Number(t.repo.slice(1)) * 3) % (3 + (Number(t.repo.slice(1)) % 4)) !== 0).map((t) => t.id));
+    for (const total of [1, 10, 40, 80, 500]) {
+      const opts = { total, perRepo: 9 };
+      const order = selectionOrder(rows, { seed, scope: 'public' });
+      const full = pickInOrder(order, (t) => keptSet.has(t.id), opts).map((t) => t.id);
+      // the partial walk: only the tasks it needs are checked
+      const q = new Quota(opts);
+      const checked = new Set();
+      for (const t of order) {
+        if (q.done) break;
+        if (!q.open(t.repo)) continue;
+        checked.add(t.id);
+        if (keptSet.has(t.id)) q.take(t.repo);
+      }
+      const partial = pickInOrder(order, (t) => checked.has(t.id) && keptSet.has(t.id), opts).map((t) => t.id);
+      assert.deepEqual(partial, full, `seed ${seed}, total ${total}`);
+      assert.ok(full.length <= total);
+      const per = {};
+      for (const id of full) per[id.slice(0, 3)] = (per[id.slice(0, 3)] ?? 0) + 1;
+      assert.ok(Object.values(per).every((n) => n <= 9), 'at most 9 per repository');
+      if (total === 40 || total === 80) assert.ok(checked.size < rows.length, 'it did not walk every task');
+    }
+  }
+});
+
+test('pickInOrder takes the first kept ones in order, capped per repository', () => {
+  const order = [{ id: '1', repo: 'a' }, { id: '2', repo: 'a' }, { id: '3', repo: 'b' }, { id: '4', repo: 'a' }, { id: '5', repo: 'b' }];
+  assert.deepEqual(ids(pickInOrder(order, () => true, { total: 4, perRepo: 2 })), ['1', '2', '3', '5']);
+  assert.deepEqual(ids(pickInOrder(order, (t) => t.id !== '2', { total: 10, perRepo: 2 })), ['1', '3', '4', '5']);
 });

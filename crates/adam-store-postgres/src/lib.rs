@@ -469,6 +469,7 @@ struct Sql {
     push_version: Arc<str>,
     put_blob: Arc<str>,
     get_blob: Arc<str>,
+    blob_exists: Arc<str>,
     commit_blobs: Arc<str>,
     purge_blobs: Arc<str>,
 }
@@ -761,6 +762,9 @@ impl Sql {
                  ON CONFLICT (digest) DO NOTHING"
             )),
             get_blob: Arc::from(format!("SELECT bytes FROM {blob} WHERE digest = $1")),
+            blob_exists: Arc::from(format!(
+                "SELECT EXISTS(SELECT 1 FROM {blob} WHERE digest = $1)"
+            )),
             // The refs of one commit. `ON CONFLICT DO NOTHING` makes a retried commit (or two
             // artifacts with the same bytes) one no-op per digest already referenced.
             commit_blobs: Arc::from(format!(
@@ -1050,6 +1054,8 @@ impl Store for PgStore {
         let RunUpdate {
             status,
             state,
+            head: _,
+            body: _,
             blobs,
             wake_at,
         } = update;
@@ -1486,6 +1492,15 @@ impl Store for PgStore {
             .await
             .map_err(classify)?;
         Ok(())
+    }
+
+    async fn blob_stored(&self, id: &BlobId) -> StoreResult<bool> {
+        let row = sqlx::query(safe(&self.sql.blob_exists))
+            .bind(id.as_str())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(classify)?;
+        row.try_get("exists").map_err(classify)
     }
 
     async fn get_blob(&self, id: &BlobId) -> StoreResult<Option<Vec<u8>>> {
