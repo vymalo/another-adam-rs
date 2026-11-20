@@ -280,16 +280,16 @@ An agent only continues if it overrides `init_continuing` (`LlmAgent`, `LlmStart
 ## A screen as the sender
 
 `RuntimeTaskBackend::with_inbound(vymalo_inbound)` reads a message the way the orchestration layer's chat
-sends it (contracts: `docs/api/ui-catalog-v1.md`, `docs/api/thread-tools-v1.md` and `docs/api/mentions-v1.md` of
+sends it (contracts: `docs/api/ui-catalog-v2.md`, `docs/api/thread-tools-v1.md` and `docs/api/mentions-v1.md` of
 `vymalo/another-agentic-system`; the card entries that announce them are in [`adam-a2a`](../adam-a2a/README.md)):
 
 | In the message | In the run |
 |---|---|
 | text parts | the text; **a line that begins as a form's answer does** (after whitespace, invisible characters and case, `The person answered through the interface`) **is marked `(typed) `**, so typed words are never a form's answer (an A2UI `answer` action is) |
-| an A2UI action part (`application/a2ui+json`, in `mediaType` or in `metadata.mimeType`) named `answer` on a surface `ask-<identifier>` (`A-Z a-z 0-9 _ . : -`, at most 64 characters after the prefix: the one `ask_user` draws; any other id is not a form's), with Choices answers (`context.answers`: `[{id, values, other?, text?}]`, and `context.note`) | `The person answered through the interface (form ask-<id>):` (the surface the answer was made on; `form_answer_surface` reads the line) then one line per question, `- db: pg`, `- auth: other: "Keycloak"`, `- name: text: "Quokka"`, and a last line `Note: "by Friday"` when the form's free box was used (what the person typed is always JSON-quoted after its label, so it can never pass for an option's value); a question with nothing chosen reads `(nothing chosen)`; it is the result of the `ask_user` call that parked the run |
+| an A2UI action part (`application/a2ui+json`, in `mediaType` or in `metadata.mimeType`; the message must say `"version": "1.0"`, any other message of the part is not read and, with no other text, the message is refused; only the action's `name`, `surfaceId` and `context` are read) named `answer` on a surface `ask-<identifier>` (`A-Z a-z 0-9 _ . : -`, at most 64 characters after the prefix: the one `ask_user` draws; any other id is not a form's), with Choices answers (`context.answers`: `[{id, values, other?, text?}]`, and `context.note`) | `The person answered through the interface (form ask-<id>):` (the surface the answer was made on; `form_answer_surface` reads the line) then one line per question, `- db: pg`, `- auth: other: "Keycloak"`, `- name: text: "Quokka"`, and a last line `Note: "by Friday"` when the form's free box was used (what the person typed is always JSON-quoted after its label, so it can never pass for an option's value); a question with nothing chosen reads `(nothing chosen)`; it is the result of the `ask_user` call that parked the run |
 | the same action, whatever its context holds (a number for a value, no `answers`, nothing) | the same message **and** the payload member `form` (`PAYLOAD_FORM`): `{surface, context}`, the surface the action names and its `context` exactly as it came (`null` when it had none; a context over 16 KiB, the most an action may carry, is `{"oversize": true}`, which no form accepts; a message with more than one such action carries the first one's and, beside them, `actions: <how many>`). It lets the tool that asked read the answer against its own form (`Tool::read_answer`, [`adam-llm-agent`](../adam-llm-agent/README.md)) without parsing the text, and sees a value the text has no line for. Words, and any other action, carry no `form` |
 | any other A2UI action (another name, another surface, even with the shape of answers: a card's button cannot pass for the form's answer) | `The person used the interface: action "<name>" on surface "<id>" with context <JSON, cut at 4096 characters>` |
-| `metadata[ui-catalog/v1]` | `Conversation::context["vymalo.ui.ref"]` = `{catalogId, version, digest}` |
+| `metadata[ui-catalog/v2]` | `Conversation::context["vymalo.ui.ref"]` = `{catalogId, version, digest}` |
 | an inline catalog with that `catalogId` in the renderer's capabilities (`metadata["a2uiRendererCapabilities"]["1.0"]`, the only entry read: `a2uiClientCapabilities` under `v0.9.1` or `v0.9`, and a `"v1.0"` key, say nothing) | `context["vymalo.ui.catalog"]` = `{catalogId, version, digest, catalog}`; an inline catalog of another id is ignored |
 | the `supportedCatalogIds` of those capabilities and the `catalogId` of each of their `inlineCatalogs` | `context["vymalo.a2ui.renderer"]` (`CONTEXT_A2UI_RENDERER`) = `{catalogIds: [...]}`: the union, non-empty strings only, each once, at most 32 (`MAX_OFFERED_CATALOG_IDS`) of at most 2048 bytes. **The offer of the latest message:** a message without that entry (and one with no metadata at all) sets the key to `null`, which deletes it, so a stale offer never carries into a later turn. `adam-ui` draws only a catalog this entry lists ([`adam-ui`](../adam-ui/README.md)) |
 | `metadata[thread-tools/v1]` `{url, token, expiresAt}` | `context["vymalo.threadTools"]`, copied exactly; the entry expires at `expiresAt` (`Conversation::drop_expired_context`) |
@@ -306,7 +306,7 @@ sequenceDiagram
     participant S as Screen (orchestrator)
     participant B as RuntimeTaskBackend
     participant R as Run
-    S->>B: message: text + metadata (ui-catalog/v1, thread-tools/v1)
+    S->>B: message: text + metadata (ui-catalog/v2, thread-tools/v1)
     B->>R: Inbound {text, context}
     R-->>B: input-required: question + an A2UI part (the interface)
     B-->>S: status message: [text, data(application/a2ui+json)]

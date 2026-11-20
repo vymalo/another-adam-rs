@@ -1,10 +1,10 @@
 #!/bin/sh
 # End-to-end test of the researcher answering with cards and a graph, against the compose mocks: the
 # general agent (`adam-agent`, service `agent`) serving the researcher folder (dev/agents/researcher/agent) is
-# asked a question that carries `[mock:cards]` and the screen's UI catalog (version 3, with `Cards` and
+# asked a question that carries `[mock:cards]` and the screen's UI catalog (version 9, with `Cards` and
 # `Mermaid`) in its metadata, and answers with one A2UI surface beside its words: a Text, three source
 # cards and a mermaid graph, under the screen's own catalogId. A screen that cannot draw them (catalog
-# version 2, or no catalog) gets the words only.
+# a catalog without them, or no catalog) gets the words only.
 #
 #   dev/agent-cards-e2e.sh                 # all steps
 #   NO_RESTART=1 dev/agent-cards-e2e.sh    # the agent already serves the researcher on `mock-researcher`
@@ -20,14 +20,14 @@
 #      folder, with the model `mock-researcher` (AGENT_FOLDER=<copy> AGENT_MODEL=mock-researcher docker compose
 #      --profile app up -d --no-build --wait agent). The default folder and model are put back at the end,
 #      also when a check failed (a trap).
-#   1. The card is the researcher's, and lists the extensions that make this work: A2UI v0.9.1 (taking the
-#      catalog inline), ui-catalog/v1 and thread-tools/v1.
-#   2. SendStreamingMessage "[mock:cards] what is async rust?" with catalog version 3 in the message's
-#      metadata (what the orchestrator sends: ui-catalog/v1 {version, digest, inline}, and the catalog in the
+#   1. The card is the researcher's, and lists the extensions that make this work: A2UI v1.0 (taking the
+#      catalog inline), ui-catalog/v2 and thread-tools/v1.
+#   2. SendStreamingMessage "[mock:cards] what is async rust?" with catalog version 9 (a `ui-catalog/v2` document) in the message's
+#      metadata (what the orchestrator sends: ui-catalog/v2 {version, digest, inline}, and the catalog in the
 #      A2UI capabilities): the task ends TASK_STATE_COMPLETED, with a `ui` artifact (media type
 #      application/a2ui+json): createSurface under the screen's catalogId, and a Column of a Text, a Cards of
 #      three cards (each with an https link) and a Mermaid graph; the words name the three links.
-#   3. The same question from a screen on catalog version 2, which has no `Cards`: `show` is refused, so the
+#   3. The same question from a screen on a smaller catalog (the checklist subset, version 8, which has no `Cards`): `show` is refused, so the
 #      task ends TASK_STATE_COMPLETED with the words and no `ui` artifact. The same with no catalog at all.
 # It prints one "ok" or "FAIL" line per check and exits 1 if any failed.
 #
@@ -35,10 +35,10 @@
 #   AGENT_URL        http://127.0.0.1:${AGENT_PORT:-8084}
 #   AGENT_TOKEN      dev-token
 #   RESEARCHER_DIR   dev/agents/researcher/agent                      the folder to serve
-#   CATALOG_FILE     crates/adam-ui/tests/fixtures/catalog-v3.json     the screen's catalog (a copy of the web's)
-#   CATALOG_LOCK     crates/adam-ui/tests/fixtures/catalog-v3.lock.json  its {version, digest}
-#   OLD_CATALOG_FILE crates/adam-ui/tests/fixtures/catalog-v2.json     an older screen's catalog, without Cards
-#   OLD_CATALOG_LOCK crates/adam-ui/tests/fixtures/catalog-v2.lock.json
+#   CATALOG_FILE     crates/adam-ui/tests/fixtures/catalog-v9.json     the screen's catalog (a `ui-catalog/v2` document)
+#   CATALOG_LOCK     crates/adam-ui/tests/fixtures/catalog-v9.lock.json  its {version, digest}
+#   OLD_CATALOG_FILE crates/adam-ui/tests/fixtures/checklist-subset-v8.json     a smaller screen's catalog, without Cards
+#   OLD_CATALOG_LOCK crates/adam-ui/tests/fixtures/checklist-subset-v8.lock.json
 #   TIMEOUT          120   seconds to wait for a task to stop
 #   NO_RESTART       unset 1 = skip step 0 (no `docker compose`)
 #
@@ -53,10 +53,10 @@ agent=${agent%/}
 token=${AGENT_TOKEN:-dev-token}
 timeout=${TIMEOUT:-120}
 researcher_dir=${RESEARCHER_DIR:-dev/agents/researcher/agent}
-catalog_file=${CATALOG_FILE:-crates/adam-ui/tests/fixtures/catalog-v3.json}
-catalog_lock=${CATALOG_LOCK:-crates/adam-ui/tests/fixtures/catalog-v3.lock.json}
-old_file=${OLD_CATALOG_FILE:-crates/adam-ui/tests/fixtures/catalog-v2.json}
-old_lock=${OLD_CATALOG_LOCK:-crates/adam-ui/tests/fixtures/catalog-v2.lock.json}
+catalog_file=${CATALOG_FILE:-crates/adam-ui/tests/fixtures/catalog-v9.json}
+catalog_lock=${CATALOG_LOCK:-crates/adam-ui/tests/fixtures/catalog-v9.lock.json}
+old_file=${OLD_CATALOG_FILE:-crates/adam-ui/tests/fixtures/checklist-subset-v8.json}
+old_lock=${OLD_CATALOG_LOCK:-crates/adam-ui/tests/fixtures/checklist-subset-v8.lock.json}
 
 for f in "$researcher_dir/instructions.md" "$catalog_file" "$catalog_lock" "$old_file" "$old_lock"; do
   if [ ! -f "$f" ]; then
@@ -95,9 +95,9 @@ restore() {
 }
 trap restore EXIT
 
-ui_uri=https://agents.vymalo.com/a2a/extensions/ui-catalog/v1
+ui_uri=https://agents.vymalo.com/a2a/extensions/ui-catalog/v2
 tools_uri=https://agents.vymalo.com/a2a/extensions/thread-tools/v1
-a2ui_uri=https://a2ui.org/a2a-extension/a2ui/v0.9.1
+a2ui_uri=https://a2ui.org/a2a-extension/a2ui/v1.0
 catalog_id=$(jq -r '.catalogId' "$catalog_file")
 
 n=0
@@ -142,7 +142,7 @@ first_message() {
         extensions: [$a2ui, $ui],
         metadata: {
           ($ui): {catalogId: $catalogId, version: $lock[0].version, digest: $lock[0].digest, inline: true},
-          a2uiClientCapabilities: {"v0.9.1": {supportedCatalogIds: [$catalogId], inlineCatalogs: [$catalog[0]]}}}}}}'
+          a2uiRendererCapabilities: {"1.0": {supportedCatalogIds: [$catalogId], inlineCatalogs: [$catalog[0]]}}}}}}'
 }
 
 last_state() {

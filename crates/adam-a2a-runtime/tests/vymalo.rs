@@ -32,8 +32,8 @@ const DIGEST: &str = "sha256:4ed91bcc9db52d5e2262aef2091d2b3eeccbf5bfe51519d7326
 
 fn surface() -> Value {
     json!([
-        {"version": "v0.9.1", "createSurface": {"surfaceId": "ask-1", "catalogId": CATALOG_ID}},
-        {"version": "v0.9.1", "updateComponents": {"surfaceId": "ask-1", "components": [
+        {"version": "1.0", "createSurface": {"surfaceId": "ask-1", "catalogId": CATALOG_ID}},
+        {"version": "1.0", "updateComponents": {"surfaceId": "ask-1", "components": [
             {"id": "root", "component": "Choices", "questions": [
                 {"id": "db", "question": "Which database?", "options": [
                     {"value": "pg", "label": "Postgres"}, {"value": "sqlite", "label": "SQLite"}]}]}]}}
@@ -137,7 +137,7 @@ fn with_metadata(mut message: Message, metadata: Value) -> Message {
 }
 
 fn a2ui_action(answers: Value) -> Message {
-    let mut part = Part::data(json!([{"version": "v0.9.1", "action": {
+    let mut part = Part::data(json!([{"version": "1.0", "action": {
         "name": "answer", "surfaceId": "ask-1", "sourceComponentId": "root",
         "timestamp": "2026-10-01T10:00:00Z", "context": {"answers": answers}}}]))
     .with_media_type(A2UI_MEDIA_TYPE);

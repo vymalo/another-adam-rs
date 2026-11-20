@@ -1,7 +1,7 @@
 //! The screen's UI catalog as model tools for an adam-rs agent.
 //!
 //! The orchestration layer's chat tells an agent which components its screen can draw (the **UI
-//! catalog**, `docs/api/ui-catalog-v1.md` of `vymalo/another-agentic-system`) and gives it one MCP
+//! catalog**, `docs/api/ui-catalog-v2.md` of `vymalo/another-agentic-system`) and gives it one MCP
 //! endpoint for the conversation (**thread tools**, `docs/api/thread-tools-v1.md`). This crate turns
 //! both into what a model uses:
 //!
@@ -12,7 +12,7 @@
 //! | [`UiCatalogTool`] (`ui_catalog {}`) | the components, what they are for, and their schemas |
 //! | [`PlanWork`], [`PlanCheck`], [`PlanAdd`] (`plan_work { title?, items }`, `plan_check { id, status, note? }`, `plan_add { items, after? }`) | the conversation's plan: a checklist the agent keeps and the person sees; each call returns the whole plan and draws it as one `Checklist` (or lines of `Text`) when the screen can |
 //! | [`ThreadTools`] (a [`ToolSource`](adam_llm_agent::ToolSource)) | every tool the thread-tools endpoint lists, under its listed name, read once per grant (a turn reuses the listing; a new grant, a refused call or [`LISTING_TTL`] lists again); a successful `turn_output { text }` makes `text` the run's answer; a tool the orchestrator reports as a step (`reportsStep`) gets no step of the agent's, a call waits as long as the tool's `timeoutSecs` (capped by `THREAD_TOOLS_MAX_CALL_SECS`) and carries a stable `callId`; with mentions in the run's context it adds a "Mentioned agents" block to the instructions |
-//! | [`card_extensions`] | the card entries that announce all this (A2UI v0.9.1, `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1`) |
+//! | [`card_extensions`] | the card entries that announce all this (A2UI v1.0, `ui-catalog/v2`, `thread-tools/v1`, `mentions/v1`, `steer/v1`) |
 //!
 //! A binary wires it in a few lines (the inbound function is `adam-a2a-runtime`'s `vymalo_inbound`):
 //!
@@ -26,7 +26,7 @@
 //!
 //! # How a catalog reaches a tool
 //!
-//! A message from the screen's orchestrator carries the catalog's reference (`ui-catalog/v1`: version
+//! A message from the screen's orchestrator carries the catalog's reference (`ui-catalog/v2`: version
 //! and digest), sometimes the catalog itself (inline), and the thread-tools grant. `vymalo_inbound`
 //! puts them in the run's inbound context; a tool looks at the context, then at the catalogs this
 //! process already holds (by digest), and when the current one is neither inline nor held it reads it
@@ -180,12 +180,12 @@ impl Ui {
     }
 }
 
-/// The card entries of an agent that draws on a screen: A2UI v0.9.1 (with `acceptsInlineCatalogs`),
-/// `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1` and `steer/v1`. All optional, no parameters beyond A2UI's own; a client
+/// The card entries of an agent that draws on a screen: A2UI v1.0 (with `acceptsInlineCatalogs`),
+/// `ui-catalog/v2`, `thread-tools/v1`, `mentions/v1` and `steer/v1`. All optional, no parameters beyond A2UI's own; a client
 /// that does not know one ignores it.
 pub fn card_extensions() -> Vec<ExtensionConfig> {
     vec![
-        ExtensionConfig::a2ui_v0_9_1(),
+        ExtensionConfig::a2ui_v1_0(),
         ExtensionConfig::ui_catalog(),
         ExtensionConfig::thread_tools(),
         ExtensionConfig::mentions(),

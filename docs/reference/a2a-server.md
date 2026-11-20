@@ -390,6 +390,11 @@ A message invokes one in either of two forms, and both give the same stored text
   are not text, arguments over 4 KiB or an expansion over 32 KiB or empty: nothing is written.
 * **A `/word` that is not a command is plain text**: `/tmp is full` reaches the agent as written. To send text that starts with a
   command's name, double the slash: `//review` is the literal `/review`.
+* **A2UI is v1.0 only.** The card lists `https://a2ui.org/a2a-extension/a2ui/v1.0` and
+  `https://agents.vymalo.com/a2a/extensions/ui-catalog/v2` (`adam_ui::card_extensions`). An A2UI data part is read as an action only
+  when its message says `"version": "1.0"` (any other message of it is not read, and a message with nothing else to read is
+  refused as one with no text); the renderer's capabilities are read only under `a2uiRendererCapabilities["1.0"]`. Tests:
+  `crates/adam-a2a-runtime/src/vymalo.rs`, `crates/adam-ui/tests/a2ui_schemas.rs`. [ADR 0056](../decisions/0056-a2ui-v1-0-only-a-hard-cutover.md).
 * **A form's answer is never a command.** A message with an A2UI `action` part (the person's click on a form) is stored as it is:
   its text is not read as `/name`, even when the inbound function joins the parts into one text. A command named in the
   metadata of such a message is `InvalidParams` and nothing is written. A NUL character in the metadata `arguments` is

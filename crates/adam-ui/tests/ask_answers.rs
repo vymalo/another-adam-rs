@@ -167,7 +167,7 @@ fn from_the_screen(text: &str, screen: &Screen) -> Message {
 }
 
 fn action(surface: &str, answers: Value) -> Message {
-    let mut part = Part::data(json!([{"version": "v0.9.1", "action": {
+    let mut part = Part::data(json!([{"version": "1.0", "action": {
         "name": "answer", "surfaceId": surface, "sourceComponentId": "root",
         "timestamp": "2026-10-01T10:00:00Z", "context": {"answers": answers}}}]))
     .with_media_type(A2UI_MEDIA_TYPE);

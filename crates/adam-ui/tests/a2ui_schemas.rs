@@ -414,3 +414,84 @@ fn the_capabilities_the_orchestrator_sends_validate_and_become_the_ref_the_catal
     assert_eq!(context[CONTEXT_UI_CATALOG]["catalog"], catalog);
     assert_eq!(context[CONTEXT_A2UI_RENDERER], json!({"catalogIds": [id]}));
 }
+
+// ---- the card and the actions (A2)
+
+/// The `params` of the A2UI entry of the cards of `adam-agent` and `adam-coder` are what
+/// `agent_capabilities.json#/properties/1.0` describes, and the entry names the v1.0 extension and
+/// the v1.0 basic catalog.
+#[test]
+fn the_cards_a2ui_params_validate_against_agent_capabilities() {
+    let validator = validator_for(
+        &json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": "https://a2ui.org/specification/v1_0/agent_capabilities.json#/properties/1.0",
+        }),
+        &catalog_nine(),
+    );
+    let entry = adam_ui::card_extensions()
+        .into_iter()
+        .find(|e| e.uri == adam_a2a::A2UI_EXTENSION_V1_0)
+        .expect("the card lists the A2UI v1.0 extension");
+    assert_eq!(
+        entry.uri, "https://a2ui.org/a2a-extension/a2ui/v1.0",
+        "the URI of the sys contract"
+    );
+    let params = Value::Object(entry.params);
+    let found = errors(&validator, &params);
+    assert!(found.is_empty(), "{found:#?}");
+    assert_eq!(
+        params["supportedCatalogIds"],
+        json!([adam_a2a::A2UI_BASIC_CATALOG_V1_0])
+    );
+    assert_eq!(
+        adam_a2a::A2UI_BASIC_CATALOG_V1_0,
+        "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"
+    );
+    // The same entry of the coder's golden card.
+    let card: Value = serde_json::from_str(include_str!(
+        "../../../bin/adam-coder/tests/fixtures/agent/card.json"
+    ))
+    .unwrap();
+    let golden = card["extensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["uri"] == adam_a2a::A2UI_EXTENSION_V1_0)
+        .expect("the coder's card lists it");
+    let found = errors(&validator, &golden["params"]);
+    assert!(found.is_empty(), "{found:#?}");
+    assert_eq!(golden["params"], params);
+    // the validator is not vacuous
+    assert!(!errors(&validator, &json!({"acceptsInlineCatalogs": "yes"})).is_empty());
+    assert!(!errors(&validator, &json!({"supportedCatalogIds": "basic"})).is_empty());
+}
+
+/// The actions adam reads (the form's submit as the orchestrator sends it, and any other action)
+/// are what `renderer_to_agent.json` describes, with `"version": "1.0"`; the same message under
+/// the earlier version is not.
+#[test]
+fn the_actions_adam_reads_validate_against_renderer_to_agent() {
+    let validator = validator_for(&schema("renderer_to_agent.json"), &catalog_nine());
+    let submit = json!({"version": "1.0", "action": {
+        "name": "answer", "surfaceId": "ask-c1", "sourceComponentId": "submit",
+        "timestamp": "2026-11-20T10:00:00Z",
+        "context": {"answers": [{"id": "q1", "values": ["a"]}], "note": "ok"}}});
+    let other = json!({"version": "1.0", "action": {
+        "name": "open", "surfaceId": "s", "sourceComponentId": "b",
+        "timestamp": "2026-11-20T10:00:00Z", "context": {}}});
+    for action in [&submit, &other] {
+        let found = errors(&validator, action);
+        assert!(found.is_empty(), "{found:#?}");
+        // and vymalo_inbound reads it
+        let part = Part::data(json!([action])).with_media_type(A2UI_MEDIA_TYPE);
+        let message = Message::new(Role::User, vec![part]);
+        let text = vymalo_inbound(&message).unwrap().payload["text"].clone();
+        assert!(text.as_str().unwrap().starts_with("The person "), "{text}");
+    }
+    for old in ["v0.9.1", "v0.9", "0.9"] {
+        let mut stale = submit.clone();
+        stale["version"] = json!(old);
+        assert!(!errors(&validator, &stale).is_empty(), "{old}");
+    }
+}

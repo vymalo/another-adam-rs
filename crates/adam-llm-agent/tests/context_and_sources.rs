@@ -595,7 +595,7 @@ impl Tool for AskWithUi {
     async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
         Err(ToolError::needs_input_with_ui(
             "which one?",
-            json!([{"version": "v0.9.1", "createSurface": {"surfaceId": "s", "catalogId": "c"}}]),
+            json!([{"version": "1.0", "createSurface": {"surfaceId": "s", "catalogId": "c"}}]),
         ))
     }
 }
@@ -614,7 +614,7 @@ async fn a_question_keeps_its_interface_while_the_run_waits() {
         .expect("start");
     let worker = spawn_worker(&rt);
     let parked = wait_waiting(&rt, run).await;
-    let ui = json!([{"version": "v0.9.1", "createSurface": {"surfaceId": "s", "catalogId": "c"}}]);
+    let ui = json!([{"version": "1.0", "createSurface": {"surfaceId": "s", "catalogId": "c"}}]);
     assert_eq!(
         conversation(&rt, &parked).await.pending_wait,
         Some(PendingWait::Question(PendingQuestion {

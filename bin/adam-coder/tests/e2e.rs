@@ -3985,10 +3985,10 @@ async fn another_caller_cannot_see_or_resume_the_task(store: DynStore) {
 const CATALOG: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.json");
 const CATALOG_LOCK: &str =
     include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.lock.json");
-const UI_CATALOG_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/ui-catalog/v1";
+const UI_CATALOG_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/ui-catalog/v2";
 const THREAD_TOOLS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/thread-tools/v1";
 
-/// A first message from the person's screen: the text, the catalog's reference (`ui-catalog/v1`),
+/// A first message from the person's screen: the text, the catalog's reference (`ui-catalog/v2`),
 /// the catalog itself in the A2UI capabilities when `inline`, and the grant for the conversation's
 /// tools when there is one.
 fn from_the_screen(text: &str, inline: bool, grant: Option<serde_json::Value>) -> Message {
@@ -4025,7 +4025,7 @@ fn from_the_screen(text: &str, inline: bool, grant: Option<serde_json::Value>) -
 
 /// The person's answers through the form, as the screen sends them: one A2UI action on the task.
 fn answers_to(task: &str, surface: &str, answers: serde_json::Value) -> Message {
-    let mut part = Part::data(json!([{"version": "v0.9.1", "action": {
+    let mut part = Part::data(json!([{"version": "1.0", "action": {
         "name": "answer", "surfaceId": surface, "sourceComponentId": "root",
         "timestamp": "2026-10-01T10:00:00Z", "context": {"answers": answers}}}]))
     .with_media_type("application/a2ui+json");

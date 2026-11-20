@@ -7,7 +7,7 @@ can use it; the binaries wire it in a few lines.
 ## Where it sits
 
 The orchestration layer's chat (`vymalo/another-agentic-system`) tells an agent, in the A2A messages it sends,
-**which components its screen can draw** (the UI catalog, [`ui-catalog-v1`][uicat]) and gives it **one MCP
+**which components its screen can draw** (the UI catalog, [`ui-catalog-v2`][uicat]) and gives it **one MCP
 endpoint for the conversation** (the thread tools, [`thread-tools-v1`][tt]). Both are optional A2A extensions an
 agent announces on its card. This crate sits above [`adam-llm-agent`](../adam-llm-agent/README.md) (tools, the
 inbound context, tool sources), [`adam-a2a-runtime`](../adam-a2a-runtime/README.md) (`vymalo_inbound` puts the
@@ -16,7 +16,7 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 [`adam-agent`](../../bin/adam-agent/README.md). The decision is
 [ADR 0006](../../docs/decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md).
 
-[uicat]: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/ui-catalog-v1.md
+[uicat]: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/ui-catalog-v2.md
 [tt]: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/thread-tools-v1.md
 [mt]: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/mentions-v1.md
 
@@ -36,7 +36,7 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 | `ThreadTools`, `ThreadToolsClient`, `META_KEY`, `GET_UI_CATALOG`, `TURN_OUTPUT`, `TURN_OUTPUT_DELIVERED` | the source (`ThreadTools::new` lists everything the endpoint lists; `hiding(name)` leaves one out), and the client behind it and behind the refetch (`with_clock` for tests of the expiry) |
 | `Catalog`, `Claimed`, `Component`, `CatalogError`, `canonical_json`, `catalog_digest` | a catalog read and checked against the digest it claims; `validate(instance)` against a component's schema; the canonical form and the digest of [the contract](https://github.com/vymalo/another-agentic-system/blob/main/docs/api/ui-catalog-v1.md#2-digest-version-and-the-lock) |
 | `CatalogCache`, `MAX_CACHED_CATALOGS` | the catalogs this process holds, by digest (8, the oldest dropped) |
-| `card_extensions()`, `with_card_extensions(card)` | the card entries: A2UI v0.9.1 (`acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1` (the host's promise that a message sent to a running task is read and never lost; `adam-llm-agent` keeps it) |
+| `card_extensions()`, `with_card_extensions(card)` | the card entries: A2UI v1.0 (`acceptsInlineCatalogs: true`), `ui-catalog/v2`, `thread-tools/v1`, `mentions/v1`, `steer/v1` (the host's promise that a message sent to a running task is read and never lost; `adam-llm-agent` keeps it) |
 | `A2UI_VERSION` | `1.0`: the A2UI version the surfaces are written for (every operation says it in `version`) and the `protocolVersion` a catalog must have |
 | `ask_surface_id(call_id)` | the id of the surface `ask_user` draws its form on for a call: `ask-` and the call's id as an identifier (at most 64 characters). A form's answer names it (`(form ask-<id>)`), so a host that holds the call can tell whether the answer is for the question it asked |
 | `ask_retry_surface_id(call_id, n)`, `ask_attempt(surface)`, `is_ask_surface_of(call_id, surface)` | the surface of a form asked again after its answer was refused (`ask-<id>.r<n>`, still at most 64 characters after `ask-`), how many times a surface was asked again, and whether a surface is a call's form or one of its re-asks |
@@ -355,7 +355,7 @@ sequenceDiagram
     participant R as Run (Conversation::context)
     participant T as Tool (ask_user, show, ui_catalog)
     participant E as Thread tools (get_ui_catalog)
-    S->>A: message: ui-catalog/v1 {version, digest, inline}, a2uiRendererCapabilities["1.0"] (with an inline catalog), thread-tools/v1 {url, token, expiresAt}
+    S->>A: message: ui-catalog/v2 {version, digest, inline}, a2uiRendererCapabilities["1.0"] (with an inline catalog), thread-tools/v1 {url, token, expiresAt}
     A->>R: context: vymalo.ui.ref, vymalo.ui.catalog (doubles written back as integers), vymalo.a2ui.renderer {catalogIds}, vymalo.threadTools
     T->>R: ctx.context_map()
     alt the renderer did not offer the catalogId this turn

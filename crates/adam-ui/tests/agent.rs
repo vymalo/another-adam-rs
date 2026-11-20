@@ -1,5 +1,5 @@
 //! A whole agent behind A2A, as the screen's orchestrator drives it: a message with the
-//! `ui-catalog/v1` and `thread-tools/v1` metadata, a scripted model that asks three questions at once,
+//! `ui-catalog/v2` and `thread-tools/v1` metadata, a scripted model that asks three questions at once,
 //! the person's answer as an A2UI action, and the thread tools of a fake endpoint offered to the model
 //! at every turn. A real `Runtime`, `LlmAgent`, `RuntimeTaskBackend` with `vymalo_inbound`, and the
 //! fake endpoint of `adam-mcp-testkit`.
@@ -158,7 +158,7 @@ fn grant(server: &ThreadToolsServer, expires_at: &str) -> Value {
 }
 
 fn answer_action(answers: Value) -> Message {
-    let mut part = Part::data(json!([{"version": "v0.9.1", "action": {
+    let mut part = Part::data(json!([{"version": "1.0", "action": {
         "name": "answer", "surfaceId": "ask-choices-call-1", "sourceComponentId": "root",
         "timestamp": "2026-10-01T10:00:00Z", "context": {"answers": answers}}}]))
     .with_media_type(A2UI_MEDIA_TYPE);

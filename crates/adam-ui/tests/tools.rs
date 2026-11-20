@@ -791,8 +791,8 @@ fn the_tool_set_and_the_card_entries_are_the_documented_ones() {
     assert_eq!(
         uris,
         [
-            "https://a2ui.org/a2a-extension/a2ui/v0.9.1",
-            "https://agents.vymalo.com/a2a/extensions/ui-catalog/v1",
+            "https://a2ui.org/a2a-extension/a2ui/v1.0",
+            "https://agents.vymalo.com/a2a/extensions/ui-catalog/v2",
             "https://agents.vymalo.com/a2a/extensions/thread-tools/v1",
             "https://agents.vymalo.com/a2a/extensions/mentions/v1",
             "https://agents.vymalo.com/a2a/extensions/steer/v1",

@@ -193,7 +193,7 @@ async fn the_card_is_the_one_the_folder_declares() {
     assert_eq!(
         uris,
         [
-            adam_a2a::A2UI_EXTENSION_V0_9_1,
+            adam_a2a::A2UI_EXTENSION_V1_0,
             adam_a2a::UI_CATALOG_EXTENSION,
             adam_a2a::THREAD_TOOLS_EXTENSION,
             adam_a2a::MENTIONS_EXTENSION,
@@ -1160,7 +1160,7 @@ fn catalog_v2(published: &str) -> serde_json::Value {
 }
 
 /// The message the orchestrator sends from a screen that draws `catalog` (the document and its lock),
-/// with the catalog inline: the `ui-catalog/v1` metadata and the A2UI capabilities.
+/// with the catalog inline: the `ui-catalog/v2` metadata and the A2UI capabilities.
 fn from_the_screen(text: &str, (catalog, lock): (&str, &str)) -> Message {
     let lock: serde_json::Value = serde_json::from_str(lock).unwrap();
     let catalog = catalog_v2(catalog);
