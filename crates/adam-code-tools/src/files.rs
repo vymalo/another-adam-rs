@@ -901,6 +901,9 @@ pub async fn write_file(
         Ok(place) => place,
         Err(outcome) => return outcome,
     };
+    if let Some(refused) = refused_unless_writable(&place) {
+        return refused;
+    }
     let (root, rel) = (Arc::clone(place.root()), path.to_owned());
     let written = tokio::task::spawn_blocking(move || write_file_in(&root, &rel, &content))
         .await
@@ -918,6 +921,17 @@ pub async fn write_file(
         }
         Err(reason) => Ok(ToolOutput::error(reason)),
     }
+}
+
+/// The port promises a writable place for `Intent::Write`; a tool that writes checks it once more,
+/// so an implementation that breaks the promise is refused, never written through.
+fn refused_unless_writable(place: &Place) -> Option<Outcome> {
+    (!place.is_writable()).then(|| {
+        Ok(ToolOutput::error(format!(
+            "`{}` can be read, not written",
+            place.name()
+        )))
+    })
 }
 
 /// What an edit did: how many places were replaced, the line of each, and how many bytes the file
@@ -1307,6 +1321,9 @@ pub async fn edit_file(
         Ok(place) => place,
         Err(outcome) => return outcome,
     };
+    if let Some(refused) = refused_unless_writable(&place) {
+        return refused;
+    }
     let (root, rel) = (Arc::clone(place.root()), path.to_owned());
     let all = replace_all.unwrap_or(false);
     let edited = tokio::task::spawn_blocking(move || edit_file_in(&root, &rel, &old, &new, all))

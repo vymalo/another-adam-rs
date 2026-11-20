@@ -9,7 +9,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-# `GitAt::plain`, `GitAt::refused`, `find::search_files_in` and `files::read_in`, for the tests of a crate that uses the tools.
+# `GitAt::plain`, `GitAt::refused`, `find::search_files_in` and `files::{read_in, write_in, edit_in}`, for the tests of a crate
+# that uses the tools.
 test-util = []
 
 [dependencies]

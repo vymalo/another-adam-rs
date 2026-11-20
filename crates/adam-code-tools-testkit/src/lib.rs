@@ -144,7 +144,8 @@ pub mod cases {
                 tail.is_empty() || tail.starts_with(' ') || tail.starts_with('\n'),
                 "call {call}: {tail:?}"
             );
-            // On a failure the message says how long the secret is, never what it is.
+            // The hook is given nothing that holds the secret: this guards an implementation that
+            // writes a secret of its own into the text. A failure says the secret's length, not it.
             assert!(
                 !tail.contains(&h.secret),
                 "call {call}: the text holds the harness's secret ({} bytes)",

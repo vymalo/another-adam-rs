@@ -201,6 +201,9 @@ pub trait CodeWorkspace: Send + Sync {
     /// to run the checks again, and, in a scratch project that was published, that the change does
     /// not reach the repository.
     ///
+    /// The text goes to the model as part of the tool's answer and is **not redacted by the tool**:
+    /// the host scrubs each result (the coder's `Redacting` layer), as for every other answer.
+    ///
     /// # Errors
     ///
     /// A [`ToolError`] when what follows the write cannot be done or recorded: the tool returns it,

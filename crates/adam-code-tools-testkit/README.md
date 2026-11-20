@@ -23,7 +23,9 @@ dev-dependency and runs the same cases: the coder's `ToolEnv` in `bin/adam-coder
 
 ## Tests
 
-`tests/dir.rs` runs the cases over `DirWorkspace` with one writable and one read-only place. `tests/find.rs` runs `adam_code_tools::find`'s three tools through the port over `DirWorkspace` and a git
+`tests/dir.rs` runs the cases over `DirWorkspace` with one writable and one read-only place. `tests/write.rs` runs the write tools over a recording workspace: once per successful write the hook is called and its
+text appended, a refused write or edit does not call it, a failing hook is the tool's error with the file still
+written, and a read-only place a broken workspace gives for a write is refused with nothing written. `tests/find.rs` runs `adam_code_tools::find`'s three tools through the port over `DirWorkspace` and a git
 repository of its own (a listing, a glob, a search that neither shows nor finds the secret, an unknown place), so the
 tools are tested over a workspace that is not the coder's. `tests/files.rs` does the same for `adam_code_tools::files`'s
 `read_file` and `read_files` (a page of a file, a missing file named with its closest path, two files in one result, a
