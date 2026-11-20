@@ -291,6 +291,7 @@ export async function advance({ deps, spec, folded }) {
       block: spec.block ?? null,
       source: spec.source ?? spec.task.source ?? null,
       language: spec.language ?? spec.task.language ?? null,
+      agentPath: spec.agentPath ?? spec.task.agentPath ?? null,
       ...(deps.digest ? { digest: deps.digest } : {}),
       ...(spec.phase ? { phase: spec.phase } : {}),
     });

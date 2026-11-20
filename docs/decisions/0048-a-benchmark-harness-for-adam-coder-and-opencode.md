@@ -465,3 +465,25 @@ clone path, the six `test/user/emails.js` tests that send a validation e-mail fa
   fails is exit 98: `infra` in a check, `invalid` in a run, never a fail. No proxy and no key reach a verifier.
 
 *Unverified:* that the two NodeBB tasks (`04998908`, `05f22361`) are kept on the owner's host, and the time a copy adds.
+
+**Amended 2026-11-20 (decided by the owner): the check grades at `/app`; the agent path is an attribute.** On the owner's
+machine with real SWE-bench Pro images, NodeBB `05f22361`'s gold passes 173 of 173 at `/app`. On the clone path all 173
+tests pass too, but the task's own `/tests/parser.py` (line 69, `re.compile(r'^(?:/app/)?(.*)$')`) strips only a literal
+`/app/` prefix, so the test names do not match and the grader reports "Required tests that passed: 0". `/tests` is the task's
+read-only mount and its tooling assumes `/app`; grading of agents' patches already runs at `/app` in a fresh container, and both
+arms work at the same agent path. The amendments above that drop a task whose gold fails at the clone path are superseded:
+
+* **A public or own task is kept when the gold passes 3/3 and the empty patch fails 3/3 at `/app`**, the real grading path, as
+  upstream does. The drop reasons are those of the `/app` runs: `gold-fails`, `gold-flaky`, `gold-does-not-apply`,
+  `empty-passes`, `empty-flaky`, `no-gold-patch`, `infra`. `gold-fails-at-app` is gone.
+* **The run at the agents' working path becomes a recorded attribute**, `agentPath`: `pass`, `fail` or `not-run`, with a reason
+  (`agentPathReason`), in `check.json` and in the lock beside each task. It is one gold run, made only for a kept task, so a
+  task costs at most 7 grading runs and a dropped one fewer. It is carried into the ledger's `Planned` record, and `bench report`
+  counts the tasks by it and rates the runs by it. It never drops a task and is the same for both arms.
+* **Resume:** a verdict with no `agentPath` was made under the old rule and is checked again (the old data has no empty-patch run
+  at `/app`, and a clone-path drop cannot be told from an `/app` one); `select` does not take it either.
+
+The egress probe of a `public` verifier and the removal of a dropped task's image are unchanged.
+
+*Unverified:* the new check on real images (the two NodeBB tasks should now be kept, `05f22361` with `agentPath: fail`).
+

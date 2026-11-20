@@ -296,18 +296,24 @@ change's added lines is in your statement. An `Interface` section is exempt: it 
   clone into `tests/test_patch.patch`, the gold without them in `solution/`) and builds its image: the workspace image
   by digest, the repository at `/app` at the base with history up to the base only, the toolchain pins you wrote.
 * `bench tasks check` (needs the host's container runtime; it grades on the networks the stack names, `adam-bench_verifier` (internal) and, for a task that asks for the internet, `adam-bench_egress`: it makes the ones that are missing the way `bench doctor --start` does and removes what it made, uses and keeps those of a running stack, and refuses a verifier network that is not internal or an owner-named one that does not exist) runs, per task, the gold patch three times and the empty patch three
-  times **from the clone path the agents will use**, not from `/app`: the image's whole working tree (`.git`, tracked,
-  untracked and ignored files) is copied there with `cp -a`, and `test.sh` runs with `/app` rewritten to that path, so a
-  task whose tests only work at `/app` is dropped. A copy, not links to `/app`'s ignored entries: through a linked
-  `node_modules` Node resolves a module's own requires from `/app` (its real path), `npm install` removes the link and
-  installs afresh, and what the test script writes (`config.json`) lands in `/app`, so the clone path graded another tree
-  than `/app` does (it dropped NodeBB tasks whose gold passes at `/app`; `bench/test/clonepath.test.mjs` runs the script on a
-  Node fixture). The copy costs the time of copying the image's tree, once per clone-path run. A task is kept only if the gold
-  passes all three and the empty patch fails all three, and is dropped with its reason otherwise (`gold-fails`,
-  `gold-flaky`, `gold-does-not-apply`, `empty-passes`, `empty-flaky`, `no-gold-patch`, `infra`). It also records whether
-  the base has a `.devcontainer`.
-* After the clone-path runs the check runs the gold **once more through the real grading path** (working directory `/app`,
-  the original `test.sh`) and keeps the task only if that passes too (`gold-fails-at-app`).
+  times **at `/app`**, the image's working directory and the real grading path (the original `test.sh` in a fresh
+  container, as upstream does and as an agent's patch is graded). A task is kept when the gold passes all three and the
+  empty patch fails all three, and is dropped with its reason otherwise (`gold-fails`, `gold-flaky`, `gold-does-not-apply`,
+  `empty-passes`, `empty-flaky`, `no-gold-patch`, `infra`). It also records whether the base has a `.devcontainer`.
+* **The agent path is an attribute, not a reason.** A task that is kept then runs its gold **once** at the agents' working
+  path, the clone path (`/work/workspaces/bench/slot`): the image's whole working tree is copied there with `cp -a` and
+  `test.sh` runs with `/app` rewritten to that path. The result is recorded as `agentPath` in `check.json`, and in the lock
+  beside each task, with `agentPathReason`: `pass`; `fail` (`tests-fail`, or the grade's error such as `apply`); or `not-run`
+  (`dropped` for a task that was dropped, which makes no such run; `infra` or `timeout` when the run itself did not finish).
+  A `fail` never drops a task. Task tooling often assumes `/app` (NodeBB `05f22361`: its gold passes 173 of 173 at `/app`
+  and all 173 tests pass at the clone path too, but the task's `/tests/parser.py` strips only a literal `/app/` prefix, so
+  the grader finds none of the required tests and says "Required tests that passed: 0"), and `/tests` is the task's read-only
+  mount. Both arms work at the same agent path, so the attribute is the same for both and fair to report; `bench report`
+  counts the tasks by it and rates the runs by it (section "Agent path"). The copy is a copy, not links to `/app`'s ignored
+  entries (a linked `node_modules` makes Node resolve from `/app`, `npm install` removes the link, and the test script's
+  writes land in `/app`); it costs the time of one copy per kept task. At most 7 grading runs per task (3 gold, 3 empty,
+  1 probe), fewer for a task that is dropped early. The grading container of a `public` verifier first connects to the npm,
+  PyPI and Go registries; a failure is exit 98, `infra` (never a fail).
 * **The public check does not walk every upstream task.** `select` needs 80 kept tasks, at most 9 per repository, so `check`
   (public) walks the tasks in the order `select` uses (`selectionOrder` in `lib/select.mjs`: a seeded shuffle in each
   repository, then rounds that take one task of every repository; `--seed`, default the configuration's) and stops as soon
@@ -316,7 +322,10 @@ change's added lines is in your statement. An `Interface` section is exempt: it 
   at once (`docker image rm`, by digest and by tag), unless a task kept so far, the workspace image or the pinned coder
   uses that digest; a removal that fails is printed (`image not removed`) and the verdict stands. The kept tasks' images
   stay: a run needs them. A re-run continues from `check.json`: a verdict recorded for the task as it is now (same checksum;
-  an `infra` result is not a verdict) is not run again, and the walk goes on in the same order. `--all` walks every task
+  an `infra` result is not a verdict) is not run again, and the walk goes on in the same order. **A verdict with no
+  `agentPath` was made under the earlier rule** (the clone path decided, and the empty patch ran only there), so it is run
+  again, and `select` does not take it: the old data has no empty run at `/app`, and a task dropped for a clone-path reason
+  cannot be told from one that fails at `/app`. `--all` walks every task
   (an audit; it still resumes and still removes the images of dropped tasks), `--only ID,ID` runs just those again.
 
 * `bench tasks select` keeps the checked tasks without a `.devcontainer`, whose check still fits the task (a result carries
@@ -925,7 +934,7 @@ Tests that need Docker skip unless `BENCH_TEST_DOCKER=1` and fail under `BENCH_T
   `<upstreamDir>/SHA256SUMS`), the exact form of `SHA256SUMS`, and the form of `solution/` (the check needs a `*.patch`
   there and drops a task without one as `no-gold-patch`).
 * That the miner's file classification (by path) matches your repositories' layouts.
-* **The copy clone path and the egress probe on real images.** *Verified 2026-11-19* in `scaleapi/SWE-bench_Pro-os` (NodeBB
+* **The copy clone path (now the `agentPath` attribute) and the egress probe on real images.** *Verified 2026-11-19* in `scaleapi/SWE-bench_Pro-os` (NodeBB
   `04998908`): `run_script.sh` runs `cp install/package.json .`, `npm install --production=false`, `npm install lodash underscore
   async`, writes `config.json` in its working directory and runs `npx mocha`, and NodeBB's `.gitignore` ignores `node_modules/`,
   `config.json`, `/package.json` and `package-lock.json`. *Verified 2026-11-19* with npm 10.9.9 here: `npm install` in a directory

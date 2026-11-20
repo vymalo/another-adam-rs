@@ -256,14 +256,16 @@ test('the sed of the check rewrites the working directory and leaves other paths
 // ---- the environment check ----
 
 /** A fake runtime whose answer depends on whether the gold or the empty patch is mounted. */
-function oracle({ gold = ['1', '1', '1'], empty = ['0', '0', '0'], devcontainer = false, probeFails = false } = {}) {
-  const counts = { gold: 0, empty: 0 };
+function oracle({ gold = ['1', '1', '1'], empty = ['0', '0', '0'], devcontainer = false, probeFails = false, clone = ['1'] } = {}) {
+  const counts = { gold: 0, empty: 0, clone: 0 };
   return new FakeContainers({
     onRun: (spec) => {
       if (!spec.mounts) return probeFails ? { exitCode: 125 } : { exitCode: 0, stdout: `devcontainer=${devcontainer ? 'yes' : 'no'}\n` };
       const withPatch = spec.mounts.some((m) => m.target === '/patch/model.patch');
-      const seq = withPatch ? gold : empty;
-      const v = seq[counts[withPatch ? 'gold' : 'empty']++ % seq.length];
+      // the clone-path probe (the agents' path) has its own answers; every other run is at /app
+      const atClone = spec.script.includes(CLONE_PATH);
+      const [seq, key] = atClone ? [clone, 'clone'] : withPatch ? [gold, 'gold'] : [empty, 'empty'];
+      const v = seq[counts[key]++ % seq.length];
       if (v === 'apply') return { exitCode: 97 };
       fs.writeFileSync(path.join(spec.mounts.find((m) => m.target === '/logs/verifier').source, 'reward.txt'), `${v}\n`);
       return { exitCode: 0 };
@@ -271,15 +273,49 @@ function oracle({ gold = ['1', '1', '1'], empty = ['0', '0', '0'], devcontainer 
   });
 }
 
-test('the check keeps a task whose gold passes three times and empty fails three times, and records the .devcontainer', async (t) => {
+test('the check keeps a task whose gold passes three times and empty fails three times at /app, and records the .devcontainer', async (t) => {
   const task = loaded(t);
   const c = oracle({ devcontainer: true });
   const r = await checkTask({ containers: c, task, workRoot: tmp(t) });
   assert.deepEqual([r.ok, r.reason, r.devcontainer, r.imageDigest], [true, null, true, DIGEST]);
-  assert.equal(c.runs.length, 1 + 3 + 1 + 3);
-  assert.equal(c.runs.slice(1).filter((s) => s.script.includes(CLONE_PATH)).length, 6, 'six runs from the agents\' clone path');
-  assert.equal(c.runs.filter((s) => !s.script?.includes(CLONE_PATH) && s.mounts?.some((m) => m.target === '/patch/model.patch')).length, 1, 'and the gold once through the real path');
+  assert.deepEqual([r.agentPath, r.agentPathReason], ['pass', null]);
+  assert.equal(c.runs.length, 1 + 3 + 3 + 1, 'the probe, three gold and three empty at /app, one gold at the clone path');
+  const graded = c.runs.slice(1);
+  assert.equal(graded.filter((s) => !s.script.includes(CLONE_PATH)).length, 6, 'six runs at /app, the real grading path');
+  assert.equal(graded.filter((s) => s.script.includes(CLONE_PATH)).length, 1, 'one run at the agents\' clone path');
+  assert.ok(graded.at(-1).script.includes(CLONE_PATH) && graded.at(-1).mounts.some((m) => m.target === '/patch/model.patch'), 'the clone path runs the gold, last');
   assert.equal(c.runs[0].network, 'none');
+});
+
+test('a task whose gold passes at /app and fails at the clone path is kept, with agentPath fail', async (t) => {
+  const c = oracle({ clone: ['0'] });
+  const r = await checkTask({ containers: c, task: loaded(t), workRoot: tmp(t) });
+  assert.deepEqual([r.ok, r.reason, r.agentPath, r.agentPathReason], [true, null, 'fail', 'tests-fail']);
+});
+
+test('a clone-path patch that does not apply is a fail with its reason, and an infrastructure error there is not-run (the task stays kept)', async (t) => {
+  const c = oracle({ clone: ['apply'] });
+  const r = await checkTask({ containers: c, task: loaded(t), workRoot: tmp(t) });
+  assert.deepEqual([r.ok, r.agentPath], [true, 'fail']);
+  assert.equal(r.agentPathReason, 'apply', 'a patch that does not apply there is a fail with its reason');
+  const infra = new FakeContainers({ onRun: (spec) => {
+    if (!spec.mounts) return { stdout: 'devcontainer=no\n' };
+    if (spec.script.includes(CLONE_PATH)) return { exitCode: 125 };
+    fs.writeFileSync(path.join(spec.mounts.find((m) => m.target === '/logs/verifier').source, 'reward.txt'), spec.mounts.some((m) => m.target === '/patch/model.patch') ? '1\n' : '0\n');
+    return { exitCode: 0 };
+  } });
+  const i = await checkTask({ containers: infra, task: loaded(t), workRoot: tmp(t) });
+  assert.deepEqual([i.ok, i.agentPath, i.agentPathReason], [true, 'not-run', 'infra']);
+});
+
+test('a dropped task did not run at the clone path: agentPath not-run, and no clone-path run is made', async (t) => {
+  const c = oracle({ gold: ['0', '0', '0'] });
+  const r = await checkTask({ containers: c, task: loaded(t), workRoot: tmp(t) });
+  assert.deepEqual([r.ok, r.reason, r.agentPath, r.agentPathReason], [false, 'gold-fails', 'not-run', 'dropped']);
+  assert.equal(c.runs.filter((s) => s.script?.includes(CLONE_PATH)).length, 0);
+  const e = oracle({ empty: ['1', '1', '1'] });
+  assert.equal((await checkTask({ containers: e, task: loaded(t), workRoot: tmp(t) })).reason, 'empty-passes');
+  assert.equal(e.runs.filter((s) => s.script?.includes(CLONE_PATH)).length, 0);
 });
 
 test('the check drops a task for its reason', async (t) => {
@@ -291,6 +327,7 @@ test('the check drops a task for its reason', async (t) => {
   assert.equal(await reason({ empty: ['0', '1', '0'] }), 'empty-flaky');
   assert.equal(await reason({ probeFails: true }), 'infra');
   assert.equal(await reason({}, { 'solution/solution.patch': null, 'solution/notes.txt': 'x' }), 'no-gold-patch');
+  assert.equal(await reason({ gold: ['1'], clone: ['0'] }), null, 'a clone-path failure alone is not a reason');
 });
 
 test('a tag-named image is pulled and pinned by its digest', async (t) => {

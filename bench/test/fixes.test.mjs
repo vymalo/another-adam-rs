@@ -274,17 +274,20 @@ test('row 8: an error that goes away on the retry is not held against the patch'
 
 // ---- row 9: the gold also passes through the real grading path ----
 
-test('row 9: a task whose gold passes only in the clone path is dropped', async (t) => {
-  const fake = new FakeContainers({ onRun: (spec) => {
+test('row 9: the gold is graded at /app, the real path: a task whose gold passes only at the clone path is dropped, the reverse is kept', async (t) => {
+  const only = (where) => new FakeContainers({ onRun: (spec) => {
     if (!spec.mounts) return { stdout: 'devcontainer=no\n' };
     const gold = spec.mounts.some((m) => m.target === '/patch/model.patch');
-    const real = !spec.script.includes(CLONE_PATH);
-    fs.writeFileSync(path.join(REWARD(spec), 'reward.txt'), gold && !real ? '1\n' : '0\n');
+    const atClone = spec.script.includes(CLONE_PATH);
+    fs.writeFileSync(path.join(REWARD(spec), 'reward.txt'), gold && atClone === (where === 'clone') ? '1\n' : '0\n');
     return {};
   } });
+  const fake = only('clone');
   const r = await checkTask({ containers: fake, task: loaded(t), workRoot: tmp(t) });
-  assert.deepEqual([r.ok, r.reason], [false, 'gold-fails-at-app']);
-  assert.ok(fake.runs.some((s) => !s.script.includes(CLONE_PATH) && s.mounts?.some((m) => m.target === '/patch/model.patch')));
+  assert.deepEqual([r.ok, r.reason], [false, 'gold-fails']);
+  assert.equal(fake.runs.filter((s) => s.script?.includes(CLONE_PATH)).length, 0, 'not even tried at the clone path');
+  const kept = await checkTask({ containers: only('app'), task: loaded(t), workRoot: tmp(t) });
+  assert.deepEqual([kept.ok, kept.reason, kept.agentPath], [true, null, 'fail']);
 });
 
 // ---- row 10 ----

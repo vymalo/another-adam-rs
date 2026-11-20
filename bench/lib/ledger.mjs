@@ -288,6 +288,7 @@ export function foldRecords(records) {
         phase: null,
         source: null,
         language: null,
+        agentPath: null,
         reservedMicro: 0,
         reservationActive: false,
         wastedMicro: 0,
@@ -313,7 +314,7 @@ export function foldRecords(records) {
       if (rec.state === 'Planned') {
         v.attempt += 1;
         v.attempts[v.attempt - 1] = newAttempt();
-        for (const f of ['task', 'agent', 'arm', 'block', 'source', 'language', 'digest', 'phase']) if (rec[f] !== undefined) v[f] = rec[f];
+        for (const f of ['task', 'agent', 'arm', 'block', 'source', 'language', 'agentPath', 'digest', 'phase']) if (rec[f] !== undefined) v[f] = rec[f];
         v.result = null;
       }
       if (rec.state === 'Reserved') {
@@ -459,9 +460,9 @@ export function resumeRecords(actions, folded) {
       out.push({ kind: 'state', run: a.run, state: 'Failed_infra', final: true, reason: 'interrupted_too_often' });
     } else if (a.action === 'rerun') {
       if (IN_FLIGHT.has(a.from)) out.push({ kind: 'state', run: a.run, state: 'Interrupted', resumed: true });
-      out.push({ kind: 'state', run: a.run, state: 'Planned', retry: true, task: v.task, agent: v.agent, arm: v.arm, block: v.block, source: v.source, language: v.language, digest: v.digest, phase: v.phase });
+      out.push({ kind: 'state', run: a.run, state: 'Planned', retry: true, task: v.task, agent: v.agent, arm: v.arm, block: v.block, source: v.source, language: v.language, agentPath: v.agentPath, digest: v.digest, phase: v.phase });
     } else if (a.action === 'retry') {
-      out.push({ kind: 'state', run: a.run, state: 'Planned', retry: true, task: v.task, agent: v.agent, arm: v.arm, block: v.block, source: v.source, language: v.language, digest: v.digest, phase: v.phase });
+      out.push({ kind: 'state', run: a.run, state: 'Planned', retry: true, task: v.task, agent: v.agent, arm: v.arm, block: v.block, source: v.source, language: v.language, agentPath: v.agentPath, digest: v.digest, phase: v.phase });
     } else if (a.action === 'regrade') {
       out.push({ kind: 'state', run: a.run, state: 'Grading', regrade: true });
     }

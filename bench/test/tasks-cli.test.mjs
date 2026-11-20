@@ -133,7 +133,10 @@ test('check, then select: the lock holds ids, checksums and digests only, and dr
   const lock = JSON.parse(fs.readFileSync(path.join(s.repoTasks, 'public.lock.json'), 'utf8'));
   assert.deepEqual(lock.tasks.map((x) => x.id), [up.ids[0], up.ids[1]], 'the devcontainer task and the failing task are dropped');
   assert.deepEqual(Object.keys(lock).sort(), ['schema', 'seed', 'source', 'tasks', 'upstreamCommit']);
-  assert.deepEqual(Object.keys(lock.tasks[0]).sort(), ['checksum', 'id', 'image', 'repo']);
+  assert.deepEqual(Object.keys(lock.tasks[0]).sort(), ['agentPath', 'checksum', 'id', 'image', 'repo']);
+  assert.equal(lock.tasks[0].agentPath, 'pass');
+  assert.equal(results[`public/${up.ids[0]}`].agentPath, 'pass');
+  assert.equal(results[`public/${up.ids[3]}`].agentPath, 'not-run', 'a dropped task has no agent-path run');
   assert.equal(lock.seed, 'seed-one');
   assert.equal(lock.tasks[0].image, `sha256:${sha(up.ids[0])}`);
   const text = fs.readFileSync(path.join(s.repoTasks, 'public.lock.json'), 'utf8');
@@ -388,4 +391,63 @@ test('check --only runs exactly the named tasks, again, whatever the target', as
   const rt = walkRuntime({ ids });
   assert.equal(await s.run(['check', '--only', ids[2]], () => rt), 0);
   assert.deepEqual(rt.checkedIds(), [ids[2]]);
+});
+
+// ---- the grading path is /app; the clone path is an attribute (owner's decision, 2026-11-20) ----
+
+/** Gold and empty answer as a good task does at /app; the gold's clone-path run answers `atClone`. */
+function pathRuntime({ ids, atClone = () => '0' }) {
+  const rt = walkRuntime({ ids });
+  rt.onRun = (spec) => {
+    if (!spec.mounts) return { exitCode: 0, stdout: 'devcontainer=no\n' };
+    const model = spec.mounts.find((m) => m.target === '/patch/model.patch');
+    const id = ids.find((x) => spec.image.endsWith(sha(x)));
+    const clone = spec.script.includes('/work/workspaces/bench/slot');
+    const bad = model && fs.readFileSync(model.source, 'utf8').includes('FAIL');
+    const reward = clone ? atClone(id) : model && !bad ? '1' : '0';
+    fs.writeFileSync(path.join(spec.mounts.find((m) => m.target === '/logs/verifier').source, 'reward.txt'), `${reward}\n`);
+    return { exitCode: 0 };
+  };
+  return rt;
+}
+
+test('a task that fails only at the clone path is kept, recorded agentPath fail and carried into the lock; the others say pass or not-run', async (t) => {
+  const ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2', 'instance_Org__Alpha-aaaaaaa3'];
+  const up = upstream(t, ids, failing(new Set([ids[2]])));
+  const s = setup(t, publicCfg(up));
+  const rt = pathRuntime({ ids, atClone: (id) => (id === ids[1] ? '0' : '1') });
+  assert.equal(await s.run(['check'], () => rt), 0);
+  const r = checkJson(s);
+  assert.deepEqual([r[`public/${ids[0]}`].ok, r[`public/${ids[0]}`].agentPath], [true, 'pass']);
+  assert.deepEqual([r[`public/${ids[1]}`].ok, r[`public/${ids[1]}`].agentPath, r[`public/${ids[1]}`].agentPathReason], [true, 'fail', 'tests-fail']);
+  assert.deepEqual([r[`public/${ids[2]}`].ok, r[`public/${ids[2]}`].reason, r[`public/${ids[2]}`].agentPath], [false, 'gold-fails', 'not-run']);
+  assert.match(s.outLines.join('\n'), new RegExp(`${ids[1]}: kept \\(agent path: fail, tests-fail\\)`));
+  assert.match(s.outLines.join('\n'), /2 kept, 1 dropped/);
+  assert.equal(await s.run(['select', '--source', 'public']), 0);
+  const lock = JSON.parse(fs.readFileSync(path.join(s.repoTasks, 'public.lock.json'), 'utf8'));
+  assert.deepEqual(Object.fromEntries(lock.tasks.map((x) => [x.id, x.agentPath])), { [ids[0]]: 'pass', [ids[1]]: 'fail' });
+});
+
+test('resume: a verdict from before the rule (no agentPath) is checked again; a verdict with one is not', async (t) => {
+  const ids = ['instance_Org__Alpha-aaaaaaa1', 'instance_Org__Alpha-aaaaaaa2'];
+  const up = upstream(t, ids);
+  const s = setup(t, publicCfg(up));
+  assert.equal(await s.run(['check'], () => pathRuntime({ ids, atClone: () => '1' })), 0);
+  const results = checkJson(s);
+  // as an old check wrote them: the clone path was the rule, and a clone-path failure was a drop
+  delete results[`public/${ids[0]}`].agentPath;
+  delete results[`public/${ids[0]}`].agentPathReason;
+  results[`public/${ids[1]}`] = { ...results[`public/${ids[1]}`], ok: false, reason: 'gold-fails' };
+  delete results[`public/${ids[1]}`].agentPath;
+  delete results[`public/${ids[1]}`].agentPathReason;
+  fs.writeFileSync(path.join(s.home, 'tasks', 'check.json'), JSON.stringify(results));
+  assert.equal(await s.run(['select', '--source', 'public']), 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(s.repoTasks, 'public.lock.json'), 'utf8')).tasks.length, 0, 'an old verdict is not selectable');
+  const again = pathRuntime({ ids, atClone: () => '1' });
+  assert.equal(await s.run(['check'], () => again), 0);
+  assert.deepEqual(again.checkedIds().sort(), [...ids].sort(), 'both are run again: the old data has no empty run at /app');
+  assert.equal(checkJson(s)[`public/${ids[1]}`].ok, true, 'the task dropped for a clone-path reason is now kept');
+  const third = pathRuntime({ ids });
+  assert.equal(await s.run(['check'], () => third), 0);
+  assert.deepEqual(third.checkedIds(), [], 'a new verdict is resumed');
 });

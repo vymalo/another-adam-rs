@@ -77,7 +77,7 @@ export function loadSelected(config, p) {
       if (!t) throw new SelectionError(`${label} task ${entry.id} is in the lock but cannot be loaded (bench tasks fetch, build, check)`);
       if (checksumOf(t) !== entry.checksum) throw new SelectionError(`${label} task ${entry.id} changed since it was selected: select again`);
       if (digestOf(t) !== entry.image) throw new SelectionError(`${label} task ${entry.id}: its image is not the one that was selected: select again`);
-      out.push(t);
+      out.push({ ...t, agentPath: entry.agentPath ?? null });
     }
   };
   if (publicLock !== '') {
