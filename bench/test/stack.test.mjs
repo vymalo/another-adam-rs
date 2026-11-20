@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { GLIBC_FILES } from '../lib/glibc.mjs';
 import { PINS, coderRef } from '../lib/pins.mjs';
 import { RUNTIME } from '../lib/runtime.mjs';
 import { Stack, StackError, coderEnvironment, redact, secretsOf, serviceNames } from '../lib/stack.mjs';
@@ -378,9 +379,11 @@ test('finding 1: the base is pushed by a one-shot container of the stack, with t
   const { stack } = makeStack(t, { exec: async (file, args) => (seen.push(args.slice(5)), { exitCode: 0, stdout: '', stderr: '' }) });
   await stack.pushBase(2, 'echo pushed');
   await stack.deleteRepo('demo-1-aaaaaa-1b2c3d4e');
-  assert.deepEqual(seen[0], ['run', '--rm', '-T', '--no-deps', 'pusher-2', 'echo pushed']);
-  assert.deepEqual(seen[1].slice(0, 5), ['exec', '-T', 'git-server', 'sh', '-c']);
-  assert.match(seen[1][5], /rm -rf \/srv\/git\/bench\/demo-1-aaaaaa-1b2c3d4e\.git; test ! -e \/srv\/git\/bench\/demo-1-aaaaaa-1b2c3d4e\.git/);
+  const run = seen.find((a) => a[0] === 'run');
+  assert.deepEqual(run, ['run', '--rm', '-T', '--no-deps', 'pusher-2', 'echo pushed']);
+  const del = seen.find((a) => a[0] === 'exec');
+  assert.deepEqual(del.slice(0, 5), ['exec', '-T', 'git-server', 'sh', '-c']);
+  assert.match(del[5], /rm -rf \/srv\/git\/bench\/demo-1-aaaaaa-1b2c3d4e\.git; test ! -e \/srv\/git\/bench\/demo-1-aaaaaa-1b2c3d4e\.git/);
 });
 
 test('finding 11: stopping a coder removes it and confirms that none is left', async (t) => {
@@ -596,4 +599,58 @@ test('the images compose builds are the ones the stack lists: every service with
   const built = [...text.matchAll(/^ {2}([a-z0-9-]+):\n(?: {4}.*\n)*? {4}build:/gm)].map((m) => `adam-bench-${m[1]}`);
   assert.deepEqual(makeStack(t).stack.builtImages(), built);
   assert.deepEqual(built, ['adam-bench-git-server']);
+});
+
+test('the pusher\'s scratch directory is made on the slot\'s work volume before the push, even when the push then fails', async (t) => {
+  const seenDir = [];
+  const ref = {};
+  const made = makeStack(t, { exec: async (file, args) => {
+    if (args.includes('pusher-1')) {
+      seenDir.push(fs.existsSync(path.join(ref.stack.workRoot(1), 'pusher-scratch')));
+      return { exitCode: 128, stdout: '', stderr: 'boom' };
+    }
+    return { exitCode: 0, stdout: '', stderr: '' };
+  } });
+  ref.stack = made.stack;
+  await assert.rejects(made.stack.pushBase(1, 'true'));
+  assert.deepEqual(seenDir, [true], 'the directory the compose file mounts exists when the pusher starts');
+});
+
+test('compose: the pusher keeps a read-only root and the base read-only, and its scratch is a disk-backed bind of the work volume, not a tmpfs', compose, () => {
+  for (const n of [1, 2]) {
+    const s = config.services[`pusher-${n}`];
+    assert.equal(s.read_only, true);
+    const byTarget = Object.fromEntries(s.volumes.map((v) => [v.target, v]));
+    assert.equal(byTarget['/work'].read_only, true);
+    assert.equal(byTarget['/scratch'].type, 'bind');
+    assert.ok(!byTarget['/scratch'].read_only);
+    assert.equal(byTarget['/scratch'].source, `/tmp/bw/${n}/pusher-scratch`);
+    const tmpfs = Object.keys(s.tmpfs ?? {}).concat(Array.isArray(s.tmpfs) ? s.tmpfs : []).join(' ');
+    assert.ok(!tmpfs.includes('/scratch'));
+    assert.ok(!(s.environment && Object.keys(s.environment).some((k) => /KEY|TOKEN|SECRET/.test(k))));
+  }
+});
+
+test('ensureGlibc copies the loader and the libraries out of the pinned coder image once, following links, and marks the directory', async (t) => {
+  const seen = [];
+  const { stack } = makeStack(t, {
+    exec: async (file, args) => {
+      seen.push(args);
+      if (args[0] === 'cp') fs.writeFileSync(args[args.length - 1], '');
+      return { exitCode: 0, stdout: 'id\n', stderr: '' };
+    },
+  });
+  const dir = await stack.ensureGlibc();
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['.image', ...GLIBC_FILES].sort());
+  assert.equal((fs.statSync(path.join(dir, 'ld-linux-x86-64.so.2')).mode & 0o111) !== 0, true, 'the loader is executable');
+  assert.equal(fs.readFileSync(path.join(dir, '.image'), 'utf8').trim(), coderRef(PINS));
+  const cps = seen.filter((a) => a[0] === 'cp');
+  assert.equal(cps.length, GLIBC_FILES.length);
+  for (const a of cps) {
+    assert.equal(a[1], '-L', 'a symbolic link is copied as the file it names');
+    assert.match(a[2], /^adam-bench-extract-[0-9a-f]+:\/usr\/lib\/x86_64-linux-gnu\/[A-Za-z0-9._+-]+$/);
+  }
+  assert.ok(!seen.some((a) => a[0] === 'run' || a[0] === 'start'), 'the image is never run');
+  assert.equal(await stack.ensureGlibc(), dir, 'a second call copies nothing');
+  assert.equal(seen.filter((a) => a[0] === 'cp').length, GLIBC_FILES.length);
 });

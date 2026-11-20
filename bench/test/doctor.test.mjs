@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { coderProbe, doctor, osRelease, renderDoctor } from '../lib/doctor.mjs';
+import { coderProbe, doctor, opencodeProbe, osRelease, renderDoctor } from '../lib/doctor.mjs';
 import { FakeContainers, HostContainers } from '../lib/containers.mjs';
 import { PINS, coderRef } from '../lib/pins.mjs';
 import { Stack } from '../lib/stack.mjs';
@@ -387,4 +387,62 @@ test('with the compose build off, the doctor fails closed when an image compose 
   assert.equal(by(present, 'compose images').status, 'ok');
   // build on (the default): nothing to check
   assert.equal(by(await run(machine(), { stack: { composeBuild: true, builtImages: () => ['x'], removeStaleEnvFiles: () => [] } }), 'compose images'), undefined);
+});
+
+// ---- the OpenCode probe: does the pinned binary start in each task image? ----
+
+const ocStack = (containers) => ({ ...probeStack(containers), ensureGlibc: async () => '/h/glibc' });
+const fetchBinary = async () => ({ path: '/h/opencode/2.3.0/opencode' });
+const coderOnly = (spec) => (spec.entrypoint === '/bin/cat' ? { exitCode: 0, stdout: 'PRETTY_NAME="Alpine Linux v3.17"\n' } : { exitCode: 78 });
+
+const ocRun = (loader, start) => (spec) => (spec.script === 'test -e /lib64/ld-linux-x86-64.so.2' ? { exitCode: loader ? 0 : 1 } : spec.script?.includes('--version') ? start : coderOnly(spec));
+
+test('the OpenCode probe: exit 0 with a version line means it starts; the shell\'s "not found" (exit 127) means it does not; an image without the loader gets the glibc mounts', async () => {
+  const starts = new FakeContainers({ onRun: ocRun(true, { exitCode: 0, stdout: 'opencode v2.3.0\n' }) });
+  const ok = await opencodeProbe({ containers: starts, image: TASK.image.ref, binary: '/h/oc', glibcDir: '/h/glibc' });
+  assert.equal(ok.starts, true);
+  const spec = starts.runs.find((s) => s.script.includes('--version'));
+  assert.equal(spec.user, '10001:10001');
+  assert.equal(spec.network, 'none');
+  assert.deepEqual(spec.mounts, [{ source: '/h/oc', target: '/opt/bench/opencode', readOnly: true }], 'an image with its loader is run as it is');
+  assert.match(spec.script, /\/opt\/bench\/opencode --version/);
+
+  const musl = new FakeContainers({ onRun: ocRun(false, { exitCode: 0, stdout: 'opencode v2.3.0\n' }) });
+  const through = await opencodeProbe({ containers: musl, image: TASK.image.ref, binary: '/h/oc', glibcDir: '/h/glibc' });
+  assert.equal(through.starts, true);
+  assert.match(through.detail, /through the harness's glibc/);
+  assert.ok(musl.runs.find((s) => s.script.includes('--version')).mounts.some((m) => m.target === '/lib64/ld-linux-x86-64.so.2' && m.source === '/h/glibc/ld-linux-x86-64.so.2' && m.readOnly));
+
+  const no = await opencodeProbe({ containers: new FakeContainers({ onRun: ocRun(true, { exitCode: 127, stdout: 'sh: /opt/bench/opencode: not found\n' }) }), image: TASK.image.ref, binary: '/h/oc', glibcDir: '/h/glibc' });
+  assert.equal(no.starts, false);
+  assert.match(no.detail, /exit 127: sh: \/opt\/bench\/opencode: not found/);
+  // exit 0 without a version line is not a start either
+  assert.equal((await opencodeProbe({ containers: new FakeContainers({ onRun: ocRun(true, { exitCode: 0, stdout: 'hello\n' }) }), image: TASK.image.ref, binary: '/h/oc', glibcDir: '/h/glibc' })).starts, false);
+});
+
+test('bench doctor probes OpenCode in each selected task image: ok where it starts, a failure (with the reason) where it does not, and the coder\'s own row is untouched', async () => {
+  const good = new FakeContainers({ onRun: ocRun(false, { exitCode: 0, stdout: 'opencode v2.3.0\n' }) });
+  const r = await run(machine(), { tasks: [TASK], containers: good, stack: ocStack(good), fetchBinary });
+  assert.equal(by(r, 'opencode in task image hello').status, 'ok');
+  assert.equal(by(r, 'task image hello').status, 'ok');
+  assert.equal(r.exitCode, 0);
+
+  const bad = new FakeContainers({ onRun: ocRun(false, { exitCode: 127, stdout: 'sh: /opt/bench/opencode: not found\n' }) });
+  const f = await run(machine(), { tasks: [TASK], containers: bad, stack: ocStack(bad), fetchBinary });
+  const c = by(f, 'opencode in task image hello');
+  assert.equal(c.status, 'fail');
+  assert.match(c.detail, /does not start/);
+  assert.match(c.detail, /not found/);
+  assert.equal(by(f, 'task image hello').status, 'ok');
+  assert.equal(f.exitCode, 1, 'caught before a paid run');
+});
+
+test('bench doctor says the OpenCode probe was not made when it cannot get the binary, and does not fail for it', async () => {
+  const c0 = new FakeContainers({ onRun: coderOnly });
+  const r = await run(machine(), { tasks: [TASK], containers: c0, stack: ocStack(c0), fetchBinary: async () => { throw new Error('the registry answered 503'); } });
+  const c = by(r, 'opencode in task image hello');
+  assert.equal(c.status, 'warn');
+  assert.match(c.detail, /not probed: the registry answered 503/);
+  assert.equal(r.exitCode, 0);
+  assert.equal(c0.runs.filter((s) => s.script?.includes('--version')).length, 0);
 });

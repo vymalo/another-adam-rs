@@ -3,6 +3,7 @@
 // mount source is a path on this machine.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { HostContainers } from '../lib/containers.mjs';
@@ -47,4 +48,36 @@ test('docker: a self-made task, the oracle grades 1 and the empty patch 0', { sk
   assert.deepEqual([gold.pass, gold.passes], [true, 3]);
   const empty = await gradePatch({ containers, task, patchFile: null, workRoot: work });
   assert.deepEqual([empty.pass, empty.passes], [false, 0]);
+});
+
+// ---- a musl task image (Alpine): the pinned OpenCode binary starts there with the harness's glibc mounted ----
+// BENCH_TEST_MUSL_IMAGE: a locally present image whose C library is musl (a SWE-bench Pro teleport image is one);
+// BENCH_TEST_OPENCODE_BIN: the pinned binary; BENCH_TEST_GLIBC_SOURCE: a locally present Debian image the runtime is copied
+// from, as `Stack.ensureGlibc` does from the coder image (debian:trixie-slim has every file).
+const MUSL = process.env.BENCH_TEST_MUSL_IMAGE;
+const OC = process.env.BENCH_TEST_OPENCODE_BIN;
+const SRC = process.env.BENCH_TEST_GLIBC_SOURCE;
+const muslSkip = MUSL && OC && SRC ? false : 'BENCH_TEST_MUSL_IMAGE, BENCH_TEST_OPENCODE_BIN and BENCH_TEST_GLIBC_SOURCE are not all set';
+
+test('OpenCode starts in a musl image with the harness\'s glibc mounted, and without it the shell says "not found" (exit 127)', { skip: muslSkip }, async (t) => {
+  const { execFileSync } = await import('node:child_process');
+  const { GLIBC_FILES, GLIBC_LIB_DIR, glibcMounts, lacksLoader } = await import('../lib/glibc.mjs');
+  const glibc = fs.mkdtempSync(path.join(os.tmpdir(), 'adam-bench-glibc-'));
+  t.after(() => fs.rmSync(glibc, { recursive: true, force: true }));
+  const containers = new HostContainers();
+  await containers.extract(SRC, GLIBC_FILES.map((f) => `${GLIBC_LIB_DIR}/${f}`), glibc, { follow: true });
+  assert.equal(await lacksLoader({ containers, image: MUSL }), true, 'the image has no /lib64/ld-linux-x86-64.so.2');
+  const dockerRun = (mounts) => {
+    try {
+      return { status: 0, out: execFileSync('docker', ['run', '--rm', '--network=none', '--user', '10001:10001', '-e', 'HOME=/tmp', '-v', `${OC}:/opt/bench/opencode:ro`, ...mounts.flatMap((m) => ['-v', `${m.source}:${m.target}:ro`]), '--entrypoint', 'sh', MUSL, '-c', '/opt/bench/opencode --version 2>&1'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) };
+    } catch (e) {
+      return { status: e.status, out: `${e.stdout}${e.stderr}` };
+    }
+  };
+  const bare = dockerRun([]);
+  assert.equal(bare.status, 127, 'the failure of the second pilot, reproduced');
+  assert.match(bare.out, /not found/);
+  const through = dockerRun(glibcMounts(glibc));
+  assert.equal(through.status, 0, through.out);
+  assert.match(through.out, /^opencode v\d/);
 });

@@ -7,7 +7,7 @@
 //   hasImage(ref)        -> boolean
 //   imageId(tag)         -> 'sha256:...' (the id of a local image)
 //   imageEnv(ref)        -> { PATH: '...' } (the image's own environment)
-//   extract(ref, paths, dir) -> void (files of an image, copied into a directory of the harness's)
+//   extract(ref, paths, dir, { follow }) -> void (files of an image, copied into a directory of the harness's; `follow` copies what a symbolic link names)
 //   build(context, tag, dockerfile, buildArgs?) -> void   (buildArgs: { NAME: value }, plain)
 //   stop(name), kill(name, signal), reapAll() (every container of this instance, removed and checked),
 //   listContainers() -> [{ image, id, labels, names }]
@@ -348,7 +348,7 @@ export class HostContainers {
   }
 
   /** Copy files out of an image (never run it): `docker create` once, `docker cp` each path, remove the container. */
-  async extract(ref, paths, dir) {
+  async extract(ref, paths, dir, { follow = false } = {}) {
     if (!parseImageRef(ref)) throw new ContainerError('the image is not a plain reference');
     if (!SAFE_PATH.test(dir)) throw new ContainerError('the destination is not a plain absolute path');
     const name = `adam-bench-extract-${randomBytes(6).toString('hex')}`;
@@ -356,7 +356,7 @@ export class HostContainers {
     try {
       for (const p of paths) {
         if (!SAFE_PATH.test(p)) throw new ContainerError('a path to extract is not plain');
-        await this.#must(['cp', `${name}:${p}`, `${dir}/${p.split('/').pop()}`], `copying ${p} out of ${ref}`);
+        await this.#must(['cp', ...(follow ? ['-L'] : []), `${name}:${p}`, `${dir}/${p.split('/').pop()}`], `copying ${p} out of ${ref}`);
       }
     } finally {
       await this.#call(['rm', '-f', name]);
@@ -428,7 +428,7 @@ export class FakeContainers {
   async imageEnv() {
     return this.imageEnvValue;
   }
-  async extract(ref, paths, dir) {
-    this.extracted.push({ ref, paths, dir });
+  async extract(ref, paths, dir, opts = {}) {
+    this.extracted.push({ ref, paths, dir, ...opts });
   }
 }
