@@ -619,8 +619,15 @@ mod tests {
         assert!(matches!(stored, Stored::Full(_)));
         assert_eq!(stored.encode().expect("encodes"), full);
 
-        // A v5 head is not a v4 envelope: `Envelope::decode` refuses it.
-        assert!(Envelope::decode(RunId::new(), &encoded).is_err());
+        // A v5 head is not a v4 envelope: `Envelope::decode` refuses it, and the refusal is
+        // `Corrupt` — the class a v4 process's worker sees, so it commits the run `Failed` rather
+        // than stepping a head as if it were a state (ADR 0055, the deploy boundary).
+        let refused =
+            Envelope::decode(RunId::new(), &encoded).expect_err("a v5 head is not a v4 envelope");
+        assert!(
+            matches!(refused, RuntimeError::Corrupt { .. }),
+            "{refused:?}"
+        );
     }
 
     #[test]
