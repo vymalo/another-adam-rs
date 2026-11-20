@@ -17,6 +17,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { HostContainers, buildRunArgs, dockerEnv } from './containers.mjs';
+import { summarize, withStderr } from './errors.mjs';
 import { PINS, coderRef } from './pins.mjs';
 import { RUNTIME, runtimeLimits, runtimeUser } from './runtime.mjs';
 import { extractEntries, parseTar, pickFiles } from './tarstream.mjs';
@@ -272,8 +273,8 @@ export class Stack {
     const r = await this.exec('docker', this.composeArgs(args), { env: this.composeEnv(), input, timeoutMs });
     this.log({ event: 'compose', verb: args[0], exit: r.exitCode });
     if (r.exitCode !== 0 || r.timedOut) {
-      const why = redact(r.stderr.trim().split('\n').slice(-3).join(' | '), this.secrets);
-      throw new StackError(`docker compose ${args[0]} ${r.timedOut ? 'timed out' : `failed (exit ${r.exitCode})`}: ${why}`);
+      const full = redact(r.stderr, this.secrets);
+      throw withStderr(new StackError(`docker compose ${args[0]} ${r.timedOut ? 'timed out' : `failed (exit ${r.exitCode})`}: ${summarize(full)}`), full);
     }
     return r.stdout;
   }

@@ -11,6 +11,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { RUN_ID_MAX } from './plan.mjs';
 
 export const STATES = ['Planned', 'Reserved', 'Preparing', 'Running', 'Collecting', 'Grading', 'Done', 'NotStarted', 'StoppedByCap', 'Interrupted', 'Failed_infra'];
 
@@ -33,7 +34,7 @@ export const TRANSITIONS = {
 export const ACTIVE = new Set(['Reserved', 'Preparing', 'Running']);
 const IN_FLIGHT = new Set(['Reserved', 'Preparing', 'Running', 'Collecting']);
 const CALL_PHASES = new Set(['pending', 'settled', 'refused', 'failed']);
-const RUN_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const RUN_ID = new RegExp(`^[A-Za-z0-9._:-]{1,${RUN_ID_MAX}}$`);
 
 export class LedgerError extends Error {
   constructor(message) {

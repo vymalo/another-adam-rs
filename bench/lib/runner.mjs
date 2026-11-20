@@ -13,6 +13,7 @@
 // graded again.
 import fs from 'node:fs';
 import path from 'node:path';
+import { saveRaw } from './agents/common.mjs';
 import { BaseCache, baseKey } from './base.mjs';
 import { CapBook } from './cap.mjs';
 import { callStats, classifyRun } from './classify.mjs';
@@ -119,12 +120,24 @@ export async function executeRun({ deps, spec, attempt }) {
   const containers = stack.containers(spec.slot);
   const opened = { meter: false };
   let ctx = null;
-  const infra = async (reason, message, { interrupted }) => {
+  const infra = async (reason, message, { interrupted, cause }) => {
     await agent.cleanup(ctx ?? { run, attempt, slot: spec.slot, stack, containers, paths }).catch(() => {});
     if (opened.meter) meter.closeRun(run);
     else book.close(run);
+    // The ledger line is short; what the failed command said, whole, is in the run's directory (the host never reads a
+    // container's files, but this text came out through a docker call's stderr, with the run's secrets taken out).
+    if (typeof cause?.stderr === 'string' && cause.stderr !== '') {
+      try {
+        saveRaw(paths.run, 'prepare-stderr.txt', `${message}\n\n${cause.stderr}\n`, [...(stack.secrets ?? []), ...(ctx ? [ctx.meter.token] : [])]);
+      } catch {
+        // the diagnostic is best effort: the failure is recorded either way
+      }
+    }
     if (interrupted) stateRecord(deps, run, 'Interrupted', { reason });
-    stateRecord(deps, run, 'Failed_infra', { reason, error: message });
+    // A retry runs the same code on the same image: it is only worth making where something outside the run can differ.
+    // An error that says it is permanent (a clone the image's git cannot read, a base that does not match its marker, a run
+    // id the driver refuses) is final at once, instead of three attempts at the same failure.
+    stateRecord(deps, run, 'Failed_infra', { reason, error: message, ...(cause?.retryable === false ? { final: true } : {}) });
     return { state: 'Failed_infra', reason, error: message };
   };
 
@@ -166,7 +179,7 @@ export async function executeRun({ deps, spec, attempt }) {
     await agent.prepare(ctx);
   } catch (e) {
     if (e.name === 'HarnessCrash') throw e;
-    return infra(e.reason ?? 'prepare', e.message, { interrupted: false });
+    return infra(e.reason ?? 'prepare', e.message, { interrupted: false, cause: e });
   }
 
   let ran;
@@ -175,7 +188,7 @@ export async function executeRun({ deps, spec, attempt }) {
     ran = await agent.run(ctx);
   } catch (e) {
     if (e.name === 'HarnessCrash') throw e;
-    return infra(e.reason ?? 'agent_error', e.message, { interrupted: true });
+    return infra(e.reason ?? 'agent_error', e.message, { interrupted: true, cause: e });
   }
   if (ran.exit === 'infra') return infra('infra', 'the agent could not be driven', { interrupted: true });
 

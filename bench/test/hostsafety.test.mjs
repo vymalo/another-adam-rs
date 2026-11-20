@@ -10,7 +10,7 @@ import { FakeContainers } from '../lib/containers.mjs';
 import { gradeOnce, isolatedGit, localGit, safeEnv } from '../lib/grade.mjs';
 import { loadTask } from '../lib/task.mjs';
 import { makeTask } from './taskfix.mjs';
-import { lsRemoteHeads, pushScript } from '../lib/gitops.mjs';
+import { SAFE_DIRECTORY_LINES, lsRemoteHeads, pushScript } from '../lib/gitops.mjs';
 import { commitFiles, git, initRepo } from './gitfix.mjs';
 import { tmp } from './helpers.mjs';
 
@@ -139,10 +139,20 @@ test('only an http address of the bench repository on the loopback is listed', a
 test('the base is pushed by a container: the script fetches into a fresh repository and pushes from it, and takes only plain names', () => {
   const script = pushScript({ base: '/work/bench-base/base.git', url: 'http://git-server:8080/bench/x-1-r1.git' });
   assert.match(script, /git init -q "\$P"/);
-  assert.match(script, /git -c safe\.directory='\*' -C "\$P" fetch -q \/work\/bench-base\/base\.git refs\/heads\/main/);
+  assert.match(script, /git -C "\$P" fetch -q \/work\/bench-base\/base\.git refs\/heads\/main/);
   assert.match(script, /git -C "\$P" push -q --force http:\/\/git-server:8080\/bench\/x-1-r1\.git FETCH_HEAD:refs\/heads\/main/);
-  assert.match(script, /GIT_CONFIG_GLOBAL=\/dev\/null/);
+  assert.match(script, /GIT_CONFIG_GLOBAL=\/tmp\/bench-gitconfig/);
   for (const bad of [{ base: '/work/a b', url: 'http://git-server:8080/bench/x.git' }, { base: '/work/b.git', url: 'http://evil.example.test/bench/x.git' }, { base: '/work/b.git', url: 'http://git-server:8080/bench/x.git; rm' }]) assert.throws(() => pushScript(bad), /plain/);
   void execFileSync;
   void git;
+});
+
+test('a git in a container is told safe.directory by a global file, the one place the git of a task image reads it for a local clone or fetch', () => {
+  // `-c safe.directory` and GIT_CONFIG_COUNT are ignored by the upload-pack of git 2.39 (the task images'): a base written by
+  // root and read as uid 10001 failed with "Could not read from remote repository" (reproduced in a SWE-bench Pro image).
+  const out = execFileSync('sh', ['-c', [...SAFE_DIRECTORY_LINES, 'git config --get-all safe.directory; echo "$GIT_CONFIG_GLOBAL"'].join('\n')], { encoding: 'utf8', env: { PATH: process.env.PATH } });
+  assert.deepEqual(out.trim().split('\n'), ['*', '/tmp/bench-gitconfig']);
+  const push = pushScript({ base: '/work/bench-base/base.git', url: 'http://git-server:8080/bench/x-1-r1.git' });
+  assert.ok(push.includes(SAFE_DIRECTORY_LINES[0]), 'the pusher makes the file');
+  assert.doesNotMatch(push, /-c safe\.directory|GIT_CONFIG_COUNT/);
 });

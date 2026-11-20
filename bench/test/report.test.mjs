@@ -108,8 +108,8 @@ test('cost, tokens, time and the meter against what the agents reported', () => 
   // a/max: 6 counted runs of 5000 micro-dollars = $0.0300; 4 solved -> $0.0075 each
   assert.match(text, /\| a \| max \| \$0\.0300 \| \$0\.0075 \| 6000 \| 2400 \| 0 \| 1200 \| 300 \|/);
   assert.match(text, /none solved/, 'b/off solved nothing: no cost per solved task');
-  assert.match(text, /\| Agent \| Runs \| Meter input \| Reported input \|/);
-  assert.match(text, /\| a \| 12 \| 12000 \| 10800 \| 2400 \| 1800 \|/);
+  assert.match(text, /\| Agent \| Runs \| Meter input \| Reported input \| Meter cached \| Reported cached \|/);
+  assert.match(text, /\| a \| 12 \| 12000 \| 10800 \| 4800 \| 0 \| 2400 \| 1800 \|/);
 });
 
 test('languages with few tasks carry a note, and flaky grades are named', () => {
