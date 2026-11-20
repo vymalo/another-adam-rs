@@ -438,6 +438,20 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    async fn release_worker_leases(&self, worker: &str) -> StoreResult<()> {
+        let mut inner = self.inner.lock().await;
+        for slot in inner.runs.values_mut() {
+            if slot
+                .lease
+                .as_ref()
+                .is_some_and(|(owner, _)| owner == worker)
+            {
+                slot.lease = None;
+            }
+        }
+        Ok(())
+    }
+
     async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         let inner = self.inner.lock().await;
         Ok(inner

@@ -194,10 +194,12 @@ pub(crate) async fn upload_all(store: &DynStore, artifacts: &[Artifact]) -> Uplo
 /// Nothing is uploaded to a store that keeps no blobs ([`Store::keeps_blobs`](adam_core::Store::keeps_blobs)),
 /// and nothing at all when no artifact is a file, so the common step costs no round trip.
 ///
-/// **Fail-open** (the expand release): an upload that fails is logged and its digest is still
+/// **Fail-open, for a v4 commit only**: an upload that fails is logged and its digest is still
 /// referenced — the state names the artifact, so the transition is not lost. A later commit retries
-/// it only if the artifact is emitted again; otherwise the reference outlives the bytes, which S2
-/// must gate the head on (ADR 0055).
+/// it only if the artifact is emitted again; otherwise the reference outlives the bytes. A commit
+/// that writes a head does not use this path: [`upload_all`] refuses the split and
+/// [`upload_carried`] leaves the file out of a carried head, so a head never names bytes that are
+/// missing (ADR 0055).
 pub(crate) async fn upload_files(store: &DynStore, artifacts: &[Artifact]) -> Vec<BlobId> {
     if !store.keeps_blobs() {
         return Vec::new();

@@ -47,6 +47,13 @@ after a commit that names a different one), a shared
   not given this suite. The purge and compaction cases take the `BLOB_SUITE` lock because
   `purge_finished` sweeps blobs in the same call. `make` is the same
   `async fn() -> Option<DynStore>` as above.
+* `worker_leases_conformance!(make)` generates one `#[tokio::test]` per worker-lease case (2 cases:
+  every run lease a worker holds goes, so its runs are claimable at once — by another worker's unpinned
+  claim too — and the owner is not cleared, so a pinned run still comes back only to the same
+  worker; and another worker's lease is untouched: still reported by `lease_until`, unclaimable and
+  renewable). `release_worker_leases` is **defaulted to a no-op**, so a store that does not
+  implement it passes `store_conformance!`; give this suite only to a store that implements the
+  release. `make` is the same `async fn() -> Option<DynStore>` as above.
 * `headless_measurement!(make)` generates the `measure_the_headless_transcript` test: it runs
   `counting::measure_headless_transcript` through `make`, prints its `p2-headless:` line (a
   delivery-shaped commit between every split, so each split writes the whole transcript) and
@@ -117,8 +124,8 @@ failure (see `adam_core::testing`).
 
 ## Tests
 
-* `tests/memory.rs`: runs the store suite, the blob suite and the body suite against `MemoryStore`
-  (always on).
+* `tests/memory.rs`: runs the store suite, the blob suite, the body suite and the worker-lease
+  suite against `MemoryStore` (always on).
 * `claim_skips_busy_runs` (both scopes): runs named as `busy` are not claimed, with a live lease or an expired one,
   take no slot of the limit, and are not leased by the call that skipped them.
 * `lease_until_reports_the_lease`: nothing before a claim or for an unknown run, the end of the claim, of a renewal, still the same after a commit and after a stranger's release, nothing after the holder's release, and an expired lease reported as it was.

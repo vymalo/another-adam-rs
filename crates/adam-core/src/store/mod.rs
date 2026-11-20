@@ -815,6 +815,20 @@ pub trait Store: Send + Sync + 'static {
     /// Drop the lease if `worker` holds it, so the run is claimable at once.
     async fn release_lease(&self, id: RunId, worker: &str) -> StoreResult<()>;
 
+    /// Release every run lease `worker` holds, so a restarted process claims its runs at once
+    /// instead of waiting for each lease to run out.
+    ///
+    /// Like [`release_lease`](Self::release_lease) it does not clear a run's owner: a released
+    /// pinned run comes back only to the same worker. A lease held by another worker is untouched.
+    ///
+    /// **The default does nothing**: the method is additive, so it breaks no implementer, and a
+    /// store that does not implement it waits for the TTL after a restart. A store that implements
+    /// it passes `worker_leases_conformance!` in `adam-store-testkit`.
+    async fn release_worker_leases(&self, worker: &str) -> StoreResult<()> {
+        let _ = worker;
+        Ok(())
+    }
+
     /// When the lease on a run ends, or `None` if the run has no lease (never claimed, or released)
     /// or does not exist.
     ///

@@ -37,7 +37,9 @@ trait at your rev: its doc comments are the contract.
    `lease_until`, `purge_finished`, then the listing (`list_runs` and `count_runs`: a caller's runs,
    newest update first, by keyset), the five push-notification methods (`push_put`, `push_list`,
    `push_delete`, `push_claim_due`, `push_commit`; schema version 3) and the **defaulted** methods:
-   the five blob ones (`keeps_blobs`, `blob_stored`, `put_blob`, `get_blob`, `purge_blobs`; schema
+   `release_worker_leases` (every run lease the worker holds, so a restarted process claims its
+   runs at once; it does not clear the owner, and another worker's lease is untouched; a no-op by
+   default), the five blob ones (`keeps_blobs`, `blob_stored`, `put_blob`, `get_blob`, `purge_blobs`; schema
    version 5, part 1: file bytes out of the run, content-addressed by `BlobId`) and the **four** body ones
    (`load_head`, which defaults to `load_run` — so it answers the same document, the head when the
    store has a current one — `keeps_bodies`, `body_list`, `gc_body`; schema version 5, part 2: an
@@ -45,7 +47,8 @@ trait at your rev: its doc comments are the contract.
    that answers `false` is never handed a head or a row — the runtime writes the whole v4 `state`
    for it — so only return `true` once `load_run` serves the head, `commit_run` writes
    `head`/`body` and `body_list` answers. A defaulted method left out of your
-   implementation answers for your store with the trait's "I keep none" answer.
+   implementation answers for your store with the trait's default — "I keep none" for the body and
+   blob methods, a no-op for `release_worker_leases`.
    Errors are `StoreError` (`crates/adam-core/README.md`, "Errors"): build a backend failure with
    `StoreError::unavailable(e)` (transient), `StoreError::internal(e)` or
    `StoreError::corrupt_source(e)`; callers decide from the error class, never from the variant.
@@ -70,6 +73,7 @@ trait at your rev: its doc comments are the contract.
    adam_store_testkit::store_conformance!(make_store);
    adam_store_testkit::blob_conformance!(make_store); // a store that keeps blobs
    adam_store_testkit::body_conformance!(make_store); // a store that keeps bodies
+   adam_store_testkit::worker_leases_conformance!(make_store); // a store that implements release_worker_leases
    ```
 
    `store_conformance!` generates one `#[tokio::test]` per case (48 at the time of writing) and
@@ -92,6 +96,11 @@ trait at your rev: its doc comments are the contract.
    `[test-groups.store-global-sweeps]`) and take the suite's `BLOB_SUITE` lock under libtest. A test
    that calls `purge_finished` or `purge_blobs` must carry `purge` in its name so the group's filter
    catches it.
+   `worker_leases_conformance!` adds the **two** worker-lease cases: every run lease the worker holds
+   goes and its runs are claimable at once (by another worker's unpinned claim too), with the owner
+   unchanged; and another worker's lease is untouched. `release_worker_leases` is defaulted to a
+   no-op, so a store that does not implement it still passes `store_conformance!`; give this suite
+   only to a store that does.
    `counting::measure_transcript_write` is a measurement helper, not a conformance case: it runs one
    50-commit transcript and prints the bytes, and it asserts nothing.
 5. **In CI set `ADAM_TEST_REQUIRE_DB=1`**: a suite whose database variable is unset then fails
@@ -135,6 +144,9 @@ trait at your rev: its doc comments are the contract.
 * Claiming must be exclusive under concurrency (the suite races workers); a read-then-write claim
   without a conditional write fails it.
 * `release_lease` never clears the run's owner (pinned claims).
+* `release_worker_leases` drops only the named worker's run leases: never the owner, and never another
+  worker's lease. It is defaulted to a no-op, so a bump does not break you — but until you implement
+  it a restarted process waits for the TTL instead of claiming its runs at once.
 * Implementing the trait with default or `unimplemented!()` bodies to get a bump compiling: the
   suite exists to catch exactly that.
 * Blobs: `put_blob` is idempotent and **the bytes behind an id never change** (a second put under a
