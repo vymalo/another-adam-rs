@@ -67,8 +67,8 @@ activated), so follow-ups, steering, answers and continuations have one implemen
 context; a send to one names its latest run in `referenceTaskIds`, which the backend continues once it has ended.
 `answer` sends the plain follow-up, which the backend takes only from a waiting run.
 
-**Not yet** (the next pull requests of slice 4): the example embedder; the proof that a killed process resumes its run,
-which needs the durable store of slice 3 (today `a_dropped_engine_resumes_its_run` proves it in memory, below); a way
+**Not yet**: the proof that a killed process resumes its run, which needs the durable store of slice 3: it is written,
+`tests/resume_process.rs`, and ignored until then (today `a_dropped_engine_resumes_its_run` proves it in memory, below); a way
 to read a file artifact's bytes (`RunInfo` carries no artifacts yet, and an event carries none, below). The backend is
 given the engine's ring too, and its A2A streaming path (`TaskBackend::subscribe`) builds a file part from a live
 event's bytes: the engine never calls it, and a future caller that streams a task through it must read files from the
@@ -125,6 +125,26 @@ while let Some(event) = events.next().await {
 * **It does not keep the engine alive.** Drop every `Engine` and the worker stops as a killed process would; an open
   stream ends then, with `Stopped`.
 
+## The example
+
+`examples/chat` is a terminal chat, the smallest application that embeds the engine (the guide:
+[Embed adam in an application](../../docs/guides/embed-in-an-app.md)):
+
+```sh
+MODEL_BASE_URL=https://gateway.example.com/v1 MODEL_API_KEY=... MODEL=my-model cargo run -p adam-engine --example chat
+```
+
+* `main.rs` builds what the host gives: the model with `adam-model-openai` from `MODEL_BASE_URL`, `MODEL_API_KEY` (may
+  be empty) and `MODEL`, the names `adam-service` uses; a `MemoryStore`; and the agent, `examples/chat/agent/`, read
+  at startup with `AgentFolder::load`. A comment shows the `include_agent!` way, which compiles the folder in.
+* `app.rs` is the loop, `run(engine, input, out)`: a plain line is a `send` to the conversation; `/steer <text>`,
+  `/answer <text>`, `/cancel`, `/list` and `/quit` (or the end of the input, which shuts the engine down). It prints
+  the followed run's text as it streams (a piece by its `offset`, so a repeat is not printed twice), its question when
+  it waits (read with `get` on a `Status`), `[behind: N events skipped]`, and how it ended; a refusal is printed with
+  its class.
+* `adam-model-openai`, `secrecy` and tokio's `io-std` and `io-util` are **dev-dependencies**: the embedded check reads
+  normal dependencies only, so the engine's tree still holds no HTTP client and no TLS stack.
+
 ## The crates it is built from
 
 The crate's dependencies are the crates an embedded agent needs, each with its server parts turned off, and it
@@ -163,7 +183,8 @@ withheld file says), `thiserror` and `uuid`.
 
 ## Features and environment
 
-No Cargo features, no environment variables.
+No Cargo features, no environment variables. The example reads `MODEL_BASE_URL`, `MODEL_API_KEY` and `MODEL` (its
+`main.rs`, not the engine), and `tests/resume_process.rs` reads `ADAM_ENGINE_TEST_RESUME_CHILD` in the child it starts.
 
 ## Tests
 
@@ -199,11 +220,29 @@ every wait is bounded by `tokio::time::timeout`:
   open stream ended with `Stopped`), and engine B, its script written before its worker starts, finishing the run once
   A's lease runs out; B's model is called once, its request holds the tool's result once and ends with it, and B's
   stream, opened while B's first model call waits at a gate (so it starts with all B did since it claimed the run),
-  shows the tool's step never run again: the committed step is kept. PR 4 of the slice adds the real proof: a process killed with `SIGKILL` over the SQLite store of slice 3,
-  and another process finishing its run;
+  shows the tool's step never run again: the committed step is kept. `tests/resume_process.rs`, below, is the real
+  proof, a process killed with `SIGKILL`, waiting on the SQLite store of slice 3;
 * `start_refuses_what_it_cannot_build` (a zero lease and a ring of 0 or over 65 536 too; it passes alone and with
   `--features adam-assembly/mcp,adam-assembly/remote`, the set CI's workspace build unifies) and `start_outside_a_tokio_runtime_is_refused`: fail
   closed.
+
+`tests/example.rs` drives the example's `app::run` (`#[path]`) with lines typed one at a time, each once the transcript
+shows what the last did, over `MemoryStore`, the example's own agent folder and a scripted model:
+
+* `the_example_chats_streams_and_answers_a_question`: the whole transcript, line for line: a send whose reply is on
+  the screen while the model has not written its second half, `[done]`, a question answered with `/answer`, `/list`
+  (two runs, the latest first) and `/quit` (`bye`);
+* `the_example_steers_refuses_an_early_answer_and_cancels`: `/answer` to a run that works is refused (`Rejected`) and
+  reaches no model request; `/steer` does, and the run takes another step to read it; `/cancel` with no open run is
+  refused by the example, and ends a waiting run `[cancelled]`.
+
+`tests/resume_process.rs` (Unix), `a_killed_process_resumes_its_run`, **ignored** until the SQLite store of slice 3
+lands: the test runs its own binary again as a child (`ADAM_ENGINE_TEST_RESUME_CHILD`, read by this test only, names
+the store's directory), which sends a message whose model blocks once the run's first step (a `plan_work` call) is
+committed and says so in a file; the parent kills it with `SIGKILL`, opens the same store, and its engine finishes the
+run: its model is called once, its request ends with the tool's result, and its stream shows the tool's step never run
+again. The store comes from one helper, `durable_store(path)`, which panics until then: the helper and the `#[ignore]`
+are the lines PR 4 changes.
 
 In `src/`: `a_name_the_environment_has_is_refused_by_the_engines_default` (slice 2's proof),
 `the_sink_keeps_file_bytes_out_of_the_ring` and `a_withheld_file_says_its_length_and_digest` (a file's event reaches a
@@ -218,4 +257,5 @@ make happen on cue).
 
 [ADR 0047](../../docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md),
 [ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md),
+[`docs/guides/embed-in-an-app.md`](../../docs/guides/embed-in-an-app.md),
 [`docs/guides/embed-adam.md`](../../docs/guides/embed-adam.md).
