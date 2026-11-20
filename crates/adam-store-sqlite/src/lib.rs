@@ -1102,13 +1102,26 @@ impl Store for SqliteStore {
         .await
     }
 
-    // TODO(#362, S-4G7Y): `Store::release_worker_leases(worker)` is defaulted and not on `main`
-    // yet (checked at 843ded1). The separate `worker_leases_conformance!` covers Memory and
-    // SQLite; PostgreSQL and MongoDB keep the no-op default. When the trait gains it, implement
-    // `async fn release_worker_leases(&self, worker: &str) -> StoreResult<u64>` as one
-    // `BEGIN IMMEDIATE` `UPDATE {runs} SET lease_owner = NULL, lease_until = NULL
-    // WHERE lease_owner = ?`, returning the rows changed, and add
-    // `adam_store_testkit::worker_leases_conformance!(make_store);` to `tests/conformance.rs`.
+    async fn release_worker_leases(&self, worker: &str) -> StoreResult<()> {
+        let worker = worker.to_owned();
+        self.blocking(move |conn, sql| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(classify)?;
+            // The owner is not touched: a released pinned run comes back only to the same worker.
+            execute(
+                &tx,
+                &format!(
+                    "UPDATE {} SET lease_owner = NULL, lease_until = NULL
+                      WHERE lease_owner = ?",
+                    sql.runs
+                ),
+                &[Value::Text(worker)],
+            )?;
+            tx.commit().map_err(classify)
+        })
+        .await
+    }
 
     async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         self.blocking(move |conn, sql| {

@@ -49,8 +49,9 @@ WAL, and is not durable.
   the same document — the head when `head_version == version` (or when the state is the tombstone),
   the whole state otherwise; `journal_put` returns the stored payload. `run_header` is one projected
   read.
-* `keeps_blobs()` and `keeps_bodies()` are `true`: the five blob methods and the three body
-  methods are implemented, and the crate passes `blob_conformance!` and `body_conformance!`.
+* `keeps_blobs()` and `keeps_bodies()` are `true`: the five blob methods, the three body methods
+  and `release_worker_leases` are implemented, and the crate passes `blob_conformance!`,
+  `body_conformance!` and `worker_leases_conformance!`.
 
 ## Concurrency
 
@@ -109,9 +110,9 @@ negative version, a row that vanished). A unique violation on a create is `Alrea
 
 ## Tests
 
-* `tests/conformance.rs`: `store_conformance!`, `blob_conformance!` and `body_conformance!`, each
-  case on its own file under `CARGO_TARGET_TMPDIR` (no database server and no environment
-  variable; the suite never skips).
+* `tests/conformance.rs`: `store_conformance!`, `blob_conformance!`, `body_conformance!` and
+  `worker_leases_conformance!`, each case on its own file under `CARGO_TARGET_TMPDIR` (no database
+  server and no environment variable; the suite never skips).
 * `tests/process.rs`: a second process is refused, and a child killed with `SIGKILL` leaves a run
   this process can claim at once after `migrate`.
 * `tests/schema.rs`: a file stamped with a newer schema is refused and left untouched, an older one
