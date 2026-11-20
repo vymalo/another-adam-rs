@@ -18,6 +18,13 @@ worker of one fires another's schedule into an agent it does not know. Slice 6 i
 (6a, the component shared as `adam_schedule::reconcile_until_stopped`); reconciling on a dev reload (6b) is not built. Nobody answers a firing, so one that asks stays waiting until it is
 cancelled; ending an unattended run instead of asking (6c) is not built either.
 
+*Amended* (2026-11-20, slice 6c): nobody answers a firing, so none waits for a person. A firing's first message
+carries `adam.unattended: true` in its context (`adam_runtime::UNATTENDED_CONTEXT_KEY`), a protected key its child
+runs inherit; in such a run, or one in an `adam.schedule:` conversation, a tool that asks the person is answered that
+nothing can be asked (`adam_llm_agent::UNATTENDED`) and the model goes on, and the coder ends a firing that would wait
+(a final question, or work it owes) `Failed`, naming why and quoting the end of its answer. Firings that parked
+before this change still wait.
+
 *Amended* (2026-11-20, slice 6b): a dev reload gives the schedules in force, `LiveAssembly::schedules()` (a refused
 reload keeps them), and the host that runs schedules reconciles every root of the first load with them when
 `generation()` moves, retired roots included (their empty list cancels their schedulers); `adam-assembly` neither
