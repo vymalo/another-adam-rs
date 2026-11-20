@@ -149,8 +149,10 @@ trait at your rev: its doc comments are the contract.
   with no body still cleans the refs it inserted. A commit with `head: None` leaves the stored head **and its `head_version`**
   alone; `load_head` serves the head only when `head_version == version`. Collect superseded
   generations after a grace period (`gc_body`, and `purge_finished` removes them with the run).
-  **Forward `gc_body` and `blob_stored` in every wrapper**: the trait defaults answer `0`/`false`,
-  so a wrapper that omits them collects nothing and re-puts every blob.
+  **Forward `gc_body`, `blob_stored` and `load_head` in every wrapper**: the trait defaults answer
+  `0`/`false`/`load_run`, so a wrapper that omits them collects nothing, re-puts every blob, and —
+  for `load_head` — answers the default, which calls the wrapper's `load_run`: the whole state, so
+  the observer loses the head silently.
 * A transient backend error must be classified transient so the runtime retries it.
 
 ## See also
