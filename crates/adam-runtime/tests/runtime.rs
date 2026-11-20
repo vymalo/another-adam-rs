@@ -8131,6 +8131,42 @@ async fn state_is_corrupt_when_the_body_is_short_twice() {
     assert_eq!(moving.loads(), 2, "one re-read, then the same short set");
 }
 
+/// `Runtime::artifact_bytes` answers an inline file's own bytes, a stored blob's bytes once, and
+/// `None` for a blob that is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn artifact_bytes_serves_an_inline_file_and_a_blob() {
+    use adam_core::Store;
+
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let rt = Runtime::builder(store.clone()).build();
+
+    let inline = adam_runtime::FileRef::inline("a.bin", vec![7_u8; 4]);
+    assert_eq!(
+        &rt.artifact_bytes(&inline)
+            .await
+            .expect("inline bytes")
+            .expect("an inline file is always there")[..],
+        &[7_u8; 4]
+    );
+
+    let digest = adam_runtime::blob_id(b"blob");
+    store.put_blob(&digest, b"blob").await.expect("put");
+    let blob = adam_runtime::FileRef::blob("b.bin", 4, digest);
+    assert_eq!(
+        &rt.artifact_bytes(&blob)
+            .await
+            .expect("blob bytes")
+            .expect("the blob is there")[..],
+        b"blob"
+    );
+
+    let gone = adam_runtime::FileRef::blob("c.bin", 4, adam_runtime::blob_id(b"gone"));
+    assert!(
+        rt.artifact_bytes(&gone).await.expect("the read").is_none(),
+        "a missing blob is None, not an empty file"
+    );
+}
+
 /// A run created with a file artifact in its state but no blob (a pre-E run; the runtime's start
 /// paths do not copy artifacts, so this is a direct `create_run`) uploads it on its first commit,
 /// before the head that names it: a head never names a digest that is not there.
