@@ -166,15 +166,14 @@ async fn the_tool_is_withheld_until_a_writable_slot_has_a_configuration() {
 async fn the_spec_is_the_tools_contract() {
     let spec = use_repository_environment_spec();
     assert_eq!(spec.name, "use_repository_environment");
-    assert_eq!(
-        spec.parameters["properties"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
-        ["config", "off", "repo"]
-    );
+    let mut keys = spec.parameters["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(keys, ["config", "off", "repo"]);
     assert!(
         spec.parameters.get("required").is_none(),
         "every argument is optional"
