@@ -2,7 +2,7 @@
 //! tool answers and the progress line it adds; the guard's refusal (nothing runs); the refusal note
 //! on refusals only; `after_run` called once, after the command and **before** the guard is
 //! settled, and not at all for a `run` refused before its command; its text appended only when
-//! files changed; and a failing `after_run`, whose error is returned with the guard unsettled.
+//! files changed; and a failing `after_run`, whose error is returned once the guard is settled.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::path::Path;
@@ -199,7 +199,8 @@ const RAN: [Call; 3] = [Call::Guard(Guarding::Make), Call::AfterRun, Call::Settl
 const RENDERED: &str = "$ echo hi\nexit code 0\n--- output ---\nhi\n";
 const NOT_LISTED: &str = "--- the worktree now differs from HEAD in (git status; files the \
                           project ignores are kept too) ---\n(nothing that git lists: the files \
-                          it changed are ignored by the project)\nThe files changed, so run the \
+                          it changed are ignored by the project, or are back as HEAD has them)\nThe \
+                          files changed, so run the \
                           project's checks again before you commit.\n";
 const RESTORED: &str =
     "Everything it did was undone, its files included: the worktree is exactly as it was.";
@@ -255,8 +256,8 @@ fn git(dir: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?}");
 }
 
-/// In a repository, what `git status` lists after the command, as it lists it: read trimmed, so the
-/// first entry loses its leading space (` M a.txt` is `M a.txt`), a known odd answer kept as it is.
+/// In a repository, what `git status` lists after the command, exactly as it lists it: the first
+/// entry keeps its leading space (` M a.txt`, a change not staged).
 #[tokio::test]
 async fn the_files_listed_are_what_git_status_says() {
     let dir = tempfile::tempdir().unwrap();
@@ -271,7 +272,7 @@ async fn the_files_listed_are_what_git_status_says() {
         out.content,
         format!(
             "$ {command}\nexit code 0\n--- output ---\n\n--- the worktree now differs from HEAD \
-             in (git status; files the project ignores are kept too) ---\nM a.txt\n?? made.txt\n\
+             in (git status; files the project ignores are kept too) ---\n M a.txt\n?? made.txt\n\
              The files changed, so run the project's checks again before you commit.\n{PUBLISHED}"
         )
     );
@@ -412,10 +413,10 @@ async fn a_refusal_before_the_guard_has_no_note_and_no_after_run() {
     assert!(progress(&sink).is_empty());
 }
 
-/// A known gap, kept from the coder's `run`: a failing `after_run` is the tool's error, and the
-/// guard is dropped without being settled, so nothing is undone.
+/// A failing `after_run` is the tool's error, and the guard is settled first, so a change to git the
+/// command made is undone all the same.
 #[tokio::test]
-async fn a_failing_after_run_is_the_error_and_the_guard_is_not_settled() {
+async fn a_failing_after_run_is_the_error_once_the_guard_is_settled() {
     let dir = tempfile::tempdir().unwrap();
     let mut ws = Scripted::over(dir.path(), Ok(Settled::Undone { restored: true }));
     ws.after_run_fails = true;
@@ -427,7 +428,7 @@ async fn a_failing_after_run_is_the_error_and_the_guard_is_not_settled() {
         matches!(&err, ToolError::Permanent(said) if said == "the notes cannot be written"),
         "{err:?}"
     );
-    assert_eq!(ws.calls(), [Call::Guard(Guarding::Make), Call::AfterRun]);
+    assert_eq!(ws.calls(), RAN);
     assert_eq!(progress(&sink), ["running: echo hi"]);
 }
 

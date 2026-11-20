@@ -211,17 +211,20 @@ pub async fn git_stdout(at: &GitAt, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-/// What `git status` says, as it says it (`--porcelain=v1 -z`, every untracked file): a cheap
-/// picture of the worktree that needs no commit and no index copy.
-///
-/// Read through [`git_stdout`], so trimmed: a first entry that starts with a space (` M a`) loses
-/// it. A known odd answer, kept as it is (ADR 0047, step 5c-2).
+/// What `git status` says, exactly as it says it (`--porcelain=v1 -z`, every untracked file): a
+/// cheap picture of the worktree that needs no commit and no index copy. Not trimmed, unlike
+/// [`git_stdout`]: an entry's status starts with a space when nothing is staged (` M a`), and that
+/// space is part of what it says.
 pub async fn status_text(at: &GitAt) -> Option<String> {
-    git_stdout(
-        at,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    )
-    .await
+    let out = at
+        .command()
+        .await?
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .await
+        .ok()?;
+    out.success
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Most paths [`list_files`] gives.

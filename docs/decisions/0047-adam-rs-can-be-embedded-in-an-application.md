@@ -145,10 +145,13 @@ workspace as it is.
    coder's own copy is gone. `git status` as text is `adam_code_tools::git::status_text`, re-exported by the coder. The
    `#[tool]` declaration is unchanged and delegates; the pins of `tests/command_results.rs` and `tests/tool_specs.rs`
    pass unchanged. Still the coder's: the background tools (`start_command`, `stop_command`, `list_commands`),
-   `run_checks`, and `Snapshot` and its restores. **Kept as they are, and fixed next, each in a change of its own:** the
-   list of changed files loses the first entry's leading space (`status_text` is trimmed), a file a command put back
-   as `HEAD` is said to be ignored by the project, and a failing `after_run` drops the guard unsettled, so a change to
-   git stays.
+   `run_checks`, and `Snapshot` and its restores. **Kept as they were, and fixed next:** the list of changed files lost
+   the first entry's leading space (`status_text` was trimmed), a file a command put back as `HEAD` was said to be
+   ignored by the project, and a failing `after_run` dropped the guard unsettled, so a change to git stayed.
+   *Amended 2026-11-20 (after step 5c-2):* the three are fixed. `status_text` is git's answer untrimmed; changed files
+   that git lists none of are said to be ignored or back as `HEAD` has them; and a failing `after_run` settles the
+   guard before its error is returned, so a change to git is undone. The answers of `run` that change are pinned
+   anew in `tests/command_results.rs`.
 8. **Commands run as the person unless a sandbox says otherwise.** A local sandbox is an `Environment`: first a process
    tree that can be killed, then the operating system's own confinement where there is one. `describe` says what is not
    protected.
