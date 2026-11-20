@@ -834,8 +834,8 @@ every run, as before the key existed.
 * **The fallback: `use_server`.** An agent with at least one triggered server has one more fixed tool,
   `use_server { name }`, present from its first request whatever the task. A successful call says which tools are
   now available and names them; the run's state records the server (`Conversation::loaded_servers`), and from the
-  **next** model call on it is no longer withheld: its instructions follow the prompt and its tools are
-  **appended after every other tool** of the request, in the order the run loaded them, never inserted or
+  **next** model call on it is no longer withheld: its instructions follow every other word a source adds and its
+  tools are **appended after every other tool** of the request, in the order the run loaded them, never inserted or
   reordered. The request before is therefore a byte prefix of the one after it, and the loop records the turn
   where the head grew (`Conversation::tools_appended`). The append costs **one full history re-prefill**, which
   the result says in words; the tool reports no number — what it cost is the next call's cached input tokens, as

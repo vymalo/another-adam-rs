@@ -15,10 +15,11 @@
 //! A task that matches nothing is not the end of the run's options: the model may call `use_server`
 //! ([`crate::use_server`]) to load one triggered server. That is the fallback, and it costs one full
 //! re-prefill: the server is added to the run's state ([`SourceCtx::loaded_servers`]), its
-//! instructions are added to the prompt by this source from the next turn on, and its tools are
-//! offered by [`ToolSource::appended`] **after every other tool** of the turn, never inserted, so
-//! the request before stays a byte prefix of the one after it. The turns where that happened are
-//! recorded by the loop (`Conversation::tools_appended`).
+//! instructions are added to the prompt from the next turn on by
+//! [`ToolSource::appended_instructions`] (after every other source's), and its tools are offered by
+//! [`ToolSource::appended`] **after every other tool** of the turn, never inserted, so the request
+//! before stays a byte prefix of the one after it. The turns where that happened are recorded by
+//! the loop (`Conversation::tools_appended`).
 
 use adam_llm_agent::{SourceCtx, ToolCtx, ToolError, ToolOutput, ToolSource, Withheld};
 use adam_model::ToolSpec;
@@ -113,6 +114,30 @@ impl McpSelect {
             })
             .collect()
     }
+
+    /// The sections of the servers the task matched, in the file's order: what the prompt held
+    /// before the run loaded anything.
+    fn task_sections(&self, ctx: &SourceCtx) -> Vec<(String, String)> {
+        self.servers
+            .iter()
+            .filter(|server| server.matches(ctx.task()))
+            .filter_map(section_of)
+            .collect()
+    }
+
+    /// The sections of the servers the run loaded during itself, in the order it loaded them.
+    fn during_sections(&self, ctx: &SourceCtx) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for name in ctx.loaded_servers() {
+            if let Some(server) = self.servers.iter().find(|server| &server.server == name)
+                && !server.matches(ctx.task())
+                && let Some(section) = section_of(server)
+            {
+                out.push(section);
+            }
+        }
+        out
+    }
 }
 
 /// What the model is told when it calls a tool of a server that was not loaded.
@@ -151,6 +176,28 @@ pub(crate) fn join_sections(sections: &[(String, String)]) -> String {
     out
 }
 
+/// A server's section, as [`join_sections`] takes it, or nothing when it said nothing.
+fn section_of(server: &Triggered) -> Option<(String, String)> {
+    server
+        .instructions
+        .as_ref()
+        .map(|text| (server.server.clone(), text.clone()))
+}
+
+/// The length of the text [`join_sections`] makes of `sections` within `budget`: the sections that
+/// fit, in order, and the blank lines between them.
+fn fitted_len(sections: &[(String, String)], budget: usize) -> usize {
+    let mut len = 0;
+    for (_, section) in sections {
+        let separator = usize::from(len > 0) * 2;
+        if len + separator + section.len() > budget {
+            break;
+        }
+        len += separator + section.len();
+    }
+    len
+}
+
 #[async_trait]
 impl ToolSource for McpSelect {
     async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
@@ -160,21 +207,42 @@ impl ToolSource for McpSelect {
     }
 
     async fn instructions(&self, ctx: &SourceCtx) -> Option<String> {
-        let loaded = self.loaded(ctx);
-        let sections: Vec<(String, String)> = self
-            .servers
-            .iter()
-            .zip(loaded)
-            .filter(|(_, loaded)| *loaded)
-            .filter_map(|(server, _)| {
-                server
-                    .instructions
-                    .as_ref()
-                    .map(|text| (server.server.clone(), text.clone()))
-            })
-            .collect();
-        let text = join_sections(&sections);
+        // What the prompt held before anything was loaded: the servers the task matched, in the
+        // file's order. A server the run loaded during itself is offered by
+        // `appended_instructions`, so its section follows everything and never sits between two
+        // parts the request before already carried (ADR 0044, decision 1).
+        let text = join_sections(&self.task_sections(ctx));
         (!text.is_empty()).then_some(text)
+    }
+
+    /// The sections of the servers the run loaded during itself, in the order it loaded them,
+    /// after every other word a source adds: a load appends to the prompt, never inserts into it.
+    async fn appended_instructions(&self, ctx: &SourceCtx) -> Option<String> {
+        let during = self.during_sections(ctx);
+        if during.is_empty() {
+            return None;
+        }
+        // The bound is the one over everything the prompt carries from the triggered servers: the
+        // task's sections, then the ones the run loaded.
+        let mut used = fitted_len(&self.task_sections(ctx), MAX_INSTRUCTIONS_BYTES);
+        let mut out = String::new();
+        for (server, section) in during {
+            let separator = usize::from(used > 0) * 2;
+            if used + separator + section.len() > MAX_INSTRUCTIONS_BYTES {
+                tracing::warn!(
+                    server = %server,
+                    "the MCP servers' instructions are over {MAX_INSTRUCTIONS_BYTES} bytes together: \
+                     this server's and the next ones' are left out"
+                );
+                break;
+            }
+            used += separator + section.len();
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&section);
+        }
+        (!out.is_empty()).then_some(out)
     }
 
     async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
@@ -489,16 +557,94 @@ mod tests {
         );
     }
 
-    /// A loaded server's instructions reach the prompt, as they do when the task loads it.
+    /// A loaded server's instructions reach the prompt, as they do when the task loads it, but
+    /// from `appended_instructions`: they follow everything the prompt already held.
     #[tokio::test]
     async fn the_instructions_of_a_server_the_run_loaded() {
         let source = source();
+        let ctx = ctx_loaded(Some("fix a typo"), &["docs"]);
+        assert!(
+            source.instructions(&ctx).await.is_none(),
+            "the task loaded nothing, so the head adds nothing"
+        );
         let text = source
-            .instructions(&ctx_loaded(Some("fix a typo"), &["docs"]))
+            .appended_instructions(&ctx)
             .await
             .expect("the loaded server said something");
         assert!(text.contains("docs words"), "{text}");
         assert!(!text.contains("linear words"), "{text}");
+    }
+
+    /// A load appends to the prompt, never inserts into it: the section of a server the run loaded
+    /// is offered apart from the ones the prompt already held, whatever place the file gives it.
+    /// Here the task loads `docs` (the second in the file) and the run then loads `linear` (the
+    /// first), so the file order would put `linear` in front of a section the request before
+    /// already had.
+    #[tokio::test]
+    async fn the_instructions_of_a_server_the_run_loaded_follow_the_ones_the_task_loaded() {
+        let source = source();
+        let ctx = ctx_loaded(Some("read the docs"), &["linear"]);
+        assert_eq!(
+            source
+                .instructions(&ctx)
+                .await
+                .expect("docs said something"),
+            "## Docs\n\n> docs words",
+            "the head holds only what the task loaded"
+        );
+        assert_eq!(
+            source
+                .appended_instructions(&ctx)
+                .await
+                .expect("linear said something"),
+            "## Linear\n\n> linear words",
+            "the loaded server's section follows it"
+        );
+    }
+
+    /// The sections the run loaded share the 8 KiB bound with the ones the task loaded: the
+    /// section that would pass it and the ones after it are left out.
+    #[tokio::test]
+    async fn the_appended_sections_share_the_bound_with_the_task_ones() {
+        let half = MAX_INSTRUCTIONS_BYTES / 2;
+        let source = McpSelect::new(vec![
+            triggered("task", &["task"], &["task__x"], Some(&"t".repeat(half))),
+            triggered("run", &["run"], &["run__x"], Some(&"r".repeat(half))),
+            triggered("late", &["late"], &["late__x"], Some("late words")),
+        ]);
+        let ctx = ctx_loaded(Some("task words"), &["run", "late"]);
+        assert_eq!(
+            source
+                .instructions(&ctx)
+                .await
+                .expect("the task's section")
+                .len(),
+            half
+        );
+        assert!(
+            source.appended_instructions(&ctx).await.is_none(),
+            "nothing fits after the task's section, and the one after it is left out too"
+        );
+    }
+
+    /// A load is never capped by [`MAX_SOURCE_TOOLS`]: the array must grow by a suffix, so a
+    /// server's tools are all appended or none, whatever the listing cap would have done.
+    #[tokio::test]
+    async fn the_appended_tools_are_not_capped() {
+        let names: Vec<String> = (0..adam_llm_agent::MAX_SOURCE_TOOLS + 8)
+            .map(|n| format!("big__tool{n:03}"))
+            .collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let source = McpSelect::new(vec![triggered("big", &["big"], &refs, None)]);
+        let appended = source.appended(&ctx_loaded(None, &["big"])).await;
+        assert_eq!(
+            appended
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            refs,
+            "every tool the server offered is appended"
+        );
     }
 
     /// A server with no tools has nothing to append, even if a state names it.

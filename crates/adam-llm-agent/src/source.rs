@@ -314,6 +314,19 @@ pub trait ToolSource: Send + Sync + 'static {
         None
     }
 
+    /// Words this source adds to the agent's instructions **during** the run, after everything
+    /// [`instructions`](Self::instructions) says: the words of a system the run loaded during
+    /// itself ([`SourceCtx::loaded_servers`]), which must follow the prompt and never be inserted
+    /// into it, or the request before would stop being a byte prefix of the one after (ADR 0044,
+    /// decision 1). `adam-assembly`'s `McpSelect` offers a server loaded with `use_server` here, so
+    /// its section comes after the agents a person mentioned, the access tier and references.
+    /// `None`, the default, adds nothing, which is what a source written before this method
+    /// existed offers.
+    async fn appended_instructions(&self, ctx: &SourceCtx) -> Option<String> {
+        let _ = ctx;
+        None
+    }
+
     /// Change how the tools offered on this model turn are described, once every source has listed
     /// its own: `specs` holds the agent's own tools, then each source's, as the model is about to be
     /// shown them. A source that knows something the tool's author could not (what the screen of this
@@ -488,11 +501,20 @@ pub(crate) async fn withheld(
 }
 
 /// What the sources add to the agent's instructions for this turn, in order, as one text (blank-line
-/// separated); `None` when none says anything.
+/// separated); `None` when none says anything. What a source gave the run **during** itself
+/// ([`ToolSource::appended_instructions`]) goes after everything else, the way its tools do: a load
+/// appends to the prompt and never inserts into it.
 pub(crate) async fn instructed(sources: &[DynToolSource], ctx: &SourceCtx) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for source in sources {
         if let Some(text) = source.instructions(ctx).await
+            && !text.trim().is_empty()
+        {
+            parts.push(text.trim().to_owned());
+        }
+    }
+    for source in sources {
+        if let Some(text) = source.appended_instructions(ctx).await
             && !text.trim().is_empty()
         {
             parts.push(text.trim().to_owned());

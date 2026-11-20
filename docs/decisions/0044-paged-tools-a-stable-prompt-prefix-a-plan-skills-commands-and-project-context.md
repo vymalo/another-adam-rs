@@ -146,9 +146,12 @@ Facts about third parties:
    recorded and paid for. A run may load a triggered server
    **during itself**, with one fixed tool, `use_server { name }` (`crates/adam-assembly/src/use_server.rs`), which
    the root and every local subagent with a triggered server has from its first request. The load is **state, not a
-   wire edit**: the result carries `ToolOutput::loaded_servers` (the whole list, in load order), the loop applies it
-   to `Conversation::loaded_servers` in the same commit as the result, and `McpSelect` stops withholding a server
-   whose name is in it from the **next** model call on, adding its instructions to the prompt. Its tools are offered
+   wire edit**: the result carries `ToolOutput::loaded_servers` (the servers the call saw, with the one it loaded,
+   in load order; the loop adds each name it did not have, in the order the results are applied) and the loop merges
+   it into `Conversation::loaded_servers` in the same commit as the result, and `McpSelect` stops withholding a server
+   whose name is in it from the **next** model call on, adding its instructions to the prompt **after every other
+   source's words** (`ToolSource::appended_instructions`), so a section is never inserted before one the request
+   before already carried. Its tools are offered
    by `ToolSource::appended` and placed **after every other tool** of the request, in the order the run loaded them,
    never inserted or reordered: the request before stays a byte prefix of the one after it, which grows by a suffix.
    The loop records the turn where the head grew in `Conversation::tools_appended`, and the prefix test skips
@@ -162,7 +165,8 @@ Facts about third parties:
    result the model can act on. `Conversation::continued` carries `loaded_servers`, so a later task offers the tools
    the run before ended with; it does not carry `tools_appended` (its first request has none before it). Breaking:
    public fields on `Conversation` (`loaded_servers`, `tools_appended`), `ToolOutput` (`loaded_servers`), `SourceCtx`
-   and `ToolCtx` (`loaded_servers`, `task`); a provided `ToolSource::appended` (additive). The tool list of a folder
+   and `ToolCtx` (`loaded_servers`, `task`); provided `ToolSource::appended` and
+   `ToolSource::appended_instructions` (additive). The tool list of a folder
    with a triggered server gains `use_server`, and every cached prefix of such a folder breaks once at deploy.
 
 ### Everything that reads is paged

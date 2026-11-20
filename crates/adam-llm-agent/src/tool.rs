@@ -470,8 +470,9 @@ pub struct ToolOutput {
     /// Absent from a journal written before it existed, and not written while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageRef>,
-    /// The MCP servers the run has loaded, as this result says: **the whole list**, in the order
-    /// they were loaded. The loop makes it the run's list
+    /// The MCP servers the run has loaded, as this result says: the list the call saw, in the
+    /// order they were loaded, with the server it loaded. The loop adds each name the run does not
+    /// have yet, in the order the results are applied, and makes the union the run's list
     /// ([`Conversation::loaded_servers`](crate::Conversation::loaded_servers)) when the result is
     /// not an error, in the same commit as the result, and records the turn of the next request in
     /// [`Conversation::tools_appended`](crate::Conversation::tools_appended); a replay takes the
@@ -608,7 +609,8 @@ impl ToolOutput {
     }
 
     /// Say which MCP servers the run has loaded ([`loaded_servers`](Self::loaded_servers)): the
-    /// whole list, in the order they were loaded. The loop makes it the run's list, and the next
+    /// list this call saw, with the one it loaded, in the order they were loaded. The loop adds
+    /// each name the run does not have, and the next
     /// model call is the first whose tools array has the loaded servers' tools appended.
     #[must_use]
     pub fn with_loaded_servers(

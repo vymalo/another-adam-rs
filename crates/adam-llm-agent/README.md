@@ -211,6 +211,11 @@ must also stop holding the tool back (`withhold`), or the loop would take the ap
 `McpSelect` is the one source that uses it: a server the run loads with `use_server` is appended from the next call on
 ([`adam-assembly`](../adam-assembly/README.md#a-server-loaded-only-when-the-task-asks-when)).
 
+What a source gives the run during itself in **words** goes the same way (`ToolSource::appended_instructions`, default
+none): the loop appends it after every source's `instructions`, so a load's section follows the agents a person
+mentioned, the access tier and references rather than being inserted before them. `McpSelect` uses it for the
+instructions of a server loaded with `use_server`, bounded with the task-loaded sections at the same 8 KiB.
+
 A source can also **refine** the description of the tools the model is about to be shown (`ToolSource::refine`): after
 every source has listed, each gets the turn's tools, the agent's own first, and may rewrite a `description` from what it
 knows of this run (what the screen of this conversation can draw, for the tool that draws on it). It runs in the same

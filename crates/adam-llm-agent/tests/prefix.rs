@@ -2388,6 +2388,13 @@ impl ToolSource for Deferred {
         }
     }
 
+    /// The server's words reach the prompt only when the run has loaded it, and then they follow
+    /// everything: a load appends to the system prompt as it appends to the tools.
+    async fn appended_instructions(&self, ctx: &SourceCtx) -> Option<String> {
+        self.loaded(ctx)
+            .then(|| format!("## {}\n\n> {} words", self.server, self.server))
+    }
+
     async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
         if self.loaded(ctx) {
             return Vec::new();
@@ -2514,6 +2521,24 @@ async fn a_load_appends_the_servers_tools_and_records_the_turn() {
         requests[2].tools, requests[1].tools,
         "the tools do not move again, and appear once"
     );
+    let before = requests[0].system.as_deref().unwrap_or_default();
+    let after = requests[1].system.as_deref().unwrap_or_default();
+    assert!(
+        after.starts_with(before),
+        "the system prompt at the load is the one before it plus a suffix: {after:?}"
+    );
+    assert!(
+        after.ends_with("> docs words"),
+        "the loaded server's words follow the prompt: {after:?}"
+    );
+    assert!(
+        !before.contains("docs words"),
+        "they were not there before the load: {before:?}"
+    );
+    assert_eq!(
+        requests[2].system, requests[1].system,
+        "the prompt does not move again"
+    );
     assert_eq!(state.loaded_servers, ["docs"]);
     assert_eq!(
         state.tools_appended,
@@ -2597,4 +2622,56 @@ async fn a_resumed_run_reproduces_the_loaded_list() {
             );
         }
     }
+}
+
+/// A load appends to the prompt even when a source **after** the one that grows contributes words
+/// of its own (the assembly puts the MCP selector before the sources a host adds: the agents a
+/// person mentioned, the access tier, references). The loaded server's section must follow
+/// everything the request before carried, never sit between two parts of it.
+#[tokio::test]
+async fn a_load_appends_to_a_prompt_another_source_already_grew() {
+    struct Always;
+
+    #[async_trait]
+    impl ToolSource for Always {
+        async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        async fn instructions(&self, _ctx: &SourceCtx) -> Option<String> {
+            Some("the person named helper".into())
+        }
+
+        async fn call(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: Value,
+        ) -> Option<Result<ToolOutput, ToolError>> {
+            None
+        }
+    }
+
+    let rig = Rig::new(0, |builder| with_deferred(builder).tool_source(Always));
+    rig.mock
+        .push_tool_calls(vec![call("c1", "use_server", json!({"name": "docs"}))])
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    let before = requests[0].system.as_deref().unwrap_or_default();
+    let after = requests[1].system.as_deref().unwrap_or_default();
+    assert!(
+        before.ends_with("the person named helper"),
+        "the other source's words are in the prompt from the first request: {before:?}"
+    );
+    assert!(
+        after.starts_with(before),
+        "the system prompt at the load is the one before it plus a suffix: {after:?}"
+    );
+    assert!(
+        after.ends_with("> docs words"),
+        "the loaded server's words follow everything: {after:?}"
+    );
+    assert_eq!(state.tools_appended, [1]);
+    assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
 }

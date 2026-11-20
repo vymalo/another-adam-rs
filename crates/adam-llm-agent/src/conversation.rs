@@ -1124,8 +1124,9 @@ impl Conversation {
     /// The run has loaded the MCP servers `servers`
     /// ([`ToolOutput::loaded_servers`](crate::ToolOutput::loaded_servers)): each one it did not have
     /// is added, in the order given, and the turn of the next model call — the first whose tools
-    /// array grows — is recorded. A list that adds nothing records nothing, so a replayed step
-    /// applies the same list to the state without a second entry.
+    /// array grows — is recorded, once however many servers that turn loaded. A list that adds
+    /// nothing records nothing, so a replayed step applies the same list to the state without a
+    /// second entry.
     pub(crate) fn load_servers(&mut self, servers: Vec<String>) {
         let before = self.loaded_servers.len();
         for server in servers {
@@ -1133,7 +1134,7 @@ impl Conversation {
                 self.loaded_servers.push(server);
             }
         }
-        if self.loaded_servers.len() > before {
+        if self.loaded_servers.len() > before && !self.tools_appended.contains(&self.turns) {
             self.tools_appended.push(self.turns);
         }
     }

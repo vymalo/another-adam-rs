@@ -574,9 +574,60 @@ async fn use_server_says_the_next_call_re_reads_the_prompt() {
     let (requests, _) = run_task(&mock, &assembly(&mock, MCP), "fix a typo").await;
     let text = requests[1].messages.last().expect("the result").text();
     assert!(text.contains("re-reads"), "{text}");
+    assert!(text.contains("slower"), "it says the cost in time: {text}");
     assert!(!text.contains("token"), "the tool invents no cost: {text}");
+    assert!(
+        !text.contains("saves") && !text.contains("faster"),
+        "it claims no saving: {text}"
+    );
+    // The fixture's server and tools carry no digit, so any digit would be an invented figure.
+    assert!(
+        !text.chars().any(|c| c.is_ascii_digit()),
+        "the tool invents no number: {text}"
+    );
     // The step the person sees carries the same words (the loop's step output is the result).
     assert!(text.contains("docs__search"), "it names the tools: {text}");
+}
+
+/// The load is a step of the run, and the step's output names the server and the tools it added:
+/// the cost is visible to the person, not only in the model's history.
+#[tokio::test]
+async fn the_load_is_a_step_that_names_the_server() {
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call_with("c1", "use_server", json!({"name": "docs"}))])
+        .push_text("done");
+    let assembly = assembly(&mock, MCP);
+    let store: adam_core::DynStore = Arc::new(adam_core::MemoryStore::new());
+    let sink = adam_runtime::CollectingSink::new();
+    let runtime = assembly
+        .register(adam_runtime::Runtime::builder(store))
+        .poll_interval(std::time::Duration::from_millis(20))
+        .event_sink(sink.clone())
+        .build();
+    let run = runtime
+        .start("root", user_message("fix a typo"), None)
+        .await
+        .unwrap();
+    let worker = common::spawn_worker(&runtime);
+    common::wait_done(&runtime, run).await;
+    worker.stop().await;
+    let steps: Vec<adam_runtime::StepEvent> = sink
+        .events_for(run)
+        .into_iter()
+        .filter_map(|event| match event {
+            adam_runtime::RunEvent::Step(step) => Some(step),
+            _ => None,
+        })
+        .collect();
+    let load = steps
+        .iter()
+        .find(|step| step.id == "tool:c1" && step.output.is_some())
+        .expect("the load's step ended");
+    assert_eq!(load.label, "Load an MCP server");
+    let output = load.output.as_ref().expect("the step ended");
+    assert!(!output.error, "{output:?}");
+    assert!(output.text.contains("docs"), "{output:?}");
+    assert!(output.text.contains("docs__search"), "{output:?}");
 }
 
 /// A folder with no triggered server has no `use_server`: the fixed tool is there only when there
@@ -590,6 +641,64 @@ async fn a_folder_with_no_triggered_server_has_no_use_server() {
         !has(&requests[0], "use_server"),
         "{:?}",
         names(&requests[0])
+    );
+}
+
+/// A folder's own tool that already has the name is refused at bind: the fixed loader is added
+/// under it, and one name would stand for two tools.
+#[test]
+fn a_folder_tool_named_use_server_is_refused_at_bind() {
+    let def = common::def(&[
+        (
+            "agent/instructions.md",
+            &common::instructions("name: root\ntools: ['use_server']", "You are root."),
+        ),
+        ("agent/mcp.json", MCP),
+    ]);
+    let error = def
+        .mcp_tools("root", common::tools(&["github__search"]))
+        .bind(ToolSet::new().tool(common::stub("use_server")))
+        .unwrap_err();
+    assert!(
+        matches!(error, adam_assembly::Error::ReservedToolName { .. }),
+        "{error}"
+    );
+}
+
+/// Two loads in one turn: the tools array grows once, at the next request, by both servers in
+/// the order the calls ran, and the state records that one turn once.
+#[tokio::test]
+async fn two_loads_in_one_turn_append_both_in_order_and_record_the_turn_once() {
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![
+        call_with("c1", "use_server", json!({"name": "docs"})),
+        // `after_previous` puts the second load in its own segment, after the first: its result
+        // then carries the whole list, the first server included, as the sequential path does.
+        call_with(
+            "c2",
+            "use_server",
+            json!({"name": "linear", "after_previous": true}),
+        ),
+    ])
+    .push_text("done");
+    let (requests, view) = run_task(&mock, &assembly(&mock, MCP), "fix a typo").await;
+    assert_eq!(
+        tool_names(&requests[1]),
+        [
+            "github__search",
+            "use_server",
+            "read_output",
+            "docs__search",
+            "linear__list_issues"
+        ],
+        "both servers' tools, in the order the calls ran"
+    );
+    let state = state_of(&view);
+    assert_eq!(state.loaded_servers, ["docs", "linear"]);
+    assert_eq!(
+        state.tools_appended,
+        [1],
+        "the array grew once, at one request"
     );
 }
 

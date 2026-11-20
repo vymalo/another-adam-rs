@@ -195,7 +195,14 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("docs__search"), "{}", out.content);
         assert!(out.content.contains("re-reads"), "{}", out.content);
+        assert!(out.content.contains("slower"), "{}", out.content);
         assert!(!out.content.contains("token"), "{}", out.content);
+        // The fixture's server and tools carry no digit, so any digit is an invented figure.
+        assert!(
+            !out.content.chars().any(|c| c.is_ascii_digit()),
+            "{}",
+            out.content
+        );
         assert_eq!(out.loaded_servers, ["docs"]);
         let again = tool()
             .call(

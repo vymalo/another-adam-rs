@@ -684,7 +684,7 @@ has no checkout before its first model call) and is ignored with a warning. The 
 { name }`, from its first request whatever the task (so the tool list is the same bytes until something is loaded;
 a folder whose own tools already have that name is refused at bind). Its result says whether the server's tools are
 now available and names them, and the loop makes the run's list from it (`Conversation::loaded_servers`): from the
-**next** model call on the server stops being withheld, its instructions follow the prompt, and its tools are
+**next** model call on the server stops being withheld, its instructions follow every other source's words, and its tools are
 **appended after every other tool** of the request, in the order the run loaded them
 ([`ToolSource::appended`](../adam-llm-agent/README.md#context-and-tool-sources)). That is the whole point: the
 request before stays a byte prefix of the one after it, and the loop records the turn where the head grew
