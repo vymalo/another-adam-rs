@@ -274,6 +274,114 @@ mod tests {
         assert!(text.contains("linear, ticket"), "{text}");
     }
 
+    /// The keyword is folded too: a file may write it in any case.
+    #[tokio::test]
+    async fn a_keyword_written_in_capitals_still_matches() {
+        let source = McpSelect::new(vec![triggered(
+            "linear",
+            &["LINEAR"],
+            &["linear__list_issues"],
+            None,
+        )]);
+        assert!(
+            source
+                .withhold(
+                    &ctx(Some("fix the linear ticket")),
+                    &["linear__list_issues"]
+                )
+                .await
+                .is_empty(),
+            "the file's keyword is folded before the match"
+        );
+    }
+
+    /// The match is a case-insensitive substring, as the reference page says: `docs` matches a
+    /// task that says `docstring`. This pins the documented behaviour, not a word boundary.
+    #[tokio::test]
+    async fn a_keyword_matches_inside_a_longer_word_as_documented() {
+        let source = source();
+        let held = source
+            .withhold(&ctx(Some("parse the docstring")), &["docs__search"])
+            .await;
+        assert!(
+            held.is_empty(),
+            "a substring match loads `docs`, and the reference page says so"
+        );
+        let held = source
+            .withhold(&ctx(Some("parse the docstring")), &["linear__list_issues"])
+            .await;
+        assert_eq!(
+            held.len(),
+            1,
+            "a word the task does not hold stays withheld"
+        );
+    }
+
+    /// The refusal is bounded, and says how many keywords it did not list.
+    #[test]
+    fn a_long_keyword_list_is_summarized_in_the_refusal() {
+        let keywords: Vec<String> = (0..16).map(|n| format!("k{n}")).collect();
+        let words: Vec<&str> = keywords.iter().map(String::as_str).collect();
+        let server = triggered("x", &words, &["x__t"], None);
+        let text = reason(&server, "x__t");
+        assert!(
+            text.contains("k0, k1, k2, k3, k4, k5, k6, k7 and 8 more"),
+            "{text}"
+        );
+    }
+
+    /// The loaded set is bounded like the eager set: the section that would pass the bound and the
+    /// ones after it are left out, so a `when` cannot add more than `adam-mcp` would at bind.
+    #[test]
+    fn the_loaded_sections_are_bounded() {
+        let half = MAX_INSTRUCTIONS_BYTES / 2;
+        let sections = vec![
+            ("a".to_owned(), "a".repeat(half)),
+            ("b".to_owned(), "b".repeat(half + 1)),
+            ("c".to_owned(), "c".to_owned()),
+        ];
+        let text = join_sections(&sections);
+        assert!(text.len() <= MAX_INSTRUCTIONS_BYTES, "{}", text.len());
+        assert!(text.starts_with('a'), "the first section fits");
+        assert!(
+            !text.contains('b'),
+            "the section that would pass is left out"
+        );
+        assert!(!text.contains('c'), "and the ones after it");
+    }
+
+    /// A loaded server that said nothing adds nothing, and one that is not loaded adds nothing
+    /// even when it did.
+    #[tokio::test]
+    async fn instructions_follow_the_loaded_set_only() {
+        let source = McpSelect::new(vec![
+            triggered("quiet", &["quiet"], &["quiet__x"], None),
+            triggered(
+                "loud",
+                &["loud"],
+                &["loud__x"],
+                Some("## Loud\n\n> loud words"),
+            ),
+        ]);
+        assert!(
+            source.instructions(&ctx(Some("be quiet"))).await.is_none(),
+            "the only loaded server said nothing, so nothing is added"
+        );
+        let text = source
+            .instructions(&ctx(Some("be loud")))
+            .await
+            .expect("the loaded server said something");
+        assert!(text.contains("loud words"), "{text}");
+        assert!(
+            !text.contains("quiet"),
+            "the server that was not loaded is not in it: {text}"
+        );
+        assert!(
+            source.instructions(&ctx(Some("neither"))).await.is_none(),
+            "nothing loaded, nothing added"
+        );
+    }
+
     #[cfg(feature = "mcp")]
     #[test]
     fn the_instruction_bound_is_the_one_adam_mcp_uses() {

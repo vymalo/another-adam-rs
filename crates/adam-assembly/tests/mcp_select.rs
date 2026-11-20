@@ -41,6 +41,16 @@ fn call(id: &str, name: &str) -> ToolCall {
     }
 }
 
+/// A call with arguments: a subagent's `message`, for instance.
+fn call_with(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments,
+        ..Default::default()
+    }
+}
+
 fn assembly(mock: &Arc<MockModel>, mcp: &str) -> Assembly {
     common::def(&[
         (
@@ -96,30 +106,29 @@ async fn run_task(
 async fn a_keyword_that_matches_loads_the_server_and_one_that_does_not_is_withheld() {
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call("c1", "linear__list_issues")])
+        .push_tool_calls(vec![call("c2", "github__search")])
         .push_text("done");
     let (requests, _) =
         run_task(&mock, &assembly(&mock, MCP), "please fix the linear ticket").await;
-    assert_eq!(
-        names(&requests[0]),
-        ["github__search", "linear__list_issues", "read_output"],
-        "the eager server and the one whose keyword the task holds"
-    );
-    assert_eq!(
-        names(&requests[1]),
-        names(&requests[0]),
-        "the same tools after the call"
-    );
-    assert_eq!(
-        head(&requests[0]),
-        head(&requests[1]),
-        "the system prompt and the tools are the same bytes at every request"
-    );
-    // The tool ran: the second request holds its answer.
-    let last = requests[1].messages.last().unwrap();
-    assert!(
-        format!("{last:?}").contains("linear__list_issues-out"),
-        "the loaded tool ran: {last:?}"
-    );
+    assert_eq!(requests.len(), 3, "two calls and the answer");
+    for request in &requests {
+        assert_eq!(
+            names(request),
+            ["github__search", "linear__list_issues", "read_output"],
+            "the eager server and the one whose keyword the task holds, at every turn"
+        );
+    }
+    for pair in requests.windows(2) {
+        assert_eq!(
+            head(&pair[0]),
+            head(&pair[1]),
+            "the system prompt and the tools are the same bytes at every request"
+        );
+    }
+    // The tools ran: the last request holds both answers.
+    let text = format!("{:?}", requests[2].messages);
+    assert!(text.contains("linear__list_issues-out"), "{text}");
+    assert!(text.contains("github__search-out"), "{text}");
 }
 
 #[tokio::test]
@@ -160,10 +169,110 @@ async fn a_call_to_a_server_that_was_not_loaded_is_refused_and_names_the_reason(
     let last = requests[1].messages.last().unwrap();
     let text = format!("{last:?}");
     assert!(text.contains("not loaded for this run"), "{text}");
-    assert!(text.contains("docs"), "{text}");
+    assert!(
+        text.contains("the MCP server `docs`"),
+        "the refusal names the server, not only the tool: {text}"
+    );
+    assert!(
+        text.contains("docs, documentation"),
+        "the refusal names the keywords: {text}"
+    );
     assert!(
         !text.contains("docs__search-out"),
         "the server did not run: {text}"
+    );
+}
+
+/// A tool whose name is no declared server's is refused at bind, so an unselected server's tool
+/// cannot be smuggled in under a name of its own (`McpForeignTool`). The withheld path is the
+/// other half: a call to the real name is refused at the call (above).
+#[test]
+fn a_tool_of_no_declared_server_is_refused_at_bind() {
+    let def = common::def(&[
+        (
+            "agent/instructions.md",
+            &common::instructions(&format!("name: root\n{TOOLS}"), "You are root."),
+        ),
+        ("agent/mcp.json", MCP),
+    ]);
+    let error = def
+        .mcp_tools(
+            "root",
+            common::tools(&[
+                "github__search",
+                "linear__list_issues",
+                "docs__search",
+                "other__search",
+            ]),
+        )
+        .bind(ToolSet::new())
+        .unwrap_err();
+    assert!(
+        matches!(error, adam_assembly::Error::McpForeignTool { .. }),
+        "{error}"
+    );
+}
+
+/// A subagent has its own `mcp.json` and its own selector: it selects on **its** task, not on the
+/// parent's, so a keyword the parent's task holds does not load the child's server.
+#[tokio::test]
+async fn a_subagent_selects_on_its_own_task_not_the_parents() {
+    const CHILD_MCP: &str = r#"{"mcpServers": {
+      "docs": {"type": "http", "url": "https://mcp.example/docs", "tools": ["search"],
+               "when": {"keywords": ["docs"]}}
+    }}"#;
+    fn child_assembly(mock: &Arc<MockModel>) -> Assembly {
+        common::def(&[
+            (
+                "agent/instructions.md",
+                &common::instructions("name: root", "You are root."),
+            ),
+            (
+                "agent/subagents/helper/instructions.md",
+                &common::instructions("description: Helps.\ntools: ['docs__search']", "You help."),
+            ),
+            ("agent/subagents/helper/mcp.json", CHILD_MCP),
+        ])
+        .mcp_tools("root/helper", common::tools(&["docs__search"]))
+        .bind(ToolSet::new())
+        .unwrap()
+        .model(mock.clone(), "default")
+        .unwrap()
+    }
+    async fn child_tools(parent_task: &str, child_task: &str) -> Vec<String> {
+        let mock = Arc::new(MockModel::new());
+        mock.push_tool_calls(vec![call_with(
+            "s1",
+            "helper",
+            json!({"message": child_task}),
+        )])
+        .push_text("child done")
+        .push_text("parent done");
+        let assembly = child_assembly(&mock);
+        let runtime = common::runtime(&assembly);
+        let run = runtime
+            .start("root", user_message(parent_task), None)
+            .await
+            .unwrap();
+        let worker = common::spawn_worker(&runtime);
+        common::wait_done(&runtime, run).await;
+        worker.stop().await;
+        let requests = mock.requests();
+        let child = requests
+            .iter()
+            .find(|r| common::plain(&r.system).as_deref() == Some("You help."))
+            .expect("the child's request");
+        names(child)
+    }
+    assert_eq!(
+        child_tools("read the docs", "fix a typo").await,
+        ["read_output"],
+        "the parent's task does not select the child's server"
+    );
+    assert_eq!(
+        child_tools("fix a typo", "read the docs").await,
+        ["docs__search", "read_output"],
+        "the child's own task selects it"
     );
 }
 
@@ -203,6 +312,38 @@ async fn a_continued_run_selects_the_same_servers() {
         has(after, "linear__list_issues"),
         "the continuation kept linear: {:?}",
         names(after)
+    );
+}
+
+/// `AgentInfo` is what the dev reload compares and what the tests compare an embedded agent with:
+/// a `when` change must make it differ, or two definitions that behave differently compare equal
+/// (and a reload reports that nothing changed).
+#[test]
+fn a_when_change_is_visible_in_the_agent_info() {
+    let mock = Arc::new(MockModel::new());
+    let before = assembly(&mock, MCP);
+    let after = assembly(
+        &mock,
+        &MCP.replace(
+            r#""keywords": ["docs", "documentation"]"#,
+            r#""keywords": ["docs"]"#,
+        ),
+    );
+    assert_eq!(
+        before.info()[0].when,
+        [
+            (
+                "docs".to_owned(),
+                vec!["docs".into(), "documentation".into()]
+            ),
+            ("linear".to_owned(), vec!["linear".into(), "ticket".into()]),
+        ],
+        "the triggered servers and their keywords, in name order"
+    );
+    assert_ne!(
+        before.info(),
+        after.info(),
+        "a `when` change makes different agents"
     );
 }
 

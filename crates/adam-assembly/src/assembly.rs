@@ -261,6 +261,7 @@ impl BoundDef {
                 tools: node.tools.iter().map(|(name, _)| name.clone()).collect(),
                 skills: node.skills.clone(),
                 preloaded: node.preloaded.clone(),
+                when: node.when.clone(),
                 limits: node.limits,
             });
             resolved.push(alias);
@@ -402,8 +403,8 @@ pub struct AgentInfo {
     /// The gateway alias its model calls use.
     pub model_alias: String,
     /// The system prompt the model sees: the instructions with the vars substituted, then the
-    /// skills catalog, the preloaded skills and the instructions of its **eager** MCP servers. A
-    /// server with a `when` adds its section to a run, when the run loads it.
+    /// instructions of its **eager** MCP servers, then the skills catalog and the preloaded skills.
+    /// A server with a `when` adds its section to a run, when the run loads it.
     pub prompt: String,
     /// The names of its tools, in the order the model is shown them: its own, then `load_skill`
     /// and `read_skill_file` when it has skills to load and files to read, then one per local
@@ -415,6 +416,12 @@ pub struct AgentInfo {
     pub skills: Vec<String>,
     /// The subset of [`skills`](Self::skills) whose body is in the prompt (`preload_skills:`).
     pub preloaded: Vec<String>,
+    /// The MCP servers whose `when` loads them only when the run's task mentions one of their
+    /// keywords: the server and its keywords, in name order. Empty for an agent whose servers are
+    /// all eager. It is part of the info because a definition that differs only here **behaves**
+    /// differently: its tools are withheld from a run the task does not select, and its
+    /// instructions are added only to such a run.
+    pub when: Vec<(String, Vec<String>)>,
     /// The loop's limits.
     pub limits: Limits,
 }

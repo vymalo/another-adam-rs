@@ -327,6 +327,18 @@ impl Rig {
         self.start_in(None).await
     }
 
+    /// Start a run whose task is `task`, not the `go` of [`start`](Self::start): a source that
+    /// selects from the task reads this text.
+    async fn start_task(&self, task: &str) -> RunId {
+        let run = self
+            .rt
+            .start("llm", user_message(task), None)
+            .await
+            .expect("start");
+        *self.arm.run.lock().unwrap() = Some(run);
+        run
+    }
+
     /// A failed commit is retried after a backoff of the runtime's clock, which only this moves.
     fn ticker(&self) -> tokio::task::JoinHandle<()> {
         let clock = self.clock.clone();
@@ -2218,4 +2230,78 @@ async fn a_tool_a_source_holds_back_from_the_start_keeps_the_head_of_every_reque
         ["handle"],
         "the held-back tool is not shown, and the head does not move"
     );
+}
+
+/// A source that loads a tool only when the run's task asks for it, as an `mcp.json` server's
+/// `when` does: the task is read from the state, so a replay selects the same.
+struct TaskSelects;
+
+#[async_trait]
+impl ToolSource for TaskSelects {
+    async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
+        let loads = ctx
+            .task()
+            .is_some_and(|task| task.to_lowercase().contains("big"));
+        if loads {
+            return Vec::new();
+        }
+        tools
+            .iter()
+            .filter(|tool| **tool == "big")
+            .map(|tool| Withheld::new(*tool, "big is not loaded for this run"))
+            .collect()
+    }
+
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        None
+    }
+}
+
+/// A tool a source selects from the task is the same tool after a lost commit: the task is the
+/// first message of the journaled state, so the replayed request is the one the run would have
+/// made (a selection stored only in memory would drop `big` here).
+#[tokio::test]
+async fn a_task_selected_tool_survives_a_lost_commit() {
+    fn push_script(mock: &MockModel) {
+        mock.push_tool_calls(vec![big("c0", 10)])
+            .push_tool_calls(vec![call("c1", "handle", json!({}))])
+            .push_text("done");
+    }
+    let baseline = {
+        let rig = Rig::new(100_000, |b| b.tool_source(TaskSelects));
+        push_script(&rig.mock);
+        let run = rig.start_task("use big please").await;
+        rig.finish(run).await
+    };
+    assert!(
+        baseline.0[0].tools.iter().any(|t| t.name == "big"),
+        "the task loads `big` in the baseline"
+    );
+    for call in [0, 1] {
+        let rig = Rig::new(100_000, |b| b.tool_source(TaskSelects));
+        push_script(&rig.mock);
+        rig.lose_the_commit_after_call(call, false);
+        let run = rig.start_task("use big please").await;
+        let (requests, state) = rig.finish(run).await;
+        let label = format!("lost commit after call {call}");
+        assert_eq!(rig.store.injected(Method::CommitRun), 1, "{label}");
+        assert_eq!(state.messages, baseline.1.messages, "{label}");
+        assert_eq!(requests.len(), baseline.0.len(), "{label}");
+        for (got, want) in requests.iter().zip(&baseline.0) {
+            assert_eq!(
+                serde_json::to_string(got).unwrap(),
+                serde_json::to_string(want).unwrap(),
+                "{label}"
+            );
+        }
+    }
 }

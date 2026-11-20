@@ -1512,6 +1512,34 @@ mod tests {
         let next = compacted.continued("something else", RunId::new());
         assert_eq!(next.task(), Some("the task"));
         assert_eq!(Conversation::default().task(), None);
+        // A first message that is not the person's words is no task at all: a round that opens on
+        // a result, or on the model's own message, loads nothing that asks for a task.
+        for first in [
+            Message::tool_result("c1", "a result"),
+            Message::assistant_text("the model spoke first"),
+        ] {
+            let conversation = Conversation {
+                messages: vec![first],
+                ..Conversation::default()
+            };
+            assert_eq!(conversation.task(), None);
+        }
+        // The keyword in a later message is not the task: the first part of the first message is.
+        let mut later = Conversation::new("fix the typo");
+        later.messages.push(Message::assistant_text("done"));
+        later.messages.push(Message::user_text("now read the docs"));
+        assert_eq!(later.task(), Some("fix the typo"));
+        // A first message with several text parts: the first is the task, the rest are not.
+        let several = Conversation {
+            messages: vec![Message::User {
+                content: vec![
+                    adam_model::ContentPart::text("fix the typo"),
+                    adam_model::ContentPart::text("and read the docs"),
+                ],
+            }],
+            ..Conversation::default()
+        };
+        assert_eq!(several.task(), Some("fix the typo"));
     }
 
     /// A continuing task starts with no kept output: its history names ids it cannot read.

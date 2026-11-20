@@ -640,6 +640,10 @@ pub(crate) struct Node {
     /// The agents that work the rounds of a session on a remote subagent, one per remote subagent
     /// of the root; empty for any other agent.
     pub(crate) round_agents: Vec<RemoteRoundAgent>,
+    /// The `mcp.json` servers whose `when` loads them only when a run's task matches: the server
+    /// and its keywords, in name order. [`AgentInfo::when`](crate::AgentInfo::when) carries them, so
+    /// a definition that differs only in a `when` compares unequal to one that does not.
+    pub(crate) when: Vec<(String, Vec<String>)>,
     /// Sources this agent alone has, added at [`BoundDef::build`](crate::BoundDef): the
     /// `mcp.json` servers whose `when` loads them only when a run's task matches.
     pub(crate) sources: Vec<DynToolSource>,
@@ -755,17 +759,22 @@ impl Walk<'_> {
         let mut sources: Vec<DynToolSource> = Vec::new();
         if !triggers.is_empty() {
             let triggered: Vec<crate::mcp_select::Triggered> = triggers
-                .into_iter()
+                .iter()
                 .map(|(server, keywords)| {
-                    let tools = mcp_by_server.get(&server).cloned().unwrap_or_default();
+                    let tools = mcp_by_server.get(server).cloned().unwrap_or_default();
                     let instructions = self.mcp.get(&name).and_then(|given| {
                         given
                             .instructions
                             .iter()
-                            .find(|(named, _)| named == &server)
+                            .find(|(named, _)| named == server)
                             .map(|(_, text)| text.clone())
                     });
-                    crate::mcp_select::Triggered::new(server, keywords, tools, instructions)
+                    crate::mcp_select::Triggered::new(
+                        server.clone(),
+                        keywords.clone(),
+                        tools,
+                        instructions,
+                    )
                 })
                 .collect();
             sources.push(Arc::new(crate::mcp_select::McpSelect::new(triggered)));
@@ -829,6 +838,7 @@ impl Walk<'_> {
             preloaded,
             session_agents,
             round_agents,
+            when: triggers,
             sources,
         });
         for sub in &manifest.subagents {
