@@ -56,6 +56,11 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      `adam_agent_fs::build("agent").emit()`; `AgentDef::from_manifest(AGENT)?.bind(tools![..])?
      .state(..).model(model, alias)?` binds it. Details and the tool rules:
      `crates/adam/README.md` ("`#[tool]`", "Agent directories"), `docs/reference/agent-files.md`.
+   * **A wrapper agent must delegate the split.** `adam_runtime::Agent` has provided `split`/`join`
+     methods (and so does `AgentStarter`) that let a run keep its transcript in an append-only body
+     beside a small head; the default keeps the whole state in the head, the v4 format. An agent of
+     yours that wraps another and delegates `init`/`step` must delegate `split`/`join` too, or its
+     runs silently stay in the v4 format (the same trap as `init_continuing`).
    * **Only the process plumbing**: `adam-host` (`Role`, `Host`): register every component
      (`.control_plane(name, f)`, `.worker(name, f)`), `Host::run(shutdown)` starts the ones the
      role runs and stops the control plane before the workers (`crates/adam-host/README.md`).

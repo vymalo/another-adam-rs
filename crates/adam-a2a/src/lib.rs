@@ -100,40 +100,54 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// These docs describe the server; built without it (the embedded set, ADR 0047) their links to it have
+// no target. The documented build, with every feature, checks every link.
+#![cfg_attr(not(feature = "server"), allow(rustdoc::broken_intra_doc_links))]
 
 mod activation;
+#[cfg(feature = "server")]
 mod auth;
 mod backend;
 mod card;
+#[cfg(feature = "server")]
 mod docs;
 mod extensions;
+#[cfg(feature = "server")]
 mod handler;
 #[cfg(feature = "test-util")]
 mod memory;
+#[cfg(feature = "server")]
 mod openapi;
 mod page;
+#[cfg(feature = "server")]
 pub mod push;
+#[cfg(feature = "server")]
 mod rest;
+#[cfg(feature = "server")]
 mod server;
+#[cfg(feature = "server")]
 mod signing;
 mod tier;
 
+#[cfg(feature = "server")]
 pub use auth::AuthConfig;
 pub use backend::{BackendError, Caller, DynTaskBackend, TaskBackend, TaskEvent};
 pub use card::{AgentCardConfig, ExtendedCardConfig, ExtensionConfig, SkillConfig};
 pub use extensions::{
     A2UI_BASIC_CATALOG_V0_9_1, A2UI_EXTENSION_V0_9_1, A2UI_MEDIA_TYPE, ACCESS_TIER_EXTENSION,
     BUILD_EXTENSION, CHILD_SESSIONS_EXTENSION, COMMANDS_EXTENSION, ChildSessionInfo, CommandInfo,
-    MENTIONS_EXTENSION, STEER_EXTENSION, STEPS_EXTENSION, TEXT_STREAM_EXTENSION,
-    TEXT_STREAM_KIND_REASONING, THREAD_TOOLS_EXTENSION, UI_CATALOG_EXTENSION, UNKNOWN_REVISION,
-    USAGE_EXTENSION, build_version, revision_of,
+    MENTIONS_EXTENSION, REPLACEABLE_ARTIFACT, STEER_EXTENSION, STEPS_EXTENSION,
+    TEXT_STREAM_EXTENSION, TEXT_STREAM_KIND_REASONING, THREAD_TOOLS_EXTENSION,
+    UI_CATALOG_EXTENSION, UNKNOWN_REVISION, USAGE_EXTENSION, build_version, revision_of,
 };
 #[cfg(feature = "test-util")]
 pub use memory::{InMemoryBackend, InMemoryConfig};
 pub use page::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, PageToken, TaskPage, TaskQuery};
+#[cfg(feature = "server")]
 pub use server::{A2aServer, SDK_KEEPALIVE_INTERVAL, ServerOptions};
-#[cfg(feature = "test-util")]
+#[cfg(all(feature = "test-util", feature = "server"))]
 pub use signing::generate_signing_key_pem;
+#[cfg(feature = "server")]
 pub use signing::{
     CardSigner, SigningError, VerifyError, VerifyingKey, canonical_payload, canonicalize,
 };

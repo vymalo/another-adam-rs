@@ -18,8 +18,8 @@ over A2A).
 
 | Item | What |
 |---|---|
-| `Agent` (trait) | `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`; see *Continuing another run*), `async step(&mut Ctx, State) -> Transition<State>`, `async on_cancelled(RunId, Value)` (provided, does nothing; see *Cancelling a run*) |
-| `AgentStarter` (trait) | the start-only half of an agent: `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`), no `step`; `State` is `Serialize + DeserializeOwned`, as the agent's is (new: a starter whose state was only `Serialize` must derive `Deserialize` too, because it reads the prior state). See *Starting without stepping* |
+| `Agent` (trait) | `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`; see *Continuing another run*), `async step(&mut Ctx, State) -> Transition<State>`, `split(&State) -> Option<(State, Vec<Value>)>` and `join(State, Vec<Value>) -> State` (both provided: the default keeps the whole state; see *The shadow*), `async on_cancelled(RunId, Value)` (provided, does nothing; see *Cancelling a run*) |
+| `AgentStarter` (trait) | the start-only half of an agent: `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`), `split`/`join` (the start-only half of the agent's, defaulted the same way), no `step`; `State` is `Serialize + DeserializeOwned`, as the agent's is (new: a starter whose state was only `Serialize` must derive `Deserialize` too, because it reads the prior state). See *Starting without stepping* |
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
 | `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
 | `Ctx`, `Emitter`, `ReservedStep` | `Ctx::step` journals a side effect's outcome; `Ctx::reserve_steps(&names)` takes the next seqs in order for steps that run at the same time (each `ReservedStep` has `seq()`, `name()`, `is_recorded()` and `run(f)`, with `step`'s contract), and `Ctx::step_all(steps, at_once)` runs them at most `at_once` at a time and returns the outcomes in the order given (see *Steps that run at the same time*); `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::arrived()` counts the messages delivered while the transition runs, `Ctx::reopen_on_arrival()` makes a `Done` that the transition returns go on instead, and `Ctx::read_already(&ids)` names the messages the run has read, whose copies are not counted (see *A message that arrives while a run finishes*); `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children and `Ctx::child_state(run)` its agent's own state (both live reads of the run's own children only), and `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*) |
@@ -61,6 +61,50 @@ A recorded step outcome is never re-executed, but a side effect is
 at-least-once (a crash between the effect and its journal write runs it
 again): keep effects idempotent. The lifecycle and guarantees are in the crate
 docs (`src/lib.rs`) and the [architecture](../../docs/architecture.md#the-mental-model).
+
+## The shadow: the head and the body
+
+The expand release of ADR 0055 (slice S2a) writes a run's **head** and its **body** beside the
+complete v4 `state`, and reads neither: the read path (`Runtime::view`, `load_run`, `claim_due`,
+`list_runs`) is unchanged, and `Store::load_head` exists for the tests and for the read path the
+next slice adds. A run's `state` is still the whole envelope a v4 process steps, so a mixed fleet is
+safe.
+
+* `Agent::split(&state)` returns `Some((head, rows))` when the agent's state has a transcript worth
+  keeping apart, and `None` (the default) when it does not. `Agent::join(head, rows)` is its inverse,
+  and the invariant is `join(split(s).0, split(s).1)` re-encodes to `s`. A wrapper that delegates
+  `init` **must delegate `split` and `join` too**, or its runs silently stay in the v4 format.
+* The split is taken **inside the erased step** (`src/erased.rs`), where the typed state already
+  exists: the state is deserialized once, and the rows are the agent's own values.
+* A step commit that splits writes the head (`v: 5`: the agent's head, the envelope's other members,
+  file artifacts **by reference** — `file.digest` and `file.size`, never the bytes — and
+  `body: {generation, len}`) and the rows, beside the full `state`. The generation is the current
+  one for an append, or a new one for a first split or a compaction; the `writer` UUID is chosen once
+  per step attempt, so a CAS retry of that attempt writes no duplicate row and a commit that loses
+  deletes its own rows and refs.
+* A commit that does not split (`deliver`, `cancel`, `park_again`, a run whose state is unreadable)
+  writes no head: it re-encodes the format it read, and the stored head becomes stale
+  (`head_version < version`), which `Store::load_head` reads as "serve the state".
+* **The reconstruction check** runs before every commit that splits: `join(head, rows)` is compared
+  with the state about to be written, and a mismatch writes `state` only, logs an error, and leaves
+  the run v4. A bad split can never produce a head that does not reconstruct its state.
+* The body is **append-only per generation**: a normal commit writes only the rows after the old
+  head's `len` and keeps the generation; a compaction (the new transcript does not start with the
+  previous one) writes all rows under a new generation. The delta win holds across **splitting**
+  commits: a headless commit (`deliver`, `cancel`, `park_again`, a failed transition) writes no head,
+  so the next split compacts until S3, where those paths write the head they read; the `head_version`
+  gate stays, because a v4 step may have changed the transcript. Measured with a delivery between
+  every step: 50 × 10 KB writes 12.7 MB of body rows (1,275 rows, 50 generations) against ~0.5 MB of
+  deltas for consecutive splits. The head names `{generation, len}`. The store
+  resolves the generation, writes the rows before the CAS with the attempt's `writer`, checks that
+  all of them landed, and a commit that loses deletes its own rows and refs, so a head never names a
+  partial generation and a loser cannot poison the next append. Every file artifact the head will
+  name is uploaded first: a failed put refuses the head, and the commit writes the state only.
+* `tests/common/v4.rs` is a frozen copy of the v4 envelope; the suite decodes every `state` written
+  and asserts a v5 head is **not** one. The contract release (S3) inverts that assertion.
+
+The cost is stated: in the expand release a step writes the whole state **and** the head **and** the
+rows, so bytes written per commit go up until S3 stops writing `state`.
 
 ## A message that arrives while a run finishes
 
@@ -549,6 +593,17 @@ class tables of `AgentError` and `RuntimeError` in `src/agent.rs`
 Two cases pin the read path: `a_header_is_one_store_call` (`Runtime::header` is one store call and reads neither the record
 nor the lease beside it) and `the_cancel_watch_polls_at_its_own_interval` (a 2.5 s step at a 1 s cancel interval reads the
 header about twice, not once per 20 ms worker poll; the watch reads no state at all).
+
+Five cases pin the shadow: `a_step_that_splits_writes_the_head_and_the_body_beside_the_state` (the first commit
+writes a `v: 5` head and starts a generation, the done commit appends to it, one generation holds the transcript, and
+`state` is still the whole v4 envelope), `a_split_that_does_not_reconstruct_the_state_writes_the_state_only` (a
+deliberately wrong split is refused: no head, no rows, the run stays v4), `every_state_written_is_a_v4_envelope_and_a_head_is_not_one`
+(the frozen `tests/common/v4.rs` decodes every state a create, a step, a delivery and a finish wrote, and rejects the
+head), `the_view_reads_the_state_and_never_the_head` (a `CountingStore`: one `load_run`, no `load_head`, no `body_list`,
+and the whole agent state in the view) and `a_pre_e_file_artifact_is_uploaded_before_the_head_names_it` (a run created
+directly with a file artifact in its state but no blob uploads and references its digest on the first commit, and the
+head names it). `a_split_whose_file_is_not_stored_writes_the_state_only` pins the other side: a failed `put_blob`
+refuses the head, and the commit writes the state only.
 
 | Variable | Meaning |
 |---|---|

@@ -13,12 +13,12 @@ adam-core.workspace = true
 adam-error.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+jiff.workspace = true
 mongodb = "3.9"
 serde_json.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-jiff.workspace = true
 proptest.workspace = true
 adam-store-testkit.workspace = true
 tokio.workspace = true

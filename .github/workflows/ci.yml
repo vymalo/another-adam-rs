@@ -27,7 +27,7 @@ env:
   COVERAGE_IGNORE: '(adam-acp-fake-agent|adam-mcp-testkit|/tests/)'
 
 jobs:
-  # Formatting and the repository rules that do not need a compiler. The five compiles are their own jobs below, and
+  # Formatting and the repository rules that do not need a compiler. The six compiles are their own jobs below, and
   # `lint` is the required check that aggregates them.
   fmt:
     runs-on: ubuntu-latest
@@ -115,11 +115,26 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # The embedded feature set (ADR 0047): each split crate with its defaults off and with each feature alone, and
+  # adam-engine's tree free of an HTTP server or client, a database driver, the Kubernetes client, a TLS stack and
+  # the MCP client. The self-test proves the check fails on a planted crate and on a gate turned back on.
+  embedded:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: tools/embedded-deps/check.sh
+      - run: tools/embedded-deps/check.sh self-test
+
   # The required check. It compiles nothing: it fails unless every job above passed, so a clippy, doctest or
-  # rustdoc error cannot merge on a green `lint`. The five jobs are extra checks, not required ones.
+  # rustdoc or embedded-set error cannot merge on a green `lint`. The six jobs are extra checks, not required ones.
   lint:
     name: lint
-    needs: [fmt, clippy-default, clippy-features, doctest-default, doctest-features, rustdoc]
+    needs: [fmt, clippy-default, clippy-features, doctest-default, doctest-features, rustdoc, embedded]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -133,7 +148,8 @@ jobs:
             "clippy-features=${{ needs['clippy-features'].result }}" \
             "doctest-default=${{ needs['doctest-default'].result }}" \
             "doctest-features=${{ needs['doctest-features'].result }}" \
-            "rustdoc=${{ needs.rustdoc.result }}"
+            "rustdoc=${{ needs.rustdoc.result }}" \
+            "embedded=${{ needs.embedded.result }}"
           do
             name=${pair%%=*}
             result=${pair#*=}

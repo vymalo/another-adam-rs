@@ -8,19 +8,26 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# thread-tools/v1: the MCP client that lists and calls the conversation's tools and reads the screen's catalog
+# again (adam-mcp, rmcp). On by default; an embedded build (adam ADR 0047) turns it off and keeps the
+# screen's tools over the catalog a message carries.
+default = ["thread-tools"]
+thread-tools = ["dep:adam-mcp", "dep:secrecy"]
+
 [dependencies]
 a2a-lf.workspace = true
 adam-core.workspace = true
-adam-a2a.workspace = true
-adam-a2a-runtime.workspace = true
+adam-a2a = { path = "../adam-a2a", version = "0.1.0", default-features = false }
+adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.1.0", default-features = false }
 adam-llm-agent.workspace = true
-adam-mcp.workspace = true
+adam-mcp = { workspace = true, optional = true }
 adam-model.workspace = true
 adam-runtime.workspace = true
 async-trait.workspace = true
 jiff.workspace = true
 jsonschema.workspace = true
-secrecy.workspace = true
+secrecy = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -34,6 +41,59 @@ adam-model.workspace = true
 adam-mcp-testkit.workspace = true
 adam-store-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+# These tests need the thread-tools client: an embedded build (no default features) leaves them out.
+[[test]]
+name = "ask_v5"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "cards"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "relay"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "access"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "ask_v7"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "plan"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "turn_output"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "ask_answers"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "ask_v8"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "plan_run"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "tools"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "agent"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "duplicate_tools"
+required-features = ["thread-tools"]
 
 [lints]
 workspace = true

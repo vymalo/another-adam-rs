@@ -32,9 +32,12 @@ trait at your rev: its doc comments are the contract.
    `journal_put` (first writer wins), `journal_list`, `claim_due`, `renew_lease`, `release_lease`,
    `lease_until`, `purge_finished`, then the listing (`list_runs` and `count_runs`: a caller's runs,
    newest update first, by keyset), the five push-notification methods (`push_put`, `push_list`,
-   `push_delete`, `push_claim_due`, `push_commit`; schema version 3) and the four **defaulted** blob
-   methods (`keeps_blobs`, `put_blob`, `get_blob`, `purge_blobs`; schema version 5, part 1: file
-   bytes out of the run, content-addressed by `BlobId`). A defaulted method left out of your
+   `push_delete`, `push_claim_due`, `push_commit`; schema version 3) and the **defaulted** methods:
+   the five blob ones (`keeps_blobs`, `blob_stored`, `put_blob`, `get_blob`, `purge_blobs`; schema
+   version 5, part 1: file bytes out of the run, content-addressed by `BlobId`) and the three body ones
+   (`load_head`, which defaults to `load_run` and serves the v5 head only when
+   `head_version == version`; `keeps_bodies`; `body_list`; `gc_body`; schema version 5, part 2: an
+   append-only transcript per generation beside the head). A defaulted method left out of your
    implementation answers for your store with the trait's "I keep none" answer.
    Errors are `StoreError` (`crates/adam-core/README.md`, "Errors"): build a backend failure with
    `StoreError::unavailable(e)` (transient), `StoreError::internal(e)` or
@@ -43,7 +46,8 @@ trait at your rev: its doc comments are the contract.
    contract" in `docs/reference/store-adapters.md` lists, per guarantee, how Postgres and MongoDB do it
    (CAS commit, first-writer-wins journal, exclusive claiming, `busy` runs never claimed,
    pinned claims and the run `owner`, one open run per conversation, journal deleted with its
-   run, blob put/get and the blob GC, schema version 5 part 1). Time is truncated to milliseconds
+   run, blob put/get and the blob GC, schema version 5 part 1, and the head and body of schema
+   version 5 part 2). Time is truncated to milliseconds
    in every store; lease expiry uses the `now` the caller passes.
 3. **Implement `Store`** in a crate of its own, depending on `adam-core` only (no driver type in
    a trait signature). Reference implementations: `crates/adam-core/src/store/memory.rs`
@@ -58,6 +62,7 @@ trait at your rev: its doc comments are the contract.
    }
    adam_store_testkit::store_conformance!(make_store);
    adam_store_testkit::blob_conformance!(make_store); // a store that keeps blobs
+   adam_store_testkit::body_conformance!(make_store); // a store that keeps bodies
    ```
 
    `store_conformance!` generates one `#[tokio::test]` per case (48 at the time of writing) and
@@ -65,7 +70,10 @@ trait at your rev: its doc comments are the contract.
    an idempotent put, an unknown id, empty bytes, a run's reference keeping a blob alive (including
    after a commit that names a different one), a shared digest surviving until the last run is
    purged, the cutoff, and `purge_finished`'s sweep); every
-   case asserts `keeps_blobs()`, so do not give it to a store that keeps none. `None` skips the
+   case asserts `keeps_blobs()`, so do not give it to a store that keeps none. `body_conformance!`
+   adds the six body cases (a set round-tripping in `idx` order with its head, an idempotent retry,
+   a superseded set that stays readable, a headless commit leaving the head stale, sets per run, and
+   the purge); every case asserts `keeps_bodies()`. `None` skips the
    suites. Cases isolate themselves with a unique agent name, so they run in parallel on one shared
    database — **except the blob cases and the cases that purge**, which sweep every unreferenced
    blob and therefore must not overlap: keep them in one nextest test group (`.config/nextest.toml`,
@@ -120,9 +128,29 @@ trait at your rev: its doc comments are the contract.
 * Blobs: `put_blob` is idempotent and **the bytes behind an id never change** (a second put under a
   taken digest writes nothing), the id is the SHA-256 of the bytes as 64 lower-case hex, and a
   commit's `RunUpdate.blobs` is a **delta** the store unions with what it already recorded — a
-  commit that names none keeps the earlier references. A blob a surviving run references is never
-  collected; `purge_blobs(before)` and `purge_finished` delete only unreferenced blobs older than
-  the cutoff.
+  commit that names none keeps the earlier references. `blob_stored(id)` is one indexed existence
+  check (the runtime checks it before it re-sends a file's bytes; the default `false` means "put
+  it"). A blob a surviving run references is never collected; `purge_blobs(before)` and
+  `purge_finished` delete only unreferenced blobs older than the cutoff.
+* Bodies: a generation is `(run, generation, idx)` and is **append-only**. `RunUpdate.body` is
+  `{generation, rows, writer}`: `generation: None` appends `rows[old_len..]` to the current head's
+  generation (or starts one when there is no head), `Some(new)` is a compaction and writes all rows
+  under `new`. Validate `rows[i].idx == i`, resolve the target, patch the head's `body` to
+  `{generation, len}` (`adam_core::set_head_body`; `head_body` reads it), write the rows **before**
+  the CAS with the attempt's `writer`, and check that all of them landed. A duplicate key is this
+  attempt's retry when the row's `writer` is this attempt. A row another attempt wrote is resolved
+  by content and age: **adopt** it when its message equals the one this attempt would write, delete
+  it and retry the insert once when it is older than the **orphan grace** (5 minutes, far longer
+  than the insert→CAS gap of a live attempt — milliseconds; the default lease is 30 s), and answer
+  `Conflict` when a live attempt holds the slot with a different message. A live conflict is not a wedge: the runtime drops the result and the next
+  claim steps the run again; an attempt that died before its CAS leaves rows that are adopted or
+  collected. A **write-concern** error is not a completeness answer. A commit that loses the CAS deletes the
+  rows and refs its `writer` added, but never a row or digest the winner's head names — and a commit
+  with no body still cleans the refs it inserted. A commit with `head: None` leaves the stored head **and its `head_version`**
+  alone; `load_head` serves the head only when `head_version == version`. Collect superseded
+  generations after a grace period (`gc_body`, and `purge_finished` removes them with the run).
+  **Forward `gc_body` and `blob_stored` in every wrapper**: the trait defaults answer `0`/`false`,
+  so a wrapper that omits them collects nothing and re-puts every blob.
 * A transient backend error must be classified transient so the runtime retries it.
 
 ## See also

@@ -15,8 +15,9 @@ pub mod time;
 pub use secrets::{DynSecretSource, NoSecrets, ProcessEnv, SecretError, SecretSource};
 pub use store::memory::MemoryStore;
 pub use store::{
-    BlobId, ClaimScope, ConversationScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun,
-    PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
-    RunUpdate, Store, StoreError, StoreResult, claimed, storable, storable_owned, storable_text,
+    BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, DynStore, JournalEntry, Lease,
+    NewPushConfig, NewRun, PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery,
+    RunRecord, RunStatus, RunUpdate, Store, StoreError, StoreResult, claimed, head_body,
+    set_head_body, storable, storable_owned, storable_text,
 };
 pub use time::Timestamp;

@@ -28,8 +28,11 @@ needs no model or GitHub configuration.
 **The tools are moving to a library.** The file and command tools become
 [`adam-code-tools`](../../crates/adam-code-tools/README.md), behind a workspace port, in steps
 ([ADR 0047](../../docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), decision 7). Moved so far: running a
-command (`tools::shell`), its sandbox meter (`tools::sandbox`), the tools' access scopes (`tools::access`) and the
-`Redactor`. These paths re-export the library, so nothing that names them changes. `Redactor::from_config` is the
+command (`tools::shell`), its sandbox meter (`tools::sandbox`), the tools' access scopes (`tools::access`), the
+`Redactor`, `GitAt` with the file listing (`tools::gitcli`, whose git writes and restores stay here) and the paths' confinement
+(`tools::files::confine`). These paths re-export the library, so nothing that names them changes. The first tools on the
+port are `list_files`, `find_files` and `search_files`: `tools::find` still declares them (their descriptions are what the
+model reads, pinned by `tests/tool_specs.rs`) and `adam_code_tools::find` does them. `Redactor::from_config` is the
 coder's own trait, `RedactorFromConfig`, re-exported at the crate root.
 
 ```mermaid

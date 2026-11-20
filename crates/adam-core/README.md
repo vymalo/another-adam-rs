@@ -16,9 +16,11 @@ database driver.
 
 | Item | What |
 |---|---|
-| `Store` (trait) | `migrate`, `create_run`, `load_run`, `run_header` (a run without its state, from one projected read where the adapter can), `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs and blob references of the runs it purges, and collects unreferenced blobs), `list_runs` and `count_runs` (a caller's runs, newest update first, by keyset: `RunQuery`, `ConversationScope`), the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*), and the four **blob** methods `keeps_blobs`, `put_blob`, `get_blob`, `purge_blobs` (see *File bytes*) |
+| `Store` (trait) | `migrate`, `create_run`, `load_run`, `load_head` (a run as an observer reads it: the head when it is current, else the state; defaults to `load_run`), `run_header` (a run without its state, from one projected read where the adapter can), `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs, body rows and blob references of the runs it purges, and collects unreferenced blobs), `list_runs` and `count_runs` (a caller's runs, newest update first, by keyset: `RunQuery`, `ConversationScope`), the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*), the five **blob** methods `keeps_blobs`, `blob_stored`, `put_blob`, `get_blob`, `purge_blobs` (see *File bytes*), and the three **body** methods `keeps_bodies`, `body_list`, `gc_body` (see *Transcripts*) |
 | `DynStore` | `Arc<dyn Store>`, the handle the runtime holds |
 | `RunRecord`, `NewRun`, `RunUpdate`, `RunStatus`, `RunId` | a run and how to create or advance one |
+| `BodyRow`, `BodyWrite` | one transcript row (`idx`, `message`) and what a commit writes (`generation`, `rows`, `writer`), keyed `(run, generation, idx)` in the store (see *Transcripts*) |
+| `head_body`, `set_head_body` | the `(generation, len)` a v5 head's `body` names, and the store's write into it: the runtime leaves the generation `null` and the store resolves it |
 | `BlobId` | the content address of a file artifact's bytes: a SHA-256 as 64 lower-case hex, opaque in this crate (see *File bytes*) |
 | `RunHeader` | a run without its state: `run_header`'s answer, with `claimed(now)` (a runnable run and a live lease) for a reader that only needs the run's own bookkeeping. `adam_core::claimed(status, lease_until, now)` is that rule, shared with a runtime view |
 | `JournalEntry` | the recorded outcome of one step, keyed by `(run, seq)` |
@@ -114,6 +116,7 @@ itself.
 | Method | What |
 |---|---|
 | `keeps_blobs()` | whether the store keeps file bytes out of a run's state. `false` (the default) means the bytes live in the state, as before |
+| `blob_stored(id)` | whether the bytes of `id` are already there; defaults to `false` ("put it"). The runtime checks it before it sends a file again, so a file an earlier commit uploaded is not re-sent |
 | `put_blob(id, bytes)` | store `bytes` under `id`; idempotent, and the bytes behind an id never change. A store that keeps none answers `InvalidInput` |
 | `get_blob(id)` | the bytes, or `None` when none are stored (never written, or collected). A store that keeps none answers `InvalidInput`, as `put_blob` does |
 | `purge_blobs(before)` | delete the blobs written before `before` that no run references; returns how many |
@@ -127,6 +130,36 @@ sets it empty, so every existing caller compiles.
 `purge_finished` keeps its signature and extends its contract: a run's references go with it, and
 the blobs no surviving run references and that were written before its `before` are deleted in the
 same sweep. A digest shared by several runs survives until the last one is purged.
+
+## Transcripts: the head and the body
+
+The expand release of [ADR 0055](../../docs/decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md)
+adds the types and the **defaulted** methods a store needs to keep a run's transcript apart from its
+head; `state` is still the whole envelope, and the runtime reads neither in this slice.
+
+| Method | What |
+|---|---|
+| `keeps_bodies()` | whether the store keeps a transcript beside the head (`body_list`, `RunUpdate::body`). `false` (the default) means `RunUpdate::state` is the whole run, exactly as before |
+| `body_list(run, generation)` | the rows of one generation, ordered by `idx`; empty when it does not exist. A store that keeps none answers empty |
+| `gc_body(run, keep_generation, before)` | delete the superseded generations of `run` written before `before`; returns how many rows. The generation a head names is never collected. A store that keeps none answers `0` |
+| `load_head(id)` | the run as an **observer** reads it: its `state` is the v5 head when the store has a current one (`head_version == version`), and the whole state otherwise. Defaults to `load_run`, so a store that keeps no head answers exactly as it does today. Nothing in the runtime calls it in the expand release: the tests do, and the read path (S2b) will |
+
+`BodyRow { idx, message }` is one row; `BodyWrite { generation, rows, writer }` is what a commit
+writes. A generation is **append-only**: `generation: None` appends `rows[old_len..]` to the current
+head's generation (or starts one when there is no head), and `Some(new)` is a compaction that writes
+the whole transcript under `new`. `writer` is the attempt's id: a commit that loses the CAS deletes
+the rows (and references) that writer added, so a loser cannot poison the next append. The head names
+`{generation, len}`; the store resolves the generation and patches the head.
+
+`RunUpdate` gained two public fields: `head: Option<Value>` (the v5 head this commit writes; `None`
+leaves the stored head and its version alone, so a delivery or a cancel keeps the format it read) and
+`body: Option<BodyWrite>` (the rows this commit writes; `None` writes none). **A hand-built
+`RunUpdate { .. }` literal stops compiling**: add `head: None, body: None` or use
+`RunUpdate::new(..)`, which keeps its signature and sets both, and the `.head(..)` / `.body(..)`
+builders. A commit that writes rows writes them **before** the CAS, and an adapter checks that all
+of them landed: a head must never name a generation that is missing a row.
+
+`purge_finished` keeps its signature and extends its contract: a run's body rows go with it.
 
 ## Push configurations
 
@@ -211,9 +244,13 @@ instead of skipping.
 live next to the code; those in `src/store/mod.rs` (`class_table`,
 `retryable_is_derived_from_the_class`,
 `backend_display_does_not_repeat_its_source`) pin the class of every
-`StoreError` variant with an exhaustive `match`. `src/secrets.rs` checks that `ProcessEnv` gives what the process has,
-that `NoSecrets` refuses a name the process has, that a held source's `Debug` shows its kind and not its values, and
-that no error says a value. Database gating is described in the
+`StoreError` variant with an exhaustive `match`. `the_defaults_keep_no_bodies_and_serve_the_whole_state`
+pins the three transcript defaults on a store that overrides none of them, and
+`a_head_round_trips_and_a_headless_commit_makes_it_stale` and
+`the_body_gc_keeps_the_current_generation_and_collects_an_old_one` pin `MemoryStore`'s head and its
+GC with an explicit cutoff. `src/secrets.rs` checks that `ProcessEnv` gives what the process has,
+that `NoSecrets` refuses a name the process has, that a held source's `Debug` shows its kind and not
+its values, and that no error says a value. Database gating is described in the
 [testing guide](../../docs/guides/testing.md).
 
 ## See also

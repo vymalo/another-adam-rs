@@ -142,6 +142,7 @@ pub mod scratch;
 pub mod share;
 pub mod shell;
 pub mod skills;
+mod workspace;
 
 pub use background::{BACKGROUND_TOOLS, Commands, CommandsSweep};
 pub use lsp::{LANGUAGE_SERVER_TOOLS, Language, ServerSpec, ServerTable};

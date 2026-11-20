@@ -47,7 +47,9 @@ use adam_core::{
     PushRecord, RunHeader, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreResult,
 };
 use async_trait::async_trait;
+use jiff::SignedDuration;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::fault::Method;
 
@@ -272,6 +274,155 @@ pub async fn measure_transcript_write(store: DynStore) -> Measurement {
     measured
 }
 
+/// The steps of [`measure_headless_transcript`]: 50, as S0's workload.
+pub const HEADLESS_STEPS: usize = 50;
+
+/// What one [`measure_headless_transcript`] run measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadlessMeasurement {
+    /// How many steps ran (50 when the workload ran to the end).
+    pub steps: usize,
+    /// The body rows the store wrote, summed over the steps: the full transcript each step.
+    pub rows: u64,
+    /// The serialized bytes of those rows.
+    pub bytes: u64,
+    /// How many body generations the store created: one per step, because a headless commit makes
+    /// the next split a compaction.
+    pub generations: u64,
+}
+
+impl HeadlessMeasurement {
+    /// The one line the test prints: `p2-headless: steps=50 rows=1275 bytes=13288347
+    /// generations=50`.
+    pub fn report(&self) -> String {
+        format!(
+            "p2-headless: steps={} rows={} bytes={} generations={}",
+            self.steps, self.rows, self.bytes, self.generations
+        )
+    }
+}
+
+impl fmt::Display for HeadlessMeasurement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.report())
+    }
+}
+
+/// Measure the **headless** path: a delivery-shaped commit (no head) between every split, so each
+/// split sees a stale head and starts a new body generation with the whole transcript.
+///
+/// This is the cost the one-line "resolve the generation from the head regardless" would hide:
+/// with a headless commit between steps, the body is quadratic again until S3, where `deliver`,
+/// `cancel` and `park_again` write the head they read. The workload is
+/// [`HEADLESS_STEPS`] steps of a 10 KB message, the last one `Done`, and the run is purged.
+///
+/// **A measurement, not a conformance case.** It asserts that each split wrote the whole
+/// transcript under a new generation (that is the path being measured) and prints
+/// [`HeadlessMeasurement::report`]; the `headless_measurement!` test asserts only that the workload
+/// ran. S3 changes the numbers, not the test.
+///
+/// # Panics
+///
+/// When the store errors: a measurement that cannot run is a broken test, not a number.
+pub async fn measure_headless_transcript(store: DynStore) -> HeadlessMeasurement {
+    // It purges the measured run at the end, and that call sweeps unreferenced blobs too: take the
+    // suite's lock so a concurrent case's blob is not collected (see `crate::BLOB_SUITE`).
+    let _turn = crate::BLOB_SUITE.lock().await;
+    let store = CountingStore::new(store);
+    let agent = crate::agent();
+    let run = store
+        .create_run(NewRun::new(&agent, json!({"turn": 0})))
+        .await
+        .expect("create the measured run");
+    let mut version = run.version;
+    let mut messages: Vec<Value> = Vec::with_capacity(HEADLESS_STEPS);
+    let mut measured = HeadlessMeasurement {
+        steps: 0,
+        rows: 0,
+        bytes: 0,
+        generations: 0,
+    };
+    for turn in 0..HEADLESS_STEPS {
+        // A delivery's shape: no head, no body, just the version. The head becomes stale.
+        version = store
+            .commit_run(
+                run.id,
+                version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": turn, "late": true})),
+            )
+            .await
+            .expect("the headless commit")
+            .version;
+        messages.push(json!({
+            "role": "assistant",
+            "text": message_text(MESSAGE_BYTES, turn as u64),
+        }));
+        let rows: Vec<adam_core::BodyRow> = messages
+            .iter()
+            .enumerate()
+            .map(|(idx, message)| adam_core::BodyRow {
+                idx: u32::try_from(idx).expect("a short transcript"),
+                message: message.clone(),
+            })
+            .collect();
+        let len = u32::try_from(rows.len()).expect("a short transcript");
+        let status = if turn + 1 == HEADLESS_STEPS {
+            RunStatus::Done
+        } else {
+            RunStatus::Runnable
+        };
+        let update = RunUpdate::new(status, json!({"messages": messages}))
+            .head(json!({"v": 5, "agent": {}, "body": {"generation": null, "len": len}}))
+            .body(adam_core::BodyWrite {
+                generation: None,
+                rows,
+                writer: Uuid::new_v4(),
+            });
+        version = store
+            .commit_run(run.id, version, update)
+            .await
+            .expect("the split after a headless commit")
+            .version;
+        let head = store
+            .load_head(run.id)
+            .await
+            .expect("load the head")
+            .expect("the measured run")
+            .state;
+        let generation = head["body"]["generation"]
+            .as_str()
+            .expect("the store resolved a generation");
+        let stored = store
+            .body_list(run.id, Uuid::parse_str(generation).expect("a uuid"))
+            .await
+            .expect("the body rows");
+        assert_eq!(
+            stored.len(),
+            messages.len(),
+            "a headless commit makes the next split write the whole transcript"
+        );
+        measured.steps += 1;
+        measured.rows += u64::try_from(stored.len()).unwrap_or(u64::MAX);
+        measured.bytes += stored
+            .iter()
+            .map(|row| {
+                serde_json::to_vec(&row.message)
+                    .map(|bytes| bytes.len() as u64)
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
+        measured.generations += 1;
+    }
+    store
+        .purge_finished(
+            &agent,
+            adam_core::store::now() + SignedDuration::from_mins(1),
+        )
+        .await
+        .expect("purge the measured run");
+    measured
+}
+
 /// One `load_run`, and the state bytes it transferred (a delta, not the cumulative counter).
 async fn read_state_bytes(store: &CountingStore, run: RunId) -> u64 {
     let before = store.state_bytes_read();
@@ -333,6 +484,15 @@ impl Store for CountingStore {
         Ok(record)
     }
 
+    async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
+        self.call(Method::LoadHead);
+        let record = self.inner.load_head(id).await?;
+        if let Some(record) = &record {
+            self.read(record);
+        }
+        Ok(record)
+    }
+
     async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
         self.call(Method::RunHeader);
         self.inner.run_header(id).await
@@ -350,6 +510,34 @@ impl Store for CountingStore {
         self.wrote(written);
         self.read(&record);
         Ok(record)
+    }
+
+    fn keeps_bodies(&self) -> bool {
+        self.inner.keeps_bodies()
+    }
+
+    async fn body_list(
+        &self,
+        run: RunId,
+        generation: Uuid,
+    ) -> StoreResult<Vec<adam_core::BodyRow>> {
+        self.call(Method::BodyList);
+        self.inner.body_list(run, generation).await
+    }
+
+    async fn gc_body(
+        &self,
+        run: RunId,
+        keep_generation: Uuid,
+        before: Timestamp,
+    ) -> StoreResult<u64> {
+        self.call(Method::GcBody);
+        self.inner.gc_body(run, keep_generation, before).await
+    }
+
+    async fn blob_stored(&self, id: &BlobId) -> StoreResult<bool> {
+        self.call(Method::BlobStored);
+        self.inner.blob_stored(id).await
     }
 
     async fn open_run_for_conversation(
@@ -512,6 +700,44 @@ mod tests {
     use super::*;
 
     const AGENT: &str = "counting-test";
+
+    /// The wrapper must not swallow `gc_body` or `blob_stored`: a wrapped store that answers the
+    /// trait defaults would collect nothing and re-put every blob.
+    #[tokio::test]
+    async fn the_wrapper_forwards_gc_body_and_blob_stored() {
+        let store = counting();
+        let run = create(&store).await;
+        let generation = Uuid::new_v4();
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1})).body(
+                    adam_core::BodyWrite {
+                        generation: Some(generation),
+                        rows: vec![adam_core::BodyRow {
+                            idx: 0,
+                            message: json!("one"),
+                        }],
+                        writer: Uuid::new_v4(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let cutoff = adam_core::store::now() + SignedDuration::from_hours(1);
+        assert_eq!(
+            store.gc_body(run.id, Uuid::new_v4(), cutoff).await.unwrap(),
+            1,
+            "the wrapper reaches the inner store's GC"
+        );
+        assert_eq!(store.calls(Method::GcBody), 1);
+        let id = BlobId::from_hex(&"a".repeat(64)).unwrap();
+        assert!(!store.blob_stored(&id).await.unwrap());
+        store.put_blob(&id, b"x").await.unwrap();
+        assert!(store.blob_stored(&id).await.unwrap());
+        assert_eq!(store.calls(Method::BlobStored), 2);
+    }
 
     fn counting() -> Arc<CountingStore> {
         Arc::new(CountingStore::new(Arc::new(MemoryStore::new())))

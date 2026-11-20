@@ -1710,9 +1710,7 @@ mod tests {
 
     #[test]
     fn the_spec_is_what_the_model_reads() {
-        let state = Arc::new(UiState::new(Arc::new(
-            crate::thread_tools::ThreadToolsClient::new(adam_mcp::McpPolicy::default()),
-        )));
+        let state = Arc::new(UiState::without_thread_tools());
         let spec = AskUser::new(Arc::clone(&state), DEFAULT_ASK_LEAD).spec();
         assert_eq!(spec.name, "ask_user");
         assert!(

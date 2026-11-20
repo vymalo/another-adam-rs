@@ -39,6 +39,9 @@
 
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
+// These docs describe the thread tools; built without them (the embedded set, ADR 0047) their links to
+// them have no target. The documented build, with every feature, checks every link.
+#![cfg_attr(not(feature = "thread-tools"), allow(rustdoc::broken_intra_doc_links))]
 
 mod ask;
 mod cache;
@@ -46,14 +49,17 @@ mod catalog;
 mod mentions;
 mod plan;
 mod resolve;
+mod screen;
 mod show;
 mod surface;
+#[cfg(feature = "thread-tools")]
 mod thread_tools;
 
 use std::sync::Arc;
 
 use adam_a2a::{AgentCardConfig, ExtensionConfig};
 use adam_llm_agent::ToolSet;
+#[cfg(feature = "thread-tools")]
 use adam_mcp::McpPolicy;
 
 pub use ask::{ASK_USER, AskUser, DEFAULT_ASK_LEAD};
@@ -63,10 +69,12 @@ pub use catalog::{
     catalog_digest,
 };
 pub use plan::{PLAN_ADD, PLAN_CHECK, PLAN_WORK, PlanAdd, PlanCheck, PlanWork};
+pub use screen::ScreenSource;
 pub use show::{MAX_BLOCKS, SHOW, Show, UI_CATALOG, UiCatalogTool};
 pub use surface::{
     A2UI_VERSION, ask_attempt, ask_retry_surface_id, ask_surface_id, is_ask_surface_of,
 };
+#[cfg(feature = "thread-tools")]
 pub use thread_tools::{
     Clock, GET_UI_CATALOG, LISTING_TTL, META_KEY, TURN_OUTPUT, TURN_OUTPUT_DELIVERED, ThreadTools,
     ThreadToolsClient,
@@ -98,14 +106,26 @@ impl std::fmt::Debug for Ui {
 
 impl Ui {
     /// The tools and the source over a thread-tools client under `policy`.
+    #[cfg(feature = "thread-tools")]
     pub fn new(policy: McpPolicy) -> Self {
         Self::with_client(ThreadToolsClient::new(policy))
     }
 
     /// As [`new`](Self::new), over a client you made (one with a clock of its own, in a test).
+    #[cfg(feature = "thread-tools")]
     pub fn with_client(client: ThreadToolsClient) -> Self {
         Self {
             state: Arc::new(UiState::new(Arc::new(client))),
+            ask_lead: DEFAULT_ASK_LEAD.to_owned(),
+        }
+    }
+
+    /// The tools with no thread-tools client, for an embedded agent (adam ADR 0047) or any agent that
+    /// is never sent an MCP endpoint: a catalog a message carries is used, and one that would have
+    /// to be read again is not, so the agent answers in text. Available in every build.
+    pub fn embedded() -> Self {
+        Self {
+            state: Arc::new(UiState::without_thread_tools()),
             ask_lead: DEFAULT_ASK_LEAD.to_owned(),
         }
     }
@@ -137,8 +157,16 @@ impl Ui {
     /// `ui_catalog` for that: [`ThreadTools`]). The source also describes `show` with the components
     /// of the conversation's screen, so register [`tools`](Self::tools) and this source on the same
     /// agent. Add it **last** among an agent's sources.
+    #[cfg(feature = "thread-tools")]
     pub fn source(&self) -> ThreadTools {
         ThreadTools::of_ui(Arc::clone(&self.state))
+    }
+
+    /// The screen's source without thread tools: the mentioned agents and `show` described with the
+    /// screen's components, no tool and nothing read from anywhere. Register it, **last** among an
+    /// agent's sources, on an agent that has no thread-tools source (an embedded one); never both.
+    pub fn screen(&self) -> ScreenSource {
+        ScreenSource::new(Arc::clone(&self.state))
     }
 
     /// The catalogs this process has read.

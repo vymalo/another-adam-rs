@@ -358,9 +358,23 @@ impl ExtensionConfig {
     }
 }
 
+/// The member of an artifact's `metadata` that says its id is **its own and kept**: the run replaces
+/// the artifact under that id when it changes, so the same id can carry different content later. An
+/// artifact without it has an id made from its content (a different content is a different id),
+/// and a delivery cursor keeps nothing more about it than the id.
+pub const REPLACEABLE_ARTIFACT: &str = "vymalo.replaceable";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The metadata key is part of the wire: clients and delivery cursors read it by name.
+    #[test]
+    fn the_replaceable_artifact_key_is_the_wire_name() {
+        assert_eq!(REPLACEABLE_ARTIFACT, "vymalo.replaceable");
+        #[cfg(feature = "server")]
+        assert_eq!(crate::push::REPLACEABLE_ARTIFACT, REPLACEABLE_ARTIFACT);
+    }
 
     #[test]
     fn a_version_carries_the_short_revision_as_build_metadata() {

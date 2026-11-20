@@ -306,11 +306,26 @@ dependencies = [
  "aho-corasick",
  "async-trait",
  "base64 0.22.1",
+ "globset",
+ "regex",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "adam-code-tools-testkit"
+version = "0.1.0"
+dependencies = [
+ "adam-code-tools",
+ "adam-llm-agent",
+ "adam-runtime",
+ "adam-workspace",
+ "async-trait",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -324,6 +339,7 @@ dependencies = [
  "adam-a2a-runtime",
  "adam-agent-fs",
  "adam-code-tools",
+ "adam-code-tools-testkit",
  "adam-core",
  "adam-devcontainer",
  "adam-env-kubernetes",
@@ -412,6 +428,20 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "adam-engine"
+version = "0.1.0"
+dependencies = [
+ "adam-a2a-runtime",
+ "adam-agent-fs",
+ "adam-core",
+ "adam-error",
+ "adam-llm-agent",
+ "adam-model",
+ "adam-runtime",
+ "adam-ui",
 ]
 
 [[package]]

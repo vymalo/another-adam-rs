@@ -14,7 +14,7 @@ use crate::runtime::RuntimeError;
 
 pub(crate) const VERSION: u32 = 1;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Envelope {
     /// Layout version.
     pub v: u32,

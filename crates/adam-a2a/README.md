@@ -194,7 +194,8 @@ answered as described under *Protocol notes*, not through `BackendError`.
 
 | Feature | Default | Effect |
 |---|---|---|
-| `test-util` | no | ships `InMemoryBackend`, `InMemoryPushStore` and `generate_signing_key_pem` (pulls in `tokio-stream`); also useful to other repositories' tests |
+| `server` | **yes** | the A2A server (`A2aServer`, `ServerOptions`, `AuthConfig`, the REST binding, Swagger UI, the extended card), card signing (`CardSigner`, `VerifyingKey`, …) and the `push` module; pulls in `axum`, `a2a-server-lf`, `utoipa-swagger-ui`, `reqwest` and `rustls` with `aws-lc-rs`. Without it ([ADR 0047](../../docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), the embedded set) the crate is the `TaskBackend` port, the card's configuration, the extension constants (`REPLACEABLE_ARTIFACT` among them, also re-exported from `push`), `AccessTier` and the page types: data, no HTTP, no TLS |
+| `test-util` | no | ships `InMemoryBackend`, `InMemoryPushStore` and `generate_signing_key_pem` (pulls in `tokio-stream`; the last two need `server`); also useful to other repositories' tests |
 
 No environment variables (the binaries read `A2A_PUSH_*`, `A2A_CARD_SIGNING_*` and `A2A_DOCS` in
 [`adam-service`](../adam-service/README.md) and pass them in `ServerOptions`).
