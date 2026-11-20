@@ -75,6 +75,7 @@ export function specsOf(blocks, { selfRepo = null, pilot = false } = {}) {
       phase: pilot ? 'pilot' : 'run',
       source: sourceOf(b.task, selfRepo),
       language: b.task.language ?? null,
+      agentPath: b.task.agentPath ?? null,
     })),
   );
   const seen = new Set();

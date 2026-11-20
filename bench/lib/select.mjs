@@ -105,11 +105,11 @@ export function pickInOrder(order, isKept, opts) {
   return chosen;
 }
 
-/** The lock file body: ids, checksums, image digests and the seed, and what pins the source. Nothing else. */
+/** The lock file body: ids, checksums, image digests, each task's agent-path attribute and the seed, and what pins the source. Nothing else. */
 export function buildLock({ source, seed, upstreamCommit = null, tasks }) {
   const lock = { schema: 1, source, seed: String(seed) };
   if (upstreamCommit) lock.upstreamCommit = upstreamCommit;
-  lock.tasks = tasks.map((t) => ({ id: t.id, repo: t.repo, checksum: t.checksum, image: t.imageDigest ?? null }));
+  lock.tasks = tasks.map((t) => ({ id: t.id, repo: t.repo, checksum: t.checksum, image: t.imageDigest ?? null, agentPath: t.agentPath ?? 'not-run' }));
   return lock;
 }
 

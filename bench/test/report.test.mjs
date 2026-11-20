@@ -254,3 +254,19 @@ test('entries a container left that the harness refused (a FIFO, a device, a fil
   assert.match(text, /\| r1 \|[^\n]*service/);
   assert.match(buildReport(records.slice(0, 6).concat({ kind: 'state', run: 'r1', state: 'Done', result: { pass: true, grades: [1, 1, 1], exit: 'done', wallMs: 1 } })), /Refused entries[\s\S]*None\./);
 });
+
+test('the report counts the tasks by the agent-path attribute, once per task and arm-independent, and rates each', () => {
+  const recs = fixture().map((r) => (r.kind === 'state' && r.state === 'Planned' ? { ...r, agentPath: r.task === 'T1' || r.task === 'T2' ? 'fail' : r.task === 'T6' ? 'not-run' : 'pass' } : r));
+  const text = buildReport(recs);
+  assert.match(text, /## Agent path/);
+  assert.match(text, /\| pass \| 3 \|/);
+  assert.match(text, /\| fail \| 2 \|/);
+  assert.match(text, /\| not-run \| 1 \|/);
+  assert.match(text, /\| fail \| a \| max \| 2 \| 2 \|/);
+  assert.match(buildReport(fixture()), /\| not recorded \| 6 \|/, 'a ledger from before the attribute says so');
+});
+
+test('the attribute survives a run that is planned again', () => {
+  const planned = { kind: 'state', run: 'T1-a-max', state: 'Planned', task: 'T1', agent: 'a', arm: 'max', source: 'public', language: 'go', agentPath: 'fail' };
+  assert.equal(foldRecords([planned]).get('T1-a-max').agentPath, 'fail');
+});

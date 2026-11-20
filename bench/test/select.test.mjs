@@ -99,9 +99,9 @@ test('bad options are refused', () => {
   assert.throws(() => selectTasks([], { seed: 1, total: 1, perRepoCap: 0 }), RangeError);
 });
 
-test('the lock holds ids, checksums, image digests and the seed, nothing else', () => {
-  const lock = buildLock({ source: 'public', seed: 7, upstreamCommit: 'c'.repeat(40), tasks: [{ id: 'x', repo: 'r', checksum: 'h', imageDigest: 'sha256:d', instruction: 'SECRET TEXT', dir: '/somewhere' }] });
-  assert.deepEqual(lock, { schema: 1, source: 'public', seed: '7', upstreamCommit: 'c'.repeat(40), tasks: [{ id: 'x', repo: 'r', checksum: 'h', image: 'sha256:d' }] });
+test('the lock holds ids, checksums, image digests, the agent-path attribute and the seed, nothing else', () => {
+  const lock = buildLock({ source: 'public', seed: 7, upstreamCommit: 'c'.repeat(40), tasks: [{ id: 'x', repo: 'r', checksum: 'h', imageDigest: 'sha256:d', agentPath: 'fail', instruction: 'SECRET TEXT', dir: '/somewhere' }] });
+  assert.deepEqual(lock, { schema: 1, source: 'public', seed: '7', upstreamCommit: 'c'.repeat(40), tasks: [{ id: 'x', repo: 'r', checksum: 'h', image: 'sha256:d', agentPath: 'fail' }] });
   assert.equal(lockText(lock).includes('SECRET TEXT'), false);
   assert.equal(lockText(lock).includes('/somewhere'), false);
 });
