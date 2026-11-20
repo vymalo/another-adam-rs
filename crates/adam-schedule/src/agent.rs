@@ -17,8 +17,16 @@ use serde_json::{Value, json};
 
 use crate::{Due, ScheduleSpec, fired_conversation_id, fired_run_id};
 
-/// The name the scheduler agent is registered under.
-pub const SCHEDULER_AGENT: &str = "adam.schedule";
+/// The last segment of a scheduler's registered name: `<agent>/adam.schedule` ([`scheduler_agent_name`]).
+pub const SCHEDULER_SUFFIX: &str = "adam.schedule";
+
+/// The name the scheduler of `agent`'s schedules is registered under, `<agent>/adam.schedule`, as a
+/// session round's is `<root>/<subagent>`: a worker claims the runs of the agents it registered, so
+/// agents that share a database each step their own schedulers (an agent's name has no `.`, so no
+/// subagent shares it).
+pub fn scheduler_agent_name(agent: &str) -> String {
+    format!("{agent}/{SCHEDULER_SUFFIX}")
+}
 
 /// The [`Inbound::kind`] of the message that starts a scheduler run: its payload is the
 /// [`SchedulerState`] to begin with.
@@ -134,9 +142,29 @@ impl SchedulerState {
     }
 }
 
-/// The scheduler agent. Register it on every runtime that steps schedules; it needs nothing.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SchedulerAgent;
+/// The scheduler of one agent's schedules, registered as [`scheduler_agent_name`] of it. Register it
+/// on every runtime that steps that agent; it needs nothing else.
+#[derive(Debug, Clone)]
+pub struct SchedulerAgent {
+    agent: String,
+    name: String,
+}
+
+impl SchedulerAgent {
+    /// The scheduler of `agent`'s schedules.
+    pub fn new(agent: impl Into<String>) -> Self {
+        let agent = agent.into();
+        Self {
+            name: scheduler_agent_name(&agent),
+            agent,
+        }
+    }
+
+    /// The agent whose schedules it fires.
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+}
 
 /// What the fire step records: whether it created the run, or why the start failed.
 #[derive(Serialize, Deserialize)]
@@ -150,7 +178,7 @@ impl Agent for SchedulerAgent {
     type State = SchedulerState;
 
     fn name(&self) -> &str {
-        SCHEDULER_AGENT
+        &self.name
     }
 
     fn init(&self, input: Inbound) -> Result<SchedulerState, AgentError> {
@@ -171,6 +199,12 @@ impl Agent for SchedulerAgent {
     ) -> Result<Transition<SchedulerState>, AgentError> {
         // A message is no instruction to a scheduler: it only woke it early.
         drop(ctx.take_inbox());
+        if state.schedule.agent != self.agent {
+            return Err(AgentError::permanent(format!(
+                "the scheduler of `{}` was given a schedule of `{}`",
+                self.agent, state.schedule.agent
+            )));
+        }
         let spec = ScheduleSpec::from_schedule(&state.schedule.to_schedule())
             .map_err(AgentError::permanent)?;
         let now = ctx.now_journaled().await?;

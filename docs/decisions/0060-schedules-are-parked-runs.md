@@ -9,6 +9,13 @@ written at the same time.
 `/` and `@` as `%25`, `%2F` and `%40`), so a name cannot make one schedule's conversation another's
 firing or a session's; `next_due` is built as `ScheduleSpec::due_after`.
 
+*Amended* (2026-11-20, slice 5): the binary registers `SchedulerAgent` and reconciles, through
+`adam_schedule::reconcile_store` in a worker component, rather than `adam-assembly`; `adam-service` is unchanged
+(no `Agents::runtime_component`): the component builds a runtime of its own over the store it is given. The
+scheduler of an agent is registered as `<agent>/adam.schedule`, not `adam.schedule` (decision 1): a worker claims
+the runs of the agents it registered, and agents that share one database must each step their own schedulers, or a
+worker of one fires another's schedule into an agent it does not know.
+
 ## Context
 
 An agent folder may hold `schedules/<name>.md`: frontmatter `cron:` and `timezone:`, the body a prompt

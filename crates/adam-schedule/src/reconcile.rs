@@ -8,7 +8,7 @@ use adam_runtime::{
     Inbound, Runtime, RuntimeError, SCHEDULE_CONVERSATION_PREFIX, view_from_record,
 };
 
-use crate::agent::{SCHEDULER_AGENT, SCHEDULER_START_KIND, SchedulerState};
+use crate::agent::{SCHEDULER_START_KIND, SchedulerState, scheduler_agent_name};
 use crate::{ScheduleError, ScheduleSpec, schedule_conversation_id};
 
 /// The reason a scheduler run is cancelled with when its schedule is gone.
@@ -45,6 +45,22 @@ pub enum ReconcileError {
     Runtime(#[from] RuntimeError),
 }
 
+impl adam_runtime::Classify for ReconcileError {
+    fn class(&self) -> adam_runtime::ErrorClass {
+        match self {
+            Self::Schedule(_) => adam_runtime::ErrorClass::Invalid,
+            Self::Runtime(e) => e.class(),
+        }
+    }
+
+    fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Schedule(_) => None,
+            Self::Runtime(e) => e.retry_after(),
+        }
+    }
+}
+
 /// Make the scheduler runs of `agent` on `runtime` match `schedules`, the folder's schedules of
 /// that agent (decision 5). For each schedule, the latest scheduler run of its conversation
 /// decides:
@@ -59,7 +75,7 @@ pub enum ReconcileError {
 /// start refused with `ConversationBusy` means another process started one first: the
 /// conversation is read again and the rules applied once more.
 ///
-/// The runtime must have [`SchedulerAgent`](crate::SchedulerAgent) registered.
+/// The runtime must have `SchedulerAgent::new(agent)` registered ([`SchedulerAgent`](crate::SchedulerAgent)).
 ///
 /// # Errors
 ///
@@ -81,6 +97,29 @@ pub async fn reconcile(
 
     let latest = latest_by_conversation(runtime, agent).await?;
     apply(runtime, agent, &expected, latest).await
+}
+
+/// [`reconcile`] on a runtime of its own over `store`, with only `agent`'s
+/// [`SchedulerAgent`](crate::SchedulerAgent) registered: what a binary's worker component calls at
+/// start, given the store the service connected. The runtime only starts and cancels scheduler
+/// runs, so it needs no other agent; the runtime that steps them registers the same scheduler.
+///
+/// It has no notifier and the system clock: the runs it starts and cancels reach the workers at
+/// their next poll, and a new scheduler's anchor (what an `after` counts from) is this process's
+/// time.
+///
+/// # Errors
+///
+/// As [`reconcile`].
+pub async fn reconcile_store(
+    store: adam_core::DynStore,
+    agent: &str,
+    schedules: &[Schedule],
+) -> Result<Reconciled, ReconcileError> {
+    let runtime = Runtime::builder(store)
+        .agent(crate::SchedulerAgent::new(agent))
+        .build();
+    reconcile(&runtime, agent, schedules).await
 }
 
 /// The rules of [`reconcile`] over a listing read before: a listing gone stale (another process
@@ -127,7 +166,7 @@ async fn apply(
             let started = runtime
                 .start_with_id(
                     RunId::new(),
-                    SCHEDULER_AGENT,
+                    &scheduler_agent_name(agent),
                     Inbound::new(SCHEDULER_START_KIND, payload),
                     Some(conversation),
                 )
@@ -139,7 +178,7 @@ async fn apply(
                 }
                 Err(RuntimeError::ConversationBusy { .. }) if attempt < BUSY_RETRIES => {
                     // Another process started one first: read the conversation and decide again.
-                    match latest_in(runtime, conversation).await? {
+                    match latest_in(runtime, agent, conversation).await? {
                         Some(rec) => latest.insert(conversation.clone(), rec),
                         None => latest.remove(conversation),
                     };
@@ -186,7 +225,7 @@ async fn latest_by_conversation(
 ) -> Result<BTreeMap<String, RunRecord>, RuntimeError> {
     let prefix = format!("{SCHEDULE_CONVERSATION_PREFIX}{agent}/");
     let mut out: BTreeMap<String, RunRecord> = BTreeMap::new();
-    for rec in list(runtime, ConversationScope::Prefix(prefix)).await? {
+    for rec in list(runtime, agent, ConversationScope::Prefix(prefix)).await? {
         let Some(conversation) = rec.conversation_id.clone() else {
             continue;
         };
@@ -203,10 +242,17 @@ async fn latest_by_conversation(
 /// The scheduler run that decides for one conversation.
 async fn latest_in(
     runtime: &Runtime,
+    agent: &str,
     conversation: &str,
 ) -> Result<Option<RunRecord>, RuntimeError> {
     let mut latest: Option<RunRecord> = None;
-    for rec in list(runtime, ConversationScope::Exact(conversation.to_owned())).await? {
+    for rec in list(
+        runtime,
+        agent,
+        ConversationScope::Exact(conversation.to_owned()),
+    )
+    .await?
+    {
         if latest.as_ref().is_none_or(|seen| decides_over(&rec, seen)) {
             latest = Some(rec);
         }
@@ -223,9 +269,13 @@ fn decides_over(rec: &RunRecord, seen: &RunRecord) -> bool {
     }
 }
 
-/// Every scheduler run in `scope`, all pages.
-async fn list(runtime: &Runtime, scope: ConversationScope) -> Result<Vec<RunRecord>, RuntimeError> {
-    let mut query = RunQuery::new(SCHEDULER_AGENT, scope, PAGE);
+/// Every run of `agent`'s scheduler in `scope`, all pages.
+async fn list(
+    runtime: &Runtime,
+    agent: &str,
+    scope: ConversationScope,
+) -> Result<Vec<RunRecord>, RuntimeError> {
+    let mut query = RunQuery::new(scheduler_agent_name(agent), scope, PAGE);
     let mut out = Vec::new();
     loop {
         let page = runtime.store().list_runs(&query).await?;
@@ -255,7 +305,7 @@ mod tests {
         let at = adam_core::time::Timestamp(created_at.parse().unwrap());
         RunRecord {
             id: RunId::new(),
-            agent: SCHEDULER_AGENT.into(),
+            agent: scheduler_agent_name("coder"),
             conversation_id: Some("adam.schedule:coder/daily".into()),
             parent_id: None,
             status,
@@ -284,7 +334,9 @@ mod tests {
     #[tokio::test]
     async fn a_start_refused_as_busy_reads_again_and_keeps_the_other() {
         let store: DynStore = Arc::new(MemoryStore::new());
-        let rt = Runtime::builder(store).agent(SchedulerAgent).build();
+        let rt = Runtime::builder(store)
+            .agent(SchedulerAgent::new("coder"))
+            .build();
         let schedule = Schedule {
             name: "daily".into(),
             cron: "0 9 * * *".into(),
@@ -318,6 +370,7 @@ mod tests {
         );
         let open = list(
             &rt,
+            "coder",
             ConversationScope::Prefix("adam.schedule:coder/".into()),
         )
         .await

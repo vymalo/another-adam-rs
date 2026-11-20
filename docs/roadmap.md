@@ -10,7 +10,7 @@
 | 2 | Run state machine and `ctx.step` journaling (`adam-runtime`) | built |
 | 3 | `#[tool]` macro (`adam-macros`, through the `adam` facade) | built: [Agent files](reference/agent-files.md#the-tool-contract) |
 | 4 | `build.rs` discovery of `agent/` (instructions, skills, subagents, `mcp.json`) | built: parser and validator (`adam-agent-fs`), binding to `LlmAgent`s (`adam-assembly`), subagents as child runs (local and remote A2A), dev reload, `mcp.json` tools, run-time folders (`ADAM_AGENT_DIR`) |
-| 5 | Parking, approvals, schedules | partly: parking and `ask_user` are built; approvals (`approval:`) and running schedules are not (schedule files are read and warned about) |
+| 5 | Parking, approvals, schedules | partly: parking and `ask_user` are built, and schedules run in `adam-agent` ([ADR 0060](decisions/0060-schedules-are-parked-runs.md); not yet in the coder); approvals (`approval:`) are not |
 | 6 | Dev TUI (`cargo adam dev`) | not started |
 | 7 | Host adapters (axum/tower), channels, sandboxes | not started |
 | 8 | The A2A 1.0 server, complete | built, [ADR 0030](decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md): push notifications (durable, at least once, off unless a webhook allow-list is set), `ListTasks`, `GetExtendedAgentCard`, signed cards. Not done: encrypted webhook credentials, signed notifications (the specification asks for none), per-caller extended cards |
