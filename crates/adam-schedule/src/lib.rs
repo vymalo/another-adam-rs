@@ -13,12 +13,19 @@
 
 #![warn(missing_docs)]
 
+mod agent;
 mod due;
 mod ids;
+mod reconcile;
 
 pub use adam_agent_fs::{At, Cron, When};
+pub use agent::{
+    FIRING_KIND, FIRINGS_KEPT, Firing, SCHEDULER_AGENT, SCHEDULER_START_KIND, ScheduleRecord,
+    SchedulerAgent, SchedulerState,
+};
 pub use due::{Due, MISSED_MAX};
 pub use ids::{Trigger, fired_conversation_id, fired_run_id, schedule_conversation_id, trigger_of};
+pub use reconcile::{CHANGED_REASON, REMOVED_REASON, ReconcileError, Reconciled, reconcile};
 
 use adam_agent_fs::Schedule;
 use jiff::tz::TimeZone;

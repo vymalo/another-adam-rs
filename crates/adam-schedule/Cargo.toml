@@ -13,10 +13,17 @@ adam-agent-fs.workspace = true
 adam-core.workspace = true
 adam-runtime.workspace = true
 # The bundled time-zone database, never the host's (ADR 0060, decision 6).
+async-trait.workspace = true
 jiff = { workspace = true, features = ["tzdb-bundle-always"] }
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+
+
+[dev-dependencies]
+tokio.workspace = true
 
 [lints]
 workspace = true
