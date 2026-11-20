@@ -77,7 +77,12 @@ test('a plain call: the key is injected, the model rewritten, the fragment merge
   assert.deepEqual(seen.body.messages, [{ role: 'user', content: 'hi' }]);
 
   const settled = callRecords(s.ledger, 'settled');
-  assert.equal(callRecords(s.ledger, 'pending').length, 1, 'a pending record came first');
+  const pending = callRecords(s.ledger, 'pending');
+  assert.equal(pending.length, 1, 'a pending record came first');
+  assert.equal(pending[0].effort, 'high', 'the effective reasoning setting is the arm');
+  assert.equal(pending[0].askedEffort, 'low', "the agent's own is kept beside it");
+  assert.equal(pending[0].bytes, Buffer.byteLength(JSON.stringify(seen.body)), 'the size of what was sent');
+  assert.equal(pending[0].tools, 0);
   assert.equal(settled.length, 1);
   assert.equal(settled[0].costMicro, SCRIPTED_COST);
   assert.equal(settled[0].usageMissing, false);

@@ -130,3 +130,30 @@ test('the work profile adds Helpers, in OpenCode words; the owner profile is unc
   assert.equal(work.text.replace(/# Helpers\n[\s\S]*?(?=# )/, ''), owner.text);
   assert.throws(() => sharedPrompt(file, { profile: 'nope' }), /no prompt profile/);
 });
+
+test('the fold reads child sessions, request sizes and the reasoning setting from the calls', async () => {
+  const { foldRecords } = await import('../lib/ledger.mjs');
+  const at = (s) => `2026-11-20T10:00:${String(s).padStart(2, '0')}.000Z`;
+  const recs = [{ v: 1, t: at(0), kind: 'state', run: 'r', state: 'Planned', task: 't', agent: 'adam', arm: 'max' }];
+  // main, main, child A x2, main, child B, child A, main
+  const prompts = ['m', 'm', 'a', 'a', 'm', 'b', 'a', 'm'];
+  prompts.forEach((p, i) => {
+    recs.push({ v: 1, t: at(i * 5), kind: 'call', run: 'r', attempt: 1, call: i + 1, phase: 'pending', worstMicro: 1, prompt: p, bytes: 100 + i, effort: 'max' });
+    recs.push({ v: 1, t: at(i * 5 + 3), kind: 'call', run: 'r', attempt: 1, call: i + 1, phase: 'settled', costMicro: 1, usage: { input: 1, output: 1 } });
+  });
+  const v = foldRecords(recs).get('r');
+  assert.deepEqual(v.sent.bytes, [100, 101, 102, 103, 104, 105, 106, 107]);
+  assert.deepEqual(v.sent.efforts, ['max']);
+  // sessions: [a a] (10s..18s = 8s), [b] (25..28 = 3s), [a] (30..33 = 3s)
+  assert.deepEqual(v.sent.children, { sessions: 3, calls: 4, ms: 14_000, kinds: 2 });
+});
+
+test('a ledger without the new fields folds to no sessions and empty lists', async () => {
+  const { foldRecords } = await import('../lib/ledger.mjs');
+  const v = foldRecords([
+    { v: 1, t: '2026-11-20T10:00:00.000Z', kind: 'state', run: 'r', state: 'Planned' },
+    { v: 1, t: '2026-11-20T10:00:01.000Z', kind: 'call', run: 'r', attempt: 1, call: 1, phase: 'pending', worstMicro: 1 },
+    { v: 1, t: '2026-11-20T10:00:02.000Z', kind: 'call', run: 'r', attempt: 1, call: 1, phase: 'settled', costMicro: 1 },
+  ]).get('r');
+  assert.deepEqual(v.sent, { bytes: [], efforts: [], children: { sessions: 0, calls: 0, ms: 0, kinds: 0 } });
+});

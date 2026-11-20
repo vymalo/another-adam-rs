@@ -40,6 +40,17 @@ const NEVER_CHARGED = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ERR_IN
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
+/**
+ * A short fingerprint of a request's system prompt: the main agent keeps one through a run, and a child session (a subagent) has
+ * another, so the report can tell the calls of each apart without reading them. Never the text itself. null without a system message.
+ */
+export function promptId(body) {
+  const sys = Array.isArray(body?.messages) ? body.messages.find((m) => m?.role === 'system' || m?.role === 'developer') : null;
+  if (!sys) return null;
+  const text = typeof sys.content === 'string' ? sys.content : JSON.stringify(sys.content);
+  return crypto.createHash('sha256').update(text).digest('hex').slice(0, 10);
+}
+
 /** Merge `over` onto `base`: objects merge key by key, anything else is replaced; `over` wins. */
 export function deepMerge(base, over) {
   const out = { ...base };
@@ -305,7 +316,10 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
       return sendJson(res, 429, { error: { message: 'bench budget reached', type: 'bench_budget', code: 'budget_reached' } });
     }
     try {
-      ledger.append({ ...base, phase: 'pending', worstMicro, stream: prepared.stream });
+      // What was sent, for the report: the effective reasoning setting (the arm's fragment wins over the agent's own, which is kept
+      // too), the size of the request and how many tools it offered.
+      const sent = { effort: prepared.body.reasoning_effort ?? null, askedEffort: parsed.reasoning_effort ?? null, bytes: payload.length, tools: Array.isArray(prepared.body.tools) ? prepared.body.tools.length : 0, prompt: promptId(prepared.body) };
+      ledger.append({ ...base, phase: 'pending', worstMicro, stream: prepared.stream, ...sent });
     } catch {
       book.endCall(run.id, worstMicro, 0);
       return sendJson(res, 500, { error: { message: 'ledger unavailable' } });
