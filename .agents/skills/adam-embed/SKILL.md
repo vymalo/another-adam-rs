@@ -78,7 +78,8 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
 ## In an application: `adam-engine`
 
 For an application (a desktop or a phone app) that runs adam itself, with no server, no protocol and nothing on
-the network of its own (ADR 0047, `docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md`), depend on
+the network of its own (ADR 0047, `docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md`:
+https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), depend on
 `crates/adam-engine` instead of the crates above. The human guide is `docs/guides/embed-in-an-app.md`:
 https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.md.
 
@@ -91,7 +92,8 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.
   `#[non_exhaustive]`). `events(run)` is bounded: a slow reader gets `Behind`, then a `Snapshot` read from the store.
 * **Keep the embedded set**: anything else you depend on takes `adam-a2a` without `server`, `adam-a2a-runtime` without
   `push`, `adam-assembly` (and `adam`) without `remote`, and `adam-ui` without `thread-tools`, or Cargo turns them back
-  on. adam-rs checks the engine's own tree with `tools/embedded-deps/check.sh`; in yours,
+  on. adam-rs checks the engine's own tree with `tools/embedded-deps/check.sh`
+  (https://github.com/vymalo/another-adam-rs/blob/main/tools/embedded-deps/check.sh); in yours,
   `cargo tree -e features -i adam-assembly` shows what turns `remote` back on. Your own model client may bring an HTTP
   client and TLS: that is the host's choice, not adam's.
 * **The worked example** is `crates/adam-engine/examples/chat` (`main.rs` builds the engine, `app.rs` is the loop a

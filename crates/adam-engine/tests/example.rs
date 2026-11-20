@@ -207,9 +207,14 @@ impl Session {
     /// `/quit`, and the example returns.
     async fn quit(mut self) -> (Transcript, Engine, Arc<MockModel>) {
         self.type_line("/quit").await;
+        self.returns().await
+    }
+
+    /// The example returns by itself.
+    async fn returns(self) -> (Transcript, Engine, Arc<MockModel>) {
         timeout(WAIT, self.app)
             .await
-            .expect("the example quits in time")
+            .expect("the example returns in time")
             .unwrap()
             .expect("the example ends cleanly");
         (self.screen, self.engine, self.mock)
@@ -339,5 +344,62 @@ async fn the_example_steers_refuses_an_early_answer_and_cancels() {
             .flat_map(|r| &r.messages)
             .all(|m| !m.text().contains("too soon")),
         "the refused answer reached nothing"
+    );
+}
+
+/// An input that ends right after a send (`printf 'hi\n' | chat`): the example follows the run to
+/// its end, prints the whole reply, and only then shuts the engine down. A second run asks a
+/// question, which ends the wait: nothing more will be typed to answer it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_end_of_the_input_waits_for_the_run() {
+    let mut s = Session::new(0, Hold::Start).await;
+    s.mock.push_text("Hello! What shall we talk about?");
+    s.type_line("hi").await;
+    timeout(WAIT, s.gate.reached.notified())
+        .await
+        .expect("the model is called");
+    // The input ends while the model has not answered, and the example reads that end first.
+    s.keys.shutdown().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.gate.release.notify_one();
+    let (screen, engine, _mock) = s.returns().await;
+    assert_eq!(
+        screen.text(),
+        "Hello! What shall we talk about?\n[done]\nbye\n"
+    );
+    let runs = engine.list(ListQuery::new()).await.unwrap().items;
+    assert_eq!(runs[0].state, RunState::Done, "{runs:?}");
+
+    let mut s = Session::new(9, Hold::Start).await;
+    s.mock.push_tool_calls(vec![ask("Which colour?")]);
+    s.type_line("pick a colour").await;
+    s.keys.shutdown().await.unwrap();
+    let (screen, engine, _mock) = s.returns().await;
+    assert_eq!(
+        screen.text(),
+        "? Which colour?\n  (answer with /answer <text>, or just type it)\nbye\n"
+    );
+    let runs = engine.list(ListQuery::new()).await.unwrap().items;
+    assert_eq!(runs[0].state, RunState::Waiting, "{runs:?}");
+}
+
+/// `/quit` while a step is in flight says that the step finishes first, and it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quit_during_a_step_says_it_waits_for_it() {
+    let mut s = Session::new(0, Hold::Start).await;
+    s.mock.push_text("finished");
+    s.type_line("hi").await;
+    timeout(WAIT, s.gate.reached.notified())
+        .await
+        .expect("the model is called");
+    s.type_line("/quit").await;
+    s.screen
+        .wait_count("[stopping: the current step finishes first]", 1)
+        .await;
+    s.gate.release.notify_one();
+    let (screen, _engine, _mock) = s.returns().await;
+    assert_eq!(
+        screen.text(),
+        "[stopping: the current step finishes first]\nbye\n"
     );
 }

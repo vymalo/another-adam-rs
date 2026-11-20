@@ -3,11 +3,14 @@
 //!
 //! A plain line is a `send` to the current conversation (the first starts one). `/steer <text>`,
 //! `/answer <text>` and `/cancel` reach the run being followed, `/list` lists the engine's runs and
-//! `/quit` (or the end of the input) shuts the engine down. While a run is followed its events are
-//! printed as they come: the text as it streams, the question when it waits, `Behind` when the
-//! reader lost events, and how it ended.
+//! `/quit` shuts the engine down (the step in flight finishes first). At the end of the input the
+//! followed run is still followed until it ends or asks a question, so `printf 'hi\n' | chat`
+//! prints the answer; then the engine shuts down. While a run is followed its events are printed as
+//! they come: the text as it streams, the question when it waits, `Behind` when the reader lost
+//! events, and how it ended.
 
 use std::io::{self, Write};
+use std::time::Duration;
 
 use adam_engine::adam_core::RunId;
 use adam_engine::adam_runtime::RunEvent;
@@ -18,11 +21,15 @@ use adam_engine::{
 use futures::StreamExt;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
+/// How long a new run waits for the run it replaces to say how it ended: its `Ended` comes within
+/// the stream's poll of the store (2 s) once the run has ended.
+const DRAIN: Duration = Duration::from_secs(5);
+
 /// What `/help` and an unknown command print.
 pub const HELP: &str = "type a message, or /steer <text>, /answer <text>, /cancel, /list, /quit";
 
-/// Read `input` a line at a time and write what happens to `out`, until `/quit` or the end of
-/// `input`; then shut `engine` down.
+/// Read `input` a line at a time and write what happens to `out`, until `/quit`, or the end of
+/// `input` and then the end of the followed run (or its question); then shut `engine` down.
 pub async fn run(
     engine: Engine,
     input: impl AsyncBufRead + Unpin,
@@ -38,18 +45,29 @@ pub async fn run(
         followed: None,
     };
     let mut lines = input.lines();
+    let mut input_open = true;
     loop {
+        // The input has ended: nothing more will be said to a run that waits, or to none.
+        if !input_open && chat.followed.as_ref().is_none_or(|f| f.asked.is_some()) {
+            break;
+        }
         // Events first when both are ready, so what a run said is printed before the next command.
         tokio::select! {
             biased;
-            Some(event) = next_event(&mut chat.followed) => chat.on_event(event).await?,
-            line = lines.next_line() => match line? {
+            event = next_event(&mut chat.followed) => match event {
+                Some(event) => chat.on_event(event).await?,
+                None => chat.followed = None,
+            },
+            line = lines.next_line(), if input_open => match line? {
                 Some(line) => {
                     if !chat.on_line(line.trim()).await? {
+                        if chat.followed.as_ref().is_some_and(|f| f.asked.is_none()) {
+                            chat.out.line("[stopping: the current step finishes first]")?;
+                        }
                         break;
                     }
                 }
-                None => break,
+                None => input_open = false,
             },
         }
     }
@@ -146,6 +164,7 @@ impl<W: Write> Chat<W> {
             Err(e) => return self.out.refused(&e),
         };
         self.conversation = Some(turn.conversation);
+        self.drain_other_than(turn.run).await?;
         match turn.delivered {
             Delivered::Answered => {
                 self.answered();
@@ -176,6 +195,26 @@ impl<W: Write> Chat<W> {
             Ok(None) => Ok(()),
             Err(e) => self.out.refused(&e),
         }
+    }
+
+    /// A send started `run` while another was followed: that one has ended in the store (a send
+    /// continues only an ended run), but its `Ended`, and maybe the last of its text, may not have
+    /// been read yet. Read them first, for at most [`DRAIN`]. (A test cannot hold a run between
+    /// its end in the store and its `Ended` on cue, so this path has none of its own.)
+    async fn drain_other_than(&mut self, run: RunId) -> io::Result<()> {
+        let started = tokio::time::Instant::now();
+        while self.followed.as_ref().is_some_and(|f| f.run != run) {
+            let left = DRAIN.saturating_sub(started.elapsed());
+            match tokio::time::timeout(left, next_event(&mut self.followed)).await {
+                Ok(Some(event)) => self.on_event(event).await?,
+                Ok(None) => self.followed = None,
+                Err(_) => {
+                    self.followed = None;
+                    self.out.line("[the last run did not say how it ended]")?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The followed run took an answer: a question it asks next is printed, the same one too.

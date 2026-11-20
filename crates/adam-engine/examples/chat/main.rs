@@ -12,10 +12,10 @@
 //! folder next to this file, read once at startup as `adam-agent` reads one. The engine reads no
 //! environment variable: this file does, and passes what it read.
 //!
-//! An application that ships its agent inside the binary embeds the folder instead:
-//! `adam_agent_fs::build("agent").root("examples/chat").emit()` in its `build.rs`,
-//! `adam::include_agent!();` in its crate, then `AgentDef::from_manifest(AGENT)?` in place of
-//! `AgentFolder::load`.
+//! Reading the folder from disk is the development path: edit the text, run again. An application
+//! ships its agent inside its binary instead: `adam_agent_fs::build("agent").root("examples/chat")
+//! .emit()` in its `build.rs`, `adam::include_agent!();` in its crate, then
+//! `AgentDef::from_manifest(AGENT)?` in place of `AgentFolder::load`.
 
 mod app;
 
@@ -34,10 +34,21 @@ use tokio::io::BufReader;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_url = required("MODEL_BASE_URL")?;
     let alias = required("MODEL")?;
-    // An empty key sends no `Authorization` header (a local gateway).
-    let key = SecretString::from(std::env::var("MODEL_API_KEY").unwrap_or_default());
+    // Unset or empty sends no `Authorization` header (a local gateway). A key that is not UTF-8 is
+    // refused, never sent as an empty one; the message names the variable, not the value.
+    let key = match std::env::var("MODEL_API_KEY") {
+        Ok(key) => key,
+        Err(std::env::VarError::NotPresent) => String::new(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("MODEL_API_KEY is not valid UTF-8".into());
+        }
+    };
+    let key = SecretString::from(key);
     let model: DynModel = Arc::new(OpenAiCompatible::new(OpenAiConfig::new(base_url, key))?);
 
+    // The development path: `CARGO_MANIFEST_DIR` is the build machine's path, compiled into the
+    // binary, so this binary finds its agent only where it was built (`include_agent!` above is
+    // how an application ships one).
     let folder = AgentFolder::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/chat"))?;
     for warning in &folder.warnings {
         eprintln!("agent folder: {warning:?}");

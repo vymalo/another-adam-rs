@@ -36,6 +36,15 @@ let engine = Engine::builder(store, folder.def, model, alias).start().await?;
 app::run(engine, BufReader::new(tokio::io::stdin()), std::io::stdout()).await?;
 ```
 
+**Ship the agent inside the application.** The example reads its folder from disk, which is the development path:
+`CARGO_MANIFEST_DIR` is the build machine's path, compiled into the binary. An application compiles the folder in:
+
+```rust
+// build.rs: adam_agent_fs::build("agent").emit()?;
+adam::include_agent!(); // AGENT, the folder's agent
+let engine = Engine::builder(store, AgentDef::from_manifest(AGENT)?, model, alias).start().await?;
+```
+
 ```sh
 MODEL_BASE_URL=https://gateway.example.com/v1 MODEL_API_KEY=... MODEL=my-model \
   cargo run -p adam-engine --example chat
@@ -43,6 +52,7 @@ MODEL_BASE_URL=https://gateway.example.com/v1 MODEL_API_KEY=... MODEL=my-model \
 
 A plain line is `send` to the conversation; `/steer <text>`, `/answer <text>`, `/cancel`, `/list` and `/quit` are the
 other calls. A send while the run waits is its answer, and one while it works steers it (`Turn::delivered` says which).
+When the input ends (`printf 'hi\n' | ...`), the example follows the run to its end or its question, then shuts down.
 
 ## How events work
 
@@ -89,8 +99,8 @@ sequenceDiagram
   0053](../decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)). Until it lands, a killed
   application loses its runs; its proof, `tests/resume_process.rs`, is written and ignored.
 * **Approvals** (slice 5): a run waits only on a question today.
-* **The person's directory and the file and command tools** (slices 6 and 7): the embedded agent has the screen's tools
-  only (`ask_user`, `show`, `plan_*`).
+* **The person's directory** (slice 7): the file and command tools are a library now (slice 6), but the engine does not
+  give them to its agent yet, which has the screen's tools only (`ask_user`, `show`, `ui_catalog`, `plan_*`).
 * **Reading a file an agent made**: `RunInfo` carries no artifacts yet, and an event withholds a file's bytes.
 * MCP servers and remote (`a2a:`) subagents: `start` refuses an agent that names them.
 

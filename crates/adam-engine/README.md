@@ -134,11 +134,15 @@ while let Some(event) = events.next().await {
 MODEL_BASE_URL=https://gateway.example.com/v1 MODEL_API_KEY=... MODEL=my-model cargo run -p adam-engine --example chat
 ```
 
-* `main.rs` builds what the host gives: the model with `adam-model-openai` from `MODEL_BASE_URL`, `MODEL_API_KEY` (may
-  be empty) and `MODEL`, the names `adam-service` uses; a `MemoryStore`; and the agent, `examples/chat/agent/`, read
-  at startup with `AgentFolder::load`. A comment shows the `include_agent!` way, which compiles the folder in.
+* `main.rs` builds what the host gives: the model with `adam-model-openai` from `MODEL_BASE_URL`, `MODEL_API_KEY` (unset
+  or empty sends no header; not UTF-8 is an error that names the variable) and `MODEL`, the names `adam-service` uses; a
+  `MemoryStore`; and the agent, `examples/chat/agent/`, read at startup with `AgentFolder::load` from
+  `CARGO_MANIFEST_DIR`, the build machine's path: the development path. An application ships its agent with
+  `include_agent!` instead (a comment shows how).
 * `app.rs` is the loop, `run(engine, input, out)`: a plain line is a `send` to the conversation; `/steer <text>`,
-  `/answer <text>`, `/cancel`, `/list` and `/quit` (or the end of the input, which shuts the engine down). It prints
+  `/answer <text>`, `/cancel`, `/list` and `/quit` (which says `[stopping: the current step finishes first]` while a
+  step is in flight). At the end of the input it follows the run to its end or its question, then shuts the engine
+  down, so `printf 'hi\n' | ...` prints the answer. A send that starts a new run first reads the last one's end. It prints
   the followed run's text as it streams (a piece by its `offset`, so a repeat is not printed twice), its question when
   it waits (read with `get` on a `Status`), `[behind: N events skipped]`, and how it ended; a refusal is printed with
   its class.
@@ -234,15 +238,19 @@ shows what the last did, over `MemoryStore`, the example's own agent folder and 
   (two runs, the latest first) and `/quit` (`bye`);
 * `the_example_steers_refuses_an_early_answer_and_cancels`: `/answer` to a run that works is refused (`Rejected`) and
   reaches no model request; `/steer` does, and the run takes another step to read it; `/cancel` with no open run is
-  refused by the example, and ends a waiting run `[cancelled]`.
+  refused by the example, and ends a waiting run `[cancelled]`;
+* `the_end_of_the_input_waits_for_the_run`: an input that ends while the model has not answered still gets the whole
+  reply, `[done]`, then `bye`; one that ends after a question gets the question, then `bye`;
+* `quit_during_a_step_says_it_waits_for_it`: `/quit` while the model works prints the stopping line, then `bye`.
 
 `tests/resume_process.rs` (Unix), `a_killed_process_resumes_its_run`, **ignored** until the SQLite store of slice 3
 lands: the test runs its own binary again as a child (`ADAM_ENGINE_TEST_RESUME_CHILD`, read by this test only, names
 the store's directory), which sends a message whose model blocks once the run's first step (a `plan_work` call) is
 committed and says so in a file; the parent kills it with `SIGKILL`, opens the same store, and its engine finishes the
-run: its model is called once, its request ends with the tool's result, and its stream shows the tool's step never run
-again. The store comes from one helper, `durable_store(path)`, which panics until then: the helper and the `#[ignore]`
-are the lines PR 4 changes.
+run: its model, scripted for the next step only, is called once, and its request holds the tool's result once and ends
+with it, which fails if the committed step was lost. The store comes from one helper, `async fn durable_store(path) ->
+Result<DynStore, _>`, which panics until then: PR 4 changes its body, the `#[ignore]` and the dev-dependencies
+(`adam-store-sqlite`), and no call site.
 
 In `src/`: `a_name_the_environment_has_is_refused_by_the_engines_default` (slice 2's proof),
 `the_sink_keeps_file_bytes_out_of_the_ring` and `a_withheld_file_says_its_length_and_digest` (a file's event reaches a

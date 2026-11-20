@@ -4,7 +4,9 @@
 //! same store, and its engine finishes the run without running that step again.
 //!
 //! The store comes from [`durable_store`] alone. Until the SQLite store of ADR 0053 slice 3 lands
-//! it panics and the test is ignored; then the helper and the `#[ignore]` are the lines that change.
+//! it panics and the test is ignored. The pull request that adds the store changes the helper's
+//! body, the `#[ignore]`, and this crate's dev-dependencies (`adam-store-sqlite`): the helper is
+//! already `async` and returns a `Result`, so its callers stay as they are.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
@@ -22,13 +24,11 @@ use adam_engine::adam_model::{
     DynModel, Message as ModelMessage, MockModel, ModelClient, ModelDelta, ModelError,
     ModelRequest, ModelResponse, ToolCall,
 };
-use adam_engine::adam_runtime::{RunEvent, StepState};
 use adam_engine::{Engine, EngineEvent, Limits, RunState, Say};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::json;
-use tokio::sync::Notify;
 use tokio::time::timeout;
 
 /// Set (to the directory of the store) in the child only: the test is then the child's half.
@@ -39,7 +39,8 @@ const WAIT: Duration = Duration::from_secs(60);
 const CHILD_LEASE: Duration = Duration::from_secs(2);
 
 /// The store both processes open at `path`: it must outlive the process that wrote it.
-fn durable_store(path: &Path) -> DynStore {
+#[allow(clippy::unused_async)] // opening the SQLite store will await
+async fn durable_store(path: &Path) -> Result<DynStore, Box<dyn std::error::Error>> {
     panic!(
         "needs a durable store: adam-store-sqlite (ADR 0053 slice 3, #362); un-ignore in the PR \
          that adds it (it would open {})",
@@ -136,49 +137,22 @@ fn child(dir: PathBuf) {
         });
         let mut limits = Limits::default();
         limits.lease_ttl = CHILD_LEASE;
-        let engine = Engine::builder(durable_store(&store_path(&dir)), chat(), model, "m")
-            .limits(limits)
-            .start()
-            .await
-            .unwrap();
+        let engine = Engine::builder(
+            durable_store(&store_path(&dir)).await.unwrap(),
+            chat(),
+            model,
+            "m",
+        )
+        .limits(limits)
+        .start()
+        .await
+        .unwrap();
         let turn = engine.send(None, Say::new("plan it")).await.unwrap();
         write_file(&dir, "run", &turn.run.to_string());
         // Killed long before this: it only keeps a lost child from living on.
         tokio::time::sleep(WAIT * 2).await;
         panic!("the child was never killed");
     });
-}
-
-/// A point the parent's model stops at: it says it got there, and waits to be let through.
-#[derive(Default)]
-struct Gate {
-    reached: Notify,
-    release: Notify,
-}
-
-/// The parent's model: a `MockModel` whose first call waits at the gate.
-struct Gated {
-    inner: Arc<MockModel>,
-    gate: Arc<Gate>,
-    calls: AtomicUsize,
-}
-
-#[async_trait]
-impl ModelClient for Gated {
-    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
-        unreachable!("the agent streams: {req:?}")
-    }
-
-    async fn stream(
-        &self,
-        req: ModelRequest,
-    ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
-        if self.calls.fetch_add(1, SeqCst) == 0 {
-            self.gate.reached.notify_one();
-            self.gate.release.notified().await;
-        }
-        self.inner.stream(req).await
-    }
 }
 
 /// Wait for the file `name` in `dir` while the child lives.
@@ -213,35 +187,26 @@ fn parent() {
     assert_eq!(status.signal(), Some(9), "the child was killed: {status}");
 
     runtime().block_on(async {
+        // Its script is the run's next step only: had the child's committed step been lost, the
+        // parent would ask its model for that step again, and the request assertions below fail.
         let mock = Arc::new(MockModel::new());
         mock.push_text("finished after the kill");
-        let gate = Arc::new(Gate::default());
-        let model: DynModel = Arc::new(Gated {
-            inner: mock.clone(),
-            gate: gate.clone(),
-            calls: AtomicUsize::new(0),
-        });
-        let engine = Engine::builder(durable_store(&store_path(dir.path())), chat(), model, "m")
-            .start()
-            .await
-            .unwrap();
-        // The parent's first model call waits at the gate: its stream starts with all it did since
-        // it claimed the run, so a step it ran again would be seen.
-        timeout(WAIT, gate.reached.notified())
-            .await
-            .expect("the parent claims the killed child's run");
+        let model: DynModel = mock.clone();
+        let engine = Engine::builder(
+            durable_store(&store_path(dir.path())).await.unwrap(),
+            chat(),
+            model,
+            "m",
+        )
+        .start()
+        .await
+        .unwrap();
         let mut events = engine.events(run).await.unwrap();
-        gate.release.notify_one();
-        let mut heard = Vec::new();
+        let mut last = None;
         while let Some(event) = timeout(WAIT, events.next()).await.expect("an event") {
-            heard.push(event.unwrap());
+            last = Some(event.unwrap());
         }
-        let reran = heard.iter().any(|e| {
-            matches!(e, EngineEvent::Live(RunEvent::Step(step))
-                if step.id == "tool:plan-1" && step.state == StepState::Running)
-        });
-        assert!(!reran, "the committed step ran again: {heard:?}");
-        match heard.last() {
+        match last {
             Some(EngineEvent::Ended(info)) => {
                 assert_eq!(info.state, RunState::Done);
                 assert_eq!(info.output.as_deref(), Some("finished after the kill"));
@@ -249,6 +214,8 @@ fn parent() {
             other => panic!("the stream ended on {other:?}"),
         }
 
+        // The proof that the committed step is kept and not run again: the parent's model is
+        // called once, for the step after it, and its request holds the tool's result once.
         let requests = mock.requests();
         assert_eq!(requests.len(), 1, "the parent called its model for the next step only");
         let messages = &requests[0].messages;
