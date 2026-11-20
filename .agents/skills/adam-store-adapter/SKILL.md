@@ -164,10 +164,10 @@ trait at your rev: its doc comments are the contract.
   generations after a grace period (`gc_body`, and `purge_finished` removes them with the run).
   **Forward `keeps_bodies`, `body_list`, `gc_body`, `blob_stored` and `load_head` in every
   wrapper**: the trait defaults answer `false`/empty/`0`/`false`/`load_run`, so a wrapper that omits
-  them reports the wrong format, collects nothing, re-puts every blob, and — for `load_head` —
-  answers the default, which calls the wrapper's `load_run` (the head in the contract release, but
-  only because your `load_run` serves it; a wrapper over a store that keeps none answers the whole
-  state).
+  them reports the wrong format, collects nothing and re-puts every blob. `load_head`'s default calls
+  the wrapper's `load_run`, which serves the head in the contract release, so a wrapper that omits it
+  is correct but pays the full read on every poll; forward it to keep the projected read (and a
+  wrapper over a store that keeps no bodies answers the whole state either way).
 * A transient backend error must be classified transient so the runtime retries it.
 
 ## See also

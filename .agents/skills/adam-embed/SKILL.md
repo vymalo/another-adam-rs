@@ -38,6 +38,11 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
 
    Take only the crates you use (`crates/adam-host`, `adam-core`, `adam-runtime`, `adam-a2a`,
    `adam-a2a-runtime`, `adam-store-postgres`, `adam-notify-postgres`, `adam-service`, `adam`).
+   **Moving across ADR 0055's S3 is a deploy boundary, not a bump**: the contract release writes
+   `state = null` and every read serves the head, and a pre-S3 process that touches a converted run
+   fails it. Scale every process of the old rev to zero before the new one starts, and do not roll
+   back past a converted run. The details are `adam-upgrade`'s S3 row and
+   `docs/guides/deploy-the-coder.md` ("The contract release: a one-time window").
 2. **TLS is built in.** `adam-store-postgres` and `adam-notify-postgres` use `rustls` on
    `aws-lc-rs`, and `DATABASE_URL` chooses the mode (`sslmode`, `sslrootcert`, `sslcert`,
    `sslkey`). There are no TLS Cargo features: the `tls-rustls`/`tls-native-tls` features left with
