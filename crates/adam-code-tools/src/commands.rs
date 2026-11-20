@@ -86,10 +86,9 @@ pub trait CommandWorkspace: CodeWorkspace {
     ///
     /// # Errors
     ///
-    /// A [`ToolError`] when what follows cannot be done or recorded: the tool returns it, and
-    /// nothing is undone. **A known gap**, kept from the coder's `run` by
-    /// [`make::run`](crate::make::run) (step 5c-2): the guard is then dropped unsettled, so a command
-    /// that also changed git keeps that change. Fixing it is a change of its own.
+    /// A [`ToolError`] when what follows cannot be done or recorded: the tool returns it, once the
+    /// guard is settled ([`make::run`](crate::make::run)), so a command that changed git is undone
+    /// all the same (for the coder, its files with it); one that only changed files keeps them.
     async fn after_run(&self, ctx: &ToolCtx, place: &Place) -> Result<String, ToolError>;
 
     /// A note the tool appends to a refusal of its guard (one from [`guard`](Self::guard), or a

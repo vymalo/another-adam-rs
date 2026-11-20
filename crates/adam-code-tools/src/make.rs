@@ -9,11 +9,8 @@
 //! refused. After the command ran, and **before** the guard is settled, the workspace's
 //! [`after_run`](CommandWorkspace::after_run) follows (the coder moves its check epoch, even for a
 //! command its guard then undoes); its text is appended to a result whose files changed. It is never
-//! a check.
-//!
-//! A known gap, kept as it was in the coder: when `after_run` fails, its error is returned and the
-//! guard is dropped unsettled, so a change the command made to git stays. Fixing it is a change of
-//! its own.
+//! a check. When `after_run` fails, the guard is settled first, so a change the command made to
+//! git is undone, and then its error is the tool's.
 
 use std::fmt::Write as _;
 
@@ -96,9 +93,24 @@ pub async fn run(
     output::settle(ws, ctx, &mut outcome).await;
 
     // The command ran: what follows it is done now, before git is checked, so it is done for a
-    // command the guard then undoes too. Its error is returned with the guard unsettled (the gap the
-    // module names).
-    let published = ws.after_run(ctx, &place).await?;
+    // command the guard then undoes too. On an error the guard is settled all the same, so git is
+    // never left as the command changed it.
+    let published = match ws.after_run(ctx, &place).await {
+        Ok(text) => text,
+        Err(e) => {
+            let settled = guard.settle().await;
+            if matches!(
+                settled,
+                Settled::Undone { restored: false } | Settled::Unreadable { restored: false }
+            ) {
+                tracing::warn!(
+                    place = place.name(),
+                    "after a failed after_run, the guard could not restore the place exactly"
+                );
+            }
+            return Err(e);
+        }
+    };
 
     // Did it touch git? The files are its to change; HEAD, the branch, the refs, the
     // configuration and `.git` are not. A place whose git cannot be read after the command is not
@@ -205,9 +217,9 @@ fn touched_git(command: &str, outcome: &ShellOutcome, restored: bool) -> String 
 /// model: the first [`MAX_LISTED`], then how many more. Files the project ignores are kept too, and
 /// are not listed.
 ///
-/// Two known odd answers, kept as they are: the status is read trimmed ([`status_text`]), so the
-/// first entry loses a leading space (` M a` is listed as `M a`); and a command that only put a file
-/// back as `HEAD` has it changed with nothing listed, which is said as files the project ignores.
+/// Changed files with nothing listed are ignored ones, or ones the command put back as `HEAD` has
+/// them (an edit of the run's undone): the note names both. With no answer from git (no
+/// repository, or git failed) it says so instead.
 fn changes_note(status: Option<&str>) -> String {
     let mut files = Vec::new();
     let mut entries = status.unwrap_or_default().split('\0');
@@ -216,8 +228,11 @@ fn changes_note(status: Option<&str>) -> String {
             continue;
         }
         files.push(entry);
-        // A rename or a copy is followed by the path it came from.
-        if matches!(entry.as_bytes()[0], b'R' | b'C') {
+        // A rename or a copy, staged (`R `) or not (` R`), is followed by the path it came from.
+        if entry.as_bytes()[..2]
+            .iter()
+            .any(|b| matches!(b, b'R' | b'C'))
+        {
             entries.next();
         }
     }
@@ -225,9 +240,12 @@ fn changes_note(status: Option<&str>) -> String {
         "--- the worktree now differs from HEAD in (git status; files the project ignores are kept \
          too) ---\n",
     );
-    if files.is_empty() {
+    if status.is_none() {
+        note.push_str("(git could not say which files changed)\n");
+    } else if files.is_empty() {
         note.push_str(
-            "(nothing that git lists: the files it changed are ignored by the project)\n",
+            "(nothing that git lists: the files it changed are ignored by the project, or are \
+             back as HEAD has them)\n",
         );
     }
     for entry in files.iter().take(MAX_LISTED) {
@@ -258,6 +276,15 @@ mod tests {
         assert!(note.contains("run the project's checks again"), "{note}");
     }
 
+    /// A rename git sees in the worktree only (` R`, after `git add -N`) is followed by its source
+    /// too, which is not a change of its own.
+    #[test]
+    fn an_unstaged_rename_is_counted_once() {
+        let note = changes_note(Some(" R ccc.txt\0aaa.txt\0?? new\0"));
+        assert!(note.contains(" R ccc.txt\n?? new\n"), "{note}");
+        assert!(!note.contains("aaa.txt"), "{note}");
+    }
+
     #[test]
     fn many_changes_are_cut_and_counted_and_no_listing_is_said() {
         let status: String = (0..25).map(|i| format!("?? f{i}\0")).collect();
@@ -269,6 +296,9 @@ mod tests {
         assert!(note.contains("and 5 more"), "{note}");
         let ignored = changes_note(Some(""));
         assert!(ignored.contains("ignored by the project"), "{ignored}");
+        let unknown = changes_note(None);
+        assert!(unknown.contains("git could not say"), "{unknown}");
+        assert!(!unknown.contains("ignored"), "{unknown}");
     }
 
     #[test]

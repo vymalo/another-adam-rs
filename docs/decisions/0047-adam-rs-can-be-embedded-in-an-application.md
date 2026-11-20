@@ -149,6 +149,12 @@ workspace as it is.
    list of changed files loses the first entry's leading space (`status_text` is trimmed), a file a command put back
    as `HEAD` is said to be ignored by the project, and a failing `after_run` drops the guard unsettled, so a change to
    git stays.
+   *Amended 2026-11-20 (after step 5c-2):* the three are fixed. `status_text` is git's answer untrimmed, and a rename
+   in the worktree only (` R`) is counted once; changed files that git lists none of are said to be ignored or back
+   as `HEAD` has them, and with no answer from git, that git could not say; a failing `after_run` settles the guard
+   before its error is returned (and logs a guard that could not restore the place), so a change to git is undone.
+   The answers of `run` that change are pinned anew in the coder's `tests/command_results.rs` and the testkit's
+   `tests/run.rs`.
 8. **Commands run as the person unless a sandbox says otherwise.** A local sandbox is an `Environment`: first a process
    tree that can be killed, then the operating system's own confinement where there is one. `describe` says what is not
    protected.
