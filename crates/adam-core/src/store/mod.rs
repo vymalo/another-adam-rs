@@ -821,6 +821,11 @@ pub trait Store: Send + Sync + 'static {
     /// Like [`release_lease`](Self::release_lease) it does not clear a run's owner: a released
     /// pinned run comes back only to the same worker. A lease held by another worker is untouched.
     ///
+    /// **The caller must be the only live process using `worker`**: the sweep releases every lease
+    /// that id holds, so a second live process with the same id would lose the leases of runs it is
+    /// stepping. In this repository's deployment `WORKER_ID` is the StatefulSet pod name, which only
+    /// one live process has.
+    ///
     /// **The default does nothing**: the method is additive, so it breaks no implementer, and a
     /// store that does not implement it waits for the TTL after a restart. A store that implements
     /// it passes `worker_leases_conformance!` in `adam-store-testkit`.

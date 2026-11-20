@@ -47,12 +47,14 @@ after a commit that names a different one), a shared
   not given this suite. The purge and compaction cases take the `BLOB_SUITE` lock because
   `purge_finished` sweeps blobs in the same call. `make` is the same
   `async fn() -> Option<DynStore>` as above.
-* `worker_leases_conformance!(make)` generates one `#[tokio::test]` per worker-lease case (2 cases:
+* `worker_leases_conformance!(make)` generates one `#[tokio::test]` per worker-lease case (3 cases:
   every run lease a worker holds goes, so its runs are claimable at once — by another worker's unpinned
   claim too — and the owner is not cleared, so a pinned run still comes back only to the same
-  worker; and another worker's lease is untouched: still reported by `lease_until`, unclaimable and
-  renewable). `release_worker_leases` is **defaulted to a no-op**, so a store that does not
-  implement it passes `store_conformance!`; give this suite only to a store that implements the
+  worker; another worker's lease is untouched: still reported by `lease_until`, unclaimable and
+  renewable; and a lease the **owner does not hold** — w1 owns the run, w2 holds its lease — survives
+  `release_worker_leases("w1")`, because the sweep keys on the lease holder, not the owner).
+  `release_worker_leases` is **defaulted to a no-op**, so a store that does not implement it passes
+  `store_conformance!`; give this suite only to a store that implements the
   release. `make` is the same `async fn() -> Option<DynStore>` as above.
 * `headless_measurement!(make)` generates the `measure_the_headless_transcript` test: it runs
   `counting::measure_headless_transcript` through `make`, prints its `p2-headless:` line (a
@@ -73,8 +75,8 @@ after a commit that names a different one), a shared
   `state` bytes that cross it — every record read (`load_run`, `load_head`, `list_runs`,
   `claim_due`, `open_run_for_conversation`) and every successful `commit_run` write (its state, its
   head and the body rows it appends; the tombstone counts nothing) — through
-  `calls(method)`, and forwards `gc_body`/`blob_stored` to the wrapped store (`GcBody`/`BlobStored`
-  calls),
+  `calls(method)`, and forwards `gc_body`/`blob_stored`/`release_worker_leases` to the wrapped store
+  (`GcBody`/`BlobStored`/`ReleaseWorkerLeases` calls),
   `state_bytes_read()`, `state_bytes_written()`, `commit_bytes()`, `max_commit_bytes()` and
   `reset()`. A commit that
   failed wrote nothing and is not counted; `migrate` is not counted, and neither is a record
@@ -100,7 +102,8 @@ after a commit that names a different one), a shared
   the message a finished child sends its parent), with
   `fault::Method` and `fault::Mode` selecting the method and whether the
   operation is applied before the error is returned. `fault::Method` is **not** `#[non_exhaustive]`:
-  a new variant breaks an exhaustive `match` on it (schema version 5 part 1 added `PutBlob`,
+  a new variant breaks an exhaustive `match` on it (`ReleaseWorkerLeases` is the worker-lease
+  sweep; schema version 5 part 1 added `PutBlob`,
   `GetBlob` and `PurgeBlobs`; part 2 added `LoadHead`, `BodyList`, `GcBody` and `BlobStored`).
   `fault::is_injected`
   tells an injected error from a real one.
@@ -129,6 +132,7 @@ failure (see `adam_core::testing`).
 * `claim_skips_busy_runs` (both scopes): runs named as `busy` are not claimed, with a live lease or an expired one,
   take no slot of the limit, and are not leased by the call that skipped them.
 * `lease_until_reports_the_lease`: nothing before a claim or for an unknown run, the end of the claim, of a renewal, still the same after a commit and after a stranger's release, nothing after the holder's release, and an expired lease reported as it was.
+* `worker_leases_*`: the sweep frees every run lease of the worker (the runs claimable at once, the owner kept), leaves another worker's lease alone, and leaves a lease the owner does not hold (the sweep keys on the holder, not the owner).
 * Pinned-claim cases (`ClaimScope::Pinned`): an owned run is never given to another worker, not
   after a release, a commit or an expired lease; the first pinned claim sets the owner and an
   `Any` claim neither reads nor sets it; 4 workers racing on 48 runs split them exactly once and

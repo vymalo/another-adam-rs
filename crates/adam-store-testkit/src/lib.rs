@@ -231,8 +231,9 @@ macro_rules! body_conformance {
 /// fails instead under `ADAM_TEST_REQUIRE_DB=1`, see `adam_core::testing`).
 ///
 /// The cases prove [`Store::release_worker_leases`](adam_core::Store::release_worker_leases): every
-/// run lease the worker holds goes and its runs are claimable at once, and another worker's lease is
-/// untouched; the run's owner is not cleared. The method is **defaulted to a no-op**, so a store
+/// run lease the worker holds goes and its runs are claimable at once, another worker's lease is
+/// untouched, and a lease the owner does not hold survives the owner's sweep (the sweep keys on the
+/// lease holder, not the owner); the run's owner is not cleared. The method is **defaulted to a no-op**, so a store
 /// that does not implement it passes [`store_conformance!`] and must not be given this suite: give
 /// it only to a store that implements the release.
 #[macro_export]
@@ -241,6 +242,7 @@ macro_rules! worker_leases_conformance {
         $crate::worker_leases_conformance!(@cases $make;
             worker_leases_frees_the_workers_runs,
             worker_leases_leaves_another_workers_lease_alone,
+            worker_leases_leaves_a_lease_the_owner_does_not_hold,
         );
     };
     (@cases $make:path; $($case:ident),* $(,)?) => {
@@ -2466,6 +2468,52 @@ pub mod cases {
                 .await
                 .unwrap(),
             "w1 still holds it"
+        );
+    }
+
+    /// The sweep keys on the **lease holder**, not the run's owner: a run owned by w1 whose lease w2
+    /// holds survives `release_worker_leases("w1")`. This is the state an implementation that
+    /// released by owner would break.
+    pub async fn worker_leases_leaves_a_lease_the_owner_does_not_hold(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let t = now() + jiff::SignedDuration::from_secs(1);
+        let ttl = Duration::from_secs(30);
+        // w1's pinned claim makes it the owner, and its lease holder.
+        assert_eq!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 1).await,
+            vec![run.id]
+        );
+        store.release_lease(run.id, "w1").await.unwrap();
+        // w2 takes the lease; the owner stays w1.
+        assert_eq!(
+            claim_ids_as(&store, ClaimScope::Any, &agent, "w2", t, ttl, 1).await,
+            vec![run.id]
+        );
+        let until = t + jiff::SignedDuration::from_secs(30);
+        assert_eq!(store.lease_until(run.id).await.unwrap(), Some(until));
+
+        store.release_worker_leases("w1").await.unwrap();
+        assert_eq!(
+            store.lease_until(run.id).await.unwrap(),
+            Some(until),
+            "the owner holds no lease: w2's is untouched"
+        );
+        assert!(
+            store
+                .renew_lease(run.id, "w2", t + jiff::SignedDuration::from_secs(1), ttl)
+                .await
+                .unwrap(),
+            "w2 still holds the lease"
+        );
+        assert!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 1)
+                .await
+                .is_empty(),
+            "w1 owns the run but does not hold the lease"
         );
     }
 

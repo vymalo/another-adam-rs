@@ -109,16 +109,17 @@ job of `.github/workflows/coder.yml` runs it in the built coder image**, whose w
 
 ## What the store suite covers
 
-48 cases: exact JSON round trip (unicode, `i64` bounds, floats, special keys), CAS conflicts, 16-way concurrent
+49 cases: exact JSON round trip (unicode, `i64` bounds, floats, special keys), CAS conflicts, 16-way concurrent
 commits with one winner, journal ordering, first-writer-wins and 16-way races, non-determinism detection, due
 rules, agent filtering and limits, busy runs left unclaimed, 8 workers claiming 60 runs with no double lease,
 lease expiry and takeover, renew and release, pinned claims (an owned run never goes to another worker, 4 workers
 racing), one open run per conversation including a 16-way race, listing and counting (scoped, ordered, keyset
 pages, filters), push configurations, and purging.
 
-The worker-lease suite (`worker_leases_conformance!`) adds two cases for a store that implements
-`release_worker_leases`: every run lease the worker holds goes and its runs are claimable at once, and its
-owner is not cleared; another worker's lease is untouched. The method is defaulted to a no-op, so the
+The worker-lease suite (`worker_leases_conformance!`) adds three cases for a store that implements
+`release_worker_leases`: every run lease the worker holds goes and its runs are claimable at once,
+and its owner is not cleared; another worker's lease is untouched; and a lease the owner does not
+hold survives the owner's sweep. The method is defaulted to a no-op, so the
 suite is separate from the required `store_conformance!`.
 
 The write cost of a transcript-shaped run is measured **and asserted**: `counting::measure_transcript_write`

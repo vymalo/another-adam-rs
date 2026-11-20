@@ -51,7 +51,9 @@ adapters override it with one projected read that never touches the state, and t
 
 `release_worker_leases(worker)` drops every run lease `worker` holds, so a restarted process claims
 its runs at once instead of waiting for the TTL. Like `release_lease` it does not clear the run's owner,
-and a lease held by another worker is untouched. The method is **defaulted to a no-op**, so it breaks
+and a lease held by another worker is untouched. The caller must be the only live process using
+`worker` (the deployment sets `WORKER_ID` to the pod name): the sweep releases every lease that id
+holds. The method is **defaulted to a no-op**, so it breaks
 no implementer: a store that does not implement it (both shipped adapters, today) waits for the TTL.
 The suite `worker_leases_conformance!` proves an implementation.
 

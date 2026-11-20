@@ -88,7 +88,9 @@ implements `Store`; the conformance cases in
 `Store::release_worker_leases(worker)` drops every run lease `worker` holds, so a restarted process
 claims its runs at once instead of waiting for each TTL. Like `release_lease` it does not clear the
 run's owner, so a released pinned run still comes back only to the same worker, and a lease held by
-another worker is untouched. The method is **defaulted to a no-op**, so it breaks no implementer: a
+another worker is untouched. The caller must be the only live process using `worker` (in this
+repository's deployment `WORKER_ID` is the pod name): the sweep releases every lease that id holds.
+The method is **defaulted to a no-op**, so it breaks no implementer: a
 store that does not implement it waits for the TTL. `MemoryStore` implements it; the suite
 `worker_leases_conformance!` in [`adam-store-testkit`](../adam-store-testkit/README.md) proves an
 implementation.

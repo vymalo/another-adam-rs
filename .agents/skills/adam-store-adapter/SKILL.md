@@ -76,7 +76,7 @@ trait at your rev: its doc comments are the contract.
    adam_store_testkit::worker_leases_conformance!(make_store); // a store that implements release_worker_leases
    ```
 
-   `store_conformance!` generates one `#[tokio::test]` per case (48 at the time of writing) and
+   `store_conformance!` generates one `#[tokio::test]` per case (49 at the time of writing) and
    calls `migrate` first. `blob_conformance!` adds the **ten** blob cases (put/get, a 4 MiB round
    trip, an idempotent put, an unknown id, empty bytes, a run's reference keeping a blob alive
    (including after a commit that names a different one), a shared digest surviving until the last
@@ -96,9 +96,11 @@ trait at your rev: its doc comments are the contract.
    `[test-groups.store-global-sweeps]`) and take the suite's `BLOB_SUITE` lock under libtest. A test
    that calls `purge_finished` or `purge_blobs` must carry `purge` in its name so the group's filter
    catches it.
-   `worker_leases_conformance!` adds the **two** worker-lease cases: every run lease the worker holds
-   goes and its runs are claimable at once (by another worker's unpinned claim too), with the owner
-   unchanged; and another worker's lease is untouched. `release_worker_leases` is defaulted to a
+   `worker_leases_conformance!` adds the **three** worker-lease cases: every run lease the worker
+   holds goes and its runs are claimable at once (by another worker's unpinned claim too), with the
+   owner unchanged; another worker's lease is untouched; and a lease the owner does **not** hold — w1
+   owns the run, w2 holds its lease — survives `release_worker_leases("w1")`, because the sweep keys
+   on the lease holder, not the owner. `release_worker_leases` is defaulted to a
    no-op, so a store that does not implement it still passes `store_conformance!`; give this suite
    only to a store that does.
    `counting::measure_transcript_write` is a measurement helper, not a conformance case: it runs one
@@ -175,9 +177,11 @@ trait at your rev: its doc comments are the contract.
   version serves the state when the state is a v4 envelope, and the head when the state is the
   tombstone. Collect superseded
   generations after a grace period (`gc_body`, and `purge_finished` removes them with the run).
-  **Forward `keeps_bodies`, `body_list`, `gc_body`, `blob_stored` and `load_head` in every
-  wrapper**: the trait defaults answer `false`/empty/`0`/`false`/`load_run`, so a wrapper that omits
-  them reports the wrong format, collects nothing and re-puts every blob. `load_head`'s default calls
+  **Forward `keeps_bodies`, `body_list`, `gc_body`, `blob_stored`, `load_head` and
+  `release_worker_leases` in every wrapper**: the trait defaults answer
+  `false`/empty/`0`/`false`/`load_run`/a no-op, so a wrapper that omits them reports the wrong
+  format, collects nothing, re-puts every blob and silently releases nothing on a restart.
+  `load_head`'s default calls
   the wrapper's `load_run`, which serves the head in the contract release, so a wrapper that omits it
   is correct but pays the full read on every poll; forward it to keep the projected read (and a
   wrapper over a store that keeps no bodies answers the whole state either way).

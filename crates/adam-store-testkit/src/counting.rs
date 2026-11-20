@@ -677,6 +677,11 @@ impl Store for CountingStore {
         self.inner.release_lease(id, worker).await
     }
 
+    async fn release_worker_leases(&self, worker: &str) -> StoreResult<()> {
+        self.call(Method::ReleaseWorkerLeases);
+        self.inner.release_worker_leases(worker).await
+    }
+
     async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         self.call(Method::LeaseUntil);
         self.inner.lease_until(id).await
@@ -812,6 +817,34 @@ mod tests {
 
     fn counting() -> Arc<CountingStore> {
         Arc::new(CountingStore::new(Arc::new(MemoryStore::new())))
+    }
+
+    /// The wrapper must not swallow `release_worker_leases`: a wrapped store that answers the trait
+    /// default releases nothing, so a restarted worker waits for its old leases to run out.
+    #[tokio::test]
+    async fn the_wrapper_forwards_release_worker_leases() {
+        let store = counting();
+        let run = create(&store).await;
+        let claimed = store
+            .claim_due(
+                &[AGENT.to_owned()],
+                "w",
+                ClaimScope::Any,
+                &[],
+                adam_core::store::now() + SignedDuration::from_secs(1),
+                Duration::from_secs(30),
+                1,
+            )
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        store.release_worker_leases("w").await.expect("sweep");
+        assert_eq!(store.calls(Method::ReleaseWorkerLeases), 1);
+        assert_eq!(
+            store.lease_until(run.id).await.expect("lease"),
+            None,
+            "the wrapper reached the inner store's sweep"
+        );
     }
 
     async fn create(store: &CountingStore) -> RunRecord {
