@@ -123,8 +123,9 @@ async fn wait_terminal(rt: &Runtime, run: RunId) -> RunView {
     }
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 fn tool_answers(state: &Conversation) -> Vec<(String, bool)> {
@@ -153,7 +154,7 @@ async fn the_third_identical_call_with_the_same_result_is_not_run() {
 
     assert_eq!(view.status, RunStatus::Done);
     assert_eq!(calls.load(SeqCst), 2, "the third call is not run");
-    let answers = tool_answers(&conversation(&view));
+    let answers = tool_answers(&conversation(&h.rt, &view).await);
     assert_eq!(answers.len(), 3);
     assert_eq!(answers[0], ("same".to_owned(), false));
     assert_eq!(answers[1], ("same".to_owned(), false));
@@ -197,7 +198,9 @@ async fn a_changing_result_or_a_call_between_is_run() {
     assert_eq!(a_calls.load(SeqCst), 4);
     assert_eq!(b_calls.load(SeqCst), 1);
     assert!(
-        tool_answers(&conversation(&view)).iter().all(|(_, e)| !e),
+        tool_answers(&conversation(&h.rt, &view).await)
+            .iter()
+            .all(|(_, e)| !e),
         "no call was refused"
     );
 
@@ -234,7 +237,7 @@ async fn key_order_does_not_matter() {
     h.mock.push_text("done");
     let view = h.run("order").await;
     assert_eq!(calls.load(SeqCst), 2, "the third spelling is the same call");
-    assert!(tool_answers(&conversation(&view))[2].1);
+    assert!(tool_answers(&conversation(&h.rt, &view).await)[2].1);
 }
 
 #[tokio::test]
@@ -262,7 +265,7 @@ async fn two_refusals_lead_to_the_closing_turn_with_repeated_call() {
         closing.messages.last(),
         Some(&Message::user_text(CLOSING_TURN))
     );
-    let answers = tool_answers(&conversation(&view));
+    let answers = tool_answers(&conversation(&h.rt, &view).await);
     assert_eq!(answers.len(), 4);
     assert!(answers[2].1 && answers[3].1);
 }
@@ -290,7 +293,7 @@ async fn the_rest_of_a_turn_is_answered_when_the_run_ends_at_the_limit() {
         "the call behind the refusal is not run"
     );
     assert_eq!(view.output.clone().unwrap()["limit"], "repeated_call");
-    let answers = tool_answers(&conversation(&view));
+    let answers = tool_answers(&conversation(&h.rt, &view).await);
     assert_eq!(answers.len(), 5, "every call has a result");
     assert!(answers[4].0.starts_with("not run"), "{answers:?}");
 }
@@ -309,7 +312,7 @@ async fn a_refusal_replays_the_same() {
         }
         h.mock.push_text("done");
         let view = h.run("replay").await;
-        states.push(conversation(&view));
+        states.push(conversation(&h.rt, &view).await);
     }
     assert_eq!(states[0].messages, states[1].messages);
     assert_eq!(states[0].repeats, states[1].repeats);
@@ -356,7 +359,7 @@ async fn a_call_that_fails_three_times_in_a_row_is_refused_whatever_the_errors_s
     h.mock.push_text("I give up on make");
     let view = h.run("go").await;
     assert_eq!(calls.load(SeqCst), 2, "the third failure is not run");
-    let answers = tool_answers(&conversation(&view));
+    let answers = tool_answers(&conversation(&h.rt, &view).await);
     assert!(answers[0].1 && answers[1].1);
     assert_ne!(answers[0].0, answers[1].0, "the errors differ");
     assert!(
@@ -376,7 +379,7 @@ async fn refusals_of_different_loops_do_not_add_up() {
     }
     h.mock.push_text("done");
     let view = h.run("go").await;
-    let answers = tool_answers(&conversation(&view));
+    let answers = tool_answers(&conversation(&h.rt, &view).await);
     assert!(
         answers[2].1 && answers[5].1,
         "each loop's third call is refused"
@@ -544,7 +547,7 @@ async fn a_command_that_fails_the_same_way_three_times_is_refused_whatever_its_t
     h.mock.push_text("make keeps failing");
     let view = h.run("go").await;
     assert_eq!(runs.load(SeqCst), 2, "the third failure is not run");
-    let answers = tool_answers(&conversation(&view));
+    let answers = tool_answers(&conversation(&h.rt, &view).await);
     assert!(
         !answers[0].1 && !answers[1].1,
         "normal text, not error results"
@@ -572,7 +575,11 @@ async fn the_same_command_succeeding_with_changing_output_runs_every_time() {
     h.mock.push_text("done");
     let view = h.run("go").await;
     assert_eq!(runs.load(SeqCst), 5);
-    assert!(tool_answers(&conversation(&view)).iter().all(|(_, e)| !e));
+    assert!(
+        tool_answers(&conversation(&h.rt, &view).await)
+            .iter()
+            .all(|(_, e)| !e)
+    );
 }
 
 #[tokio::test]
@@ -694,7 +701,7 @@ async fn a_replay_of_a_journal_with_repeat_keys_refuses_the_same_call() {
         2,
         "the replay decided the same: the call is not run"
     );
-    let answers = tool_answers(&conversation(&view));
+    let answers = tool_answers(&conversation(&rt_b, &view).await);
     assert!(
         answers[2].0.starts_with("Not run: this is the third call"),
         "{answers:?}"

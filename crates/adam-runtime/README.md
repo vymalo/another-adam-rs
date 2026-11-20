@@ -23,9 +23,9 @@ over A2A).
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
 | `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
 | `Ctx`, `Emitter`, `ReservedStep` | `Ctx::step` journals a side effect's outcome; `Ctx::reserve_steps(&names)` takes the next seqs in order for steps that run at the same time (each `ReservedStep` has `seq()`, `name()`, `is_recorded()` and `run(f)`, with `step`'s contract), and `Ctx::step_all(steps, at_once)` runs them at most `at_once` at a time and returns the outcomes in the order given (see *Steps that run at the same time*); `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::arrived()` counts the messages delivered while the transition runs, `Ctx::reopen_on_arrival()` makes a `Done` that the transition returns go on instead, and `Ctx::read_already(&ids)` names the messages the run has read, whose copies are not counted (see *A message that arrives while a run finishes*); `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children and `Ctx::child_state(run)` its agent's own state (both live reads of the run's own children only), and `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*) |
-| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_child_continuing`, `list_sessions`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `header`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*), `.poll_interval(..)` (the worker's idle poll, 250 ms) and `.cancel_poll_interval(..)` (a step's cancel watch, 1 s; see *Several processes*), and the getters `worker_id()`, `claim_scope()` |
+| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_child_continuing`, `list_sessions`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `state`, `artifact_bytes`, `header`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*), `.poll_interval(..)` (the worker's idle poll, 250 ms) and `.cancel_poll_interval(..)` (a step's cancel watch, 1 s; see *Several processes*), and the getters `worker_id()`, `claim_scope()` |
 | `Runtime::notify_parent(child, output, error)` | tells a finished child's parent (`RUN_FINISHED_KIND`, or `CHILD_REPORTED_KIND` for a session round) from the `output`/`error` the caller just committed; `child` supplies the ids, the status and the parent. The runtime calls it itself after a commit and a cancel. **Breaking:** it used to take only `&RunRecord` and decoded the child's state, which `Store::commit_run` no longer returns (`RunRecord::state` is `null`); an embedder that called it must pass the values it committed |
-| `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`). `RunView::claimed` is true while a worker holds an unexpired lease on a runnable run (read with `Store::lease_until` against the runtime's clock, before the record, so a step that commits and releases between the two reads never reads as unclaimed at version 1): the first step of a run commits nothing until it ends, and this is how a reader, in any process, tells a run being stepped from one nobody has taken |
+| `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`). `RunView::claimed` is true while a worker holds an unexpired lease on a runnable run (read with `Store::lease_until` against the runtime's clock, before the head, so a step that commits and releases between the two reads never reads as unclaimed at version 1): the first step of a run commits nothing until it ends, and this is how a reader, in any process, tells a run being stepped from one nobody has taken. `RunView::state` is the agent's **head** (a v5 run) or the whole agent state (a v4 one), `RunView::artifacts` is a `Vec<ArtifactRef>` (a file is a `FileRef`, inline or a blob), `Runtime::state(run)` joins the head and its body generation (the only full-state read), and `Runtime::artifact_bytes(&FileRef)` fetches a file's blob once into a bounded cache |
 | `RunHeader` (re-exported from `adam-core`), `Runtime::header`, `view_from_record`, `Runtime::now` | the record without its state: `Runtime::header(run)` is one `Store::run_header` call (an adapter that overrides it projects the header and the lease; the trait's default reads the lease and the record), for a reader that only needs the run's own bookkeeping (a cancel watch, a parent check; an A2A task's state also needs `waiting`, so a status poll reads `view`). `RunHeader::claimed(now)` is `RunView::claimed`'s rule, one `adam_core::claimed(..)` helper. `view_from_record(record, claimed)` builds the `RunView` of a record a caller already holds (a listing), so it does not read the run again; `Runtime::now()` is the clock to compare a lease against, so the result agrees with `view` |
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
@@ -64,11 +64,11 @@ docs (`src/lib.rs`) and the [architecture](../../docs/architecture.md#the-mental
 
 ## The shadow: the head and the body
 
-The expand release of ADR 0055 (slice S2a) writes a run's **head** and its **body** beside the
-complete v4 `state`, and reads neither: the read path (`Runtime::view`, `load_run`, `claim_due`,
-`list_runs`) is unchanged, and `Store::load_head` exists for the tests and for the read path the
-next slice adds. A run's `state` is still the whole envelope a v4 process steps, so a mixed fleet is
-safe.
+ADR 0055's expand release writes a run's **head** and its **body** beside the complete v4 `state`:
+the steps write both (S2a), and an observer reads the head (S2b). `Runtime::view` is one
+`load_head` call and never a body; `Runtime::state` is the one full-state read, joining the head and
+the generation it names. The worker still reads the full state through `load_run`, and a run's `state`
+is still the whole envelope a v4 process steps, so a mixed fleet is safe.
 
 * `Agent::split(&state)` returns `Some((head, rows))` when the agent's state has a transcript worth
   keeping apart, and `None` (the default) when it does not. `Agent::join(head, rows)` is its inverse,
@@ -103,8 +103,33 @@ safe.
 * `tests/common/v4.rs` is a frozen copy of the v4 envelope; the suite decodes every `state` written
   and asserts a v5 head is **not** one. The contract release (S3) inverts that assertion.
 
+### The read path
+
+* `Runtime::view` reads the lease and then `Store::load_head` (one query on Memory and MongoDB;
+  PostgreSQL answers with the trait default until its half lands), and decodes the record as
+  `Stored`: `v: 1` is the v4 envelope, `v: 5` the head. A stale head
+  (`head_version != version`, left by a `deliver`, a `cancel` or a `park`) is not an error:
+  `load_head` serves the whole state, which decodes as `Stored::Full`, and the next step re-splits.
+* `RunView.state` is the agent's **head** for a v5 run and the whole agent state for a v4 one. The
+  pointers a front reads — `pending_wait`, `pending_question`, `question`, `usage_totals`,
+  `sandbox_usage`, `context`, `session` — are in the head. `RunView.artifacts` is a
+  `Vec<ArtifactRef>`: a file is a `FileRef { filename, size, source }`, `FileSource::Inline` for a
+  v4 run's bytes and `FileSource::Blob` for a v5 head's digest.
+* `Runtime::state(run)` is the only full-state read: the head, the `body_list(run, generation)` it
+  names, and the agent's `join`. A set whose length or indices do not match the head is re-read
+  once (the head may have moved between the two reads); a set that still does not match is
+  `Corrupt`. A v4 run answers its record with no body read.
+* `Runtime::artifact_bytes(&FileRef)` fetches a blob once and caches it by content address in a
+  bounded (32 MiB, least recently used first) cache shared by the runtime's clones. An inline file
+  answers its own bytes. A missing blob is `Ok(None)`: that artifact cannot be served, and the run
+  is intact.
+* `start_continuing`/`prior_state` join a v5 prior run (one body read), and `cancel` hands
+  `Agent::on_cancelled` the joined state. `view_from_record` builds the same view from a record a
+  caller already holds (a listing), which in the expand release carries the full v4 state.
+
 The cost is stated: in the expand release a step writes the whole state **and** the head **and** the
-rows, so bytes written per commit go up until S3 stops writing `state`.
+rows, so bytes written per commit go up until S3 stops writing `state`; the read side pays for the
+head, and for the whole state only where there is no current one.
 
 ## A message that arrives while a run finishes
 
@@ -590,20 +615,32 @@ class tables of `AgentError` and `RuntimeError` in `src/agent.rs`
 (`class_table`, `from_classified_maps_retryable_to_transient_and_keeps_the_hint`,
 `a_message_never_repeats_its_source`, `the_default_continuation_is_init_and_ignores_the_prior_state`) and `src/runtime.rs` (`error_tests`, and `defaults`: the worker's idle poll is 250 ms and a step's cancel watch 1 s, set separately).
 
-Two cases pin the read path: `a_header_is_one_store_call` (`Runtime::header` is one store call and reads neither the record
+Two cases pin the header path: `a_header_is_one_store_call` (`Runtime::header` is one store call and reads neither the record
 nor the lease beside it) and `the_cancel_watch_polls_at_its_own_interval` (a 2.5 s step at a 1 s cancel interval reads the
 header about twice, not once per 20 ms worker poll; the watch reads no state at all).
 
-Five cases pin the shadow: `a_step_that_splits_writes_the_head_and_the_body_beside_the_state` (the first commit
+Five cases pin the shadow's writes: `a_step_that_splits_writes_the_head_and_the_body_beside_the_state` (the first commit
 writes a `v: 5` head and starts a generation, the done commit appends to it, one generation holds the transcript, and
 `state` is still the whole v4 envelope), `a_split_that_does_not_reconstruct_the_state_writes_the_state_only` (a
 deliberately wrong split is refused: no head, no rows, the run stays v4), `every_state_written_is_a_v4_envelope_and_a_head_is_not_one`
 (the frozen `tests/common/v4.rs` decodes every state a create, a step, a delivery and a finish wrote, and rejects the
-head), `the_view_reads_the_state_and_never_the_head` (a `CountingStore`: one `load_run`, no `load_head`, no `body_list`,
-and the whole agent state in the view) and `a_pre_e_file_artifact_is_uploaded_before_the_head_names_it` (a run created
-directly with a file artifact in its state but no blob uploads and references its digest on the first commit, and the
-head names it). `a_split_whose_file_is_not_stored_writes_the_state_only` pins the other side: a failed `put_blob`
-refuses the head, and the commit writes the state only.
+head), `a_pre_e_file_artifact_is_uploaded_before_the_head_names_it` (a run created directly with a file artifact in its
+state but no blob uploads and references its digest on the first commit, and the head names it) and
+`a_split_whose_file_is_not_stored_writes_the_state_only` (a failed `put_blob` refuses the head, and the commit writes the
+state only).
+
+Six cases here pin the read path, and two in `adam-a2a-runtime`: `the_view_reads_the_head_and_the_state_joins_the_body`
+(a 50-message run of 10 KB turns: the view is one `load_head`, no `load_run`, no `body_list`, and less than 2 KB of state;
+`Runtime::state` is one `load_head`, one `body_list` and all 50 messages), `a_stale_head_falls_back_to_the_whole_state`
+(a delivery leaves the head stale: the view is the whole state, no body is read, and the next step rewrites the head),
+`a_v4_runs_view_is_the_whole_state` (a run that never split serves its whole agent state, and `Runtime::state` reads no
+body), `state_re_reads_a_moved_head_and_joins_its_new_generation` (a compaction between the first `load_head` and
+`body_list`: one re-read, the new head and generation, every message), `state_is_corrupt_when_the_body_is_short_twice`
+(the version did not move, so a second short set is `Corrupt`) and `artifact_bytes_serves_an_inline_file_and_a_blob`
+(an inline file's bytes, a stored blob's bytes, and `None` for a missing blob). In `adam-a2a-runtime`,
+`a_blob_backed_artifact_is_fetched_once_across_ten_polls` (ten `GetTask` polls read the head ten times, no state and no
+body, and fetch the file's blob once) and `a_four_mib_inline_file_is_served_whole_without_a_blob_read` (a v4 file is
+served byte for byte with no blob read).
 
 | Variable | Meaning |
 |---|---|

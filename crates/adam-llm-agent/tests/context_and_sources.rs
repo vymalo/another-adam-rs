@@ -108,8 +108,9 @@ async fn wait_waiting(rt: &Runtime, run: RunId) -> RunView {
     wait_for(rt, run, "parked and waiting", |v| v.waiting).await
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).expect("state is a Conversation")
 }
 
 fn call(id: &str, name: &str, args: Value) -> ToolCall {
@@ -195,7 +196,7 @@ async fn the_context_of_the_start_message_reaches_a_tool() {
     worker.stop().await;
 
     assert_eq!(*seen.lock().unwrap(), [Some(json!({"width": 3}))]);
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert_eq!(
         Value::Object(state.context),
         json!({"vymalo.screen": {"width": 3}, "other": true}),
@@ -257,6 +258,8 @@ async fn the_calls_of_a_turn_share_one_context_map() {
     let view = wait_done(&rt, run).await;
     worker.stop().await;
 
+    // The join reads the store, so it happens before the lock is taken.
+    let state = conversation(&rt, &view).await;
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 5, "{seen:?}");
     assert!(
@@ -264,10 +267,7 @@ async fn the_calls_of_a_turn_share_one_context_map() {
         "the five calls of the turn read one map: {seen:?}"
     );
     assert_eq!(
-        conversation(&view).context["catalog"]
-            .as_str()
-            .unwrap()
-            .len(),
+        state.context["catalog"].as_str().unwrap().len(),
         catalog.len()
     );
 }
@@ -305,7 +305,7 @@ async fn a_later_message_replaces_a_key_and_null_deletes_one() {
 
     assert_eq!(*seen.lock().unwrap(), [Some(json!(10))]);
     assert_eq!(
-        Value::Object(conversation(&view).context),
+        Value::Object(conversation(&rt, &view).await.context),
         json!({"a": 10, "c": 3, "d": 4})
     );
 }
@@ -391,7 +391,7 @@ async fn a_run_that_continues_another_starts_with_its_context_and_the_new_messag
 
     assert_eq!(*seen.lock().unwrap(), [Some(json!("new"))]);
     assert_eq!(
-        Value::Object(conversation(&view).context),
+        Value::Object(conversation(&rt, &view).await.context),
         json!({"a": "new", "keep": true})
     );
 }
@@ -438,7 +438,12 @@ async fn an_expired_entry_leaves_the_state_and_a_live_one_stays() {
         [None],
         "the tool never saw the expired grant"
     );
-    let mut kept: Vec<String> = conversation(&view).context.keys().cloned().collect();
+    let mut kept: Vec<String> = conversation(&rt, &view)
+        .await
+        .context
+        .keys()
+        .cloned()
+        .collect();
     kept.sort();
     assert_eq!(kept, ["live", "odd", "plain"]);
 }
@@ -457,7 +462,7 @@ async fn a_context_over_the_limit_is_dropped_and_the_text_is_still_read() {
     let worker = spawn_worker(&rt);
     let view = wait_done(&rt, run).await;
     worker.stop().await;
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert!(state.context.is_empty());
     assert_eq!(state.messages[0], Message::user_text("hi"));
 }
@@ -542,7 +547,7 @@ async fn a_message_with_a_large_context_and_a_tier_keeps_the_tier() {
     let worker = spawn_worker(&rt);
     let view = wait_done(&rt, run).await;
     worker.stop().await;
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert_eq!(
         Value::Object(state.context.clone()),
         json!({ACCESS_TIER_CONTEXT_KEY: {"tier": "plan"}})
@@ -611,7 +616,7 @@ async fn a_question_keeps_its_interface_while_the_run_waits() {
     let parked = wait_waiting(&rt, run).await;
     let ui = json!([{"version": "v0.9.1", "createSurface": {"surfaceId": "s", "catalogId": "c"}}]);
     assert_eq!(
-        conversation(&parked).pending_wait,
+        conversation(&rt, &parked).await.pending_wait,
         Some(PendingWait::Question(PendingQuestion {
             call_id: "c1".into(),
             tool: "ask".into(),
@@ -627,7 +632,7 @@ async fn a_question_keeps_its_interface_while_the_run_waits() {
         .expect("deliver");
     let view = wait_done(&rt, run).await;
     worker.stop().await;
-    assert!(conversation(&view).pending_wait.is_none());
+    assert!(conversation(&rt, &view).await.pending_wait.is_none());
 }
 
 #[test]
@@ -831,7 +836,7 @@ async fn an_own_tool_wins_a_name_clash_and_a_name_nobody_has_is_an_error_result(
     );
     assert!(called.lock().unwrap().is_empty());
     // The unknown name is an error result the model reads; the run goes on.
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     let ghost = state
         .messages
         .iter()
@@ -1006,7 +1011,7 @@ async fn a_source_tool_can_ask_the_person_and_the_answer_is_its_result() {
     let worker = spawn_worker(&rt);
     let parked = wait_waiting(&rt, run).await;
     assert!(matches!(
-        conversation(&parked).pending_wait,
+        conversation(&rt, &parked).await.pending_wait,
         Some(PendingWait::Question(PendingQuestion { tool, .. })) if tool == "ask_remote"
     ));
     assert_eq!(pings.load(SeqCst), 0, "the calls after the parked one wait");
@@ -1016,7 +1021,7 @@ async fn a_source_tool_can_ask_the_person_and_the_answer_is_its_result() {
     let view = wait_done(&rt, run).await;
     worker.stop().await;
     assert_eq!(pings.load(SeqCst), 1);
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert_eq!(state.messages[2], Message::tool_result("c1", "the first"));
     assert_eq!(state.messages[3], Message::tool_result("c2", "pong"));
 }
@@ -1150,7 +1155,7 @@ async fn a_source_tool_that_was_recorded_is_not_called_again_by_a_replay() {
     assert_eq!(calls.load(SeqCst), 1, "the tool ran once");
     assert_eq!(view.output.clone().expect("output")["text"], "done");
     assert_eq!(
-        conversation(&view).messages[2],
+        conversation(&rt, &view).await.messages[2],
         Message::tool_result("c1", "recorded"),
         "and its recorded answer is the result"
     );
@@ -1203,7 +1208,7 @@ async fn a_source_tool_cannot_wait_on_a_remote_task_and_the_call_is_an_error_res
     worker.stop().await;
 
     assert_eq!(view.output.clone().expect("output")["text"], "noted");
-    let state = conversation(&view);
+    let state = conversation(&rt, &view).await;
     assert!(
         matches!(&state.messages[2], Message::Tool { call_id, content, is_error: true, .. }
             if call_id == "c1" && content.contains("`start_task`") && content.contains("is gone")),

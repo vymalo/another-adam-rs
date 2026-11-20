@@ -18,6 +18,7 @@ use uuid::Uuid;
 use adam_core::{BlobId, RunId, StoreError};
 
 use crate::agent::Inbound;
+use crate::artifact_ref::{ArtifactRef, FileRef};
 use crate::blob::blob_id;
 use crate::envelope::{Envelope, VERSION as FULL_VERSION};
 use crate::events::Artifact;
@@ -162,10 +163,6 @@ impl Head {
 
     /// Decode `state` as a v5 head; [`RuntimeError::Corrupt`] for another version or a document
     /// that does not decode.
-    #[allow(
-        dead_code,
-        reason = "S2a writes and verifies the head; S2b's read path decodes it"
-    )]
     pub(crate) fn decode(run: RunId, state: &Value) -> Result<Self, RuntimeError> {
         let corrupt = |reason: String| RuntimeError::Corrupt {
             run,
@@ -219,6 +216,20 @@ fn head_artifact(
     }
 }
 
+/// A head artifact as a view carries it: a file by content address, never its bytes. Consumes the
+/// head artifact, so a poll does not clone its members.
+fn head_artifact_ref(artifact: HeadArtifact) -> ArtifactRef {
+    ArtifactRef {
+        id: artifact.id,
+        name: artifact.name,
+        mime_type: artifact.mime_type,
+        data: artifact.data,
+        file: artifact
+            .file
+            .map(|file| FileRef::blob(file.filename, file.size, file.digest)),
+    }
+}
+
 /// The two documents a run's `state` can be in the expand release: the v4 envelope, or the v5
 /// head. Every commit path re-encodes the variant it read.
 #[derive(Clone, Debug, PartialEq)]
@@ -229,13 +240,6 @@ pub(crate) enum Stored {
     Head(Head),
 }
 
-// S2a writes and verifies the head but reads neither; the read path (S2b) is what calls these.
-// The allow covers this enum and its methods; `Head::decode`, the one callee outside it, carries
-// its own allow.
-#[allow(
-    dead_code,
-    reason = "S2a writes and verifies the head; S2b's read path decodes and serves it"
-)]
 impl Stored {
     /// Decode `state` as the variant its `v` names.
     pub(crate) fn decode(run: RunId, state: &Value) -> Result<Self, RuntimeError> {
@@ -274,10 +278,19 @@ impl Stored {
     }
 
     /// The failure reason, in the variant's own document.
+    #[cfg(test)]
     pub(crate) fn error(&self) -> Option<&str> {
         match self {
             Self::Full(envelope) => envelope.error.as_deref(),
             Self::Head(head) => head.error.as_deref(),
+        }
+    }
+
+    /// The failure reason, to set it (a cancel).
+    pub(crate) fn error_mut(&mut self) -> &mut Option<String> {
+        match self {
+            Self::Full(envelope) => &mut envelope.error,
+            Self::Head(head) => &mut head.error,
         }
     }
 
@@ -289,6 +302,57 @@ impl Stored {
             Self::Head(head) => &head.agent,
         }
     }
+
+    /// The body generation a `Head` names; `None` for a `Full` state, whose transcript is in it.
+    pub(crate) fn body(&self) -> Option<&BodyRef> {
+        match self {
+            Self::Full(_) => None,
+            Self::Head(head) => Some(&head.body),
+        }
+    }
+
+    /// The members a [`RunView`](crate::RunView) takes, moved out of the document (a file's bytes
+    /// are moved, not cloned, for a v4 run).
+    pub(crate) fn into_parts(self) -> ViewParts {
+        match self {
+            Self::Full(envelope) => ViewParts {
+                agent: envelope.agent,
+                inbox: envelope.inbox,
+                attempt: envelope.attempt,
+                output: envelope.output,
+                error: envelope.error,
+                artifacts: envelope
+                    .artifacts
+                    .into_iter()
+                    .map(ArtifactRef::from)
+                    .collect(),
+                agent_wake: envelope.agent_wake,
+                hb: envelope.hb,
+            },
+            Self::Head(head) => ViewParts {
+                agent: head.agent,
+                inbox: head.inbox,
+                attempt: head.attempt,
+                output: head.output,
+                error: head.error,
+                artifacts: head.artifacts.into_iter().map(head_artifact_ref).collect(),
+                agent_wake: head.agent_wake,
+                hb: head.hb,
+            },
+        }
+    }
+}
+
+/// The members a view takes from a stored document.
+pub(crate) struct ViewParts {
+    pub agent: Value,
+    pub inbox: Vec<Inbound>,
+    pub attempt: u32,
+    pub output: Value,
+    pub error: Option<String>,
+    pub artifacts: Vec<ArtifactRef>,
+    pub agent_wake: Option<Timestamp>,
+    pub hb: bool,
 }
 
 #[cfg(test)]

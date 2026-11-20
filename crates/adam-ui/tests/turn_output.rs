@@ -103,13 +103,10 @@ impl Rig {
     }
 
     async fn state_of(&self, task: &Task) -> (Value, Value) {
-        let view = self
-            .runtime
-            .view(RunId(task.id.parse().unwrap()))
-            .await
-            .unwrap()
-            .unwrap();
-        (view.output.unwrap(), view.state)
+        let run = RunId(task.id.parse().unwrap());
+        let view = self.runtime.view(run).await.unwrap().unwrap();
+        let state = self.runtime.state(run).await.unwrap().expect("the run");
+        (view.output.unwrap(), state)
     }
 }
 

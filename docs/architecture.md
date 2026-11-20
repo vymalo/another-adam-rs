@@ -899,7 +899,7 @@ How a run looks to an A2A client (`task_state`, `crates/adam-a2a-runtime/src/con
 | `Failed` with an error that starts `cancelled: ` | `canceled` |
 | `Failed` otherwise | `failed` |
 
-`Runtime::view` reads the lease **before** the record, so a step that commits between the two reads is
+`Runtime::view` reads the lease **before** the head, so a step that commits between the two reads is
 never shown as `submitted` again. A front that holds only the starter claims nothing: its tasks stay
 `submitted`. A task's id is derived, not random: `task_id_for(agent, caller, context, messageId)`
 (`crates/adam-a2a-runtime/src/ids.rs`), so a repeated `SendMessage` reaches the task its first attempt made.
@@ -1031,10 +1031,12 @@ the bytes too until the contract release, so a reader of the old format still re
 
 ### The head and the body (schema version 5, part 2)
 
-The expand release writes a **head** and a **body generation** beside `state`, and reads neither:
-the read path (`Runtime::view`, `load_run`, `claim_due`, `list_runs`) is unchanged in this slice, and
-`Store::load_head` exists for the tests (the read path is the next slice). MongoDB keeps both now; the
-PostgreSQL half is the follow-up after #361, and `PgStore` keeps `keeps_bodies() == false` until then.
+The expand release writes a **head** and a **body generation** beside `state`: the steps write both
+(S2a), and the observer reads the head (S2b). `Runtime::view` is one `Store::load_head` and no body;
+`Runtime::state` is the one full-state read, joining the head and the generation it names. The
+worker, `load_run`, `claim_due` and `list_runs` still read the whole state until S3. MongoDB keeps
+both now; the PostgreSQL half is the follow-up after #361, and `PgStore` keeps `keeps_bodies() ==
+false` until then, so its `load_head` is the trait default and its view is the whole state.
 The head is the envelope with `v: 5`, `agent` reduced to the agent's head, file artifacts by
 reference, and a `body` member naming one generation; the rows are the messages.
 
@@ -1059,8 +1061,14 @@ than the insert→CAS gap of a live attempt (milliseconds; the default lease is 
 distinguishes a dead attempt from a live one without trusting the lease. The runtime reconstructs `join(head, rows)` before every commit and
 refuses a split that does not equal the state, which keeps a bad split at `state` only. A commit that
 does not split (a delivery, a cancel, a park) leaves the stored head and its version alone;
-`load_head` serves the head only when `head_version == version`. **The contract release (S3) stops
-writing `state`**; until then, the expand release pays for both representations.
+`load_head` serves the head only when `head_version == version`. A **stale** head is not an error:
+the whole state is served, and the next step re-splits and rewrites the head. `Runtime::view`
+decodes either document (`Stored`: `v: 1` or `v: 5`), so an observer of a v4 run and of a v5 one
+gets the same `RunView` shape; `RunView.state` is the agent's **head** and `RunView.artifacts` is a
+`Vec<ArtifactRef>`, a file by reference. `Runtime::state` joins the head and
+`body_list(run, generation)` (one body read, the only full-state read), and
+`Runtime::artifact_bytes` fetches a file's blob once into a bounded, shared cache. **The contract
+release (S3) stops writing `state`**; until then, the expand release pays for both representations.
 
 `Conversation` (`crates/adam-llm-agent/src/conversation.rs`) has `messages`, `turns`, `tool_calls`,
 `usage`, `pending_calls`, `pending_wait` (a question for the user, a child run or a remote task),

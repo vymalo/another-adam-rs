@@ -383,7 +383,7 @@ fn builder(mock: &Arc<MockModel>) -> adam::LlmAgentBuilder {
 }
 
 /// Run `agent` until the run stops moving: done, failed, or parked on a question.
-async fn run_until_settled(agent: &LlmAgent) -> RunView {
+async fn run_until_settled(agent: &LlmAgent) -> (Runtime, RunView) {
     let store: DynStore = Arc::new(MemoryStore::new());
     let rt = Runtime::builder(store)
         .agent(agent.clone())
@@ -408,8 +408,11 @@ async fn run_until_settled(agent: &LlmAgent) -> RunView {
     let deadline = Instant::now() + Duration::from_secs(20);
     let view = loop {
         let view = rt.view(run).await.unwrap().unwrap();
-        let conversation: Conversation = serde_json::from_value(view.state.clone()).unwrap();
-        let parked = conversation.pending_wait.is_some();
+        // `pending_wait` is in the head, so the poll reads no body.
+        let parked = view
+            .state
+            .get("pending_wait")
+            .is_some_and(|wait| !wait.is_null());
         if matches!(view.status, RunStatus::Done | RunStatus::Failed) || parked {
             break view;
         }
@@ -418,15 +421,17 @@ async fn run_until_settled(agent: &LlmAgent) -> RunView {
     };
     let _ = stop.send(());
     worker.await.unwrap().unwrap();
-    view
+    (rt, view)
 }
 
-fn conversation(view: &RunView) -> Conversation {
-    serde_json::from_value(view.state.clone()).unwrap()
+async fn conversation(rt: &Runtime, view: &RunView) -> Conversation {
+    let state = rt.state(view.id).await.expect("state").expect("the run");
+    serde_json::from_value(state).unwrap()
 }
 
-fn tool_results(view: &RunView) -> Vec<(String, bool)> {
-    conversation(view)
+async fn tool_results(rt: &Runtime, view: &RunView) -> Vec<(String, bool)> {
+    conversation(rt, view)
+        .await
         .messages
         .into_iter()
         .filter_map(|m| match m {
@@ -453,9 +458,9 @@ async fn the_model_calls_generated_tools_and_reads_their_output() {
         .tools(tools![GetWeather, Whoami, Searcher])
         .try_build()
         .unwrap();
-    let view = run_until_settled(&agent).await;
+    let (rt, view) = run_until_settled(&agent).await;
     assert_eq!(view.status, RunStatus::Done);
-    let results = tool_results(&view);
+    let results = tool_results(&rt, &view).await;
     assert_eq!(results.len(), 4, "{results:?}");
     assert_eq!(results[0], ("Berlin: 18 C (+1 days)".to_owned(), false));
     assert_eq!(results[1], ("whoami / c2".to_owned(), false));
@@ -487,8 +492,9 @@ async fn a_tool_that_needs_input_parks_the_run_with_the_question() {
         json!({"question": "Which branch?"}),
     )]);
     let agent = builder(&mock).tools(tools![AskUser]).try_build().unwrap();
-    let view = run_until_settled(&agent).await;
-    let pending = conversation(&view)
+    let (rt, view) = run_until_settled(&agent).await;
+    let pending = conversation(&rt, &view)
+        .await
         .pending_wait
         .expect("parked on the question");
     assert!(
@@ -541,13 +547,13 @@ async fn a_permanent_tool_error_is_the_models_to_read() {
     mock.push_tool_calls(vec![call("c1", "flaky", json!({"class": "invalid"}))])
         .push_text("done");
     let agent = builder(&mock).tools(tools![Flaky]).try_build().unwrap();
-    let view = run_until_settled(&agent).await;
+    let (rt, view) = run_until_settled(&agent).await;
     assert_eq!(
         view.status,
         RunStatus::Done,
         "a permanent error is the model's to read"
     );
-    let results = tool_results(&view);
+    let results = tool_results(&rt, &view).await;
     assert_eq!(results.len(), 1);
     assert!(
         results[0].1 && results[0].0.contains("upstream is Invalid"),

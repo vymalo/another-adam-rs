@@ -58,9 +58,10 @@
 //! * **Events** ([`EventSink`], [`RunEvent`]): live and best effort, lost if
 //!   the process dies. In-process fan-out: [`BroadcastSink`].
 //! * **The durable record** ([`Runtime::view`] -> [`RunView`]): status,
-//!   output, error, attempt, timers, emitted artifacts and the agent's own
-//!   state, all read from the store. A consumer that restarts (or lives in
-//!   another process) polls this to rebuild what it missed.
+//!   output, error, attempt, timers, emitted artifacts and the agent's head
+//!   (its state without the transcript), all read from the store. A consumer that restarts (or
+//!   lives in another process) polls this to rebuild what it missed; [`Runtime::state`] is the one
+//!   read that joins the head and the body generation it names.
 //!
 //! # Guarantees
 //!
@@ -81,6 +82,7 @@
 #![warn(missing_docs)]
 
 mod agent;
+mod artifact_ref;
 mod blob;
 mod cancel;
 mod child;
@@ -105,6 +107,7 @@ pub use adam_core::RunHeader;
 pub use adam_error::{Classify, ErrorClass};
 pub use adam_model::Usage;
 pub use agent::{Agent, AgentError, AgentStarter, Inbound, Transition};
+pub use artifact_ref::{ArtifactRef, FileRef, FileSource};
 pub use blob::blob_id;
 pub use cancel::CancelToken;
 pub use child::{CHILD_REPORTED_KIND, ChildStarter, ChildStatus, RUN_FINISHED_KIND, child_run_id};

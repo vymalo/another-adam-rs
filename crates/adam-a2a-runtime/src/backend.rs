@@ -10,7 +10,9 @@ use adam_a2a::{
 };
 use adam_core::{RunId, StoreError};
 use adam_error::ErrorClass;
-use adam_runtime::{AgentError, BroadcastSink, Classify, RunView, Runtime, RuntimeError};
+use adam_runtime::{
+    AgentError, ArtifactRef, BroadcastSink, Classify, FileSource, RunView, Runtime, RuntimeError,
+};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use uuid::Uuid;
@@ -670,7 +672,8 @@ impl RuntimeTaskBackend {
         }
         // The delivery is a commit, so a run nobody has stepped yet reads `working` from here on.
         let view = self.view_of(run).await?;
-        Ok(self.said(caller, &view, task_from_view(&view, context, &self.prompt)))
+        let task = self.task_of(&view, context).await;
+        Ok(self.said(caller, &view, task))
     }
 
     /// A message to a root context or to a task of the root agent.
@@ -717,7 +720,7 @@ impl RuntimeTaskBackend {
                 Some(view) => view,
                 None => self.view_of(run).await?,
             };
-            let mut task = self.said(caller, &view, task_from_view(&view, &context, &self.prompt));
+            let mut task = self.said(caller, &view, self.task_of(&view, &context).await);
             let mut first = message;
             first.task_id = Some(task.id.clone());
             first.context_id = Some(context);
@@ -771,7 +774,7 @@ impl RuntimeTaskBackend {
         // The delivery made the run runnable, so this reads `working`; make
         // that certain even if the record is read before the commit is visible.
         let view = self.view_of(run).await?;
-        let mut task = task_from_view(&view, &context, &self.prompt);
+        let mut task = self.task_of(&view, &context).await;
         if task.status.state == TaskState::InputRequired {
             task.status.state = TaskState::Working;
             task.status.message = None;
@@ -787,6 +790,92 @@ impl RuntimeTaskBackend {
             .await
             .map_err(map_err)?
             .ok_or_else(|| BackendError::TaskNotFound(run.to_string()))
+    }
+
+    /// The A2A task of `view`: the run's artifacts resolved for the wire, then the mapping.
+    ///
+    /// A file artifact is fetched by its blob, once: the runtime's bounded cache answers every
+    /// later read of the same file, so a poll of an unchanged run transfers no bytes.
+    pub(crate) async fn task_of(&self, view: &RunView, context_id: &str) -> Task {
+        let artifacts = self.artifacts_of(view).await;
+        task_from_view(view, context_id, &self.prompt, artifacts)
+    }
+
+    /// Every artifact of `view` as A2A serves it. A file whose blob is gone is left out (the run
+    /// is intact; that one artifact cannot be served).
+    pub(crate) async fn artifacts_of(&self, view: &RunView) -> Vec<a2a::Artifact> {
+        let mut artifacts = Vec::with_capacity(view.artifacts.len());
+        for artifact in &view.artifacts {
+            if let Some(artifact) = self.artifact_of(artifact).await {
+                artifacts.push(artifact);
+            }
+        }
+        artifacts
+    }
+
+    /// One artifact as A2A serves it, its blob fetched when it has one.
+    pub(crate) async fn artifact_of(&self, artifact: &ArtifactRef) -> Option<a2a::Artifact> {
+        let id = crate::convert::artifact_id(artifact);
+        self.artifact_of_with(artifact, id).await
+    }
+
+    /// [`artifact_of`](Self::artifact_of) for a caller that already derived the id (a subscriber
+    /// caches it): the id is not derived again, so a poll hashes an artifact once.
+    ///
+    /// Only a [`FileSource::Blob`] is fetched. An inline file (a v4 run) is served from the view's
+    /// own bytes, so the backend neither copies them into an `Arc` nor copies them again.
+    pub(crate) async fn artifact_of_with(
+        &self,
+        artifact: &ArtifactRef,
+        id: String,
+    ) -> Option<a2a::Artifact> {
+        let bytes = match &artifact.file {
+            Some(file) if matches!(file.source, FileSource::Blob(_)) => {
+                #[cfg(test)]
+                fetch_hook::fetched();
+                match self.runtime.artifact_bytes(file).await {
+                    Ok(Some(bytes)) => Some(bytes),
+                    Ok(None) => {
+                        tracing::warn!(
+                            artifact = %artifact.name,
+                            blob = %file.digest(),
+                            "the file's blob is gone; the artifact is left out of the task"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            artifact = %artifact.name,
+                            error = %adam_error::report(&error),
+                            "a file artifact's bytes could not be read; it is left out of the task"
+                        );
+                        None
+                    }
+                }
+            }
+            // An inline file (a v4 run): the ref carries its bytes, and `convert` serves them.
+            Some(_) => None,
+            None => None,
+        };
+        crate::convert::artifact_of_with(artifact, id, bytes)
+    }
+}
+
+/// Counts the blobs the backend fetches, for the test that proves an inline file is not fetched.
+#[cfg(test)]
+mod fetch_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FETCHES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn fetched() {
+        FETCHES.with(|n| n.set(n.get() + 1));
+    }
+
+    pub(super) fn take() -> usize {
+        FETCHES.with(|n| n.replace(0))
     }
 }
 
@@ -980,7 +1069,7 @@ impl TaskBackend for RuntimeTaskBackend {
         let Some((_, view, context)) = self.locate(caller, task_id).await? else {
             return Ok(None);
         };
-        let task = self.said(caller, &view, task_from_view(&view, &context, &self.prompt));
+        let task = self.said(caller, &view, self.task_of(&view, &context).await);
         Ok(Some(self.with_sessions(caller, task).await?))
     }
 
@@ -1005,7 +1094,7 @@ impl TaskBackend for RuntimeTaskBackend {
         }
         match state {
             TaskState::Canceled => {
-                let task = task_from_view(&view, &context, &self.prompt);
+                let task = self.task_of(&view, &context).await;
                 self.with_sessions(caller, task).await
             }
             other => Err(BackendError::NotCancelable {
@@ -1183,6 +1272,67 @@ mod tests {
         assert!(
             matches!(foreign, BackendError::Internal { .. }),
             "{foreign:?}"
+        );
+    }
+
+    /// An inline file is served from the view's bytes with **no** `artifact_bytes` call; a blob is
+    /// fetched (and the runtime's cache answers a second read).
+    #[tokio::test]
+    async fn an_inline_file_is_not_fetched_and_a_blob_is() {
+        use std::sync::Arc;
+
+        use adam_core::{DynStore, MemoryStore};
+        use adam_runtime::FileRef;
+
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let runtime = Runtime::builder(store.clone()).build();
+        let backend = RuntimeTaskBackend::new(runtime, BroadcastSink::default(), "a");
+
+        let bytes = vec![7_u8; 4 * 1024 * 1024];
+        let inline = ArtifactRef::file("big", "application/octet-stream", "big.bin", bytes.clone())
+            .expect("a file");
+        super::fetch_hook::take();
+        let served = backend.artifact_of(&inline).await.expect("served");
+        assert_eq!(
+            super::fetch_hook::take(),
+            0,
+            "an inline file is not fetched"
+        );
+        assert_eq!(
+            served.parts[0].content,
+            a2a::PartContent::Raw(bytes.clone())
+        );
+
+        let digest = adam_runtime::blob_id(&bytes);
+        store.put_blob(&digest, &bytes).await.expect("put the blob");
+        let mut blob = ArtifactRef::new(
+            "big",
+            Some("application/octet-stream".into()),
+            serde_json::Value::Null,
+        );
+        blob.file = Some(FileRef::blob("big.bin", bytes.len() as u64, digest));
+        let served = backend.artifact_of(&blob).await.expect("served");
+        assert_eq!(super::fetch_hook::take(), 1, "a blob is fetched once");
+        assert_eq!(served.parts[0].content, a2a::PartContent::Raw(bytes));
+    }
+
+    /// A blob that is gone serves nothing: the artifact is left out, and the run is intact.
+    #[tokio::test]
+    async fn a_missing_blob_leaves_the_artifact_out() {
+        use std::sync::Arc;
+
+        use adam_core::{DynStore, MemoryStore};
+        use adam_runtime::FileRef;
+
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let runtime = Runtime::builder(store).build();
+        let backend = RuntimeTaskBackend::new(runtime, BroadcastSink::default(), "a");
+        let digest = adam_runtime::blob_id(b"gone");
+        let mut blob = ArtifactRef::new("gone", None, serde_json::Value::Null);
+        blob.file = Some(FileRef::blob("gone.bin", 4, digest));
+        assert!(
+            backend.artifact_of(&blob).await.is_none(),
+            "a missing blob is not served as an empty file"
         );
     }
 }

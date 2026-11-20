@@ -25,7 +25,7 @@ use crate::cancel::CancelToken;
 use crate::child::news_since;
 use crate::ctx::{Ctx, CtxOutcome, CtxParts};
 use crate::envelope::Envelope;
-use crate::erased::Stepped;
+use crate::erased::{ErasedAgent, Stepped};
 use crate::events::Artifact;
 use crate::head::Head;
 use crate::notify::{Delivery, Signal};
@@ -628,7 +628,7 @@ async fn transition(
     // goes alone, the run keeps its format, and the log says why. The typed state is deserialized
     // once more (the same `S`), never re-parsed from the head.
     if let Some((head, rows)) = &next.split {
-        match agent.join(head.clone(), rows.clone()) {
+        match ErasedAgent::join(agent.as_ref(), head.clone(), rows.clone()) {
             Ok(joined) if joined == next.agent => {}
             Ok(_) => {
                 tracing::error!(

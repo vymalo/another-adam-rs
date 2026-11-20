@@ -30,9 +30,7 @@ use uuid::Uuid;
 
 use crate::backend::{RuntimeTaskBackend, map_err};
 use crate::child_sessions::{ContextKind, kind_of};
-use crate::convert::{
-    chrono_of, decode_conversation, encode_conversation, task_from_view, timestamp_of,
-};
+use crate::convert::{chrono_of, decode_conversation, encode_conversation, timestamp_of};
 
 /// The most runs one page reads while looking for matches that need their state read. A filter
 /// that matches rarely returns a short page and a token instead of reading a whole history.
@@ -57,7 +55,7 @@ fn narrowing(state: Option<&TaskState>) -> (Option<Vec<RunStatus>>, bool) {
 
 impl RuntimeTaskBackend {
     /// The record as a task: of its root context, or a round of the session being listed.
-    fn shaped(
+    async fn shaped(
         &self,
         rec: &RunRecord,
         view: RunView,
@@ -66,11 +64,14 @@ impl RuntimeTaskBackend {
         match session {
             Some((session, parent)) => {
                 let context = adam_runtime::session_conversation_id(parent, session.id);
-                Some(self.listed_round(session, &context, parent, rec, view))
+                Some(
+                    self.listed_round(session, &context, parent, rec, view)
+                        .await,
+                )
             }
             None => {
                 let (_, context) = decode_conversation(rec.conversation_id.as_deref()?)?;
-                Some(task_from_view(&view, &context, &self.prompt))
+                Some(self.task_of(&view, &context).await)
             }
         }
     }
@@ -208,7 +209,7 @@ impl RuntimeTaskBackend {
                     }
                     Err(e) => return Err(map_err(e)),
                 };
-                let Some(task) = self.shaped(&rec, view, session.as_ref()) else {
+                let Some(task) = self.shaped(&rec, view, session.as_ref()).await else {
                     continue;
                 };
                 if !exact
