@@ -128,9 +128,11 @@ function setup(t, { runResult = { exitCode: 0 }, outFiles = null, refused = [], 
   const containers = new FakeContainers({ onRun: (spec) => (spec.script.includes(' run --standalone ') ? runResult : { exitCode: 0 }) });
   const slotDir = path.join(home, 'slots', '2'); // as Stack.slotDir: a directory of the harness's own home
   const workRoot = path.join(home, 'work', '2');
+  const glibcDir = path.join(home, 'glibc'); // as Stack.ensureGlibc
   fs.mkdirSync(workRoot, { recursive: true });
   const stack = {
     slotDir: () => slotDir,
+    ensureGlibc: async () => glibcDir,
     workRoot: () => workRoot,
     coderContainers: () => ({ listContainers: async () => [{ image: task.image.ref, imageId: 'f'.repeat(64), labels: {}, names: ['coder-2'] }] }),
     workDir: async (slot, dir, o) => stackCalls.push(['workDir', slot, dir, Boolean(o?.remove)]),
@@ -256,8 +258,9 @@ test('run: the container of the task image by digest, as uid 10001, the binary r
   assert.equal(result.sessionId, 'ses_abc123XYZ');
   assert.deepEqual(result.selfReported, { input: 199, output: 20, cached: 47, calls: 2 });
   assert.equal(result.record.limits, 'runtime');
+  assert.ok(!mounts['/lib64/ld-linux-x86-64.so.2'], 'an image with its own loader is run as it is: nothing of the harness\'s glibc is mounted');
   const exp = containers.runs.find((s) => s.script.includes('session export'));
-  assert.match(exp.script, /session export --standalone 'ses_abc123XYZ'/);
+  assert.match(exp.script, /\/opt\/bench\/opencode session export --standalone 'ses_abc123XYZ'/);
   assert.equal(exp.network, 'none');
   assert.equal(JSON.parse(exp.input).provider.bench.options.baseURL, URL);
 });
@@ -604,4 +607,62 @@ test('the clone for OpenCode names safe.directory in a global file, as the pushe
   assert.match(script, /GIT_CONFIG_GLOBAL=\/tmp\/bench-gitconfig/);
   assert.doesNotMatch(script, /GIT_CONFIG_COUNT/);
   assert.throws(() => opencodeCloneScript({ repo: '/work/a b', dir: '/work/x' }), /plain/);
+});
+
+// ---- a task image without glibc (Alpine, musl): the binary starts through the harness's own loader ----
+
+test('a task image with its own loader is run as it is; one without (musl) gets the harness\'s glibc mounted read-only at the places glibc looks, and no variable carries it', async (t) => {
+  const own = setup(t);
+  await own.agent.prepare(own.ctx);
+  await own.agent.run(own.ctx);
+  const ownSpec = own.containers.runs.find((x) => x.script.includes(' run --standalone '));
+  assert.ok(!ownSpec.mounts.some((m) => m.target === '/lib64/ld-linux-x86-64.so.2'));
+
+  // a container that finds no loader: `test -e /lib64/ld-linux-x86-64.so.2` exits 1
+  const s = setup(t);
+  const base = s.containers.onRun;
+  s.containers.onRun = (spec, i) => (spec.script === 'test -e /lib64/ld-linux-x86-64.so.2' ? { exitCode: 1 } : base(spec, i));
+  let asked = 0;
+  s.ctx.stack.ensureGlibc = async () => (asked += 1, '/h/glibc');
+  await s.agent.prepare(s.ctx);
+  await s.agent.run(s.ctx);
+  const specs = s.containers.runs.filter((x) => x.script.includes(' run --standalone ') || x.script.includes('session export'));
+  assert.equal(specs.length, 2, 'the run and the export');
+  for (const spec of specs) {
+    const m = Object.fromEntries(spec.mounts.map((x) => [x.target, x]));
+    assert.deepEqual(m['/lib64/ld-linux-x86-64.so.2'], { source: '/h/glibc/ld-linux-x86-64.so.2', target: '/lib64/ld-linux-x86-64.so.2', readOnly: true });
+    for (const f of ['libc.so.6', 'libgcc_s.so.1', 'libstdc++.so.6', 'libnss_files.so.2', 'libnss_dns.so.2', 'libresolv.so.2']) assert.deepEqual(m[`/usr/lib/x86_64-linux-gnu/${f}`], { source: `/h/glibc/${f}`, target: `/usr/lib/x86_64-linux-gnu/${f}`, readOnly: true }, f);
+    assert.ok(spec.mounts.filter((x) => x.target !== '/work' && x.target !== '/bench/out').every((x) => x.readOnly), 'nothing of it is writable');
+    assert.ok(!JSON.stringify(spec.env).match(/LD_/), 'no variable carries the libraries: the agent\'s tools never see them');
+  }
+  assert.equal(asked, 1, 'the runtime is copied out of the coder image once, and only for an image that needs it');
+  // the answer is remembered for the image: a second attempt does not ask again
+  const before = s.containers.runs.filter((x) => x.script.startsWith('test -e')).length;
+  await s.agent.prepare(s.ctx);
+  assert.equal(s.containers.runs.filter((x) => x.script.startsWith('test -e')).length, before);
+});
+
+test('an image that cannot run a shell for the loader test is infrastructure of reason runtime, found in prepare', async (t) => {
+  const s = setup(t);
+  const base = s.containers.onRun;
+  s.containers.onRun = (spec, i) => (spec.script === 'test -e /lib64/ld-linux-x86-64.so.2' ? { exitCode: 127, stderr: 'exec: sh: not found' } : base(spec, i));
+  await assert.rejects(s.agent.prepare(s.ctx), (e) => e.reason === 'runtime' && /could not run a shell/.test(e.message));
+});
+
+test('a container that does not start: the shell\'s own message (in stderr.txt, not on the container\'s stderr) is in the error, in the run\'s directory and in the error\'s stderr', async (t) => {
+  const said = 'sh: /opt/bench/opencode: not found\n';
+  const s = setup(t, { runResult: { exitCode: 127, stderr: '' }, outFiles: [['stderr.txt', Buffer.from(said)]] });
+  await s.agent.prepare(s.ctx);
+  await assert.rejects(s.agent.run(s.ctx), (e) => {
+    assert.ok(e instanceof InfraError && e.reason === 'runtime');
+    assert.match(e.message, /did not start \(exit 127\): sh: \/opt\/bench\/opencode: not found/);
+    assert.match(e.stderr, /opencode: not found/, 'the runner writes it to prepare-stderr.txt');
+    return true;
+  });
+  assert.equal(fs.readFileSync(path.join(s.ctx.paths.run, 'opencode', 'stderr.txt'), 'utf8'), said);
+  // the run token is taken out of it
+  const leaky = setup(t, { runResult: { exitCode: 126, stderr: '' }, outFiles: [['stderr.txt', Buffer.from(`boom ${TOKEN}\n`)]] });
+  await leaky.agent.prepare(leaky.ctx);
+  await assert.rejects(leaky.agent.run(leaky.ctx), (e) => !e.message.includes(TOKEN) && !e.stderr.includes(TOKEN));
+  assert.ok(!fs.readFileSync(path.join(leaky.ctx.paths.run, 'opencode', 'stderr.txt'), 'utf8').includes(TOKEN));
 });

@@ -25,6 +25,8 @@ export function stackRepoUrl(slug) {
 
 const GIT_URL_RE = /^http:\/\/(127\.0\.0\.1|localhost):\d{1,5}\/bench\/[a-z0-9][a-z0-9-]{0,80}\.git$/;
 const PUSH_URL_RE = /^http:\/\/git-server:8080\/bench\/[a-z0-9][a-z0-9-]{0,80}\.git$/;
+/** Where the pusher makes its scratch repository: the slot's work volume, mounted by compose.yaml (`pusher-N`). */
+export const PUSH_SCRATCH = '/scratch';
 const PLAIN_PATH = /^\/[A-Za-z0-9._/@+=-]*$/;
 
 /**
@@ -49,7 +51,9 @@ export function pushScript({ base, url }) {
   return [
     'set -eu',
     ...SAFE_DIRECTORY_LINES,
-    'P=$(mktemp -d)',
+    // The scratch repository is as large as the base: it goes on the disk-backed scratch volume, never in /tmp (a small tmpfs).
+    `P=$(mktemp -d ${PUSH_SCRATCH}/push.XXXXXX)`,
+    "trap 'rm -rf \"$P\"' EXIT",
     'git init -q "$P"',
     // The base may have been made by another uid (a task image whose default user is root): the repository is the
     // harness's own, and this git runs in a container with no secret, so its ownership is not a question here.

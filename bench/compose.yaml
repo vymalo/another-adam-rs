@@ -72,7 +72,9 @@ x-pusher: &pusher
   restart: "no"
   user: "10001:10001"
   read_only: true
-  tmpfs: ["/tmp:size=256m"]
+  # /tmp holds only the one-line git configuration. The scratch repository (a whole copy of the base, as large as the
+  # repository) is on the slot's work volume, /scratch below: never in memory, never in a size-limited tmpfs.
+  tmpfs: ["/tmp:size=16m"]
   entrypoint: ["sh", "-c"]
   profiles: [tools]
   networks: [gitpub-net]
@@ -163,14 +165,19 @@ services:
     volumes: ["${BENCH_WORK_2_DIR:?the harness sets BENCH_WORK_2_DIR}:/work"]
 
   # One-shot: puts a run's base on the git server from a container (the host runs no git in a repository a container
-  # wrote). `docker compose run --rm pusher-N '<script>'`; the base is read from the slot's work directory.
+  # wrote). `docker compose run --rm pusher-N '<script>'`; the base is read from the slot's work directory (read-only)
+  # and the scratch repository is made in its `pusher-scratch` subdirectory (read-write, made by the harness).
   pusher-1:
     <<: *pusher
-    volumes: ["${BENCH_WORK_1_DIR:?the harness sets BENCH_WORK_1_DIR}:/work:ro"]
+    volumes:
+      - "${BENCH_WORK_1_DIR:?the harness sets BENCH_WORK_1_DIR}:/work:ro"
+      - "${BENCH_WORK_1_DIR}/pusher-scratch:/scratch"
 
   pusher-2:
     <<: *pusher
-    volumes: ["${BENCH_WORK_2_DIR:?the harness sets BENCH_WORK_2_DIR}:/work:ro"]
+    volumes:
+      - "${BENCH_WORK_2_DIR:?the harness sets BENCH_WORK_2_DIR}:/work:ro"
+      - "${BENCH_WORK_2_DIR}/pusher-scratch:/scratch"
 
 networks:
   slot-1:
