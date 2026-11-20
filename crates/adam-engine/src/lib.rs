@@ -2,16 +2,36 @@
 //! store and a model client the host gives, no server, no protocol and nothing on the network of
 //! its own.
 //!
-//! **Slice 1 of ADR 0047:** this crate is the embedded set and nothing more yet. Its dependencies
-//! are the crates an embedded agent needs, each with its server parts turned off
-//! (`adam-a2a-runtime` without `push`, `adam-ui` without `thread-tools`, `adam-assembly` without
-//! `remote`, and through them `adam-a2a` without `server`), and `tools/embedded-deps/check.sh` fails when its tree holds an
-//! HTTP server or client, a database driver, the Kubernetes client, a TLS stack or the MCP client.
-//! The API (start, send, steer, answer, cancel, list and the events) is slice 4.
+//! ```no_run
+//! # async fn demo(agent: adam_assembly::AgentDef, model: adam_model::DynModel) -> Result<(), adam_engine::EngineError> {
+//! use std::sync::Arc;
+//! use adam_engine::{Engine, Say};
+//!
+//! let store = Arc::new(adam_core::MemoryStore::new());
+//! let engine = Engine::builder(store, agent, model, "my-alias").start().await?;
+//! let turn = engine.send(None, Say::new("hello")).await?;
+//! // later: the next message of the same conversation continues it
+//! engine.send(Some(&turn.conversation), Say::new("and then?")).await?;
+//! engine.shutdown().await?;
+//! # Ok(()) }
+//! ```
+//!
+//! [`Engine::builder`] takes the store, the agent's definition, the model and its alias; `start`
+//! binds the agent with the screen's tools of an embedded agent and starts the worker. Then
+//! [`Engine::send`] starts or continues a conversation, [`Engine::steer`] and [`Engine::answer`]
+//! reach a run that works or waits, [`Engine::cancel`] ends one, and [`Engine::list`] and
+//! [`Engine::get`] read them. No A2A type is in a signature: inside, every call is the code the
+//! A2A server calls (`RuntimeTaskBackend`).
+//!
+//! **The embedded set.** The dependencies are the crates an embedded agent needs, each with its
+//! server parts turned off (`adam-a2a-runtime` without `push`, `adam-ui` without `thread-tools`,
+//! `adam-assembly` without `remote`, and through them `adam-a2a` without `server`), and
+//! `tools/embedded-deps/check.sh` fails when its tree holds an HTTP server or client, a database
+//! driver, the Kubernetes client, a TLS stack or the MCP client.
 //!
 //! **Secrets** ([ADR 0047] decision 5): an embedded agent reads none of the person's environment.
 //! [`default_secrets`] refuses every name, and a host that has secrets for the agent's files gives
-//! a source of its own (`adam_core::SecretSource`) to the agent's definition.
+//! a source of its own ([`EngineBuilder::secrets`]).
 //!
 //! [ADR 0047]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md
 
@@ -27,6 +47,17 @@ pub use adam_llm_agent;
 pub use adam_model;
 pub use adam_runtime;
 pub use adam_ui;
+
+mod engine;
+mod error;
+mod types;
+
+pub use engine::{Engine, EngineBuilder, Limits};
+pub use error::EngineError;
+pub use types::{
+    ConversationId, DEFAULT_PAGE_SIZE, Delivered, ListQuery, MAX_PAGE_SIZE, Page, RunInfo,
+    RunState, Say, Turn,
+};
 
 use std::sync::Arc;
 

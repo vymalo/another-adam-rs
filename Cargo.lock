@@ -439,6 +439,8 @@ dependencies = [
 name = "adam-engine"
 version = "0.1.0"
 dependencies = [
+ "a2a-lf",
+ "adam-a2a",
  "adam-a2a-runtime",
  "adam-agent-fs",
  "adam-assembly",
@@ -448,6 +450,13 @@ dependencies = [
  "adam-model",
  "adam-runtime",
  "adam-ui",
+ "async-trait",
+ "futures",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
