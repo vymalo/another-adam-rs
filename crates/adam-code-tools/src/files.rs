@@ -1,11 +1,12 @@
-//! `read_file` and `read_files`: read the files of a place without a shell (moved from the coder's
-//! file tools, ADR 0047 decision 7). The write tools (`write_file`, `edit_file`, `apply_patch`) are
-//! still the coder's, and come here next.
+//! `read_file`, `read_files`, `write_file` and `edit_file`: read and change the files of a place
+//! without a shell (moved from the coder's file tools, ADR 0047 decision 7). `apply_patch` is still
+//! the coder's, and comes here next.
 //!
-//! The tools read in the agent's own process, through the place's descriptor ([`SlotDir`]), and
-//! are **confined to it**: the model chooses the path, so a path is checked by
-//! [`confine`](crate::confine) (through [`open_for_read`] and [`parts_of`]) before anything is
-//! opened. A read follows a symlink only while it stays inside the place, and never into a `.git`.
+//! The tools read and write in the agent's own process, through the place's descriptor
+//! ([`SlotDir`]), and are **confined to it**: the model chooses the path, so a path is checked by
+//! [`confine`](crate::confine) (through [`open_for_read`], [`parts_of`] and [`locate_for_write`])
+//! before anything is opened. A read follows a symlink only while it stays inside the place, and
+//! never into a `.git`; a write follows none, the file itself included.
 //!
 //! # Relative to the place
 //!
@@ -35,17 +36,32 @@
 //!
 //! The work is bounded by what is done, and a call that runs out of time ([`DEADLINE`]) is an
 //! **error result, never a partial page**.
+//!
+//! # What a write does
+//!
+//! * `write_file` creates or replaces a file with exactly its content, at most [`WRITE_CAP`]
+//!   bytes: the parents are made, a new file is written beside the target and renamed over it (an
+//!   interrupted write leaves the old file or the new one, and a read beside it sees one whole), and
+//!   the mode of a file it replaces is kept.
+//! * `edit_file` replaces exact text, once or everywhere (`replace_all`), and writes the file the
+//!   same way. When the exact text is not there, line endings and blanks at the ends of lines are
+//!   tolerated, leading whitespace never; a miss, or a text in several places, changes nothing and
+//!   says why: the closest region with its line numbers, or the lines of each place.
+//! * After a write, the workspace says what follows ([`CodeWorkspace::after_write`]): its text is
+//!   appended to the tool's sentence as it is.
 
-use std::io::{self, Read};
+use std::ffi::OsString;
+use std::fs;
+use std::io::{self, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use adam_llm_agent::{ToolCtx, ToolOutput, keep_image, paging};
+use adam_llm_agent::{ToolCtx, ToolError, ToolOutput, keep_image, paging};
 use adam_model::ImageOrigin;
-use adam_workspace::safe_fs::{BeneathError, Meta, SlotDir};
+use adam_workspace::safe_fs::{BeneathError, Meta, SlotDir, race};
 
-use crate::confine::{is_dot_git, open_for_read, parts_of};
+use crate::confine::{Located, is_dot_git, locate_for_write, open_for_read, parts_of};
 use crate::find::{DEADLINE, non_empty, with_nested, within};
 use crate::git as gitcli;
 use crate::workspace::{CodeWorkspace, Intent, MAX_INSTRUCTIONS_BLOCK, Outcome, Place, Target};
@@ -256,10 +272,8 @@ async fn read_image(ctx: &ToolCtx, place: &Place, path: &str) -> Option<ToolOutp
     Some(ToolOutput::text(said).with_image(outcome))
 }
 
-/// What a read or an edit says of a binary file. Public for the coder's `edit_file` until it moves
-/// here.
-#[doc(hidden)]
-pub fn binary_notice(shown: &str, len: u64) -> String {
+/// What a read or an edit says of a binary file.
+fn binary_notice(shown: &str, len: u64) -> String {
     format!("`{shown}` is a binary file, {len} bytes, not shown")
 }
 
@@ -752,9 +766,8 @@ pub async fn read_files(
 
 /// How alike two lines are, from 0 to 1000: the Sorensen-Dice coefficient of their character pairs
 /// (whitespace at the ends does not count). Two empty lines are alike; an empty line and one with
-/// text are not. Public for the coder's `edit_file` until it moves here.
-#[doc(hidden)]
-pub fn similarity(a: &str, b: &str) -> usize {
+/// text are not.
+fn similarity(a: &str, b: &str) -> usize {
     let (a, b) = (a.trim(), b.trim());
     if a == b {
         return 1000;
@@ -800,6 +813,522 @@ fn dice(left: &[u64], right: &[u64]) -> usize {
     2 * common * 1000 / (left.len() + right.len())
 }
 
+// ------------------------------------------------------------------ write_file and edit_file
+
+/// Most bytes of `content` `write_file` accepts, and of a file `edit_file` changes.
+pub const WRITE_CAP: usize = 1024 * 1024;
+
+/// What a write did: whether the file was created, and how many bytes it has.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Written {
+    created: bool,
+    bytes: usize,
+}
+
+/// Write `content` to `rel` of the place `root`: parents are created, the file is written next to
+/// its target and renamed over it (an interrupted write leaves the old file or the new one, never
+/// half of one), and the mode of a file that is replaced is kept (an executable script stays one).
+fn write_file_in(root: &SlotDir, rel: &str, content: &str) -> Result<Written, String> {
+    if content.len() > WRITE_CAP {
+        return Err(format!(
+            "content is {} bytes, over the limit of {WRITE_CAP}: write the file in parts with \
+             apply_patch",
+            content.len()
+        ));
+    }
+    let located = locate_for_write(root, rel, true)?;
+    write_located(&located, content)
+}
+
+/// The write of [`write_file_in`], to the directory [`locate_for_write`] found: a new file made in it
+/// (`O_EXCL`, so nothing is followed), written, and renamed over the target.
+fn write_located(located: &Located, content: &str) -> Result<Written, String> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let shown = located.shown();
+    let Some(parent) = located.parent() else {
+        return Err(format!("`{shown}` has no directory to be written in"));
+    };
+    race::checkpoint(located.slot(), "write");
+    let tmp = OsString::from(format!(
+        ".adam-write-{}-{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = (|| -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut file = parent.create_new(&tmp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        if let Some(meta) = located.existing() {
+            file.set_permissions(fs::Permissions::from_mode(meta.permissions()))?;
+        }
+        drop(file);
+        parent.rename(&tmp, located.name())
+    })();
+    if let Err(e) = written {
+        let _ = parent.unlink(&tmp);
+        return Err(format!("cannot write `{shown}`: {e}"));
+    }
+    Ok(Written {
+        created: located.existing().is_none(),
+        bytes: content.len(),
+    })
+}
+
+/// The write of `write_file`, without a workspace: for the race tests of a crate that uses the
+/// tools (`test-util`).
+#[cfg(any(test, feature = "test-util"))]
+pub fn write_in(root: &SlotDir, rel: &str, content: &str) -> Result<Written, String> {
+    write_file_in(root, rel, content)
+}
+
+/// The tool `write_file` over `ws`. Its description is the caller's own declaration (the coder's
+/// `tools::files`).
+pub async fn write_file(
+    ws: &dyn CodeWorkspace,
+    ctx: &ToolCtx,
+    // Path of the file, relative to the root of the worktree
+    path: String,
+    // The whole new content of the file (at most 1 MiB)
+    content: String,
+    // The slot to write in: its name, or the repository's address. Leave out when the workspace has one.
+    repo: Option<String>,
+) -> Outcome {
+    let Some(path) = non_empty(&path) else {
+        return Ok(ToolOutput::error("path is required"));
+    };
+    let place = match ws.place(ctx, repo.as_deref(), Intent::Write).await {
+        Ok(place) => place,
+        Err(outcome) => return outcome,
+    };
+    let (root, rel) = (Arc::clone(place.root()), path.to_owned());
+    let written = tokio::task::spawn_blocking(move || write_file_in(&root, &rel, &content))
+        .await
+        .map_err(|e| ToolError::Transient(format!("the write was interrupted: {e}")))?;
+    match written {
+        Ok(done) => {
+            let tail = ws.after_write(ctx, &place, &[path.to_owned()]).await?;
+            ctx.emit_progress(format!("wrote {path} ({})", place.name()))
+                .await;
+            Ok(ToolOutput::text(format!(
+                "{} {path} ({} bytes).{tail}",
+                if done.created { "Created" } else { "Replaced" },
+                done.bytes
+            )))
+        }
+        Err(reason) => Ok(ToolOutput::error(reason)),
+    }
+}
+
+/// What an edit did: how many places were replaced, the line of each, and how many bytes the file
+/// has now.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Edited {
+    /// How many places were replaced.
+    replaced: usize,
+    /// The 1-based line each replaced place started on, in the file as it was.
+    lines: Vec<usize>,
+    bytes: usize,
+}
+
+/// Most places `edit_file` lists by line number.
+const MAX_PLACES: usize = 10;
+
+/// Most lines of the closest region an error shows (and of context around it, each side).
+const MAX_REGION_LINES: usize = 30;
+const REGION_CONTEXT: usize = 2;
+
+/// Longest line an error quotes, in characters.
+const MAX_QUOTED_CHARS: usize = 200;
+
+/// Replace `old` with `new` in `rel` of the place `root`: exactly, once or everywhere.
+///
+/// The file must exist, be a regular file of at most [`WRITE_CAP`] bytes, and be UTF-8 text without
+/// NUL. The path is confined as a write is ([`confine`](crate::confine::confine) with
+/// [`Access::Write`](crate::confine::Access::Write)), so nothing inside
+/// `.git`, nothing outside the worktree and nothing through a symlink is edited. The file is read
+/// and written in the directory the path was located in, and the write is [`write_file_in`]'s (a new
+/// file renamed over the old, the mode kept).
+fn edit_file_in(
+    root: &SlotDir,
+    rel: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<Edited, String> {
+    let shown = rel.trim();
+    if old.is_empty() {
+        return Err(
+            "old is empty: give the exact text to replace (to create a file use write_file)".into(),
+        );
+    }
+    if old == new {
+        return Err("old and new are the same text: there is nothing to change".into());
+    }
+    let located = locate_for_write(root, rel, false)?;
+    race::checkpoint(root.path(), "edit");
+    let (Some(parent), Some(meta)) = (located.parent(), located.existing().copied()) else {
+        return Err(format!(
+            "`{shown}` does not exist: edit_file changes a file that is there (write_file \
+             creates one)"
+        ));
+    };
+    if !meta.is_file() {
+        return Err(format!("`{shown}` is not a regular file"));
+    }
+    if meta.size() > WRITE_CAP as u64 {
+        return Err(format!(
+            "`{shown}` is {} bytes, over the {WRITE_CAP} bytes edit_file works on: use apply_patch",
+            meta.size()
+        ));
+    }
+    let (file, _) = parent
+        .open_regular(located.name())
+        .map_err(|e| format!("cannot read `{shown}`: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(WRITE_CAP as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read `{shown}`: {e}"))?;
+    if bytes.len() > WRITE_CAP {
+        return Err(format!(
+            "`{shown}` is over the {WRITE_CAP} bytes edit_file works on: use apply_patch"
+        ));
+    }
+    let Ok(content) = String::from_utf8(bytes) else {
+        return Err(format!(
+            "`{shown}` is not UTF-8 text: edit_file changes text files"
+        ));
+    };
+    if content.contains('\0') {
+        return Err(binary_notice(shown, meta.size()));
+    }
+
+    let exact: Vec<usize> = content.match_indices(old).map(|(at, _)| at).collect();
+    let (edited, lines) = if exact.is_empty() {
+        // The exact match is the rule; the tolerance is the one fallback that keeps a model from
+        // spending a turn on a line ending or a blank it copied wrong. Leading whitespace is never
+        // ignored: an indentation is semantic.
+        let Some(places) = normalized_places(&content, old) else {
+            return Err(not_found(shown, &content, old));
+        };
+        if places.len() > 1 && !replace_all {
+            return Err(not_found(shown, &content, old));
+        }
+        let lines: Vec<usize> = places.iter().map(|(_, _, line)| *line).collect();
+        let spans: Vec<(usize, usize)> = places.iter().map(|(at, end, _)| (*at, *end)).collect();
+        (replace_spans(&content, &spans, new), lines)
+    } else {
+        let lines: Vec<usize> = exact.iter().map(|at| line_of(&content, *at)).collect();
+        match exact.len() {
+            1 => {}
+            n if !replace_all => {
+                return Err(format!(
+                    "`old` is in `{shown}` {n} times (starting at {}): nothing was changed. Add the \
+                     lines around the one you mean to `old` so that it matches once, or set \
+                     replace_all to replace every one",
+                    places_listed(&lines)
+                ));
+            }
+            _ => {}
+        }
+        let edited = if replace_all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, 1)
+        };
+        (edited, lines)
+    };
+    let written = write_located(&located, &edited)?;
+    Ok(Edited {
+        replaced: lines.len(),
+        lines,
+        bytes: written.bytes,
+    })
+}
+
+/// The edit of `edit_file`, without a workspace: for the race tests of a crate that uses the tools
+/// (`test-util`).
+#[cfg(any(test, feature = "test-util"))]
+pub fn edit_in(
+    root: &SlotDir,
+    rel: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<Edited, String> {
+    edit_file_in(root, rel, old, new, replace_all)
+}
+
+/// The 1-based line of the byte offset `at` of `text`.
+fn line_of(text: &str, at: usize) -> usize {
+    text[..at].bytes().filter(|b| *b == b'\n').count() + 1
+}
+
+/// `text` with `\r\n` and `\r` read as `\n`, and the spaces and tabs at the end of every line
+/// dropped, and where each byte of the result came from: `spans[i]` is the byte range of `text`
+/// the result's byte `i` covers, one byte or one line ending. The blanks dropped at the end of a
+/// line are in no range, so a match that stops at the last character of a line leaves them.
+fn normalized(text: &str) -> (String, Vec<(usize, usize)>) {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut spans = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let mut end = at;
+        while end < bytes.len() && bytes[end] != b'\r' && bytes[end] != b'\n' {
+            end += 1;
+        }
+        let mut kept = end;
+        while kept > at && (bytes[kept - 1] == b' ' || bytes[kept - 1] == b'\t') {
+            kept -= 1;
+        }
+        spans.extend((at..kept).map(|byte| (byte, byte + 1)));
+        out.push_str(&text[at..kept]);
+        if end < bytes.len() {
+            let line_end = if bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n') {
+                end + 2
+            } else {
+                end + 1
+            };
+            spans.push((end, line_end));
+            out.push('\n');
+            at = line_end;
+        } else {
+            at = end;
+        }
+    }
+    (out, spans)
+}
+
+/// The places `old` is in `content` once [`normalized`]: each as the byte span of `content` the
+/// match covers and the 1-based line of the normalized text it starts on. `None` when nothing
+/// matches, or when `old` is only blanks (which would match everywhere).
+fn normalized_places(content: &str, old: &str) -> Option<Vec<(usize, usize, usize)>> {
+    let (needle, _) = normalized(old);
+    if needle.is_empty() {
+        return None;
+    }
+    let (haystack, spans) = normalized(content);
+    let places: Vec<(usize, usize, usize)> = haystack
+        .match_indices(needle.as_str())
+        .map(|(at, _)| {
+            let (start, _) = spans[at];
+            let (_, end) = spans[at + needle.len() - 1];
+            (start, end, line_of(&haystack, at))
+        })
+        .collect();
+    (!places.is_empty()).then_some(places)
+}
+
+/// `content` with each byte span of `places` (in order, not overlapping) replaced by `new`.
+fn replace_spans(content: &str, places: &[(usize, usize)], new: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut at = 0;
+    for (start, end) in places {
+        out.push_str(&content[at..*start]);
+        out.push_str(new);
+        at = *end;
+    }
+    out.push_str(&content[at..]);
+    out
+}
+
+/// `lines 3, 9, 14` (the first [`MAX_PLACES`], then how many more).
+fn places_listed(lines: &[usize]) -> String {
+    let mut text = format!(
+        "line{} {}",
+        if lines.len() == 1 { "" } else { "s" },
+        lines
+            .iter()
+            .take(MAX_PLACES)
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if lines.len() > MAX_PLACES {
+        text.push_str(&format!(" and {} more", lines.len() - MAX_PLACES));
+    }
+    text
+}
+
+/// `line` cut to [`MAX_QUOTED_CHARS`] characters.
+fn quoted(line: &str) -> String {
+    let mut text: String = line.chars().take(MAX_QUOTED_CHARS).collect();
+    if line.chars().count() > MAX_QUOTED_CHARS {
+        text.push_str("...");
+    }
+    text
+}
+/// Where the lines of `old` are most nearly in the lines of `content`: the 0-based index of the
+/// first line of the window of the same length that matches best, or `None` when nothing in the file
+/// is anything like it.
+///
+/// A line of `old` that is in the file (ignoring the whitespace at its ends) votes for the window
+/// it would sit in if `old` were there; the window with the most votes is the closest. When no line
+/// matches at all (every line was written a little differently), the most alike pair of one of the
+/// longest lines of `old` and a line of the file places the window.
+fn closest_window(content_lines: &[&str], old_lines: &[&str]) -> Option<usize> {
+    use std::collections::HashMap;
+    let mut by_text: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (at, line) in content_lines.iter().enumerate() {
+        by_text.entry(line.trim()).or_default().push(at);
+    }
+    let mut votes: HashMap<usize, usize> = HashMap::new();
+    for (i, line) in old_lines.iter().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        for &at in by_text.get(line).into_iter().flatten() {
+            if let Some(start) = at.checked_sub(i) {
+                *votes.entry(start).or_default() += 1;
+            }
+        }
+    }
+    // The most votes; the earliest window among equals.
+    if let Some((start, _)) = votes.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))) {
+        return Some(*start);
+    }
+    // No line is the same: the best pair of one of the longest lines of `old` and a line of the
+    // file, when it is alike enough to be worth showing.
+    let mut longest: Vec<(usize, &str)> = old_lines
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .collect();
+    longest.sort_by_key(|(_, l)| std::cmp::Reverse(l.trim().len()));
+    let mut best: Option<(usize, usize)> = None;
+    for (i, line) in longest.into_iter().take(3) {
+        for (at, candidate) in content_lines.iter().enumerate() {
+            let score = similarity(line, candidate);
+            if score >= 500 && best.is_none_or(|(s, _)| score > s) {
+                best = Some((score, at.saturating_sub(i)));
+            }
+        }
+    }
+    best.map(|(_, start)| start)
+}
+
+/// A line made readable when it differs from another only in blanks: tabs, spaces at the ends and
+/// carriage returns are spelled out.
+fn visible(line: &str) -> String {
+    quoted(&line.replace('\t', "\\t").replace('\r', "\\r"))
+}
+
+/// What the model is told when `old` is nowhere in the file: the region that is closest to it with
+/// line numbers and a few lines around it, and the first line where the two differ.
+fn not_found(shown: &str, content: &str, old: &str) -> String {
+    let content_lines: Vec<&str> = content.lines().collect();
+    let old_lines: Vec<&str> = old.lines().collect();
+    let mut message = format!("`old` was not found in `{shown}`, and nothing was changed.");
+    let Some(start) =
+        closest_window(&content_lines, &old_lines).filter(|s| *s < content_lines.len())
+    else {
+        message.push_str(
+            " Nothing in the file is like it: read the file again with read_file and copy the \
+             text from it.",
+        );
+        return message;
+    };
+    let len = old_lines.len().max(1);
+    let end = (start + len).min(content_lines.len());
+    let shown_end = end.min(start + MAX_REGION_LINES);
+    let from = start.saturating_sub(REGION_CONTEXT);
+    let to = (shown_end + REGION_CONTEXT).min(content_lines.len());
+    message.push_str(&format!(
+        " The closest region is lines {}-{} (shown with its surroundings):\n",
+        start + 1,
+        end
+    ));
+    for (at, line) in content_lines.iter().enumerate().take(to).skip(from) {
+        let mark = if (start..shown_end).contains(&at) {
+            ">"
+        } else {
+            " "
+        };
+        message.push_str(&format!("{mark}{:>6}\t{}\n", at + 1, quoted(line)));
+    }
+    if end > shown_end {
+        message.push_str(&format!(
+            "       \t[... {} more lines of the region]\n",
+            end - shown_end
+        ));
+    }
+    // The first line where the region and `old` part.
+    let differs = (0..len).find(|i| content_lines.get(start + i) != old_lines.get(*i));
+    if let Some(i) = differs {
+        let mine = old_lines.get(i).copied().unwrap_or("");
+        match content_lines.get(start + i) {
+            Some(theirs) if theirs.trim() == mine.trim() => message.push_str(&format!(
+                "First difference, at line {}: only the blanks differ (tabs or spaces, spaces at \
+                 the end, or the line ending). The file has `{}`, your `old` has `{}`.\n",
+                start + i + 1,
+                visible(theirs),
+                visible(mine)
+            )),
+            Some(theirs) => message.push_str(&format!(
+                "First difference, at line {}: the file has `{}`, your `old` has `{}`.\n",
+                start + i + 1,
+                quoted(theirs),
+                quoted(mine)
+            )),
+            None => message.push_str(&format!(
+                "Your `old` goes on past the end of the file, at its line {}: `{}`.\n",
+                i + 1,
+                quoted(mine)
+            )),
+        }
+    }
+    message.push_str("Copy `old` from the file exactly, or use apply_patch.");
+    message
+}
+
+/// The tool `edit_file` over `ws`. Its description is the caller's own declaration (the coder's
+/// `tools::files`).
+pub async fn edit_file(
+    ws: &dyn CodeWorkspace,
+    ctx: &ToolCtx,
+    // Path of the file, relative to the root of the worktree
+    path: String,
+    // The text to replace, copied from the file (blanks and line breaks too). Must be in the file; and once, unless replace_all is set.
+    old: String,
+    // What it becomes. May be empty, to delete the text.
+    new: String,
+    // Replace every place `old` is in. Leave out to replace the one place that has it.
+    replace_all: Option<bool>,
+    // The slot to edit in: its name, or the repository's address. Leave out when the workspace has one.
+    repo: Option<String>,
+) -> Outcome {
+    let Some(path) = non_empty(&path) else {
+        return Ok(ToolOutput::error("path is required"));
+    };
+    let place = match ws.place(ctx, repo.as_deref(), Intent::Write).await {
+        Ok(place) => place,
+        Err(outcome) => return outcome,
+    };
+    let (root, rel) = (Arc::clone(place.root()), path.to_owned());
+    let all = replace_all.unwrap_or(false);
+    let edited = tokio::task::spawn_blocking(move || edit_file_in(&root, &rel, &old, &new, all))
+        .await
+        .map_err(|e| ToolError::Transient(format!("the edit was interrupted: {e}")))?;
+    match edited {
+        Ok(done) => {
+            let tail = ws.after_write(ctx, &place, &[path.to_owned()]).await?;
+            ctx.emit_progress(format!("edited {path} ({})", place.name()))
+                .await;
+            Ok(ToolOutput::text(format!(
+                "Edited {path}: replaced {} place{} ({}), {} bytes now.{tail}",
+                done.replaced,
+                if done.replaced == 1 { "" } else { "s" },
+                places_listed(&done.lines),
+                done.bytes
+            )))
+        }
+        Err(reason) => Ok(ToolOutput::error(reason)),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -824,6 +1353,20 @@ mod tests {
         limit: Option<i64>,
     ) -> Result<String, String> {
         super::read_in(&open(root)?, rel, offset, limit)
+    }
+
+    fn write_in(root: &Path, rel: &str, content: &str) -> Result<Written, String> {
+        super::write_in(&open(root)?, rel, content)
+    }
+
+    fn edit_in(
+        root: &Path,
+        rel: &str,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+    ) -> Result<Edited, String> {
+        super::edit_in(&open(root)?, rel, old, new, replace_all)
     }
 
     /// What the tool does with its arguments: the aliases first, then the page.
@@ -1247,5 +1790,766 @@ mod tests {
                 .unwrap_err()
                 .contains("list_files")
         );
+    }
+
+    /// A file that is open while `write_file` or `edit_file` replaces it keeps the old content whole
+    /// and the path names a new file with the new content whole: the tools write a file of their own and
+    /// rename it over the old, never into the old one. That is what lets a read run beside a write
+    /// (ADR 0049). The check is made on an open handle, so it does not depend on timing; the control
+    /// shows that it fails for a write made in place.
+    #[test]
+    fn a_write_or_an_edit_replaces_the_file_and_never_changes_the_one_a_read_holds() {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = root();
+        let path = dir.path().join("src/shared.txt");
+        let (old, new) = ("alpha\n".repeat(2_000), "bravo\n".repeat(2_000));
+        let open_old = |text: &str| {
+            fs::write(&path, text).unwrap();
+            (
+                fs::File::open(&path).unwrap(),
+                fs::metadata(&path).unwrap().ino(),
+            )
+        };
+        let seen = |mut held: fs::File| {
+            let mut text = String::new();
+            held.read_to_string(&mut text).unwrap();
+            text
+        };
+
+        // The control: a write in place changes what the open handle sees.
+        let (held, _) = open_old(&old);
+        fs::write(&path, &new).unwrap();
+        assert_eq!(seen(held), new, "an in-place write reaches the open handle");
+
+        // `write_file`.
+        let (held, ino) = open_old(&old);
+        write_in(dir.path(), "src/shared.txt", &new).unwrap();
+        assert_eq!(seen(held), old, "the open file is untouched");
+        assert_eq!(fs::read_to_string(&path).unwrap(), new);
+        assert_ne!(fs::metadata(&path).unwrap().ino(), ino, "a new file");
+
+        // `edit_file`.
+        let (held, ino) = open_old(&old);
+        edit_in(dir.path(), "src/shared.txt", "alpha", "bravo", true).unwrap();
+        assert_eq!(seen(held), old, "the open file is untouched");
+        assert_eq!(fs::read_to_string(&path).unwrap(), new);
+        assert_ne!(fs::metadata(&path).unwrap().ino(), ino, "a new file");
+    }
+
+    /// The same, as readers and a writer that run at the same time: no read is half of each.
+    #[test]
+    fn a_read_beside_a_write_or_an_edit_sees_a_whole_file() {
+        let dir = root();
+        let path = dir.path().join("src/shared.txt");
+        let (a, b) = ("alpha\n".repeat(1_000), "bravo\n".repeat(1_000));
+        fs::write(&path, &a).unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for i in 0..10 {
+                    let text = if i % 2 == 0 { &b } else { &a };
+                    write_in(dir.path(), "src/shared.txt", text).unwrap();
+                    // An edit rewrites the whole file too.
+                    let (from, to) = if i % 2 == 0 {
+                        ("bravo", "alpha")
+                    } else {
+                        ("alpha", "bravo")
+                    };
+                    edit_in(dir.path(), "src/shared.txt", from, to, true).unwrap();
+                }
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let mut reads = 0;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) || reads < 20 {
+                let text = fs::read_to_string(&path).unwrap();
+                assert_eq!(text.len(), 6_000, "a partial file");
+                assert!(text == a || text == b, "a file that is half of each");
+                reads += 1;
+            }
+        });
+    }
+
+    #[test]
+    fn a_write_creates_parents_replaces_and_leaves_nothing_behind() {
+        let dir = root();
+        let done = write_in(dir.path(), "a/b/c.txt", "hello\n").unwrap();
+        assert_eq!(
+            done,
+            Written {
+                created: true,
+                bytes: 6
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),
+            "hello\n"
+        );
+        let done = write_in(dir.path(), "a/b/c.txt", "bye\n").unwrap();
+        assert_eq!(
+            done,
+            Written {
+                created: false,
+                bytes: 4
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),
+            "bye\n"
+        );
+        let names: Vec<_> = fs::read_dir(dir.path().join("a/b"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["c.txt"], "the temporary file is gone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_file_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root();
+        let script = dir.path().join("run.sh");
+        fs::write(&script, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        write_in(dir.path(), "run.sh", "#!/bin/sh\necho hi\n").unwrap();
+        assert_eq!(
+            fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn too_much_content_is_refused_before_anything_is_written() {
+        let dir = root();
+        let why = write_in(dir.path(), "big.txt", &"x".repeat(WRITE_CAP + 1)).unwrap_err();
+        assert!(why.contains("over the limit"), "{why}");
+        assert!(!dir.path().join("big.txt").exists());
+        assert!(write_in(dir.path(), "ok.txt", &"x".repeat(WRITE_CAP)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_through_a_symlink_changes_nothing() {
+        let dir = root();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("target"), "keep").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("target"), dir.path().join("link")).unwrap();
+        assert!(
+            write_in(dir.path(), "link", "overwritten")
+                .unwrap_err()
+                .contains("symlink")
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("target")).unwrap(),
+            "keep"
+        );
+    }
+
+    const MAIN_RS: &str = "use std::io;\n\nfn main() {\n    let name = \"world\";\n    println!(\"hello, {name}\");\n}\n\nfn helper() {\n    let name = \"world\";\n    drop(name);\n}\n";
+
+    fn edit(root: &Path, old: &str, new: &str, all: bool) -> Result<Edited, String> {
+        edit_in(root, "src/main.rs", old, new, all)
+    }
+
+    fn with_main() -> tempfile::TempDir {
+        let dir = root();
+        fs::write(dir.path().join("src/main.rs"), MAIN_RS).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_edit_replaces_the_one_place_and_says_where() {
+        let dir = with_main();
+        let done = edit(
+            dir.path(),
+            "println!(\"hello, {name}\");",
+            "println!(\"bye, {name}\");",
+            false,
+        )
+        .unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![5]));
+        let now = fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
+        assert_eq!(now, MAIN_RS.replace("hello", "bye"));
+        assert_eq!(done.bytes, now.len());
+        // A multi-line replacement, and a deletion (an empty `new`).
+        edit(
+            dir.path(),
+            "fn helper() {\n    let name = \"world\";\n    drop(name);\n}\n",
+            "",
+            false,
+        )
+        .unwrap();
+        assert!(
+            !fs::read_to_string(dir.path().join("src/main.rs"))
+                .unwrap()
+                .contains("helper")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_keeps_the_mode_of_the_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = with_main();
+        let path = dir.path().join("src/main.rs");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        edit(dir.path(), "hello", "bye", false).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn a_text_in_two_places_is_refused_with_their_lines_unless_replace_all_is_set() {
+        let dir = with_main();
+        let why = edit(
+            dir.path(),
+            "let name = \"world\";",
+            "let name = \"you\";",
+            false,
+        )
+        .unwrap_err();
+        assert!(why.contains("2 times (starting at lines 4, 9)"), "{why}");
+        assert!(why.contains("replace_all"), "{why}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+            MAIN_RS,
+            "nothing changed"
+        );
+        let done = edit(
+            dir.path(),
+            "let name = \"world\";",
+            "let name = \"you\";",
+            true,
+        )
+        .unwrap();
+        assert_eq!((done.replaced, done.lines), (2, vec![4, 9]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/main.rs"))
+                .unwrap()
+                .matches("\"you\"")
+                .count(),
+            2
+        );
+        // replace_all with one place is that place.
+        let one = edit(dir.path(), "use std::io;", "use std::fmt;", true).unwrap();
+        assert_eq!(one.replaced, 1);
+    }
+
+    #[test]
+    fn a_text_that_is_not_there_shows_the_closest_region_with_numbers_and_the_first_difference() {
+        let dir = with_main();
+        // Indentation is wrong (two spaces for four): every line of it is nearly there.
+        let why = edit(
+            dir.path(),
+            "fn main() {\n  let name = \"world\";\n  println!(\"hello, {name}\");\n}",
+            "x",
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            why.contains("was not found") && why.contains("nothing was changed"),
+            "{why}"
+        );
+        assert!(why.contains("closest region is lines 3-6"), "{why}");
+        // The region with line numbers, marked, and the line before it for context.
+        assert!(why.contains(">     3\tfn main() {"), "{why}");
+        assert!(why.contains(">     4\t    let name = \"world\";"), "{why}");
+        assert!(why.contains("      2\t"), "context above: {why}");
+        assert!(
+            why.contains("First difference, at line 4: only the blanks differ"),
+            "{why}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+            MAIN_RS
+        );
+
+        // A word that is different: the lines are said, not a blanks hint.
+        let why = edit(dir.path(), "println!(\"goodbye, {name}\");", "x", false).unwrap_err();
+        assert!(why.contains("closest region is lines 5-5"), "{why}");
+        assert!(
+            why.contains(
+                "First difference, at line 5: the file has `    println!(\"hello, {name}\");`"
+            ),
+            "{why}"
+        );
+        assert!(!why.contains("only the blanks"), "{why}");
+    }
+
+    #[test]
+    fn a_text_nothing_is_like_says_so() {
+        let dir = with_main();
+        let why = edit(dir.path(), "zzzzzzzz qqqqqqqq", "x", false).unwrap_err();
+        assert!(why.contains("Nothing in the file is like it"), "{why}");
+    }
+
+    /// The tolerance: a line ending or trailing blanks that differ are not a miss. The edit is
+    /// applied to the original bytes at the matched span, so the lines around it keep their own
+    /// endings and blanks.
+    #[test]
+    fn a_crlf_file_is_edited_by_an_old_with_lf_and_keeps_its_other_endings() {
+        let dir = root();
+        fs::write(dir.path().join("mixed.txt"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+        let done = edit_in(dir.path(), "mixed.txt", "beta\ngamma", "BETA\nGAMMA", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("mixed.txt")).unwrap(),
+            "alpha\r\nBETA\nGAMMA\r\n",
+            "the replaced span has new's bytes, the rest keeps CRLF"
+        );
+    }
+
+    #[test]
+    fn trailing_blanks_on_a_line_do_not_hide_it() {
+        let dir = root();
+        fs::write(dir.path().join("blanks.txt"), "one\ntwo   \nthree\n").unwrap();
+        let done = edit_in(dir.path(), "blanks.txt", "two\nthree", "2\n3", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("blanks.txt")).unwrap(),
+            "one\n2\n3\n"
+        );
+    }
+
+    /// The tolerance is on both sides: an `old` copied with CRLF endings or with trailing blanks
+    /// the file does not have is normalized too.
+    #[test]
+    fn an_old_with_crlf_or_trailing_blanks_is_normalized_too() {
+        let dir = root();
+        fs::write(dir.path().join("old.txt"), "one\ntwo\nthree\n").unwrap();
+        let done = edit_in(dir.path(), "old.txt", "one\r\ntwo  ", "1\n2", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("old.txt")).unwrap(),
+            "1\n2\nthree\n"
+        );
+    }
+
+    #[test]
+    fn a_normalized_match_in_two_places_is_refused_as_a_miss_and_changes_nothing() {
+        let dir = root();
+        let body = "foo   \nbar\nfoo\t\n";
+        fs::write(dir.path().join("twice.txt"), body).unwrap();
+        let why = edit_in(dir.path(), "twice.txt", "foo\n", "x\n", false).unwrap_err();
+        assert!(
+            why.contains("was not found") && why.contains("nothing was changed"),
+            "{why}"
+        );
+        assert!(why.contains("closest region is lines "), "{why}");
+        assert!(
+            why.contains(">     1\t") || why.contains(">     3\t"),
+            "the region is numbered: {why}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("twice.txt")).unwrap(),
+            body,
+            "nothing changed"
+        );
+        // `replace_all` takes every normalized place, each at its own span.
+        let done = edit_in(dir.path(), "twice.txt", "foo\n", "x\n", true).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (2, vec![1, 3]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("twice.txt")).unwrap(),
+            "x\nbar\nx\n"
+        );
+    }
+
+    #[test]
+    fn a_leading_indentation_that_differs_is_still_a_miss() {
+        let dir = root();
+        let body = "fn main() {\n    let a = 1;\n}\n";
+        fs::write(dir.path().join("indent.rs"), body).unwrap();
+        let why = edit_in(
+            dir.path(),
+            "indent.rs",
+            "fn main() {\n  let a = 1;\n}\n",
+            "x",
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            why.contains("was not found") && why.contains("nothing was changed"),
+            "{why}"
+        );
+        assert!(
+            why.contains("First difference, at line 2: only the blanks differ"),
+            "{why}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("indent.rs")).unwrap(),
+            body,
+            "leading whitespace is not guessed"
+        );
+    }
+
+    /// The exact match is tried first: `foo\n` is in the file once exactly and twice once the
+    /// trailing blanks are ignored. The exact place is the one replaced.
+    #[test]
+    fn an_exact_match_is_taken_before_the_tolerant_one() {
+        let dir = root();
+        fs::write(dir.path().join("exact.txt"), "foo  \nbar\nfoo\n").unwrap();
+        let done = edit_in(dir.path(), "exact.txt", "foo\n", "bar\n", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![3]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("exact.txt")).unwrap(),
+            "foo  \nbar\nbar\n",
+            "the trailing blanks of the first line are untouched"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_edit_changes_only_its_span_among_mixed_endings() {
+        let dir = root();
+        fs::write(dir.path().join("mixed.txt"), "a\r\nb   \nc\r\nd\r\n").unwrap();
+        let done = edit_in(dir.path(), "mixed.txt", "b\nc", "B\nC", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("mixed.txt")).unwrap(),
+            "a\r\nB\nC\r\nd\r\n"
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_alone_is_a_line_ending_too() {
+        let dir = root();
+        fs::write(dir.path().join("cr.txt"), "one\rtwo\r").unwrap();
+        let done = edit_in(dir.path(), "cr.txt", "one\ntwo", "1\n2", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("cr.txt")).unwrap(),
+            "1\n2\r"
+        );
+    }
+
+    #[test]
+    fn an_old_of_blanks_only_does_not_match_everywhere() {
+        let dir = root();
+        let body = "abc\n";
+        fs::write(dir.path().join("blank.txt"), body).unwrap();
+        for old in ["   ", "\t", " \t "] {
+            for all in [false, true] {
+                let why = edit_in(dir.path(), "blank.txt", old, "x", all).unwrap_err();
+                assert!(why.contains("was not found"), "{old:?}, all={all}: {why}");
+                assert_eq!(
+                    fs::read_to_string(dir.path().join("blank.txt")).unwrap(),
+                    body
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_blanks_at_the_end_of_the_file_are_tolerated() {
+        let dir = root();
+        fs::write(dir.path().join("eof.txt"), "one  \ntwo   ").unwrap();
+        let done = edit_in(dir.path(), "eof.txt", "one\ntwo", "1\n2", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("eof.txt")).unwrap(),
+            "1\n2   ",
+            "the blanks after the last byte the model matched stay"
+        );
+    }
+
+    #[test]
+    fn the_tolerance_keeps_multibyte_characters_whole() {
+        let dir = root();
+        fs::write(dir.path().join("utf8.txt"), "héllo  \nwörld\n").unwrap();
+        edit_in(dir.path(), "utf8.txt", "héllo\nwörld", "x", false).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("utf8.txt")).unwrap(),
+            "x\n"
+        );
+    }
+
+    /// The blanks after the last byte of a match are not the edit's: the two spaces of a Markdown
+    /// hard break survive an edit that stops at the last character of the line.
+    #[test]
+    fn trailing_blanks_after_the_matched_text_are_kept() {
+        let dir = root();
+        fs::write(dir.path().join("hard.md"), "one  \ntwo  \nthree\n").unwrap();
+        let done = edit_in(dir.path(), "hard.md", "one\ntwo", "1\n2", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("hard.md")).unwrap(),
+            "1\n2  \nthree\n",
+            "the hard break after `two` is outside the match"
+        );
+    }
+
+    #[test]
+    fn replace_all_keeps_the_blanks_of_every_line_it_does_not_match() {
+        let dir = root();
+        fs::write(dir.path().join("all.txt"), "x  \ny  \nx  \ny  \n").unwrap();
+        let done = edit_in(dir.path(), "all.txt", "x\ny", "X\nY", true).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (2, vec![1, 3]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("all.txt")).unwrap(),
+            "X\nY  \nX\nY  \n"
+        );
+    }
+
+    /// `new` is inserted once and never read back as more places to replace.
+    #[test]
+    fn a_new_that_contains_the_needle_is_inserted_once() {
+        let dir = root();
+        fs::write(dir.path().join("grow.txt"), "a  \nb  \n").unwrap();
+        let done = edit_in(dir.path(), "grow.txt", "a\nb", "a\nb\nc", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("grow.txt")).unwrap(),
+            "a\nb\nc  \n"
+        );
+    }
+
+    /// A match that ends with the line ending takes the whole `\r\n`, not just the `\r`.
+    #[test]
+    fn a_tolerant_edit_that_ends_with_a_newline_takes_the_whole_crlf() {
+        let dir = root();
+        fs::write(dir.path().join("crlf.txt"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+        let done = edit_in(dir.path(), "crlf.txt", "beta\n", "BETA\n", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("crlf.txt")).unwrap(),
+            "alpha\r\nBETA\ngamma\r\n"
+        );
+    }
+
+    /// A tolerant deletion takes only the matched bytes; the blanks after the match stay.
+    #[test]
+    fn a_tolerant_deletion_keeps_the_blanks_after_the_match() {
+        let dir = root();
+        fs::write(dir.path().join("del.txt"), "a  \nb  \n").unwrap();
+        edit_in(dir.path(), "del.txt", "a\nb", "", false).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("del.txt")).unwrap(),
+            "  \n"
+        );
+    }
+
+    /// Every span is the bytes the match covers: it starts and ends on a character boundary, its
+    /// text normalizes to `old`, and it ends at the last byte matched.
+    #[test]
+    fn a_tolerant_span_covers_exactly_the_matched_bytes() {
+        for (content, old) in [
+            ("ab  \ncd", "ab"),
+            ("ab\t\r\ncd", "ab"),
+            ("ab  ", "ab"),
+            ("ab", "ab"),
+            ("ab\t\ncd", "ab  \ncd"),
+            ("a  \nb\n", "a\nb"),
+            ("a\r\nb  \r\nc\r\n", "a\nb"),
+            ("a\r\nb\nc\rd", "b\nc"),
+            ("a\r\nb\n", "\nb"),
+            ("héllo  \nwörld\n", "héllo\nwörld"),
+            ("cafe\u{301}  \nx\n", "cafe\u{301}"),
+            ("😀  \nx\n", "😀"),
+            ("one\rtwo\r", "two"),
+            ("a\n   \nb\n", "a\n\nb"),
+        ] {
+            let (needle, _) = normalized(old);
+            let places = normalized_places(content, old)
+                .unwrap_or_else(|| panic!("{content:?} has no tolerant match for {old:?}"));
+            let mut before = 0;
+            for (start, end, _) in places {
+                assert!(
+                    content.is_char_boundary(start) && content.is_char_boundary(end),
+                    "{content:?} {old:?}: {start}..{end} is not on character boundaries"
+                );
+                assert!(
+                    before <= start && start < end,
+                    "{content:?} {old:?}: {start}..{end}"
+                );
+                assert_eq!(
+                    normalized(&content[start..end]).0,
+                    needle,
+                    "{content:?} {old:?}: the span is not the match"
+                );
+                let last = content.as_bytes()[end - 1];
+                assert!(
+                    last != b' ' && last != b'\t',
+                    "{content:?} {old:?}: the span ends in a blank the match ignored"
+                );
+                assert_eq!(
+                    replace_spans(content, &[(start, end)], "N"),
+                    format!("{}N{}", &content[..start], &content[end..]),
+                    "the bytes outside the span are untouched"
+                );
+                before = end;
+            }
+        }
+    }
+
+    /// The map [`normalized`] returns says, for every byte it kept, which byte of the original it
+    /// is: one byte copied, or one line ending, and nothing overlaps.
+    #[test]
+    fn normalized_maps_every_byte_back_to_the_original() {
+        for text in [
+            "",
+            "abc",
+            "a  \n b\t\r\nc\r",
+            "héllo  \n😀\t\n",
+            "\n\n",
+            "   ",
+            "a\r\r\nb",
+        ] {
+            let (out, spans) = normalized(text);
+            assert_eq!(spans.len(), out.len(), "{text:?}");
+            for (i, (start, end)) in spans.iter().enumerate() {
+                assert!(start < end, "{text:?} byte {i}: {start}..{end}");
+                assert!(*end <= text.len(), "{text:?} byte {i}: {start}..{end}");
+                let source = &text.as_bytes()[*start..*end];
+                assert!(
+                    (source.len() == 1 && source[0] == out.as_bytes()[i])
+                        || matches!(source, [b'\n'] | [b'\r'] | [b'\r', b'\n']),
+                    "{text:?} byte {i}: {source:?} for {:?}",
+                    out.as_bytes()[i] as char
+                );
+                if i > 0 {
+                    assert!(
+                        spans[i - 1].1 <= *start,
+                        "{text:?} byte {i}: {}..{} overlaps the one before",
+                        start,
+                        end
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_old_of_only_a_line_ending_matches_one_place_or_is_refused() {
+        let dir = root();
+        fs::write(dir.path().join("nl.txt"), "a\rb\r").unwrap();
+        let why = edit_in(dir.path(), "nl.txt", "\n", "x", false).unwrap_err();
+        assert!(why.contains("was not found"), "{why}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("nl.txt")).unwrap(),
+            "a\rb\r"
+        );
+        let done = edit_in(dir.path(), "nl.txt", "\n", "x", true).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (2, vec![1, 2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("nl.txt")).unwrap(),
+            "axbx"
+        );
+    }
+
+    /// The exact match decides even when it is ambiguous: the tolerance does not turn an error the
+    /// model must fix into an edit of some other place.
+    #[test]
+    fn an_exact_match_that_is_ambiguous_is_not_rescued_by_the_tolerance() {
+        let dir = root();
+        let body = "foo\nbar\nfoo\nbaz\nfoo  \n";
+        fs::write(dir.path().join("exact2.txt"), body).unwrap();
+        let why = edit_in(dir.path(), "exact2.txt", "foo\n", "x\n", false).unwrap_err();
+        assert!(why.contains("2 times (starting at lines 1, 3)"), "{why}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("exact2.txt")).unwrap(),
+            body,
+            "nothing changed"
+        );
+    }
+
+    #[test]
+    fn an_empty_file_and_a_file_of_blanks_are_clean_misses() {
+        let dir = root();
+        for (name, body) in [("empty.txt", ""), ("blanks.txt", "   \n\t\n")] {
+            fs::write(dir.path().join(name), body).unwrap();
+            for all in [false, true] {
+                let why = edit_in(dir.path(), name, "a", "b", all).unwrap_err();
+                assert!(
+                    why.contains("was not found") && why.contains("nothing was changed"),
+                    "{name}, all={all}: {why}"
+                );
+                assert_eq!(fs::read_to_string(dir.path().join(name)).unwrap(), body);
+            }
+        }
+    }
+
+    #[test]
+    fn an_edit_of_a_file_over_the_cap_is_refused() {
+        let dir = root();
+        fs::write(dir.path().join("big.txt"), "x".repeat(WRITE_CAP + 1)).unwrap();
+        let why = edit_in(dir.path(), "big.txt", "x", "y", false).unwrap_err();
+        assert!(
+            why.contains("over the") && why.contains("edit_file works on"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_very_long_region_is_cut() {
+        let dir = root();
+        let body: String = (0..100).map(|i| format!("line number {i}\n")).collect();
+        fs::write(dir.path().join("long.txt"), &body).unwrap();
+        let asked: String = (0..100)
+            .map(|i| format!("line number {i}\n"))
+            .collect::<String>()
+            + "extra\n";
+        let why = edit_in(dir.path(), "long.txt", &asked, "x", false).unwrap_err();
+        assert!(why.contains("more lines of the region"), "{why}");
+        assert!(why.len() < 4000, "{}", why.len());
+    }
+
+    #[test]
+    fn what_edit_file_cannot_do_is_said_and_nothing_is_touched() {
+        let dir = with_main();
+        for (rel, old, new, expected) in [
+            ("src/main.rs", "", "x", "old is empty"),
+            ("src/main.rs", "fn", "fn", "nothing to change"),
+            ("src/none.rs", "a", "b", "does not exist"),
+            ("src", "a", "b", "is a directory"),
+            ("../x", "a", "b", "`..`"),
+            ("/etc/passwd", "a", "b", "absolute"),
+            (".git", "a", "b", ".git"),
+            ("sub/.GIT/config", "a", "b", ".git"),
+            ("  ", "a", "b", "path is required"),
+        ] {
+            let why = edit_in(dir.path(), rel, old, new, false).unwrap_err();
+            assert!(why.contains(expected), "{rel}: {why}");
+        }
+        fs::write(dir.path().join("bin.dat"), b"a\0b").unwrap();
+        let why = edit_in(dir.path(), "bin.dat", "a", "b", false).unwrap_err();
+        assert!(why.contains("binary"), "{why}");
+        fs::write(dir.path().join("latin1.txt"), [0xe9, b'a']).unwrap();
+        let why = edit_in(dir.path(), "latin1.txt", "a", "b", false).unwrap_err();
+        assert!(why.contains("not UTF-8"), "{why}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+            MAIN_RS
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_not_edited_through() {
+        let dir = with_main();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret"), "s3cr3t").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("src/main.rs"), dir.path().join("inside"))
+            .unwrap();
+        for rel in ["link", "inside"] {
+            let why = edit_in(dir.path(), rel, "s3cr3t", "x", false).unwrap_err();
+            assert!(why.contains("symlink"), "{rel}: {why}");
+        }
+        assert_eq!(
+            fs::read_to_string(outside.path().join("secret")).unwrap(),
+            "s3cr3t"
+        );
+    }
+
+    #[test]
+    fn the_similarity_of_lines_ignores_the_blanks_at_the_ends() {
+        assert_eq!(similarity("  a b ", "a b"), 1000);
+        assert_eq!(similarity("", "  "), 1000);
+        assert_eq!(similarity("abc", ""), 0);
+        assert!(similarity("println!(\"hello\")", "println!(\"hallo\")") > 700);
+        assert!(similarity("println!(\"hello\")", "fn main() {") < 400);
+        assert_eq!(line_of("a\nb\nc", 4), 3);
     }
 }

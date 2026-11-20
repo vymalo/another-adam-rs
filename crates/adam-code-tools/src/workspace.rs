@@ -2,7 +2,7 @@
 //!
 //! A tool asks its workspace for the [`Place`] it works in (the directory a `repo` argument names,
 //! or the only one), and for what depends on whose workspace it is: the project instructions a path
-//! shows for the first time. What the file tools need after a write comes with them.
+//! shows for the first time, and what follows a write ([`CodeWorkspace::after_write`]).
 //!
 //! The coder implements it over the worktrees of a run (`adam_coder::ToolEnv`); a host implements
 //! it over a person's own directory (slice 7), which a run never owns, cleans or restores.
@@ -10,9 +10,11 @@
 //! The commands (`run_command`, `run`) need more of the workspace (a session to run in, a guard that
 //! records what a command changed and, where the workspace owns the place, undoes it). They get a
 //! port that extends this one and takes a [`Place`] from the same [`CodeWorkspace::place`], so a
-//! command and a file tool find a place and refuse a write the same way. The file tools' hook after
-//! a write comes with them (step 4) as a required method: a stated break for the implementations of
-//! this repository, the only ones until then.
+//! command and a file tool find a place and refuse a write the same way.
+//!
+//! [`CodeWorkspace::after_write`] is a **required** method, added when `write_file` and `edit_file`
+//! moved here: a breaking change for every implementation (the coder's and the testkit's
+//! `DirWorkspace`, the only ones then).
 //!
 //! A place's `git` is a [`GitAt`] from the workspace's own metadata (`GitAt::slot`,
 //! `GitAt::worktree`). A host's directory, which no workspace metadata describes, gets a
@@ -188,6 +190,27 @@ pub trait CodeWorkspace: Send + Sync {
     ) -> Result<Option<String>, ToolError> {
         Ok(None)
     }
+
+    /// After a write tool changed `paths` (relative to `place`): what the workspace does. Returns
+    /// text the tool appends verbatim to its sentence: empty, or starting with ' ' or '\n'.
+    ///
+    /// **Required**: every implementation says what a write is followed by, even when it is
+    /// nothing (`Ok(String::new())`). It is called once per successful write, after the files were
+    /// written and before the tool reports progress; a failed write does not call it. The coder
+    /// moves its run's check epoch (a file the project ignores is still read by a check) and says
+    /// to run the checks again, and, in a scratch project that was published, that the change does
+    /// not reach the repository.
+    ///
+    /// # Errors
+    ///
+    /// A [`ToolError`] when what follows the write cannot be done or recorded: the tool returns it,
+    /// and the files stay written.
+    async fn after_write(
+        &self,
+        ctx: &ToolCtx,
+        place: &Place,
+        paths: &[String],
+    ) -> Result<String, ToolError>;
 }
 
 /// A shared [`CodeWorkspace`].
