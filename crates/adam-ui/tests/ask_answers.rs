@@ -175,7 +175,13 @@ fn action(surface: &str, answers: Value) -> Message {
         "mimeType".to_owned(),
         json!(A2UI_MEDIA_TYPE),
     )]));
-    Message::new(Role::User, vec![part])
+    let mut message = Message::new(Role::User, vec![part]);
+    // Every message of the screen says what it offers: an answer turn that did not would be in words.
+    message.metadata = Some(HashMap::from([(
+        "a2uiRendererCapabilities".to_owned(),
+        json!({"1.0": {"supportedCatalogIds": [CATALOG_ID]}}),
+    )]));
+    message
 }
 
 /// The five questions of the contract's own examples, asked by one call.
@@ -523,7 +529,11 @@ fn verdict(
 }
 
 fn payload(surface: &str, context: Value) -> Value {
-    json!({"text": "The person answered", PAYLOAD_FORM: {"surface": surface, "context": context}})
+    json!({
+        "text": "The person answered",
+        PAYLOAD_FORM: {"surface": surface, "context": context},
+        "context": {"vymalo.a2ui.renderer": {"catalogIds": [CATALOG_ID]}},
+    })
 }
 
 #[tokio::test]
@@ -659,6 +669,54 @@ async fn a_form_from_before_the_cutover_is_asked_again_in_words_not_on_a_new_sur
         operation["version"] = json!("v0.9.1");
     }
     assert!(current(&every).ui.is_none());
+}
+
+/// The form is asked again on a surface only when this turn's offer lists the surface's catalog: with no
+/// offer, or one that lists another id, the question comes back in words (the answer is judged the same).
+#[tokio::test]
+async fn a_form_is_asked_again_on_a_surface_only_when_this_turns_offer_lists_its_catalog() {
+    let (tool, args, ui) = asked_with_v7().await;
+    let catalog_id = ui[0]["createSurface"]["catalogId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let answer = |offer: Option<Value>| {
+        let mut p = payload(
+            "ask-c1",
+            json!({"answers": with("budget", json!(["1500"]))}),
+        );
+        match offer {
+            Some(offer) => p["context"] = json!({"vymalo.a2ui.renderer": offer}),
+            None => p
+                .as_object_mut()
+                .unwrap()
+                .remove("context")
+                .map(drop)
+                .unwrap_or(()),
+        }
+        match tool.read_answer("c1", &args, Some(&ui), &p) {
+            AnswerCheck::Refuse(refusal) => refusal,
+            other => panic!("refused: {other:?}"),
+        }
+    };
+    assert!(
+        answer(Some(json!({"catalogIds": [catalog_id]})))
+            .ui
+            .is_some()
+    );
+    for (what, offer) in [
+        ("no offer", None),
+        ("a null offer", Some(Value::Null)),
+        (
+            "another id",
+            Some(json!({"catalogIds": ["https://example.test/other"]})),
+        ),
+        ("an empty list", Some(json!({"catalogIds": []}))),
+    ] {
+        let words = answer(offer);
+        assert!(words.ui.is_none(), "{what}: asked on a surface");
+        assert_eq!(words.rule, "above_max", "{what}: judged as before");
+    }
 }
 
 #[tokio::test]

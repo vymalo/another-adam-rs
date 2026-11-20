@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use adam_a2a_runtime::{PAYLOAD_FORM, is_format_or_control};
+use adam_a2a_runtime::{CONTEXT_A2UI_RENDERER, PAYLOAD_FORM, is_format_or_control};
 use adam_llm_agent::{AnswerCheck, Refusal};
 use serde_json::{Value, json};
 
@@ -60,9 +60,12 @@ pub(super) fn read(
     if tries >= MAX_REFUSALS {
         return AnswerCheck::End(giving_up(&form, &verdict));
     }
-    AnswerCheck::Refuse(ask_again(
-        call_id, &question, &form, &drawn, ui, context, &verdict,
-    ))
+    let mut refusal = ask_again(call_id, &question, &form, &drawn, ui, context, &verdict);
+    // The surface is asked again only when this turn's renderer offers its catalog; else in words.
+    if !offers_the_catalog_of(ui, payload) {
+        refusal.ui = None;
+    }
+    AnswerCheck::Refuse(refusal)
 }
 
 /// Why the answer in `answered` is not used, or `None` when it is.
@@ -357,6 +360,28 @@ fn fits(asked: &mut Value, form: &Form) -> bool {
         }
     }
     shown::check_size(asked).is_ok()
+}
+
+/// Whether the renderer of **this turn's message** (`vymalo.a2ui.renderer` in the payload's context)
+/// offers the `catalogId` of the surface the interface creates. An earlier turn's offer does not
+/// count: the payload is the message's own.
+fn offers_the_catalog_of(ui: &Value, payload: &Value) -> bool {
+    let Some(catalog_id) = ui.as_array().and_then(|messages| {
+        messages
+            .iter()
+            .find_map(|m| m.get("createSurface")?.get("catalogId")?.as_str())
+    }) else {
+        return false;
+    };
+    payload
+        .get("context")
+        .and_then(|context| {
+            context
+                .get(CONTEXT_A2UI_RENDERER)?
+                .get("catalogIds")?
+                .as_array()
+        })
+        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(catalog_id)))
 }
 
 /// Whether every operation of the interface says [`A2UI_VERSION`].
