@@ -407,19 +407,50 @@ fn open_messages(request: &ModelRequest) -> String {
 /// The requests that do not start with the one before: their indices (the turn each was made at).
 /// A summary request (a compaction's) is no turn and has its own rule (`the_summary_request_...`); it
 /// is left out here, so the index of a request is the number of model turns made before it.
-fn breaks(requests: &[ModelRequest]) -> Vec<u32> {
+///
+/// `appended` is [`Conversation::tools_appended`]: the turns at whose request the head grew by an
+/// MCP server the run loaded. There, and **only** there, `system` and `tools` may differ from the
+/// request before, and only by a **suffix**: the server's instructions follow the ones that were
+/// there and its tools follow the tools that were there, so every byte before them is the one the
+/// provider cached. Every other pair must have the same head, to the byte.
+fn breaks(requests: &[ModelRequest], appended: &[u32]) -> Vec<u32> {
     let requests: Vec<&ModelRequest> = requests.iter().filter(|r| !is_summary(r)).collect();
     let mut found = Vec::new();
     for (n, pair) in requests.windows(2).enumerate() {
         let (a, b) = (&pair[0], &pair[1]);
-        assert_eq!(
-            head(a),
-            head(b),
-            "system and tools are the same bytes at request {}",
-            n + 1
-        );
+        let turn = u32::try_from(n + 1).unwrap();
+        if appended.contains(&turn) {
+            assert_eq!(
+                a.tool_choice, b.tool_choice,
+                "the choice does not move at the turn a load appended tools: {turn}"
+            );
+            assert!(
+                b.tools.len() >= a.tools.len(),
+                "the tools array at turn {turn} did not shrink"
+            );
+            assert_eq!(
+                b.tools[..a.tools.len()],
+                a.tools[..],
+                "the tools array at turn {turn} is the one before it plus a suffix"
+            );
+            let (old, new) = (
+                a.system.as_deref().unwrap_or_default(),
+                b.system.as_deref().unwrap_or_default(),
+            );
+            assert!(
+                new.starts_with(old),
+                "the system prompt at turn {turn} is the one before it plus a suffix"
+            );
+        } else {
+            assert_eq!(
+                head(a),
+                head(b),
+                "system and tools are the same bytes at request {}",
+                n + 1
+            );
+        }
         if !open_messages(b).starts_with(&open_messages(a)) {
-            found.push(u32::try_from(n + 1).unwrap());
+            found.push(turn);
         }
     }
     found
@@ -453,7 +484,7 @@ async fn each_request_starts_with_the_one_before() {
     let (requests, state) = six_turns(SIX_TURNS_BUDGET).await;
     assert_eq!(requests.len(), 6);
     assert_eq!(state.turns, 6);
-    let cut = breaks(&requests);
+    let cut = breaks(&requests, &state.tools_appended);
     assert_eq!(
         cut, state.shortenings,
         "the breaks are the recorded shortenings"
@@ -464,7 +495,7 @@ async fn each_request_starts_with_the_one_before() {
 #[tokio::test]
 async fn without_a_budget_nothing_is_shortened_and_the_state_has_no_member_for_it() {
     let (requests, state) = six_turns(0).await;
-    assert_eq!(breaks(&requests), Vec::<u32>::new());
+    assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
     assert!(state.shortenings.is_empty());
     let written = serde_json::to_value(&state).unwrap();
     assert!(written.get("shortenings").is_none(), "{written}");
@@ -657,10 +688,13 @@ async fn a_message_that_arrives_before_a_replay_does_not_move_the_cut() {
     // that is the first with the cut.
     assert!(!requests[3].messages.iter().any(|m| m.text() == message));
     assert!(requests[4].messages.iter().any(|m| m.text() == message));
-    assert_eq!(breaks(&requests[..4]), Vec::<u32>::new());
+    assert_eq!(
+        breaks(&requests[..4], &state.tools_appended),
+        Vec::<u32>::new()
+    );
     // The message keeps the history at the budget, so more cuts follow (the README says when); the
     // first is at request 4 and every one is recorded at the turn of its request.
-    let cut = breaks(&requests);
+    let cut = breaks(&requests, &state.tools_appended);
     assert_eq!(
         cut.first(),
         Some(&4),
@@ -695,7 +729,7 @@ async fn a_kept_output_and_its_reads_keep_the_prefix() {
     rig.mock.push_text("done");
     let (requests, state) = rig.finish(run).await;
     assert_eq!(requests.len(), 5);
-    assert_eq!(breaks(&requests), state.shortenings);
+    assert_eq!(breaks(&requests, &state.tools_appended), state.shortenings);
     assert!(
         !state.shortenings.is_empty(),
         "the pages go over the budget"
@@ -810,7 +844,7 @@ async fn the_closing_request_extends_the_one_before_and_its_turn_is_not_kept() {
         r.tool_choice = ToolChoice::Auto;
     }
     assert_eq!(
-        breaks(&shown),
+        breaks(&shown, &[]),
         Vec::<u32>::new(),
         "the closing request extends the one before"
     );
@@ -936,13 +970,13 @@ async fn the_tools_of_a_source_are_offered_in_name_order() {
         .push_tool_calls(vec![big("c1", 5)])
         .push_text("done");
     let run = rig.start().await;
-    let (requests, _) = rig.finish(run).await;
+    let (requests, state) = rig.finish(run).await;
     assert_eq!(
         names_of(&requests[0]),
         ["big", "handle", "alpha", "bravo", "charlie", "delta"]
     );
     assert_eq!(
-        breaks(&requests),
+        breaks(&requests, &state.tools_appended),
         Vec::<u32>::new(),
         "the listing flipped, the request did not"
     );
@@ -993,7 +1027,7 @@ async fn a_compaction_is_the_only_break_besides_shortenings() {
     expected.push(at);
     expected.sort_unstable();
     assert_eq!(
-        breaks(&requests),
+        breaks(&requests, &state.tools_appended),
         expected,
         "the breaks are the recorded ones"
     );
@@ -1178,7 +1212,7 @@ async fn images_keep_the_prefix() {
     *rig.arm.run.lock().unwrap() = Some(run);
     let (requests, state) = rig.finish(run).await;
     assert_eq!(requests.len(), 4);
-    assert_eq!(breaks(&requests), Vec::<u32>::new());
+    assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
     assert_eq!(images_of(&state.messages).len(), 4);
     for request in &requests {
         for image in images_of(&request.messages) {
@@ -1247,7 +1281,7 @@ async fn the_ninth_image_is_a_stand_in_and_nothing_before_changes() {
     let run = rig.rt.start("llm", looking(0), None).await.expect("start");
     *rig.arm.run.lock().unwrap() = Some(run);
     let (requests, state) = rig.finish(run).await;
-    assert_eq!(breaks(&requests), Vec::<u32>::new());
+    assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
     assert_eq!(images_of(&state.messages).len(), 8);
     let last = state
         .messages
@@ -1323,7 +1357,7 @@ async fn a_shortening_replaces_old_tool_images_once() {
     *rig.arm.run.lock().unwrap() = Some(run);
     let (requests, state) = rig.finish(run).await;
     assert!(!state.shortenings.is_empty(), "{:?}", state.shortenings);
-    assert_eq!(breaks(&requests), state.shortenings);
+    assert_eq!(breaks(&requests, &state.tools_appended), state.shortenings);
     let tools: Vec<&Message> = state
         .messages
         .iter()
@@ -1493,7 +1527,7 @@ async fn a_compaction_summarises_the_images_of_dropped_turns_and_keeps_the_rest(
     let mut expected = state.shortenings.clone();
     expected.push(state.compactions[0].turn);
     expected.sort_unstable();
-    assert_eq!(breaks(&requests), expected);
+    assert_eq!(breaks(&requests, &state.tools_appended), expected);
     // The task's picture, the picture of the turn that stayed, and the one made after.
     let names: Vec<&str> = images_of(&state.messages)
         .iter()
@@ -2223,9 +2257,9 @@ async fn a_tool_a_source_holds_back_from_the_start_keeps_the_head_of_every_reque
         .push_tool_calls(vec![call("c1", "handle", json!({}))])
         .push_text("done");
     let run = rig.start().await;
-    let (requests, _) = rig.finish(run).await;
+    let (requests, state) = rig.finish(run).await;
     assert_eq!(requests.len(), 3);
-    assert_eq!(breaks(&requests), Vec::<u32>::new());
+    assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
     assert_eq!(
         requests[0]
             .tools
@@ -2309,4 +2343,335 @@ async fn a_task_selected_tool_survives_a_lost_commit() {
             );
         }
     }
+}
+
+/// A server of MCP-like tools the run loads during itself, as `adam-assembly`'s `McpSelect` does
+/// for a server whose `when` the task did not match: withheld until the run's state names it,
+/// then appended after every other tool. `big` and `handle` are the agent's own tools; `docs__*`
+/// are this "server"'s.
+struct Deferred {
+    server: &'static str,
+    specs: Vec<ToolSpec>,
+}
+
+impl Deferred {
+    fn new(server: &'static str, tools: &[&str]) -> Self {
+        Self {
+            server,
+            specs: tools
+                .iter()
+                .map(|name| ToolSpec {
+                    name: (*name).to_owned(),
+                    description: format!("the {name} tool"),
+                    parameters: json!({"type": "object", "properties": {}}),
+                })
+                .collect(),
+        }
+    }
+
+    fn loaded(&self, ctx: &SourceCtx) -> bool {
+        ctx.loaded_servers().iter().any(|name| name == self.server)
+    }
+}
+
+#[async_trait]
+impl ToolSource for Deferred {
+    async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    async fn appended(&self, ctx: &SourceCtx) -> Vec<ToolSpec> {
+        if self.loaded(ctx) {
+            self.specs.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The server's words reach the prompt only when the run has loaded it, and then they follow
+    /// everything: a load appends to the system prompt as it appends to the tools.
+    async fn appended_instructions(&self, ctx: &SourceCtx) -> Option<String> {
+        self.loaded(ctx)
+            .then(|| format!("## {}\n\n> {} words", self.server, self.server))
+    }
+
+    async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
+        if self.loaded(ctx) {
+            return Vec::new();
+        }
+        self.specs
+            .iter()
+            .filter(|spec| tools.contains(&spec.name.as_str()))
+            .map(|spec| {
+                Withheld::new(
+                    spec.name.clone(),
+                    format!("`{}` is not loaded for this run", spec.name),
+                )
+            })
+            .collect()
+    }
+
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        None
+    }
+}
+
+/// The `use_server` tool of `adam-assembly`, in miniature: a fixed tool whose result says which
+/// servers the run has loaded, which the loop applies to the state.
+struct Load {
+    server: &'static str,
+}
+
+#[async_trait]
+impl Tool for Load {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "use_server".into(),
+            description: "loads an MCP server's tools".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        if args["name"].as_str() != Some(self.server) {
+            return Ok(ToolOutput::error("no such server"));
+        }
+        if ctx.loaded_servers().iter().any(|name| name == self.server) {
+            return Ok(ToolOutput::error("already loaded"));
+        }
+        let mut loaded: Vec<String> = ctx.loaded_servers().to_vec();
+        loaded.push(self.server.to_owned());
+        let mut out = ToolOutput::text(format!("loaded {}", self.server));
+        out.loaded_servers = loaded;
+        Ok(out)
+    }
+}
+
+/// The agent with a deferred "server": its tools are own tools, withheld until the run loads it.
+fn with_deferred(builder: LlmAgentBuilder) -> LlmAgentBuilder {
+    builder
+        .tool(Fixed("docs__search"))
+        .tool(Fixed("docs__read"))
+        .tool(Load { server: "docs" })
+        .tool_source(Deferred::new("docs", &["docs__search", "docs__read"]))
+}
+
+/// An own tool that answers `<name>-out`, for the server's tools.
+struct Fixed(&'static str);
+
+#[async_trait]
+impl Tool for Fixed {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.0.to_owned(),
+            description: format!("the {} tool", self.0),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text(format!("{}-out", self.0)))
+    }
+}
+
+/// The tools a request offered, by name, in the order the model saw them.
+fn tool_names(request: &ModelRequest) -> Vec<String> {
+    request.tools.iter().map(|t| t.name.clone()).collect()
+}
+
+/// A `use_server` call appends the server's tools to the next request, once, and the state records
+/// the list and the turn the head moved: the tools array is the one before it plus a suffix, never
+/// an insertion, and the messages still start with the ones before.
+#[tokio::test]
+async fn a_load_appends_the_servers_tools_and_records_the_turn() {
+    let rig = Rig::new(0, with_deferred);
+    rig.mock
+        .push_tool_calls(vec![call("c1", "use_server", json!({"name": "docs"}))])
+        .push_tool_calls(vec![call("c2", "docs__search", json!({}))])
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        tool_names(&requests[0]),
+        ["big", "handle", "use_server"],
+        "the server's tools are not shown before the run loads it"
+    );
+    assert_eq!(
+        tool_names(&requests[1]),
+        ["big", "handle", "use_server", "docs__search", "docs__read"],
+        "the next request is the one before it plus the server's tools"
+    );
+    assert_eq!(
+        &requests[1].tools[..requests[0].tools.len()],
+        &requests[0].tools[..],
+        "the array grew by a suffix, never by an insertion"
+    );
+    assert_eq!(
+        requests[2].tools, requests[1].tools,
+        "the tools do not move again, and appear once"
+    );
+    let before = requests[0].system.as_deref().unwrap_or_default();
+    let after = requests[1].system.as_deref().unwrap_or_default();
+    assert!(
+        after.starts_with(before),
+        "the system prompt at the load is the one before it plus a suffix: {after:?}"
+    );
+    assert!(
+        after.ends_with("> docs words"),
+        "the loaded server's words follow the prompt: {after:?}"
+    );
+    assert!(
+        !before.contains("docs words"),
+        "they were not there before the load: {before:?}"
+    );
+    assert_eq!(
+        requests[2].system, requests[1].system,
+        "the prompt does not move again"
+    );
+    assert_eq!(state.loaded_servers, ["docs"]);
+    assert_eq!(
+        state.tools_appended,
+        [1],
+        "the turn of the request that grew"
+    );
+    assert_eq!(
+        breaks(&requests, &state.tools_appended),
+        Vec::<u32>::new(),
+        "the messages' prefix rule is unchanged"
+    );
+    // The call to the loaded tool ran: its result is in the last request.
+    let text = format!("{:?}", requests[2].messages);
+    assert!(text.contains("docs__search-out"), "{text}");
+}
+
+/// A run that never loads a server records no break: the head is the same bytes at every request
+/// and the state has no member for a load.
+#[tokio::test]
+async fn a_run_that_never_loads_a_server_records_no_break() {
+    let rig = Rig::new(0, with_deferred);
+    rig.mock
+        .push_tool_calls(vec![big("c0", 5)])
+        .push_tool_calls(vec![call("c1", "handle", json!({}))])
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    assert!(state.loaded_servers.is_empty());
+    assert!(state.tools_appended.is_empty());
+    assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
+    let written = serde_json::to_value(&state).unwrap();
+    assert!(written.get("loaded_servers").is_none(), "{written}");
+    assert!(written.get("tools_appended").is_none(), "{written}");
+}
+
+/// The load is state: a run whose commit is lost after the load replays the same list, the same
+/// requests and the same recorded turn, and the server's tools appear once.
+#[tokio::test]
+async fn a_resumed_run_reproduces_the_loaded_list() {
+    fn push_script(mock: &MockModel) {
+        mock.push_tool_calls(vec![call("c1", "use_server", json!({"name": "docs"}))])
+            .push_tool_calls(vec![call("c2", "docs__search", json!({}))])
+            .push_text("done");
+    }
+    let baseline = {
+        let rig = Rig::new(0, with_deferred);
+        push_script(&rig.mock);
+        let run = rig.start().await;
+        rig.finish(run).await
+    };
+    assert_eq!(baseline.1.loaded_servers, ["docs"]);
+    for call in [0, 1] {
+        for after_apply in [false, true] {
+            let rig = Rig::new(0, with_deferred);
+            push_script(&rig.mock);
+            rig.lose_the_commit_after_call(call, after_apply);
+            let run = rig.start().await;
+            let (requests, state) = rig.finish(run).await;
+            let label = format!("after call {call}, applied before the loss: {after_apply}");
+            assert_eq!(rig.store.injected(Method::CommitRun), 1, "{label}");
+            assert_eq!(state.loaded_servers, ["docs"], "{label}");
+            assert_eq!(state.tools_appended, [1], "{label}");
+            assert_eq!(state.messages, baseline.1.messages, "{label}");
+            for request in &requests {
+                let once = request
+                    .tools
+                    .iter()
+                    .filter(|t| t.name == "docs__search")
+                    .count();
+                assert!(once <= 1, "{label}: the tool appears at most once");
+            }
+            let last = requests.last().unwrap();
+            assert!(
+                last.tools.iter().any(|t| t.name == "docs__search"),
+                "{label}: the replay kept the load"
+            );
+            assert_eq!(
+                breaks(&requests, &state.tools_appended),
+                Vec::<u32>::new(),
+                "{label}"
+            );
+        }
+    }
+}
+
+/// A load appends to the prompt even when a source **after** the one that grows contributes words
+/// of its own (the assembly puts the MCP selector before the sources a host adds: the agents a
+/// person mentioned, the access tier, references). The loaded server's section must follow
+/// everything the request before carried, never sit between two parts of it.
+#[tokio::test]
+async fn a_load_appends_to_a_prompt_another_source_already_grew() {
+    struct Always;
+
+    #[async_trait]
+    impl ToolSource for Always {
+        async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        async fn instructions(&self, _ctx: &SourceCtx) -> Option<String> {
+            Some("the person named helper".into())
+        }
+
+        async fn call(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: Value,
+        ) -> Option<Result<ToolOutput, ToolError>> {
+            None
+        }
+    }
+
+    let rig = Rig::new(0, |builder| with_deferred(builder).tool_source(Always));
+    rig.mock
+        .push_tool_calls(vec![call("c1", "use_server", json!({"name": "docs"}))])
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    let before = requests[0].system.as_deref().unwrap_or_default();
+    let after = requests[1].system.as_deref().unwrap_or_default();
+    assert!(
+        before.ends_with("the person named helper"),
+        "the other source's words are in the prompt from the first request: {before:?}"
+    );
+    assert!(
+        after.starts_with(before),
+        "the system prompt at the load is the one before it plus a suffix: {after:?}"
+    );
+    assert!(
+        after.ends_with("> docs words"),
+        "the loaded server's words follow everything: {after:?}"
+    );
+    assert_eq!(state.tools_appended, [1]);
+    assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
 }

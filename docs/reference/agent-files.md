@@ -266,8 +266,9 @@ The prompts of an agent's MCP servers are commands too, named `<server>__<prompt
   `connectTimeoutSecs`, `instructions` and `prompts` (adam extensions) are [below](#timeouts-instructions-and-prompts).
 * `when: { "keywords": ["…"] }` (an adam extension) loads the server's tools **only when the run's task
   mentions one of its keywords**, ignoring case; a server without `when` is loaded for every run. The test is
-  made once, from the words of the run's first message, before its first model call, and never again:
-  the tools the model is shown do not move during a run ([below](#a-server-loaded-only-when-the-task-asks-when)).
+  made from the words of the run's first message, before its first model call; a run that needs a server the task
+  did not name loads it with the fixed tool `use_server { name }`, which **appends** the server's tools to the next
+  request and never inserts them ([below](#a-server-loaded-only-when-the-task-asks-when)).
   `paths` is **not** supported in this version and is ignored with a warning: the coder has no checkout before
   its first model call (`prepare_workspace` is a tool), so a path glob would have nothing to match. A `when`
   still needs `keywords`; one without is a load error and the server is left out.
@@ -826,10 +827,21 @@ every run, as before the key existed.
   (`Conversation::task`). A run that continues another carries that first message, so it selects the same
   servers as the run before, whatever its new message says. A message with no words (an empty one, or images
   only) matches nothing: only the eager servers are loaded.
-* **When it is decided.** Before the run's first model call, from the task alone, and never again. The tools
-  array is the same bytes at every request of the run, so the cached prefix holds ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md),
-  decision 1). The decision is **recomputed** from the run's state at each turn, not stored: the state
-  already holds the task, and a stored field would be a second place where the same decision lives.
+* **When it is decided.** From the task, before the run's first model call: the tools array is the same bytes at
+  every request of a run that loads no server during itself, so the cached prefix holds ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md),
+  decision 1). The decision is **recomputed** from the run's state at each turn, not stored: the state already
+  holds the task, and a stored field would be a second place where the same decision lives.
+* **The fallback: `use_server`.** An agent with at least one triggered server has one more fixed tool,
+  `use_server { name }`, present from its first request whatever the task. A successful call says which tools are
+  now available and names them; the run's state records the server (`Conversation::loaded_servers`), and from the
+  **next** model call on it is no longer withheld: its instructions follow every other word a source adds and its
+  tools are **appended after every other tool** of the request, in the order the run loaded them, never inserted or
+  reordered. The request before is therefore a byte prefix of the one after it, and the loop records the turn
+  where the head grew (`Conversation::tools_appended`). The append costs **one full history re-prefill**, which
+  the result says in words; the tool reports no number — what it cost is the next call's cached input tokens, as
+  the provider reports them. A refused load changes nothing: an unknown name, a server with no `when` (its tools
+  are already there), one the task or the run already loaded, and one that offered no tool when the agent started
+  (an `optional` server that was not reachable, or an allow-list that selects nothing).
 * **What is withheld.** An unselected server's tools are not shown, and a call to one (the model may name a
   tool it was not shown) is refused with a result that says the tool is not loaded for this run and names the
   server and its keywords. Its instructions are not in the agent's prompt either: they are appended for a

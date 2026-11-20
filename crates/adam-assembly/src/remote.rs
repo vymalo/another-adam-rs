@@ -430,31 +430,31 @@ impl RemoteEndpoint {
                 } else {
                     cap_text(text, MAX_RESULT_BYTES)
                 };
-                Outcome::Done(with_files(text, files))
+                Outcome::Done(Box::new(with_files(text, files)))
             }
-            TaskState::Failed => Outcome::Done(ToolOutput::error(format!(
+            TaskState::Failed => Outcome::Done(Box::new(ToolOutput::error(format!(
                 "the remote agent `{name}` failed{}",
                 with(&said)
-            ))),
-            TaskState::Canceled => Outcome::Done(ToolOutput::error(format!(
+            )))),
+            TaskState::Canceled => Outcome::Done(Box::new(ToolOutput::error(format!(
                 "the remote task of `{name}` was canceled{}",
                 with(&said)
-            ))),
-            TaskState::Rejected => Outcome::Done(ToolOutput::error(format!(
+            )))),
+            TaskState::Rejected => Outcome::Done(Box::new(ToolOutput::error(format!(
                 "the remote agent `{name}` rejected the task{}",
                 with(&said)
-            ))),
-            TaskState::InputRequired => Outcome::Done(ToolOutput::error(format!(
+            )))),
+            TaskState::InputRequired => Outcome::Done(Box::new(ToolOutput::error(format!(
                 "the remote agent `{name}` needs more input{}. A subagent cannot ask the user, so \
                  the task is over: call `{name}` again with a `message` that has everything the \
                  agent needs",
                 with(&said)
-            ))),
-            TaskState::AuthRequired => Outcome::Done(ToolOutput::error(format!(
+            )))),
+            TaskState::AuthRequired => Outcome::Done(Box::new(ToolOutput::error(format!(
                 "the remote agent `{name}` needs authorization{} that this deployment cannot give \
                  it: tell the user",
                 with(&said)
-            ))),
+            )))),
         }
     }
 
@@ -557,7 +557,9 @@ impl RemoteSubagentTool {
 /// A task's state, from the tool's side.
 pub(crate) enum Outcome {
     Working,
-    Done(ToolOutput),
+    /// The result, boxed: a `ToolOutput` is the size of the run's own record, and `Working` holds
+    /// nothing (a `RemotePoll` keeps it by value, where the tool hands its result over once).
+    Done(Box<ToolOutput>),
 }
 
 /// The text of the parts of a message or an artifact, one per line. Data parts are their JSON; a
@@ -709,7 +711,7 @@ impl Tool for RemoteSubagentTool {
             {
                 Outcome::Done(mut output) => {
                     ctx.spend_files_of(&mut output);
-                    Ok(output)
+                    Ok(*output)
                 }
                 Outcome::Working => {
                     tracing::debug!(tool = %self.name(), task = %task.id, "remote task started");
@@ -736,7 +738,7 @@ impl Tool for RemoteSubagentTool {
             .map_err(|e| self.endpoint.failure("look at the task on", &e))?;
         Ok(match self.endpoint.outcome(&task, ctx.files_left()) {
             Outcome::Working => RemotePoll::Working,
-            Outcome::Done(output) => RemotePoll::Ready(output),
+            Outcome::Done(output) => RemotePoll::Ready(*output),
         })
     }
 }

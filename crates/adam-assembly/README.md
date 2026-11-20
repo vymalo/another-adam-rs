@@ -68,7 +68,7 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 | `RemoteRoundAgent` (feature `remote`) | the `Agent` (and `AgentStarter`) that works the rounds of a session on a remote subagent of the root, registered as `<root>/<subagent>`; `with_wait_poll(Duration)` (`BoundDef::wait_poll` sets it). See [Remote sessions](#remote-sessions) |
 | `RemoteRoundStarter` (feature `remote`) | its start-only twin, `new(name)`: makes the same round state (`init`, `init_continuing`) with no endpoint and no credential; `AgentDef::session_starters` registers it |
 | `Assembly::prompt_commands()` (feature `mcp`) | the prompts of the **root's** MCP servers as commands (`adam_mcp::PromptCommand`), read once when the servers were connected; a subagent's give none. `adam-service` adds them to the backend and the card ([adam-mcp](../adam-mcp/README.md#prompts-as-commands)) |
-| `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `prompt` (rendered, with the skills catalog and the instructions of its MCP servers), `tools` (own, skill tools, then one per subagent, local or remote, then the five session tools of the root when it has a subagent, local or remote: what the model is offered), `skills`, `preloaded`, `limits`: what an `LlmAgent` was made from, comparable |
+| `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `prompt` (rendered, with the skills catalog and the instructions of its MCP servers), `tools` (own, `use_server` when one of its servers has a `when`, skill tools, then one per subagent, local or remote, then the five session tools of the root when it has a subagent, local or remote: what the model is offered), `skills`, `preloaded`, `when`, `limits`: what an `LlmAgent` was made from, comparable |
 | `RemoteInfo` | a remote (`a2a:`) subagent, as data (its tool is in `AgentInfo::tools` like a local subagent's) |
 | `LiveAssembly`, `LiveBuilder`, `Watch` (feature `dev`) | dev reload: `LiveAssembly::builder(dir, model, alias)` then `tools`, `configure`, `configure_bound`, `strictness`, `default_name`, `debounce`, `connect_mcp(&McpPolicy)` (feature `mcp`), `load()`; on the handle `register(RuntimeBuilder)`, `reload()`, `watch()`, `generation()`, `last_error()`, `info()`, `retired()`, `runs_on_previous_tools()`, `dir()` |
 | `Reloaded`, `ToolChange`, `ReloadError`, `WatchError` (feature `dev`) | what a reload did (`generation`, `changed`, `tool_changes`, `retired`), why it changed nothing (`Load(Error)` with `diagnostics()`, `NeedsRestart { added }`), why a watcher did not start |
@@ -669,6 +669,31 @@ let assembly = AgentDef::from_manifest(AGENT)?
 * **Files of a `files: true` server** are artifacts of the run that made the call
   ([`adam-mcp`](../adam-mcp/README.md#files-files-true)): the root's go to the person, a subagent's stay on the
   subagent's run with its budget, as for every artifact of a child (see *Subagents*).
+
+### A server loaded only when the task asks (`when`)
+
+A server entry may say `"when": { "keywords": ["linear", "ticket"] }`. Its tools are then **withheld** from every
+run whose task does not mention one of its keywords, and its instructions are not in the agent's prompt; a call to
+one of its tools is refused with a result that names the server and its keywords. A server with no `when` is eager,
+as before the key existed. The task is the words of the run's first message (`Conversation::task`), the same text
+at every turn, so a run that continues another selects the same servers. `when.paths` is not supported (the coder
+has no checkout before its first model call) and is ignored with a warning. The format is
+[`agent-files.md`](../../docs/reference/agent-files.md#a-server-loaded-only-when-the-task-asks-when).
+
+**The fallback: `use_server`.** An agent with at least one triggered server has one more fixed tool, `use_server
+{ name }`, from its first request whatever the task (so the tool list is the same bytes until something is loaded;
+a folder whose own tools already have that name is refused at bind). Its result says whether the server's tools are
+now available and names them, and the loop makes the run's list from it (`Conversation::loaded_servers`): from the
+**next** model call on the server stops being withheld, its instructions follow every other source's words, and its tools are
+**appended after every other tool** of the request, in the order the run loaded them
+([`ToolSource::appended`](../adam-llm-agent/README.md#context-and-tool-sources)). That is the whole point: the
+request before stays a byte prefix of the one after it, and the loop records the turn where the head grew
+(`Conversation::tools_appended`), so the prefix test knows the one recorded exception. The append costs **one full
+history re-prefill** — the result says so in words, and the tool invents no number: what it cost is the next call's
+`Usage::cached_input_tokens`, which only the provider reports. A refused load changes nothing: an unknown name, an
+eager server (its tools are already there), a server the task or the run already loaded, and a server that offered
+no tool at bind (an `optional` server that was not reachable, or an allow-list that selects nothing) are each a
+result the model can act on.
 
 ### Extra MCP servers (`ADAM_EXTRA_MCP_FILE`)
 

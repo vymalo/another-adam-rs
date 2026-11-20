@@ -162,6 +162,7 @@ mod skills;
 mod subagent;
 mod suggest;
 mod template;
+mod use_server;
 
 pub use assembly::{AgentInfo, Assembly, BoundDef, RemoteInfo};
 pub use def::{AgentDef, IntoManifest};
