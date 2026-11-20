@@ -428,7 +428,7 @@ the git sandbox, the pusher): no other image is added to the dev stack's postgre
 | `gitbox-1`, `gitbox-2` | `adam-git-sandbox` of the same image: no network, no secret, a read-only root, an in-memory `/tmp`, the slot's work directory; the coder's git runs there (`GIT_SANDBOX_SOCKET`), so what a repository's configuration names cannot read a secret or reach the network |
 | `meter-1`, `meter-2` | TCP relays with one fixed target, the harness's meter on the host |
 | `pub-coder-1`, `pub-coder-2`, `pub-git` | TCP relays that publish a coder's A2A port and the git server on the loopback |
-| `pusher-1`, `pusher-2` | one-shot containers that put a run's base on the git server |
+| `pusher-1`, `pusher-2` | one-shot containers that put a run's base on the git server: no secret, a read-only root, the base read-only; the scratch repository it builds (a whole copy of the base, 2 GB for a large one) is in `pusher-scratch` of the slot's work directory, on disk, made and removed by the harness around each push, never in a tmpfs (a 256 MB `/tmp` was full for element-web: "No space left on device"); its `/tmp` (16 MB) holds only the one-line git configuration. `gitbox`'s 64 MB `/tmp` holds no repository: git keeps its temporary packs in the repository, which is on the work volume |
 
 The coder, the OpenCode arm and the grading are **host containers** the harness starts with `docker run`: the coder from
 the task image, with `--env-file` (mode 0600), `--user 10001:10001`, the runtime's limits, its binaries and agent folder

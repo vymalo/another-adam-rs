@@ -10,7 +10,7 @@ import { FakeContainers } from '../lib/containers.mjs';
 import { gradeOnce, isolatedGit, localGit, safeEnv } from '../lib/grade.mjs';
 import { loadTask } from '../lib/task.mjs';
 import { makeTask } from './taskfix.mjs';
-import { SAFE_DIRECTORY_LINES, lsRemoteHeads, pushScript } from '../lib/gitops.mjs';
+import { PUSH_SCRATCH, SAFE_DIRECTORY_LINES, lsRemoteHeads, pushScript } from '../lib/gitops.mjs';
 import { commitFiles, git, initRepo } from './gitfix.mjs';
 import { tmp } from './helpers.mjs';
 
@@ -155,4 +155,11 @@ test('a git in a container is told safe.directory by a global file, the one plac
   const push = pushScript({ base: '/work/bench-base/base.git', url: 'http://git-server:8080/bench/x-1-r1.git' });
   assert.ok(push.includes(SAFE_DIRECTORY_LINES[0]), 'the pusher makes the file');
   assert.doesNotMatch(push, /-c safe\.directory|GIT_CONFIG_COUNT/);
+});
+
+test('the pusher\'s scratch repository is not in /tmp (a size-limited tmpfs): it is made on the scratch volume and removed on exit', () => {
+  const script = pushScript({ base: '/work/bench-base/base.git', url: 'http://git-server:8080/bench/x-1-r1.git' });
+  assert.ok(script.includes(`P=$(mktemp -d ${PUSH_SCRATCH}/push.XXXXXX)`));
+  assert.ok(script.includes(`trap 'rm -rf "$P"' EXIT`));
+  for (const line of script.split('\n')) if (line.includes('/tmp')) assert.match(line, /bench-gitconfig/);
 });

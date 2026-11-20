@@ -30,6 +30,8 @@ export class StackError extends Error {
 }
 
 export const SLOTS = 2;
+/** The pusher's scratch directory on the slot's work volume (compose.yaml mounts it at /scratch). */
+export const PUSHER_SCRATCH = '/work/pusher-scratch';
 export const COMPOSE_TIMEOUT_MS = 2 * 60 * 1000;
 export const DEFAULT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const SAFE_VALUE = /^[^\n\r\0$"'\\]*$/;
@@ -443,7 +445,15 @@ export class Stack {
 
   /** A base repository of the slot's work directory on the git server, pushed by a one-shot container with no secret. */
   async pushBase(slot, script) {
-    await this.compose(['run', '--rm', '-T', '--no-deps', this.slotService('pusher', slot), script], { timeoutMs: 5 * 60 * 1000 });
+    // The pusher's scratch repository is on the work volume (compose.yaml), made here as the harness's own directory and
+    // removed after, whatever the push did.
+    await this.workDir(slot, PUSHER_SCRATCH, { remove: true });
+    await this.workDir(slot, PUSHER_SCRATCH);
+    try {
+      await this.compose(['run', '--rm', '-T', '--no-deps', this.slotService('pusher', slot), script], { timeoutMs: 5 * 60 * 1000 });
+    } finally {
+      await this.workDir(slot, PUSHER_SCRATCH, { remove: true }).catch(() => {});
+    }
   }
 
   /** Remove a run's repository from the git server. */
