@@ -1523,8 +1523,8 @@ async fn plan(at: &GitAt, patch: &str, recount: bool) -> Result<Plan, PatchError
     if paths.is_empty() {
         return Err(PatchError::Refused("the patch changes no file".to_owned()));
     }
-    // Only a check: `git apply` writes these paths by name, which the coder cannot protect (see the
-    // coder's `tools::files`, *Races*).
+    // Only a check: `git apply` writes these paths by name, which a descriptor cannot protect (see
+    // `confine`, *Races*).
     for path in &paths {
         confine(at.root(), path, Access::Write).map_err(PatchError::Refused)?;
     }

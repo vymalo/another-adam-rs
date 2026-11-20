@@ -27,7 +27,8 @@ dev-dependency and runs the same cases: the coder's `ToolEnv` in `bin/adam-coder
 text appended, a refused write or edit does not call it, a failing hook is the tool's error with the file still
 written, and a read-only place a broken workspace gives for a write is refused with nothing written; `apply_patch`, in a git
 repository the test makes, calls the hook once with the paths it changed, and neither a patch that does not apply nor a
-read-only place calls it. `tests/find.rs` runs `adam_code_tools::find`'s three tools through the port over `DirWorkspace` and a git
+read-only place calls it; a patch into `.git`, one that makes a symlink and a binary patch are refused before `git`
+writes anything, with nothing written and no hook called. `tests/find.rs` runs `adam_code_tools::find`'s three tools through the port over `DirWorkspace` and a git
 repository of its own (a listing, a glob, a search that neither shows nor finds the secret, an unknown place), so the
 tools are tested over a workspace that is not the coder's. `tests/files.rs` does the same for `adam_code_tools::files`'s
 `read_file` and `read_files` (a page of a file, a missing file named with its closest path, two files in one result, a

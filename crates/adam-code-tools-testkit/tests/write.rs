@@ -272,3 +272,42 @@ async fn a_patch_to_a_read_only_place_is_refused_and_nothing_is_changed() {
     );
     assert!(ws.calls().is_empty());
 }
+
+/// What `apply_patch` refuses before `git` writes anything: a path inside `.git` (a hook that runs
+/// on the next commit), a symlink, and a binary patch. Each is an error result for the model; the
+/// tree is as it was and the hook is not called.
+#[tokio::test]
+async fn a_patch_into_git_or_with_a_link_or_binary_is_refused_and_nothing_is_written() {
+    const INTO_GIT: &str = "--- a/.git/config\n+++ b/.git/config\n@@ -0,0 +1 @@\n+[core]\n";
+    const LINK: &str = "diff --git a/l b/l\nnew file mode 120000\n--- /dev/null\n+++ b/l\n\
+                        @@ -0,0 +1 @@\n+a.txt\n\\ No newline at end of file\n";
+    const BINARY: &str = "diff --git a/b.bin b/b.bin\nnew file mode 100644\n\
+                          index 0000000000000000000000000000000000000000..8352675d67aed6625ece79af41c27fdb4ee2e867\n\
+                          GIT binary patch\nliteral 3\nKcmZQzWC8#H2LJ>B\n\nliteral 0\nHcmV?d00001\n\n";
+    for (name, patch, said, made) in [
+        (".git", INTO_GIT, "inside .git", None),
+        ("a link", LINK, "symlink or a submodule", Some("l")),
+        ("binary", BINARY, "changes a binary file", Some("b.bin")),
+    ] {
+        let dir = repository();
+        let config = std::fs::read_to_string(dir.path().join(".git/config")).unwrap();
+        let ws = Recording::over(dir.path());
+        let ctx = detached_ctx();
+
+        let out = apply_patch(&ws, &ctx, patch.into(), None).await.unwrap();
+        assert!(out.is_error, "{name}: {}", out.content);
+        assert!(out.content.contains(said), "{name}: {}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".git/config")).unwrap(),
+            config,
+            "{name}"
+        );
+        if let Some(made) = made {
+            assert!(
+                std::fs::symlink_metadata(dir.path().join(made)).is_err(),
+                "{name}: {made} was made"
+            );
+        }
+        assert!(ws.calls().is_empty(), "{name}: {:?}", ws.calls());
+    }
+}
