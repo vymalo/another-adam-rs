@@ -31,9 +31,9 @@ pub const CONTEXT_UI_CATALOG: &str = "vymalo.ui.catalog";
 /// to `null`, which deletes it: a run that continues another must not draw with an earlier
 /// message's offer, so a turn with no capabilities draws nothing.
 ///
-/// It is one of `adam_llm_agent::PER_MESSAGE_CONTEXT_KEYS`: when a message's context is too large
+/// It is one of `adam_llm_agent::PER_MESSAGE_CONTEXT_KEYS` (a test keeps the two equal): when a message's context is too large
 /// and dropped, the key is deleted too (an earlier turn's offer never survives).
-pub const CONTEXT_A2UI_RENDERER: &str = adam_llm_agent::RENDERER_OFFER_CONTEXT_KEY;
+pub const CONTEXT_A2UI_RENDERER: &str = "vymalo.a2ui.renderer";
 
 /// The most catalog ids kept in [`CONTEXT_A2UI_RENDERER`]; the ones after it are dropped.
 pub const MAX_OFFERED_CATALOG_IDS: usize = 32;

@@ -453,6 +453,15 @@ fn the_offer_is_bounded() {
     assert_eq!(kept[0], "https://example.test/c0");
 }
 
+#[test]
+fn the_offer_key_is_one_the_run_deletes_when_a_context_is_dropped() {
+    assert_eq!(
+        CONTEXT_A2UI_RENDERER,
+        adam_llm_agent::RENDERER_OFFER_CONTEXT_KEY
+    );
+    assert!(adam_llm_agent::PER_MESSAGE_CONTEXT_KEYS.contains(&CONTEXT_A2UI_RENDERER));
+}
+
 /// A `catalogId` is at most 256 bytes (the contract's limit): 256 is kept, 257 is left out.
 #[test]
 fn a_catalog_id_over_256_bytes_is_left_out() {

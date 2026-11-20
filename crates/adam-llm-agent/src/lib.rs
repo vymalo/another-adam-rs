@@ -172,8 +172,8 @@ pub use conversation::{
     ACCESS_TIER_CONTEXT_KEY, ArtifactRef, CALLER_CONTEXT_KEY, Conversation, LimitHit, LimitKind,
     MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS,
     MAX_REPORTED_ROUNDS, MESSAGE_KIND, OMITTED_MARKER_PREFIX, PER_MESSAGE_CONTEXT_KEYS,
-    PROTECTED_CONTEXT_KEYS, PendingQuestion, PendingRemote, PendingRun, PendingSession, PendingWait, Repeats,
-    RENDERER_OFFER_CONTEXT_KEY, STOPPED_BY_THE_PERSON, user_message,
+    PROTECTED_CONTEXT_KEYS, PendingQuestion, PendingRemote, PendingRun, PendingSession,
+    PendingWait, RENDERER_OFFER_CONTEXT_KEY, Repeats, STOPPED_BY_THE_PERSON, user_message,
 };
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]
