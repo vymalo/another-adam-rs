@@ -104,7 +104,7 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// | text parts | the text, joined by blank lines; a line that would read as the first line of a form's answer is marked `(typed) ` first |
 /// | an A2UI data part (`application/a2ui+json`) with the action `answer` of a surface `ask-<id>` that carries Choices answers | the text `The person answered through the interface (form ask-<id>):` (the surface the answer is for: [`form_answer_surface`]) and one line `- <question id>: <values>` per answer, an "other" as `other: "<text>"`, the words of a typed question as `text: "<text>"`, and a last line `Note: "<text>"` when the form's free box was used |
 /// | any other A2UI action | `The person used the interface: action "<name>" on surface "<id>" with context <compact JSON, cut at 4 KiB>` |
-/// | any other data part | its JSON, as the default reading does |
+/// | any other data part, an A2UI part none of whose messages says `"1.0"` included | its JSON, as the default reading does |
 /// | a `raw` part that is a PNG, JPEG, GIF or WebP | an entry of the payload's `images`, at most 4 and 2 MiB a message (over that, a line in the text) |
 /// | any other `raw` part, a `url` part | one line of the text, `[attached: ...; only images are read]` or `[linked: <url>]`; a link is never fetched |
 /// | `metadata[ui-catalog/v2]` `{catalogId, version, digest, inline}` | context [`CONTEXT_UI_REF`] `{catalogId, version, digest}` |
@@ -141,7 +141,13 @@ pub fn vymalo_inbound(message: &Message) -> Result<Inbound, String> {
         match &part.content {
             PartContent::Text(text) => chunks.push(typed_text(text)),
             PartContent::Data(data) if claims_a2ui(part) => {
-                chunks.extend(action_texts(data));
+                let actions = action_texts(data);
+                if actions.is_empty() && !says_current_version(data) {
+                    // Not a 1.0 message at all (an action of another version, ADR 0056 decision 4):
+                    // read as any other data part. A 1.0 message that is no action says nothing.
+                    chunks.push(data.to_string());
+                }
+                chunks.extend(actions);
                 forms.extend(forms_of(data));
             }
             PartContent::Data(data) => chunks.push(data.to_string()),
@@ -225,7 +231,8 @@ fn action_texts(data: &Value) -> Vec<String> {
 }
 
 /// The `action` of every message of an A2UI data part (an array of messages, or one) that says
-/// `"version": "1.0"`: a renderer-to-agent message of any other version is not read.
+/// `"version": "1.0"`: a renderer-to-agent message of any other version is no action (a part with
+/// none is read as any other data part).
 fn actions_of(data: &Value) -> Vec<&Value> {
     let messages: Vec<&Value> = match data {
         Value::Array(items) => items.iter().collect(),
@@ -236,6 +243,15 @@ fn actions_of(data: &Value) -> Vec<&Value> {
         .filter(|m| m.get("version").and_then(Value::as_str) == Some(A2UI_VERSION))
         .filter_map(|m| m.get("action"))
         .collect()
+}
+
+/// Whether any message of an A2UI data part (an array of messages, or one) says `"version": "1.0"`.
+fn says_current_version(data: &Value) -> bool {
+    let says = |m: &Value| m.get("version").and_then(Value::as_str) == Some(A2UI_VERSION);
+    match data {
+        Value::Array(items) => items.iter().any(says),
+        other => says(other),
+    }
 }
 
 /// The name of the action the Choices form submits its answers with.
@@ -1158,15 +1174,21 @@ mod tests {
             ("1.0 as a number", json!(1.0)),
             ("none", Value::Null),
         ] {
-            // Not an action: no text to read, so the message is refused, and no form is built.
-            assert!(
-                vymalo_inbound(&message(action(version))).is_err(),
-                "{what}: read as an action"
-            );
+            // Not an action: read as any other data part, its JSON as text, and no form is built.
+            let data = action(version);
+            let read = vymalo_inbound(&message(data.clone())).unwrap();
+            assert_eq!(read.payload["text"], json!(data.to_string()), "{what}");
+            assert!(read.payload.get(PAYLOAD_FORM).is_none(), "{what}: a form");
         }
         let mut without = action(json!("1.0"));
         without[0].as_object_mut().unwrap().remove("version");
-        assert!(vymalo_inbound(&message(without)).is_err(), "no version");
+        let read = vymalo_inbound(&message(without.clone())).unwrap();
+        assert_eq!(
+            read.payload["text"],
+            json!(without.to_string()),
+            "no version"
+        );
+        assert!(read.payload.get(PAYLOAD_FORM).is_none());
     }
 
     #[test]
