@@ -205,6 +205,7 @@ macro_rules! code_workspace_conformance {
 /// what it printed is settled by `adam_code_tools::output::settle`, as the command tools do.
 pub mod command_cases {
     use adam_code_tools::redact::REDACTED;
+    use adam_code_tools::sandbox::Meter;
     use adam_code_tools::shell::{ShellOutcome, shell_spec};
     use adam_code_tools::{Place, commands, output};
 
@@ -265,12 +266,30 @@ pub mod command_cases {
     pub async fn a_command_runs_in_the_writable_place(h: &CommandHarness) {
         const NAME: &str = "conformance-ran.txt";
         let place = writable(h).await;
+        let written = place.path().join(NAME);
+        // A file left by an interrupted run would pass for a command that ran elsewhere.
+        let _ = std::fs::remove_file(&written);
         let outcome = run(h, &format!("printf ran > {NAME}"), false).await;
         assert_eq!(outcome.exit_code, Some(0), "{outcome:?}");
-        let written = place.path().join(NAME);
         let text = std::fs::read_to_string(&written);
         let _ = std::fs::remove_file(&written);
         assert_eq!(text.ok().as_deref(), Some("ran"), "{}", written.display());
+    }
+
+    /// The session a command runs in is reported to the call's usage, as `session`'s contract says:
+    /// an environment the usage can name ([`Meter::of`]) is named once it is asked for.
+    pub async fn a_session_is_reported_to_the_calls_usage(h: &CommandHarness) {
+        let session = match h.workspace.session(&h.ctx).await {
+            Ok(session) => session,
+            Err(e) => panic!("no session: {e:?}"),
+        };
+        if Meter::of(&*session).is_some() {
+            assert!(
+                h.ctx.reported_sandbox().environment().is_some(),
+                "the session was not reported: {:?}",
+                h.ctx.reported_sandbox()
+            );
+        }
     }
 
     /// A long output that holds the secret is shown as a head and a tail and kept, both scrubbed:
@@ -367,6 +386,7 @@ pub mod command_cases {
 macro_rules! command_workspace_conformance {
     ($harness:expr) => {
         $crate::command_workspace_conformance!(@case $harness, a_command_runs_in_the_writable_place);
+        $crate::command_workspace_conformance!(@case $harness, a_session_is_reported_to_the_calls_usage);
         $crate::command_workspace_conformance!(@case $harness, a_long_output_is_shown_and_kept_scrubbed);
         $crate::command_workspace_conformance!(@case $harness, timeout_of_keeps_to_the_limit);
         $crate::command_workspace_conformance!(@case $harness, a_short_output_is_shown_whole_scrubbed_and_not_kept);

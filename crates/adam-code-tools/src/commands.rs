@@ -51,6 +51,11 @@ pub trait CommandWorkspace: CodeWorkspace {
     fn limits(&self) -> CommandLimits;
 
     /// Where a long output is kept, for `read_output`.
+    ///
+    /// The keeper scrubs what it keeps: an output longer than what is captured reaches it as it was
+    /// printed ([`output::settle`](crate::output::settle)), so a keeper that does not scrub stores
+    /// secrets. Run `adam_llm_agent::kept_outputs_conformance` over it; the command cases here
+    /// do not reach that path.
     fn kept(&self) -> &dyn KeptOutputs;
 }
 
