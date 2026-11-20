@@ -27,7 +27,7 @@ use crate::ctx::{Ctx, CtxOutcome, CtxParts};
 use crate::envelope::Envelope;
 use crate::erased::{ErasedAgent, Stepped};
 use crate::events::Artifact;
-use crate::head::Head;
+use crate::head::{Claimed, Head, HeadParts, Stored};
 use crate::notify::{Delivery, Signal};
 use crate::runtime::{Inner, MAX_COMMIT_RETRIES, Runtime, RuntimeError};
 
@@ -431,22 +431,27 @@ async fn advance(inner: Arc<Inner>, lease: Lease, guard: InFlightGuard) {
         .then(|| spawn_renewer(inner.clone(), run));
     let cancel = CancelToken::new();
     let tracked = inner.track(run, cancel.clone());
-    // Decoded once, here, and handed to `transition`: it is the same record.
-    let envelope = Envelope::decode(run, &lease.run.state);
+    // Decoded and joined once, here, and handed to `transition`: a v5 run's head and the rows it
+    // names are read once, and a v4 run is its whole state.
+    let claimed = inner.claimed(&lease.run).await;
     // A run that waited for a person and is stepped again has the rest of its time from now.
     let restored = (lease.run.status == RunStatus::Runnable)
-        .then(|| envelope.as_ref().ok().and_then(|e| e.remaining_secs))
+        .then(|| claimed.as_ref().ok().and_then(|c| c.env.remaining_secs))
         .flatten()
         .map(|secs| {
             inner.clock.now() + jiff::SignedDuration::from_secs(secs.try_into().unwrap_or(i64::MAX))
         });
     let watched = Watched {
         parent: lease.run.parent_id,
-        deadline: envelope.as_ref().ok().and_then(|e| e.deadline).or(restored),
-        limit_secs: envelope.as_ref().ok().and_then(|e| e.limit_secs),
+        deadline: claimed
+            .as_ref()
+            .ok()
+            .and_then(|c| c.env.deadline)
+            .or(restored),
+        limit_secs: claimed.as_ref().ok().and_then(|c| c.env.limit_secs),
     };
     let watch = spawn_cancel_watch(inner.clone(), run, watched, cancel.clone());
-    let release = transition(&inner, lease.run, envelope, cancel).await;
+    let release = transition(&inner, lease.run, claimed, cancel).await;
     drop(watch);
     drop(tracked);
     drop(renewer);
@@ -508,12 +513,13 @@ enum Plan {
 
 /// Returns whether the lease should be released.
 ///
-/// `decoded` is [`RunRecord::state`] of `rec`, decoded by [`advance`]: a transition reads the state
-/// once, and the failure it carries (an unreadable envelope) is committed here.
+/// `claimed` is [`RunRecord::state`] of `rec`, decoded and joined by [`advance`]: a transition
+/// reads the state once, and the failure it carries (an unreadable or unjoinable state) is
+/// committed here.
 async fn transition(
     inner: &Arc<Inner>,
     rec: RunRecord,
-    decoded: Result<Envelope, RuntimeError>,
+    claimed: Result<Claimed, RuntimeError>,
     cancel: CancelToken,
 ) -> bool {
     let run = rec.id;
@@ -533,12 +539,17 @@ async fn transition(
         cancel_for_parent(inner, run).await;
         return true;
     }
-    let mut env = match decoded {
-        Ok(env) => env,
+    let (mut env, base_head, base_rows) = match claimed {
+        Ok(claimed) => (claimed.env, claimed.head, claimed.rows),
         Err(e) => {
             tracing::error!(run = %run, error = %e, "failing run with unreadable state");
-            // The state is unreadable, so it is stored as it is: the record's own value is moved.
-            let update = RunUpdate::new(RunStatus::Failed, rec.state);
+            // The document is unreadable, so it is stored as it is — except a head, which stays
+            // the head and keeps the tombstone for its state: it was readable, its body was not.
+            let update = if matches!(Stored::decode(run, &rec.state), Ok(Stored::Head(_))) {
+                RunUpdate::new(RunStatus::Failed, Value::Null).head(rec.state)
+            } else {
+                RunUpdate::new(RunStatus::Failed, rec.state)
+            };
             if let Ok(committed) = inner.store.commit_run(run, rec.version, update).await {
                 inner
                     .emit_status(run, &rec.agent, RunStatus::Failed, Some(e.to_string()))
@@ -649,50 +660,65 @@ async fn transition(
         }
     }
     // Where the rows go: a new generation for the first split or a compaction, an append
-    // otherwise. The previous transcript is in the full v4 state this step read, so the decision
-    // costs no store read.
+    // otherwise. A v5 run's previous transcript is the rows the head named, read with the claim; a
+    // v4 run's is in the full state this step read. Neither costs a store read here.
     let generation = match &next.split {
         None => None,
         Some((_, rows)) => {
-            let previous = rec.state.get("agent").cloned();
-            let (previous_rows, unreadable) = match previous {
-                Some(state) => match agent.transcript(state) {
-                    Ok(rows) => (rows, false),
-                    Err(e) => {
-                        // A step that decoded this state decoded the same `A::State`, so this arm
-                        // is a guard rather than a path: if it ever fires (a second state type
-                        // for the same agent name), the warning says why and a new generation is
-                        // the safe answer. It has no test because no public path reaches it.
-                        tracing::warn!(
-                            run = %run,
-                            error = %report(&e),
-                            "the previous state's transcript does not decode; starting a new generation"
-                        );
-                        (None, true)
-                    }
-                },
-                None => (None, false),
+            let compaction = match &base_head {
+                Some(_) => env.rev == 0 || !is_prefix(&base_rows, rows),
+                None => {
+                    let previous = rec.state.get("agent").cloned();
+                    let (previous_rows, unreadable) = match previous {
+                        Some(state) => match agent.transcript(state) {
+                            Ok(rows) => (rows, false),
+                            Err(e) => {
+                                // A step that decoded this state decoded the same `A::State`, so
+                                // this arm is a guard rather than a path: if it ever fires (a
+                                // second state type for the same agent name), the warning says why
+                                // and a new generation is the safe answer. It has no test because
+                                // no public path reaches it.
+                                tracing::warn!(
+                                    run = %run,
+                                    error = %report(&e),
+                                    "the previous state's transcript does not decode; starting a new generation"
+                                );
+                                (None, true)
+                            }
+                        },
+                        None => (None, false),
+                    };
+                    unreadable
+                        || env.rev == 0
+                        || previous_rows
+                            .as_ref()
+                            .is_some_and(|previous| !is_prefix(previous, rows))
+                }
             };
-            let compaction = unreadable
-                || env.rev == 0
-                || previous_rows
-                    .as_ref()
-                    .is_some_and(|previous| !is_prefix(previous, rows));
             compaction.then(Uuid::new_v4)
         }
     };
     next.generation = generation;
     // The head names every file artifact of the state, so upload them all and refuse the head if
     // one's bytes are not stored (a pre-E artifact, a failed put): a head never names a digest that
-    // is not there.
+    // is not there. A v5 run's head names its files by digest already, so only what this step adds
+    // is uploaded — the bytes of a file it inherited are never read.
     if next.split.is_some() {
         let artifacts = merged_artifacts(&env, &next);
-        let uploaded = crate::blob::upload_all(&inner.store, &artifacts).await;
+        let uploaded = match &base_head {
+            Some(_) => crate::blob::upload_all(&inner.store, &next.artifacts).await,
+            None => crate::blob::upload_all(&inner.store, &artifacts).await,
+        };
         if uploaded.all_stored {
             // The head pairs its file references with this pass, so carry the list the pass saw:
-            // a retry merges deliveries into the envelope, never artifacts.
+            // a retry merges deliveries into the envelope, never artifacts. A v5 run's inherited
+            // files are paired first, in artifact order, and the pass covers the rest.
             next.head_artifacts = Some(artifacts);
-            next.shadow_files = uploaded.files;
+            next.shadow_files = base_head
+                .as_ref()
+                .map(HeadParts::file_refs)
+                .unwrap_or_default();
+            next.shadow_files.extend(uploaded.files);
             next.shadow_blobs = uploaded.ids;
         } else {
             tracing::error!(
@@ -719,6 +745,7 @@ async fn transition(
         inner,
         &rec,
         &env,
+        base_head.as_ref(),
         &next,
         rec.parent_id.is_some(),
         body_writer,
@@ -953,7 +980,9 @@ fn span_of(d: Duration) -> jiff::SignedDuration {
 /// deadline (plus a second when this wake came early) and the next look at the parent. A message that
 /// lands meanwhile moves the version and this commit is dropped: the run is runnable and is claimed.
 ///
-/// Takes the record by value: its state is moved into the update, not copied.
+/// Takes the record by value: its state is moved into the update, not copied. A v5 run's head is
+/// written back beside the tombstone, so the head stays current and the next step appends to the
+/// same generation.
 async fn park_again(inner: &Inner, rec: RunRecord, env: &Envelope, now: Timestamp) {
     let mut wake = now + span_of(CHILD_WAIT_POLL);
     if let Some(agent) = env.agent_wake {
@@ -962,7 +991,16 @@ async fn park_again(inner: &Inner, rec: RunRecord, env: &Envelope, now: Timestam
     if let Some(deadline) = env.deadline {
         wake = wake.min(deadline + span_of(DEADLINE_SKEW));
     }
-    let mut update = RunUpdate::new(RunStatus::Parked, rec.state);
+    let mut update = match Stored::decode(rec.id, &rec.state) {
+        Ok(Stored::Head(head)) => match head.encode() {
+            Ok(head) => RunUpdate::new(RunStatus::Parked, Value::Null).head(head),
+            Err(e) => {
+                tracing::warn!(run = %rec.id, error = %report(&e), "the head does not encode; parking a watched run again is skipped");
+                return;
+            }
+        },
+        _ => RunUpdate::new(RunStatus::Parked, rec.state),
+    };
     update.wake_at = Some(wake);
     match inner.store.commit_run(rec.id, rec.version, update).await {
         Ok(_) | Err(StoreError::Conflict { .. } | StoreError::NotFound(_)) => {}
@@ -975,15 +1013,20 @@ async fn park_again(inner: &Inner, rec: RunRecord, env: &Envelope, now: Timestam
 /// The record to write, built on the freshest envelope.
 ///
 /// `cur` is the claim's envelope on the first attempt, or a freshly decoded retry. A stepped
-/// envelope is drained (`cur.agent` is `Null`), so nothing here may read that member.
+/// envelope is drained (`cur.agent` is `Null`), so nothing here may read that member. `base_head`
+/// is the v5 head the same record carried, if any: a commit that does not re-split writes it back
+/// (with this commit's members) and keeps its file references.
+#[allow(clippy::too_many_arguments)] // one commit, described by its parts
 fn build_update(
     next: &Next,
     cur: &Envelope,
+    base_head: Option<&HeadParts>,
     base_inbox_len: usize,
     base_rev: u64,
     parent: bool,
     now: Timestamp,
     body_writer: Uuid,
+    keeps_bodies: bool,
 ) -> StoreResult<RunUpdate> {
     // Messages that arrived while stepping sit after the ones we started
     // with. A parked agent must not sleep through them.
@@ -1039,39 +1082,54 @@ fn build_update(
         agent_wake,
         hb: heartbeat,
     };
-    let mut update = RunUpdate::new(status, env.encode()?);
+    let mut update = RunUpdate::new(status, Value::Null);
     update.wake_at = wake_at;
-    // The shadow: the head beside the full state, and the rows it names. Only a step that split
-    // writes them; a commit that writes no head leaves the stored one (and its version) alone.
-    if let Some((head, rows)) = &next.split {
-        let len = u32::try_from(rows.len())
-            .map_err(|_| StoreError::InvalidInput("a transcript is longer than u32".into()))?;
-        let head = Head::of(
-            &env,
-            head.clone(),
-            len,
-            next.head_artifacts.as_deref().unwrap_or(&env.artifacts),
-            &next.shadow_files,
-        );
-        update.head = Some(head.encode()?);
-        let rows = rows
-            .iter()
-            .enumerate()
-            .map(|(idx, message)| {
-                let idx = u32::try_from(idx).map_err(|_| {
-                    StoreError::InvalidInput("a transcript has more rows than u32::MAX".into())
-                })?;
-                Ok(BodyRow {
-                    idx,
-                    message: message.clone(),
+    match (&next.split, base_head) {
+        // A step that splits: the head, the rows it names, and — for a store that keeps bodies —
+        // the tombstone instead of the whole state (ADR 0055, the contract release).
+        (Some((head, rows)), _) => {
+            let len = u32::try_from(rows.len())
+                .map_err(|_| StoreError::InvalidInput("a transcript is longer than u32".into()))?;
+            let head = Head::of(
+                &env,
+                head.clone(),
+                len,
+                next.head_artifacts.as_deref().unwrap_or(&env.artifacts),
+                &next.shadow_files,
+            );
+            update.head = Some(head.encode()?);
+            let rows = rows
+                .iter()
+                .enumerate()
+                .map(|(idx, message)| {
+                    let idx = u32::try_from(idx).map_err(|_| {
+                        StoreError::InvalidInput("a transcript has more rows than u32::MAX".into())
+                    })?;
+                    Ok(BodyRow {
+                        idx,
+                        message: message.clone(),
+                    })
                 })
-            })
-            .collect::<StoreResult<Vec<_>>>()?;
-        update.body = Some(BodyWrite {
-            generation: next.generation,
-            rows,
-            writer: body_writer,
-        });
+                .collect::<StoreResult<Vec<_>>>()?;
+            update.body = Some(BodyWrite {
+                generation: next.generation,
+                rows,
+                writer: body_writer,
+            });
+            update.state = if keeps_bodies {
+                Value::Null
+            } else {
+                env.encode()?
+            };
+        }
+        // A v5 run whose transition did not split (a failure, a retry): the head it read, with
+        // this commit's members, and the transcript set unchanged. The state stays the tombstone.
+        (None, Some(base)) => {
+            update.head = Some(base.carried(&env).encode()?);
+            update.state = Value::Null;
+        }
+        // A v4 run that did not split: the whole state, as it always was.
+        (None, None) => update.state = env.encode()?,
     }
     Ok(update)
 }
@@ -1130,21 +1188,27 @@ async fn commit(
     inner: &Inner,
     claimed: &RunRecord,
     base: &Envelope,
+    base_head: Option<&HeadParts>,
     next: &Next,
     parent: bool,
     body_writer: Uuid,
 ) -> StoreResult<Option<RunRecord>> {
     let run = claimed.id;
+    let keeps_bodies = inner.store.keeps_bodies();
     // On the first attempt the update is built from the borrowed record and envelope: nothing is
     // copied. A retry owns the record it just loaded, and builds from that.
-    let mut retried: Option<(RunRecord, Envelope)> = None;
+    let mut retried: Option<(RunRecord, Envelope, Option<HeadParts>)> = None;
     for attempt in 0..MAX_COMMIT_RETRIES {
         if attempt > 0 {
             let Some(rec) = inner.store.load_run(run).await? else {
                 return Ok(None);
             };
-            let env = match Envelope::decode(run, &rec.state) {
-                Ok(env) => env,
+            let (env, head) = match Stored::decode(run, &rec.state) {
+                Ok(Stored::Full(env)) => (env, None),
+                Ok(Stored::Head(head)) => {
+                    let (env, parts) = head.into_parts(Value::Null);
+                    (env, Some(parts))
+                }
                 Err(_) => return Ok(None),
             };
             // `deliver` never bumps `rev` and never changes a runnable run's
@@ -1155,30 +1219,33 @@ async fn commit(
             {
                 return Ok(None);
             }
-            retried = Some((rec, env));
+            retried = Some((rec, env, head));
         }
-        let (cur_rec, cur_env) = match &retried {
-            Some((rec, env)) => (rec, env),
-            None => (claimed, base),
+        let (cur_rec, cur_env, cur_head) = match &retried {
+            Some((rec, env, head)) => (rec, env, head.as_ref()),
+            None => (claimed, base, base_head),
         };
         let mut update = build_update(
             next,
             cur_env,
+            cur_head,
             base.inbox.len(),
             base.rev,
             parent,
             inner.clock.now(),
             body_writer,
+            keeps_bodies,
         )?;
         // The bytes of every file artifact this commit's state names go to the store before the
         // commit that names them (ADR 0055). A split's own pass (`upload_all`, in `transition`)
         // already stored what was missing and refused the head if one was not; a non-split commit
         // keeps the fail-open per-artifact upload, which skips a digest the store already holds.
+        // A v5 run's inherited files are already stored and named by the head it read.
         let mut blobs = if next.split.is_some() {
             next.shadow_blobs.clone()
         } else {
             let mut blobs = Vec::new();
-            if cur_env.rev == 0 {
+            if cur_env.rev == 0 && cur_head.is_none() {
                 blobs = crate::blob::upload_files(&inner.store, &cur_env.artifacts).await;
             }
             blobs.extend(crate::blob::upload_files(&inner.store, &next.artifacts).await);
@@ -1355,8 +1422,8 @@ mod claim_tests {
         let cancelled = store.load_run(run).await.expect("load").expect("run");
         assert_eq!(cancelled.status, RunStatus::Failed);
 
-        let decoded = Envelope::decode(cancelled.id, &cancelled.state);
-        assert!(transition(&rt.inner, cancelled.clone(), decoded, CancelToken::new()).await);
+        let claimed = rt.inner.claimed(&cancelled).await;
+        assert!(transition(&rt.inner, cancelled.clone(), claimed, CancelToken::new()).await);
 
         assert_eq!(steps.load(SeqCst), 0, "the agent was not stepped");
         let after = store.load_run(run).await.expect("load").expect("run");

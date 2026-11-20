@@ -189,31 +189,14 @@ impl Head {
             .map_err(|e| StoreError::InvalidInput(format!("the head does not serialize: {e}")))
     }
 
-    /// The content address and size of every file artifact, in artifact order: what a commit that
-    /// carries this head pairs its next head's file references with, so it never reads the bytes.
-    pub(crate) fn file_refs(&self) -> Vec<(BlobId, u64)> {
-        self.artifacts
-            .iter()
-            .filter_map(|artifact| artifact.file.as_ref())
-            .map(|file| (file.digest.clone(), file.size))
-            .collect()
-    }
-
-    /// The head's artifacts as the runtime's [`Artifact`], with a file's bytes **empty**: a head
-    /// names its files by digest and size, and the bytes stay in the blob store. A commit that
-    /// carries this head writes the same references back ([`file_refs`](Self::file_refs) pairs
-    /// them), and a commit that carries it in a v4 state would need the bytes from the store.
-    pub(crate) fn carried_artifacts(&self) -> Vec<Artifact> {
-        carried_artifacts(&self.artifacts)
-    }
-
-    /// The head as the full v4 envelope a transition reads: `agent` is the joined agent state and
-    /// the transcript is no longer a member (it is in `body`), so `artifacts` are the head's own
-    /// references ([`carried_artifacts`](Self::carried_artifacts)).
+    /// The head as the full v4 envelope a transition reads, and the parts a commit carries from it.
     ///
-    /// `v` is the v4 version: the envelope is a working value, and a commit that cannot write a
-    /// head (a refused split) falls back to encoding it as the whole state, which is v4.
-    pub(crate) fn into_envelope(self, agent: Value) -> Envelope {
+    /// `agent` is the joined agent state and the transcript is no longer a member (it is in
+    /// `body`), so the envelope's `artifacts` are the head's own references
+    /// ([`carried_artifacts`](Self::carried_artifacts)). `v` is the v4 version: the envelope is a
+    /// working value, and a commit that cannot write a head (a refused split) falls back to
+    /// encoding it as the whole state, which is v4.
+    pub(crate) fn into_parts(self, agent: Value) -> (Envelope, HeadParts) {
         let Self {
             inbox,
             seq,
@@ -227,9 +210,11 @@ impl Head {
             remaining_secs,
             agent_wake,
             hb,
+            body,
             ..
         } = self;
-        Envelope {
+        let parts = HeadParts { artifacts, body };
+        let env = Envelope {
             v: FULL_VERSION,
             agent,
             inbox,
@@ -238,24 +223,49 @@ impl Head {
             rev,
             output,
             error,
-            artifacts: carried_artifacts(&artifacts),
+            artifacts: carried_artifacts(&parts.artifacts),
             deadline,
             limit_secs,
             remaining_secs,
             agent_wake,
             hb,
-        }
+        };
+        (env, parts)
+    }
+}
+
+/// What a commit carries from the head it read, without the agent state: the transcript set the
+/// head names and its artifact references.
+///
+/// A commit that does not re-split writes the head back from these, and one that does keeps the
+/// file references so it never reads a file's bytes (the upload pass covers only what the step
+/// adds).
+pub(crate) struct HeadParts {
+    /// The head's artifacts, in order.
+    pub artifacts: Vec<HeadArtifact>,
+    /// The generation and the prefix of it the head names.
+    pub body: BodyRef,
+}
+
+impl HeadParts {
+    /// The content address and size of every file artifact, in artifact order: what a commit that
+    /// carries this head pairs its next head's file references with, so it never reads the bytes.
+    pub(crate) fn file_refs(&self) -> Vec<(BlobId, u64)> {
+        self.artifacts
+            .iter()
+            .filter_map(|artifact| artifact.file.as_ref())
+            .map(|file| (file.digest.clone(), file.size))
+            .collect()
     }
 
-    /// The head a commit that does not split writes: `self`'s transcript set (the generation it
-    /// names, resolved) and artifacts, with `env`'s own members — the status the commit carries is
-    /// on the record, not here.
+    /// The head a commit that does not split writes: these transcript set and artifacts, with
+    /// `env`'s own members — the status the commit carries is on the record, not here.
     ///
     /// The generation is named explicitly: the store patches it only for a commit that writes rows,
-    /// and a head that names none is unreadable. A head this is built from is current (a stale one
+    /// and a head that names none is unreadable. The head these came from is current (a stale one
     /// is served as the state, not the head), so its generation is the run's.
-    pub(crate) fn carried(&self, env: &Envelope) -> Self {
-        Self {
+    pub(crate) fn carried(&self, env: &Envelope) -> Head {
+        Head {
             v: VERSION,
             agent: env.agent.clone(),
             inbox: env.inbox.clone(),
@@ -367,16 +377,12 @@ impl Stored {
     }
 
     /// Encode the same variant that was decoded.
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> Result<Value, StoreError> {
         match self {
             Self::Full(envelope) => envelope.encode(),
             Self::Head(head) => head.encode(),
         }
-    }
-
-    /// Whether the document is the v5 head.
-    pub(crate) fn is_head(&self) -> bool {
-        matches!(self, Self::Head(_))
     }
 
     /// The inbox, read.
@@ -395,20 +401,6 @@ impl Stored {
         }
     }
 
-    /// The document as the envelope a caller reads the members of (the inbox, the result, the
-    /// counters): a v4 envelope as it is, a head as the envelope its members make.
-    ///
-    /// A head's `agent` is the head, **not** the joined state: a caller that needs the state joins
-    /// it ([`Inner::joined_state`](crate::Runtime)), and a caller that only reads the other members
-    /// never does. The `agent` of the head variant is left [`Value::Null`], because a commit builds
-    /// its envelope from the transition's state and never reads this member.
-    pub(crate) fn into_envelope(self) -> Envelope {
-        match self {
-            Self::Full(envelope) => envelope,
-            Self::Head(head) => head.into_envelope(Value::Null),
-        }
-    }
-
     /// The inbox, in the variant's own document.
     pub(crate) fn inbox_mut(&mut self) -> &mut Vec<Inbound> {
         match self {
@@ -418,7 +410,6 @@ impl Stored {
     }
 
     /// The failure reason, in the variant's own document.
-    #[cfg(test)]
     pub(crate) fn error(&self) -> Option<&str> {
         match self {
             Self::Full(envelope) => envelope.error.as_deref(),
@@ -431,15 +422,6 @@ impl Stored {
         match self {
             Self::Full(envelope) => &mut envelope.error,
             Self::Head(head) => &mut head.error,
-        }
-    }
-
-    /// The agent's state as the document carries it: the whole state for `Full`, the agent's head
-    /// for `Head`.
-    pub(crate) fn agent(&self) -> &Value {
-        match self {
-            Self::Full(envelope) => &envelope.agent,
-            Self::Head(head) => &head.agent,
         }
     }
 
@@ -495,6 +477,20 @@ pub(crate) struct ViewParts {
     pub hb: bool,
 }
 
+/// A claimed run's state, decoded and joined: what a transition reads.
+///
+/// A v4 run is its whole state in `env`, with no head and no rows. A v5 run's `env` is the head
+/// with the joined agent state, `head` is what a commit carries from it, and `rows` is the
+/// transcript the head named — kept so a commit decides append-or-compaction without decoding the
+/// previous state again.
+pub(crate) struct Claimed {
+    /// The envelope the transition reads.
+    pub env: Envelope,
+    /// What a commit carries from the head, for a v5 run.
+    pub head: Option<HeadParts>,
+    /// The transcript the head named, oldest first (empty for a v4 run).
+    pub rows: Vec<Value>,
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,7 +610,6 @@ mod tests {
         // `Stored` tells them apart by `v`, and re-encodes the variant it read.
         let stored = Stored::decode(RunId::new(), &encoded).expect("a head");
         assert!(matches!(stored, Stored::Head(_)));
-        assert_eq!(stored.agent(), &json!({}));
         assert_eq!(stored.encode().expect("encodes"), encoded);
 
         let full = Envelope::new(json!({"messages": [1]}))

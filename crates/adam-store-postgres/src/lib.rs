@@ -119,10 +119,25 @@ pub const MAX_POOL_SIZE: u32 = 65_535;
 
 const PUSH_COLUMNS: &str = "run_id, id, agent, owner, config, cursor, state, attempts, last_error, next_attempt_at, version, created_at, updated_at";
 
-const RUN_COLUMNS: &str = "id, agent, conversation_id, parent_id, status, state, wake_at, version, created_at, updated_at";
+/// The record a **reader** sees in the contract release (ADR 0055): the current head when the store
+/// has one (`head_version = version`), the whole state otherwise (a v4 run, or a head a later commit
+/// did not rebuild). No read here touches a body row; `Runtime::state` joins the head with the
+/// generation it names.
+///
+/// `prefix` is the table alias a statement needs (`""` for a plain `SELECT`, `"r."` for the
+/// `UPDATE ... FROM` of a claim).
+fn served_columns(prefix: &str) -> String {
+    let p = prefix;
+    format!(
+        "{p}id, {p}agent, {p}conversation_id, {p}parent_id, {p}status, \
+         CASE WHEN {p}head_version = {p}version AND {p}head IS NOT NULL THEN {p}head ELSE {p}state \
+         END AS state, \
+         {p}wake_at, {p}version, {p}created_at, {p}updated_at"
+    )
+}
 
-/// What `create_run` and `commit_run` return: [`RUN_COLUMNS`] without `state`. The caller wrote
-/// the state, and a `RETURNING` that echoed it would parse the largest column back on every
+/// What `create_run` and `commit_run` return: the record's metadata without `state`. The caller
+/// wrote the state, and a `RETURNING` that echoed it would parse the largest column back on every
 /// transition.
 const RUN_METADATA_COLUMNS: &str =
     "id, agent, conversation_id, parent_id, status, wake_at, version, created_at, updated_at";
@@ -741,15 +756,16 @@ impl Sql {
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $9)
                  RETURNING {RUN_METADATA_COLUMNS}"
             )),
-            load_run: Arc::from(format!("SELECT {RUN_COLUMNS} FROM {runs} WHERE id = $1")),
-            // The observer's read: the head when it is current, the whole state otherwise. Never a
-            // body row; `Runtime::state` joins the head and its generation when it needs them.
+            load_run: Arc::from(format!(
+                "SELECT {} FROM {runs} WHERE id = $1",
+                served_columns("")
+            )),
+            // The observer's read: the same document as `load_run` (the head when it is current,
+            // the whole state otherwise), kept as its own statement so a later release can make the
+            // observer cheaper than the worker without touching this one. Never a body row.
             load_head: Arc::from(format!(
-                "SELECT id, agent, conversation_id, parent_id, status,
-                        CASE WHEN head_version = version AND head IS NOT NULL THEN head ELSE state
-                        END AS state,
-                        wake_at, version, created_at, updated_at
-                   FROM {runs} WHERE id = $1"
+                "SELECT {} FROM {runs} WHERE id = $1",
+                served_columns("")
             )),
             run_header: Arc::from(format!(
                 "SELECT {RUN_HEADER_COLUMNS} FROM {runs} WHERE id = $1"
@@ -800,8 +816,9 @@ impl Sql {
                 "DELETE FROM {body} WHERE run_id = $1 AND generation <> $2 AND written_at < $3"
             )),
             open_run: Arc::from(format!(
-                "SELECT {RUN_COLUMNS} FROM {runs}
-                  WHERE agent = $1 AND conversation_id = $2 AND status IN ('runnable', 'parked')"
+                "SELECT {} FROM {runs}
+                  WHERE agent = $1 AND conversation_id = $2 AND status IN ('runnable', 'parked')",
+                served_columns("")
             )),
             journal_get: Arc::from(format!(
                 "SELECT seq, name, ok, payload, recorded_at FROM {journal} WHERE run_id = $1 AND seq = $2"
@@ -944,8 +961,8 @@ fn claim_due_sql(runs: &str, scope: ClaimScope) -> String {
             SET lease_owner = $4, lease_until = $5{set_owner}
            FROM due
           WHERE r.id = due.id
-         RETURNING r.id, r.agent, r.conversation_id, r.parent_id, r.status, r.state, r.wake_at,
-                   r.version, r.created_at, r.updated_at, r.sched_at"
+         RETURNING {}, r.sched_at",
+        served_columns("r.")
     )
 }
 
@@ -961,8 +978,9 @@ enum Scope {
 /// prefix (`NULL` for an exact scope). The prefix is a range over the index **and** an exact
 /// `starts_with`, so the range may be wide but never wrong.
 fn list_sql(runs: &str, scope: Scope) -> String {
+    let columns = served_columns("");
     format!(
-        "SELECT {RUN_COLUMNS} FROM {runs}
+        "SELECT {columns} FROM {runs}
           WHERE agent = $1
             AND {}
             AND ($2::text[] IS NULL OR status = ANY($2))

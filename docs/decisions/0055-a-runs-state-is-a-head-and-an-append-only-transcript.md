@@ -2,10 +2,12 @@
 
 Status: **Accepted** (2026-11-19). The owner's decision: option 2 of the optimisation review's P2 (an
 append-only transcript, one row per message, a head-only `state`) plus option 1 (file bytes out of the
-state into a content-addressed blob store). Schema version 5. *Amended 2026-11-19 (S1, S2a)*: the blob
-half (S1) and the non-PostgreSQL shadow (S2a) are built; the body is append-only **per generation**
-(the S2a amendment below); the PostgreSQL head/body half is built in #361 (*amended 2026-11-20*). It follows the I/O-layer
-pull request, which does not change the state schema.
+state into a content-addressed blob store). Schema version 5 (6 on PostgreSQL). *Amended 2026-11-19
+(S1, S2a)*: the blob half (S1) and the non-PostgreSQL shadow (S2a) are built; the body is append-only
+**per generation** (the S2a amendment below); the PostgreSQL head/body half is built in #361
+(*amended 2026-11-20*). *Amended 2026-11-20 (S3)*: the contract release is built — `state` is the
+tombstone, every read serves the head, the PostgreSQL store takes the contract with the rest (the S3
+amendment below). It follows the I/O-layer pull request, which does not change the state schema.
 
 ## Context
 
@@ -82,7 +84,7 @@ a later cleanup.
 | **S1 — blobs** | `BlobId`, `keeps_blobs`/`put_blob`/`get_blob`, `purge_blobs`; schema v5 part 1; the three implementations; `blob_conformance!`; the runtime uploads file artifacts and passes `RunUpdate.blobs`; `state` unchanged. The blob sweep and a commit's ref insert are **not one transaction**: an uncommitted ref is invisible to the sweep, which S2a's CTE closes (see the S1 amendment) | blob conformance on Memory/Postgres/Mongo; a 4 MiB file round-trips; the v4 fixture still decodes every `state` |
 | **S2a — the shadow** | `Agent`/`AgentStarter::split`/`join`, `Conversation`'s split, the `Head` type, schema v5 part 2, `RunUpdate.head/body`; the step path writes the head and the **delta** of an append-only generation (a compaction starts a new one); **nothing reads the head**; the non-PostgreSQL half only (the PostgreSQL head/body half is the follow-up after #361; *amended 2026-11-20: built in #361*) | `split/join` conformance; the per-commit reconstruction check; the body conformance (append/compaction/lost CAS/purge); every runtime test green; the v4 fixture green |
 | **S2b — the view** | `load_head`, `Stored` (`v1`/`v5`), `Runtime::view` on the head, `RunView.state` = the head, `RunView.artifacts: Vec<ArtifactRef>`, `Runtime::state`/`artifact_bytes`, the A2A blob read and cache | the read-counting test; every A2A test; the write measurement still shows the old cost |
-| **S3 — contract** | `state = null` on every commit; `load_run`, `claim_due`, `open_run` and `list_runs` return the head; the step path joins; `deliver`, `cancel_run` and `park_again` write the head they read; `start_continuing`/`on_cancelled` join; the v4 fixture test inverted to assert the documented failure | the 50 × 20 KB test green; `pg_relation_size`/WAL green; the "v4 cannot read a v5 run" test |
+| **S3 — contract** (landed 2026-11-20) | `state = null` on every commit of a store that keeps bodies; `load_run`, `claim_due`, `open_run` and `list_runs` return the head; the step path joins; `deliver`, `cancel_run` and `park_again` write the head they read; `start_continuing`/`on_cancelled` join; the PostgreSQL store takes the contract; the v4 fixture test inverted to assert the documented failure | the 50 × 20 KB test green; `pg_relation_size`/WAL green; the "v4 cannot read a v5 run" test |
 | **S4 — later** | drop the v4 `Envelope` read path and the `state` column, after every live run is v5 | — |
 
 *Amended 2026-11-19 (S0)*: S0 lands the measurement **green**, not recorded red — a red test cannot
@@ -175,14 +177,58 @@ count); a prefix that is short or not contiguous `0..len` is still `Corrupt`, be
 damage the head's `len` catches. This is a read rule only: the writes, the loser's cleanup and the
 next append's foreign-slot check (decision 6) are unchanged.
 
+*Amended 2026-11-20 (S3)*: **the contract release.** Every commit of a run whose store keeps bodies
+writes `state = null` (the tombstone), the head, and the body rows it appends; `load_run`,
+`load_head`, `claim_due`, `open_run_for_conversation` and `list_runs` answer the **same document**
+(the current head, else the whole state); the step path joins the head with the rows its claim read;
+`deliver`, `cancel_run` and `park_again` write the head they read, so the head stays current and the
+next split appends. The PostgreSQL head/body half (#232/#361) landed first, so the PG store takes the
+contract in the same release; `keeps_bodies()` is the gate, and a third-party store that keeps no
+bodies still gets the whole v4 `state` and no head. `commit_run` stores `state` as it is given: the
+runtime decides, the store does not. A v4 run that never commits again keeps its `state` and reads as
+before; its first commit under the contract splits it (the writer has the whole state it decoded).
+The frozen `V4Envelope` test is **inverted**: the fixture now rejects the tombstone, and a
+pre-contract run still decodes.
+
+The measured drop, on the same stack and a fresh database, one run of 50 commits appending 10 KB
+each (the workload is `counting::measure_transcript_write`; `dev/p2-measure.sh` prints the disk
+side):
+
+| Metric | Before (expand release) | After (contract) |
+|---|---|---|
+| logical bytes written (`total_written`) | 13,290,322 | 524,320 |
+| largest commit (`max_commit`) | 521,202 | 10,521 |
+| first `load_run` (`first_read`) | 10,434 | 96 |
+| last `load_run` (`final_read`) | 521,202 | 98 |
+| PostgreSQL `pg_total_relation_size(runs)` | 13,762,560 | 90,112 |
+| PostgreSQL `pg_total_relation_size(body)` | 24,576 | 696,320 |
+| PostgreSQL `pg_stat_wal.wal_bytes` delta | 19,419,969 (S0: 14,470,163) | 5,194,319 / 11,760,965 |
+| MongoDB WiredTiger log bytes written | 13,750,784 | 628,864 |
+| MongoDB WiredTiger block-manager bytes | 397,312 | 516,096 |
+
+The two WAL deltas are two back-to-back after runs: `pg_stat_wal` is server-wide, so a shared server
+adds its own writes, and the retained relation sizes are the stable number. The before run's body is
+empty because the old workload committed only `state`; the after run's body holds the transcript, so
+`runs + body` is 13,787,136 before and 786,432 after (17.5×). `collStats.size` reads 0 after the
+workload purges its run (MongoDB counts live documents), which is why the script reports
+`storageSize` and the WiredTiger counters.
+
+**The deploy boundary.** A v4 process that touches a converted run fails it (`Envelope::decode`
+refuses a head, so the run is committed `Failed`). The contract therefore ships as its own deploy:
+the operator scales the coder to zero (or relies on the default single-replica delete-then-create)
+and rolls, and **no v4 process runs against the database afterwards**. A rollback to the expand
+release reads the runs the contract has not converted; a converted run's `state` is `null` and only
+a v5 binary reads it. Do not merge the contract and roll in one step.
+
 ## Consequences
 
 * The **body's** quadratic write is gone across splitting commits: a split writes one message plus a
   head, not the transcript (amended S2a: the append-only generation is what makes this true in the
-  expand release too). A headless commit or a v4 commit still compacts the transcript until S3, and
-  every commit still carries the full `state`, so the commit's full win (no `state`) arrives at S3.
-  Across splitting commits the corrected 20× at 40 turns and 50× at 100 become ~1× for the body. The
-  read of a status becomes one small row.
+  expand release too). In the contract release every commit of a v5 run appends (the headless paths
+  write the head they read) and `state` is the tombstone, so the commit's full win has arrived: the
+  50 × 10 KB workload writes 524,320 logical bytes instead of 13,290,322. Across splitting commits
+  the corrected 20× at 40 turns and 50× at 100 become ~1× for the body. The read of a status becomes
+  one small row (96 bytes against 10,434 after the first commit).
 * **Breaking:** `RunView.artifacts` becomes `Vec<ArtifactRef>` (bytes by reference,
   `Runtime::artifact_bytes` to fetch), and `RunView.state` is the agent's head, not the whole state
   (`Runtime::state(run)` is the joined state). Every in-repo consumer already reads only head members;

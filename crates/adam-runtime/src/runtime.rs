@@ -24,7 +24,7 @@ use crate::clock::{Clock, DynClock, SystemClock};
 use crate::envelope::Envelope;
 use crate::erased::{Erased, ErasedAgent, ErasedStarter, StarterOnly};
 use crate::events::{DynEventSink, EventSink, NoopSink, RunEvent};
-use crate::head::Stored;
+use crate::head::{Claimed, Head, Stored};
 use crate::notify::{DynNotifier, Notifier, Signal};
 use crate::retry::RetryPolicy;
 use crate::session::{
@@ -357,7 +357,7 @@ impl Inner {
             return Ok(None);
         };
         let stored = Stored::decode(run, &first.state)?;
-        if let Some(state) = self.join_stored(&first, &stored).await? {
+        if let Some((state, _)) = self.join_stored(&first, &stored).await? {
             return Ok(Some((first, state)));
         }
         // The rows do not match the head: either the generation was collected between the two
@@ -377,7 +377,7 @@ impl Inner {
         }
         let stored = Stored::decode(run, &second.state)?;
         match self.join_stored(&second, &stored).await? {
-            Some(state) => Ok(Some((second, state))),
+            Some((state, _)) => Ok(Some((second, state))),
             None => Err(RuntimeError::Corrupt {
                 run,
                 reason: "the head moved and its body generation is still incomplete".into(),
@@ -397,21 +397,31 @@ impl Inner {
         &self,
         rec: &RunRecord,
         stored: &Stored,
-    ) -> Result<Option<Value>, RuntimeError> {
-        let Some(body) = stored.body() else {
-            return Ok(Some(stored.agent().clone()));
-        };
+    ) -> Result<Option<(Value, Vec<Value>)>, RuntimeError> {
+        match stored {
+            Stored::Full(envelope) => Ok(Some((envelope.agent.clone(), Vec::new()))),
+            Stored::Head(head) => self.join_head(rec, head).await,
+        }
+    }
+
+    /// [`join_stored`](Self::join_stored) for the head of a v5 run: the rows of the generation it
+    /// names, read and joined with the agent's `join`.
+    async fn join_head(
+        &self,
+        rec: &RunRecord,
+        head: &Head,
+    ) -> Result<Option<(Value, Vec<Value>)>, RuntimeError> {
         let Some(registered) = self.agents.get(&rec.agent) else {
             return Err(RuntimeError::UnknownAgent(rec.agent.clone()));
         };
-        let Some(generation) = body.generation else {
+        let Some(generation) = head.body.generation else {
             return Err(RuntimeError::Corrupt {
                 run: rec.id,
                 reason: "the head names no body generation".into(),
                 source: None,
             });
         };
-        let len = body.len as usize;
+        let len = head.body.len as usize;
         let mut rows = self.store.body_list(rec.id, generation).await?;
         let extra = rows.iter().filter(|row| row.idx as usize >= len).count();
         if extra > 0 {
@@ -432,9 +442,10 @@ impl Inner {
         }
         let rows: Vec<Value> = rows.into_iter().map(|row| row.message).collect();
         let had_rows = !rows.is_empty();
-        let head = stored.agent();
-        let joined = registered.starter().join(head.clone(), rows)?;
-        if had_rows && joined == *head {
+        let joined = registered
+            .starter()
+            .join(head.agent.clone(), rows.clone())?;
+        if had_rows && joined == head.agent {
             // A starter registered without delegating `join` (its default returns the head) would
             // silently hand a consumer a state with no transcript. The in-repo starters delegate;
             // this is for a consumer's front.
@@ -444,7 +455,48 @@ impl Inner {
                 "the registered starter's `join` ignored the transcript; delegate `split`/`join` to the agent's"
             );
         }
-        Ok(Some(joined))
+        Ok(Some((joined, rows)))
+    }
+
+    /// The record a claim returned, decoded and joined: what a transition reads.
+    ///
+    /// A v4 run is its whole state, with no rows. A v5 run's head names a body generation: the
+    /// rows are read once, joined with the head, and **kept**, so the commit decides
+    /// append-or-compaction without decoding the previous state again. The head is kept too: a
+    /// commit that does not re-split writes it back (with this commit's members), and one that does
+    /// keeps its file references, so a step never reads a file's bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::Corrupt`] when the head names a prefix that is not whole (a row below `len`
+    /// is missing: the generation was collected or damaged), and
+    /// [`RuntimeError::UnknownAgent`] when the run's agent is not registered here.
+    pub(crate) async fn claimed(&self, rec: &RunRecord) -> Result<Claimed, RuntimeError> {
+        match Stored::decode(rec.id, &rec.state)? {
+            Stored::Full(env) => Ok(Claimed {
+                env,
+                head: None,
+                rows: Vec::new(),
+            }),
+            Stored::Head(head) => {
+                let Some((state, rows)) = self.join_head(rec, &head).await? else {
+                    return Err(RuntimeError::Corrupt {
+                        run: rec.id,
+                        reason: format!(
+                            "the head names {} body rows and the generation does not hold them",
+                            head.body.len
+                        ),
+                        source: None,
+                    });
+                };
+                let (env, parts) = head.into_parts(state);
+                Ok(Claimed {
+                    env,
+                    head: Some(parts),
+                    rows,
+                })
+            }
+        }
     }
 
     pub fn notify_workers(&self) {
@@ -489,7 +541,7 @@ impl Inner {
                 self.fire_cancel(run);
                 return Ok(());
             }
-            // S3: `load_run` returns the head, and a cancel writes the head it read (this already
+            // S3: `load_run` returns the head; a cancel writes the head it read (this already
             // re-encodes the same `Stored` variant, so it survives the switch).
             let mut stored = Stored::decode(run, &rec.state)?;
             let error = format!("cancelled: {reason}");
@@ -510,7 +562,7 @@ impl Inner {
                 .is_some()
             {
                 match self.join_stored(&rec, &stored).await {
-                    Ok(state) => state,
+                    Ok(joined) => joined.map(|(state, _)| state),
                     Err(e) => {
                         tracing::warn!(%run, error = %adam_error::report(&e), "the cancelled run's state could not be joined; its agent is not told");
                         None
@@ -519,7 +571,9 @@ impl Inner {
             } else {
                 None
             };
-            let update = RunUpdate::new(RunStatus::Failed, stored.encode()?);
+            let (head, state) = carried(&self.store, &stored)?;
+            let mut update = RunUpdate::new(RunStatus::Failed, state);
+            update.head = head;
             match self.store.commit_run(run, rec.version, update).await {
                 Ok(committed) => {
                     // First, and on a task of its own: firing the token below lets the step end,
@@ -567,17 +621,19 @@ impl Inner {
                     status: rec.status,
                 });
             }
-            // S3: `load_run` returns the head; `deliver` must decode `Stored` and re-encode the
-            // variant it read, as `cancel_run` already does. In E the state is always `Full`.
-            let mut env = Envelope::decode(run, &rec.state)?;
-            env.inbox.push(inbound.clone());
+            // The contract read: `load_run` answers the head for a v5 run, so the inbox is changed
+            // on the variant that was read and the same variant is written back.
+            let mut stored = Stored::decode(run, &rec.state)?;
+            stored.inbox_mut().push(inbound.clone());
             let woke = rec.status == RunStatus::Parked;
             let (status, wake_at) = if woke {
                 (RunStatus::Runnable, None)
             } else {
                 (rec.status, rec.wake_at)
             };
-            let mut update = RunUpdate::new(status, env.encode()?);
+            let (head, state) = carried(&self.store, &stored)?;
+            let mut update = RunUpdate::new(status, state);
+            update.head = head;
             update.wake_at = wake_at;
             match self.store.commit_run(run, rec.version, update).await {
                 Ok(_) => {
@@ -648,6 +704,28 @@ impl Inner {
         self.sink
             .emit(run, agent, RunEvent::Status { status, detail })
             .await;
+    }
+}
+
+/// The `(head, state)` a commit writes when it carries the document it read, without re-splitting:
+/// a v5 head stays the head, and a store that keeps bodies keeps the tombstone as its state; a v4
+/// envelope stays the whole state (ADR 0055, the contract release).
+///
+/// A head is only ever written by a store that keeps bodies, so the tombstone is the state there.
+/// The fallback for a store that reports it keeps none is the head itself, which keeps the run
+/// readable instead of destroying it.
+fn carried(store: &DynStore, stored: &Stored) -> Result<(Option<Value>, Value), RuntimeError> {
+    match stored {
+        Stored::Full(envelope) => Ok((None, envelope.encode()?)),
+        Stored::Head(head) => {
+            let head = head.encode()?;
+            let state = if store.keeps_bodies() {
+                Value::Null
+            } else {
+                head.clone()
+            };
+            Ok((Some(head), state))
+        }
     }
 }
 

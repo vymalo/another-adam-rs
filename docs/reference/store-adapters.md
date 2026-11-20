@@ -30,9 +30,17 @@ let run = store.commit_run(run.id, run.version, RunUpdate::new(RunStatus::Parked
 
 A `create_run` or a `commit_run` returns the record **without its state** (`RunRecord::state` is `null`):
 the caller has the state it wrote, and echoing it back would transfer the largest member of the record
-on every transition. Read the run for the stored state (a store may have replaced a NUL in it);
+on every transition. Read the run for its document (a store may have replaced a NUL in it);
 `journal_put` is the exception and returns the payload it stored, because the loop decodes the step's
 outcome from it.
+
+**Every read that returns a record answers the same document** (ADR 0055, the contract release):
+`load_run`, `load_head`, `claim_due`, `open_run_for_conversation` and `list_runs` serve the v5 **head**
+when the store has a current one (`head_version == version`), and the whole `state` otherwise — a v4
+run, or a head a later commit did not rebuild. `state` is the tombstone (`null`) for a run whose head
+is current, so the head is the run. A store that keeps no bodies (`keeps_bodies() == false`, the
+default) is not written the contract: the runtime keeps the whole v4 `state` for it, and its reads
+answer that, exactly as before.
 
 `run_header` answers a run **without its state** — its id, agent, conversation, parent, status, wake
 time, version, timestamps and lease — which is all a reader that only needs the run's own bookkeeping
@@ -60,34 +68,33 @@ is uploaded once. A store that keeps no blobs leaves the bytes in the state, exa
 gains the field: add `blobs: Vec::new()` or use `RunUpdate::new`.
 
 `keeps_bodies` / `body_list` / `gc_body` keep a run's **transcript** beside its head (ADR 0055). The
-expand release writes a v5 head and an append-only body generation beside the full v4 `state`; the
-observer reads the head (`Runtime::view` is one `load_head` and no body), while the worker and the
-contract release still read `state` through `load_run`. A generation is `(run, generation, idx)`;
-`RunUpdate.body` is `{generation, rows, writer}`, where `generation: None` appends the rows after the
-head's `len` and `Some(new)` is a compaction. A duplicate slot is this attempt's retry when the row's
-`writer` is this attempt. A row another attempt wrote is adopted when its message is the one this
-attempt would write; foreign rows older than the orphan grace (5 minutes, far longer than the
-insert→CAS gap of a live attempt — milliseconds; the default lease is 30 s) are collected and the
-insert retried once; a live attempt with a different message is a `Conflict`. The delta win holds
-across splitting commits: a headless commit (`deliver`, `cancel`, `park_again`, a failed one) makes
-the next split a compaction until S3, which writes the head those paths read. A commit with `head: None` leaves the stored head and
-its `head_version` alone (a delivery, a cancel or a park keeps the format it read), and `load_head`
-serves the head only when `head_version == version`. `load_head` is the observer's read (`Runtime::view`). MongoDB overrides it with one **projected**
-`find_one` that carries the head and the record's own fields, never `state`; PostgreSQL with one
-`SELECT` whose `state` column is `CASE WHEN head_version = version THEN head ELSE state END`. A
+contract release writes the head, the append-only body generation and the tombstone on every commit
+of a v5 run; the step path joins the head with the rows its claim read, and `deliver`, `cancel_run`
+and `park_again` write the head they read, so it stays current. A generation is
+`(run, generation, idx)`; `RunUpdate.body` is `{generation, rows, writer}`, where `generation: None`
+appends the rows after the head's `len` and `Some(new)` is a compaction. A duplicate slot is this
+attempt's retry when the row's `writer` is this attempt. A row another attempt wrote is adopted when
+its message is the one this attempt would write; foreign rows older than the orphan grace (5 minutes,
+far longer than the insert→CAS gap of a live attempt — milliseconds; the default lease is 30 s) are
+collected and the insert retried once; a live attempt with a different message is a `Conflict`. The
+delta win holds across every commit of a v5 run: a failed transition writes the head it read and no
+rows, and the next split appends. A commit with `head: None` leaves the stored head and its
+`head_version` alone — the runtime passes the head for a delivery, a cancel and a park, so `None` is
+only a v4 commit (a process of the expand release). `load_head` is the observer's read
+(`Runtime::view`). MongoDB answers it with one **projected** `find_one` that carries the head and the
+record's own fields, never `state`; PostgreSQL with one `SELECT` whose `state` column is
+`CASE WHEN head_version = version AND head IS NOT NULL THEN head ELSE state END`. A
 current head transfers only the head, and a v4 state the run still carries (a transcript, file
-bytes) is not read. A stale or absent head takes the second, full read and serves the state — the
-`state` bytes are read only there. That is not rare in every deployment: it is the path of a run
-before its first split, of an agent whose `split` returns `None` (it never writes a head), and of a
-**cancelled** run, whose stale head is permanent because no step re-splits it. The trait default is
-`load_run`, so a store that keeps no head answers the whole state exactly as before, and its view is
-the whole state. A `head_version != version` is
-**stale**, not corrupt: the whole state is served, and the next step re-splits and rewrites the
-head. That comparison is the whole mixed-fleet story in the read direction. A store that keeps no
-bodies
-(`keeps_bodies()` is `false`, the default) answers `body_list` empty and ignores both fields, exactly
-as before. **A hand-built `RunUpdate { .. }` literal stops compiling**: add `head: None, body: None`
-or use `RunUpdate::new`.
+bytes) is not read. A stale or absent head serves the state — the `state` bytes are read only there.
+That is the path of a run before its first split, of an agent whose `split` returns `None` (it never
+writes a head), of a run the expand release converted and then a v4 process committed over, and of a
+**cancelled** v4 run. The trait default is `load_run`, which answers the same document in the
+contract release; a store that keeps no head answers the whole state exactly as before. A
+`head_version != version` is **stale**, not corrupt: the whole state is served, and the next step
+re-splits and rewrites the head. That comparison is the whole mixed-fleet story in the read
+direction. A store that keeps no bodies (`keeps_bodies()` is `false`, the default) answers
+`body_list` empty and ignores both fields, exactly as before. **A hand-built `RunUpdate { .. }`
+literal stops compiling**: add `head: None, body: None` or use `RunUpdate::new`.
 
 Creating a run with a deterministic id gives idempotent "fire once" semantics, for example one run per
 cron tick across all replicas. A second message on a conversation that has an open run gets
@@ -113,7 +120,7 @@ cron tick across all replicas. A second message on a conversation that has an op
 | Blob GC | `DELETE .. WHERE created_at < $cutoff AND NOT EXISTS (a run_blob row)`, in batches; run references cascade with the run. The sweep and a commit's ref insert are **not one transaction**: under `READ COMMITTED` an uncommitted ref is invisible, so a sweep can collect a blob a commit is about to name; a later PostgreSQL change closes it with one data-modifying CTE | the same sweep in a loop; run references are deleted with the run. Its find-then-delete has the same uncommitted-ref window, closed by the insert, completeness check, then CAS ([ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md), decision 3) |
 | Blob references deleted with their run | `ON DELETE CASCADE` | deleted by the purge before the run document |
 | Transcript rows (schema version 5, part 2): a commit's delta, `body_list`, `gc_body` | the CAS, the rows after the head's `len` and the refs are **one transaction** (`INSERT .. SELECT unnest($idx, $messages) ON CONFLICT DO NOTHING`, then the slots another writer owns are read: identical adopted, older than the 5-minute orphan grace collected and retried once, live and different `Conflict`). A compaction writes all rows under a new generation; the old one is collected an hour after the commit (`gc_body`) | a generation is append-only: one unordered `insertMany` of the rows after the old head's `len` **before** the CAS, the completeness check (`inserted + duplicate_keys == rows.len()`, a write-concern error aborts), and a lost CAS deletes the attempt's `writer` rows and refs. A duplicate foreign slot is adopted when its message matches, collected after the 5-minute orphan grace, else a `Conflict`. A compaction writes all rows under a new generation; the old one is collected an hour later (`gc_body`) |
-| The head (schema version 5, part 2): `head`, `head_version`, `load_head` | `head` and `head_version` columns; the store patches the head's `body` to `{generation, len}`; `load_head` is one `SELECT` whose `state` column is the head when `head_version == version`, else the whole state; a headless commit leaves both alone. `Runtime::view` reads it: one lease read and one head read, no body | `head` and `head_version` on the run document; the store patches the head's `body` to `{generation, len}`; `load_head` is one projected `find_one` (the head and the record's fields, never `state`) when `head_version == version`, else a second full read (`load_run`) that serves the whole state; a headless commit leaves both alone. `Runtime::view` reads it, one projected query and no body on the current path |
+| The head (schema version 5, part 2; the contract release): `head`, `head_version`, `load_head`, and every read | `head` and `head_version` columns; the store patches the head's `body` to `{generation, len}`; `load_run`, `load_head`, `claim_due`, `open_run` and the listings select one `CASE` (`head` when `head_version == version` and it is not null, else `state`) as `state`. `Runtime::view` reads it: one lease read and one head read, no body. A v4 commit (the expand release) leaves both alone, so the head is stale and the state is served | `head` and `head_version` on the run document; the store patches the head's `body` to `{generation, len}`; `load_run`, the claim and the listings serve the head through `served_from_doc` (the current head, else `state`), and `load_head` is one projected `find_one` (the head and the record's fields, never `state`) with a second full read only when the head is stale. `Runtime::view` reads it, one projected query and no body on the current path |
 | Body rows deleted with their run | `ON DELETE CASCADE` | deleted by the purge with the journal and the references |
 | `run_header`: a run without its state, with its lease | one primary-key statement selecting the header columns and `lease_until`, never `state` | one `find_one` projected to the header and `lease_until` |
 | Transactions | none held across calls; a commit that names blobs opens one for its two statements | none (single-document writes only) |

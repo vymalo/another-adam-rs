@@ -39,7 +39,9 @@ after a commit that names a different one), a shared
   adapter's own test); a v4 first split writes the
   whole transcript under one generation (named by the runtime or by the store); the same transcript
   committed again adds no row; a non-contiguous index is refused; a purge removes the rows; an
-  unknown generation is empty; a NUL in a head and in a row is stored as U+FFFD). Every case asserts `keeps_bodies()`: a store that keeps none is
+  unknown generation is empty; a NUL in a head and in a row is stored as U+FFFD; every read serves
+  the current head — `load_run`, `load_head`, `claim_due`, `open_run_for_conversation` and
+  `list_runs` — and a stale head serves the whole state). Every case asserts `keeps_bodies()`: a store that keeps none is
   not given this suite. The purge and compaction cases take the `BLOB_SUITE` lock because
   `purge_finished` sweeps blobs in the same call. `make` is the same
   `async fn() -> Option<DynStore>` as above.
@@ -49,18 +51,21 @@ after a commit that names a different one), a shared
   asserts only that the workload ran. `make` is the same as above; a store that keeps no bodies
   skips it.
 * `transcript_measurement!(make)` generates the `measure_the_transcript_write` test: it runs
-  `counting::measure_transcript_write` through `make`, prints its `p2-measure:` line and asserts
-  only that the workload ran. `make` is the same `async fn() -> Option<DynStore>` as above; `None`
-  skips it. S3 rewrites the workload to commit a head and a body, then adds the `< 50 × 20 KB` and
-  `max < 20 KB` assertions here.
+  `counting::measure_transcript_write` through `make`, prints its `p2-measure:` line and asserts the
+  S0 bound — the 50 commits write under `50 × 20 KB` in all, and no commit writes over `20 KB`. The
+  workload commits the contract shape (the tombstone, a head and the body rows; the store appends
+  the delta). `make` is the same `async fn() -> Option<DynStore>` as above; `None`, or a store that
+  keeps no bodies, skips it.
 * `cases::*`: the cases as plain async functions taking a `DynStore`, for
   harnesses that do not use the macro.
 * `counting::CountingStore`: wraps a `DynStore` and counts calls per `fault::Method` and the
   `state` bytes that cross it — every record read (`load_run`, `load_head`, `list_runs`,
-  `claim_due`, `open_run_for_conversation`) and every successful `commit_run` write — through
+  `claim_due`, `open_run_for_conversation`) and every successful `commit_run` write (its state, its
+  head and the body rows it appends; the tombstone counts nothing) — through
   `calls(method)`, and forwards `gc_body`/`blob_stored` to the wrapped store (`GcBody`/`BlobStored`
   calls),
-  `state_bytes_read()`, `state_bytes_written()`, `max_commit_bytes()` and `reset()`. A commit that
+  `state_bytes_read()`, `state_bytes_written()`, `commit_bytes()`, `max_commit_bytes()` and
+  `reset()`. A commit that
   failed wrote nothing and is not counted; `migrate` is not counted, and neither is a record
   returned without its state (a `create_run` or `commit_run` echo). `run_header` is forwarded: an
   adapter that overrides it answers in one small read with no state; one that does not reads the
@@ -71,11 +76,12 @@ after a commit that names a different one), a shared
   whose `load_head` is the trait default answers the `LoadRun` the wrapper sees inside the adapter,
   which it cannot count: measure the head with `load_head`, as `adam-runtime`'s suite does.
 * `counting::measure_transcript_write`: a **measurement helper, not a conformance case**. One run,
-  `Measurement::COMMITS` commits of a 10 KB message, the last one `Done`, then purged; returns
-  `Measurement` (`commits`, `total_written`, `max_commit`, `first_read`, `final_read`) and
-  `report()`, the `p2-measure:` line `dev/p2-measure.sh` parses. It asserts nothing: the
-  `transcript_measurement!` test prints the line and asserts only that the workload ran. The
-  measured baseline is in [ADR 0055](../../docs/decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md).
+  `Measurement::COMMITS` commits of a 10 KB message in the contract shape (the tombstone, a head
+  and the body rows), the last one `Done`, then purged; returns `Measurement` (`commits`,
+  `total_written`, `max_commit`, `first_read`, `final_read`) and `report()`, the `p2-measure:` line
+  `dev/p2-measure.sh` parses. It asserts nothing: the `transcript_measurement!` test prints the line
+  and asserts the bound. The before/after numbers are in
+  [ADR 0055](../../docs/decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md).
 * `fault::FaultyStore`: wraps a `DynStore` and fails scripted calls
   (`fail`, `fail_always`, `fail_after_apply`, `heal`, `calls`, `injected`, and `claimed(run)`, how many times
   `claim_due` handed a run to its caller; and `fail_run` /
@@ -123,8 +129,8 @@ failure (see `adam_core::testing`).
   counts nothing, a forwarded header whose default read inside the adapter the wrapper cannot
   see) and a doctest of `CountingStore`.
 * `tests/memory.rs` also runs `transcript_measurement!(make_store)`; the Postgres and MongoDB
-  adapters run it in `tests/conformance.rs`. It is a measurement, not a case: the test asserts only
-  that the workload ran.
+  adapters run it in `tests/conformance.rs`. It is a measurement, not a case: the test asserts the
+  S0 bound (under `50 × 20 KB` in all, under `20 KB` per commit).
 
 The Postgres and MongoDB adapters run the suite from their own
 `tests/conformance.rs`.

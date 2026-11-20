@@ -33,9 +33,11 @@ accept the poll latency.
 * `Store::blob_stored(id)`: one `find_one` on `_id` in `adam_blob`, so a split that names a file an
   earlier commit uploaded does not send its bytes again.
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
-  state, and returning it would convert the document back on every transition. `load_run`, the claim
-  and the listings return the stored state; `journal_put` returns the stored payload (the loop
-  decodes the step's outcome from it).
+  state, and returning it would convert the document back on every transition. `load_run`,
+  `load_head`, the claim, `open_run_for_conversation` and the listings answer the **contract
+  document**: the current head when `head_version == version`, the stored `state` otherwise (ADR 0055,
+  the contract release). `journal_put` returns the stored payload (the loop decodes the step's
+  outcome from it).
 * `run_header` is one `find_one` projected to the header and `lease_until`: the state is never read,
   so a reader that only needs the run's own bookkeeping (a cancel watch, a parent check) pays for one
   small document.
@@ -136,9 +138,10 @@ before.
 A run document gains `head` (the v5 document the runtime writes beside `state`) and `head_version`
 (the version the head was written at). Nothing is rewritten by the migration: a version 4 document
 has neither field, and `{head_version: null}` matches a missing field, as `owner` did for version 2.
-A commit that writes a head sets both; a commit that does not (a delivery, a cancel, a park) leaves
-both alone, so the head becomes stale (`head_version < version`) and `load_head` serves the whole
-`state` instead.
+A commit that writes a head sets both. In the contract release every commit of a v5 run writes the
+head — a delivery, a cancel and a park re-encode the one they read — so it stays current; a v4
+commit (a process of the expand release) leaves both alone, so the head becomes stale
+(`head_version < version`) and every read serves the whole `state` instead.
 
 `<prefix>body` holds the transcript, **append-only per generation**: `_id =
 "<run>:<generation>:<idx>"`, `run_id`, `generation` and `writer` (binary UUIDs), `idx` (int),

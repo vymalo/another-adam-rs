@@ -62,13 +62,16 @@ at-least-once (a crash between the effect and its journal write runs it
 again): keep effects idempotent. The lifecycle and guarantees are in the crate
 docs (`src/lib.rs`) and the [architecture](../../docs/architecture.md#the-mental-model).
 
-## The shadow: the head and the body
+## The head and the body (the contract release)
 
-ADR 0055's expand release writes a run's **head** and its **body** beside the complete v4 `state`:
-the steps write both (S2a), and an observer reads the head (S2b). `Runtime::view` is one
-`load_head` call and never a body; `Runtime::state` is the one full-state read, joining the head and
-the generation it names. The worker still reads the full state through `load_run`, and a run's `state`
-is still the whole envelope a v4 process steps, so a mixed fleet is safe.
+ADR 0055's contract release makes a run's **head** and its **body** the run: every commit writes the
+head, the rows it appends and — for a store that keeps bodies — the **tombstone** (`state = null`).
+`Runtime::view` is one `load_head` call and never a body; `Runtime::state` is the one full-state
+read, joining the head and the generation it names. The worker reads the head through `load_run`
+(the store answers the head when `head_version == version`), joins the rows its claim read, steps,
+and writes the next head. A store that keeps no bodies (`Store::keeps_bodies() == false`) is not
+written the contract: the runtime keeps the whole v4 `state` for it and no head, as before. A v4 run
+keeps its whole state until its first commit under the contract, which splits it.
 
 * `Agent::split(&state)` returns `Some((head, rows))` when the agent's state has a transcript worth
   keeping apart, and `None` (the default) when it does not. `Agent::join(head, rows)` is its inverse,
@@ -78,38 +81,44 @@ is still the whole envelope a v4 process steps, so a mixed fleet is safe.
   exists: the state is deserialized once, and the rows are the agent's own values.
 * A step commit that splits writes the head (`v: 5`: the agent's head, the envelope's other members,
   file artifacts **by reference** — `file.digest` and `file.size`, never the bytes — and
-  `body: {generation, len}`) and the rows, beside the full `state`. The generation is the current
+  `body: {generation, len}`), the rows, and the tombstone as `state`. The generation is the current
   one for an append, or a new one for a first split or a compaction; the `writer` UUID is chosen once
   per step attempt, so a CAS retry of that attempt writes no duplicate row and a commit that loses
   deletes its own rows and refs.
-* A commit that does not split (`deliver`, `cancel`, `park_again`, a run whose state is unreadable)
-  writes no head: it re-encodes the format it read, and the stored head becomes stale
-  (`head_version < version`), which `Store::load_head` reads as "serve the state".
+* A commit that does not split (`deliver`, `cancel`, `park_again`, a failed transition) writes the
+  head it read, with this commit's members and its transcript set unchanged, and the tombstone: the
+  head stays current, so the next step appends to the same generation. A run whose state cannot be
+  read is stored as it is (a head stays a head beside the tombstone; a v4 state stays whole) and the
+  run is failed. A head becomes **stale** only when a v4 process commits over it
+  (`head_version < version`, the expand release's mixed fleet): every read then serves the whole
+  `state`, and the next step re-splits.
 * **The reconstruction check** runs before every commit that splits: `join(head, rows)` is compared
   with the state about to be written, and a mismatch writes `state` only, logs an error, and leaves
   the run v4. A bad split can never produce a head that does not reconstruct its state.
 * The body is **append-only per generation**: a normal commit writes only the rows after the old
   head's `len` and keeps the generation; a compaction (the new transcript does not start with the
-  previous one) writes all rows under a new generation. The delta win holds across **splitting**
-  commits: a headless commit (`deliver`, `cancel`, `park_again`, a failed transition) writes no head,
-  so the next split compacts until S3, where those paths write the head they read; the `head_version`
-  gate stays, because a v4 step may have changed the transcript. Measured with a delivery between
-  every step: 50 × 10 KB writes 12.7 MB of body rows (1,275 rows, 50 generations) against ~0.5 MB of
-  deltas for consecutive splits. The head names `{generation, len}`. The store
+  previous one) writes all rows under a new generation. The delta win now holds across **every**
+  commit of a v5 run, because the headless paths write the head they read; the `head_version` gate
+  stays, because a v4 step may have changed the transcript. The expand release's headless path
+  measured 12.7 MB of body rows for 50 × 10 KB (1,275 rows, 50 generations) against ~0.5 MB of
+  deltas for consecutive splits; the contract writes 524,320 logical bytes for the same workload
+  (ADR 0055's S3 amendment). The head names `{generation, len}`. The store
   resolves the generation, writes the rows before the CAS with the attempt's `writer`, checks that
   all of them landed, and a commit that loses deletes its own rows and refs, so a head never names a
   partial generation and a loser cannot poison the next append. Every file artifact the head will
   name is uploaded first: a failed put refuses the head, and the commit writes the state only.
-* `tests/common/v4.rs` is a frozen copy of the v4 envelope; the suite decodes every `state` written
-  and asserts a v5 head is **not** one. The contract release (S3) inverts that assertion.
+* `tests/common/v4.rs` is a frozen copy of the v4 envelope. The contract release **inverts** its
+  test: the tombstone and a v5 head are not v4 envelopes, and a pre-contract run's state still
+  decodes. The suite also proves a cancel and a `park_again` write the head they read and the
+  tombstone.
 
 ### The read path
 
-* `Runtime::view` reads the lease and then `Store::load_head` (one query on Memory and MongoDB;
-  PostgreSQL answers with the trait default until its half lands), and decodes the record as
-  `Stored`: `v: 1` is the v4 envelope, `v: 5` the head. A stale head
-  (`head_version != version`, left by a `deliver`, a `cancel` or a `park`) is not an error:
-  `load_head` serves the whole state, which decodes as `Stored::Full`, and the next step re-splits.
+* `Runtime::view` reads the lease and then `Store::load_head` (one query on Memory, MongoDB and
+  PostgreSQL), and decodes the record as `Stored`: `v: 1` is the v4 envelope, `v: 5` the head. A
+  stale head (`head_version != version`, left by a v4 commit in the expand release) is not an
+  error: `load_head` serves the whole state, which decodes as `Stored::Full`, and the next step
+  re-splits.
 * `RunView.state` is the agent's **head** for a v5 run and the whole agent state for a v4 one. The
   pointers a front reads — `pending_wait`, `pending_question`, `question`, `usage_totals`,
   `sandbox_usage`, `context`, `session` — are in the head. `RunView.artifacts` is a
@@ -124,12 +133,13 @@ is still the whole envelope a v4 process steps, so a mixed fleet is safe.
   answers its own bytes. A missing blob is `Ok(None)`: that artifact cannot be served, and the run
   is intact.
 * `start_continuing`/`prior_state` join a v5 prior run (one body read), and `cancel` hands
-  `Agent::on_cancelled` the joined state. `view_from_record` builds the same view from a record a
-  caller already holds (a listing), which in the expand release carries the full v4 state.
+  `Agent::on_cancelled` the joined state. `Ctx::child_state` and `ChildStarter::round_state` join
+  too, so the child's or round's agent must be registered on the runtime that reads it (an agent or
+  a starter: both have `join`). `view_from_record` builds the same view from a record a caller
+  already holds (a listing), which now carries the head.
 
-The cost is stated: in the expand release a step writes the whole state **and** the head **and** the
-rows, so bytes written per commit go up until S3 stops writing `state`; the read side pays for the
-head, and for the whole state only where there is no current one.
+The contract release removes the double write: a commit of a v5 run writes the head and the delta
+only. The read side pays for the head, and for the whole state only where there is no current one.
 
 ## A message that arrives while a run finishes
 

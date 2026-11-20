@@ -1167,7 +1167,9 @@ mod tests {
         }
 
         async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
-            let t = now();
+            // A fixed instant: the test compares two reads, and a clock read per call made the
+            // records differ by a millisecond now and then.
+            let t = Timestamp::from_second(1_700_000_000).expect("in range");
             Ok(Some(RunRecord {
                 id,
                 agent: "a".into(),

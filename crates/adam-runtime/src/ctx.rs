@@ -14,7 +14,6 @@ use crate::agent::{AgentError, Inbound};
 use crate::cancel::CancelToken;
 use crate::child::{ChildStarter, ChildStatus, news_since};
 use crate::clock::DynClock;
-use crate::envelope::Envelope;
 use crate::events::{Artifact, DynEventSink, RunEvent};
 use crate::runtime::Runtime;
 
@@ -423,9 +422,10 @@ impl Ctx {
         let Some(rec) = self.store.load_run(self.run).await.map_err(store_error)? else {
             return Ok(0);
         };
-        let env = Envelope::decode(self.run, &rec.state)
+        // A v5 run's record is its head, which carries the inbox: no body is read.
+        let stored = crate::head::Stored::decode(self.run, &rec.state)
             .map_err(|e| AgentError::permanent(format!("the run's record is unreadable: {e}")))?;
-        Ok(news_since(&env.inbox, self.base_inbox, &self.read))
+        Ok(news_since(stored.inbox(), self.base_inbox, &self.read))
     }
 
     /// Say which messages the run has read, by id: a copy of one that arrives while this
@@ -495,6 +495,10 @@ impl Ctx {
     /// tokens its model calls took. **Not journaled**: a live read, like
     /// [`child_status`](Self::child_status); a finished child's state does not change any more.
     ///
+    /// A v5 child's state is its head and the body generation it names, so the child's agent must
+    /// be registered on this runtime — as an agent or a starter — for its `join` to rebuild the
+    /// state (ADR 0055). A runtime that hosts only the parent cannot read a v5 child's whole state.
+    ///
     /// `Ok(None)` when the run does not exist (a child purged after it finished).
     ///
     /// # Errors
@@ -511,9 +515,13 @@ impl Ctx {
                 self.run
             )));
         }
-        let env = Envelope::decode(run, &rec.state)
-            .map_err(|e| AgentError::permanent(format!("the child's record is unreadable: {e}")))?;
-        Ok(Some(env.agent))
+        // A v5 child's state is its head and the body it names: joined once, as `Runtime::state`
+        // does, because the parent asked for the whole state.
+        let claimed =
+            self.runtime.inner.claimed(&rec).await.map_err(|e| {
+                AgentError::permanent(format!("the child's record is unreadable: {e}"))
+            })?;
+        Ok(Some(claimed.env.agent))
     }
 
     /// A handle for starting children of this run on the runtime that steps it: owned and cloneable,
@@ -696,6 +704,7 @@ mod tests {
 
     use super::*;
     use crate::clock::SystemClock;
+    use crate::envelope::Envelope;
     use crate::events::CollectingSink;
 
     async fn ctx(sink: &CollectingSink) -> Ctx {

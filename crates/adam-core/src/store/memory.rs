@@ -71,12 +71,7 @@ impl MemoryStore {
 }
 
 impl Inner {
-    fn open_run(
-        &self,
-        agent: &str,
-        conversation_id: &str,
-        except: Option<RunId>,
-    ) -> Option<RunId> {
+    fn open_run(&self, agent: &str, conversation_id: &str, except: Option<RunId>) -> Option<RunId> {
         self.runs
             .values()
             .map(|s| &s.run)
@@ -156,13 +151,7 @@ impl Store for MemoryStore {
 
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
         // The contract read: the head when it is current, the whole state otherwise.
-        Ok(self
-            .inner
-            .lock()
-            .await
-            .runs
-            .get(&id)
-            .map(Inner::served))
+        Ok(self.inner.lock().await.runs.get(&id).map(Inner::served))
     }
 
     async fn commit_run(
@@ -304,13 +293,7 @@ impl Store for MemoryStore {
 
     async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
         // The same read as `load_run`: the head when it is current, the whole state otherwise.
-        Ok(self
-            .inner
-            .lock()
-            .await
-            .runs
-            .get(&id)
-            .map(Inner::served))
+        Ok(self.inner.lock().await.runs.get(&id).map(Inner::served))
     }
 
     async fn open_run_for_conversation(
@@ -848,6 +831,17 @@ mod tests {
             loaded.state["body"]["generation"].as_str().is_some(),
             "the store resolved and patched the generation"
         );
+        // The contract read: `load_run` answers the same document as `load_head`.
+        assert_eq!(
+            store
+                .load_run(run.id)
+                .await
+                .expect("load")
+                .expect("the run")
+                .state,
+            loaded.state,
+            "every read serves the current head"
+        );
 
         // No head on this commit: the stored one is now stale.
         store
@@ -867,6 +861,16 @@ mod tests {
             loaded.state,
             json!({"v": 1, "turn": 2}),
             "a stale head is not served: the whole state is"
+        );
+        assert_eq!(
+            store
+                .load_run(run.id)
+                .await
+                .expect("load")
+                .expect("the run")
+                .state,
+            json!({"v": 1, "turn": 2}),
+            "and `load_run` agrees"
         );
     }
 

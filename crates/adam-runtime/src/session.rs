@@ -247,10 +247,14 @@ impl RoundFacts {
         // The envelope's version gate, without the envelope: a state another version wrote is not
         // read here, exactly as `Envelope::decode` refuses it.
         //
-        // S3: `load_run` and `list_runs` return the head; the session header, `close_asked` and
-        // the error are in the head, so this must accept `v: 5` (and join only if it needs a
-        // member the head does not carry).
-        if rec.state.get("v").and_then(Value::as_u64) != Some(u64::from(crate::envelope::VERSION)) {
+        // The contract release: `load_run` and `list_runs` answer the head for a v5 run. The
+        // session header, `close_asked` and the error are in the head (its `agent` is the agent's
+        // head, which carries `session`), so both versions are read; nothing here needs the
+        // transcript, and no body is read.
+        let version = rec.state.get("v").and_then(Value::as_u64);
+        if version != Some(u64::from(crate::envelope::VERSION))
+            && version != Some(u64::from(crate::head::VERSION))
+        {
             return None;
         }
         // `agent` is required, and `artifacts`, when present, must be the array the envelope says:

@@ -27,13 +27,15 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `PgStore::pool()`, `SCHEMA_VERSION` (6).
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
   state, and the state is the largest column, so a `RETURNING` that echoed it would parse it back on
-  every transition. `load_run`, the claim and the listings return the stored state; `journal_put`
-  returns the stored payload (the loop decodes the step's outcome from it).
+  every transition. `load_run`, `load_head`, the claim, `open_run_for_conversation` and the listings
+  answer the **contract document**: the head when `head_version == version`, the whole `state`
+  otherwise (ADR 0055, the contract release). `journal_put` returns the stored payload (the loop
+  decodes the step's outcome from it).
 * `run_header` is one statement over the primary key that selects the header columns and
   `lease_until`, never `state`: a reader that only needs the run's own bookkeeping (a cancel watch,
   a parent check) does not pay for the largest column.
-* `load_head` is one statement: the head when `head_version == version`, the whole state otherwise,
-  never a body row (`Runtime::view` is one `lease_until` + one `load_head`). `body_list` reads one
+* `load_head` is the same one-statement read as `load_run` (the `CASE`), never a body row
+  (`Runtime::view` is one `lease_until` + one `load_head`). `body_list` reads one
   generation in order; `gc_body` collects superseded generations older than its cutoff. **A `Store`
   wrapper must forward `load_head`** (as it must forward `keeps_bodies`, `body_list` and
   `gc_body`): the trait default calls the wrapper's `load_run`, so a view through a wrapper that
@@ -164,7 +166,9 @@ upgrade from a version 5 database is its own step gated on `stored < 6` (not on 
 database stamped 5 already has the blob tables but no head or body) and is metadata-only: two
 nullable columns and one table.
 
-`commit_run` with a head, a body or blob references is **one transaction**: the run row is locked
+The contract release reads the same document from `load_run`, `load_head`, `claim_due`,
+`open_run_for_conversation` and `list_runs` (the `CASE` in `served_columns`): the head when it is
+current, the whole state otherwise. `commit_run` with a head, a body or blob references is **one transaction**: the run row is locked
 `FOR UPDATE`, the version is checked, the rows after the head's `len` are inserted
 (`INSERT .. SELECT unnest(..) ON CONFLICT DO NOTHING`), the slots another writer owns are read
 (an identical message is adopted; one older than the 5-minute orphan grace is collected and the

@@ -15,7 +15,6 @@ use uuid::Uuid;
 use adam_core::{RunId, RunRecord, RunStatus};
 
 use crate::agent::Inbound;
-use crate::envelope::Envelope;
 use crate::runtime::{Runtime, RuntimeError};
 use crate::session::SESSION_CLOSE_KIND;
 
@@ -323,6 +322,10 @@ impl ChildStarter {
     /// [`Ctx::child_state`](crate::Ctx::child_state), which answers for children of the run only
     /// where this answers for the rounds of its conversation.
     ///
+    /// A v5 round's state is its head and the body generation it names, so the round's agent must
+    /// be registered on this runtime — as an agent or a starter — for its `join` to rebuild the
+    /// state (ADR 0055).
+    ///
     /// # Errors
     ///
     /// [`RuntimeError::InvalidSession`] when `round` is not a round of a session of this
@@ -360,7 +363,7 @@ impl ChildStarter {
         }
         Ok(Some((
             rec.status,
-            Envelope::decode(round, &rec.state)?.agent,
+            self.runtime.inner.claimed(&rec).await?.env.agent,
         )))
     }
 }
@@ -407,8 +410,8 @@ impl ChildStatus {
                 error: None,
             };
         }
-        match Envelope::decode(rec.id, &rec.state) {
-            Ok(env) => Self::from_parts(rec.status, &env.output, env.error.as_deref()),
+        match crate::head::Stored::decode(rec.id, &rec.state) {
+            Ok(stored) => Self::from_parts(rec.status, stored.output(), stored.error()),
             Err(e) => Self {
                 status: RunStatus::Failed,
                 output: None,

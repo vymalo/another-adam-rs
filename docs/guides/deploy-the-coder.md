@@ -164,6 +164,30 @@ The values you will actually set:
 
 Render-time guards stop a bad combination at `helm template`, not at rollout (`templates/_validate.tpl`).
 
+## The contract release: a one-time window
+
+ADR 0055 shipped in two releases. The **expand** release (S0–S2b) writes the whole v4 `state`
+beside the head, so a v4 process and a v5 one can both step a run; the **contract** release (S3)
+writes `state = null` (the tombstone), the head and the body, and every read serves the head. A v4
+process that touches a converted run **fails it** (`Envelope::decode` refuses a head, so the run is
+committed `Failed`): there is no fence inside a v4 binary that would make it refuse first.
+
+So the rollout from an expand-release image to a contract-release image is a **deploy boundary**, not
+an ordinary `helm upgrade`:
+
+1. Confirm no process still runs an expand-release image against this database — the front and every
+   worker. The default chart is one StatefulSet, one replica: its `RollingUpdate` deletes the pod
+   before it creates the next, so the old image is gone before the new one starts. A deployment that
+   ran more than one worker, or a pinned old image somewhere else, must be scaled to zero first.
+2. Roll the new image (`helm upgrade --install …`). The store's `migrate()` runs first and is
+   idempotent; PostgreSQL's schema is version 6.
+3. Do not roll back to the expand release after a run has committed under the contract: its `state`
+   is `null` and only a v5 binary reads it. A rollback is safe only for runs the contract has not
+   converted.
+
+Do **not** merge the contract and roll it in one step: the merge is what makes the next image
+available, and the roll is the window.
+
 ## Verify
 
 * The pods are `Ready` (probes hit `/healthz`; the GitHub MCP sidecar starts first).
