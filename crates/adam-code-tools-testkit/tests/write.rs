@@ -287,12 +287,7 @@ async fn a_patch_into_git_or_with_a_link_or_binary_is_refused_and_nothing_is_wri
     for (name, patch, said, made) in [
         (".git", INTO_GIT, "inside .git", None),
         ("a link", LINK, "symlink or a submodule", Some("l")),
-        (
-            "binary",
-            BINARY,
-            "binary patches are not accepted",
-            Some("b.bin"),
-        ),
+        ("binary", BINARY, "changes a binary file", Some("b.bin")),
     ] {
         let dir = repository();
         let config = std::fs::read_to_string(dir.path().join(".git/config")).unwrap();

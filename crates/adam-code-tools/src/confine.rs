@@ -31,7 +31,7 @@
 //! What a descriptor cannot cover is `git`: `git apply` (`apply_patch`) writes the paths of a patch
 //! by name, after they are checked here, and `git` finds its work tree by name in its own process.
 //! A name is safe only where nothing can rename it, so that is the workspace's to ensure: the coder
-//! makes each slot of a run pod a mount point of its own ([ADR 0041], decision 3), and a host whose
+//! makes each slot of a run pod a mount point of its own ([ADR 0041], decisions 1 and 3), and a host whose
 //! directory a command can rename has the same gap.
 //!
 //! [ADR 0041]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0041-a-run-pod-sees-only-its-own-run.md
@@ -569,7 +569,16 @@ mod rules {
         fs::write(other.path().join(".env"), "TOKEN=another run's").unwrap();
         let link = other.path().join("slot");
         std::os::unix::fs::symlink(dir.path(), &link).unwrap();
-        // A link to a worktree is canonicalised into that worktree: refused before.
+        // A link to a worktree is canonicalised into that worktree: refused before. The refusal is
+        // `SlotDir::open`'s own, not another failure the helper words the same way.
+        for root in [link.clone(), dir.path().join("README.md")] {
+            let refused = SlotDir::open(&root).expect_err("a link or a file is no root");
+            assert_eq!(
+                refused.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{refused}"
+            );
+        }
         for access in [Access::Read, Access::Write] {
             let why = refused(&link, "README.md", access);
             assert!(why.contains("not a plain directory"), "{why}");

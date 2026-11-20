@@ -56,7 +56,7 @@
 //! What these tools cannot do alone is `git`: `git apply` writes the paths of a patch by name (they
 //! are checked here first), and `git` finds its work tree by name inside its own process. A name is
 //! safe only if the run cannot rename it, so **in a run pod the slot's directory is a mount point of
-//! its own** (ADR 0041, decision 3): the pod's commands, and the processes they left running, cannot
+//! its own** (ADR 0041, decisions 1 and 3): the pod's commands, and the processes they left running, cannot
 //! rename, move, remove or exchange it, and the coder's `git` can rely on its name. The coder tells
 //! the environment of each slot it adds (`ToolEnv::seal`), because these tools never ask for the pod
 //! and a pod made before the slot lacks the mount.
