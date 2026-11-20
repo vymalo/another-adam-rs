@@ -23,8 +23,8 @@ use std::time::Duration;
 use adam_code_tools::git::GitAt;
 use adam_code_tools::sandbox::Meter;
 use adam_code_tools::{
-    CodeWorkspace, CommandLimits, CommandWorkspace, DynCodeWorkspace, DynCommandWorkspace, Intent,
-    Outcome, Place, Redactor,
+    CodeWorkspace, CommandGuard, CommandLimits, CommandWorkspace, DynCodeWorkspace,
+    DynCommandWorkspace, Guarding, Intent, Outcome, Place, Redactor, Unwatched,
 };
 use adam_llm_agent::{KeptOutputs, MemoryKept, ToolCtx, ToolError, ToolOutput};
 use adam_runtime::CollectingSink;
@@ -206,8 +206,8 @@ macro_rules! code_workspace_conformance {
 pub mod command_cases {
     use adam_code_tools::redact::REDACTED;
     use adam_code_tools::sandbox::Meter;
-    use adam_code_tools::shell::{ShellOutcome, shell_spec};
-    use adam_code_tools::{Place, commands, output};
+    use adam_code_tools::shell::{MissingTool, ShellOutcome, missing_tool, shell_spec};
+    use adam_code_tools::{Guarding, Place, Settled, commands, output};
 
     use super::{CommandHarness, Intent};
 
@@ -378,6 +378,172 @@ pub mod command_cases {
         assert!(outcome.kept.is_none(), "{:?}", outcome.kept);
         assert_eq!(outcome.tail, format!("short {REDACTED}\n"));
     }
+
+    /// `command` run in the writable place under the guard `guarding`: what the guard found.
+    async fn guarded(h: &CommandHarness, guarding: Guarding, command: &str) -> Settled {
+        let place = writable(h).await;
+        let guard = match h.workspace.guard(&h.ctx, &place, guarding).await {
+            Ok(guard) => guard,
+            Err(refused) => panic!("{guarding:?} in {:?} refused: {refused}", h.writable),
+        };
+        let outcome = run(h, command, false).await;
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "{command:?}: {:?}",
+            outcome.tail
+        );
+        guard.settle().await
+    }
+
+    /// A look that changes nothing is [`Unchanged`](Settled::Unchanged), or unwatched.
+    pub async fn a_look_that_changes_nothing_is_unchanged(h: &CommandHarness) {
+        let settled = guarded(h, Guarding::Look, "true").await;
+        assert!(
+            matches!(settled, Settled::Unchanged | Settled::Unwatched),
+            "{settled:?}"
+        );
+    }
+
+    /// A look that writes a file is never [`Unchanged`](Settled::Unchanged); undone and restored,
+    /// the file is gone.
+    pub async fn a_look_that_writes_is_never_unchanged(h: &CommandHarness) {
+        const NAME: &str = "conformance-look.txt";
+        let written = writable(h).await.path().join(NAME);
+        let _ = std::fs::remove_file(&written);
+        let settled = guarded(h, Guarding::Look, &format!("printf x > {NAME}")).await;
+        let there = written.exists();
+        let _ = std::fs::remove_file(&written);
+        assert!(!matches!(settled, Settled::Unchanged), "{settled:?}");
+        if matches!(
+            settled,
+            Settled::Undone { restored: true } | Settled::Unreadable { restored: true }
+        ) {
+            assert!(!there, "restored, and {} is still there", written.display());
+        }
+    }
+
+    /// A make that writes a file keeps it: [`FilesChanged`](Settled::FilesChanged), or unwatched.
+    pub async fn a_make_that_writes_keeps_the_file(h: &CommandHarness) {
+        const NAME: &str = "conformance-make.txt";
+        let written = writable(h).await.path().join(NAME);
+        let _ = std::fs::remove_file(&written);
+        let settled = guarded(h, Guarding::Make, &format!("printf made > {NAME}")).await;
+        let text = std::fs::read_to_string(&written);
+        let _ = std::fs::remove_file(&written);
+        assert!(
+            matches!(settled, Settled::FilesChanged | Settled::Unwatched),
+            "{settled:?}"
+        );
+        assert_eq!(text.ok().as_deref(), Some("made"), "{}", written.display());
+    }
+
+    /// A make that changes nothing is [`Unchanged`](Settled::Unchanged), or unwatched.
+    pub async fn a_make_that_changes_nothing_is_unchanged(h: &CommandHarness) {
+        let settled = guarded(h, Guarding::Make, "true").await;
+        assert!(
+            matches!(settled, Settled::Unchanged | Settled::Unwatched),
+            "{settled:?}"
+        );
+    }
+
+    /// A make that adds a branch in a place with a commit is undone, and the branch is gone; or
+    /// unwatched (the branch is then removed by the case). A place with no `HEAD` passes it with
+    /// nothing checked.
+    pub async fn a_make_that_changes_git_is_undone(h: &CommandHarness) {
+        const BRANCH: &str = "conformance-rogue";
+        let dir = writable(h).await.path().to_owned();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        };
+        if git(&["rev-parse", "--verify", "--quiet", "HEAD"]).is_none() {
+            return;
+        }
+        let settled = guarded(h, Guarding::Make, &format!("git branch {BRANCH}")).await;
+        let listed = git(&["branch", "--list", BRANCH]).unwrap_or_default();
+        if !listed.is_empty() {
+            let _ = git(&["branch", "-D", BRANCH]);
+        }
+        match settled {
+            Settled::Undone { restored: true } => {
+                assert_eq!(listed, "", "undone, and the branch is still there");
+            }
+            Settled::Unwatched => {}
+            other => panic!("a new branch: {other:?}"),
+        }
+    }
+
+    /// What follows a command that makes things ([`after_run`](adam_code_tools::CommandWorkspace::after_run))
+    /// on the writable place, twice: each `Ok`, its text empty or starting with a line break, and
+    /// none holding the secret.
+    pub async fn a_run_is_followed_by_the_hook(h: &CommandHarness) {
+        let place = writable(h).await;
+        for call in 1..=2 {
+            let tail = match h.workspace.after_run(&h.ctx, &place).await {
+                Ok(tail) => tail,
+                Err(e) => panic!("call {call}: {e:?}"),
+            };
+            assert!(
+                tail.is_empty() || tail.starts_with('\n'),
+                "call {call}: {tail:?}"
+            );
+            assert!(
+                !tail.contains(&h.secret),
+                "call {call}: the text holds the harness's secret ({} bytes)",
+                h.secret.len()
+            );
+        }
+    }
+
+    /// The note of a refusal is empty or starts with a line break, and holds no secret.
+    pub async fn the_refusal_note_holds_no_secret(h: &CommandHarness) {
+        let place = writable(h).await;
+        let note = h.workspace.refusal_note(&h.ctx, &place);
+        assert!(note.is_empty() || note.starts_with('\n'), "{note:?}");
+        assert!(
+            !note.contains(&h.secret),
+            "the note holds the harness's secret ({} bytes)",
+            h.secret.len()
+        );
+    }
+
+    /// A command the shell cannot find is answered by the workspace, or left to the tool (`None`):
+    /// an answer is not empty and holds no secret.
+    pub async fn a_missing_tool_is_answered_or_left(h: &CommandHarness) {
+        const COMMAND: &str = "no-such-tool-7c41 --version";
+        let place = writable(h).await;
+        let outcome = run(h, COMMAND, false).await;
+        let missing = missing_tool(&outcome, COMMAND).unwrap_or_else(|| MissingTool {
+            name: "no-such-tool-7c41".to_owned(),
+        });
+        let session = match h.workspace.session(&h.ctx).await {
+            Ok(session) => session,
+            Err(e) => panic!("no session: {e:?}"),
+        };
+        let answer = match h
+            .workspace
+            .missing_tool_answer(&h.ctx, &place, &missing, &[place.path()], &*session)
+            .await
+        {
+            Ok(answer) => answer,
+            Err(e) => panic!("{e:?}"),
+        };
+        if let Some(said) = answer {
+            assert!(!said.trim().is_empty(), "an empty answer");
+            assert!(
+                !said.contains(&h.secret),
+                "the answer holds the harness's secret ({} bytes)",
+                h.secret.len()
+            );
+        }
+    }
 }
 
 /// One `#[tokio::test]` per case of [`command_cases`], each over a [`CommandHarness`] built by
@@ -390,6 +556,14 @@ macro_rules! command_workspace_conformance {
         $crate::command_workspace_conformance!(@case $harness, a_long_output_is_shown_and_kept_scrubbed);
         $crate::command_workspace_conformance!(@case $harness, timeout_of_keeps_to_the_limit);
         $crate::command_workspace_conformance!(@case $harness, a_short_output_is_shown_whole_scrubbed_and_not_kept);
+        $crate::command_workspace_conformance!(@case $harness, a_look_that_changes_nothing_is_unchanged);
+        $crate::command_workspace_conformance!(@case $harness, a_look_that_writes_is_never_unchanged);
+        $crate::command_workspace_conformance!(@case $harness, a_make_that_writes_keeps_the_file);
+        $crate::command_workspace_conformance!(@case $harness, a_make_that_changes_nothing_is_unchanged);
+        $crate::command_workspace_conformance!(@case $harness, a_make_that_changes_git_is_undone);
+        $crate::command_workspace_conformance!(@case $harness, a_run_is_followed_by_the_hook);
+        $crate::command_workspace_conformance!(@case $harness, the_refusal_note_holds_no_secret);
+        $crate::command_workspace_conformance!(@case $harness, a_missing_tool_is_answered_or_left);
     };
     (@case $harness:expr, $case:ident) => {
         #[tokio::test]
@@ -554,5 +728,20 @@ impl CommandWorkspace for DirWorkspace {
 
     fn kept(&self) -> &dyn KeptOutputs {
         &self.kept
+    }
+
+    /// A person's directory is never undone (ADR 0047, decision 7): nothing is watched.
+    async fn guard(
+        &self,
+        _ctx: &ToolCtx,
+        _place: &Place,
+        _guarding: Guarding,
+    ) -> Result<Box<dyn CommandGuard>, String> {
+        Ok(Box::new(Unwatched))
+    }
+
+    /// Nothing follows a command here.
+    async fn after_run(&self, _ctx: &ToolCtx, _place: &Place) -> Result<String, ToolError> {
+        Ok(String::new())
     }
 }

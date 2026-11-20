@@ -38,8 +38,13 @@ epoch moved, "Run the checks again before you commit.", the note of a published 
 `CodeWorkspace::after_write` in `src/tools/workspace.rs`, pinned by `tests/write_results.rs`. The commands have their port,
 `CommandWorkspace`, which `ToolEnv` implements in the same file (the run's environment, `CHECK_TIMEOUT_SECS` and
 `CHECK_OUTPUT_TAIL_BYTES`, the kept files): `ToolEnv::run` and what a command shows and keeps (`tools::output`) are
-`adam_code_tools::commands` and `adam_code_tools::output`, while `run_command` and `run` are still declared and done here,
-pinned by `tests/command_results.rs`. `Redactor::from_config` is the
+`adam_code_tools::commands` and `adam_code_tools::output`. `run_command` is declared in `tools::inspect` and done by
+`adam_code_tools::inspect`; its guard is the coder's `SlotGuard` (`src/tools/workspace.rs`), over the worktree's
+`Snapshot`, which stays in `tools::inspect`: its refusals (the worktree cannot be read, `HEAD` off the run's branch),
+its verdicts after the command (unchanged, files changed, undone, unreadable), the note on the commands that keep running in
+the slot (`refusal_note`) and the answer to a missing tool are `ToolEnv`'s `CommandWorkspace` methods; `ToolEnv::after_run`
+(the check epoch moved, the note of a published scratch project) is there for `run`, which is still done here.
+Both are pinned by `tests/command_results.rs`. `Redactor::from_config` is the
 coder's own trait, `RedactorFromConfig`, re-exported at the crate root.
 
 ```mermaid

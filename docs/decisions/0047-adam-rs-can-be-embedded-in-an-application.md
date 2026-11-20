@@ -124,6 +124,15 @@ workspace as it is.
    `command_workspace_conformance!`; the pins of `tests/command_results.rs` and `tests/write_results.rs` pass unchanged.
    `session_error` and its advice to call `rebuild_environment` stay the coder's. **Not yet:** the guard (what a command
    changed, and its undo) and the tools themselves, step 5c; the trait's methods grow then.
+   *Built 2026-11-20 (step 5c-1):* the guard is on the port, and `run_command` is `adam_code_tools::inspect::run_command`
+   over it. **A break:** `CommandWorkspace` has two new required methods, `guard(ctx, place, Guarding)` (`Look` or `Make`;
+   it returns a `CommandGuard` whose `settle` says `Unchanged`, `FilesChanged`, `Undone`, `Unreadable` or `Unwatched`, or
+   the refusal the model is told) and `after_run(ctx, place)` (what follows a command that makes things; `run_command`
+   never calls it), and two provided ones, `refusal_note` and `missing_tool_answer`; only `ToolEnv` and the testkit's
+   `DirWorkspace` implement it here. The coder's guard, `SlotGuard`, wraps the worktree's `Snapshot`, which stays the
+   coder's; the person's directory is never undone, so `DirWorkspace`'s guard is `Unwatched`. The coder's `#[tool]`
+   declaration is unchanged and delegates; the pins of `tests/command_results.rs` and `tests/tool_specs.rs` pass
+   unchanged. **Not yet:** `run`, step 5c-2.
 8. **Commands run as the person unless a sandbox says otherwise.** A local sandbox is an `Environment`: first a process
    tree that can be killed, then the operating system's own confinement where there is one. `describe` says what is not
    protected.

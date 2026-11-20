@@ -7,20 +7,25 @@
 //! follows a write) work on what was found.
 //!
 //! The same `ToolEnv` is the commands' [`CommandWorkspace`]: the run's environment, the deployment's
-//! limits (`CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES`) and the coder's kept files.
+//! limits (`CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES`), the coder's kept files, and the guard of
+//! a command, [`SlotGuard`]: the slot's [`Snapshot`] before the command, compared and restored after
+//! it.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use adam_code_tools::git::GitAt;
+use adam_code_tools::shell::MissingTool;
 use adam_code_tools::{
-    CodeWorkspace, CommandLimits, CommandWorkspace, Intent, Outcome, Place, Redactor, Target,
+    CodeWorkspace, CommandGuard, CommandLimits, CommandWorkspace, Guarding, Intent, Outcome, Place,
+    Redactor, Settled, Target,
 };
 use adam_llm_agent::{KeptOutputs, ToolCtx, ToolError};
 use adam_workspace::{EnvSession, Slot};
 use async_trait::async_trait;
 
-use super::project;
-use super::{ToolEnv, notes_error, scratch};
+use super::inspect::{Snapshot, cannot_snapshot};
+use super::{ToolEnv, background, checks, notes_error, project, scratch};
 
 // A block of the nested instructions fits the room the port promises (`MAX_INSTRUCTIONS_BLOCK`):
 // the text, cut at `NESTED_CAP`, and its header and footer. It is exactly that room, the room
@@ -116,5 +121,126 @@ impl CommandWorkspace for ToolEnv {
 
     fn kept(&self) -> &dyn KeptOutputs {
         &*self.kept
+    }
+
+    /// The slot's `Snapshot`, taken now: what a command must leave as it found it. A worktree that
+    /// cannot be read, or whose `HEAD` is off the run's own branch, is refused (nothing it does could
+    /// be undone), and so is a place the coder did not make, which carries no slot.
+    async fn guard(
+        &self,
+        _ctx: &ToolCtx,
+        place: &Place,
+        guarding: Guarding,
+    ) -> Result<Box<dyn CommandGuard>, String> {
+        let Some(slot) = place.handle::<Slot>() else {
+            return Err(format!(
+                "`{}` is not a slot of this run: nothing was run, because a change a command made \
+                 there could not be undone.",
+                place.name()
+            ));
+        };
+        let not_done = match guarding {
+            Guarding::Look => {
+                "Nothing was run, because a command that might change the worktree cannot be \
+                 undone."
+            }
+            Guarding::Make => {
+                "Nothing was run, because a command that might change git cannot be undone."
+            }
+        };
+        let before = Snapshot::of_slot(slot)
+            .await
+            .map_err(|e| cannot_snapshot(e, not_done))?;
+        if let Some(refusal) = before.refusal() {
+            return Err(refusal);
+        }
+        Ok(Box::new(SlotGuard {
+            slot: slot.clone(),
+            before,
+            guarding,
+        }))
+    }
+
+    /// The check epoch moves, as after a write: the files a command keeps, ignored ones included
+    /// (`target/`, `node_modules/`), may be what a check reads without the tree id changing, so no
+    /// failed check record from before is reused (`ChecksNotes::epoch`). It moves for a command its
+    /// guard then undoes too: a change to an ignored file may stay. The text is the published note
+    /// of a scratch project.
+    async fn after_run(&self, ctx: &ToolCtx, place: &Place) -> Result<String, ToolError> {
+        let run = ctx.root_run_id().to_string();
+        self.notes
+            .update(&run, |notes| {
+                notes.checks.epoch = notes.checks.epoch.saturating_add(1);
+            })
+            .await
+            .map_err(|e| notes_error(&e))?;
+        let mut tail = String::new();
+        if let Some(slot) = place.handle::<Slot>() {
+            scratch::push_published_note(&mut tail, slot);
+        }
+        Ok(tail)
+    }
+
+    /// The commands that keep running in the slot (`background::slot_note`): they write in it,
+    /// and what they write is not undone.
+    fn refusal_note(&self, ctx: &ToolCtx, place: &Place) -> String {
+        place.handle::<Slot>().map_or_else(String::new, |slot| {
+            background::slot_note(self, &ctx.root_run_id().to_string(), slot.dir())
+        })
+    }
+
+    /// The coder's answer: a missing toolchain, or a dependency of the project with its install
+    /// command, said once and then as repeated (`checks::missing_tool_answer`).
+    async fn missing_tool_answer(
+        &self,
+        ctx: &ToolCtx,
+        _place: &Place,
+        missing: &MissingTool,
+        dirs: &[&Path],
+        session: &dyn EnvSession,
+    ) -> Result<Option<String>, ToolError> {
+        checks::missing_tool_answer(self, ctx, missing, dirs, &session.describe().kind)
+            .await
+            .map(Some)
+    }
+}
+
+/// The guard of a command in a slot: the [`Snapshot`] before it, and what it is held to.
+struct SlotGuard {
+    slot: Slot,
+    before: Snapshot,
+    guarding: Guarding,
+}
+
+#[async_trait]
+impl CommandGuard for SlotGuard {
+    /// A look may change nothing; a make may change the files and nothing of git. What it was not
+    /// allowed to change is put back, all of it, its files included. A worktree that cannot be read
+    /// after the command is not known to be untouched, and is put back too.
+    async fn settle(self: Box<Self>) -> Settled {
+        let Self {
+            slot,
+            before,
+            guarding,
+        } = *self;
+        let Ok(after) = Snapshot::of_slot(&slot).await else {
+            return Settled::Unreadable {
+                restored: before.restore(&slot).await,
+            };
+        };
+        let allowed = match guarding {
+            Guarding::Look => after == before,
+            Guarding::Make => before.same_git_as(&after),
+        };
+        if !allowed {
+            return Settled::Undone {
+                restored: before.restore(&slot).await,
+            };
+        }
+        if guarding == Guarding::Make && after.files_differ_from(&before) {
+            Settled::FilesChanged
+        } else {
+            Settled::Unchanged
+        }
     }
 }
