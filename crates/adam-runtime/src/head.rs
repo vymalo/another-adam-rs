@@ -21,7 +21,7 @@ use crate::agent::Inbound;
 use crate::artifact_ref::{ArtifactRef, FileRef};
 use crate::blob::blob_id;
 use crate::envelope::{Envelope, VERSION as FULL_VERSION};
-use crate::events::Artifact;
+use crate::events::{Artifact, ArtifactFile};
 use crate::runtime::RuntimeError;
 
 /// The head's layout version. A run's `state` is `1` (the v4 envelope) or this.
@@ -186,6 +186,109 @@ impl Head {
         serde_json::to_value(self)
             .map_err(|e| StoreError::InvalidInput(format!("the head does not serialize: {e}")))
     }
+
+    /// The content address and size of every file artifact, in artifact order: what a commit that
+    /// carries this head pairs its next head's file references with, so it never reads the bytes.
+    pub(crate) fn file_refs(&self) -> Vec<(BlobId, u64)> {
+        self.artifacts
+            .iter()
+            .filter_map(|artifact| artifact.file.as_ref())
+            .map(|file| (file.digest.clone(), file.size))
+            .collect()
+    }
+
+    /// The head's artifacts as the runtime's [`Artifact`], with a file's bytes **empty**: a head
+    /// names its files by digest and size, and the bytes stay in the blob store. A commit that
+    /// carries this head writes the same references back ([`file_refs`](Self::file_refs) pairs
+    /// them), and a commit that carries it in a v4 state would need the bytes from the store.
+    pub(crate) fn carried_artifacts(&self) -> Vec<Artifact> {
+        carried_artifacts(&self.artifacts)
+    }
+
+    /// The head as the full v4 envelope a transition reads: `agent` is the joined agent state and
+    /// the transcript is no longer a member (it is in `body`), so `artifacts` are the head's own
+    /// references ([`carried_artifacts`](Self::carried_artifacts)).
+    ///
+    /// `v` is the v4 version: the envelope is a working value, and a commit that cannot write a
+    /// head (a refused split) falls back to encoding it as the whole state, which is v4.
+    pub(crate) fn into_envelope(self, agent: Value) -> Envelope {
+        let Self {
+            inbox,
+            seq,
+            attempt,
+            rev,
+            output,
+            error,
+            artifacts,
+            deadline,
+            limit_secs,
+            remaining_secs,
+            agent_wake,
+            hb,
+            ..
+        } = self;
+        Envelope {
+            v: FULL_VERSION,
+            agent,
+            inbox,
+            seq,
+            attempt,
+            rev,
+            output,
+            error,
+            artifacts: carried_artifacts(&artifacts),
+            deadline,
+            limit_secs,
+            remaining_secs,
+            agent_wake,
+            hb,
+        }
+    }
+
+    /// The head a commit that does not split writes: `self`'s transcript set (the generation it
+    /// names, resolved) and artifacts, with `env`'s own members — the status the commit carries is
+    /// on the record, not here.
+    ///
+    /// The generation is named explicitly: the store patches it only for a commit that writes rows,
+    /// and a head that names none is unreadable. A head this is built from is current (a stale one
+    /// is served as the state, not the head), so its generation is the run's.
+    pub(crate) fn carried(&self, env: &Envelope) -> Self {
+        Self {
+            v: VERSION,
+            agent: env.agent.clone(),
+            inbox: env.inbox.clone(),
+            seq: env.seq,
+            attempt: env.attempt,
+            rev: env.rev,
+            output: env.output.clone(),
+            error: env.error.clone(),
+            artifacts: self.artifacts.clone(),
+            deadline: env.deadline,
+            limit_secs: env.limit_secs,
+            remaining_secs: env.remaining_secs,
+            agent_wake: env.agent_wake,
+            hb: env.hb,
+            body: self.body,
+        }
+    }
+}
+
+/// The head's artifacts as the runtime's [`Artifact`], with a file's bytes empty: see
+/// [`Head::carried_artifacts`].
+fn carried_artifacts(artifacts: &[HeadArtifact]) -> Vec<Artifact> {
+    artifacts
+        .iter()
+        .map(|artifact| Artifact {
+            id: artifact.id.clone(),
+            name: artifact.name.clone(),
+            mime_type: artifact.mime_type.clone(),
+            data: artifact.data.clone(),
+            file: artifact.file.as_ref().map(|file| ArtifactFile {
+                filename: file.filename.clone(),
+                bytes: Vec::new(),
+            }),
+        })
+        .collect()
 }
 
 /// An artifact as a head keeps it: the same shape, with a file's bytes replaced by its address.
@@ -266,6 +369,41 @@ impl Stored {
         match self {
             Self::Full(envelope) => envelope.encode(),
             Self::Head(head) => head.encode(),
+        }
+    }
+
+    /// Whether the document is the v5 head.
+    pub(crate) fn is_head(&self) -> bool {
+        matches!(self, Self::Head(_))
+    }
+
+    /// The inbox, read.
+    pub(crate) fn inbox(&self) -> &[Inbound] {
+        match self {
+            Self::Full(envelope) => &envelope.inbox,
+            Self::Head(head) => &head.inbox,
+        }
+    }
+
+    /// The result of a `Done` run, in either variant.
+    pub(crate) fn output(&self) -> &Value {
+        match self {
+            Self::Full(envelope) => &envelope.output,
+            Self::Head(head) => &head.output,
+        }
+    }
+
+    /// The document as the envelope a caller reads the members of (the inbox, the result, the
+    /// counters): a v4 envelope as it is, a head as the envelope its members make.
+    ///
+    /// A head's `agent` is the head, **not** the joined state: a caller that needs the state joins
+    /// it ([`Inner::joined_state`](crate::Runtime)), and a caller that only reads the other members
+    /// never does. The `agent` of the head variant is left [`Value::Null`], because a commit builds
+    /// its envelope from the transition's state and never reads this member.
+    pub(crate) fn into_envelope(self) -> Envelope {
+        match self {
+            Self::Full(envelope) => envelope,
+            Self::Head(head) => head.into_envelope(Value::Null),
         }
     }
 

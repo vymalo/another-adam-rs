@@ -596,6 +596,23 @@ fn run_from_doc(d: &Document) -> StoreResult<RunRecord> {
     run_from_doc_with_state(d, state)
 }
 
+/// The run as a reader sees it in the contract release (ADR 0055): the current head when the
+/// document has one (`head_version == version`), the stored `state` otherwise. The head is stored
+/// beside the state on the same document, so a read that already has the document pays nothing.
+fn served_from_doc(d: &Document) -> StoreResult<RunRecord> {
+    let version = get_u64(d, "version")?;
+    // A missing or null `head_version` is a run no commit has written a head for; a head written
+    // at an older version was superseded by a commit that did not rebuild it, and is stale.
+    let current = match d.get("head_version") {
+        None | Some(Bson::Null) => false,
+        Some(_) => get_u64(d, "head_version")? == version,
+    };
+    if current && let Some(head @ Bson::Document(_)) = d.get("head") {
+        return run_from_doc_with_state(d, bson_to_json(head)?);
+    }
+    run_from_doc(d)
+}
+
 /// [`run_from_doc`] with the `state` already decoded: a projection may carry the head instead of
 /// the state, and the record's own fields are the same either way.
 fn run_from_doc_with_state(d: &Document, state: Value) -> StoreResult<RunRecord> {
@@ -938,7 +955,7 @@ impl Store for MongoStore {
             .find_one(doc! { "_id": uuid(id) })
             .await
             .map_err(classify)?;
-        found.as_ref().map(run_from_doc).transpose()
+        found.as_ref().map(served_from_doc).transpose()
     }
 
     async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
@@ -1230,7 +1247,7 @@ impl Store for MongoStore {
             .find_one(doc! { "open_key": open_conversation_key(agent, conversation_id) })
             .await
             .map_err(classify)?;
-        found.as_ref().map(run_from_doc).transpose()
+        found.as_ref().map(served_from_doc).transpose()
     }
 
     async fn journal_get(&self, run: RunId, seq: u64) -> StoreResult<Option<JournalEntry>> {
@@ -1394,7 +1411,7 @@ impl Store for MongoStore {
         docs.iter()
             .map(|d| {
                 Ok(Lease {
-                    run: run_from_doc(d)?,
+                    run: served_from_doc(d)?,
                     worker: worker.to_owned(),
                     until,
                 })
@@ -1468,7 +1485,7 @@ impl Store for MongoStore {
             .try_collect()
             .await
             .map_err(classify)?;
-        docs.iter().map(run_from_doc).collect()
+        docs.iter().map(served_from_doc).collect()
     }
 
     async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64> {

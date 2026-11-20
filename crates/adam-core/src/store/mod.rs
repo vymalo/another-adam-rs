@@ -305,9 +305,10 @@ pub struct RunUpdate {
     pub state: Value,
     /// The v5 head this commit writes, or `None` to leave the stored head (and its version) alone.
     ///
-    /// A step that splits its agent state writes the head beside the full `state`; a delivery, a
-    /// cancel or a park re-encodes what it read and passes `None`, so it keeps the format it read
-    /// and a stale head is not made current by a commit that did not rebuild it.
+    /// A step that splits its agent state writes the head; a commit that carries the document it
+    /// read re-encodes it and passes it here (a delivery, a cancel, a park), so the head stays
+    /// current and the run keeps its format. `None` leaves the stored head and its version alone,
+    /// which a store that keeps no bodies ignores.
     pub head: Option<Value>,
     /// The transcript rows this commit writes, or `None` to write no rows.
     ///
@@ -639,6 +640,13 @@ pub trait Store: Send + Sync + 'static {
     /// supplied it, and a read returns the stored one (a store may have replaced a NUL in it).
     async fn create_run(&self, run: NewRun) -> StoreResult<RunRecord>;
 
+    /// The run, or `None` if it does not exist.
+    ///
+    /// A store that keeps bodies ([`keeps_bodies`](Self::keeps_bodies)) answers the **head** when it
+    /// is current (`head_version == version`), and the stored `state` otherwise: a v4 run, or a head
+    /// a later commit did not rebuild. The contract release (ADR 0055): the head is the run, and
+    /// `state` is the tombstone a body store keeps (`null`). A store that keeps no bodies answers
+    /// the whole state, as before.
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>>;
 
     /// The run as an **observer** reads it: its `state` is the v5 head when the store has a current
@@ -649,6 +657,11 @@ pub trait Store: Send + Sync + 'static {
     /// stale and is **not** served: the whole state is, and the next step re-splits and rewrites the
     /// head. `Runtime::view` reads this and never a body; `Runtime::state` joins the head with the
     /// rows of the generation it names.
+    ///
+    /// In the contract release a store that keeps bodies answers the same document from
+    /// [`load_run`](Self::load_run), [`claim_due`](Self::claim_due),
+    /// [`open_run_for_conversation`](Self::open_run_for_conversation) and
+    /// [`list_runs`](Self::list_runs): the head is the run.
     async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
         self.load_run(id).await
     }
@@ -701,10 +714,10 @@ pub trait Store: Send + Sync + 'static {
     /// ([`RunUpdate::blobs`]) with the references already recorded, in the same step as the version
     /// check, and a commit that loses the check records nothing.
     ///
-    /// `update.head` and `update.body` are the expand release's shadow (ADR 0055): a step that
-    /// splits its agent state writes the v5 head beside the full `state` and the rows the head
-    /// names. `head: None` leaves the stored head and its version alone, so a delivery, a cancel or
-    /// a park keeps the format it read. `body: None` writes no rows.
+    /// `update.head` and `update.body` are the v5 representation (ADR 0055): a step that splits its
+    /// agent state writes the head and the rows the head names; a commit that carries the document
+    /// it read (a delivery, a cancel, a park) writes that head back and writes no rows, so the head
+    /// stays current and the run keeps its format. `body: None` writes no rows.
     ///
     /// A store that keeps bodies ([`keeps_bodies`](Self::keeps_bodies)) resolves the generation
     /// ([`BodyWrite`]), appends only the rows after the current head's `len` (or writes all of them
@@ -712,6 +725,10 @@ pub trait Store: Send + Sync + 'static {
     /// patches the head's `body` to `{generation, len}`. A commit that loses deletes the rows its
     /// `writer` inserted: a loser must not poison the next append. It also checks that all the rows
     /// landed, so a head never names a generation that is missing a row.
+    ///
+    /// `update.state` is stored as given. The runtime writes [`Value::Null`] — the tombstone — for a
+    /// commit that writes a head to a store that keeps bodies, and the whole v4 state otherwise, so
+    /// a store that keeps no bodies keeps today's bytes exactly (ADR 0055, S3).
     async fn commit_run(
         &self,
         id: RunId,
@@ -720,6 +737,9 @@ pub trait Store: Send + Sync + 'static {
     ) -> StoreResult<RunRecord>;
 
     /// The open (runnable or parked) run of a conversation, if any.
+    ///
+    /// Answers the same document [`load_run`](Self::load_run) does: the current head when the store
+    /// keeps bodies and has one, the whole state otherwise.
     async fn open_run_for_conversation(
         &self,
         agent: &str,
@@ -748,7 +768,9 @@ pub trait Store: Send + Sync + 'static {
     ///
     /// The record returned may be read after the lease was set, so it can be newer than what
     /// the claim matched, terminal included ([`Store::commit_run`] does not touch the lease).
-    /// A caller must not step a returned run that is not open.
+    /// A caller must not step a returned run that is not open. Its `state` is what
+    /// [`load_run`](Self::load_run) would answer: the current head for a store that keeps bodies,
+    /// the whole state otherwise.
     ///
     /// `scope` decides whose runs are claimable (see [`ClaimScope`]): with
     /// [`ClaimScope::Pinned`] a run that another worker owns is skipped, and
@@ -801,6 +823,9 @@ pub trait Store: Send + Sync + 'static {
     ///
     /// The scope is required, so a listing is always one owner's (or one conversation's) runs.
     /// Every adapter indexes it: a page is one indexed read, however deep.
+    ///
+    /// Each record is the one [`load_run`](Self::load_run) would return: the current head when the
+    /// store keeps bodies and has one, the whole state otherwise.
     async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>>;
 
     /// How many runs match `query`'s filters (its `after` and `limit` are ignored): the total
