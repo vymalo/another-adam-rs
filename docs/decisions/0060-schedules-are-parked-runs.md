@@ -14,7 +14,8 @@ firing or a session's; `next_due` is built as `ScheduleSpec::due_after`.
 (no `Agents::runtime_component`): the component builds a runtime of its own over the store it is given. The
 scheduler of an agent is registered as `<agent>/adam.schedule`, not `adam.schedule` (decision 1): a worker claims
 the runs of the agents it registered, and agents that share one database must each step their own schedulers, or a
-worker of one fires another's schedule into an agent it does not know.
+worker of one fires another's schedule into an agent it does not know. Slice 6 is split: the coder runs schedules
+(6a, the component shared as `adam_schedule::reconcile_until_stopped`); reconciling on a dev reload (6b) is not built.
 
 ## Context
 

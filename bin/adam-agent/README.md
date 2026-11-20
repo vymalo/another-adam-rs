@@ -337,9 +337,8 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
 * `src/config.rs`: `ADAM_AGENT_DIR` required by every role and an existing directory, every problem at once,
   a control plane that needs no model, `MODEL_CONTEXT_WINDOW` read by the workers (a bad value is exit 78),
   `A2A_ALLOW_INSECURE_REMOTES` off by default, read by the workers and a boolean, secrets hidden from `Debug`;
-  `src/serve.rs`: the switch reaches the binding of the folder's remote subagents (off: refused; on: bound);
-  `src/agent.rs`: the `schedules` component tries a store fault again, reconciles and waits for the stop, and a stop
-  while the store keeps failing ends it at once.
+  `src/serve.rs`: the switch reaches the binding of the folder's remote subagents (off: refused; on: bound). The
+  `schedules` component is `adam_schedule::reconcile_until_stopped`, tested in `adam-schedule`.
 * `tests/agent.rs` (in-process, over the in-memory store, scripted models): a folder's `after: 1s` schedule fires the
   agent with its prompt as a person's message (and a control plane has no `schedules` component); the card is the folder's, and lists the screen's three extensions, `steps/v1`, `text-stream/v1` and `usage/v1`; **a chat
   folder answers "hi" in role over A2A** (the task completes with the greeting its two persona lines give, the

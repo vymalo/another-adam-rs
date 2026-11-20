@@ -1998,7 +1998,7 @@ The contract of a folder:
 | `tools:` | optional; may narrow the coder's own tools, and a name that is not one is refused with a suggestion. Without it the agent gets all of them |
 | `subagents/` | assembled and **registered beside the coder** (`coder/<name>`, `CoderAgent::subagents`). A subagent runs as a child run with its own run id, so the tools that work on the worktree of the run that calls them find none in it: give it tools that need no worktree |
 | `mcp.json` | optional: the MCP servers whose tools the agent gets, named `<server>__<tool>` after its own (see [MCP tools](#mcp-tools-from-the-folder)). Connected by the **workers** at startup |
-| `schedules/` | read, not run: a warning says so |
+| `schedules/` | run ([ADR 0060](../../docs/decisions/0060-schedules-are-parked-runs.md)), as in `adam-agent`: the worker roles register the coder's scheduler (`coder/adam.schedule`), and a `schedules` worker component (`adam_schedule::reconcile_until_stopped`) reconciles the scheduler runs with the files at start; a firing is a run of the coder with the prompt as a person's message. **With `WORKSPACE_PLACEMENT` `affinity` or `isolated`**, which pin a run to the worker that first claimed it (`ClaimScope::Pinned`), a scheduler run is pinned too, so it stops firing when that worker is gone for good, until the next start reconciles: a known gap until a claim scope can be set per agent |
 | the rest | skills, `limits`, `model:` and the card follow the [agent files](../../docs/reference/agent-files.md) |
 
 What a folder cannot change is what the tools do (the policy, the checks, the redaction): it changes what the agent

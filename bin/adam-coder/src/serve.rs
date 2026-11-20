@@ -415,6 +415,8 @@ pub async fn serve(
         .context("reading the agent definition")?
         .session_limits(config.service.sessions.limits);
     let sessions = helpers.child_sessions();
+    // The files' schedules (ADR 0060), run by the roles that run workers.
+    let schedules = helpers.manifest().schedules.clone();
 
     // Only a role that runs workers builds the agent: model, GitHub client, workspaces, MCP
     // servers. A control plane starts, delivers to, cancels and views runs, which needs the
@@ -433,12 +435,27 @@ pub async fn serve(
             // commands too; the coder's own `github` server has a bearer per call and gives none.
             let prompts = agent.assembly().prompt_commands().to_vec();
             (
-                Agents::new(AGENT_NAME, move |builder| agent.register(builder))
-                    .options(options_of(worker))
-                    // Beside the runtime's worker: the sweep of the workspaces of finished runs.
-                    .worker_component("janitor", move |store, stop| janitor.run(store, stop))
-                    // The commands that keep running: stopped with their run, whatever ended it.
-                    .worker_component("commands", move |store, stop| sweep.run(store, stop)),
+                Agents::new(AGENT_NAME, move |builder| {
+                    agent
+                        .register(builder)
+                        .agent(adam_schedule::SchedulerAgent::new(AGENT_NAME))
+                })
+                .options(options_of(worker))
+                // Beside the runtime's worker: the sweep of the workspaces of finished runs.
+                .worker_component("janitor", move |store, stop| janitor.run(store, stop))
+                // The commands that keep running: stopped with their run, whatever ended it.
+                .worker_component("commands", move |store, stop| sweep.run(store, stop))
+                // The scheduler runs made to match the files' schedules at start (ADR 0060).
+                .worker_component("schedules", move |store, stop| async move {
+                    adam_schedule::reconcile_until_stopped(
+                        store,
+                        AGENT_NAME.to_owned(),
+                        schedules,
+                        stop,
+                    )
+                    .await
+                    .map_err(Into::into)
+                }),
                 prompts,
             )
         }

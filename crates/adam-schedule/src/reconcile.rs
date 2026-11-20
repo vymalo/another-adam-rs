@@ -122,6 +122,54 @@ pub async fn reconcile_store(
     reconcile(&runtime, agent, schedules).await
 }
 
+/// A binary's `schedules` worker component: [`reconcile_store`] once at start, a retryable failure
+/// (the store not reachable yet) tried again with a backoff of up to a minute, then wait for
+/// `stop`. A failure no retry mends is the error, which stops the process; a stop ends it at once,
+/// the reconcile half done (each of its cancels and starts commits on its own, and the next start
+/// finishes the work). It logs `schedules reconciled` with what it started, kept and cancelled.
+///
+/// # Errors
+///
+/// A [`ReconcileError`] that is not retryable.
+pub async fn reconcile_until_stopped(
+    store: adam_core::DynStore,
+    agent: String,
+    schedules: Vec<Schedule>,
+    stop: tokio_util::sync::CancellationToken,
+) -> Result<(), ReconcileError> {
+    use adam_runtime::Classify as _;
+    let mut wait = std::time::Duration::from_secs(1);
+    loop {
+        let attempt = tokio::select! {
+            () = stop.cancelled() => return Ok(()),
+            done = reconcile_store(store.clone(), &agent, &schedules) => done,
+        };
+        match attempt {
+            Ok(done) => {
+                tracing::info!(
+                    agent = %agent,
+                    started = ?done.started,
+                    kept = ?done.kept,
+                    cancelled = ?done.cancelled,
+                    "schedules reconciled"
+                );
+                break;
+            }
+            Err(e) if e.is_retryable() => {
+                tracing::warn!(error = %e, retry_in = ?wait, "the schedules are not reconciled yet");
+                tokio::select! {
+                    () = stop.cancelled() => return Ok(()),
+                    () = tokio::time::sleep(wait) => {}
+                }
+                wait = (wait * 2).min(std::time::Duration::from_secs(60));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    stop.cancelled().await;
+    Ok(())
+}
+
 /// The rules of [`reconcile`] over a listing read before: a listing gone stale (another process
 /// started a scheduler since) is what the `ConversationBusy` branch mends.
 async fn apply(

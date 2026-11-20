@@ -336,7 +336,7 @@ sequenceDiagram
   credential in a header, env value or URL is a warning (an error under `.strict()`).
 * **Schedules** ([ADR 0060](../decisions/0060-schedules-are-parked-runs.md)): exactly one of three keys, a
   non-empty body (the prompt of each run), and `timezone` (default `UTC`); they belong to the root agent. Read and
-  checked here; `adam-agent` runs them (its README, "schedules/"); the coder does not yet (ADR 0060, slice 6).
+  checked here; `adam-agent` and the coder run them (their READMEs, "schedules/").
   * `cron`: five fields, minute, hour, day of month, month, day of week, evaluated. `*`, lists, ranges, steps
     (`*/15`, `1-30/2`, and `5/15` for `5-59/15`), `JAN`-`DEC`, `SUN`-`SAT` (any case), `0` and `7` for Sunday, `?` as
     `*`. When both day fields are restricted (neither starts with `*` or `?`), a day matches either. A field out of

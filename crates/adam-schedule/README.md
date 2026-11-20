@@ -6,7 +6,8 @@ when each one is due, and the ids and conversations of the runs it fires. `adam-
 needs), and runs them: the `adam.schedule` agent, and `reconcile`, which reads the store and the runtime's clock.
 
 **Built so far:** slice 3, the evaluation; slice 4, the scheduler agent and `reconcile`; slice 5, `reconcile_store`,
-with which `adam-agent` runs a folder's schedules. The coder does not run them yet (slice 6).
+and slice 6, `reconcile_until_stopped`, the worker component with which `adam-agent` and the coder run a folder's
+schedules. Reconciling on a dev reload is not built yet.
 
 ## API at a glance
 
@@ -31,6 +32,7 @@ with which `adam-agent` runs a folder's schedules. The coder does not run them y
 | A firing | a run of the root agent under `fired_run_id`, in `fired_conversation_id`, started with kind `message` (`FIRING_KIND`) and the payload `{"text": <prompt>, "schedule": {"name", "due", "missed"}}`, which an `LlmAgent` reads as a person's message. `created` is false when the run existed (another scheduler, or a replay, fired the due time first) or the start was refused (`error`) |
 | `reconcile(runtime, agent, schedules)` → `Reconciled { started, kept, cancelled }` | decision 5; the runtime must have `SchedulerAgent::new(agent)` registered. For each `adam.schedule:<agent>/` conversation, the scheduler run that decides is its open one (at most one), else the one created last. Open with the same hash, or `Done` with it (a fired one-shot, or a `cron` that has no due time in the next eight years): kept; a `Done` run whose state carries no readable hash is kept too, so a fired one-shot never fires twice (only the `hash` field is read). Open with another hash: cancelled (`CHANGED_REASON`, `schedule changed`), the cancel committed, then started. None, failed (a cancel ends a run `Failed`), or finished with another hash: started with a new id and an anchor from the runtime's clock. An open scheduler no schedule asks for is cancelled (`REMOVED_REASON`). A start refused with `ConversationBusy` (another process started one first) reads the conversation again and decides again, up to three times; a schedule can then be named in both `cancelled` and `kept`. A schedule that does not evaluate is `ReconcileError::Schedule`, before anything changes. Schedules of another agent are ignored |
 | `reconcile_store(store, agent, schedules)` | `reconcile` on a runtime of its own over `store`, with only `agent`'s scheduler registered: what a binary's worker component calls at start (`adam-agent`'s `schedules` component). That runtime has no notifier and the system clock: what it starts and cancels reaches the workers at their next poll, and a new scheduler's anchor is this process's time. `ReconcileError` is `Classify`: a schedule that does not evaluate is `Invalid`, the runtime's errors keep their class, so a caller retries what is retryable |
+| `reconcile_until_stopped(store, agent, schedules, stop)` | a binary's `schedules` worker component: `reconcile_store` once at start, a retryable failure (the store not reachable yet) tried again with a backoff of up to a minute, then wait for `stop`; a stop ends it at once, a failure no retry mends is its error (which stops the process). Logs `schedules reconciled` |
 
 ## Time
 

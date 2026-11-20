@@ -230,8 +230,10 @@ pub async fn agents(
                     assembly.register(builder).agent(scheduler)
                 })
                 .options(parts.options)
-                .worker_component("schedules", move |store, stop| {
-                    reconcile_schedules(store, root, schedules, stop)
+                .worker_component("schedules", move |store, stop| async move {
+                    adam_schedule::reconcile_until_stopped(store, root, schedules, stop)
+                        .await
+                        .map_err(Into::into)
                 }),
                 commands,
                 card,
@@ -268,131 +270,9 @@ pub async fn agents(
     })
 }
 
-/// The `schedules` component: reconcile once at start, trying a retryable failure (the store not
-/// reachable yet) again with a backoff of up to a minute, then wait for the stop. A failure no
-/// retry mends stops the process; a stop ends it at once, the reconcile half done (each of its
-/// cancels and starts commits on its own, and the next start finishes the work).
-async fn reconcile_schedules(
-    store: adam_core::DynStore,
-    agent: String,
-    schedules: Vec<adam::agent_fs::Schedule>,
-    stop: tokio_util::sync::CancellationToken,
-) -> Result<(), adam_error::BoxError> {
-    use adam_runtime::Classify as _;
-    let mut wait = std::time::Duration::from_secs(1);
-    loop {
-        let attempt = tokio::select! {
-            () = stop.cancelled() => return Ok(()),
-            done = adam_schedule::reconcile_store(store.clone(), &agent, &schedules) => done,
-        };
-        match attempt {
-            Ok(done) => {
-                tracing::info!(
-                    started = ?done.started,
-                    kept = ?done.kept,
-                    cancelled = ?done.cancelled,
-                    "schedules reconciled"
-                );
-                break;
-            }
-            Err(e) if e.is_retryable() => {
-                tracing::warn!(error = %e, retry_in = ?wait, "the schedules are not reconciled yet");
-                tokio::select! {
-                    () = stop.cancelled() => return Ok(()),
-                    () = tokio::time::sleep(wait) => {}
-                }
-                wait = (wait * 2).min(std::time::Duration::from_secs(60));
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    stop.cancelled().await;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn soon() -> adam::agent_fs::Schedule {
-        adam::agent_fs::Schedule {
-            name: "soon".into(),
-            cron: String::new(),
-            at: None,
-            after: Some("1h".into()),
-            timezone: "UTC".into(),
-            agent: "chat".into(),
-            prompt: "Go.".into(),
-            path: std::path::PathBuf::new(),
-        }
-    }
-
-    /// The store is not reachable at first: the component tries again, reconciles, and returns
-    /// only when it is stopped.
-    #[tokio::test]
-    async fn the_schedules_component_tries_a_store_fault_again() {
-        use adam_store_testkit::fault::{FaultyStore, Method};
-        let memory: adam_core::DynStore = std::sync::Arc::new(adam_core::MemoryStore::new());
-        let faulty = std::sync::Arc::new(FaultyStore::new(memory.clone()));
-        faulty.fail(Method::ListRuns, 1);
-        let store: adam_core::DynStore = faulty.clone();
-        let stop = tokio_util::sync::CancellationToken::new();
-        let task = tokio::spawn(reconcile_schedules(
-            store.clone(),
-            "chat".into(),
-            vec![soon()],
-            stop.clone(),
-        ));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            // The memory store itself, so that this reading spends no fault.
-            let runs = memory
-                .list_runs(&adam_core::RunQuery::new(
-                    adam_schedule::scheduler_agent_name("chat"),
-                    adam_core::ConversationScope::Prefix("adam.schedule:chat/".into()),
-                    10,
-                ))
-                .await
-                .expect("list");
-            if !runs.is_empty() {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "never reconciled");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert_eq!(faulty.injected(Method::ListRuns), 1);
-        assert!(!task.is_finished(), "it waits for the stop");
-        stop.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(5), task)
-            .await
-            .expect("it stops in time")
-            .expect("the task")
-            .expect("no error");
-    }
-
-    /// A stop while the store keeps failing ends the component at once, with no error.
-    #[tokio::test]
-    async fn the_schedules_component_stops_while_it_waits() {
-        use adam_store_testkit::fault::{FaultyStore, Method};
-        let faulty = std::sync::Arc::new(FaultyStore::new(std::sync::Arc::new(
-            adam_core::MemoryStore::new(),
-        )));
-        faulty.fail_always(Method::ListRuns);
-        let stop = tokio_util::sync::CancellationToken::new();
-        let task = tokio::spawn(reconcile_schedules(
-            faulty.clone(),
-            "chat".into(),
-            vec![soon()],
-            stop.clone(),
-        ));
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        stop.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(2), task)
-            .await
-            .expect("it stops at once")
-            .expect("the task")
-            .expect("no error");
-    }
 
     #[test]
     fn the_card_says_which_build_and_which_folder_answer() {

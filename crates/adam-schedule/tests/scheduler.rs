@@ -719,3 +719,72 @@ async fn agents_that_share_a_database_each_fire_their_own_schedules() {
         );
     }
 }
+
+/// The store is not reachable at first: `reconcile_until_stopped` tries again, reconciles, and
+/// returns only when it is stopped.
+#[tokio::test]
+async fn the_component_tries_a_store_fault_again_and_waits_for_the_stop() {
+    use adam_store_testkit::fault::{FaultyStore, Method};
+    let memory: DynStore = Arc::new(MemoryStore::new());
+    let faulty = Arc::new(FaultyStore::new(memory.clone()));
+    faulty.fail(Method::ListRuns, 1);
+    let stop = tokio_util::sync::CancellationToken::new();
+    let soon = schedule("soon", "", Some("1h"), "Go.");
+    let task = tokio::spawn(adam_schedule::reconcile_until_stopped(
+        faulty.clone(),
+        ROOT.into(),
+        vec![soon],
+        stop.clone(),
+    ));
+    // The memory store itself, so that this reading spends no fault.
+    until("the scheduler", || async {
+        !schedulers(&memory, "soon").await.is_empty()
+    })
+    .await;
+    assert_eq!(faulty.injected(Method::ListRuns), 1);
+    assert!(!task.is_finished(), "it waits for the stop");
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("it stops in time")
+        .expect("the task")
+        .expect("no error");
+}
+
+/// A stop while the store keeps failing ends the component at once, with no error; a failure no
+/// retry mends is its error.
+#[tokio::test]
+async fn the_component_stops_while_it_waits_and_returns_what_no_retry_mends() {
+    use adam_store_testkit::fault::{FaultyStore, Method};
+    let faulty = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+    faulty.fail_always(Method::ListRuns);
+    let stop = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(adam_schedule::reconcile_until_stopped(
+        faulty.clone(),
+        ROOT.into(),
+        vec![schedule("soon", "", Some("1h"), "Go.")],
+        stop.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("it stops at once")
+        .expect("the task")
+        .expect("no error");
+
+    let mut bad = schedule("bad", "0 9 * * *", None, "Go.");
+    bad.timezone = "Mars/Olympus".into();
+    let err = adam_schedule::reconcile_until_stopped(
+        Arc::new(MemoryStore::new()),
+        ROOT.into(),
+        vec![bad],
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, adam_schedule::ReconcileError::Schedule(_)),
+        "{err}"
+    );
+}

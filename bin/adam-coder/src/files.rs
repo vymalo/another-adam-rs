@@ -231,13 +231,6 @@ impl AgentFiles {
         for warning in self.warnings() {
             tracing::warn!("{warning}");
         }
-        if let Self::Folder(folder) = self
-            && !folder.def.manifest().schedules.is_empty()
-        {
-            tracing::warn!(
-                "the agent folder has schedules, which the coder reads but does not run"
-            );
-        }
     }
 }
 
