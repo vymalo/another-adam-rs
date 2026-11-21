@@ -2663,7 +2663,64 @@ async fn a_deployment_that_asked_for_podman_exits_78_naming_adr_0052() {
     );
 }
 
-// ------------------------------------------------------ GitHub credentials, per installation
+/// ADR 0052 decision 2: every removed variable but `DEVCONTAINER_RUNTIME=podman` is **ignored with a
+/// warning**, once, naming the variable and never its value (ADR 0038's rule). (The Postgres address
+/// is unreachable: the warnings come before anything connects.)
+#[tokio::test]
+async fn every_removed_devcontainer_variable_is_warned_about_once_without_its_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut env = valid_env("postgres://adam:p@127.0.0.1:1/adam", tmp.path());
+    env.extend(
+        [
+            ("DEVCONTAINER_NETWORK", "VALUE-NOT-LOGGED-1"),
+            ("DEVCONTAINER_DEFAULT_IMAGE", "VALUE-NOT-LOGGED-2"),
+            ("CONTAINER_HOST", "VALUE-NOT-LOGGED-3"),
+            ("DEVCONTAINER_RUNTIME", "off"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned())),
+    );
+    let mut p = Proc::spawn(&env);
+    let status = p.exit_within(Duration::from_secs(45)).await;
+    assert_eq!(
+        status.code(),
+        Some(69),
+        "the removed variables are no configuration error; only Postgres is unreachable:\n{}",
+        p.logs()
+    );
+    let out = p.stdout();
+    for name in [
+        "DEVCONTAINER_NETWORK",
+        "DEVCONTAINER_DEFAULT_IMAGE",
+        "CONTAINER_HOST",
+        "DEVCONTAINER_RUNTIME",
+    ] {
+        let warned: Vec<Value> = out
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|log| {
+                log["fields"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with(&format!("{name} is set and ignored")))
+            })
+            .collect();
+        assert_eq!(warned.len(), 1, "{name}: one line:\n{out}");
+        assert_eq!(warned[0]["level"], "WARN", "{name}");
+        assert_eq!(warned[0]["fields"]["variable"], name);
+        assert!(
+            warned[0]["fields"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("ADR 0052"),
+            "{name}: {}",
+            warned[0]
+        );
+    }
+    assert!(
+        !out.contains("VALUE-NOT-LOGGED"),
+        "no value is logged:\n{out}"
+    );
+    assert!(!p.stderr().contains("VALUE-NOT-LOGGED"), "{}", p.stderr());
+}
 
 /// `valid_env` for a GitHub App installation instead of a token: `GITHUB_TOKEN` is gone, and the key
 /// is a file under `dir` (what a deployment mounts).
