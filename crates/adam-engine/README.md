@@ -24,11 +24,12 @@ engine.shutdown().await?;
 | `send(Some(&conversation), say)` | the latest run of the conversation has ended: a new run that continues it, the agent starting from its state, the transcript included (`Continued`); it is still open: the message is delivered to it, as a steer while it works (`Steered`) or as the answer while it waits (`Answered`), by the state read just before. A `Say` that already started a run starts nothing (`Repeated`) | `NotFound` for a conversation the engine has no run in |
 | `steer(run, say)` | a message for a run that works: it reads it at its next step, and a run about to finish takes another step first; a waiting run takes it as its answer | `Finished` (`Rejected`) for a run that ended; `NotFound`; `Unavailable` (`Transient`) when its state moved under the call |
 | `answer(run, say)` | the answer to the question a waiting run asked; it works again | `NotWaiting` (`Rejected`) for a run that works; `Finished` for one that ended; `NotFound`. A refusal names the state read after it, never one it did not read |
-| `cancel(run)` | ends the run `Cancelled`; a cancelled run is answered as it is | `Finished` for a run that ended otherwise; `NotFound` |
+| `cancel(run)` | ends the run `Cancelled`, a schedule's firing included; a cancelled run is answered as it is | `Finished` for a run that ended otherwise; `NotFound` |
 | `list(ListQuery)` | a `Page<RunInfo>` of the engine's runs, the most recently updated first, by cursor (`page_size`, at most 100, default 50; `conversation`; `after(token)`) | `Invalid` for a token of another query |
-| `get(run)` | the `RunInfo`, or `None` | |
+| `get(run)` | the `RunInfo`, or `None`; a schedule's firing too (see *Schedules*) | |
+| `firings(FiringQuery)` | a `Page<Firing>` of the runs the agent's `schedules/` fired, the most recently updated first (`schedule`, `page_size`, `page_token` as for `list`): each its `RunInfo` and its `adam_schedule::Trigger` (`agent`, `name`, `due`) | `Invalid` for a page token of another query |
 | `commands()` | the agent's commands (`adam_agent_fs::Command`: `name`, `description`, `argument_hint`, `template`), in name order: what the host lists in its `/` menu, as a client reads them from the card (`commands/v1`) | |
-| `files(run)` | the files the agent handed over in the run (`RunFile`: `name`, `mime_type`, `filename`, `len`, `sha256`), in the order they were emitted, without their bytes | `NotFound` for a run this engine has not (a schedule's firing included, as for `get`); `Unavailable` (`Transient`) or `Internal` when the store cannot be read |
+| `files(run)` | the files the agent handed over in the run (`RunFile`: `name`, `mime_type`, `filename`, `len`, `sha256`), in the order they were emitted, without their bytes | `NotFound` for a run this engine has not (as for `get`: a firing is one it has); `Unavailable` (`Transient`) or `Internal` when the store cannot be read |
 | `file(run, sha256)` | the bytes (`Arc<[u8]>`) of the run's file with that SHA-256, as `files` or the event's `WithheldFile` says it; `None` for no such file, or bytes gone from the store | as for `files`, and `Store` (the store's class) when the bytes cannot be read |
 | `events(run)` | `RunEvents`, a `futures::Stream` of `Result<EngineEvent, EngineError>`: the run's recent events, then the live ones, then `Ended` once the store says the run has ended; a run that has already ended gives `Ended` at once. See [A run's events](#a-runs-events) | `NotFound` for a run the engine does not have, refused at the call (the stream would have nothing to say) |
 | `shutdown()` | waits for the messages being written, then nothing new is claimed and the steps in flight finish and commit; it returns once the worker has stopped, and so does every concurrent or later call; every clone stops; reads and `cancel` still work. Dropping a `shutdown` before it is done (a timeout around it) aborts the worker, and so does dropping the last engine, as a killed process would: the next engine started with the same fixed worker id claims its runs at once, any other once their leases run out | what the worker ended with |
@@ -70,10 +71,11 @@ engine as in `adam-agent`. `start` registers the agent's scheduler (`adam_schedu
 holds, so a scheduler a folder dropped is stepped to its cancel) and reconciles before the worker starts: a schedule
 added is started, one changed is replaced, one dropped is cancelled. Each due time fires one run of the agent, the
 prompt as a person's message, which nobody answers (a question ends the call instead of parking). A firing is nobody's
-message, so it is no caller's run: `list`, `get`, `events`, `cancel`, `files` and `file` do not reach it, as an A2A server does not to a
-caller ([#289](https://github.com/vymalo/another-adam-rs/issues/289) would let the host see and stop one); the host reads
-it from its store, its conversation `adam_schedule::fired_conversation_id(agent, schedule, due)` (the schedule's name
-escaped) and its trigger `adam_schedule::trigger_of` (re-exported as `adam_engine::adam_schedule`). A reconcile that
+message, so it is no caller's run and not in `list`, but the host owns the store and sees it all the same (#289):
+`firings` lists them with their trigger (`adam_schedule::Trigger`, re-exported as `adam_engine::adam_schedule`), and
+`get`, `events`, `cancel`, `files` and `file` reach one. `steer` and `answer` do not (`NotFound`): nobody talks to a
+firing, and its conversation (`adam_schedule::fired_conversation_id(agent, schedule, due)`) is not one to `send` to. The
+binaries are unchanged: an A2A caller still sees no firing. A reconcile that
 fails ends `start` with `Schedules`; on a retryable class, call `start` again.
 
 **A fixed worker id makes a restart claim its old runs at once; it is opt-in.** With `worker_id: None` the engine
@@ -201,7 +203,8 @@ re-exports them:
 
 It also depends on `a2a-lf` (the A2A types, data only: ADR 0047's confirmed decision 1), `tokio` (`rt`, `sync`,
 `time`), `futures` (the `Stream` of a run's events), `async-trait` (the engine's event sink), `serde_json` (what a
-withheld file says), `thiserror` and `uuid`.
+withheld file says), `thiserror`, `uuid` and `tracing` (a firing whose state cannot be read is left out of
+`firings` with a warning, as `list` leaves out a task).
 
 ## The dependency check
 
@@ -281,8 +284,14 @@ every wait is bounded by `tokio::time::timeout`:
   bytes, another digest is `None`, and a run the engine has not is `NotFound` to both;
 * `a_host_tool_named_as_the_engines_is_refused`: a host's `ask_user` is `DuplicateTool` (`Invalid`) at `start`;
 * `a_folders_schedule_fires_the_agent`: a folder with `schedules/soon.md` (`after: 1s`) fires a run of the agent, in
-  the store, whose model is given the prompt and whose `get` is `None` (and `files` and `file` `NotFound`);
-  `the_hosts_retry_policy_governs_a_transient_failure`: `Limits::retry` of two attempts gives a transient model failure
+  the store, whose model is given the prompt; it is in no `list`, and `firings` lists it, `Done`, with its output and
+  trigger, as `get` answers it, and `files` reaches it;
+* `a_host_lists_and_cancels_a_working_firing`: schedules `a` and `ab` fire, one held at the model; `firings` pages them
+  one at a time, filters by schedule (`a` never lists `ab`'s, each `total` 1) and refuses a token of another query; a
+  done firing is `Finished` to `cancel`; the schedulers are not reached by `get`; `steer`, `answer` and a `send` to a
+  firing's conversation are `NotFound`; `cancel` ends the working one `Cancelled`, its `events` end with it, and a
+  second `cancel` answers it as it is; and, in `src/engine.rs`, `a_firing_page_token_reads_back_and_refuses_another_query`;
+* `the_hosts_retry_policy_governs_a_transient_failure`: `Limits::retry` of two attempts gives a transient model failure
   up after two calls, not five;
 * `start_refuses_what_it_cannot_build` (a zero lease and a ring of 0 or over 65 536 too; it passes alone and with
   `--features adam-assembly/mcp,adam-assembly/remote`, the set CI's workspace build unifies) and `start_outside_a_tokio_runtime_is_refused`: fail

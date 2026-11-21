@@ -59,8 +59,8 @@ pub use engine::{Engine, EngineBuilder, Limits};
 pub use error::EngineError;
 pub use events::{EngineEvent, RunEvents, WithheldFile};
 pub use types::{
-    ConversationId, DEFAULT_PAGE_SIZE, Delivered, ListQuery, MAX_PAGE_SIZE, Page, RunFile, RunInfo,
-    RunState, Say, Turn,
+    ConversationId, DEFAULT_PAGE_SIZE, Delivered, Firing, FiringQuery, ListQuery, MAX_PAGE_SIZE,
+    Page, RunFile, RunInfo, RunState, Say, Turn,
 };
 
 use std::sync::Arc;

@@ -11,19 +11,52 @@ use adam_a2a::{BackendError, Caller, STEER_EXTENSION, TaskBackend, TaskQuery};
 use adam_a2a_runtime::{Commands, RuntimeTaskBackend, task_id_for};
 use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
-use adam_core::{DynSecretSource, DynStore, RunId};
+use adam_core::{ConversationScope, DynSecretSource, DynStore, RunId, RunQuery, RunStatus};
 use adam_llm_agent::{DEFAULT_MAX_PARALLEL, ToolSet};
 use adam_model::DynModel;
-use adam_runtime::{BroadcastSink, FileRef, RetryPolicy, Runtime, RuntimeBuilder, RuntimeError};
+use adam_runtime::{
+    BroadcastSink, FileRef, RetryPolicy, RunView, Runtime, RuntimeBuilder, RuntimeError,
+    SCHEDULE_CONVERSATION_PREFIX,
+};
 use adam_ui::Ui;
 use tokio::sync::{RwLock, RwLockReadGuard, oneshot, watch};
 use tokio::task::AbortHandle;
 
 use crate::events::EngineSink;
 use crate::{
-    ConversationId, Delivered, EngineError, ListQuery, Page, RunEvents, RunFile, RunInfo, RunState,
-    Say, Turn, default_secrets,
+    ConversationId, Delivered, EngineError, Firing, FiringQuery, ListQuery, Page, RunEvents,
+    RunFile, RunInfo, RunState, Say, Turn, default_secrets,
 };
+
+/// Why a firing a host cancelled ended (#289).
+const FIRING_CANCEL_REASON: &str = "cancelled by the host";
+
+/// The page token of [`Engine::firings`]: the position of the page's last firing and the schedule
+/// the query names, so a token of another query is refused.
+mod firing_token {
+    use adam_core::RunId;
+    use adam_core::time::Timestamp;
+
+    use crate::EngineError;
+
+    pub(super) fn write(filter: &str, at: Timestamp, run: RunId) -> String {
+        format!("{at}|{run}|{filter}")
+    }
+
+    pub(super) fn read(token: &str, filter: &str) -> Result<(Timestamp, RunId), EngineError> {
+        let bad = || EngineError::Invalid("the page token is not one of this query's".to_owned());
+        let mut parts = token.splitn(3, '|');
+        let at = parts.next().and_then(|t| t.parse().ok()).ok_or_else(bad)?;
+        let run = parts
+            .next()
+            .and_then(|r| uuid::Uuid::parse_str(r).ok())
+            .map(RunId)
+            .ok_or_else(bad)?;
+        (parts.next() == Some(filter))
+            .then_some((at, run))
+            .ok_or_else(bad)
+    }
+}
 
 /// The one subject every call of an engine is made as: the engine serves one person, and the
 /// backend scopes runs to a subject. Not `anonymous`, which the backend lets continue nothing.
@@ -229,6 +262,7 @@ impl EngineBuilder {
         // binaries do; it is registered whatever the folder holds, so a scheduler run a folder
         // dropped is still stepped to its cancel.
         let scheduler = adam_schedule::SchedulerAgent::new(&name);
+        let lister = store.clone();
         let (runtime, events) = runtime_with_ring(
             assembly.register(Runtime::builder(store)).agent(scheduler),
             &limits,
@@ -278,6 +312,7 @@ impl EngineBuilder {
                 caller,
                 backend,
                 runtime: reader,
+                store: lister,
                 events,
                 agent: name,
                 commands,
@@ -375,6 +410,8 @@ pub(crate) struct Shared {
     /// What [`Engine::file`] reads a file's bytes from, once the backend has said the run is this
     /// engine's caller's.
     runtime: Runtime,
+    /// What [`Engine::firings`] lists the schedule's runs from: the host's store.
+    store: DynStore,
     /// The ring every reader of [`Engine::events`] subscribes to; the runtime emits into it through
     /// [`EngineSink`], which takes a file's bytes out.
     events: BroadcastSink,
@@ -585,7 +622,27 @@ impl Engine {
                     Expected::Open,
                 )),
             },
+            Err(BackendError::TaskNotFound(_)) => self.cancel_firing(run).await,
             Err(e) => Err(EngineError::of_backend(e, Some(run))),
+        }
+    }
+
+    /// [`cancel`](Self::cancel) of a run a schedule fired, which the backend does not reach: as
+    /// the backend cancels a caller's run, through the runtime, then read again.
+    async fn cancel_firing(&self, run: RunId) -> Result<RunInfo, EngineError> {
+        let gone = || EngineError::NotFound(format!("run {run}"));
+        let (view, _) = self.firing_view(run).await?.ok_or_else(gone)?;
+        if !view.status.is_terminal() {
+            self.shared
+                .runtime
+                .cancel(run, FIRING_CANCEL_REASON)
+                .await
+                .map_err(|e| EngineError::of_run_read(e, run))?;
+        }
+        let info = self.get(run).await?.ok_or_else(gone)?;
+        match info.state {
+            RunState::Cancelled => Ok(info),
+            state => Err(EngineError::by_state(run, Ok(Some(state)), Expected::Open)),
         }
     }
 
@@ -693,17 +750,24 @@ impl Engine {
             .map_err(EngineError::of_read)
     }
 
-    /// The file artifacts of `run`, if this engine's caller may see it: one read of the run, owned
-    /// as every call checks it (a run of another caller, a schedule's firing, #289, is `NotFound`
-    /// here as it is to `get`), and no file's bytes.
+    /// The file artifacts of `run`, if this engine shows it (the caller's, or a firing of its
+    /// schedules, as for `get`): one read of the run, and no file's bytes.
     async fn file_refs(&self, run: RunId) -> Result<Vec<(RunFile, FileRef)>, EngineError> {
         let shared = &self.shared;
-        let view = shared
+        let owned = shared
             .backend
             .owned_view(&shared.caller, &run.to_string())
             .await
-            .map_err(|e| EngineError::of_backend(e, Some(run)))?
-            .ok_or_else(|| EngineError::NotFound(format!("run {run}")))?;
+            .map_err(|e| EngineError::of_backend(e, Some(run)))?;
+        let view = match owned {
+            Some(view) => view,
+            None => {
+                self.firing_view(run)
+                    .await?
+                    .ok_or_else(|| EngineError::NotFound(format!("run {run}")))?
+                    .0
+            }
+        };
         Ok(view
             .artifacts
             .into_iter()
@@ -736,14 +800,126 @@ impl Engine {
     /// The store's failures.
     pub async fn get(&self, run: RunId) -> Result<Option<RunInfo>, EngineError> {
         let shared = &self.shared;
-        shared
+        let task = shared
             .backend
             .get(&shared.caller, &run.to_string())
             .await
-            .map_err(|e| EngineError::of_backend(e, Some(run)))?
-            .as_ref()
-            .map(RunInfo::of)
-            .transpose()
+            .map_err(|e| EngineError::of_backend(e, Some(run)))?;
+        match task {
+            Some(task) => RunInfo::of(&task).map(Some),
+            None => match self.firing_view(run).await? {
+                Some((view, _)) => RunInfo::of(&shared.backend.unowned_task(&view)).map(Some),
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// The runs the agent's `schedules/` fired (ADR 0060), the most recently updated first, each
+    /// with the schedule and the due time that fired it. A firing is nobody's message, so it is in
+    /// no [`list`](Self::list); [`get`](Self::get), [`events`](Self::events),
+    /// [`cancel`](Self::cancel), [`files`](Self::files) and [`file`](Self::file) reach it, while
+    /// [`steer`](Self::steer) and [`answer`](Self::answer) do not (nobody answers a firing).
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Invalid`] for a page token of another query, and the store's failures.
+    pub async fn firings(&self, query: FiringQuery) -> Result<Page<Firing>, EngineError> {
+        let shared = &self.shared;
+        let agent = &shared.agent;
+        let prefix = match &query.schedule {
+            // The scheduler's conversation, then `@`: only that schedule's firings, never one of a
+            // schedule whose name starts with the same text (names are escaped, `@` among them).
+            Some(name) => format!("{}@", adam_schedule::schedule_conversation_id(agent, name)),
+            None => format!("{SCHEDULE_CONVERSATION_PREFIX}{agent}/"),
+        };
+        let size = query.resolved_page_size();
+        let filter = query.schedule.as_deref().unwrap_or("");
+        let mut runs = RunQuery::new(agent.clone(), ConversationScope::Prefix(prefix), size + 1);
+        if let Some(token) = &query.page_token {
+            runs.after = Some(firing_token::read(token, filter)?);
+        }
+        let total = shared
+            .store
+            .count_runs(&runs)
+            .await
+            .map_err(EngineError::Store)?;
+        let mut records = shared
+            .store
+            .list_runs(&runs)
+            .await
+            .map_err(EngineError::Store)?;
+        let more = records.len() > size;
+        records.truncate(size);
+        let next_page_token = more
+            .then(|| records.last())
+            .flatten()
+            .map(|last| firing_token::write(filter, last.updated_at, last.id));
+        let mut items = Vec::with_capacity(records.len());
+        for record in records {
+            let Some(trigger) = record
+                .conversation_id
+                .as_deref()
+                .and_then(adam_schedule::trigger_of)
+            else {
+                continue;
+            };
+            // The record holds the state a view is built from, as `list` builds it: the lease is
+            // read only where it can still say `working`, a runnable run at version 1, so a held
+            // firing is `Working` as `get` says.
+            let lease = if record.status == RunStatus::Runnable && record.version <= 1 {
+                shared
+                    .store
+                    .lease_until(record.id)
+                    .await
+                    .map_err(EngineError::Store)?
+            } else {
+                None
+            };
+            let claimed = adam_core::claimed(record.status, lease, shared.runtime.now());
+            let id = record.id;
+            let view = match adam_runtime::view_from_record(record, claimed) {
+                Ok(view) => view,
+                Err(RuntimeError::Corrupt { .. }) => {
+                    tracing::warn!(run = %id, "a firing has an unreadable state; it is not listed");
+                    continue;
+                }
+                Err(e) => return Err(EngineError::of_run_read(e, id)),
+            };
+            let info = RunInfo::of(&shared.backend.unowned_task(&view))?;
+            items.push(Firing { info, trigger });
+        }
+        Ok(Page {
+            items,
+            next_page_token,
+            total: usize::try_from(total).unwrap_or(usize::MAX),
+        })
+    }
+
+    /// `run` as the runtime has it, when it is a run of this engine's agent that one of its
+    /// schedules fired: the one kind of run beyond the caller's that the engine shows its host
+    /// (#289). A run of another agent, a scheduler's, or a conversation of a caller is `None`.
+    async fn firing_view(
+        &self,
+        run: RunId,
+    ) -> Result<Option<(RunView, adam_schedule::Trigger)>, EngineError> {
+        let shared = &self.shared;
+        let Some(view) = shared
+            .runtime
+            .view(run)
+            .await
+            .map_err(|e| EngineError::of_run_read(e, run))?
+        else {
+            return Ok(None);
+        };
+        if view.agent != shared.agent {
+            return Ok(None);
+        }
+        let trigger = view
+            .conversation_id
+            .as_deref()
+            .and_then(adam_schedule::trigger_of)
+            .filter(|t| t.agent == shared.agent);
+        Ok(trigger.map(|t| (view, t)))
     }
 
     /// Stop the worker: nothing new is claimed, the steps in flight finish and commit, and their
@@ -887,6 +1063,26 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    /// The page token of `firings` reads back what it wrote: a timestamp to the nanosecond, a
+    /// schedule name with `|` in it, and it refuses a token of another filter or a malformed one.
+    #[test]
+    fn a_firing_page_token_reads_back_and_refuses_another_query() {
+        let at: adam_core::time::Timestamp = "2026-11-21T09:00:00.123456789Z".parse().unwrap();
+        let run = RunId::new();
+        for filter in ["", "daily", "a|b|c"] {
+            let token = firing_token::write(filter, at, run);
+            assert_eq!(firing_token::read(&token, filter).unwrap(), (at, run));
+            let other = firing_token::read(&token, "weekly").unwrap_err();
+            assert!(matches!(other, EngineError::Invalid(_)), "{other:?}");
+        }
+        for bad in ["", "x|y|", "2026-11-21T09:00:00Z|not-a-uuid|"] {
+            assert!(matches!(
+                firing_token::read(bad, ""),
+                Err(EngineError::Invalid(_))
+            ));
+        }
+    }
     use crate::WithheldFile;
 
     const FILE: &[u8] = b"the bytes of the file, kept with the run";

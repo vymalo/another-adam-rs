@@ -37,6 +37,12 @@ agent's scheduler and calls `reconcile` once, on the engine's own runtime, befor
 `events` and `cancel` do not reach it, as an A2A caller of the binaries does not; it lives in the host's store. A host
 that must see or stop one is #289.
 
+*Amended* (2026-11-21, #289): **the engine shows its host the firings.** An embedded application owns its whole store,
+so `adam-engine` lists the runs its agent's schedules fired (`Engine::firings`, each with its `Trigger`), and `get`,
+`events`, `cancel`, `files` and `file` reach one, through the runtime and the backend's `unowned_task`, for a run of the
+engine's agent whose conversation is a firing's and nothing else. `steer` and `answer` still do not: nobody talks to a
+firing. The binaries are unchanged: a firing is no A2A caller's, and no A2A call reaches it.
+
 ## Context
 
 An agent folder may hold `schedules/<name>.md`: frontmatter `cron:` and `timezone:`, the body a prompt

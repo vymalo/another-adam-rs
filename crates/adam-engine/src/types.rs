@@ -259,6 +259,67 @@ impl ListQuery {
     }
 }
 
+/// Which firings [`firings`](crate::Engine::firings) answers: the runs the agent's `schedules/`
+/// fired (ADR 0060), which are no caller's and so not in [`list`](crate::Engine::list).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FiringQuery {
+    /// Only the firings of the schedule of this name (the file's stem in `schedules/`).
+    pub schedule: Option<String>,
+    /// At most this many firings, 1 to [`MAX_PAGE_SIZE`]; `0` is [`DEFAULT_PAGE_SIZE`].
+    pub page_size: usize,
+    /// Continue after the page that gave this [`Page::next_page_token`].
+    pub page_token: Option<String>,
+}
+
+impl FiringQuery {
+    /// The first page of every firing of the agent, [`DEFAULT_PAGE_SIZE`] at a time.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Only the firings of the schedule `name`.
+    #[must_use]
+    pub fn schedule(mut self, name: impl Into<String>) -> Self {
+        self.schedule = Some(name.into());
+        self
+    }
+
+    /// At most `size` firings a page.
+    #[must_use]
+    pub fn page_size(mut self, size: usize) -> Self {
+        self.page_size = size;
+        self
+    }
+
+    /// The page after the one that gave `token`.
+    #[must_use]
+    pub fn after(mut self, token: impl Into<String>) -> Self {
+        self.page_token = Some(token.into());
+        self
+    }
+
+    pub(crate) fn resolved_page_size(&self) -> usize {
+        match self.page_size {
+            0 => DEFAULT_PAGE_SIZE,
+            n => n.min(MAX_PAGE_SIZE),
+        }
+    }
+}
+
+/// A run one of the agent's schedules fired: the run as [`get`](crate::Engine::get) answers it,
+/// and what fired it. Its [`RunInfo::conversation`] is the firing's own, not one to
+/// [`send`](crate::Engine::send) to: a message to it is [`EngineError::NotFound`](crate::EngineError::NotFound).
+/// Not `adam_schedule::Firing`, the scheduler's record of a due time it fired.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Firing {
+    /// The run.
+    pub info: RunInfo,
+    /// The schedule and the due time it fired for.
+    pub trigger: adam_schedule::Trigger,
+}
+
 /// One page of a listing, the most recently updated first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
