@@ -323,7 +323,7 @@ The runtime retries a transition that fails with a `Transient` `AgentError` (its
 error carries one (`AgentError::with_retry`, `Ctx::step_retrying`; ADR 0061), else the runtime's; a policy
 retries only the classes it lists (`retry_on`, all three by default), so an error of another class fails
 the run at once. Failures are counted per step's key, under a ceiling of 100 consecutive failures, and
-the messages name the key (`gave up after 3 attempts of `fetch``); see the
+the messages name the key (``gave up after 3 attempts of `fetch` ``); see the
 [adam-runtime README](../../crates/adam-runtime/README.md#retries-per-step). Any other class fails the run. A store error while stepping is decided by class: `Corrupt` and
 `Invalid` fail the run; everything else leaves the run to its lease and is logged with its class.
 

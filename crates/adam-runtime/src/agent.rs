@@ -85,13 +85,14 @@ pub enum Transition<S> {
 /// | Variant | Class | The run |
 /// |---|---|---|
 /// | `Transient`, no `retry_after` | its `class` (`Transient` unless built by [`from_classified`](AgentError::from_classified)) | retried after the policy's backoff, when the policy retries the class |
-/// | `Transient` of class `Transient` with `retry_after` | `RateLimited` | retried after `max(backoff, retry_after)` |
-///
-/// The policy is the error's own [`StepRetry`] when it carries one ([`with_retry`](AgentError::with_retry)),
-/// else the runtime's ([ADR 0061](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0061-a-step-names-its-retry-policy.md)).
+/// | `Transient` of class `Transient` with `retry_after` | `RateLimited` | retried after `max(backoff, retry_after)`, when the policy retries rate limits |
+/// | `Transient` of class `RateLimited` or `Conflict` with `retry_after` | its `class` | retried after `max(backoff, retry_after)` |
 /// | `Permanent` | `Invalid` | `Failed` |
 /// | `NonDeterminism` | `Corrupt` | `Failed` |
 /// | `Store(e)` | `e.class()` | `Failed` for `Corrupt` and `Invalid`, otherwise left to its lease |
+///
+/// The policy is the error's own [`StepRetry`] when it carries one ([`with_retry`](AgentError::with_retry)),
+/// else the runtime's ([ADR 0061](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0061-a-step-names-its-retry-policy.md)).
 ///
 /// A message describes this layer only; the lower error is the
 /// [`source`](std::error::Error::source) and [`adam_error::report`] prints the chain.

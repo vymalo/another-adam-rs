@@ -562,7 +562,8 @@ decides from the class (see [`adam-error`](../adam-error/README.md)).
 | `AgentError` | Class | The run |
 |---|---|---|
 | `Transient`, no `retry_after` | its `class`: `Transient`, or the class `from_classified` kept (`RateLimited`, `Conflict`) | retried after the policy's backoff, when the policy retries the class |
-| `Transient` of class `Transient` with `retry_after` | `RateLimited` | retried after `max(backoff, retry_after)`, the hint capped at `MAX_RETRY_AFTER` |
+| `Transient` of class `Transient` with `retry_after` | `RateLimited` | retried after `max(backoff, retry_after)`, the hint capped at `MAX_RETRY_AFTER`, when the policy retries rate limits (a policy that retries only `transient` fails it at once) |
+| `Transient` of class `RateLimited` or `Conflict` with `retry_after` | its `class` | retried after `max(backoff, retry_after)` |
 | `Permanent` | `Invalid` | `Failed` |
 | `NonDeterminism` | `Corrupt` | `Failed` |
 | `Store(e)` | `e.class()` | `Failed` for `Corrupt` and `Invalid`; otherwise left to its lease and logged with its class |
@@ -597,27 +598,31 @@ An error that names no policy counts under the key `runtime` (`RUNTIME_RETRY_KEY
 * Build a policy with `RetryPolicy::new(attempts)`, `.with_backoff(initial, max)`, `.with_multiplier(m)` (a
   factor that is not finite and positive is refused) and `.with_retry_on(RetryClasses::of([..]))`; it is
   `#[non_exhaustive]`. A policy retries only the classes in `retry_on` (all three retryable ones by
-  default): a transient error of another class fails the run at once (`not retried: the policy of `key`
-  does not retry <class>`).
+  default): a transient error of another class fails the run at once (``not retried: the policy of `key`
+  does not retry <class>``).
 * The run counts failures **per key**, and retries while that key's count is under its policy's
   `max_attempts` and `attempt` (every consecutive failure, whatever its key) is under
   `MAX_CONSECUTIVE_FAILURES` (100). The wait is the key's policy's backoff, lengthened by a hint and cut at
-  the deadline. The messages name the key: `attempt 1 of 3 of `fetch` failed, retrying in ..`, `gave up
-  after 3 attempts of `fetch`: ..`; the runtime's key is not named, so its messages read as before.
+  the deadline. The messages name the key: ``attempt 1 of 3 of `fetch` failed, retrying in ..``, ``gave up
+  after 3 attempts of `fetch`: ..``; the runtime's key is not named, so its messages read as before.
 * The count and each key's policy are recorded in the run's state (the v5 head, or the v4 envelope),
   in the commit that sets `wake_at` or fails the run; the policy is recorded at the key's first failure and
   read back after that, never recomputed. A transition that succeeds clears the record. Stored policies
   are plain (`max_attempts`, `initial_backoff_ms`, `max_backoff_ms`, `multiplier`, `retry_on` by name:
   `transient`, `rate-limited`, `conflict`); a class name this build does not know is dropped, and a record
-  that does not decode is ignored. A run without a record (written before it existed) counts its
-  `attempt` so far under `runtime`.
+  that does not decode is ignored: the run counts its `attempt` so far under `runtime`, as one written
+  before records does, and the failing key starts again from one under its own policy (the ceiling still
+  bounds it). Every failing run writes a record, the runtime's key included, so its policy is recorded too;
+  a run that never fails writes the bytes it wrote before. A store keeps a duration of at most `i64::MAX`
+  ms, and a factor JSON cannot hold is kept as one that backs off alike (infinity as `f64::MAX`, NaN or a
+  negative one as `0`).
 
 Tests: `retry.rs` (the classes by name, the builder), `envelope.rs` and `head.rs` (the record's stored
 form, a record that does not decode, a class name dropped, a v5 head that carries it through `of`,
 `decode`, `into_parts` and `carried`), `agent.rs` (`from_classified` keeps the class, `with_retry`), and
 the suite's `a_step_retries_under_its_own_policy`, `a_policy_retries_only_its_classes`,
-`the_recorded_policy_outlives_a_change_in_code`, `steps_that_fail_by_turns_stop_at_the_ceiling` and
-`a_success_clears_the_record`.
+`the_recorded_policy_outlives_a_change_in_code`, `the_runtime_policy_is_recorded_too`,
+`steps_that_fail_by_turns_stop_at_the_ceiling` and `a_success_clears_the_record`.
 
 ## Steps that run at the same time
 

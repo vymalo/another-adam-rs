@@ -111,7 +111,8 @@ impl Default for RetryClasses {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct RetryPolicy {
-    /// Total tries allowed for one transition (first try included).
+    /// Total tries allowed under the policy's key, the first included: the failures of the
+    /// transitions that failed under that key, counted until one succeeds.
     pub max_attempts: u32,
     /// Delay after the first failure.
     pub initial_backoff: Duration,
@@ -233,6 +234,9 @@ impl StepRetry {
     }
 }
 
+/// The largest duration a record keeps, in milliseconds: `i64::MAX`, what every store keeps.
+const STORED_MS_MAX: u64 = i64::MAX as u64;
+
 /// A policy as a run records it: durations in integer milliseconds, classes by name (ADR 0061,
 /// decision 7).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -246,12 +250,23 @@ pub(crate) struct StoredPolicy {
 
 impl StoredPolicy {
     pub(crate) fn of(policy: &RetryPolicy) -> Self {
-        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        // Every store keeps a signed 64-bit integer (MongoDB refuses more), and JSON has no
+        // infinity or NaN: a record that cannot be written, or read back, would lose the count.
+        let ms = |d: Duration| {
+            u64::try_from(d.as_millis()).map_or(STORED_MS_MAX, |ms| ms.min(STORED_MS_MAX))
+        };
+        // The factors the fields allow but JSON does not keep, as factors that back off alike: an
+        // infinite one jumps to the cap at once, and a NaN or negative one is read as 0 by `backoff`.
+        let multiplier = match policy.multiplier {
+            m if m.is_finite() => m,
+            m if m > 0.0 => f64::MAX,
+            _ => 0.0,
+        };
         Self {
             max_attempts: policy.max_attempts,
             initial_backoff_ms: ms(policy.initial_backoff),
             max_backoff_ms: ms(policy.max_backoff),
-            multiplier: policy.multiplier,
+            multiplier,
             retry_on: policy
                 .retry_on
                 .names()
@@ -264,15 +279,19 @@ impl StoredPolicy {
     /// The policy again; a class name this build does not know is dropped, so it retries less,
     /// never more.
     pub(crate) fn policy(&self) -> RetryPolicy {
-        RetryPolicy::new(self.max_attempts)
+        let mut policy = RetryPolicy::new(self.max_attempts)
             .with_backoff(
                 Duration::from_millis(self.initial_backoff_ms),
                 Duration::from_millis(self.max_backoff_ms),
             )
-            .with_multiplier(self.multiplier)
             .with_retry_on(RetryClasses::from_names_lenient(
                 self.retry_on.iter().map(String::as_str),
-            ))
+            ));
+        // As recorded, `0.0` included: the record is the decision, not a new request to check.
+        if self.multiplier.is_finite() {
+            policy.multiplier = self.multiplier;
+        }
+        policy
     }
 }
 
@@ -377,6 +396,37 @@ mod tests {
         assert!(p.retries(ErrorClass::RateLimited) && !p.retries(ErrorClass::Transient));
         assert_eq!(RetryPolicy::new(3).with_multiplier(1.5).multiplier, 1.5);
         assert!(RetryPolicy::default().retries(ErrorClass::Conflict));
+    }
+
+    #[test]
+    fn a_stored_policy_is_one_every_store_keeps_and_backs_off_alike() {
+        let mut p = RetryPolicy::new(3).with_backoff(Duration::from_secs(1), Duration::MAX);
+        p.multiplier = f64::INFINITY;
+        let stored = StoredPolicy::of(&p);
+        let json = serde_json::to_value(&stored).expect("serialises");
+        assert_eq!(json["max_backoff_ms"], serde_json::json!(i64::MAX));
+        assert!(json["multiplier"].is_f64(), "{json}");
+        let back: StoredPolicy = serde_json::from_value(json).expect("decodes");
+        let read = back.policy();
+        assert_eq!(
+            (read.backoff(1), read.backoff(2)),
+            (p.backoff(1), read.max_backoff)
+        );
+        for m in [f64::NAN, f64::NEG_INFINITY, -2.0, 0.0] {
+            p.multiplier = m;
+            let json = serde_json::to_value(StoredPolicy::of(&p)).expect("serialises");
+            let back: StoredPolicy = serde_json::from_value(json).expect("decodes");
+            assert_eq!(back.policy().backoff(3), Duration::ZERO, "{m}");
+        }
+        let mut record = RetryRecord::default();
+        assert_eq!(record.fail("k", &RetryPolicy::new(4)).0, 1);
+        let (n, recorded) = record.fail("k", &RetryPolicy::new(9));
+        assert_eq!((n, recorded.max_attempts), (2, 4));
+        assert_eq!(
+            RetryRecord::seeded(3).failures.get(RUNTIME_RETRY_KEY),
+            Some(&3)
+        );
+        assert!(RetryRecord::seeded(0).failures.is_empty());
     }
 
     #[test]

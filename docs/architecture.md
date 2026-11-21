@@ -875,7 +875,10 @@ stateDiagram-v2
 
 * **Retries.** A transient step failure (or a panic) is committed `Runnable` with
   `wake_at = now + delay` and `attempt + 1`. The delay is the larger of the backoff and the error's
-  `retry_after` (capped at 24 h). At `max_attempts` the run is `Failed`.
+  `retry_after` (capped at 24 h). The policy is the failing step's own when it names one, else the
+  runtime's, and the failures are counted per step's key: at that key's `max_attempts`, at 100
+  consecutive failures whatever their keys, or for a class the policy does not retry, the run is `Failed`
+  ([ADR 0061](decisions/0061-a-step-names-its-retry-policy.md)).
 * **A lease that lapses under a step.** The worker passes the run as `busy` in every `claim_due`, so the
   store never leases it to the same worker twice. Another worker may claim it; the CAS rejects the
   commit that comes second.
@@ -1025,7 +1028,8 @@ What `state` holds (JSON, versioned `v`; the layout is private to the runtime,
 | `v` | layout version: `1` is this envelope, `5` the head (below) |
 | `agent` | the agent's own state; for an `LlmAgent`, a `Conversation` (below). The whole state in `v: 1`, the head without its messages in `v: 5` |
 | `inbox` | delivered, not yet read messages (`Inbound { id, kind, payload, received_at }`) |
-| `seq`, `attempt`, `rev` | next journal seq; failed tries of this transition; bumped by each worker commit |
+| `seq`, `attempt`, `rev` | next journal seq; consecutive failed tries of the run's transitions; bumped by each worker commit |
+| `retry` | while a run fails: the failures per step's key and each key's policy, recorded at its first failure; cleared by a transition that succeeds, absent otherwise ([ADR 0061](decisions/0061-a-step-names-its-retry-policy.md)) |
 | `output`, `error` | the result of a `Done` run; the reason of a `Failed` one |
 | `artifacts` | artifacts emitted so far, committed with their transitions |
 

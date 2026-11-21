@@ -1807,6 +1807,55 @@ mod cases {
         );
     }
 
+    /// The runtime's own policy is recorded at a run's first failure too: a worker that steps the
+    /// run later under another runtime policy (a deploy in between) gives up where the first said.
+    pub async fn the_runtime_policy_is_recorded_too(store: DynStore) {
+        let name = uniq("runtime-recorded");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let calls = calls.clone();
+                move |_ctx, _state| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, SeqCst);
+                        Err(AgentError::transient("down"))
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let clock = FrozenClock::new();
+        let first = builder(&store, &uniq("w"), &agent)
+            .retry(RetryPolicy::new(2).with_backoff(Duration::from_secs(1), Duration::from_secs(1)))
+            .clock(clock.clone())
+            .build();
+        let run = first.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&first);
+        wait_for(&first, run, "a retry is scheduled", |v| {
+            v.attempt == 1 && v.wake_at.is_some()
+        })
+        .await;
+        worker.stop().await;
+
+        let second = builder(&store, &uniq("w"), &agent)
+            .retry(RetryPolicy::new(9).with_backoff(Duration::ZERO, Duration::ZERO))
+            .clock(clock.clone())
+            .build();
+        clock.advance(Duration::from_secs(1));
+        let worker = spawn_worker(&second);
+        let failed = wait_failed(&second, run).await;
+        worker.stop().await;
+        let error = failed.error.expect("error");
+        assert!(error.contains("gave up after 2 attempts: down"), "{error}");
+        assert_eq!(
+            count(&calls),
+            2,
+            "the policy of the first failure, not the second runtime's"
+        );
+    }
+
     /// Two steps that fail by turns, each under a policy that never runs out, stop at the run's
     /// ceiling of consecutive failures.
     pub async fn steps_that_fail_by_turns_stop_at_the_ceiling(store: DynStore) {
@@ -7833,6 +7882,7 @@ macro_rules! runtime_suite {
                 a_policy_retries_only_its_classes,
                 the_recorded_policy_outlives_a_change_in_code,
                 steps_that_fail_by_turns_stop_at_the_ceiling,
+                the_runtime_policy_is_recorded_too,
                 a_success_clears_the_record,
                 permanent_fails_immediately,
                 agent_fail_transition,
