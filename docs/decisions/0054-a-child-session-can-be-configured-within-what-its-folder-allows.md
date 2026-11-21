@@ -83,13 +83,10 @@ amendment is the owner's to make there.
    text); every other option is refused in words: its loop is another system's. Tools the loop itself needs (`read_output`)
    are never removed by `tools` or `deny_tools`.
 
-   *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the deployment's declaration is
-   `MODEL_REASONING_EFFORT` (a comma-separated set; a single value is a one-element set), and **unset declares the full
-   closed list**; until `MODEL_ALIASES_FILE` carries the facts per alias (slice 11), the declaration is the deployment's
-   one model, and a subagent on another alias accepts the full list. The folder's `reasoning_effort` is a **default
-   within the declared set, not a bound**; a session or a request outside the declared set is refused, and a session's
-   value wins over the inherited thread value for that child's calls. A deployment that narrows the set refuses a folder
-   outside it at load (exit 78). `temperature` is unchanged.
+   *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the declaration is the **model entry** in
+   `MODEL_ALIASES_FILE` (the alias's `reasoning` object: its levels and its wire), not a global variable. A folder or
+   session value must be one of that model's levels; a request outside them is refused; a model whose entry takes none
+   refuses any effort. There is **no default**: unset sends nothing. `temperature` is unchanged.
 5. **Dropped, each for a reason.**
 
    | Candidate | Why not |
@@ -312,8 +309,8 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
 **12. `reasoning_effort` and `temperature`.** Depends on 11.
 * Files: `crates/adam-model/src/types.rs`, `crates/adam-model-openai/src/wire.rs`, `agent.rs`.
 * Accepted when: the declared values are sent and others refused; an alias that declares none refuses both.
-* *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort`, unset declares the full closed list (a deployment that
-  declares none accepts all four); `temperature` still refuses.
+* *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort`, the declared values are the model entry's levels, and
+  unset sends nothing (no default); `temperature` still refuses when none is declared.
 
 ## What is put to the owner
 

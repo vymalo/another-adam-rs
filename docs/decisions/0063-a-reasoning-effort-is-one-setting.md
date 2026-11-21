@@ -1,137 +1,147 @@
-# 0063. A reasoning effort is one setting, configurable end to end
+# 0063. A reasoning effort is one setting, per model, configurable end to end
 
 Status: **Accepted** (2026-11-21)
 
 ## Context
 
-The model gateway `api.ai.camer.digital` reasons **not at all** when a request carries no
-`reasoning_effort`, and adam sends none today: `MODEL_EXTRA_BODY` is the only way to set it, and the
-chart documents that escape hatch (`deploy/coder/values.yaml:71-79`). The owner asked for one setting,
-reasoning effort, configurable in adam and all its clients.
+The model gateway reasons **not at all** when a request carries no reasoning setting, and adam sends none
+today: `MODEL_EXTRA_BODY` is the only way to set one. The owner asked for one setting, reasoning effort,
+configurable in adam and all its clients — and ruled, on 2026-11-21, that:
 
-The gateway's own values were **verified** on 2026-11-20 by direct calls from the benchmark harness
-(`bench/README.md` at `bench/variants-reasoning`'s `3281d519`, not merged; model
-`deepseek-v4.1-flash-1017`): `low`, `medium`, `high` and `max` are accepted; omitting the member
-reasons not at all; `none` and `minimal` were never sent and are **unverified**. At a 32k-token output
-budget, `medium`, `high` and `max` spent more than 32k reasoning tokens and produced no answer, so the
-effort and the output budget interact (the loop's handling of a reasoning-only length stop is its own
-change, tracked separately).
+- **there is no default anywhere** (not in the chart, the env or the code); unset means nothing is sent;
+- **the setting is per model**, because each model behind the gateway differs: a deployment's model
+  configuration declares, for each model it can call, whether it takes a reasoning setting, which levels
+  it accepts, and **how they are sent**;
+- the four-value vocabulary adam speaks can stay closed, but the mapping and the allowed levels belong to
+  the model's entry;
+- `reasoning/v1` advertises the levels of the agent's **current model**, and a request outside them is
+  refused, fail closed;
+- the precedence stays request → thread → agent folder → deployment, each level choosing among the
+  model's levels;
+- every surface (coder, folder agent, engine, orchestrator/web, platform) gets the feature through its
+  own mechanism — the parity rule.
+
+The bench's earlier probe (2026-11-20) found `medium`, `high` and `max` spending more than 32k reasoning
+tokens at a 32k output budget with no answer; #273 (2026-11-21) now continues a turn that the output limit
+cuts while the model is only thinking, so the run no longer ends as a question — the budget still bounds
+one turn, and the effort still trades latency and tokens for reasoning.
+
+The gateway probe of 2026-11-21 records, for each of the 26 models it lists, no setting, `none`,
+`minimal`, `low`, `medium`, `high` and `max`, with a 64-token answer, the reasoning tokens and the finish
+reason. The table is below; each row is *verified* on that date against `api.ai.camer.digital`, or
+*unverified* where the probe could not tell.
 
 ## Decision
 
-1. **The values are a closed enum.** `ReasoningEffort` in `adam-model`: `Low`, `Medium`, `High`,
-   `Max`, spelled `low`, `medium`, `high`, `max` on the wire and in every setting. Built like
-   `AccessTier`: an `ALL` array, an exhaustive `as_str` and `FromStr`, and serde `rename_all` on top, so
-   a new variant fails to compile everywhere until it is handled. `none` and `minimal` are refused as
-   unknown, not passed through; they are added only when the gateway verifies them, with a dated note
-   here. "Off" is **the absence of the setting**, never a value.
+1. **The vocabulary is closed.** `ReasoningEffort` in `adam-model`: `Low`, `Medium`, `High`, `Max`,
+   spelled `low`, `medium`, `high`, `max`. Built like `AccessTier`: an `ALL` array, an exhaustive
+   `as_str` and `FromStr`, and serde `rename_all` on top, so a new variant fails to compile everywhere
+   until it is handled. `none` and `minimal` are **not** adam's vocabulary: "off" is the absence of the
+   setting. A model that takes only `none`/`minimal` is a model adam cannot ask to reason; its entry says
+   it takes none.
 
-2. **The deployment declares the accepted set; the narrower levels choose within it.**
-   `MODEL_REASONING_EFFORT` (and the chart's `config.modelReasoningEffort`) declares a **set**, written as a
-   comma-separated list (`low,medium`); a single value is a one-element set; unset declares the full closed
-   list. The **folder's** `reasoning_effort` is the agent's default and must be one of the declared values
-   (anything else is a load error); it is not a bound on the agent's children — the deployment's set is.
-   The **request** and the **thread** choose one of the declared values; anything outside is refused, never
-   clamped. A deployment that narrows the set refuses a folder outside it **at load** (exit 78, naming the
-   file and line): roll the image with the folder first, then narrow the value.
-   The order is: request → thread → agent folder → deployment → `MODEL_EXTRA_BODY` → absent.
-   - **request**: the `reasoning/v1` extension on one A2A message (decision 4).
+2. **The model entry is the only seat.** Each model alias in `MODEL_ALIASES_FILE` (ADR 0054 slice 11)
+   declares a `reasoning` object:
+   ```json
+   "reasoning": { "levels": ["low", "medium"], "wire": "reasoning_effort" }
+   ```
+   - `levels` is a subset of the closed vocabulary, lowest first; an empty list or an absent
+     `reasoning` means the model takes **no** reasoning setting.
+   - `wire` is one of a closed set, and it is how a level is sent:
+     - `reasoning_effort` → `{"reasoning_effort": "<level>"}` (an OpenAI-compatible endpoint);
+     - `reasoning_object` → `{"reasoning": {"effort": "<level>"}}`;
+     - `thinking_budget` → `{"thinking": {"type": "enabled", "budget_tokens": <n>}}`, with a `budgets`
+       object mapping every declared level to its token budget.
+   - A level outside the vocabulary, an unknown `wire`, a missing budget, or a `reasoning` object that
+     declares levels without a wire is a **startup error (exit 78)**, naming the alias and the file.
+   - **There is no `MODEL_REASONING_EFFORT`, no chart value and no code default.** The file is the
+     deployment's; the chart may mount it, and unset renders nothing.
+
+3. **No default anywhere.** If the request, the thread, the session and the folder set nothing, no
+   reasoning member is sent — today's behaviour. The card has no `default`; `reasoning/v1` advertises
+   `efforts` only.
+
+4. **The levels, narrowest wins: request → thread → session → agent folder → the model entry.**
+   - **request**: the `reasoning/v1` extension on one A2A message (decision 5).
    - **thread**: the run's current effort, held in the protected context key `vymalo.reasoningEffort`;
      the newest activated message sets it. It **carries into a continuing task of the same thread and
-     into a child run** — this is a thread setting, unlike the access tier's per-message one. A new
-     thread starts at the folder's value, else the deployment's.
+     into a child run** (and the child's own children). A **new thread starts with nothing**.
    - **session**: a child's `subagent_start` config (ADR 0054's table row) is an explicit choice by the
-     person or the parent; it **wins over the inherited thread value** for that child's calls, and must be
-     in the declared set. Absent, the thread's value applies.
+     person or the parent; it **wins over the inherited thread value** for that child's calls.
    - **agent folder**: `reasoning_effort` at the top level of the frontmatter.
-   - **deployment**: `MODEL_REASONING_EFFORT`, and the chart's `config.modelReasoningEffort`.
-   - **`MODEL_EXTRA_BODY`**: its `reasoning_effort` member keeps working as the raw deployment escape
-     hatch, but **loses to any typed level**: a set typed effort replaces that one member (ADR 0054's
-     owner item 8). This is the one exception to "the extra body wins over what the runtime wrote",
-     and it is stated in `adam-model-openai`'s docs, the chart's and `docs/reference/environment.md`.
-   - Every level is optional; absent everywhere is today's behaviour. Before `MODEL_ALIASES_FILE` carries
-     the facts per alias (0054 slice 11), a subagent whose `model:` names another alias has no declaration
-     and accepts the full closed list; the deployment's one model follows the variable.
+   - **the model entry**: declares the allowed levels and the wire; it sets no value.
+   Every level picks among **the current model's** levels. A request outside them is `InvalidParams`
+   (`-32602`) **before anything is written**; a folder or session value outside them is a load/start
+   error naming the file and line (exit 78 for a binary). A folder that sets an effort on a model whose
+   entry takes none is that same error.
 
-3. **The folder key is `reasoning_effort`, not `effort`.** `effort` is already an ignored Claude
-   Code/Copilot key (`crates/adam-agent-fs/src/load/agent.rs:27`); promoting it would change what an
-   existing folder means. It stays ignored. A folder value outside the declared set is a load error
-   naming the file and line.
+5. **The A2A extension is `https://agents.vymalo.com/a2a/extensions/reasoning/v1`.**
+   - The card lists it **only when the root agent's model takes at least one level**; `params` is
+     `{efforts: [the model's levels, lowest first]}` — **no `default`**.
+   - It is activated per message exactly like `access-tier/v1` (the `A2A-Extensions` header and/or
+     `message.extensions`); an activated message **must** carry
+     `metadata[URI] = {"effort": "<one of the model's levels>"}`. A missing entry, a non-object, a missing
+     or non-string `effort`, an unknown word, or a level the model does not take is `InvalidParams`
+     (`-32602`) before anything is written. Other members of the entry are ignored.
+   - The accepted set is a `ReasoningEfforts` in `adam-a2a`, carried to the backend as `AccessTiers` is
+     (`with_reasoning_efforts`); it builds the card's `efforts` and refuses a request. `Bound` carries the
+     folder's explicit value (or none), not a default.
+   - The value is merged into the run's protected context as `vymalo.reasoningEffort`
+     (`{"effort": ..}`); the newest message wins from the agent's next step. A caller that activated it
+     is echoed the effort on the `SendMessage` answer, `GetTask`, the first stream frame, and when it
+     changes — the access tier's echo shape. The extension can only set: no member clears an effort.
+   - A subagent's `subagent_start` value is checked against the **subagent's** model entry, not the root's
+     (the card describes the root's model).
 
-4. **The A2A extension is `https://agents.vymalo.com/a2a/extensions/reasoning/v1`.** Its card entry is
-   `required: false` with `params: {efforts: [lowest first], default?: <one of them>}`:
-   - `efforts` is **the set this agent accepts** — the deployment's declared set (the full closed list
-     when `MODEL_REASONING_EFFORT` is unset). It is the enforcement point: a request outside it is
-     refused, so a deployment that sets `low` cannot be raised by a caller. A deployment that declares a
-     single value makes the client's choice a single option; a deployment that wants a choice declares
-     `low,medium` (or leaves the variable unset).
-   - `default` is the effort a **new thread** starts at: the folder's value, else the deployment's; it is
-     absent when neither sets one. A continuing task or a child carries the thread's value, which may
-     differ.
-   It is activated per message exactly like `access-tier/v1` (the `A2A-Extensions` header and/or
-   `message.extensions`); an activated message **must** carry
-   `metadata[URI] = {"effort": "<one the agent accepts>"}`. A missing entry, a non-object, a missing or
-   non-string `effort`, an unknown word, or a word outside the accepted set is `InvalidParams`
-   (`-32602`) **before anything is written**. Other members of the entry are ignored, as
-   `access-tier/v1` ignores them. A message that did not activate the extension carries no effort. The
-   value is merged into the run's protected context as `vymalo.reasoningEffort`
-   (`{"effort": ..}`); the newest message wins from the agent's next step. A caller that activated it
-   is echoed the effort on the `SendMessage` answer, `GetTask`, the first stream frame, and when it
-   changes — the same shape as the access tier's echo. The extension can only set an effort: an effort is a
-   scalar it can only set, no member clears one, and a message that does not activate it leaves the
-   thread's value as it is.
+6. **The wire.** `ModelRequest` gains `reasoning_effort: Option<ReasoningEffort>`; the client is given
+   the alias entries and applies the entry of the request's model:
+   - the typed level is applied **after** the extra body, and it removes the known reasoning members
+     (`reasoning_effort`, `reasoning.effort`, `thinking`) from the extra body first, so a typed level
+     always wins and no two reasoning settings are sent;
+   - other extra-body members remain;
+   - the compaction/summary call sets the typed field to `None`, so it sends nothing unless the raw
+     `MODEL_EXTRA_BODY` still names a reasoning member (stated in the docs).
+   A test pins the order: `MODEL_EXTRA_BODY={"reasoning_effort":"medium"}` + a request `low` on a
+   `reasoning_effort` model → body `low` only.
 
-5. **The wire and where the default is applied.** `ModelRequest` gains
-   `reasoning_effort: Option<ReasoningEffort>`; `adam-model-openai` sends it as `reasoning_effort`. The
-   merge order is: the extra body, then the request's own member, so a typed level wins (a test pins
-   `MODEL_EXTRA_BODY={"reasoning_effort":"medium"}` + request `low` → body `low`).
-   The deployment's value is **not** put on the client: the assembly resolves the folder's value, else
-   the deployment's, into the agent's default, carried on `Bound::reasoning_effort` (the `max_parallel`
-   precedent) and set on `LlmAgentBuilder::reasoning_effort`; the loop uses the thread's context value if
-   present, else that default. The compaction/summary call sets the typed field to `None` (a fixed output
-   budget; reasoning there spends it); `MODEL_EXTRA_BODY` still reaches every request, so a deployment
-   that uses the raw escape hatch also reasons in summaries — stated in the docs.
+7. **Usage.** Each model call's `UsageEvent` carries `effort: Option<ReasoningEffort>` — **the typed
+   effort the request named**; it is absent when no typed level was set (including when only
+   `MODEL_EXTRA_BODY` set a reasoning member, because the loop cannot see the raw member). Reported per
+   call by `usage/v1` (the struct is `#[non_exhaustive]`, so additive); the totals stay per
+   provider+model.
 
-6. **Usage.** Each model call's `UsageEvent` carries `effort: Option<ReasoningEffort>`, reported per
-   call by `usage/v1` (the struct is `#[non_exhaustive]`, so additive). It is **the typed effort the
-   request named**; it is absent when only `MODEL_EXTRA_BODY` set one, because the loop cannot see the
-   raw member. The totals stay per provider+model; the effort is per call. The bench's own arm
-   fragment remains the source for the raw case.
+8. **The engine.** `Engine::builder()` takes the same per-model entries (`models(entries)`, additive);
+   `Limits` keeps the run bounds and stays `Copy`. The folder's or session's value is checked against the
+   entry; the engine has no per-message extension, so the run's effort is the folder's, else the
+   session's, else nothing.
 
-7. **The engine.** `adam_engine::Limits` gains `reasoning_effort: Option<ReasoningEffort>`
-   (`#[non_exhaustive]`, additive). It is the deployment's declaration for the agents the engine
-   hosts: the folder's value must be in it, and the engine has no per-message extension, so that value
-   is the run's effort.
+9. **The parity table.** The feature is not done until every surface has it through its own mechanism;
+   the gaps are filed as issues and linked from `docs/reference/parity.md` (being written).
 
-8. **The deployment.** `MODEL_REASONING_EFFORT` (both binaries, through `ModelConfig`) and the chart's
-   `config.modelReasoningEffort`, a comma-separated list of the closed values; an invalid member is a
-   startup error (exit 78), as `MODEL_CONTEXT_WINDOW` is. The chart **refuses**
-   `config.modelReasoningEffort` beside a `config.modelExtraBody.reasoning_effort` member (a render
-   error naming both), matching its convention for every other clash; a hand-written
-   `MODEL_REASONING_EFFORT` beside `MODEL_EXTRA_BODY` follows the binary's rule (the typed value wins).
-   Unset renders nothing, so the chart's goldens stay byte-identical. `deploy/coder` is read by
-   `vymalo/another-agentic-platform`'s parity goldens; the PR says so.
+   | Surface | How it sets the effort, per model | State |
+   |---|---|---|
+   | `adam-coder` | the model entry for its model; the folder's `reasoning_effort`; `reasoning/v1` per message; the card lists the model's levels | to build |
+   | `adam-agent` (folder agents) | the same: the model entry, the folder key, the extension, the card | to build |
+   | `adam-engine` (embedded) | `Engine::builder().models(entries)`; the folder/session value checked; no per-message extension | to build |
+   | orchestrator and web | read `reasoning/v1` from the live card (never cached); send the level per message and store it per thread; the picker shows the card's levels | assigned: S-S5bS/S-WEB |
+   | platform | `ModelEndpoint` declares the levels and the wire; `AgentConfig` picks; forms, Platform API, `aapctl` | assigned: S-PLAT |
+   | another-app | the hexagonal plan's ports (private) | coordinator |
 
-9. **The default.** The code ships with **no** default: nothing changes until a deployment sets one.
-   The recommended deployment value for the coder is **`low`** — the only level the bench verified to
-   answer quickly (10–20 s), while `medium`, `high` and `max` ran past 32k reasoning tokens with no
-   answer at that budget. `medium` is the intended next step once the length-stop fix and a larger
-   output budget are proven. The owner decides whether the chart ships a default.
+## The probe, model by model (2026-11-21)
+
+<!-- PROBE-TABLE -->
 
 ## The effort's life
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Absent
-    Absent --> Baseline: a folder or the deployment sets a value
-    Absent --> Set: a message names an effort (the full list is accepted)
-    Baseline --> Set: a message names an effort
+    [*] --> Idle
+    Idle --> Set: a message names a level the model takes
     Set --> Set: a continuing task, or a newer message
     Set --> Inherited: a child starts
-    Inherited --> Set: the child's message names an effort
-    Set --> Baseline: a new thread, a value configured
-    Set --> Absent: a new thread, nothing configured
-    Inherited --> Absent: a new thread, nothing configured
+    Inherited --> Set: the child's message names one
+    Set --> Idle: a new thread
+    Inherited --> Idle: a new thread
 ```
 
 ## The extension in one message
@@ -143,11 +153,11 @@ sequenceDiagram
     participant R as Run
     participant M as Model
     C->>F: message + A2A-Extensions: reasoning/v1<br/>metadata[URI] = {"effort": "high"}
-    alt effort outside the agent's accepted set
+    alt the model does not take that level
         F-->>C: InvalidParams (-32602), nothing written
-    else effort accepted
+    else the model takes it
         F->>R: context vymalo.reasoningEffort = {"effort": "high"}
-        R->>M: ModelRequest.reasoning_effort = high
+        R->>M: the model entry's wire, with high
         M-->>R: answer + usage (effort = high)
         R-->>C: answer, metadata[URI] = {"effort": "high"}
     end
@@ -155,69 +165,55 @@ sequenceDiagram
 
 ## Consequences
 
-- A deployment that sets nothing is byte-identical to today: no member, no reasoning, no new env.
-- **Breaks (a struct literal must add the field):** `ModelRequest` (`adam-model`), `ModelConfig`
-  (`adam-service`), and `AgentFrontmatter` (`adam-agent-fs`, public and not `#[non_exhaustive]`).
-  `adam-engine::Limits` and `UsageEvent` are `#[non_exhaustive]`, so they are additive. The
-  implementation PR updates the crate READMEs and the `adam-upgrade` skill.
+- A deployment that sets nothing is byte-identical to today: no member, no reasoning, no new env, no new
+  chart value. The model file is the only new input, and it is the deployment's.
+- **Breaks (a struct literal must add the field):** `ModelRequest` (`adam-model`) and `AgentFrontmatter`
+  (`adam-agent-fs`, public and not `#[non_exhaustive]`). The alias-file types are new. `UsageEvent` and
+  `adam-engine::Limits` are `#[non_exhaustive]`, so additive; the engine's builder gains a method.
+  The implementation PR updates the crate READMEs and the `adam-upgrade` skill.
 - **Files that say the opposite today** and change with the implementation: `docs/reference/agent-files.md`
   (the known-key list and the "`ModelRequest` has no such fields, so the keys are ignored" paragraph),
   `docs/reference/a2a-server.md` (one section per extension, and the `usage/v1` members),
-  `docs/reference/environment.md`, `docs/reference/errors.md` (the exit-78 variable list),
+  `docs/reference/environment.md`, `docs/reference/errors.md` (the exit-78 list),
   `docs/architecture.md` (the new context key), `crates/adam-a2a/src/extensions.rs`'s "Twelve extensions"
   and table, `crates/adam-a2a/README.md`, `crates/adam-a2a-runtime/README.md`,
   `crates/adam-model-openai/README.md` (the "it wins over what the client wrote" sentence gains the
-  exception), `deploy/coder/README.md` and `values.yaml` (the new value), `bin/adam-agent/README.md` and
-  `bin/adam-coder/README.md` (the env var and the card's extension list),
-  `bin/adam-coder/tests/fixtures/agent/card.json`, the two binaries' card tests' exact URI lists,
-  `.agents/skills/adam-a2a-extensions`, `.agents/skills/adam-agent-folder`, and `bench/README.md`
-  (the `off` arm still sends `{"reasoning_effort":"none"}`, which this ADR refuses for the typed levels).
-- `docs/api/usage-v1.md` lives in `vymalo/another-agentic-system`; the system half's ADR and PR amend it
-  (the effort member is additive).
-- The card gains one extension; the chart renders `MODEL_REASONING_EFFORT` only when set, so the four
-  goldens are unchanged by default.
-- The bench is the instrument that verified the values; its `sent.effort`/`askedEffort` already exist on
-  `bench/variants-reasoning`, and the full run can read the typed effort a call named.
-- The enum is this gateway's vocabulary (`low`/`medium`/`high`/`max`); another OpenAI-compatible gateway
-  that spells them differently uses `MODEL_EXTRA_BODY` or its own client, as `adam-model-openai`'s
-  provider notes already say.
-- The length-stop fix is complementary: a high effort can spend the whole output budget reasoning; the
-  loop must not treat that as a question.
+  exception), `crates/adam-llm-agent/README.md` (the protected-keys list gains `vymalo.reasoningEffort`),
+  `deploy/coder/README.md` and `values.yaml` (the model file), `bin/adam-agent/README.md` and
+  `bin/adam-coder/README.md`, `bin/adam-coder/tests/fixtures/agent/card.json`, the two binaries' card
+  tests' exact URI lists, `.agents/skills/adam-a2a-extensions`, `.agents/skills/adam-agent-folder`, and
+  `bench/README.md` (its `off` arm sends `{"reasoning_effort":"none"}`, which is not adam's vocabulary).
+- `docs/api/usage-v1.md` lives in `vymalo/another-agentic-system`; the system half's ADR and PR amend it.
+- The card gains one extension only for a model that takes a level; the chart renders nothing new by
+  default, so the four goldens are unchanged.
+- The parity gaps (orchestrator/web, platform, another-app) are issues, linked from the matrix; the
+  engine's builder and the two binaries are this repository's.
+- The probe is the evidence for the model entries; the entries themselves are the deployment's, and the
+  ADR's examples are not a shipped configuration.
 
 ## Amends ADR 0054
 
-*Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the deployment's declaration is
-`MODEL_REASONING_EFFORT` (a comma-separated set; a single value is a one-element set), and **unset
-declares the full closed list**; until `MODEL_ALIASES_FILE` carries the facts per alias (0054 slice 11),
-the declaration is the deployment's one model, and a subagent on another alias has no declaration and
-accepts the full list. The folder's `reasoning_effort` is a **default within the declared set, not a
-bound**; a session (decision 4's table row, slice 12) or a request outside the declared set is refused,
-and **a session's value wins over the inherited thread value** for that child's calls (absent, the
-thread's value applies). A deployment that narrows the set refuses a folder outside it at load (exit
-78). `temperature` is unchanged (an alias that declares none refuses it). The `MODEL_EXTRA_BODY` rule is
-0054's owner item 8, not decision 8.
+*Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the declaration is the **model entry** in
+`MODEL_ALIASES_FILE` (the alias's `reasoning` object: its levels and its wire), not a global variable; a
+session or folder value must be one of that model's levels, and there is **no default** (unset sends
+nothing). The `MODEL_EXTRA_BODY` rule is 0054's owner item 8, extended: a typed level removes the known
+reasoning members from the extra body and writes the model's mapping. `temperature` is unchanged.
 
 ## Alternatives considered
 
-- **The deployment as a default only** (a caller may raise it): a caller could force `max` and burn
-  >32k tokens per task on a deployment that set `low` — a denial-of-wallet, given the bench's own
-  evidence. The declared set is the bound instead.
-- **The folder as a bound on its children**: 0054's "never widens" is about the options a folder allows; the
-  effort is a default, and the owner's order puts the request above the folder. The dated note above records
-  the reading. The deployment's set bounds everyone.
-- Accept `none`/`minimal`: unverified against the gateway; fail closed instead.
-- Reserve `reasoning_effort` in `MODEL_EXTRA_BODY`: breaks every deployment and the chart's own
-  documented example (`{reasoning_effort: medium}`); the typed-wins exception keeps them working.
-- Promote `effort`: silently changes an ignored key's meaning.
-- A hardcoded default: the owner said nothing changes until it is configured.
-- A separate extension per level: the effort is one scalar; one URI with `efforts`/`default` is enough.
+- **A global `MODEL_REASONING_EFFORT`** (an earlier draft): the owner rejected it — the models behind the
+  gateway differ, and one wire mapping cannot serve them.
+- **A default value**: the owner rejected it; unset must stay "nothing sent".
+- **A free-form wire template** (a JSON fragment with placeholders): too easy to send a malformed body;
+  the three closed mappings cover the observed shapes, and a fourth is a new ADR.
+- **`none`/`minimal` in the vocabulary**: they are not what adam asks for; "off" is absence. A model that
+  takes only them is declared as taking none.
+- **A separate extension per model**: the card already describes one agent's model; one URI with
+  `efforts` is enough.
 
 ## Open questions
 
-- The owner's default (recommendation: `low` for the coder, the only level the bench verified to answer
-  quickly; `medium` once the length-stop fix and a larger budget are proven; off in code).
-- The system and web half (read `reasoning/v1` from the live card, per message and per thread, the
-  picker) and the platform field (`AgentConfig.model.reasoningEffort`, a deployment ceiling, `aapctl`)
-  are separate ADRs in their repositories; they follow this contract.
-- Whether `medium`/`high`/`max` need a larger output budget to answer at all is a bench question, not
-  a setting this ADR adds.
+- The `reasoning` entries for the deployment's models (the probe informs them; the owner sets them).
+- The orchestrator/web and platform ADRs (assigned), and the `docs/reference/parity.md` rows.
+- Whether a model's `thinking_budget` budgets are per level a fixed table or a formula; the entry carries
+  the table, and a formula is a later ADR if a model needs one.
