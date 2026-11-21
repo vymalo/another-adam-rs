@@ -549,6 +549,10 @@ No environment variables at runtime.
 
 ## Tests
 
+`tests/model_run.rs`: a message whose metadata or data part says `root_run`, `model_run` or `session` does not change the
+run its task's model calls name ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)),
+with the default inbound and with `vymalo_inbound`: the call names the task, and the state holds none of the three.
+
 `tests/backend.rs` drives the backend with a real A2A client over HTTP and a
 scripted agent (its `listing` module: the caller's tasks newest first and each state told from the others, including
 `failed` from `canceled` and `submitted` from `working`; pages that walk the whole list once at every page size, also under

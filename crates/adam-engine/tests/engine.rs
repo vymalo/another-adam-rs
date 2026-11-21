@@ -1972,3 +1972,60 @@ async fn the_hosts_session_limits_refuse_a_session_too_many() {
     assert_eq!(listed[0].conversation, first.conversation);
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 }
+
+// ------------------------------------------------------------------ S0: the lean first request
+
+/// The first request's bytes: the system prompt plus each tool schema as the OpenAI wire wraps it.
+fn first_request_bytes(req: &ModelRequest) -> (usize, usize) {
+    let system = req.system.as_deref().map_or(0, str::len);
+    let tools = req
+        .tools
+        .iter()
+        .map(|t| {
+            serde_json::to_vec(&json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+            }))
+            .expect("a tool schema serialises")
+            .len()
+        })
+        .sum();
+    (system, tools)
+}
+
+/// S0 of the lean-first-request plan (`plans/2026-11-21-lean-first-request.md`): an embedded
+/// engine's first request is held to the owner's **5,000-token** budget for a lazy agent
+/// (ADR 0066), with the same assembly as a plain folder agent. The message is not counted: it is
+/// the same "Hi" in every measurement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_engines_first_request_stays_under_the_lean_budget() {
+    const BUDGET_TOKENS: usize = 5000;
+
+    let rig = Rig::new(None).await;
+    rig.mock
+        .push_text("Hello. What would you like me to work on?");
+    let turn = rig.engine.send(None, Say::new("Hi")).await.unwrap();
+    rig.wait(turn.run, RunState::Done).await;
+
+    let first = &rig.mock.requests()[0];
+    let (system, tools) = first_request_bytes(first);
+    let total = system + tools;
+    let tokens = total / 4;
+    println!(
+        "engine first request: system {system} B + tools {tools} B = {total} B \
+         (~{tokens} tokens at chars/4); lean budget {BUDGET_TOKENS} tokens \
+         (~{} B), margin {} tokens",
+        BUDGET_TOKENS * 4,
+        BUDGET_TOKENS.saturating_sub(tokens)
+    );
+    assert!(
+        tokens <= BUDGET_TOKENS,
+        "the engine's first request is ~{tokens} tokens (chars/4), over the {BUDGET_TOKENS}-token \
+         budget for a lazy agent (ADR 0066)"
+    );
+    rig.stop().await;
+}

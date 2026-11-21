@@ -44,6 +44,10 @@ pub struct ModelRequest {
     /// wire is the client's choice. Never the id itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    /// The id of the root run this call belongs to, from in-process state (never a message's
+    /// context), which an injector in front of the model reads to find the run's credential (ADR 0067).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
     /// The bytes of the images that `messages` name ([`ImageRef::sha256`]), for a client that can
     /// send them. The agent loop fills it inside the step that calls the model and never journals
     /// it: it is not serialized, so neither a journal nor a stored history ever holds a byte of an

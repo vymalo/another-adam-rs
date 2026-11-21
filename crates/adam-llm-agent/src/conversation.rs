@@ -43,6 +43,20 @@ pub(crate) fn parse_root_run(payload: &Value) -> Option<RunId> {
     serde_json::from_value(payload.get(ROOT_RUN_KEY)?.clone()).ok()
 }
 
+/// The key of the payload of a child's first message that names the run its model calls name
+/// ([`Conversation::model_run`], [ADR 0067]): the run its parent's calls name, so the whole tree
+/// under a task, or under a session's round, names one run. Only code in the process writes it
+/// ([`ToolCtx::start_child`](crate::ToolCtx::start_child) and the session tools), like
+/// [`ROOT_RUN_KEY`].
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+pub(crate) const MODEL_RUN_KEY: &str = "model_run";
+
+/// The run named by [`MODEL_RUN_KEY`] in an inbound payload, if it is there and is a run id.
+pub(crate) fn parse_model_run(payload: &Value) -> Option<RunId> {
+    serde_json::from_value(payload.get(MODEL_RUN_KEY)?.clone()).ok()
+}
+
 /// The key of the payload of a child's first message that names the step of the **root** run the
 /// child's work is under: the root's call of a subagent tool (`tool:<call id>`), handed down to a
 /// child's own children. Written by [`ToolCtx::start_child`](crate::ToolCtx::start_child) only, like
@@ -565,6 +579,16 @@ pub struct Conversation {
     /// Absent from state written before it existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_run: Option<RunId>,
+    /// The run this run's model calls name ([`ModelRequest::run`](adam_model::ModelRequest::run),
+    /// [ADR 0067]), when the run that started it said one: the run its parent's calls name, put in
+    /// its first message by in-process code only. `None` for a run nobody started that way; its
+    /// calls then name its session's root, else [`root_run`](Self::root_run), else itself. Absent
+    /// from state written before it existed, and not written while it is `None`; a run that
+    /// continues another does not inherit it.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_run: Option<RunId>,
     /// The step of the [`root_run`](Self::root_run) this child run works under: the root's call of a
     /// subagent tool (`tool:<call id>`), put in the child's first message by the tool that started it
     /// and handed down to the child's own children. The report of each of this run's model calls
