@@ -353,10 +353,7 @@ fn merge_head_artifacts(base: &[HeadArtifact], added: &[Artifact]) -> Vec<HeadAr
 
 /// Drop the file artifacts of `artifacts` whose digests the store does not hold; each one is
 /// logged by [`missing_blobs`](crate::blob::missing_blobs).
-async fn drop_missing_files(
-    store: DynStore,
-    artifacts: &mut Vec<HeadArtifact>,
-) -> StoreResult<()> {
+async fn drop_missing_files(store: DynStore, artifacts: &mut Vec<HeadArtifact>) -> StoreResult<()> {
     let mut refs = Vec::with_capacity(artifacts.len());
     for artifact in artifacts.iter() {
         if let Some(file) = artifact.file.as_ref() {
