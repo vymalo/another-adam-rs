@@ -15,9 +15,9 @@ use adam_engine::adam_core::{DynStore, MemoryStore, RunId, Store};
 use adam_engine::adam_error::{Classify, ErrorClass};
 use adam_engine::adam_llm_agent::{FnTool, ToolError, ToolOutput, ToolSet};
 use adam_engine::adam_model::{
-    ContentPart, DynModel, Message as ModelMessage, MockModel, ModelClient, ModelDelta, ModelError,
-    ModelProfile, ModelProfiles, ModelRequest, ModelResponse, ReasoningEffort, ReasoningWire,
-    ToolCall,
+    ContentPart, DynModel, InputModalities, Message as ModelMessage, MockModel, ModelClient,
+    ModelDelta, ModelError, ModelProfile, ModelProfiles, ModelRequest, ModelResponse,
+    ReasoningEffort, ReasoningWire, ToolCall,
 };
 use adam_engine::adam_runtime::{Artifact, REPLAY_EVENTS_PER_RUN, RunEvent, StepState};
 use adam_engine::{
@@ -100,6 +100,18 @@ impl ModelClient for GateModel {
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
         self.hold().await;
         self.inner.stream(req).await
+    }
+
+    fn provider(&self) -> Option<&str> {
+        self.inner.provider()
+    }
+
+    fn context_window(&self, model: &str) -> Option<u64> {
+        self.inner.context_window(model)
+    }
+
+    fn input_modalities(&self, model: &str) -> InputModalities {
+        self.inner.input_modalities(model)
     }
 }
 

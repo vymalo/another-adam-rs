@@ -17,9 +17,9 @@ parity](#how-to-keep-parity).
 | **system** | the orchestrator and the web of vymalo/another-agentic-system | what it reads from the live card, its per-message API (AG-UI `forwardedProps`) and REST API, the web |
 | **platform** | vymalo/another-agentic-platform | the `AgentConfig`, `AgentService`, `ModelEndpoint` and `ToolProvider` CRDs, the dashboard's forms, the Platform API, `aapctl` |
 
-Citations are `repo:path:line`: `adam:` is this repository at `99f64b2`, `sys:` another-agentic-system at `ebcee350`, `plat:`
-another-agentic-platform at `dd8bba3`, all read on 2026-11-21. The engine's profile and level cells were added in
-[#317](https://github.com/vymalo/another-adam-rs/pull/317), after the `99f64b2` pin; the pin is not moved.
+Citations are `repo:path:line`: `adam:` is this repository at `99f64b2` (except the engine cells added in
+[#317](https://github.com/vymalo/another-adam-rs/pull/317); the pin is not moved), `sys:` another-agentic-system at `ebcee350`, `plat:`
+another-agentic-platform at `dd8bba3`, all read on 2026-11-21.
 
 ## Legend
 
