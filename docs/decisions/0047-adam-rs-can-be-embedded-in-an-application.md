@@ -264,6 +264,12 @@ same process with the same id on the same store (`EngineError::WorkerIdInUse`, a
 cannot see, and the SQLite lock that would cover them for a file comes with slice 3. `Limits` lost `Copy`. The proofs:
 `a_restarted_engine_claims_its_old_runs_at_once`, `two_default_engines_on_one_store_do_not_take_each_others_leases` and
 `a_second_live_engine_with_the_same_id_is_refused` in `crates/adam-engine/tests/engine.rs`.
+*Amended 2026-11-21:* **slice 4 is done** (PR 4, #286). `tests/resume_process.rs` runs on the SQLite store of ADR
+0053 slice 3 (#245), a dev-dependency, and is no longer ignored: a child killed with `SIGKILL` has its run finished by
+the next process without its committed step running again, with the default random id and with a fixed one. On SQLite
+a fixed id is not needed for that: the file's lock proves the old process is gone, and `start` (the store's
+`migrate`) clears every lease the file holds; so an application runs one engine per SQLite file, since the clearing
+also takes a live engine's leases of the same process.
 
 ## Decisions the owner confirmed
 

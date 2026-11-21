@@ -15,7 +15,7 @@ The calls, their refusals and their defaults: the [crate README](../../crates/ad
 
 | The host gives | As | Today |
 |---|---|---|
-| the store | `DynStore` | `adam_core::MemoryStore` (a restart forgets every run); the SQLite store of slice 3 when it lands |
+| the store | `DynStore` | `adam_store_sqlite::SqliteStore::open(path)`, a file of the application's own that outlives the process (a killed process's runs are finished by the next one); `adam_core::MemoryStore` (a restart forgets every run) |
 | the agent | `AgentDef` | a folder read at startup (`AgentFolder::load`), or one compiled in (`include_agent!`) |
 | the model | `DynModel`, with its credentials | any `ModelClient`: the engine links no model client and reads no key |
 | secrets the agent's files name | `SecretSource` (`EngineBuilder::secrets`) | none: `default_secrets()` refuses every name |
@@ -24,9 +24,9 @@ The calls, their refusals and their defaults: the [crate README](../../crates/ad
 The engine reads no environment variable and no file it was not given.
 
 **A restart that claims its runs at once is opt-in.** By default (`Limits::worker_id: None`) every start has a random
-worker id and releases nothing, so a restarted application waits up to `lease_ttl` for the runs it was stepping. Set
-`Some(id)` only for a store no other engine shares (the application's own SQLite file once slice 3 lands, or a store
-per install): the host promises that no other live engine uses that id on the store, and `start` releases the
+worker id and releases nothing, so a restarted application waits up to `lease_ttl` for the runs it was stepping, on
+a store that keeps the leases (the SQLite store does not: its lock allows one process per file, and `start` clears
+every lease the file holds; so run one engine per SQLite file, or a second one would take the first one's runs). Set `Some(id)` only for a store no other engine shares (a store per install): the host promises that no other live engine uses that id on the store, and `start` releases the
 leases the id holds. In one process `start` refuses a second live engine with the same id on the same store
 (`WorkerIdInUse`); it cannot see other processes, and a broken promise steps a run twice. Restarting in the same process,
 call `shutdown` first.
@@ -103,9 +103,6 @@ sequenceDiagram
 
 ## Not there yet
 
-* **A durable store**: the SQLite store is slice 3 ([ADR
-  0053](../decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)). Until it lands, a killed
-  application loses its runs; its proof, `tests/resume_process.rs`, is written and ignored.
 * **Approvals** (slice 5): a run waits only on a question today.
 * **The person's directory** (slice 7): the file and command tools are a library now (slice 6), but the engine does not
   give them to its agent yet, which has the screen's tools only (`ask_user`, `show`, `ui_catalog`, `plan_*`).
