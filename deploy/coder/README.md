@@ -160,8 +160,9 @@ Each model call's `usage/v1` report can say the model's window, so a screen show
 model profile's cap, else 128,000, clamped to the window less 20,000 tokens and the history the agent keeps (ADR 0064).
 On the dev stack (`MODEL_CONTEXT_WINDOW=131072`, the coder's `max_history_tokens: 100000`) that is
 `131072 − 20000 − 100000 = 11072`, not 128,000. A deployment that wants the full 128,000 for a long-context model
-declares the model's real window with `config.modelContextWindow` (and gives the model a profile with
-`maxOutputTokensLimit` when the provider documents a lower maximum).
+declares a window of at least **248,000** (128,000 + 20,000 + 100,000); below that the cap is `window − 120,000`
+(a 200,000 window leaves 80,000). It also gives the model a profile with `maxOutputTokensLimit` when the provider
+documents a lower maximum.
 
 ## Model profiles
 

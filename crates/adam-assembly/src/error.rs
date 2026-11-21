@@ -446,7 +446,7 @@ pub enum Error {
         origin: Origin,
         /// Where it was set.
         set_by: CapSource,
-        /// The cap as resolved.
+        /// The value the preset asked for.
         cap: u32,
         /// The model's documented maximum for one request.
         limit: u32,

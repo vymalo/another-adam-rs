@@ -284,7 +284,7 @@ async fn the_fixture_agent_runs_end_to_end_on_a_mock_model() {
     let offered: Vec<&str> = reviewer.tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(offered, ["read_diff", "list_files"]);
     assert_eq!(reviewer.model, "coder-large");
-    assert_eq!(reviewer.max_output_tokens, Some(4096));
+    assert_eq!(reviewer.max_output_tokens, Some(128_000));
 
     worker.stop().await;
 }

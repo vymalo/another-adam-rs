@@ -6,11 +6,12 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use adam_assembly::{AgentDef, Assembly, CapSource, Error};
 use adam_llm_agent::ToolSet;
-use adam_model::{MockModel, ModelProfiles};
+use adam_model::{MockModel, ModelProfile, ModelProfiles, Preset};
 use common::{def, instructions, runtime, spawn_worker, wait_done};
 
 const INSTRUCTIONS: &str = "agent/instructions.md";
@@ -178,6 +179,95 @@ fn a_window_with_no_room_asks_for_one_token() {
     )
     .unwrap();
     assert_eq!(assembly.info()[0].limits.max_output_tokens, 1);
+}
+
+#[test]
+fn a_known_window_clamps_the_folders_own_value_too() {
+    // The decisive case: the folder's 60,000 is clamped by the window, not passed through.
+    let assembly = assembly_with(
+        MockModel::new().with_context_window("large", 131_072),
+        "name: coder\nmodel: large\nlimits:\n  max_output_tokens: 60000",
+        "large",
+        with_profile(),
+    )
+    .unwrap();
+    assert_eq!(assembly.info()[0].limits.max_output_tokens, 11_072);
+}
+
+#[test]
+fn the_folder_wins_over_the_preset_too() {
+    assert_eq!(
+        cap_of(
+            "name: coder\nmodel: large\nmodel_preset: quick\nlimits:\n  max_output_tokens: 7000",
+            "large",
+            with_profile()
+        ),
+        7_000
+    );
+}
+
+#[test]
+fn a_preset_with_no_profile_still_caps_the_calls() {
+    let profiles = profiles(r#"{"presets": {"quick": {"maxOutputTokens": 50000}}}"#);
+    assert_eq!(
+        cap_of(
+            "name: coder\nmodel: any\nmodel_preset: quick",
+            "any",
+            profiles
+        ),
+        50_000
+    );
+}
+
+#[test]
+fn a_hand_built_profile_with_a_limit_of_zero_asks_for_one_token() {
+    let profiles = ModelProfiles {
+        profiles: BTreeMap::from([(
+            "large".to_owned(),
+            ModelProfile {
+                max_output_tokens_limit: Some(0),
+                ..ModelProfile::default()
+            },
+        )]),
+        presets: BTreeMap::new(),
+    };
+    assert_eq!(cap_of("name: coder\nmodel: large", "large", profiles), 1);
+}
+
+#[test]
+fn a_hand_built_base_preset_above_the_limit_names_the_profiles_file() {
+    let profiles = ModelProfiles {
+        profiles: BTreeMap::from([(
+            "large".to_owned(),
+            ModelProfile {
+                max_output_tokens_limit: Some(131_072),
+                preset: Some("base".to_owned()),
+                ..ModelProfile::default()
+            },
+        )]),
+        presets: BTreeMap::from([(
+            "base".to_owned(),
+            Preset {
+                reasoning_effort: None,
+                max_output_tokens: Some(200_000),
+            },
+        )]),
+    };
+    let error = assembly("name: coder\nmodel: large", "large", profiles).unwrap_err();
+    let Error::OutputCap {
+        origin,
+        set_by,
+        cap,
+        limit,
+        ..
+    } = &error
+    else {
+        panic!("{error}");
+    };
+    assert_eq!(origin.file.to_string_lossy(), "MODEL_ALIASES_FILE");
+    assert_eq!(*set_by, CapSource::Preset("base".into()));
+    assert_eq!(*cap, 200_000);
+    assert_eq!(*limit, 131_072);
 }
 
 #[test]

@@ -149,7 +149,7 @@ file names another alias. Two planned changes make it change at run time, which 
    agent's value, its preset's, then 128,000. **The cap never exceeds what the model and the window allow**: it is the
    smallest of the chosen value, the profile's `maxOutputTokensLimit` when known, and, when the context window is known,
    what the window leaves after the 20,000-token margin and the history the agent keeps (`max_history_tokens`, or half
-   the window when the agent sets none). A cap lowered by the clamp is logged once per agent and model. A model with no
+   the window when it is `0`; an omitted key keeps the 100,000 default). A cap lowered by the clamp is logged once per agent and model. A model with no
    `maxOutputTokensLimit` gets the chosen value as it is: a deployment that serves a model below 128,000 (Gemini 4 at
    65,536, the 4.5 generation of Claude at 64K) gives it a profile, and the startup check warns when `MODEL`'s alias has
    none.
@@ -177,7 +177,7 @@ file names another alias. Two planned changes make it change at run time, which 
        reasoningEfforts: [low, medium, high, max]
        reasoningWire: reasoning_effort
        maxOutputTokensLimit: 131072
-       contextWindow: 1000000
+       contextWindow: 1000000                 # not read yet (ADR 0054 slice 11)
      small-chat:
        reasoningEfforts: []
        maxOutputTokensLimit: 65536
@@ -297,3 +297,14 @@ file.
 it becoming optional; it does not. The assembly resolves and clamps the cap once per agent, before the loop, and hands
 the loop the final value, so the loop keeps one field and no `Option`. A folder's `0` is refused by the loader; `0`
 stays legal on the Rust `Limits` for an embedder that builds an agent by hand, where it means "the model's own".
+
+*Amended 2026-11-21:* **decision 4's "applied at each model call" is superseded for slices 2 to 4 by a per-agent
+resolution at bind.** The model is fixed at bind in these slices, so `BoundDef::model` resolves and clamps each
+agent's cap once (slice 2), and the loop receives the final `Limits::max_output_tokens`; the compaction budget is
+derived from that resolved cap. Slice 5 (a model chosen at run time) is where the resolution returns to each call.
+
+*Amended 2026-11-21:* **a preset above the model's limit is refused, not clamped.** This supersedes the sentence in
+"Settled by the owner (2026-11-21)" item 2 that a preset's `maxOutputTokens` is "still **clamped**": a preset the agent
+names that asks above the model's `maxOutputTokensLimit` is refused at bind (exit 78), while the folder's own value is
+clamped. It follows the coordinator's 18:42Z ruling accepting decision 4; the board post asks the owner for a veto,
+and if he takes it we amend again.

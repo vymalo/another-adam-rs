@@ -436,7 +436,7 @@ impl BoundDef {
     /// [`DEFAULT_MAX_OUTPUT_TOKENS`]. The value is then clamped to the model's
     /// `maxOutputTokensLimit` and, when the window is known, to what the window leaves after
     /// [`WINDOW_MARGIN_TOKENS`] and the history the agent keeps (`max_history_tokens`, or half the
-    /// window when it sets none).
+    /// window when it is `0`; an omitted key keeps the 100,000 default).
     ///
     /// A preset above the model's limit is refused, not clamped: a preset is the deployment's
     /// promise about the model, where the folder's value is the agent's own choice. The folder's
@@ -454,16 +454,23 @@ impl BoundDef {
         let base_preset = self.profiles.preset_of(alias);
         let limit = profile.and_then(|p| p.max_output_tokens_limit);
         if let Some(limit) = limit {
-            let presets = [
-                (node.model_preset.as_deref(), agent_preset),
-                (profile.and_then(|p| p.preset.as_deref()), base_preset),
-            ];
-            for (name, preset) in presets {
+            for (name, preset, from_profile) in [
+                (node.model_preset.as_deref(), agent_preset, false),
+                (profile.and_then(|p| p.preset.as_deref()), base_preset, true),
+            ] {
                 if let (Some(name), Some(cap)) = (name, preset.and_then(|p| p.max_output_tokens))
                     && cap > limit
                 {
+                    // The loader refuses a profile's named preset above its limit for a parsed
+                    // file; a hand-built `ModelProfiles` can reach it here, and the value is in
+                    // the profiles file, not in the agent's file.
+                    let origin = if from_profile {
+                        Origin::new(alias.to_owned(), "MODEL_ALIASES_FILE")
+                    } else {
+                        origin.clone()
+                    };
                     return Err(Error::OutputCap {
-                        origin: origin.clone(),
+                        origin,
                         set_by: CapSource::Preset(name.to_owned()),
                         cap,
                         limit,
@@ -472,11 +479,20 @@ impl BoundDef {
                 }
             }
         }
+        // A hand-built `ModelProfiles` may hold a `0` the loader refuses; a cap of 0 is no cap, so
+        // every source is filtered and the result is at least 1.
         let chosen = node
             .max_output_tokens
-            .or(agent_preset.and_then(|p| p.max_output_tokens))
-            .or(profile.and_then(|p| p.max_output_tokens))
-            .or(base_preset.and_then(|p| p.max_output_tokens))
+            .filter(|cap| *cap > 0)
+            .or(agent_preset
+                .and_then(|p| p.max_output_tokens)
+                .filter(|cap| *cap > 0))
+            .or(profile
+                .and_then(|p| p.max_output_tokens)
+                .filter(|cap| *cap > 0))
+            .or(base_preset
+                .and_then(|p| p.max_output_tokens)
+                .filter(|cap| *cap > 0))
             .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
         let mut cap = chosen;
         if let Some(limit) = limit {
@@ -496,6 +512,7 @@ impl BoundDef {
                 .max(1);
             cap = cap.min(u32::try_from(room).unwrap_or(u32::MAX));
         }
+        let cap = cap.max(1);
         if cap < chosen {
             tracing::warn!(
                 agent = %origin.agent,

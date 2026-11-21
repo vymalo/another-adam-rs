@@ -9,8 +9,8 @@ use adam_core::time::Timestamp;
 use adam_core::{RunId, RunStatus};
 use adam_error::report;
 use adam_model::{
-    Classify, DEFAULT_MAX_OUTPUT_TOKENS, DynModel, FinishReason, Message, ModelError, ModelRequest,
-    ModelResponse, ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
+    Classify, DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse,
+    ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, CancelToken,
@@ -656,7 +656,7 @@ pub struct Limits {
     /// Passed to the model as `max_output_tokens`; `0` leaves it to the model. The assembly
     /// resolves it per model from the agent's folder, its `model_preset`, the model's profile and
     /// the 128,000 fallback, then clamps it to the model's limit and window (ADR 0064); a host that
-    /// builds an agent by hand gets [`DEFAULT_MAX_OUTPUT_TOKENS`](adam_model::DEFAULT_MAX_OUTPUT_TOKENS).
+    /// builds an agent by hand gets this default, 4,096, and no resolution or clamp.
     pub max_output_tokens: u32,
     /// Budget for the history sent to the model, estimated as characters / 4.
     /// Over it, old tool outputs are truncated **in the stored history**, with an explicit marker,
@@ -672,7 +672,7 @@ impl Default for Limits {
         Self {
             max_turns: 50,
             max_tool_calls: 200,
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            max_output_tokens: 4096,
             max_history_tokens: 100_000,
         }
     }

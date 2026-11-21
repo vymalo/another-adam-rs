@@ -837,25 +837,23 @@ impl ModelConfig {
         let model_aliases_file = parse_file(&get, "MODEL_ALIASES_FILE", problems);
         let profiles = parse_profiles(model_aliases_file.as_deref(), problems);
         let context_window = parse_context_window(&get("MODEL_CONTEXT_WINDOW"), problems);
-        if !alias.is_empty() && profiles.profile(&alias).is_none() {
-            if model_aliases_file.is_some() {
-                tracing::warn!(
-                    model = %alias,
-                    fallback = DEFAULT_MAX_OUTPUT_TOKENS,
-                    window = context_window,
-                    "MODEL_ALIASES_FILE is set but declares no profile for this alias: its output \
-                     cap is the 128,000 fallback, clamped to the context window when one is known \
-                     (ADR 0064)"
-                );
-            } else {
-                tracing::info!(
-                    model = %alias,
-                    fallback = DEFAULT_MAX_OUTPUT_TOKENS,
-                    window = context_window,
-                    "no MODEL_ALIASES_FILE: every model's output cap is the 128,000 fallback, \
-                     clamped to the context window when one is known (ADR 0064)"
-                );
-            }
+        if warns_no_output_limit(model_aliases_file.as_deref(), &profiles, &alias) {
+            tracing::warn!(
+                model = %alias,
+                fallback = DEFAULT_MAX_OUTPUT_TOKENS,
+                window = context_window,
+                "MODEL_ALIASES_FILE gives no maxOutputTokensLimit for this alias: its output cap \
+                 is the 128,000 fallback, clamped to the context window when one is known \
+                 (ADR 0064)"
+            );
+        } else if model_aliases_file.is_none() && !alias.is_empty() {
+            tracing::info!(
+                model = %alias,
+                fallback = DEFAULT_MAX_OUTPUT_TOKENS,
+                window = context_window,
+                "no MODEL_ALIASES_FILE: every model's output cap is the 128,000 fallback, \
+                 clamped to the context window when one is known (ADR 0064)"
+            );
         }
         Self {
             base_url,
@@ -1149,6 +1147,22 @@ fn parse_profiles(path: Option<&std::path::Path>, problems: &mut Vec<String>) ->
             ModelProfiles::default()
         }
     }
+}
+
+/// Whether the startup log warns that the alias has no `maxOutputTokensLimit` (ADR 0064): a
+/// profiles file is set and the profile gives none (or does not exist). With no file the 128,000
+/// fallback is logged at `info`, not as a warning.
+fn warns_no_output_limit(
+    model_aliases_file: Option<&std::path::Path>,
+    profiles: &ModelProfiles,
+    alias: &str,
+) -> bool {
+    model_aliases_file.is_some()
+        && !alias.is_empty()
+        && profiles
+            .profile(alias)
+            .and_then(|p| p.max_output_tokens_limit)
+            .is_none()
 }
 
 /// `MODEL_EXTRA_BODY`: a JSON object, or a problem. The message names what is wrong and never
@@ -2100,6 +2114,57 @@ mod tests {
         vars.insert("MODEL_ECHO_REASONING", "yes please");
         let (_, problems) = model_problems(&vars);
         assert!(mentions(&problems, "MODEL_ECHO_REASONING"), "{problems:?}");
+    }
+
+    #[test]
+    fn the_no_output_limit_warning_needs_a_file_and_a_missing_limit() {
+        use std::collections::BTreeMap;
+
+        use adam_model::ModelProfile;
+
+        let alias = "large";
+        let file = std::path::Path::new("/etc/adam/model-profiles.json");
+        let empty = ModelProfiles::default();
+        let no_limit = ModelProfiles {
+            profiles: BTreeMap::from([(
+                alias.to_owned(),
+                ModelProfile {
+                    max_output_tokens: Some(64_000),
+                    ..ModelProfile::default()
+                },
+            )]),
+            presets: BTreeMap::new(),
+        };
+        let limited = ModelProfiles {
+            profiles: BTreeMap::from([(
+                alias.to_owned(),
+                ModelProfile {
+                    max_output_tokens_limit: Some(131_072),
+                    ..ModelProfile::default()
+                },
+            )]),
+            presets: BTreeMap::new(),
+        };
+        assert!(
+            warns_no_output_limit(Some(file), &empty, alias),
+            "a file with no profile for the alias"
+        );
+        assert!(
+            warns_no_output_limit(Some(file), &no_limit, alias),
+            "a profile with no limit"
+        );
+        assert!(
+            !warns_no_output_limit(Some(file), &limited, alias),
+            "a declared limit"
+        );
+        assert!(
+            !warns_no_output_limit(None, &empty, alias),
+            "no file is an info, not a warning"
+        );
+        assert!(
+            !warns_no_output_limit(Some(file), &empty, ""),
+            "an unset MODEL is not warned about"
+        );
     }
 
     #[test]

@@ -132,7 +132,7 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   profile's base preset, else 128,000 (ADR 0064). The result is clamped to the model's
   `maxOutputTokensLimit` and, when the context window is known, to what the window leaves after
   20,000 tokens and the history the agent keeps (`max_history_tokens`, or half the window when it
-  sets none). A **preset** above the model's limit is refused at startup, and a profile's own
+  is `0`; an omitted key keeps the 100,000 default). A **preset** above the model's limit is refused at startup, and a profile's own
   `maxOutputTokens` above its limit is refused when the profiles file is read; the folder's own
   value is clamped. `0` is refused: leave the key out to take the profile and the fallback.
 * **The tools a root agent has without writing any** are the person's screen and a plan: `ask_user`, `show`,

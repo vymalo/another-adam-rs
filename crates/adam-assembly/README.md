@@ -181,7 +181,7 @@ value is `AgentInfo::reasoning_effort` and goes to `LlmAgentBuilder::reasoning_e
 preset, then `adam_model::DEFAULT_MAX_OUTPUT_TOKENS` (128,000). It is then the smallest of that, the model's
 `maxOutputTokensLimit` and, when the client knows the alias's context window, what the window leaves after
 `adam_llm_agent::WINDOW_MARGIN_TOKENS` (20,000) and the history the agent keeps (`max_history_tokens`, or half the
-window when it sets none; at least 1). A lowered cap is logged once per agent and model. A **preset** above the
+window when it is `0`; an omitted key keeps the 100,000 default; at least 1). A lowered cap is logged once per agent and model. A **preset** above the
 model's limit is `Error::OutputCap` (a preset is the deployment's promise); the folder's value is clamped, and a
 profile's own cap above its limit is refused when the profiles file is read. The resolved cap is
 `AgentInfo::limits.max_output_tokens` and the loop's `Limits`, so the request, the
