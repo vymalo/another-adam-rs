@@ -275,7 +275,9 @@ test('the context window is required, because both agents are given the same val
 
 test('the limits of a run are one set of values in the configuration: minutes, steps and the cancel grace', () => {
   const d = normalizeConfig(rawConfig());
-  assert.deepEqual(d.limits, { minutes: 50, steps: 200, cancelGraceSeconds: 60, limitMs: 50 * 60 * 1000, cancelGraceMs: 60_000 });
+  assert.deepEqual(d.limits, { minutes: 50, steps: 200, cancelGraceSeconds: 60, outputTokens: 8192, limitMs: 50 * 60 * 1000, cancelGraceMs: 60_000 });
+  assert.equal(normalizeConfig(rawConfig({ limits: { outputTokens: 32768 } })).limits.outputTokens, 32768);
+  assert.throws(() => normalizeConfig(rawConfig({ limits: { outputTokens: 500 } })), /limits\.outputTokens/);
   const c = normalizeConfig(rawConfig({ limits: { minutes: 10, steps: 80, cancelGraceSeconds: 5 } }));
   assert.deepEqual([c.limits.limitMs, c.limits.steps, c.limits.cancelGraceMs], [600_000, 80, 5000]);
   refused(rawConfig({ limits: { minutes: 0 } }), 'limits.minutes');

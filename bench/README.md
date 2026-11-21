@@ -58,7 +58,7 @@ Every value below is made up.
 | `keyEnv` | the environment variable that holds the key (default `BENCH_MODEL_API_KEY`) |
 | `concurrency` | runs at once, 1 to 8 (default 2) |
 | `contextWindow` | **required**: the model's context window; both agents are given this one value |
-| `limits` | optional, the same for both agents: `minutes` (the time limit of a run, 50), `steps` (adam's turn limit and OpenCode's `steps`, 200) and `cancelGraceSeconds` (60) |
+| `limits` | optional, the same for both agents: `minutes` (the time limit of a run, 50), `steps` (adam's turn limit and OpenCode's `steps`, 200), `cancelGraceSeconds` (60) and `outputTokens` (the meter's clamp of every call's output, and OpenCode's output limit, 8192; a reasoning arm needs more: at 8192 the reasoning used it all and no answer came, 2026-11-21) |
 | `timeouts` | optional: the meter's first-byte and idle timeouts in seconds |
 | `tasks` | optional: task sources and grading, see Tasks |
 
@@ -637,6 +637,46 @@ sequenceDiagram
     D-->>R: the patch
     R->>D: cleanup(ctx)
 ```
+
+## Agent variants
+
+Decided by the owner on 2026-11-20. The configuration's `agents` lists the cells to run (default `adam` and `opencode`, the
+two of ADR 0048); each runs in every arm. `lib/variants.mjs` defines them:
+
+| Variant | Driver | What it is given |
+|---|---|---|
+| `adam` | adam | adam-coder as it ships: its whole `instructions.md` and every tool (42 at the pin) |
+| `adam-lean` | adam | the same binary, with an agent folder whose `tools:` offers 13 coding tools (`LEAN_TOOLS`) and whose prompt keeps the opening paragraphs and the four work sections (`LEAN_SECTIONS`); no subagents or skills; variables only the dropped sections read are removed (adam refuses an unused one, exit 78) |
+| `opencode` | OpenCode | its built-in prompt plus the `owner` profile: the four shared sections below |
+| `opencode-prompt` | OpenCode | its built-in prompt plus the `work` profile: the four sections and "Helpers", where adam's `explorer` and `reviewer` become OpenCode's `subagent` tool |
+| `opencode-bare` | OpenCode | its built-in prompt only |
+
+The prompts are read from adam's file **at the pinned coder revision**, so a later change to `instructions.md` does not change a
+cell. adam-lean's folder is made again when its recipe changes (`LEAN_RECIPE` in the folder's marker). What one call sends,
+measured in the dry run with `BENCH_DRYRUN_REQUESTS_DIR` (2026-11-20, pin `e46c8f4`): `adam` 94 KB (prompt 31 KB, 42 tools
+62 KB), `adam-lean` 31 KB (11 KB, 15 tools 20 KB), `opencode` 25 KB, `opencode-prompt` 26 KB, `opencode-bare` 20 KB.
+
+**Reasoning arms.** An arm's fragment wins over what an agent sends, so both drivers get the same setting. At
+the owner's gateway (*verified 2026-11-20* by direct calls) a request **without** `reasoning_effort` reasons not at all,
+`low` and `max` are both accepted, and `max` used more reasoning tokens than `low` on the same question (about 920 against
+550 to 800). The meter records per call the setting it sent (`effort`) and the agent's own (`askedEffort`).
+
+**Per call**, the meter's pending record also has the request size (`bytes`), the number of tools offered (`tools`) and a
+fingerprint of the system prompt (`prompt`, a hash, never the text). The fold turns the fingerprints into **child sessions**:
+consecutive calls whose prompt is not the attempt's first call's are a subagent's; the report counts sessions, their calls and
+their time per cell.
+
+**Collecting a tree.** The agent's working tree is read without the dependency and cache folders (`HEAVY_DIRS` in
+`lib/agents/common.mjs`: `node_modules`, `.mypy_cache`, `__pycache__`, ...) that the base tracks no file under, and the
+patch leaves the tool caches out (`TOOL_CACHES` in `lib/grade.mjs`): element-web's `node_modules` was over the tree's size
+limit, and a `.mypy_cache` over the patch's. A folder the base tracks is read, or its files would look deleted.
+
+**Quality review.** `bench review` scores every Done run's patch with the configured model at `max`, one rubric for every
+cell (`lib/review.mjs`: correctness, tests, design, scope, hygiene, docs, overall, 1 to 5), blind to the agent, the arm and the
+run id, in a seeded order that mixes the cells. Files under tool caches (`.mypy_cache`, `.pytest_cache`, `__pycache__`, ...)
+are cut out first and counted as stray files. Results go to `$BENCH_HOME/reviews.jsonl`; a run reviewed with the same patch and
+rubric is not sent again; the spend counts against the cap with the ledger's. The report's "Quality (blind review)" section
+shows the means per cell.
 
 ## The shared system prompt
 

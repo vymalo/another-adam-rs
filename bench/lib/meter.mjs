@@ -40,6 +40,17 @@ const NEVER_CHARGED = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ERR_IN
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
+/**
+ * A short fingerprint of a request's system prompt: the main agent keeps one through a run, and a child session (a subagent) has
+ * another, so the report can tell the calls of each apart without reading them. Never the text itself. null without a system message.
+ */
+export function promptId(body) {
+  const sys = Array.isArray(body?.messages) ? body.messages.find((m) => m?.role === 'system' || m?.role === 'developer') : null;
+  if (!sys) return null;
+  const text = typeof sys.content === 'string' ? sys.content : JSON.stringify(sys.content);
+  return crypto.createHash('sha256').update(text).digest('hex').slice(0, 10);
+}
+
 /** Merge `over` onto `base`: objects merge key by key, anything else is replaced; `over` wins. */
 export function deepMerge(base, over) {
   const out = { ...base };
@@ -50,10 +61,10 @@ export function deepMerge(base, over) {
   return out;
 }
 
-const clampTokens = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 1 ? Math.min(Math.floor(v), MAX_OUTPUT_TOKENS) : MAX_OUTPUT_TOKENS);
+const clampTokens = (v, cap) => (typeof v === 'number' && Number.isFinite(v) && v >= 1 ? Math.min(Math.floor(v), cap) : cap);
 
 /** The body the endpoint receives, and the most output it may produce. Throws a string on a bad body. */
-export function prepareBody(body, fragment, modelId) {
+export function prepareBody(body, fragment, modelId, cap = MAX_OUTPUT_TOKENS) {
   if (body.stream !== undefined && typeof body.stream !== 'boolean') throw 'stream must be a boolean';
   if ('n' in body && body.n !== 1) throw 'n must be absent or 1: one completion per call';
   const out = deepMerge({ ...body, model: modelId, n: 1 }, fragment);
@@ -61,13 +72,13 @@ export function prepareBody(body, fragment, modelId) {
   const limits = [];
   for (const k of ['max_tokens', 'max_completion_tokens']) {
     if (k in out) {
-      out[k] = clampTokens(out[k]);
+      out[k] = clampTokens(out[k], cap);
       limits.push(out[k]);
     }
   }
   if (limits.length === 0) {
-    out.max_tokens = MAX_OUTPUT_TOKENS;
-    limits.push(MAX_OUTPUT_TOKENS);
+    out.max_tokens = cap;
+    limits.push(cap);
   }
   const stream = out.stream === true;
   if (stream) out.stream_options = { ...(isObject(out.stream_options) ? out.stream_options : {}), include_usage: true };
@@ -288,7 +299,8 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
     }
     let prepared;
     try {
-      prepared = prepareBody(parsed, run.fragment, config.modelId);
+      // `limits.outputTokens` (default 8192), the same for every agent.
+      prepared = prepareBody(parsed, run.fragment, config.modelId, config.limits?.outputTokens ?? MAX_OUTPUT_TOKENS);
     } catch (reason) {
       return sendJson(res, 400, { error: { message: typeof reason === 'string' ? reason : 'bad request' } });
     }
@@ -305,7 +317,10 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
       return sendJson(res, 429, { error: { message: 'bench budget reached', type: 'bench_budget', code: 'budget_reached' } });
     }
     try {
-      ledger.append({ ...base, phase: 'pending', worstMicro, stream: prepared.stream });
+      // What was sent, for the report: the effective reasoning setting (the arm's fragment wins over the agent's own, which is kept
+      // too), the size of the request and how many tools it offered.
+      const sent = { effort: prepared.body.reasoning_effort ?? null, askedEffort: parsed.reasoning_effort ?? null, bytes: payload.length, tools: Array.isArray(prepared.body.tools) ? prepared.body.tools.length : 0, prompt: promptId(prepared.body) };
+      ledger.append({ ...base, phase: 'pending', worstMicro, stream: prepared.stream, ...sent });
     } catch {
       book.endCall(run.id, worstMicro, 0);
       return sendJson(res, 500, { error: { message: 'ledger unavailable' } });
