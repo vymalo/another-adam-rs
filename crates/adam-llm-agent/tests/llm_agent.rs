@@ -898,6 +898,10 @@ impl<T: Tool> Tool for Patient<T> {
     fn spec(&self) -> ToolSpec {
         self.0.spec()
     }
+    // Shares nothing, so the calls of a turn run at the same time.
+    fn access(&self, _args: &Value) -> adam_llm_agent::ToolAccess {
+        adam_llm_agent::ToolAccess::Independent
+    }
     fn retry_policy(&self) -> Option<RetryPolicy> {
         Some(self.1)
     }
@@ -955,7 +959,8 @@ async fn a_tools_policy_decides_its_retries_and_one_set_by_name_wins() {
     }
 }
 
-/// Beside another call of its turn, a tool's failure is still counted under its own key and policy.
+/// Beside another call of its turn, running at the same time, a tool's failure is still counted under
+/// its own key and policy.
 #[tokio::test]
 async fn a_tools_policy_holds_beside_other_calls() {
     let h = Harness::new();
@@ -963,7 +968,10 @@ async fn a_tools_policy_holds_beside_other_calls() {
     let agent = h
         .agent()
         .tool(Patient(rate_limited(&calls), quick(2)))
-        .tool(fn_tool("fine", |_ctx, _| Ok(ToolOutput::text("ok"))))
+        .tool(Patient(
+            fn_tool("fine", |_ctx, _| Ok(ToolOutput::text("ok"))),
+            quick(9),
+        ))
         .build();
     for _ in 0..2 {
         h.mock.push_tool_calls(vec![

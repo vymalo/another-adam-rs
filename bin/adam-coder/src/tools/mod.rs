@@ -1759,6 +1759,52 @@ mod redacting_kept_tests {
         let kept = out.kept.unwrap();
         assert_eq!(kept.text, "line one\nkey=[redacted]\n");
     }
+
+    /// Fails with a rate limit whose message carries the key, and has a retry policy.
+    struct Limited;
+
+    #[async_trait::async_trait]
+    impl Tool for Limited {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "limited".into(),
+                description: "x".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn retry_policy(&self) -> Option<adam_runtime::RetryPolicy> {
+            Some(adam_runtime::RetryPolicy::new(4))
+        }
+
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Err(ToolError::retryable(
+                "429 for key sk-live-0123456789abcdef",
+                adam_error::ErrorClass::RateLimited,
+            ))
+        }
+    }
+
+    /// A rate limit is scrubbed, keeps its class, and the tool's policy passes through (ADR 0061).
+    #[tokio::test]
+    async fn a_rate_limit_is_scrubbed_and_keeps_its_class_and_policy() {
+        let mut layer = Redacting::layer(Redactor::new(["sk-live-0123456789abcdef"]));
+        let tool = layer(Arc::new(Limited));
+        assert_eq!(tool.retry_policy(), Some(adam_runtime::RetryPolicy::new(4)));
+        let ctx = ToolCtx::detached(
+            "limited",
+            "c1",
+            Arc::new(adam_runtime::CollectingSink::new()),
+        );
+        let error = tool.call(&ctx, Value::Null).await.unwrap_err();
+        assert_eq!(
+            error,
+            ToolError::retryable(
+                "429 for key [redacted]",
+                adam_error::ErrorClass::RateLimited
+            )
+        );
+    }
 }
 
 #[cfg(test)]
