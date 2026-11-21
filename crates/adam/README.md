@@ -117,7 +117,8 @@ Options, `#[tool(..)]`:
 | `name = "..."` | the tool's name; default the function's. Must match `^[a-z][a-z0-9_]{0,63}$` |
 | `type = Name` | the generated struct; default the function's name in `UpperCamelCase`. It has the function's visibility |
 | `strict` | unknown argument fields are refused (`deny_unknown_fields`, and `additionalProperties: false` in the schema) |
-| `classify` | the error type is `adam::error::Classify` (`adam_error::Classify`): retryable classes become `ToolError::Transient`, the others `Permanent` (`ToolError::from_classified`) |
+| `classify` | the error type is `adam::error::Classify` (`adam_error::Classify`): retryable classes become `ToolError::Transient` (or `Retryable` with the class, for a rate limit or a conflict), the others `Permanent` (`ToolError::from_classified`) |
+| `retry(attempts = 3, backoff = "1s", max_backoff = "30s", multiplier = 2.0, on = ["rate-limited"])` | the tool's retry policy (`Tool::retry_policy`, [ADR 0061](../../docs/decisions/0061-a-step-names-its-retry-policy.md)): its failures are counted under `tool:<name>` and retried `attempts` times in all (required, at least 1) with that backoff (durations `500ms`, `1s`, `30m`, `1h`; `max_backoff` not under `backoff`; what is left out is `RetryPolicy`'s default, not the runtime's configured policy: 1 s, 60 s, 2.0; a `max_backoff` under 1 s needs a `backoff`) for the classes in `on` (`transient`, `rate-limited`, `conflict`; default all three). A policy set for the tool by name (an agent folder's `retry:`) wins over it |
 | `paged` | the tool's results are pages of the paging convention (`offset` and `limit` in, one final line out): the generated `Tool::paged` says `true`, and the loop's 64 KiB cap on a result then tells the model to call again with a later `offset`. Never inferred from an argument called `offset` |
 | `asks_user` | the tool can end a call with `ToolError::NeedsInput`: the generated `Tool::asks_user` says `true`, and `adam-assembly` refuses to give the tool to a subagent (nobody could answer it) |
 | `step = "subagent"`, `label = "Hand to the helper"`, `icon = "agent"` | how a call is drawn as a step (`Tool::step_style`): `step` is the kind (`subagent`, `tool`, `command`, `message`; default `tool`), `label` replaces the tool's name as the label, `icon` is one of `agent`, `read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `web`, `git`, `test`, `file`, `tool`, `opencode` (the orchestration layer's `steps/v1`; any other word is a compile error that lists them). Any one of them is enough |
@@ -241,7 +242,7 @@ The macro checks what it can and says so where you wrote it:
 | two `&ToolCtx` | at most one `&ToolCtx` parameter |
 | `#[args]` with another model argument | `#[args]` must be the only model argument |
 | a bad tool name | tool names must match `^[a-z][a-z0-9_]{0,63}$` |
-| an unknown option | unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, paged, crate, step, label, icon, parallel, path, access |
+| an unknown option | unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, paged, crate, step, label, icon, parallel, path, access, retry |
 | on a struct or trait | `#[tool]` goes on an `async fn` |
 
 Every mistake of one function is reported in one compile. rustc reports the rest, with messages

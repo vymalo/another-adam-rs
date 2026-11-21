@@ -15,9 +15,9 @@ use adam_model::{
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, CancelToken,
     ChildStarter, ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES, MAX_SESSION_PAGE,
-    RUN_FINISHED_KIND, ReservedStep, RunEvent, SESSION_CLOSE_KIND, SandboxUsage, SessionState,
-    SessionSummary, StepEvent, StepIcon, StepKind, StepState, Transition, UsageEvent, UsageTotals,
-    child_run_id,
+    RUN_FINISHED_KIND, ReservedStep, RetryPolicy, RunEvent, SESSION_CLOSE_KIND, SandboxUsage,
+    SessionState, SessionSummary, StepEvent, StepIcon, StepKind, StepState, Transition, UsageEvent,
+    UsageTotals, child_run_id,
 };
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -205,6 +205,22 @@ pub const MAX_PARALLEL_LIMIT: usize = 32;
 /// What the model is told when a tool that asks the person, or waits for a child run or a remote
 /// task, was called beside other calls: it has nowhere to park there.
 const NOT_ALONGSIDE: &str = "this tool cannot run alongside others: call it alone";
+
+/// The result a tool that asks the person gets in a run nobody answers, a firing of a schedule (a
+/// conversation under `adam.schedule:`, ADR 0060): the run cannot wait for an answer, so the model
+/// is told to go on without one.
+pub const UNATTENDED: &str = "nobody answers this run: a schedule started it, not a person, so nothing \
+can be asked. Do what you can without asking, and say in your final answer what is still needed";
+
+/// Whether nobody answers a run: a firing of a schedule (its conversation is under
+/// `adam.schedule:`), or a child of one (its context carries `adam_runtime::UNATTENDED_CONTEXT_KEY`,
+/// which the scheduler sets and children inherit).
+pub fn is_unattended(conversation_id: Option<&str>, context: Option<&Map<String, Value>>) -> bool {
+    conversation_id.is_some_and(|c| c.starts_with(adam_runtime::SCHEDULE_CONVERSATION_PREFIX))
+        || context.is_some_and(|c| {
+            c.get(adam_runtime::UNATTENDED_CONTEXT_KEY) == Some(&Value::Bool(true))
+        })
+}
 
 /// Whether a result reports the rounds of sessions: only a call that runs alone may.
 fn reports_rounds(output: &ToolOutput) -> bool {
@@ -498,7 +514,7 @@ impl<'a> Early<'a> {
     pub(crate) async fn next(&mut self) {
         if let Some((i, finished)) = self.running.next().await {
             if let Finished::Ran { outcome, .. } = &finished {
-                self.failed |= transient_failure(&self.started[i].1, outcome).is_some();
+                self.failed |= transient_failure(&self.started[i].1, outcome, None).is_some();
             }
             self.accesses[i] = None;
             self.done[i] = Some(finished);
@@ -577,7 +593,7 @@ impl<'a> Early<'a> {
                 next = self.running.next() => match next {
                     Some((i, finished)) => {
                         if let Finished::Ran { outcome, .. } = &finished {
-                            self.failed |= transient_failure(&self.started[i].1, outcome).is_some();
+                            self.failed |= transient_failure(&self.started[i].1, outcome, None).is_some();
                         }
                         self.accesses[i] = None;
                         self.done[i] = Some(finished);
@@ -609,6 +625,17 @@ impl<'a> Early<'a> {
 /// `max_turns` or `max_tool_calls`. Sent after the history, as a user message that is not kept in it.
 pub const CLOSING_TURN: &str = "You have used all the steps this run may take. Do not call any \
 tool. Reply in plain words: what you did, what is finished, and what is still left to do.";
+
+/// What the model is told after a turn that reached the output limit while it was still thinking:
+/// no words and no call, only reasoning. Kept in the history after that turn, except when the
+/// next turn is the closing turn.
+pub const THINKING_CUT_TURN: &str = "Your last turn reached the output limit while you were still \
+thinking, before you wrote anything. Think briefly this time, then call a tool or answer.";
+
+/// How many turns in a row may end at the output limit with reasoning only before the run fails
+/// (each is continued with [`THINKING_CUT_TURN`] and counts as a model call against `max_turns`).
+/// A turn with words or a tool call starts the count again.
+pub const MAX_THINKING_CUTS: u32 = 2;
 
 /// Bounds on one run. A run that reaches `max_turns` or `max_tool_calls` gets one closing model
 /// call in which it may call no tool, and ends with that answer marked `limited` (the output's
@@ -690,6 +717,16 @@ struct ModelFailure {
 }
 
 impl ModelFailure {
+    /// The retryable class the provider's error had, as recorded (ADR 0061): `RateLimited` or
+    /// `Conflict`, else `Transient` (a journal written before classes, or any other name).
+    fn retry_class(&self) -> adam_error::ErrorClass {
+        match self.class.as_deref() {
+            Some("RateLimited") => adam_error::ErrorClass::RateLimited,
+            Some("Conflict") => adam_error::ErrorClass::Conflict,
+            _ => adam_error::ErrorClass::Transient,
+        }
+    }
+
     /// The call was dropped because the run was cancelled. Not retryable: nobody is waiting for it.
     fn cancelled() -> Self {
         Self {
@@ -969,6 +1006,7 @@ pub struct LlmAgentBuilder {
     session_agents: Vec<String>,
     session_reports: bool,
     max_parallel: usize,
+    tool_retry: BTreeMap<String, RetryPolicy>,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -1137,6 +1175,19 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// The retry policy of the tool `name`'s retryable failures, which wins over the tool's own
+    /// ([`Tool::retry_policy`]): what an agent folder's `retry:` sets ([ADR 0061]). A tool that
+    /// another system offers (an MCP server's `<server>__<tool>`) has no policy of its own, so this
+    /// is the only way to give it one. The failures count under the key `tool:<name>`
+    /// ([`tool_retry_key`]). A policy for a name the agent never calls is never used.
+    ///
+    /// [ADR 0061]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0061-a-step-names-its-retry-policy.md
+    #[must_use]
+    pub fn tool_retry(mut self, name: impl Into<String>, policy: RetryPolicy) -> Self {
+        self.tool_retry.insert(name.into(), policy);
+        self
+    }
+
     /// How the step of a tool call reports what the tool was given and what it answered: the
     /// arguments on the report that starts the step, the result (or the error) on the one that ends
     /// it, each scrubbed by [`StepIo::redact`] and then cut to the contract's bounds (4 KiB in, 8 KiB
@@ -1265,6 +1316,7 @@ impl LlmAgentBuilder {
             session_agents: self.session_agents.into(),
             session_reports: self.session_reports,
             max_parallel: self.max_parallel,
+            tool_retry: self.tool_retry,
             images_cache: Arc::new(Mutex::new(ImageCache::new())),
             run_chars: Arc::new(Mutex::new(RunChars::default())),
         }
@@ -1396,8 +1448,10 @@ impl LlmAgentBuilder {
 ///
 /// # Failure handling
 ///
-/// * Retryable model error (`ModelError::is_retryable`) or
-///   [`ToolError::Transient`]: `AgentError::Transient`, retried by the runtime.
+/// * Retryable model error (`ModelError::is_retryable`), [`ToolError::Transient`] or
+///   [`ToolError::Retryable`]: `AgentError::Transient` of the error's class, retried by the
+///   runtime, under the tool's policy for a tool that has one ([`Tool::retry_policy`],
+///   [`LlmAgentBuilder::tool_retry`], counted under [`tool_retry_key`]).
 ///   A `ModelError::RateLimited` that carries a `retry_after` becomes an
 ///   `AgentError::Transient` with that hint (`with_retry_after`), so the
 ///   retry waits at least that long
@@ -1435,6 +1489,8 @@ pub struct LlmAgent {
     session_reports: bool,
     /// The most tool calls of a turn that run at the same time.
     max_parallel: usize,
+    /// The retry policies set per tool by name ([`LlmAgentBuilder::tool_retry`]).
+    tool_retry: BTreeMap<String, RetryPolicy>,
     /// The bytes of the images already read and checked, by SHA-256, shared by every run of this
     /// agent: a turn reads an image file once, not once per model call.
     images_cache: Arc<Mutex<ImageCache>>,
@@ -1528,6 +1584,7 @@ impl LlmAgent {
             session_agents: Vec::new(),
             session_reports: true,
             max_parallel: DEFAULT_MAX_PARALLEL,
+            tool_retry: BTreeMap::new(),
         }
     }
 
@@ -1544,6 +1601,31 @@ impl LlmAgent {
 
     fn tool(&self, name: &str) -> Option<&DynTool> {
         self.index.get(name).map(|&i| &self.tools[i])
+    }
+
+    /// The retry policy of the tool `name`, first found: the one set by name
+    /// ([`LlmAgentBuilder::tool_retry`]), the tool's own ([`Tool::retry_policy`]); `None`: the
+    /// runtime's (ADR 0061, decision 3).
+    fn tool_retry_policy(&self, name: &str) -> Option<RetryPolicy> {
+        self.tool_retry
+            .get(name)
+            .copied()
+            .or_else(|| self.tool(name).and_then(|tool| tool.retry_policy()))
+    }
+
+    /// The runtime's error for a retryable failure of the tool `tool`: `context` and the reason,
+    /// of `class`, under the tool's policy when it has one (ADR 0061).
+    fn tool_retry_error(
+        &self,
+        tool: &str,
+        message: String,
+        class: adam_error::ErrorClass,
+    ) -> AgentError {
+        tool_transient(
+            message,
+            class,
+            self.tool_retry_policy(tool).map(|p| (tool, p)),
+        )
     }
 
     /// Whether the tool `name` pages its results: it says so ([`Tool::paged`]). Never inferred
@@ -1595,6 +1677,7 @@ impl LlmAgent {
         // A message that reaches the run starts a new turn: what a tool announced as the answer of
         // the one before is not the answer of this one.
         if !texts.as_slice().is_empty() {
+            state.thinking_cuts = 0;
             state.announced = None;
             state.announced_final = false;
         }
@@ -2130,7 +2213,11 @@ impl LlmAgent {
                 if let Some(mut early) = early {
                     early.settle().await;
                 }
-                let error = AgentError::transient(format!("model call failed: {}", f.message));
+                let error = tool_transient(
+                    format!("model call failed: {}", f.message),
+                    f.retry_class(),
+                    None,
+                );
                 return Err(match f.retry_after_ms {
                     // The provider said how long to wait: the runtime waits
                     // at least that long (see `AgentError::with_retry_after`).
@@ -2228,7 +2315,17 @@ impl LlmAgent {
             }
             calls.push(wait);
         }
-        if !text.is_empty() {
+        // Only a turn that is continued as a cut keeps the count: any other ends or moves the run on.
+        let cut = finish == FinishReason::Length
+            && text.trim().is_empty()
+            && calls.is_empty()
+            && !unread
+            && state.limit.is_none()
+            && state.announced.is_none();
+        if !cut {
+            state.thinking_cuts = 0;
+        }
+        if !text.trim().is_empty() {
             let mut payload = json!({ "text": text, "turn": turn });
             // The words before a tool call are said whole, under the stream they were sent as, because
             // nothing else will say them: the turn goes on to its tools. The answer that ends the run
@@ -2280,6 +2377,40 @@ impl LlmAgent {
                     })),
                     early,
                 ));
+            }
+            // Reasoning that filled the output limit before any word is no answer: the model is
+            // asked again, a few times, and then the run fails (never an empty answer, never a
+            // question to the person).
+            if cut {
+                state.thinking_cuts += 1;
+                if state.thinking_cuts > MAX_THINKING_CUTS {
+                    return Ok((
+                        Flow::Fail(format!(
+                            "output limit reached while thinking: {} turns in a row ended at the \
+                             output limit with no words and no tool call; raise max_output_tokens \
+                             or lower the reasoning effort",
+                            state.thinking_cuts
+                        )),
+                        early,
+                    ));
+                }
+                // A cut turn with nothing the model will see (no reasoning echoed back) would be
+                // sent as an empty assistant message, which some servers refuse: it leaves the
+                // history.
+                if matches!(
+                    state.messages.last(),
+                    Some(Message::Assistant {
+                        reasoning: None,
+                        ..
+                    })
+                ) {
+                    state.messages.pop();
+                }
+                // The next turn is the closing turn, which has its own instruction.
+                if state.turns < self.limits.max_turns {
+                    state.messages.push(Message::user_text(THINKING_CUT_TURN));
+                }
+                return Ok((Flow::Next, early));
             }
             let mut output = json!({
                 "text": text,
@@ -2557,7 +2688,11 @@ impl LlmAgent {
                 (done.summary, done.cut, state.overflow_message.take())
             }
             Err(f) if f.retryable => {
-                let error = AgentError::transient(format!("summary call failed: {}", f.message));
+                let error = tool_transient(
+                    format!("summary call failed: {}", f.message),
+                    f.retry_class(),
+                    None,
+                );
                 return Err(match f.retry_after_ms {
                     Some(ms) => error.with_retry_after(Duration::from_millis(ms)),
                     None => error,
@@ -3505,6 +3640,7 @@ impl LlmAgent {
                         &unjournaled,
                         files_kept(&state.artifacts),
                         Some(live),
+                        is_unattended(ctx.conversation_id(), Some(&state.context)),
                     )
                     .await?
                 }
@@ -3585,6 +3721,7 @@ impl LlmAgent {
         step: ReservedStep,
     ) -> BoxFuture<'static, (usize, Result<Finished, AgentError>)> {
         let call = call.clone();
+        let policy = self.tool_retry_policy(&call.name);
         async move {
             let Finished::Ran {
                 outcome,
@@ -3604,7 +3741,7 @@ impl LlmAgent {
                     Ok(outcome) => outcome,
                     Err(error) => return (i, Err(error)),
                 };
-            let failure = transient_failure(&call, &journaled);
+            let failure = transient_failure(&call, &journaled, policy);
             let finished = Finished::Ran {
                 outcome: Box::new(journaled),
                 unjournaled,
@@ -3657,7 +3794,7 @@ impl LlmAgent {
         let outcome: Result<ToolOutput, ToolError> = step.run(move || work).await?;
         // How it ended, said now; `conclude` says it again only if applying the result changes it.
         let live = self.say_outcome(call, notes, emitter, &outcome).await;
-        if let Some(error) = transient_failure(call, &outcome) {
+        if let Some(error) = transient_failure(call, &outcome, self.tool_retry_policy(&call.name)) {
             return Err(error);
         }
         Ok(Finished::Ran {
@@ -3737,7 +3874,12 @@ impl LlmAgent {
                 .await;
                 Live { said: None }
             }
-            Err(ToolError::Transient(reason)) => {
+            Err(
+                ToolError::Transient(reason)
+                | ToolError::Retryable {
+                    message: reason, ..
+                },
+            ) => {
                 say_with(
                     emitter,
                     silent,
@@ -3993,6 +4135,7 @@ impl LlmAgent {
                     &unjournaled,
                     files_used,
                     Some(live),
+                    is_unattended(ctx.conversation_id(), context.map(|c| c.as_ref())),
                 )
                 .await;
         }
@@ -4024,8 +4167,18 @@ impl LlmAgent {
         let work = self.step_work(call, self.source_note(notes, &call.name), prepared);
         let outcome: Result<ToolOutput, ToolError> =
             ctx.step(&format!("tool:{}", call.id), move || work).await?;
-        self.conclude(ctx, notes, call, outcome, &unjournaled, files_used, None)
-            .await
+        let unattended = is_unattended(ctx.conversation_id(), context.map(|c| c.as_ref()));
+        self.conclude(
+            ctx,
+            notes,
+            call,
+            outcome,
+            &unjournaled,
+            files_used,
+            None,
+            unattended,
+        )
+        .await
     }
 
     /// What the call's recorded outcome means for the run: the message that answers it, its artifacts
@@ -4042,6 +4195,7 @@ impl LlmAgent {
         unjournaled: &Mutex<SandboxUsage>,
         files_used: u64,
         live: Option<Live>,
+        unattended: bool,
     ) -> Result<(ToolResult, SandboxUsage), AgentError> {
         let silent = self
             .source_note(notes, &call.name)
@@ -4057,7 +4211,7 @@ impl LlmAgent {
         let reported = match &outcome {
             Ok(output) => output.sandbox.clone(),
             // Tried again: only the try that is kept counts.
-            Err(ToolError::Transient(_)) => SandboxUsage::new(),
+            Err(ToolError::Transient(_) | ToolError::Retryable { .. }) => SandboxUsage::new(),
             Err(_) => unjournaled
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -4130,7 +4284,11 @@ impl LlmAgent {
                 }
                 ToolResult::error(&call.id, backstop(&reason, &call.name, false).into_owned())
             }
-            Err(ToolError::Transient(reason)) => {
+            Err(error @ (ToolError::Transient(_) | ToolError::Retryable { .. })) => {
+                let (reason, class) = error.retry_parts().map_or(
+                    (String::new(), adam_error::ErrorClass::Transient),
+                    |(r, c)| (r.to_owned(), c),
+                );
                 if live.is_none() {
                     say(
                         ctx,
@@ -4145,10 +4303,11 @@ impl LlmAgent {
                     )
                     .await;
                 }
-                return Err(AgentError::transient(format!(
-                    "tool `{}` failed: {reason}",
-                    call.name
-                )));
+                return Err(self.tool_retry_error(
+                    &call.name,
+                    format!("tool `{}` failed: {reason}", call.name),
+                    class,
+                ));
             }
             // Beside other calls a question or a wait has nowhere to park: the model is told to call
             // the tool alone (its end was said as it happened).
@@ -4158,6 +4317,23 @@ impl LlmAgent {
                 | ToolError::AwaitSession { .. }
                 | ToolError::AwaitRemote { .. },
             ) if live.is_some() => ToolResult::error(&call.id, NOT_ALONGSIDE.to_owned()),
+            // Nobody answers a firing of a schedule: the question is refused, and the model goes on.
+            Err(ToolError::NeedsInput { question, .. }) if unattended => {
+                let reason = format!("{UNATTENDED}. The question was: {question}");
+                say(
+                    ctx,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        StepState::Failed,
+                        Some((&reason, true)),
+                        notes,
+                    ),
+                )
+                .await;
+                ToolResult::error(&call.id, backstop(&reason, &call.name, false).into_owned())
+            }
             Err(ToolError::NeedsInput { question, ui }) => {
                 say(ctx, silent, end(StepState::Waiting)).await;
                 ToolResult::NeedsInput { question, ui }
@@ -4427,10 +4603,19 @@ impl LlmAgent {
                 owed(state, message);
                 Ok(Some(outcome))
             }
-            Err(ToolError::Transient(reason)) => Err(AgentError::transient(format!(
-                "tool `{}` failed while polling its remote task: {reason}",
-                wait.tool
-            ))),
+            Err(error @ (ToolError::Transient(_) | ToolError::Retryable { .. })) => {
+                let (reason, class) = error
+                    .retry_parts()
+                    .unwrap_or(("", adam_error::ErrorClass::Transient));
+                Err(self.tool_retry_error(
+                    &wait.tool,
+                    format!(
+                        "tool `{}` failed while polling its remote task: {reason}",
+                        wait.tool
+                    ),
+                    class,
+                ))
+            }
             Err(ToolError::Permanent(reason)) => {
                 owed(
                     state,
@@ -4941,13 +5126,39 @@ pub(crate) fn call_key(call: &ToolCall) -> String {
 fn transient_failure(
     call: &ToolCall,
     outcome: &Result<ToolOutput, ToolError>,
+    policy: Option<RetryPolicy>,
 ) -> Option<AgentError> {
-    match outcome {
-        Err(ToolError::Transient(reason)) => Some(AgentError::transient(format!(
-            "tool `{}` failed: {reason}",
-            call.name
-        ))),
-        _ => None,
+    let (reason, class) = outcome.as_ref().err()?.retry_parts()?;
+    Some(tool_transient(
+        format!("tool `{}` failed: {reason}", call.name),
+        class,
+        policy.map(|p| (call.name.as_str(), p)),
+    ))
+}
+
+/// The key a tool's failures count under: `tool:<name>`, the name and never the call id, so a tool
+/// called again in a later turn counts as the same step (ADR 0061, decision 3).
+pub fn tool_retry_key(tool: &str) -> String {
+    format!("tool:{tool}")
+}
+
+/// An `AgentError::Transient` of `class` with `message`, under `policy` (the tool's name and its
+/// policy) when there is one: a tool's retryable failure, or the model's (with no policy).
+fn tool_transient(
+    message: String,
+    class: adam_error::ErrorClass,
+    policy: Option<(&str, RetryPolicy)>,
+) -> AgentError {
+    let error = AgentError::Transient {
+        message,
+        retry_after: None,
+        class,
+        retry: None,
+        source: None,
+    };
+    match policy {
+        Some((tool, policy)) => error.with_retry(tool_retry_key(tool), policy),
+        None => error,
     }
 }
 
@@ -5455,6 +5666,34 @@ impl Agent for LlmAgent {
                 Transition::Fail { state, error }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod thinking_cut_tests {
+    use super::*;
+    use adam_model::MockModel;
+
+    #[test]
+    fn a_message_that_reaches_the_run_starts_the_count_again() {
+        let model: DynModel = Arc::new(MockModel::new());
+        let agent = LlmAgent::builder("t", model, "m").build();
+        let mut state = Conversation::new("work");
+        state.thinking_cuts = 2;
+        let message = crate::user_message("and also this");
+        agent.absorb_inbox(&mut state, vec![message], &HashMap::new());
+        assert_eq!(state.thinking_cuts, 0);
+    }
+
+    #[test]
+    fn an_unreadable_message_does_not() {
+        let model: DynModel = Arc::new(MockModel::new());
+        let agent = LlmAgent::builder("t", model, "m").build();
+        let mut state = Conversation::new("work");
+        state.thinking_cuts = 2;
+        let junk = Inbound::new("message", json!({ "nothing": true }));
+        agent.absorb_inbox(&mut state, vec![junk], &HashMap::new());
+        assert_eq!(state.thinking_cuts, 2);
     }
 }
 

@@ -1109,6 +1109,51 @@ async fn ask_user_parks_and_an_a2a_follow_up_resumes(store: DynStore) {
     );
 }
 
+// ----------------------------------------------- a firing of a schedule
+
+/// A firing of a schedule that stops where a person's run would wait, on a question, ends `Failed`
+/// naming why and quoting the question: nobody answers it (ADR 0060). Started the way the scheduler
+/// starts one, on the runtime, in the firing's conversation and with its context.
+async fn a_firing_that_stops_on_a_question_fails_instead_of_waiting(store: DynStore) {
+    let fx = Fixture::new().await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Which repository, which base branch and what is the task?");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let run = RunId::new();
+    let first = adam_runtime::Inbound::new(
+        "message",
+        serde_json::json!({
+            "text": "Do the nightly chores.",
+            "context": { adam_runtime::UNATTENDED_CONTEXT_KEY: true },
+        }),
+    );
+    server
+        .coder
+        .runtime
+        .start_with_id(
+            run,
+            AGENT_NAME,
+            first,
+            Some("adam.schedule:coder/nightly@2026-12-24T17:00:00Z"),
+        )
+        .await
+        .unwrap();
+    let done = wait_for(&server.coder.runtime, run, "the firing to end", |v| {
+        v.status.is_terminal()
+    })
+    .await;
+    worker.stop().await;
+    assert_eq!(done.status, RunStatus::Failed, "{done:?}");
+    assert!(!done.waiting);
+    let error = done.error.unwrap_or_default();
+    assert!(
+        error.contains("nobody answers it") && error.contains("what is the task?"),
+        "{error}"
+    );
+    assert_eq!(mock.requests().len(), 1, "the model is not asked again");
+}
+
 // ----------------------------------------------- a stop with nothing delivered
 
 /// The owner's report: the person typed "Hi", the model answered in plain text without calling
@@ -1944,6 +1989,68 @@ async fn an_empty_stop_after_work_does_not_ask_for_the_repository(store: DynStor
         "{:#?}",
         seen.messages
     );
+}
+
+/// A turn that reached the output limit while thinking is no answer: the loop continues it, so the
+/// coder never reads it as an empty stop.
+async fn a_turn_cut_while_thinking_is_continued_and_never_asks(store: DynStore) {
+    let fx = Fixture::new().await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_response(thinking_only_cut())
+        .push_text("Nothing to change here.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let seen = run_to_end(&server, &format!("Look at {}", fx.remote_url())).await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        seen.labels
+    );
+    assert!(
+        !seen.saw_message("What would you like me to do next?"),
+        "{:#?}",
+        seen.messages
+    );
+    assert_eq!(mock.requests().len(), 2);
+}
+
+/// Turns cut while thinking, past the bound, fail the run: not an answer, not a question.
+async fn turns_cut_while_thinking_past_the_bound_fail_the_coder_run(store: DynStore) {
+    let fx = Fixture::new().await;
+    let mock = Arc::new(MockModel::new());
+    for _ in 0..=adam_llm_agent::MAX_THINKING_CUTS {
+        mock.push_response(thinking_only_cut());
+    }
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let seen = run_to_end(&server, &format!("Look at {}", fx.remote_url())).await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Failed),
+        "{:?}",
+        seen.labels
+    );
+    assert!(
+        seen.saw_message("output limit reached while thinking"),
+        "{:#?}",
+        seen.messages
+    );
+    assert_eq!(
+        mock.requests().len(),
+        adam_llm_agent::MAX_THINKING_CUTS as usize + 1,
+        "one request per cut, and none after the bound"
+    );
+}
+
+fn thinking_only_cut() -> ModelResponse {
+    ModelResponse {
+        finish: adam_model::FinishReason::Length,
+        reasoning: Some("thinking".into()),
+        ..ModelResponse::text("")
+    }
 }
 
 /// Red checks do not fail a run that has check cycles left: the model's text is a question like
@@ -3168,12 +3275,10 @@ fn coder_retrying(fx: &Fixture, model: DynModel, store: DynStore, max_attempts: 
         .concurrency(opts.concurrency)
         .lease_ttl(opts.lease_ttl)
         .poll_interval(opts.poll_interval)
-        .retry(RetryPolicy {
-            max_attempts,
-            initial_backoff: Duration::from_millis(50),
-            max_backoff: Duration::from_millis(100),
-            multiplier: 2.0,
-        })
+        .retry(
+            RetryPolicy::new(max_attempts)
+                .with_backoff(Duration::from_millis(50), Duration::from_millis(100)),
+        )
         .build();
     let backend = RuntimeTaskBackend::new(runtime.clone(), events, AGENT_NAME)
         .with_poll_interval(opts.poll_interval);
@@ -3981,19 +4086,23 @@ async fn another_caller_cannot_see_or_resume_the_task(store: DynStore) {
 
 // ------------------------------------------------------- asking with choices
 
-/// The screen's catalog (the web's, version 2: Text, Column, Choices): the copy `adam-ui` pins.
-const CATALOG: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.json");
+/// The screen's catalog (the web's, version 9): the copy `adam-ui` pins.
+const CATALOG: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v9.json");
 const CATALOG_LOCK: &str =
-    include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.lock.json");
-const UI_CATALOG_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/ui-catalog/v1";
+    include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v9.lock.json");
+const UI_CATALOG_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/ui-catalog/v2";
 const THREAD_TOOLS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/thread-tools/v1";
 
-/// A first message from the person's screen: the text, the catalog's reference (`ui-catalog/v1`),
+/// A first message from the person's screen: the text, the catalog's reference (`ui-catalog/v2`),
 /// the catalog itself in the A2UI capabilities when `inline`, and the grant for the conversation's
 /// tools when there is one.
 fn from_the_screen(text: &str, inline: bool, grant: Option<serde_json::Value>) -> Message {
     let lock: serde_json::Value = serde_json::from_str(CATALOG_LOCK).unwrap();
-    let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    let mut catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    // A screen sends a `ui-catalog/v2` document: the published version 2 gets `protocolVersion`, and the
+    // digest is of what is sent.
+    catalog["protocolVersion"] = json!("1.0");
+    let digest = adam_ui::catalog_digest(&catalog).unwrap();
     let id = catalog["catalogId"].clone();
     let mut capabilities = json!({"supportedCatalogIds": [id.clone()]});
     if inline {
@@ -4001,8 +4110,8 @@ fn from_the_screen(text: &str, inline: bool, grant: Option<serde_json::Value>) -
     }
     let mut metadata = json!({
         UI_CATALOG_EXTENSION: {
-            "catalogId": id, "version": lock["version"], "digest": lock["digest"], "inline": inline},
-        "a2uiClientCapabilities": {"v0.9.1": capabilities},
+            "catalogId": id, "version": lock["version"], "digest": digest, "inline": inline},
+        "a2uiRendererCapabilities": {"1.0": capabilities},
     });
     if let Some(grant) = grant {
         metadata[THREAD_TOOLS_EXTENSION] = grant;
@@ -4021,7 +4130,7 @@ fn from_the_screen(text: &str, inline: bool, grant: Option<serde_json::Value>) -
 
 /// The person's answers through the form, as the screen sends them: one A2UI action on the task.
 fn answers_to(task: &str, surface: &str, answers: serde_json::Value) -> Message {
-    let mut part = Part::data(json!([{"version": "v0.9.1", "action": {
+    let mut part = Part::data(json!([{"version": "1.0", "action": {
         "name": "answer", "surfaceId": surface, "sourceComponentId": "root",
         "timestamp": "2026-10-01T10:00:00Z", "context": {"answers": answers}}}]))
     .with_media_type("application/a2ui+json");
@@ -4031,6 +4140,12 @@ fn answers_to(task: &str, surface: &str, answers: serde_json::Value) -> Message 
     )]));
     let mut message = Message::new(Role::User, vec![part]);
     message.task_id = Some(task.to_owned());
+    // Every message of the screen says what it offers: an answer turn that did not would be in words.
+    let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    message.metadata = Some(std::collections::HashMap::from([(
+        "a2uiRendererCapabilities".to_owned(),
+        json!({"1.0": {"supportedCatalogIds": [catalog["catalogId"].clone()]}}),
+    )]));
     message
 }
 
@@ -4209,12 +4324,14 @@ async fn the_catalog_is_read_again_over_the_thread_tools_and_their_tools_are_off
     store: DynStore,
 ) {
     let lock: serde_json::Value = serde_json::from_str(CATALOG_LOCK).unwrap();
-    let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    let mut catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    catalog["protocolVersion"] = json!("1.0");
+    let digest = adam_ui::catalog_digest(&catalog).unwrap();
     let thread = adam_mcp_testkit::ThreadToolsServer::start(&["thread-token"]).await;
     thread.set_catalog(Some((
         catalog["catalogId"].as_str().unwrap(),
         lock["version"].as_u64().unwrap(),
-        lock["digest"].as_str().unwrap(),
+        &digest,
         catalog.clone(),
     )));
     thread.add_tool(
@@ -4416,16 +4533,19 @@ async fn another_repository_joins_the_workspace_when_the_person_says_yes_on_the_
     assert_eq!(parts.len(), 2, "the question and its form: {parts:?}");
     let text = parts[0].as_text().unwrap();
     assert!(
-        text.contains("May I add the repository library")
-            && text.contains(&library_url)
-            && text.contains(
-                "The agent says why: \"the shared greeting lives in greeting.txt there\""
-            ),
+        text.contains("May I add the repository library") && text.contains(&library_url),
         "{text}"
     );
     let a2a::PartContent::Data(surface) = &parts[1].content else {
         panic!("the second part is the form: {parts:?}");
     };
+    // The screen's `Choices` has a description: the reason is drawn there, not folded into the words.
+    assert!(
+        surface
+            .to_string()
+            .contains(r#"The agent says why: \"the shared greeting lives in greeting.txt there\""#),
+        "{surface}"
+    );
     let choices = &surface[1]["updateComponents"]["components"][0];
     assert_eq!(choices["component"], "Choices");
     assert_eq!(choices["questions"][0]["id"], "consent");
@@ -5414,6 +5534,7 @@ macro_rules! coder_suite {
                 a_scratch_project_is_published_to_the_repository_the_person_names,
                 ask_user_parks_and_an_a2a_follow_up_resumes,
                 a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run,
+                a_firing_that_stops_on_a_question_fails_instead_of_waiting,
                 a_question_is_answered_from_a_look_around_and_costs_no_check_cycles,
                 an_answer_that_asks_nothing_completes_the_task,
                 work_left_in_a_worktree_is_not_finished_by_a_statement,
@@ -5424,6 +5545,8 @@ macro_rules! coder_suite {
                 the_environment_is_sealed_when_a_project_is_started_and_when_one_is_taken_over,
                 a_stop_without_text_asks_what_to_do,
                 an_empty_stop_after_work_does_not_ask_for_the_repository,
+                a_turn_cut_while_thinking_is_continued_and_never_asks,
+                turns_cut_while_thinking_past_the_bound_fail_the_coder_run,
                 red_checks_with_cycles_left_then_text_is_a_question,
                 a_repository_in_quoted_findings_is_not_named,
                 checks_without_a_pull_request_then_text_is_a_question,

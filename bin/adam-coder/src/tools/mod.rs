@@ -467,7 +467,9 @@ impl ToolEnv {
         let e = sealed.err()?;
         tracing::warn!(run = %workspace.run(), error = %report(&e), "cannot seal the run's environment for a slot that was added");
         let said = match environment_error(&self.redactor, &e) {
-            ToolError::Transient(text) | ToolError::Permanent(text) => text,
+            ToolError::Transient(text)
+            | ToolError::Retryable { message: text, .. }
+            | ToolError::Permanent(text) => text,
             other => report(&other),
         };
         Some(format!(
@@ -1068,6 +1070,10 @@ impl Tool for Gated {
         own_limit(&self.name, &self.env.settings).or_else(|| self.inner.time_limit())
     }
 
+    fn retry_policy(&self) -> Option<adam_runtime::RetryPolicy> {
+        self.inner.retry_policy()
+    }
+
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
         // Every tier allows what needs the lowest one: no read of the notes for a look.
         if self.needs > AccessTier::Plan {
@@ -1250,6 +1256,10 @@ impl Tool for Redacting {
         self.inner.time_limit()
     }
 
+    fn retry_policy(&self) -> Option<adam_runtime::RetryPolicy> {
+        self.inner.retry_policy()
+    }
+
     fn read_answer(
         &self,
         call_id: &str,
@@ -1307,6 +1317,10 @@ impl Tool for Redacting {
                 Ok(out)
             }
             Err(ToolError::Transient(m)) => Err(ToolError::Transient(r.scrub_string(m))),
+            Err(ToolError::Retryable { message, class }) => Err(ToolError::Retryable {
+                message: r.scrub_string(message),
+                class,
+            }),
             Err(ToolError::Permanent(m)) => Err(ToolError::Permanent(r.scrub_string(m))),
             Err(ToolError::NeedsInput { question, mut ui }) => {
                 if let Some(ui) = &mut ui {
@@ -1366,7 +1380,9 @@ pub(crate) fn session_error(redactor: &Redactor, e: &EnvError) -> ToolError {
         return environment_error(redactor, e);
     }
     let mut text = match environment_error(redactor, e) {
-        ToolError::Transient(text) | ToolError::Permanent(text) => text,
+        ToolError::Transient(text)
+        | ToolError::Retryable { message: text, .. }
+        | ToolError::Permanent(text) => text,
         other => report(&other),
     };
     text.push_str(BROKEN_ENVIRONMENT);
@@ -1742,6 +1758,52 @@ mod redacting_kept_tests {
         let out = tool.call(&ctx, Value::Null).await.unwrap();
         let kept = out.kept.unwrap();
         assert_eq!(kept.text, "line one\nkey=[redacted]\n");
+    }
+
+    /// Fails with a rate limit whose message carries the key, and has a retry policy.
+    struct Limited;
+
+    #[async_trait::async_trait]
+    impl Tool for Limited {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "limited".into(),
+                description: "x".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn retry_policy(&self) -> Option<adam_runtime::RetryPolicy> {
+            Some(adam_runtime::RetryPolicy::new(4))
+        }
+
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Err(ToolError::retryable(
+                "429 for key sk-live-0123456789abcdef",
+                adam_error::ErrorClass::RateLimited,
+            ))
+        }
+    }
+
+    /// A rate limit is scrubbed, keeps its class, and the tool's policy passes through (ADR 0061).
+    #[tokio::test]
+    async fn a_rate_limit_is_scrubbed_and_keeps_its_class_and_policy() {
+        let mut layer = Redacting::layer(Redactor::new(["sk-live-0123456789abcdef"]));
+        let tool = layer(Arc::new(Limited));
+        assert_eq!(tool.retry_policy(), Some(adam_runtime::RetryPolicy::new(4)));
+        let ctx = ToolCtx::detached(
+            "limited",
+            "c1",
+            Arc::new(adam_runtime::CollectingSink::new()),
+        );
+        let error = tool.call(&ctx, Value::Null).await.unwrap_err();
+        assert_eq!(
+            error,
+            ToolError::retryable(
+                "429 for key [redacted]",
+                adam_error::ErrorClass::RateLimited
+            )
+        );
     }
 }
 

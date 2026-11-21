@@ -100,13 +100,14 @@ flowchart LR
     StoreError -->|"Corrupt, NonDeterminism, Backend corrupt_source"| Corrupt
     StoreError -->|"Backend internal"| Internal
 
-    AgentError -->|"Transient, no retry_after"| Transient
-    AgentError -->|"Transient with retry_after"| RateLimited
+    AgentError -->|"Transient of class Transient, no retry_after"| Transient
+    AgentError -->|"Transient of class Transient with retry_after, or kept from from_classified"| RateLimited
+    AgentError -->|"Transient of class Conflict, kept from from_classified"| Conflict
     AgentError -->|Permanent| Invalid
     AgentError -->|NonDeterminism| Corrupt
     StoreError -.->|"Store(e)"| AgentError
 
-    RuntimeError -->|UnknownAgent| Invalid
+    RuntimeError -->|"UnknownAgent, WrongAgent, InvalidSession, ForeignConversation"| Invalid
     RuntimeError -->|NotFound| NotFound
     RuntimeError -->|"Finished, ConversationBusy"| Rejected
     RuntimeError -->|Corrupt| Corrupt
@@ -149,6 +150,8 @@ flowchart LR
     PushStoreError -->|Internal| Internal
 
     ToolError -->|Transient| Transient
+    ToolError -->|"Retryable, a rate limit"| RateLimited
+    ToolError -->|"Retryable, a conflict"| Conflict
     ToolError -->|Permanent| Invalid
     ToolError -->|NeedsInput| Rejected
 
@@ -220,7 +223,8 @@ Where each decision is made:
 * **Retry** is in `adam-runtime` (`worker.rs`). The model, workspace and ACP
   errors reach it through the agent: a retryable one becomes
   `AgentError::Transient` (directly in `LlmAgent` for a model error, or through
-  `ToolError::Transient` for a tool), carrying its `retry_after`. Anything else
+  `ToolError::Transient` or `ToolError::Retryable` for a tool), carrying its class and its `retry_after`, and,
+  for a tool with a policy, that policy under the key `tool:<name>`. Anything else
   fails the call. In the coder, a permanent tool failure is an error result
   the model sees, and the run goes on.
 * **Conflict** retries at once and is bounded: the runtime's commit, deliver,
@@ -267,6 +271,12 @@ Three results the loop writes itself, as error results the run goes on from (`ad
 A child whose parent ended is `cancelled: the parent run ended`. Two refusals of a repeated call end the run with its closing
 turn and `limit: "repeated_call"`; a closing turn with no words fails it with `the same tool call was repeated with the same
 result and the run was stopped (doom_loop)`.
+
+A model turn that stops at the output limit with only reasoning (no words, no call) is continued with a short message, at
+most twice in a row; the third fails the run with `output limit reached while thinking: 3 turns in a row ended at the output
+limit with no words and no tool call; raise max_output_tokens or lower the reasoning effort`. It is never the run's answer, so
+the coder never asks the person about it. A cut turn that has words is still an answer marked `truncated`. A closing turn
+that is cut with no words fails with `turn limit exceeded`.
 
 ### A language server that cannot answer
 
@@ -316,9 +326,14 @@ The **first read of an image in a process** (one `(scope, SHA-256)` of the histo
 
 ## Retry
 
-The runtime retries a step that fails with a `Transient` or `RateLimited` `AgentError` with exponential
-backoff (`RetryPolicy`), waiting at least the error's `retry_after()` (a provider's `Retry-After`, capped
-at 24 hours). Any other class fails the run. A store error while stepping is decided by class: `Corrupt` and
+The runtime retries a transition that fails with a `Transient` `AgentError` (its class `Transient`,
+`RateLimited` or `Conflict`) with exponential backoff (`RetryPolicy`), waiting at least the error's
+`retry_after()` (a provider's `Retry-After`, capped at 24 hours). The policy is the step's own when the
+error carries one (`AgentError::with_retry`, `Ctx::step_retrying`; ADR 0061), else the runtime's; a policy
+retries only the classes it lists (`retry_on`, all three by default), so an error of another class fails
+the run at once. Failures are counted per step's key, under a ceiling of 100 consecutive failures, and
+the messages name the key (``gave up after 3 attempts of `fetch` ``); see the
+[adam-runtime README](../../crates/adam-runtime/README.md#retries-per-step). Any other class fails the run. A store error while stepping is decided by class: `Corrupt` and
 `Invalid` fail the run; everything else leaves the run to its lease and is logged with its class.
 
 ## Exit codes
@@ -330,14 +345,28 @@ the coder's own errors in `bin/adam-coder/src/exit.rs`):
 | Code | Meaning |
 |---|---|
 | 0 | clean shutdown after SIGTERM |
-| 78 | configuration (`ConfigError`, an invalid `OpenAiConfigError`, `ServeError::Push`: push notifications are on and cannot be set up, `ServeError::ChildSessions`: the agent serves `child-sessions/v1` for a helper the process did not register (a fault of the binary, found at start; the message names the helper), a `LANGUAGE_SERVERS` that is not `on` or `off`, a `LANGUAGE_SERVER_IDLE_SECS` outside 30 to 86400 or a `LANGUAGE_SERVERS_MAX` outside 1 to 32, or a `MAX_PARALLEL_TOOL_CALLS` outside 1 to 32, or a `SESSION_MAX_OPEN` outside 1 to 100, a `SESSION_MAX_WORKING` outside 1 to 32 or, when set, above `SESSION_MAX_OPEN` (an unset one is cut down to it), a `SESSION_MAX_ROUNDS` outside 2 to 200 or a `SESSION_IDLE_DAYS` outside 1 to 365, on every role (the line names the variable), any other `Invalid` error, such as a `ReferencesError`: `ADAM_REFERENCES_FILE` that cannot be read, is not a file of references, repeats a name the agent declares, or names an address the workspaces' policy refuses). A bad `A2A_PUSH_*`, `A2A_CARD_SIGNING_*`, `MODEL_CONTEXT_WINDOW`, `MODEL_INPUT_MODALITIES`, `MODEL_OUTPUT_MODALITIES` (`image` is not built for any provider) or `MODEL_IMAGE_*` or `A2A_ALLOW_INSECURE_REMOTES` value is a `ConfigError`, and so is a `MODEL_IMAGE_*` variable set while `MODEL_INPUT_MODALITIES` lacks `image` (the line names the variable), and so is `MODEL_IMAGE_MAX_BYTES` times `MODEL_IMAGE_MAX_COUNT` over 32 MiB (the line names both: a request resends every admitted image), and so is a `BACKGROUND_COMMANDS_MAX`, `BACKGROUND_COMMAND_MAX_SECS` or `BACKGROUND_SWEEP_SECS` outside its range (`0` included: none of the three turns the bound off, because the sweep is what a cancel depends on), the message names the variable; so is `adam-coder` with a **GitHub App key file while the commands run in its own container** (a command could read the key and act as the App at any access tier; the message names the settings that change it) unless `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` accepts it, and so is a value of that variable that is no boolean; a remote subagent at plain `http` on another machine without `A2A_ALLOW_INSECURE_REMOTES`, or whose `auth` variable is unset, is an `Invalid` error of the assembly |
-| 69 | a dependency unreachable at boot (Postgres) |
+| 78 | configuration (`ConfigError`, an invalid `OpenAiConfigError`, `ServeError::Push`: push notifications are on and cannot be set up, `ServeError::ChildSessions`: the agent serves `child-sessions/v1` for a helper the process did not register (a fault of the binary, found at start; the message names the helper), `ServeError::UnsupportedScheme` / `ServeError::StoreNotBuilt` / `ServeError::SqliteWithoutPath` / `ServeError::SplitRoleOnSqlite`: `DATABASE_URL` names a store this process cannot serve (see below), a `LANGUAGE_SERVERS` that is not `on` or `off`, a `LANGUAGE_SERVER_IDLE_SECS` outside 30 to 86400 or a `LANGUAGE_SERVERS_MAX` outside 1 to 32, or a `MAX_PARALLEL_TOOL_CALLS` outside 1 to 32, or a `SESSION_MAX_OPEN` outside 1 to 100, a `SESSION_MAX_WORKING` outside 1 to 32 or, when set, above `SESSION_MAX_OPEN` (an unset one is cut down to it), a `SESSION_MAX_ROUNDS` outside 2 to 200 or a `SESSION_IDLE_DAYS` outside 1 to 365, on every role (the line names the variable), any other `Invalid` error, such as a `ReferencesError`: `ADAM_REFERENCES_FILE` that cannot be read, is not a file of references, repeats a name the agent declares, or names an address the workspaces' policy refuses). A bad `A2A_PUSH_*`, `A2A_CARD_SIGNING_*`, `MODEL_CONTEXT_WINDOW`, `MODEL_INPUT_MODALITIES`, `MODEL_OUTPUT_MODALITIES` (`image` is not built for any provider) or `MODEL_IMAGE_*` or `A2A_ALLOW_INSECURE_REMOTES` value is a `ConfigError`, and so is a `MODEL_IMAGE_*` variable set while `MODEL_INPUT_MODALITIES` lacks `image` (the line names the variable), and so is `MODEL_IMAGE_MAX_BYTES` times `MODEL_IMAGE_MAX_COUNT` over 32 MiB (the line names both: a request resends every admitted image), and so is a `BACKGROUND_COMMANDS_MAX`, `BACKGROUND_COMMAND_MAX_SECS` or `BACKGROUND_SWEEP_SECS` outside its range (`0` included: none of the three turns the bound off, because the sweep is what a cancel depends on), the message names the variable; so is `adam-coder` with a **GitHub App key file while the commands run in its own container** (a command could read the key and act as the App at any access tier; the message names the settings that change it) unless `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` accepts it, and so is a value of that variable that is no boolean; a remote subagent at plain `http` on another machine without `A2A_ALLOW_INSECURE_REMOTES`, or whose `auth` variable is unset, is an `Invalid` error of the assembly |
+| 69 | a dependency unreachable at boot (Postgres, MongoDB or SQLite) |
 | 71 | an OS error (a port that cannot bind, a directory that cannot be created) |
 | 70 | a half of the process stopped, a panic or an internal error |
 | 1 | anything else |
 
 The failure is one structured JSON log line (`adam-coder failed`, `adam-agent failed`) with the whole
 cause chain and none of the process's secrets.
+
+### The store's exit-78 reasons
+
+`DATABASE_URL` is read once at start ([store adapters](store-adapters.md#sqlite)). Each of these is a
+`ServeError`, exit 78, and its message says which rule it broke:
+
+| Reason | Message says |
+|---|---|
+| the scheme is not `postgres`, `postgresql`, `mongodb`, `mongodb+srv` or `sqlite` | the scheme as written, and the five accepted ones |
+| the binary was built without that adapter (a library build with the feature off) | the scheme and the `store-<scheme>` feature to rebuild with |
+| `sqlite://` with no path | the shape of a URL that has one |
+| `sqlite://` with `ROLE=worker` or `ROLE=control-plane` | the role, that a SQLite file is opened by one process, and the stores a split deployment uses |
+| the SQLite file is held by another process | the file and its `<path>.lock` |
+| the SQLite file's `schema_version` is newer than the binary's | both versions, and to start the release that migrated the file |
 
 `adam-egress` (the egress proxy, [its README](../../bin/adam-egress/README.md)) ends with 0 after SIGTERM, 78 for its
 configuration and 71 when it cannot bind `EGRESS_LISTEN` (`bin/adam-egress/src/error.rs`); it logs `adam-egress failed`

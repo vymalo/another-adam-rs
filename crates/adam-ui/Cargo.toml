@@ -60,6 +60,10 @@ name = "access"
 required-features = ["thread-tools"]
 
 [[test]]
+name = "offer_edges"
+required-features = ["thread-tools"]
+
+[[test]]
 name = "ask_v7"
 required-features = ["thread-tools"]
 
@@ -81,6 +85,10 @@ required-features = ["thread-tools"]
 
 [[test]]
 name = "plan_run"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "offer"
 required-features = ["thread-tools"]
 
 [[test]]

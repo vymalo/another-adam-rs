@@ -40,7 +40,7 @@ applies at the next start, and a restart is a deploy.
 | `skills/` | Agent Skills: a catalog the model loads from on demand (`load_skill`, `read_skill_file`) |
 | `subagents/` | assembled and **registered beside the agent** (`<name>/<subagent>`): one tool per subagent, a child run with its own prompt and tools. A subagent gets only the tools it lists, and not `ask_user` (nobody would answer it) |
 | `mcp.json` | MCP servers whose tools the agent gets, see [below](#mcp-servers-from-the-folder). Connected by the **workers** |
-| `schedules/` | read, not run: a warning says so |
+| `schedules/` | run ([ADR 0060](../../docs/decisions/0060-schedules-are-parked-runs.md)): the worker roles register the agent's scheduler (`<agent>/adam.schedule`, its own, so agents that share one database never step each other's), and a `schedules` worker component reconciles the scheduler runs with the folder at start (logged as `schedules reconciled`, with what it started, kept and cancelled; a store that is not reachable yet is tried again with a backoff of up to a minute, and a stop ends it at once); a folder with none cancels the schedulers it had. Each firing is a run of the agent with the prompt as a person's message, in a conversation of its own (`adam.schedule:<agent>/<name>@<due>`) that no A2A caller lists. `control-plane` does neither |
 | `commands/` | prompt templates (`commands/<name>.md`: `description`, optional `argument-hint`, a body with `$ARGUMENTS` and `$1` to `$9`). The card lists `commands/v1` with them, and a message that names one (in its metadata, or as `/name arguments` at the start of its text) is expanded before it is stored: [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md#commands-commandsnamemd), [`a2a-server.md`](../../docs/reference/a2a-server.md#commands-commandsv1). A folder without `commands/` lists nothing |
 
 The built-in tools are the person's screen ([`adam-ui`](../../crates/adam-ui/README.md)), and the same ones
@@ -79,7 +79,7 @@ ending the run, so a message sent during the last model call is answered; a fini
 activation the message is refused as before ([`adam-a2a-runtime`](../../crates/adam-a2a-runtime/README.md#steering-a-running-task),
 [ADR 0016](../../docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md)).
 
-The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1`, `steps/v1`,
+The card lists A2UI v1.0 (with `acceptsInlineCatalogs: true`), `ui-catalog/v2`, `thread-tools/v1`, `mentions/v1`, `steer/v1`, `steps/v1`,
 `text-stream/v1` and `usage/v1` (`card_of`; and `commands/v1` when the folder has `commands/`, and `child-sessions/v1` when the root has a subagent, local or remote: `serve` adds it, with `maxOpen` the effective `SESSION_MAX_OPEN` that the root's `limits.max_open_sessions` may lower, **only when the backend serves it**, so a person's client can open, talk to and close a session on a helper: [`a2a-server.md`](../../docs/reference/a2a-server.md#child-sessions-child-sessionsv1). `agents()` gives `Agents::child_sessions(def.child_sessions())`; the control plane registers the helpers' starters beside the root's, and a worker steps the rounds), and `build/v1` (`card_of_folder`: the build's revision and the folder's digest, [ADR 0028](../../docs/decisions/0028-the-card-says-which-build-answers.md)), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
 whose messages carry none of that is not affected. **Every tool call is a step** (`tool:<call id>`, labelled with a
 title a person reads (`Ask you`, an MCP tool's own `title`, a subagent's name capitalised, [ADR 0027](../../docs/decisions/0027-every-tool-has-a-title-for-its-step.md)); running, then completed, failed or waiting for the person; with the
@@ -196,7 +196,7 @@ same way; every problem is reported at once at startup):
 | `ADAM_AGENT_DIR` | the agent folder; **required by every role**, and an existing directory (exit 78 naming the variable otherwise) | required |
 | `ADAM_EXTRA_MCP_FILE` | roles that run workers: a file of extra MCP servers in the shape of `mcp.json`, added to the folder's own before they connect (an existing file, else exit 78; a name the folder already has is refused, exit 78). Same parser, `${VAR}`, `tools`, `optional` and policy as `mcp.json`; the variables it names are scrubbed from the tool-call steps like the folder's own (`redact::step_io_named`). See [`adam-assembly`](../../crates/adam-assembly/README.md#extra-mcp-servers-adam_extra_mcp_file) | unset: only the folder's servers |
 | `ROLE` | what this process runs: `all`, `control-plane` or `worker` (see [Roles](#roles)) | `all` |
-| `DATABASE_URL` | Postgres for the run store | required |
+| `DATABASE_URL` | the run store: `postgres://`/`postgresql://`, `mongodb://`/`mongodb+srv://` or `sqlite://<path>` (one file, one process, `ROLE=all` only) | required |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required by `all` and `control-plane` |
 | `A2A_PUSH_ALLOWED_URLS` | turns A2A push notifications **on** and names the webhooks they may reach: comma-separated URL prefixes or hosts ([`adam-service`](../../crates/adam-service/README.md#environment)); a client's webhook that matches none, is not `https` or is a private address is refused | unset: off, the card says so |
@@ -277,9 +277,8 @@ stateDiagram-v2
 Startup logs one `agent files` line (`source=folder`, `path`: the directory that holds `agent/`, `digest`:
 `sha256:...`, `agent`, `warnings`) and each warning as `path:line: warning: ...`; the same line `adam-coder`
 logs. A mistake in the files stops the process before it connects to anything, exit code 78, with every finding
-as `path:line: error: ...` in the one `adam-agent failed` line. A folder that declares `schedules` or
-`references:` logs one more warning each: this binary reads them and runs or serves neither (only `adam-coder` reads
-references).
+as `path:line: error: ...` in the one `adam-agent failed` line. A folder that declares `references:` logs one more
+warning: this binary reads them and serves none (only `adam-coder` reads references).
 
 Exit codes are `adam-service`'s: 0 after a clean shutdown, 78 configuration (including the folder and the files),
 69 a dependency is unreachable (Postgres, an MCP server), 71 the OS refused something (a port), 70 internal (a
@@ -338,8 +337,10 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
 * `src/config.rs`: `ADAM_AGENT_DIR` required by every role and an existing directory, every problem at once,
   a control plane that needs no model, `MODEL_CONTEXT_WINDOW` read by the workers (a bad value is exit 78),
   `A2A_ALLOW_INSECURE_REMOTES` off by default, read by the workers and a boolean, secrets hidden from `Debug`;
-  `src/serve.rs`: the switch reaches the binding of the folder's remote subagents (off: refused; on: bound).
-* `tests/agent.rs` (in-process, over the in-memory store, scripted models): the card is the folder's, and lists the screen's three extensions, `steps/v1`, `text-stream/v1` and `usage/v1`; **a chat
+  `src/serve.rs`: the switch reaches the binding of the folder's remote subagents (off: refused; on: bound). The
+  `schedules` component is `adam_schedule::reconcile_until_stopped`, tested in `adam-schedule`.
+* `tests/agent.rs` (in-process, over the in-memory store, scripted models): a folder's `after: 1s` schedule fires the
+  agent with its prompt as a person's message (and a control plane has no `schedules` component); the card is the folder's, and lists the screen's three extensions, `steps/v1`, `text-stream/v1` and `usage/v1`; **a chat
   folder answers "hi" in role over A2A** (the task completes with the greeting its two persona lines give, the
   model is sent the folder's rendered prompt and the screen's and the plan's six tools only; `a_folder_agent_without_tools_offers_the_plan_tools`: a `plan_work` call keeps a plan, and `tools:` narrows them); an edited folder says the edited words; `ask_user`
   parks the run as `input-required` and the answer resumes it; a control plane starts a run that a worker over the

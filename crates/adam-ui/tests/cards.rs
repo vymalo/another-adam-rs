@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use adam_a2a_runtime::{CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
+use adam_a2a_runtime::{CONTEXT_A2UI_RENDERER, CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
 use adam_llm_agent::{ToolCtx, ToolOutput};
 use adam_mcp::McpPolicy;
 use adam_runtime::NoopSink;
@@ -22,8 +22,16 @@ const LOCK: &str = include_str!("fixtures/catalog-v3.lock.json");
 const PINNED_DIGEST: &str =
     "sha256:9f65f9e6ddd424688b1cf61c47634eafee321a3b6736fb7fea8c0f7db1fc7579";
 
-fn document() -> Value {
+/// The catalog as the web published it, with no `protocolVersion` (versions 2 to 8).
+fn published() -> Value {
     serde_json::from_str(FIXTURE).unwrap()
+}
+
+/// The catalog as a screen sends it now: a `ui-catalog/v2` document.
+fn document() -> Value {
+    let mut document = published();
+    document["protocolVersion"] = json!("1.0");
+    document
 }
 
 fn claimed() -> Claimed {
@@ -31,7 +39,7 @@ fn claimed() -> Claimed {
     Claimed {
         catalog_id: CATALOG_ID.to_owned(),
         version: u32::try_from(lock["version"].as_u64().unwrap()).unwrap(),
-        digest: lock["digest"].as_str().unwrap().to_owned(),
+        digest: catalog_digest(&document()).unwrap(),
     }
 }
 
@@ -54,6 +62,7 @@ fn inline_context() -> Map<String, Value> {
     let c = claimed();
     json!({
         CONTEXT_UI_REF: {"catalogId": c.catalog_id, "version": c.version, "digest": c.digest},
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]},
         CONTEXT_UI_CATALOG: {
             "catalogId": c.catalog_id, "version": c.version, "digest": c.digest,
             "catalog": as_doubles(&document())},
@@ -184,7 +193,8 @@ async fn the_list_of_components_is_one_short_line_each_and_bounded() {
             )
         })
         .collect();
-    let document = json!({"catalogId": CATALOG_ID, "components": components});
+    let document =
+        json!({"catalogId": CATALOG_ID, "protocolVersion": "1.0", "components": components});
     let digest = catalog_digest(&document).unwrap();
     let c = Claimed {
         catalog_id: CATALOG_ID.to_owned(),
@@ -194,6 +204,7 @@ async fn the_list_of_components_is_one_short_line_each_and_bounded() {
     let catalog = Catalog::from_document(document.clone(), &c).unwrap();
     let context = json!({
         CONTEXT_UI_REF: {"catalogId": c.catalog_id, "version": c.version, "digest": c.digest},
+        CONTEXT_A2UI_RENDERER: {"catalogIds": [c.catalog_id]},
         CONTEXT_UI_CATALOG: {
             "catalogId": c.catalog_id, "version": c.version, "digest": c.digest,
             "catalog": as_doubles(&document)},
@@ -263,18 +274,23 @@ async fn a_choices_block_is_refused_because_a_form_drawn_by_show_would_be_dead()
 fn version_three_of_the_web_catalog_hashes_to_its_lock_and_every_component_compiles() {
     let c = claimed();
     assert_eq!(c.version, 3);
-    assert_eq!(c.digest, PINNED_DIGEST, "the lock is the pinned digest");
+    let lock: Value = serde_json::from_str(LOCK).unwrap();
     assert_eq!(
-        catalog_digest(&document()).unwrap(),
-        PINNED_DIGEST,
-        "adam's digest of the fixture is the web's"
+        lock["digest"], PINNED_DIGEST,
+        "the lock is the pinned digest"
     );
+    assert_eq!(
+        catalog_digest(&published()).unwrap(),
+        PINNED_DIGEST,
+        "adam's digest of the published file is the web's"
+    );
+    assert_eq!(c.digest, catalog_digest(&document()).unwrap());
     let catalog = Catalog::from_document(document(), &c).unwrap();
     assert_eq!(catalog.names(), "Cards, Choices, Column, Mermaid, Text");
     assert_eq!(catalog.version(), 3);
     // The doubles of an A2A message's metadata do not change what the catalog is.
     let doubles = Catalog::from_document(as_doubles(&document()), &c).unwrap();
-    assert_eq!(doubles.digest(), PINNED_DIGEST);
+    assert_eq!(doubles.digest(), c.digest);
     assert_eq!(doubles.document(), catalog.document());
 }
 
@@ -507,7 +523,7 @@ async fn ui_catalog_lists_cards_and_mermaid_with_what_they_are_for() {
     assert!(!out.is_error);
     let described: Value = serde_json::from_str(&out.content).unwrap();
     assert_eq!(described["version"], 3);
-    assert_eq!(described["digest"], PINNED_DIGEST);
+    assert_eq!(described["digest"], claimed().digest.as_str());
     let by_name = |name: &str| {
         described["components"]
             .as_array()

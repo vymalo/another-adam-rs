@@ -47,6 +47,7 @@ pub use adam_error;
 pub use adam_llm_agent;
 pub use adam_model;
 pub use adam_runtime;
+pub use adam_schedule;
 pub use adam_ui;
 
 mod engine;

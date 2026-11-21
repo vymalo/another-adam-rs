@@ -12,13 +12,31 @@ The roles that run workers (`all`, `worker`) read everything below except where 
 A `control-plane` reads only `ROLE`, `DATABASE_URL`, `ADAM_PG_POOL_SIZE`, `NOTIFY_LOCAL_ONLY`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR`,
 `ADAM_AGENT_DIR`, the `SESSION_*` limits and the optional `A2A_PUSH_*`, `A2A_CARD_SIGNING_*` and `A2A_DOCS`, and a chart may set the rest for every role.
 
+### The store `DATABASE_URL` selects
+
+`adam-service` chooses the adapter from the scheme ([ADR 0053](../decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md),
+decision 3). Every adapter is built into the binaries; a library build can take only the one it
+needs (`store-postgres`, `store-sqlite`, `store-mongodb` features of `adam-service`).
+
+| `DATABASE_URL` | Store | Signals across processes | Roles |
+|---|---|---|---|
+| `postgres://…`, `postgresql://…` | `adam-store-postgres` | `LISTEN`/`NOTIFY` (`adam-notify-postgres`) | `all`, `control-plane`, `worker` |
+| `mongodb://…`, `mongodb+srv://…` | `adam-store-mongodb`; the path is the database (`adam` when it names none) | none: workers poll | `all`, `control-plane`, `worker` |
+| `sqlite://<path>` | `adam-store-sqlite`; one file, one process, WAL | in-process (`LocalNotifier`) | **`all` only** |
+| anything else | — | — | exit 78, naming the scheme |
+
+`sqlite:///var/lib/adam/adam.sqlite` is an absolute path; `sqlite://adam.sqlite` and
+`sqlite://./adam.sqlite` are relative to the process's working directory; `sqlite://` with no path
+is exit 78. The file's `<path>.lock` refuses a second process, and a file stamped with a schema
+version newer than the binary's is refused ([store adapters](store-adapters.md#sqlite)).
+
 ## Both binaries (`adam-service`)
 
 | Variable | Meaning | Default |
 |---|---|---|
 | `ROLE` | `all`, `control-plane` or `worker` | `all` |
-| `DATABASE_URL` | Postgres for the run store | required |
-| `ADAM_PG_POOL_SIZE` | connections in the Postgres store's pool, **per process** (2 to 65535; one is refused because an `adam-notify-postgres` listener holds a connection for the process's lifetime, so a one-connection pool would leave none for a query; **two is the floor, not a size to run** — the default 16 is the intended size). Read by `adam-store-postgres` when it connects, not by `adam-service`'s own configuration: a value that is not an integer in range fails that connect at startup | `16` |
+| `DATABASE_URL` | the run store: `postgres://` or `postgresql://` (PostgreSQL), `mongodb://` or `mongodb+srv://` (MongoDB; its path is the database, `adam` when absent), or `sqlite://<path>` (one SQLite file, one process). Any other scheme is exit 78, and so is `sqlite://` with `ROLE=worker` or `ROLE=control-plane` ([the store each scheme selects](#the-store-database_url-selects)) | required |
+| `ADAM_PG_POOL_SIZE` | **Postgres only**: connections in the Postgres store's pool, **per process** (2 to 65535; one is refused because an `adam-notify-postgres` listener holds a connection for the process's lifetime, so a one-connection pool would leave none for a query; **two is the floor, not a size to run** — the default 16 is the intended size). Read by `adam-store-postgres` when it connects, not by `adam-service`'s own configuration: a value that is not an integer in range fails that connect at startup | `16` |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens; **none = no server** | required by `all`, `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (goes in the agent card) | required by `all`, `control-plane` |
 | `LISTEN_ADDR` | the A2A server, or a worker's `/healthz` | `0.0.0.0:8080` |
@@ -72,8 +90,9 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 
 `adam-coder`, in every role (`all`, `control-plane`, `worker`): the `notify` component. Both binaries'
 shared configuration parses the variable, so a bad value is exit 78 in either; `adam-agent` runs no
-`notify` component, so the value has no effect there. Source: `crates/adam-notify-postgres/src/lib.rs`,
-[the crate README](../../crates/adam-notify-postgres/README.md).
+`notify` component, so the value has no effect there. It also has no effect on a store without a
+cross-process listener: SQLite's notifier is always in-process, and MongoDB has none. Source:
+`crates/adam-notify-postgres/src/lib.rs`, [the crate README](../../crates/adam-notify-postgres/README.md).
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -221,6 +240,7 @@ Put these in a `.env` next to `compose.yaml`.
 | `ADAM_TEST_OPENAI_BASE_URL`, `ADAM_TEST_OPENAI_API_KEY`, `ADAM_TEST_OPENAI_MODEL` | a live model for `adam-model-openai/tests/live.rs` |
 | `ADAM_TEST_OPENCODE=1` | the live OpenCode test of `adam-acp` (a library no binary uses now) |
 | `ADAM_ENGINE_TEST_RESUME_CHILD` | set by `crates/adam-engine/tests/resume_process.rs` on the child process it starts (the store's directory); never set it yourself |
+| `ADAM_ENGINE_TEST_RESUME_FIXED_ID` | set by the same test on the child it starts when both halves use the fixed worker id; never set it yourself |
 | `ADAM_TRYBUILD=1` | the rustc-worded half of the `#[tool]` compile tests |
 | `ADAM_UPDATE_GOLDEN=1` | regenerate the codegen golden of `adam-agent-fs` |
 

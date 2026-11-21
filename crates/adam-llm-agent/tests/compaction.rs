@@ -264,12 +264,11 @@ impl Rig {
             .worker_id("w")
             .poll_interval(Duration::from_millis(10))
             .lease_ttl(Duration::from_secs(10))
-            .retry(RetryPolicy {
-                max_attempts: 4,
-                initial_backoff: Duration::from_millis(5),
-                max_backoff: Duration::from_millis(5),
-                multiplier: 1.0,
-            })
+            .retry(
+                RetryPolicy::new(4)
+                    .with_backoff(Duration::from_millis(5), Duration::from_millis(5))
+                    .with_multiplier(1.0),
+            )
             .build();
         let _ = arm.rt.set(rt.clone());
         Self {

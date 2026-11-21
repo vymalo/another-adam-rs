@@ -1390,7 +1390,19 @@ impl Agent for CoderAgent {
                                 None => Transition::Done { state, output },
                             }
                         } else if asks_the_person(&output) || owes_delivery(&notes, &slots).await {
-                            stop_as_question(ctx, state, output, !slots.is_empty()).await
+                            if adam_llm_agent::is_unattended(
+                                ctx.conversation_id(),
+                                Some(&state.context),
+                            ) {
+                                // Nobody answers a firing of a schedule (ADR 0060): a run that
+                                // would wait for the person ends, saying what it needed.
+                                Transition::Fail {
+                                    state,
+                                    error: redactor.failure_text(unattended_ending(&output)),
+                                }
+                            } else {
+                                stop_as_question(ctx, state, output, !slots.is_empty()).await
+                            }
                         } else {
                             // An answer that asks nothing, with no repository work left undelivered:
                             // the turn is over, and the person's next message starts the next one.
@@ -1404,9 +1416,29 @@ impl Agent for CoderAgent {
     }
 }
 
+/// The failure of a firing of a schedule that ended where a person's run would wait: a question,
+/// or repository work left undelivered. It names what the run needed and quotes its last words.
+fn unattended_ending(output: &Value) -> String {
+    let said = output
+        .get("text")
+        .and_then(Value::as_str)
+        .or_else(|| output.as_str())
+        .unwrap_or_default()
+        .trim();
+    // The end of the answer: a question is its last paragraph, and the run's failure is bounded.
+    let count = said.chars().count();
+    let tail: String = said.chars().skip(count.saturating_sub(1_500)).collect();
+    let cut = if count > 1_500 { "…" } else { "" };
+    format!(
+        "a schedule started this run and nobody answers it, so it stopped where it would have waited \
+         for the person (a question, or work left undelivered); its last words: {cut}{tail}"
+    )
+}
+
 /// The boundary a failed step crosses on its way to the run's failure text and the retry note:
 /// the whole error chain is flattened into the message, scrubbed of the process's secrets, and
-/// bounded ([`Redactor::failure_text`]). The retry hint survives; the source does not, because a
+/// bounded ([`Redactor::failure_text`]). The retry hint, the class and the step's retry policy
+/// survive; the source does not, because a
 /// source is exactly where a secret hides once nothing scrubs it. A `Store` error carries no model
 /// or tool text and passes through; a variant added later becomes a scrubbed permanent error.
 fn boundary_error(e: AgentError, redactor: &Redactor) -> AgentError {
@@ -1419,17 +1451,21 @@ fn boundary_error(e: AgentError, redactor: &Redactor) -> AgentError {
         redactor.failure_text(text)
     };
     match e {
+        // The class and the step's policy survive too: they decide whether it is retried, and
+        // how often (ADR 0061).
         AgentError::Transient {
             message,
             retry_after,
+            class,
+            retry,
             source,
-        } => {
-            let out = AgentError::transient(clean(message, source.as_deref()));
-            match retry_after {
-                Some(after) => out.with_retry_after(after),
-                None => out,
-            }
-        }
+        } => AgentError::Transient {
+            message: clean(message, source.as_deref()),
+            retry_after,
+            class,
+            retry,
+            source: None,
+        },
         AgentError::Permanent { message, source } => {
             AgentError::permanent(clean(message, source.as_deref()))
         }
@@ -1699,6 +1735,34 @@ mod tests {
         assert!(out.is_retryable());
         assert_eq!(text(&out), "transient error: rate limited: 429");
 
+        // A conflict stays a conflict, and the step's policy stays on it (ADR 0061).
+        let conflict = AgentError::from_classified(
+            "lost a race",
+            adam_core::StoreError::Conflict {
+                run: adam_core::RunId::new(),
+                expected: 1,
+                actual: 2,
+            },
+        )
+        .with_retry("tool:commit", adam_runtime::RetryPolicy::new(2));
+        assert_eq!(
+            conflict.class(),
+            adam_error::ErrorClass::Conflict,
+            "{conflict:?}"
+        );
+        let out = boundary_error(conflict, &redactor());
+        assert_eq!(out.class(), adam_error::ErrorClass::Conflict);
+        let AgentError::Transient {
+            retry: Some(retry), ..
+        } = &out
+        else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            (retry.key.as_str(), retry.policy.max_attempts),
+            ("tool:commit", 2)
+        );
+
         let out = boundary_error(AgentError::permanent("no"), &redactor());
         assert!(!out.is_retryable());
         let out = boundary_error(AgentError::non_determinism("no"), &redactor());
@@ -1780,6 +1844,25 @@ mod tests {
 
     fn said(state: &Conversation) -> Vec<String> {
         person_texts(state, &[])
+    }
+
+    #[test]
+    fn an_unattended_ending_says_why_and_quotes_the_last_words() {
+        let text = unattended_ending(&json!({"text": "  Tests pass. Open the PR?  "}));
+        assert!(text.contains("nobody answers it"), "{text}");
+        assert!(
+            text.ends_with("its last words: Tests pass. Open the PR?"),
+            "{text}"
+        );
+        // A long answer keeps its end, where the question is.
+        let long =
+            unattended_ending(&json!({"text": format!("{}Shall I open it?", "x".repeat(3_000))}));
+        assert!(
+            long.ends_with("Shall I open it?") && long.contains('…'),
+            "{long}"
+        );
+        assert!(long.chars().count() < 1_800, "{}", long.chars().count());
+        assert!(unattended_ending(&json!(null)).ends_with("its last words: "));
     }
 
     #[test]
@@ -2423,7 +2506,7 @@ mod tests {
             "name": "answer", "surfaceId": surface, "sourceComponentId": "root",
             "timestamp": "2026-10-11T10:00:00Z", "context": {"answers": answers},
         });
-        let mut part = a2a::Part::data(json!([{"version": "v0.9.1", "action": action}]))
+        let mut part = a2a::Part::data(json!([{"version": "1.0", "action": action}]))
             .with_media_type(A2UI_MEDIA_TYPE);
         part.metadata = Some(std::collections::HashMap::from([(
             "mimeType".to_owned(),

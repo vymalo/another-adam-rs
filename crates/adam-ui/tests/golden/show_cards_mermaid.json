@@ -1,13 +1,13 @@
 [
   {
-    "version": "v0.9.1",
+    "version": "1.0",
     "createSurface": {
       "surfaceId": "show-research-call-1",
       "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat"
     }
   },
   {
-    "version": "v0.9.1",
+    "version": "1.0",
     "updateComponents": {
       "surfaceId": "show-research-call-1",
       "components": [

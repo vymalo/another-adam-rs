@@ -43,7 +43,7 @@ my-agent/                       # a normal Cargo package
 │   │   └── billing.md                   # `a2a: <agent-card URL>` makes it a remote subagent
 │   ├── commands/review.md      # a prompt template a message invokes by name (`/review ...`)
 │   ├── mcp.json                # {"mcpServers": {...}}; secrets only as ${VAR}
-│   └── schedules/daily.md      # frontmatter `cron:`; body = prompt (roadmap 5, sketch)
+│   └── schedules/daily.md      # frontmatter `cron:`, `at:` or `after:`; body = prompt (ADR 0060)
 └── src/
     ├── main.rs                 # adam::include_agent!(); compose store + model + tools + serve
     └── tools/weather.rs        # #[tool] async fn get_weather(...)
@@ -91,6 +91,8 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_open_sessions: 8         # root only: most sessions open at once, 1 to 100; lowers SESSION_MAX_OPEN, never raises it (a larger value is lowered with a warning)
   max_working_sessions: 2      # root only: most rounds working at once, 1 to 32 and at most max_open_sessions; lowers SESSION_MAX_WORKING
   max_session_rounds: 10       # root only: most rounds one session may have, 2 to 200; lowers SESSION_MAX_ROUNDS (a subagent's value is ignored, with a warning)
+retry:                         # a retry policy per tool (below); this agent's own, none inherits
+  web_search: { attempts: 5, backoff: 2s, max_backoff: 5m, on: [rate-limited] }
 vars: { max_check_cycles: 3 }  # defaults for {{placeholders}} in the body; code may override
 references:                    # root only: repositories the coder reads and never writes (below)
   - { name: design-system, url: "https://github.com/acme/design-system", description: Tokens and components the UI follows. }
@@ -121,6 +123,20 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   any other, so **a folder with `tools:` must list `plan_*` (or `"*"`) to keep the plan**. A subagent has none of them
   unless it lists them, and even then `plan_*` answers that a subagent keeps no plan: the plan belongs to the
   conversation's root run.
+* **`retry:` is a retry policy per tool** ([ADR 0061](../decisions/0061-a-step-names-its-retry-policy.md)): a map from
+  one of the agent's tool names (its own, an MCP server's `<server>__<tool>`, a skill or subagent tool) to `attempts`
+  (required, 1 to 20, the tries in all), `backoff` and `max_backoff` (`500ms`, `1s`, `30m`, `1h`; at most `1h`, and
+  `max_backoff` not under `backoff`, whose default is `1s`), `multiplier` (a positive number) and `on` (the classes
+  retried, a list or one name: `transient`, `rate-limited`, `conflict`; default all three). What is left out is the
+  runtime's default policy (`1s`, `60s`, `2.0`); a `backoff` over `60s` with no `max_backoff` is its own bound, so
+  the delay does not grow. A name is what the model is shown (`A-Z`, `a-z`, `0-9`, `_`, `-`), and a key of an entry
+  that is none of these five is an error: a misspelt one would leave the policy weaker than written. The tool's failures then count under `tool:<name>`, apart from the run's other steps,
+  and are retried under this policy, which wins over the tool's own (`#[tool(retry(...))]`) and the deployment's.
+  The loader checks the shape and the bounds; `bind` checks each name against the agent's tools, the MCP servers'
+  included (they are connected before binding), and refuses an unknown one with a "did you mean"; an entry for a
+  declared server that gave no tools (an `optional` one that is down) is skipped with a warning. Ignored, with a
+  warning, on a remote subagent. A policy only applies to failures the tool reports as retryable: an MCP tool's
+  call that fails is an error result for the model, so its `retry:` covers little more than a refused bearer.
 * **A subagent inherits nothing** from its parent (eve's isolation boundary), and omitting `tools:`
   gives it **no tools** (decision D3). Claude Code inherits everything; adam does not.
 * **A copied file parses unchanged, but its `tools` must name adam tools.** A Claude Code file listing
@@ -334,8 +350,28 @@ sequenceDiagram
   `streamable-http` or `sse` (refused at run time). A `url` without `type` is an error; `ws` is unsupported.
   The server name and each allow-listed tool must fit `<server>__<tool>` in 64 characters. A literal
   credential in a header, env value or URL is a warning (an error under `.strict()`).
-* **Schedules**: `cron` (five fields, checked for shape, not evaluated), `timezone` (default `UTC`), a
-  non-empty body; they belong to the root agent.
+* **Schedules** ([ADR 0060](../decisions/0060-schedules-are-parked-runs.md)): exactly one of three keys, a
+  non-empty body (the prompt of each run), and `timezone` (default `UTC`); they belong to the root agent. Read and
+  checked here; `adam-agent`, the coder and `adam-engine` run them (their READMEs, "schedules/"). A firing is the prompt as a person's message,
+  sent to the agent directly: a `/command` in it is not expanded, and nobody answers it: a tool that asks the person
+  (`ask_user`) is answered that nothing can be asked, and the model goes on, in the firing and in its subagents (the coder
+  ends a firing that would wait, `Failed`). Write the prompt so that the agent need not ask.
+  * `cron`: five fields, minute, hour, day of month, month, day of week, evaluated. `*`, lists, ranges, steps
+    (`*/15`, `1-30/2`, and `5/15` for `5-59/15`), `JAN`-`DEC`, `SUN`-`SAT` (any case), `0` and `7` for Sunday, `?` as
+    `*`. When both day fields are restricted (neither starts with `*` or `?`), a day matches either. A field out of
+    range, a backwards range, a step of 0 or beyond the field, and a day of the month that none of the listed months has
+    (`0 9 30 2 *`) are errors; `L`, `W` and `#` are not cron here.
+  * `at`: one time, `YYYY-MM-DDTHH:MM`, optionally `:SS`, then nothing (read in `timezone`), `Z` or `±HH:MM`. A bare
+    date, a lower-case `t` or `z`, fractions of a second, the second 60, a `[zone]` annotation, an offset beyond a day,
+    `-00:00` (RFC 3339's unknown offset: write `Z`), a year after 9998 and a date that does not exist are errors. With an
+    offset, `timezone` is ignored, with a warning.
+  * `after`: one duration from when the schedule starts, whole numbers with units largest first, each once: `90s`,
+    `30m`, `2h`, `1h30m`, `1d 12h` (a day is 24 hours). Zero and more than 366 days are errors; `timezone` is ignored,
+    with a warning.
+  * `timezone` must name a zone of the IANA database that adam bundles (jiff's copy), never the host's
+    `/usr/share/zoneinfo`; `Mars/Olympus` is an error.
+  * Fields are separated by ASCII spaces and tabs only: a no-break space is not a separator.
+  * A `cron` schedule's part of the digest is what it was before `at` and `after` existed.
 * **Other**: a prompt over 30,000 characters warns (Copilot's limit, *verified 2026-09-29*); an entry that is
   not a slot (`tools/`, `channels/`) warns and points at `#[tool]`; dotfiles, `*.test.md`, `__tests__/` and
   `README.md` are never read; non-UTF-8 is an error.
@@ -433,8 +469,13 @@ of `adam-llm-agent`.
   existing struct as the whole argument object and must be the only model argument.
 * **Return:** `Result<T, E>` or a bare `T`, with `T: IntoToolOutput` and `E: Into<ToolError>`.
 * **Options:** `name = "..."`, `type = Ident`, `strict` (`deny_unknown_fields`, which also closes the
-  schema), `classify` (the error is `adam_error::Classify`: retryable becomes `ToolError::Transient`,
-  the rest `Permanent`), `asks_user` (the tool can end a call with `ToolError::NeedsInput`: the
+  schema), `classify` (the error is `adam_error::Classify`: retryable becomes `ToolError::Transient`, or
+  `ToolError::Retryable` with its class for a rate limit or a conflict, the rest `Permanent`),
+  `retry(attempts = 3, backoff = "1s", max_backoff = "30s", multiplier = 2.0, on = ["rate-limited"])` (the
+  tool's retry policy, `Tool::retry_policy`: its failures count under `tool:<name>`; `attempts` is required;
+  durations are `500ms`, `1s`, `30m`, `1h`; `on` lists `transient`, `rate-limited`, `conflict`; what is left out
+  is `RetryPolicy`'s default, 1 s, 60 s, 2.0 and all three classes;
+  [ADR 0061](../decisions/0061-a-step-names-its-retry-policy.md)), `asks_user` (the tool can end a call with `ToolError::NeedsInput`: the
   generated `Tool::asks_user` says `true`, and `bind` refuses it on a subagent), `step`, `label` and
   `icon` (how a call is drawn as a step, `Tool::step_style`: the kind, a label instead of the tool's name (give one: it is what the person reads), and an
   icon from the closed vocabulary of the orchestration layer's `steps/v1` (`opencode` is OpenCode's own); [ADR 0007](../decisions/0007-progress-as-steps-and-streamed-text.md)) and
@@ -1059,7 +1100,7 @@ and its only deployment step is mounting it.
 | `connections/*.ts` | `mcp.json` (MCP only) | `mcpServers` (Claude Code, SEP-2633 draft) |
 | `channels/` | code: `adam-a2a`; `card:` frontmatter | **A2A** agent card |
 | `hooks/*.ts` | `EventSink` in code | none |
-| `schedules/*.md` (`cron:`) | same | five-field cron |
+| `schedules/*.md` (`cron:`) | same, plus `at:` and `after:` | five-field cron |
 | `sandbox.ts` | later (roadmap 7) | none |
 | `lib/` | `src/` | Cargo |
 | `eve info`, `.eve/compile/*.json` | build errors and warnings, `OUT_DIR/adam_agent.rs`, `cargo adam check` | none |

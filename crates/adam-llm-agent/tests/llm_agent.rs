@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use adam_core::{DynStore, JournalEntry, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
     Artifact, CLOSING_TURN, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter,
-    MAX_CARRIED_BYTES, OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait, StepIo, StepStyle,
-    TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError, ToolOutput, user_message,
+    MAX_CARRIED_BYTES, MAX_THINKING_CUTS, OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait,
+    StepIo, StepStyle, THINKING_CUT_TURN, TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError,
+    ToolOutput, user_message,
 };
 use adam_model::{
     ContentPart, DynModel, FinishReason, Message, MockModel, ModelClient, ModelDelta, ModelError,
@@ -863,12 +864,11 @@ async fn transient_tool_error_retries_the_step() {
         .push_tool_calls(vec![call("c1", "flaky", json!({}))])
         .push_text("ok");
     let rt = h.runtime_with(&agent, "w", |b| {
-        b.retry(RetryPolicy {
-            max_attempts: 3,
-            initial_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(10),
-            multiplier: 1.0,
-        })
+        b.retry(
+            RetryPolicy::new(3)
+                .with_backoff(Duration::from_millis(10), Duration::from_millis(10))
+                .with_multiplier(1.0),
+        )
     });
     let run = rt
         .start("llm", user_message("go"), None)
@@ -891,17 +891,210 @@ async fn transient_tool_error_retries_the_step() {
     );
 }
 
+/// A tool with a retry policy of its own (ADR 0061).
+struct Patient<T>(T, RetryPolicy);
+
+#[async_trait]
+impl<T: Tool> Tool for Patient<T> {
+    fn spec(&self) -> ToolSpec {
+        self.0.spec()
+    }
+    // Shares nothing, so the calls of a turn run at the same time.
+    fn access(&self, _args: &Value) -> adam_llm_agent::ToolAccess {
+        adam_llm_agent::ToolAccess::Independent
+    }
+    fn retry_policy(&self) -> Option<RetryPolicy> {
+        Some(self.1)
+    }
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        self.0.call(ctx, args).await
+    }
+}
+
+/// A tool that always fails with a rate limit, counting its calls.
+fn rate_limited(calls: &Arc<AtomicUsize>) -> impl Tool {
+    let calls = calls.clone();
+    fn_tool("busy", move |_ctx, _| {
+        calls.fetch_add(1, SeqCst);
+        Err(ToolError::retryable(
+            "slow down",
+            adam_error::ErrorClass::RateLimited,
+        ))
+    })
+}
+
+fn quick(attempts: u32) -> RetryPolicy {
+    RetryPolicy::new(attempts).with_backoff(Duration::from_millis(5), Duration::from_millis(5))
+}
+
+/// A tool's own policy decides its retries, counted under `tool:<name>`, and a policy set for it
+/// by name wins over it.
+#[tokio::test]
+async fn a_tools_policy_decides_its_retries_and_one_set_by_name_wins() {
+    for (by_name, attempts) in [(None, 2), (Some(quick(1)), 1)] {
+        let h = Harness::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = h.agent().tool(Patient(rate_limited(&calls), quick(2)));
+        if let Some(policy) = by_name {
+            builder = builder.tool_retry("busy", policy);
+        }
+        let agent = builder.build();
+        for _ in 0..attempts {
+            h.mock.push_tool_calls(vec![call("c1", "busy", json!({}))]);
+        }
+        let rt = h.runtime_with(&agent, "w", |b| b.retry(quick(9)));
+        let run = rt
+            .start("llm", user_message("go"), None)
+            .await
+            .expect("start");
+        let worker = spawn_worker(&rt);
+        let view = wait_failed(&rt, run).await;
+        worker.stop().await;
+        let error = view.error.expect("error");
+        assert!(
+            error.contains(&format!("gave up after {attempts} attempts of `tool:busy`"))
+                && error.contains("slow down"),
+            "{error}"
+        );
+        assert_eq!(calls.load(SeqCst), attempts as usize);
+    }
+}
+
+/// Beside another call of its turn, running at the same time, a tool's failure is still counted under
+/// its own key and policy.
+#[tokio::test]
+async fn a_tools_policy_holds_beside_other_calls() {
+    let h = Harness::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = h
+        .agent()
+        .tool(Patient(rate_limited(&calls), quick(2)))
+        .tool(Patient(
+            fn_tool("fine", |_ctx, _| Ok(ToolOutput::text("ok"))),
+            quick(9),
+        ))
+        .build();
+    for _ in 0..2 {
+        h.mock.push_tool_calls(vec![
+            call("c1", "fine", json!({})),
+            call("c2", "busy", json!({})),
+        ]);
+    }
+    let rt = h.runtime_with(&agent, "w", |b| b.retry(quick(9)));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+    let error = view.error.expect("error");
+    assert!(
+        error.contains("gave up after 2 attempts of `tool:busy`"),
+        "{error}"
+    );
+    assert_eq!(calls.load(SeqCst), 2);
+}
+
+/// A closure tool's policy (`FnTool::with_retry_policy`) governs a plain transient failure too.
+#[tokio::test]
+async fn a_closure_tools_policy_governs_a_transient_failure() {
+    let h = Harness::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool = adam_llm_agent::FnTool::raw("flaky", "Fails.", json!({"type": "object"}), {
+        let calls = calls.clone();
+        move |_ctx, _args| {
+            calls.fetch_add(1, SeqCst);
+            async { Err::<String, _>(ToolError::Transient("timeout".into())) }
+        }
+    })
+    .with_retry_policy(quick(3));
+    let agent = h.agent().tool(tool).build();
+    for _ in 0..3 {
+        h.mock.push_tool_calls(vec![call("c1", "flaky", json!({}))]);
+    }
+    let rt = h.runtime_with(&agent, "w", |b| b.retry(quick(9)));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+    let error = view.error.expect("error");
+    assert!(
+        error.contains("gave up after 3 attempts of `tool:flaky`") && error.contains("timeout"),
+        "{error}"
+    );
+    assert_eq!(calls.load(SeqCst), 3);
+}
+
+/// A tool's failure keeps its class: a policy that retries only transient errors does not retry a
+/// rate limit.
+#[tokio::test]
+async fn a_tools_failure_keeps_its_class() {
+    let h = Harness::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let only_transient = quick(5).with_retry_on(adam_runtime::RetryClasses::of([
+        adam_error::ErrorClass::Transient,
+    ]));
+    let agent = h
+        .agent()
+        .tool(Patient(rate_limited(&calls), only_transient))
+        .build();
+    h.mock.push_tool_calls(vec![call("c1", "busy", json!({}))]);
+    let rt = h.runtime_with(&agent, "w", quick_retry);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+    let error = view.error.expect("error");
+    assert!(
+        error.contains("the policy of `tool:busy` does not retry rate-limited"),
+        "{error}"
+    );
+    assert_eq!(calls.load(SeqCst), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Model errors
 // ---------------------------------------------------------------------------
 
 fn quick_retry(b: RuntimeBuilder) -> RuntimeBuilder {
-    b.retry(RetryPolicy {
-        max_attempts: 3,
-        initial_backoff: Duration::from_millis(10),
-        max_backoff: Duration::from_millis(10),
-        multiplier: 1.0,
-    })
+    b.retry(
+        RetryPolicy::new(3)
+            .with_backoff(Duration::from_millis(10), Duration::from_millis(10))
+            .with_multiplier(1.0),
+    )
+}
+
+/// A model provider's rate limit is a rate limit to the runtime's policy (ADR 0061): a runtime
+/// that retries only transient errors fails it at once.
+#[tokio::test]
+async fn a_model_rate_limit_keeps_its_class() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock
+        .push_error(ModelError::RateLimited { retry_after: None })
+        .push_text("never");
+    let rt = h.runtime_with(&agent, "w", |b| {
+        b.retry(quick(5).with_retry_on(adam_runtime::RetryClasses::of([
+            adam_error::ErrorClass::Transient,
+        ])))
+    });
+    let run = rt
+        .start("llm", user_message("hi"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+    let error = view.error.expect("error");
+    assert!(error.contains("does not retry rate-limited"), "{error}");
+    assert_eq!(h.mock.requests().len(), 1);
 }
 
 #[tokio::test]
@@ -1069,6 +1262,208 @@ fn length_limited(text: &str) -> ModelResponse {
         finish: FinishReason::Length,
         ..ModelResponse::text(text)
     }
+}
+
+fn thinking_only_cut() -> ModelResponse {
+    ModelResponse {
+        finish: FinishReason::Length,
+        reasoning: Some("a long chain of thought".into()),
+        ..ModelResponse::text("")
+    }
+}
+
+#[tokio::test]
+async fn a_turn_cut_while_thinking_is_continued_not_answered() {
+    let h = Harness::new();
+    let (a, a_calls) = CountingTool::new("a");
+    let agent = h.agent().tool(a).build();
+    h.mock
+        .push_response(thinking_only_cut())
+        .push_tool_calls(vec![call("c1", "a", json!({}))])
+        .push_text("done");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("work"), None)
+        .await
+        .expect("start");
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    assert_eq!(
+        output_of(&view),
+        Some(json!({"text": "done", "artifacts": []}))
+    );
+    assert_eq!(a_calls.load(SeqCst), 1);
+    assert_eq!(
+        h.mock.requests().len(),
+        3,
+        "each continuation is a model call"
+    );
+    let state = conversation(&rt, &view).await;
+    assert_eq!(state.turns, 3);
+    assert_eq!(state.thinking_cuts, 0, "a call starts the count again");
+    assert!(
+        state
+            .messages
+            .contains(&Message::user_text(THINKING_CUT_TURN))
+    );
+    let sent = &h.mock.requests()[1].messages;
+    assert_eq!(sent.last(), Some(&Message::user_text(THINKING_CUT_TURN)));
+}
+
+#[tokio::test]
+async fn turns_cut_while_thinking_past_the_bound_fail_the_run() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    for _ in 0..=MAX_THINKING_CUTS {
+        h.mock.push_response(thinking_only_cut());
+    }
+    h.mock.push_text("never asked");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("work"), None)
+        .await
+        .expect("start");
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+
+    let error = view.error.expect("error");
+    assert!(
+        error.starts_with("output limit reached while thinking:"),
+        "{error}"
+    );
+    assert!(error.contains("3 turns in a row"), "{error}");
+    assert!(view.output.is_none(), "no answer");
+    assert_eq!(h.mock.requests().len(), MAX_THINKING_CUTS as usize + 1);
+}
+
+/// A cut turn as a client that echoes reasoning reports it: the message keeps the reasoning.
+fn thinking_only_cut_echoed() -> ModelResponse {
+    let mut cut = thinking_only_cut();
+    cut.message = Message::Assistant {
+        content: Vec::new(),
+        tool_calls: Vec::new(),
+        reasoning: Some("a long chain of thought".into()),
+    };
+    cut
+}
+
+/// The messages of request 0 and request 1 of a run whose first turn is `cut` and whose second says
+/// `done`.
+async fn requests_after_a_cut(cut: ModelResponse) -> (Vec<Message>, Vec<Message>) {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock.push_response(cut).push_text("done");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("work"), None)
+        .await
+        .expect("start");
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 2);
+    (requests[0].messages.clone(), requests[1].messages.clone())
+}
+
+#[tokio::test]
+async fn a_cut_turn_that_sends_nothing_is_not_in_the_next_request() {
+    let (first, second) = requests_after_a_cut(thinking_only_cut()).await;
+    let mut want = first;
+    want.push(Message::user_text(THINKING_CUT_TURN));
+    assert_eq!(second, want, "no empty assistant message on the wire");
+}
+
+#[tokio::test]
+async fn a_cut_turn_whose_reasoning_is_echoed_stays_in_the_next_request() {
+    let (first, second) = requests_after_a_cut(thinking_only_cut_echoed()).await;
+    let mut want = first;
+    want.push(Message::Assistant {
+        content: Vec::new(),
+        tool_calls: Vec::new(),
+        reasoning: Some("a long chain of thought".into()),
+    });
+    want.push(Message::user_text(THINKING_CUT_TURN));
+    assert_eq!(second, want);
+}
+
+#[tokio::test]
+async fn a_cut_before_the_closing_turn_is_not_told_to_call_a_tool() {
+    let h = Harness::new();
+    let agent = h
+        .agent()
+        .limits(Limits {
+            max_turns: 1,
+            ..Limits::default()
+        })
+        .build();
+    h.mock
+        .push_response(thinking_only_cut())
+        .push_text("what I know");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("work"), None)
+        .await
+        .expect("start");
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 2);
+    let mut want = requests[0].messages.clone();
+    want.push(Message::user_text(CLOSING_TURN));
+    assert_eq!(requests[1].messages, want, "only the closing turn is said");
+    let state = conversation(&rt, &view).await;
+    assert!(
+        !state
+            .messages
+            .contains(&Message::user_text(THINKING_CUT_TURN))
+    );
+}
+
+#[tokio::test]
+async fn a_cut_followed_by_an_empty_stop_leaves_no_count_behind() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock.push_response(thinking_only_cut()).push_text("");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("work"), None)
+        .await
+        .expect("start");
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(conversation(&rt, &view).await.thinking_cuts, 0);
+}
+
+#[tokio::test]
+async fn a_whitespace_only_length_turn_counts_as_cut_while_thinking() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock
+        .push_response(length_limited("  \n"))
+        .push_text("after");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("work"), None)
+        .await
+        .expect("start");
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(
+        output_of(&view),
+        Some(json!({"text": "after", "artifacts": []}))
+    );
+    assert_eq!(
+        h.events(run),
+        vec![custom("agent_text", json!({"text": "after", "turn": 1}))],
+        "the whitespace of the cut turn is not said"
+    );
 }
 
 #[tokio::test]
@@ -1569,6 +1964,73 @@ fn asking_tool() -> impl Tool {
     fn_tool("ask", |_, _| {
         Err(ToolError::needs_input("which environment?"))
     })
+}
+
+/// Nobody answers a firing of a schedule (ADR 0060): in its conversation a question is refused as
+/// the tool's result, the run goes on, and it never parks.
+#[tokio::test]
+async fn needs_input_in_a_firing_of_a_schedule_is_refused_and_the_run_goes_on() {
+    let h = Harness::new();
+    let (echo, echo_calls) = CountingTool::new("echo");
+    let agent = h.agent().tool(asking_tool()).tool(echo).build();
+    h.mock
+        .push_tool_calls(vec![
+            call("c1", "ask", json!({})),
+            call("c2", "echo", json!({})),
+        ])
+        .push_text("deployed to staging; prod needs a person's yes");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start(
+            "llm",
+            user_message("deploy"),
+            Some("adam.schedule:llm/nightly@2026-12-24T17:00:00Z"),
+        )
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert!(!view.waiting);
+    assert_eq!(echo_calls.load(SeqCst), 1, "the next call ran");
+    let second = serde_json::to_string(&h.mock.requests()[1].messages).unwrap();
+    assert!(second.contains("nobody answers this run"), "{second}");
+    assert!(
+        second.contains("The question was: which environment?"),
+        "{second}"
+    );
+    assert!(
+        !h.events(run).contains(&custom(
+            "input_required",
+            json!({"question": "which environment?", "call_id": "c1"})
+        )),
+        "nothing is asked of a person"
+    );
+    // The asking call's step failed, saying why.
+    let ended: Vec<_> = h
+        .events(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::Step(step) if step.id == "tool:c1" => Some(step.state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ended.last(), Some(&StepState::Failed), "{ended:?}");
+    let ctx = |v: serde_json::Value| v.as_object().cloned().unwrap();
+    assert!(adam_llm_agent::is_unattended(
+        Some("adam.schedule:llm/nightly@x"),
+        None
+    ));
+    assert!(adam_llm_agent::is_unattended(
+        None,
+        Some(&ctx(json!({ "adam.unattended": true })))
+    ));
+    assert!(!adam_llm_agent::is_unattended(
+        None,
+        Some(&ctx(json!({ "adam.unattended": "yes" })))
+    ));
+    assert!(!adam_llm_agent::is_unattended(Some("token-1:chat"), None));
+    assert!(!adam_llm_agent::is_unattended(None, None));
 }
 
 #[tokio::test]

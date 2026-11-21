@@ -19,7 +19,7 @@ engine.shutdown().await?;
 
 | Call | What it does | Refused with (class) |
 |---|---|---|
-| `Engine::builder(store, agent, model, alias)`, then `start()` | migrates the store, binds the agent with the screen's tools of an embedded agent (`adam_ui::Ui::embedded`: `ask_user`, `show`, `ui_catalog`, `plan_*`, and `Ui::screen` as its source), gives it the model, and spawns the worker on the current tokio runtime | `NoRuntime` (`Invalid`) outside a tokio runtime; `Invalid` for a zero `lease_ttl`; `Store` (the store's); `Invalid` for an `mcp.json` or an `a2a:` subagent, the subagents' included: the engine runs neither yet, and refuses them itself, so what it accepts does not depend on the features another crate of the build turns on in `adam-assembly`; `Agent` (the definition's, `Invalid`): an empty alias, a tool nobody registered, a secret refused |
+| `Engine::builder(store, agent, model, alias)`, then `start()` | migrates the store, releases the leases a fixed `Limits::worker_id` holds (`Store::release_worker_leases`: the runs its last process was stepping are claimed at once; nothing with the default, `None`), binds the agent with the screen's tools of an embedded agent (`adam_ui::Ui::embedded`: `ask_user`, `show`, `ui_catalog`, `plan_*`, and `Ui::screen` as its source), gives it the model, registers its scheduler and makes the store's scheduler runs match the folder's `schedules/` (see *Schedules*), gives the backend the folder's `commands/` (a message `/name args` is expanded from `commands/<name>.md` before it is stored, as on the server surfaces), and spawns the worker on the current tokio runtime | `NoRuntime` (`Invalid`) outside a tokio runtime; `Invalid` for a zero `lease_ttl` or a `worker_id` of `Some("")`; `WorkerIdInUse` (`Rejected`) for a fixed id another live engine of this process uses on the same store; `Store` (the store's: its migration or the release); `Invalid` for an `mcp.json` or an `a2a:` subagent, the subagents' included: the engine runs neither yet, and refuses them itself, so what it accepts does not depend on the features another crate of the build turns on in `adam-assembly`; `Agent` (the definition's, `Invalid`): an empty alias, a tool nobody registered, a secret refused; `Schedules` (the reconcile's class) when the scheduler runs cannot be made to match the folder |
 | `send(None, say)` | starts a run in a new conversation (`Delivered::Started`) | `Invalid` for no text or no id; `Stopped` (`Rejected`) after `shutdown` |
 | `send(Some(&conversation), say)` | the latest run of the conversation has ended: a new run that continues it, the agent starting from its state, the transcript included (`Continued`); it is still open: the message is delivered to it, as a steer while it works (`Steered`) or as the answer while it waits (`Answered`), by the state read just before. A `Say` that already started a run starts nothing (`Repeated`) | `NotFound` for a conversation the engine has no run in |
 | `steer(run, say)` | a message for a run that works: it reads it at its next step, and a run about to finish takes another step first; a waiting run takes it as its answer | `Finished` (`Rejected`) for a run that ended; `NotFound`; `Unavailable` (`Transient`) when its state moved under the call |
@@ -27,8 +27,9 @@ engine.shutdown().await?;
 | `cancel(run)` | ends the run `Cancelled`; a cancelled run is answered as it is | `Finished` for a run that ended otherwise; `NotFound` |
 | `list(ListQuery)` | a `Page<RunInfo>` of the engine's runs, the most recently updated first, by cursor (`page_size`, at most 100, default 50; `conversation`; `after(token)`) | `Invalid` for a token of another query |
 | `get(run)` | the `RunInfo`, or `None` | |
+| `commands()` | the agent's commands (`adam_agent_fs::Command`: `name`, `description`, `argument_hint`, `template`), in name order: what the host lists in its `/` menu, as a client reads them from the card (`commands/v1`) | |
 | `events(run)` | `RunEvents`, a `futures::Stream` of `Result<EngineEvent, EngineError>`: the run's recent events, then the live ones, then `Ended` once the store says the run has ended; a run that has already ended gives `Ended` at once. See [A run's events](#a-runs-events) | `NotFound` for a run the engine does not have, refused at the call (the stream would have nothing to say) |
-| `shutdown()` | waits for the messages being written, then nothing new is claimed and the steps in flight finish and commit; it returns once the worker has stopped, and so does every concurrent or later call; every clone stops; reads and `cancel` still work. Dropping a `shutdown` before it is done (a timeout around it) aborts the worker, and so does dropping the last engine, as a killed process would: the runs are claimed again once their leases run out | what the worker ended with |
+| `shutdown()` | waits for the messages being written, then nothing new is claimed and the steps in flight finish and commit; it returns once the worker has stopped, and so does every concurrent or later call; every clone stops; reads and `cancel` still work. Dropping a `shutdown` before it is done (a timeout around it) aborts the worker, and so does dropping the last engine, as a killed process would: the next engine started with the same fixed worker id claims its runs at once, any other once their leases run out | what the worker ended with |
 
 The types are the engine's own: `Say { id, text }` (the id makes a send idempotent: the same `Say` again reaches
 the run its first attempt started), `Turn { conversation, run, delivered, info }`, `Delivered` (`Started`, `Continued`, `Steered`, `Answered`,
@@ -44,8 +45,9 @@ yes to a tool call): match it with a `_` arm.
 **The engine's own API is the supported one.** The crates it re-exports (`adam_a2a_runtime` and the others) are
 there for the types a host passes in (`AgentDef`, `DynModel`, `DynStore`, `SecretSource`), not as a second way in.
 
-**What the host gives.** The store (`DynStore`: `adam_core::MemoryStore` today, the SQLite adapter of slice 3 when
-it lands, which changes that one argument), the agent's definition (`AgentDef`, from `include_agent!` or a folder),
+**What the host gives.** The store (`DynStore`: `adam_store_sqlite::SqliteStore::open(path)` for a file of the
+application's own that outlives the process, or `adam_core::MemoryStore`; the engine depends on neither, so the
+host brings the one it chooses), the agent's definition (`AgentDef`, from `include_agent!` or a folder),
 the model (`DynModel`, with its credentials: ADR 0047 decision 4, [ADR
 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)) and, if the
 agent's files name secrets, a `SecretSource`. The engine reads no environment variable, no key and no file it was not
@@ -54,12 +56,41 @@ builder's source replaces whatever source the definition had.
 
 **Defaults** (`Limits`, `#[non_exhaustive]`: set its fields on `Limits::default()`): `concurrency` 4 runs stepped at
 once, `max_parallel_tools` 10 tool calls of one turn at once (an agent's file may lower it), `lease_ttl` 30 s (zero
-is refused), `event_capacity` 256 live events in the ring (1 to 65 536; the channel rounds it up to a power of two).
-The worker's id is the runtime's random default: the engine sets no fixed id yet. A fixed one (so that a restarted
-engine can release its own leases at once) is safe only under slice 3's lock, one process per store, and needs
-`Store::release_worker_leases`, which another change adds to `adam-core`. **Until it lands, a restarted engine waits up
-to `lease_ttl` for its own old runs**: the runs the last process was stepping are claimed again only once their leases
-run out.
+is refused), `event_capacity` 256 live events in the ring (1 to 65 536; the channel rounds it up to a power of two),
+`worker_id` `None` (a random id at every start; `Some("")` is refused), `retry` `RetryPolicy::default()` (5 attempts, 1 s
+to 60 s: the runtime's policy, for a transient failure that names none of its own, such as a model provider's outage;
+a folder's `retry:` and a tool's own policy win for their tools, [ADR
+0061](../../docs/decisions/0061-a-step-names-its-retry-policy.md)). `Limits` is `Clone` and `PartialEq`, no longer
+`Copy` (it holds the id) nor `Eq` (the policy's factor is a float).
+
+**Schedules** ([ADR 0060](../../docs/decisions/0060-schedules-are-parked-runs.md)): a folder's `schedules/` run in the
+engine as in `adam-agent`. `start` registers the agent's scheduler (`adam_schedule::SchedulerAgent`, whatever the folder
+holds, so a scheduler a folder dropped is stepped to its cancel) and reconciles before the worker starts: a schedule
+added is started, one changed is replaced, one dropped is cancelled. Each due time fires one run of the agent, the
+prompt as a person's message, which nobody answers (a question ends the call instead of parking). A firing is nobody's
+message, so it is no caller's run: `list`, `get`, `events` and `cancel` do not reach it, as an A2A server does not to a
+caller ([#289](https://github.com/vymalo/another-adam-rs/issues/289) would let the host see and stop one); the host reads
+it from its store, its conversation `adam_schedule::fired_conversation_id(agent, schedule, due)` (the schedule's name
+escaped) and its trigger `adam_schedule::trigger_of` (re-exported as `adam_engine::adam_schedule`). A reconcile that
+fails ends `start` with `Schedules`; on a retryable class, call `start` again.
+
+**A fixed worker id makes a restart claim its old runs at once; it is opt-in.** With `worker_id: None` the engine
+releases nothing, so engines that share a store never take each other's leases, and a restarted engine waits up to
+`lease_ttl` for the runs its last process was stepping. With `Some(id)` the host promises that **no other live engine,
+in any process, uses `id` on this store**, and `start` releases every lease `id` holds (`Store::release_worker_leases`)
+before the worker starts, so those runs are claimed at once (a store that does not implement the release, whose
+default does nothing, still waits). Set an id only for a store no other engine shares, such as a store per install.
+The SQLite store needs none: its lock allows one process per file, and `start` clears every lease the file holds,
+so a restart claims its runs at once with the default too (one engine per file, above). A
+broken promise steps a run twice, its tools included: the release takes the other engine's leases, and both renew
+under the same id.
+
+Within one process, `start` refuses a second live engine with the same id on the same store (`WorkerIdInUse`,
+`Rejected`: shut the other down, or give this one another id); it cannot see other processes. The id is free again once
+the first engine's worker task has ended: when `shutdown` returns, or shortly after the last `Engine` is dropped (the
+abort takes effect at the task's next poll, so a `start` just after can still be refused). The steps the worker spawned
+are aborted with it, not waited for: a tool that ignores cancellation (blocking code, a task of its own) can still run
+once the id is free, so a host that restarts in the same process calls `shutdown` first.
 
 **Inside.** Every call is what the A2A server does for one caller: `RuntimeTaskBackend` of
 [`adam-a2a-runtime`](../adam-a2a-runtime/README.md), as the subject `adam-engine` (a steer with `steer/v1`
@@ -67,9 +98,14 @@ activated), so follow-ups, steering, answers and continuations have one implemen
 context; a send to one names its latest run in `referenceTaskIds`, which the backend continues once it has ended.
 `answer` sends the plain follow-up, which the backend takes only from a waiting run.
 
-**Not yet**: the proof that a killed process resumes its run, which needs the durable store of slice 3: it is written,
-`tests/resume_process.rs`, and ignored until then (today `a_dropped_engine_resumes_its_run` proves it in memory, below); a way
-to read a file artifact's bytes (`RunInfo` carries no artifacts yet, and an event carries none, below). The backend is
+**A killed process resumes its run** on the SQLite store: the next process to open the file finishes it, without
+running a committed step again (`tests/resume_process.rs`, below). With SQLite no fixed `worker_id` is needed: the
+store's lock on the file proves the killed process is gone, and `start` (the store's `migrate`) clears every lease the
+file holds. So run **one engine per SQLite file**: that clearing takes the leases of a live engine of the same process
+too, and a second engine on the file, or an in-process restart without `shutdown`, would step the first one's runs
+again.
+
+**Not yet**: a way to read a file artifact's bytes (`RunInfo` carries no artifacts yet, and an event carries none, below). The backend is
 given the engine's ring too, and its A2A streaming path (`TaskBackend::subscribe`) builds a file part from a live
 event's bytes: the engine never calls it, and a future caller that streams a task through it must read files from the
 store, since the ring withholds them. Approvals are slice 5: today a run waits only on a question, and `answer`
@@ -188,7 +224,7 @@ withheld file says), `thiserror` and `uuid`.
 ## Features and environment
 
 No Cargo features, no environment variables. The example reads `MODEL_BASE_URL`, `MODEL_API_KEY` and `MODEL` (its
-`main.rs`, not the engine), and `tests/resume_process.rs` reads `ADAM_ENGINE_TEST_RESUME_CHILD` in the child it starts.
+`main.rs`, not the engine), and `tests/resume_process.rs` reads `ADAM_ENGINE_TEST_RESUME_CHILD` and `ADAM_ENGINE_TEST_RESUME_FIXED_ID` in the child it starts.
 
 ## Tests
 
@@ -220,12 +256,28 @@ every wait is bounded by `tokio::time::timeout`:
 * `a_stream_ends_stopped_after_shutdown`: a stream on a waiting run, and one opened after `shutdown`, end with
   `Stopped`, under a second, not at a poll;
 * `a_dropped_engine_resumes_its_run`, the in-memory stand-in for a killed process: two engines over one `MemoryStore`
-  (`Arc`), engine A (a lease of 300 ms) dropped while its run's second model call is in flight (its worker aborted, its
-  open stream ended with `Stopped`), and engine B, its script written before its worker starts, finishing the run once
-  A's lease runs out; B's model is called once, its request holds the tool's result once and ends with it, and B's
+  (`Arc`) on the lease-expiry path, a random worker id each (the default) and a lease of 300 ms: engine A dropped while
+  its run's second model call is in flight (its worker aborted, its open stream ended with `Stopped`), and engine B,
+  its script written before its worker starts, finishing the run once A's lease runs out; B's model is called once, its request holds the tool's result once and
+  ends with it, and B's
   stream, opened while B's first model call waits at a gate (so it starts with all B did since it claimed the run),
   shows the tool's step never run again: the committed step is kept. `tests/resume_process.rs`, below, is the real
-  proof, a process killed with `SIGKILL`, waiting on the SQLite store of slice 3;
+  proof, a process killed with `SIGKILL`, on the SQLite store;
+* `a_restarted_engine_claims_its_old_runs_at_once`: A, with the fixed id `restarted` and a lease of an hour, is dropped
+  mid-step, and B, the same id on the same store (started once A's worker has ended and freed the id), finishes the
+  run within 5 s, which it cannot do without the release; `an_empty_worker_id_is_refused` (`Some("")`, `Invalid`);
+* `two_default_engines_on_one_store_do_not_take_each_others_leases` (`None` twice) and
+  `two_engines_with_their_own_ids_keep_their_own_leases` (`engine-a`, `engine-b`): two live engines on one store, A's
+  run in flight under a lease of an hour; after B's start it is still leased and `Working`, B's model sees only B's
+  run, and each engine steps its own run once;
+* `a_second_live_engine_with_the_same_id_is_refused`: `WorkerIdInUse` (`Rejected`) on the same store; the same id on
+  another store starts, and on the first once A has shut down;
+* `a_folders_command_is_expanded`: `/greet Ada` reaches the model as `commands/greet.md`'s template, `commands()` lists
+  it with its description and hint, and an unknown `/wave Ada` reaches the model as typed;
+* `a_folders_schedule_fires_the_agent`: a folder with `schedules/soon.md` (`after: 1s`) fires a run of the agent, in
+  the store, whose model is given the prompt and whose `get` is `None`;
+  `the_hosts_retry_policy_governs_a_transient_failure`: `Limits::retry` of two attempts gives a transient model failure
+  up after two calls, not five;
 * `start_refuses_what_it_cannot_build` (a zero lease and a ring of 0 or over 65 536 too; it passes alone and with
   `--features adam-assembly/mcp,adam-assembly/remote`, the set CI's workspace build unifies) and `start_outside_a_tokio_runtime_is_refused`: fail
   closed.
@@ -243,14 +295,17 @@ shows what the last did, over `MemoryStore`, the example's own agent folder and 
   reply, `[done]`, then `bye`; one that ends after a question gets the question, then `bye`;
 * `quit_during_a_step_says_it_waits_for_it`: `/quit` while the model works prints the stopping line, then `bye`.
 
-`tests/resume_process.rs` (Unix), `a_killed_process_resumes_its_run`, **ignored** until the SQLite store of slice 3
-lands: the test runs its own binary again as a child (`ADAM_ENGINE_TEST_RESUME_CHILD`, read by this test only, names
-the store's directory), which sends a message whose model blocks once the run's first step (a `plan_work` call) is
-committed and says so in a file; the parent kills it with `SIGKILL`, opens the same store, and its engine finishes the
-run: its model, scripted for the next step only, is called once, and its request holds the tool's result once and ends
-with it, which fails if the committed step was lost. The store comes from one helper, `async fn durable_store(path) ->
-Result<DynStore, _>`, which panics until then: PR 4 changes its body, the `#[ignore]` and the dev-dependencies
-(`adam-store-sqlite`), and no call site.
+`tests/resume_process.rs` (Unix), `a_killed_process_resumes_its_run`, on a SQLite file in the test's own directory
+(`adam-store-sqlite`, a dev-dependency only, so the embedded tree is unchanged): the test runs its own binary again as
+a child (`ADAM_ENGINE_TEST_RESUME_CHILD`, read by this test only, names the store's directory), which sends a message
+whose model blocks once the run's first step (a `plan_work` call) is committed and says so in a file; the parent kills
+it with `SIGKILL`, opens the same store, and its engine finishes the run. The child's lease is an hour, so the parent
+finishes in time only because the lease is let go when it opens the store. It runs twice: with the engine's default,
+a random worker id, where the store's `migrate` clears the dead process's leases (its file lock proves the process is
+gone); and with the fixed id `resume-test` in both halves (`ADAM_ENGINE_TEST_RESUME_FIXED_ID`), which checks the two
+work together (the clearing runs first, so this run does not prove the release itself:
+`a_restarted_engine_claims_its_old_runs_at_once` does). Each time the parent's model, scripted for the next step only, is called once, and its request
+holds the tool's result once and ends with it, which fails if the committed step was lost.
 
 In `src/`: `a_name_the_environment_has_is_refused_by_the_engines_default` (slice 2's proof),
 `the_sink_keeps_file_bytes_out_of_the_ring` and `a_withheld_file_says_its_length_and_digest` (a file's event reaches a

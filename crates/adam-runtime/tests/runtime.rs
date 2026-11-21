@@ -1560,12 +1560,8 @@ mod cases {
                 }
             }),
         );
-        let policy = RetryPolicy {
-            max_attempts: 3,
-            initial_backoff: Duration::from_millis(150),
-            max_backoff: Duration::from_secs(5),
-            multiplier: 2.0,
-        };
+        let policy =
+            RetryPolicy::new(3).with_backoff(Duration::from_millis(150), Duration::from_secs(5));
         let sink = CollectingSink::new();
         let clock = FrozenClock::new();
         let rt = builder(&store, &uniq("w"), &agent)
@@ -1614,6 +1610,378 @@ mod cases {
         assert_eq!(retry_events, 2);
     }
 
+    /// An error of a step that names its policy (ADR 0061): `rate_limited` makes it a rate limit,
+    /// else it is a plain transient error.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Flaky {
+        message: String,
+        rate_limited: bool,
+    }
+
+    impl std::fmt::Display for Flaky {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for Flaky {}
+
+    impl Classify for Flaky {
+        fn class(&self) -> adam_error::ErrorClass {
+            if self.rate_limited {
+                adam_error::ErrorClass::RateLimited
+            } else {
+                adam_error::ErrorClass::Transient
+            }
+        }
+    }
+
+    /// An agent whose every transition runs `key`'s step under `policy(attempt)`, failing with a
+    /// [`Flaky`] (a rate limit when `rate_limited`), and whose `calls` count the tries.
+    fn flaky_agent(
+        name: &str,
+        calls: &Arc<AtomicUsize>,
+        rate_limited: bool,
+        policy: fn(u32) -> (&'static str, RetryPolicy),
+    ) -> FnAgent {
+        fn_agent(
+            name,
+            step_fn({
+                let calls = calls.clone();
+                move |ctx, _state| {
+                    let calls = calls.clone();
+                    async move {
+                        let (key, policy) = policy(ctx.attempt());
+                        let r: Result<u32, Flaky> = ctx
+                            .step_retrying("fetch", key, policy, || async move {
+                                calls.fetch_add(1, SeqCst);
+                                Err(Flaky {
+                                    message: "down".to_owned(),
+                                    rate_limited,
+                                })
+                            })
+                            .await?;
+                        Err(AgentError::permanent(format!("not retryable: {r:?}")))
+                    }
+                    .boxed()
+                }
+            }),
+        )
+    }
+
+    /// A step that names its policy is retried under it, not the runtime's: its backoff, its
+    /// attempts, counted under its key (ADR 0061, decisions 3 and 4).
+    pub async fn a_step_retries_under_its_own_policy(store: DynStore) {
+        let name = uniq("own-policy");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = flaky_agent(&name, &calls, false, |_| {
+            (
+                "fetch",
+                RetryPolicy::new(2).with_backoff(Duration::from_millis(70), Duration::from_secs(1)),
+            )
+        });
+        let clock = FrozenClock::new();
+        let sink = CollectingSink::new();
+        let rt = builder(&store, &uniq("w"), &agent)
+            .retry(RetryPolicy::new(9).with_backoff(Duration::from_secs(5), Duration::from_secs(5)))
+            .clock(clock.clone())
+            .event_sink(sink.clone())
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let v = wait_for(&rt, run, "a retry is scheduled", |v| {
+            v.attempt == 1 && v.wake_at.is_some()
+        })
+        .await;
+        let delay = v.wake_at.expect("wake_at") - clock.now();
+        assert_eq!(
+            delay.as_millis(),
+            70,
+            "the step's backoff, not the runtime's"
+        );
+        clock.advance(Duration::from_millis(70));
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        let error = failed.error.expect("error");
+        assert!(
+            error.contains("gave up after 2 attempts of `fetch`") && error.contains("down"),
+            "{error}"
+        );
+        assert_eq!((failed.attempt, count(&calls)), (2, 2));
+        let detail = sink
+            .events_for(run)
+            .into_iter()
+            .find_map(|e| match e {
+                RunEvent::Status {
+                    status: RunStatus::Runnable,
+                    detail: Some(d),
+                } if d.contains("retrying") => Some(d),
+                _ => None,
+            })
+            .expect("a retry event");
+        assert!(
+            detail.starts_with("attempt 1 of 2 of `fetch` failed"),
+            "{detail}"
+        );
+    }
+
+    /// A policy retries only the classes it names: a transient error under a policy that retries
+    /// rate limits fails the run at once.
+    pub async fn a_policy_retries_only_its_classes(store: DynStore) {
+        let name = uniq("classes");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = flaky_agent(&name, &calls, false, |_| {
+            (
+                "fetch",
+                RetryPolicy::new(5).with_retry_on(adam_runtime::RetryClasses::of([
+                    adam_error::ErrorClass::RateLimited,
+                ])),
+            )
+        });
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        let error = failed.error.expect("error");
+        assert!(
+            error.contains("the policy of `fetch` does not retry transient"),
+            "{error}"
+        );
+        assert_eq!(count(&calls), 1);
+
+        // The same policy retries a rate limit.
+        let name = uniq("classes-rl");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = flaky_agent(&name, &calls, true, |_| {
+            (
+                "fetch",
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::ZERO, Duration::ZERO)
+                    .with_retry_on(adam_runtime::RetryClasses::of([
+                        adam_error::ErrorClass::RateLimited,
+                    ])),
+            )
+        });
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        assert!(
+            failed
+                .error
+                .expect("error")
+                .contains("gave up after 3 attempts of `fetch`")
+        );
+        assert_eq!(count(&calls), 3);
+
+        // A plain transient error with a hint is a rate limit: a policy that retries only
+        // transient errors does not retry it.
+        let name = uniq("classes-hint");
+        let agent = fn_agent(
+            &name,
+            step_fn(|_ctx, _state| {
+                async move {
+                    Err(
+                        AgentError::transient_after("slow down", Duration::from_millis(1))
+                            .with_retry(
+                                "fetch",
+                                RetryPolicy::new(5).with_retry_on(adam_runtime::RetryClasses::of(
+                                    [adam_error::ErrorClass::Transient],
+                                )),
+                            ),
+                    )
+                }
+                .boxed()
+            }),
+        );
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        let error = failed.error.expect("error");
+        assert!(
+            error.contains("the policy of `fetch` does not retry rate-limited"),
+            "{error}"
+        );
+    }
+
+    /// A key's policy is recorded at its first failure: code that names another policy for a later
+    /// attempt (a deploy in between) does not change the retries of a run already failing.
+    pub async fn the_recorded_policy_outlives_a_change_in_code(store: DynStore) {
+        let name = uniq("recorded");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = flaky_agent(&name, &calls, false, |attempt| {
+            let attempts = if attempt == 0 { 3 } else { 10 };
+            (
+                "fetch",
+                RetryPolicy::new(attempts).with_backoff(Duration::ZERO, Duration::ZERO),
+            )
+        });
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        assert!(
+            failed
+                .error
+                .expect("error")
+                .contains("gave up after 3 attempts of `fetch`")
+        );
+        assert_eq!(
+            count(&calls),
+            3,
+            "the first failure's policy, not the later code's"
+        );
+    }
+
+    /// The runtime's own policy is recorded at a run's first failure too: a worker that steps the
+    /// run later under another runtime policy (a deploy in between) gives up where the first said.
+    pub async fn the_runtime_policy_is_recorded_too(store: DynStore) {
+        let name = uniq("runtime-recorded");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let calls = calls.clone();
+                move |_ctx, _state| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, SeqCst);
+                        Err(AgentError::transient("down"))
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let clock = FrozenClock::new();
+        let first = builder(&store, &uniq("w"), &agent)
+            .retry(RetryPolicy::new(2).with_backoff(Duration::from_secs(1), Duration::from_secs(1)))
+            .clock(clock.clone())
+            .build();
+        let run = first.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&first);
+        wait_for(&first, run, "a retry is scheduled", |v| {
+            v.attempt == 1 && v.wake_at.is_some()
+        })
+        .await;
+        worker.stop().await;
+
+        let second = builder(&store, &uniq("w"), &agent)
+            .retry(RetryPolicy::new(9).with_backoff(Duration::ZERO, Duration::ZERO))
+            .clock(clock.clone())
+            .build();
+        clock.advance(Duration::from_secs(1));
+        let worker = spawn_worker(&second);
+        let failed = wait_failed(&second, run).await;
+        worker.stop().await;
+        let error = failed.error.expect("error");
+        assert!(error.contains("gave up after 2 attempts: down"), "{error}");
+        assert_eq!(
+            count(&calls),
+            2,
+            "the policy of the first failure, not the second runtime's"
+        );
+    }
+
+    /// Two steps that fail by turns, each under a policy that never runs out, stop at the run's
+    /// ceiling of consecutive failures.
+    pub async fn steps_that_fail_by_turns_stop_at_the_ceiling(store: DynStore) {
+        let name = uniq("ceiling");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = flaky_agent(&name, &calls, false, |attempt| {
+            let key = if attempt % 2 == 0 { "a" } else { "b" };
+            (
+                key,
+                RetryPolicy::new(u32::MAX).with_backoff(Duration::ZERO, Duration::ZERO),
+            )
+        });
+        let rt = builder(&store, &uniq("w"), &agent)
+            .poll_interval(Duration::from_millis(1))
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let failed = wait_for_within(&rt, run, Duration::from_secs(120), "the ceiling", |v| {
+            v.status == RunStatus::Failed
+        })
+        .await;
+        worker.stop().await;
+        let error = failed.error.expect("error");
+        assert!(
+            error.contains(&format!(
+                "gave up after {} consecutive failed transitions",
+                adam_runtime::MAX_CONSECUTIVE_FAILURES
+            )),
+            "{error}"
+        );
+        assert_eq!(failed.attempt, adam_runtime::MAX_CONSECUTIVE_FAILURES);
+        assert_eq!(
+            count(&calls),
+            adam_runtime::MAX_CONSECUTIVE_FAILURES as usize
+        );
+    }
+
+    /// A transition that succeeds clears the record: a step that fails once between successes is
+    /// never given up on, however often that happens.
+    pub async fn a_success_clears_the_record(store: DynStore) {
+        let name = uniq("clears");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let calls = calls.clone();
+                move |ctx, state| {
+                    let calls = calls.clone();
+                    async move {
+                        let turns = state["turns"].as_u64().unwrap_or(0);
+                        if turns == 4 {
+                            return Ok(Transition::Done {
+                                state,
+                                output: json!("ok"),
+                            });
+                        }
+                        let fail = ctx.attempt() == 0;
+                        let r: Result<u32, Flaky> = ctx
+                            .step_retrying(
+                                "fetch",
+                                "fetch",
+                                RetryPolicy::new(2).with_backoff(Duration::ZERO, Duration::ZERO),
+                                || async move {
+                                    calls.fetch_add(1, SeqCst);
+                                    if fail {
+                                        Err(Flaky {
+                                            message: "once".to_owned(),
+                                            rate_limited: false,
+                                        })
+                                    } else {
+                                        Ok(1)
+                                    }
+                                },
+                            )
+                            .await?;
+                        assert!(r.is_ok());
+                        Ok(Transition::Continue(json!({"turns": turns + 1})))
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(done.attempt, 0);
+        assert_eq!(
+            count(&calls),
+            8,
+            "each of four turns failed once, then passed"
+        );
+    }
+
     /// A transient error that clears ends `Done`, with the attempt reset.
     pub async fn retry_recovers_and_resets_attempt(store: DynStore) {
         let name = uniq("recover");
@@ -1639,12 +2007,10 @@ mod cases {
             }),
         );
         let rt = builder(&store, &uniq("w"), &agent)
-            .retry(RetryPolicy {
-                max_attempts: 5,
-                initial_backoff: Duration::from_millis(20),
-                max_backoff: Duration::from_millis(100),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(5)
+                    .with_backoff(Duration::from_millis(20), Duration::from_millis(100)),
+            )
             .build();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
@@ -1791,6 +2157,271 @@ mod cases {
         worker.stop().await;
         assert_eq!(done.output, Some(json!("boom")));
         assert_eq!(count(&executed), 0);
+    }
+
+    /// A contender of a race: what it answers after `delay_ms`, counting its runs, and setting
+    /// `stopped` when its token fires.
+    type Contender = Box<
+        dyn FnOnce(adam_runtime::CancelToken) -> BoxFuture<'static, Result<String, String>> + Send,
+    >;
+
+    fn contender(
+        answer: Result<&'static str, &'static str>,
+        delay_ms: u64,
+        runs: &Arc<AtomicUsize>,
+        stopped: &Arc<AtomicBool>,
+    ) -> Contender {
+        let (runs, stopped) = (runs.clone(), stopped.clone());
+        Box::new(move |token: adam_runtime::CancelToken| {
+            runs.fetch_add(1, SeqCst);
+            // The token outlives the dropped future: a task that watches it is what a contender's
+            // own work (a process, a spawned task) would be.
+            let watch = token.clone();
+            tokio::spawn(async move {
+                watch.cancelled().await;
+                stopped.store(true, SeqCst);
+            });
+            async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                answer.map(str::to_owned).map_err(str::to_owned)
+            }
+            .boxed()
+        })
+    }
+
+    /// An agent that races `contenders()` under the step `race` and ends with the outcome.
+    fn racing(name: &str, contenders: Arc<dyn Fn() -> Vec<Contender> + Send + Sync>) -> FnAgent {
+        fn_agent(
+            name,
+            step_fn(move |ctx, state| {
+                let contenders = contenders();
+                async move {
+                    let raced: Result<(usize, String), Vec<String>> =
+                        ctx.step_race("race", contenders).await?;
+                    Ok(Transition::Done {
+                        state,
+                        output: serde_json::to_value(raced).expect("serialises"),
+                    })
+                }
+                .boxed()
+            }),
+        )
+    }
+
+    /// The first success wins, an earlier failure does not end the race, and the losers' tokens
+    /// fire (ADR 0062).
+    pub async fn a_race_is_won_by_the_first_success_and_the_losers_are_stopped(store: DynStore) {
+        let name = uniq("race");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let stops: Vec<Arc<AtomicBool>> =
+            (0..3).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let agent = racing(&name, {
+            let (runs, stops) = (runs.clone(), stops.clone());
+            Arc::new(move || {
+                vec![
+                    contender(Err("down"), 0, &runs, &stops[0]),
+                    contender(Ok("fast"), 30, &runs, &stops[1]),
+                    contender(Ok("slow"), 5_000, &runs, &stops[2]),
+                ]
+            })
+        });
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!({"Ok": [1, "fast"]})));
+        assert_eq!(count(&runs), 3);
+        wait_until("the loser's token fires", || stops[2].load(SeqCst)).await;
+        assert!(!stops[1].load(SeqCst), "the winner is not told to stop");
+        let journal = store.journal_list(run).await.expect("journal");
+        assert_eq!(journal.len(), 1, "one step: the race");
+        assert_eq!(journal[0].name, "race");
+    }
+
+    /// A race nobody wins records every error, in contender order, not the order they ended.
+    pub async fn a_race_with_no_winner_records_every_error_in_order(store: DynStore) {
+        let name = uniq("race-lost");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let agent = racing(&name, {
+            let (runs, stop) = (runs.clone(), stop.clone());
+            Arc::new(move || {
+                vec![
+                    contender(Err("first, late"), 40, &runs, &stop),
+                    contender(Err("second, early"), 0, &runs, &stop),
+                ]
+            })
+        });
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(
+            done.output,
+            Some(json!({"Err": ["first, late", "second, early"]}))
+        );
+    }
+
+    /// A recorded race returns its winner and runs no contender: a replay picks the same one.
+    pub async fn a_recorded_race_returns_its_winner_and_runs_nobody(store: DynStore) {
+        let name = uniq("race-replay");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let agent = racing(&name, {
+            let (runs, stop) = (runs.clone(), stop.clone());
+            Arc::new(move || {
+                vec![
+                    contender(Ok("a"), 0, &runs, &stop),
+                    contender(Ok("b"), 0, &runs, &stop),
+                ]
+            })
+        });
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        store
+            .journal_put(run, JournalEntry::ok(0, "race", json!([1, "b"])))
+            .await
+            .expect("seed journal");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!({"Ok": [1, "b"]})));
+        assert_eq!(count(&runs), 0, "no contender ran");
+    }
+
+    /// A record for other contenders than the code races is a non-deterministic replay: an index
+    /// it no longer has, or another number of errors (ADR 0062).
+    pub async fn a_race_recorded_for_other_contenders_fails_the_run(store: DynStore) {
+        for (entry, what) in [
+            (
+                JournalEntry::ok(0, "race", json!([5, "x"])),
+                "an index out of range",
+            ),
+            (
+                JournalEntry::err(0, "race", json!(["only one"])),
+                "one error for two",
+            ),
+        ] {
+            let name = uniq("race-other");
+            let runs = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let agent = racing(&name, {
+                let (runs, stop) = (runs.clone(), stop.clone());
+                Arc::new(move || {
+                    vec![
+                        contender(Ok("a"), 0, &runs, &stop),
+                        contender(Ok("b"), 0, &runs, &stop),
+                    ]
+                })
+            });
+            let rt = runtime(&store, &agent);
+            let run = rt.start(&name, inbound(), None).await.expect("start");
+            store.journal_put(run, entry).await.expect("seed journal");
+            let worker = spawn_worker(&rt);
+            let failed = wait_failed(&rt, run).await;
+            worker.stop().await;
+            let error = failed.error.expect("error");
+            assert!(
+                error.contains("non-deterministic replay") && error.contains("other contenders"),
+                "{what}: {error}"
+            );
+            assert_eq!(count(&runs), 0, "{what}: no contender ran");
+        }
+    }
+
+    /// A contender that panics ends the race, and the others' tokens still fire, before their
+    /// futures are dropped: what they spawned stops (ADR 0062).
+    pub async fn a_panicking_contender_still_stops_the_others(store: DynStore) {
+        /// Asserts, as it is dropped, that its token fired first.
+        struct FiredFirst(adam_runtime::CancelToken, Arc<AtomicBool>);
+        impl Drop for FiredFirst {
+            fn drop(&mut self) {
+                self.1.store(self.0.is_cancelled(), SeqCst);
+            }
+        }
+        let name = uniq("race-panic");
+        let fired_before_drop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let (fired_before_drop, stopped) = (fired_before_drop.clone(), stopped.clone());
+                move |ctx, state| {
+                    let (fired_before_drop, stopped) = (fired_before_drop.clone(), stopped.clone());
+                    async move {
+                        if ctx.attempt() > 0 {
+                            return Ok(Transition::Done {
+                                state,
+                                output: json!("after the panic"),
+                            });
+                        }
+                        let contenders: Vec<Contender> = vec![
+                            Box::new(|_token| {
+                                async {
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                    panic!("a contender panics");
+                                }
+                                .boxed()
+                            }),
+                            Box::new(move |token: adam_runtime::CancelToken| {
+                                let watch = token.clone();
+                                tokio::spawn(async move {
+                                    watch.cancelled().await;
+                                    stopped.store(true, SeqCst);
+                                });
+                                let guard = FiredFirst(token, fired_before_drop);
+                                async move {
+                                    let _guard = guard;
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                    Ok("slow".to_owned())
+                                }
+                                .boxed()
+                            }),
+                        ];
+                        let _: Result<(usize, String), Vec<String>> =
+                            ctx.step_race("race", contenders).await?;
+                        Err(AgentError::permanent("the race should not end"))
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let rt = builder(&store, &uniq("w"), &agent)
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(5), Duration::from_millis(5)),
+            )
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!("after the panic")));
+        wait_until("the loser's spawned work stops", || stopped.load(SeqCst)).await;
+        assert!(
+            fired_before_drop.load(SeqCst),
+            "the token fires before the future is dropped"
+        );
+    }
+
+    /// A race with no contender is the code's mistake: the run fails and nothing is journaled.
+    pub async fn a_race_with_no_contender_fails_the_run(store: DynStore) {
+        let name = uniq("race-empty");
+        let agent = racing(&name, Arc::new(Vec::new));
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        assert!(
+            failed
+                .error
+                .expect("error")
+                .contains("the race `race` has no contender")
+        );
+        assert!(store.journal_list(run).await.expect("journal").is_empty());
     }
 
     /// The journal is one sequence across transitions.
@@ -2386,6 +3017,93 @@ mod cases {
         );
     }
 
+    /// `Ctx::run_starter` starts root runs from a step, idempotently, and only in `adam.schedule:`
+    /// conversations (ADR 0060, decision 2).
+    pub async fn a_step_starts_root_runs_only_in_schedule_conversations(store: DynStore) {
+        let name = uniq("starter");
+        // Unique per case, so a run a crashed case left on a shared database cannot make this busy.
+        let fired_conv = format!("adam.schedule:{name}/daily@2026-12-24T18:00:00Z");
+        let scheduler_conv = format!("adam.schedule:{name}/daily");
+        let fired = RunId::new();
+        let agent_name = name.clone();
+        let conv = fired_conv.clone();
+        let agent = fn_agent(
+            &name,
+            step_fn(move |ctx, state| {
+                let starter = ctx.run_starter();
+                let name = agent_name.clone();
+                let conv = conv.clone();
+                async move {
+                    if state["role"] == "fired" {
+                        return Ok(Transition::Done {
+                            state,
+                            output: json!("fired"),
+                        });
+                    }
+                    let input = || Inbound::new("start", json!({"role": "fired"}));
+                    let fail = |e: RuntimeError| AgentError::permanent(e.to_string());
+                    let first = starter
+                        .start_with_id(fired, &name, input(), &conv)
+                        .await
+                        .map_err(fail)?;
+                    let again = starter
+                        .start_with_id(fired, &name, input(), &conv)
+                        .await
+                        .map_err(fail)?;
+                    // Not under the prefix: a person's conversation, the prefix inside another one,
+                    // and the namespace's name without its separator.
+                    let mut refused = true;
+                    for other in ["token-1:chat", "token-1:adam.schedule:x", "adam.schedule"] {
+                        let foreign = starter
+                            .start_with_id(RunId::new(), &name, input(), other)
+                            .await;
+                        refused &= matches!(
+                            &foreign,
+                            Err(e @ RuntimeError::ForeignConversation { conversation_id })
+                                if conversation_id == other
+                                    && e.class() == adam_runtime::ErrorClass::Invalid
+                        );
+                    }
+                    Ok(Transition::Done {
+                        state,
+                        output: json!([first, again, refused]),
+                    })
+                }
+                .boxed()
+            }),
+        );
+        let rt = runtime(&store, &agent);
+        let worker = spawn_worker(&rt);
+        let scheduler = rt
+            .start(
+                &name,
+                Inbound::new("start", json!({"role": "scheduler"})),
+                Some(scheduler_conv.as_str()),
+            )
+            .await
+            .expect("start");
+        let done = wait_done(&rt, scheduler).await;
+        assert_eq!(done.output, Some(json!([true, false, true])));
+        let fired_view = wait_done(&rt, fired).await;
+        assert_eq!(fired_view.agent, name);
+        assert_eq!(
+            fired_view.conversation_id.as_deref(),
+            Some(fired_conv.as_str())
+        );
+        assert_eq!(fired_view.output, Some(json!("fired")));
+        // The refused start wrote nothing: the agent has the scheduler's run and the fired one.
+        let runs = store
+            .count_runs(&adam_core::RunQuery::new(
+                &name,
+                adam_core::ConversationScope::Prefix(String::new()),
+                10,
+            ))
+            .await
+            .expect("count");
+        assert_eq!(runs, 2);
+        worker.stop().await;
+    }
+
     /// Error surface of the control API.
     pub async fn api_errors(store: DynStore) {
         let name = uniq("errors");
@@ -2875,12 +3593,10 @@ mod cases {
             }),
         );
         let rt = builder(&store, &uniq("w"), &agent)
-            .retry(RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_millis(20),
-                max_backoff: Duration::from_millis(50),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(20), Duration::from_millis(50)),
+            )
             .build();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
@@ -3017,12 +3733,10 @@ mod cases {
         let rt = builder(&store, &uniq("w"), &agent)
             .clock(clock.clone())
             .event_sink(sink.clone())
-            .retry(RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(50),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(10), Duration::from_millis(50)),
+            )
             .build();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
@@ -3101,12 +3815,9 @@ mod cases {
         let t0 = clock.now();
         let rt = builder(&store, &uniq("w"), &agent)
             .clock(clock.clone())
-            .retry(RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_secs(20),
-                max_backoff: Duration::from_secs(60),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(3).with_backoff(Duration::from_secs(20), Duration::from_secs(60)),
+            )
             .build();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
@@ -3146,12 +3857,10 @@ mod cases {
         let t0 = clock.now();
         let rt = builder(&store, &uniq("w"), &agent)
             .clock(clock.clone())
-            .retry(RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(50),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(10), Duration::from_millis(50)),
+            )
             .build();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
@@ -3198,12 +3907,10 @@ mod cases {
         let rt = builder(&store, &uniq("w"), &agent)
             .clock(clock.clone())
             .lease_ttl(Duration::from_secs(24 * 3600))
-            .retry(RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(50),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(10), Duration::from_millis(50)),
+            )
             .build();
         let t0 = clock.now();
         let run = rt.start(&name, inbound(), None).await.expect("start");
@@ -7409,12 +8116,10 @@ mod cases {
         let clock = ManualClock::new();
         let rt = builder(&store, &uniq("w"), &agent)
             .clock(clock.clone())
-            .retry(RetryPolicy {
-                max_attempts: 2,
-                initial_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(50),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(2)
+                    .with_backoff(Duration::from_millis(10), Duration::from_millis(50)),
+            )
             .build();
         let run = rt
             .start(&name, Inbound::new("start", json!({"k": 2})), None)
@@ -7469,10 +8174,22 @@ macro_rules! runtime_suite {
                 timers_with_manual_clock,
                 retries_back_off_then_fail,
                 retry_recovers_and_resets_attempt,
+                a_step_retries_under_its_own_policy,
+                a_policy_retries_only_its_classes,
+                the_recorded_policy_outlives_a_change_in_code,
+                steps_that_fail_by_turns_stop_at_the_ceiling,
+                the_runtime_policy_is_recorded_too,
+                a_success_clears_the_record,
                 permanent_fails_immediately,
                 agent_fail_transition,
                 non_determinism_fails_the_run,
                 journal_replays_recorded_err,
+                a_race_is_won_by_the_first_success_and_the_losers_are_stopped,
+                a_race_with_no_winner_records_every_error_in_order,
+                a_recorded_race_returns_its_winner_and_runs_nobody,
+                a_race_with_no_contender_fails_the_run,
+                a_race_recorded_for_other_contenders_fails_the_run,
+                a_panicking_contender_still_stops_the_others,
                 journal_seq_spans_transitions,
                 ctx_accessors,
                 cancel_parked,
@@ -7484,6 +8201,7 @@ macro_rules! runtime_suite {
                 graceful_shutdown,
                 conversation_delivers_to_the_open_run,
                 start_with_id_is_idempotent,
+                a_step_starts_root_runs_only_in_schedule_conversations,
                 api_errors,
                 a_header_is_one_store_call,
                 a_starter_only_runtime_starts_and_a_full_runtime_steps,
@@ -8186,8 +8904,9 @@ async fn a_park_again_writes_the_head_it_read_and_the_tombstone() {
     worker.stop().await;
 
     // The runtime's wake and a commit can race a concurrent claim, so a CAS retry can commit the
-    // same park-again twice: every attempt is the same document, and at least one landed.
-    let commits = recording.commits();
+    // same park-again twice: every attempt is the same document, and at least one landed. The
+    // parent, woken by the same clock, commits beside it: only the child's are read.
+    let commits = recording.commits_of(child);
     assert!(!commits.is_empty(), "the run was parked again");
     for again in &commits {
         assert_eq!(again.state, Value::Null, "the state is the tombstone");

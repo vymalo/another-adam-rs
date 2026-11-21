@@ -18,9 +18,10 @@ use crate::engine::Expected;
 /// | `Agent` | the agent definition's own (`Invalid` for a file that does not bind) |
 /// | `NoRuntime`, `Invalid` | `Invalid` |
 /// | `NotFound` | `NotFound` |
-/// | `NotWaiting`, `Finished`, `Stopped` | `Rejected` |
+/// | `NotWaiting`, `Finished`, `Stopped`, `WorkerIdInUse` | `Rejected` |
 /// | `Unavailable` (a store that is down, or a run whose state moved under the call: try again) | `Transient` |
 /// | `Store` | the store's own |
+/// | `Schedules` | the reconcile's own |
 /// | `Internal` | `Internal` |
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -56,6 +57,17 @@ pub enum EngineError {
     /// The engine was shut down: nothing would step a run it started now.
     #[error("the engine was shut down")]
     Stopped,
+    /// `start` with a fixed [`Limits::worker_id`](crate::Limits::worker_id) that another live
+    /// engine of this process uses on the same store: its release would take that engine's leases.
+    /// Shut the other engine down first, or give this one another id (or none).
+    #[error(
+        "another live engine of this process uses the worker id {id:?} on this store: shut it down \
+         first, or give this engine another id"
+    )]
+    WorkerIdInUse {
+        /// The id in use.
+        id: String,
+    },
     /// The store or the runtime is temporarily unavailable; the same call may succeed later.
     #[error("the engine is temporarily unavailable: {message}")]
     Unavailable {
@@ -65,9 +77,13 @@ pub enum EngineError {
         #[source]
         source: Option<BoxError>,
     },
-    /// The store refused or failed at `start` (its migration).
+    /// The store refused or failed at `start`: its migration, or the release of the worker's leases.
     #[error("the store failed")]
     Store(#[source] StoreError),
+    /// `start` could not make the store's scheduler runs match the folder's `schedules/` (ADR
+    /// 0060): a schedule that does not parse, or a store that failed while it was read or written.
+    #[error("the agent's schedules cannot be set up")]
+    Schedules(#[source] adam_schedule::ReconcileError),
     /// A bug, or a failure nothing above describes.
     #[error("internal error: {message}")]
     Internal {
@@ -85,9 +101,13 @@ impl Classify for EngineError {
             Self::Agent(source) => source.class(),
             Self::NoRuntime | Self::Invalid(_) => ErrorClass::Invalid,
             Self::NotFound(_) => ErrorClass::NotFound,
-            Self::NotWaiting { .. } | Self::Finished { .. } | Self::Stopped => ErrorClass::Rejected,
+            Self::NotWaiting { .. }
+            | Self::Finished { .. }
+            | Self::Stopped
+            | Self::WorkerIdInUse { .. } => ErrorClass::Rejected,
             Self::Unavailable { .. } => ErrorClass::Transient,
             Self::Store(source) => source.class(),
+            Self::Schedules(source) => source.class(),
             Self::Internal { .. } => ErrorClass::Internal,
         }
     }
@@ -176,9 +196,11 @@ mod tests {
             EngineError::NotFound(_) => ErrorClass::NotFound,
             EngineError::NotWaiting { .. }
             | EngineError::Finished { .. }
-            | EngineError::Stopped => ErrorClass::Rejected,
+            | EngineError::Stopped
+            | EngineError::WorkerIdInUse { .. } => ErrorClass::Rejected,
             EngineError::Unavailable { .. } => ErrorClass::Transient,
             EngineError::Store(source) => source.class(),
+            EngineError::Schedules(source) => source.class(),
             EngineError::Internal { .. } => ErrorClass::Internal,
         }
     }

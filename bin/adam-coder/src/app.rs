@@ -214,7 +214,7 @@ fn card_for_build(
         .map_err(Box::new)
 }
 
-/// `card` with the extensions the coder speaks: the screen's (A2UI, `ui-catalog/v1`,
+/// `card` with the extensions the coder speaks: the screen's (A2UI, `ui-catalog/v2`,
 /// `thread-tools/v1`, `mentions/v1`, `steer/v1`), `steps/v1` (every tool call is reported as a step to a
 /// client that activates it) and `text-stream/v1` (its answers are sent as the model writes them to a
 /// client that activates it: the agent streams its model calls) and `usage/v1` (the tokens of every model

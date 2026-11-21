@@ -109,12 +109,18 @@ job of `.github/workflows/coder.yml` runs it in the built coder image**, whose w
 
 ## What the store suite covers
 
-48 cases: exact JSON round trip (unicode, `i64` bounds, floats, special keys), CAS conflicts, 16-way concurrent
+49 cases: exact JSON round trip (unicode, `i64` bounds, floats, special keys), CAS conflicts, 16-way concurrent
 commits with one winner, journal ordering, first-writer-wins and 16-way races, non-determinism detection, due
 rules, agent filtering and limits, busy runs left unclaimed, 8 workers claiming 60 runs with no double lease,
 lease expiry and takeover, renew and release, pinned claims (an owned run never goes to another worker, 4 workers
 racing), one open run per conversation including a 16-way race, listing and counting (scoped, ordered, keyset
 pages, filters), push configurations, and purging.
+
+The worker-lease suite (`worker_leases_conformance!`) adds three cases for a store that implements
+`release_worker_leases`: every run lease the worker holds goes and its runs are claimable at once,
+and its owner is not cleared; another worker's lease is untouched; and a lease the owner does not
+hold survives the owner's sweep. The method is defaulted to a no-op, so the
+suite is separate from the required `store_conformance!`.
 
 The write cost of a transcript-shaped run is measured **and asserted**: `counting::measure_transcript_write`
 commits a 10 KB message 50 times through `CountingStore` in the contract shape (the tombstone, a head and the
@@ -126,8 +132,10 @@ and `dev/p2-measure.sh` quotes the disk side. The before/after numbers are in
 ## Adding a backend
 
 Implement `Store` and add one line: `adam_store_testkit::store_conformance!(make_store);` (and
-`adam_store_testkit::blob_conformance!(make_store);` when it keeps blobs, and
-`adam_store_testkit::body_conformance!(make_store);` when it keeps bodies). A new `Notifier` runs
+`adam_store_testkit::blob_conformance!(make_store);` when it keeps blobs,
+`adam_store_testkit::body_conformance!(make_store);` when it keeps bodies, and
+`adam_store_testkit::worker_leases_conformance!(make_store);` when it implements
+`release_worker_leases`, which defaults to a no-op). A new `Notifier` runs
 `adam_notify_testkit::notifier_conformance!(make_pair);` (the Postgres one needs `ADAM_TEST_POSTGRES_URL`, a
 superuser, for its reconnect test). See [Store adapters](../reference/store-adapters.md#adding-a-backend).
 
@@ -147,9 +155,9 @@ docker compose --profile app up -d --build --wait postgres mock-openai mock-gith
 |---|---|
 | `sh dev/coder-e2e.sh` | one task ends in a pushed branch and one pull request; the `checks`, `branch` and `pull_request` artifacts; GitHub read over MCP with the coder's credentials of each call. Variants: `SCENARIO=files` (the coder reads a file first), `scratch` (no repository named, then published), `second-repo` and `create-repo` (each with `ANSWER=yes` or `no`: consent is asked and honoured), `GITHUB_AUTH=app` (with `-f dev/compose.github-app.yaml`) |
 | `sh dev/greeting-e2e.sh` | "hi" gets a greeting built from the folder's persona lines, streamed, and its one model call reported over `usage/v1` (the task carries the totals); the same task goes on to a pull request; a restart on an edited folder changes the answer |
-| `sh dev/coder-choices-e2e.sh` | three questions asked as one A2UI form, one action answers them; a screen that cannot read it gets the options as text |
+| `sh dev/coder-choices-e2e.sh` | three questions asked as one A2UI form, one action answers them; a screen that cannot read it gets the options as text (the screen's capabilities are `a2uiRendererCapabilities["1.0"]` and its catalog is catalog 9, a `ui-catalog/v2` document) |
 | `sh dev/agent-e2e.sh` | the general agent answers "hi" in role; a restart on an edited folder changes the card and the answer |
-| `sh dev/agent-cards-e2e.sh` | the researcher folder answers with a surface of cards and a graph on a screen that has them, words only on one that has not |
+| `sh dev/agent-cards-e2e.sh` | the researcher folder answers with a surface of cards and a graph on a screen that has them, words only on one that has not (catalog 9, and the checklist subset, which has no `Cards`) |
 | `sh dev/painter-e2e.sh` | the painter folder: the instructions of its image MCP server reach the model, the picture is a shared `image/png` file the words name, and the server's prompt is the command `images__scene` (it starts `mock-image-mcp` and restarts `agent` on a copy of the folder with `AGENT_MCP_ALLOW_INSECURE=true`) |
 
 How the scripted models and mocks work, and how to change a script: [the local stack](../reference/dev-stack.md).

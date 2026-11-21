@@ -263,6 +263,11 @@ impl BoundDef {
                 skills: node.skills.clone(),
                 preloaded: node.preloaded.clone(),
                 when: node.when.clone(),
+                retry: node
+                    .retry
+                    .iter()
+                    .map(|(tool, def, _)| (tool.clone(), def.clone()))
+                    .collect(),
                 limits: node.limits,
             });
             resolved.push(alias);
@@ -359,6 +364,9 @@ impl BoundDef {
         if let Some(every) = self.wait_poll {
             builder = builder.wait_poll(every);
         }
+        for (tool, _, policy) in &node.retry {
+            builder = builder.tool_retry(tool.clone(), *policy);
+        }
         if let Some(step_io) = &self.step_io {
             builder = builder.step_io(step_io.clone());
         }
@@ -421,6 +429,10 @@ pub struct AgentInfo {
     /// differently: its tools are withheld from a run the task does not select, and its
     /// instructions are added only to such a run.
     pub when: Vec<(String, Vec<String>)>,
+    /// `retry:` of its file: the retry policy per tool, by name, as the file says it (ADR 0061).
+    /// Each is one of [`tools`](Self::tools). Part of the info because an agent that retries a
+    /// tool differently behaves differently.
+    pub retry: Vec<(String, adam_agent_fs::RetryDef)>,
     /// The loop's limits.
     pub limits: Limits,
 }

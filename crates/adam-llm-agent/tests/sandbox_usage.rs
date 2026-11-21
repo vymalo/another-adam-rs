@@ -147,12 +147,11 @@ async fn run_to_end(rt: &Runtime, run: RunId) -> RunView {
 fn runtime(store: DynStore, agents: Vec<LlmAgent>) -> Runtime {
     let mut builder = Runtime::builder(store)
         .poll_interval(Duration::from_millis(20))
-        .retry(RetryPolicy {
-            max_attempts: 3,
-            initial_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(10),
-            multiplier: 1.0,
-        });
+        .retry(
+            RetryPolicy::new(3)
+                .with_backoff(Duration::from_millis(10), Duration::from_millis(10))
+                .with_multiplier(1.0),
+        );
     for agent in agents {
         builder = builder.agent(agent);
     }
