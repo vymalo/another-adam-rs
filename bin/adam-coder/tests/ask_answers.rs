@@ -20,20 +20,32 @@ const V8_LOCK: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catal
 const V5: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v5.json");
 const V5_LOCK: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v5.lock.json");
 
+/// What the message that carries an answer says about its renderer: it offers the screen's catalog.
+fn offer() -> Value {
+    json!({adam_a2a_runtime::CONTEXT_A2UI_RENDERER: {
+        "catalogIds": ["https://agents.vymalo.com/a2ui/catalogs/chat"]}})
+}
+
 fn screen() -> Map<String, Value> {
     screen_of(V7, V7_LOCK)
 }
 
 fn screen_of(document: &str, lock: &str) -> Map<String, Value> {
     let lock: Value = serde_json::from_str(lock).unwrap();
+    // A screen sends a `ui-catalog/v2` document: the published catalogs before 9 get its `protocolVersion`
+    // and the digest is of what is sent.
+    let mut document: Value = serde_json::from_str(document).unwrap();
+    document["protocolVersion"] = json!("1.0");
     let claimed = json!({
         "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat",
-        "version": lock["version"], "digest": lock["digest"]});
+        "version": lock["version"], "digest": adam_ui::catalog_digest(&document).unwrap()});
     let mut inline = claimed.clone();
-    inline["catalog"] = serde_json::from_str(document).unwrap();
+    inline["catalog"] = document;
     json!({
         adam_a2a_runtime::CONTEXT_UI_REF: claimed,
         adam_a2a_runtime::CONTEXT_UI_CATALOG: inline,
+        adam_a2a_runtime::CONTEXT_A2UI_RENDERER: {
+            "catalogIds": ["https://agents.vymalo.com/a2ui/catalogs/chat"]},
     })
     .as_object()
     .cloned()
@@ -106,7 +118,7 @@ async fn what_a_refusal_and_an_ending_say_never_repeats_a_secret_the_redactor_hi
     else {
         panic!("ask_user did not ask with a form");
     };
-    let bad = json!({"text": "x", "form": {"surface": "ask-call-1", "context": {
+    let bad = json!({"text": "x", "context": offer(), "form": {"surface": "ask-call-1", "context": {
         "answers": [{"id": "budget", "values": ["1500"]}]}}});
     let clean = |what: &str, text: &str| {
         for secret in common::SECRETS {
@@ -205,7 +217,7 @@ async fn a_secret_in_what_a_question_shows_reaches_neither_the_surface_nor_the_q
                 .as_str()
                 .unwrap()
                 .to_owned();
-            let answer = json!({"text": "x", "form": {"surface": surface, "context": {
+            let answer = json!({"text": "x", "context": offer(), "form": {"surface": surface, "context": {
                 "answers": [{"id": "budget", "values": ["1500"]}]}}});
             let AnswerCheck::Refuse(refusal) =
                 tool.read_answer("call-1", &args, Some(&ui), &answer)

@@ -244,6 +244,151 @@ async fn a_reload_of_unchanged_files_swaps_and_says_nothing_changed() {
     assert!(live.last_error().is_none());
 }
 
+/// The schedules in force are the files' as of the last reload that swapped, for a host to
+/// reconcile (ADR 0060): a new one appears, a changed one changes, and a refused reload keeps them.
+#[tokio::test]
+async fn the_schedules_in_force_follow_the_reloads_that_swap() {
+    let name = uniq("scheduled");
+    let dir = tempfile::tempdir().unwrap();
+    edit(dir.path(), FILE, &agent_file(&name, "", "Hello."));
+    edit(
+        dir.path(),
+        "agent/schedules/daily.md",
+        "---\ncron: \"0 9 * * *\"\n---\nDigest.\n",
+    );
+    let model = Arc::new(MockModel::new());
+    let live = builder(dir.path(), &model).load().unwrap();
+    let crons = |live: &LiveAssembly| -> Vec<(String, String, String)> {
+        live.schedules()
+            .into_iter()
+            .map(|s| (s.agent, s.name, s.cron))
+            .collect()
+    };
+    assert_eq!(
+        crons(&live),
+        [(name.clone(), "daily".into(), "0 9 * * *".into())]
+    );
+
+    edit(
+        dir.path(),
+        "agent/schedules/daily.md",
+        "---\ncron: \"30 9 * * *\"\n---\nDigest.\n",
+    );
+    edit(
+        dir.path(),
+        "agent/schedules/weekly.md",
+        "---\ncron: \"0 8 * * MON\"\n---\nStatus.\n",
+    );
+    live.reload().unwrap();
+    assert_eq!(
+        crons(&live),
+        [
+            (name.clone(), "daily".into(), "30 9 * * *".into()),
+            (name.clone(), "weekly".into(), "0 8 * * MON".into()),
+        ]
+    );
+
+    // A schedule the loader refuses fails the reload: the schedules in force stay.
+    edit(
+        dir.path(),
+        "agent/schedules/weekly.md",
+        "---\ncron: \"0 25 * * *\"\n---\nStatus.\n",
+    );
+    assert!(live.reload().is_err());
+    assert_eq!(crons(&live).len(), 2);
+    assert_eq!(crons(&live)[1].2, "0 8 * * MON");
+}
+
+/// A deleted schedule file leaves the schedules in force, and a reload refused at install (a new
+/// subagent needs a restart) keeps them as they were.
+#[tokio::test]
+async fn a_deleted_schedule_goes_and_a_reload_that_needs_a_restart_keeps_them() {
+    let name = uniq("scheduled");
+    let dir = tempfile::tempdir().unwrap();
+    edit(dir.path(), FILE, &agent_file(&name, "", "Hello."));
+    edit(
+        dir.path(),
+        "agent/schedules/a.md",
+        "---\nafter: 1h\n---\nA.\n",
+    );
+    edit(
+        dir.path(),
+        "agent/schedules/b.md",
+        "---\nafter: 2h\n---\nB.\n",
+    );
+    let model = Arc::new(MockModel::new());
+    let live = builder(dir.path(), &model).load().unwrap();
+    let names = |live: &LiveAssembly| -> Vec<String> {
+        live.schedules().into_iter().map(|s| s.name).collect()
+    };
+    assert_eq!(names(&live), ["a", "b"]);
+    std::fs::remove_file(dir.path().join("agent/schedules/b.md")).unwrap();
+    live.reload().unwrap();
+    assert_eq!(names(&live), ["a"]);
+
+    edit(
+        dir.path(),
+        "agent/schedules/c.md",
+        "---\nafter: 3h\n---\nC.\n",
+    );
+    edit(
+        dir.path(),
+        "agent/subagents/extra.md",
+        "---\ndescription: Does one thing.\n---\nYou do one thing.\n",
+    );
+    let error = live.reload().unwrap_err();
+    assert!(
+        matches!(&*error, ReloadError::NeedsRestart { .. }),
+        "{error}"
+    );
+    assert_eq!(
+        names(&live),
+        ["a"],
+        "the schedules of the refused load are not in force"
+    );
+}
+
+/// Each root of a package has its own schedules, under its own name.
+#[tokio::test]
+async fn every_root_of_a_package_gives_its_schedules() {
+    let (one, two) = (uniq("one"), uniq("two"));
+    let dir = tempfile::tempdir().unwrap();
+    edit(
+        dir.path(),
+        &format!("agents/{one}/instructions.md"),
+        &agent_file(&one, "", "One."),
+    );
+    edit(
+        dir.path(),
+        &format!("agents/{one}/schedules/daily.md"),
+        "---\ncron: \"0 9 * * *\"\n---\nOne's digest.\n",
+    );
+    edit(
+        dir.path(),
+        &format!("agents/{two}/instructions.md"),
+        &agent_file(&two, "", "Two."),
+    );
+    edit(
+        dir.path(),
+        &format!("agents/{two}/schedules/daily.md"),
+        "---\ncron: \"0 10 * * *\"\n---\nTwo's digest.\n",
+    );
+    let model = Arc::new(MockModel::new());
+    let live = builder(dir.path(), &model).load().unwrap();
+    let mut got: Vec<(String, String)> = live
+        .schedules()
+        .into_iter()
+        .map(|s| (s.agent, s.cron))
+        .collect();
+    got.sort();
+    let mut want = vec![
+        (one, "0 9 * * *".to_owned()),
+        (two, "0 10 * * *".to_owned()),
+    ];
+    want.sort();
+    assert_eq!(got, want);
+}
+
 // --- an invalid edit ------------------------------------------------------------------------
 
 #[tokio::test]

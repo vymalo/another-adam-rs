@@ -13,7 +13,10 @@ use crate::caller::{CONTEXT_CALLER, caller_of};
 use crate::person::{CONTEXT_PERSON, person_of};
 use crate::words::comparable;
 
-/// The context key under which a message that carries `ui-catalog/v1` says which catalog is
+/// The A2UI version the renderer's messages must say (`adam_ui::A2UI_VERSION`; this crate does not depend on `adam-ui`).
+const A2UI_VERSION: &str = "1.0";
+
+/// The context key under which a message that carries `ui-catalog/v2` says which catalog is
 /// current: `{catalogId, version, digest}`.
 pub const CONTEXT_UI_REF: &str = "vymalo.ui.ref";
 
@@ -21,6 +24,23 @@ pub const CONTEXT_UI_REF: &str = "vymalo.ui.ref";
 /// `{catalogId, version, digest, catalog}`. Only set when the inline catalog has the `catalogId`
 /// of the ref.
 pub const CONTEXT_UI_CATALOG: &str = "vymalo.ui.catalog";
+
+/// The context key of what the renderer offers (`a2uiRendererCapabilities["1.0"]`): `{catalogIds:
+/// [...]}`, the union of its `supportedCatalogIds` and the ids of its `inlineCatalogs`, without
+/// duplicates and at most [`MAX_OFFERED_CATALOG_IDS`] of them. A message without that entry sets it
+/// to `null`, which deletes it: a run that continues another must not draw with an earlier
+/// message's offer, so a turn with no capabilities draws nothing.
+///
+/// It is one of `adam_llm_agent::PER_MESSAGE_CONTEXT_KEYS` (a test keeps the two equal): when a message's context is too large
+/// and dropped, the key is deleted too (an earlier turn's offer never survives).
+pub const CONTEXT_A2UI_RENDERER: &str = "vymalo.a2ui.renderer";
+
+/// The most catalog ids kept in [`CONTEXT_A2UI_RENDERER`]; the ones after it are dropped.
+pub const MAX_OFFERED_CATALOG_IDS: usize = 32;
+
+/// The longest catalog id kept, in bytes: the contract's limit (a `catalogId` is at most 256 bytes);
+/// a longer one is left out.
+const MAX_CATALOG_ID_BYTES: usize = 256;
 
 /// The context key of the thread-tools grant: `{url, token, expiresAt}`. A credential; the entry
 /// expires at `expiresAt`.
@@ -63,7 +83,7 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// The default reading ([`default_inbound`](crate::default_inbound)) joins the text parts and
 /// prints the data parts as JSON; that is right for a message from another agent. A message
 /// from a screen carries three more things, all optional extensions the sender detects on the
-/// agent's card (`docs/api/ui-catalog-v1.md`, `docs/api/thread-tools-v1.md` of
+/// agent's card (`docs/api/ui-catalog-v2.md`, `docs/api/thread-tools-v1.md` of
 /// `vymalo/another-agentic-system`):
 ///
 /// ```mermaid
@@ -74,7 +94,7 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 ///     participant T as Tool (ToolCtx::context)
 ///     S->>B: message: text, or an A2UI action part, and metadata
 ///     Note over B: text = the text parts, an action rendered as what the person did
-///     Note over B: context = ui-catalog/v1, an inline catalog, thread-tools/v1
+///     Note over B: context = ui-catalog/v2, an inline catalog, thread-tools/v1
 ///     B->>R: Inbound {text, context}, merged into the conversation
 ///     T->>R: ctx.context("vymalo.ui.ref") ...
 /// ```
@@ -84,20 +104,21 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// | text parts | the text, joined by blank lines; a line that would read as the first line of a form's answer is marked `(typed) ` first |
 /// | an A2UI data part (`application/a2ui+json`) with the action `answer` of a surface `ask-<id>` that carries Choices answers | the text `The person answered through the interface (form ask-<id>):` (the surface the answer is for: [`form_answer_surface`]) and one line `- <question id>: <values>` per answer, an "other" as `other: "<text>"`, the words of a typed question as `text: "<text>"`, and a last line `Note: "<text>"` when the form's free box was used |
 /// | any other A2UI action | `The person used the interface: action "<name>" on surface "<id>" with context <compact JSON, cut at 4 KiB>` |
-/// | any other data part | its JSON, as the default reading does |
+/// | any other data part, an A2UI part none of whose messages says `"1.0"` included | its JSON, as the default reading does |
 /// | a `raw` part that is a PNG, JPEG, GIF or WebP | an entry of the payload's `images`, at most 4 and 2 MiB a message (over that, a line in the text) |
 /// | any other `raw` part, a `url` part | one line of the text, `[attached: ...; only images are read]` or `[linked: <url>]`; a link is never fetched |
-/// | `metadata[ui-catalog/v1]` `{catalogId, version, digest, inline}` | context [`CONTEXT_UI_REF`] `{catalogId, version, digest}` |
-/// | the renderer's capabilities (`a2uiClientCapabilities.v0.9.1`, else `.v0.9`, else `a2uiRendererCapabilities.v1.0`) holding an inline catalog with the ref's `catalogId` | context [`CONTEXT_UI_CATALOG`] `{catalogId, version, digest, catalog}` |
+/// | `metadata[ui-catalog/v2]` `{catalogId, version, digest, inline}` | context [`CONTEXT_UI_REF`] `{catalogId, version, digest}` |
+/// | the renderer's capabilities (`a2uiRendererCapabilities["1.0"]`; nothing else is read) holding an inline catalog with the ref's `catalogId` | context [`CONTEXT_UI_CATALOG`] `{catalogId, version, digest, catalog}` |
+/// | those capabilities' `supportedCatalogIds` and the ids of their `inlineCatalogs` | context [`CONTEXT_A2UI_RENDERER`] `{catalogIds}`, deduplicated and bounded ([`MAX_OFFERED_CATALOG_IDS`]); `null` for a message without the entry |
 /// | `metadata[thread-tools/v1]` `{url, token, expiresAt}` | context [`CONTEXT_THREAD_TOOLS`], the same three members |
 /// | the `caller` and `depth` claims of that `token` (any entry under the URI) | context [`CONTEXT_CALLER`](crate::CONTEXT_CALLER): `{caller: "main"}`, `{caller: "ask:<n>", depth}`, or `{caller: "unreadable"}` ([`asked_by_an_agent`](crate::asked_by_an_agent)) |
 /// | the `person` member of that entry, `{said: [<strings>], omitted?}`, what the person wrote in the thread (on the message of an agent another agent asked) | context [`CONTEXT_PERSON`](crate::CONTEXT_PERSON): the same, `omitted` as an integer and only above 0; `null` for any entry under the URI without a well-formed one ([`person_said`](crate::person_said)) |
 /// | `metadata[mentions/v1]` `{mentions: [{agentId, label, start, end, name?, cardUrl?}], coordinate?: {tool}}` | context [`CONTEXT_MENTIONS`], the mentions that are well formed (at most [`MAX_MENTIONS`]) and the `coordinate` tool; a message with other extension metadata and no mentions sets it to `null` |
 ///
-/// A message with none of the metadata has no `context` at all, so it changes nothing in the run.
-/// The capability key is read under both `v0.9` and `v0.9.1` because A2UI's own files disagree on
-/// it (*verified 2026-10-01*, `github.com/google/A2UI` `main`: the JSON schema keys by `v0.9`, the
-/// extension page's example by `v0.9.1`).
+/// Every message has a `context`, which says at least [`CONTEXT_A2UI_RENDERER`]: `null` when the
+/// message has no renderer capabilities, so that a run never draws with an offer of an earlier turn.
+/// Any other capability key and any renderer-to-agent message that does not say
+/// `"version": "1.0"` are not read: A2UI v1.0 is the only protocol.
 ///
 /// **Numbers.** An A2A server holds the numbers of a message's metadata as doubles (they are a
 /// protobuf `Struct`), so an inline catalog reads `maxLength: 256.0` and a `version` reads `2.0`.
@@ -120,7 +141,13 @@ pub fn vymalo_inbound(message: &Message) -> Result<Inbound, String> {
         match &part.content {
             PartContent::Text(text) => chunks.push(typed_text(text)),
             PartContent::Data(data) if claims_a2ui(part) => {
-                chunks.extend(action_texts(data));
+                let actions = action_texts(data);
+                if actions.is_empty() && !says_current_version(data) {
+                    // Not a 1.0 message at all (an action of another version, ADR 0056 decision 4):
+                    // read as any other data part. A 1.0 message that is no action says nothing.
+                    chunks.push(data.to_string());
+                }
+                chunks.extend(actions);
                 forms.extend(forms_of(data));
             }
             PartContent::Data(data) => chunks.push(data.to_string()),
@@ -140,11 +167,9 @@ pub fn vymalo_inbound(message: &Message) -> Result<Inbound, String> {
         }
         payload[PAYLOAD_FORM] = form;
     }
-    if let Some(context) = message.metadata.as_ref().and_then(context_of)
-        && !context.is_empty()
-    {
-        payload["context"] = Value::Object(context);
-    }
+    // Every message says what its renderer offers, if only by deleting an earlier offer.
+    let none = HashMap::new();
+    payload["context"] = Value::Object(context_of(message.metadata.as_ref().unwrap_or(&none)));
     Ok(Inbound::new("message", payload).with_id(message.message_id.clone()))
 }
 
@@ -202,15 +227,31 @@ pub(crate) fn claims_a2ui(part: &Part) -> bool {
 
 /// The text of every client action in an A2UI data part (an array of messages, or one).
 fn action_texts(data: &Value) -> Vec<String> {
+    actions_of(data).into_iter().map(action_text).collect()
+}
+
+/// The `action` of every message of an A2UI data part (an array of messages, or one) that says
+/// `"version": "1.0"`: a renderer-to-agent message of any other version is no action (a part with
+/// none is read as any other data part).
+fn actions_of(data: &Value) -> Vec<&Value> {
     let messages: Vec<&Value> = match data {
         Value::Array(items) => items.iter().collect(),
         other => vec![other],
     };
     messages
         .into_iter()
+        .filter(|m| m.get("version").and_then(Value::as_str) == Some(A2UI_VERSION))
         .filter_map(|m| m.get("action"))
-        .map(action_text)
         .collect()
+}
+
+/// Whether any message of an A2UI data part (an array of messages, or one) says `"version": "1.0"`.
+fn says_current_version(data: &Value) -> bool {
+    let says = |m: &Value| m.get("version").and_then(Value::as_str) == Some(A2UI_VERSION);
+    match data {
+        Value::Array(items) => items.iter().any(says),
+        other => says(other),
+    }
 }
 
 /// The name of the action the Choices form submits its answers with.
@@ -253,14 +294,9 @@ pub fn form_answer_surface(line: &str) -> Option<Option<&str>> {
 /// Every form's submit in an A2UI data part, as [`PAYLOAD_FORM`]: the action `answer` of a
 /// surface `ask_user` drew, with its context whatever it holds (the receiver judges its shape).
 fn forms_of(data: &Value) -> Vec<Value> {
-    let messages: Vec<&Value> = match data {
-        Value::Array(items) => items.iter().collect(),
-        other => vec![other],
-    };
-    messages
+    actions_of(data)
         .into_iter()
-        .filter_map(|m| {
-            let action = m.get("action")?;
+        .filter_map(|action| {
             let surface = action
                 .get("surfaceId")
                 .and_then(Value::as_str)
@@ -388,9 +424,9 @@ fn cut(text: &str, max: usize) -> String {
 // Context
 // ---------------------------------------------------------------------------------------------
 
-/// What the message's metadata says about the screen, as the run's inbound context; `None` when
-/// it says nothing this module reads.
-fn context_of(metadata: &HashMap<String, Value>) -> Option<Map<String, Value>> {
+/// What the message's metadata says about the screen, as the run's inbound context. It always
+/// holds [`CONTEXT_A2UI_RENDERER`].
+fn context_of(metadata: &HashMap<String, Value>) -> Map<String, Value> {
     let mut context = Map::new();
     if let Some(reference) = metadata.get(UI_CATALOG_EXTENSION).and_then(catalog_ref) {
         if let Some(catalog) = inline_catalog(metadata, &reference) {
@@ -428,7 +464,47 @@ fn context_of(metadata: &HashMap<String, Value>) -> Option<Map<String, Value>> {
         }
         None => {}
     }
-    (!context.is_empty()).then_some(context)
+    context.insert(CONTEXT_A2UI_RENDERER.to_owned(), offered(metadata));
+    context
+}
+
+/// The renderer's capabilities of the message: `a2uiRendererCapabilities["1.0"]`, the only entry read.
+fn renderer_capabilities(metadata: &HashMap<String, Value>) -> Option<&Value> {
+    metadata
+        .get("a2uiRendererCapabilities")?
+        .get(A2UI_VERSION)
+        .filter(|entry| entry.is_object())
+}
+
+/// `{catalogIds}` of what the renderer offers (its `supportedCatalogIds` and the ids of its
+/// `inlineCatalogs`: non-empty strings, once each, bounded), or `null` without the entry.
+fn offered(metadata: &HashMap<String, Value>) -> Value {
+    let Some(entry) = renderer_capabilities(metadata) else {
+        return Value::Null;
+    };
+    let supported = entry
+        .get("supportedCatalogIds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    let inline = entry
+        .get("inlineCatalogs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|catalog| catalog.get("catalogId")?.as_str());
+    let mut ids: Vec<&str> = Vec::new();
+    for id in supported.chain(inline) {
+        if !id.is_empty()
+            && id.len() <= MAX_CATALOG_ID_BYTES
+            && !ids.contains(&id)
+            && ids.len() < MAX_OFFERED_CATALOG_IDS
+        {
+            ids.push(id);
+        }
+    }
+    json!({ "catalogIds": ids })
 }
 
 /// The longest `agentId` kept, in bytes.
@@ -508,7 +584,7 @@ fn is_tool_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// `{catalogId, version, digest}` of the `ui-catalog/v1` metadata, with `version` as an integer;
+/// `{catalogId, version, digest}` of the `ui-catalog/v2` metadata, with `version` as an integer;
 /// `None` when a member is missing or has the wrong type.
 fn catalog_ref(value: &Value) -> Option<Value> {
     let catalog_id = value.get("catalogId")?.as_str().filter(|s| !s.is_empty())?;
@@ -524,26 +600,16 @@ fn catalog_ref(value: &Value) -> Option<Value> {
 /// numbers as integers.
 fn inline_catalog(metadata: &HashMap<String, Value>, reference: &Value) -> Option<Value> {
     let wanted = reference["catalogId"].as_str()?;
-    [
-        ("a2uiClientCapabilities", "v0.9.1"),
-        ("a2uiClientCapabilities", "v0.9"),
-        ("a2uiRendererCapabilities", "v1.0"),
-    ]
-    .into_iter()
-    .filter_map(|(key, version)| {
-        metadata
-            .get(key)?
-            .get(version)?
-            .get("inlineCatalogs")?
-            .as_array()
-    })
-    .flatten()
-    .find(|catalog| catalog.get("catalogId").and_then(Value::as_str) == Some(wanted))
-    .map(|catalog| {
-        let mut catalog = catalog.clone();
-        integral_numbers(&mut catalog);
-        catalog
-    })
+    renderer_capabilities(metadata)?
+        .get("inlineCatalogs")?
+        .as_array()?
+        .iter()
+        .find(|catalog| catalog.get("catalogId").and_then(Value::as_str) == Some(wanted))
+        .map(|catalog| {
+            let mut catalog = catalog.clone();
+            integral_numbers(&mut catalog);
+            catalog
+        })
 }
 
 /// `{url, token, expiresAt}` of the `thread-tools/v1` metadata; `None` when one is missing or is
@@ -613,7 +679,7 @@ mod tests {
     fn action_message(action: Value) -> Message {
         Message::new(
             Role::User,
-            vec![a2ui_part(json!([{"version": "v0.9.1", "action": action}]))],
+            vec![a2ui_part(json!([{"version": "1.0", "action": action}]))],
         )
     }
 
@@ -647,8 +713,12 @@ mod tests {
         let m = text_message("add hello.txt");
         let ours = vymalo_inbound(&m).unwrap();
         let default = crate::default_inbound(&m).unwrap();
-        assert_eq!(ours.payload, default.payload);
-        assert_eq!(ours.payload, json!({"text": "add hello.txt"}));
+        // The text is the default's; beside it the context says there is no renderer offer.
+        assert_eq!(ours.payload["text"], default.payload["text"]);
+        assert_eq!(
+            ours.payload,
+            json!({"text": "add hello.txt", "context": {CONTEXT_A2UI_RENDERER: null}})
+        );
         assert_eq!(ours.id, m.message_id);
         assert_eq!(ours.kind, "message");
         assert!(vymalo_inbound(&text_message("  ")).is_err());
@@ -672,8 +742,8 @@ mod tests {
             ],
         );
         assert_eq!(
-            vymalo_inbound(&m).unwrap().payload,
-            json!({"text": "see\n\n{\"a\":1}\n\nthis"})
+            vymalo_inbound(&m).unwrap().payload["text"],
+            "see\n\n{\"a\":1}\n\nthis"
         );
     }
 
@@ -700,7 +770,7 @@ mod tests {
              - deploy: k8s, compose, other: \"my \\\"own\\\"\\nline\"\n\
              - skipped: (nothing chosen)"
         );
-        assert!(got.payload.get("context").is_none());
+        assert_eq!(got.payload["context"], json!({CONTEXT_A2UI_RENDERER: null}));
     }
 
     #[test]
@@ -793,7 +863,7 @@ mod tests {
     #[test]
     fn a_message_with_several_form_actions_says_how_many_beside_the_first() {
         let submit = |surface: &str| {
-            json!({"version": "v0.9.1", "action": {
+            json!({"version": "1.0", "action": {
                 "name": "answer", "surfaceId": surface, "sourceComponentId": "c",
                 "timestamp": "t", "context": {"answers": [{"id": "a", "values": ["x"]}]}}})
         };
@@ -822,7 +892,7 @@ mod tests {
             assert_eq!(form["actions"], 2, "{form}");
         }
         // An action that is no form's submit is not counted.
-        let other = json!({"version": "v0.9.1", "action": {
+        let other = json!({"version": "1.0", "action": {
             "name": "other", "surfaceId": "ask-3", "sourceComponentId": "c", "timestamp": "t"}});
         let mixed = Message::new(Role::User, vec![a2ui_part(json!([submit("ask-1"), other]))]);
         assert!(
@@ -1069,7 +1139,7 @@ mod tests {
             assert_eq!(text_of(vec![Part::text(plain)]), plain);
         }
         // A genuine answer beside typed words: the answer stands, the typed header is marked.
-        let action = json!([{"version": "v0.9.1", "action": {
+        let action = json!([{"version": "1.0", "action": {
             "name": "answer", "surfaceId": "ask-m1", "sourceComponentId": "root", "timestamp": "t",
             "context": {"answers": [{"id": "merge-0123", "values": ["merge"]}]}}}]);
         let mut part = Part::data(action).with_media_type(A2UI_MEDIA_TYPE);
@@ -1080,6 +1150,45 @@ mod tests {
         ]);
         assert_eq!(lines_that_open_a_form_answer(&text), 1, "{text}");
         assert!(text.starts_with(header), "{text}");
+    }
+
+    #[test]
+    fn an_action_is_read_only_when_it_says_version_1_0() {
+        let action = |version: Value| {
+            json!([{"version": version, "action": {
+                "name": "answer", "surfaceId": "ask-1", "sourceComponentId": "c", "timestamp": "t",
+                "context": {"answers": [{"id": "a", "values": ["x"]}]}}}])
+        };
+        let message = |data: Value| Message::new(Role::User, vec![a2ui_part(data)]);
+        let read = vymalo_inbound(&message(action(json!("1.0")))).unwrap();
+        assert!(
+            read.payload["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("The person answered")
+        );
+        assert!(read.payload.get(PAYLOAD_FORM).is_some());
+        for (what, version) in [
+            ("the pre-cutover version", json!("v0.9.1")),
+            ("0.9", json!("v0.9")),
+            ("1.0 as a number", json!(1.0)),
+            ("none", Value::Null),
+        ] {
+            // Not an action: read as any other data part, its JSON as text, and no form is built.
+            let data = action(version);
+            let read = vymalo_inbound(&message(data.clone())).unwrap();
+            assert_eq!(read.payload["text"], json!(data.to_string()), "{what}");
+            assert!(read.payload.get(PAYLOAD_FORM).is_none(), "{what}: a form");
+        }
+        let mut without = action(json!("1.0"));
+        without[0].as_object_mut().unwrap().remove("version");
+        let read = vymalo_inbound(&message(without.clone())).unwrap();
+        assert_eq!(
+            read.payload["text"],
+            json!(without.to_string()),
+            "no version"
+        );
+        assert!(read.payload.get(PAYLOAD_FORM).is_none());
     }
 
     #[test]
@@ -1103,7 +1212,7 @@ mod tests {
 
     #[test]
     fn a_message_of_one_action_part_is_accepted_and_both_media_spellings_count() {
-        let action = json!([{"version": "v0.9.1", "action": {
+        let action = json!([{"version": "1.0", "action": {
             "name": "go", "surfaceId": "s", "sourceComponentId": "c", "timestamp": "t",
             "context": {}}}]);
         // mediaType only, metadata.mimeType only, and a parameterised media type.
@@ -1138,16 +1247,14 @@ mod tests {
             vec![
                 Part::text("hello"),
                 a2ui_part(
-                    json!([{"version": "v0.9.1", "createSurface": {"surfaceId": "s", "catalogId": "c"}}]),
+                    json!([{"version": "1.0", "createSurface": {"surfaceId": "s", "catalogId": "c"}}]),
                 ),
             ],
         );
         assert_eq!(vymalo_inbound(&m).unwrap().payload["text"], "hello");
         let only = Message::new(
             Role::User,
-            vec![a2ui_part(
-                json!([{"version": "v0.9.1", "createSurface": {}}]),
-            )],
+            vec![a2ui_part(json!([{"version": "1.0", "createSurface": {}}]))],
         );
         assert!(vymalo_inbound(&only).is_err());
     }
@@ -1167,31 +1274,25 @@ mod tests {
             payload["context"],
             // A message that speaks for the screen and names no agent takes the earlier mentions away.
             json!({CONTEXT_UI_REF: {"catalogId": CATALOG_ID, "version": 2, "digest": DIGEST},
-                   CONTEXT_MENTIONS: null})
+                   CONTEXT_MENTIONS: null, CONTEXT_A2UI_RENDERER: null})
         );
         assert!(payload["context"]["vymalo.ui.ref"]["version"].is_i64());
     }
 
     #[test]
-    fn an_inline_catalog_is_kept_with_its_whole_numbers_as_integers_under_each_capability_key() {
-        for (key, version) in [
-            ("a2uiClientCapabilities", "v0.9.1"),
-            ("a2uiClientCapabilities", "v0.9"),
-            ("a2uiRendererCapabilities", "v1.0"),
-        ] {
-            let mut metadata = ref_metadata(json!(2), true);
-            metadata[key] = json!({version: {
-                "supportedCatalogIds": [CATALOG_ID, "https://a2ui.org/basic"],
-                "inlineCatalogs": [catalog()]}});
-            let m = with_metadata(text_message("hi"), metadata);
-            let context = vymalo_inbound(&m).unwrap().payload["context"].clone();
-            let kept = &context[CONTEXT_UI_CATALOG];
-            assert_eq!(kept["digest"], DIGEST, "{key}/{version}");
-            assert_eq!(kept["version"], 2);
-            let max = &kept["catalog"]["components"]["Text"]["properties"]["text"]["maxLength"];
-            assert!(max.is_i64() && *max == 4000, "{key}/{version}: {max}");
-            assert!(context[CONTEXT_UI_REF].is_object());
-        }
+    fn an_inline_catalog_is_kept_with_its_whole_numbers_as_integers() {
+        let mut metadata = ref_metadata(json!(2), true);
+        metadata["a2uiRendererCapabilities"] = json!({"1.0": {
+            "supportedCatalogIds": [CATALOG_ID, "https://a2ui.org/basic"],
+            "inlineCatalogs": [catalog()]}});
+        let m = with_metadata(text_message("hi"), metadata);
+        let context = vymalo_inbound(&m).unwrap().payload["context"].clone();
+        let kept = &context[CONTEXT_UI_CATALOG];
+        assert_eq!(kept["digest"], DIGEST);
+        assert_eq!(kept["version"], 2);
+        let max = &kept["catalog"]["components"]["Text"]["properties"]["text"]["maxLength"];
+        assert!(max.is_i64() && *max == 4000, "{max}");
+        assert!(context[CONTEXT_UI_REF].is_object());
     }
 
     #[test]
@@ -1199,8 +1300,8 @@ mod tests {
         let mut metadata = ref_metadata(json!(2), true);
         let mut other = catalog();
         other["catalogId"] = json!("https://example.com/other");
-        metadata["a2uiClientCapabilities"] =
-            json!({"v0.9.1": {"inlineCatalogs": [other], "supportedCatalogIds": []}});
+        metadata["a2uiRendererCapabilities"] =
+            json!({"1.0": {"inlineCatalogs": [other], "supportedCatalogIds": []}});
         let m = with_metadata(text_message("hi"), metadata);
         let context = vymalo_inbound(&m).unwrap().payload["context"].clone();
         assert!(context.get(CONTEXT_UI_CATALOG).is_none());
@@ -1210,10 +1311,12 @@ mod tests {
     #[test]
     fn a_catalog_without_the_extension_metadata_is_not_ours_and_is_not_read() {
         let mut metadata = json!({});
-        metadata["a2uiClientCapabilities"] =
-            json!({"v0.9.1": {"inlineCatalogs": [catalog()], "supportedCatalogIds": []}});
+        metadata["a2uiRendererCapabilities"] =
+            json!({"1.0": {"inlineCatalogs": [catalog()], "supportedCatalogIds": []}});
         let m = with_metadata(text_message("hi"), metadata);
-        assert!(vymalo_inbound(&m).unwrap().payload.get("context").is_none());
+        let context = vymalo_inbound(&m).unwrap().payload["context"].clone();
+        assert!(context.get(CONTEXT_UI_CATALOG).is_none());
+        assert!(context.get(CONTEXT_UI_REF).is_none());
     }
 
     #[test]
@@ -1227,8 +1330,9 @@ mod tests {
             json!("nope"),
         ] {
             let m = with_metadata(text_message("hi"), json!({UI_CATALOG_EXTENSION: bad}));
-            assert!(
-                vymalo_inbound(&m).unwrap().payload.get("context").is_none(),
+            assert_eq!(
+                vymalo_inbound(&m).unwrap().payload["context"],
+                json!({CONTEXT_A2UI_RENDERER: null}),
                 "{bad}"
             );
         }
@@ -1259,7 +1363,7 @@ mod tests {
         assert_eq!(
             vymalo_inbound(&m).unwrap().payload["context"],
             json!({CONTEXT_THREAD_TOOLS: grant, CONTEXT_CALLER: {"caller": "main"},
-                   CONTEXT_PERSON: null, CONTEXT_MENTIONS: null})
+                   CONTEXT_PERSON: null, CONTEXT_MENTIONS: null, CONTEXT_A2UI_RENDERER: null})
         );
         for missing in ["url", "token", "expiresAt"] {
             let mut partial = grant.clone();
@@ -1301,7 +1405,10 @@ mod tests {
             context(json!({MENTIONS_EXTENSION: {"mentions": [{"agentId": "a", "label": "@a"}]}}))
                 .unwrap();
         assert!(mentions.get(CONTEXT_CALLER).is_none());
-        assert_eq!(context(json!({"something": 1})), None);
+        assert_eq!(
+            context(json!({"something": 1})),
+            Some(json!({CONTEXT_A2UI_RENDERER: null}))
+        );
     }
 
     /// The orchestrator tells an asked agent what the person wrote in the thread, beside the grant:
@@ -1365,12 +1472,9 @@ mod tests {
                 .unwrap()
                 .contains_key(CONTEXT_PERSON)
         );
-        assert!(
-            vymalo_inbound(&text_message("hi"))
-                .unwrap()
-                .payload
-                .get("context")
-                .is_none()
+        assert_eq!(
+            vymalo_inbound(&text_message("hi")).unwrap().payload["context"],
+            json!({CONTEXT_A2UI_RENDERER: null})
         );
     }
 
@@ -1498,26 +1602,36 @@ mod tests {
                 .unwrap()
                 .contains_key(CONTEXT_MENTIONS)
         );
-        // A message with no extension metadata at all changes nothing (no context).
-        assert_eq!(context_of_mentions(json!({"something": 1})), None);
+        // A message with no extension metadata at all says nothing about mentions.
+        let m = with_metadata(text_message("hi"), json!({"something": 1}));
+        let payload = vymalo_inbound(&m).unwrap().payload;
+        assert!(
+            !payload["context"]
+                .as_object()
+                .unwrap()
+                .contains_key(CONTEXT_MENTIONS)
+        );
     }
 
     #[test]
     fn a_message_says_nothing_about_mentions_when_it_says_nothing_at_all() {
         let m = with_metadata(text_message("hi"), json!({}));
-        assert!(vymalo_inbound(&m).unwrap().payload.get("context").is_none());
+        assert_eq!(
+            vymalo_inbound(&m).unwrap().payload["context"],
+            json!({CONTEXT_A2UI_RENDERER: null})
+        );
     }
 
     #[test]
-    fn a_message_without_extensions_has_no_context() {
+    fn a_message_without_extensions_has_only_the_renderer_entry_and_it_is_null() {
         let m = with_metadata(text_message("hi"), json!({"something": {"else": true}}));
-        assert!(vymalo_inbound(&m).unwrap().payload.get("context").is_none());
-        assert!(
-            vymalo_inbound(&text_message("hi"))
-                .unwrap()
-                .payload
-                .get("context")
-                .is_none()
+        assert_eq!(
+            vymalo_inbound(&m).unwrap().payload["context"],
+            json!({CONTEXT_A2UI_RENDERER: null})
+        );
+        assert_eq!(
+            vymalo_inbound(&text_message("hi")).unwrap().payload["context"],
+            json!({CONTEXT_A2UI_RENDERER: null})
         );
     }
 

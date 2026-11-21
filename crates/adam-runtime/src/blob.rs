@@ -3,9 +3,10 @@
 //! A file artifact's bytes are stored under their SHA-256 ([`BlobId`]) and the commit that first
 //! names them references the digest ([`RunUpdate::blobs`]), so a store can keep the bytes outside
 //! the run and collect them once no run references them (ADR 0055). This module owns the digest
-//! rule — `adam-core` has no hash dependency — and the upload, which is **fail-open in this
-//! release**: a failed upload is logged and the commit goes on, because the run's state still
-//! carries the bytes. The contract release gates a run's head on the upload instead.
+//! rule — `adam-core` has no hash dependency — and the upload. A commit that writes a head
+//! **gates** on it: [`upload_all`] refuses the split when a put fails, and [`upload_carried`]
+//! leaves a file the head cannot name out of a carried head. A v4 commit stays fail-open: its
+//! state carries the bytes inline, so a failed put costs the copy, not the run.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -193,10 +194,12 @@ pub(crate) async fn upload_all(store: &DynStore, artifacts: &[Artifact]) -> Uplo
 /// Nothing is uploaded to a store that keeps no blobs ([`Store::keeps_blobs`](adam_core::Store::keeps_blobs)),
 /// and nothing at all when no artifact is a file, so the common step costs no round trip.
 ///
-/// **Fail-open** (the expand release): an upload that fails is logged and its digest is still
+/// **Fail-open, for a v4 commit only**: an upload that fails is logged and its digest is still
 /// referenced — the state names the artifact, so the transition is not lost. A later commit retries
-/// it only if the artifact is emitted again; otherwise the reference outlives the bytes, which S2
-/// must gate the head on (ADR 0055).
+/// it only if the artifact is emitted again; otherwise the reference outlives the bytes. A commit
+/// that writes a head does not use this path: [`upload_all`] reports `all_stored: false` and its
+/// caller refuses the split, and [`upload_carried`] leaves the file out of a carried head, so a
+/// head never names bytes that are missing (ADR 0055).
 pub(crate) async fn upload_files(store: &DynStore, artifacts: &[Artifact]) -> Vec<BlobId> {
     if !store.keeps_blobs() {
         return Vec::new();
@@ -221,6 +224,59 @@ pub(crate) async fn upload_files(store: &DynStore, artifacts: &[Artifact]) -> Ve
         ids.push(id);
     }
     ids
+}
+
+/// What one [`upload_carried`] pass found: the artifacts a carried head may name, and their digests.
+pub(crate) struct Carried {
+    /// The transition's artifacts the head may name: every JSON artifact, and a file whose bytes
+    /// are stored.
+    pub artifacts: Vec<Artifact>,
+    /// The digests of the kept files, without duplicates.
+    pub ids: Vec<BlobId>,
+}
+
+/// Upload the transition's file artifacts for a commit that **carries a head**, and keep only the
+/// ones the head may name.
+///
+/// A carried head is written beside the tombstone, so it is the run's only copy of its artifacts:
+/// a head must never name a digest whose bytes are not stored (ADR 0055). A failed put therefore
+/// drops that **file** artifact (logged); a JSON artifact carries its data in the head and is kept.
+/// A store that keeps no blobs cannot back a file reference at all, so every file is dropped.
+pub(crate) async fn upload_carried(store: &DynStore, artifacts: &[Artifact]) -> Carried {
+    let mut carried = Carried {
+        artifacts: Vec::new(),
+        ids: Vec::new(),
+    };
+    let mut seen = HashSet::new();
+    for artifact in artifacts {
+        let Some(file) = artifact.file.as_ref() else {
+            carried.artifacts.push(artifact.clone());
+            continue;
+        };
+        if !store.keeps_blobs() {
+            tracing::warn!(
+                name = %artifact.name,
+                "a store that keeps no blobs cannot back a file artifact; the carried head leaves it out"
+            );
+            continue;
+        }
+        let id = blob_id(&file.bytes);
+        let stored = store.blob_stored(&id).await.unwrap_or(false)
+            || store.put_blob(&id, &file.bytes).await.is_ok();
+        if !stored {
+            tracing::warn!(
+                blob = %id,
+                name = %artifact.name,
+                "a file artifact's bytes could not be stored; the carried head leaves it out"
+            );
+            continue;
+        }
+        if seen.insert(id.clone()) {
+            carried.ids.push(id);
+        }
+        carried.artifacts.push(artifact.clone());
+    }
+    carried
 }
 
 #[cfg(test)]

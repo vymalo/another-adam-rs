@@ -21,8 +21,8 @@ over A2A).
 | `Agent` (trait) | `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`; see *Continuing another run*), `async step(&mut Ctx, State) -> Transition<State>`, `split(&State) -> Option<(State, Vec<Value>)>` and `join(State, Vec<Value>) -> State` (both provided: the default keeps the whole state; see *The shadow*), `async on_cancelled(RunId, Value)` (provided, does nothing; see *Cancelling a run*) |
 | `AgentStarter` (trait) | the start-only half of an agent: `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`), `split`/`join` (the start-only half of the agent's, defaulted the same way), no `step`; `State` is `Serialize + DeserializeOwned`, as the agent's is (new: a starter whose state was only `Serialize` must derive `Deserialize` too, because it reads the prior state). See *Starting without stepping* |
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
-| `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
-| `Ctx`, `Emitter`, `ReservedStep` | `Ctx::step` journals a side effect's outcome; `Ctx::reserve_steps(&names)` takes the next seqs in order for steps that run at the same time (each `ReservedStep` has `seq()`, `name()`, `is_recorded()` and `run(f)`, with `step`'s contract), and `Ctx::step_all(steps, at_once)` runs them at most `at_once` at a time and returns the outcomes in the order given (see *Steps that run at the same time*); `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::arrived()` counts the messages delivered while the transition runs, `Ctx::reopen_on_arrival()` makes a `Done` that the transition returns go on instead, and `Ctx::read_already(&ids)` names the messages the run has read, whose copies are not counted (see *A message that arrives while a run finishes*); `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children and `Ctx::child_state(run)` its agent's own state (both live reads of the run's own children only), and `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*) |
+| `AgentError` | `Transient { retry_after, class, retry, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`; `class` the retryable class; `retry` a step's own policy), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
+| `Ctx`, `Emitter`, `ReservedStep` | `Ctx::step` journals a side effect's outcome; `Ctx::reserve_steps(&names)` takes the next seqs in order for steps that run at the same time (each `ReservedStep` has `seq()`, `name()`, `is_recorded()` and `run(f)`, with `step`'s contract), and `Ctx::step_all(steps, at_once)` runs them at most `at_once` at a time and returns the outcomes in the order given (see *Steps that run at the same time*); `Ctx::step_race(name, contenders)` races them as one step and records the winner (see *A race of steps*); `Ctx::step_retrying(name, key, policy, f)` is `step` under the step's own retry policy (see *Retries per step*); `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::arrived()` counts the messages delivered while the transition runs, `Ctx::reopen_on_arrival()` makes a `Done` that the transition returns go on instead, and `Ctx::read_already(&ids)` names the messages the run has read, whose copies are not counted (see *A message that arrives while a run finishes*); `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children and `Ctx::child_state(run)` its agent's own state (both live reads of the run's own children only), and `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*); `Ctx::run_starter()` gives an owned `RunStarter` |
 | `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_child_continuing`, `list_sessions`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `state`, `artifact_bytes`, `header`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*), `.poll_interval(..)` (the worker's idle poll, 250 ms) and `.cancel_poll_interval(..)` (a step's cancel watch, 1 s; see *Several processes*), and the getters `worker_id()`, `claim_scope()` |
 | `Runtime::notify_parent(child, output, error)` | tells a finished child's parent (`RUN_FINISHED_KIND`, or `CHILD_REPORTED_KIND` for a session round) from the `output`/`error` the caller just committed; `child` supplies the ids, the status and the parent. The runtime calls it itself after a commit and a cancel. **Breaking:** it used to take only `&RunRecord` and decoded the child's state, which `Store::commit_run` no longer returns (`RunRecord::state` is `null`); an embedder that called it must pass the values it committed |
 | `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`). `RunView::claimed` is true while a worker holds an unexpired lease on a runnable run (read with `Store::lease_until` against the runtime's clock, before the head, so a step that commits and releases between the two reads never reads as unclaimed at version 1): the first step of a run commits nothing until it ends, and this is how a reader, in any process, tells a run being stepped from one nobody has taken. `RunView::state` is the agent's **head** (a v5 run) or the whole agent state (a v4 one), `RunView::artifacts` is a `Vec<ArtifactRef>` (a file is a `FileRef`, inline or a blob), `Runtime::state(run)` joins the head and its body generation (the only full-state read), and `Runtime::artifact_bytes(&FileRef)` fetches a file's blob once into a bounded cache |
@@ -31,6 +31,7 @@ over A2A).
 | `Inbound` | a message delivered to a run |
 | `UsageEvent`, `UsageTotals`, `UsageTotal`, `Usage`, `MAX_USAGE_CALL_BYTES`, `MAX_USAGE_LABEL_BYTES`, `MAX_USAGE_TOTALS` | `RunEvent::Usage`: one model call completed, its tokens (`Usage`, re-exported from `adam-model`), its model, provider and context window, and the step of the task it ran under; and a task's totals, one entry per provider and model; see *Usage*. `Emitter::emit_for(run, event)` sends an event as another run's (a child's call is its root's) |
 | `SandboxUsage`, `SandboxEntry`, `SandboxEnvironment`, `MAX_SANDBOX_ENTRIES` | the time a run's commands ran in a sandbox (a run pod), one `SandboxEntry` per shape (`cpu_millis`, `memory_bytes`, `commands`, `milliseconds`), at most 8, and the environment they ran in; what a tool reports (`ToolCtx::report_sandbox` in `adam-llm-agent`), what the agent keeps in its state next to the totals, and what the A2A server writes as `sandbox`; see *Usage* |
+| `RunStarter`, `SCHEDULE_CONVERSATION_PREFIX`, `UNATTENDED_CONTEXT_KEY` | **root** runs a step may start ([ADR 0060](../../docs/decisions/0060-schedules-are-parked-runs.md), decision 2): `RunStarter::start_with_id(id, agent, input, conversation)` is `Runtime::start_with_id`, idempotent and never delivering into another run, and only in conversations under `adam.schedule:`; any other conversation is `RuntimeError::ForeignConversation` (class `Invalid`, new and additive: the enum is `#[non_exhaustive]`) before anything is read or written. The schedules' scheduler fires through it. `UNATTENDED_CONTEXT_KEY` (`adam.unattended`) is the context key, value `true`, that says nobody answers a run: a firing carries it and an agent's children inherit it |
 | `child_run_id`, `ChildStatus`, `ChildStarter`, `RUN_FINISHED_KIND`, `CHILD_REPORTED_KIND` | child runs: the id a parent derives for the child of a call, the payload of the finished message (also what `Ctx::child_status` returns), and the message's `Inbound::kind` (`adam.run.finished`, or `adam.child.reported` for a session round). `ChildStarter` also reads and acts on **the sessions of the run's conversation** (slice 2, below): `session_conversation()`, `start_round`, `session`, `sessions`, `steer`, `cancel_round`, `round_state`, `round_record` (the same with the round's status); `session_idle_ttl()` and `start_in_parent_conversation(id, agent, input)` (a timer run of a session, parked until it may expire, in a conversation made from the session's parent one and unique to the timer, which a run in it still reads as its parent's: `Runtime::start_child_in`); `SessionView::cleanup_rounds` and `countable_rounds()` (the rounds a limit counts: the closing rounds of a session that stays open only cancel what the round before left, and are not counted) |
 | `session_conversation_id`, `session_conversation_prefix`, `parse_session_conversation_id`, `SessionState`, `RoundOutcome`, `SessionSummary`, `ReportRound`, `SessionList`, `SessionView`, `SessionHeader`, `SESSION_STATE_KEY`, `SESSION_CLOSE_KIND`, `SESSION_CLOSE_ROUND_KEY`, `closing_round_payload`, `SessionSummary::started_outside_a_run`, `SessionView::started_outside_a_run`, `Runtime::session_view` | child sessions (ADR 0045): the conversation id the rounds of a session share, what `list_sessions` and `session_view` return, the header a round's agent keeps in its state under `session`, the message that asks a working round to be the session's last, and the first message of a round that only closes its session (`closing_round_payload(&header)`, `{close_session: true, session: header}`, which `subagent_close` and the A2A front both build). `started_outside_a_run` is true for a round that is **its own parent** (`start_child_continuing(id, id, ..)`: a person started it, no run of an agent did): no run's end cancels it and none waits for it, the A2A front's `by: person` (`adam-a2a-runtime`, *Child sessions*). The two methods are additions; no trait changes |
 | `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events: `Status` (after a commit, and `Status(Runnable, "claimed")` once, when a worker first takes a run), `Progress`, `Step`, `TextDelta`, `ReasoningDelta`, `Usage`, `Custom`, `Artifact`. `BroadcastSink::subscribe_run(run)` starts with the run's recent events: see *A late subscriber*. Its `RunSubscription::recv` skips the events a slow subscriber lost (and logs it); `recv_or_lag` says it instead, `Received::Lagged(skipped)` (the sink's events, every run's, so an upper bound on the run's), then the newest events the channel kept |
@@ -42,7 +43,7 @@ over A2A).
 | `ReceivedFiles`, `MAX_FILES_PER_RESULT` | the files of one tool result that another system sent (an MCP server's images and blobs, a remote agent's `raw` parts), shared as file artifacts as they are met: `new(stem, budget)`, `admit(claimed, len)` (every cap, on the length alone: call it before reading or copying the bytes), `share(claimed, filename, name, bytes)` (the line for the model), `refuse(claimed, why)`, `into_parts()` (the artifacts, and whether one was refused: then the result is an error result). What a sender says is untrusted: a file is named `<base>-<hash>.<ext>` (the sender's file name without its extension and cut to `[A-Za-z0-9._-]`, else the stem; the first 8 hexadecimal digits of the SHA-256 of the bytes, so names are unique within a run and stable on replay; the extension of the checked type), its type is the sender's, checked, its artifact name one line of at most 120 characters, and a refusal repeats the sender's type only when it is one. At most 4 MiB a file, 16 a result and `budget` in all: what the run may still share (`ToolCtx::files_left`), because the result is journaled before the loop's run cap applies ([ADR 0033](../../docs/decisions/0033-files-from-mcp-results-are-shared-files.md)) |
 | `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput`, `MAX_STEP_ID_BYTES`, `MAX_STEP_LABEL_CHARS`, `MAX_STEP_DETAIL_CHARS`, `STEP_INPUT_MAX_BYTES`, `STEP_INPUT_STRING_MAX_CHARS`, `STEP_OUTPUT_MAX_BYTES` | `RunEvent::Step`: a step of the run's work (a tool call, a sub-agent's work, a command) started, moved or ended, and which step it runs under; a tool call's step can carry what the tool was given (`input`) and answered (`output`), cut to the contract's bounds; see *Steps* |
 | `Notifier` (trait), `Signal`, `Delivery`, `LocalNotifier`, `DynNotifier` | cross-process wake-up and cancel; `RuntimeBuilder::notifier(..)`. See *Several processes* |
-| `RetryPolicy`, `MAX_RETRY_AFTER` | exponential backoff for transient errors |
+| `RetryPolicy`, `RetryClasses`, `StepRetry`, `MAX_RETRY_AFTER`, `MAX_CONSECUTIVE_FAILURES`, `RUNTIME_RETRY_KEY` | exponential backoff for transient errors, the classes a policy retries, and a step's own policy under a key; see *Retries per step* |
 | `Clock`, `SystemClock`, `ManualClock` | injectable time: `Clock::now` returns `adam_core::time::Timestamp`, the instant the whole framework uses (ADR 0057) |
 
 ```rust
@@ -62,54 +63,68 @@ at-least-once (a crash between the effect and its journal write runs it
 again): keep effects idempotent. The lifecycle and guarantees are in the crate
 docs (`src/lib.rs`) and the [architecture](../../docs/architecture.md#the-mental-model).
 
-## The shadow: the head and the body
+## The head and the body (the contract release)
 
-ADR 0055's expand release writes a run's **head** and its **body** beside the complete v4 `state`:
-the steps write both (S2a), and an observer reads the head (S2b). `Runtime::view` is one
-`load_head` call and never a body; `Runtime::state` is the one full-state read, joining the head and
-the generation it names. The worker still reads the full state through `load_run`, and a run's `state`
-is still the whole envelope a v4 process steps, so a mixed fleet is safe.
+ADR 0055's contract release makes a run's **head** and its **body** the run: every commit writes the
+head, the rows it appends and — for a store that keeps bodies — the **tombstone** (`state = null`).
+`Runtime::view` is one `load_head` call and never a body; `Runtime::state` is the one full-state
+read, joining the head and the generation it names. The worker reads the head through `load_run`
+(the store answers the head when `head_version == version`), joins the rows its claim read, steps,
+and writes the next head. A store that keeps no bodies (`Store::keeps_bodies() == false`) is not
+written the contract: the runtime keeps the whole v4 `state` for it and no head, as before. A v4 run
+keeps its whole state until its first commit under the contract, which splits it.
 
 * `Agent::split(&state)` returns `Some((head, rows))` when the agent's state has a transcript worth
   keeping apart, and `None` (the default) when it does not. `Agent::join(head, rows)` is its inverse,
   and the invariant is `join(split(s).0, split(s).1)` re-encodes to `s`. A wrapper that delegates
-  `init` **must delegate `split` and `join` too**, or its runs silently stay in the v4 format.
+  `init` **must delegate `split` and `join` too**: a new run of a wrapper that does not silently
+  stays in the v4 format, and a **v5 run must split** — a successful step that returns `None` on a
+  current head is a refused split, and the commit demotes the run to the whole v4 state (the
+  demotion re-reads the head's file digests, so an inherited file keeps its bytes).
 * The split is taken **inside the erased step** (`src/erased.rs`), where the typed state already
   exists: the state is deserialized once, and the rows are the agent's own values.
 * A step commit that splits writes the head (`v: 5`: the agent's head, the envelope's other members,
   file artifacts **by reference** — `file.digest` and `file.size`, never the bytes — and
-  `body: {generation, len}`) and the rows, beside the full `state`. The generation is the current
+  `body: {generation, len}`), the rows, and the tombstone as `state`. The generation is the current
   one for an append, or a new one for a first split or a compaction; the `writer` UUID is chosen once
   per step attempt, so a CAS retry of that attempt writes no duplicate row and a commit that loses
   deletes its own rows and refs.
-* A commit that does not split (`deliver`, `cancel`, `park_again`, a run whose state is unreadable)
-  writes no head: it re-encodes the format it read, and the stored head becomes stale
-  (`head_version < version`), which `Store::load_head` reads as "serve the state".
+* A commit that does not split (`deliver`, `cancel`, `park_again`, a failed transition) writes the
+  head it read, with this commit's members and its transcript set unchanged, and the tombstone: the
+  head stays current, so the next step appends to the same generation. A run whose state cannot be
+  read is stored as it is (a head stays a head beside the tombstone; a v4 state stays whole) and the
+  run is failed. A head becomes **stale** only when a v4 process commits over it
+  (`head_version < version`, the expand release's mixed fleet): the reads then serve the whole
+  `state` when it is the v4 envelope that commit wrote, and the head when it is the tombstone (a
+  pre-S3 process failed a converted run); the next step re-splits.
 * **The reconstruction check** runs before every commit that splits: `join(head, rows)` is compared
   with the state about to be written, and a mismatch writes `state` only, logs an error, and leaves
   the run v4. A bad split can never produce a head that does not reconstruct its state.
 * The body is **append-only per generation**: a normal commit writes only the rows after the old
   head's `len` and keeps the generation; a compaction (the new transcript does not start with the
-  previous one) writes all rows under a new generation. The delta win holds across **splitting**
-  commits: a headless commit (`deliver`, `cancel`, `park_again`, a failed transition) writes no head,
-  so the next split compacts until S3, where those paths write the head they read; the `head_version`
-  gate stays, because a v4 step may have changed the transcript. Measured with a delivery between
-  every step: 50 × 10 KB writes 12.7 MB of body rows (1,275 rows, 50 generations) against ~0.5 MB of
-  deltas for consecutive splits. The head names `{generation, len}`. The store
+  previous one) writes all rows under a new generation. The delta win now holds across **every**
+  commit of a v5 run, because the headless paths write the head they read; the `head_version` gate
+  stays, because a v4 step may have changed the transcript. The expand release's headless path
+  measured 12.7 MB of body rows for 50 × 10 KB (1,275 rows, 50 generations) against ~0.5 MB of
+  deltas for consecutive splits; the contract writes 524,320 logical bytes for the same workload
+  (ADR 0055's S3 amendment). The head names `{generation, len}`. The store
   resolves the generation, writes the rows before the CAS with the attempt's `writer`, checks that
   all of them landed, and a commit that loses deletes its own rows and refs, so a head never names a
   partial generation and a loser cannot poison the next append. Every file artifact the head will
   name is uploaded first: a failed put refuses the head, and the commit writes the state only.
-* `tests/common/v4.rs` is a frozen copy of the v4 envelope; the suite decodes every `state` written
-  and asserts a v5 head is **not** one. The contract release (S3) inverts that assertion.
+* `tests/common/v4.rs` is a frozen copy of the v4 envelope. The contract release **inverts** its
+  test: the tombstone and a v5 head are not v4 envelopes, and a pre-contract run's state still
+  decodes. The suite also proves a cancel and a `park_again` write the head they read and the
+  tombstone.
 
 ### The read path
 
-* `Runtime::view` reads the lease and then `Store::load_head` (one query on Memory and MongoDB;
-  PostgreSQL answers with the trait default until its half lands), and decodes the record as
-  `Stored`: `v: 1` is the v4 envelope, `v: 5` the head. A stale head
-  (`head_version != version`, left by a `deliver`, a `cancel` or a `park`) is not an error:
-  `load_head` serves the whole state, which decodes as `Stored::Full`, and the next step re-splits.
+* `Runtime::view` reads the lease and then `Store::load_head` (one query on Memory, MongoDB and
+  PostgreSQL), and decodes the record as `Stored`: `v: 1` is the v4 envelope, `v: 5` the head. A
+  stale head (`head_version != version`) is not an error: when the state is the v4 envelope a v4
+  commit wrote, that state is served (it decodes as `Stored::Full`) and the next step re-splits;
+  when the state is the tombstone — a run a pre-S3 process failed, with the head behind the version
+  — the **head** is served, so the run stays readable.
 * `RunView.state` is the agent's **head** for a v5 run and the whole agent state for a v4 one. The
   pointers a front reads — `pending_wait`, `pending_question`, `question`, `usage_totals`,
   `sandbox_usage`, `context`, `session` — are in the head. `RunView.artifacts` is a
@@ -124,12 +139,13 @@ is still the whole envelope a v4 process steps, so a mixed fleet is safe.
   answers its own bytes. A missing blob is `Ok(None)`: that artifact cannot be served, and the run
   is intact.
 * `start_continuing`/`prior_state` join a v5 prior run (one body read), and `cancel` hands
-  `Agent::on_cancelled` the joined state. `view_from_record` builds the same view from a record a
-  caller already holds (a listing), which in the expand release carries the full v4 state.
+  `Agent::on_cancelled` the joined state. `Ctx::child_state` and `ChildStarter::round_state` join
+  too, so the child's or round's agent must be registered on the runtime that reads it (an agent or
+  a starter: both have `join`). `view_from_record` builds the same view from a record a caller
+  already holds (a listing), which now carries the head.
 
-The cost is stated: in the expand release a step writes the whole state **and** the head **and** the
-rows, so bytes written per commit go up until S3 stops writing `state`; the read side pays for the
-head, and for the whole state only where there is no current one.
+The contract release removes the double write: a commit of a v5 run writes the head and the delta
+only. The read side pays for the head, and for the whole state only where there is no current one.
 
 ## A message that arrives while a run finishes
 
@@ -547,8 +563,9 @@ decides from the class (see [`adam-error`](../adam-error/README.md)).
 
 | `AgentError` | Class | The run |
 |---|---|---|
-| `Transient`, no `retry_after` | `Transient` | retried after `RetryPolicy`'s backoff |
-| `Transient` with `retry_after` | `RateLimited` | retried after `max(backoff, retry_after)`, the hint capped at `MAX_RETRY_AFTER` |
+| `Transient`, no `retry_after` | its `class`: `Transient`, or the class `from_classified` kept (`RateLimited`, `Conflict`) | retried after the policy's backoff, when the policy retries the class |
+| `Transient` of class `Transient` with `retry_after` | `RateLimited` | retried after `max(backoff, retry_after)`, the hint capped at `MAX_RETRY_AFTER`, when the policy retries rate limits (a policy that retries only `transient` fails it at once) |
+| `Transient` of class `RateLimited` or `Conflict` with `retry_after` | its `class` | retried after `max(backoff, retry_after)` |
 | `Permanent` | `Invalid` | `Failed` |
 | `NonDeterminism` | `Corrupt` | `Failed` |
 | `Store(e)` | `e.class()` | `Failed` for `Corrupt` and `Invalid`; otherwise left to its lease and logged with its class |
@@ -564,14 +581,50 @@ decides from the class (see [`adam-error`](../adam-error/README.md)).
 
 Build an `AgentError` with `AgentError::transient(msg)`,
 `transient_after(msg, wait)`, `permanent(msg)` or `non_determinism(msg)`, then
-`.with_retry_after(wait)` (only a `Transient` has one) and `.with_source(err)`.
-`AgentError::from_classified(context, err)` turns any classified error into a
-`Transient` (retryable, keeping its `retry_after`) or a `Permanent`, with `err`
+`.with_retry_after(wait)` and `.with_retry(key, policy)` (only a `Transient` has them) and
+`.with_source(err)`. `AgentError::from_classified(context, err)` turns any classified error into a
+`Transient` (retryable, keeping its class and its `retry_after`) or a `Permanent`, with `err`
 as the source. `TransientAfter` no longer exists. A message describes its own
 layer only; the run's stored failure text is a boundary, so the worker flattens
 `message: cause` there once. A store error that fails a run, and every store
 error the worker leaves to its lease, is logged with `adam_error::report`
 (the second also with its class and `alert`).
+
+## Retries per step
+
+A step can name its own retry policy ([ADR 0061](../../docs/decisions/0061-a-step-names-its-retry-policy.md)):
+`Ctx::step_retrying(name, key, policy, f)` is `Ctx::step` whose recorded `Err`, when retryable, fails the
+transition with `AgentError::from_classified(..).with_retry(key, policy)`; any other `Err` is the agent's.
+An error that names no policy counts under the key `runtime` (`RUNTIME_RETRY_KEY`) with the runtime's.
+
+* Build a policy with `RetryPolicy::new(attempts)`, `.with_backoff(initial, max)`, `.with_multiplier(m)` (a
+  factor that is not finite and positive is refused) and `.with_retry_on(RetryClasses::of([..]))`; it is
+  `#[non_exhaustive]`. A policy retries only the classes in `retry_on` (all three retryable ones by
+  default): a transient error of another class fails the run at once (``not retried: the policy of `key`
+  does not retry <class>``).
+* The run counts failures **per key**, and retries while that key's count is under its policy's
+  `max_attempts` and `attempt` (every consecutive failure, whatever its key) is under
+  `MAX_CONSECUTIVE_FAILURES` (100). The wait is the key's policy's backoff, lengthened by a hint and cut at
+  the deadline. The messages name the key: ``attempt 1 of 3 of `fetch` failed, retrying in ..``, ``gave up
+  after 3 attempts of `fetch`: ..``; the runtime's key is not named, so its messages read as before.
+* The count and each key's policy are recorded in the run's state (the v5 head, or the v4 envelope),
+  in the commit that sets `wake_at` or fails the run; the policy is recorded at the key's first failure and
+  read back after that, never recomputed. A transition that succeeds clears the record. Stored policies
+  are plain (`max_attempts`, `initial_backoff_ms`, `max_backoff_ms`, `multiplier`, `retry_on` by name:
+  `transient`, `rate-limited`, `conflict`); a class name this build does not know is dropped, and a record
+  that does not decode is ignored: the run counts its `attempt` so far under `runtime`, as one written
+  before records does, and the failing key starts again from one under its own policy (the ceiling still
+  bounds it). Every failing run writes a record, the runtime's key included, so its policy is recorded too;
+  a run that never fails writes the bytes it wrote before. A store keeps a duration of at most `i64::MAX`
+  ms, and a factor JSON cannot hold is kept as one that backs off alike (infinity as `f64::MAX`, NaN or a
+  negative one as `0`).
+
+Tests: `retry.rs` (the classes by name, the builder), `envelope.rs` and `head.rs` (the record's stored
+form, a record that does not decode, a class name dropped, a v5 head that carries it through `of`,
+`decode`, `into_parts` and `carried`), `agent.rs` (`from_classified` keeps the class, `with_retry`), and
+the suite's `a_step_retries_under_its_own_policy`, `a_policy_retries_only_its_classes`,
+`the_recorded_policy_outlives_a_change_in_code`, `the_runtime_policy_is_recorded_too`,
+`steps_that_fail_by_turns_stop_at_the_ceiling` and `a_success_clears_the_record`.
 
 ## Steps that run at the same time
 
@@ -590,6 +643,22 @@ reserves their seqs first and runs them after:
 
 Because the names and seqs depend only on the order of the reservation, the journal of a batch equals the one a
 sequential run writes, so a replay works whatever concurrency each side used.
+
+### A race of steps
+
+`Ctx::step_race(name, contenders)` ([ADR 0062](../../docs/decisions/0062-a-race-of-steps-records-its-winner.md)) runs its
+contenders at the same time as **one** journaled step `name`, and the first `Ok` to finish wins: it answers
+`Ok((index, value))`, or `Err(errors)` in contender order when every one failed (an `Err` does not end the race while
+another runs). Each contender is a `FnOnce(CancelToken) -> Future` given its own child of the run's cancel token;
+when a winner is found the others' tokens fire and their futures are dropped. The record names the winner, so a
+replay returns it and runs no contender; the count and the order of the contenders are part of the replay (a record
+for others is `NonDeterminism`). The tokens fire however the race ends, a panic or a dropped race included, before
+the futures are dropped. A contender that wins at once may leave later ones never started. The effect is at-least-once until the record lands, as for any step, and a
+transient retry races afresh. A race with no contender fails the run before anything is journaled. Tests: the
+suite's `a_race_is_won_by_the_first_success_and_the_losers_are_stopped`,
+`a_race_with_no_winner_records_every_error_in_order`, `a_recorded_race_returns_its_winner_and_runs_nobody`,
+`a_race_with_no_contender_fails_the_run`, `a_race_recorded_for_other_contenders_fails_the_run` and
+`a_panicking_contender_still_stops_the_others`.
 
 ## Features and environment
 
@@ -624,20 +693,25 @@ Two cases pin the header path: `a_header_is_one_store_call` (`Runtime::header` i
 nor the lease beside it) and `the_cancel_watch_polls_at_its_own_interval` (a 2.5 s step at a 1 s cancel interval reads the
 header about twice, not once per 20 ms worker poll; the watch reads no state at all).
 
-Five cases pin the shadow's writes: `a_step_that_splits_writes_the_head_and_the_body_beside_the_state` (the first commit
-writes a `v: 5` head and starts a generation, the done commit appends to it, one generation holds the transcript, and
-`state` is still the whole v4 envelope), `a_split_that_does_not_reconstruct_the_state_writes_the_state_only` (a
-deliberately wrong split is refused: no head, no rows, the run stays v4), `every_state_written_is_a_v4_envelope_and_a_head_is_not_one`
-(the frozen `tests/common/v4.rs` decodes every state a create, a step, a delivery and a finish wrote, and rejects the
-head), `a_pre_e_file_artifact_is_uploaded_before_the_head_names_it` (a run created directly with a file artifact in its
-state but no blob uploads and references its digest on the first commit, and the head names it) and
-`a_split_whose_file_is_not_stored_writes_the_state_only` (a failed `put_blob` refuses the head, and the commit writes the
-state only).
+Seven cases pin the contract's writes: `a_step_that_splits_writes_the_head_and_the_body_and_the_tombstone` (the first
+commit writes a `v: 5` head and starts a generation, the done commit appends to it, one generation holds the transcript,
+and `state` is `null`), `a_split_that_does_not_reconstruct_the_state_writes_the_state_only` (a deliberately wrong split
+is refused: no head, no rows, the run stays v4), `a_refused_split_on_a_v5_run_writes_the_whole_state_and_no_head` (the
+same on a run that is already v5: the run demotes instead of writing the transcript into a head),
+`a_contract_run_writes_the_tombstone_and_a_pre_contract_state_still_reads` (the frozen `tests/common/v4.rs` rejects the
+tombstone and a v5 head, and a seeded v4 run still decodes), `a_v5_run_whose_split_is_none_demotes_to_the_whole_state`
+(a step whose `split` returns `None` on a v5 run is a refused split), `a_refused_split_keeps_the_inherited_files_bytes`
+(the demotion re-reads the head's file digests, so the v4 state carries the bytes) and
+`a_failed_transition_keeps_its_artifact_in_the_head` (a permanent failure's artifact is named by the carried head);
+`a_pre_e_file_artifact_is_uploaded_before_the_head_names_it` and
+`a_split_whose_file_is_not_stored_writes_the_state_only` pin the upload gate, and
+`a_store_that_keeps_no_bodies_never_gets_a_head` pins the `keeps_bodies` gate.
 
 Eight cases here pin the read path, and two in `adam-a2a-runtime`: `the_view_reads_the_head_and_the_state_joins_the_body`
 (a 50-message run of 10 KB turns: the view is one `load_head`, no `load_run`, no `body_list`, and less than 2 KB of state;
 `Runtime::state` is one `load_head`, one `body_list` and all 50 messages), `a_stale_head_falls_back_to_the_whole_state`
-(a delivery leaves the head stale: the view is the whole state, no body is read, and the next step rewrites the head),
+(a **v4 commit** — what a process of the expand release writes — leaves the head stale: the view is the whole state, no
+body is read, and the next step rewrites the head; a delivery writes the head it read and does not stale it),
 `a_v4_runs_view_is_the_whole_state` (a run that never split serves its whole agent state, and `Runtime::state` reads no
 body), `state_re_reads_a_moved_head_and_joins_its_new_generation` (a compaction between the first `load_head` and
 `body_list`: one re-read, the new head and generation, every message), `state_is_corrupt_when_the_body_is_short_twice`

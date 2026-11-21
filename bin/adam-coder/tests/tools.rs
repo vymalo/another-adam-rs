@@ -6248,13 +6248,18 @@ async fn a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_r
 fn screen_with(document: &str, lock: &str) -> serde_json::Map<String, Value> {
     let lock: Value = serde_json::from_str(lock).unwrap();
     let catalog_id = "https://agents.vymalo.com/a2ui/catalogs/chat";
-    let claimed =
-        json!({"catalogId": catalog_id, "version": lock["version"], "digest": lock["digest"]});
+    // A screen sends a `ui-catalog/v2` document; the published catalogs before 9 (and the subsets) get its
+    // `protocolVersion`, and the digest is of what is sent.
+    let mut document: Value = serde_json::from_str(document).unwrap();
+    document["protocolVersion"] = json!("1.0");
+    let digest = adam_ui::catalog_digest(&document).unwrap();
+    let claimed = json!({"catalogId": catalog_id, "version": lock["version"], "digest": digest});
     let mut inline = claimed.clone();
-    inline["catalog"] = serde_json::from_str(document).unwrap();
+    inline["catalog"] = document;
     json!({
         adam_a2a_runtime::CONTEXT_UI_REF: claimed,
         adam_a2a_runtime::CONTEXT_UI_CATALOG: inline,
+        adam_a2a_runtime::CONTEXT_A2UI_RENDERER: {"catalogIds": [catalog_id]},
     })
     .as_object()
     .cloned()

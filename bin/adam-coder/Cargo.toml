@@ -38,6 +38,8 @@ adam-host.workspace = true
 adam-llm-agent.workspace = true
 adam-model.workspace = true
 adam-runtime.workspace = true
+# The files' schedules: the scheduler and its `schedules` component (ADR 0060).
+adam-schedule = { path = "../../crates/adam-schedule", version = "0.1.0" }
 adam-service = { workspace = true, features = ["mcp"] }
 adam-ui.workspace = true
 adam-workspace.workspace = true

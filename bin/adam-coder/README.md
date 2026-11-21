@@ -220,7 +220,7 @@ activation the message is refused as before ([`adam-a2a-runtime`](../../crates/a
 [ADR 0016](../../docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md)).
 
 The person's screen (the orchestration layer's chat) can draw a form. The coder announces that on its card
-(`adam_ui::with_card_extensions`: A2UI v0.9.1 with `acceptsInlineCatalogs: true`, `ui-catalog/v1`,
+(`adam_ui::with_card_extensions`: A2UI v1.0 with `acceptsInlineCatalogs: true`, `ui-catalog/v2`,
 `thread-tools/v1`, `mentions/v1`, `steer/v1`; `agent_card_from` adds them, with `steps/v1`, `text-stream/v1`, `usage/v1`, `access-tier/v1` ([above](#access-tiers-what-the-person-lets-it-do-alone)), `child-sessions/v1` (added by `adam_service::serve`, not by `agent_card_from`, and only when the backend serves it: [Sessions a person opens](#sessions-a-person-opens)), `commands/v1` (the three commands of `agent/commands/`: `review`, `fix-checks` and `explain`; templates the agent expands, never part of the prompt) and `build/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
 a screen (`vymalo_inbound`, set by `Coder::new_with` and `serve`), and gives the model `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`:
 three questions at once (a database, a login, where it runs) become **one Choices surface** beside the question, with a title
@@ -237,7 +237,7 @@ sequenceDiagram
   participant C as Coder (A2A server and worker)
   participant M as Model
   participant E as Thread tools endpoint
-  S->>C: message: text, ui-catalog/v1 {version, digest}, the catalog inline or only referenced, thread-tools/v1 {url, token}
+  S->>C: message: text, ui-catalog/v2 {version, digest}, the catalog inline or only referenced, thread-tools/v1 {url, token}
   C->>E: tools/list (once per grant, and again after the 60 s TTL, with the grant)
   E-->>C: get_ui_catalog and the tools attached since
   C->>M: the coder's tools, ask_user, show, ui_catalog, plan_work, plan_check, plan_add, then the listed ones except get_ui_catalog
@@ -1950,7 +1950,7 @@ The contract of a folder:
 | `tools:` | optional; may narrow the coder's own tools, and a name that is not one is refused with a suggestion. Without it the agent gets all of them |
 | `subagents/` | assembled and **registered beside the coder** (`coder/<name>`, `CoderAgent::subagents`). A subagent runs as a child run with its own run id, so the tools that work on the worktree of the run that calls them find none in it: give it tools that need no worktree |
 | `mcp.json` | optional: the MCP servers whose tools the agent gets, named `<server>__<tool>` after its own (see [MCP tools](#mcp-tools-from-the-folder)). Connected by the **workers** at startup |
-| `schedules/` | read, not run: a warning says so |
+| `schedules/` | run ([ADR 0060](../../docs/decisions/0060-schedules-are-parked-runs.md)), as in `adam-agent`: the worker roles register the coder's scheduler (`coder/adam.schedule`), and a `schedules` worker component (`adam_schedule::reconcile_until_stopped`) reconciles the scheduler runs with the files at start; a firing is a run of the coder with the prompt as a person's message, so the repositories it names are granted as a person's would be. **Nobody answers a firing**: its conversation (`adam.schedule:coder/<name>@<due>`) is no A2A caller's, so a firing never waits for a person. `ask_user` and `request_repository` answer the model that nothing can be asked (`adam_llm_agent::UNATTENDED`) and it goes on; a firing that would end with a question, or with work it owes (not committed, not pushed, no pull request), ends `Failed`, naming why and quoting the end of its answer. A firing's subagents know it too (the firing's context carries `adam.unattended`, which children inherit). Write a schedule's prompt so that it need not ask. **With `WORKSPACE_PLACEMENT` `affinity` or `isolated`**, which pin a run to the worker that first claimed it (`ClaimScope::Pinned`), a scheduler run is pinned too: its firings wait for that worker's free slots (a delay counted in `missed`), and when that worker is gone for good it never fires again, restarts included, since `reconcile` keeps an open scheduler of the same spec and a pin is never cleared; only a change to the schedule (a new hash) or cancelling that run starts a new one. Both are known gaps (ADR 0060) |
 | the rest | skills, `limits`, `model:` and the card follow the [agent files](../../docs/reference/agent-files.md) |
 
 What a folder cannot change is what the tools do (the policy, the checks, the redaction): it changes what the agent

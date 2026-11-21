@@ -18,10 +18,12 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { PermanentError, summarize } from '../errors.mjs';
+import { PermanentError, summarize, withStderr } from '../errors.mjs';
 import { SAFE_DIRECTORY_LINES } from '../gitops.mjs';
+import { glibcMounts, lacksLoader } from '../glibc.mjs';
 import { RUN_ID_MAX } from '../plan.mjs';
 import { fetchPinnedBinary } from '../npm.mjs';
+import { redact } from '../stack.mjs';
 import { runtimeLimits, runtimeUser } from '../runtime.mjs';
 import { InfraError, patchOfTree, saveRaw } from './common.mjs';
 
@@ -180,6 +182,8 @@ export class OpenCodeAgent {
     Object.assign(this, { pins, home, fetchBinary, now, contextWindow, pollMs, sharedPrompt });
     this.binary = null;
     this.binarySha = null;
+    this.glibcDir = null;
+    this.lacking = new Map();
   }
 
   #names(ctx) {
@@ -195,6 +199,14 @@ export class OpenCodeAgent {
   /** An empty directory of the harness's own, mounted read-only over the image's global skill directories. */
   #globals(ctx) {
     return path.join(this.slotDir(ctx), 'no-globals');
+  }
+
+  /** Does the task image need the harness's glibc? Asked once for each image, and the runtime is only read from the stack then. */
+  async #needsGlibc(ctx) {
+    const image = ctx.task.image.ref;
+    if (!this.lacking.has(image)) this.lacking.set(image, await lacksLoader({ containers: ctx.containers, image }));
+    if (this.lacking.get(image)) this.glibcDir ??= await ctx.stack.ensureGlibc();
+    return this.lacking.get(image);
   }
 
   async prepare(ctx) {
@@ -236,6 +248,7 @@ export class OpenCodeAgent {
       labels: { 'bench.slot': String(ctx.slot), 'bench.run': names.container.slice(14) },
     });
     if (r.exitCode !== 0) throw new PermanentError(`the clone for OpenCode failed (exit ${r.exitCode}): ${summarize(r.stderr)}`, { stderr: r.stderr });
+    await this.#needsGlibc(ctx); // found here, before the run, and not in the middle of it
   }
 
   async run(ctx) {
@@ -251,6 +264,7 @@ export class OpenCodeAgent {
       { source: names.inDir, target: '/bench/in', readOnly: true },
       { source: outHost, target: '/bench/out' },
       { source: ctx.stack.workRoot(ctx.slot), target: '/work' },
+      ...(await this.#needsGlibc(ctx) ? glibcMounts(this.glibcDir) : []),
     ];
     const base = { image: ctx.task.image.ref, workdir: '/', user: runtimeUser(), env: opencodeEnv(), mounts, input, ...runtimeLimits(), labels: { 'bench.slot': String(ctx.slot), 'bench.run': names.container.slice(14) } };
     // The image the container runs is the task's, by digest: asserted here, before the container starts.
@@ -282,14 +296,19 @@ export class OpenCodeAgent {
     let got = await ctx.stack.readFiles(ctx.slot, names.out, OUT_FILES);
     const eventsText = text(got.files, 'events.jsonl');
     const events = parseEvents(eventsText);
-    if (ended === null && eventsText === '' && [125, 126, 127].includes(r.exitCode)) throw new InfraError('runtime', `the OpenCode container did not start (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
-
+    const secrets = [ctx.meter.token];
+    const keep = path.join(ctx.paths.run, 'opencode');
+    if (ended === null && eventsText === '' && [125, 126, 127].includes(r.exitCode)) {
+      // The shell's own message ("not found") goes to the pipe that becomes stderr.txt, not to the container's stderr: it is
+      // read from there, kept in the run's directory and carried to `prepare-stderr.txt`, as a failed prepare is.
+      const said = [r.stderr, text(got.files, 'stderr.txt')].filter((x) => x && x.trim() !== '').join('\n');
+      for (const name of OUT_FILES) if (got.files.has(name)) saveRaw(keep, name, text(got.files, name).slice(name === 'stderr.txt' ? -20_000 : 0), secrets);
+      throw withStderr(new InfraError('runtime', `the OpenCode container did not start (exit ${r.exitCode}): ${summarize(redact(said, secrets))}`), redact(said, secrets));
+    }
     if (events.sessionId) {
       const e = await ctx.containers.run({ ...base, name: `${names.container}-x`, script: opencodeExportScript({ bin: '/opt/bench/opencode', out: '/bench/out', sessionId: events.sessionId }), network: 'none', timeoutMs: 5 * 60 * 1000 });
       if (e.exitCode === 0) got = await ctx.stack.readFiles(ctx.slot, names.out, OUT_FILES);
     }
-    const secrets = [ctx.meter.token];
-    const keep = path.join(ctx.paths.run, 'opencode');
     for (const name of OUT_FILES) saveRaw(keep, name, text(got.files, name).slice(name === 'stderr.txt' ? -20_000 : 0), secrets);
     if (got.refused.length > 0) {
       ctx.log({ event: 'refused_output', names: got.refused });

@@ -395,12 +395,11 @@ impl Rig {
             .clock(self.clock.clone())
             .poll_interval(Duration::from_millis(20))
             .lease_ttl(Duration::from_secs(10))
-            .retry(RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(10),
-                multiplier: 1.0,
-            })
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(10), Duration::from_millis(10))
+                    .with_multiplier(1.0),
+            )
     }
 
     fn together(&self, store: &DynStore, parent: &LlmAgent, child: &LlmAgent) -> Runtime {

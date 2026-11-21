@@ -123,12 +123,11 @@ impl Harness {
     async fn run(&self, agent: LlmAgent, retry: bool, message: &str) -> (RunId, RunView) {
         let rt = self.runtime(agent, |b| {
             if retry {
-                b.retry(RetryPolicy {
-                    max_attempts: 3,
-                    initial_backoff: Duration::from_millis(10),
-                    max_backoff: Duration::from_millis(10),
-                    multiplier: 1.0,
-                })
+                b.retry(
+                    RetryPolicy::new(3)
+                        .with_backoff(Duration::from_millis(10), Duration::from_millis(10))
+                        .with_multiplier(1.0),
+                )
             } else {
                 b
             }

@@ -218,6 +218,33 @@ pub enum Error {
         /// Every registered tool, in registration order.
         available: Vec<String>,
     },
+    /// `retry:` names a tool the agent does not have (ADR 0061).
+    #[error(
+        "{origin}: `retry` names `{tool}`, which is not one of the agent's tools{}; its tools: {}",
+        hint(.suggestion.as_deref()),
+        list(.available)
+    )]
+    UnknownRetryTool {
+        /// The agent and file that name it.
+        origin: Origin,
+        /// The name as written.
+        tool: String,
+        /// The closest of the agent's tools, when one is close.
+        suggestion: Option<String>,
+        /// The agent's tools, in order.
+        available: Vec<String>,
+    },
+    /// A `retry:` entry that is not a policy, in a manifest the loader did not check: one built in
+    /// code, or embedded by another version (the loader refuses such an entry in a file).
+    #[error("{origin}: `retry.{tool}` is not a retry policy: {reason}")]
+    InvalidRetry {
+        /// The agent and file.
+        origin: Origin,
+        /// The tool it is for.
+        tool: String,
+        /// What is wrong.
+        reason: String,
+    },
     /// A `tools:` pattern (`linear__*`) matches no registered tool.
     #[error(
         "{origin}: the `tools` pattern `{pattern}` matches no registered tool; registered: {}",
@@ -721,6 +748,17 @@ mod tests {
                 origin: o.clone(),
                 pattern: "linear__*".into(),
                 available: vec![],
+            },
+            Error::UnknownRetryTool {
+                origin: o.clone(),
+                tool: "web_serch".into(),
+                suggestion: Some("web_search".into()),
+                available: vec!["web_search".into()],
+            },
+            Error::InvalidRetry {
+                origin: o.clone(),
+                tool: "web_search".into(),
+                reason: "it has no `attempts`".into(),
             },
             Error::Template {
                 origin: o.clone(),

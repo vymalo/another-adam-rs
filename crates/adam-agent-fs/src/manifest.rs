@@ -1,5 +1,6 @@
 //! The owned manifest: what a directory of agent files means, after parsing and validation.
 
+use crate::when::{Cron, When, WhenError, parse_after, parse_at};
 use std::path::{Path, PathBuf};
 
 use serde::{Serialize, Serializer};
@@ -171,9 +172,19 @@ impl Instructions {
 pub struct Schedule {
     /// From the path: `schedules/a/b.md` is `a/b`.
     pub name: String,
-    /// A five-field cron expression.
+    /// A five-field cron expression; empty for an `at` or `after` schedule. Left out of the JSON
+    /// when empty, and `at` and `after` when absent, so a cron schedule's digest is what it was
+    /// before they existed.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub cron: String,
-    /// An IANA time zone name; `UTC` when the file names none.
+    /// `at`, as written: see [`parse_at`](crate::parse_at).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// `after`, as written: see [`parse_after`](crate::parse_after).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// An IANA time zone name; `UTC` when the file names none. Its spelling is checked here, the
+    /// zone itself where schedules are evaluated (`adam-schedule`).
     pub timezone: String,
     /// The agent it runs.
     pub agent: String,
@@ -182,6 +193,26 @@ pub struct Schedule {
     /// The file, relative to the source root.
     #[serde(serialize_with = "portable_path")]
     pub path: PathBuf,
+}
+
+impl Schedule {
+    /// When it fires, parsed again from the keys the loader checked. `Err` only for a `Schedule`
+    /// built by hand (or embedded) with a value the loader would have refused, or with none or
+    /// more than one of `cron`, `at` and `after`.
+    pub fn when(&self) -> Result<When, WhenError> {
+        match (
+            self.cron.as_str(),
+            self.at.as_deref(),
+            self.after.as_deref(),
+        ) {
+            (cron, None, None) if !cron.is_empty() => Cron::parse(cron).map(When::Cron),
+            ("", Some(at), None) => parse_at(at).map(When::At),
+            ("", None, Some(after)) => parse_after(after).map(When::After),
+            _ => Err(WhenError::new(
+                "needs exactly one of `cron`, `at` or `after`",
+            )),
+        }
+    }
 }
 
 /// A command (`commands/<name>.md`): a prompt template an agent serves, expanded by the agent
@@ -307,4 +338,61 @@ impl Report {
 /// where they were built.
 fn portable_path<S: Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&path.to_string_lossy().replace('\\', "/"))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn schedule(cron: &str, at: Option<&str>, after: Option<&str>) -> Schedule {
+        Schedule {
+            name: "daily".into(),
+            cron: cron.into(),
+            at: at.map(Into::into),
+            after: after.map(Into::into),
+            timezone: "UTC".into(),
+            agent: "a".into(),
+            prompt: "Go.".into(),
+            path: PathBuf::from("agent/schedules/daily.md"),
+        }
+    }
+
+    /// The JSON a `cron` schedule had before `at` and `after` existed: the digest depends on it.
+    #[test]
+    fn a_cron_schedule_serializes_as_before() {
+        assert_eq!(
+            serde_json::to_string(&schedule("0 9 * * *", None, None)).unwrap(),
+            r#"{"name":"daily","cron":"0 9 * * *","timezone":"UTC","agent":"a","prompt":"Go.","path":"agent/schedules/daily.md"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&schedule("", None, Some("30m"))).unwrap(),
+            r#"{"name":"daily","after":"30m","timezone":"UTC","agent":"a","prompt":"Go.","path":"agent/schedules/daily.md"}"#
+        );
+    }
+
+    #[test]
+    fn when_needs_exactly_one_key() {
+        assert!(matches!(
+            schedule("0 9 * * *", None, None).when(),
+            Ok(When::Cron(_))
+        ));
+        assert!(matches!(
+            schedule("", Some("2026-12-24T18:00"), None).when(),
+            Ok(When::At(_))
+        ));
+        assert!(matches!(
+            schedule("", None, Some("30m")).when(),
+            Ok(When::After(_))
+        ));
+        for bad in [
+            schedule("", None, None),
+            schedule("0 9 * * *", Some("2026-12-24T18:00"), None),
+            schedule("0 9 * * *", None, Some("30m")),
+            schedule("", Some("2026-12-24T18:00"), Some("30m")),
+            schedule("0 9 * *", None, None),
+        ] {
+            assert!(bad.when().is_err(), "{bad:?}");
+        }
+    }
 }

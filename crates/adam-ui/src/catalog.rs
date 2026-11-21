@@ -1,5 +1,5 @@
 //! The screen's catalog: the components the person's screen can draw, as the web defines them
-//! (`docs/api/ui-catalog-v1.md` of `vymalo/another-agentic-system`).
+//! ([`ui-catalog-v2`](https://github.com/vymalo/another-agentic-system/blob/66db4ee5c885c12f28367a4c623f9c97c38e0930/docs/api/ui-catalog-v2.md), at `66db4ee5`).
 //!
 //! The document is an A2UI inline catalog, `{catalogId, components: {<Name>: <JSON Schema>}}`. Its
 //! **digest** is `sha256:` and the lowercase hex of SHA-256 over its canonical JSON: object keys
@@ -18,6 +18,8 @@ use adam_a2a_runtime::integral_numbers;
 use jsonschema::Validator;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+
+use crate::surface::A2UI_VERSION;
 
 /// The most bytes (serialised JSON) a catalog may hold: the contract's limit.
 pub const MAX_CATALOG_BYTES: usize = 64 * 1024;
@@ -42,9 +44,13 @@ const MAX_PROBLEM_BYTES: usize = 300;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CatalogError {
-    /// The value is not `{catalogId, components}` or is not the catalog it claims to be.
+    /// The value is not `{catalogId, protocolVersion, components}` or is not the catalog it claims to be.
     #[error("not a UI catalog: {0}")]
     Shape(String),
+    /// `protocolVersion` is missing or is not the A2UI version adam writes ([`A2UI_VERSION`]): a catalog of
+    /// version 8 or before (it has none), or one for another protocol. The text says what was found.
+    #[error("the catalog is not for A2UI {A2UI_VERSION}: {0}")]
+    ProtocolVersion(String),
     /// Larger than [`MAX_CATALOG_BYTES`].
     #[error("the catalog is larger than {MAX_CATALOG_BYTES} bytes")]
     TooLarge,
@@ -128,7 +134,8 @@ impl Catalog {
     /// Read `document` as the catalog `claimed` says it is.
     ///
     /// The numbers are made whole (see the module docs), the document must be exactly
-    /// `{catalogId, components}` with the `catalogId` claimed, within the contract's size and count
+    /// `{catalogId, protocolVersion, components}` with the `catalogId` claimed and the
+    /// `protocolVersion` [`A2UI_VERSION`], within the contract's size and count
     /// limits, its digest must be the claimed one, and every component's schema must compile.
     ///
     /// # Errors
@@ -141,11 +148,25 @@ impl Catalog {
         };
         if let Some(extra) = members
             .keys()
-            .find(|k| !matches!(k.as_str(), "catalogId" | "components"))
+            .find(|k| !matches!(k.as_str(), "catalogId" | "protocolVersion" | "components"))
         {
             return Err(CatalogError::Shape(format!(
-                "it has a member `{extra}`; only catalogId and components are accepted"
+                "it has a member `{extra}`; only catalogId, protocolVersion and components are accepted"
             )));
+        }
+        match members.get("protocolVersion") {
+            Some(Value::String(version)) if version == A2UI_VERSION => {}
+            Some(other) => {
+                return Err(CatalogError::ProtocolVersion(format!(
+                    "its protocolVersion is {}",
+                    elide(&other.to_string(), 40)
+                )));
+            }
+            None => {
+                return Err(CatalogError::ProtocolVersion(
+                    "it has no protocolVersion".into(),
+                ));
+            }
         }
         if members.get("catalogId").and_then(Value::as_str) != Some(claimed.catalog_id.as_str()) {
             return Err(CatalogError::Shape(
@@ -446,12 +467,13 @@ mod tests {
 
     use super::*;
 
-    /// The known-answer vector of the contract (computed 2026-10-01 with Python's `json.dumps(
+    /// The known-answer vector of `ui-catalog/v2` (v1's vector with `protocolVersion`, `sha256:a237e931…` there; computed 2026-11-19 with Python's `json.dumps(
     /// sort_keys=True, separators=(',', ':'), ensure_ascii=False)` and SHA-256): the web, the
     /// orchestrator and adam-rs all pin it.
     fn vector() -> Value {
         json!({
             "catalogId": "https://agents.vymalo.com/a2ui/catalogs/test",
+            "protocolVersion": "1.0",
             "components": {"Note": {
                 "type": "object",
                 "properties": {"component": {"const": "Note"}, "text": {"type": "string", "maxLength": 10}},
@@ -459,9 +481,9 @@ mod tests {
         })
     }
 
-    const VECTOR_CANONICAL: &str = r#"{"catalogId":"https://agents.vymalo.com/a2ui/catalogs/test","components":{"Note":{"properties":{"component":{"const":"Note"},"text":{"maxLength":10,"type":"string"}},"required":["component","text"],"type":"object"}}}"#;
+    const VECTOR_CANONICAL: &str = r#"{"catalogId":"https://agents.vymalo.com/a2ui/catalogs/test","components":{"Note":{"properties":{"component":{"const":"Note"},"text":{"maxLength":10,"type":"string"}},"required":["component","text"],"type":"object"}},"protocolVersion":"1.0"}"#;
     const VECTOR_DIGEST: &str =
-        "sha256:a237e931c3a02fc72b214561e3a52d33eaf0e29c9306bbe0ef7b3da238507293";
+        "sha256:9fdab0c5c2094871cfb01d15046f206f3460341960ddcee4767e2bd33ab8e8f8";
 
     fn claimed(digest: &str) -> Claimed {
         Claimed {
@@ -550,9 +572,9 @@ mod tests {
             Err(CatalogError::Shape(m)) if m.contains("theme")
         ));
         for no_components in [
-            json!({"catalogId": "https://agents.vymalo.com/a2ui/catalogs/test"}),
-            json!({"catalogId": "https://agents.vymalo.com/a2ui/catalogs/test", "components": {}}),
-            json!({"catalogId": "https://agents.vymalo.com/a2ui/catalogs/test", "components": []}),
+            json!({"catalogId": "https://agents.vymalo.com/a2ui/catalogs/test", "protocolVersion": "1.0"}),
+            json!({"catalogId": "https://agents.vymalo.com/a2ui/catalogs/test", "protocolVersion": "1.0", "components": {}}),
+            json!({"catalogId": "https://agents.vymalo.com/a2ui/catalogs/test", "protocolVersion": "1.0", "components": []}),
         ] {
             assert!(matches!(
                 Catalog::from_document(no_components, &claimed(VECTOR_DIGEST)),
@@ -566,9 +588,48 @@ mod tests {
     }
 
     #[test]
+    fn a_catalog_that_does_not_say_protocol_version_1_0_is_refused() {
+        // v8 as it was published, and the spellings that are not "1.0": each hashes to its own digest, so it
+        // is the member and not the digest that refuses it.
+        let mut v8 = vector();
+        v8.as_object_mut().unwrap().remove("protocolVersion");
+        let with = |value: Value| {
+            let mut document = vector();
+            document["protocolVersion"] = value;
+            document
+        };
+        for document in [
+            v8,
+            with(json!("0.9")),
+            with(json!("v1.0")),
+            with(json!("v0.9.1")),
+            with(json!(1)),
+            with(json!(1.0)),
+            with(json!(null)),
+        ] {
+            let digest = catalog_digest(&document).unwrap();
+            let error = Catalog::from_document(document.clone(), &claimed(&digest)).unwrap_err();
+            assert!(
+                matches!(&error, CatalogError::ProtocolVersion(_)),
+                "{document}: {error}"
+            );
+        }
+        // The same catalog with the member is taken, and an extra member is still refused.
+        assert!(Catalog::from_document(vector(), &claimed(VECTOR_DIGEST)).is_ok());
+        let mut extra = vector();
+        extra["theme"] = json!({});
+        let digest = catalog_digest(&extra).unwrap();
+        assert!(matches!(
+            Catalog::from_document(extra, &claimed(&digest)),
+            Err(CatalogError::Shape(m)) if m.contains("theme")
+        ));
+    }
+
+    #[test]
     fn a_schema_that_does_not_compile_refuses_the_catalog_naming_the_component() {
         let broken = json!({
             "catalogId": "https://agents.vymalo.com/a2ui/catalogs/test",
+            "protocolVersion": "1.0",
             "components": {"Bad": {"type": 5}}
         });
         let digest = catalog_digest(&broken).unwrap();
@@ -583,6 +644,7 @@ mod tests {
     fn an_oversized_catalog_is_refused() {
         let big = json!({
             "catalogId": "https://agents.vymalo.com/a2ui/catalogs/test",
+            "protocolVersion": "1.0",
             "components": {"Note": {"description": "x".repeat(MAX_CATALOG_BYTES)}}
         });
         let digest = catalog_digest(&big).unwrap();
@@ -616,19 +678,10 @@ mod tests {
             "it has no `component`"
         );
         // At most three problems are listed.
-        let many = Catalog::from_document(
-            {
-                let doc = json!({"catalogId": "https://agents.vymalo.com/a2ui/catalogs/test",
-                    "components": {"M": {"type": "object", "required": ["a", "b", "c", "d", "e"]}}});
-                doc
-            },
-            &claimed(
-                &catalog_digest(&json!({"catalogId": "https://agents.vymalo.com/a2ui/catalogs/test",
-                    "components": {"M": {"type": "object", "required": ["a", "b", "c", "d", "e"]}}}))
-                .unwrap(),
-            ),
-        )
-        .unwrap();
+        let doc = json!({"catalogId": "https://agents.vymalo.com/a2ui/catalogs/test", "protocolVersion": "1.0",
+            "components": {"M": {"type": "object", "required": ["a", "b", "c", "d", "e"]}}});
+        let many =
+            Catalog::from_document(doc.clone(), &claimed(&catalog_digest(&doc).unwrap())).unwrap();
         let message = many.validate(&json!({"component": "M"})).unwrap_err();
         assert!(message.ends_with("; and more"), "{message}");
         assert_eq!(message.matches("; ").count(), 3, "{message}");

@@ -5,6 +5,10 @@
 # `tools/check-vendored-catalogs.sh` compares each file with the published one (CI, job `docs`);
 # `tests/ask_v7.rs` compares each digest with its lock.
 #
+# `catalog-v9.json` is the exception: from `ui-catalog/v2` the catalog is no longer a file of the web but the body of the
+# fenced block tagged `json catalog-9` on the contract page, so its line has a fourth field, the path of that page, and
+# the script extracts the block from the page at the commit instead of fetching a file.
+#
 # <file>  <commit>  <digest>
 catalog-v2.json  d8f7ccb7e2568f1843c4563b500c0fc13f540e0c  sha256:4ed91bcc9db52d5e2262aef2091d2b3eeccbf5bfe51519d7326fdc6641fb7856
 catalog-v3.json  1e876417cae8c1f2639dbb4fb0379bc4c0c74c05  sha256:9f65f9e6ddd424688b1cf61c47634eafee321a3b6736fb7fea8c0f7db1fc7579
@@ -12,6 +16,7 @@ catalog-v5.json  62aeb754980036d94bbe72a75ee33f1eeabf0368  sha256:14ec7c0dff6cb4
 catalog-v6.json  cf1f4fc37a236a87c9470b062ad6864dc7dd8231  sha256:f0baf255994b3c80144a5f3db634f06bce37253eb43efb4a85b33c47628c105d
 catalog-v7.json  5ed8950f09383220cc1bca26c7798b0c7ea135c7  sha256:6df9a37d0ae6fa53b8d22145dc1b5674b6d3f228d1c1b83b2ec640d7b3093d49
 catalog-v8.json  d0a732f21d93485835d7287e9f09a25d2b4fb338  sha256:22c333102bed676791dc9d47f21fc0a39be6e5062ef2c52f5a599ecca1b8341d
+catalog-v9.json  66db4ee5c885c12f28367a4c623f9c97c38e0930  sha256:5f174ee91c50759d59a0d7e91e3a1dc2e7c110b82ee91d858f4a23a944ed72b2  docs/api/ui-catalog-v2.md
 
 # `choices-v7-vectors.json` is not a copy. It holds the `json` blocks `vectors` (133 cases),
 # `whole-answers`, `invalid-questions`, `surfaces`, `questions` and `answers` of

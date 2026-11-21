@@ -5,8 +5,8 @@
 //!
 //! | Extension | URI | What it is |
 //! |---|---|---|
-//! | A2UI v0.9.1 | [`A2UI_EXTENSION_V0_9_1`] | the agent can send A2UI surfaces (data parts of [`A2UI_MEDIA_TYPE`]) and receives the renderer's capabilities and actions |
-//! | `ui-catalog/v1` | [`UI_CATALOG_EXTENSION`] | the agent reads the screen's own component catalog and draws with it |
+//! | A2UI v1.0 | [`A2UI_EXTENSION_V1_0`] | the agent can send A2UI surfaces (data parts of [`A2UI_MEDIA_TYPE`]) and receives the renderer's capabilities and actions |
+//! | `ui-catalog/v2` | [`UI_CATALOG_EXTENSION`] | the agent reads the screen's own component catalog and draws with it |
 //! | `thread-tools/v1` | [`THREAD_TOOLS_EXTENSION`] | the agent can use the per-thread tool endpoint a message announces |
 //! | `steps/v1` | [`STEPS_EXTENSION`] | the agent reports its tool calls and its sub-agents' work as nested steps, to a client whose request activated it |
 //! | `text-stream/v1` | [`TEXT_STREAM_EXTENSION`] | the agent sends its reply as the model writes it (chunks, transient) and says the whole text once, to a client whose request activated it |
@@ -18,7 +18,7 @@
 //! | `commands/v1` | [`COMMANDS_EXTENSION`] | the card lists the prompt templates the agent serves; a message names one and the agent expands it before it is stored |
 //! | `child-sessions/v1` | [`CHILD_SESSIONS_EXTENSION`] | the card lists the helpers a person may start a session with; a client that activates it sees the agent's sessions, follows their rounds as tasks, and starts, talks to and closes one |
 //!
-//! The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md`,
+//! The contracts are the orchestration layer's (`docs/api/ui-catalog-v2.md`,
 //! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md`,
 //! `docs/api/mentions-v1.md`, `docs/api/steer-v1.md` and `docs/api/usage-v1.md` of `vymalo/another-agentic-system`); what an agent does with the messages is `adam-a2a-runtime`'s
 //! `vymalo_inbound` and `adam-ui`, and what it reports is `adam-a2a-runtime`'s subscription.
@@ -32,15 +32,15 @@ use crate::tier::AccessTiers;
 /// part's `metadata.mimeType` (the A2UI extension's own spelling).
 pub const A2UI_MEDIA_TYPE: &str = "application/a2ui+json";
 
-/// The URI of the A2UI v0.9.1 extension.
-pub const A2UI_EXTENSION_V0_9_1: &str = "https://a2ui.org/a2a-extension/a2ui/v0.9.1";
+/// The URI of the A2UI v1.0 extension.
+pub const A2UI_EXTENSION_V1_0: &str = "https://a2ui.org/a2a-extension/a2ui/v1.0";
 
-/// The id of A2UI v0.9.1's basic catalog.
-pub const A2UI_BASIC_CATALOG_V0_9_1: &str =
-    "https://a2ui.org/specification/v0_9_1/catalogs/basic/catalog.json";
+/// The id of A2UI v1.0's basic catalog.
+pub const A2UI_BASIC_CATALOG_V1_0: &str =
+    "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json";
 
-/// The URI of the `ui-catalog/v1` extension: the agent reads the screen's component catalog.
-pub const UI_CATALOG_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/ui-catalog/v1";
+/// The URI of the `ui-catalog/v2` extension: the agent reads the screen's component catalog.
+pub const UI_CATALOG_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/ui-catalog/v2";
 
 /// The URI of the `thread-tools/v1` extension: a message carries the endpoint of the tools of its
 /// thread, and a token to call it.
@@ -196,16 +196,16 @@ impl ExtensionConfig {
         extension
     }
 
-    /// The A2UI v0.9.1 extension, as the card of an agent that takes the screen's catalog inline
+    /// The A2UI v1.0 extension, as the card of an agent that takes the screen's catalog inline
     /// declares it: `supportedCatalogIds` lists the basic catalog, and `acceptsInlineCatalogs` is
     /// `true` (A2UI's default is `false`, so without it a renderer never sends one).
-    pub fn a2ui_v0_9_1() -> Self {
-        let mut extension = Self::new(A2UI_EXTENSION_V0_9_1);
+    pub fn a2ui_v1_0() -> Self {
+        let mut extension = Self::new(A2UI_EXTENSION_V1_0);
         extension.description =
             Some("Draws A2UI surfaces; takes the screen's catalog inline".into());
         extension.params.insert(
             "supportedCatalogIds".into(),
-            json!([A2UI_BASIC_CATALOG_V0_9_1]),
+            json!([A2UI_BASIC_CATALOG_V1_0]),
         );
         extension
             .params
@@ -213,7 +213,7 @@ impl ExtensionConfig {
         extension
     }
 
-    /// The `ui-catalog/v1` extension: the agent reads the screen's component catalog and draws
+    /// The `ui-catalog/v2` extension: the agent reads the screen's component catalog and draws
     /// with it. Optional, no parameters.
     pub fn ui_catalog() -> Self {
         let mut extension = Self::new(UI_CATALOG_EXTENSION);
@@ -414,7 +414,7 @@ mod tests {
     fn the_uris_are_the_ones_of_the_contracts() {
         assert_eq!(
             UI_CATALOG_EXTENSION,
-            "https://agents.vymalo.com/a2a/extensions/ui-catalog/v1"
+            "https://agents.vymalo.com/a2a/extensions/ui-catalog/v2"
         );
         assert_eq!(
             THREAD_TOOLS_EXTENSION,
@@ -445,8 +445,8 @@ mod tests {
             "https://agents.vymalo.com/a2a/extensions/usage/v1"
         );
         assert_eq!(
-            A2UI_EXTENSION_V0_9_1,
-            "https://a2ui.org/a2a-extension/a2ui/v0.9.1"
+            A2UI_EXTENSION_V1_0,
+            "https://a2ui.org/a2a-extension/a2ui/v1.0"
         );
         assert_eq!(A2UI_MEDIA_TYPE, "application/a2ui+json");
     }
@@ -529,15 +529,28 @@ mod tests {
         );
     }
 
+    /// The A2UI v1.0 URIs, written out (the test above compares with the constants themselves).
+    #[test]
+    fn the_a2ui_v1_0_ids_are_spelled_out() {
+        assert_eq!(
+            A2UI_BASIC_CATALOG_V1_0,
+            "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"
+        );
+        assert_eq!(
+            ExtensionConfig::a2ui_v1_0().params["supportedCatalogIds"],
+            json!(["https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"])
+        );
+    }
+
     #[test]
     fn the_a2ui_entry_declares_inline_catalogs_and_the_basic_one() {
-        let e = ExtensionConfig::a2ui_v0_9_1();
-        assert_eq!(e.uri, A2UI_EXTENSION_V0_9_1);
+        let e = ExtensionConfig::a2ui_v1_0();
+        assert_eq!(e.uri, A2UI_EXTENSION_V1_0);
         assert!(!e.required);
         assert_eq!(
             serde_json::Value::Object(e.params),
             json!({
-                "supportedCatalogIds": [A2UI_BASIC_CATALOG_V0_9_1],
+                "supportedCatalogIds": [A2UI_BASIC_CATALOG_V1_0],
                 "acceptsInlineCatalogs": true
             })
         );

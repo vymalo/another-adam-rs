@@ -65,20 +65,18 @@ async fn a_sqlx_migrated_database_opens_and_upgrades_to_the_head_and_body() {
     assert_eq!(version, "5");
     drop(client);
 
-    // No `migrate`: the fixture is what the old release left behind.
+    // No `migrate`: the fixture is what the old release left behind. A run can be created (the
+    // insert names no v6 column), but a read is the contract's read and needs the head columns.
     let store = PgStore::from_pool(PgConfig::parse(&url).expect("URL").pool(2).expect("pool"));
     let run = store
         .create_run(NewRun::new("fixture-agent", json!({"turn": 1})).conversation("c:1"))
         .await
         .expect("create a run in the old schema");
     assert_eq!(run.version, 1);
-    let loaded = store
-        .load_run(run.id)
-        .await
-        .expect("load the run")
-        .expect("the run exists");
-    assert_eq!(loaded.state, json!({"turn": 1}));
-    assert_eq!(loaded.conversation_id.as_deref(), Some("c:1"));
+    assert!(
+        store.load_run(run.id).await.is_err(),
+        "a version 5 database has no head columns: migrate before reading"
+    );
 
     // The upgrade is the migration the new build runs: metadata only, the run survives.
     store.migrate().await.expect("migrate a version 5 schema");
@@ -95,6 +93,15 @@ async fn a_sqlx_migrated_database_opens_and_upgrades_to_the_head_and_body() {
     };
     assert_eq!(version, SCHEMA_VERSION.to_string());
     assert_eq!(version, "6");
+
+    // The old run reads as it was written: no head, so the whole state is served.
+    let loaded = store
+        .load_run(run.id)
+        .await
+        .expect("load the run")
+        .expect("the run exists");
+    assert_eq!(loaded.state, json!({"turn": 1}));
+    assert_eq!(loaded.conversation_id.as_deref(), Some("c:1"));
 
     // And the head and the body work on the upgraded database.
     let generation = Uuid::new_v4();

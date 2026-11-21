@@ -286,12 +286,11 @@ impl Rig {
             .clock(self.clock.clone())
             .poll_interval(Duration::from_millis(20))
             .lease_ttl(Duration::from_secs(10))
-            .retry(RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(10),
-                multiplier: 1.0,
-            })
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(10), Duration::from_millis(10))
+                    .with_multiplier(1.0),
+            )
     }
 
     /// One runtime for both.
@@ -1245,7 +1244,13 @@ mod cases {
             .agent(child_agent)
             .build();
         rig.cell.set(a.clone()).ok().expect("set once");
-        let b = rig.builder(&store, "b").agent(parent_b).build();
+        let b = rig
+            .builder(&store, "b")
+            .agent(parent_b)
+            // The parent reads the child's whole state (its usage), and a v5 run's state is the
+            // head plus the body: only the child's agent (or its starter) can join it.
+            .starter(LlmStarter::new(&rig.child_name))
+            .build();
 
         let parent = a
             .start(&rig.parent_name, user_message("go"), None)

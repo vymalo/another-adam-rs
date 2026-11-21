@@ -1,5 +1,5 @@
 //! A whole agent behind A2A, as the screen's orchestrator drives it: a message with the
-//! `ui-catalog/v1` and `thread-tools/v1` metadata, a scripted model that asks three questions at once,
+//! `ui-catalog/v2` and `thread-tools/v1` metadata, a scripted model that asks three questions at once,
 //! the person's answer as an A2UI action, and the thread tools of a fake endpoint offered to the model
 //! at every turn. A real `Runtime`, `LlmAgent`, `RuntimeTaskBackend` with `vymalo_inbound`, and the
 //! fake endpoint of `adam-mcp-testkit`.
@@ -20,7 +20,7 @@ use adam_mcp::McpPolicy;
 use adam_mcp_testkit::ThreadToolsServer;
 use adam_model::{MockModel, ModelRequest, ToolCall};
 use adam_runtime::{BroadcastSink, Runtime};
-use adam_ui::{Claimed, Ui};
+use adam_ui::{Claimed, Ui, catalog_digest};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -29,8 +29,16 @@ const FIXTURE: &str = include_str!("fixtures/catalog-v2.json");
 const LOCK: &str = include_str!("fixtures/catalog-v2.lock.json");
 const SECRET: &str = "sekret-token-4f1c9a";
 
-fn document() -> Value {
+/// The catalog as the web published it, with no `protocolVersion` (versions 2 to 8).
+fn published() -> Value {
     serde_json::from_str(FIXTURE).unwrap()
+}
+
+/// The catalog as a screen sends it now: a `ui-catalog/v2` document.
+fn document() -> Value {
+    let mut document = published();
+    document["protocolVersion"] = json!("1.0");
+    document
 }
 
 fn claimed() -> Claimed {
@@ -38,7 +46,7 @@ fn claimed() -> Claimed {
     Claimed {
         catalog_id: CATALOG_ID.to_owned(),
         version: u32::try_from(lock["version"].as_u64().unwrap()).unwrap(),
-        digest: lock["digest"].as_str().unwrap().to_owned(),
+        digest: catalog_digest(&document()).unwrap(),
     }
 }
 
@@ -126,11 +134,11 @@ fn from_the_screen(text: &str, grant: Value, inline: bool) -> Message {
         UI_CATALOG_EXTENSION: {
             "catalogId": c.catalog_id, "version": f64::from(c.version), "digest": c.digest,
             "inline": inline},
-        "a2uiClientCapabilities": {"v0.9.1": {"supportedCatalogIds": [CATALOG_ID]}},
+        "a2uiRendererCapabilities": {"1.0": {"supportedCatalogIds": [CATALOG_ID]}},
         THREAD_TOOLS_EXTENSION: grant,
     });
     if inline {
-        metadata["a2uiClientCapabilities"]["v0.9.1"]["inlineCatalogs"] =
+        metadata["a2uiRendererCapabilities"]["1.0"]["inlineCatalogs"] =
             json!([as_doubles(&document())]);
     }
     let mut message = Message::new(Role::User, vec![Part::text(text)]);
@@ -150,7 +158,7 @@ fn grant(server: &ThreadToolsServer, expires_at: &str) -> Value {
 }
 
 fn answer_action(answers: Value) -> Message {
-    let mut part = Part::data(json!([{"version": "v0.9.1", "action": {
+    let mut part = Part::data(json!([{"version": "1.0", "action": {
         "name": "answer", "surfaceId": "ask-choices-call-1", "sourceComponentId": "root",
         "timestamp": "2026-10-01T10:00:00Z", "context": {"answers": answers}}}]))
     .with_media_type(A2UI_MEDIA_TYPE);

@@ -21,7 +21,8 @@ use crate::agent::Inbound;
 use crate::artifact_ref::{ArtifactRef, FileRef};
 use crate::blob::blob_id;
 use crate::envelope::{Envelope, VERSION as FULL_VERSION};
-use crate::events::Artifact;
+use crate::events::{Artifact, ArtifactFile};
+use crate::retry::RetryRecord;
 use crate::runtime::RuntimeError;
 
 /// The head's layout version. A run's `state` is `1` (the v4 envelope) or this.
@@ -89,6 +90,15 @@ pub(crate) struct Head {
     /// Consecutive failed tries of the current transition.
     #[serde(default)]
     pub attempt: u32,
+    /// What a failing run recorded of its retries: the failures per key and each key's policy
+    /// (ADR 0061). Cleared by a transition that succeeds; absent from state written before it
+    /// existed, and not written while `None`; one that does not decode reads as `None`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::retry::lenient_record"
+    )]
+    pub retry: Option<RetryRecord>,
     /// Bumped by every commit a worker makes.
     #[serde(default)]
     pub rev: u64,
@@ -141,6 +151,7 @@ impl Head {
             inbox: env.inbox.clone(),
             seq: env.seq,
             attempt: env.attempt,
+            retry: env.retry.clone(),
             rev: env.rev,
             output: env.output.clone(),
             error: env.error.clone(),
@@ -188,6 +199,155 @@ impl Head {
         serde_json::to_value(self)
             .map_err(|e| StoreError::InvalidInput(format!("the head does not serialize: {e}")))
     }
+
+    /// The head as the full v4 envelope a transition reads, and the parts a commit carries from it.
+    ///
+    /// `agent` is the joined agent state and the transcript is no longer a member (it is in
+    /// `body`), so the envelope's `artifacts` are the head's own references
+    /// ([`carried_artifacts`](Self::carried_artifacts)). `v` is the v4 version: the envelope is a
+    /// working value, and a commit that cannot write a head (a refused split) falls back to
+    /// encoding it as the whole state, which is v4.
+    pub(crate) fn into_parts(self, agent: Value) -> (Envelope, HeadParts) {
+        let Self {
+            inbox,
+            seq,
+            attempt,
+            retry,
+            rev,
+            output,
+            error,
+            artifacts,
+            deadline,
+            limit_secs,
+            remaining_secs,
+            agent_wake,
+            hb,
+            body,
+            ..
+        } = self;
+        let parts = HeadParts { artifacts, body };
+        let env = Envelope {
+            v: FULL_VERSION,
+            agent,
+            inbox,
+            seq,
+            attempt,
+            retry,
+            rev,
+            output,
+            error,
+            artifacts: carried_artifacts(&parts.artifacts),
+            deadline,
+            limit_secs,
+            remaining_secs,
+            agent_wake,
+            hb,
+        };
+        (env, parts)
+    }
+}
+
+/// What a commit carries from the head it read, without the agent state: the transcript set the
+/// head names and its artifact references.
+///
+/// A commit that does not re-split writes the head back from these, and one that does keeps the
+/// file references so it never reads a file's bytes (the upload pass covers only what the step
+/// adds).
+pub(crate) struct HeadParts {
+    /// The head's artifacts, in order.
+    pub artifacts: Vec<HeadArtifact>,
+    /// The generation and the prefix of it the head names.
+    pub body: BodyRef,
+}
+
+impl HeadParts {
+    /// The content address and size of every file artifact, in artifact order: what a commit that
+    /// carries this head pairs its next head's file references with, so it never reads the bytes.
+    pub(crate) fn file_refs(&self) -> Vec<(BlobId, u64)> {
+        self.artifacts
+            .iter()
+            .filter_map(|artifact| artifact.file.as_ref())
+            .map(|file| (file.digest.clone(), file.size))
+            .collect()
+    }
+
+    /// The head a commit that does not split writes: these transcript set and artifacts, with
+    /// `env`'s own members — the status the commit carries is on the record, not here — and the
+    /// transition's own `added` artifacts merged in (a failed transition keeps what it emitted).
+    ///
+    /// The generation is named explicitly: the store patches it only for a commit that writes rows,
+    /// and a head that names none is unreadable. The head these came from is current (a stale one
+    /// is served as the state, not the head), so its generation is the run's.
+    pub(crate) fn carried(&self, env: &Envelope, added: &[Artifact]) -> Head {
+        Head {
+            v: VERSION,
+            agent: env.agent.clone(),
+            inbox: env.inbox.clone(),
+            seq: env.seq,
+            attempt: env.attempt,
+            retry: env.retry.clone(),
+            rev: env.rev,
+            output: env.output.clone(),
+            error: env.error.clone(),
+            artifacts: merge_head_artifacts(&self.artifacts, added),
+            deadline: env.deadline,
+            limit_secs: env.limit_secs,
+            remaining_secs: env.remaining_secs,
+            agent_wake: env.agent_wake,
+            hb: env.hb,
+            body: self.body,
+        }
+    }
+}
+
+/// The head's artifacts with `added` merged in the way a step's commit merges them: an artifact
+/// whose id a JSON artifact of the head has replaces it in place, and a file is appended (a file
+/// is content-addressed and never replaces anything). A file's reference comes from its bytes.
+fn merge_head_artifacts(base: &[HeadArtifact], added: &[Artifact]) -> Vec<HeadArtifact> {
+    let mut artifacts = base.to_vec();
+    for artifact in added {
+        let file = artifact.file.as_ref().map(|file| HeadFile {
+            filename: file.filename.clone(),
+            digest: blob_id(&file.bytes),
+            size: u64::try_from(file.bytes.len()).unwrap_or(u64::MAX),
+        });
+        let head = HeadArtifact {
+            // A file has no identity: it is never replaced, and an id on one is dropped.
+            id: file.is_none().then(|| artifact.id.clone()).flatten(),
+            name: artifact.name.clone(),
+            mime_type: artifact.mime_type.clone(),
+            data: artifact.data.clone(),
+            file,
+        };
+        if let Some(id) = &head.id
+            && let Some(held) = artifacts
+                .iter_mut()
+                .find(|held| held.file.is_none() && held.id.as_deref() == Some(id.as_str()))
+        {
+            *held = head;
+            continue;
+        }
+        artifacts.push(head);
+    }
+    artifacts
+}
+
+/// The head's artifacts as the runtime's [`Artifact`], with a file's bytes empty: see
+/// [`Head::carried_artifacts`].
+fn carried_artifacts(artifacts: &[HeadArtifact]) -> Vec<Artifact> {
+    artifacts
+        .iter()
+        .map(|artifact| Artifact {
+            id: artifact.id.clone(),
+            name: artifact.name.clone(),
+            mime_type: artifact.mime_type.clone(),
+            data: artifact.data.clone(),
+            file: artifact.file.as_ref().map(|file| ArtifactFile {
+                filename: file.filename.clone(),
+                bytes: Vec::new(),
+            }),
+        })
+        .collect()
 }
 
 /// An artifact as a head keeps it: the same shape, with a file's bytes replaced by its address.
@@ -264,10 +424,27 @@ impl Stored {
     }
 
     /// Encode the same variant that was decoded.
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> Result<Value, StoreError> {
         match self {
             Self::Full(envelope) => envelope.encode(),
             Self::Head(head) => head.encode(),
+        }
+    }
+
+    /// The inbox, read.
+    pub(crate) fn inbox(&self) -> &[Inbound] {
+        match self {
+            Self::Full(envelope) => &envelope.inbox,
+            Self::Head(head) => &head.inbox,
+        }
+    }
+
+    /// The result of a `Done` run, in either variant.
+    pub(crate) fn output(&self) -> &Value {
+        match self {
+            Self::Full(envelope) => &envelope.output,
+            Self::Head(head) => &head.output,
         }
     }
 
@@ -280,7 +457,6 @@ impl Stored {
     }
 
     /// The failure reason, in the variant's own document.
-    #[cfg(test)]
     pub(crate) fn error(&self) -> Option<&str> {
         match self {
             Self::Full(envelope) => envelope.error.as_deref(),
@@ -293,15 +469,6 @@ impl Stored {
         match self {
             Self::Full(envelope) => &mut envelope.error,
             Self::Head(head) => &mut head.error,
-        }
-    }
-
-    /// The agent's state as the document carries it: the whole state for `Full`, the agent's head
-    /// for `Head`.
-    pub(crate) fn agent(&self) -> &Value {
-        match self {
-            Self::Full(envelope) => &envelope.agent,
-            Self::Head(head) => &head.agent,
         }
     }
 
@@ -357,6 +524,20 @@ pub(crate) struct ViewParts {
     pub hb: bool,
 }
 
+/// A claimed run's state, decoded and joined: what a transition reads.
+///
+/// A v4 run is its whole state in `env`, with no head and no rows. A v5 run's `env` is the head
+/// with the joined agent state, `head` is what a commit carries from it, and `rows` is the
+/// transcript the head named — kept so a commit decides append-or-compaction without decoding the
+/// previous state again.
+pub(crate) struct Claimed {
+    /// The envelope the transition reads.
+    pub env: Envelope,
+    /// What a commit carries from the head, for a v5 run.
+    pub head: Option<HeadParts>,
+    /// The transcript the head named, oldest first (empty for a v4 run).
+    pub rows: Vec<Value>,
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,11 +559,31 @@ mod tests {
         env.artifacts.push(file_artifact());
         env.artifacts
             .push(Artifact::new("plan", None, json!({"steps": [1]})));
+        let mut record = RetryRecord::default();
+        record.fail("fetch", &crate::RetryPolicy::new(4));
+        env.retry = Some(record);
         env.hb = true;
         let head = Head::of(&env, json!({"turns": 3}), 2, &env.artifacts, &[]);
         assert_eq!(head.v, 5);
         assert_eq!(head.agent, json!({"turns": 3}));
         assert_eq!((head.seq, head.attempt, head.rev), (7, 1, 4));
+        assert_eq!(
+            head.retry, env.retry,
+            "a v5 run keeps its retry record (ADR 0061)"
+        );
+        let decoded =
+            Head::decode(RunId::new(), &head.encode().expect("encodes")).expect("decodes");
+        assert_eq!(decoded.retry, env.retry);
+        let (back, parts) = decoded.into_parts(json!({"turns": 3}));
+        assert_eq!(
+            back.retry, env.retry,
+            "and the envelope a transition reads has it"
+        );
+        assert_eq!(
+            parts.carried(&back, &[]).retry,
+            env.retry,
+            "and a commit carries it"
+        );
         assert_eq!(head.output, env.output);
         assert_eq!(head.error, env.error);
         assert_eq!(
@@ -476,7 +677,6 @@ mod tests {
         // `Stored` tells them apart by `v`, and re-encodes the variant it read.
         let stored = Stored::decode(RunId::new(), &encoded).expect("a head");
         assert!(matches!(stored, Stored::Head(_)));
-        assert_eq!(stored.agent(), &json!({}));
         assert_eq!(stored.encode().expect("encodes"), encoded);
 
         let full = Envelope::new(json!({"messages": [1]}))
@@ -486,8 +686,15 @@ mod tests {
         assert!(matches!(stored, Stored::Full(_)));
         assert_eq!(stored.encode().expect("encodes"), full);
 
-        // A v5 head is not a v4 envelope: `Envelope::decode` refuses it.
-        assert!(Envelope::decode(RunId::new(), &encoded).is_err());
+        // A v5 head is not a v4 envelope: `Envelope::decode` refuses it, and the refusal is
+        // `Corrupt` — the class a v4 process's worker sees, so it commits the run `Failed` rather
+        // than stepping a head as if it were a state (ADR 0055, the deploy boundary).
+        let refused =
+            Envelope::decode(RunId::new(), &encoded).expect_err("a v5 head is not a v4 envelope");
+        assert!(
+            matches!(refused, RuntimeError::Corrupt { .. }),
+            "{refused:?}"
+        );
     }
 
     #[test]

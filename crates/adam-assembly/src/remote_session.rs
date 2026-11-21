@@ -162,7 +162,7 @@ struct CallFailure {
 impl CallFailure {
     fn of(error: ToolError) -> Self {
         match error {
-            ToolError::Transient(text) => Self {
+            ToolError::Transient(text) | ToolError::Retryable { message: text, .. } => Self {
                 transient: true,
                 text,
             },

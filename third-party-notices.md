@@ -15,4 +15,10 @@ Schema of OpenAPI 3.1 documents, unchanged, from <https://spec.openapis.org/oas/
 [OpenAPI Initiative](https://github.com/OAI/OpenAPI-Specification), Apache-2.0, checked 2026-10-07). It is used by a test
 only and is not part of any binary.
 
+The six JSON Schemas of A2UI v1.0 under `crates/adam-ui/tests/a2ui-v1_0/` (`agent_to_renderer`, `common_types`,
+`catalog_definition`, `renderer_capabilities`, `renderer_to_agent`, `agent_capabilities`) are unchanged copies of
+`specification/v1_0/json/` of <https://github.com/a2ui-project/a2ui> at commit `b4f91c26fcf62abc0720c21a65840220941d0a3f`
+(Apache-2.0, the upstream repository's `LICENSE`; its `UPSTREAM` file records each SHA-256). They are used by tests only
+and are not part of any binary.
+
 Everything else in this repository is the project's own work.

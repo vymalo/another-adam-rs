@@ -16,6 +16,7 @@ import { parseArgs } from 'node:util';
 import { ConfigError, EXIT_CONFIG, assertOutsideRepo, benchHome, configPath, describeConfig, loadConfig } from '../lib/config.mjs';
 import { doctor, renderDoctor } from '../lib/doctor.mjs';
 import { BENCH_DIR, runDryRun } from '../lib/dryrun.mjs';
+import { fetchPinnedBinary } from '../lib/npm.mjs';
 import { LedgerError, readLedger } from '../lib/ledger.mjs';
 import { PINS } from '../lib/pins.mjs';
 import { ReportError, buildReport } from '../lib/report.mjs';
@@ -98,7 +99,7 @@ async function doctorCommand(argv, env) {
   } catch (e) {
     if (env.BENCH_CONFIG || fs.existsSync(configPath(env))) taskError = e.message;
   }
-  const result = await doctor({ home, pins: PINS, stack, start: values.start === true, tasks, taskError, containers: stack.hostContainers(), env, justInTime: values['keep-images'] !== true });
+  const result = await doctor({ home, pins: PINS, stack, start: values.start === true, tasks, taskError, containers: stack.hostContainers(), env, justInTime: values['keep-images'] !== true, fetchBinary: fetchPinnedBinary });
   process.stdout.write(`${renderDoctor(result)}\n`);
   return result.exitCode;
 }

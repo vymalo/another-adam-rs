@@ -8,16 +8,14 @@
 
 use std::collections::HashMap;
 
-use adam_a2a_runtime::{PAYLOAD_FORM, is_format_or_control};
+use adam_a2a_runtime::{CONTEXT_A2UI_RENDERER, PAYLOAD_FORM, is_format_or_control};
 use adam_llm_agent::{AnswerCheck, Refusal};
 use serde_json::{Value, json};
 
 use super::answer::{Check, FormSpec, Rule, Verdict, check_answer, whole};
 use super::shown;
-use super::{
-    Args, Form, Kind, MAX_LONG_TEXT, MAX_TEXT, clipped, kinds, lead_with_description, normalize,
-};
-use crate::surface::{ask_attempt, ask_retry_surface_id};
+use super::{Args, Form, Kind, MAX_LONG_TEXT, MAX_TEXT, clipped, kinds, normalize};
+use crate::surface::{A2UI_VERSION, ask_attempt, ask_retry_surface_id};
 
 /// The longest words of a question quoted back to the person.
 pub(super) const QUOTED_QUESTION: usize = 80;
@@ -60,9 +58,12 @@ pub(super) fn read(
     if tries >= MAX_REFUSALS {
         return AnswerCheck::End(giving_up(&form, &verdict));
     }
-    AnswerCheck::Refuse(ask_again(
-        call_id, &question, &form, &drawn, ui, context, &verdict,
-    ))
+    let mut refusal = ask_again(call_id, &question, &form, &drawn, ui, context, &verdict);
+    // The surface is asked again only when this turn's renderer offers its catalog; else in words.
+    if !offers_the_catalog_of(ui, payload) {
+        refusal.ui = None;
+    }
+    AnswerCheck::Refuse(refusal)
 }
 
 /// Why the answer in `answered` is not used, or `None` when it is.
@@ -305,22 +306,17 @@ fn ask_again(
         ),
     };
     let mut asked = ui.clone();
-    let folded = form.description.is_some()
-        && root_of(ui).is_some_and(|root| root.get("description").is_none());
-    let lead = if folded {
-        lead_with_description(question, form)
-    } else {
-        question.to_owned()
-    };
     // What the form shows and the screen could not draw is still said, in the same words.
-    let lead = format!("{lead}{}", shown::undrawn_words(form, ui));
+    let lead = format!("{question}{}", shown::undrawn_words(form, ui));
     let attempt = surface_of(ui)
         .and_then(|surface| ask_attempt(&surface))
         .map_or(1, |n| n + 1);
     let surface = ask_retry_surface_id(call_id, attempt);
     set_surface(&mut asked, &surface);
     carry_answers(&mut asked, drawn, context, &verdict.valid);
-    let asked = fits(&mut asked, form).then_some(asked);
+    // A form from before the cutover (an operation that does not say `A2UI_VERSION`) is asked again in words:
+    // its operations are copied, never edited into the current version.
+    let asked = (is_current(ui) && fits(&mut asked, form)).then_some(asked);
     let refusal = Refusal::new(format!("{said}\n{lead}"), asked, rule);
     match &verdict.question {
         Some(id) => refusal.about(id.clone()),
@@ -355,6 +351,38 @@ fn fits(asked: &mut Value, form: &Form) -> bool {
         }
     }
     shown::check_size(asked).is_ok()
+}
+
+/// Whether the renderer of **this turn's message** (`vymalo.a2ui.renderer` in the payload's context)
+/// offers the `catalogId` of the surface the interface creates. An earlier turn's offer does not
+/// count: the payload is the message's own.
+fn offers_the_catalog_of(ui: &Value, payload: &Value) -> bool {
+    let Some(catalog_id) = ui.as_array().and_then(|messages| {
+        messages
+            .iter()
+            .find_map(|m| m.get("createSurface")?.get("catalogId")?.as_str())
+    }) else {
+        return false;
+    };
+    payload
+        .get("context")
+        .and_then(|context| {
+            context
+                .get(CONTEXT_A2UI_RENDERER)?
+                .get("catalogIds")?
+                .as_array()
+        })
+        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(catalog_id)))
+}
+
+/// Whether every operation of the interface says [`A2UI_VERSION`].
+fn is_current(ui: &Value) -> bool {
+    ui.as_array().is_some_and(|messages| {
+        !messages.is_empty()
+            && messages
+                .iter()
+                .all(|m| m.get("version").and_then(Value::as_str) == Some(A2UI_VERSION))
+    })
 }
 
 /// The id of the surface the interface creates.

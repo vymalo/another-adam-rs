@@ -72,6 +72,8 @@ pub enum Method {
     RenewLease,
     /// [`Store::release_lease`].
     ReleaseLease,
+    /// [`Store::release_worker_leases`].
+    ReleaseWorkerLeases,
     /// [`Store::lease_until`].
     LeaseUntil,
     /// [`Store::purge_finished`].
@@ -461,6 +463,15 @@ impl Store for FaultyStore {
         .await
     }
 
+    async fn release_worker_leases(&self, worker: &str) -> StoreResult<()> {
+        self.run(
+            Method::ReleaseWorkerLeases,
+            None,
+            self.inner.release_worker_leases(worker),
+        )
+        .await
+    }
+
     async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         self.run(Method::LeaseUntil, Some(id), self.inner.lease_until(id))
             .await
@@ -610,6 +621,53 @@ mod tests {
 
     async fn create(store: &FaultyStore) -> StoreResult<RunRecord> {
         store.create_run(NewRun::new("fault-test", json!({}))).await
+    }
+
+    /// The wrapper must not swallow `release_worker_leases`: a wrapped store that answers the trait
+    /// default releases nothing, so a restarted worker waits for its old leases to run out. A fault
+    /// on the sweep must reach the caller too.
+    #[tokio::test]
+    async fn the_wrapper_forwards_release_worker_leases() {
+        let store = faulty();
+        let run = create(&store).await.unwrap();
+        let claim = |worker: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .claim_due(
+                        &["fault-test".to_owned()],
+                        worker,
+                        ClaimScope::Pinned,
+                        &[],
+                        adam_core::store::now() + SignedDuration::from_secs(1),
+                        Duration::from_secs(30),
+                        1,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(claim("w1").await.len(), 1);
+        store.release_worker_leases("w1").await.unwrap();
+        assert_eq!(store.calls(Method::ReleaseWorkerLeases), 1);
+        assert_eq!(
+            store.lease_until(run.id).await.unwrap(),
+            None,
+            "the wrapper reached the inner store's sweep"
+        );
+
+        assert_eq!(claim("w1").await.len(), 1);
+        store.fail_always(Method::ReleaseWorkerLeases);
+        let err = store
+            .release_worker_leases("w1")
+            .await
+            .expect_err("scripted fault");
+        assert!(is_injected(&err), "{err}");
+        assert_eq!(store.injected(Method::ReleaseWorkerLeases), 1);
+        assert!(
+            store.lease_until(run.id).await.unwrap().is_some(),
+            "the fault struck before the sweep: the lease is still there"
+        );
     }
 
     #[tokio::test]

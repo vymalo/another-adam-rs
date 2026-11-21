@@ -14,8 +14,8 @@ use crate::agent::{AgentError, Inbound};
 use crate::cancel::CancelToken;
 use crate::child::{ChildStarter, ChildStatus, news_since};
 use crate::clock::DynClock;
-use crate::envelope::Envelope;
 use crate::events::{Artifact, DynEventSink, RunEvent};
+use crate::retry::RetryPolicy;
 use crate::runtime::Runtime;
 
 /// Journal name of [`Ctx::now_journaled`].
@@ -288,6 +288,44 @@ impl Ctx {
         Ok(outcome)
     }
 
+    /// [`step`](Self::step) with its own retry policy, under `key` (ADR 0061): a recorded `Err`
+    /// that is retryable ([`Classify::is_retryable`](adam_error::Classify::is_retryable)) fails the
+    /// transition with [`AgentError::from_classified`] and
+    /// [`with_retry(key, policy)`](AgentError::with_retry), so the run retries it under `policy`
+    /// (when the policy retries the error's class) and counts its failures under `key`, apart from
+    /// any other step's. Any other `Err` is returned as `step` returns it, for the agent to decide.
+    ///
+    /// The `key` is what the failures count under: a stable name, the same in every transition
+    /// that may run the step (a step's name, never a call id). The policy is recorded at the key's
+    /// first failure and read back from the run after that, so changing it in code does not
+    /// change the retries of a run already failing.
+    ///
+    /// # Errors
+    ///
+    /// As [`step`](Self::step), plus the retryable `Err` above as [`AgentError::Transient`].
+    pub async fn step_retrying<T, E, F, Fut>(
+        &mut self,
+        name: &str,
+        key: &str,
+        policy: RetryPolicy,
+        f: F,
+    ) -> Result<Result<T, E>, AgentError>
+    where
+        T: Serialize + DeserializeOwned,
+        E: Serialize + DeserializeOwned + adam_error::Classify + Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
+    {
+        match self.step(name, f).await? {
+            Err(e) if e.is_retryable() => Err(AgentError::from_classified(
+                format!("step `{name}` failed"),
+                e,
+            )
+            .with_retry(key, policy)),
+            outcome => Ok(outcome),
+        }
+    }
+
     /// Take the next `names.len()` seqs, in order, for steps that will run at the same time:
     /// `seq` `k .. k+n-1` for `names[0] .. names[n-1]`, and the next [`step`](Self::step) takes
     /// `k+n` whichever of them finishes first.
@@ -360,6 +398,86 @@ impl Ctx {
             .await
     }
 
+    /// Race `contenders`, run at the same time, as one journaled step `name`: the first `Ok` to
+    /// finish wins ([ADR 0062](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0062-a-race-of-steps-records-its-winner.md)).
+    ///
+    /// The step records the winner's index and value, `Ok((index, value))` (an `ok` entry whose
+    /// payload is `[index, value]`), or, when every contender failed, their errors in contender
+    /// order, `Err(errors)` (an entry that is not `ok`, payload `[e0, e1, ...]`). An `Err` does not
+    /// end the race while another contender runs. Contenders are started as the race is first
+    /// polled, in order: one that wins at once may leave later ones never started.
+    ///
+    /// Each contender is given its own child of the run's cancel token. When the race ends, by a
+    /// winner, by every error, or by a panic or a caller that drops it, every token but the winner's
+    /// fires (those of contenders that already failed too), and then their futures are dropped: work
+    /// a contender spawned stops by watching its token. A replay returns the record without running
+    /// any contender, so the winner is the same every time; the **count and the order of the
+    /// contenders** are part of the replay, as a step's name is. The contract is otherwise
+    /// [`step`](Self::step)'s: the effect is at-least-once until the outcome is recorded, and a
+    /// transient retry of the transition races afresh.
+    ///
+    /// Contenders of different code are boxed to one type, `Box<dyn FnOnce(CancelToken) ->
+    /// BoxFuture<'_, Result<T, E>> + Send>`. A race that every contender lost is the agent's to
+    /// decide: to retry it, return `AgentError::from_classified(error, ..).with_retry(key, policy)`
+    /// for one of its errors (ADR 0061), and the transition races afresh.
+    ///
+    /// ```no_run
+    /// # use adam_runtime::{AgentError, CancelToken, Ctx};
+    /// # use futures::future::{BoxFuture, FutureExt};
+    /// # async fn example(ctx: &mut Ctx) -> Result<(), AgentError> {
+    /// type Contender = Box<dyn FnOnce(CancelToken) -> BoxFuture<'static, Result<String, String>> + Send>;
+    /// let mirrors: Vec<Contender> = vec![
+    ///     Box::new(|_token| async { Ok("from a".to_owned()) }.boxed()),
+    ///     Box::new(|token| async move {
+    ///         token.cancelled().await;
+    ///         Err("b stopped".to_owned())
+    ///     }.boxed()),
+    /// ];
+    /// let fetched = ctx.step_race("fetch", mirrors).await?;
+    /// # let _ = fetched;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`step`](Self::step); [`AgentError::Permanent`] for a race with no contender, before
+    /// anything is journaled; [`AgentError::NonDeterminism`] for a record that names a contender
+    /// the code no longer has, or holds another number of errors than it has contenders.
+    pub async fn step_race<T, E, F, Fut>(
+        &mut self,
+        name: &str,
+        contenders: Vec<F>,
+    ) -> Result<Result<(usize, T), Vec<E>>, AgentError>
+    where
+        T: Serialize + DeserializeOwned + Send,
+        E: Serialize + DeserializeOwned + Send,
+        F: FnOnce(CancelToken) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
+    {
+        if contenders.is_empty() {
+            return Err(AgentError::permanent(format!(
+                "the race `{name}` has no contender"
+            )));
+        }
+        let n = contenders.len();
+        let parent = self.cancel.clone();
+        let raced = self.step(name, move || race(parent, contenders)).await?;
+        // The count and the order of the contenders are part of the replay, as a step's name is: a
+        // record for other contenders names a winner, or holds errors, these do not have.
+        let fits = match &raced {
+            Ok((index, _)) => *index < n,
+            Err(errors) => errors.len() == n,
+        };
+        if !fits {
+            return Err(AgentError::non_determinism(format!(
+                "run {} race {name:?}: the record is for other contenders than the {n} the code races",
+                self.run
+            )));
+        }
+        Ok(raced)
+    }
+
     /// What the journal holds at `seq`, for the step `name`: `None` when nothing is recorded yet.
     async fn recorded_at(&self, seq: u64, name: &str) -> Result<Option<JournalEntry>, AgentError> {
         let found = self
@@ -423,9 +541,10 @@ impl Ctx {
         let Some(rec) = self.store.load_run(self.run).await.map_err(store_error)? else {
             return Ok(0);
         };
-        let env = Envelope::decode(self.run, &rec.state)
+        // A v5 run's record is its head, which carries the inbox: no body is read.
+        let stored = crate::head::Stored::decode(self.run, &rec.state)
             .map_err(|e| AgentError::permanent(format!("the run's record is unreadable: {e}")))?;
-        Ok(news_since(&env.inbox, self.base_inbox, &self.read))
+        Ok(news_since(stored.inbox(), self.base_inbox, &self.read))
     }
 
     /// Say which messages the run has read, by id: a copy of one that arrives while this
@@ -495,6 +614,10 @@ impl Ctx {
     /// tokens its model calls took. **Not journaled**: a live read, like
     /// [`child_status`](Self::child_status); a finished child's state does not change any more.
     ///
+    /// A v5 child's state is its head and the body generation it names, so the child's agent must
+    /// be registered on this runtime — as an agent or a starter — for its `join` to rebuild the
+    /// state (ADR 0055). A runtime that hosts only the parent cannot read a v5 child's whole state.
+    ///
     /// `Ok(None)` when the run does not exist (a child purged after it finished).
     ///
     /// # Errors
@@ -511,9 +634,13 @@ impl Ctx {
                 self.run
             )));
         }
-        let env = Envelope::decode(run, &rec.state)
-            .map_err(|e| AgentError::permanent(format!("the child's record is unreadable: {e}")))?;
-        Ok(Some(env.agent))
+        // A v5 child's state is its head and the body it names: joined once, as `Runtime::state`
+        // does, because the parent asked for the whole state.
+        let claimed =
+            self.runtime.inner.claimed(&rec).await.map_err(|e| {
+                AgentError::permanent(format!("the child's record is unreadable: {e}"))
+            })?;
+        Ok(Some(claimed.env.agent))
     }
 
     /// A handle for starting children of this run on the runtime that steps it: owned and cloneable,
@@ -524,6 +651,13 @@ impl Ctx {
             self.run,
             self.conversation_id.as_deref(),
         )
+    }
+
+    /// A handle for starting root runs on the runtime that steps this run, only in `adam.schedule:`
+    /// conversations: owned and cloneable, so it can be moved into a [`Ctx::step`] closure (see
+    /// [`RunStarter`](crate::RunStarter)).
+    pub fn run_starter(&self) -> crate::RunStarter {
+        crate::RunStarter::new(self.runtime.clone())
     }
 
     /// A handle on this transition's cancellation signal, cloneable and
@@ -603,6 +737,57 @@ where
         ))
         .with_source(e)
     })
+}
+
+/// Run `contenders` at the same time, each with its own child of `parent`: the first `Ok` wins and
+/// the others' tokens fire before their futures are dropped; with no `Ok`, every error, in
+/// contender order.
+async fn race<T, E, F, Fut>(parent: CancelToken, contenders: Vec<F>) -> Result<(usize, T), Vec<E>>
+where
+    F: FnOnce(CancelToken) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let tokens: Vec<CancelToken> = contenders.iter().map(|_| parent.child()).collect();
+    let mut running: futures::stream::FuturesUnordered<_> = contenders
+        .into_iter()
+        .zip(tokens.iter().cloned())
+        .enumerate()
+        .map(|(i, (contender, token))| async move { (i, contender(token).await) })
+        .collect();
+    // Declared after `running`, so it is dropped first: the tokens fire before the futures are
+    // dropped, however the race ends (a winner, every error, a panic that unwinds, a caller that
+    // drops the race).
+    let mut losers = Losers {
+        tokens,
+        winner: None,
+    };
+    let mut errors: Vec<Option<E>> = (0..losers.tokens.len()).map(|_| None).collect();
+    while let Some((i, outcome)) = running.next().await {
+        match outcome {
+            Ok(value) => {
+                losers.winner = Some(i);
+                return Ok((i, value));
+            }
+            Err(e) => errors[i] = Some(e),
+        }
+    }
+    Err(errors.into_iter().flatten().collect())
+}
+
+/// The contenders' tokens: on drop, every one but the winner's fires.
+struct Losers {
+    tokens: Vec<CancelToken>,
+    winner: Option<usize>,
+}
+
+impl Drop for Losers {
+    fn drop(&mut self) {
+        for (j, token) in self.tokens.iter().enumerate() {
+            if Some(j) != self.winner {
+                token.cancel();
+            }
+        }
+    }
 }
 
 /// A step whose seq [`Ctx::reserve_steps`] took: owned, so several can run at the same time while
@@ -696,6 +881,7 @@ mod tests {
 
     use super::*;
     use crate::clock::SystemClock;
+    use crate::envelope::Envelope;
     use crate::events::CollectingSink;
 
     async fn ctx(sink: &CollectingSink) -> Ctx {

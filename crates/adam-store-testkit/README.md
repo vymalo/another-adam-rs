@@ -32,35 +32,53 @@ after a commit that names a different one), a shared
   `BLOB_SUITE` lock, which the cases that purge take too); under nextest, where each test is its own
   process, `.config/nextest.toml` puts the same cases in one single-thread group. Runs are still
   isolated by agent name. `make` is the same `async fn() -> Option<DynStore>` as above.
-* `body_conformance!(make)` generates one `#[tokio::test]` per body case (10 cases: an append writes
+* `body_conformance!(make)` generates one `#[tokio::test]` per body case (14 cases: an append writes
   only the rows after the head's `len`, so a generation holds the transcript once; the generation
   is stable across appends; a compaction starts a new generation and `gc_body` collects the old one
   with an explicit cutoff; a stale version is a `Conflict` (a real insert-then-lose race is the
   adapter's own test); a v4 first split writes the
   whole transcript under one generation (named by the runtime or by the store); the same transcript
   committed again adds no row; a non-contiguous index is refused; a purge removes the rows; an
-  unknown generation is empty; a NUL in a head and in a row is stored as U+FFFD). Every case asserts `keeps_bodies()`: a store that keeps none is
+  unknown generation is empty; a NUL in a head and in a row is stored as U+FFFD; every read serves
+  the current head — `load_run`, `load_head`, `claim_due`, `open_run_for_conversation` and
+  `list_runs`; a stale head serves the state; a tombstoned run whose head is behind the version
+  serves the head (the repair of a run a pre-S3 process failed); and a head that is JSON `null` is
+  not a head). Every case asserts `keeps_bodies()`: a store that keeps none is
   not given this suite. The purge and compaction cases take the `BLOB_SUITE` lock because
   `purge_finished` sweeps blobs in the same call. `make` is the same
   `async fn() -> Option<DynStore>` as above.
+* `worker_leases_conformance!(make)` generates one `#[tokio::test]` per worker-lease case (3 cases:
+  every run lease a worker holds goes, so its runs are claimable at once — by another worker's unpinned
+  claim too — and the owner is not cleared, so a pinned run still comes back only to the same
+  worker; another worker's lease is untouched: still reported by `lease_until`, unclaimable and
+  renewable; and a lease the **owner does not hold** — w1 owns the run, w2 holds its lease — survives
+  `release_worker_leases("w1")`, because the sweep keys on the lease holder, not the owner).
+  `release_worker_leases` is **defaulted to a no-op**, so a store that does not implement it passes
+  `store_conformance!`; give this suite only to a store that implements the
+  release. `make` is the same `async fn() -> Option<DynStore>` as above.
 * `headless_measurement!(make)` generates the `measure_the_headless_transcript` test: it runs
   `counting::measure_headless_transcript` through `make`, prints its `p2-headless:` line (a
   delivery-shaped commit between every split, so each split writes the whole transcript) and
   asserts only that the workload ran. `make` is the same as above; a store that keeps no bodies
   skips it.
 * `transcript_measurement!(make)` generates the `measure_the_transcript_write` test: it runs
-  `counting::measure_transcript_write` through `make`, prints its `p2-measure:` line and asserts
-  only that the workload ran. `make` is the same `async fn() -> Option<DynStore>` as above; `None`
-  skips it. S3 rewrites the workload to commit a head and a body, then adds the `< 50 × 20 KB` and
-  `max < 20 KB` assertions here.
+  `counting::measure_transcript_write` through `make`, prints its `p2-measure:` line and asserts the
+  S0 bound — the 50 commits write under `50 × 20 KB` in all, and no commit writes over `20 KB`. The
+  workload commits the contract shape (the tombstone, a head and the body rows; the store appends
+  the delta). The bound is the **wrapper's** arithmetic — the bytes a commit hands the store — not
+  the adapter's: the store's own bytes are `dev/p2-measure.sh`'s relation sizes and WAL deltas, which
+  a PR quotes beside it. `make` is the same `async fn() -> Option<DynStore>` as above; `None`, or a
+  store that keeps no bodies, skips it.
 * `cases::*`: the cases as plain async functions taking a `DynStore`, for
   harnesses that do not use the macro.
 * `counting::CountingStore`: wraps a `DynStore` and counts calls per `fault::Method` and the
   `state` bytes that cross it — every record read (`load_run`, `load_head`, `list_runs`,
-  `claim_due`, `open_run_for_conversation`) and every successful `commit_run` write — through
-  `calls(method)`, and forwards `gc_body`/`blob_stored` to the wrapped store (`GcBody`/`BlobStored`
-  calls),
-  `state_bytes_read()`, `state_bytes_written()`, `max_commit_bytes()` and `reset()`. A commit that
+  `claim_due`, `open_run_for_conversation`) and every successful `commit_run` write (its state, its
+  head and the body rows it appends; the tombstone counts nothing) — through
+  `calls(method)`, and forwards `gc_body`/`blob_stored`/`release_worker_leases` to the wrapped store
+  (`GcBody`/`BlobStored`/`ReleaseWorkerLeases` calls),
+  `state_bytes_read()`, `state_bytes_written()`, `commit_bytes()`, `max_commit_bytes()` and
+  `reset()`. A commit that
   failed wrote nothing and is not counted; `migrate` is not counted, and neither is a record
   returned without its state (a `create_run` or `commit_run` echo). `run_header` is forwarded: an
   adapter that overrides it answers in one small read with no state; one that does not reads the
@@ -71,11 +89,12 @@ after a commit that names a different one), a shared
   whose `load_head` is the trait default answers the `LoadRun` the wrapper sees inside the adapter,
   which it cannot count: measure the head with `load_head`, as `adam-runtime`'s suite does.
 * `counting::measure_transcript_write`: a **measurement helper, not a conformance case**. One run,
-  `Measurement::COMMITS` commits of a 10 KB message, the last one `Done`, then purged; returns
-  `Measurement` (`commits`, `total_written`, `max_commit`, `first_read`, `final_read`) and
-  `report()`, the `p2-measure:` line `dev/p2-measure.sh` parses. It asserts nothing: the
-  `transcript_measurement!` test prints the line and asserts only that the workload ran. The
-  measured baseline is in [ADR 0055](../../docs/decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md).
+  `Measurement::COMMITS` commits of a 10 KB message in the contract shape (the tombstone, a head
+  and the body rows), the last one `Done`, then purged; returns `Measurement` (`commits`,
+  `total_written`, `max_commit`, `first_read`, `final_read`) and `report()`, the `p2-measure:` line
+  `dev/p2-measure.sh` parses. It asserts nothing: the `transcript_measurement!` test prints the line
+  and asserts the bound. The before/after numbers are in
+  [ADR 0055](../../docs/decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md).
 * `fault::FaultyStore`: wraps a `DynStore` and fails scripted calls
   (`fail`, `fail_always`, `fail_after_apply`, `heal`, `calls`, `injected`, and `claimed(run)`, how many times
   `claim_due` handed a run to its caller; and `fail_run` /
@@ -83,7 +102,8 @@ after a commit that names a different one), a shared
   the message a finished child sends its parent), with
   `fault::Method` and `fault::Mode` selecting the method and whether the
   operation is applied before the error is returned. `fault::Method` is **not** `#[non_exhaustive]`:
-  a new variant breaks an exhaustive `match` on it (schema version 5 part 1 added `PutBlob`,
+  a new variant breaks an exhaustive `match` on it (`ReleaseWorkerLeases` is the worker-lease
+  sweep; schema version 5 part 1 added `PutBlob`,
   `GetBlob` and `PurgeBlobs`; part 2 added `LoadHead`, `BodyList`, `GcBody` and `BlobStored`).
   `fault::is_injected`
   tells an injected error from a real one.
@@ -107,11 +127,12 @@ failure (see `adam_core::testing`).
 
 ## Tests
 
-* `tests/memory.rs`: runs the store suite, the blob suite and the body suite against `MemoryStore`
-  (always on).
+* `tests/memory.rs`: runs the store suite, the blob suite, the body suite and the worker-lease
+  suite against `MemoryStore` (always on).
 * `claim_skips_busy_runs` (both scopes): runs named as `busy` are not claimed, with a live lease or an expired one,
   take no slot of the limit, and are not leased by the call that skipped them.
 * `lease_until_reports_the_lease`: nothing before a claim or for an unknown run, the end of the claim, of a renewal, still the same after a commit and after a stranger's release, nothing after the holder's release, and an expired lease reported as it was.
+* `worker_leases_*`: the sweep frees every run lease of the worker (the runs claimable at once, the owner kept), leaves another worker's lease alone, and leaves a lease the owner does not hold (the sweep keys on the holder, not the owner).
 * Pinned-claim cases (`ClaimScope::Pinned`): an owned run is never given to another worker, not
   after a release, a commit or an expired lease; the first pinned claim sets the owner and an
   `Any` claim neither reads nor sets it; 4 workers racing on 48 runs split them exactly once and
@@ -123,8 +144,8 @@ failure (see `adam_core::testing`).
   counts nothing, a forwarded header whose default read inside the adapter the wrapper cannot
   see) and a doctest of `CountingStore`.
 * `tests/memory.rs` also runs `transcript_measurement!(make_store)`; the Postgres and MongoDB
-  adapters run it in `tests/conformance.rs`. It is a measurement, not a case: the test asserts only
-  that the workload ran.
+  adapters run it in `tests/conformance.rs`. It is a measurement, not a case: the test asserts the
+  S0 bound (under `50 × 20 KB` in all, under `20 KB` per commit).
 
 The Postgres and MongoDB adapters run the suite from their own
 `tests/conformance.rs`.

@@ -8,7 +8,9 @@
 // does not, and such an image is refused for both arms. Each check is { name, status: 'ok' | 'warn' | 'fail', detail,
 // fix? }; the exit code is 1 when any check fails. Nothing is started unless `start` is set.
 import fs from 'node:fs';
+import path from 'node:path';
 import { dockerEnv } from './containers.mjs';
+import { glibcMounts, lacksLoader } from './glibc.mjs';
 import { probeLimits } from './limits.mjs';
 import { coderRef } from './pins.mjs';
 import { RUNTIME, runtimeLimits, runtimeUser } from './runtime.mjs';
@@ -75,6 +77,27 @@ export async function coderProbe({ containers, image, filesDir, timeoutMs = 120_
   return { starts: null, exitCode: r.exitCode, detail: `exit ${r.exitCode}: ${text || 'no output'}` };
 }
 
+/**
+ * Start the pinned OpenCode binary (`--version`) as uid 10001 in `image`, the way a run does: an image without the loader the
+ * binary asks for (Alpine, musl) gets the harness's glibc mounted (`glibcMounts`), any other image is run as it is. Exit 0 and
+ * a version line mean it starts. Returns { starts, exitCode, detail, glibc }; the detail is the last lines of what the shell or
+ * the loader said.
+ */
+export async function opencodeProbe({ containers, image, binary, glibcDir, timeoutMs = 120_000 }) {
+  const glibc = await lacksLoader({ containers, image });
+  const r = await containers.run({
+    image,
+    network: 'none',
+    user: runtimeUser(),
+    mounts: [{ source: binary, target: '/opt/bench/opencode', readOnly: true }, ...(glibc ? glibcMounts(glibcDir) : [])],
+    script: 'HOME=/tmp; export HOME; /opt/bench/opencode --version 2>&1',
+    timeoutMs,
+  });
+  const text = `${r.stdout ?? ''}\n${r.stderr ?? ''}`.trim().split('\n').filter(Boolean).slice(-2).join(' | ');
+  if (r.exitCode === 0 && /^opencode v?\d/m.test(r.stdout ?? '')) return { starts: true, exitCode: 0, glibc, detail: `${(r.stdout ?? '').trim().split('\n')[0]}${glibc ? ', through the harness\'s glibc: the image has none' : ''}` };
+  return { starts: false, exitCode: r.exitCode, glibc, detail: `exit ${r.exitCode}: ${text || 'no output'}` };
+}
+
 /** The image's distribution, best effort: `PRETTY_NAME` from `/etc/os-release`, or null when it cannot be read. */
 export async function osRelease({ containers, image, timeoutMs = 60_000 }) {
   const r = await containers.run({ image, network: 'none', entrypoint: '/bin/cat', command: ['/etc/os-release'], timeoutMs });
@@ -90,12 +113,13 @@ export async function osRelease({ containers, image, timeoutMs = 60_000 }) {
  * @param {Array} [o.tasks]     the selected tasks: one probe per task image
  * @param {object} [o.containers] what the probes run on (a HostContainers); the stack's when `stack` is given
  * @param {(file: string, args: string[]) => Promise<{exitCode: number, stdout: string, stderr: string}>} [o.exec]
+ * @param {Function} [o.fetchBinary] `({pin, dir}) => {path}`: the verified OpenCode binary (`fetchPinnedBinary`); without it OpenCode is not probed
  * @param {object} [o.stack]    a Stack; with `start` it is brought up and a container is run on the host
  * @param {boolean} [o.start]
  * @param {object} [o.env]      the environment to read (default: the stack's `baseEnv`, or `process.env` without a stack)
  * @returns {Promise<{checks: object[], exitCode: number}>}
  */
-export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfsSync, nodeVersion = process.versions.node, arch = process.arch, stack = null, start = false, slots = 2, tasks = [], taskError = null, containers = null, env = null, justInTime = false }) {
+export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfsSync, nodeVersion = process.versions.node, arch = process.arch, stack = null, start = false, slots = 2, tasks = [], taskError = null, containers = null, env = null, justInTime = false, fetchBinary = null }) {
   // A stack carries the environment it was built with (`baseEnv`), which is what its compose calls and host containers
   // already use. The doctor's own docker calls must use the same one, never the ambient environment: a caller that
   // injects a stack (the tests do, and `bench doctor` builds it from `main`'s env) would otherwise get two lists.
@@ -233,6 +257,29 @@ export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfs
         if (p.starts === true) checks.push(ok(label, `${where}the coder starts (${p.detail})`));
         else if (p.starts === false) checks.push(fail(label, `${where}the coder does not start (${p.detail}); the image is refused for both arms`, 'use a task image whose loader and architecture can run a static x86-64 binary, or fix the image'));
         else checks.push(warn(label, `${where}the coder's start is unclear (${p.detail})`, 'run a container of the image by hand and read the error'));
+      }
+
+      // And OpenCode: its binary is dynamically linked, so an image whose C library is not glibc starts it only through the harness's
+      // own loader. A start that fails here would be a `Failed_infra` run after a paid preparation, so it is found now.
+      let oc = null;
+      let ocError = null;
+      try {
+        if (!fetchBinary || !stack?.ensureGlibc) throw new Error('the doctor has no source for the OpenCode binary');
+        oc = { binary: (await fetchBinary({ pin: pins.opencode, dir: path.join(home, 'opencode', pins.opencode.version) })).path, glibcDir: await stack.ensureGlibc() };
+      } catch (e) {
+        ocError = e.message;
+      }
+      for (const task of tasks) {
+        const imageRef = task.image?.ref ?? task.image?.name;
+        const label = `opencode in task image ${task.id}`;
+        if (!oc) {
+          checks.push(warn(label, `not probed: ${ocError}`, 'check the network and `docker pull` the coder image, then run bench doctor again'));
+          continue;
+        }
+        const p = await opencodeProbe({ containers: probe, image: imageRef, ...oc }).catch((e) => ({ starts: null, exitCode: null, detail: e.message }));
+        if (p.starts === true) checks.push(ok(label, `OpenCode starts (${p.detail})`));
+        else if (p.starts === false) checks.push(fail(label, `OpenCode does not start (${p.detail}); its runs in this image would be infrastructure failures`, 'a task image needs an x86-64 Linux userland with /bin/sh; run the probe by hand: docker run --rm --entrypoint sh <image> -c "ls -l /bin/sh"'));
+        else checks.push(warn(label, `OpenCode's start is unclear (${p.detail})`, 'run a container of the image by hand and read the error'));
       }
     }
   }

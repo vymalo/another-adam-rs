@@ -353,6 +353,12 @@ impl McpTool {
             Err(ToolError::Transient(why)) => {
                 return Err(ToolError::Transient(per_call.scrub(&why)));
             }
+            Err(ToolError::Retryable { message, class }) => {
+                return Err(ToolError::Retryable {
+                    message: per_call.scrub(&message),
+                    class,
+                });
+            }
             Err(other) => return Err(other),
         };
         let recipe = match per_call.recipe(&token) {

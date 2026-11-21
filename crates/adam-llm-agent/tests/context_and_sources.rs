@@ -532,6 +532,25 @@ fn a_limit_the_person_set_is_kept_when_the_rest_of_the_context_is_dropped() {
     );
 }
 
+#[test]
+fn a_per_message_key_never_outlives_a_message_whose_context_is_dropped() {
+    let obj = |v: Value| v.as_object().cloned().unwrap();
+    let offer = |id: &str| json!({"catalogIds": [id]});
+    let key = "vymalo.a2ui.renderer";
+    let big = || "x".repeat(MAX_CONTEXT_BYTES);
+    // Turn 1 offered catalog C; turn 2 says nothing (null) and its context is too large.
+    let mut c = Conversation::new("t");
+    assert!(c.merge_context(&obj(json!({key: offer("C"), "keep": 1}))));
+    assert!(!c.merge_context(&obj(json!({key: null, "big": big()}))));
+    assert!(!c.context.contains_key(key));
+    assert_eq!(c.context["keep"], json!(1));
+    // Turn 2 offers another catalog and is too large: the offer is gone, not the old one, not the new.
+    let mut c = Conversation::new("t");
+    assert!(c.merge_context(&obj(json!({key: offer("C")}))));
+    assert!(!c.merge_context(&obj(json!({key: offer("D"), "big": big()}))));
+    assert!(!c.context.contains_key(key));
+}
+
 #[tokio::test]
 async fn a_message_with_a_large_context_and_a_tier_keeps_the_tier() {
     let h = Harness::new();
@@ -595,7 +614,7 @@ impl Tool for AskWithUi {
     async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
         Err(ToolError::needs_input_with_ui(
             "which one?",
-            json!([{"version": "v0.9.1", "createSurface": {"surfaceId": "s", "catalogId": "c"}}]),
+            json!([{"version": "1.0", "createSurface": {"surfaceId": "s", "catalogId": "c"}}]),
         ))
     }
 }
@@ -614,7 +633,7 @@ async fn a_question_keeps_its_interface_while_the_run_waits() {
         .expect("start");
     let worker = spawn_worker(&rt);
     let parked = wait_waiting(&rt, run).await;
-    let ui = json!([{"version": "v0.9.1", "createSurface": {"surfaceId": "s", "catalogId": "c"}}]);
+    let ui = json!([{"version": "1.0", "createSurface": {"surfaceId": "s", "catalogId": "c"}}]);
     assert_eq!(
         conversation(&rt, &parked).await.pending_wait,
         Some(PendingWait::Question(PendingQuestion {
@@ -1039,12 +1058,11 @@ fn quick_runtime(store: &DynStore, agent: &LlmAgent, clock: &ManualClock) -> Run
         .clock(clock.clone())
         .poll_interval(Duration::from_millis(20))
         .lease_ttl(Duration::from_secs(1))
-        .retry(RetryPolicy {
-            max_attempts: 3,
-            initial_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(10),
-            multiplier: 1.0,
-        })
+        .retry(
+            RetryPolicy::new(3)
+                .with_backoff(Duration::from_millis(10), Duration::from_millis(10))
+                .with_multiplier(1.0),
+        )
         .build()
 }
 

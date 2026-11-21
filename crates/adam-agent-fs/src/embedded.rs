@@ -399,8 +399,12 @@ impl EmbeddedMcp {
 pub struct EmbeddedSchedule {
     /// From the path: `schedules/a/b.md` is `a/b`.
     pub name: &'static str,
-    /// A five-field cron expression.
+    /// A five-field cron expression; empty for an `at` or `after` schedule.
     pub cron: &'static str,
+    /// `at`, as written.
+    pub at: Option<&'static str>,
+    /// `after`, as written.
+    pub after: Option<&'static str>,
     /// An IANA time zone name.
     pub timezone: &'static str,
     /// The agent it runs.
@@ -416,6 +420,8 @@ impl EmbeddedSchedule {
         Schedule {
             name: self.name.to_owned(),
             cron: self.cron.to_owned(),
+            at: self.at.map(str::to_owned),
+            after: self.after.map(str::to_owned),
             timezone: self.timezone.to_owned(),
             agent: self.agent.to_owned(),
             prompt: self.prompt.to_owned(),
@@ -638,6 +644,8 @@ mod tests {
             schedules: &[EmbeddedSchedule {
                 name: "daily",
                 cron: "0 9 * * *",
+                at: None,
+                after: None,
                 timezone: "UTC",
                 agent: "a",
                 prompt: "Digest.",

@@ -103,13 +103,27 @@ pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
 /// behind it, which is a limit on what it may ask for.
 pub const CALLER_CONTEXT_KEY: &str = "vymalo.caller";
 
-/// The context keys that carry a **limit on the agent**: the access tier the person picked, and
-/// who the message was sent for. A message always sets them, even when the rest of its context is
+/// The context keys that carry a **limit on the agent**: the access tier the person picked, who the
+/// message was sent for, and that nobody answers the run (`adam_runtime::UNATTENDED_CONTEXT_KEY`). A message always sets them, even when the rest of its context is
 /// over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large catalog next to a `plan` tier would
 /// lift the limit), and a child run starts with the ones its parent has
 /// ([`ToolCtx::start_child`](crate::ToolCtx::start_child)). Each value is at most
 /// [`MAX_PROTECTED_VALUE_BYTES`]; a larger one is ignored.
-pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[ACCESS_TIER_CONTEXT_KEY, CALLER_CONTEXT_KEY];
+pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[
+    ACCESS_TIER_CONTEXT_KEY,
+    CALLER_CONTEXT_KEY,
+    adam_runtime::UNATTENDED_CONTEXT_KEY,
+];
+
+/// The context key under which a message says what its renderer offers this turn (A2UI v1.0
+/// `a2uiRendererCapabilities`): `{"catalogIds": [...]}`.
+pub const RENDERER_OFFER_CONTEXT_KEY: &str = "vymalo.a2ui.renderer";
+
+/// The context keys that speak for **one message only**: a message sets them or, by saying nothing,
+/// clears them. When a message's context is over [`MAX_CONTEXT_BYTES`] and dropped, these are
+/// **deleted** (neither the earlier value nor the update stays), so a run never acts on what an
+/// earlier message offered: a turn whose offer was lost draws nothing.
+pub const PER_MESSAGE_CONTEXT_KEYS: &[&str] = &[RENDERER_OFFER_CONTEXT_KEY];
 
 /// The most serialized JSON, in bytes, that the value of a [`PROTECTED_CONTEXT_KEYS`] key may hold.
 pub const MAX_PROTECTED_VALUE_BYTES: usize = 1024;
@@ -122,8 +136,8 @@ pub(crate) fn parse_context(payload: &Value) -> Option<&Map<String, Value>> {
 /// A tool call that asked the user a question and waits for the answer.
 ///
 /// One kind of [`PendingWait`], stored in [`Conversation::pending_wait`], so it
-/// is visible in the durable run view (`RunView::state`) while the run is
-/// parked.
+/// is visible in the durable run view (`RunView::state`, the head) while the run
+/// is parked.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingQuestion {
     /// The tool call the answer will be returned for.
@@ -323,9 +337,10 @@ pub struct LimitHit {
 /// The state of an [`LlmAgent`](crate::LlmAgent) run: the persisted history
 /// plus the bookkeeping the loop needs to resume from any commit.
 ///
-/// It is the run's durable record: `Runtime::view(run).state` deserializes into
-/// it. Every field has a serde default, so state written by an older version
-/// still loads.
+/// It is the run's durable record: `Runtime::state(run)` deserializes into
+/// it. `Runtime::view(run).state` is its **head** (ADR 0055), the same shape
+/// with `messages` empty. Every field has a serde default, so state written by
+/// an older version still loads.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Conversation {
     /// The history, oldest first. Nothing is removed from it while the run goes on, but **old tool
@@ -1009,8 +1024,10 @@ impl Conversation {
     ///
     /// Returns `false` when the merged context would be larger than [`MAX_CONTEXT_BYTES`] (a warning
     /// says so: the message is still read for its text). Then **only the update's
-    /// [`PROTECTED_CONTEXT_KEYS`] are merged**, and nothing else changes: a limit the person set is
-    /// never lost to a large context. The protected keys do not count toward the limit.
+    /// [`PROTECTED_CONTEXT_KEYS`] are merged** and the [`PER_MESSAGE_CONTEXT_KEYS`] are deleted;
+    /// nothing else changes: a limit the person set is never lost to a large context, and an
+    /// earlier message's offer is never taken for this one's. The protected keys do not count
+    /// toward the limit.
     pub fn merge_context(&mut self, update: &Map<String, Value>) -> bool {
         if update.is_empty() {
             return true;
@@ -1052,6 +1069,9 @@ impl Conversation {
                 "the context of an inbound message would take the run's context over its limit: it is dropped, but for the keys that carry a limit the person set"
             );
             apply(&mut self.context, true);
+            for key in PER_MESSAGE_CONTEXT_KEYS {
+                self.context.remove(*key);
+            }
             return false;
         }
         self.context = merged;

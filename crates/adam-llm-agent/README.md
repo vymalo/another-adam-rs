@@ -27,7 +27,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
 | `StepIo` | how a call's step reports its input and output: `StepIo::default().redact(\|text\| ..).input_max(n).output_max(n)`, or `StepIo::off()`; given to the builder with `step_io(..)` (see *Steps*) |
 | `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `start_child(agent, message)` (starts it on the runtime that steps the run), `root_run_id()` (the run whose work this one serves: the top of the chain of parents for a child run, the run itself otherwise), `with_root_run(id)` for tests, `step_id()` (`tool:<call id>`), `note()` (what the source that offered the tool said of it, `ToolNote`), `parent_step_id()` / `under_step(id)` (the step this call runs under; none for a call of the model's own), `report_step(StepEvent)` (a step that runs under this call's), `emit_progress` (an update of the call's own step, the text in its detail), `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, `context(key)` / `context_map()` (the run's inbound context, see *Context and tool sources*), `files_left()` (the bytes of files the run may still share: 6 MiB less what it kept, as the call began; the loop sets it with `with_files_left` for every call and poll, a detached context has the whole 6 MiB), `report_sandbox(&SandboxUsage)` (the time this call's commands ran in a sandbox, see *Sandbox time*) with `reported_sandbox()` to read it back, and for tests `detached(..).with_state(..).with_context(..)` |
-| `ToolError` | `Transient`, `Permanent`, `NeedsInput { question, ui }` (parks the run; A2A reports `input-required`; `ui` is an interface that comes with the question; build one with `ToolError::needs_input(q)` or `needs_input_with_ui(q, ui)`), `AwaitRun { run }` (the result is a child run's outcome; the run parks with a timer, A2A reports `working`), `AwaitRemote { task, timeout_ms }` (the result is the outcome of a task on another system, polled on the timer), `AwaitSession { session }` (the result is the report of a child session's round; the run parks on a `PendingWait::Session`, see *Child sessions*); `#[non_exhaustive]`, see *Errors* |
+| `ToolError` | `Transient`, `Retryable { message, class }` (a rate limit or a conflict, see *Errors*), `Permanent`, `NeedsInput { question, ui }` (parks the run; A2A reports `input-required`; in a run nobody answers, a firing of a schedule or a child of one (a conversation under `adam.schedule:`, or `adam.unattended: true` in its context, a protected key children inherit: `is_unattended`), it parks nothing: the call's step fails with the reason and its result is `UNATTENDED` and the question, so the model goes on (ADR 0060); `ui` is an interface that comes with the question; build one with `ToolError::needs_input(q)` or `needs_input_with_ui(q, ui)`), `AwaitRun { run }` (the result is a child run's outcome; the run parks with a timer, A2A reports `working`), `AwaitRemote { task, timeout_ms }` (the result is the outcome of a task on another system, polled on the timer), `AwaitSession { session }` (the result is the report of a child session's round; the run parks on a `PendingWait::Session`, see *Child sessions*); `#[non_exhaustive]`, see *Errors* |
 | `LlmAgentBuilder::state`, `try_build`, `tools` | `state(Arc<T>)` shares a value with the tools (one per type); `try_build() -> Result<LlmAgent, BuildError>` fails on a tool whose `required_state` was not given (`BuildError::MissingState`) or on two tools with one name (`BuildError::DuplicateTool`); `tools(ToolSet)` registers a group. `build()` is unchanged (last duplicate wins, no state check) |
 | `State<T>`, `StateKey`, `Extensions` | a cheap `Arc` handle that derefs to `T`; the key of a state type; the typed map behind them |
 | `ToolSet`, `tools!` | an ordered group of tools: `tools![Clock, Search::new()]`, `.extend(..)`, `.wrap(\|tool\| ..)` for middleware, `names()`, `get(..)` |
@@ -36,13 +36,14 @@ instructions + a model + a toolset. It is served over A2A by
 | `DEFAULT_MAX_PARALLEL`, `MAX_PARALLEL_LIMIT` | 10 and 32 |
 | `FnTool` | a tool from a closure: `FnTool::raw(name, description, schema, \|ctx, args\| async ..)`; with feature `schema`, `FnTool::builder(name).description(..).args::<A>().handler(..)` |
 | `spec_for::<A>(name, description)`, `ToolSpecExt::for_args` | feature `schema`: the `ToolSpec` of a tool whose arguments are `A: JsonSchema` |
-| `ToolError::from_classified(&e)` | a retryable `Classify` error becomes `Transient`, any other `Permanent`, with the whole source chain as the message |
+| `ToolError::from_classified(&e)`, `ToolError::retryable(message, class)`, `retry_parts()` | a `Classify` error of class `Transient` becomes `Transient`, of another retryable class `Retryable` with the class, any other `Permanent`, with the whole source chain as the message |
+| `Tool::retry_policy`, `FnTool::with_retry_policy`, `LlmAgentBuilder::tool_retry`, `tool_retry_key` | a tool's retry policy and the key `tool:<name>` its failures count under; see *Retry policies per tool* |
 | `__private` | feature `schema`, `#[doc(hidden)]`: the paths `#[tool]` generates code against (`serde`, `schemars`, `async_trait`, `spec_for`, `parse_args`, ...). Not API: it changes with the macro |
 | `ToolSource`, `DynToolSource`, `SourceCtx`, `LlmAgentBuilder::tool_source`, `MAX_SOURCE_TOOLS` | tools the agent learns about while it runs: a source reads the run with `SourceCtx` (`run_id`, `root_run_id`, `conversation_id`, `context`, `task`: the words the run was started with, the same text at every turn and at every call, `Conversation::task`, and `loaded_servers`: the MCP servers the run loaded during itself, `Conversation::loaded_servers`); it lists its tools at every model turn (`specs(&SourceCtx)`, or `listing` for the tools **and their notes**), may rewrite how the tools of that turn are described (`refine(&SourceCtx, &mut [ToolSpec])`, default: nothing), may add words to the agent's instructions for the turn (`instructions(&SourceCtx) -> Option<String>`, default: nothing), **holds tools back** (`withhold(&SourceCtx, tools: &[&str]) -> Vec<Withheld>`, default: none: the tools of `tools` it names, the agent's own and the MCP servers' included, are not shown to the model on that turn, and a call to one is refused with the `Withheld::reason` when it would run), **appends the tools the run has loaded** (`appended(&SourceCtx) -> Vec<ToolSpec>`, default: none: put **after every other tool** of the turn, in the source's order, so the tools array grows by a suffix and never by an insertion) and answers the calls to them (`call(&ToolCtx, name, args) -> Option<..>`), see *Context and tool sources* |
 | `Listing`, `ToolNote`, `Conversation::source_notes` | what a source says about a tool it lists: the system behind it **reports each call as a step itself** (`reports_step`, so the agent reports none), how long a call may run (`timeout_ms`) and what its step is called (`label`); kept in the run's state with the model's answer, so a later call, on another worker, reads it without listing again |
 | `Conversation::context`, `merge_context`, `drop_expired_context`, `MAX_CONTEXT_BYTES` | what the messages of the run say about their sender, merged key by key (`null` deletes), bounded, with expiring entries; see *Context and tool sources* |
 | `SessionTools`, `SessionAgent`, `SESSION_TOOLS`, `SUBAGENT_START` .. `SUBAGENT_LIST`, `MAX_OPEN_SESSIONS`, `MAX_SESSION_ROUNDS`, `LlmAgentBuilder::session_agents` | the five tools that run a subagent in the background as a session (ADR 0045), and the wait a turn makes for the sessions it started: see *Child sessions* |
-| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `PendingSession`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `Conversation::split`/`join` are the `Agent` hook that keeps `messages` in the body and everything else in the head (see the runtime's *The shadow*); `PendingQuestion::ui` is the interface that came with the question (absent when there is none, and in state stored before it existed); `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on, and `Conversation::omitted_turns` how many turns of earlier conversation were left out to meet the cap (both absent otherwise, and in state stored before they existed), `Conversation::root_run` the top of a child run's parent chain (absent for a run that is nobody's child, and in state stored before it existed) |
+| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `PendingSession`, `ArtifactRef` | what `Runtime::state(run)` deserializes into (the whole state); `Runtime::view(run).state` is its **head** — the same shape with `messages` empty (ADR 0055); `Conversation::split`/`join` are the `Agent` hook that keeps `messages` in the body and everything else in the head (see the runtime's *The head and the body*); `PendingQuestion::ui` is the interface that came with the question (absent when there is none, and in state stored before it existed); `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on, and `Conversation::omitted_turns` how many turns of earlier conversation were left out to meet the cap (both absent otherwise, and in state stored before they existed), `Conversation::root_run` the top of a child run's parent chain (absent for a run that is nobody's child, and in state stored before it existed) |
 | `Conversation::continued(&self, text, from: RunId)`, `LlmAgent::init_continuing`, `LlmStarter::init_continuing` | the conversation of a new run that carries on this one with one more user message; what is carried, dropped and reset is in *Continuing a conversation* |
 | `Conversation::is_omission_marker(message, part)` | whether that text part is the marker (the second part of the first message while `omitted_turns` is not zero), so a rule that reads what the user said skips exactly it: the coder's `person_texts` |
 | `MAX_CARRIED_BYTES`, `OMITTED_MARKER_PREFIX` | the cap on the history a continuation carries (256 KiB of JSON), and the prefix of the marker text part that stands in for the turns dropped to fit it |
@@ -140,8 +141,8 @@ change of worker keeps it, and a run that continues another starts with the one 
 (`Conversation::continued`; the new message's keys then win). Two bounds: the whole context is at most
 `MAX_CONTEXT_BYTES` (256 KiB of JSON; a message that would take it over has its context dropped, with a warning,
 and is still read for its text, **but for the keys of `PROTECTED_CONTEXT_KEYS`**, today `ACCESS_TIER_CONTEXT_KEY`
-(`vymalo.accessTier`) and `CALLER_CONTEXT_KEY` (`vymalo.caller`, who the message was sent for): a limit on the agent is never
-lost to a large context, does not count toward the bound, and a value over `MAX_PROTECTED_VALUE_BYTES` is ignored), and **an entry that is an object with an `expiresAt` (RFC 3339) is removed once
+(`vymalo.accessTier`), `CALLER_CONTEXT_KEY` (`vymalo.caller`, who the message was sent for) and `adam_runtime::UNATTENDED_CONTEXT_KEY` (`adam.unattended`, nobody answers the run: a firing of a schedule, ADR 0060): a limit on the agent is never
+lost to a large context, does not count toward the bound, and a value over `MAX_PROTECTED_VALUE_BYTES` is ignored; and the keys of `PER_MESSAGE_CONTEXT_KEYS`, today `RENDERER_OFFER_CONTEXT_KEY` (`vymalo.a2ui.renderer`, what the renderer offers this turn), are **deleted** then, so an earlier message's offer never stands for this one's), and **an entry that is an object with an `expiresAt` (RFC 3339) is removed once
 that time has passed**, at the start of the next step (`drop_expired_context`): a credential the sender put there
 does not stay in the store after it stops working. (A run parked for hours still holds it until it next steps.)
 
@@ -647,6 +648,7 @@ design is in [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md
 | `ToolError` | Class | The run |
 |---|---|---|
 | `Transient` | `Transient` | the step fails with `AgentError::Transient`; the runtime retries with backoff |
+| `Retryable { message, class }` | its `class` (`RateLimited`, `Conflict`) | as `Transient`, of that class: a policy that names its classes may not retry it |
 | `Permanent` | `Invalid` | the model is told, and can go on |
 | `NeedsInput` | `Rejected` | valid, but it needs the user first: the run parks |
 | `AwaitRun` | `Rejected` | valid, but it needs a child run first: the run parks with a timer |
@@ -654,13 +656,30 @@ design is in [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md
 
 `ToolError` is journaled, so its serde shape is frozen and it carries no
 `source`: a tool flattens its own cause into the message (with
-`adam_error::report`) before it returns.
+`adam_error::report`) before it returns. `ToolError::from_classified` and `ToolError::retryable(message, class)`
+build `Transient` for the class `Transient`, `Retryable` for another retryable class and `Permanent` for the rest;
+`retry_parts()` gives the message and class of either retryable one. `Retryable` is journaled with its class by
+name (`{"Retryable": {"message": .., "class": "rate-limited"}}`); a name this build does not know decodes as
+`transient`, and a build older than this one cannot read the entry at all, so roll forward, not back.
+
+### Retry policies per tool
+
+A tool's retryable failures are retried under the tool's policy, counted under the key `tool:<name>`
+(`tool_retry_key`) apart from the run's other steps ([ADR 0061](../../docs/decisions/0061-a-step-names-its-retry-policy.md)).
+The policy, first found: one set by name with `LlmAgentBuilder::tool_retry(name, policy)` (an agent folder's
+`retry:`, and the only way to give a policy to a tool another system offers, such as `<server>__<tool>`), the
+tool's own `Tool::retry_policy()` (default `None`; `FnTool::with_retry_policy`; `#[tool(retry(...))]`; a
+wrapper must forward it), else the runtime's. It applies to a call's failure in its turn, in an early call, and
+while a remote task is polled. A model provider's retryable error keeps its class too (a rate limit is
+`RateLimited`), under the runtime's policy. Tests: `tests/llm_agent.rs`
+`a_tools_policy_decides_its_retries_and_one_set_by_name_wins`, `a_tools_failure_keeps_its_class`,
+`a_model_rate_limit_keeps_its_class`, and `tool.rs` `a_retryable_error_is_journaled_by_its_class_name`.
 
 Model failures are classified by `adam_model::ModelError` and journaled as a
 record of `retryable`, the flattened message (`report`, so the chain is printed
 once), `retry_after_ms` and the `class` name (records written before classes
 existed decode with `class` absent). A retryable one becomes
-`AgentError::Transient`, with `with_retry_after` when the provider sent a
+`AgentError::Transient` of the recorded class, with `with_retry_after` when the provider sent a
 `Retry-After`, so the retry waits at least that long; any other fails the run
 with `model call failed: ...`. An unreadable start message is
 `AgentError::Permanent` (`unusable start message: ...`), which A2A reports as
@@ -692,6 +711,7 @@ ADR 0037 says of its state: a worker that has not been rolled runs a tool whose 
   replay decides the same; a journal without it decodes. A model can still wait and retry by doing something else between two
   calls (`sleep`): any other call resets the count. The decision reads only `Conversation::repeats` (two FNV-1a hashes and counters), so a replay decides
   the same. A call that waits (a question, a child) resets it.
+* **`Tool::retry_policy`** (default `None`, the runtime's): see *Retry policies per tool*.
 * **`Tool::time_limit`** (default `None` = `DEFAULT_TOOL_TIME_LIMIT`, 300 s; `FnTool::with_time_limit`; a wrapper must forward
   it). The timer runs inside the journaled `tool:<id>` step: the call gets a child `CancelToken`, which fires at the
   limit; the tool has `TOOL_STOP_GRACE` (5 s) to stop and is then dropped; the model gets an error result that says the call

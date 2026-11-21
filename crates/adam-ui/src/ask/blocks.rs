@@ -1,9 +1,9 @@
-//! The members of the seven components a question may show, as the web's catalog of version 8 defines
+//! The members of the seven components a question may show, as the web's catalog of version 9 defines
 //! them: required members, types and limits. A block is checked against this table on every screen,
 //! including a screen that cannot draw the component and a thread with no catalog, so a block the
 //! web would refuse is refused the same way everywhere, naming the member.
 //!
-//! A test holds the table equal to the vendored catalog of version 8 (`tests/fixtures/catalog-v8.json`),
+//! A test holds the table equal to the vendored catalog of version 9 (`tests/fixtures/catalog-v9.json`),
 //! member by member, so the two cannot drift.
 
 use serde_json::{Map, Value};
@@ -425,14 +425,14 @@ mod tests {
     }
 
     #[test]
-    fn the_table_is_the_catalog_of_version_8_member_by_member() {
+    fn the_table_is_the_catalog_of_version_9_member_by_member() {
         let catalog: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/catalog-v8.json")).unwrap();
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog-v9.json")).unwrap();
         for name in super::super::shown::SHOWABLE {
             assert_eq!(
                 object_schema(members(name).unwrap()),
                 vendored(&catalog["components"][name]),
-                "{name} drifted from the catalog of version 8"
+                "{name} drifted from the catalog of version 9"
             );
         }
     }

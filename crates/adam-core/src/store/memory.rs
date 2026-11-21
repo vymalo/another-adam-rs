@@ -59,7 +59,8 @@ struct Slot {
     /// Set by the first [`ClaimScope::Pinned`] claim; never cleared.
     owner: Option<String>,
     /// The v5 head last written by a commit, and the version it was written at. A commit that
-    /// writes no head leaves both alone, so a stale head is never served.
+    /// writes no head leaves both alone, so a stale head is served only as the repair of a
+    /// tombstoned run (`state = null`), never over a v4 state.
     head: Option<serde_json::Value>,
     head_version: Option<u64>,
 }
@@ -71,18 +72,40 @@ impl MemoryStore {
 }
 
 impl Inner {
-    fn open_run(
-        &self,
-        agent: &str,
-        conversation_id: &str,
-        except: Option<RunId>,
-    ) -> Option<&RunRecord> {
-        self.runs.values().map(|s| &s.run).find(|r| {
-            Some(r.id) != except
-                && r.status.is_open()
-                && r.agent == agent
-                && r.conversation_id.as_deref() == Some(conversation_id)
-        })
+    fn open_run(&self, agent: &str, conversation_id: &str, except: Option<RunId>) -> Option<RunId> {
+        self.runs
+            .values()
+            .map(|s| &s.run)
+            .find(|r| {
+                Some(r.id) != except
+                    && r.status.is_open()
+                    && r.agent == agent
+                    && r.conversation_id.as_deref() == Some(conversation_id)
+            })
+            .map(|r| r.id)
+    }
+
+    /// The run as a reader sees it: the current head when the store has one (`head_version ==
+    /// version`), the stored `state` otherwise (a v4 run, or a head a later commit did not rebuild).
+    ///
+    /// The contract release (ADR 0055): every read that returns a record — `load_run`, `load_head`,
+    /// `claim_due`, `open_run_for_conversation` and `list_runs` — answers through this.
+    ///
+    /// A **tombstoned** run whose head is behind the version (a pre-S3 process failed a converted
+    /// run with `state = null`, no head and the version bumped) serves the head: it is the only
+    /// readable document, and serving it is the one-line repair. A head that is JSON `null` is not
+    /// a head.
+    fn served(slot: &Slot) -> RunRecord {
+        let mut rec = slot.run.clone();
+        let current = slot.head_version == Some(rec.version);
+        let tombstoned = rec.state.is_null();
+        if (current || tombstoned)
+            && let Some(head) = &slot.head
+            && head.is_object()
+        {
+            rec.state = head.clone();
+        }
+        rec
     }
 }
 
@@ -136,7 +159,8 @@ impl Store for MemoryStore {
     }
 
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
-        Ok(self.inner.lock().await.runs.get(&id).map(|s| s.run.clone()))
+        // The contract read: the head when it is current, the whole state otherwise.
+        Ok(self.inner.lock().await.runs.get(&id).map(Inner::served))
     }
 
     async fn commit_run(
@@ -277,18 +301,8 @@ impl Store for MemoryStore {
     }
 
     async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
-        let inner = self.inner.lock().await;
-        let Some(slot) = inner.runs.get(&id) else {
-            return Ok(None);
-        };
-        let mut rec = slot.run.clone();
-        // A head a later commit did not rebuild is stale: serve the whole state instead.
-        if slot.head_version == Some(rec.version)
-            && let Some(head) = &slot.head
-        {
-            rec.state = head.clone();
-        }
-        Ok(Some(rec))
+        // The same read as `load_run`: the head when it is current, the whole state otherwise.
+        Ok(self.inner.lock().await.runs.get(&id).map(Inner::served))
     }
 
     async fn open_run_for_conversation(
@@ -296,12 +310,11 @@ impl Store for MemoryStore {
         agent: &str,
         conversation_id: &str,
     ) -> StoreResult<Option<RunRecord>> {
-        Ok(self
-            .inner
-            .lock()
-            .await
+        let inner = self.inner.lock().await;
+        Ok(inner
             .open_run(agent, conversation_id, None)
-            .cloned())
+            .and_then(|id| inner.runs.get(&id))
+            .map(Inner::served))
     }
 
     async fn journal_get(&self, run: RunId, seq: u64) -> StoreResult<Option<JournalEntry>> {
@@ -383,7 +396,7 @@ impl Store for MemoryStore {
                     }
                 }
                 Lease {
-                    run: slot.run.clone(),
+                    run: Inner::served(slot),
                     worker: worker.to_owned(),
                     until,
                 }
@@ -425,6 +438,20 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    async fn release_worker_leases(&self, worker: &str) -> StoreResult<()> {
+        let mut inner = self.inner.lock().await;
+        for slot in inner.runs.values_mut() {
+            if slot
+                .lease
+                .as_ref()
+                .is_some_and(|(owner, _)| owner == worker)
+            {
+                slot.lease = None;
+            }
+        }
+        Ok(())
+    }
+
     async fn lease_until(&self, id: RunId) -> StoreResult<Option<Timestamp>> {
         let inner = self.inner.lock().await;
         Ok(inner
@@ -437,21 +464,20 @@ impl Store for MemoryStore {
     async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
         let inner = self.inner.lock().await;
         // Sort references and clone the page only: a listing of a thousand runs must not copy a
-        // thousand states to return ten of them.
-        let mut found: Vec<&RunRecord> = inner
+        // thousand states to return ten of them. A served record is the head when it is current.
+        let mut found: Vec<&Slot> = inner
             .runs
             .values()
-            .map(|s| &s.run)
-            .filter(|r| query.matches(r))
-            .filter(|r| {
+            .filter(|s| query.matches(&s.run))
+            .filter(|s| {
                 query
                     .after
-                    .is_none_or(|(at, id)| (r.updated_at, r.id) < (at, id))
+                    .is_none_or(|(at, id)| (s.run.updated_at, s.run.id) < (at, id))
             })
             .collect();
-        found.sort_by_key(|r| std::cmp::Reverse((r.updated_at, r.id)));
+        found.sort_by_key(|s| std::cmp::Reverse((s.run.updated_at, s.run.id)));
         found.truncate(query.limit);
-        Ok(found.into_iter().cloned().collect())
+        Ok(found.into_iter().map(Inner::served).collect())
     }
 
     async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64> {
@@ -789,8 +815,8 @@ mod tests {
     }
 
     /// The head a commit writes is served by `load_head` at the version it was written at; a commit
-    /// that writes no head (a delivery, a cancel, a park) leaves it stale, and `load_head` falls
-    /// back to the whole state.
+    /// that writes no head leaves it stale, and `load_head` serves the state it wrote — the whole
+    /// v4 state, or the head itself when the state is the tombstone.
     #[tokio::test]
     async fn a_head_round_trips_and_a_headless_commit_makes_it_stale() {
         let store = MemoryStore::new();
@@ -828,6 +854,17 @@ mod tests {
             loaded.state["body"]["generation"].as_str().is_some(),
             "the store resolved and patched the generation"
         );
+        // The contract read: `load_run` answers the same document as `load_head`.
+        assert_eq!(
+            store
+                .load_run(run.id)
+                .await
+                .expect("load")
+                .expect("the run")
+                .state,
+            loaded.state,
+            "every read serves the current head"
+        );
 
         // No head on this commit: the stored one is now stale.
         store
@@ -847,6 +884,16 @@ mod tests {
             loaded.state,
             json!({"v": 1, "turn": 2}),
             "a stale head is not served: the whole state is"
+        );
+        assert_eq!(
+            store
+                .load_run(run.id)
+                .await
+                .expect("load")
+                .expect("the run")
+                .state,
+            json!({"v": 1, "turn": 2}),
+            "and `load_run` agrees"
         );
     }
 

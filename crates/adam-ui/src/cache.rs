@@ -70,6 +70,7 @@ mod tests {
     fn catalog(n: usize) -> Arc<Catalog> {
         let document = json!({
             "catalogId": "https://agents.vymalo.com/a2ui/catalogs/test",
+            "protocolVersion": "1.0",
             "components": {"Note": {"type": "object", "description": n.to_string()}}
         });
         let digest = catalog_digest(&document).unwrap();

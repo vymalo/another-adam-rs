@@ -32,8 +32,8 @@ use adam_core::store::{now, truncate_ms};
 use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, DynStore, JournalEntry,
-    NewPushConfig, NewRun, PushProgress, PushState, RunId, RunQuery, RunStatus, RunUpdate,
-    StoreError,
+    NewPushConfig, NewRun, PushProgress, PushState, RunId, RunQuery, RunRecord, RunStatus,
+    RunUpdate, StoreError,
 };
 use futures::future::join_all;
 use jiff::SignedDuration;
@@ -101,15 +101,13 @@ macro_rules! store_conformance {
 }
 
 /// Generate the `measure_the_transcript_write` test: run
-/// [`counting::measure_transcript_write`] through `$make`, print its line, and assert that the
-/// workload ran.
+/// [`counting::measure_transcript_write`] through `$make`, print its line, and assert the S0 bound:
+/// the 50 commits write less than `50 × 20 KB` in all and no commit writes more than `20 KB`.
 ///
 /// `$make` is a path to an `async fn() -> Option<DynStore>`, like [`store_conformance!`]: `None`
-/// skips the test (and fails instead under `ADAM_TEST_REQUIRE_DB=1`, see `adam_core::testing`).
-///
-/// This is a measurement, not a conformance case: it asserts only that the workload ran. S3
-/// rewrites the workload to commit a head and a body, then adds the `< 50 × 20 KB` and
-/// `max < 20 KB` assertions here.
+/// skips the test (and fails instead under `ADAM_TEST_REQUIRE_DB=1`, see `adam_core::testing`). A
+/// store that keeps no bodies skips it too: the workload commits the contract's head and body, which
+/// such a store does not have.
 #[macro_export]
 macro_rules! transcript_measurement {
     ($make:path) => {
@@ -120,6 +118,10 @@ macro_rules! transcript_measurement {
                 return;
             };
             store.migrate().await.expect("migrate");
+            if !store.keeps_bodies() {
+                $crate::skipped("measure_the_transcript_write: store keeps no bodies");
+                return;
+            }
             let measured = $crate::counting::measure_transcript_write(store).await;
             println!("{measured}");
             assert_eq!(
@@ -127,7 +129,20 @@ macro_rules! transcript_measurement {
                 $crate::counting::Measurement::COMMITS,
                 "the workload ran to the end"
             );
-            assert!(measured.total_written > 0, "the commits wrote state");
+            // The S0 bound, now true: 50 appends of 10 KB are ~0.5 MB with their heads, not the
+            // 12.75 MB the whole state cost.
+            let total_bound = 50 * 20 * 1024;
+            let commit_bound = 20 * 1024;
+            assert!(
+                measured.total_written < total_bound,
+                "the 50 commits wrote {} bytes, over the bound of {total_bound}",
+                measured.total_written
+            );
+            assert!(
+                measured.max_commit < commit_bound,
+                "the largest commit wrote {} bytes, over the bound of {commit_bound}",
+                measured.max_commit
+            );
         }
     };
 }
@@ -184,10 +199,50 @@ macro_rules! body_conformance {
             body_a_compaction_starts_a_new_generation_and_the_gc_collects_the_old,
             body_a_stale_version_is_a_conflict,
             body_a_first_split_writes_the_whole_transcript,
+            body_every_read_serves_the_current_head, body_a_stale_head_serves_the_state,
+            body_a_tombstoned_run_with_a_stale_head_serves_the_head,
+            body_a_head_that_is_json_null_is_not_a_head,
             body_the_same_transcript_committed_again_adds_no_row, body_purge_removes_the_rows,
             body_a_non_contiguous_index_is_refused,
             body_an_unknown_generation_is_empty,
             body_a_nul_is_stored_as_the_replacement_character,
+        );
+    };
+    (@cases $make:path; $($case:ident),* $(,)?) => {
+        $(
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn $case() {
+                let Some(store) = $make().await else {
+                    $crate::skipped(&format!(
+                        "{}: store not configured",
+                        stringify!($case)
+                    ));
+                    return;
+                };
+                store.migrate().await.expect("migrate");
+                $crate::cases::$case(store).await;
+            }
+        )*
+    };
+}
+
+/// Generate one `#[tokio::test]` per worker-lease conformance case. `$make` is a path to an
+/// `async fn() -> Option<DynStore>`, like [`store_conformance!`]: `None` skips the suite (and
+/// fails instead under `ADAM_TEST_REQUIRE_DB=1`, see `adam_core::testing`).
+///
+/// The cases prove [`Store::release_worker_leases`](adam_core::Store::release_worker_leases): every
+/// run lease the worker holds goes and its runs are claimable at once, another worker's lease is
+/// untouched, and a lease the owner does not hold survives the owner's sweep (the sweep keys on the
+/// lease holder, not the owner); the run's owner is not cleared. The method is **defaulted to a no-op**, so a store
+/// that does not implement it passes [`store_conformance!`] and must not be given this suite: give
+/// it only to a store that implements the release.
+#[macro_export]
+macro_rules! worker_leases_conformance {
+    ($make:path) => {
+        $crate::worker_leases_conformance!(@cases $make;
+            worker_leases_frees_the_workers_runs,
+            worker_leases_leaves_another_workers_lease_alone,
+            worker_leases_leaves_a_lease_the_owner_does_not_hold,
         );
     };
     (@cases $make:path; $($case:ident),* $(,)?) => {
@@ -324,6 +379,217 @@ pub mod cases {
 
     fn messages(rows: &[BodyRow]) -> Vec<Value> {
         rows.iter().map(|row| row.message.clone()).collect()
+    }
+
+    /// Every read that returns a record, by name: `load_run`, `load_head`, `claim_due`,
+    /// `open_run_for_conversation` and `list_runs`. The contract release makes them all answer the
+    /// same document (the current head, or the whole state when there is none).
+    async fn every_read(
+        store: &DynStore,
+        agent: &str,
+        conversation: &str,
+        run: RunId,
+    ) -> Vec<(&'static str, RunRecord)> {
+        let query = RunQuery::new(agent, ConversationScope::Exact(conversation.to_owned()), 10);
+        let listed = store.list_runs(&query).await.unwrap();
+        assert_eq!(listed.len(), 1, "the listing finds the run");
+        let claimed = store
+            .claim_due(
+                &[agent.to_owned()],
+                "testkit-head",
+                ClaimScope::Any,
+                &[],
+                adam_core::store::now(),
+                Duration::from_secs(30),
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1, "the run is due and unleased");
+        // Give the lease back: the case reads every document through more than one pass.
+        store.release_lease(run, "testkit-head").await.unwrap();
+        vec![
+            ("load_run", store.load_run(run).await.unwrap().unwrap()),
+            ("load_head", store.load_head(run).await.unwrap().unwrap()),
+            ("claim_due", claimed[0].run.clone()),
+            (
+                "open_run",
+                store
+                    .open_run_for_conversation(agent, conversation)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            ),
+            ("list_runs", listed[0].clone()),
+        ]
+    }
+
+    /// The contract release: every read serves the **current head** when the store has one, and
+    /// the head is the same document `load_head` answers.
+    pub async fn body_every_read_serves_the_current_head(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let conversation = format!("testkit-head-{}", Uuid::new_v4().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({"turn": 0})).conversation(conversation.clone()))
+            .await
+            .unwrap();
+        // Before the first split the run is v4: every read serves its whole state.
+        for (what, rec) in every_read(&store, &agent, &conversation, run.id).await {
+            assert_eq!(rec.state["turn"], 0, "{what} serves the v4 state");
+        }
+
+        let generation = Uuid::new_v4();
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, Value::Null)
+                    .head(head_doc(2))
+                    .body(rows(Some(generation), Uuid::new_v4(), &["one", "two"])),
+            )
+            .await
+            .unwrap();
+        let served = generation_of(&store.load_head(run.id).await.unwrap().unwrap().state);
+        for (what, rec) in every_read(&store, &agent, &conversation, run.id).await {
+            assert_eq!(rec.state["v"], 5, "{what} serves the head");
+            assert_eq!(rec.state["body"]["len"], 2, "{what}");
+            assert_eq!(generation_of(&rec.state), served, "{what}");
+            assert_eq!(
+                rec.state["agent"],
+                json!({}),
+                "{what}: the head's agent, not a whole state"
+            );
+        }
+    }
+
+    /// A head a commit did not rebuild (`head_version < version`, what a v4 process leaves in the
+    /// expand release) is stale: every read serves the whole state, and the body the head named is
+    /// still there for the next split to re-read.
+    pub async fn body_a_stale_head_serves_the_state(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let conversation = format!("testkit-stale-{}", Uuid::new_v4().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({"turn": 0})).conversation(conversation.clone()))
+            .await
+            .unwrap();
+        let generation = Uuid::new_v4();
+        let version = store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, Value::Null)
+                    .head(head_doc(2))
+                    .body(rows(Some(generation), Uuid::new_v4(), &["one", "two"])),
+            )
+            .await
+            .unwrap()
+            .version;
+        // A v4 commit: the whole state, no head. The head stays at the older version.
+        let state = json!({
+            "v": 1,
+            "agent": {"turn": 1},
+            "inbox": [], "seq": 0, "attempt": 0, "rev": 1,
+            "output": null, "error": null,
+        });
+        store
+            .commit_run(
+                run.id,
+                version,
+                RunUpdate::new(RunStatus::Runnable, state.clone()),
+            )
+            .await
+            .unwrap();
+        for (what, rec) in every_read(&store, &agent, &conversation, run.id).await {
+            assert_eq!(
+                rec.state, state,
+                "{what} serves the whole state, not the stale head"
+            );
+        }
+        assert_eq!(
+            messages(&store.body_list(run.id, generation).await.unwrap()),
+            vec![json!("one"), json!("two")],
+            "a v4 commit writes no rows: the generation the stale head named is intact"
+        );
+    }
+
+    /// A run a **pre-S3 process** failed is `state = null` (the tombstone), no head, and the version
+    /// bumped, so its head is behind the version: the head is the only readable document, and every
+    /// read serves it — the one-line repair, not a `Corrupt` run.
+    pub async fn body_a_tombstoned_run_with_a_stale_head_serves_the_head(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let conversation = format!("testkit-tombstone-{}", Uuid::new_v4().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({"turn": 0})).conversation(conversation.clone()))
+            .await
+            .unwrap();
+        let generation = Uuid::new_v4();
+        let version = store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, Value::Null)
+                    .head(head_doc(2))
+                    .body(rows(Some(generation), Uuid::new_v4(), &["one", "two"])),
+            )
+            .await
+            .unwrap()
+            .version;
+        // What a pre-S3 worker commits for a run it cannot decode: the tombstone, no head, Failed.
+        store
+            .commit_run(
+                run.id,
+                version,
+                RunUpdate::new(RunStatus::Failed, Value::Null),
+            )
+            .await
+            .unwrap();
+
+        let loaded = store.load_run(run.id).await.unwrap().unwrap();
+        assert_eq!(loaded.state["v"], 5, "the head is the run");
+        assert_eq!(generation_of(&loaded.state), generation);
+        assert_eq!(
+            store.load_head(run.id).await.unwrap().unwrap().state,
+            loaded.state,
+            "`load_head` agrees"
+        );
+        let query = RunQuery::new(&agent, ConversationScope::Exact(conversation), 10);
+        let listed = store.list_runs(&query).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, loaded.state, "and the listing");
+        assert_eq!(
+            messages(&store.body_list(run.id, generation).await.unwrap()),
+            vec![json!("one"), json!("two")],
+            "the body set the head names is intact"
+        );
+    }
+
+    /// A head that is JSON `null` is not a head, whatever `head_version` says: the state is served.
+    pub async fn body_a_head_that_is_json_null_is_not_a_head(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let conversation = format!("testkit-null-head-{}", Uuid::new_v4().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({"turn": 0})).conversation(conversation.clone()))
+            .await
+            .unwrap();
+        let state = json!({"turn": 1});
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, state.clone()).head(Value::Null),
+            )
+            .await
+            .unwrap();
+        for (what, rec) in every_read(&store, &agent, &conversation, run.id).await {
+            assert_eq!(
+                rec.state, state,
+                "{what} serves the state: a null head is not a head"
+            );
+        }
     }
 
     pub async fn blob_round_trip(store: DynStore) {
@@ -2111,6 +2377,143 @@ pub mod cases {
         assert_eq!(
             store.lease_until(run.id).await.unwrap(),
             Some(t2 + jiff::SignedDuration::from_secs(10))
+        );
+    }
+
+    /// `release_worker_leases(worker)` drops every run lease `worker` holds, so its runs are
+    /// claimable at once instead of after the TTL. It does not clear the owner: a released pinned run still
+    /// comes back only to the same worker.
+    pub async fn worker_leases_frees_the_workers_runs(store: DynStore) {
+        let agent = agent();
+        let mut mine = Vec::new();
+        for n in 0..2 {
+            mine.push(
+                store
+                    .create_run(NewRun::new(&agent, json!({ "n": n })))
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        mine.sort();
+        let t = now() + jiff::SignedDuration::from_secs(1);
+        let ttl = Duration::from_secs(30);
+        // A pinned claim sets the owner and leases both runs to w1.
+        let mut claimed = claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 10).await;
+        claimed.sort();
+        assert_eq!(claimed, mine);
+        let until = t + jiff::SignedDuration::from_secs(30);
+        for id in &mine {
+            assert_eq!(store.lease_until(*id).await.unwrap(), Some(until));
+        }
+
+        store.release_worker_leases("w1").await.unwrap();
+        for id in &mine {
+            assert_eq!(
+                store.lease_until(*id).await.unwrap(),
+                None,
+                "the worker's lease is gone"
+            );
+        }
+        // Claimable at once, not after the TTL: another worker's unpinned claim takes them.
+        let mut taken = claim_ids_as(&store, ClaimScope::Any, &agent, "w2", t, ttl, 10).await;
+        taken.sort();
+        assert_eq!(taken, mine, "a released run is claimable at once");
+        for id in &mine {
+            store.release_lease(*id, "w2").await.unwrap();
+        }
+        // The owner is still w1: w2's pinned claim is refused and w1's succeeds.
+        assert!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w2", t, ttl, 10)
+                .await
+                .is_empty(),
+            "the release did not clear the owner"
+        );
+        let mut back = claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 10).await;
+        back.sort();
+        assert_eq!(back, mine, "the owner still gets its runs");
+    }
+
+    /// `release_worker_leases` touches only the named worker's leases: another worker's run stays
+    /// leased, unclaimable and renewable.
+    pub async fn worker_leases_leaves_another_workers_lease_alone(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let t = now() + jiff::SignedDuration::from_secs(1);
+        let ttl = Duration::from_secs(30);
+        assert_eq!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 1).await,
+            vec![run.id]
+        );
+        let until = t + jiff::SignedDuration::from_secs(30);
+
+        store.release_worker_leases("w2").await.unwrap();
+        assert_eq!(
+            store.lease_until(run.id).await.unwrap(),
+            Some(until),
+            "w1's lease is untouched"
+        );
+        assert!(
+            claim_ids_as(&store, ClaimScope::Any, &agent, "w2", t, ttl, 1)
+                .await
+                .is_empty(),
+            "the run is still leased to w1"
+        );
+        assert!(
+            store
+                .renew_lease(run.id, "w1", t + jiff::SignedDuration::from_secs(1), ttl)
+                .await
+                .unwrap(),
+            "w1 still holds it"
+        );
+    }
+
+    /// The sweep keys on the **lease holder**, not the run's owner: a run owned by w1 whose lease w2
+    /// holds survives `release_worker_leases("w1")`. This is the state an implementation that
+    /// released by owner would break.
+    pub async fn worker_leases_leaves_a_lease_the_owner_does_not_hold(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let t = now() + jiff::SignedDuration::from_secs(1);
+        let ttl = Duration::from_secs(30);
+        // w1's pinned claim makes it the owner, and its lease holder.
+        assert_eq!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 1).await,
+            vec![run.id]
+        );
+        store.release_lease(run.id, "w1").await.unwrap();
+        // w2 takes the lease; the owner stays w1.
+        assert_eq!(
+            claim_ids_as(&store, ClaimScope::Any, &agent, "w2", t, ttl, 1).await,
+            vec![run.id]
+        );
+        let until = t + jiff::SignedDuration::from_secs(30);
+        assert_eq!(store.lease_until(run.id).await.unwrap(), Some(until));
+
+        store.release_worker_leases("w1").await.unwrap();
+        assert_eq!(
+            store.lease_until(run.id).await.unwrap(),
+            Some(until),
+            "the owner holds no lease: w2's is untouched"
+        );
+        assert!(
+            store
+                .renew_lease(run.id, "w2", t + jiff::SignedDuration::from_secs(1), ttl)
+                .await
+                .unwrap(),
+            "w2 still holds the lease"
+        );
+        assert!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 1)
+                .await
+                .is_empty(),
+            "w1 owns the run but does not hold the lease"
         );
     }
 

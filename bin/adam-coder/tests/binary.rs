@@ -2107,10 +2107,18 @@ async fn sigterm_mid_run_commits_the_in_flight_step() {
         mid.version,
         after.version
     );
+    // The contract release: `load_run` answers the head, and the transcript (the check's result)
+    // is the body generation the head names.
+    let head = store.load_head(run).await.unwrap().unwrap().state;
+    let generation = head["body"]["generation"]
+        .as_str()
+        .expect("the head names a generation");
+    let generation = uuid::Uuid::parse_str(generation).expect("a uuid");
+    let rows = store.body_list(run, generation).await.unwrap();
     assert!(
-        after.state.to_string().contains("check-done"),
-        "the check's result is in the run: {}",
-        after.state
+        rows.iter()
+            .any(|row| row.message.to_string().contains("check-done")),
+        "the check's result is in the run's transcript: {rows:?}"
     );
     assert_eq!(turns(&asked), 3, "no new turn after SIGTERM");
     assert!(
