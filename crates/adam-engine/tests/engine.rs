@@ -1356,7 +1356,8 @@ async fn the_hosts_retry_policy_governs_a_transient_failure() {
 }
 
 /// A folder's `commands/` are expanded in the engine as on the server surfaces (`commands/v1`,
-/// #276): `/greet Ada` reaches the model as the command's template, `commands()` lists it, and an
+/// #276): `/greet Ada Lovelace` reaches the model as the command's template with `$1` (not the
+/// whole argument line), `commands()` lists it, and an
 /// unknown `/name` reaches the model as typed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_folders_command_is_expanded() {
@@ -1387,7 +1388,7 @@ async fn a_folders_command_is_expanded() {
     );
 
     for (said, expected) in [
-        ("/greet Ada", "Say hello to Ada, warmly."),
+        ("/greet Ada Lovelace", "Say hello to Ada, warmly."),
         ("/wave Ada", "/wave Ada"),
     ] {
         let turn = engine.send(None, Say::new(said)).await.unwrap();
