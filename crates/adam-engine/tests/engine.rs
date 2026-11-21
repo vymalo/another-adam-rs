@@ -1971,6 +1971,7 @@ async fn the_hosts_session_limits_refuse_a_session_too_many() {
     assert_eq!(listed.len(), 1, "{listed:?}");
     assert_eq!(listed[0].conversation, first.conversation);
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
 
 // ------------------------------------------------------------------ S0: the lean first request
 
