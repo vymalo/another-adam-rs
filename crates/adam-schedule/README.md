@@ -7,7 +7,8 @@ needs), and runs them: the `adam.schedule` agent, and `reconcile`, which reads t
 
 **Built so far:** slice 3, the evaluation; slice 4, the scheduler agent and `reconcile`; slice 5, `reconcile_store`,
 and slice 6, `reconcile_until_stopped`, the worker component with which `adam-agent` and the coder run a folder's
-schedules. After a dev reload, a host reconciles with `adam_assembly::LiveAssembly::schedules()`.
+schedules; `adam-engine` calls `reconcile` once at `start`, before its worker. After a dev reload, a host reconciles
+with `adam_assembly::LiveAssembly::schedules()`.
 
 ## API at a glance
 

@@ -352,7 +352,7 @@ sequenceDiagram
   credential in a header, env value or URL is a warning (an error under `.strict()`).
 * **Schedules** ([ADR 0060](../decisions/0060-schedules-are-parked-runs.md)): exactly one of three keys, a
   non-empty body (the prompt of each run), and `timezone` (default `UTC`); they belong to the root agent. Read and
-  checked here; `adam-agent` and the coder run them (their READMEs, "schedules/"). A firing is the prompt as a person's message,
+  checked here; `adam-agent`, the coder and `adam-engine` run them (their READMEs, "schedules/"). A firing is the prompt as a person's message,
   sent to the agent directly: a `/command` in it is not expanded, and nobody answers it: a tool that asks the person
   (`ask_user`) is answered that nothing can be asked, and the model goes on, in the firing and in its subagents (the coder
   ends a firing that would wait, `Failed`). Write the prompt so that the agent need not ask.
