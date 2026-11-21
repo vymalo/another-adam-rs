@@ -82,6 +82,12 @@ amendment is the owner's to make there.
    A **remote** (`a2a:`) subagent takes `time_limit`, `max_rounds` and `instructions` (sent ahead of the first message, as
    text); every other option is refused in words: its loop is another system's. Tools the loop itself needs (`read_output`)
    are never removed by `tools` or `deny_tools`.
+
+   *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the deployment's declaration is
+   `MODEL_REASONING_EFFORT` (one value), and **unset declares the full closed list**; until `MODEL_ALIASES_FILE` carries
+   the facts per alias (slice 11), the declaration is the deployment's one model. The folder's `reasoning_effort` is a
+   **default within the declared set, not a bound**; a session or a request outside the declared set is refused.
+   `temperature` is unchanged.
 5. **Dropped, each for a reason.**
 
    | Candidate | Why not |
@@ -304,6 +310,8 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
 **12. `reasoning_effort` and `temperature`.** Depends on 11.
 * Files: `crates/adam-model/src/types.rs`, `crates/adam-model-openai/src/wire.rs`, `agent.rs`.
 * Accepted when: the declared values are sent and others refused; an alias that declares none refuses both.
+* *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort`, unset declares the full closed list (a deployment that
+  declares none accepts all four); `temperature` still refuses.
 
 ## What is put to the owner
 
