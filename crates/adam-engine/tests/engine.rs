@@ -1444,7 +1444,14 @@ async fn a_file_the_agent_hands_over_is_read_by_its_digest() {
         ..Default::default()
     }])
     .push_text("Here is the report.");
-    let model: DynModel = mock.clone();
+    // The first model call waits until the reader is subscribed, so its stream holds the file.
+    let gate = Arc::new(Gate::default());
+    let model: DynModel = Arc::new(GateModel {
+        inner: mock.clone(),
+        hold_on: Some(0),
+        calls: AtomicUsize::new(0),
+        gate: gate.clone(),
+    });
     let engine = Engine::builder(Arc::new(MemoryStore::new()), def, model, "m")
         .tools(ToolSet::new().tool(report))
         .start()
@@ -1452,7 +1459,9 @@ async fn a_file_the_agent_hands_over_is_read_by_its_digest() {
         .unwrap();
 
     let turn = engine.send(None, Say::new("Write it.")).await.unwrap();
+    gate.wait_reached().await;
     let mut events = engine.events(turn.run).await.unwrap();
+    gate.release.notify_one();
     let mut withheld = Vec::new();
     while let Some(event) = timeout(WAIT, events.next()).await.expect("an event") {
         if let EngineEvent::Live(event) = event.unwrap() {
