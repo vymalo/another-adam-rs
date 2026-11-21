@@ -30,6 +30,7 @@
 //! | `MODEL_OAUTH_CLIENT_ID` | with `MODEL_AUTH=device`: the public client the issuer knows the process as | required with `device` |
 //! | `MODEL_OAUTH_SCOPE` | with `MODEL_AUTH=device`: the scope asked for | `offline_access` |
 //! | `MODEL` | model alias of the agent | required for `all` and `worker` |
+//! | `MODEL_ALIASES_FILE` | the per-model profiles (ADR 0063, ADR 0064): **JSON only for now**, one object with `profiles` and `presets`; a file that cannot be read or does not parse is a startup error naming the file and the key ([`ModelConfig::profiles`]) | unset (no profile) |
 //! | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request, to make a gateway or a model emit its reasoning (`{"reasoning_effort":"medium"}`); **not secret**; an invalid value is a startup error ([`ModelConfig::extra_body`]) | unset (nothing added) |
 //! | `MODEL_ECHO_REASONING` | send the reasoning of earlier turns back, under this member name (`reasoning_content` or `reasoning`), for a provider that requires it (DeepSeek's thinking mode with tools); `false` or unset sends none ([`ModelConfig::echo_reasoning`]) | unset (never sent) |
 //! | `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; an invalid value is a startup error ([`ModelConfig::context_window`]) | unset (no `contextWindow`) |
@@ -76,7 +77,7 @@ use adam_a2a::CardSigner;
 use adam_a2a::push::PushPolicy;
 use adam_error::{Classify, ErrorClass};
 use adam_host::Role;
-use adam_model::{DynModel, ImageLimits, ImageOrigin, InputModalities};
+use adam_model::{DynModel, ImageLimits, ImageOrigin, InputModalities, ModelProfiles};
 use adam_model_openai::{
     OpenAiCompatible, OpenAiConfig, OpenAiConfigError, ReasoningField, endpoint_for_logs,
 };
@@ -685,6 +686,15 @@ pub struct ModelConfig {
     pub device_grant: Option<DeviceGrant>,
     /// `MODEL`: the model alias the gateway knows.
     pub alias: String,
+    /// `MODEL_ALIASES_FILE`: the file of per-model profiles (ADR 0063, ADR 0064), **JSON only for
+    /// now**. `None` when unset: no model has a profile, and nothing beyond the variables below
+    /// changes. Read and checked at startup; a file that cannot be read or does not parse is a
+    /// problem naming the file and the key.
+    pub model_aliases_file: Option<std::path::PathBuf>,
+    /// The profiles read from [`model_aliases_file`](Self::model_aliases_file), by model id; empty
+    /// when the file is unset. The client is not yet given them (the wire slice): they are parsed,
+    /// validated and exposed here.
+    pub profiles: ModelProfiles,
     /// `MODEL_EXTRA_BODY`: members merged into every request body (a flag that makes the model
     /// emit its reasoning). Not secret, and never a member the runtime owns (`model`, `messages`,
     /// `tools`, `tool_choice`, `stream`). `None` when unset or `{}`.
@@ -753,6 +763,12 @@ impl std::fmt::Debug for ModelConfig {
             .field("context_window", &self.context_window)
             .field("prompt_cache_key", &self.prompt_cache_key)
             .field("images", &self.images)
+            // The path and the models the file declares, never a profile's values.
+            .field("model_aliases_file", &self.model_aliases_file)
+            .field(
+                "profiles",
+                &self.profiles.profiles.keys().collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -788,11 +804,15 @@ impl ModelConfig {
                 String::new()
             }
         };
+        let model_aliases_file = parse_file(&get, "MODEL_ALIASES_FILE", problems);
+        let profiles = parse_profiles(model_aliases_file.as_deref(), problems);
         Self {
             base_url,
             api_key: SecretString::from(api_key),
             device_grant,
             alias,
+            model_aliases_file,
+            profiles,
             extra_body: parse_extra_body(&get("MODEL_EXTRA_BODY"), problems),
             echo_reasoning: parse_echo_reasoning(&get("MODEL_ECHO_REASONING"), problems),
             context_window: parse_context_window(&get("MODEL_CONTEXT_WINDOW"), problems),
@@ -1017,6 +1037,34 @@ fn parse_images(
         max_side: u32::try_from(max_side).unwrap_or(IMAGE_MAX_SIDE_DEFAULT),
         sources,
     })
+}
+
+/// `MODEL_ALIASES_FILE`: the per-model profiles (ADR 0063, ADR 0064), JSON only for now. Each
+/// problem names the file and the profile or preset and key it is about; an unreadable file is one
+/// problem, and an empty set is returned either way, so the rest of the configuration is still
+/// reported.
+fn parse_profiles(path: Option<&std::path::Path>, problems: &mut Vec<String>) -> ModelProfiles {
+    const NAME: &str = "MODEL_ALIASES_FILE";
+    let Some(path) = path else {
+        return ModelProfiles::default();
+    };
+    let shown = path.display().to_string();
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => {
+            problems.push(format!("{NAME} {shown:?} cannot be read: {}", e.kind()));
+            return ModelProfiles::default();
+        }
+    };
+    match ModelProfiles::parse_json(&text) {
+        Ok(profiles) => profiles,
+        Err(errors) => {
+            for error in errors {
+                problems.push(format!("{NAME} {shown:?}: {error}"));
+            }
+            ModelProfiles::default()
+        }
+    }
 }
 
 /// `MODEL_EXTRA_BODY`: a JSON object, or a problem. The message names what is wrong and never
@@ -1968,6 +2016,96 @@ mod tests {
         vars.insert("MODEL_ECHO_REASONING", "yes please");
         let (_, problems) = model_problems(&vars);
         assert!(mentions(&problems, "MODEL_ECHO_REASONING"), "{problems:?}");
+    }
+
+    #[test]
+    fn the_profiles_file_is_read_and_a_bad_one_names_the_file_and_the_key() {
+        let dir =
+            std::env::temp_dir().join(format!("adam-service-profiles-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("model-profiles.json");
+        // The test's `Vars` holds `&'static str`: leak this one path for the test's lifetime.
+        let shown: &'static str = Box::leak(file.display().to_string().into_boxed_str());
+        let run = |text: Option<&str>| {
+            let mut vars = model_vars();
+            if let Some(text) = text {
+                std::fs::write(&file, text).unwrap();
+                vars.insert("MODEL_ALIASES_FILE", shown);
+            }
+            model_problems(&vars)
+        };
+
+        // Unset (or blank): no file, no profile.
+        let (model, problems) = run(None);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(model.model_aliases_file, None);
+        assert!(model.profiles.is_empty());
+        let mut vars = model_vars();
+        vars.insert("MODEL_ALIASES_FILE", "  ");
+        let (model, problems) = model_problems(&vars);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(model.profiles.is_empty());
+
+        // The ADR 0064 example: read, validated, and the path and the keys (never a value) in `Debug`.
+        let good = r#"{
+            "presets": { "quick": { "reasoningEffort": "low" } },
+            "profiles": {
+                "large-coder": {
+                    "preset": "quick",
+                    "reasoningEfforts": ["low", "medium", "high", "max"],
+                    "reasoningWire": "reasoning_effort",
+                    "maxOutputTokensLimit": 131072,
+                    "contextWindow": 1000000
+                },
+                "small-chat": { "reasoningEfforts": [], "maxOutputTokensLimit": 65536 }
+            }
+        }"#;
+        let (model, problems) = run(Some(good));
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(model.model_aliases_file.as_deref(), Some(file.as_path()));
+        assert_eq!(model.profiles.profiles.len(), 2);
+        assert_eq!(
+            model
+                .profiles
+                .profile("large-coder")
+                .and_then(|p| p.reasoning_efforts.as_ref())
+                .map(Vec::len),
+            Some(4)
+        );
+        let debug = format!("{model:?}");
+        assert!(debug.contains(shown), "{debug}");
+        assert!(
+            debug.contains("large-coder") && debug.contains("small-chat"),
+            "{debug}"
+        );
+        assert!(!debug.contains("131072"), "{debug}");
+        // The client is untouched: the wire is the next slice.
+        model.client().expect("a usable client");
+
+        // An unknown level names the file, the profile and the key, and the run is refused.
+        let (model, problems) = run(Some(
+            r#"{"profiles": {"gpt-x": {"reasoningEfforts": ["ultra"], "reasoningWire": "reasoning_effort"}}}"#,
+        ));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("MODEL_ALIASES_FILE"),
+            "{problems:?}"
+        );
+        assert!(problems[0].contains(shown), "{problems:?}");
+        assert!(problems[0].contains("gpt-x"), "{problems:?}");
+        assert!(problems[0].contains("reasoningEfforts"), "{problems:?}");
+        assert!(model.profiles.is_empty(), "a refused file leaves nothing");
+
+        // A file that is not JSON, and a path that is not a file.
+        let (_, problems) = run(Some("{oops"));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("not valid JSON"), "{problems:?}");
+        let mut vars = model_vars();
+        vars.insert("MODEL_ALIASES_FILE", "/definitely/not/here.json");
+        let (model, problems) = model_problems(&vars);
+        assert!(mentions(&problems, "MODEL_ALIASES_FILE"), "{problems:?}");
+        assert!(model.profiles.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

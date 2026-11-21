@@ -436,3 +436,25 @@ environment when a worker starts, never values: SEARCH_MCP_TOKEN and CONTEXT7_AP
 {{- end -}}
 {{- toPrettyJson (dict "mcpServers" $servers) -}}
 {{- end -}}
+
+{{/*
+The per-model profiles (values `config.modelProfiles`, ADR 0063 and ADR 0064): one JSON file of profiles and presets,
+read at startup by the pods that run workers (MODEL_ALIASES_FILE). Unset (an empty map) renders nothing, so the goldens
+are unchanged. JSON only for now: the binary refuses a file that does not parse.
+*/}}
+{{- define "coder.modelProfiles" -}}
+{{- if and .Values.config.modelProfiles (include "coder.runsWorkers" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/* Name of the ConfigMap that holds the profiles file. */}}
+{{- define "coder.modelProfilesConfigMapName" -}}
+{{- printf "%s-model-profiles" (include "coder.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/* Where it is mounted, and MODEL_ALIASES_FILE. */}}
+{{- define "coder.modelProfilesFile" -}}/etc/adam/model-profiles.json{{- end -}}
+
+{{/* The file: the value as pretty JSON. */}}
+{{- define "coder.modelProfilesJson" -}}
+{{- toPrettyJson .Values.config.modelProfiles -}}
+{{- end -}}

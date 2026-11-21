@@ -24,6 +24,7 @@ the provider asked to wait, and the runtime owns backoff.
 | `ModelRequest`, `ModelResponse`, `ModelDelta` | request (`model`, `system`, `messages`, `tools`, `ToolChoice`, `max_output_tokens`, `temperature`, `metadata`, `prompt_cache_key`: a stable key per conversation, which the agent loop sets and a client may send; **new public field, breaks `ModelRequest` struct literals**: use `ModelRequest::new`), response and streamed chunks. `ModelDelta` is `#[non_exhaustive]` since `ToolCallComplete` (below): a `match` over it needs one more arm |
 | `Message`, `ContentPart`, `ToolCall`, `ToolSpec`, `Usage`, `FinishReason` | conversation and tool-calling types; all derive `Serialize`/`Deserialize` because a run persists its history. `ToolCall` has `new(id, name, arguments)`, `with_invalid_arguments(id, name, raw)` and `Default`; its `invalid_arguments: Option<String>` holds the raw argument text when it was not JSON (`arguments` is then `{}`). **Breaking:** a `ToolCall { id, name, arguments }` literal no longer compiles (use `ToolCall::new` or `..Default::default()`); the serialized form and the `ModelClient` trait are unchanged, and journals written before the field decode with `None` |
 | `ModelError` | `RateLimited { retry_after }`, `Transient`, `ContextLength`, `InvalidRequest`, `Auth`, `Protocol`; `#[non_exhaustive]`, see *Errors* |
+| `ReasoningEffort`, `ReasoningWire`, `ModelProfile`, `Preset`, `ModelProfiles` | the per-model profiles of `MODEL_ALIASES_FILE` (ADR 0063, ADR 0064), parsed and validated by `ModelProfiles::parse_json`; pure data, no file I/O (see [Per-model profiles](#per-model-profiles)) |
 | `Classify`, `ErrorClass` | re-exported from `adam-error`: `class()`, `is_retryable()`, `retry_after()` |
 | `ModelCredentials` (trait), `DynCredentials` | where the credentials of a model call come from, **asked for every call** ([ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)): `headers(CredentialRequest { method, url, attempt }) -> CredentialHeaders` and `rejected(call, &Rejection { status, www_authenticate, dpop_nonce }) -> AfterRejection` (`Retry` or `GiveUp`, the default). A host mints, renews or proves a credential at the moment of use (a token renewed from the person's session, a DPoP proof over the method and URL), or gives a header with no key at all (an injector's run tag). Its errors are its choice of class: `Auth` when the person must act, `Transient` when the issuer did not answer. `Arc<T>` forwards it |
 | `CredentialHeaders` | the headers of one call: `none()`, `bearer(&token)`, `.with(name, value)` (a later one of the same name replaces it, case-insensitive); values are `SecretString`, `Debug` shows the names only |
@@ -99,6 +100,32 @@ A message names an image by reference and never holds its bytes (ADR 0044).
 
 **Breaking** for code that builds or matches these types: `ContentPart` gains a variant, `Message::Tool` a field and `ModelRequest` a field (`..Default::default()` or `..` fixes a literal or a pattern); `ModelClient` gains a provided method, so no implementer breaks.
 
+## Per-model profiles
+
+`MODEL_ALIASES_FILE` (ADR 0063, ADR 0064) declares, for each model a deployment can call, whether it takes a
+reasoning setting, which levels it accepts, how they are sent, its output cap and the members merged into its
+requests only. The types live here; the file is read by the binary (`adam-service`'s `ModelConfig`), and nothing
+in this crate touches the file system.
+
+| Item | What |
+|---|---|
+| `ReasoningEffort` | `None`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max`, spelled `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Closed on purpose, `ALL` lowest first, exhaustive `as_str`/`FromStr`, serde lower case, `Ord` in that order. `none` is a real level (some models reason unless it is sent); **absent** sends nothing |
+| `ReasoningWire` | `ReasoningEffort` (`{"reasoning_effort": ...}`, the only one verified on the deployment's gateway), `ReasoningObject` (`{"reasoning": {"effort": ...}}`), `ThinkingBudget` (`{"thinking": {"type": "enabled", "budget_tokens": n}}`); serde snake case |
+| `ModelProfile` | serde camelCase, `Default`, unknown members ignored: `reasoning_efforts`, `reasoning_wire`, `reasoning_budgets`, `reasoning_effort`, `max_output_tokens`, `max_output_tokens_limit`, `extra_body`, `preset`. A profile with only a cap or only an extra body is valid |
+| `Preset`, `ModelProfiles` | a named bundle (`reasoning_effort`, `max_output_tokens`) and the document (`profiles` by model id, `presets` by name). `profile(id)`, `preset(name)`, `preset_of(id)` |
+| `ModelProfiles::parse_json(text)` | parse and validate, **JSON only for now** (the workspace has no YAML parser). `Err(Vec<String>)` lists every problem, each naming the profile (or preset) and the key, but not the file: the caller adds the path. A file with any problem is refused whole |
+
+The rules, all of them refusals at load: a level outside the vocabulary; an unknown wire; a duplicate level (the
+list is sorted lowest first); a budget for an undeclared level, a declared level with no budget, or a budget of
+`0`; an effort outside the model's levels (a profile's own, or a preset's); an unknown preset; efforts without a
+wire, a wire with no efforts, or budgets without `thinking_budget`; a cap of `0`, or above
+`maxOutputTokensLimit` (a preset's too); an `extra_body` member the runtime owns (`RESERVED_EXTRA_BODY_KEYS`:
+`model`, `messages`, `tools`, `tool_choice`, `stream`, `reasoning_effort`, `max_tokens`,
+`max_completion_tokens`). `reasoningEfforts: []` says the model takes no reasoning setting.
+
+Nothing here is applied to a request yet: the `ModelRequest` field, the wire and the cap are the following
+slices.
+
 ## Errors
 ## Errors
 
@@ -132,7 +159,9 @@ Doctests (the crate docs run as tests in CI's `cargo test --doc`) and unit
 tests in `src/error.rs` (`class_table`,
 `retry_after_comes_from_the_rate_limit_only`,
 `a_source_is_kept_and_printed_once`), `src/credentials.rs` (a fixed key and an empty one, giving up, `Debug` without values, a header replaced by name, the double's renewal), `src/mock.rs` and `src/types.rs` (the usage accounting:
-`a_part_above_its_total_is_added_in_and_one_within_it_is_left`, `usages_add_part_by_part_and_saturate`). No external
+`a_part_above_its_total_is_added_in_and_one_within_it_is_left`, `usages_add_part_by_part_and_saturate`), and
+`src/profiles.rs` (the seven levels and the three wires, the ADR 0064 example, and every refusal: an unknown level or
+wire, a duplicate, the budgets, the caps, the preset references, the reserved extra-body members). No external
 service, no environment variables. [`adam-model-openai`](../adam-model-openai/README.md)
 tests a real implementation against a mock HTTP server.
 

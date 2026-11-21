@@ -24,6 +24,7 @@ decision 11), so they start in any x86-64 Linux image whatever its C library. Th
 | `PersistentVolumeClaim` | `cache.create` only: `<release>-coder-cache`, ReadWriteMany, deleted with the release, see [The package cache](#the-package-cache) |
 | `ConfigMap`, `ServiceAccount`, `Role`, `RoleBinding`, `PriorityClass`, `ResourceQuota`, `ValidatingAdmissionPolicy` and its binding, a second `NetworkPolicy`, the egress proxy (a `Deployment`, a `Service`, a `PodDisruptionBudget`, a `ServiceAccount`, a `ConfigMap` and a third `NetworkPolicy`), and, in the coder pod, the `git-sandbox` container | `runPods.enabled` only, on the roles that run workers: a pod of its own for each active run, see [Run pods](#run-pods) |
 | `ConfigMap` | `mcp.websearch.url` set or `mcp.context7.enabled` only: `<release>-coder-mcp`, one file of extra MCP servers in the shape of `mcp.json`, mounted in the pods that run workers and named by `ADAM_EXTRA_MCP_FILE`, see [Extra MCP servers](#extra-mcp-servers-web-search-and-context7) |
+| `ConfigMap` | `config.modelProfiles` non-empty only: `<release>-coder-model-profiles`, the per-model profiles file (`model-profiles.json`, JSON only for now) mounted in the pods that run workers at `/etc/adam/model-profiles.json` and named by `MODEL_ALIASES_FILE`, see [Model profiles](#model-profiles) |
 
 ```sh
 helm lint deploy/coder
@@ -154,6 +155,38 @@ Each model call's `usage/v1` report can say the model's window, so a screen show
 |---|---|---|
 | `config.maxParallelToolCalls` | `MAX_PARALLEL_TOOL_CALLS` | The most tool calls of one model turn that run at the same time: a whole number from 1 to 32 (`1` is one at a time). `null` (default) renders nothing and the binary runs 10, **so the render of a deployment that does not set it is unchanged**. An agent file's `limits.max_parallel` may lower it for that agent. The chart refuses a value outside 1 to 32 and one given beside `config.extraEnv.MAX_PARALLEL_TOOL_CALLS`; a control plane renders none |
 | `config.modelContextWindow` | `MODEL_CONTEXT_WINDOW` | The window of `config.model`, in tokens: a whole number from 1 to 9007199254740991, as a number or a string of digits (written in full, never `1e+06`). The chart refuses anything else, which the binary would refuse at startup (exit 78), and a value given beside `config.extraEnv.MODEL_CONTEXT_WINDOW`. A subagent on another alias and OpenCode report no window |
+
+## Model profiles
+
+A deployment's models differ: one takes a reasoning level and another refuses the member, one has half the output
+limit of the next. `config.modelProfiles` is the file that says so, per model id (ADR 0063 and ADR 0064). Rendered
+only for the roles that run workers; empty by default (nothing is rendered, and the default render is byte for byte
+`tests/golden/combined.yaml`).
+
+| Value | Variable | What |
+|---|---|---|
+| `config.modelProfiles` | `MODEL_ALIASES_FILE` | The per-model profiles, a map rendered as **JSON only for now**: `presets` (by name: `reasoningEffort`, `maxOutputTokens`) and `profiles` (by model id: `reasoningEfforts`, `reasoningWire`, `reasoningBudgets`, `reasoningEffort`, `maxOutputTokens`, `maxOutputTokensLimit`, `extraBody`, `preset`). The chart refuses a value that is not a map (or whose `profiles`/`presets` is not one) and one given beside `config.extraEnv.MODEL_ALIASES_FILE`; the binary refuses a file that cannot be read or breaks a rule at startup (exit 78), naming the file and the key. The file is the deployment's: none is shipped in the chart or the image |
+
+```yaml
+config:
+  modelProfiles:
+    presets:
+      quick: { reasoningEffort: low }
+    profiles:
+      coder:
+        preset: quick
+        reasoningEfforts: [low, medium, high, max]
+        reasoningWire: reasoning_effort
+        maxOutputTokensLimit: 131072
+      small-chat:
+        reasoningEfforts: []
+        maxOutputTokensLimit: 65536
+        extraBody: { enable_thinking: false }
+```
+
+The chart writes it as JSON in a ConfigMap (`<release>-coder-model-profiles`, key `model-profiles.json`), mounts its `model-profiles.json` key at
+`/etc/adam/model-profiles.json` (by `subPath`) and sets `MODEL_ALIASES_FILE` to it; a changed map changes the pod template's
+`checksum/model-profiles`, so the pods roll. A key never belongs in a profile. Checks: `tests/render-check.sh`.
 
 ## Topology
 
