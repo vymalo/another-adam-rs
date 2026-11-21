@@ -134,17 +134,18 @@ host, and is the merge blocker.
    call by `usage/v1` (the struct is `#[non_exhaustive]`, so additive); the totals stay per
    provider+model.
 
-8. **The engine.** `Engine::builder()` takes the same profiles (`models(profiles)`, additive);
-   `Limits` keeps the run bounds and stays `Copy`. The session's, folder's, preset's or profile's value is
-   checked against the profile; the engine has no per-message extension, so the run's effort is the
-   session's, else the folder's, else the preset's, else the profile's, else nothing.
+8. **The engine.** `Engine::builder()` takes the same profiles (`models(profiles)`, additive) and the
+   agent's explicit value (`reasoning_effort(value)`, checked against the profile) for an embedded agent
+   with no folder — the platform's `agent.embedded` coder is this seat. `Limits` keeps the run bounds and
+   stays `Copy`. The engine has no per-message extension, so the run's effort is the session's, else the
+   folder's, else the builder's explicit value, else the preset's, else the profile's, else nothing.
 
 9. **The parity table.** The feature is not done until every surface has it through its own mechanism;
    the gaps are the issues linked from `docs/reference/parity.md`, whose reasoning row this ADR updates.
 
    | Surface | How it sets the effort, per model | State |
    |---|---|---|
-   | `adam-coder` | the profile for its model; the folder's `reasoning_effort`; `reasoning/v1` per message; the card lists the model's levels | to build (#284) |
+   | `adam-coder` | the profile for its model; the folder's `reasoning_effort`; the engine builder's explicit value when embedded; `reasoning/v1` per message; the card lists the model's levels | to build (#284) |
    | `adam-agent` (folder agents) | the same: the profile, the folder key, the extension, the card | to build (#284) |
    | `adam-engine` (embedded) | `Engine::builder().models(profiles)`; the session/folder/preset/profile value checked; no per-message extension | to build (#284) |
    | orchestrator and web | read `reasoning/v1` from the live card (never cached); send the level per message and store it per thread; the picker shows the card's levels | gap: #415 |
