@@ -507,10 +507,11 @@ pub(crate) const MAX_BODY_BYTES: usize = 16 << 20;
 /// Read a response body, refusing one over [`MAX_BODY_BYTES`] before it grows past it.
 async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>, ModelError> {
     let mut body = BoundedBody::new(MAX_BODY_BYTES);
-    if let Some(len) = response.content_length() {
-        if len > MAX_BODY_BYTES as u64 {
-            return Err(body.over());
-        }
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_BODY_BYTES as u64)
+    {
+        return Err(body.over());
     }
     while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
         body.push(&chunk)?;
