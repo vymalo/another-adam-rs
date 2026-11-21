@@ -26,6 +26,7 @@
 //! | `MODEL_BASE_URL` | OpenAI-compatible gateway, with its `/v1` prefix ([`ModelConfig`]) | required for `all` and `worker` |
 //! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required for `all` and `worker`, unless `MODEL_AUTH=device` or `injector` |
 //! | `MODEL_AUTH` | `key` (the token of `MODEL_API_KEY`), `device`: the process signs in to an OAuth 2.0 issuer with the device grant and renews its token (ADR 0058, [`ModelConfig::device_grant`]); the code and the link are a `WARN` log line at startup; or `injector`: no key, every model call carries `X-Run-Id: <root run id>` and no `Authorization`, for an injector in front of the model that adds the run's credential (ADR 0067, [`ModelConfig::injected_run`]). With `device` or `injector`, `MODEL_API_KEY` must be unset or empty | `key` |
+//! | `MODEL_PARK_LIMIT` | how long parks on a timer in a row may last, from the first, before the run fails with the last reason: a model call the gateway refused (or could not be reached, with `MODEL_AUTH=injector`) parks the run and is made again (ADR 0067, [`ModelConfig::park_limit`]). Whole seconds, or a number with `s`, `m`, `h` or `d` (`24h`), from 60 s to 30 d; anything else is a startup error | `24h` |
 //! | `MODEL_CA_FILE` | a PEM file of certificates trusted for the model endpoint, beside the default roots (ADR 0067, [`ModelConfig::ca_roots`]); not for the device grant's issuer. A file that cannot be read or holds no certificate is a startup error | unset (the default roots) |
 //! | `MODEL_OAUTH_ISSUER` | with `MODEL_AUTH=device`: the issuer, whose `/.well-known/openid-configuration` names the device and token endpoints (on its own origin); `https`, or `http` on a loopback address | required with `device` |
 //! | `MODEL_OAUTH_CLIENT_ID` | with `MODEL_AUTH=device`: the public client the issuer knows the process as | required with `device` |
@@ -692,6 +693,11 @@ pub struct ModelConfig {
     /// `MODEL_CA_FILE`: certificates trusted for the model endpoint beside the default roots, read
     /// and checked at startup. `None` when unset.
     pub ca_roots: Option<ExtraRoots>,
+    /// `MODEL_PARK_LIMIT`: how long parks on a timer in a row may last, from the first, before the
+    /// run fails with the last reason (ADR 0067; `adam_llm_agent::ModelParking::limit`). 24 hours
+    /// by default. A binary gives it to its agents with whether an unreachable endpoint parks,
+    /// which is [`injected_run`](Self::injected_run).
+    pub park_limit: Duration,
     /// `MODEL`: the model alias the gateway knows.
     pub alias: String,
     /// `MODEL_ALIASES_FILE`: the file of per-model profiles (ADR 0063, ADR 0064), **JSON only for
@@ -762,6 +768,7 @@ impl std::fmt::Debug for ModelConfig {
             .field("device_grant", &self.device_grant)
             .field("injected_run", &self.injected_run)
             .field("ca_roots", &self.ca_roots)
+            .field("park_limit", &self.park_limit)
             // The members, not their values.
             .field(
                 "extra_body",
@@ -840,6 +847,7 @@ impl ModelConfig {
             device_grant,
             injected_run,
             ca_roots: parse_ca_file(&get, problems),
+            park_limit: parse_park_limit(&get("MODEL_PARK_LIMIT"), problems),
             alias,
             model_aliases_file,
             profiles,
@@ -1183,6 +1191,43 @@ fn parse_context_window(raw: &Option<String>, problems: &mut Vec<String>) -> Opt
             None
         }
     }
+}
+
+/// The default of `MODEL_PARK_LIMIT`: 24 hours.
+const MODEL_PARK_LIMIT_DEFAULT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The range of `MODEL_PARK_LIMIT`: a minute to thirty days.
+const MODEL_PARK_LIMIT_RANGE: std::ops::RangeInclusive<Duration> =
+    Duration::from_secs(60)..=Duration::from_secs(30 * 24 * 60 * 60);
+
+/// `MODEL_PARK_LIMIT`: whole seconds, or a whole number with `s`, `m`, `h` or `d`, within
+/// [`MODEL_PARK_LIMIT_RANGE`].
+fn parse_park_limit(raw: &Option<String>, problems: &mut Vec<String>) -> Duration {
+    let Some(raw) = raw.as_deref().map(str::trim) else {
+        return MODEL_PARK_LIMIT_DEFAULT;
+    };
+    let (digits, unit) = match raw.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => raw.split_at(at),
+        None => (raw, "s"),
+    };
+    let scale = match unit {
+        "s" => Some(1),
+        "m" => Some(60),
+        "h" => Some(3600),
+        "d" => Some(86_400),
+        _ => None,
+    };
+    let limit = scale
+        .zip(digits.parse::<u64>().ok())
+        .and_then(|(scale, n)| n.checked_mul(scale))
+        .map(Duration::from_secs)
+        .filter(|limit| MODEL_PARK_LIMIT_RANGE.contains(limit));
+    limit.unwrap_or_else(|| {
+        problems.push(
+            "MODEL_PARK_LIMIT must be whole seconds or a whole number with `s`, `m`, `h` or `d`, from 60s to 30d, like 24h".into(),
+        );
+        MODEL_PARK_LIMIT_DEFAULT
+    })
 }
 
 /// `MODEL_ECHO_REASONING`: `reasoning_content`, `reasoning`, or off (`false`, `off`, `no`, `0`).
@@ -2419,6 +2464,45 @@ mod tests {
             model_problems(&vars).1.is_empty(),
             "loopback http is allowed"
         );
+    }
+
+    #[test]
+    fn model_park_limit_is_a_day_by_default_and_a_minute_to_thirty_days() {
+        let mut vars = model_vars();
+        assert_eq!(
+            model_problems(&vars).0.park_limit,
+            Duration::from_secs(86_400)
+        );
+        for (raw, secs) in [
+            ("3600", 3600),
+            ("90m", 5400),
+            ("2h", 7200),
+            ("60s", 60),
+            ("30d", 30 * 86_400),
+            (" 12h ", 43_200),
+        ] {
+            vars.insert("MODEL_PARK_LIMIT", raw);
+            let (model, problems) = model_problems(&vars);
+            assert!(problems.is_empty(), "{raw}: {problems:?}");
+            assert_eq!(model.park_limit, Duration::from_secs(secs), "{raw}");
+        }
+        for bad in [
+            "59",
+            "31d",
+            "0",
+            "1w",
+            "-5m",
+            "h",
+            "1.5h",
+            "24 h",
+            "99999999999999999999d",
+        ] {
+            vars.insert("MODEL_PARK_LIMIT", bad);
+            assert!(
+                mentions(&model_problems(&vars).1, "MODEL_PARK_LIMIT"),
+                "{bad} is refused"
+            );
+        }
     }
 
     #[test]

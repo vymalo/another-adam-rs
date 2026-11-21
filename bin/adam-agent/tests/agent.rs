@@ -70,6 +70,7 @@ fn worker(model: DynModel, mcp: McpPolicy) -> WorkerParts<'static> {
         options: options(),
         step_io: adam_llm_agent::StepIo::default(),
         max_parallel: 10,
+        parking: adam_llm_agent::ModelParking::default(),
     }
 }
 
@@ -1630,6 +1631,7 @@ async fn each_failure_maps_to_the_exit_code_of_its_cause() {
         device_grant: None,
         injected_run: false,
         ca_roots: None,
+        park_limit: std::time::Duration::from_secs(24 * 60 * 60),
         alias: "m".into(),
         model_aliases_file: None,
         profiles: Default::default(),
