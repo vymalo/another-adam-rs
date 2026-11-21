@@ -389,14 +389,11 @@ impl BoundDef {
             ))
         } else if let Some(effort) = profile.and_then(|p| p.reasoning_effort) {
             Some((effort, EffortSource::Profile))
-        } else if let Some(effort) = self
-            .profiles
-            .preset_of(alias)
-            .and_then(|p| p.reasoning_effort)
-        {
-            Some((effort, EffortSource::Profile))
         } else {
-            None
+            self.profiles
+                .preset_of(alias)
+                .and_then(|p| p.reasoning_effort)
+                .map(|effort| (effort, EffortSource::Profile))
         };
         let Some((effort, set_by)) = chosen else {
             return Ok(None);

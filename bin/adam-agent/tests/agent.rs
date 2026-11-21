@@ -2233,9 +2233,9 @@ async fn the_deployments_model_profiles_reach_the_agents_request_and_refuse_a_ba
     parts.profiles = profiles(r#"["low", "high"]"#);
     let agents = build(def_of(&folder), None, Some(parts)).await.unwrap();
     let service = service_over(agents, &store());
-    let worker = Worker::start(&service);
+    let started = Worker::start(&service);
     ask(&service, "hi").await;
-    worker.stop().await;
+    started.stop().await;
     assert_eq!(
         mock.requests()[0].reasoning_effort,
         Some(ReasoningEffort::High),
