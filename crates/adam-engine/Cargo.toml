@@ -35,12 +35,14 @@ uuid.workspace = true
 # embedded check (normal dependencies) never sees them.
 [dev-dependencies]
 adam-model-openai.workspace = true
-# The durable store of the resume proof (`tests/resume_process.rs`): a dev-dependency, so the embedded
-# check (normal dependencies) never sees SQLite; the application brings the store it chooses.
-adam-store-sqlite.workspace = true
 secrecy.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread", "time"] }
+
+# The durable store of the resume proof (`tests/resume_process.rs`, Unix only, as the store's `flock`
+# is): a dev-dependency, so the embedded check (normal dependencies) never sees SQLite.
+[target.'cfg(unix)'.dev-dependencies]
+adam-store-sqlite.workspace = true
 
 [lints]
 workspace = true

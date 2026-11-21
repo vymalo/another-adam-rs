@@ -11,9 +11,11 @@
 //! * the engine's default, a random id ([`Limits::worker_id`] `None`): the SQLite store's lock on the
 //!   file is the process's, so the killed child's is gone, and its `migrate` clears every lease it
 //!   finds, since the lock proves no other process is alive;
-//! * a fixed id, [`WORKER`], in both halves: the parent's `start` also releases the leases that id
-//!   holds (`Store::release_worker_leases`). The promise a fixed id makes holds: the child is dead
-//!   before the parent opens the store, and the store is this test's alone.
+//! * a fixed id, [`WORKER`], in both halves, which checks the two work together: the parent's `start`
+//!   also releases the leases that id holds (`Store::release_worker_leases`), after the clearing, so
+//!   this run does not prove the release alone (`a_restarted_engine_claims_its_old_runs_at_once` in
+//!   `tests/engine.rs` does). The promise a fixed id makes holds: the child is dead before the parent
+//!   opens the store, and the store is this test's alone.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 

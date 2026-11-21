@@ -65,8 +65,8 @@ releases nothing, so engines that share a store never take each other's leases, 
 in any process, uses `id` on this store**, and `start` releases every lease `id` holds (`Store::release_worker_leases`)
 before the worker starts, so those runs are claimed at once (a store that does not implement the release, whose
 default does nothing, still waits). Set an id only for a store no other engine shares, such as a store per install.
-The SQLite store needs none: its lock allows one process per file, and opening the file clears every lease the
-last process held, so a restart claims its runs at once with the default too. A
+The SQLite store needs none: its lock allows one process per file, and `start` clears every lease the file holds,
+so a restart claims its runs at once with the default too (one engine per file, above). A
 broken promise steps a run twice, its tools included: the release takes the other engine's leases, and both renew
 under the same id.
 
@@ -85,7 +85,10 @@ context; a send to one names its latest run in `referenceTaskIds`, which the bac
 
 **A killed process resumes its run** on the SQLite store: the next process to open the file finishes it, without
 running a committed step again (`tests/resume_process.rs`, below). With SQLite no fixed `worker_id` is needed: the
-store's lock on the file proves the killed process is gone, and opening it clears every lease the file holds.
+store's lock on the file proves the killed process is gone, and `start` (the store's `migrate`) clears every lease the
+file holds. So run **one engine per SQLite file**: that clearing takes the leases of a live engine of the same process
+too, and a second engine on the file, or an in-process restart without `shutdown`, would step the first one's runs
+again.
 
 **Not yet**: a way to read a file artifact's bytes (`RunInfo` carries no artifacts yet, and an event carries none, below). The backend is
 given the engine's ring too, and its A2A streaming path (`TaskBackend::subscribe`) builds a file part from a live
@@ -278,8 +281,9 @@ whose model blocks once the run's first step (a `plan_work` call) is committed a
 it with `SIGKILL`, opens the same store, and its engine finishes the run. The child's lease is an hour, so the parent
 finishes in time only because the lease is let go when it opens the store. It runs twice: with the engine's default,
 a random worker id, where the store's `migrate` clears the dead process's leases (its file lock proves the process is
-gone); and with the fixed id `resume-test` in both halves (`ADAM_ENGINE_TEST_RESUME_FIXED_ID`), where `start` releases
-that id's leases too. Each time the parent's model, scripted for the next step only, is called once, and its request
+gone); and with the fixed id `resume-test` in both halves (`ADAM_ENGINE_TEST_RESUME_FIXED_ID`), which checks the two
+work together (the clearing runs first, so this run does not prove the release itself:
+`a_restarted_engine_claims_its_old_runs_at_once` does). Each time the parent's model, scripted for the next step only, is called once, and its request
 holds the tool's result once and ends with it, which fails if the committed step was lost.
 
 In `src/`: `a_name_the_environment_has_is_refused_by_the_engines_default` (slice 2's proof),

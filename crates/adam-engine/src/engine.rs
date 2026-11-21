@@ -61,8 +61,9 @@ pub struct Limits {
     ///   this store.** `start` then releases every lease `id` holds
     ///   (`Store::release_worker_leases`), so the runs the last process was stepping are claimed at
     ///   once. Set one only for a store no other engine shares, such as a store per install. The
-    ///   SQLite store needs none: its lock allows one process per file, and opening the file clears
-    ///   the last process's leases.
+    ///   SQLite store needs none: its lock allows one process per file, and `start` (its `migrate`)
+    ///   clears every lease the file holds. Run one engine per SQLite file: the clearing takes a live
+    ///   engine's leases of the same process too.
     ///   Broken, the promise costs a run stepped twice, its tools run twice: the release takes the
     ///   leases of the runs the other engine is stepping, and both renew under the same id.
     ///
