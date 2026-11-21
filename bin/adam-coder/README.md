@@ -2176,7 +2176,7 @@ way; every problem is reported at once at startup):
 | Variable | Meaning | Default |
 |---|---|---|
 | `ROLE` | what this process runs: `all`, `control-plane` or `worker` (see [Roles](#roles)) | `all` |
-| `DATABASE_URL` | Postgres for the run store | required |
+| `DATABASE_URL` | the run store: `postgres://`/`postgresql://`, `mongodb://`/`mongodb+srv://` or `sqlite://<path>` (one file, one process, `ROLE=all` only) | required |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required by `all` and `control-plane` |
 | `LISTEN_ADDR` | bind address: the A2A server, or a worker's `/healthz` listener | `0.0.0.0:8080` |

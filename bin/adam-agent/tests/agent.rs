@@ -1639,9 +1639,10 @@ async fn each_failure_maps_to_the_exit_code_of_its_cause() {
     assert_eq!(error.to_string(), "building the model client");
 
     // The service: Postgres gone is 69, a taken port 71, a component that stopped 70.
-    let down = ServeError::Connect(adam_core::StoreError::unavailable(std::io::Error::other(
-        "refused",
-    )));
+    let down = ServeError::Connect {
+        backend: "Postgres",
+        source: adam_core::StoreError::unavailable(std::io::Error::other("refused")),
+    };
     assert_eq!(exit_code(&AgentError::Serve(down)), 69);
     let bind = ServeError::Bind {
         addr: "127.0.0.1:1".parse().unwrap(),

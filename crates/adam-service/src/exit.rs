@@ -8,7 +8,7 @@
 //! | Code | Name | Root cause |
 //! |---|---|---|
 //! | 0 | | clean shutdown after a signal (not an error) |
-//! | 78 | `EX_CONFIG` | [`ConfigError`], `OpenAiConfigError`, [`ServeError::NoCard`], [`ServeError::ChildSessions`] (a helper of `child-sessions/v1` that is not registered), [`ServeError::Push`] (push notifications are on and cannot be set up), or any error whose class is `Invalid` (a mistake in the agent's files, for the errors a binary classifies with [`exit_code_with`]) |
+//! | 78 | `EX_CONFIG` | [`ConfigError`], `OpenAiConfigError`, [`ServeError::NoCard`], [`ServeError::ChildSessions`] (a helper of `child-sessions/v1` that is not registered), [`ServeError::Push`] (push notifications are on and cannot be set up), [`ServeError::UnsupportedScheme`], [`ServeError::StoreNotBuilt`], [`ServeError::SqliteWithoutPath`], [`ServeError::SplitRoleOnSqlite`], or any error whose class is `Invalid` (a mistake in the agent's files, for the errors a binary classifies with [`exit_code_with`]) |
 //! | 69 | `EX_UNAVAILABLE` | a dependency is unreachable: a `Transient`, `RateLimited` or `Conflict` error, such as Postgres or an MCP server |
 //! | 71 | `EX_OSERR` | an [`std::io::Error`], and [`ServeError::Bind`]: a listener that cannot bind, a directory that cannot be created |
 //! | 70 | `EX_SOFTWARE` | [`HostError`] (a component of the process stopped, panicked or ended while still needed), a panicked task, or a `Corrupt` or `Internal` error |
@@ -83,9 +83,13 @@ fn code_of(
             ServeError::NoCard | ServeError::ChildSessions { .. } | ServeError::Push(_) => {
                 return Some(EX_CONFIG);
             }
+            ServeError::StoreNotBuilt { .. }
+            | ServeError::UnsupportedScheme { .. }
+            | ServeError::SqliteWithoutPath
+            | ServeError::SplitRoleOnSqlite { .. } => return Some(EX_CONFIG),
             ServeError::Bind { .. } | ServeError::LocalAddr(_) => return Some(EX_OSERR),
             // The cause, next in the chain, says why.
-            ServeError::Connect(_) | ServeError::Migrate(_) => {}
+            ServeError::Connect { .. } | ServeError::Migrate(_) => {}
         }
     }
     if let Some(class) = classify(cause).or_else(|| class_of(cause)) {
@@ -174,7 +178,10 @@ mod tests {
         // Postgres refusing connections: an io::Error at the bottom, but the StoreError above it
         // is what says "unreachable", and the walk goes from the outside in.
         let io = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-        let e = ServeError::Connect(StoreError::unavailable(io));
+        let e = ServeError::Connect {
+            backend: "Postgres",
+            source: StoreError::unavailable(io),
+        };
         assert_eq!(coded(layered("starting", e)), 69);
         let io = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
         assert_eq!(coded(ServeError::Migrate(StoreError::unavailable(io))), 69);
