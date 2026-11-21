@@ -3,6 +3,7 @@
 //
 //   bench config            check the configuration and print what may be shown of it
 //   bench report            build report.md from the ledger
+//   bench review            the blind quality review of every Done run's patch (spends money, within the cap)
 //   bench tasks <fetch|mine|lint|build|check|select>   task sources and the environment check
 //   bench doctor [--start]  what the machine must have, and whether the coder starts in each selected task image
 //   bench dry-run [--phase P] [--down]   the whole path on a scripted model, no money (needs a container runtime)
@@ -20,6 +21,8 @@ import { fetchPinnedBinary } from '../lib/npm.mjs';
 import { LedgerError, readLedger } from '../lib/ledger.mjs';
 import { PINS } from '../lib/pins.mjs';
 import { ReportError, buildReport } from '../lib/report.mjs';
+import { readReviews, reviewRuns } from '../lib/review.mjs';
+import { foldRecords } from '../lib/ledger.mjs';
 import { Stack } from '../lib/stack.mjs';
 import { runCli, loadSelected } from '../lib/run-cli.mjs';
 import { paths, runTasks } from '../lib/tasks-cli.mjs';
@@ -29,6 +32,7 @@ const USAGE = `usage: bench <command>
   config                          check the configuration; print what may be shown of it
   report [--ledger FILE] [--out FILE] [--show-model-id]
                                   build the report from the ledger (default $BENCH_HOME/report.md)
+  review                          score every Done run's patch with one blind reviewer and rubric ($BENCH_HOME/reviews.jsonl)
   tasks fetch|mine|lint|build|check|select
                                   task sources, the environment check and selection (bench tasks --help)
   doctor [--start] [--keep-images]
@@ -72,10 +76,42 @@ function report(argv, env) {
   } else if (opts.showModelId) {
     throw new ConfigError('--show-model-id', 'needs the configuration, which holds the model id');
   }
+  opts.reviews = readReviews(home);
   fs.mkdirSync(path.dirname(outFile), { recursive: true });
   fs.writeFileSync(outFile, buildReport(records, opts));
   process.stdout.write(`${outFile}\n`);
   return 0;
+}
+
+async function reviewCommand(argv, env) {
+  parseArgs({ args: argv, options: {}, allowPositionals: false });
+  const home = benchHome(env);
+  assertOutsideRepo(home, 'BENCH_HOME');
+  const config = loadConfig({ env });
+  const key = env[config.keyEnv];
+  if (!key) throw new ConfigError(config.keyEnv, 'the key is not set in the environment');
+  const { records } = readLedger(path.join(home, 'ledger.jsonl'));
+  const runs = [...foldRecords(records).values()];
+  const statements = new Map();
+  try {
+    for (const t of loadSelected(config, paths(env)).tasks) statements.set(t.id, t.instruction);
+  } catch (e) {
+    process.stderr.write(`bench: warning: the task statements could not be read (${e.message}); the reviewer gets none\n`);
+  }
+  const patchOf = (v) => {
+    const file = path.join(home, 'runs', `${v.run}-a${v.attempt}`, 'model.patch');
+    return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+  };
+  const spentMicro = runs.reduce((s, v) => s + v.spentMicro, 0) + readReviews(home).reduce((s, r) => s + (r.costMicro ?? 0), 0);
+  const send = async (body) => {
+    const res = await fetch(`${config.endpoint.replace(/\/$/, '')}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` }, body: JSON.stringify(body), signal: AbortSignal.timeout(600_000) });
+    if (!res.ok) throw new Error(`the endpoint answered ${res.status}`);
+    return res.json();
+  };
+  const r = await reviewRuns({ runs, statementOf: (id) => statements.get(id), patchOf, send, config, home, budgetMicro: config.capMicro - spentMicro, out: (l) => process.stdout.write(`${l}\n`) });
+  process.stdout.write(`review: ${r.reviewed} reviewed, ${r.skipped} skipped, ${r.failed.length} failed, $${(r.spentMicro / 1e6).toFixed(4)} spent\n`);
+  for (const f of r.failed) process.stdout.write(`  ${f.run}: ${f.error}\n`);
+  return r.failed.length > 0 ? 1 : 0;
 }
 
 async function doctorCommand(argv, env) {
@@ -123,6 +159,7 @@ export async function main(argv, env = process.env) {
       return 0;
     }
     if (command === 'report') return report(rest, env);
+    if (command === 'review') return await reviewCommand(rest, env);
     if (command === 'doctor') return await doctorCommand(rest, env);
     if (command === 'dry-run') return await dryRunCommand(rest, env);
     if (['pilot', 'confirm', 'run', 'regrade'].includes(command)) return await runCli(command, rest, { env });

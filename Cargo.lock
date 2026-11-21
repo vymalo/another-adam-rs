@@ -453,6 +453,8 @@ dependencies = [
  "adam-model",
  "adam-model-openai",
  "adam-runtime",
+ "adam-schedule",
+ "adam-store-sqlite",
  "adam-ui",
  "async-trait",
  "futures",
@@ -461,6 +463,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
