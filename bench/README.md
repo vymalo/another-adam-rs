@@ -478,7 +478,7 @@ them equal.
 
 | Pin | Value | |
 |---|---|---|
-| coder image | `ghcr.io/vymalo/another-adam-rs/coder:sha-e46c8f4@sha256:60b2…5744`, revision `e46c8f405b68…` | *verified 2026-11-19*: the digest by an anonymous manifest request to `ghcr.io` for the tag the `coder` workflow pushed for main `e46c8f4`, the revision from the image's `org.opencontainers.image.revision` label |
+| coder image | `ghcr.io/vymalo/another-adam-rs/coder:sha-35af9f4@sha256:7b4c…3bd4`, revision `35af9f40eaeb…` | *verified 2026-11-21*: the digest by an anonymous manifest request to `ghcr.io` for the tag the `coder` workflow pushed for main `35af9f4` (an anonymous `docker pull` of it works), the revision from the image's `org.opencontainers.image.revision` label; it has adam#273 (a turn cut while thinking is continued) |
 | OpenCode V2 | `@opencode/cli` 2.3.0, platform package `@opencode/cli-linux-x64`, integrity `sha512-8T3K…FFg==` | *verified 2026-11-17* on `registry.npmjs.org`: the newest 2.x at least three days old (2.3.0 was published 2026-11-13, the platform package at 08:43 UTC, `@opencode/cli` at 08:54); the integrity is of the exact tarball that is mounted and was computed again from the download; the tarball holds `package/bin/opencode`, a 250 MB native executable (`@opencode/cli` itself has only a `postinstall` that picks a platform package and a launcher; nothing is installed at run time) |
 
 |  | adam-coder | OpenCode |
@@ -641,7 +641,7 @@ sequenceDiagram
 ## Agent variants
 
 Decided by the owner on 2026-11-20. The configuration's `agents` lists the cells to run (default `adam` and `opencode`, the
-two of ADR 0048); each runs in every arm. `lib/variants.mjs` defines them:
+two of ADR 0048); each runs in every arm. One agent is allowed, for a run that compares models or arms, not agents. `lib/variants.mjs` defines them:
 
 | Variant | Driver | What it is given |
 |---|---|---|
@@ -747,7 +747,7 @@ renamed like `read_file`.
 | how-8-pull-request | rewritten | 8. **Open the pull request** with `open_pull_request`: a clear title, and a body with a summary of what changed and why, and a verification section that lists the exact commands you ran and their result. Never claim a check passed that you did not run. (in a later revision: 8. **Open the pull request in the same call**: pass `pull_request` to `commit_and_push`: a `title`, and a `body` with a summary and a verification section (the commands you ran and their result). Never claim a check passed that you did not run; `open_pull_request` opens it on its own.) | 8. **Report.** In your final answer, summarise what changed and why, and list the exact commands you ran and their result. Never claim a check passed that you did not run. |
 | how-9-finish | rewritten | telling the person the pull request URL and what you verified. | telling the person what you changed and what you verified. |
 | toolchain-which-tools | rewritten | When `run_checks`, `run` or `run_command` says the workspace has no `mvn` | When a command says the workspace has no `mvn` |
-| toolchain-result-says | dropped | The result says whether the tool has to be added to the repository's devcontainer or the repository has none. | (nothing) |
+| toolchain-result-says | dropped | The result says which environment lacks the tool and how the tool gets there. (before pin `35af9f4`: The result says whether the tool has to be added to the repository's devcontainer or the repository has none.) | (nothing) |
 | toolchain-ask | rewritten | Tell the person which toolchain is missing and what you needed it for, with `ask_user`, and wait for their answer. | Say which toolchain is missing and what you needed it for in your final answer. Nobody can answer questions in this run. |
 | toolchain-install | rewritten | with `run` only (`run_checks` is for the project's real checks: an install that passes is not a check of the code, and running it would only spend a cycle or pass the gate on nothing) | with `shell` (an install that passes is not a check of the code) |
 | ending-pull-request | rewritten | - **You opened the pull request.** Tell the person its URL and what you verified. The run is then complete. | - **You made the change.** Tell the person what you changed and what you verified. The run is then complete. |
