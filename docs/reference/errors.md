@@ -221,7 +221,8 @@ Where each decision is made:
 * **Retry** is in `adam-runtime` (`worker.rs`). The model, workspace and ACP
   errors reach it through the agent: a retryable one becomes
   `AgentError::Transient` (directly in `LlmAgent` for a model error, or through
-  `ToolError::Transient` for a tool), carrying its `retry_after`. Anything else
+  `ToolError::Transient` or `ToolError::Retryable` for a tool), carrying its class and its `retry_after`, and,
+  for a tool with a policy, that policy under the key `tool:<name>`. Anything else
   fails the call. In the coder, a permanent tool failure is an error result
   the model sees, and the run goes on.
 * **Conflict** retries at once and is bounded: the runtime's commit, deliver,

@@ -16,7 +16,9 @@ use crate::typed::IntoToolOutput;
 
 pub use crate::schema::spec_for;
 pub use crate::typed::{IntoToolResult, parse_args};
+pub use adam_error::ErrorClass;
 pub use adam_model::ToolSpec;
+pub use adam_runtime::{RetryClasses, RetryPolicy};
 pub use async_trait::async_trait;
 pub use schemars;
 pub use serde;

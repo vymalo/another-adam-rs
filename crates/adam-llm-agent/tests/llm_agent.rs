@@ -890,6 +890,101 @@ async fn transient_tool_error_retries_the_step() {
     );
 }
 
+/// A tool with a retry policy of its own (ADR 0061).
+struct Patient<T>(T, RetryPolicy);
+
+#[async_trait]
+impl<T: Tool> Tool for Patient<T> {
+    fn spec(&self) -> ToolSpec {
+        self.0.spec()
+    }
+    fn retry_policy(&self) -> Option<RetryPolicy> {
+        Some(self.1)
+    }
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        self.0.call(ctx, args).await
+    }
+}
+
+/// A tool that always fails with a rate limit, counting its calls.
+fn rate_limited(calls: &Arc<AtomicUsize>) -> impl Tool {
+    let calls = calls.clone();
+    fn_tool("busy", move |_ctx, _| {
+        calls.fetch_add(1, SeqCst);
+        Err(ToolError::retryable(
+            "slow down",
+            adam_error::ErrorClass::RateLimited,
+        ))
+    })
+}
+
+fn quick(attempts: u32) -> RetryPolicy {
+    RetryPolicy::new(attempts).with_backoff(Duration::from_millis(5), Duration::from_millis(5))
+}
+
+/// A tool's own policy decides its retries, counted under `tool:<name>`, and a policy set for it
+/// by name wins over it.
+#[tokio::test]
+async fn a_tools_policy_decides_its_retries_and_one_set_by_name_wins() {
+    for (by_name, attempts) in [(None, 2), (Some(quick(1)), 1)] {
+        let h = Harness::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = h.agent().tool(Patient(rate_limited(&calls), quick(2)));
+        if let Some(policy) = by_name {
+            builder = builder.tool_retry("busy", policy);
+        }
+        let agent = builder.build();
+        for _ in 0..attempts {
+            h.mock.push_tool_calls(vec![call("c1", "busy", json!({}))]);
+        }
+        let rt = h.runtime_with(&agent, "w", |b| b.retry(quick(9)));
+        let run = rt
+            .start("llm", user_message("go"), None)
+            .await
+            .expect("start");
+        let worker = spawn_worker(&rt);
+        let view = wait_failed(&rt, run).await;
+        worker.stop().await;
+        let error = view.error.expect("error");
+        assert!(
+            error.contains(&format!("gave up after {attempts} attempts of `tool:busy`"))
+                && error.contains("slow down"),
+            "{error}"
+        );
+        assert_eq!(calls.load(SeqCst), attempts as usize);
+    }
+}
+
+/// A tool's failure keeps its class: a policy that retries only transient errors does not retry a
+/// rate limit.
+#[tokio::test]
+async fn a_tools_failure_keeps_its_class() {
+    let h = Harness::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let only_transient = quick(5).with_retry_on(adam_runtime::RetryClasses::of([
+        adam_error::ErrorClass::Transient,
+    ]));
+    let agent = h
+        .agent()
+        .tool(Patient(rate_limited(&calls), only_transient))
+        .build();
+    h.mock.push_tool_calls(vec![call("c1", "busy", json!({}))]);
+    let rt = h.runtime_with(&agent, "w", quick_retry);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+    let error = view.error.expect("error");
+    assert!(
+        error.contains("the policy of `tool:busy` does not retry rate-limited"),
+        "{error}"
+    );
+    assert_eq!(calls.load(SeqCst), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Model errors
 // ---------------------------------------------------------------------------
@@ -900,6 +995,32 @@ fn quick_retry(b: RuntimeBuilder) -> RuntimeBuilder {
             .with_backoff(Duration::from_millis(10), Duration::from_millis(10))
             .with_multiplier(1.0),
     )
+}
+
+/// A model provider's rate limit is a rate limit to the runtime's policy (ADR 0061): a runtime
+/// that retries only transient errors fails it at once.
+#[tokio::test]
+async fn a_model_rate_limit_keeps_its_class() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock
+        .push_error(ModelError::RateLimited { retry_after: None })
+        .push_text("never");
+    let rt = h.runtime_with(&agent, "w", |b| {
+        b.retry(quick(5).with_retry_on(adam_runtime::RetryClasses::of([
+            adam_error::ErrorClass::Transient,
+        ])))
+    });
+    let run = rt
+        .start("llm", user_message("hi"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+    let error = view.error.expect("error");
+    assert!(error.contains("does not retry rate-limited"), "{error}");
+    assert_eq!(h.mock.requests().len(), 1);
 }
 
 #[tokio::test]

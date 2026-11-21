@@ -52,6 +52,10 @@ impl Scrubbed {
     fn error(&self, error: ToolError) -> ToolError {
         match error {
             ToolError::Transient(m) => ToolError::Transient((self.scrub)(&m)),
+            ToolError::Retryable { message, class } => ToolError::Retryable {
+                message: (self.scrub)(&message),
+                class,
+            },
             ToolError::Permanent(m) => ToolError::Permanent((self.scrub)(&m)),
             // The waits carry an id and nothing to hide; a question is scrubbed like text.
             ToolError::NeedsInput { question, mut ui } => ToolError::NeedsInput {
@@ -116,6 +120,10 @@ impl Tool for Scrubbed {
 
     fn time_limit(&self) -> Option<Duration> {
         self.inner.time_limit()
+    }
+
+    fn retry_policy(&self) -> Option<adam_runtime::RetryPolicy> {
+        self.inner.retry_policy()
     }
 
     fn read_answer(

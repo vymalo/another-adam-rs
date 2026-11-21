@@ -647,6 +647,7 @@ design is in [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md
 | `ToolError` | Class | The run |
 |---|---|---|
 | `Transient` | `Transient` | the step fails with `AgentError::Transient`; the runtime retries with backoff |
+| `Retryable { message, class }` | its `class` (`RateLimited`, `Conflict`) | as `Transient`, of that class: a policy that names its classes may not retry it |
 | `Permanent` | `Invalid` | the model is told, and can go on |
 | `NeedsInput` | `Rejected` | valid, but it needs the user first: the run parks |
 | `AwaitRun` | `Rejected` | valid, but it needs a child run first: the run parks with a timer |
@@ -654,13 +655,30 @@ design is in [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md
 
 `ToolError` is journaled, so its serde shape is frozen and it carries no
 `source`: a tool flattens its own cause into the message (with
-`adam_error::report`) before it returns.
+`adam_error::report`) before it returns. `ToolError::from_classified` and `ToolError::retryable(message, class)`
+build `Transient` for the class `Transient`, `Retryable` for another retryable class and `Permanent` for the rest;
+`retry_parts()` gives the message and class of either retryable one. `Retryable` is journaled with its class by
+name (`{"Retryable": {"message": .., "class": "rate-limited"}}`); a name this build does not know decodes as
+`transient`, and a build older than this one cannot read the entry at all, so roll forward, not back.
+
+### Retry policies per tool
+
+A tool's retryable failures are retried under the tool's policy, counted under the key `tool:<name>`
+(`tool_retry_key`) apart from the run's other steps ([ADR 0061](../../docs/decisions/0061-a-step-names-its-retry-policy.md)).
+The policy, first found: one set by name with `LlmAgentBuilder::tool_retry(name, policy)` (an agent folder's
+`retry:`, and the only way to give a policy to a tool another system offers, such as `<server>__<tool>`), the
+tool's own `Tool::retry_policy()` (default `None`; `FnTool::with_retry_policy`; `#[tool(retry(...))]`; a
+wrapper must forward it), else the runtime's. It applies to a call's failure in its turn, in an early call, and
+while a remote task is polled. A model provider's retryable error keeps its class too (a rate limit is
+`RateLimited`), under the runtime's policy. Tests: `tests/llm_agent.rs`
+`a_tools_policy_decides_its_retries_and_one_set_by_name_wins`, `a_tools_failure_keeps_its_class`,
+`a_model_rate_limit_keeps_its_class`, and `tool.rs` `a_retryable_error_is_journaled_by_its_class_name`.
 
 Model failures are classified by `adam_model::ModelError` and journaled as a
 record of `retryable`, the flattened message (`report`, so the chain is printed
 once), `retry_after_ms` and the `class` name (records written before classes
 existed decode with `class` absent). A retryable one becomes
-`AgentError::Transient`, with `with_retry_after` when the provider sent a
+`AgentError::Transient` of the recorded class, with `with_retry_after` when the provider sent a
 `Retry-After`, so the retry waits at least that long; any other fails the run
 with `model call failed: ...`. An unreadable start message is
 `AgentError::Permanent` (`unusable start message: ...`), which A2A reports as
@@ -692,6 +710,7 @@ ADR 0037 says of its state: a worker that has not been rolled runs a tool whose 
   replay decides the same; a journal without it decodes. A model can still wait and retry by doing something else between two
   calls (`sleep`): any other call resets the count. The decision reads only `Conversation::repeats` (two FNV-1a hashes and counters), so a replay decides
   the same. A call that waits (a question, a child) resets it.
+* **`Tool::retry_policy`** (default `None`, the runtime's): see *Retry policies per tool*.
 * **`Tool::time_limit`** (default `None` = `DEFAULT_TOOL_TIME_LIMIT`, 300 s; `FnTool::with_time_limit`; a wrapper must forward
   it). The timer runs inside the journaled `tool:<id>` step: the call gets a child `CancelToken`, which fires at the
   limit; the tool has `TOOL_STOP_GRACE` (5 s) to stop and is then dropped; the model gets an error result that says the call

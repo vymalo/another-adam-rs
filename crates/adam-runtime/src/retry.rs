@@ -24,10 +24,7 @@ const RETRYABLE: [(ErrorClass, &str); 3] = [
 /// The name of a retryable class (`transient`, `rate-limited`, `conflict`), or its `Debug` form for
 /// another.
 pub(crate) fn class_name(class: ErrorClass) -> String {
-    RETRYABLE
-        .iter()
-        .find(|(c, _)| *c == class)
-        .map_or_else(|| format!("{class:?}"), |(_, name)| (*name).to_owned())
+    RetryClasses::name_of(class).map_or_else(|| format!("{class:?}"), str::to_owned)
 }
 
 /// A set of the retryable [`ErrorClass`]es (`Transient`, `RateLimited`, `Conflict`): the ones a
@@ -51,6 +48,23 @@ impl RetryClasses {
                 None => set,
             }
         })
+    }
+
+    /// The name a policy writes a retryable class with (`transient`, `rate-limited`, `conflict`);
+    /// `None` for a class that is not retryable.
+    pub fn name_of(class: ErrorClass) -> Option<&'static str> {
+        RETRYABLE
+            .iter()
+            .find(|(c, _)| *c == class)
+            .map(|(_, name)| *name)
+    }
+
+    /// The retryable class written `name`; `None` for a name that is not one.
+    pub fn class_named(name: &str) -> Option<ErrorClass> {
+        RETRYABLE
+            .iter()
+            .find(|(_, n)| *n == name)
+            .map(|(class, _)| *class)
     }
 
     /// Whether `class` is in the set.
@@ -374,6 +388,12 @@ mod tests {
             RetryClasses::of([ErrorClass::Conflict])
         );
         assert!(!RetryClasses::NONE.contains(ErrorClass::Transient));
+        for (class, name) in RETRYABLE {
+            assert_eq!(RetryClasses::name_of(class), Some(name));
+            assert_eq!(RetryClasses::class_named(name), Some(class));
+        }
+        assert_eq!(RetryClasses::name_of(ErrorClass::Invalid), None);
+        assert_eq!(RetryClasses::class_named("invalid"), None);
     }
 
     #[test]

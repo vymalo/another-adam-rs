@@ -467,7 +467,9 @@ impl ToolEnv {
         let e = sealed.err()?;
         tracing::warn!(run = %workspace.run(), error = %report(&e), "cannot seal the run's environment for a slot that was added");
         let said = match environment_error(&self.redactor, &e) {
-            ToolError::Transient(text) | ToolError::Permanent(text) => text,
+            ToolError::Transient(text)
+            | ToolError::Retryable { message: text, .. }
+            | ToolError::Permanent(text) => text,
             other => report(&other),
         };
         Some(format!(
@@ -1068,6 +1070,10 @@ impl Tool for Gated {
         own_limit(&self.name, &self.env.settings).or_else(|| self.inner.time_limit())
     }
 
+    fn retry_policy(&self) -> Option<adam_runtime::RetryPolicy> {
+        self.inner.retry_policy()
+    }
+
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
         // Every tier allows what needs the lowest one: no read of the notes for a look.
         if self.needs > AccessTier::Plan {
@@ -1250,6 +1256,10 @@ impl Tool for Redacting {
         self.inner.time_limit()
     }
 
+    fn retry_policy(&self) -> Option<adam_runtime::RetryPolicy> {
+        self.inner.retry_policy()
+    }
+
     fn read_answer(
         &self,
         call_id: &str,
@@ -1307,6 +1317,10 @@ impl Tool for Redacting {
                 Ok(out)
             }
             Err(ToolError::Transient(m)) => Err(ToolError::Transient(r.scrub_string(m))),
+            Err(ToolError::Retryable { message, class }) => Err(ToolError::Retryable {
+                message: r.scrub_string(message),
+                class,
+            }),
             Err(ToolError::Permanent(m)) => Err(ToolError::Permanent(r.scrub_string(m))),
             Err(ToolError::NeedsInput { question, mut ui }) => {
                 if let Some(ui) = &mut ui {
@@ -1366,7 +1380,9 @@ pub(crate) fn session_error(redactor: &Redactor, e: &EnvError) -> ToolError {
         return environment_error(redactor, e);
     }
     let mut text = match environment_error(redactor, e) {
-        ToolError::Transient(text) | ToolError::Permanent(text) => text,
+        ToolError::Transient(text)
+        | ToolError::Retryable { message: text, .. }
+        | ToolError::Permanent(text) => text,
         other => report(&other),
     };
     text.push_str(BROKEN_ENVIRONMENT);

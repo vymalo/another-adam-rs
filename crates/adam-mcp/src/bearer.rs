@@ -129,7 +129,7 @@ impl PerCall {
         };
         let token = match self.bearer.for_listing().await {
             Ok(token) => token,
-            Err(ToolError::Transient(message)) => {
+            Err(ToolError::Transient(message) | ToolError::Retryable { message, .. }) => {
                 return Err(Error::ListTools {
                     server: self.server.clone(),
                     message: self.scrub(&format!(
@@ -157,7 +157,9 @@ impl PerCall {
 /// What a [`ToolError`] says, without its own prefix.
 pub(crate) fn reason(error: &ToolError) -> String {
     match error {
-        ToolError::Transient(message) | ToolError::Permanent(message) => message.clone(),
+        ToolError::Transient(message)
+        | ToolError::Retryable { message, .. }
+        | ToolError::Permanent(message) => message.clone(),
         other => other.to_string(),
     }
 }
