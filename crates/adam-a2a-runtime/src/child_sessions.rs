@@ -779,6 +779,12 @@ impl RuntimeTaskBackend {
             }
             (Some(task), None, _) => return Err(BackendError::TaskNotFound(task.to_owned())),
             (None, _, Some(ContextKind::Child(parent, session))) => {
+                // A resume names the round it resumes, as at the top level (ADR 0067).
+                if crate::model_park::is_resume(message) {
+                    return Err(BackendError::InvalidParams(
+                        crate::model_park::RESUME_NAMES_ITS_TASK.to_owned(),
+                    ));
+                }
                 let inbound = match asked {
                     Asked::Start(_) => {
                         return Err(BackendError::InvalidParams(

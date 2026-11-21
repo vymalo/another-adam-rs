@@ -782,7 +782,7 @@ impl RuntimeTaskBackend {
         if crate::model_park::is_resume(&message) {
             let Some(task_id) = task_id else {
                 return Err(BackendError::InvalidParams(
-                    "a resume names the task it resumes (taskId)".to_owned(),
+                    crate::model_park::RESUME_NAMES_ITS_TASK.to_owned(),
                 ));
             };
             let located = self

@@ -6,7 +6,7 @@
 
 use a2a::Message;
 use adam_core::RunStatus;
-use adam_runtime::{Inbound, RunView};
+use adam_runtime::{Inbound, RESUME_KIND, RunView};
 use serde_json::{Value, json};
 
 pub(crate) use adam_a2a::is_resume;
@@ -14,10 +14,8 @@ pub(crate) use adam_a2a::is_resume;
 /// The reason a resume to a task that is not parked on the model is refused with.
 pub const NOT_PARKED: &str = "the task is not parked on the model";
 
-/// The inbound kind a resume is delivered as: `adam_llm_agent::MODEL_RESUME_KIND`, which the agent
-/// loop reads as a wake-up and drops (this crate does not depend on the loop, so the word is
-/// repeated; a test holds the two equal).
-pub(crate) const RESUME_KIND: &str = "adam.resume";
+/// The reason a resume with no `taskId` is refused with.
+pub(crate) const RESUME_NAMES_ITS_TASK: &str = "a resume names the task it resumes (taskId)";
 
 /// What a resume delivers: a wake-up with no text, under the message's id.
 pub(crate) fn resume_inbound(message: &Message) -> Inbound {
@@ -30,10 +28,11 @@ fn model_wait(view: &RunView) -> Option<&Value> {
     view.state.get("model_wait").filter(|w| w.is_object())
 }
 
-/// Whether the run is parked on the model: not finished, and its state holds a model wait. A run
-/// woken a moment ago and not yet stepped still is (it makes the call again when it steps).
+/// Whether the run is parked on the model: parked, and its state holds a model wait. A run woken a
+/// moment ago, working on the call it waited to make, is not: it is `working`, and a resume says
+/// nothing to it (the contract's refusal, `NOT_PARKED`).
 pub(crate) fn parked_on_model(view: &RunView) -> bool {
-    !view.status.is_terminal() && model_wait(view).is_some()
+    parked_now(view).is_some()
 }
 
 /// Whether the run waits on the model, parked: what its task's state and message come from.

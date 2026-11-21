@@ -34,11 +34,20 @@ pub const RUN_FINISHED_KIND: &str = "adam.run.finished";
 /// the end of a call it is waiting on.
 pub const CHILD_REPORTED_KIND: &str = "adam.child.reported";
 
+/// [`Inbound::kind`] of a message that only **wakes** a parked run and says nothing to it: a resume
+/// of a run parked on the model ([ADR 0067]), which makes the call it waits to make again. A run
+/// that is working or finishing has nothing to read in it, so one that lands during a step neither
+/// reopens a finishing run nor counts as an arrival ([`Ctx::arrived`](crate::Ctx::arrived)); one
+/// delivered to a parked run wakes it, as any message does. Its payload is not read.
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+pub const RESUME_KIND: &str = "adam.resume";
+
 /// How many of the messages in `inbox` after its first `base` a run that is finishing has to read:
 /// all of them but the [`RUN_FINISHED_KIND`] notices, the [`CHILD_REPORTED_KIND`] ones (a report
 /// is read from the store, by a tool or by the agent loop; a turn that a report keeps going is
 /// decided from the store at its end, not from a notice) and the [`SESSION_CLOSE_KIND`] requests (a round finishes its work and says so in its header; one that
-/// lands while the round finishes stays in its inbox, where a reader of the session finds it). A notice only saves a waiting parent its
+/// lands while the round finishes stays in its inbox, where a reader of the session finds it) and the [`RESUME_KIND`] wake-ups (they say nothing). A notice only saves a waiting parent its
 /// timer. A run that finishes has no wait left (it settled its waits from the notice or from the
 /// store), and the same notice delivered just after its commit is refused, so one that lands during
 /// the step must not keep the run going either.
@@ -54,6 +63,7 @@ pub(crate) fn news_since(inbox: &[Inbound], base: usize, read: &[String]) -> usi
             i.kind != RUN_FINISHED_KIND
                 && i.kind != CHILD_REPORTED_KIND
                 && i.kind != SESSION_CLOSE_KIND
+                && i.kind != RESUME_KIND
                 && (i.id.is_empty() || !read.contains(&i.id))
         })
         .count()
@@ -492,6 +502,23 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// What a finishing run has to read: messages, not the wake-ups and notices that say nothing to
+    /// it (a resume, ADR 0067, among them), nor a copy of one it read.
+    #[test]
+    fn only_news_counts_and_a_resume_is_none() {
+        let inbox = vec![
+            Inbound::new("message", json!({"text": "old"})).with_id("m-0"),
+            Inbound::new(RESUME_KIND, json!({})).with_id("r-1"),
+            Inbound::new(RUN_FINISHED_KIND, json!({})).with_id("c-1"),
+            Inbound::new(CHILD_REPORTED_KIND, json!({})).with_id("c-2"),
+            Inbound::new(SESSION_CLOSE_KIND, json!({})).with_id("s-1"),
+            Inbound::new("message", json!({"text": "read"})).with_id("m-1"),
+        ];
+        assert_eq!(news_since(&inbox, 1, &["m-1".to_owned()]), 0);
+        assert_eq!(news_since(&inbox, 1, &[]), 1);
+        assert_eq!(news_since(&inbox, 0, &[]), 2);
+    }
 
     #[test]
     fn a_child_id_depends_on_both_inputs_and_nothing_else() {

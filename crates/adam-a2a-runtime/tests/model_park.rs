@@ -57,6 +57,61 @@ impl Tool for Ask {
     }
 }
 
+/// The subagent tool: starts the child `helper` and waits for it.
+struct Spawn;
+
+#[async_trait]
+impl Tool for Spawn {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "sub".into(),
+            description: "hands the work to the helper".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let run = ctx.start_child("helper", "go").await?;
+        Err(ToolError::AwaitRun { run })
+    }
+}
+
+/// Wraps the mock: the `hold_on`-th call (0-based) waits until the test lets it go.
+struct GateModel {
+    inner: Arc<MockModel>,
+    hold_on: usize,
+    calls: std::sync::atomic::AtomicUsize,
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl GateModel {
+    async fn hold(&self) {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == self.hold_on {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+    }
+}
+
+#[async_trait]
+impl adam_model::ModelClient for GateModel {
+    async fn complete(&self, req: ModelRequest) -> Result<adam_model::ModelResponse, ModelError> {
+        self.hold().await;
+        self.inner.complete(req).await
+    }
+
+    async fn stream(
+        &self,
+        req: ModelRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<adam_model::ModelDelta, ModelError>>,
+        ModelError,
+    > {
+        self.hold().await;
+        self.inner.stream(req).await
+    }
+}
+
 struct Rig {
     mock: Arc<MockModel>,
     runtime: Runtime,
@@ -67,14 +122,24 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
-        let name = format!("park-{}", RunId::new());
-        let store: DynStore = Arc::new(MemoryStore::new());
         let mock = Arc::new(MockModel::new());
         let model: DynModel = mock.clone();
-        let agent = LlmAgent::builder(&name, model, "m").tool(Ask).build();
+        Self::over(mock, model)
+    }
+
+    /// The agent (with `ask` and `sub`, which hands work to the subagent `helper`) on `model`.
+    fn over(mock: Arc<MockModel>, model: DynModel) -> Self {
+        let name = format!("park-{}", RunId::new());
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let agent = LlmAgent::builder(&name, model.clone(), "m")
+            .tool(Ask)
+            .tool(Spawn)
+            .build();
+        let helper = LlmAgent::builder("helper", model, "m").build();
         let events = BroadcastSink::default();
         let runtime = Runtime::builder(store)
             .agent(agent)
+            .agent(helper)
             .event_sink(events.clone())
             .poll_interval(Duration::from_millis(10))
             .build();
@@ -498,4 +563,114 @@ async fn cancel_ends_a_park() {
         assert_eq!(canceled.status.state, TaskState::Canceled);
         rig.stop().await;
     }
+}
+
+/// A resume to a task whose run was woken and is making its call is refused: it is working, not
+/// parked. The run makes two requests and completes once.
+#[tokio::test]
+async fn a_resume_while_the_woken_call_is_made_is_refused() {
+    let mock = Arc::new(MockModel::new());
+    let (reached, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let model: DynModel = Arc::new(GateModel {
+        inner: mock.clone(),
+        hold_on: 1,
+        calls: Default::default(),
+        reached: reached.clone(),
+        release: release.clone(),
+    });
+    let rig = Rig::over(mock, model);
+    let who = caller();
+    rig.mock
+        .push_error(refused(402, "over_limit", Park::UntilWoken))
+        .push_text("answered");
+    let task = rig.start(&who, "c").await;
+    rig.wait(&who, &task.id, TaskState::InputRequired, None)
+        .await;
+    rig.backend
+        .submit(who.clone(), resume("r-1"), Some(task.id.clone()), None)
+        .await
+        .expect("the first resume wakes it");
+    tokio::time::timeout(Duration::from_secs(20), reached.notified())
+        .await
+        .expect("the woken call is made");
+    let before = rig.written(&task).await;
+    let err = rig
+        .backend
+        .submit(who.clone(), resume("r-2"), Some(task.id.clone()), None)
+        .await
+        .unwrap_err();
+    assert!(is_not_parked(&err), "{err:?}");
+    assert_eq!(rig.written(&task).await, before, "nothing written");
+    release.notify_one();
+    rig.wait(&who, &task.id, TaskState::Completed, Some("answered"))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let done = rig.backend.get(&who, &task.id).await.unwrap().unwrap();
+    assert_eq!(done.status.state, TaskState::Completed);
+    assert_eq!(rig.mock.requests().len(), 2);
+    rig.stop().await;
+}
+
+/// A task on a timer that is not a park on the model (it waits for its subagent) takes neither a
+/// resume nor, without `steer/v1`, a message. A resume with no `taskId` is refused.
+#[tokio::test]
+async fn a_task_waiting_on_a_child_takes_no_resume_and_a_resume_names_its_task() {
+    let rig = Rig::new();
+    let who = caller();
+    rig.mock
+        .push_tool_calls(vec![ToolCall {
+            id: "c1".into(),
+            name: "sub".into(),
+            arguments: json!({}),
+            ..Default::default()
+        }])
+        .push_error(refused(503, "unavailable", timer()));
+    let task = rig.start(&who, "c").await;
+    // The child parks on the model; the parent waits on the child, on a timer.
+    let child = adam_runtime::child_run_id(RunId(task.id.parse().unwrap()), "c1");
+    for _ in 0..2000 {
+        let view = rig.runtime.view(child).await.unwrap();
+        if view.is_some_and(|v| v.status == adam_core::RunStatus::Parked) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let parent = rig.wait(&who, &task.id, TaskState::Working, None).await;
+    assert_eq!(said(&parent), None, "no reason on the root yet (S8b-2b)");
+    let before = rig.written(&task).await;
+    let err = rig
+        .backend
+        .submit(who.clone(), resume("r-1"), Some(task.id.clone()), None)
+        .await
+        .unwrap_err();
+    assert!(is_not_parked(&err), "{err:?}");
+    let err = rig
+        .backend
+        .submit(
+            who.clone(),
+            user("hello", "m-2"),
+            Some(task.id.clone()),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, BackendError::InvalidParams(m) if m.contains("cannot take a follow-up")),
+        "{err:?}"
+    );
+    assert_eq!(rig.written(&task).await, before, "nothing written");
+
+    let err = rig
+        .backend
+        .submit(who.clone(), resume("r-2"), None, Some("c".into()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, BackendError::InvalidParams(m) if m.contains("names the task")),
+        "{err:?}"
+    );
+    rig.stop().await;
 }
