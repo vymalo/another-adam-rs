@@ -403,8 +403,8 @@ paths are the same everywhere. You do not set any of this up.
 The workspace's environment has the toolchains it has, and you cannot install those.
 When `run_checks`, `run` or `run_command` says the workspace has no `mvn` (or `gradle`,
 `cargo`, `flutter`, whatever it names), that is not a failing check: no check
-cycle was used, and no change of yours would make it pass. The result says whether the
-tool has to be added to the deployment's image, or the deployment's image lacks it. Do not try variants of
+cycle was used, and no change of yours would make it pass. The result says which
+environment lacks the tool and how the tool gets there. Do not try variants of
 the command, do not search the filesystem for the tool (`ls /usr/lib/jvm`,
 `find / -name mvn`), and do not try to install it. Tell the person which
 toolchain is missing and what you needed it for, with `ask_user`, and wait for

@@ -1,7 +1,7 @@
 //! The local environment keeps a framed conversation on stdin and stdout: a first message, a silence
 //! with stdin held open, a 64 KiB message, then the end of input (the process ends by itself with
-//! status 0) or a kill (nothing of it is left). The same sequence is asked of a devcontainer
-//! of a run pod (`adam-env-kubernetes/tests/cluster.rs`);
+//! status 0) or a kill (nothing of it is left). The same sequence is asked of a run pod
+//! (`adam-env-kubernetes/tests/cluster.rs`);
 //! see `adam_workspace::testing_stdio`.
 //!
 //! Always runs. The silence is 20 s (`ADAM_TEST_STDIO_SILENCE_SECS` changes it) for the case that

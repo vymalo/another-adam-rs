@@ -59,7 +59,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0007](decisions/0007-progress-as-steps-and-streamed-text.md) | tool calls as `Step` events, the model's answer streamed as it is written |
 | [0008](decisions/0008-a-workspace-holds-several-repositories.md) | a workspace is a directory of slots: repositories and scratch projects |
 | [0009](decisions/0009-github-per-installation-read-through-mcp.md) | a token or a GitHub App per installation; GitHub read through the official MCP server |
-| [0010](decisions/0010-a-run-works-in-its-repositorys-devcontainer.md) | a run's commands run in its repository's devcontainer, on rootless Podman |
+| [0010](decisions/0010-a-run-works-in-its-repositorys-devcontainer.md) | a run's commands run in its repository's devcontainer (superseded by [0052](decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)) |
 | [0011](decisions/0011-a-tool-calls-step-carries-its-input-and-output.md) | a tool call's step carries its input and output, cut and redacted |
 | [0012](decisions/0012-files-as-a2a-artifacts.md) | a file an agent made is an A2A artifact with a `raw` part |
 | [0013](decisions/0013-run-keeps-changes-edit-file-and-scratch-completion.md) | three shell tools of one job each, `edit_file`, and scratch work that completes without a PR |

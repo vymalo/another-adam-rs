@@ -867,9 +867,6 @@ mod tests {
         Local.release("any-run").await.unwrap();
     }
 
-    #[tokio::test]
-    async fn local_has_nothing_to_make_again() {}
-
     fn a_run(dir: &std::path::Path) -> RunWorkspace {
         crate::Workspaces::new(dir.join("root"), Arc::new(crate::StaticToken::new("t")))
             .run("run-1")
