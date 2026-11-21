@@ -10,9 +10,10 @@ mod schedule;
 mod skill;
 
 pub use agent::{
-    AgentFrontmatter, Card, CardSkill, ExtendedCard, Limits, MAX_MINUTES_LIMIT,
-    MAX_OPEN_SESSIONS_LIMIT, MAX_PARALLEL_LIMIT, MAX_SESSION_ROUNDS_LIMIT,
-    MAX_WORKING_SESSIONS_LIMIT, ModelRef, SkillSelection, ToolList,
+    AgentFrontmatter, Card, CardSkill, DEFAULT_RETRY_BACKOFF, DEFAULT_RETRY_MAX_BACKOFF,
+    ExtendedCard, Limits, MAX_MINUTES_LIMIT, MAX_OPEN_SESSIONS_LIMIT, MAX_PARALLEL_LIMIT,
+    MAX_RETRY_ATTEMPTS, MAX_RETRY_BACKOFF, MAX_SESSION_ROUNDS_LIMIT, MAX_WORKING_SESSIONS_LIMIT,
+    ModelRef, RETRY_CLASS_NAMES, RetryDef, SkillSelection, ToolList, retry_duration,
 };
 pub use command::CommandFrontmatter;
 pub use mcp::{

@@ -705,6 +705,9 @@ pub(crate) struct Node {
     pub(crate) limits: Limits,
     /// `limits.max_parallel` of the agent's file: it lowers the deployment's setting for this agent.
     pub(crate) max_parallel: Option<usize>,
+    /// `retry:` of the agent's file: the retry policy per tool, by name, each one of its tools
+    /// (ADR 0061). The agent's own; a subagent's are its file's.
+    pub(crate) retry: Vec<(String, adam_agent_fs::RetryDef, adam_runtime::RetryPolicy)>,
     /// The skills the agent may use, in order.
     pub(crate) skills: Vec<String>,
     /// The skills whose body is in the prompt.
@@ -929,6 +932,7 @@ impl Walk<'_> {
             &mut tools,
             parent.is_none().then_some(self.session_limits),
         )?;
+        let retry = retry_policies(&origin, manifest, &tools)?;
         let index = self.nodes.len();
         self.nodes.push(Node {
             name: name.clone(),
@@ -949,6 +953,7 @@ impl Walk<'_> {
                 .as_ref()
                 .and_then(|file| file.max_parallel)
                 .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
+            retry,
             skills,
             preloaded,
             session_agents,
@@ -1366,6 +1371,57 @@ fn resolve_tools(
         }
     }
     Ok(chosen)
+}
+
+/// The policies of `retry:` (ADR 0061, decision 6), each for one of the agent's `tools`: its own,
+/// the MCP servers' (connected before binding, so known here) and the skill and subagent tools.
+fn retry_policies(
+    origin: &Origin,
+    manifest: &AgentManifest,
+    tools: &[(String, DynTool)],
+) -> Result<Vec<(String, adam_agent_fs::RetryDef, adam_runtime::RetryPolicy)>, Error> {
+    let mut policies = Vec::new();
+    for (tool, def) in &manifest.frontmatter.retry {
+        if !tools.iter().any(|(name, _)| name == tool) {
+            let available: Vec<String> = tools.iter().map(|(name, _)| name.clone()).collect();
+            return Err(Error::UnknownRetryTool {
+                origin: origin.clone(),
+                tool: tool.clone(),
+                suggestion: closest(tool, available.iter().map(String::as_str)).map(str::to_owned),
+                available,
+            });
+        }
+        let invalid = |reason: &str| Error::InvalidRetry {
+            origin: origin.clone(),
+            tool: tool.clone(),
+            reason: reason.to_owned(),
+        };
+        let attempts = def
+            .attempts
+            .filter(|n| (1..=adam_agent_fs::MAX_RETRY_ATTEMPTS).contains(n))
+            .ok_or_else(|| invalid("`attempts` is from 1 to 20"))?;
+        let (Some(initial), Some(bound)) = (def.initial_backoff(), def.bound()) else {
+            return Err(invalid("a backoff is not a duration"));
+        };
+        let mut policy = adam_runtime::RetryPolicy::new(attempts).with_backoff(initial, bound);
+        if def.multiplier.is_some() {
+            let factor = def
+                .factor()
+                .filter(|m| *m > 0.0)
+                .ok_or_else(|| invalid("`multiplier` is not a positive number"))?;
+            policy = policy.with_multiplier(factor);
+        }
+        if let Some(on) = &def.on {
+            let classes = adam_runtime::RetryClasses::from_names(on.iter().map(String::as_str))
+                .map_err(|name| invalid(&format!("`{name}` is not a retryable class")))?;
+            if classes == adam_runtime::RetryClasses::NONE {
+                return Err(invalid("`on` names no class"));
+            }
+            policy = policy.with_retry_on(classes);
+        }
+        policies.push((tool.clone(), def.clone(), policy));
+    }
+    Ok(policies)
 }
 
 /// Whether `name` matches `pattern`, where `*` stands for any run of characters.

@@ -285,6 +285,123 @@ fn cases() -> Vec<Case> {
             "`limits.max_minutes` is at most 1440",
         ),
         (
+            "retry without attempts",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { backoff: 1s } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search` needs `attempts`",
+        ),
+        (
+            "retry attempts over 20",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 21 } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search.attempts` is from 1 to 20; it is 21",
+        ),
+        (
+            "retry attempts of 0",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 0 } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search.attempts` is from 1 to 20",
+        ),
+        (
+            "retry backoff that is no duration",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, backoff: 1.5s } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search.backoff` is a duration",
+        ),
+        (
+            "retry max_backoff over an hour",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, max_backoff: 2h } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search.max_backoff` is at most 1h",
+        ),
+        (
+            "retry max_backoff under backoff",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, backoff: 1m, max_backoff: 30s } }\n---\nHi.\n",
+            )],
+            Error,
+            "is shorter than `backoff`",
+        ),
+        (
+            "retry max_backoff under the default backoff",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, max_backoff: 500ms } }\n---\nHi.\n",
+            )],
+            Error,
+            "the default `backoff` (1s)",
+        ),
+        (
+            "retry multiplier of 0",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, multiplier: 0 } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search.multiplier` is a positive number",
+        ),
+        (
+            "retry on an unknown class",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, on: [invalid] } }\n---\nHi.\n",
+            )],
+            Error,
+            "names `invalid`, which is not a retryable class",
+        ),
+        (
+            "retry on no class",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, on: [] } }\n---\nHi.\n",
+            )],
+            Error,
+            "names at least one class",
+        ),
+        (
+            "retry of a name that is no tool name",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { Search: { attempts: 3 } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.Search` is not a tool name",
+        ),
+        (
+            "retry with an unknown key",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, tries: 2 } }\n---\nHi.\n",
+            )],
+            Warning,
+            "unknown key `retry.search.tries`",
+        ),
+        with_root(
+            "retry on a remote subagent",
+            vec![(
+                "agent/subagents/far.md",
+                "---\ndescription: d\na2a: https://agents.example.com/far\nretry: { search: { attempts: 3 } }\n---\n",
+            )],
+            Warning,
+            "`retry` is ignored on a remote subagent",
+        ),
+        (
             "max_parallel of 0",
             vec![(
                 "agent/instructions.md",
@@ -965,6 +1082,26 @@ fn cases() -> Vec<Case> {
             "commands belong to the root agent",
         ),
     ]
+}
+
+#[test]
+fn a_retry_per_tool_is_read_with_no_diagnostic() {
+    let dir = write(&[(
+        "agent/instructions.md",
+        "---\nname: root\nretry:\n  web_search: { attempts: 5, backoff: 2s, max_backoff: 5m, on: [rate-limited, transient] }\n  github__create_issue: { attempts: 1 }\n---\nHi.\n",
+    )]);
+    let report = load(dir.path());
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let retry = &report.package.agents[0].frontmatter.retry;
+    assert_eq!(retry.len(), 2);
+    let search = &retry["web_search"];
+    assert_eq!(search.attempts, Some(5));
+    assert_eq!(search.bound(), Some(std::time::Duration::from_secs(300)));
+    assert_eq!(
+        search.on.as_deref(),
+        Some(&["rate-limited".to_owned(), "transient".to_owned()][..])
+    );
+    assert_eq!(retry["github__create_issue"].attempts, Some(1));
 }
 
 #[test]

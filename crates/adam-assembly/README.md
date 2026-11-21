@@ -128,6 +128,14 @@ agent gets every registered tool and a subagent gets none (decision D3 of `docs/
 every tool and `[]` none. A subagent's tools come from the same set but are only the ones it lists: it
 inherits nothing.
 
+**Retry policies.** Each name of an agent's `retry:` ([ADR 0061](../../docs/decisions/0061-a-step-names-its-retry-policy.md))
+must be one of that agent's tools once they are all bound (its own, its MCP servers', which are connected before
+`bind`, and its skill and subagent tools): another is `Error::UnknownRetryTool`, with the closest of its tools as a
+suggestion. The policy goes to the agent as `LlmAgentBuilder::tool_retry`, so it wins over the tool's own
+`Tool::retry_policy`; `AgentInfo::retry` lists it as the file says it. Each agent has its own: a subagent does not
+inherit the root's. An entry the loader let through but that is no policy (a lenient read) is
+`Error::InvalidRetry`. Tests: `tests/retry.rs`.
+
 **Vars.** `{{name}}` is logic-free substitution into the body of `instructions.md` and each
 `instructions/*.md`; spaces inside the braces are ignored, `{{{{` writes a literal `{{` (so a
 literal `{{name}}` is `{{{{name}}`), and a `}}` in text is always itself. The rules, checked per agent:
@@ -467,7 +475,7 @@ MSRV 1.77; the API used is `recommended_watcher`, `Watcher::watch`, `RecursiveMo
 
 ## Errors
 
-`Error` is a closed enum (`RemoteNotEnabled` is the newest variant, in every build: see
+`Error` is a closed enum (`UnknownRetryTool` and `InvalidRetry` are the newest variants; `RemoteNotEnabled` is one in every build: see
 [Without remote subagents](#without-remote-subagents-feature-remote)); every variant about the files carries an `Origin { agent, file }`, printed as
 ``agent `coder/reviewer` (agent/subagents/reviewer.md)``. All are `ErrorClass::Invalid` (the same input
 never succeeds) except `Manifest`, which keeps its source's class (a folder that is not there is `NotFound`), and `Mcp`, which keeps the class of the MCP

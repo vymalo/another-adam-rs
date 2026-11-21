@@ -91,6 +91,8 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_open_sessions: 8         # root only: most sessions open at once, 1 to 100; lowers SESSION_MAX_OPEN, never raises it (a larger value is lowered with a warning)
   max_working_sessions: 2      # root only: most rounds working at once, 1 to 32 and at most max_open_sessions; lowers SESSION_MAX_WORKING
   max_session_rounds: 10       # root only: most rounds one session may have, 2 to 200; lowers SESSION_MAX_ROUNDS (a subagent's value is ignored, with a warning)
+retry:                         # a retry policy per tool (below); this agent's own, none inherits
+  web_search: { attempts: 5, backoff: 2s, max_backoff: 5m, on: [rate-limited] }
 vars: { max_check_cycles: 3 }  # defaults for {{placeholders}} in the body; code may override
 references:                    # root only: repositories the coder reads and never writes (below)
   - { name: design-system, url: "https://github.com/acme/design-system", description: Tokens and components the UI follows. }
@@ -121,6 +123,17 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   any other, so **a folder with `tools:` must list `plan_*` (or `"*"`) to keep the plan**. A subagent has none of them
   unless it lists them, and even then `plan_*` answers that a subagent keeps no plan: the plan belongs to the
   conversation's root run.
+* **`retry:` is a retry policy per tool** ([ADR 0061](../decisions/0061-a-step-names-its-retry-policy.md)): a map from
+  one of the agent's tool names (its own, an MCP server's `<server>__<tool>`, a skill or subagent tool) to `attempts`
+  (required, 1 to 20, the tries in all), `backoff` and `max_backoff` (`500ms`, `1s`, `30m`, `1h`; at most `1h`, and
+  `max_backoff` not under `backoff`, whose default is `1s`), `multiplier` (a positive number) and `on` (the classes
+  retried: `transient`, `rate-limited`, `conflict`; default all three). What is left out is the runtime's default
+  policy (`1s`, `60s`, `2.0`). The tool's failures then count under `tool:<name>`, apart from the run's other steps,
+  and are retried under this policy, which wins over the tool's own (`#[tool(retry(...))]`) and the deployment's.
+  The loader checks the shape and the bounds; `bind` checks each name against the agent's tools, the MCP servers'
+  included (they are connected before binding), and refuses an unknown one with a "did you mean". Ignored, with a
+  warning, on a remote subagent. A policy only applies to failures the tool reports as retryable: an MCP tool's
+  call that fails is an error result for the model, so its `retry:` covers little more than a refused bearer.
 * **A subagent inherits nothing** from its parent (eve's isolation boundary), and omitting `tools:`
   gives it **no tools** (decision D3). Claude Code inherits everything; adam does not.
 * **A copied file parses unchanged, but its `tools` must name adam tools.** A Claude Code file listing
