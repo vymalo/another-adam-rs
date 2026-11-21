@@ -19,7 +19,7 @@ import path from 'node:path';
 import { A2AClient, driveTask } from '../a2a.mjs';
 import { externalFailure } from '../classify.mjs';
 import { ensureAgentFolder, hostRepoUrl, lsRemoteHeads, pushScript, runRepoName, stackRepoUrl } from '../gitops.mjs';
-import { InfraError, WorktreeError, crossCheckBranch, locateWorktree, patchOfTree, saveRaw } from './common.mjs';
+import { InfraError, WorktreeError, crossCheckBranch, locateWorktree, patchOfTree, saveRaw, untrackedHeavyDirs } from './common.mjs';
 
 /** The coder's per-run settings. Pure. Every value is plain: a settings file has no quoting. */
 export function adamSettings({ meterBaseUrl, bearer, contextWindow }) {
@@ -100,7 +100,7 @@ export class AdamAgent {
       throw e;
     }
     const treeDir = path.join(ctx.paths.scratch, 'tree');
-    const ex = await stack.extractTree(slot, found.path, treeDir);
+    const ex = await stack.extractTree(slot, found.path, treeDir, { exclude: await untrackedHeavyDirs(ctx.base) });
     const patch = await patchOfTree({ treeDir, base: ctx.base, workRoot: ctx.paths.scratch });
     fs.rmSync(treeDir, { recursive: true, force: true });
     let branch = null;

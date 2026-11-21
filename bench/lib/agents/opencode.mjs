@@ -25,7 +25,7 @@ import { RUN_ID_MAX } from '../plan.mjs';
 import { fetchPinnedBinary } from '../npm.mjs';
 import { redact } from '../stack.mjs';
 import { runtimeLimits, runtimeUser } from '../runtime.mjs';
-import { InfraError, patchOfTree, saveRaw } from './common.mjs';
+import { InfraError, patchOfTree, saveRaw, untrackedHeavyDirs } from './common.mjs';
 
 export const MODEL = 'bench/bench-model';
 const METER_URL = /^http:\/\/meter-\d:8090\/r\/[A-Za-z0-9_-]{16,128}\/v1$/;
@@ -38,7 +38,7 @@ export const SHARED_PROMPT_FILE = 'shared-prompt.md';
 const OUT_FILES = ['events.jsonl', 'stderr.txt', 'export.json'];
 
 /** The OpenCode configuration of a run (`OPENCODE_CONFIG_CONTENT`). Pure. */
-export function opencodeConfig({ baseUrl, contextWindow, steps = 200, urlPattern = METER_URL, instructions = [] }) {
+export function opencodeConfig({ baseUrl, contextWindow, steps = 200, urlPattern = METER_URL, instructions = [], outputTokens = OUTPUT_TOKENS }) {
   if (!urlPattern.test(baseUrl ?? '')) throw new Error('the model address must be the meter\'s: http://meter-<slot>:8090/r/<run token>/v1');
   if (!Number.isSafeInteger(contextWindow) || contextWindow < 1) throw new Error('the context window is required: both agents are given the same one');
   return {
@@ -54,7 +54,7 @@ export function opencodeConfig({ baseUrl, contextWindow, steps = 200, urlPattern
         npm: '@ai-sdk/openai-compatible',
         name: 'bench',
         options: { baseURL: baseUrl, apiKey: 'bench-dummy-key' }, // the meter holds the real key
-        models: { 'bench-model': { name: 'bench-model', tool_call: true, limit: { context: contextWindow, output: OUTPUT_TOKENS } } },
+        models: { 'bench-model': { name: 'bench-model', tool_call: true, limit: { context: contextWindow, output: outputTokens } } },
       },
     },
     permission: { '*': 'allow', webfetch: 'deny', websearch: 'deny', external_directory: 'deny', question: 'deny' },
@@ -251,7 +251,7 @@ export class OpenCodeAgent {
 
   async run(ctx) {
     const names = this.#names(ctx);
-    const config = opencodeConfig({ baseUrl: ctx.meter.baseUrl, contextWindow: this.contextWindow, steps: ctx.limits.steps, instructions: this.sharedPrompt ? [`/bench/in/${SHARED_PROMPT_FILE}`] : [] });
+    const config = opencodeConfig({ baseUrl: ctx.meter.baseUrl, contextWindow: this.contextWindow, steps: ctx.limits.steps, outputTokens: ctx.limits.outputTokens ?? OUTPUT_TOKENS, instructions: this.sharedPrompt ? [`/bench/in/${SHARED_PROMPT_FILE}`] : [] });
     const input = opencodeInput({ config });
     const globals = this.#globals(ctx);
     const outHost = path.join(ctx.stack.workRoot(ctx.slot), 'bench-out', path.basename(names.out));
@@ -335,7 +335,7 @@ export class OpenCodeAgent {
   async collect(ctx) {
     const names = this.#names(ctx);
     const treeDir = path.join(ctx.paths.scratch, 'tree');
-    const ex = await ctx.stack.extractTree(ctx.slot, names.dir, treeDir);
+    const ex = await ctx.stack.extractTree(ctx.slot, names.dir, treeDir, { exclude: await untrackedHeavyDirs(ctx.base) });
     const patch = await patchOfTree({ treeDir, base: ctx.base, workRoot: ctx.paths.scratch });
     fs.rmSync(treeDir, { recursive: true, force: true });
     return { patch, notes: { refused: ex?.refused ?? [] } };

@@ -437,9 +437,15 @@ export class Stack {
   async extractTree(slot, dir, dest, limits = {}) {
     if (!/^\/work\/workspaces\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(dir) && !/^\/work\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(dir)) throw new StackError('the tree is not a worktree of the volume');
     fs.rmSync(dest, { recursive: true, force: true });
-    const r = await this.streamFrom(slot, ['--format=posix', '-cf', '-', '--exclude=./.git', '-C', dir, '.'], { maxBytes: limits.maxBytes ?? 512 * 1024 * 1024 });
+    // `exclude`: folder names left out at any depth (the agents pass the dependency and cache folders the base does not track).
+    const excludes = (limits.exclude ?? []).map((name) => {
+      if (!/^[A-Za-z0-9._-]+$/.test(name) || name === '.' || name === '..') throw new StackError('an excluded folder name is not plain');
+      return `--exclude=${name}`;
+    });
+    const r = await this.streamFrom(slot, ['--format=posix', '-cf', '-', '--exclude=./.git', ...excludes, '-C', dir, '.'], { maxBytes: limits.maxBytes ?? 512 * 1024 * 1024 });
     if (r.exitCode !== 0) throw new StackError(`the tree could not be read (exit ${r.exitCode})`);
-    const entries = parseTar(r.stdout, { allowSymlinks: true, ...limits });
+    const { exclude, ...parseLimits } = limits;
+    const entries = parseTar(r.stdout, { allowSymlinks: true, ...parseLimits });
     extractEntries(entries, dest);
     return { refused: entries.refused }; // a FIFO, a device or a file over its cap: skipped, and recorded
   }

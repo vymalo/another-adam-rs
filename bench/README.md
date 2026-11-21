@@ -58,7 +58,7 @@ Every value below is made up.
 | `keyEnv` | the environment variable that holds the key (default `BENCH_MODEL_API_KEY`) |
 | `concurrency` | runs at once, 1 to 8 (default 2) |
 | `contextWindow` | **required**: the model's context window; both agents are given this one value |
-| `limits` | optional, the same for both agents: `minutes` (the time limit of a run, 50), `steps` (adam's turn limit and OpenCode's `steps`, 200) and `cancelGraceSeconds` (60) |
+| `limits` | optional, the same for both agents: `minutes` (the time limit of a run, 50), `steps` (adam's turn limit and OpenCode's `steps`, 200), `cancelGraceSeconds` (60) and `outputTokens` (the meter's clamp of every call's output, and OpenCode's output limit, 8192; a reasoning arm needs more: at 8192 the reasoning used it all and no answer came, 2026-11-21) |
 | `timeouts` | optional: the meter's first-byte and idle timeouts in seconds |
 | `tasks` | optional: task sources and grading, see Tasks |
 
@@ -665,6 +665,11 @@ measured in the dry run with `BENCH_DRYRUN_REQUESTS_DIR` (2026-11-20, pin `e46c8
 fingerprint of the system prompt (`prompt`, a hash, never the text). The fold turns the fingerprints into **child sessions**:
 consecutive calls whose prompt is not the attempt's first call's are a subagent's; the report counts sessions, their calls and
 their time per cell.
+
+**Collecting a tree.** The agent's working tree is read without the dependency and cache folders (`HEAVY_DIRS` in
+`lib/agents/common.mjs`: `node_modules`, `.mypy_cache`, `__pycache__`, ...) that the base tracks no file under, and the
+patch leaves the tool caches out (`TOOL_CACHES` in `lib/grade.mjs`): element-web's `node_modules` was over the tree's size
+limit, and a `.mypy_cache` over the patch's. A folder the base tracks is read, or its files would look deleted.
 
 **Quality review.** `bench review` scores every Done run's patch with the configured model at `max`, one rubric for every
 cell (`lib/review.mjs`: correctness, tests, design, scope, hygiene, docs, overall, 1 to 5), blind to the agent, the arm and the

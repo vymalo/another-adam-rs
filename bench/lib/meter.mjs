@@ -61,10 +61,10 @@ export function deepMerge(base, over) {
   return out;
 }
 
-const clampTokens = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 1 ? Math.min(Math.floor(v), MAX_OUTPUT_TOKENS) : MAX_OUTPUT_TOKENS);
+const clampTokens = (v, cap) => (typeof v === 'number' && Number.isFinite(v) && v >= 1 ? Math.min(Math.floor(v), cap) : cap);
 
 /** The body the endpoint receives, and the most output it may produce. Throws a string on a bad body. */
-export function prepareBody(body, fragment, modelId) {
+export function prepareBody(body, fragment, modelId, cap = MAX_OUTPUT_TOKENS) {
   if (body.stream !== undefined && typeof body.stream !== 'boolean') throw 'stream must be a boolean';
   if ('n' in body && body.n !== 1) throw 'n must be absent or 1: one completion per call';
   const out = deepMerge({ ...body, model: modelId, n: 1 }, fragment);
@@ -72,13 +72,13 @@ export function prepareBody(body, fragment, modelId) {
   const limits = [];
   for (const k of ['max_tokens', 'max_completion_tokens']) {
     if (k in out) {
-      out[k] = clampTokens(out[k]);
+      out[k] = clampTokens(out[k], cap);
       limits.push(out[k]);
     }
   }
   if (limits.length === 0) {
-    out.max_tokens = MAX_OUTPUT_TOKENS;
-    limits.push(MAX_OUTPUT_TOKENS);
+    out.max_tokens = cap;
+    limits.push(cap);
   }
   const stream = out.stream === true;
   if (stream) out.stream_options = { ...(isObject(out.stream_options) ? out.stream_options : {}), include_usage: true };
@@ -299,7 +299,8 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
     }
     let prepared;
     try {
-      prepared = prepareBody(parsed, run.fragment, config.modelId);
+      // `limits.outputTokens` (default 8192), the same for every agent.
+      prepared = prepareBody(parsed, run.fragment, config.modelId, config.limits?.outputTokens ?? MAX_OUTPUT_TOKENS);
     } catch (reason) {
       return sendJson(res, 400, { error: { message: typeof reason === 'string' ? reason : 'bad request' } });
     }

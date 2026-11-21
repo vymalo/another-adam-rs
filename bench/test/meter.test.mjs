@@ -309,6 +309,8 @@ test('prepareBody: the clamp, the default limit, n, and include_usage only for s
   assert.equal('stream_options' in clamp({ stream: false }).body, false);
   assert.deepEqual(clamp({ stream: true }).body.stream_options, { include_usage: true });
   assert.equal(clamp({ stream: true }, { max_tokens: 99999 }).body.max_tokens, 8192, 'the clamp applies to the fragment too');
+  assert.equal(prepareBody({ max_tokens: 100000 }, {}, 'm', 32768).body.max_tokens, 32768, 'limits.outputTokens moves the clamp');
+  assert.equal(prepareBody({}, {}, 'm', 32768).maxOutputTokens, 32768);
   assert.throws(() => clamp({ stream: 'yes' }), /boolean/);
 });
 

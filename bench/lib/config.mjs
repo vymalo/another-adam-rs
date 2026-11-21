@@ -55,6 +55,7 @@ export const SCHEMA = {
       minutes: { type: 'int', min: 1, max: 600, default: 50 },
       steps: { type: 'int', min: 1, max: 1000, default: 200 },
       cancelGraceSeconds: { type: 'int', min: 1, max: 600, default: 60 },
+      outputTokens: { type: 'int', min: 1024, max: 131072, default: 8192 },
     },
   },
   timeouts: {
@@ -265,7 +266,7 @@ export function normalizeConfig(raw) {
     if (!Number.isSafeInteger(v) || v < spec.min || v > spec.max) throw new ConfigError(`limits.${name}`, `must be a whole number from ${spec.min} to ${spec.max}`);
     return v;
   };
-  const limits = { minutes: limit('minutes'), steps: limit('steps'), cancelGraceSeconds: limit('cancelGraceSeconds') };
+  const limits = { minutes: limit('minutes'), steps: limit('steps'), cancelGraceSeconds: limit('cancelGraceSeconds'), outputTokens: limit('outputTokens') };
   limits.limitMs = limits.minutes * 60_000;
   limits.cancelGraceMs = limits.cancelGraceSeconds * 1000;
 
