@@ -1391,7 +1391,9 @@ async fn stopping_a_run_leaves_no_process_of_its_servers_not_even_a_grandchild()
 #[tokio::test]
 async fn changing_the_runs_image_stops_the_servers_of_the_run() {
     use adam_coder::tools::environment::use_repository_environment;
-    let lsp = Lsp::new(script_with_tree()).await;
+    // A fake environment that, like a run pod, has an image of the run's to set (`off` clears it).
+    let fake = common::FakeEnvironment::in_run_pods(None, &["ghcr.io/acme/"]);
+    let lsp = Lsp::over(Fixture::new().await.using(fake), script_with_tree()).await;
     rust_project(&lsp);
     lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
     let pids = lsp.tree().await;
