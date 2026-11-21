@@ -1313,8 +1313,16 @@ async fn a_folders_schedule_fires_the_agent() {
     // to a caller, the engine's `get` does not show it; the host reads it from its store.
     assert!(engine.get(fired.id).await.unwrap().is_none());
     // Nor are its files (#280): the runtime is read only for a run `get` shows.
-    let hidden = engine.files(fired.id).await.unwrap_err();
-    assert_eq!(hidden.class(), ErrorClass::NotFound, "{hidden:?}");
+    for hidden in [
+        engine.files(fired.id).await.map(|_| ()).unwrap_err(),
+        engine
+            .file(fired.id, &"0".repeat(64))
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+    ] {
+        assert_eq!(hidden.class(), ErrorClass::NotFound, "{hidden:?}");
+    }
     let asked = mock.requests();
     assert!(
         format!("{:?}", asked[0].messages).contains("Say what is due."),
@@ -1455,6 +1463,11 @@ async fn a_file_the_agent_hands_over_is_read_by_its_digest() {
         panic!("one file event: {withheld:?}");
     };
     assert_eq!(said.len, BYTES.len() as u64);
+    let digest = Artifact::file("report", "text/plain", "report.txt", BYTES.to_vec())
+        .expect("a file")
+        .file_sha256()
+        .expect("a digest");
+    assert_eq!(said.sha256, digest, "the event says the bytes' SHA-256");
 
     let files = engine.files(turn.run).await.unwrap();
     let [file] = files.as_slice() else {
@@ -1504,4 +1517,31 @@ async fn a_file_the_agent_hands_over_is_read_by_its_digest() {
         assert_eq!(refused.class(), ErrorClass::NotFound, "{refused:?}");
     }
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A host's tool named as one of the engine's own is refused at `start` (`DuplicateTool`), never
+/// put in the other's place.
+#[tokio::test]
+async fn a_host_tool_named_as_the_engines_is_refused() {
+    let ask = FnTool::raw(
+        "ask_user",
+        "Not the engine's.",
+        json!({"type": "object", "properties": {}}),
+        |_ctx, _args| async move { Ok::<_, ToolError>(ToolOutput::text("mine")) },
+    );
+    let refused = Engine::builder(
+        Arc::new(MemoryStore::new()),
+        chat(),
+        MockModel::new().into_dyn(),
+        "m",
+    )
+    .tools(ToolSet::new().tool(ask))
+    .start()
+    .await
+    .expect_err("start refuses it");
+    assert!(
+        matches!(&refused, EngineError::Agent(e) if matches!(**e, AssemblyError::DuplicateTool { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(refused.class(), ErrorClass::Invalid);
 }

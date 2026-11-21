@@ -14,9 +14,7 @@ use adam_assembly::AgentDef;
 use adam_core::{DynSecretSource, DynStore, RunId};
 use adam_llm_agent::{DEFAULT_MAX_PARALLEL, ToolSet};
 use adam_model::DynModel;
-use adam_runtime::{
-    BroadcastSink, FileRef, FileSource, RetryPolicy, Runtime, RuntimeBuilder, RuntimeError, blob_id,
-};
+use adam_runtime::{BroadcastSink, FileRef, RetryPolicy, Runtime, RuntimeBuilder, RuntimeError};
 use adam_ui::Ui;
 use tokio::sync::{RwLock, RwLockReadGuard, oneshot, watch};
 use tokio::task::AbortHandle;
@@ -130,9 +128,10 @@ impl EngineBuilder {
         self
     }
 
-    /// The host's own tools (`#[tool]` functions, `tools!`, an `FnTool`), which the agent's files
-    /// select with `tools:` as a server built with `adam-host` does; the engine's own (`ask_user`,
-    /// `show`, the plan tools) are always there. Default none. A name used twice, or one the files
+    /// The host's own tools (`#[tool]` functions, `tools!`, an `FnTool`), beside the engine's own
+    /// (`ask_user`, `show`, `ui_catalog`, the plan tools): together they are the catalog the
+    /// agent's `tools:` selects from, as on a server built with `adam-host`. Default none; a later
+    /// call replaces the set. A name used twice (one of the engine's included), or one the files
     /// name and nobody gives, is refused at [`start`](Self::start).
     pub fn tools(mut self, tools: ToolSet) -> Self {
         self.tools = tools;
@@ -373,8 +372,8 @@ impl Drop for AbortOnDrop {
 
 pub(crate) struct Shared {
     backend: RuntimeTaskBackend,
-    /// What [`Engine::files`] and [`Engine::file`] read a run's files from, once `get` has said
-    /// the run is this engine's caller's.
+    /// What [`Engine::file`] reads a file's bytes from, once the backend has said the run is this
+    /// engine's caller's.
     runtime: Runtime,
     /// The ring every reader of [`Engine::events`] subscribes to; the runtime emits into it through
     /// [`EngineSink`], which takes a file's bytes out.
@@ -691,39 +690,31 @@ impl Engine {
             .runtime
             .artifact_bytes(&file)
             .await
-            .map_err(|e| EngineError::of_runtime(Arc::new(e)))
+            .map_err(EngineError::of_read)
     }
 
-    /// The file artifacts of `run`, if this engine's caller may see it. The runtime is read only
-    /// after `get` has found the run, so a run of another caller (a schedule's firing, #289) is
-    /// `NotFound` here as it is to every other call.
+    /// The file artifacts of `run`, if this engine's caller may see it: one read of the run, owned
+    /// as every call checks it (a run of another caller, a schedule's firing, #289, is `NotFound`
+    /// here as it is to `get`), and no file's bytes.
     async fn file_refs(&self, run: RunId) -> Result<Vec<(RunFile, FileRef)>, EngineError> {
-        let gone = || EngineError::NotFound(format!("run {run}"));
-        if self.get(run).await?.is_none() {
-            return Err(gone());
-        }
-        let view = self
-            .shared
-            .runtime
-            .view(run)
+        let shared = &self.shared;
+        let view = shared
+            .backend
+            .owned_view(&shared.caller, &run.to_string())
             .await
-            .map_err(|e| EngineError::of_runtime(Arc::new(e)))?
-            .ok_or_else(gone)?;
+            .map_err(|e| EngineError::of_backend(e, Some(run)))?
+            .ok_or_else(|| EngineError::NotFound(format!("run {run}")))?;
         Ok(view
             .artifacts
             .into_iter()
             .filter_map(|artifact| {
                 let file = artifact.file?;
-                let sha256 = match &file.source {
-                    FileSource::Blob(id) => id.as_str().to_owned(),
-                    FileSource::Inline(bytes) => blob_id(bytes).as_str().to_owned(),
-                };
                 let listed = RunFile {
                     name: artifact.name,
                     mime_type: artifact.mime_type,
                     filename: file.filename.clone(),
                     len: file.size,
-                    sha256,
+                    sha256: file.digest().as_str().to_owned(),
                 };
                 Some((listed, file))
             })
