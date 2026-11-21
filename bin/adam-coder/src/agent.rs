@@ -355,6 +355,8 @@ impl CoderAgent {
             // How many calls of one model turn run at once: the deployment's setting, which a file's
             // `limits.max_parallel` may lower (ADR 0049).
             .max_parallel(env.settings.max_parallel_tool_calls)
+            // How a run waits on a model that refused it (ADR 0067).
+            .model_parking(env.settings.model_parking)
             // The access tier of the message: tools above it are not shown and not run.
             .tool_source(crate::tier::TierSource::new(
                 env.notes.clone(),

@@ -39,6 +39,7 @@ mod convert;
 mod files_in;
 mod ids;
 mod list;
+mod model_park;
 mod person;
 #[cfg(feature = "push")]
 mod push;
@@ -51,6 +52,7 @@ mod usage;
 mod vymalo;
 mod words;
 
+pub use adam_a2a::RESUME_METADATA_KEY;
 pub use backend::{DEFAULT_POLL_INTERVAL, MAX_REFERENCES, RuntimeTaskBackend};
 pub use caller::{CONTEXT_CALLER, UNREADABLE_CALLER, asked_by_an_agent};
 pub use child_sessions::{
@@ -65,6 +67,7 @@ pub use convert::{
 pub use files_in::{MAX_INBOUND_IMAGE_BYTES, MAX_INBOUND_IMAGES};
 pub use ids::task_id_for;
 pub use list::MAX_SCAN;
+pub use model_park::NOT_PARKED;
 pub use person::{CONTEXT_PERSON, person_said};
 #[cfg(feature = "push")]
 pub use push::StorePushStore;

@@ -14,6 +14,23 @@ use futures::stream::BoxStream;
 
 use crate::page::{TaskPage, TaskQuery};
 
+/// The key of a message's `metadata` that makes it a **resume** of a run parked on the model
+/// (`"adam.resume": true`, adam-rs ADR 0067): it wakes the run and adds nothing to its
+/// conversation, so it may have no text, and no part at all. The server lets such a message through
+/// with no part; the backend decides whether the task takes it (`adam-a2a-runtime` refuses one for a
+/// task that is not parked on the model). A contract of adam's A2A server
+/// (`docs/reference/a2a-server.md`, "A run parked on the model").
+pub const RESUME_METADATA_KEY: &str = "adam.resume";
+
+/// Whether `message` is a resume: its metadata holds [`RESUME_METADATA_KEY`] as `true`.
+pub fn is_resume(message: &Message) -> bool {
+    message
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(RESUME_METADATA_KEY))
+        == Some(&serde_json::Value::Bool(true))
+}
+
 /// The authenticated principal on whose behalf a request runs, and the extensions the request
 /// activated.
 ///

@@ -7,7 +7,7 @@ use std::time::Duration;
 use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent};
 use adam_llm_agent::{
     DEFAULT_MAX_PARALLEL, DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder,
-    MAX_PARALLEL_LIMIT, SESSION_TOOLS, StepIo, ToolSource, WINDOW_MARGIN_TOKENS,
+    MAX_PARALLEL_LIMIT, ModelParking, SESSION_TOOLS, StepIo, ToolSource, WINDOW_MARGIN_TOKENS,
 };
 use adam_model::{DEFAULT_MAX_OUTPUT_TOKENS, DynModel, ModelProfiles, Preset, ReasoningEffort};
 use adam_runtime::{RuntimeBuilder, SessionLimits};
@@ -38,6 +38,7 @@ pub struct BoundDef {
     profiles: ModelProfiles,
     wait_poll: Option<Duration>,
     max_parallel: Option<usize>,
+    model_parking: Option<ModelParking>,
     session_limits: SessionLimits,
     #[cfg(feature = "sessions")]
     child_sessions: Option<adam_a2a_runtime::ChildSessions>,
@@ -83,6 +84,7 @@ impl BoundDef {
             profiles: ModelProfiles::default(),
             wait_poll: None,
             max_parallel: None,
+            model_parking: None,
             session_limits,
             #[cfg(feature = "sessions")]
             child_sessions: None,
@@ -177,6 +179,18 @@ impl BoundDef {
     #[must_use]
     pub fn max_parallel(mut self, n: usize) -> Self {
         self.max_parallel = Some(n);
+        self
+    }
+
+    /// How every agent waits on a model that refused it or could not be reached
+    /// ([`LlmAgentBuilder::model_parking`], [ADR 0067]): the deployment's `MODEL_PARK_LIMIT`, and
+    /// whether an unreachable endpoint parks (`MODEL_AUTH=injector`). Without it the loop's
+    /// default: a limit of 24 hours, and an unreachable endpoint that fails the run.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[must_use]
+    pub fn model_parking(mut self, parking: ModelParking) -> Self {
+        self.model_parking = Some(parking);
         self
     }
 
@@ -573,6 +587,9 @@ impl BoundDef {
             .reasoning_effort(effort);
         if let Some(every) = self.wait_poll {
             builder = builder.wait_poll(every);
+        }
+        if let Some(parking) = self.model_parking {
+            builder = builder.model_parking(parking);
         }
         for (tool, _, policy) in &node.retry {
             builder = builder.tool_retry(tool.clone(), *policy);
