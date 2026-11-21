@@ -486,6 +486,11 @@ pub struct Conversation {
     /// existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<Plan>,
+    /// Turns in a row that stopped at the output limit with reasoning only (no words, no call): the
+    /// loop continues them and fails the run past [`MAX_THINKING_CUTS`](crate::MAX_THINKING_CUTS).
+    /// Absent from state written before it existed, and not written while `0`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub thinking_cuts: u32,
     /// The latest model turn stopped at the output limit (`FinishReason::Length`): a call of it whose
     /// arguments are not JSON is most likely cut off, and its error says so. Absent from state
     /// written before it existed, and not written while `false`.

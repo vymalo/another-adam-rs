@@ -21,6 +21,7 @@ use crate::engine::Expected;
 /// | `NotWaiting`, `Finished`, `Stopped`, `WorkerIdInUse` | `Rejected` |
 /// | `Unavailable` (a store that is down, or a run whose state moved under the call: try again) | `Transient` |
 /// | `Store` | the store's own |
+/// | `Schedules` | the reconcile's own |
 /// | `Internal` | `Internal` |
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -76,9 +77,14 @@ pub enum EngineError {
         #[source]
         source: Option<BoxError>,
     },
-    /// The store refused or failed at `start`: its migration, or the release of the worker's leases.
+    /// The store refused or failed: at `start`, its migration or the release of the worker's
+    /// leases; or while [`file`](crate::Engine::file) read a file's bytes.
     #[error("the store failed")]
     Store(#[source] StoreError),
+    /// `start` could not make the store's scheduler runs match the folder's `schedules/` (ADR
+    /// 0060): a schedule that does not parse, or a store that failed while it was read or written.
+    #[error("the agent's schedules cannot be set up")]
+    Schedules(#[source] adam_schedule::ReconcileError),
     /// A bug, or a failure nothing above describes.
     #[error("internal error: {message}")]
     Internal {
@@ -102,6 +108,7 @@ impl Classify for EngineError {
             | Self::WorkerIdInUse { .. } => ErrorClass::Rejected,
             Self::Unavailable { .. } => ErrorClass::Transient,
             Self::Store(source) => source.class(),
+            Self::Schedules(source) => source.class(),
             Self::Internal { .. } => ErrorClass::Internal,
         }
     }
@@ -162,6 +169,22 @@ impl EngineError {
         }
     }
 
+    /// A read of a run's file that failed ([`file`](crate::Engine::file)): the store's own error
+    /// keeps its class, anything else is a transient failure or a bug.
+    pub(crate) fn of_read(err: RuntimeError) -> Self {
+        match err {
+            RuntimeError::Store(source) => Self::Store(source),
+            err if err.is_retryable() => Self::Unavailable {
+                message: "the store, reading a file".to_owned(),
+                source: Some(Box::new(err)),
+            },
+            err => Self::Internal {
+                message: "a file could not be read".to_owned(),
+                source: Some(Box::new(err)),
+            },
+        }
+    }
+
     /// The worker's end, at [`shutdown`](crate::Engine::shutdown).
     pub(crate) fn of_runtime(err: Arc<RuntimeError>) -> Self {
         if err.is_retryable() {
@@ -194,6 +217,7 @@ mod tests {
             | EngineError::WorkerIdInUse { .. } => ErrorClass::Rejected,
             EngineError::Unavailable { .. } => ErrorClass::Transient,
             EngineError::Store(source) => source.class(),
+            EngineError::Schedules(source) => source.class(),
             EngineError::Internal { .. } => ErrorClass::Internal,
         }
     }

@@ -87,6 +87,10 @@ cargo run -p adam-coder
 halves. All variables: [Environment](../reference/environment.md). Against a real model and GitHub, see the
 live smoke test in the [coder README](../../bin/adam-coder/README.md#live-smoke-test-manual-not-run-in-ci).
 
+With no database server at all, use `export DATABASE_URL=sqlite:///tmp/adam.sqlite` and `ROLE=all`: the
+file holds one process, and a second one is refused ([store adapters](../reference/store-adapters.md#sqlite)).
+The model and GitHub variables are still needed by a role that runs workers.
+
 How a *live* model behaves with these instructions is *unverified*: the mocks prove what the model is sent, not
 what it says.
 

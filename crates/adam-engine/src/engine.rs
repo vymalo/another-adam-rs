@@ -8,21 +8,21 @@ use std::time::Duration;
 
 use a2a::{Message, Part, Role, Task};
 use adam_a2a::{BackendError, Caller, STEER_EXTENSION, TaskBackend, TaskQuery};
-use adam_a2a_runtime::{RuntimeTaskBackend, task_id_for};
-use adam_agent_fs::{AgentManifest, Subagent};
+use adam_a2a_runtime::{Commands, RuntimeTaskBackend, task_id_for};
+use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
 use adam_core::{DynSecretSource, DynStore, RunId};
-use adam_llm_agent::DEFAULT_MAX_PARALLEL;
+use adam_llm_agent::{DEFAULT_MAX_PARALLEL, ToolSet};
 use adam_model::DynModel;
-use adam_runtime::{BroadcastSink, Runtime, RuntimeBuilder, RuntimeError};
+use adam_runtime::{BroadcastSink, FileRef, RetryPolicy, Runtime, RuntimeBuilder, RuntimeError};
 use adam_ui::Ui;
 use tokio::sync::{RwLock, RwLockReadGuard, oneshot, watch};
 use tokio::task::AbortHandle;
 
 use crate::events::EngineSink;
 use crate::{
-    ConversationId, Delivered, EngineError, ListQuery, Page, RunEvents, RunInfo, RunState, Say,
-    Turn, default_secrets,
+    ConversationId, Delivered, EngineError, ListQuery, Page, RunEvents, RunFile, RunInfo, RunState,
+    Say, Turn, default_secrets,
 };
 
 /// The one subject every call of an engine is made as: the engine serves one person, and the
@@ -36,7 +36,7 @@ const DEFAULT_EVENT_CAPACITY: usize = 256;
 const MAX_EVENT_CAPACITY: usize = 1 << 16;
 
 /// What the engine runs within. Set the fields on [`Limits::default`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct Limits {
     /// Runs stepped at the same time (the runtime's `concurrency`). Default 4, at least 1.
@@ -60,8 +60,10 @@ pub struct Limits {
     /// * `Some(id)`: **the host promises that no other live engine, in any process, uses `id` on
     ///   this store.** `start` then releases every lease `id` holds
     ///   (`Store::release_worker_leases`), so the runs the last process was stepping are claimed at
-    ///   once. Set one only for a store no other engine shares: the application's own SQLite file
-    ///   (when slice 3 lands, its lock will allow one process per file) or a store per install.
+    ///   once. Set one only for a store no other engine shares, such as a store per install. The
+    ///   SQLite store needs none: its lock allows one process per file, and `start` (its `migrate`)
+    ///   clears every lease the file holds. Run one engine per SQLite file: the clearing takes a live
+    ///   engine's leases of the same process too.
     ///   Broken, the promise costs a run stepped twice, its tools run twice: the release takes the
     ///   leases of the runs the other engine is stepping, and both renew under the same id.
     ///
@@ -74,6 +76,12 @@ pub struct Limits {
     /// a host that restarts in the same process calls `shutdown` first, which lets the steps in
     /// flight finish.
     pub worker_id: Option<String>,
+    /// The runtime's retry policy: what a transient failure that names no policy of its own (a
+    /// model provider's outage, a tool with none) is retried under ([ADR
+    /// 0061](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0061-a-step-names-its-retry-policy.md)).
+    /// A folder's `retry:` and a tool's own policy win over it for their tools. Default
+    /// [`RetryPolicy::default`]: 5 attempts, 1 s to 60 s.
+    pub retry: RetryPolicy,
 }
 
 impl Default for Limits {
@@ -84,6 +92,7 @@ impl Default for Limits {
             lease_ttl: Duration::from_secs(30),
             event_capacity: DEFAULT_EVENT_CAPACITY,
             worker_id: None,
+            retry: RetryPolicy::default(),
         }
     }
 }
@@ -97,6 +106,7 @@ pub struct EngineBuilder {
     alias: String,
     secrets: DynSecretSource,
     limits: Limits,
+    tools: ToolSet,
 }
 
 impl std::fmt::Debug for EngineBuilder {
@@ -118,6 +128,16 @@ impl EngineBuilder {
         self
     }
 
+    /// The host's own tools (`#[tool]` functions, `tools!`, an `FnTool`), beside the engine's own
+    /// (`ask_user`, `show`, `ui_catalog`, the plan tools): together they are the catalog the
+    /// agent's `tools:` selects from, as on a server built with `adam-host`. Default none; a later
+    /// call replaces the set. A name used twice (one of the engine's included), or one the files
+    /// name and nobody gives, is refused at [`start`](Self::start).
+    pub fn tools(mut self, tools: ToolSet) -> Self {
+        self.tools = tools;
+        self
+    }
+
     /// The limits the engine runs within. Default [`Limits::default`].
     pub fn limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
@@ -125,8 +145,9 @@ impl EngineBuilder {
     }
 
     /// Migrate the store, release the leases a fixed [`Limits::worker_id`] holds in it (a restarted
-    /// engine claims its old runs at once), build the agent and start the worker on the current
-    /// tokio runtime.
+    /// engine claims its old runs at once), build the agent, register its scheduler and make the
+    /// store's scheduler runs match the folder's `schedules/` (ADR 0060), and start the worker on
+    /// the current tokio runtime.
     ///
     /// The agent gets the screen's tools of an embedded agent (`ask_user`, `show`, `ui_catalog`,
     /// `plan_*`, from `adam_ui::Ui::embedded`) and nothing on the network: a file that names an
@@ -144,7 +165,9 @@ impl EngineBuilder {
     /// * [`EngineError::Store`] when the store's migration or the release of the worker's leases
     ///   fails, with the store's class;
     /// * [`EngineError::Agent`] when the agent does not bind (an unknown tool, an MCP server, a
-    ///   remote subagent, a secret refused) or the model alias is refused.
+    ///   remote subagent, a secret refused) or the model alias is refused;
+    /// * [`EngineError::Schedules`] when the scheduler runs cannot be made to match the folder, with
+    ///   the reconcile's class: on a retryable one, call `start` again (what was done is kept).
     pub async fn start(self) -> Result<Engine, EngineError> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| EngineError::NoRuntime)?;
         let Self {
@@ -154,6 +177,7 @@ impl EngineBuilder {
             alias,
             secrets,
             limits,
+            tools,
         } = self;
         if limits.lease_ttl.is_zero() {
             return Err(EngineError::Invalid(
@@ -173,10 +197,12 @@ impl EngineBuilder {
         }
         refuse_what_is_not_embedded(agent.manifest(), agent.name())?;
         let name = agent.name().to_owned();
+        let schedules = agent.manifest().schedules.clone();
+        let commands = agent.manifest().commands.clone();
         let ui = Ui::embedded();
         let assembly = agent
             .secrets(secrets)
-            .bind(ui.tools())
+            .bind(ui.tools().extend(tools))
             .map_err(|e| EngineError::Agent(Box::new(e)))?
             .tool_source(ui.screen())
             .max_parallel(limits.max_parallel_tools)
@@ -199,13 +225,28 @@ impl EngineBuilder {
             None => None,
         };
 
-        let (runtime, events) =
-            runtime_with_ring(assembly.register(Runtime::builder(store)), &limits);
+        // The folder's schedules are stepped beside the agent by its scheduler (ADR 0060), as the
+        // binaries do; it is registered whatever the folder holds, so a scheduler run a folder
+        // dropped is still stepped to its cancel.
+        let scheduler = adam_schedule::SchedulerAgent::new(&name);
+        let (runtime, events) = runtime_with_ring(
+            assembly.register(Runtime::builder(store)).agent(scheduler),
+            &limits,
+        );
+        // Make the store's scheduler runs match the folder before the worker starts: a schedule
+        // added is started, one changed is replaced, one dropped is cancelled.
+        adam_schedule::reconcile(&runtime, &name, &schedules)
+            .await
+            .map_err(EngineError::Schedules)?;
         // The backend is given the same ring, for the A2A path that streams a task
         // (`TaskBackend::subscribe`), whose file parts are built from a live event's bytes. The engine
         // never calls that path: an artifact in this ring has its bytes withheld, so a caller that
         // streams a task through this backend must read files from the store.
-        let backend = RuntimeTaskBackend::new(runtime.clone(), events.clone(), name.clone());
+        // The folder's commands (`commands/v1`): a message whose text is `/name args` is expanded
+        // from `commands/<name>.md` before it is stored, as on the server surfaces.
+        let backend = RuntimeTaskBackend::new(runtime.clone(), events.clone(), name.clone())
+            .with_commands(Commands::from_manifest(&commands));
+        let reader = runtime.clone();
 
         let (stop, stopped) = oneshot::channel::<()>();
         let running = handle.spawn(async move {
@@ -236,8 +277,10 @@ impl EngineBuilder {
                 steering: caller.clone().with_extensions([STEER_EXTENSION]),
                 caller,
                 backend,
+                runtime: reader,
                 events,
                 agent: name,
+                commands,
                 writes: RwLock::new(()),
                 stopping: AtomicBool::new(false),
                 worker: Worker {
@@ -260,7 +303,8 @@ pub(crate) fn runtime_with_ring(
     let builder = builder
         .event_sink(EngineSink(events.clone()))
         .concurrency(limits.concurrency)
-        .lease_ttl(limits.lease_ttl);
+        .lease_ttl(limits.lease_ttl)
+        .retry(limits.retry);
     // `None` keeps the runtime's default, a random id.
     let builder = match &limits.worker_id {
         Some(id) => builder.worker_id(id.clone()),
@@ -328,6 +372,9 @@ impl Drop for AbortOnDrop {
 
 pub(crate) struct Shared {
     backend: RuntimeTaskBackend,
+    /// What [`Engine::file`] reads a file's bytes from, once the backend has said the run is this
+    /// engine's caller's.
+    runtime: Runtime,
     /// The ring every reader of [`Engine::events`] subscribes to; the runtime emits into it through
     /// [`EngineSink`], which takes a file's bytes out.
     events: BroadcastSink,
@@ -336,6 +383,8 @@ pub(crate) struct Shared {
     /// The same subject, with `steer/v1` activated: a message for a running run is delivered.
     steering: Caller,
     agent: String,
+    /// The agent's commands, from its `commands/`: what [`Engine::commands`] lists.
+    commands: Vec<Command>,
     /// Held shared by every message for the length of its call, and exclusively by `shutdown` while
     /// it sets `stopping`: a message is either written before the worker is told to stop, or
     /// refused.
@@ -387,6 +436,7 @@ impl Engine {
             alias: alias.into(),
             secrets: default_secrets(),
             limits: Limits::default(),
+            tools: ToolSet::new(),
         }
     }
 
@@ -602,6 +652,81 @@ impl Engine {
             next_page_token: page.next_page_token,
             total: page.total_size,
         })
+    }
+
+    /// The files the agent handed over in `run` (its file artifacts), in the order they were
+    /// emitted, without their bytes. An event withholds a file's bytes too; this list is what a
+    /// host that missed the event (or reads the run later) finds them by.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NotFound`] when this engine has no such run, and the store's failures.
+    pub async fn files(&self, run: RunId) -> Result<Vec<RunFile>, EngineError> {
+        Ok(self
+            .file_refs(run)
+            .await?
+            .into_iter()
+            .map(|(file, _)| file)
+            .collect())
+    }
+
+    /// The bytes of the file of `run` whose SHA-256 is `sha256` (a [`RunFile`]'s, or the
+    /// [`WithheldFile`](crate::WithheldFile) an event says). `None` when the run has no such
+    /// file, or its bytes are gone from the store.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NotFound`] when this engine has no such run, and the store's failures.
+    pub async fn file(&self, run: RunId, sha256: &str) -> Result<Option<Arc<[u8]>>, EngineError> {
+        let Some((_, file)) = self
+            .file_refs(run)
+            .await?
+            .into_iter()
+            .find(|(file, _)| file.sha256 == sha256)
+        else {
+            return Ok(None);
+        };
+        self.shared
+            .runtime
+            .artifact_bytes(&file)
+            .await
+            .map_err(EngineError::of_read)
+    }
+
+    /// The file artifacts of `run`, if this engine's caller may see it: one read of the run, owned
+    /// as every call checks it (a run of another caller, a schedule's firing, #289, is `NotFound`
+    /// here as it is to `get`), and no file's bytes.
+    async fn file_refs(&self, run: RunId) -> Result<Vec<(RunFile, FileRef)>, EngineError> {
+        let shared = &self.shared;
+        let view = shared
+            .backend
+            .owned_view(&shared.caller, &run.to_string())
+            .await
+            .map_err(|e| EngineError::of_backend(e, Some(run)))?
+            .ok_or_else(|| EngineError::NotFound(format!("run {run}")))?;
+        Ok(view
+            .artifacts
+            .into_iter()
+            .filter_map(|artifact| {
+                let file = artifact.file?;
+                let listed = RunFile {
+                    name: artifact.name,
+                    mime_type: artifact.mime_type,
+                    filename: file.filename.clone(),
+                    len: file.size,
+                    sha256: file.digest().as_str().to_owned(),
+                };
+                Some((listed, file))
+            })
+            .collect())
+    }
+
+    /// The agent's commands (`commands/<name>.md`), in name order: what a person may type as
+    /// `/name args`, which the engine expands from the command's template before it is stored. A
+    /// host lists them in its `/` menu with their `description` and `argument_hint`, as a client
+    /// of the server surfaces reads them from the card (`commands/v1`).
+    pub fn commands(&self) -> &[Command] {
+        &self.shared.commands
     }
 
     /// `run` as the store has it now, or `None` when this engine has no such run.

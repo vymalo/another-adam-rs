@@ -5,7 +5,7 @@
 //! The coder checks a path and then uses it, and the tests of this repository prove that nothing it
 //! does follows such a link by making the swap happen **between** the check and the use: the code
 //! calls [`checkpoint`] where a check ends and the use begins, and a test registers a closure
-//! ([`on_checkpoint`]) that does what the run could do there.
+//! (`on_checkpoint`) that does what the run could do there.
 //!
 //! [`checkpoint`] does nothing unless the crate is built for its tests or with the `test-util`
 //! feature: a release build has no registry, no lock and no closure to call.

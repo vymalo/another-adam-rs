@@ -47,6 +47,7 @@ pub use adam_error;
 pub use adam_llm_agent;
 pub use adam_model;
 pub use adam_runtime;
+pub use adam_schedule;
 pub use adam_ui;
 
 mod engine;
@@ -58,7 +59,7 @@ pub use engine::{Engine, EngineBuilder, Limits};
 pub use error::EngineError;
 pub use events::{EngineEvent, RunEvents, WithheldFile};
 pub use types::{
-    ConversationId, DEFAULT_PAGE_SIZE, Delivered, ListQuery, MAX_PAGE_SIZE, Page, RunInfo,
+    ConversationId, DEFAULT_PAGE_SIZE, Delivered, ListQuery, MAX_PAGE_SIZE, Page, RunFile, RunInfo,
     RunState, Say, Turn,
 };
 

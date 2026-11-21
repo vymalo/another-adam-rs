@@ -8,6 +8,25 @@ use uuid::Uuid;
 
 use crate::EngineError;
 
+/// A file the agent handed over in a run (a file artifact), without its bytes: what
+/// [`Engine::files`](crate::Engine::files) lists. Read the bytes with
+/// [`Engine::file`](crate::Engine::file) and its `sha256`, which is also what an event that
+/// withholds the file says ([`WithheldFile`](crate::WithheldFile)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RunFile {
+    /// The artifact's name.
+    pub name: String,
+    /// Its media type, if the agent gave one.
+    pub mime_type: Option<String>,
+    /// The name the file is saved under.
+    pub filename: String,
+    /// How many bytes it has.
+    pub len: u64,
+    /// The SHA-256 of its bytes, as 64 lower-case hexadecimal digits.
+    pub sha256: String,
+}
+
 /// A conversation: the runs that one person's thread is made of, each continuing the one before.
 /// Opaque; the engine makes it on the first [`send`](crate::Engine::send) of a thread, and the host
 /// keeps it to send the next message.
