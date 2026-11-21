@@ -64,8 +64,8 @@ pub(crate) struct AgentMcp {
     /// What its servers said about themselves, by server, heading included, ready to append to its
     /// instructions (empty for tools supplied by hand). Read once, when the servers were
     /// connected, so the prompt of the agent never changes during the process. A server with a
-    /// `when` contributes its section to a run only when the run loads it
-    /// ([`mcp_select`](crate::mcp_select)).
+    /// `when` contributes its section to the note of its group, which the load's result says
+    /// ([`groups`](crate::groups)).
     pub(crate) instructions: Vec<(String, String)>,
     /// The prompts of its servers as commands (the root's are served; a subagent's are not).
     pub(crate) prompts: Prompts,
@@ -172,4 +172,30 @@ pub(crate) fn local_agents<'a>(
             local_agents(child, &format!("{name}/{}", child.name), out);
         }
     }
+}
+
+/// The most the instructions of an agent's MCP servers may add to its prompt, all together: the
+/// bound `adam-mcp` applies to the whole set when it is appended at bind
+/// (`adam_mcp::MAX_INSTRUCTIONS_BYTES`, 8 KiB).
+pub(crate) const MAX_INSTRUCTIONS_BYTES: usize = 8 * 1024;
+
+/// `sections` (a server's name and the section `adam_mcp::McpServers::instructions_by_server` gives
+/// it) as one text: blank-line separated, in order, cut at [`MAX_INSTRUCTIONS_BYTES`] together (the
+/// server that would pass it and the ones after are left out, with a warning).
+pub(crate) fn join_sections(sections: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (server, section) in sections {
+        let separator = if out.is_empty() { "" } else { "\n\n" };
+        if out.len() + separator.len() + section.len() > MAX_INSTRUCTIONS_BYTES {
+            tracing::warn!(
+                server = %server,
+                "the MCP servers' instructions are over {MAX_INSTRUCTIONS_BYTES} bytes together: \
+                 this server's and the next ones' are left out"
+            );
+            break;
+        }
+        out.push_str(separator);
+        out.push_str(section);
+    }
+    out
 }

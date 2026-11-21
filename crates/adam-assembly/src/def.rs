@@ -833,72 +833,62 @@ impl Walk<'_> {
                 .filter(|(server, _)| !triggers.iter().any(|(triggered, _)| triggered == server))
                 .cloned()
                 .collect();
-            let text = crate::mcp_select::join_sections(&eager);
+            let text = crate::mcp::join_sections(&eager);
             if !text.is_empty() {
                 prompt.push_str("\n\n");
                 prompt.push_str(&text);
             }
         }
+        // A name under the loaders' reserved prefix is refused at bind: the loader of a group and
+        // an MCP tool would collide (ADR 0066, decision 2).
+        if let Some((reserved, _)) = tools
+            .iter()
+            .find(|(tool, _)| tool.starts_with(crate::groups::RESERVED_PREFIX))
+        {
+            return Err(Error::ReservedToolName {
+                origin: origin.clone(),
+                tool: reserved.clone(),
+            });
+        }
         let mut sources: Vec<DynToolSource> = Vec::new();
         if !triggers.is_empty() {
-            let triggered: Vec<crate::mcp_select::Triggered> = triggers
+            // Each server whose `when` did not match the task is one group, named after the
+            // server: its tools are withheld until the group's loader is called (or the task holds
+            // one of its keywords), and its instructions are the group's note, said in the load's
+            // result rather than in the prompt (ADR 0066, decisions 2 and 3).
+            let defs: Vec<crate::groups::Group> = triggers
                 .iter()
                 .map(|(server, keywords)| {
                     // Only the tools this agent selected: a load may not offer a tool the agent
                     // was never given (its `tools:` narrowed the server's list).
-                    let specs = mcp_by_server
+                    let members: Vec<String> = mcp_by_server
                         .get(server)
                         .map(|names| {
                             names
                                 .iter()
                                 .filter(|name| tools.iter().any(|(selected, _)| selected == *name))
-                                .filter_map(|name| {
-                                    own_mcp
-                                        .iter()
-                                        .find(|(named, _)| named == name)
-                                        .map(|(_, tool)| tool.spec())
-                                })
+                                .cloned()
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let instructions = self.mcp.get(&name).and_then(|given| {
-                        given
-                            .instructions
-                            .iter()
-                            .find(|(named, _)| named == server)
-                            .map(|(_, text)| text.clone())
-                    });
-                    crate::mcp_select::Triggered::new(
-                        server.clone(),
-                        keywords.clone(),
-                        specs,
-                        instructions,
-                    )
+                    let note = self
+                        .mcp
+                        .get(&name)
+                        .and_then(|given| {
+                            given
+                                .instructions
+                                .iter()
+                                .find(|(named, _)| named == server)
+                                .map(|(_, text)| text.clone())
+                        })
+                        .unwrap_or_else(|| format!("The tools of the MCP server `{server}`."));
+                    crate::groups::Group::new(server.clone(), note, members)
+                        .with_keywords(keywords.clone())
                 })
                 .collect();
-            // The fallback: one fixed tool that loads a triggered server during the run, present
-            // from the first request whatever the task, so the tool list is the same bytes until
-            // something is loaded.
-            if tools
-                .iter()
-                .any(|(tool, _)| tool == crate::use_server::USE_SERVER)
-            {
-                return Err(Error::ReservedToolName {
-                    origin: origin.clone(),
-                    tool: crate::use_server::USE_SERVER.to_owned(),
-                });
-            }
-            let declared: Vec<String> = mcp::declared(manifest)
-                .map(|config| config.servers.keys().cloned().collect())
-                .unwrap_or_default();
-            tools.push((
-                crate::use_server::USE_SERVER.to_owned(),
-                Arc::new(crate::use_server::UseServer::new(
-                    declared,
-                    triggered.clone(),
-                )),
-            ));
-            sources.push(Arc::new(crate::mcp_select::McpSelect::new(triggered)));
+            let groups = crate::groups::Groups::bind(&origin, defs, &tools)?;
+            tools.extend(groups.loader_tools());
+            sources.push(Arc::new(groups));
         }
         // An agent that has an MCP tool can get a long result that is kept and paged: it reads the
         // rest with `read_output` (a folder agent keeps it in the run's state, up to 4 MiB).

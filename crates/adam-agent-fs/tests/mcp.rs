@@ -69,6 +69,19 @@ fn warnings(messages: &[(Severity, String)]) -> Vec<&str> {
         .collect()
 }
 
+/// The loaders reserve `load` and `load__`: a server named `load` is refused at start, so an MCP
+/// tool can never be mistaken for a loader (ADR 0066, decision 2).
+#[test]
+fn a_server_named_load_is_refused_at_start() {
+    let text = r#"{"mcpServers": {"load": {"type": "http", "url": "https://mcp.example/x", "tools": ["search"]}}}"#;
+    let (json, messages) = parse(text);
+    assert!(
+        errors(&messages).iter().any(|m| m.contains("reserved")),
+        "{messages:#?}"
+    );
+    assert!(json.is_none() || json.unwrap()["servers"].get("load").is_none());
+}
+
 #[test]
 fn a_when_is_read_and_written_back() {
     let (json, messages) = parse(&with_when(r#"{"keywords": ["linear", "ticket"]}"#));

@@ -74,6 +74,15 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
             ),
         );
     }
+    if name == "load" {
+        fail(
+            sink,
+            "server `load` is refused: `load` is reserved for the tool loaders \
+             (`load__group__<name>`, `load__tool__<name>`), and its tools would be mistaken for \
+             one; rename the server"
+                .to_owned(),
+        );
+    }
     for key in raw.extra.keys() {
         let normalized: String = key
             .chars()
