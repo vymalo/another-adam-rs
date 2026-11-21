@@ -33,7 +33,18 @@
 //! * **Timeouts.** [`OpenAiConfig::timeout`] bounds a whole `complete` call.
 //!   For `stream` it bounds the wait for the response headers and then the
 //!   silence between chunks, so a long generation is never cut off while
-//!   tokens keep arriving. Expiry is [`Transient`](adam_model::ModelError::Transient).
+//!   tokens keep arriving. Expiry is [`Transient`](adam_model::ModelError::Transient). A
+//!   connection that cannot be made (refused, no route) is
+//!   [`Unreachable`](adam_model::ModelError::Unreachable), class `Transient`; a connection that
+//!   times out is a timeout, and a TLS handshake that fails is `Transient`.
+//! * **Refusals** ([ADR 0067](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+//!   decision 3). For an answer of status 400 or above the client builds a
+//!   [`Refusal`] (the status, the slug of an `application/problem+json`
+//!   body's `type`, the `Retry-After`) and asks the provider whether it parks
+//!   ([`ModelCredentials::parks`](adam_model::ModelCredentials::parks)). The slug `model_locked`
+//!   is [`ModelLocked`](adam_model::ModelError::ModelLocked) for every provider. A park is
+//!   [`Refused`](adam_model::ModelError::Refused), which holds no body and no header; no park is
+//!   the error the status always gave. An error object inside a stream is the model's and never parks.
 //! * **Response size caps.** A body over 16 MiB, an SSE line over 1 MiB, one
 //!   event's `data:` over 4 MiB, or a stream over 64 MiB is a
 //!   [`Protocol`](adam_model::ModelError::Protocol) error (class `Corrupt`),
@@ -83,8 +94,9 @@ use std::time::{Duration, SystemTime};
 
 use adam_error::{BoxError, Classify, ErrorClass};
 use adam_model::{
-    AfterRejection, CredentialHeaders, CredentialRequest, DynCredentials, InputModalities, Message,
-    ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse, Rejection, StaticBearer,
+    AfterRejection, CredentialHeaders, CredentialRequest, DynCredentials, InputModalities,
+    MODEL_LOCKED_SLUG, Message, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
+    Park, Refusal, Rejection, StaticBearer,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -485,11 +497,13 @@ impl OpenAiCompatible {
         Ok(self)
     }
 
-    /// Send the request of the run `run` and return the response if it is a success.
+    /// Send the request of the run `run` for the model `model` and return the response if it is a
+    /// success.
     async fn send(
         &self,
         body: Vec<u8>,
         streaming: bool,
+        model: &str,
         run: Option<&str>,
     ) -> Result<reqwest::Response, ModelError> {
         let body = Bytes::from(body);
@@ -540,12 +554,43 @@ impl OpenAiCompatible {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| errors::parse_retry_after(v, SystemTime::now()));
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let text = tokio::time::timeout(self.timeout, read_body(response))
             .await
             .ok()
             .and_then(Result::ok)
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default();
+        // A refusal (ADR 0067 decision 3) is read by its problem type, and its provider says whether
+        // it parks the run. A gateway refuses before a response streams, so this is the only place
+        // a refusal is read: an error object inside a stream is the upstream model's (`sse.rs`,
+        // `errors::from_error_object`) and never parks.
+        if status.as_u16() >= 400 {
+            let refusal = Refusal::new(status.as_u16())
+                .with_problem(errors::problem_type(content_type.as_deref(), &text))
+                .with_retry_after(retry_after);
+            if refusal.slug() == Some(MODEL_LOCKED_SLUG) {
+                return Err(ModelError::ModelLocked {
+                    model: model.to_owned(),
+                });
+            }
+            match self.credentials.parks(&refusal) {
+                Park::No => {}
+                // The status, the slug and the wait only: the body and the headers stay here.
+                park => {
+                    return Err(ModelError::Refused {
+                        status: refusal.status,
+                        slug: refusal.slug().map(str::to_owned),
+                        retry_after: refusal.retry_after,
+                        park,
+                    });
+                }
+            }
+        }
         Err(errors::from_http(status, retry_after, &text))
     }
 }
@@ -745,13 +790,40 @@ fn rejection_of(response: &reqwest::Response) -> Rejection {
     }
 }
 
+/// Whether `err`'s chain holds a [`rustls::Error`]. `tokio-rustls` wraps it in an `io::Error`, and
+/// hyper-rustls wraps that in another one; an `io::Error` built around an error does not give it as
+/// its `source` (it gives that error's source), so each `io::Error` is opened with `get_ref`.
+fn is_tls_failure(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(err) = current {
+        if err.is::<rustls::Error>() {
+            return true;
+        }
+        if let Some(inner) = err
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            && is_tls_failure(inner)
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 fn transport_error(e: reqwest::Error) -> ModelError {
     // The URL is not secret, but it is noise; the key is never in it.
     let e = e.without_url();
+    // A timeout first: a connection that timed out is a timeout, never `Unreachable` (ADR 0067
+    // decision 3: a timeout keeps today's retries and failure, and never parks a run). A failed TLS
+    // handshake (a CA not trusted, a name that does not match) is no endpoint that waiting brings
+    // back: `Transient`, as before, never `Unreachable`.
     if e.is_timeout() {
         ModelError::transient("request timed out").with_source(e)
+    } else if e.is_connect() && is_tls_failure(&e) {
+        ModelError::transient("TLS handshake failed").with_source(e)
     } else if e.is_connect() {
-        ModelError::transient("connection failed").with_source(e)
+        ModelError::unreachable().with_source(e)
     } else if e.is_builder() {
         ModelError::invalid_request("the request could not be built").with_source(e)
     } else {
@@ -779,7 +851,9 @@ impl ModelClient for OpenAiCompatible {
     #[tracing::instrument(name = "model.complete", skip_all, fields(model = %req.model, url = %self.url))]
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
         let body = wire::build_request(&req, false, self.options())?;
-        let response = self.send(body, false, req.run.as_deref()).await?;
+        let response = self
+            .send(body, false, &req.model, req.run.as_deref())
+            .await?;
         let bytes = read_body(response).await?;
         let parsed = wire::parse_completion(&bytes).map(|r| self.echoed(r));
         match &parsed {
@@ -800,7 +874,9 @@ impl ModelClient for OpenAiCompatible {
         req: ModelRequest,
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
         let body = wire::build_request(&req, true, self.options())?;
-        let response = self.send(body, true, req.run.as_deref()).await?;
+        let response = self
+            .send(body, true, &req.model, req.run.as_deref())
+            .await?;
         let this = self.clone();
         Ok(sse::deltas(response.bytes_stream(), self.timeout)
             .map(move |item| {
@@ -914,6 +990,23 @@ mod tests {
     #[test]
     fn the_default_body_cap_is_the_documented_one() {
         assert_eq!(MAX_BODY_BYTES, 16 << 20, "one body: 16 MiB");
+    }
+
+    #[test]
+    fn a_rustls_error_is_found_however_it_is_wrapped() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("outer")]
+        struct Outer(#[source] std::io::Error);
+        let tls = || rustls::Error::General("bad certificate".into());
+        // As tokio-rustls and hyper-rustls wrap it.
+        let wrapped =
+            std::io::Error::other(std::io::Error::new(std::io::ErrorKind::InvalidData, tls()));
+        assert!(is_tls_failure(&wrapped));
+        assert!(is_tls_failure(&Outer(wrapped)));
+        assert!(is_tls_failure(&tls()));
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert!(!is_tls_failure(&refused));
+        assert!(!is_tls_failure(&Outer(std::io::Error::other("no route"))));
     }
 
     #[test]

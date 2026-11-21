@@ -180,8 +180,13 @@ async fn the_model_endpoint_is_reached_only_with_model_ca_file() {
     };
 
     let refused = call(false).await.unwrap_err();
+    // A handshake that fails is `Transient`, never `Unreachable` (ADR 0067 decision 3).
     assert!(
-        refused.to_string().contains("connection failed"),
+        matches!(refused, adam_model::ModelError::Transient { .. }),
+        "{refused:?}"
+    );
+    assert!(
+        refused.to_string().contains("TLS handshake failed"),
         "{refused}"
     );
     assert_eq!(served.load(Ordering::SeqCst), 0);

@@ -68,8 +68,13 @@ Behaviour (details in the crate docs, `src/lib.rs`):
   close, never as `{}`; a provider that sends a whole call in one chunk is announced in that chunk, after its
   `ToolCallStarted`; and a provider that sends the arguments before the name is announced when the name arrives (a call
   with no name is not a call: `finish` refuses it), never skipped.
-* A transport failure (timeout, connection error) is a `Transient` that keeps
-  the `reqwest` error as its `source`; a body that is not JSON is a `Protocol`
+* A transport failure is a `Transient` that keeps the `reqwest` error as its `source`, except a connection that could
+  not be made (refused, no route, a name that does not resolve), which is `Unreachable`, of class `Transient` too. A
+  timeout, the connect timeout included, stays `Transient`, and so does a TLS handshake that failed (a `rustls::Error`
+  anywhere in the chain, `io::Error`s opened with `get_ref`): `transient model error: TLS handshake failed`, since
+  waiting cures neither a CA not trusted nor a name that does not match.
+  **Visible change:** a refused connection's message was `transient model error: connection failed` and is now
+  `the model endpoint could not be reached`; a body that is not JSON is a `Protocol`
   that keeps the parser's error. The message does not repeat the source.
 * A response that stops short is `Transient`, so the runtime retries the turn: a stream (or `[DONE]`)
   that ended with no `finish_reason`, a last chunk cut off mid-JSON, a body cut off mid-JSON. A *complete*
@@ -148,7 +153,10 @@ Failures map onto `adam_model::ModelError`, which is classified (see
 | Cause | `ModelError` | Class |
 |---|---|---|
 | HTTP 429 (`Retry-After` kept) | `RateLimited` | `RateLimited` |
-| HTTP 408, 5xx; timeout; connection failure; transport error; a stream or body that ended before the model said why it stopped | `Transient` | `Transient` |
+| a refusal the provider parks (below) | `Refused { status, slug, retry_after, park }` | by its status |
+| a refusal whose problem type is `model_locked`, for every provider | `ModelLocked { model }` | `Rejected` |
+| a connection that could not be made (`reqwest::Error::is_connect`, not a timeout, not a TLS failure) | `Unreachable` | `Transient` |
+| HTTP 408, 5xx; timeout; a failed TLS handshake; transport error; a stream or body that ended before the model said why it stopped | `Transient` | `Transient` |
 | HTTP 401, 403 | `Auth` | `Unauthenticated` |
 | HTTP 400, 413, 422 naming the context window | `ContextLength` | `Invalid` |
 | any other 4xx; a request that cannot be built | `InvalidRequest` | `Invalid` |
@@ -158,6 +166,18 @@ Failures map onto `adam_model::ModelError`, which is classified (see
 `context_length_exceeded` and the words "maximum context length"); the agent loop compacts its
 history once on it. The bodies of other providers (Anthropic-style, Gemini, llama.cpp, Ollama) are
 *unverified* and none is mapped without a captured body.
+
+**Refusals** ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+decision 3). For an answer of status 400 or above, before the table's own rows, the client builds an
+`adam_model::Refusal`: the status, the `Retry-After` (seconds or an HTTP date; a number too large for a `u64` is the
+longest wait, not none) and the problem type, read only from an `application/problem+json` body (any parameters, any
+case). It is `Absent` for no body, no `type` member or `about:blank`; a `Slug` when the `type`'s last path segment, or
+the member as is when it holds no `/`, is a word of at most 64 letters, digits, `_`, `-` and `.`; and `Unreadable` for
+any other `type` (a `urn:`, a query, a fragment, a trailing `/`, not a string) or a body that is not a JSON object,
+which `InjectedRun` never parks on. The slug `model_locked` is `ModelLocked`; otherwise the provider is asked `parks`: `No`
+keeps the table's error exactly (a key of one's own fails as before), any other answer is `Refused`, which holds no body
+and no header. `InjectedRun`'s answers are in [`adam-model`](../adam-model/README.md#refusals). A gateway refuses before a
+response streams, so an error object inside a stream is never a refusal.
 
 An error object inside a `200` or a stream is `RateLimited` for a
 `rate_limit` type, `ContextLength` for a context-length code, `InvalidRequest`
@@ -197,7 +217,9 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
 * `tests/http.rs`: the client against a `wiremock` server (requests, streaming,
   tool calls, error mapping and classes, timeouts, source chains, reasoning in a stream and a completion, the extra body on every request, reasoning sent back only when echoed). Always
   runs, no network.
-* Unit tests: `src/errors.rs` (`status_mapping`), `src/lib.rs`
+* Unit tests: `src/errors.rs` (`status_mapping`, `a_problem_type_is_read_by_its_last_segment`,
+  `a_problem_document_is_told_by_its_content_type`, `retry_after_seconds_and_date`), `src/lib.rs` also
+  `a_rustls_error_is_found_however_it_is_wrapped`, `src/lib.rs`
   (`config_error_class_table`, `bad_headers_and_keys_are_rejected`, which refuses a credential in `extra_headers`,
   `debug_shows_the_gateway_by_scheme_and_host_only`,
   `the_provider_is_openai_and_a_window_is_said_for_its_alias_only`) and `src/wire.rs` (the request shape, including several text parts
@@ -209,8 +231,20 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
 * `tests/injector.rs`: `InjectedRun` against a `wiremock` server: every completion and stream carries `X-Run-Id` and no
   `Authorization` (a key in the configuration is never sent), the run is in no body, the retry after a 401 names the run
   too, and a call with no run sends no request. Always runs.
+* `tests/refusals.rs`: refusals against a `wiremock` server: under `InjectedRun` each slug of the table, completed and
+  streamed, is `Refused` with its park, status, slug and `Retry-After` (120 s is a 120 s timer, 5 s a 30 s one) in one
+  request, and its class follows its status; a `Retry-After` in the year 9999 or too large for a `u64` parks for 24 h
+  and is kept as said, and an HTTP date two minutes ahead parks for about two minutes; a problem `type` that cannot be
+  read (`urn:`, a query, a fragment, a trailing `/`, 65 characters) parks nothing on a 401, 403 or 402, while no `type`
+  or `about:blank` on a 403 parks as `unauthenticated`; a 401 or a 403 with no body, a plain body, a JSON body that is no problem
+  document or only a `Retry-After` parks for 30 s; `model_locked` is `ModelLocked` under the injector and a fixed key; an
+  unknown slug, a slugless 500 and a 402 whose `type` is in plain JSON are today's errors; under `StaticBearer` every answer
+  is today's error, against `Display` goldens of what `errors::from_http` gave at `9f40a3b`; no `Refused` nor `ModelLocked` holds the body's
+  words or a secret in its `Display`, `Debug` or source chain; an error object inside a stream is not a refusal; a port with
+  nothing listening is `Unreachable` (class `Transient`) for a completion and a stream, and a timeout is `Transient`, not
+  `Unreachable`. Always runs.
 * `tests/ca_file.rs`: a TLS server on the loopback (rustls, a test CA and a server certificate for `localhost` and
-  `127.0.0.1` in `tests/fixtures/`, valid until 2126, signing nothing else) is refused with the default roots, nothing
+  `127.0.0.1` in `tests/fixtures/`, valid until 2126, signing nothing else) is refused with the default roots (`Transient`, "TLS handshake failed", never `Unreachable`), nothing
   reaching it, and answers once the client trusts the CA with `with_extra_roots`; a missing file, an empty one, a key, bad
   base64 and a block that is no certificate are each `InvalidCaFile`, with the cause kept as the source; a file over 1 MiB
   is `CaFileTooLarge` and one of exactly 1 MiB is read. Always runs. The fixtures are test only: `tests/fixtures/README.md`

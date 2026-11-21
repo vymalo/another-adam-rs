@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use adam_error::{BoxError, Classify, ErrorClass};
 
+use crate::credentials::Park;
+
 /// Why a model call failed.
 ///
 /// Implementations map their transport's failures onto these variants; the runtime decides
@@ -53,6 +55,44 @@ pub enum ModelError {
         #[source]
         source: Option<BoxError>,
     },
+    /// The endpoint refused the call and its provider parks the run on it
+    /// ([`ModelCredentials::parks`](crate::ModelCredentials::parks), [ADR 0067] decision 3): a
+    /// refusal cured outside the run (a lease not bound yet, a usage limit reached). It holds **no
+    /// body and no header**; its `Display` is the status and the slug. Classed by its status: `401`
+    /// and `403` [`Unauthenticated`](ErrorClass::Unauthenticated), `402`
+    /// [`Rejected`](ErrorClass::Rejected), `429` [`RateLimited`](ErrorClass::RateLimited) (with its
+    /// `retry_after`), `503` [`Transient`](ErrorClass::Transient), any other
+    /// [`Rejected`](ErrorClass::Rejected).
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[error("the model endpoint refused the call: HTTP {status}{}", .slug.as_deref().map(|s| format!(" {s}")).unwrap_or_default())]
+    Refused {
+        /// The status code.
+        status: u16,
+        /// The problem type's slug, when there was one ([`Refusal::slug`](crate::Refusal::slug)).
+        slug: Option<String>,
+        /// The `Retry-After` header, when there was one.
+        retry_after: Option<Duration>,
+        /// What the provider said: never [`Park::No`], which keeps the error the call has without a park.
+        park: Park,
+    },
+    /// The endpoint does not allow this model at all (the problem type `model_locked`, for every
+    /// provider, [ADR 0067] decision 7): waiting cures nothing.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[error("the model endpoint does not allow the model `{model}`")]
+    ModelLocked {
+        /// The model the request named (its alias, [`ModelRequest::model`](crate::ModelRequest::model)).
+        model: String,
+    },
+    /// No connection to the endpoint could be made (refused, no route, a name that does not
+    /// resolve): not a timeout, not a stream cut off. Retryable, so a short drop costs seconds.
+    #[error("the model endpoint could not be reached")]
+    Unreachable {
+        /// The transport's own error, when there is one.
+        #[source]
+        source: Option<BoxError>,
+    },
 }
 
 impl ModelError {
@@ -70,6 +110,11 @@ impl ModelError {
             message: message.into(),
             source: None,
         }
+    }
+
+    /// No connection to the endpoint could be made ([`Unreachable`](Self::Unreachable)).
+    pub fn unreachable() -> Self {
+        Self::Unreachable { source: None }
     }
 
     /// A response that cannot be understood ([`Protocol`](Self::Protocol)).
@@ -94,7 +139,8 @@ impl ModelError {
     pub fn with_source(mut self, err: impl std::error::Error + Send + Sync + 'static) -> Self {
         if let Self::Transient { source, .. }
         | Self::InvalidRequest { source, .. }
-        | Self::Protocol { source, .. } = &mut self
+        | Self::Protocol { source, .. }
+        | Self::Unreachable { source } = &mut self
         {
             *source = Some(Box::new(err));
         }
@@ -106,16 +152,28 @@ impl Classify for ModelError {
     fn class(&self) -> ErrorClass {
         match self {
             Self::RateLimited { .. } => ErrorClass::RateLimited,
-            Self::Transient { .. } => ErrorClass::Transient,
+            Self::Transient { .. } | Self::Unreachable { .. } => ErrorClass::Transient,
             Self::ContextLength(_) | Self::InvalidRequest { .. } => ErrorClass::Invalid,
             Self::Auth(_) => ErrorClass::Unauthenticated,
             Self::Protocol { .. } => ErrorClass::Corrupt,
+            Self::Refused { status, .. } => match status {
+                401 | 403 => ErrorClass::Unauthenticated,
+                429 => ErrorClass::RateLimited,
+                503 => ErrorClass::Transient,
+                _ => ErrorClass::Rejected,
+            },
+            Self::ModelLocked { .. } => ErrorClass::Rejected,
         }
     }
 
     fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::RateLimited { retry_after } => *retry_after,
+            Self::RateLimited { retry_after }
+            | Self::Refused {
+                status: 429,
+                retry_after,
+                ..
+            } => *retry_after,
             _ => None,
         }
     }
@@ -138,6 +196,23 @@ mod tests {
             ModelError::InvalidRequest { .. } => (ErrorClass::Invalid, false),
             ModelError::Auth(_) => (ErrorClass::Unauthenticated, false),
             ModelError::Protocol { .. } => (ErrorClass::Corrupt, false),
+            ModelError::Refused { status, .. } => match status {
+                401 | 403 => (ErrorClass::Unauthenticated, false),
+                429 => (ErrorClass::RateLimited, true),
+                503 => (ErrorClass::Transient, true),
+                _ => (ErrorClass::Rejected, false),
+            },
+            ModelError::ModelLocked { .. } => (ErrorClass::Rejected, false),
+            ModelError::Unreachable { .. } => (ErrorClass::Transient, true),
+        }
+    }
+
+    fn refused(status: u16, slug: Option<&str>, retry_after: Option<u64>) -> ModelError {
+        ModelError::Refused {
+            status,
+            slug: slug.map(str::to_owned),
+            retry_after: retry_after.map(Duration::from_secs),
+            park: Park::OnTimer(Duration::from_secs(30)),
         }
     }
 
@@ -149,7 +224,81 @@ mod tests {
             ModelError::invalid_request("x"),
             ModelError::Auth("x".into()),
             ModelError::protocol("x"),
+            refused(401, Some("unauthenticated"), None),
+            refused(401, None, None),
+            refused(403, Some("run_not_bound"), None),
+            refused(402, Some("over_limit"), None),
+            refused(429, Some("rate_limited"), Some(60)),
+            refused(503, Some("unavailable"), Some(60)),
+            refused(400, Some("other"), None),
+            refused(404, None, None),
+            refused(500, None, None),
+            ModelError::ModelLocked {
+                model: "big-model".into(),
+            },
+            ModelError::unreachable(),
         ]
+    }
+
+    /// The classes of the new variants, written out (the table above decides by the same rules).
+    #[test]
+    fn a_refusal_is_classed_by_its_status() {
+        let class = |status| refused(status, None, None).class();
+        assert_eq!(class(401), ErrorClass::Unauthenticated);
+        assert_eq!(class(403), ErrorClass::Unauthenticated);
+        assert_eq!(class(402), ErrorClass::Rejected);
+        assert_eq!(class(429), ErrorClass::RateLimited);
+        assert_eq!(class(503), ErrorClass::Transient);
+        for other in [400, 404, 409, 500, 502] {
+            assert_eq!(class(other), ErrorClass::Rejected, "{other}");
+        }
+        let locked = ModelError::ModelLocked { model: "m".into() };
+        assert_eq!(locked.class(), ErrorClass::Rejected);
+        assert!(!locked.is_retryable());
+        let unreachable = ModelError::unreachable();
+        assert_eq!(unreachable.class(), ErrorClass::Transient);
+        assert!(unreachable.is_retryable());
+    }
+
+    #[test]
+    fn a_refusals_retry_after_is_said_for_a_rate_limit_only() {
+        assert_eq!(
+            refused(429, Some("rate_limited"), Some(45)).retry_after(),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(refused(429, None, None).retry_after(), None);
+        assert_eq!(
+            refused(503, Some("unavailable"), Some(45)).retry_after(),
+            None
+        );
+        assert_eq!(refused(403, None, Some(45)).retry_after(), None);
+    }
+
+    /// The status and the slug, nothing else: the variant has no body to show.
+    #[test]
+    fn a_refusal_shows_its_status_and_slug_only() {
+        assert_eq!(
+            refused(403, Some("run_not_bound"), Some(60)).to_string(),
+            "the model endpoint refused the call: HTTP 403 run_not_bound"
+        );
+        assert_eq!(
+            refused(401, None, None).to_string(),
+            "the model endpoint refused the call: HTTP 401"
+        );
+        let e = refused(402, Some("over_limit"), None);
+        assert!(std::error::Error::source(&e).is_none());
+        assert_eq!(adam_error::report(&e), e.to_string());
+        assert_eq!(
+            ModelError::ModelLocked {
+                model: "big-model".into()
+            }
+            .to_string(),
+            "the model endpoint does not allow the model `big-model`"
+        );
+        assert_eq!(
+            ModelError::unreachable().to_string(),
+            "the model endpoint could not be reached"
+        );
     }
 
     #[test]
@@ -207,6 +356,7 @@ mod tests {
             ModelError::transient("connection failed").with_source(Lower),
             ModelError::invalid_request("not serializable").with_source(Lower),
             ModelError::protocol("response is not JSON").with_source(Lower),
+            ModelError::unreachable().with_source(Lower),
         ] {
             let source = std::error::Error::source(&e).expect("source kept");
             assert!(source.is::<Lower>());

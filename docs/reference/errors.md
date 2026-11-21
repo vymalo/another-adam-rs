@@ -115,10 +115,11 @@ flowchart LR
     AgentError -.->|"Agent(e)"| RuntimeError
     StoreError -.->|"Store(e)"| RuntimeError
 
-    ModelError -->|RateLimited| RateLimited
-    ModelError -->|Transient| Transient
+    ModelError -->|"RateLimited, Refused 429"| RateLimited
+    ModelError -->|"Transient, Unreachable, Refused 503"| Transient
     ModelError -->|"ContextLength, InvalidRequest"| Invalid
-    ModelError -->|Auth| Unauthenticated
+    ModelError -->|"Auth, Refused 401 or 403"| Unauthenticated
+    ModelError -->|"ModelLocked, Refused 402 or another status"| Rejected
     ModelError -->|Protocol| Corrupt
     OpenAiConfigError -->|"InvalidBaseUrl, InvalidHeader, InvalidApiKey"| Invalid
     OpenAiConfigError -->|Client| Internal
@@ -185,6 +186,20 @@ retries: `ModelError::is_context_overflow()` is true for it, so the loop compact
 turn fails the run, naming both. A summary request that fails for another reason after a rejection fails the
 run with that error's class and message; one that is itself too long drops the turns without a summary. Only the two shapes `adam-model-openai` maps (the code `context_length_exceeded`
 and "maximum context length") are recognised.
+
+Three model errors come from [ADR 0067](../decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+decision 3:
+
+| Variant | When | Class |
+|---|---|---|
+| `Refused { status, slug, retry_after, park }` | an answer of status 400 or above that the credential provider parks on (`ModelCredentials::parks`, today `InjectedRun` alone: the gateway's `unauthenticated`, `run_not_bound`, `lease_expired`, `over_limit`, `rate_limited`, `unavailable`, or a 401 or 403 with no problem type; never one whose `type` cannot be read) | by its status: `401`, `403` `Unauthenticated`; `402` `Rejected`; `429` `RateLimited` (`retry_after()` is its `Retry-After`); `503` `Transient`; any other `Rejected` |
+| `ModelLocked { model }` | the problem type `model_locked`, for every provider: the model is not allowed at all | `Rejected` |
+| `Unreachable` | a connection to the model endpoint could not be made (refused, no route, a name that does not resolve); a timeout, a cut stream and a failed TLS handshake stay `Transient` | `Transient` |
+
+`Refused` holds no body and no header: its message is `the model endpoint refused the call: HTTP <status>[ <slug>]`.
+A provider that does not park (a key of one's own, the device grant) keeps the errors above, so a wrong key fails as
+before. Nothing parks a run yet: the LLM agent treats these errors as any other of their class (the runtime retries a `429`,
+a `503` and `Unreachable`; the rest fail the run).
 
 ## What each class decides
 
