@@ -1354,3 +1354,51 @@ async fn the_hosts_retry_policy_governs_a_transient_failure() {
     );
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 }
+
+/// A folder's `commands/` are expanded in the engine as on the server surfaces (`commands/v1`,
+/// #276): `/greet Ada` reaches the model as the command's template, `commands()` lists it, and an
+/// unknown `/name` reaches the model as typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folders_command_is_expanded() {
+    let def = agent(&[
+        ("agent/instructions.md", CHAT),
+        (
+            "agent/commands/greet.md",
+            "---\ndescription: Greet someone.\nargument-hint: \"<name>\"\n---\nSay hello to $1, warmly.\n",
+        ),
+    ]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Hello, Ada!");
+    mock.push_text("I do not know that one.");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), def, model, "m")
+        .start()
+        .await
+        .unwrap();
+    let listed: Vec<(&str, &str)> = engine
+        .commands()
+        .iter()
+        .map(|c| (c.name.as_str(), c.description.as_str()))
+        .collect();
+    assert_eq!(listed, [("greet", "Greet someone.")]);
+    assert_eq!(
+        engine.commands()[0].argument_hint.as_deref(),
+        Some("<name>")
+    );
+
+    for (said, expected) in [
+        ("/greet Ada", "Say hello to Ada, warmly."),
+        ("/wave Ada", "/wave Ada"),
+    ] {
+        let turn = engine.send(None, Say::new(said)).await.unwrap();
+        let mut events = engine.events(turn.run).await.unwrap();
+        while let Some(event) = timeout(WAIT, events.next()).await.expect("an event") {
+            event.unwrap();
+        }
+        let asked = mock.requests();
+        let last = asked.last().expect("a model call");
+        let text = format!("{:?}", last.messages.last());
+        assert!(text.contains(expected), "{said}: {text}");
+    }
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
