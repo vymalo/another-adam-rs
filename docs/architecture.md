@@ -407,7 +407,11 @@ its `model_preset` and the profile (`crates/adam-assembly/src/assembly.rs`), and
 per model: the folder's `limits.max_output_tokens`, its preset's, the profile's, the profile's base preset, then
 128,000, then the smallest of that, the model's `maxOutputTokensLimit` and what the window leaves after 20,000 tokens
 and the agent's history (`crates/adam-assembly/src/assembly.rs`, `output_cap`; the margin and the compaction budget
-are `crates/adam-llm-agent/src/compaction.rs`). The client's reasoning wire and the profile's
+are `crates/adam-llm-agent/src/compaction.rs`). An embedded engine takes the same profiles from its host
+(`EngineBuilder::models`), and its builder's level (`EngineBuilder::reasoning_effort`) sits between the folder and
+the preset: the folder's key wins over it, and it over the agent's `model_preset` and the profile
+(`crates/adam-engine/src/engine.rs`, the host's seat; `crates/adam-assembly/src/def.rs`, the root's fallback;
+`crates/adam-assembly/src/assembly.rs`, `default_effort`). The client's reasoning wire and the profile's
 `extraBody` are the following slices.
 
 ### The tokens of each model call

@@ -154,6 +154,15 @@ recorded outside this repository.
    stays `Copy`. The engine has no per-message extension, so the run's effort is the session's, else the
    folder's, else the builder's explicit value, else the preset's, else the profile's, else nothing.
 
+   *Amended 2026-11-21:* two `Limits` types are in play, and only the second is `Copy`.
+   `adam_engine::Limits` (the engine's) is `Clone + PartialEq`, not `Copy` — it holds the worker id,
+   the retry policy and the session limits — and it holds no model setting; `adam_llm_agent::Limits`,
+   the loop's per-run bounds, **is** `Copy`. The operative requirement is that the engine's `Limits`
+   keeps the run bounds and never a model setting: the profiles and the level reach the engine through
+   `EngineBuilder::models` and `EngineBuilder::reasoning_effort`, never through `Limits`. The builder's
+   level applies to **any root whose file sets none**, folder or not — the file's own
+   `reasoning_effort` wins — and never to a subagent, which has its own file.
+
 9. **The parity table.** The feature is not done until every surface has it through its own mechanism;
    the gaps are the issues linked from `docs/reference/parity.md`, whose reasoning row this ADR updates.
 
@@ -165,6 +174,9 @@ recorded outside this repository.
    | orchestrator and web | read `reasoning/v1` from the live card (never cached); send the level per message and store it per thread; the picker shows the card's levels | gap: #415 |
    | platform | `ModelEndpoint` declares the levels and the wire; `AgentConfig` picks; forms, Platform API, `aapctl` | to build (#284) |
    | another-app | the hexagonal plan's ports (private) | no column; the coordinator tracks it |
+
+   *State 2026-11-21:* the `adam-engine` row's builder seat is built (#317); the table's "to build"
+   is kept as the decision was written.
 
 ## The probe, model by model (2026-11-21)
 

@@ -125,8 +125,9 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; ADR 0063), and `model_preset` names a
   preset of the deployment's `MODEL_ALIASES_FILE` (ADR 0064). The assembly resolves the default —
   the folder's value, else the preset's, else the profile's, else the profile's base preset — and
-  refuses a level the model does not take, naming the agent and the value. Claude Code's `effort`
-  is still ignored with a warning.
+  refuses a level the model does not take, naming the agent and the value. An embedded engine's host
+  gives the root's level (`EngineBuilder::reasoning_effort`) when the file sets none: the file's key
+  wins. Claude Code's `effort` is still ignored with a warning.
 * **The output cap is per model.** `limits.max_output_tokens` is what this agent's calls ask for;
   without it the cap is its `model_preset`'s, else the model profile's `maxOutputTokens`, else the
   profile's base preset, else 128,000 (ADR 0064). The result is clamped to the model's
