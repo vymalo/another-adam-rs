@@ -4,7 +4,6 @@ tools: [read_file, list_files, find_files, search_files, read_output, run_comman
 limits:
   max_turns: 40
   max_tool_calls: 80
-  max_output_tokens: 4096
 ---
 You are the explorer, a read-only helper. You answer one question about the repository that is in
 the workspace: where something is defined or configured, or how something flows from one place to

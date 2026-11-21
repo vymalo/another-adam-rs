@@ -529,6 +529,31 @@ async fn the_summary_request_extends_the_previous_request() {
 }
 
 #[tokio::test]
+async fn a_cap_below_the_summary_bound_is_asked_on_the_summary() {
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        b.limits(Limits {
+            max_output_tokens: 1000,
+            max_history_tokens: BUDGET,
+            ..Limits::default()
+        })
+    });
+    script_one_compaction(&rig.mock, "S");
+    let run = rig.start().await;
+    let (requests, _) = rig.finish(run).await;
+    let (turns, summaries) = split(&requests);
+    assert_eq!(summaries.len(), 1);
+    assert!(
+        turns.iter().all(|r| r.max_output_tokens == Some(1000)),
+        "every turn asks the run's cap"
+    );
+    assert_eq!(
+        summaries[0].max_output_tokens,
+        Some(1000),
+        "a summary asks no more than the run's own cap"
+    );
+}
+
+#[tokio::test]
 async fn the_summary_is_replayed_from_the_journal_not_recomputed() {
     for after_apply in [false, true] {
         let rig = Rig::new(BUDGET);
@@ -706,7 +731,14 @@ async fn with_a_window_the_reported_tokens_trigger_it() {
     let reports = Rig::with(
         MockModel::new().with_context_window("test-model", 26_096),
         0,
-        |b| b,
+        // The 4,096 output cap the window arithmetic above assumes.
+        |b| {
+            b.limits(Limits {
+                max_output_tokens: 4096,
+                max_history_tokens: 0,
+                ..Limits::default()
+            })
+        },
     );
     script(&reports.mock, 2_500, true);
     let run = reports.start().await;
@@ -720,7 +752,14 @@ async fn with_a_window_the_reported_tokens_trigger_it() {
     let small = Rig::with(
         MockModel::new().with_context_window("test-model", 26_096),
         0,
-        |b| b,
+        // The 4,096 output cap the window arithmetic above assumes.
+        |b| {
+            b.limits(Limits {
+                max_output_tokens: 4096,
+                max_history_tokens: 0,
+                ..Limits::default()
+            })
+        },
     );
     script(&small.mock, 300, false);
     let run = small.start().await;
@@ -947,6 +986,7 @@ async fn a_history_over_the_budget_when_the_closing_turn_comes_is_not_compacted(
         |b| {
             b.limits(Limits {
                 max_tool_calls: 9,
+                max_output_tokens: 4096,
                 max_history_tokens: 0,
                 ..Limits::default()
             })
@@ -1054,8 +1094,15 @@ async fn a_replay_applies_the_cut_the_journal_recorded() {
     let rig = Rig::with(
         MockModel::new().with_context_window("test-model", 25_696),
         0,
-        // The window is measured to the token: no `after_previous` in the request.
-        |b| b.max_parallel(1),
+        // The window is measured to the token: no `after_previous` in the request. The 4,096 output
+        // cap is what leaves the 1,600 and 800 budgets above.
+        |b| {
+            b.max_parallel(1).limits(Limits {
+                max_output_tokens: 4096,
+                max_history_tokens: 0,
+                ..Limits::default()
+            })
+        },
     );
     for n in 0..11 {
         rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 600)]);

@@ -32,7 +32,7 @@ applies at the next start, and a restart is a deploy.
 | `agent/instructions.md` frontmatter `name` | the registered name of the agent, which is the key of its stored runs: **renaming strands the runs of the old name**. Required |
 | `description` or `card.description` | the A2A card needs one of them (exit 78 for a role that serves A2A otherwise) |
 | `card:` | the card: `name`, `skills` (`id`, `name`, `description`, `tags`, `examples`) and `extended` (`description`, `skills`: what an authenticated caller sees on top, `GetExtendedAgentCard`). The URL is `PUBLIC_URL`, the version is this binary's with the build's revision as build metadata (`0.1.0+6478fbc`, `+unknown` without one: the build argument `ADAM_BUILD_REVISION` of the image) |
-| `limits:` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens` |
+| `limits:` | `max_turns`, `max_tool_calls`, `max_output_tokens` (the cap this agent asks for; absent, its preset's, the model's profile's, then 128,000, clamped to the model's limit and window, ADR 0064), `max_history_tokens` |
 | `model:` | the model alias of the agent, when it should not be `MODEL` |
 | `vars:` | `{{placeholders}}` of the prompt. **Every var needs a value in the file**: nothing in this binary supplies one, so a var declared without a value (or one the prompt does not use, or a placeholder `vars` does not declare) stops the process at startup, naming it |
 | `tools:` | optional; selects among the tools the agent has (`ask_user`, `show`, `ui_catalog`, `plan_work`, `plan_check`, `plan_add`, the MCP tools `<server>__<tool>`, the skills' tools, the subagents). `linear__*` takes a server's tools. A name that is none of them is refused with a suggestion |

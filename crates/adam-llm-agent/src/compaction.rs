@@ -30,12 +30,23 @@ Findings; Files touched; Open questions (asked and not answered); Next. Say \"un
 /// continues another carries ([`Compaction::carried`]) does not count.
 pub const MAX_COMPACTIONS: usize = 8;
 
-/// The output tokens a summary may take.
+/// The output tokens a summary may take, at most.
 pub(crate) const SUMMARY_OUTPUT_TOKENS: u32 = 4096;
+
+/// The output tokens a summary asks for, given the cap the run's own calls ask (ADR 0064 decision
+/// 3): a run capped below 4,096 gets a summary capped the same way, and one that leaves the cap to
+/// the model (`0`) keeps the summary's own 4,096, because a summary is bounded by the loop.
+pub fn summary_output_tokens(cap: u32) -> u32 {
+    if cap == 0 {
+        SUMMARY_OUTPUT_TOKENS
+    } else {
+        cap.min(SUMMARY_OUTPUT_TOKENS)
+    }
+}
 
 /// The tokens a window keeps free of the history: the answer, the tools' own growth and the
 /// estimate's error.
-const WINDOW_MARGIN_TOKENS: u64 = 20_000;
+pub const WINDOW_MARGIN_TOKENS: u64 = 20_000;
 
 /// The most bytes of a summary that is kept.
 const SUMMARY_MAX_BYTES: usize = 16 * 1024;
@@ -643,6 +654,15 @@ mod tests {
             m.push(Message::tool_result(format!("c{i}"), "x".repeat(size)));
         }
         m
+    }
+
+    #[test]
+    fn a_summary_asks_at_most_the_runs_own_cap() {
+        assert_eq!(summary_output_tokens(0), 4096, "the cap is the model's");
+        assert_eq!(summary_output_tokens(1), 1);
+        assert_eq!(summary_output_tokens(1000), 1000);
+        assert_eq!(summary_output_tokens(4096), 4096);
+        assert_eq!(summary_output_tokens(128_000), 4096);
     }
 
     #[test]

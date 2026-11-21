@@ -537,6 +537,17 @@ fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter, k
             ),
         );
     }
+    if let Some(0) = fm
+        .limits
+        .as_ref()
+        .and_then(|limits| limits.max_output_tokens)
+    {
+        sink.error(
+            key_line(split, "limits"),
+            "`limits.max_output_tokens` is at least 1: leave it out to take the model's profile and \
+             the 128,000 fallback (ADR 0064)",
+        );
+    }
     // The session limits are the root's: a subagent's are ignored (with a warning), so they are
     // not range-checked there.
     if let Some(limits) = fm.limits.as_ref().filter(|_| kind != FileKind::Sub) {

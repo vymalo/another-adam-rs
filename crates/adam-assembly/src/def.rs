@@ -712,6 +712,10 @@ pub(crate) struct Node {
     pub(crate) prompt: String,
     pub(crate) tools: Vec<(String, DynTool)>,
     pub(crate) limits: Limits,
+    /// `limits.max_output_tokens` of the agent's file, as written (ADR 0064): the cap the agent
+    /// asks for, before the preset, the model's profile and the fallback. `None` when the file
+    /// says nothing.
+    pub(crate) max_output_tokens: Option<u32>,
     /// `limits.max_parallel` of the agent's file: it lowers the deployment's setting for this agent.
     pub(crate) max_parallel: Option<usize>,
     /// `retry:` of the agent's file: the retry policy per tool, by name, each one of its tools
@@ -958,6 +962,11 @@ impl Walk<'_> {
             prompt,
             tools,
             limits: limits(manifest.frontmatter.limits.as_ref()),
+            max_output_tokens: manifest
+                .frontmatter
+                .limits
+                .as_ref()
+                .and_then(|file| file.max_output_tokens),
             max_parallel: manifest
                 .frontmatter
                 .limits

@@ -429,6 +429,15 @@ fn cases() -> Vec<Case> {
             "`limits.max_parallel` is from 1 to 32",
         ),
         (
+            "max_output_tokens of 0",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_output_tokens: 0 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_output_tokens` is at least 1",
+        ),
+        (
             "max_open_sessions of 0",
             vec![(
                 "agent/instructions.md",

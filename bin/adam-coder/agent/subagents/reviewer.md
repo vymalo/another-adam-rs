@@ -4,7 +4,6 @@ tools: [read_file, list_files, find_files, search_files, read_output, run_comman
 limits:
   max_turns: 40
   max_tool_calls: 80
-  max_output_tokens: 4096
 ---
 You are the reviewer, a read-only helper. You review the change in the worktree before it becomes a
 pull request. You never edit a file, and you do not run the project's checks.
