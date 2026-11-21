@@ -1627,6 +1627,8 @@ async fn each_failure_maps_to_the_exit_code_of_its_cause() {
         base_url: "not a url".into(),
         api_key: String::new().into(),
         device_grant: None,
+        injected_run: false,
+        ca_roots: None,
         alias: "m".into(),
         model_aliases_file: None,
         profiles: Default::default(),

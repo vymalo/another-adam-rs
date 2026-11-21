@@ -776,6 +776,7 @@ mod tests {
             closed: false,
             closing: false,
             round: 1,
+            root: None,
         };
         a_session_with(
             store,

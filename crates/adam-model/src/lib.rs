@@ -85,8 +85,8 @@ mod types;
 pub use adam_error::{Classify, ErrorClass};
 pub use client::{DynModel, ModelClient};
 pub use credentials::{
-    AfterRejection, CredentialHeaders, CredentialRequest, DynCredentials, ModelCredentials,
-    Rejection, RenewingCredentials, StaticBearer,
+    AfterRejection, CredentialHeaders, CredentialRequest, DynCredentials, InjectedRun,
+    ModelCredentials, RUN_HEADER, Rejection, RenewingCredentials, StaticBearer,
 };
 pub use error::ModelError;
 pub use mock::{MockModel, RecordedCall};
