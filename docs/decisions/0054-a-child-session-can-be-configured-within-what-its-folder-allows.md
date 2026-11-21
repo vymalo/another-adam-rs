@@ -323,4 +323,4 @@ The work proceeds with these; a different answer is a dated note here.
 5. `context_window` has a floor (20,000 + `max_output_tokens` + 8,000); usage reports keep the model's own window.
 6. The card lists each helper's named sets (models, tools, skills); they are not secrets, and the card already lists the helpers.
 7. `model` chooses among aliases of one endpoint; several endpoints wait for the model relay.
-8. A set reasoning effort replaces a `MODEL_EXTRA_BODY` member of the same name.
+8. A set reasoning effort replaces a `MODEL_EXTRA_BODY` member of the same name *(amended 2026-11-21, ADR 0063: the members the model's wire would duplicate)*.

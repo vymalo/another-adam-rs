@@ -1,6 +1,6 @@
 # 0063. A reasoning effort is one setting, per model, configurable end to end
 
-Status: **Accepted** (2026-11-21)
+Status: **Proposed** (2026-11-21; accepted when the probe table is filled)
 
 ## Context
 
@@ -26,10 +26,11 @@ tokens at a 32k output budget with no answer; #273 (2026-11-21) now continues a 
 cuts while the model is only thinking, so the run no longer ends as a question — the budget still bounds
 one turn, and the effort still trades latency and tokens for reasoning.
 
-The gateway probe of 2026-11-21 records, for each of the 26 models it lists, no setting, `none`,
-`minimal`, `low`, `medium`, `high` and `max`, with a 64-token answer, the reasoning tokens and the finish
-reason. The table is below; each row is *verified* on that date against `api.ai.camer.digital`, or
-*unverified* where the probe could not tell.
+The gateway probe of 2026-11-21 is **pending the gateway credential**; when it runs, the table below
+records, for each of the 26 models the gateway lists, no setting, `none`, `minimal`, `low`, `medium`,
+`high` and `max`, with a 64-token answer, the reasoning tokens and the finish reason. Each row will be
+*verified* on that date against `api.ai.camer.digital`, or *unverified* where the probe could not tell.
+The table is the merge blocker.
 
 ## Decision
 
@@ -52,25 +53,32 @@ reason. The table is below; each row is *verified* on that date against `api.ai.
      - `reasoning_object` → `{"reasoning": {"effort": "<level>"}}`;
      - `thinking_budget` → `{"thinking": {"type": "enabled", "budget_tokens": <n>}}`, with a `budgets`
        object mapping every declared level to its token budget.
-   - A level outside the vocabulary, an unknown `wire`, a missing budget, or a `reasoning` object that
-     declares levels without a wire is a **startup error (exit 78)**, naming the alias and the file.
-   - **There is no `MODEL_REASONING_EFFORT`, no chart value and no code default.** The file is the
-     deployment's; the chart may mount it, and unset renders nothing.
+   - A level outside the vocabulary, an unknown `wire`, an empty `reasoning` object, a `wire` with no
+     `levels`, a duplicate level, a `budgets` entry for an undeclared level, a budget that is not a
+     positive integer, or a `reasoning` object that declares levels without a wire is a **startup error
+     (exit 78)**, naming the alias and the file. `levels` are sorted lowest first; `levels: []` is how a
+     model says it takes none.
+   - **There is no `MODEL_REASONING_EFFORT` and no code default.** The chart gains **one value** that
+     mounts the model file (a ConfigMap, as the extra MCP file is mounted); it is unset by default, so
+     the goldens are unchanged. The file is the deployment's.
 
 3. **No default anywhere.** If the request, the thread, the session and the folder set nothing, no
    reasoning member is sent — today's behaviour. The card has no `default`; `reasoning/v1` advertises
    `efforts` only.
 
-4. **The levels, narrowest wins: request → thread → session → agent folder → the model entry.**
-   - **request**: the `reasoning/v1` extension on one A2A message (decision 5).
+4. **The levels, narrowest wins: request → thread → agent folder; the model entry bounds every level.**
+   A child's `subagent_start` value is a **request-level** choice (ADR 0054's table says "per request"),
+   so it sits with the request and wins over the inherited thread.
+   - **request**: the `reasoning/v1` extension on one A2A message (decision 5), and a child's
+     `subagent_start` config (ADR 0054's table row) — both explicit choices by the person or the parent,
+     both winning over the inherited thread for that child's calls.
    - **thread**: the run's current effort, held in the protected context key `vymalo.reasoningEffort`;
      the newest activated message sets it. It **carries into a continuing task of the same thread and
      into a child run** (and the child's own children). A **new thread starts with nothing**.
-   - **session**: a child's `subagent_start` config (ADR 0054's table row) is an explicit choice by the
-     person or the parent; it **wins over the inherited thread value** for that child's calls.
    - **agent folder**: `reasoning_effort` at the top level of the frontmatter.
-   - **the model entry**: declares the allowed levels and the wire; it sets no value.
-   Every level picks among **the current model's** levels. A request outside them is `InvalidParams`
+   - **the model entry** declares the allowed levels and the wire; it **sets no value**, so it is the
+     bound, not a level.
+   Every choice picks among **the current model's** levels. A request outside them is `InvalidParams`
    (`-32602`) **before anything is written**; a folder or session value outside them is a load/start
    error naming the file and line (exit 78 for a binary). A folder that sets an effort on a model whose
    entry takes none is that same error.
@@ -83,21 +91,25 @@ reason. The table is below; each row is *verified* on that date against `api.ai.
      `metadata[URI] = {"effort": "<one of the model's levels>"}`. A missing entry, a non-object, a missing
      or non-string `effort`, an unknown word, or a level the model does not take is `InvalidParams`
      (`-32602`) before anything is written. Other members of the entry are ignored.
-   - The accepted set is a `ReasoningEfforts` in `adam-a2a`, carried to the backend as `AccessTiers` is
-     (`with_reasoning_efforts`); it builds the card's `efforts` and refuses a request. `Bound` carries the
-     folder's explicit value (or none), not a default.
+   - The accepted sets are a `ReasoningEfforts` in `adam-a2a`, mapping each alias to its model's levels,
+     carried to the backend as `AccessTiers` is (`with_reasoning_efforts`); it builds the card's
+     `efforts` for the root's model and refuses a request against the model of the run it reaches — the
+     root's for the root context, the child's for a child context. `Bound` carries the folder's explicit
+     value (or none), not a default.
    - The value is merged into the run's protected context as `vymalo.reasoningEffort`
      (`{"effort": ..}`); the newest message wins from the agent's next step. A caller that activated it
      is echoed the effort on the `SendMessage` answer, `GetTask`, the first stream frame, and when it
      changes — the access tier's echo shape. The extension can only set: no member clears an effort.
    - A subagent's `subagent_start` value is checked against the **subagent's** model entry, not the root's
-     (the card describes the root's model).
+     (the card describes the root's model). A helper's `child-sessions/v1` `config` bounds carry its
+     model's levels, so a person can set a session value on a helper whose model differs.
 
 6. **The wire.** `ModelRequest` gains `reasoning_effort: Option<ReasoningEffort>`; the client is given
    the alias entries and applies the entry of the request's model:
-   - the typed level is applied **after** the extra body, and it removes the known reasoning members
-     (`reasoning_effort`, `reasoning.effort`, `thinking`) from the extra body first, so a typed level
-     always wins and no two reasoning settings are sent;
+   - the typed level is applied **after** the extra body, and it removes only the members the chosen
+     wire would duplicate — `reasoning_effort` and `reasoning.effort` for the first two wires,
+     `thinking` for `thinking_budget` — so a typed level wins without dropping a flag the model needs;
+     if the extra body's `reasoning` object becomes empty, the object is removed;
    - other extra-body members remain;
    - the compaction/summary call sets the typed field to `None`, so it sends nothing unless the raw
      `MODEL_EXTRA_BODY` still names a reasoning member (stated in the docs).
@@ -111,21 +123,21 @@ reason. The table is below; each row is *verified* on that date against `api.ai.
    provider+model.
 
 8. **The engine.** `Engine::builder()` takes the same per-model entries (`models(entries)`, additive);
-   `Limits` keeps the run bounds and stays `Copy`. The folder's or session's value is checked against the
-   entry; the engine has no per-message extension, so the run's effort is the folder's, else the
-   session's, else nothing.
+   `Limits` keeps the run bounds and stays `Copy`. The session's or folder's value is checked against the
+   entry; the engine has no per-message extension, so the run's effort is the session's, else the
+   folder's, else nothing.
 
 9. **The parity table.** The feature is not done until every surface has it through its own mechanism;
-   the gaps are filed as issues and linked from `docs/reference/parity.md` (being written).
+   the gaps are the issues linked from `docs/reference/parity.md`, whose reasoning row this ADR updates.
 
    | Surface | How it sets the effort, per model | State |
    |---|---|---|
-   | `adam-coder` | the model entry for its model; the folder's `reasoning_effort`; `reasoning/v1` per message; the card lists the model's levels | to build |
-   | `adam-agent` (folder agents) | the same: the model entry, the folder key, the extension, the card | to build |
-   | `adam-engine` (embedded) | `Engine::builder().models(entries)`; the folder/session value checked; no per-message extension | to build |
-   | orchestrator and web | read `reasoning/v1` from the live card (never cached); send the level per message and store it per thread; the picker shows the card's levels | assigned: S-S5bS/S-WEB |
-   | platform | `ModelEndpoint` declares the levels and the wire; `AgentConfig` picks; forms, Platform API, `aapctl` | assigned: S-PLAT |
-   | another-app | the hexagonal plan's ports (private) | coordinator |
+   | `adam-coder` | the model entry for its model; the folder's `reasoning_effort`; `reasoning/v1` per message; the card lists the model's levels | to build (#284) |
+   | `adam-agent` (folder agents) | the same: the model entry, the folder key, the extension, the card | to build (#284) |
+   | `adam-engine` (embedded) | `Engine::builder().models(entries)`; the folder/session value checked; no per-message extension | to build (#284) |
+   | orchestrator and web | read `reasoning/v1` from the live card (never cached); send the level per message and store it per thread; the picker shows the card's levels | gap: #415 |
+   | platform | `ModelEndpoint` declares the levels and the wire; `AgentConfig` picks; forms, Platform API, `aapctl` | to build (#284) |
+   | another-app | the hexagonal plan's ports (private) | no column; the coordinator tracks it |
 
 ## The probe, model by model (2026-11-21)
 
@@ -167,9 +179,11 @@ sequenceDiagram
 
 - A deployment that sets nothing is byte-identical to today: no member, no reasoning, no new env, no new
   chart value. The model file is the only new input, and it is the deployment's.
-- **Breaks (a struct literal must add the field):** `ModelRequest` (`adam-model`) and `AgentFrontmatter`
-  (`adam-agent-fs`, public and not `#[non_exhaustive]`). The alias-file types are new. `UsageEvent` and
-  `adam-engine::Limits` are `#[non_exhaustive]`, so additive; the engine's builder gains a method.
+- **Breaks (a struct literal must add the field):** `ModelRequest` (`adam-model`), `AgentFrontmatter`
+  (`adam-agent-fs`, public and not `#[non_exhaustive]`), and `ModelConfig` (`adam-service`, the
+  `MODEL_ALIASES_FILE` path and entries). The alias-file types are new. `UsageEvent` is
+  `#[non_exhaustive]`, so additive; `Bound`, `OpenAiCompatible` and `ReasoningEfforts` gain fields or
+  methods additively; `adam-engine::Limits` is unchanged and the engine's builder gains `models(entries)`.
   The implementation PR updates the crate READMEs and the `adam-upgrade` skill.
 - **Files that say the opposite today** and change with the implementation: `docs/reference/agent-files.md`
   (the known-key list and the "`ModelRequest` has no such fields, so the keys are ignored" paragraph),
@@ -184,8 +198,8 @@ sequenceDiagram
   tests' exact URI lists, `.agents/skills/adam-a2a-extensions`, `.agents/skills/adam-agent-folder`, and
   `bench/README.md` (its `off` arm sends `{"reasoning_effort":"none"}`, which is not adam's vocabulary).
 - `docs/api/usage-v1.md` lives in `vymalo/another-agentic-system`; the system half's ADR and PR amend it.
-- The card gains one extension only for a model that takes a level; the chart renders nothing new by
-  default, so the four goldens are unchanged.
+- The card gains one extension only for a model that takes a level; the chart gains one value that mounts
+  the model file, unset by default, so the four goldens are unchanged.
 - The parity gaps (orchestrator/web, platform, another-app) are issues, linked from the matrix; the
   engine's builder and the two binaries are this repository's.
 - The probe is the evidence for the model entries; the entries themselves are the deployment's, and the
@@ -196,8 +210,9 @@ sequenceDiagram
 *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the declaration is the **model entry** in
 `MODEL_ALIASES_FILE` (the alias's `reasoning` object: its levels and its wire), not a global variable; a
 session or folder value must be one of that model's levels, and there is **no default** (unset sends
-nothing). The `MODEL_EXTRA_BODY` rule is 0054's owner item 8, extended: a typed level removes the known
-reasoning members from the extra body and writes the model's mapping. `temperature` is unchanged.
+nothing). The `MODEL_EXTRA_BODY` rule is 0054's owner item 8, extended: a typed level removes the members
+the model's wire would duplicate from the extra body and writes the model's mapping. `temperature` is
+unchanged.
 
 ## Alternatives considered
 
@@ -214,6 +229,9 @@ reasoning members from the extra body and writes the model's mapping. `temperatu
 ## Open questions
 
 - The `reasoning` entries for the deployment's models (the probe informs them; the owner sets them).
-- The orchestrator/web and platform ADRs (assigned), and the `docs/reference/parity.md` rows.
+- The orchestrator/web and platform halves (the system's #415, the platform's #284), and the
+  `docs/reference/parity.md` rows.
+- **The probe table is the merge blocker**: the model-by-model run needs the gateway credential (or the
+  proxy that injects it).
 - Whether a model's `thinking_budget` budgets are per level a fixed table or a formula; the entry carries
   the table, and a formula is a later ADR if a model needs one.
