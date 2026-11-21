@@ -491,6 +491,12 @@ pub struct Conversation {
     /// written before it existed, and not written while `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub output_cut: bool,
+    /// How many model turns in a row stopped at the output limit with no tool call and were taken
+    /// again ([`CUT_TURN`](crate::CUT_TURN)) instead of ending the run: at
+    /// [`MAX_CUT_TURNS`](crate::MAX_CUT_TURNS) the cut answer ends it as before. Absent from state
+    /// written before it existed, and not written while `0`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cut_turns: u32,
     /// The limit this run hit, once it has: the next model call is the closing turn (no tool may be
     /// called), and once that has answered the run finishes with the answer marked limited. Absent
     /// from state written before it existed, and not written while `None`; a run that continues

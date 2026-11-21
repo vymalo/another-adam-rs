@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, JournalEntry, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    Artifact, CLOSING_TURN, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter,
-    MAX_CARRIED_BYTES, OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait, StepIo, StepStyle,
-    TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError, ToolOutput, user_message,
+    Artifact, CLOSING_TURN, CUT_TURN, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter,
+    MAX_CARRIED_BYTES, MAX_CUT_TURNS, OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait, StepIo,
+    StepStyle, TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError, ToolOutput, user_message,
 };
 use adam_model::{
     ContentPart, DynModel, FinishReason, Message, MockModel, ModelClient, ModelDelta, ModelError,
@@ -1292,6 +1292,80 @@ async fn length_finish_without_tools_is_done_and_marked_truncated() {
         output_of(&whole),
         Some(json!({"text": "a complete answer", "artifacts": []})),
         "a normal stop is not marked"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_answer_cut_at_the_output_limit_is_asked_again_with_a_note() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock
+        .push_response(length_limited(""))
+        .push_text("the real answer");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("think hard"), None)
+        .await
+        .expect("start");
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    assert_eq!(
+        output_of(&view),
+        Some(json!({"text": "the real answer", "artifacts": []})),
+        "the cut answer is not the run's answer"
+    );
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].messages.last(),
+        Some(&Message::user_text(CUT_TURN)),
+        "the second call says why it is asked again"
+    );
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .all(|m| !matches!(m, Message::Assistant { .. })),
+        "the empty cut answer was dropped from the history"
+    );
+    let state = conversation(&rt, &view).await;
+    assert!(
+        state
+            .messages
+            .iter()
+            .all(|m| *m != Message::user_text(CUT_TURN)),
+        "the note is sent, never recorded"
+    );
+    assert_eq!(state.cut_turns, 0, "a whole answer resets the count");
+}
+
+#[tokio::test]
+async fn empty_answers_cut_at_the_output_limit_end_the_run_after_max_cut_turns() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    for _ in 0..=MAX_CUT_TURNS {
+        h.mock.push_response(length_limited(""));
+    }
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("think forever"), None)
+        .await
+        .expect("start");
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    assert_eq!(
+        h.mock.requests().len(),
+        usize::try_from(MAX_CUT_TURNS).expect("small") + 1,
+        "asked again MAX_CUT_TURNS times, then no more"
+    );
+    assert_eq!(
+        output_of(&view),
+        Some(json!({"text": "", "artifacts": [], "truncated": true})),
+        "then the cut answer ends the run, as before"
     );
 }
 

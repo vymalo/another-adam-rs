@@ -621,6 +621,17 @@ impl<'a> Early<'a> {
     }
 }
 
+/// Told to the model when its last answer stopped at the output limit before it said anything or
+/// called a tool (most often its reasoning used the whole limit): the run takes another turn instead of
+/// ending with an empty, cut answer, at most [`MAX_CUT_TURNS`] times in a row. Sent after the history,
+/// as a user message that is not kept in it.
+pub const CUT_TURN: &str = "Your last answer was cut off at the output limit before you said anything \
+or called a tool. Continue the task: think more briefly, then call the tool you need or give your answer.";
+
+/// How many answers in a row that stopped at the output limit with nothing said or called are taken
+/// again ([`CUT_TURN`]); the next one ends the run as a cut answer, as before.
+pub const MAX_CUT_TURNS: u32 = 3;
+
 /// What the model is asked in the closing turn, the last model call of a run that reached
 /// `max_turns` or `max_tool_calls`. Sent after the history, as a user message that is not kept in it.
 pub const CLOSING_TURN: &str = "You have used all the steps this run may take. Do not call any \
@@ -1983,6 +1994,10 @@ impl LlmAgent {
             // the calls in the history still have their tools; only the choice changes.
             request.tool_choice = ToolChoice::None;
             request.messages.push(Message::user_text(CLOSING_TURN));
+        } else if state.cut_turns > 0 && state.output_cut {
+            // The answer before stopped at the output limit with nothing said or called, and was
+            // dropped: the model is told why it is asked again. Sent, never recorded.
+            request.messages.push(Message::user_text(CUT_TURN));
         }
         request.max_output_tokens =
             (self.limits.max_output_tokens > 0).then_some(self.limits.max_output_tokens);
@@ -2343,6 +2358,28 @@ impl LlmAgent {
                 hit.answer = Some(output.clone());
             }
             return Ok((Flow::Done(output), early));
+        }
+        // An answer cut at the output limit before it said or called anything is no answer: it is
+        // dropped (an empty assistant message is refused by some providers) and the model is asked
+        // again, a few times in a row at most; then it ends the run as a cut answer, as it did.
+        if calls.is_empty()
+            && finish == FinishReason::Length
+            && text.trim().is_empty()
+            && state.announced.is_none()
+            && state.cut_turns < MAX_CUT_TURNS
+        {
+            state.messages.pop();
+            state.cut_turns += 1;
+            tracing::debug!(
+                run = %ctx.run_id(),
+                turn,
+                cut_turns = state.cut_turns,
+                "the answer stopped at the output limit with nothing said or called: the model is asked again"
+            );
+            return Ok((Flow::Next, early));
+        }
+        if finish != FinishReason::Length || !calls.is_empty() || !text.trim().is_empty() {
+            state.cut_turns = 0;
         }
         if calls.is_empty() {
             // What a tool announced as the answer is the run's answer (the last announcement wins);

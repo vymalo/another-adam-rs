@@ -757,6 +757,15 @@ corrected end, a source's `access`, `after_previous`: a barrier in the middle of
 `after_previous`, about 140 characters), and the instructions one sentence; the compaction budget counts both for the
 agent's own tools (`fixed_chars`). An agent with no instructions of its own gets that sentence as its system prompt.
 
+## An answer cut at the output limit
+
+An answer that stops at the output limit (`finish_reason: length`) **with no words and no tool call**, most often
+because the model's reasoning used the whole limit, is not taken as the run's answer: it is dropped from the history
+and the model is called again with a user message, `CUT_TURN`, sent for that call only and never stored. At most
+`MAX_CUT_TURNS` (3) such answers in a row are taken again (`Conversation::cut_turns` counts them; any other answer
+resets it); the next one ends the run as before, with `{"text": "", "artifacts": [], "truncated": true}`. A cut
+answer that has words, or a tool call, is handled as it always was.
+
 ## Limits and the closing turn
 
 A run that reaches `max_turns` (the model has been called that many times, each followed by tools) or
