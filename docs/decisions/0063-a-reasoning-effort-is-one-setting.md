@@ -57,7 +57,7 @@ recorded outside this repository.
 
 2. **The model profile is the only seat.** Each model's profile in `MODEL_ALIASES_FILE` (the `profiles:`
    map; ADR 0054 slice 11; the output cap, `extraBody` and the `presets:` bundle are the companion ADR
-   0064's) declares its reasoning fields:
+   0064's, not in this PR) declares its reasoning fields:
    - `reasoningEfforts`: the levels it accepts, a subset of the closed vocabulary, lowest first; absent or
      empty means the model takes **no** reasoning setting.
    - `reasoningWire`: one of a closed set, and it is how a level is sent:
@@ -72,7 +72,9 @@ recorded outside this repository.
    - A preset in `presets:` may carry `reasoningEffort`; a profile may name one (`preset:`).
    - A level outside the vocabulary, an unknown `reasoningWire`, a duplicate level, a
      `reasoningBudgets` entry for an undeclared level, a declared level with no budget, a budget that is
-     not a positive integer, or `reasoningEfforts` without a `reasoningWire` is a **startup error
+     not a positive integer, a `reasoningEffort` outside the model's `reasoningEfforts`, a preset's
+     `reasoningEffort` outside them, `reasoningBudgets` without `thinking_budget`, `reasoningEfforts`
+     without a `reasoningWire`, or a `reasoningWire` with no `reasoningEfforts` is a **startup error
      (exit 78)**, naming the alias and the file. `reasoningEfforts: []` is how a model says it takes none.
    - **There is no `MODEL_REASONING_EFFORT` and no code default.** The chart gains **one value**,
      `config.modelProfiles`, that mounts the file (a ConfigMap); it is unset by default, so the goldens
@@ -94,7 +96,8 @@ recorded outside this repository.
    - **thread**: the run's current effort, held in the protected context key `vymalo.reasoningEffort`;
      the newest activated message sets it. It **carries into a continuing task of the same thread and
      into a child run** (and the child's own children). A **new thread starts at the resolved default**.
-   - **agent folder**: `reasoning_effort` at the top level of the frontmatter.
+   - **agent folder**: `reasoning_effort` at the top level of the frontmatter (the engine builder's value
+     is the same level for an embedded agent with no folder).
    - **the agent's preset**: the folder's `model_preset:` (ADR 0064) and the profile's base preset.
    - **the profile**: its own `reasoningEffort` (then its base preset's), the model's own value.
    Every choice picks among **the current model's** `reasoningEfforts`. A request outside them is
@@ -123,10 +126,6 @@ recorded outside this repository.
    - A subagent's `subagent_start` value is checked against the **subagent's** profile, not the root's
      (the card describes the root's model). A helper's `child-sessions/v1` `config` bounds carry its
      model's levels, so a person can set a session value on a helper whose model differs. A child whose
-     model takes levels under a root whose model takes none is not reachable by the extension (the card
-     does not list it); only the child's session `config` can set its effort. A child whose
-     model takes levels under a root whose model takes none is not reachable by the extension (the card
-     does not list it); only the child's session `config` can set its effort. A child whose
      model takes levels under a root whose model takes none is not reachable by the extension (the card
      does not list it); only the child's session `config` can set its effort.
 
@@ -179,7 +178,7 @@ recorded outside this repository.
 | MiniMax (m3, m2p5, m2.7) | all levels | yes | `[none, low]` | |
 | MiMo (v2p5-pro, v2p5, v2.6-pro, v2.6-flash) | all levels | yes | `[none, low]` | |
 | Ornith, Gemma, adorsys-* | all levels | **no** for `adorsys-frontend`/`adorsys-researcher`; yes otherwise | `[none, low]` | |
-| `qwen3-embedding-8b` | not a chat model | — | none | no profile |
+| `qwen3-embedding-8b` | not a chat model | — | `[]` | no profile |
 
 "all levels" is `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The recommended set is the
 cheapest reliable level per family; the full per-model table is recorded outside this repository.
@@ -243,12 +242,12 @@ sequenceDiagram
   `deploy/coder/README.md` and `values.yaml` (the model file), `bin/adam-agent/README.md` and
   `bin/adam-coder/README.md`, `bin/adam-coder/tests/fixtures/agent/card.json`, the two binaries' card
   tests' exact URI lists, `.agents/skills/adam-a2a-extensions`, `.agents/skills/adam-agent-folder`, and
-  `bench/README.md` (its `off` arm sends `{"reasoning_effort":"none"}`, which is not adam's vocabulary).
+  `bench/README.md` (its `off` arm sends `{"reasoning_effort":"none"}`; `none` is now a real level, so the arm is unchanged).
 - `docs/api/usage-v1.md` lives in `vymalo/another-agentic-system`; the system half's ADR and PR amend it.
 - The card gains one extension only for a model that takes a level; the chart gains one value that mounts
   the model file, unset by default, so the four goldens are unchanged.
-- The parity gaps (orchestrator/web, platform, another-app) are issues, linked from the matrix; the
-  engine's builder and the two binaries are this repository's.
+- The parity gaps (orchestrator/web and platform) are issues, linked from the matrix; another-app is
+  private and has no column. The engine's builder and the two binaries are this repository's.
 - The probe is the evidence for the profiles; the profiles themselves are the deployment's, and the
   ADR's examples are not a shipped configuration.
 
@@ -266,11 +265,11 @@ typed level removes the members the model's wire would duplicate from the profil
 
 - **A global `MODEL_REASONING_EFFORT`** (an earlier draft): the owner rejected it — the models behind the
   gateway differ, and one wire mapping cannot serve them.
-- **A default value**: the owner rejected it; unset must stay "nothing sent".
+- **A global default value**: the owner rejected it; unset must stay "nothing sent" (a profile's or preset's per-model value is allowed, decision 3).
 - **A free-form wire template** (a JSON fragment with placeholders): too easy to send a malformed body;
   the three closed mappings cover the observed shapes, and a fourth is a new ADR.
-- **`none`/`minimal` in the vocabulary**: they are not what adam asks for; "off" is absence. A model that
-  takes only them is declared as taking none.
+- **`none`/`minimal` kept out of the vocabulary** (an earlier draft): the probe showed some models reason
+  unless `none` is sent, so both are real levels and are in.
 - **A separate extension per model**: the card already describes one agent's model; one URI with
   `efforts` is enough.
 
@@ -279,7 +278,6 @@ typed level removes the members the model's wire would duplicate from the profil
 - The `reasoning` fields for the deployment's models (the probe informs them; the owner sets them).
 - The orchestrator/web and platform halves (the system's #415, the platform's #284), and the
   `docs/reference/parity.md` rows.
-- **The probe table is the merge blocker**: the model-by-model run needs the gateway credential (or the
-  proxy that injects it).
+- The full per-model probe table lives outside this repository; the deployment's profiles are the owner's.
 - Whether a model's `thinking_budget` budgets are per level a fixed table or a formula; the entry carries
   the table, and a formula is a later ADR if a model needs one.
