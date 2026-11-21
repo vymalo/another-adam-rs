@@ -31,8 +31,10 @@
 //!     {"cpuMillis": 250, "memoryBytes": 536870912, "commands": 12, "milliseconds": 81234}]}}}
 //! ```
 //!
-//! `{"environment": "local"}` and `{"environment": "devcontainer"}` have no `usage`: *not measured*,
-//! which is not zero. `"usage": []` is a pod that was asked for and ran no command: a measured zero.
+//! `{"environment": "local"}` has no `usage`: *not measured*, which is not zero. A report of an
+//! older coder may say `{"environment": "devcontainer"}`, which reads as `local` (ADR 0052), and
+//! this coder writes `local` from now on. `"usage": []` is a pod that was asked for and ran no
+//! command: a measured zero.
 //! `totals` is always there when the object is, `[]` for a run that made no model call.
 //!
 //! The counts are AG-UI 1.0's `TokenUsage` (parts never additions), each at most 2^53 - 1, and the
@@ -387,14 +389,16 @@ mod tests {
         );
     }
 
+    /// ADR 0052 removed the dev container: a report of an older coder may say `devcontainer`, which
+    /// reads as `local` (neither is measured), and this coder writes `local` from now on.
     #[test]
     fn an_environment_that_is_not_measured_says_where_and_no_usage() {
         for environment in ["local", "devcontainer"] {
             let object = written(json!({"sandbox_usage": {"environment": environment}})).unwrap();
             assert_eq!(
                 object,
-                json!({"totals": [], "sandbox": {"environment": environment}}),
-                "not measured is not zero: there is no `usage`"
+                json!({"totals": [], "sandbox": {"environment": "local"}}),
+                "{environment}: not measured is not zero: there is no `usage`, and devcontainer reads as local"
             );
         }
         // Whatever the state holds, an environment that is not measured has no entries.
