@@ -407,8 +407,8 @@ impl AgentDef {
     /// process role and made without binding, so a control plane that never builds the agent
     /// serves the card and the sessions a worker's tools agree with.
     ///
-    /// Only with the feature `a2a`.
-    #[cfg(feature = "a2a")]
+    /// Only with the feature `sessions` (which `a2a` turns on).
+    #[cfg(feature = "sessions")]
     pub fn child_sessions(&self) -> Option<adam_a2a_runtime::ChildSessions> {
         use adam_a2a_runtime::{ChildSessionAgent, ChildSessions};
         let limits = self.effective_session_limits();
@@ -623,7 +623,7 @@ impl AgentDef {
     /// The first problem found, in the order above; see [`Error`].
     pub fn bind(self, tools: ToolSet) -> Result<BoundDef, Error> {
         let catalog = Catalog::new(&tools)?;
-        #[cfg(feature = "a2a")]
+        #[cfg(feature = "sessions")]
         let child_sessions = self.child_sessions();
         // An agent given MCP tools that the definition does not contain: a typo, found before the
         // walk, so that the message is about the name and not about a server that "is not
@@ -675,7 +675,7 @@ impl AgentDef {
         }
         let root = self.manifest.name.clone();
         let bound = BoundDef::new(self.manifest, nodes, remotes, session_limits);
-        #[cfg(feature = "a2a")]
+        #[cfg(feature = "sessions")]
         let bound = bound.with_child_sessions(child_sessions);
         #[cfg(feature = "mcp")]
         let bound = bound.with_prompt_commands(

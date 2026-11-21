@@ -242,7 +242,8 @@ export function normalizeConfig(raw) {
   }
 
   const agents = raw.agents === undefined ? [...DEFAULT_AGENTS] : raw.agents;
-  if (!Array.isArray(agents) || agents.length < 2 || new Set(agents).size !== agents.length) throw new ConfigError('agents', 'must list two or more different agent variants');
+  // One agent is allowed: a run that compares models or arms, not agents (the reasoning presets, 2026-11-21).
+  if (!Array.isArray(agents) || agents.length < 1 || new Set(agents).size !== agents.length) throw new ConfigError('agents', 'must list one or more different agent variants');
   for (const a of agents) if (!AGENT_NAMES.includes(a)) throw new ConfigError('agents', `no agent variant ${String(a).slice(0, 40)}: ${AGENT_NAMES.join(', ')}`);
 
   const keyEnv = raw.keyEnv === undefined ? SCHEMA.keyEnv.default : raw.keyEnv;

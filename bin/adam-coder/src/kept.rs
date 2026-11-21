@@ -7,7 +7,7 @@
 //! * **Not in the journal.** The files are on the volume, beside the notes (`coder/<run>.json`) and
 //!   the workspaces. A worker that takes the run over reads the same files, whatever environment the
 //!   run's commands use: the output is captured by this process from the command's pipes, and
-//!   `read_output` reads it here, so a run pod or a devcontainer never sees `outputs/` (a pod mounts
+//!   `read_output` reads it here, so a run pod never sees `outputs/` (a pod mounts
 //!   only the slots of its run).
 //! * **Scrubbed before it is written.** [`FileKept::keep`](adam_llm_agent::KeptOutputs::keep) scrubs
 //!   the whole text with the process's [`Redactor`] and then cuts and folds it, so no secret it knows
@@ -23,7 +23,7 @@
 //!   the file is made in the held run directory with `O_EXCL` and `O_NOFOLLOW`, `0600`, written
 //!   under a temporary name and renamed; a link or a file in the way is refused (`NOT kept`), the
 //!   volume's paths are never in a message, and a file with more than one hard link is not read. A
-//!   command of the **local** environment (and a Podman devcontainer's) runs as the same user and
+//!   command of the **local** environment runs as the same user and
 //!   **can rewrite a kept file** (or fill the directory), as it can already rewrite the notes and the
 //!   other slots: what `read_output` returns is no more trusted than the output of a command was.
 //!   Nothing decides on it: the verdict of `run_checks` is its exit code, never the kept text.

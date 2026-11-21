@@ -42,7 +42,7 @@ x-wiremock: &wiremock
     retries: 30
     start_period: 5s
 
-x-image: &image ghcr.io/vymalo/another-adam-rs/coder:sha-e46c8f4@sha256:60b211ab2709913d0e175d07cc00af9e431a94dc55f0bdcb26cbd33e4f305744
+x-image: &image ghcr.io/vymalo/another-adam-rs/coder:sha-35af9f4@sha256:7b4c1c19bdbf1ca9c82f4858d6034cdbffb57476ca757ab6fdc9a83ceb9e3bd4
 
 x-relay: &relay
   image: *image

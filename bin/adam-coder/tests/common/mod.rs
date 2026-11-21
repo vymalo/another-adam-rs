@@ -1500,12 +1500,6 @@ pub struct FakeEnvironment {
     /// The next this many calls of `ensure` fail with `Unavailable` (a quota that is used up), and
     /// then it works.
     pub unavailable_for: AtomicUsize,
-    /// The runs `rebuild` was called for, and whether it was to use the default.
-    pub rebuilt: Mutex<Vec<(String, bool)>>,
-    /// What `rebuild` says: whether there is anything of its own to make again.
-    pub rebuild_says: AtomicBool,
-    /// `ensure` fails with this after a `rebuild` (a build that goes wrong again).
-    pub ensure_fails_after_rebuild: Mutex<Option<fn() -> EnvError>>,
     /// The runs `seal` was called for, each with the directory names of the slots the run's
     /// workspace had at that moment (so a test can tell the call came after the slot was added).
     pub sealed: Mutex<Vec<(String, Vec<String>)>>,
@@ -1529,7 +1523,7 @@ pub struct FakeSession {
     pub killed: Mutex<Vec<ExecId>>,
     /// Variables added to every prepared command.
     pub extra_env: Mutex<BTreeMap<String, String>>,
-    /// What the session says it is; a devcontainer of an image `fake` when not set.
+    /// What the session says it is; this container when not set.
     pub kind: Mutex<Option<EnvKind>>,
     /// What the session says its processes reserve (`EnvSession::sandbox_shape`); `None`: it is not
     /// metered.
@@ -1583,9 +1577,6 @@ impl FakeEnvironment {
             release_fails: AtomicBool::new(false),
             hang: AtomicBool::new(false),
             unavailable_for: AtomicUsize::new(0),
-            rebuilt: Mutex::new(Vec::new()),
-            rebuild_says: AtomicBool::new(true),
-            ensure_fails_after_rebuild: Mutex::new(None),
             sealed: Mutex::new(Vec::new()),
             seal_fails: Mutex::new(None),
             images: Mutex::new(Vec::new()),
@@ -1644,16 +1635,6 @@ impl Environment for FakeEnvironment {
         Ok(self.held.lock().unwrap().clone())
     }
 
-    async fn rebuild(&self, run: &str, use_default: bool) -> Result<bool, EnvError> {
-        self.rebuilt
-            .lock()
-            .unwrap()
-            .push((run.to_owned(), use_default));
-        // What a rebuild clears: a broken environment is made again at the next `ensure`.
-        *self.ensure_fails.lock().unwrap() = self.ensure_fails_after_rebuild.lock().unwrap().take();
-        Ok(self.rebuild_says.load(Ordering::SeqCst))
-    }
-
     async fn seal(&self, workspace: &RunWorkspace) -> Result<(), EnvError> {
         let slots = workspace
             .slots()
@@ -1687,15 +1668,7 @@ impl Environment for FakeEnvironment {
 impl EnvSession for FakeSession {
     fn describe(&self) -> EnvDescription {
         EnvDescription {
-            kind: self
-                .kind
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap_or(EnvKind::DevContainer {
-                    source: None,
-                    image: "fake".to_owned(),
-                }),
+            kind: self.kind.lock().unwrap().clone().unwrap_or(EnvKind::Local),
             summary: "a fake environment".to_owned(),
         }
     }

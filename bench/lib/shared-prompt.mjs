@@ -29,7 +29,7 @@ export const SECTIONS = Object.freeze({
   'Access tiers': { shared: false, why: "adam's access tiers (plan, edits, auto, bypass), which the benchmark does not set" },
   'How to work': { shared: true, owner: true, why: 'how to do the task: discover the checks, small steps, verify, fix, commit and open the pull request in one call' },
   'Starting without a repository': { shared: false, why: "adam's scratch projects, publish_scratch and repository creation: the benchmark always names a repository" },
-  'The work environment': { shared: false, why: "adam's devcontainer environment, rebuild_environment and the obscura browser; OpenCode runs in the task's own container" },
+  'The work environment': { shared: false, why: "adam's run pod or its own container, use_repository_environment and the obscura browser; OpenCode runs in the task's own container" },
   'A missing toolchain': { shared: true, owner: true, why: 'what to do when the environment lacks a toolchain, and when a project tool only needs its dependencies installed' },
   'Asking the person': { shared: false, why: 'ask_user and its forms; OpenCode has a different question tool, which the benchmark denies' },
   'Questions and conversation': { shared: false, why: 'names run_command and refers to the "Who you are" section, which is left out' },

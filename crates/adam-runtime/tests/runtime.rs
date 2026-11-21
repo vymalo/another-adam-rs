@@ -8339,8 +8339,8 @@ struct TranscriptAgent {
     fail_at: Option<u32>,
     /// A file artifact the failing step emits, for the carried head's upload gate.
     fail_file: Option<Artifact>,
-    /// A file artifact the first step emits, for the blob gate.
-    file: Option<Artifact>,
+    /// File artifacts to emit, by the state's turn count at the step that emits them.
+    emit_files: Vec<(u32, Artifact)>,
     /// Replace the transcript on the second step: a compaction, not an append.
     compact: bool,
     /// Pad every step's message with this many bytes, so a full state is too large to pass a
@@ -8358,14 +8358,14 @@ impl TranscriptAgent {
             stop_splitting: false,
             fail_at: None,
             fail_file: None,
-            file: None,
+            emit_files: Vec::new(),
             compact: false,
             padding: 0,
         }
     }
 
     fn with_file(mut self, file: Artifact) -> Self {
-        self.file = Some(file);
+        self.emit_files.push((0, file));
         self
     }
 
@@ -8422,10 +8422,10 @@ impl Agent for TranscriptAgent {
         ctx: &mut Ctx,
         mut state: Transcript,
     ) -> Result<Transition<Transcript>, AgentError> {
-        if state.turns == 0
-            && let Some(file) = &self.file
-        {
-            ctx.emit(RunEvent::from(file.clone())).await;
+        for (at, file) in &self.emit_files {
+            if state.turns == *at {
+                ctx.emit(RunEvent::from(file.clone())).await;
+            }
         }
         if self.compact && state.turns == 1 {
             state.messages.clear();
@@ -8887,6 +8887,16 @@ async fn a_park_again_writes_the_head_it_read_and_the_tombstone() {
         .expect("start the child");
     let worker = spawn_worker(&rt);
     wait_waiting(&rt, child).await;
+    // The recording store logs a commit after the inner store has taken it, and the run reads as
+    // waiting from the inner store: wait for the step's own commit to be logged, or the reset
+    // below can come first and the step's commit (which writes a row) be read as a park-again.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while recording.commits_of(child).is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the step's commit is logged");
     let parked = inner
         .load_head(child)
         .await
@@ -9175,7 +9185,7 @@ async fn a_carried_head_names_only_stored_file_digests() {
     let mut agent = TranscriptAgent::new(&uniq("carried-upload"), 2);
     agent.park_at = Some(1);
     agent.fail_at = Some(2);
-    agent.file = Some(stored);
+    agent.emit_files = vec![(0, stored)];
     agent.fail_file = Some(lost);
     let rt = transcript_runtime(&store, &agent);
     let run = rt.start(&agent.name, inbound(), None).await.expect("start");
@@ -9238,6 +9248,243 @@ async fn a_carried_head_names_only_stored_file_digests() {
         "no reference is recorded for a digest the head does not name: {:?}",
         last.blobs
     );
+}
+
+/// A correct split on a v5 run leaves an inherited file whose bytes are gone out of the head and
+/// its references, and keeps the files that are there, the step's own included: an S2a
+/// expand-release head can name a digest whose blob was never stored (its full state carried the
+/// bytes), and S3's first commit tombstones that state. The commit lands and the run reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_split_drops_an_inherited_file_whose_bytes_are_gone() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let lost_bytes = SVG.to_vec();
+    let kept_bytes = b"<svg><circle r='2'/></svg>".to_vec();
+    let own_bytes = b"<svg><path d='M0 0'/></svg>".to_vec();
+    let lost = Artifact::file("chart", "image/svg+xml", "chart.svg", lost_bytes.clone())
+        .expect("a small file");
+    let kept =
+        Artifact::file("logo", "image/png", "logo.png", kept_bytes.clone()).expect("a small file");
+    let own = Artifact::file(
+        "sparkline",
+        "image/svg+xml",
+        "sparkline.svg",
+        own_bytes.clone(),
+    )
+    .expect("a small file");
+    let mut agent = TranscriptAgent::new(&uniq("lost-split"), 2);
+    agent.emit_files = vec![(0, lost.clone()), (0, kept.clone()), (1, own.clone())];
+    agent.park_at = Some(1);
+    let rt = transcript_runtime(&inner, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_waiting(&rt, run).await;
+    worker.stop().await;
+    let parked = inner.load_head(run).await.unwrap().unwrap().state;
+    assert_eq!(
+        parked["artifacts"].as_array().unwrap().len(),
+        2,
+        "the park's head names both files"
+    );
+    // A delivery on the store that still holds the bytes wakes the run; the head keeps naming the
+    // lost file until the next commit checks it.
+    rt.deliver(run, late()).await.expect("deliver");
+
+    // The blob is gone (a purged blob, or an S2a head that never stored it). The correct split
+    // must not name it: its bytes cannot be stored again, so refusing would retry for ever.
+    let lost_store: DynStore = Arc::new(common::lost::LostBlob::new(
+        inner.clone(),
+        adam_runtime::blob_id(&lost_bytes),
+    ));
+    let recording = Arc::new(common::recording::RecordingStore::new(lost_store));
+    let store: DynStore = recording.clone();
+    let rt = transcript_runtime(&store, &agent);
+    let worker = spawn_worker(&rt);
+    let done = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let names: Vec<&str> = done.artifacts.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["logo", "sparkline"],
+        "the missing inherited file is gone; the present one and the step's own stay"
+    );
+    for artifact in &done.artifacts {
+        let file = artifact.file.as_ref().expect("a file artifact");
+        assert!(
+            rt.artifact_bytes(file)
+                .await
+                .expect("read the blob")
+                .is_some(),
+            "the head names {} with bytes that are not stored",
+            artifact.name
+        );
+    }
+    let served = inner.load_head(run).await.unwrap().unwrap();
+    assert_eq!(
+        served.state["v"], 5,
+        "the split wrote a head, not a demotion"
+    );
+    let digests: Vec<String> = served.state["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| {
+            artifact["file"]["digest"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        digests,
+        [
+            adam_runtime::blob_id(&kept_bytes).to_string(),
+            adam_runtime::blob_id(&own_bytes).to_string(),
+        ],
+        "the head names the two files whose bytes are there"
+    );
+    let commit = recording.commits().pop().expect("the split's commit");
+    assert!(
+        !commit.blobs.contains(&adam_runtime::blob_id(&lost_bytes)),
+        "the commit does not reference the missing digest: {:?}",
+        commit.blobs
+    );
+    // The run is readable: the head joins the transcript it names.
+    let state = rt.state(run).await.expect("state").expect("the run");
+    assert_eq!(state["turns"], 2);
+}
+
+/// A failed transition carries the head it read and leaves an inherited file whose bytes are gone
+/// out of it: the carried head is the run's only copy, so it must name only stored digests. The
+/// transition's own artifact and the files that are there stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_transition_drops_an_inherited_file_whose_bytes_are_gone() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let lost_bytes = SVG.to_vec();
+    let kept_bytes = b"<svg><circle r='2'/></svg>".to_vec();
+    let lost = Artifact::file("chart", "image/svg+xml", "chart.svg", lost_bytes.clone())
+        .expect("a small file");
+    let kept =
+        Artifact::file("logo", "image/png", "logo.png", kept_bytes.clone()).expect("a small file");
+    let mut agent = TranscriptAgent::new(&uniq("lost-carried"), 2);
+    agent.emit_files = vec![(0, lost), (0, kept.clone())];
+    agent.park_at = Some(1);
+    let rt = transcript_runtime(&inner, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_waiting(&rt, run).await;
+    worker.stop().await;
+    rt.deliver(run, late()).await.expect("deliver");
+
+    let lost_store: DynStore = Arc::new(common::lost::LostBlob::new(
+        inner.clone(),
+        adam_runtime::blob_id(&lost_bytes),
+    ));
+    let recording = Arc::new(common::recording::RecordingStore::new(lost_store));
+    let store: DynStore = recording.clone();
+    let mut failing = agent.clone();
+    failing.fail_at = Some(2);
+    let rt = transcript_runtime(&store, &failing);
+    let worker = spawn_worker(&rt);
+    let failed = wait_failed(&rt, run).await;
+    worker.stop().await;
+
+    let names: Vec<&str> = failed.artifacts.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["logo", "failure-note"],
+        "the missing inherited file is gone; the present one and the failure's note stay"
+    );
+    let served = inner.load_head(run).await.unwrap().unwrap();
+    assert_eq!(served.state["v"], 5, "the carried head stayed the run");
+    let digests: Vec<String> = served.state["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|artifact| artifact["file"]["digest"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        digests,
+        [adam_runtime::blob_id(&kept_bytes).to_string()],
+        "only the file whose bytes are there is named"
+    );
+    let commit = recording
+        .commits()
+        .pop()
+        .expect("the failed transition's commit");
+    assert!(
+        !commit.blobs.contains(&adam_runtime::blob_id(&lost_bytes)),
+        "the commit does not reference the missing digest: {:?}",
+        commit.blobs
+    );
+}
+
+/// A delivery writes the head it read **unchanged**, so a later refused split still sees an
+/// inherited file whose bytes are gone and refuses (ADR 0055); a cancel is terminal and drops it,
+/// so the head a front reads never keeps naming a digest nobody can serve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivery_keeps_a_missing_inherited_file_and_a_cancel_drops_it() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let lost_bytes = SVG.to_vec();
+    let kept_bytes = b"<svg><circle r='2'/></svg>".to_vec();
+    let lost = Artifact::file("chart", "image/svg+xml", "chart.svg", lost_bytes.clone())
+        .expect("a small file");
+    let kept =
+        Artifact::file("logo", "image/png", "logo.png", kept_bytes.clone()).expect("a small file");
+    let mut agent = TranscriptAgent::new(&uniq("lost-delivery"), 2);
+    agent.emit_files = vec![(0, lost), (0, kept)];
+    agent.park_at = Some(1);
+    let rt = transcript_runtime(&inner, &agent);
+    let delivered = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let cancelled = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_waiting(&rt, delivered).await;
+    wait_waiting(&rt, cancelled).await;
+    worker.stop().await;
+
+    let lost_store: DynStore = Arc::new(common::lost::LostBlob::new(
+        inner.clone(),
+        adam_runtime::blob_id(&lost_bytes),
+    ));
+    let rt = transcript_runtime(&lost_store, &agent);
+    rt.deliver(delivered, late()).await.expect("deliver");
+    let head = inner.load_head(delivered).await.unwrap().unwrap().state;
+    let names: Vec<&str> = head["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| artifact["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        ["chart", "logo"],
+        "the delivery writes the head it read: the demotion must still see the missing file"
+    );
+    assert_eq!(
+        rt.view(delivered)
+            .await
+            .expect("view")
+            .expect("the run")
+            .status,
+        RunStatus::Runnable
+    );
+
+    rt.cancel(cancelled, "stop").await.expect("cancel");
+    let head = inner.load_head(cancelled).await.unwrap().unwrap().state;
+    let names: Vec<&str> = head["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| artifact["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        ["logo"],
+        "the cancel dropped the missing file and kept the present one"
+    );
+    let view = rt.view(cancelled).await.expect("view").expect("the run");
+    assert_eq!(view.status, RunStatus::Failed);
+    assert_eq!(view.error.as_deref(), Some("cancelled: stop"));
 }
 
 /// A refused split whose inherited file's bytes are gone commits **nothing**: the demotion cannot
@@ -9760,8 +10007,8 @@ async fn a_file_is_uploaded_once_across_splits() {
         1,
         "the file's bytes are sent on the first split only"
     );
-    // The second split inherits the file by reference: it neither re-sends the bytes nor asks the
-    // store about the digest, because the head it read already names it.
+    // The second split inherits the file by reference: it re-sends no bytes, and one existence
+    // check confirms the inherited digest is still stored before the new head names it.
     let served = inner
         .load_head(run.id)
         .await

@@ -259,6 +259,186 @@ impl ListQuery {
     }
 }
 
+/// Which firings [`firings`](crate::Engine::firings) answers: the runs the agent's `schedules/`
+/// fired (ADR 0060), which are no caller's and so not in [`list`](crate::Engine::list).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FiringQuery {
+    /// Only the firings of the schedule of this name (the file's stem in `schedules/`).
+    pub schedule: Option<String>,
+    /// At most this many firings, 1 to [`MAX_PAGE_SIZE`]; `0` is [`DEFAULT_PAGE_SIZE`].
+    pub page_size: usize,
+    /// Continue after the page that gave this [`Page::next_page_token`].
+    pub page_token: Option<String>,
+}
+
+impl FiringQuery {
+    /// The first page of every firing of the agent, [`DEFAULT_PAGE_SIZE`] at a time.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Only the firings of the schedule `name`.
+    #[must_use]
+    pub fn schedule(mut self, name: impl Into<String>) -> Self {
+        self.schedule = Some(name.into());
+        self
+    }
+
+    /// At most `size` firings a page.
+    #[must_use]
+    pub fn page_size(mut self, size: usize) -> Self {
+        self.page_size = size;
+        self
+    }
+
+    /// The page after the one that gave `token`.
+    #[must_use]
+    pub fn after(mut self, token: impl Into<String>) -> Self {
+        self.page_token = Some(token.into());
+        self
+    }
+
+    pub(crate) fn resolved_page_size(&self) -> usize {
+        match self.page_size {
+            0 => DEFAULT_PAGE_SIZE,
+            n => n.min(MAX_PAGE_SIZE),
+        }
+    }
+}
+
+/// A run one of the agent's schedules fired: the run as [`get`](crate::Engine::get) answers it,
+/// and what fired it. Its [`RunInfo::conversation`] is the firing's own, not one to
+/// [`send`](crate::Engine::send) to: a message to it is [`EngineError::NotFound`](crate::EngineError::NotFound).
+/// Not `adam_schedule::Firing`, the scheduler's record of a due time it fired.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Firing {
+    /// The run.
+    pub info: RunInfo,
+    /// The schedule and the due time it fired for.
+    pub trigger: adam_schedule::Trigger,
+}
+
+/// What starts a child session ([`start_session`](crate::Engine::start_session)): which helper,
+/// what the session is for, and whether it stays open after its first round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StartSession {
+    /// The helper, by the name [`helpers`](crate::Engine::helpers) lists.
+    pub helper: String,
+    /// One line, at most 80 characters: what the session is for, as the host shows it.
+    pub description: String,
+    /// Whether the session stays open, idle, after a round ends; otherwise it closes when its
+    /// first round ends.
+    pub keep_open: bool,
+}
+
+impl StartSession {
+    /// A session of `helper` for `description`, closed when its first round ends.
+    pub fn new(helper: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            helper: helper.into(),
+            description: description.into(),
+            keep_open: false,
+        }
+    }
+
+    /// Keep the session open after each round, until it is closed.
+    #[must_use]
+    pub fn keep_open(mut self) -> Self {
+        self.keep_open = true;
+        self
+    }
+}
+
+/// A helper a person may start a session with: a local subagent of the root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionHelper {
+    /// Its name, as [`StartSession::helper`] names it.
+    pub name: String,
+    /// What it does, from its file.
+    pub description: String,
+}
+
+/// Where a child session is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionState {
+    /// A round works.
+    Working,
+    /// Open, no round works: the next message starts one.
+    Idle,
+    /// Closed: it takes no more messages.
+    Closed,
+}
+
+/// A child session of a conversation ([`sessions`](crate::Engine::sessions)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionInfo {
+    /// The session's id within its conversation.
+    pub session: String,
+    /// Its own conversation: where [`send`](crate::Engine::send) talks to it, and what
+    /// [`close_session`](crate::Engine::close_session) and [`list`](crate::Engine::list) take.
+    pub conversation: ConversationId,
+    /// The helper that works it.
+    pub helper: String,
+    /// What it is for.
+    pub description: String,
+    /// Whether it stays open between rounds.
+    pub keep_open: bool,
+    /// Where it is.
+    pub state: SessionState,
+    /// How many rounds it has had.
+    pub round: u32,
+    /// Its latest round.
+    pub latest: Option<RunId>,
+}
+
+impl SessionInfo {
+    /// A session as the parent task's `child-sessions/v1` object lists it.
+    pub(crate) fn of(entry: &serde_json::Value) -> Result<Self, EngineError> {
+        let bad = |what: &str| EngineError::internal(format!("a session listed without {what}"));
+        let text = |key: &str| {
+            entry
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| bad(key))
+        };
+        let state = match entry.get("state").and_then(serde_json::Value::as_str) {
+            Some("working") => SessionState::Working,
+            Some("idle") => SessionState::Idle,
+            Some("closed") => SessionState::Closed,
+            _ => return Err(bad("a state")),
+        };
+        let round = entry.get("round");
+        Ok(Self {
+            session: text("session")?,
+            conversation: ConversationId(text("contextId")?),
+            helper: text("agent")?,
+            description: text("description")?,
+            keep_open: entry
+                .get("keepOpen")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            state,
+            round: round
+                .and_then(|r| r.get("number"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(0),
+            latest: round
+                .and_then(|r| r.get("taskId"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .map(RunId),
+        })
+    }
+}
+
 /// One page of a listing, the most recently updated first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]

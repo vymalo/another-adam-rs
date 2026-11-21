@@ -898,3 +898,44 @@ async fn the_prompt_cache_key_is_sent_only_by_a_client_built_to_send_it() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_body_over_the_cap_is_a_protocol_error() {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_raw(vec![b'x'; (16 << 20) + 1], "application/json"),
+    )
+    .await;
+    let err = client(&server)
+        .complete(request())
+        .await
+        .expect_err("over 16 MiB");
+    assert!(matches!(err, ModelError::Protocol { .. }), "{err:?}");
+    assert!(err.to_string().contains("over 16777216 bytes"), "{err}");
+    assert_eq!(err.class(), ErrorClass::Corrupt);
+}
+
+#[tokio::test]
+async fn a_stream_line_over_the_cap_is_a_protocol_error() {
+    let server = MockServer::start().await;
+    let mut body = b"data: ".to_vec();
+    body.extend_from_slice(&vec![b'x'; 1 << 20]);
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
+    )
+    .await;
+    let mut stream = client(&server)
+        .stream(request())
+        .await
+        .expect("the response headers");
+    let err = stream
+        .next()
+        .await
+        .expect("one item")
+        .expect_err("over 1 MiB");
+    assert!(matches!(err, ModelError::Protocol { .. }), "{err:?}");
+    assert!(err.to_string().contains("over 1048576 bytes"), "{err}");
+    assert!(stream.next().await.is_none(), "the stream stops after it");
+}

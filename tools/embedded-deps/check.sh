@@ -91,10 +91,11 @@ features() {
     cargo clippy --locked -q -p "$crate" --no-default-features --features "$feature" --all-targets -- -D warnings
   done
   # adam-assembly's doctests prove the remote API is gone without the feature (`compile_fail`), and
-  # its other features each have a path of their own without `remote` (dev reload, MCP tools).
+  # its other features each have a path of their own without `remote` (dev reload, MCP tools, and
+  # the child sessions of local subagents that `adam-engine` turns on).
   echo "embedded-deps: adam-assembly, doctests with no default feature"
   cargo test --locked -q -p adam-assembly --no-default-features --doc
-  for feature in dev mcp; do
+  for feature in dev mcp sessions; do
     echo "embedded-deps: adam-assembly, only $feature (no remote)"
     cargo clippy --locked -q -p adam-assembly --no-default-features --features "$feature" --all-targets -- -D warnings
     cargo test --locked -q -p adam-assembly --no-default-features --features "$feature" --lib --tests

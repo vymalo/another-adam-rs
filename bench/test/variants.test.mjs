@@ -110,12 +110,13 @@ test('makeDrivers: one driver per named variant, with its name, folder or prompt
   assert.deepEqual(Object.keys(makeDrivers({ make: { adam: Adam, opencode: Oc }, prompts: {}, common: {}, agents: ['adam', 'opencode-bare'] })), ['adam', 'opencode-bare']);
 });
 
-test('the config names the variants to run: default adam and opencode, unknown or repeated names refused', () => {
+test('the config names the variants to run: default adam and opencode, one is enough, unknown or repeated names refused', () => {
   const base = { endpoint: 'https://models.example.test/v1', modelId: 'm', modelLabel: 'M', prices: { inputPerMTok: 1, cachedInputPerMTok: 0.1, cacheWritePerMTok: 1, outputPerMTok: 2 }, capUSD: 10, perRunBudgetUSD: 1, arms: { a: {} }, contextWindow: 100000 };
   assert.deepEqual(normalizeConfig(base).agents, ['adam', 'opencode']);
   assert.deepEqual(normalizeConfig({ ...base, agents: AGENT_NAMES.slice(1) }).agents, AGENT_NAMES.slice(1));
-  assert.throws(() => normalizeConfig({ ...base, agents: ['adam'] }), /two or more/);
-  assert.throws(() => normalizeConfig({ ...base, agents: ['adam', 'adam'] }), /two or more different/);
+  assert.deepEqual(normalizeConfig({ ...base, agents: ['adam-lean'] }).agents, ['adam-lean'], 'one agent: a run that compares models or arms');
+  assert.throws(() => normalizeConfig({ ...base, agents: [] }), /one or more/);
+  assert.throws(() => normalizeConfig({ ...base, agents: ['adam', 'adam'] }), /one or more different/);
   assert.throws(() => normalizeConfig({ ...base, agents: ['adam', 'claude'] }), /no agent variant claude/);
   for (const v of Object.values(VARIANTS)) assert.ok(v.driver === 'adam' || v.profile === null || Object.hasOwn(PROFILES, v.profile));
 });

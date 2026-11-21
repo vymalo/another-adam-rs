@@ -90,22 +90,19 @@ if docker exec "$name" bash -lc 'test -O /cache && test -w /cache && test -k /ca
 else
   bad "the package caches are not under /cache (ADR 0040)"
 fi
-# The devcontainer client side (ADR 0010): the CLI that makes a repository's devcontainer and
-# Podman's client it drives. Nothing in this image runs containers.
-if docker exec "$name" bash -lc 'test "$(devcontainer --version)" = 0.89.0 && podman-remote --version | grep -q "5\\.8\\.7"' >/dev/null; then
-  ok "the devcontainer CLI is 0.89.0 and podman-remote is 5.8.7, the service's release"
+# ADR 0052: the image carries no devcontainer CLI and no container engine's client, and nothing
+# needs them: the coder runs a repository's commands in this container or in a run pod.
+for binary in adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git github-mcp-server; do
+  if docker exec "$name" test -x "/usr/local/bin/$binary"; then
+    ok "$binary is in /usr/local/bin"
+  else
+    bad "$binary is missing from /usr/local/bin"
+  fi
+done
+if docker exec "$name" sh -c 'command -v devcontainer || command -v podman-remote' >/dev/null 2>&1; then
+  bad "the image still carries a devcontainer CLI or a container engine's client (ADR 0052)"
 else
-  bad "the devcontainer CLI or podman-remote is missing or not the pinned version (0.89.0, 5.8.7)"
-fi
-# DEVCONTAINER_RUNTIME=podman needs no OpenCode (ADR 0038): with only the runtime set, the problems listed
-# name the database, the model and so on, and never OpenCode. The three removed variables are not refused
-# either: each one set is ignored (the warning that says so is logged once the configuration is valid).
-out=$(docker run --rm -e DEVCONTAINER_RUNTIME=podman -e CONTAINER_HOST=unix:///run/podman/podman.sock \
-  -e OPENCODE_BINARY=/no/such/opencode "$image" 2>&1 || true)
-if echo "$out" | grep -q "invalid configuration" && ! echo "$out" | grep -qi "opencode"; then
-  ok "DEVCONTAINER_RUNTIME=podman starts without an OpenCode (OPENCODE_BINARY is ignored)"
-else
-  bad "DEVCONTAINER_RUNTIME=podman asks for an OpenCode, or refuses OPENCODE_BINARY: $out"
+  ok "no devcontainer CLI and no container engine's client (ADR 0052)"
 fi
 # Local-process MCP servers are the deployment's to allow: the image sets no MCP_ALLOW_STDIO (an `adam-agent`
 # run from it refuses such servers unless its own deployment opts in), and the coder above did not need it:
