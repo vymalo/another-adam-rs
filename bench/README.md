@@ -657,7 +657,7 @@ measured in the dry run with `BENCH_DRYRUN_REQUESTS_DIR` (2026-11-20, pin `e46c8
 62 KB), `adam-lean` 31 KB (11 KB, 15 tools 20 KB), `opencode` 25 KB, `opencode-prompt` 26 KB, `opencode-bare` 20 KB.
 
 **Reasoning arms.** An arm's fragment wins over what an agent sends, so both drivers get the same setting. At
-`api.ai.camer.digital` (*verified 2026-11-20* by direct calls) a request **without** `reasoning_effort` reasons not at all,
+the owner's gateway (*verified 2026-11-20* by direct calls) a request **without** `reasoning_effort` reasons not at all,
 `low` and `max` are both accepted, and `max` used more reasoning tokens than `low` on the same question (about 920 against
 550 to 800). The meter records per call the setting it sent (`effort`) and the agent's own (`askedEffort`).
 

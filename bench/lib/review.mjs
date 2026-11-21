@@ -14,7 +14,7 @@ import { normalizeUsage, priceCall, worstCase, estimateInputTokens } from './cos
 export const RUBRIC_VERSION = 2;
 /**
  * The reviewer's reasoning and samples. At `medium`, `high` and `max` this model's reasoning ran past 32k tokens on a review and
- * no answer came (*verified 2026-11-20*, api.ai.camer.digital, deepseek-v4.1-flash-1017); at `low` it answers in 10 to 20 s but
+ * no answer came (*verified 2026-11-20*, the owner's gateway and model); at `low` it answers in 10 to 20 s but
  * two answers can differ by a point, so three are asked and the median of each score is kept.
  */
 export const REVIEW_EFFORT = 'low';
