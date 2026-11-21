@@ -54,22 +54,29 @@ fn request() -> ModelRequest {
     req
 }
 
-/// A problem document whose `type` ends in `slug`, with words and a secret beside it.
+/// A problem document whose `type` ends in `slug`, with words and a secret beside it. Written out,
+/// so the goldens of `a_static_key_fails_as_before` are exact.
 fn problem_body(slug: &str) -> String {
-    json!({
-        "type": format!("https://gateway.example.test/problems/{slug}"),
-        "title": WORDS,
-        "detail": format!("Authorization: Bearer {SECRET}"),
-        "credential": SECRET,
-    })
-    .to_string()
+    problem_body_typed(&format!("https://gateway.example.test/problems/{slug}"))
+}
+
+/// A problem document whose `type` is `kind`.
+fn problem_body_typed(kind: &str) -> String {
+    format!(
+        r#"{{"type":"{kind}","title":"{WORDS}","detail":"Authorization: Bearer {SECRET}","credential":"{SECRET}"}}"#
+    )
 }
 
 fn problem(status: u16, slug: &str, retry_after: Option<u64>) -> ResponseTemplate {
-    let template =
-        ResponseTemplate::new(status).set_body_raw(problem_body(slug), "application/problem+json");
+    with_retry_after(
+        ResponseTemplate::new(status).set_body_raw(problem_body(slug), "application/problem+json"),
+        retry_after.map(|secs| secs.to_string()).as_deref(),
+    )
+}
+
+fn with_retry_after(template: ResponseTemplate, retry_after: Option<&str>) -> ResponseTemplate {
     match retry_after {
-        Some(secs) => template.insert_header("Retry-After", secs.to_string().as_str()),
+        Some(value) => template.insert_header("Retry-After", value),
         None => template,
     }
 }
@@ -249,29 +256,68 @@ async fn what_the_injector_does_not_park_is_todays_error() {
 }
 
 /// A deployment with its own key fails as before (ADR 0058 decision 3): every answer of the table
-/// but `model_locked` is the error it was, word for word the error of the same body sent as plain
-/// JSON, which no change read.
+/// but `model_locked` is the error it was. The goldens are what `errors::from_http` and
+/// `ModelError`'s `Display` gave before this change (at `9f40a3b`): `HTTP <status>: <body>` for a
+/// body with no `error` member, `(empty body)` for none.
 #[tokio::test]
 async fn a_static_key_fails_as_before() {
-    let table: [(u16, &str, Option<u64>); 7] = [
-        (401, "unauthenticated", None),
-        (403, "run_not_bound", None),
-        (403, "lease_expired", None),
-        (402, "over_limit", None),
-        (429, "rate_limited", Some(120)),
-        (503, "unavailable", Some(90)),
-        (401, "", None),
+    let body = |slug| problem_body(slug);
+    let table: [(u16, &str, Option<u64>, String); 7] = [
+        (
+            401,
+            "unauthenticated",
+            None,
+            r#"authentication failed: HTTP 401: {"type":"https://gateway.example.test/problems/unauthenticated","title":"the lease of this person","detail":"Authorization: Bearer sk-live-SECRET-0f9e8d","credential":"sk-live-SECRET-0f9e8d"}"#
+            .to_owned(),
+        ),
+        (
+            403,
+            "run_not_bound",
+            None,
+            format!("authentication failed: HTTP 403: {}", body("run_not_bound")),
+        ),
+        (
+            403,
+            "lease_expired",
+            None,
+            format!("authentication failed: HTTP 403: {}", body("lease_expired")),
+        ),
+        (
+            402,
+            "over_limit",
+            None,
+            r#"invalid request: HTTP 402: {"type":"https://gateway.example.test/problems/over_limit","title":"the lease of this person","detail":"Authorization: Bearer sk-live-SECRET-0f9e8d","credential":"sk-live-SECRET-0f9e8d"}"#
+            .to_owned(),
+        ),
+        (
+            429,
+            "rate_limited",
+            Some(120),
+            "rate limited (retry after 120s)".to_owned(),
+        ),
+        (
+            503,
+            "unavailable",
+            Some(90),
+            format!("transient model error: HTTP 503: {}", body("unavailable")),
+        ),
+        (
+            401,
+            "",
+            None,
+            "authentication failed: HTTP 401: (empty body)".to_owned(),
+        ),
     ];
     for streaming in [false, true] {
-        for (status, slug, header) in table {
+        for (status, slug, header, golden) in &table {
             let template = if slug.is_empty() {
-                ResponseTemplate::new(status)
+                ResponseTemplate::new(*status)
             } else {
-                problem(status, slug, header)
+                problem(*status, slug, *header)
             };
             let (err, sent) = refused_with(static_bearer(), template, streaming).await;
             assert_eq!(sent, 1);
-            let expected = match status {
+            let variant = match status {
                 401 | 403 => matches!(err, ModelError::Auth(_)),
                 402 => matches!(err, ModelError::InvalidRequest { .. }),
                 429 => matches!(
@@ -281,19 +327,103 @@ async fn a_static_key_fails_as_before() {
                 503 => matches!(err, ModelError::Transient { .. }),
                 _ => unreachable!(),
             };
-            assert!(expected, "{status} {slug} (streaming {streaming}): {err:?}");
-
-            if !slug.is_empty() {
-                let mut as_json = ResponseTemplate::new(status)
-                    .set_body_raw(problem_body(slug), "application/json");
-                if let Some(secs) = header {
-                    as_json = as_json.insert_header("Retry-After", secs.to_string().as_str());
-                }
-                let (before, _) = refused_with(static_bearer(), as_json, streaming).await;
-                assert_eq!(err.to_string(), before.to_string(), "{status} {slug}");
-            }
+            assert!(variant, "{status} {slug} (streaming {streaming}): {err:?}");
+            assert_eq!(&err.to_string(), golden, "streaming {streaming}");
         }
     }
+}
+
+/// A problem document whose `type` is there but cannot be read is not one with no type: under the
+/// injector it parks nothing, on a `401` or `403` too, and is the error the status always gave.
+#[tokio::test]
+async fn an_unreadable_problem_type_parks_nothing() {
+    let unreadable = [
+        "urn:gw:model_locked".to_owned(),
+        "https://gateway.example.test/problems/model_locked?v=1".to_owned(),
+        "https://gateway.example.test/problems#run_not_bound".to_owned(),
+        "https://gateway.example.test/problems/".to_owned(),
+        "a".repeat(65),
+    ];
+    for kind in &unreadable {
+        for status in [401, 403] {
+            let template = ResponseTemplate::new(status)
+                .set_body_raw(problem_body_typed(kind), "application/problem+json");
+            let (err, sent) = refused_with(injected(), template, false).await;
+            assert!(
+                matches!(err, ModelError::Auth(_)),
+                "{status} {kind}: {err:?}"
+            );
+            assert_eq!(sent, 1);
+        }
+        let template = ResponseTemplate::new(402)
+            .set_body_raw(problem_body_typed(kind), "application/problem+json");
+        let (err, _) = refused_with(injected(), template, false).await;
+        assert!(
+            matches!(err, ModelError::InvalidRequest { .. }),
+            "{kind}: {err:?}"
+        );
+    }
+    // No `type`, or `about:blank`, is no type: a 403 parks as `unauthenticated`.
+    for body in [
+        format!(r#"{{"title":"{WORDS}"}}"#),
+        r#"{"type":"about:blank","title":"Forbidden"}"#.to_owned(),
+    ] {
+        let template = ResponseTemplate::new(403).set_body_raw(body, "application/problem+json");
+        let (err, _) = refused_with(injected(), template, false).await;
+        assert!(
+            matches!(&err, ModelError::Refused { slug: None, park, .. } if *park == timer(30)),
+            "{err:?}"
+        );
+        assert_holds_no_body(&err);
+    }
+}
+
+/// A `Retry-After` far ahead, as an HTTP date or as a number too large for a `u64`, parks for at
+/// most a day; a date two minutes ahead parks for about two minutes.
+#[tokio::test]
+async fn a_long_retry_after_parks_for_a_day_at_most() {
+    let day = timer(24 * 60 * 60);
+    for value in [
+        "Fri, 31 Dec 9999 23:59:59 GMT",
+        "99999999999999999999999999",
+        "18446744073709551615",
+    ] {
+        let template = with_retry_after(
+            ResponseTemplate::new(429)
+                .set_body_raw(problem_body("rate_limited"), "application/problem+json"),
+            Some(value),
+        );
+        let (err, _) = refused_with(injected(), template, false).await;
+        let ModelError::Refused {
+            park, retry_after, ..
+        } = &err
+        else {
+            panic!("{value}: {err:?}");
+        };
+        assert_eq!(*park, day, "{value}");
+        assert!(
+            retry_after.is_some_and(|d| d > Duration::from_secs(24 * 60 * 60)),
+            "the endpoint's wait is kept as said, never dropped: {value}: {retry_after:?}"
+        );
+    }
+    let soon = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(120));
+    let template = with_retry_after(
+        ResponseTemplate::new(503)
+            .set_body_raw(problem_body("unavailable"), "application/problem+json"),
+        Some(&soon),
+    );
+    let (err, _) = refused_with(injected(), template, false).await;
+    let ModelError::Refused {
+        park: Park::OnTimer(wait),
+        ..
+    } = err
+    else {
+        panic!("{err:?}");
+    };
+    assert!(
+        wait > Duration::from_secs(100) && wait <= Duration::from_secs(120),
+        "{wait:?}"
+    );
 }
 
 /// An error object inside a stream is the upstream model's, never a refusal: it does not park.

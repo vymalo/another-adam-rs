@@ -2,7 +2,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use adam_model::ModelError;
+use adam_model::{ModelError, ProblemType};
 use reqwest::StatusCode;
 use serde_json::Value;
 
@@ -39,12 +39,12 @@ pub(crate) fn from_http(
     }
 }
 
-/// The longest slug a problem type is read as: a word of the gateway's vocabulary, never a sentence.
+/// The longest slug a problem type is read as: a word of the gateway's vocabulary, not a sentence.
 const MAX_SLUG: usize = 64;
 
 /// Whether a `Content-Type` is `application/problem+json` (RFC 9457), whatever its parameters
 /// and its case.
-pub(crate) fn is_problem_json(content_type: Option<&str>) -> bool {
+fn is_problem_json(content_type: Option<&str>) -> bool {
     content_type
         .and_then(|value| value.split(';').next())
         .is_some_and(|essence| {
@@ -54,20 +54,43 @@ pub(crate) fn is_problem_json(content_type: Option<&str>) -> bool {
         })
 }
 
-/// The slug of a problem document's `type` (ADR 0067 decision 3): its last path segment
-/// (`https://gw.example/problems/run_not_bound` is `run_not_bound`), or the member as is when it
-/// holds no `/`; a `type` that ends in `/` has no last segment. A member that is not a string, is empty, or is not a short word of letters, digits,
-/// `_`, `-` and `.` gives none: the slug is the only part of a refusal's body an error keeps.
-pub(crate) fn problem_slug(body: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    let kind = value.get("type")?.as_str()?.trim();
+/// The problem type of a refusal (ADR 0067 decision 3), read only from a body whose `Content-Type`
+/// is `application/problem+json`.
+///
+/// * [`ProblemType::Absent`]: no problem document, an empty body, no `type` member, `about:blank`.
+/// * [`ProblemType::Slug`]: the `type`'s last path segment
+///   (`https://gw.example/problems/run_not_bound` is `run_not_bound`), or the member as is when it
+///   holds no `/`, when it is a word of at most [`MAX_SLUG`] letters, digits, `_`, `-` and `.`.
+/// * [`ProblemType::Unreadable`]: any other `type` (a `urn:`, a query, a fragment, a trailing `/`,
+///   a member that is not a string), and a body that is not a JSON object.
+///
+/// The slug is the only part of a refusal's body an error keeps.
+pub(crate) fn problem_type(content_type: Option<&str>, body: &str) -> ProblemType {
+    if !is_problem_json(content_type) || body.trim().is_empty() {
+        return ProblemType::Absent;
+    }
+    let Ok(Value::Object(document)) = serde_json::from_str::<Value>(body) else {
+        return ProblemType::Unreadable;
+    };
+    let kind = match document.get("type") {
+        None => return ProblemType::Absent,
+        Some(Value::String(kind)) => kind.trim(),
+        Some(_) => return ProblemType::Unreadable,
+    };
+    if kind == "about:blank" {
+        return ProblemType::Absent;
+    }
     let slug = kind.rsplit('/').next().unwrap_or(kind);
     let word = !slug.is_empty()
         && slug.len() <= MAX_SLUG
         && slug
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
-    word.then(|| slug.to_owned())
+    if word {
+        ProblemType::Slug(slug.to_owned())
+    } else {
+        ProblemType::Unreadable
+    }
 }
 
 /// Map an error object delivered inside a 200 response or mid-stream, where
@@ -92,11 +115,15 @@ pub(crate) fn from_error_object(value: &Value) -> ModelError {
     }
 }
 
-/// Parse a `Retry-After` header: delay-seconds, or an HTTP-date.
+/// Parse a `Retry-After` header: delay-seconds, or an HTTP-date. A number of seconds too large for
+/// a `u64` is the longest wait there is, not none: the endpoint asked for a long one (a park clamps
+/// it, `adam_model::MAX_PARK`).
 pub(crate) fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     let value = value.trim();
-    if let Ok(secs) = value.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(Duration::from_secs(
+            value.parse::<u64>().unwrap_or(u64::MAX),
+        ));
     }
     let at = httpdate::parse_http_date(value).ok()?;
     Some(at.duration_since(now).unwrap_or(Duration::ZERO))
@@ -252,52 +279,63 @@ mod tests {
 
     #[test]
     fn a_problem_type_is_read_by_its_last_segment() {
-        let slug = |body: &str| problem_slug(body);
+        let read = |body: &str| problem_type(Some("application/problem+json"), body);
+        let slug = |s: &str| ProblemType::Slug(s.to_owned());
         assert_eq!(
-            slug(r#"{"type":"https://gw.example/problems/run_not_bound","title":"x"}"#).as_deref(),
-            Some("run_not_bound")
+            read(r#"{"type":"https://gw.example/problems/run_not_bound","title":"x"}"#),
+            slug("run_not_bound")
         );
         assert_eq!(
-            slug(r#"{"type":"/problems/over_limit"}"#).as_deref(),
-            Some("over_limit")
+            read(r#"{"type":"/problems/over_limit"}"#),
+            slug("over_limit")
         );
-        assert_eq!(
-            slug(r#"{"type":"lease_expired"}"#).as_deref(),
-            Some("lease_expired")
-        );
-        assert_eq!(
-            slug(r#"{"type":"urn:x:rate-limited.v1"}"#),
-            None,
-            "a ':' is no word"
-        );
-        for none in [
+        assert_eq!(read(r#"{"type":"lease_expired"}"#), slug("lease_expired"));
+        let at_cap = "a".repeat(MAX_SLUG);
+        assert_eq!(read(&format!(r#"{{"type":"{at_cap}"}}"#)), slug(&at_cap));
+        // No problem type: the status says it all.
+        for absent in [
             "",
+            "  ",
+            r#"{"title":"no type"}"#,
+            r#"{"type":"about:blank"}"#,
+        ] {
+            assert_eq!(read(absent), ProblemType::Absent, "{absent}");
+        }
+        // A type that is there and cannot be read: never taken for no type.
+        let long = format!(r#"{{"type":"{}"}}"#, "a".repeat(MAX_SLUG + 1));
+        for unreadable in [
             "not json",
             "[]",
-            r#"{"title":"no type"}"#,
+            r#""run_not_bound""#,
             r#"{"type":7}"#,
+            r#"{"type":null}"#,
             r#"{"type":""}"#,
+            r#"{"type":"urn:gw:model_locked"}"#,
+            r#"{"type":"https://gw.example/problems/model_locked?v=1"}"#,
+            r#"{"type":"https://gw.example/problems#run_not_bound"}"#,
             r#"{"type":"https://gw.example/"}"#,
             r#"{"type":"/problems/over_limit/"}"#,
             r#"{"type":"two words"}"#,
             r#"{"type":"sk-live 0123"}"#,
+            long.as_str(),
         ] {
-            assert_eq!(slug(none), None, "{none}");
+            assert_eq!(read(unreadable), ProblemType::Unreadable, "{unreadable}");
         }
-        let long = format!(r#"{{"type":"{}"}}"#, "a".repeat(MAX_SLUG + 1));
-        assert_eq!(slug(&long), None);
-        let at_cap = format!(r#"{{"type":"{}"}}"#, "a".repeat(MAX_SLUG));
-        assert_eq!(slug(&at_cap).map(|s| s.len()), Some(MAX_SLUG));
     }
 
     #[test]
     fn a_problem_document_is_told_by_its_content_type() {
+        let body = r#"{"type":"over_limit"}"#;
         for yes in [
             "application/problem+json",
             "Application/Problem+JSON",
             "application/problem+json; charset=utf-8",
         ] {
-            assert!(is_problem_json(Some(yes)), "{yes}");
+            assert_eq!(
+                problem_type(Some(yes), body),
+                ProblemType::Slug("over_limit".into()),
+                "{yes}"
+            );
         }
         for no in [
             "application/json",
@@ -305,9 +343,14 @@ mod tests {
             "",
             "application/problem+xml",
         ] {
-            assert!(!is_problem_json(Some(no)), "{no}");
+            assert_eq!(problem_type(Some(no), body), ProblemType::Absent, "{no}");
+            assert_eq!(
+                problem_type(Some(no), "not json"),
+                ProblemType::Absent,
+                "{no}"
+            );
         }
-        assert!(!is_problem_json(None));
+        assert_eq!(problem_type(None, body), ProblemType::Absent);
     }
 
     #[test]
@@ -319,6 +362,22 @@ mod tests {
             Some(Duration::from_secs(120))
         );
         assert_eq!(parse_retry_after("soon", now), None);
+        assert_eq!(parse_retry_after("-5", now), None);
+        assert_eq!(parse_retry_after("1.5", now), None);
+        // Too large for a u64: the longest wait, not none.
+        assert_eq!(
+            parse_retry_after("99999999999999999999999999", now),
+            Some(Duration::from_secs(u64::MAX))
+        );
+        assert_eq!(
+            parse_retry_after(&u64::MAX.to_string(), now),
+            Some(Duration::from_secs(u64::MAX))
+        );
+        assert!(
+            parse_retry_after("Fri, 31 Dec 9999 23:59:59 GMT", now)
+                .is_some_and(|d| d > Duration::from_secs(200 * 365 * 24 * 3600)),
+            "a date far ahead is a long wait"
+        );
         assert_eq!(parse_retry_after("", now), None);
         // 2001-09-09T01:46:40Z is exactly 1_000_000_000; ten seconds later:
         assert_eq!(

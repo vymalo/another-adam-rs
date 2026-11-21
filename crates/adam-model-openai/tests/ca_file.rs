@@ -118,10 +118,20 @@ async fn the_endpoint_is_reached_only_with_the_ca() {
     let (port, served) = tls_server();
 
     let err = client(port).complete(request()).await.unwrap_err();
-    // A handshake that fails is a connection that could not be made (ADR 0067 decision 3).
+    // A handshake that fails is no endpoint that waiting brings back: `Transient`, as before, and
+    // never `Unreachable`, which parks a run once its retries are spent (ADR 0067 decision 3).
     assert!(
-        matches!(err, adam_model::ModelError::Unreachable { .. }),
+        matches!(err, adam_model::ModelError::Transient { .. }),
         "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "transient model error: TLS handshake failed"
+    );
+    assert!(adam_model::Classify::is_retryable(&err));
+    assert!(
+        std::error::Error::source(&err).is_some(),
+        "the transport's error is kept"
     );
     assert_eq!(
         served.load(Ordering::SeqCst),

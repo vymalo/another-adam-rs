@@ -192,9 +192,9 @@ decision 3:
 
 | Variant | When | Class |
 |---|---|---|
-| `Refused { status, slug, retry_after, park }` | an answer of status 400 or above that the credential provider parks on (`ModelCredentials::parks`, today `InjectedRun` alone: the gateway's `unauthenticated`, `run_not_bound`, `lease_expired`, `over_limit`, `rate_limited`, `unavailable`, or a 401 or 403 with no problem type) | by its status: `401`, `403` `Unauthenticated`; `402` `Rejected`; `429` `RateLimited` (`retry_after()` is its `Retry-After`); `503` `Transient`; any other `Rejected` |
+| `Refused { status, slug, retry_after, park }` | an answer of status 400 or above that the credential provider parks on (`ModelCredentials::parks`, today `InjectedRun` alone: the gateway's `unauthenticated`, `run_not_bound`, `lease_expired`, `over_limit`, `rate_limited`, `unavailable`, or a 401 or 403 with no problem type; never one whose `type` cannot be read) | by its status: `401`, `403` `Unauthenticated`; `402` `Rejected`; `429` `RateLimited` (`retry_after()` is its `Retry-After`); `503` `Transient`; any other `Rejected` |
 | `ModelLocked { model }` | the problem type `model_locked`, for every provider: the model is not allowed at all | `Rejected` |
-| `Unreachable` | a connection to the model endpoint could not be made (refused, no route, a failed TLS handshake); a timeout and a cut stream stay `Transient` | `Transient` |
+| `Unreachable` | a connection to the model endpoint could not be made (refused, no route, a name that does not resolve); a timeout, a cut stream and a failed TLS handshake stay `Transient` | `Transient` |
 
 `Refused` holds no body and no header: its message is `the model endpoint refused the call: HTTP <status>[ <slug>]`.
 A provider that does not park (a key of one's own, the device grant) keeps the errors above, so a wrong key fails as

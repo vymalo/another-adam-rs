@@ -36,7 +36,7 @@
 //!   tokens keep arriving. Expiry is [`Transient`](adam_model::ModelError::Transient). A
 //!   connection that cannot be made (refused, no route) is
 //!   [`Unreachable`](adam_model::ModelError::Unreachable), class `Transient`; a connection that
-//!   times out is a timeout.
+//!   times out is a timeout, and a TLS handshake that fails is `Transient`.
 //! * **Refusals** ([ADR 0067](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
 //!   decision 3). For an answer of status 400 or above the client builds a
 //!   [`Refusal`](adam_model::Refusal) (the status, the slug of an `application/problem+json`
@@ -554,12 +554,11 @@ impl OpenAiCompatible {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| errors::parse_retry_after(v, SystemTime::now()));
-        let problem = errors::is_problem_json(
-            response
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok()),
-        );
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let text = tokio::time::timeout(self.timeout, read_body(response))
             .await
             .ok()
@@ -571,12 +570,10 @@ impl OpenAiCompatible {
         // a refusal is read: an error object inside a stream is the upstream model's (`sse.rs`,
         // `errors::from_error_object`) and never parks.
         if status.as_u16() >= 400 {
-            let refusal = Refusal {
-                status: status.as_u16(),
-                slug: problem.then(|| errors::problem_slug(&text)).flatten(),
-                retry_after,
-            };
-            if refusal.slug.as_deref() == Some(MODEL_LOCKED_SLUG) {
+            let refusal = Refusal::new(status.as_u16())
+                .with_problem(errors::problem_type(content_type.as_deref(), &text))
+                .with_retry_after(retry_after);
+            if refusal.slug() == Some(MODEL_LOCKED_SLUG) {
                 return Err(ModelError::ModelLocked {
                     model: model.to_owned(),
                 });
@@ -587,7 +584,7 @@ impl OpenAiCompatible {
                 park => {
                     return Err(ModelError::Refused {
                         status: refusal.status,
-                        slug: refusal.slug,
+                        slug: refusal.slug().map(str::to_owned),
                         retry_after: refusal.retry_after,
                         park,
                     });
@@ -793,13 +790,38 @@ fn rejection_of(response: &reqwest::Response) -> Rejection {
     }
 }
 
+/// Whether `err`'s chain holds a [`rustls::Error`]. `tokio-rustls` wraps it in an `io::Error`, and
+/// hyper-rustls wraps that in another one; an `io::Error` built around an error does not give it as
+/// its `source` (it gives that error's source), so each `io::Error` is opened with `get_ref`.
+fn is_tls_failure(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(err) = current {
+        if err.is::<rustls::Error>() {
+            return true;
+        }
+        if let Some(inner) = err
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            && is_tls_failure(inner)
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 fn transport_error(e: reqwest::Error) -> ModelError {
     // The URL is not secret, but it is noise; the key is never in it.
     let e = e.without_url();
     // A timeout first: a connection that timed out is a timeout, never `Unreachable` (ADR 0067
-    // decision 3: a timeout keeps today's retries and failure, and never parks a run).
+    // decision 3: a timeout keeps today's retries and failure, and never parks a run). A failed TLS
+    // handshake (a CA not trusted, a name that does not match) is no endpoint that waiting brings
+    // back: `Transient`, as before, never `Unreachable`.
     if e.is_timeout() {
         ModelError::transient("request timed out").with_source(e)
+    } else if e.is_connect() && is_tls_failure(&e) {
+        ModelError::transient("TLS handshake failed").with_source(e)
     } else if e.is_connect() {
         ModelError::unreachable().with_source(e)
     } else if e.is_builder() {
@@ -968,6 +990,23 @@ mod tests {
     #[test]
     fn the_default_body_cap_is_the_documented_one() {
         assert_eq!(MAX_BODY_BYTES, 16 << 20, "one body: 16 MiB");
+    }
+
+    #[test]
+    fn a_rustls_error_is_found_however_it_is_wrapped() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("outer")]
+        struct Outer(#[source] std::io::Error);
+        let tls = || rustls::Error::General("bad certificate".into());
+        // As tokio-rustls and hyper-rustls wrap it.
+        let wrapped =
+            std::io::Error::other(std::io::Error::new(std::io::ErrorKind::InvalidData, tls()));
+        assert!(is_tls_failure(&wrapped));
+        assert!(is_tls_failure(&Outer(wrapped)));
+        assert!(is_tls_failure(&tls()));
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert!(!is_tls_failure(&refused));
+        assert!(!is_tls_failure(&Outer(std::io::Error::other("no route"))));
     }
 
     #[test]

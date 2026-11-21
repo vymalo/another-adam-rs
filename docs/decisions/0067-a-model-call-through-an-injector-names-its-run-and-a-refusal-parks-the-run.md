@@ -83,15 +83,20 @@ Three things are missing in adam today:
      edge's own denial may carry no problem body, *unverified*).
    * `model_locked` is `ModelError::ModelLocked`, class `Rejected`, for every provider (decision 7).
 
-   *Amended 2026-11-21 (S8b-1):* what the decision left open, as built. The slug is read only from a body whose
-   `Content-Type` is `application/problem+json`, and only when it is a word of at most 64 letters, digits, `_`, `-`
-   and `.` (a `type` that ends in `/` has no last segment): it is the one part of a body an error keeps. A slug of the
-   table decides whatever the status; a slug not in it parks nothing, on a `401` or `403` too (only a refusal with no
-   slug reads as `unauthenticated`). `ModelLocked` names the request's model alias (`ModelLocked { model }`), so the
-   failure of decision 7 names it. `Refused`'s `retry_after` is its `Classify::retry_after` for a `429` alone. A TLS
-   handshake that fails is `Unreachable`, since `reqwest` reports it as a connection that could not be made; a connect
-   timeout is a timeout. `Ctx::retries_left()` counts what the runtime's own key allows an error of class `Transient`
-   that names no policy, which is what the LLM agent returns for a model call.
+   *Amended 2026-11-21 (S8b-1):* what the decision left open, as built. The problem type is read only from a body
+   whose `Content-Type` is `application/problem+json`, and has three states (`ProblemType`): **absent** (no body, no
+   `type` member, `about:blank`), a **slug** (the `type`'s last path segment, or the member as is with no `/`, when it
+   is a word of at most 64 letters, digits, `_`, `-` and `.`: the one part of a body an error keeps), or
+   **unreadable** (any other `type`: a `urn:`, a query, a fragment, a trailing `/`, not a string; a body that is not a
+   JSON object). A slug of the table decides whatever the status; a slug not in it, and an unreadable type, park
+   nothing, on a `401` or `403` too: only a refusal with no problem type reads as `unauthenticated`. A timer park is at
+   most `MAX_PARK` (24 h) whatever `Retry-After` says, and a `Retry-After` too large for a `u64` is the longest wait,
+   not none. `ModelLocked` names the request's model alias (`ModelLocked { model }`), so the failure of decision 7
+   names it. `Refused`'s `retry_after` is its `Classify::retry_after` for a `429` alone. A TLS handshake that fails (a
+   `rustls::Error` in the chain) is `Transient`, as before, never `Unreachable`: waiting cures neither a CA not
+   trusted nor a name that does not match; a connect timeout is a timeout. `Ctx::retries_left() -> u32` is the
+   worker's own decision (`retry::decide`, which both call) for an error of class `Transient` that names no policy,
+   which is what the LLM agent returns for a model call.
 
    **A gateway that cannot be reached.** The client reports a failed connection (not a timeout, not a stream cut off)
    as the new `ModelError::Unreachable`, class `Transient`, so the runtime retries it as today and a short drop costs
@@ -203,7 +208,8 @@ Three things are missing in adam today:
 | Slice | What is true after it | Proof |
 |---|---|---|
 | S8a | `InjectedRun`, `MODEL_AUTH=injector`, `MODEL_CA_FILE` and the two `run` fields: every model call of a run, its subagents' and its sessions' included, carries the root's id and no `Authorization` | two levels. **Requests:** the scripted `MockModel` records every `ModelRequest` of a chain of child runs, a compaction's summary call (of a root and of a child), a session's rounds (opened by a task, sent by a later task, sent by a person) and a subagent under a person's round, and each names the run decision 2 says; a message's metadata cannot change it. **Wire:** a mock HTTP server records each call's headers through `adam-model-openai` and `adam-service`: `X-Run-Id` and no `Authorization` on completions, streams and the retry after a 401; a call with no run sends nothing; a TLS server whose certificate a test CA signed is reached only with `MODEL_CA_FILE` |
-| S8b | decisions 3 to 8 | the test gateway answers each slug of the table, a slugless `401`, a refused connection and a timeout in turn: the run parks with the state and reason above, keeps its conversation, and the same call is made again after the timer, a message or `adam.resume` (which adds no turn); a timeout fails as today; `model_locked` and an unattended run that would wait fail; a parked child shows on the root and is woken through it; `MODEL_PARK_LIMIT` fails a run that never binds; `StaticBearer` fails as before; nothing of a header or body in the journal |
+| S8b-1 | the model layer of decision 3, and of decisions 7 and 8: `Refusal`, `ProblemType`, `Park`, `ModelCredentials::parks` (no park by default), `InjectedRun`'s table, `ModelError::Refused`, `ModelLocked` and `Unreachable`, `MAX_PARK`, and `Ctx::retries_left()`; nothing parks a run yet | **Unit:** each row of the table and its clamp, an unreadable type, the classes, a `Display` with no body, the worker's verdicts and `retries_left` sharing one decision. **Wire** (`adam-model-openai`, a mock server): each slug, a slugless `401` and `403`, an unreadable `type`, a `Retry-After` far ahead, `model_locked` for every provider, `StaticBearer`'s errors against goldens from before, no body in any error, a refused connection `Unreachable`, a timeout and a TLS handshake refused for its CA not; **runtime:** a policy of three attempts sees 2, 1 and 0, and the last failure fails the run |
+| S8b-2 | decisions 3 to 8 beyond S8b-1 | the test gateway answers each slug of the table, a slugless `401`, a refused connection and a timeout in turn: the run parks with the state and reason above, keeps its conversation, and the same call is made again after the timer, a message or `adam.resume` (which adds no turn); a timeout fails as today; `model_locked` and an unattended run that would wait fail; a parked child shows on the root and is woken through it; `MODEL_PARK_LIMIT` fails a run that never binds; `StaticBearer` fails as before; nothing of a header or body in the journal |
 | S8c | the coder's chart sets `MODEL_AUTH=injector` when its values say so | the chart's goldens; another-agentic-system#334 S10 puts the agents behind the gateway |
 
 ## Open

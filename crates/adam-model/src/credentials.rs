@@ -56,18 +56,77 @@ pub enum AfterRejection {
 
 /// What the endpoint answered when it refused a call (a status of 400 or above), as a provider is
 /// asked about it ([`ModelCredentials::parks`], [ADR 0067] decision 3). It holds no body and no
-/// header: the slug is the only part of the body that is read, and only from a problem document.
+/// header: the problem type is the only part of the body that is read, and only from a problem
+/// document.
+///
+/// `#[non_exhaustive]`: build one with [`Refusal::new`] and the `with_` methods.
 ///
 /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Refusal {
     /// The status code (`403`).
     pub status: u16,
-    /// The problem type's slug (`run_not_bound`): the last path segment of the `type` member of an
-    /// `application/problem+json` body (RFC 9457), when there was one.
-    pub slug: Option<String>,
+    /// The `type` of an `application/problem+json` body (RFC 9457), as far as it could be read.
+    pub problem: ProblemType,
     /// The `Retry-After` header, when there was one.
     pub retry_after: Option<Duration>,
+}
+
+impl Refusal {
+    /// A refusal of status `status`, with no problem type and no `Retry-After`.
+    #[must_use]
+    pub fn new(status: u16) -> Self {
+        Self {
+            status,
+            ..Self::default()
+        }
+    }
+
+    /// With the problem type `problem`.
+    #[must_use]
+    pub fn with_problem(mut self, problem: ProblemType) -> Self {
+        self.problem = problem;
+        self
+    }
+
+    /// With the slug `slug` ([`ProblemType::Slug`]).
+    #[must_use]
+    pub fn with_slug(self, slug: impl Into<String>) -> Self {
+        self.with_problem(ProblemType::Slug(slug.into()))
+    }
+
+    /// With the `Retry-After` `after`.
+    #[must_use]
+    pub fn with_retry_after(mut self, after: Option<Duration>) -> Self {
+        self.retry_after = after;
+        self
+    }
+
+    /// The problem type's slug, when it had one ([`ProblemType::Slug`]).
+    #[must_use]
+    pub fn slug(&self) -> Option<&str> {
+        match &self.problem {
+            ProblemType::Slug(slug) => Some(slug),
+            ProblemType::Absent | ProblemType::Unreadable => None,
+        }
+    }
+}
+
+/// The problem type of a refusal ([`Refusal::problem`]): none, a slug, or one that cannot be read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ProblemType {
+    /// No problem type: no problem document (another `Content-Type`, an empty body), no `type`
+    /// member, or `about:blank` (RFC 9457 §4.2.1: the status says it all).
+    #[default]
+    Absent,
+    /// The `type`'s slug (`run_not_bound`): its last path segment, or the member as is when it
+    /// holds no `/`, when that is a word of at most 64 letters, digits, `_`, `-` and `.`.
+    Slug(String),
+    /// A problem document whose `type` is there but is no such word (`urn:gw:model_locked`, a
+    /// query or a fragment, a member that is not a string, a body that is not a JSON object): the
+    /// endpoint said what the refusal is, and adam cannot read it.
+    Unreadable,
 }
 
 /// Whether a refused call parks its run, and how it wakes ([`ModelCredentials::parks`]).
@@ -88,6 +147,12 @@ pub enum Park {
 ///
 /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
 pub const FIRST_PARK: Duration = Duration::from_secs(30);
+
+/// The longest wait of a park on a timer, whatever `Retry-After` says: 24 hours, so a wake time is
+/// always one a clock can hold and a limit on parks applies ([ADR 0067] decision 4).
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+pub const MAX_PARK: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The slug of a refusal that says the model is not allowed at all
 /// ([`ModelError::ModelLocked`] for every provider, [ADR 0067] decision 7).
@@ -246,9 +311,9 @@ pub const RUN_HEADER: &str = "X-Run-Id";
 /// |---|---|
 /// | `unauthenticated`, `run_not_bound`, `lease_expired` | [`Park::OnTimer`]`(`[`FIRST_PARK`]`)` |
 /// | `over_limit` | [`Park::UntilWoken`] |
-/// | `rate_limited`, `unavailable` | [`Park::OnTimer`] of the longer of [`FIRST_PARK`] and `Retry-After` |
-/// | none, on a `401` or `403` | [`Park::OnTimer`]`(`[`FIRST_PARK`]`)`, as `unauthenticated` (an edge's own denial may carry no problem body, *unverified*) |
-/// | `model_locked`, any other slug, no slug on any other status | [`Park::No`] |
+/// | `rate_limited`, `unavailable` | [`Park::OnTimer`] of `Retry-After`, at least [`FIRST_PARK`] and at most [`MAX_PARK`] |
+/// | none ([`ProblemType::Absent`]), on a `401` or `403` | [`Park::OnTimer`]`(`[`FIRST_PARK`]`)`, as `unauthenticated` (an edge's own denial may carry no problem body, *unverified*) |
+/// | `model_locked`, any other slug, a `type` that cannot be read ([`ProblemType::Unreadable`]), none on any other status | [`Park::No`] |
 ///
 /// A known slug decides whatever the status; `model_locked` is [`ModelError::ModelLocked`], which
 /// the client gives for every provider.
@@ -279,23 +344,27 @@ impl ModelCredentials for InjectedRun {
     }
 
     fn parks(&self, refusal: &Refusal) -> Park {
-        let at_least_retry_after = || {
+        let after_retry_after = || {
             Park::OnTimer(
                 refusal
                     .retry_after
-                    .map_or(FIRST_PARK, |after| after.max(FIRST_PARK)),
+                    .map_or(FIRST_PARK, |after| after.clamp(FIRST_PARK, MAX_PARK)),
             )
         };
-        match refusal.slug.as_deref() {
-            Some("unauthenticated" | "run_not_bound" | "lease_expired") => {
-                Park::OnTimer(FIRST_PARK)
-            }
-            Some("over_limit") => Park::UntilWoken,
-            Some("rate_limited" | "unavailable") => at_least_retry_after(),
-            // `model_locked` is no park (the client makes it `ModelLocked`), nor a slug it does not know.
-            Some(_) => Park::No,
-            None if matches!(refusal.status, 401 | 403) => Park::OnTimer(FIRST_PARK),
-            None => Park::No,
+        match &refusal.problem {
+            ProblemType::Slug(slug) => match slug.as_str() {
+                "unauthenticated" | "run_not_bound" | "lease_expired" => Park::OnTimer(FIRST_PARK),
+                "over_limit" => Park::UntilWoken,
+                "rate_limited" | "unavailable" => after_retry_after(),
+                // `model_locked` is no park (the client makes it `ModelLocked`), nor a slug it does
+                // not know.
+                _ => Park::No,
+            },
+            // The endpoint named the refusal and adam cannot read the name: it is not one of the
+            // table's, so it parks nothing.
+            ProblemType::Unreadable => Park::No,
+            ProblemType::Absent if matches!(refusal.status, 401 | 403) => Park::OnTimer(FIRST_PARK),
+            ProblemType::Absent => Park::No,
         }
     }
 }
@@ -435,10 +504,10 @@ mod tests {
     }
 
     fn refusal(status: u16, slug: Option<&str>, retry_after: Option<u64>) -> Refusal {
-        Refusal {
-            status,
-            slug: slug.map(str::to_owned),
-            retry_after: retry_after.map(Duration::from_secs),
+        let refusal = Refusal::new(status).with_retry_after(retry_after.map(Duration::from_secs));
+        match slug {
+            Some(slug) => refusal.with_slug(slug),
+            None => refusal,
         }
     }
 
@@ -461,6 +530,19 @@ mod tests {
             (refusal(429, Some("rate_limited"), Some(5)), timer(30)),
             (refusal(429, Some("rate_limited"), Some(30)), timer(30)),
             (refusal(429, Some("rate_limited"), Some(120)), timer(120)),
+            // Never past `MAX_PARK`, whatever the endpoint asks.
+            (
+                refusal(429, Some("rate_limited"), Some(86_400)),
+                timer(86_400),
+            ),
+            (
+                refusal(429, Some("rate_limited"), Some(86_401)),
+                timer(86_400),
+            ),
+            (
+                refusal(503, Some("unavailable"), Some(u64::MAX)),
+                timer(86_400),
+            ),
             (refusal(503, Some("unavailable"), None), timer(30)),
             (refusal(503, Some("unavailable"), Some(1)), timer(30)),
             (refusal(503, Some("unavailable"), Some(90)), timer(90)),
@@ -482,7 +564,30 @@ mod tests {
             assert_eq!(InjectedRun::new().parks(&refusal), park, "{refusal:?}");
         }
         assert_eq!(FIRST_PARK, Duration::from_secs(30));
+        assert_eq!(MAX_PARK, Duration::from_secs(24 * 60 * 60));
         assert_eq!(MODEL_LOCKED_SLUG, "model_locked");
+    }
+
+    /// A problem type that is there but cannot be read is not "no problem type": it parks nothing,
+    /// on a `401` or `403` too, where no type at all parks as `unauthenticated`.
+    #[test]
+    fn an_unreadable_problem_type_parks_nothing() {
+        for status in [401, 402, 403, 429, 503] {
+            let unreadable = Refusal::new(status)
+                .with_problem(ProblemType::Unreadable)
+                .with_retry_after(Some(Duration::from_secs(60)));
+            assert_eq!(InjectedRun::new().parks(&unreadable), Park::No, "{status}");
+            assert_eq!(unreadable.slug(), None);
+        }
+        assert_eq!(
+            InjectedRun::new().parks(&Refusal::new(403).with_problem(ProblemType::Absent)),
+            Park::OnTimer(FIRST_PARK)
+        );
+        assert_eq!(Refusal::new(403).problem, ProblemType::Absent);
+        assert_eq!(
+            Refusal::new(403).with_slug("over_limit").slug(),
+            Some("over_limit")
+        );
     }
 
     /// The default is no park: a wrong key fails as before (ADR 0058 decision 3), and an `Arc`

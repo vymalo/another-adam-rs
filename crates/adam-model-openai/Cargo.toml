@@ -18,6 +18,8 @@ futures.workspace = true
 httpdate.workspace = true
 memchr.workspace = true
 reqwest.workspace = true
+# Only to tell a failed TLS handshake from an unreachable endpoint; the version reqwest uses.
+rustls.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -27,8 +29,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-# The TLS server of the `MODEL_CA_FILE` test; already in the tree under reqwest.
-rustls.workspace = true
 wiremock.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
