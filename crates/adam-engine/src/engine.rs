@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use a2a::{Message, Part, Role, Task};
-use adam_a2a::{BackendError, Caller, STEER_EXTENSION, TaskBackend, TaskQuery};
+use adam_a2a::{
+    BackendError, CHILD_SESSIONS_EXTENSION, Caller, STEER_EXTENSION, TaskBackend, TaskQuery,
+};
 use adam_a2a_runtime::{Commands, RuntimeTaskBackend, task_id_for};
 use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
@@ -16,7 +18,7 @@ use adam_llm_agent::{DEFAULT_MAX_PARALLEL, ToolSet};
 use adam_model::DynModel;
 use adam_runtime::{
     BroadcastSink, FileRef, RetryPolicy, RunView, Runtime, RuntimeBuilder, RuntimeError,
-    SCHEDULE_CONVERSATION_PREFIX,
+    SCHEDULE_CONVERSATION_PREFIX, SessionLimits,
 };
 use adam_ui::Ui;
 use tokio::sync::{RwLock, RwLockReadGuard, oneshot, watch};
@@ -25,7 +27,8 @@ use tokio::task::AbortHandle;
 use crate::events::EngineSink;
 use crate::{
     ConversationId, Delivered, EngineError, Firing, FiringQuery, ListQuery, Page, RunEvents,
-    RunFile, RunInfo, RunState, Say, Turn, default_secrets,
+    RunFile, RunInfo, RunState, Say, SessionHelper, SessionInfo, StartSession, Turn,
+    default_secrets,
 };
 
 /// Why a firing a host cancelled ended (#289).
@@ -115,6 +118,11 @@ pub struct Limits {
     /// A folder's `retry:` and a tool's own policy win over it for their tools. Default
     /// [`RetryPolicy::default`]: 5 attempts, 1 s to 60 s.
     pub retry: RetryPolicy,
+    /// The limits of the root's child sessions (`child-sessions/v1`, ADR 0045): how many are open
+    /// and working at once in one conversation, and how many rounds one may have. The agent's
+    /// file may lower them, never raise them. Default [`SessionLimits::default`]: 16 open, 4
+    /// working, 20 rounds.
+    pub sessions: SessionLimits,
 }
 
 impl Default for Limits {
@@ -126,6 +134,7 @@ impl Default for Limits {
             event_capacity: DEFAULT_EVENT_CAPACITY,
             worker_id: None,
             retry: RetryPolicy::default(),
+            sessions: SessionLimits::default(),
         }
     }
 }
@@ -235,12 +244,14 @@ impl EngineBuilder {
         let ui = Ui::embedded();
         let assembly = agent
             .secrets(secrets)
+            .session_limits(limits.sessions)
             .bind(ui.tools().extend(tools))
             .map_err(|e| EngineError::Agent(Box::new(e)))?
             .tool_source(ui.screen())
             .max_parallel(limits.max_parallel_tools)
             .model(model, alias)
             .map_err(|e| EngineError::Agent(Box::new(e)))?;
+        let sessions = assembly.child_sessions().cloned();
         store.migrate().await.map_err(EngineError::Store)?;
         // Held until the worker task has ended, so a second engine of this process with the same id
         // on this store is refused before its release could take this one's leases.
@@ -280,6 +291,12 @@ impl EngineBuilder {
         // from `commands/<name>.md` before it is stored, as on the server surfaces.
         let backend = RuntimeTaskBackend::new(runtime.clone(), events.clone(), name.clone())
             .with_commands(Commands::from_manifest(&commands));
+        // The helpers a person may start a session with (`child-sessions/v1`), as `adam-agent`
+        // serves them: every local subagent of the root, under the effective limits.
+        let backend = match &sessions {
+            Some(sessions) => backend.with_child_sessions(sessions.clone()),
+            None => backend,
+        };
         let reader = runtime.clone();
 
         let (stop, stopped) = oneshot::channel::<()>();
@@ -305,10 +322,28 @@ impl EngineBuilder {
             drop(claim);
             let _ = said.send(Some(how));
         });
-        let caller = Caller::new(SUBJECT);
+        // The engine's caller activates `child-sessions/v1` when the agent has helpers: a message to
+        // a session's conversation, and the listing of its rounds, are refused without it.
+        let extensions: &[&str] = if sessions.is_some() {
+            &[CHILD_SESSIONS_EXTENSION]
+        } else {
+            &[]
+        };
+        let caller = Caller::new(SUBJECT).with_extensions(extensions.iter().copied());
+        let steering = Caller::new(SUBJECT)
+            .with_extensions(extensions.iter().copied().chain([STEER_EXTENSION]));
+        let helpers = sessions
+            .iter()
+            .flat_map(|s| s.agents())
+            .map(|a| SessionHelper {
+                name: a.name.clone(),
+                description: a.description.clone(),
+            })
+            .collect();
         Ok(Engine {
             shared: Arc::new(Shared {
-                steering: caller.clone().with_extensions([STEER_EXTENSION]),
+                steering,
+                helpers,
                 caller,
                 backend,
                 runtime: reader,
@@ -422,6 +457,8 @@ pub(crate) struct Shared {
     agent: String,
     /// The agent's commands, from its `commands/`: what [`Engine::commands`] lists.
     commands: Vec<Command>,
+    /// The helpers a person may start a session with: what [`Engine::helpers`] lists.
+    helpers: Vec<SessionHelper>,
     /// Held shared by every message for the length of its call, and exclusively by `shutdown` while
     /// it sets `stopping`: a message is either written before the worker is told to stop, or
     /// refused.
@@ -524,14 +561,20 @@ impl Engine {
             .backend
             .submit(shared.caller.clone(), message, None, context)
             .await
-            .map_err(|e| EngineError::of_backend(e, None))?;
+            // A refusal for the conversation's state (a closed child session) names its latest
+            // run: `Finished`, not a bug.
+            .map_err(|e| EngineError::of_backend(e, latest.as_ref().map(|l| l.run)))?;
         let info = RunInfo::of(&task)?;
         let delivered = match &latest {
             _ if info.run != own => match latest {
                 Some(latest) if latest.run == info.run && latest.state == RunState::Waiting => {
                     Delivered::Answered
                 }
-                _ => Delivered::Steered,
+                Some(latest) if latest.run == info.run => Delivered::Steered,
+                // A new run that is not the one this message derives: the next round of a child
+                // session, whose ids the backend derives from the session.
+                Some(_) => Delivered::Continued,
+                None => Delivered::Started,
             },
             Some(_) => Delivered::Continued,
             None => Delivered::Started,
@@ -783,6 +826,146 @@ impl Engine {
                 Some((listed, file))
             })
             .collect())
+    }
+
+    /// The helpers a person may start a child session with (`child-sessions/v1`, ADR 0045): every
+    /// local subagent of the root, with its description. Empty when the agent has none.
+    pub fn helpers(&self) -> &[SessionHelper] {
+        &self.shared.helpers
+    }
+
+    /// Start a child session of `start.helper` in `conversation`, a conversation of this engine,
+    /// with `say` as its first message: its first round is the run [`Turn`] names, in the
+    /// session's own conversation ([`Turn::conversation`]). Talk to the session with
+    /// [`send`](Self::send) to that conversation (each message to an idle session is its next
+    /// round, one to a working round is delivered into it), list its rounds with
+    /// [`list`](Self::list), and close it with [`close_session`](Self::close_session). The parent
+    /// conversation takes no turn.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Invalid`] when the agent has no helper of that name, the description is
+    /// blank, longer than 80 characters or not one line, `say` has no text, or the conversation is
+    /// a session's own; [`EngineError::Refused`] for a session too many ([`Limits::sessions`]);
+    /// [`EngineError::Stopped`] after [`shutdown`](Self::shutdown); and the store's failures.
+    pub async fn start_session(
+        &self,
+        conversation: &ConversationId,
+        start: StartSession,
+        say: Say,
+    ) -> Result<Turn, EngineError> {
+        let _writing = self.writable().await?;
+        say.check()?;
+        let shared = &self.shared;
+        if shared.helpers.is_empty() {
+            return Err(EngineError::Invalid(
+                "this agent has no helper to start a session with".to_owned(),
+            ));
+        }
+        let mut message = message(&say);
+        message.metadata = Some(std::collections::HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            serde_json::json!({ "start": {
+                "agent": start.helper,
+                "description": start.description,
+                "keepOpen": start.keep_open,
+            }}),
+        )]));
+        let task = shared
+            .backend
+            .submit(
+                shared.caller.clone(),
+                message,
+                None,
+                Some(conversation.as_str().to_owned()),
+            )
+            .await
+            .map_err(|e| match e {
+                BackendError::UnsupportedOperation(why) => EngineError::Refused(why),
+                e => EngineError::of_backend(e, None),
+            })?;
+        let info = RunInfo::of(&task)?;
+        Ok(Turn {
+            conversation: info.conversation.clone(),
+            run: info.run,
+            delivered: Delivered::Started,
+            info,
+        })
+    }
+
+    /// The child sessions of `conversation`: the open ones first, then the most recently closed
+    /// (at most 16 of those), as the parent task of the conversation says them.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NotFound`] for a conversation this engine has not, and the store's
+    /// failures.
+    pub async fn sessions(
+        &self,
+        conversation: &ConversationId,
+    ) -> Result<Vec<SessionInfo>, EngineError> {
+        if self.shared.helpers.is_empty() {
+            self.latest_run(conversation).await?;
+            return Ok(Vec::new());
+        }
+        let latest = self.latest_run(conversation).await?;
+        let shared = &self.shared;
+        let task = shared
+            .backend
+            .get(&shared.caller, &latest.run.to_string())
+            .await
+            .map_err(|e| EngineError::of_backend(e, Some(latest.run)))?
+            .ok_or_else(|| EngineError::NotFound(format!("conversation {conversation}")))?;
+        let listed = task
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(CHILD_SESSIONS_EXTENSION))
+            .and_then(|entry| entry.get("sessions"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| EngineError::Unavailable {
+                message: "the sessions of the conversation could not be listed".to_owned(),
+                source: None,
+            })?;
+        listed.iter().map(SessionInfo::of).collect()
+    }
+
+    /// Close the child session whose conversation is `session` ([`SessionInfo::conversation`]): an
+    /// idle session closes by a round of its own, a working one when its round ends, or at once
+    /// with `cancel` (its round is cancelled first). The answer is the round that closes it, or
+    /// the working round. A closed session takes no more messages.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Invalid`] for a conversation that is not a session's, [`EngineError::Refused`]
+    /// for one the backend refuses for its state, [`EngineError::Stopped`] after
+    /// [`shutdown`](Self::shutdown), and the store's failures.
+    pub async fn close_session(
+        &self,
+        session: &ConversationId,
+        cancel: bool,
+    ) -> Result<RunInfo, EngineError> {
+        let _writing = self.writable().await?;
+        let shared = &self.shared;
+        // The close carries no text of the person's: the backend's closing round is its own.
+        let mut message = message(&Say::new("close the session"));
+        message.metadata = Some(std::collections::HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            serde_json::json!({ "close": { "cancel": cancel } }),
+        )]));
+        let task = shared
+            .backend
+            .submit(
+                shared.caller.clone(),
+                message,
+                None,
+                Some(session.as_str().to_owned()),
+            )
+            .await
+            .map_err(|e| match e {
+                BackendError::UnsupportedOperation(why) => EngineError::Refused(why),
+                e => EngineError::of_backend(e, None),
+            })?;
+        RunInfo::of(&task)
     }
 
     /// The agent's commands (`commands/<name>.md`), in name order: what a person may type as
