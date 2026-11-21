@@ -691,28 +691,30 @@ let assembly = AgentDef::from_manifest(AGENT)?
 
 ### A server loaded only when the task asks (`when`)
 
-A server entry may say `"when": { "keywords": ["linear", "ticket"] }`. Its tools are then **withheld** from every
-run whose task does not mention one of its keywords, and its instructions are not in the agent's prompt; a call to
-one of its tools is refused with a result that names the server and its keywords. A server with no `when` is eager,
-as before the key existed. The task is the words of the run's first message (`Conversation::task`), the same text
-at every turn, so a run that continues another selects the same servers. `when.paths` is not supported (the coder
-has no checkout before its first model call) and is ignored with a warning. The format is
+A server entry may say `"when": { "keywords": ["linear", "ticket"] }`. It becomes one **group**, named after
+the server, and the agent gets one generated tool per group, `load__group__<server>`
+([ADR 0066](../../docs/decisions/0066-a-first-request-is-lean-and-tools-load-in-groups.md)). A server with no
+`when` is eager, as before the key existed. The task is the words of the run's first message
+(`Conversation::task`), the same text at every turn, so a run that continues another selects the same groups.
+`when.paths` is not supported (the coder has no checkout before its first model call) and is ignored with a
+warning. The format is
 [`agent-files.md`](../../docs/reference/agent-files.md#a-server-loaded-only-when-the-task-asks-when).
 
-**The fallback: `use_server`.** An agent with at least one triggered server has one more fixed tool, `use_server
-{ name }`, from its first request whatever the task (so the tool list is the same bytes until something is loaded;
-a folder whose own tools already have that name is refused at bind). Its result says whether the server's tools are
-now available and names them, and the loop makes the run's list from it (`Conversation::loaded_servers`): from the
-**next** model call on the server stops being withheld, its instructions follow every other source's words, and its tools are
-**appended after every other tool** of the request, in the order the run loaded them
-([`ToolSource::appended`](../adam-llm-agent/README.md#context-and-tool-sources)). That is the whole point: the
-request before stays a byte prefix of the one after it, and the loop records the turn where the head grew
-(`Conversation::tools_appended`), so the prefix test knows the one recorded exception. The append costs **one full
-history re-prefill** — the result says so in words, and the tool invents no number: what it cost is the next call's
-`Usage::cached_input_tokens`, which only the provider reports. A refused load changes nothing: an unknown name, an
-eager server (its tools are already there), a server the task or the run already loaded, and a server that offered
-no tool at bind (an `optional` server that was not reachable, or an allow-list that selects nothing) are each a
-result the model can act on.
+**A group and its loader.** The group's tools are the agent's own tools, **withheld** until the task holds one
+of the group's keywords or the run calls its loader. The loader's result says what arrived and the group's note
+(the server's instructions section), and the loop makes the run's list from it (`Conversation::loaded`): from the
+**next** model call on the group stops being withheld and its tools are **appended after every other tool** of
+the request, in the order the run loaded them ([`ToolSource::appended`](../adam-llm-agent/README.md#context-and-tool-sources)).
+That is the whole point: the request before stays a byte prefix of the one after it, and the loop records the
+turn where the head grew (`Conversation::tools_appended`), so the prefix test knows the one recorded exception.
+The append costs **one full history re-prefill** — the result says so in words, and the tool invents no number:
+what it cost is the next call's `Usage::cached_input_tokens`, which only the provider reports. A refused load
+changes nothing: a loader called twice, and one whose group the task already loaded. A group with no member the
+agent was given (its `tools:` narrowed the server's list, or an `optional` server was not reachable) has **no
+loader**: lazy never widens access, and its existence is not revealed. `Groups::bind` refuses a group name that
+does not fit `^[a-z0-9]+(_[a-z0-9]+)*$` (at most 40 characters), two groups of one name, and a searchable group
+until S2. The loaders reserve the word `load`: a server named `load` is refused at start, and a registered tool
+whose name starts with `load__` is refused at bind.
 
 ### Extra MCP servers (`ADAM_EXTRA_MCP_FILE`)
 

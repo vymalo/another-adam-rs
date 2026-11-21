@@ -78,15 +78,17 @@ before you rely on a detail here.
      that is down is exit 69). A header whose `${VAR}` is empty is an error (a skip when optional).
      Naming a skipped optional server's tools in the agent's `tools:` (`search__*`) makes the folder exit 78,
      so leave an optional server's tools out of `tools:` or make the server required.
-   * `"when": {"keywords": ["linear", "ticket"]}` on a server: its tools are **withheld** from a run whose
-     task (the words of the first message) mentions none of them, and its instructions stay out of the prompt.
-     An agent with at least one such server also gets the fixed tool `use_server {name}`: a successful call
-     makes that server's tools available from the **next** model call, **appended** after the tools the model
+   * `"when": {"keywords": ["linear", "ticket"]}` on a server: it becomes one **group** of tools, named after
+     the server, loaded by one generated tool `load__group__<server>` (its schema is a constant). Its tools are
+     **withheld** from a run whose task (the words of the first message) mentions none of the keywords, and the
+     server's instructions are the group's note, said in the load's result, not in the prompt. A successful call
+     makes the group's tools available from the **next** model call, **appended** after the tools the model
      already had (never inserted), at the price of one full re-prefill of the prompt; the run's state records
-     the server and the turn the tool list grew. A refused load (unknown, eager, already loaded, or a server
-     that offered no tool at startup, such as a skipped `optional` one) changes nothing. Rules:
-     `docs/reference/agent-files.md` ("A server loaded only when the task asks"), code
-     `crates/adam-assembly/src/use_server.rs` and `crates/adam-assembly/src/mcp_select.rs`.
+     the group and the turn the tool list grew. A group with no tool the agent's `tools:` allows has **no
+     loader**, and a call to a tool of an unloaded group is refused. The loaders reserve the word `load`: a
+     server named `load` is refused at start, and a registered tool whose name starts with `load__` is refused
+     at bind. Rules: `docs/reference/agent-files.md` ("A server loaded only when the task asks"), code
+     `crates/adam-assembly/src/groups.rs`.
    * `"files": true` on a server (a headless browser's screenshots and PDFs): each image, audio clip and blob
      of its results becomes a **file artifact of the run**, the shape the coder's `share_file` gives (one A2A
      `raw` part with `mediaType` and `filename`), named `<tool>-<hash>.<ext>`; the model reads

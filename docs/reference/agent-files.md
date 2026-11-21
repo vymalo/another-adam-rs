@@ -860,41 +860,46 @@ stateDiagram-v2
 
 #### A server loaded only when the task asks (`when`)
 
-A server entry may say `"when": { "keywords": ["linear", "ticket"] }`. Its tools are then **loaded only for a
-run whose task mentions one of the keywords**, ignoring case; a server without `when` is eager and loaded for
-every run, as before the key existed.
+A server entry may say `"when": { "keywords": ["linear", "ticket"] }`. It becomes one **group** of
+tools, named after the server, loaded by one generated tool, `load__group__<server>`
+([ADR 0066](../decisions/0066-a-first-request-is-lean-and-tools-load-in-groups.md)); a server without
+`when` is eager and loaded for every run, as before the key existed.
 
 * **The task** is the first part of the run's first message: the words the person sent
   (`Conversation::task`). A run that continues another carries that first message, so it selects the same
-  servers as the run before, whatever its new message says. A message with no words (an empty one, or images
+  groups as the run before, whatever its new message says. A message with no words (an empty one, or images
   only) matches nothing: only the eager servers are loaded.
 * **When it is decided.** From the task, before the run's first model call: the tools array is the same bytes at
-  every request of a run that loads no server during itself, so the cached prefix holds ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md),
+  every request of a run that loads no group during itself, so the cached prefix holds ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md),
   decision 1). The decision is **recomputed** from the run's state at each turn, not stored: the state already
   holds the task, and a stored field would be a second place where the same decision lives.
-* **The fallback: `use_server`.** An agent with at least one triggered server has one more fixed tool,
-  `use_server { name }`, present from its first request whatever the task. A successful call says which tools are
-  now available and names them; the run's state records the server (`Conversation::loaded_servers`), and from the
-  **next** model call on it is no longer withheld: its instructions follow every other word a source adds and its
-  tools are **appended after every other tool** of the request, in the order the run loaded them, never inserted or
-  reordered. The request before is therefore a byte prefix of the one after it, and the loop records the turn
-  where the head grew (`Conversation::tools_appended`). The append costs **one full history re-prefill**, which
-  the result says in words; the tool reports no number — what it cost is the next call's cached input tokens, as
-  the provider reports them. A refused load changes nothing: an unknown name, a server with no `when` (its tools
-  are already there), one the task or the run already loaded, and one that offered no tool when the agent started
-  (an `optional` server that was not reachable, or an allow-list that selects nothing).
-* **What is withheld.** An unselected server's tools are not shown, and a call to one (the model may name a
-  tool it was not shown) is refused with a result that says the tool is not loaded for this run and names the
-  server and its keywords. Its instructions are not in the agent's prompt either: they are appended for a
-  turn only when the run loads the server, and each set is still bounded at 8 KiB. The eager servers'
-  instructions stay in the prompt, after the agent's own text and before its skills; a loaded triggered
-  server's come after the prompt and the skills.
+* **The loader.** An agent with at least one triggered server has one more fixed tool per group,
+  `load__group__<server>`, present from its first request whatever the task. Its schema and description are
+  constants (the group's name and its one-line note, never a member count), so the tool list is the same bytes
+  until something is loaded. A successful call says which tools are now available, names them and says the
+  group's note (the server's instructions section); the run's state records the group
+  (`Conversation::loaded`), and from the **next** model call on its tools are **appended after every other
+  tool** of the request, in the order the run loaded them, never inserted or reordered. The request before is
+  therefore a byte prefix of the one after it, and the loop records the turn where the head grew
+  (`Conversation::tools_appended`). The append costs **one full history re-prefill**, which the result says in
+  words; the tool reports no number — what it cost is the next call's cached input tokens, as the provider
+  reports them. A refused load changes nothing: a loader called twice, and one whose group the task already
+  loaded. A group with no tool this agent was given (its `tools:` narrowed the server's list, or the server
+  was not reachable and is `optional`) has **no loader**: its existence is not revealed.
+* **What is withheld.** A group's tools are not shown, and a call to one (the model may name a tool it was not
+  shown) is refused with a result that names the tool, the group and its loader. The server's instructions are
+  not in the agent's prompt either: they are the group's note, said in the load's result, so the prompt does
+  not grow during a run. The eager servers' instructions stay in the prompt, after the agent's own text and
+  before its skills.
 * **No `paths` in this version.** The coder has no checkout before its first model call
   (`prepare_workspace` is a tool), so a path glob would have nothing to match. `when.paths` is ignored with a
   warning at load; a `when` with no `keywords` is a load error, because the server would never load.
 * **Keywords.** 1 to 16, each 1 to 64 characters, no control or format character; the match is a
   case-insensitive substring, so a plural or a possessive still matches. A `when` with no keyword is a load
   error and the server is left out (it would never load: leave `when` out to load it for every run).
+* **The reserved word `load`.** A server named `load` is refused at start, and a registered tool whose name
+  starts with `load__` is refused at bind; an MCP or conversation tool whose full name starts with it is left
+  out with a warning. An MCP tool is `<server>__<tool>`, so a server named `load` and a loader would collide.
 * **Fail closed at startup.** `AgentDef::connect_mcp` finds everything that can be wrong before the first
   model call: a `${VAR}` with no value, `type: sse`, a stdio server the policy forbids, a plain-http URL to
   another machine, a URL with credentials or a `${VAR}`, a bad header, a server that is down or refuses the
@@ -931,7 +936,7 @@ Six optional keys of a server entry, in `mcp.json` and in the deployment's extra
 | `instructions` | `false` leaves out the text the server returns when it initializes | on |
 | `prompts` | `false` stops the server's prompts from becoming commands | on |
 | `parallel` | `false` makes the calls of this server's tools run one at a time, alone in their turn; by default they run at the same time as the turn's other calls, up to `MAX_PARALLEL_TOOL_CALLS` ([ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)). **Folder agents change behaviour here:** MCP tools now run at the same time by default; a server with a session (a browser, a cursor, a file being written then read) needs `"parallel": false` in mcp.json before you take this revision. | on |
-| `when` | `{ "keywords": ["…"] }`: the server's tools and its instructions reach a run only when the run's task mentions one of the keywords (see [below](#a-server-loaded-only-when-the-task-asks-when)); `paths` is not supported and is ignored with a warning | eager (no `when`) |
+| `when` | `{ "keywords": ["…"] }`: the server becomes a group, `load__group__<server>`, whose tools and note reach a run when the task mentions one of the keywords or the run loads it (see [below](#a-server-loaded-only-when-the-task-asks-when)); `paths` is not supported and is ignored with a warning | eager (no `when`) |
 
 * **Seconds.** A whole number, at least 1. Zero, a negative or a fractional number, or text refuses that server
   when the file is loaded (`path: error: ...`).
