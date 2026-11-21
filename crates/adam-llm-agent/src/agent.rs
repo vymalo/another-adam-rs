@@ -45,6 +45,10 @@ use crate::images::{
     image_scope, image_step, parse_inbound_images, parts_of, state_bytes,
 };
 use crate::kept::{KeptOutput, MAX_RUN_KEPT_BYTES};
+use crate::model_wait::{
+    MODEL_RESUME_KIND, ModelPark, ModelParking, ModelWait, RecordedPark, backoff, detail_of,
+    reason_of,
+};
 use crate::order;
 use crate::paging::backstop;
 use crate::plan::Plan;
@@ -728,6 +732,16 @@ struct ModelFailure {
     /// from journals written before, which decode as `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     refused: bool,
+    /// The endpoint refused the call and its provider parks the run on it
+    /// ([`ModelError::Refused`], ADR 0067): its status, slug and wait, and nothing else of the
+    /// answer. Absent from journals written before, and for every other failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    park: Option<RecordedPark>,
+    /// No connection to the endpoint could be made ([`ModelError::Unreachable`]): a run whose
+    /// endpoint parks ([`ModelParking::when_unreachable`]) parks once the step's retries are
+    /// spent. Absent from journals written before, which decode as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unreachable: bool,
 }
 
 impl ModelFailure {
@@ -750,6 +764,8 @@ impl ModelFailure {
             class: None,
             context_length: false,
             refused: false,
+            park: None,
+            unreachable: false,
         }
     }
 }
@@ -774,6 +790,8 @@ impl From<ModelError> for ModelFailure {
             class: Some(format!("{:?}", e.class())),
             context_length: e.is_context_overflow(),
             refused: e.class() == adam_error::ErrorClass::Invalid && !e.is_context_overflow(),
+            park: RecordedPark::of(&e),
+            unreachable: matches!(e, ModelError::Unreachable { .. }),
         }
     }
 }
@@ -1022,6 +1040,7 @@ pub struct LlmAgentBuilder {
     max_parallel: usize,
     tool_retry: BTreeMap<String, RetryPolicy>,
     reasoning_effort: Option<ReasoningEffort>,
+    model_parking: ModelParking,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -1214,6 +1233,17 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// How a run waits on a model that refused it or could not be reached ([ADR 0067]): how long
+    /// parks on a timer in a row may last (24 hours by default), and whether an unreachable
+    /// endpoint parks at all (no, by default). See "A run parked on the model" on [`LlmAgent`].
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[must_use]
+    pub fn model_parking(mut self, parking: ModelParking) -> Self {
+        self.model_parking = parking;
+        self
+    }
+
     /// How the step of a tool call reports what the tool was given and what it answered: the
     /// arguments on the report that starts the step, the result (or the error) on the one that ends
     /// it, each scrubbed by [`StepIo::redact`] and then cut to the contract's bounds (4 KiB in, 8 KiB
@@ -1344,6 +1374,7 @@ impl LlmAgentBuilder {
             max_parallel: self.max_parallel,
             tool_retry: self.tool_retry,
             reasoning_effort: self.reasoning_effort,
+            model_parking: self.model_parking,
             images_cache: Arc::new(Mutex::new(ImageCache::new())),
             run_chars: Arc::new(Mutex::new(RunChars::default())),
         }
@@ -1473,6 +1504,33 @@ impl LlmAgentBuilder {
 /// not repeated. If the tool gave a timeout, the call is answered with an error result once it has
 /// passed (measured by the journaled clock). Cancelling the run does not cancel the remote task.
 ///
+/// # A run parked on the model
+///
+/// A model call the endpoint refused, when its provider parks the run on the refusal
+/// ([`ModelCredentials::parks`](adam_model::ModelCredentials::parks), [ADR 0067]), does not fail the
+/// run. The conversation is kept as it was before the call, [`Conversation::model_wait`] says why
+/// ([`ModelWait`]: the reason, the status, the slug, how it wakes, and since when), and the run
+/// parks. When it wakes, the **same call** is made again, in a new journaled step; the summary call
+/// of a compaction parks and is made again the same way. The first call that is answered clears the
+/// wait.
+///
+/// * **On a timer** (a lease not bound yet, a busy gateway, one that cannot be reached): the run
+///   wakes on its own after 30 s, doubling at each park in a row up to [`MAX_MODEL_BACKOFF`](crate::MAX_MODEL_BACKOFF), and
+///   never sooner than the provider asked (`Retry-After`). Parks on a timer in a row are bounded by
+///   [`ModelParking::limit`] from the first of them, on the journaled clock: past it the run fails
+///   with the last reason. A timer counts against a child run's time limit, as any timer does.
+/// * **Until woken** (a usage limit reached): the run waits like a question, with no timer and its
+///   deadline paused, and never fails on its own. A run nobody can wake, a schedule's firing
+///   ([`is_unattended`]), fails instead.
+/// * **Waking.** A message wakes either kind: its text is the person's turn, added before the call. A
+///   message of kind [`MODEL_RESUME_KIND`] wakes it and adds nothing. A cancel ends the park as it
+///   ends any wait.
+///
+/// The journal, the run's error and what a front shows hold the reason, the status and the slug,
+/// never a header, a body or a credential.
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+///
 /// # Failure handling
 ///
 /// * Retryable model error (`ModelError::is_retryable`), [`ToolError::Transient`] or
@@ -1483,7 +1541,13 @@ impl LlmAgentBuilder {
 ///   `AgentError::Transient` with that hint (`with_retry_after`), so the
 ///   retry waits at least that long
 ///   (the runtime's backoff still applies when it is longer).
-/// * Other model error: the run fails (`model call failed: ...`).
+/// * A refusal whose provider parks the run (`ModelError::Refused`), and, with
+///   [`ModelParking::when_unreachable`], an endpoint that cannot be reached once the step's retries
+///   are spent: the run parks on the model (below), and fails only past [`ModelParking::limit`], or
+///   on a park until woken in a run nobody can wake.
+/// * Other model error, `ModelError::ModelLocked` (naming the model) among them: the run fails
+///   (`model call failed: ...`). So does a refusal under a provider that does not park
+///   (`StaticBearer`'s `401` is `ModelError::Auth`).
 /// * [`ToolError::Permanent`], `ToolOutput { is_error: true }` and unknown
 ///   tool names: an error tool result for the model; the run goes on. So does
 ///   a child run that failed, was cancelled or no longer exists.
@@ -1521,6 +1585,8 @@ pub struct LlmAgent {
     /// The effort every turn asks for unless the run's context names one
     /// ([`LlmAgentBuilder::reasoning_effort`]).
     reasoning_effort: Option<ReasoningEffort>,
+    /// How a run waits on a model that refused it ([`LlmAgentBuilder::model_parking`]).
+    model_parking: ModelParking,
     /// The bytes of the images already read and checked, by SHA-256, shared by every run of this
     /// agent: a turn reads an image file once, not once per model call.
     images_cache: Arc<Mutex<ImageCache>>,
@@ -1577,6 +1643,17 @@ struct Absorbed {
     refusals: Vec<(String, Refusal)>,
 }
 
+/// What [`LlmAgent::compact_if_due`] did.
+enum Compacted {
+    /// Nothing: no compaction was due, or none could be made.
+    No,
+    /// The history was compacted: the model is asked in the next transition.
+    Made,
+    /// The summary call parked the run on the model (a [`Flow::Park`], [`Flow::Sleep`] or
+    /// [`Flow::Fail`]).
+    Parked(Flow),
+}
+
 /// What a part of a step decided.
 enum Flow {
     /// Nothing terminal happened; carry on.
@@ -1585,6 +1662,8 @@ enum Flow {
     Park,
     /// Wait for a child run, with a timer.
     Wait,
+    /// Wait on the model until this time (a park on a timer, ADR 0067).
+    Sleep(Timestamp),
     /// The model finished.
     Done(Value),
     /// Fail the run.
@@ -1616,7 +1695,13 @@ impl LlmAgent {
             max_parallel: DEFAULT_MAX_PARALLEL,
             tool_retry: BTreeMap::new(),
             reasoning_effort: None,
+            model_parking: ModelParking::default(),
         }
+    }
+
+    /// How a run of this agent waits on a model that refused it ([`LlmAgentBuilder::model_parking`]).
+    pub fn model_parking(&self) -> ModelParking {
+        self.model_parking
     }
 
     /// The limits in force.
@@ -1927,6 +2012,98 @@ impl LlmAgent {
         Ok(now + every)
     }
 
+    /// What a model call that failed with `failure` does when it parks the run ([ADR 0067]
+    /// decisions 4, 6 and 8): `None` for a failure that does not park, which the caller handles as
+    /// it always has.
+    ///
+    /// A refusal whose provider parks ([`ModelError::Refused`]) parks on a timer or until woken, as
+    /// the provider said; an endpoint that could not be reached parks on a timer, when this agent
+    /// parks on one ([`ModelParking::when_unreachable`]) and the step's retries are spent. The
+    /// conversation is left as it was before the call, with [`Conversation::model_wait`] set, so the
+    /// same call is made again when the run wakes. A park on a timer waits with a backoff, and parks
+    /// on a timer in a row past [`ModelParking::limit`] fail the run; a run nobody can wake (a
+    /// schedule's firing) fails on a park until woken. What is recorded is the reason, the status
+    /// and the slug, never anything else of the answer.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    async fn parked_on_model(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        failure: &ModelFailure,
+    ) -> Result<Option<Flow>, AgentError> {
+        let (status, slug, timer) = match &failure.park {
+            Some(park) => (
+                Some(park.status),
+                park.slug.clone(),
+                park.timer_ms.map(Duration::from_millis),
+            ),
+            None if failure.unreachable
+                && self.model_parking.when_unreachable
+                && ctx.retries_left() == 0 =>
+            {
+                (None, None, Some(Duration::ZERO))
+            }
+            None => return Ok(None),
+        };
+        let reason = reason_of(status, slug.as_deref());
+        let detail = detail_of(reason, status, slug.as_deref());
+        let previous = state.model_wait.take();
+        let run = ctx.run_id();
+        let Some(at_least) = timer else {
+            if is_unattended(ctx.conversation_id(), Some(&state.context)) {
+                tracing::info!(%run, %detail, "the model refused the call, and nobody can wake this run: it fails");
+                return Ok(Some(Flow::Fail(format!(
+                    "model call failed: {detail}; a schedule started this run, so nobody can wake it"
+                ))));
+            }
+            let now = ctx.now_journaled().await?;
+            let parked_since = match &previous {
+                Some(w) if w.park == ModelPark::UntilWoken => w.parked_since,
+                _ => now,
+            };
+            tracing::info!(%run, %detail, "the model refused the call: the run waits until it is woken");
+            state.model_wait = Some(ModelWait {
+                reason: reason.to_owned(),
+                status,
+                slug,
+                park: ModelPark::UntilWoken,
+                parked_since,
+                parks: 0,
+                wake_at: None,
+            });
+            return Ok(Some(Flow::Park));
+        };
+        let now = ctx.now_journaled().await?;
+        let (parked_since, parks) = match &previous {
+            Some(w) if w.park == ModelPark::Timer => (w.parked_since, w.parks.saturating_add(1)),
+            _ => (now, 1),
+        };
+        let parked_for = Duration::try_from(now - parked_since).unwrap_or(Duration::ZERO);
+        if parked_for >= self.model_parking.limit {
+            tracing::info!(%run, %detail, parks, "parked on the model past the limit: the run fails");
+            return Ok(Some(Flow::Fail(format!(
+                "model call failed: {detail}; the run waited on the model for {}, past its limit of \
+                 {} (MODEL_PARK_LIMIT)",
+                words_of(parked_for),
+                words_of(self.model_parking.limit)
+            ))));
+        }
+        let wait = backoff(parks, at_least);
+        let wake_at = now + adam_core::time::span_of(wait);
+        tracing::info!(%run, %detail, parks, wait_secs = wait.as_secs(), "the model refused the call: the run waits on a timer");
+        state.model_wait = Some(ModelWait {
+            reason: reason.to_owned(),
+            status,
+            slug,
+            park: ModelPark::Timer,
+            parked_since,
+            parks,
+            wake_at: Some(wake_at),
+        });
+        Ok(Some(Flow::Sleep(wake_at)))
+    }
+
     /// The child's outcome as the result of the call that waited for it. Returns the state the end of
     /// the call's step carries.
     fn answer_run(state: &mut Conversation, wait: &PendingRun, child: &ChildStatus) -> StepState {
@@ -2209,6 +2386,21 @@ impl LlmAgent {
         // by the worker's commit.
         if ctx.is_cancelled() {
             return Ok((Flow::Fail(CANCELLED.into()), early));
+        }
+        // A refusal that parks the run (ADR 0067): the conversation stays as it was before the call,
+        // which is made again when the run wakes. The calls that started end; their results go.
+        if let Err(f) = &recorded
+            && let Some(flow) = self.parked_on_model(ctx, state, f).await?
+        {
+            if let Some(mut early) = early {
+                early.settle().await;
+            }
+            return Ok((flow, None));
+        }
+        // Anything else the endpoint answered ends a wait on it; a retry keeps it, since the state of
+        // a failed transition is not kept.
+        if !matches!(&recorded, Err(f) if f.retryable) {
+            state.model_wait = None;
         }
         let answered_stale: bool;
         let mut seen_at: usize;
@@ -2615,8 +2807,9 @@ impl LlmAgent {
         ctx: &mut Ctx,
         state: &mut Conversation,
         output_id_of: &(dyn Fn(&str) -> Option<String> + Sync),
-    ) -> Result<bool, AgentError> {
-        let reason = match state.compact_next.take() {
+    ) -> Result<Compacted, AgentError> {
+        let asked = state.compact_next.take();
+        let reason = match asked {
             Some(reason) => reason,
             None => {
                 if !state.pending_calls.is_empty()
@@ -2624,13 +2817,13 @@ impl LlmAgent {
                     || state.limit.is_some()
                     || !self.compaction_due(state)
                 {
-                    return Ok(false);
+                    return Ok(Compacted::No);
                 }
                 CompactionReason::Budget
             }
         };
         let Some(cut) = self.cut_for(state, reason) else {
-            return Ok(false);
+            return Ok(Compacted::No);
         };
         let n = state.compactions.len();
         let before_tokens = self.estimated_tokens(state);
@@ -2719,6 +2912,22 @@ impl LlmAgent {
                 })
             })
             .await?;
+        // A refusal that parks the run parks it here too (ADR 0067): the summary is asked for again
+        // when the run wakes, from the history as it is.
+        if let Err(f) = &recorded
+            && let Some(flow) = self.parked_on_model(ctx, state, f).await?
+        {
+            state.compact_next = asked;
+            if let Some(wait) = &state.model_wait {
+                let reason = wait.reason.clone();
+                ctx.emit(RunEvent::Step(step(StepState::Waiting).with_detail(reason)))
+                    .await;
+            }
+            return Ok(Compacted::Parked(flow));
+        }
+        if !matches!(&recorded, Err(f) if f.retryable) {
+            state.model_wait = None;
+        }
         let (summary, cut_at, rejected) = match recorded {
             Ok(done) => {
                 // The call was made and counts, whatever its summary is worth.
@@ -2772,7 +2981,7 @@ impl LlmAgent {
                     ),
                 )))
                 .await;
-                return Ok(false);
+                return Ok(Compacted::No);
             }
         };
         // The recorded cut is the one to apply; it must still be a turn start of this history.
@@ -2781,7 +2990,7 @@ impl LlmAgent {
             && matches!(state.messages[cut_at], Message::Assistant { .. });
         if !valid {
             state.compact_failed = Some(state.turns);
-            return Ok(false);
+            return Ok(Compacted::No);
         }
         compaction::apply(
             state,
@@ -2800,7 +3009,7 @@ impl LlmAgent {
             ),
         )))
         .await;
-        Ok(true)
+        Ok(Compacted::Made)
     }
 
     /// Report a completed model call of this run (`usage/v1`): as an event of the **root** run, the
@@ -5071,6 +5280,17 @@ enum ToolResult {
 const SOURCE_LIMIT_MARGIN: Duration = Duration::from_secs(10);
 
 /// What the model is told when a call ran past its time limit.
+/// A duration in words, to the minute past an hour: `24 h`, `1 h 30 min`, `5 min`, `45 s`.
+fn words_of(d: Duration) -> String {
+    let secs = d.as_secs();
+    match (secs / 3600, (secs % 3600) / 60) {
+        (0, 0) => format!("{secs} s"),
+        (0, m) => format!("{m} min"),
+        (h, 0) => format!("{h} h"),
+        (h, m) => format!("{h} h {m} min"),
+    }
+}
+
 fn timed_out(tool: &str, limit: Duration) -> String {
     format!(
         "`{tool}` did not finish within {} and was stopped. What it had done is not undone: look \
@@ -5479,8 +5699,25 @@ impl Agent for LlmAgent {
         };
         // A history that has reached the budget is summarised first, at a journaled step of its own;
         // the model is asked in the next transition, from the new history.
-        if self.compact_if_due(ctx, &mut state, &output_id_of).await? {
-            return Ok(Transition::Continue(state));
+        match self.compact_if_due(ctx, &mut state, &output_id_of).await? {
+            Compacted::Made => return Ok(Transition::Continue(state)),
+            Compacted::Parked(flow) => {
+                return Ok(match flow {
+                    Flow::Sleep(wake_at) => Transition::Park {
+                        state,
+                        wake_at: Some(wake_at),
+                    },
+                    Flow::Fail(error) => {
+                        self.forget_chars(ctx.run_id());
+                        Transition::Fail { state, error }
+                    }
+                    _ => Transition::Park {
+                        state,
+                        wake_at: None,
+                    },
+                });
+            }
+            Compacted::No => {}
         }
         let mut counted = {
             let mut totals = self
@@ -5523,6 +5760,9 @@ impl Agent for LlmAgent {
             // A session round's report (ADR 0045) is a wake-up, not a person's words: it is
             // dropped, never shown to the model, and the report is read from the store.
             .filter(|i| i.kind != CHILD_REPORTED_KIND)
+            // A resume (ADR 0067) only wakes a run parked on the model, which then makes its call
+            // again: it adds nothing to the conversation and answers no question.
+            .filter(|i| i.kind != MODEL_RESUME_KIND)
             .partition(|i| i.kind == RUN_FINISHED_KIND);
         // A request to close the session this round belongs to: the round goes on and finishes its
         // work, and the session takes no more messages after it.
@@ -5726,6 +5966,10 @@ impl Agent for LlmAgent {
             },
             Flow::Wait => Transition::Park {
                 wake_at: Some(self.next_poll(ctx)),
+                state,
+            },
+            Flow::Sleep(wake_at) => Transition::Park {
+                wake_at: Some(wake_at),
                 state,
             },
             Flow::Done(mut output) => {

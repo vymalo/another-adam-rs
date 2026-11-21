@@ -438,6 +438,47 @@ async fn a_long_run_is_summarised_once_and_keeps_the_prefix_after() {
     );
 }
 
+/// A summary call the endpoint refuses, under a provider that parks, parks the run as a turn does
+/// (ADR 0067): the history is kept as it was, the same summary is asked for again after the timer,
+/// and the answered call clears the wait.
+#[tokio::test]
+async fn a_refused_summary_parks_the_run_and_is_asked_for_again() {
+    let rig = Rig::new(BUDGET);
+    rig.mock
+        .push_tool_calls(vec![big("c0", 1200)])
+        .push_tool_calls(vec![big("c1", 1200)])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_error(ModelError::Refused {
+            status: 503,
+            slug: Some("unavailable".into()),
+            retry_after: None,
+            park: adam_model::Park::OnTimer(Duration::from_secs(30)),
+        })
+        .push_text("SUMMARY: after the park")
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    let (turns, summaries) = split(&requests);
+    assert_eq!(summaries.len(), 2, "the refused summary is asked for again");
+    assert_eq!(
+        summaries[0].messages, summaries[1].messages,
+        "from the history as it was"
+    );
+    assert_eq!(turns.len(), 5);
+    assert_eq!(state.compactions.len(), 1);
+    assert!(state.messages[0].text().contains("SUMMARY: after the park"));
+    assert!(
+        state.model_wait.is_none(),
+        "the answered call cleared the wait"
+    );
+    let waited = rig.sink.events_for(run).into_iter().any(|e| {
+        matches!(&e, RunEvent::Step(step) if step.state == adam_runtime::StepState::Waiting
+            && step.detail.as_deref() == Some("the model gateway is busy"))
+    });
+    assert!(waited, "the summary's step says why it waits");
+}
+
 #[tokio::test]
 async fn the_summary_asks_for_no_reasoning_effort_while_the_turns_do() {
     let rig = Rig::with(MockModel::new(), BUDGET, |b| {

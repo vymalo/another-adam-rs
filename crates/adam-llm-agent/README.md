@@ -19,7 +19,8 @@ instructions + a model + a toolset. It is served over A2A by
 | Item | What |
 |---|---|
 | `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
-| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.reasoning_effort(Option<ReasoningEffort>)` (the level every turn asks for unless the run's context names one: see *Reasoning effort*), `.build()` |
+| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.reasoning_effort(Option<ReasoningEffort>)` (the level every turn asks for unless the run's context names one: see *Reasoning effort*), `.model_parking(ModelParking)` (how a run waits on a model that refused it: see *A run parked on the model*), `.build()` |
+| `ModelParking`, `ModelWait`, `ModelPark`, `MODEL_RESUME_KIND`, `DEFAULT_MODEL_PARK_LIMIT`, `MAX_MODEL_BACKOFF` | a run parked on the model (ADR 0067): `ModelParking::new(limit).when_unreachable(bool)`, the default a limit of 24 h and an unreachable endpoint that fails as before; `Conversation::model_wait` is the `ModelWait` of a parked run (`reason`, `status`, `slug`, `park`, `parked_since`, `parks`, `wake_at`); see *A run parked on the model* |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*); it also splits and joins the conversation exactly like `LlmAgent` (`AgentStarter::split`/`join`), so a run it starts is written with a head and a body, not left in the v4 format |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to the helper", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) and `read_answer(call_id, args, ui, payload) -> AnswerCheck` (`Accept`, `Read(text)`, `Refuse(Refusal)` or `End(Refusal)`; the default accepts: reads the answer to the tool's own question before the model does; see *The answer is read by the tool that asked*) |
@@ -692,6 +693,32 @@ while a remote task is polled. A model provider's retryable error keeps its clas
 `RateLimited`), under the runtime's policy. Tests: `tests/llm_agent.rs`
 `a_tools_policy_decides_its_retries_and_one_set_by_name_wins`, `a_tools_failure_keeps_its_class`,
 `a_model_rate_limit_keeps_its_class`, and `tool.rs` `a_retryable_error_is_journaled_by_its_class_name`.
+
+### A run parked on the model
+
+A refusal whose provider parks the run (`adam_model::ModelError::Refused`, [ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+decisions 4, 6 to 8) does not fail it. Neither does an endpoint that cannot be reached (`ModelError::Unreachable`) once the
+step's retries are spent (`Ctx::retries_left() == 0`), when `ModelParking::when_unreachable` is set (`adam-service` sets it
+for `MODEL_AUTH=injector`).
+
+| | Park on a timer | Park until woken |
+|---|---|---|
+| When | the provider said `Park::OnTimer`, or the endpoint cannot be reached | the provider said `Park::UntilWoken` (a usage limit reached) |
+| The run | parked with `wake_at`: 30 s, doubling at each park in a row, at most 15 min (`MAX_MODEL_BACKOFF`), at least what the provider asked | parked with no timer, like a question: its deadline is paused |
+| Ends | on its own; past `ModelParking::limit` (`MODEL_PARK_LIMIT`, 24 h) from the first park of the row, on the journaled clock, the run fails with the last reason | never on its own; a schedule's firing (`is_unattended`) fails instead |
+| Woken by | its timer, a message (its text is the person's turn), a resume | a message, a resume |
+
+The conversation is kept as it was before the call and `Conversation::model_wait` says why (`reason`, `status`, `slug`,
+`park`, `parked_since`, `parks`, `wake_at`). When the run wakes the **same call** is made again (a new journal position,
+so it is called); the summary call of a compaction parks and is asked for again the same way (its step says `waiting`
+with the reason). A message of kind `MODEL_RESUME_KIND` (`adam.resume`) wakes the run and adds nothing. The first call
+that is answered clears the wait. A cancel ends the park. `ModelError::ModelLocked` is no park: the run fails naming the
+model. A provider that does not park (`StaticBearer`) fails as before. The journal holds the reason's status and slug
+(`park` in the failure's record), never a header, a body or a credential.
+
+Tests: `tests/model_park.rs` (each kind, the backoff, the limit, a message, a resume, an unattended run, an unreachable
+endpoint, `ModelLocked`, `StaticBearer`'s errors, a cancel, and nothing of a problem document's body in the journal through
+`adam-model-openai` against a mock server), `tests/compaction.rs` `a_refused_summary_parks_the_run_and_is_asked_for_again`.
 
 Model failures are classified by `adam_model::ModelError` and journaled as a
 record of `retryable`, the flattened message (`report`, so the chain is printed
