@@ -5,7 +5,7 @@ use adam::mcp::McpPolicy;
 use adam::{AgentDef, AgentFolder, Assembly};
 use adam_a2a::AgentCardConfig;
 use adam_llm_agent::{DEFAULT_MAX_PARALLEL, LlmStarter, StepIo};
-use adam_model::DynModel;
+use adam_model::{DynModel, ModelProfiles};
 use adam_service::{Agents, RuntimeOptions};
 use adam_ui::Ui;
 use url::Url;
@@ -90,6 +90,10 @@ pub struct WorkerParts<'a> {
     pub model: DynModel,
     /// The model alias the agent asks for (`MODEL`).
     pub alias: &'a str,
+    /// The deployment's per-model profiles (`MODEL_ALIASES_FILE`, ADR 0063/0064): what each model
+    /// takes as a reasoning effort, and the presets an agent's `model_preset` may name. Empty when
+    /// the file is unset: no model has a profile, so an agent that sets an effort is refused.
+    pub profiles: ModelProfiles,
     /// What the folder's MCP servers may be.
     pub mcp: McpPolicy,
     /// How the runtime that steps the runs is set up.
@@ -154,6 +158,36 @@ pub async fn assemble_limited(
     step_io: StepIo,
     max_parallel: usize,
 ) -> Result<Assembly, AgentError> {
+    assemble_limited_with_profiles(
+        def,
+        model,
+        alias,
+        mcp,
+        step_io,
+        max_parallel,
+        ModelProfiles::default(),
+    )
+    .await
+}
+
+/// [`assemble_limited`], with the deployment's per-model profiles (`MODEL_ALIASES_FILE`, ADR
+/// 0063/0064): `BoundDef::model_profiles` resolves each agent's default reasoning effort from its
+/// folder, its `model_preset` and the profile, and refuses a value the model does not take. A role
+/// that runs workers passes its `ModelConfig`'s profiles here.
+///
+/// # Errors
+///
+/// As [`assemble`], and [`AgentError::Assembly`] when an agent's `reasoning_effort` or
+/// `model_preset` is not one its model's profile allows.
+pub async fn assemble_limited_with_profiles(
+    def: AgentDef,
+    model: DynModel,
+    alias: &str,
+    mcp: &McpPolicy,
+    step_io: StepIo,
+    max_parallel: usize,
+    profiles: ModelProfiles,
+) -> Result<Assembly, AgentError> {
     // The servers are connected now, at startup, before the agent is bound: a server that is down,
     // a local process the policy does not allow, a `${VAR}` that is unset are startup errors with
     // their own exit code, never something found in the middle of a run.
@@ -172,6 +206,7 @@ pub async fn assemble_limited(
         .max_parallel(max_parallel)
         .step_io(step_io);
     bound
+        .model_profiles(profiles)
         .model(model, alias)
         .map_err(|e| AgentError::Assembly(Box::new(e)))
 }
@@ -206,13 +241,14 @@ pub async fn agents(
     let schedules = def.manifest().schedules.clone();
     let (agents, commands, card) = match workers {
         Some(parts) => {
-            let assembly = assemble_limited(
+            let assembly = assemble_limited_with_profiles(
                 def,
                 parts.model,
                 parts.alias,
                 &parts.mcp,
                 parts.step_io,
                 parts.max_parallel,
+                parts.profiles,
             )
             .await?;
             // The prompts of the root's MCP servers are commands too, known only now that the

@@ -1460,6 +1460,26 @@ fn a_skill_with_an_error_is_left_out_and_its_siblings_stay() {
 }
 
 #[test]
+fn the_reasoning_keys_are_read_and_the_effort_key_stays_ignored() {
+    let dir = write(&[(
+        "agent/instructions.md",
+        "---\nname: root\nreasoning_effort: high\nmodel_preset: quick\neffort: high\n---\nHi.\n",
+    )]);
+    let report = load(dir.path());
+    assert!(report.is_ok(), "{:?}", report.diagnostics);
+    // `effort` is Claude Code's spelling: the softer "ignored by adam" warning, not "unknown".
+    let warnings: Vec<String> = report.warnings().map(ToString::to_string).collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("`effort` is a Claude Code or Copilot key that adam ignores"),
+        "{warnings:?}"
+    );
+    let front = &report.package.agents[0].frontmatter;
+    assert_eq!(front.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(front.model_preset.as_deref(), Some("quick"));
+}
+
+#[test]
 fn diagnostics_carry_the_file_and_the_line() {
     let dir = write(&[(
         "agent/instructions.md",

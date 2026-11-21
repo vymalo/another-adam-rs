@@ -172,7 +172,8 @@ pub use dev::{
     WatchError,
 };
 pub use error::{
-    AliasProblem, Error, Origin, RemoteAuthProblem, RemoteUrlProblem, SkillField, ToolClash,
+    AliasProblem, EffortSource, Error, Origin, RemoteAuthProblem, RemoteUrlProblem, SkillField,
+    ToolClash,
 };
 pub use folder::{
     AGENT_DIR_ENV, AgentFolder, EXTRA_MCP_FILE_ENV, agent_dir, agent_dir_from_env,

@@ -9,8 +9,8 @@ use adam_core::time::Timestamp;
 use adam_core::{RunId, RunStatus};
 use adam_error::report;
 use adam_model::{
-    Classify, DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse, ToolCall,
-    ToolChoice, ToolSpec,
+    Classify, DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse,
+    ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, CancelToken,
@@ -34,8 +34,9 @@ use crate::compaction::{
 };
 use crate::conversation::{
     ArtifactRef, Conversation, LimitHit, LimitKind, PendingQuestion, PendingRemote, PendingRun,
-    PendingSession, PendingWait, Repeats, asks_to_close, parse_context, parse_model_run,
-    parse_root_run, parse_root_step, parse_session, parse_user_text,
+    PendingSession, PendingWait, REASONING_EFFORT_CONTEXT_KEY, Repeats, asks_to_close,
+    parse_context, parse_model_run, parse_root_run, parse_root_step, parse_session,
+    parse_user_text,
 };
 use crate::history::{RunChars, record_shortenings};
 use crate::images::{
@@ -683,6 +684,18 @@ fn prompt_cache_key(conversation_id: &str) -> String {
     digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
+/// The effort the run's context names ([`REASONING_EFFORT_CONTEXT_KEY`]): the `effort` member of
+/// `{"effort": "<level>"}`. A value of another shape, or a word that is not a level, is ignored:
+/// the A2A front refuses it before the message is written (ADR 0063).
+fn context_effort(context: Option<&Arc<Map<String, Value>>>) -> Option<ReasoningEffort> {
+    context?
+        .get(REASONING_EFFORT_CONTEXT_KEY)?
+        .get("effort")?
+        .as_str()?
+        .parse()
+        .ok()
+}
+
 /// What a turn that a cancel ended says. The run is `Failed` with the reason the canceller gave
 /// (`cancelled: <reason>`, written by `Runtime::cancel`); this text is only ever dropped with the
 /// commit that carries it, and shows up in logs.
@@ -1008,6 +1021,7 @@ pub struct LlmAgentBuilder {
     session_reports: bool,
     max_parallel: usize,
     tool_retry: BTreeMap<String, RetryPolicy>,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -1189,6 +1203,17 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// The reasoning effort every model call of this agent asks for unless the run's context names
+    /// one ([`REASONING_EFFORT_CONTEXT_KEY`], ADR 0063): what an agent folder, its `model_preset`
+    /// or its model profile resolves to. `None` (the default) sends nothing, which is the model's
+    /// own default and may reason. The loop sets it on the request of each turn, never on the
+    /// summary call.
+    #[must_use]
+    pub fn reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
     /// How the step of a tool call reports what the tool was given and what it answered: the
     /// arguments on the report that starts the step, the result (or the error) on the one that ends
     /// it, each scrubbed by [`StepIo::redact`] and then cut to the contract's bounds (4 KiB in, 8 KiB
@@ -1318,6 +1343,7 @@ impl LlmAgentBuilder {
             session_reports: self.session_reports,
             max_parallel: self.max_parallel,
             tool_retry: self.tool_retry,
+            reasoning_effort: self.reasoning_effort,
             images_cache: Arc::new(Mutex::new(ImageCache::new())),
             run_chars: Arc::new(Mutex::new(RunChars::default())),
         }
@@ -1492,6 +1518,9 @@ pub struct LlmAgent {
     max_parallel: usize,
     /// The retry policies set per tool by name ([`LlmAgentBuilder::tool_retry`]).
     tool_retry: BTreeMap<String, RetryPolicy>,
+    /// The effort every turn asks for unless the run's context names one
+    /// ([`LlmAgentBuilder::reasoning_effort`]).
+    reasoning_effort: Option<ReasoningEffort>,
     /// The bytes of the images already read and checked, by SHA-256, shared by every run of this
     /// agent: a turn reads an image file once, not once per model call.
     images_cache: Arc<Mutex<ImageCache>>,
@@ -1586,6 +1615,7 @@ impl LlmAgent {
             session_reports: true,
             max_parallel: DEFAULT_MAX_PARALLEL,
             tool_retry: BTreeMap::new(),
+            reasoning_effort: None,
         }
     }
 
@@ -2000,6 +2030,8 @@ impl LlmAgent {
         }
         request.max_output_tokens =
             (self.limits.max_output_tokens > 0).then_some(self.limits.max_output_tokens);
+        // What the newest message activated wins over the agent's resolved default (ADR 0063).
+        request.reasoning_effort = context_effort(context).or(self.reasoning_effort);
 
         let model = self.model.clone();
         let sources = self.sources.clone();
@@ -2628,6 +2660,9 @@ impl LlmAgent {
         request.prompt_cache_key = ctx.conversation_id().map(prompt_cache_key);
         request.run = Some(model_run(state, ctx).to_string());
         request.max_output_tokens = Some(SUMMARY_OUTPUT_TOKENS);
+        // A summary is not a reasoning choice: it asks for no level, whatever the run or the agent
+        // set (ADR 0063, decision 6).
+        request.reasoning_effort = None;
         let model = self.model.clone();
         let ordered = self.max_parallel > 1;
         let sources = self.sources.clone();

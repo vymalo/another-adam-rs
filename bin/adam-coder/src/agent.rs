@@ -276,6 +276,33 @@ impl CoderAgent {
         env: Arc<ToolEnv>,
         tools: impl IntoIterator<Item = DynTool>,
     ) -> Result<Self, Box<AssemblyError>> {
+        Self::try_from_def_with_profiles(
+            def,
+            model,
+            model_alias,
+            adam_model::ModelProfiles::default(),
+            env,
+            tools,
+        )
+    }
+
+    /// [`try_from_def`](Self::try_from_def) with the deployment's per-model profiles
+    /// (`MODEL_ALIASES_FILE`, ADR 0063/0064): the folder's `reasoning_effort` and `model_preset`
+    /// resolve against the profile of the model the coder uses, and a value the model does not take
+    /// is a bind error naming the agent.
+    ///
+    /// # Errors
+    ///
+    /// As [`try_from_def`](Self::try_from_def), and `adam::AssemblyError::ReasoningEffort` for a
+    /// level the model does not take.
+    pub fn try_from_def_with_profiles(
+        def: AgentDef,
+        model: DynModel,
+        model_alias: impl Into<String>,
+        profiles: adam_model::ModelProfiles,
+        env: Arc<ToolEnv>,
+        tools: impl IntoIterator<Item = DynTool>,
+    ) -> Result<Self, Box<AssemblyError>> {
         // The budget of scratch work is told to the model when the folder's prompt has a place for
         // it (the shipped one does). A folder written before it existed does not, and a var the
         // folder does not declare is an error: it keeps working, and the tool says the limit when
@@ -361,7 +388,7 @@ impl CoderAgent {
             Some(found) => bound.state(found),
             None => bound,
         };
-        let assembly = bound.model(model, model_alias)?;
+        let assembly = bound.model_profiles(profiles).model(model, model_alias)?;
         Ok(Self { assembly, env })
     }
 
