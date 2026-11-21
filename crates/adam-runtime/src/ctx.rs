@@ -401,18 +401,49 @@ impl Ctx {
     /// Race `contenders`, run at the same time, as one journaled step `name`: the first `Ok` to
     /// finish wins ([ADR 0062](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0062-a-race-of-steps-records-its-winner.md)).
     ///
-    /// The step records the winner's index and value, `Ok((index, value))`, or, when every
-    /// contender failed, their errors in contender order, `Err(errors)`. An `Err` does not end the
-    /// race while another contender runs. Each contender is given its own child of the run's cancel
-    /// token: when a winner is found, the others' tokens fire and their futures are dropped. A
-    /// replay returns the record without running any contender, so the winner is the same every
-    /// time. The contract is otherwise [`step`](Self::step)'s: the effect is at-least-once until the
-    /// outcome is recorded, and a transient retry of the transition races afresh.
+    /// The step records the winner's index and value, `Ok((index, value))` (an `ok` entry whose
+    /// payload is `[index, value]`), or, when every contender failed, their errors in contender
+    /// order, `Err(errors)` (an entry that is not `ok`, payload `[e0, e1, ...]`). An `Err` does not
+    /// end the race while another contender runs. Contenders are started as the race is first
+    /// polled, in order: one that wins at once may leave later ones never started.
+    ///
+    /// Each contender is given its own child of the run's cancel token. When the race ends, by a
+    /// winner, by every error, or by a panic or a caller that drops it, every token but the winner's
+    /// fires (those of contenders that already failed too), and then their futures are dropped: work
+    /// a contender spawned stops by watching its token. A replay returns the record without running
+    /// any contender, so the winner is the same every time; the **count and the order of the
+    /// contenders** are part of the replay, as a step's name is. The contract is otherwise
+    /// [`step`](Self::step)'s: the effect is at-least-once until the outcome is recorded, and a
+    /// transient retry of the transition races afresh.
+    ///
+    /// Contenders of different code are boxed to one type, `Box<dyn FnOnce(CancelToken) ->
+    /// BoxFuture<'_, Result<T, E>> + Send>`. A race that every contender lost is the agent's to
+    /// decide: to retry it, return `AgentError::from_classified(error, ..).with_retry(key, policy)`
+    /// for one of its errors (ADR 0061), and the transition races afresh.
+    ///
+    /// ```no_run
+    /// # use adam_runtime::{AgentError, CancelToken, Ctx};
+    /// # use futures::future::{BoxFuture, FutureExt};
+    /// # async fn example(ctx: &mut Ctx) -> Result<(), AgentError> {
+    /// type Contender = Box<dyn FnOnce(CancelToken) -> BoxFuture<'static, Result<String, String>> + Send>;
+    /// let mirrors: Vec<Contender> = vec![
+    ///     Box::new(|_token| async { Ok("from a".to_owned()) }.boxed()),
+    ///     Box::new(|token| async move {
+    ///         token.cancelled().await;
+    ///         Err("b stopped".to_owned())
+    ///     }.boxed()),
+    /// ];
+    /// let fetched = ctx.step_race("fetch", mirrors).await?;
+    /// # let _ = fetched;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
-    /// As [`step`](Self::step), and [`AgentError::Permanent`] for a race with no contender, before
-    /// anything is journaled.
+    /// As [`step`](Self::step); [`AgentError::Permanent`] for a race with no contender, before
+    /// anything is journaled; [`AgentError::NonDeterminism`] for a record that names a contender
+    /// the code no longer has, or holds another number of errors than it has contenders.
     pub async fn step_race<T, E, F, Fut>(
         &mut self,
         name: &str,
@@ -429,8 +460,22 @@ impl Ctx {
                 "the race `{name}` has no contender"
             )));
         }
+        let n = contenders.len();
         let parent = self.cancel.clone();
-        self.step(name, move || race(parent, contenders)).await
+        let raced = self.step(name, move || race(parent, contenders)).await?;
+        // The count and the order of the contenders are part of the replay, as a step's name is: a
+        // record for other contenders names a winner, or holds errors, these do not have.
+        let fits = match &raced {
+            Ok((index, _)) => *index < n,
+            Err(errors) => errors.len() == n,
+        };
+        if !fits {
+            return Err(AgentError::non_determinism(format!(
+                "run {} race {name:?}: the record is for other contenders than the {n} the code races",
+                self.run
+            )));
+        }
+        Ok(raced)
     }
 
     /// What the journal holds at `seq`, for the step `name`: `None` when nothing is recorded yet.
@@ -709,21 +754,40 @@ where
         .enumerate()
         .map(|(i, (contender, token))| async move { (i, contender(token).await) })
         .collect();
-    let mut errors: Vec<Option<E>> = (0..tokens.len()).map(|_| None).collect();
+    // Declared after `running`, so it is dropped first: the tokens fire before the futures are
+    // dropped, however the race ends (a winner, every error, a panic that unwinds, a caller that
+    // drops the race).
+    let mut losers = Losers {
+        tokens,
+        winner: None,
+    };
+    let mut errors: Vec<Option<E>> = (0..losers.tokens.len()).map(|_| None).collect();
     while let Some((i, outcome)) = running.next().await {
         match outcome {
             Ok(value) => {
-                for (j, token) in tokens.iter().enumerate() {
-                    if j != i {
-                        token.cancel();
-                    }
-                }
+                losers.winner = Some(i);
                 return Ok((i, value));
             }
             Err(e) => errors[i] = Some(e),
         }
     }
     Err(errors.into_iter().flatten().collect())
+}
+
+/// The contenders' tokens: on drop, every one but the winner's fires.
+struct Losers {
+    tokens: Vec<CancelToken>,
+    winner: Option<usize>,
+}
+
+impl Drop for Losers {
+    fn drop(&mut self) {
+        for (j, token) in self.tokens.iter().enumerate() {
+            if Some(j) != self.winner {
+                token.cancel();
+            }
+        }
+    }
 }
 
 /// A step whose seq [`Ctx::reserve_steps`] took: owned, so several can run at the same time while

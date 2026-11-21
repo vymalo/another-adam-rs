@@ -642,7 +642,6 @@ reserves their seqs first and runs them after:
 Because the names and seqs depend only on the order of the reservation, the journal of a batch equals the one a
 sequential run writes, so a replay works whatever concurrency each side used.
 
-
 ### A race of steps
 
 `Ctx::step_race(name, contenders)` ([ADR 0062](../../docs/decisions/0062-a-race-of-steps-records-its-winner.md)) runs its
@@ -650,11 +649,15 @@ contenders at the same time as **one** journaled step `name`, and the first `Ok`
 `Ok((index, value))`, or `Err(errors)` in contender order when every one failed (an `Err` does not end the race while
 another runs). Each contender is a `FnOnce(CancelToken) -> Future` given its own child of the run's cancel token;
 when a winner is found the others' tokens fire and their futures are dropped. The record names the winner, so a
-replay returns it and runs no contender. The effect is at-least-once until the record lands, as for any step, and a
+replay returns it and runs no contender; the count and the order of the contenders are part of the replay (a record
+for others is `NonDeterminism`). The tokens fire however the race ends, a panic or a dropped race included, before
+the futures are dropped. A contender that wins at once may leave later ones never started. The effect is at-least-once until the record lands, as for any step, and a
 transient retry races afresh. A race with no contender fails the run before anything is journaled. Tests: the
 suite's `a_race_is_won_by_the_first_success_and_the_losers_are_stopped`,
-`a_race_with_no_winner_records_every_error_in_order`, `a_recorded_race_returns_its_winner_and_runs_nobody` and
-`a_race_with_no_contender_fails_the_run`.
+`a_race_with_no_winner_records_every_error_in_order`, `a_recorded_race_returns_its_winner_and_runs_nobody`,
+`a_race_with_no_contender_fails_the_run`, `a_race_recorded_for_other_contenders_fails_the_run` and
+`a_panicking_contender_still_stops_the_others`.
+
 ## Features and environment
 
 No Cargo features, no environment variables at runtime.

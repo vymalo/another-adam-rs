@@ -2291,6 +2291,121 @@ mod cases {
         assert_eq!(count(&runs), 0, "no contender ran");
     }
 
+    /// A record for other contenders than the code races is a non-deterministic replay: an index
+    /// it no longer has, or another number of errors (ADR 0062).
+    pub async fn a_race_recorded_for_other_contenders_fails_the_run(store: DynStore) {
+        for (entry, what) in [
+            (
+                JournalEntry::ok(0, "race", json!([5, "x"])),
+                "an index out of range",
+            ),
+            (
+                JournalEntry::err(0, "race", json!(["only one"])),
+                "one error for two",
+            ),
+        ] {
+            let name = uniq("race-other");
+            let runs = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let agent = racing(&name, {
+                let (runs, stop) = (runs.clone(), stop.clone());
+                Arc::new(move || {
+                    vec![
+                        contender(Ok("a"), 0, &runs, &stop),
+                        contender(Ok("b"), 0, &runs, &stop),
+                    ]
+                })
+            });
+            let rt = runtime(&store, &agent);
+            let run = rt.start(&name, inbound(), None).await.expect("start");
+            store.journal_put(run, entry).await.expect("seed journal");
+            let worker = spawn_worker(&rt);
+            let failed = wait_failed(&rt, run).await;
+            worker.stop().await;
+            let error = failed.error.expect("error");
+            assert!(
+                error.contains("non-deterministic replay") && error.contains("other contenders"),
+                "{what}: {error}"
+            );
+            assert_eq!(count(&runs), 0, "{what}: no contender ran");
+        }
+    }
+
+    /// A contender that panics ends the race, and the others' tokens still fire, before their
+    /// futures are dropped: what they spawned stops (ADR 0062).
+    pub async fn a_panicking_contender_still_stops_the_others(store: DynStore) {
+        /// Asserts, as it is dropped, that its token fired first.
+        struct FiredFirst(adam_runtime::CancelToken, Arc<AtomicBool>);
+        impl Drop for FiredFirst {
+            fn drop(&mut self) {
+                self.1.store(self.0.is_cancelled(), SeqCst);
+            }
+        }
+        let name = uniq("race-panic");
+        let fired_before_drop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let (fired_before_drop, stopped) = (fired_before_drop.clone(), stopped.clone());
+                move |ctx, state| {
+                    let (fired_before_drop, stopped) = (fired_before_drop.clone(), stopped.clone());
+                    async move {
+                        if ctx.attempt() > 0 {
+                            return Ok(Transition::Done {
+                                state,
+                                output: json!("after the panic"),
+                            });
+                        }
+                        let contenders: Vec<Contender> = vec![
+                            Box::new(|_token| {
+                                async {
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                    panic!("a contender panics");
+                                }
+                                .boxed()
+                            }),
+                            Box::new(move |token: adam_runtime::CancelToken| {
+                                let watch = token.clone();
+                                tokio::spawn(async move {
+                                    watch.cancelled().await;
+                                    stopped.store(true, SeqCst);
+                                });
+                                let guard = FiredFirst(token, fired_before_drop);
+                                async move {
+                                    let _guard = guard;
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                    Ok("slow".to_owned())
+                                }
+                                .boxed()
+                            }),
+                        ];
+                        let _: Result<(usize, String), Vec<String>> =
+                            ctx.step_race("race", contenders).await?;
+                        Err(AgentError::permanent("the race should not end"))
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let rt = builder(&store, &uniq("w"), &agent)
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(5), Duration::from_millis(5)),
+            )
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!("after the panic")));
+        wait_until("the loser's spawned work stops", || stopped.load(SeqCst)).await;
+        assert!(
+            fired_before_drop.load(SeqCst),
+            "the token fires before the future is dropped"
+        );
+    }
+
     /// A race with no contender is the code's mistake: the run fails and nothing is journaled.
     pub async fn a_race_with_no_contender_fails_the_run(store: DynStore) {
         let name = uniq("race-empty");
@@ -8073,6 +8188,8 @@ macro_rules! runtime_suite {
                 a_race_with_no_winner_records_every_error_in_order,
                 a_recorded_race_returns_its_winner_and_runs_nobody,
                 a_race_with_no_contender_fails_the_run,
+                a_race_recorded_for_other_contenders_fails_the_run,
+                a_panicking_contender_still_stops_the_others,
                 journal_seq_spans_transitions,
                 ctx_accessors,
                 cancel_parked,
