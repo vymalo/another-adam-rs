@@ -799,6 +799,20 @@ impl ModelConfig {
         let alias = required("MODEL");
         let (device, device_grant) = parse_device_grant(lookup, problems);
         let injected_run = is_injector(lookup);
+        if injected_run {
+            // The injector signs nothing in: a device-grant setting beside it is a contradiction.
+            for name in [
+                "MODEL_OAUTH_ISSUER",
+                "MODEL_OAUTH_CLIENT_ID",
+                "MODEL_OAUTH_SCOPE",
+            ] {
+                if not_blank(lookup, name).is_some() {
+                    problems.push(format!(
+                        "{name} is for MODEL_AUTH=device: unset it with MODEL_AUTH=injector"
+                    ));
+                }
+            }
+        }
         let keyless = device || injected_run;
         let api_key = match (lookup("MODEL_API_KEY"), keyless) {
             (Some(v), false) => v,
@@ -2433,6 +2447,20 @@ mod tests {
         );
         let error = ConfigError::check(problems).unwrap_err();
         assert_eq!(crate::exit_code(&error), 78);
+        // A device-grant setting beside the injector is a contradiction, named, and exit 78.
+        vars.insert("MODEL_API_KEY", "");
+        for name in [
+            "MODEL_OAUTH_ISSUER",
+            "MODEL_OAUTH_CLIENT_ID",
+            "MODEL_OAUTH_SCOPE",
+        ] {
+            let mut with = vars.clone();
+            with.insert(name, "https://id.example.test");
+            let (_, problems) = model_problems(&with);
+            assert!(mentions(&problems, name), "{name}: {problems:?}");
+            let error = ConfigError::check(problems).unwrap_err();
+            assert_eq!(crate::exit_code(&error), 78);
+        }
         // `key`, the default, is not the injector.
         vars.insert("MODEL_AUTH", "key");
         assert!(!model_problems(&vars).0.injected_run);
