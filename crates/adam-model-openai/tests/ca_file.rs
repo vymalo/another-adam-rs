@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use adam_model::{Message, ModelClient, ModelRequest};
-use adam_model_openai::{ExtraRoots, OpenAiCompatible, OpenAiConfig, OpenAiConfigError};
+use adam_model_openai::{
+    ExtraRoots, MAX_CA_FILE_BYTES, OpenAiCompatible, OpenAiConfig, OpenAiConfigError,
+};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use secrecy::SecretString;
@@ -138,7 +140,7 @@ async fn the_endpoint_is_reached_only_with_the_ca() {
 #[test]
 fn a_file_that_cannot_be_used_is_refused() {
     let invalid = |e: Result<ExtraRoots, OpenAiConfigError>| match e {
-        Err(OpenAiConfigError::InvalidCaFile(reason)) => reason,
+        Err(OpenAiConfigError::InvalidCaFile { reason, .. }) => reason,
         other => panic!("expected InvalidCaFile, got {other:?}"),
     };
     let reason = invalid(ExtraRoots::read(&fixture("no-such-file.pem")));
@@ -166,4 +168,28 @@ fn a_file_that_cannot_be_used_is_refused() {
     }
     let roots = ExtraRoots::read(&fixture("test-ca.pem")).unwrap();
     assert_eq!(format!("{roots:?}"), "ExtraRoots(1)");
+
+    // The cause is kept: a file that cannot be read says the reader's error.
+    let err = ExtraRoots::read(&fixture("no-such-file.pem")).unwrap_err();
+    assert!(std::error::Error::source(&err).is_some(), "{err:?}");
+
+    // Over 1 MiB is no bundle of roots: refused before it is read whole.
+    let dir = std::env::temp_dir().join(format!("adam-ca-file-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let big = dir.join("big.pem");
+    let mut pem = std::fs::read(fixture("test-ca.pem")).unwrap();
+    pem.resize(usize::try_from(MAX_CA_FILE_BYTES).unwrap() + 1, b'\n');
+    std::fs::write(&big, &pem).unwrap();
+    assert!(matches!(
+        ExtraRoots::read(&big),
+        Err(OpenAiConfigError::CaFileTooLarge { limit }) if limit == MAX_CA_FILE_BYTES
+    ));
+    pem.truncate(usize::try_from(MAX_CA_FILE_BYTES).unwrap());
+    std::fs::write(&big, &pem).unwrap();
+    assert_eq!(
+        ExtraRoots::read(&big).unwrap().len(),
+        1,
+        "exactly the cap is read"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

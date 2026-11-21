@@ -22,7 +22,7 @@ never see this crate's types. Retries are not done here: failures map onto
 | `ReasoningField` | `ReasoningContent` (`reasoning_content`) or `Reasoning` (`reasoning`): the member that carries reasoning when a client echoes it |
 | `MaxTokensField` | `MaxTokens` (default) or `MaxCompletionTokens`, for models that want the newer field name |
 | `ExtraRoots`, `OpenAiCompatible::with_extra_roots(&roots)` | `MODEL_CA_FILE` ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md) decision 9): `ExtraRoots::read(path)` or `from_pem(bytes)` reads a PEM bundle and checks it with the TLS backend (a file that cannot be read, is not PEM, holds no certificate or one the backend refuses is `InvalidCaFile`); `with_extra_roots` builds the client again trusting them **beside** the default roots, for the model endpoint only. `Debug` says how many |
-| `OpenAiConfigError` | invalid configuration: `InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `ReservedBodyKey`, `InvalidCaFile` (new; the enum is `#[non_exhaustive]`), `Client`; see *Errors* |
+| `OpenAiConfigError` | invalid configuration: `InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `ReservedBodyKey`, `InvalidCaFile { reason, source }`, `CaFileTooLarge { limit }` (a file over `MAX_CA_FILE_BYTES`, 1 MiB, not read past it), `CredentialHeader` (an `extra_headers` entry named `authorization` or `proxy-authorization`), `Client`; the last four are new and the enum is `#[non_exhaustive]`; see *Errors* |
 
 ```rust
 use std::sync::Arc;
@@ -164,7 +164,8 @@ An error object inside a `200` or a stream is `RateLimited` for a
 for `invalid_request` or `authentication`, and `Transient` for anything else.
 
 `OpenAiConfigError` (from `OpenAiCompatible::new`, `with_extra_body`, `with_extra_roots` and `ExtraRoots`) is `Invalid` for
-`InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `ReservedBodyKey` and `InvalidCaFile`, and `Internal` for
+`InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `ReservedBodyKey`, `InvalidCaFile` (its reader's or TLS backend's
+error is its `source`), `CaFileTooLarge` and `CredentialHeader`, and `Internal` for
 `Client` (the HTTP client could not be built; the `reqwest` error is its
 `source`). No message carries the URL, the header value or the key.
 
@@ -177,8 +178,8 @@ of use, prove it over the request, or send a run's tag with no key.
 * The provider is told the method (`POST`), the full URL, the attempt and the request's `run` (`ModelRequest::run`), on the
   first try and on the retry after a 401, for a completion and a stream alike. With `adam_model::InjectedRun` the call
   carries `X-Run-Id` and no `Authorization`: the key of the `OpenAiConfig` is replaced, and a call with no run sends nothing.
-  `extra_headers` are still sent as configured, so a host that uses the injector sets no `authorization` there
-  (`adam-service` has no variable for them). Its headers are sent as sensitive values and
+  No `extra_headers` entry may carry a credential: `authorization` and `proxy-authorization` (any case) are refused
+  when the client is built (`CredentialHeader`), so nothing but the provider sends one. Its headers are sent as sensitive values and
   replace any of the same name; `content-type`, `content-length`, `accept`, `host` and `transfer-encoding` are refused, as is
   a value that is no valid header, with `InvalidRequest` (the value is never in the error) and nothing sent.
 * A provider's error is the call's, before anything is sent: its class decides whether the runtime retries.
@@ -197,7 +198,8 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
   tool calls, error mapping and classes, timeouts, source chains, reasoning in a stream and a completion, the extra body on every request, reasoning sent back only when echoed). Always
   runs, no network.
 * Unit tests: `src/errors.rs` (`status_mapping`), `src/lib.rs`
-  (`config_error_class_table`, `debug_shows_the_gateway_by_scheme_and_host_only`,
+  (`config_error_class_table`, `bad_headers_and_keys_are_rejected`, which refuses a credential in `extra_headers`,
+  `debug_shows_the_gateway_by_scheme_and_host_only`,
   `the_provider_is_openai_and_a_window_is_said_for_its_alias_only`) and `src/wire.rs` (the request shape, including several text parts
   sent as one string; the usage parts of a completion and of a stream's last chunk, absent ones, and reasoning beside a smaller
   completion count; made-up ids for calls with none: random, distinct, the same in the stream and the message).
@@ -210,7 +212,9 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
 * `tests/ca_file.rs`: a TLS server on the loopback (rustls, a test CA and a server certificate for `localhost` and
   `127.0.0.1` in `tests/fixtures/`, valid until 2126, signing nothing else) is refused with the default roots, nothing
   reaching it, and answers once the client trusts the CA with `with_extra_roots`; a missing file, an empty one, a key, bad
-  base64 and a block that is no certificate are each `InvalidCaFile`. Always runs.
+  base64 and a block that is no certificate are each `InvalidCaFile`, with the cause kept as the source; a file over 1 MiB
+  is `CaFileTooLarge` and one of exactly 1 MiB is read. Always runs. The fixtures are test only: `tests/fixtures/README.md`
+  says how to make them again.
 * `tests/wiremock_compose.rs`: the client against the `mock-openai` WireMock of `compose.yaml` (text and tool-call answers,
   streamed or not, the error scenarios), and **every scripted model** (`mock-coder`, `mock-assistant`, `mock-researcher`, `mock-painter`)
   played from its first request to its final answer both as a completion and as a stream, which must say the same, with the
