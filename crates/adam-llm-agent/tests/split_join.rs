@@ -244,3 +244,14 @@ fn the_starter_delegates_to_the_conversation() {
         "the starter's join is the conversation's"
     );
 }
+
+#[test]
+fn the_thinking_cut_count_survives_the_round_trip() {
+    let mut state = Conversation::new("hello");
+    state.thinking_cuts = 2;
+    let (head, rows) = state.split();
+    assert_eq!(head.thinking_cuts, 2, "the head keeps the count");
+    let joined = Conversation::join(head, rows).unwrap();
+    assert_eq!(joined.thinking_cuts, 2);
+    assert_round_trips(&state);
+}

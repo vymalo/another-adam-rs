@@ -139,11 +139,26 @@ jobs:
       - run: tools/embedded-deps/check.sh
       - run: tools/embedded-deps/check.sh self-test
 
+  # ADR 0053 decision 2: an application that keeps its own state on cratestack links one sqlite3.
+  # The probe resolves `adam-store-sqlite` together with `cratestack-sqlite` and asserts one
+  # `rusqlite` and one `libsqlite3-sys`; its own workspace keeps cratestack (Rust 1.98) out of the
+  # main lockfile, and its test builds neither side.
+  sqlite-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/sqlite-probe
+      - run: cargo test --manifest-path tools/sqlite-probe/Cargo.toml --locked
+
   # The required check. It compiles nothing: it fails unless every job above passed, so a clippy, doctest or
-  # rustdoc or embedded-set error cannot merge on a green `lint`. The six jobs are extra checks, not required ones.
+  # rustdoc or embedded-set error cannot merge on a green `lint`. The jobs above are extra checks, not required ones.
   lint:
     name: lint
-    needs: [fmt, clippy-default, clippy-features, doctest-default, doctest-features, rustdoc, embedded]
+    needs: [fmt, clippy-default, clippy-features, doctest-default, doctest-features, rustdoc, embedded, sqlite-probe]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -158,7 +173,8 @@ jobs:
             "doctest-default=${{ needs['doctest-default'].result }}" \
             "doctest-features=${{ needs['doctest-features'].result }}" \
             "rustdoc=${{ needs.rustdoc.result }}" \
-            "embedded=${{ needs.embedded.result }}"
+            "embedded=${{ needs.embedded.result }}" \
+            "sqlite-probe=${{ needs['sqlite-probe'].result }}"
           do
             name=${pair%%=*}
             result=${pair#*=}

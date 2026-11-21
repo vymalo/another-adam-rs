@@ -1991,6 +1991,68 @@ async fn an_empty_stop_after_work_does_not_ask_for_the_repository(store: DynStor
     );
 }
 
+/// A turn that reached the output limit while thinking is no answer: the loop continues it, so the
+/// coder never reads it as an empty stop.
+async fn a_turn_cut_while_thinking_is_continued_and_never_asks(store: DynStore) {
+    let fx = Fixture::new().await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_response(thinking_only_cut())
+        .push_text("Nothing to change here.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let seen = run_to_end(&server, &format!("Look at {}", fx.remote_url())).await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        seen.labels
+    );
+    assert!(
+        !seen.saw_message("What would you like me to do next?"),
+        "{:#?}",
+        seen.messages
+    );
+    assert_eq!(mock.requests().len(), 2);
+}
+
+/// Turns cut while thinking, past the bound, fail the run: not an answer, not a question.
+async fn turns_cut_while_thinking_past_the_bound_fail_the_coder_run(store: DynStore) {
+    let fx = Fixture::new().await;
+    let mock = Arc::new(MockModel::new());
+    for _ in 0..=adam_llm_agent::MAX_THINKING_CUTS {
+        mock.push_response(thinking_only_cut());
+    }
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let seen = run_to_end(&server, &format!("Look at {}", fx.remote_url())).await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Failed),
+        "{:?}",
+        seen.labels
+    );
+    assert!(
+        seen.saw_message("output limit reached while thinking"),
+        "{:#?}",
+        seen.messages
+    );
+    assert_eq!(
+        mock.requests().len(),
+        adam_llm_agent::MAX_THINKING_CUTS as usize + 1,
+        "one request per cut, and none after the bound"
+    );
+}
+
+fn thinking_only_cut() -> ModelResponse {
+    ModelResponse {
+        finish: adam_model::FinishReason::Length,
+        reasoning: Some("thinking".into()),
+        ..ModelResponse::text("")
+    }
+}
+
 /// Red checks do not fail a run that has check cycles left: the model's text is a question like
 /// any other. (At the limit the run fails: `red_checks_n_times_fail_the_run_with_the_findings`.)
 async fn red_checks_with_cycles_left_then_text_is_a_question(store: DynStore) {
@@ -5483,6 +5545,8 @@ macro_rules! coder_suite {
                 the_environment_is_sealed_when_a_project_is_started_and_when_one_is_taken_over,
                 a_stop_without_text_asks_what_to_do,
                 an_empty_stop_after_work_does_not_ask_for_the_repository,
+                a_turn_cut_while_thinking_is_continued_and_never_asks,
+                turns_cut_while_thinking_past_the_bound_fail_the_coder_run,
                 red_checks_with_cycles_left_then_text_is_a_question,
                 a_repository_in_quoted_findings_is_not_named,
                 checks_without_a_pull_request_then_text_is_a_question,

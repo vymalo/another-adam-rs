@@ -165,7 +165,8 @@ pub use access::{ToolAccess, Use, UseMode, path_scope};
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{
     BuildError, CLOSING_TURN, DEFAULT_MAX_PARALLEL, DEFAULT_WAIT_POLL, Limits, LlmAgent,
-    LlmAgentBuilder, LlmStarter, MAX_PARALLEL_LIMIT, UNATTENDED, is_unattended, tool_retry_key,
+    LlmAgentBuilder, LlmStarter, MAX_PARALLEL_LIMIT, MAX_THINKING_CUTS, THINKING_CUT_TURN,
+    UNATTENDED, is_unattended, tool_retry_key,
 };
 pub use compaction::{COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize};
 pub use conversation::{

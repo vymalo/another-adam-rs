@@ -1,0 +1,19 @@
+[package]
+name = "adam-sqlite-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+rust-version = "1.98"
+
+# A workspace of its own: the probe must resolve `adam-store-sqlite` and cratestack's SQLite
+# runtime together without putting cratestack (and its Rust 1.98 floor) in the main lockfile.
+[workspace]
+
+[dependencies]
+# Optional, so `cargo test` does not build either: the test asks `cargo tree --features probe` to
+# resolve both, which is the whole assertion.
+adam-store-sqlite = { path = "../../crates/adam-store-sqlite", optional = true }
+cratestack-sqlite = { version = "0.20.4", optional = true }
+
+[features]
+probe = ["dep:adam-store-sqlite", "dep:cratestack-sqlite"]

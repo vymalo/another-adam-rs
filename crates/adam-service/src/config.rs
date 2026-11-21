@@ -3,7 +3,7 @@
 //! | Variable | Meaning | Default |
 //! |---|---|---|
 //! | `ROLE` | what this process runs: `all`, `control-plane` or `worker` ([`adam_host::Role`]) | `all` |
-//! | `DATABASE_URL` | Postgres for the run store (`adam-store-postgres`) | required |
+//! | `DATABASE_URL` | the run store: `postgres://`/`postgresql://`, `mongodb://`/`mongodb+srv://` or `sqlite://<path>` (one file, one process; `ROLE=all` only) | required |
 //! | `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0`: keep this process's run events local, without `NOTIFY` (one process; `ROLE=all`, one pod); signals still cross. Never detected ([`ServiceConfig::notify_local_only`]) | `false` |
 //! | `A2A_BEARER_TOKENS` | comma-separated tokens accepted by the A2A server | required for `all` and `control-plane`, non-empty (fail closed) |
 //! | `PUBLIC_URL` | URL clients reach the JSON-RPC endpoint at (agent card) | required for `all` and `control-plane` |
