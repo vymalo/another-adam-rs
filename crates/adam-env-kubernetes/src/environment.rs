@@ -856,15 +856,6 @@ impl Environment for KubeEnvironment {
         Ok(runs)
     }
 
-    /// Delete the run's pod: the next `ensure` makes a new one from the template. There is no
-    /// repository file to ignore (the template is the deployment's), so `use_default` changes
-    /// nothing.
-    async fn rebuild(&self, run: &str, use_default: bool) -> Result<bool, EnvError> {
-        let _ = use_default;
-        self.release(run).await?;
-        Ok(true)
-    }
-
     /// Record the image the run chose (`use_repository_environment`, ADR 0052): the next `ensure`
     /// makes the pod again when the pod that is there runs another one. The pod's annotation is the
     /// record, so a coder that restarts reads the choice back from it; this process remembers it

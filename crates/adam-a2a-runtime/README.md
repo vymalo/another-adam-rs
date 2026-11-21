@@ -452,7 +452,8 @@ totals (when the task ends or waits, cumulative, for every reader):
 ```
 
 One entry per shape (at most 8), whole numbers of at most `MAX_TOKEN_COUNT`; a request the pod does not make is left out of the entry.
-`"environment": "local"` and `"devcontainer"` have **no `usage`**: the commands were not measured, which is not zero; `"usage": []` is a
+`"environment": "local"` has **no `usage`**: the commands were not measured, which is not zero. A report of an older coder may say
+`"devcontainer"`, which reads as `"local"` (ADR 0052), and this coder writes `"local"` from now on; `"usage": []` is a
 pod that was asked for and ran no command. The object is written when there are token totals **or** a sandbox report, and `totals` is
 always in it (`[]` for a run that made no model call), because the orchestrator rejects an object without it. A task whose agent keeps
 neither carries no metadata, and a task with tokens only carries the object it always did, byte for byte.

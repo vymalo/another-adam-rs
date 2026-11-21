@@ -6901,7 +6901,7 @@ async fn share_file_returns_the_file_as_an_artifact_and_tells_the_model_one_line
 }
 
 /// What a command made is shared like what the coder wrote: the workspace is one directory, whatever
-/// runs in it (the repository's devcontainer mounts the same one).
+/// runs in it (a run pod mounts the same one).
 #[tokio::test]
 async fn share_file_shares_what_a_command_produced() {
     let rig = Rig::new().await;

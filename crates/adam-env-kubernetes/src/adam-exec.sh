@@ -1,9 +1,10 @@
 #!/bin/sh
-# adam-exec: starts and stops the processes the coder runs in a devcontainer.
+# adam-exec: starts and stops the processes the coder runs in a run pod.
 #
-# It is written once to <root>/environments/.tools/<version>/adam-exec by adam-devcontainer, mounted
-# read-only at /opt/adam/bin, and called through `devcontainer exec` (run, shell) and `podman exec`
-# (kill, chown). POSIX sh, no tool beyond what a minimal image has (chown, kill, and a /proc).
+# The coder's image carries it at /opt/adam/bin/adam-exec; the chart's init container copies it into
+# an emptyDir that the run container mounts read-only at the same path, and adam-kube-exec calls it
+# through `pods/exec` (run, shell, kill, chown). POSIX sh, no tool beyond what a minimal image has
+# (chown, kill, and a /proc).
 #
 #   adam-exec run   <id> <cwd> :<program> [:<arg>...]   run a program in cwd
 #   adam-exec shell <id> <cwd> :<command line>           run a command line in a login shell
@@ -13,22 +14,22 @@
 #   adam-exec active-fg                                  the same, without the commands whose id starts with `bg-`
 #
 # `active` is for adam-env-kubernetes, which deletes a run's pod when no command used it for a while
-# and must not do so under a build that is still running (a devcontainer is removed with its run, and
-# never asks). `active-fg` is for the other question it asks, whether the pod may be made again for a
-# slot it does not mount: a command the run started to keep running (a development server, id
-# `bg-...`) keeps the pod from the idle sweep, and never from a new slot (the pod is made again and the
-# server ends with it). An older adam-exec has no `active-fg` and fails with the usage line: the caller
-# then asks `active`, as it did before, and every command holds the pod.
+# and must not do so under a build that is still running. `active-fg` is for the other question it
+# asks, whether the pod may be made again for a slot it does not mount: a command the run started to
+# keep running (a development server, id `bg-...`) keeps the pod from the idle sweep, and never from a
+# new slot (the pod is made again and the server ends with it). An older adam-exec has no `active-fg`
+# and fails with the usage line: the caller then asks `active`, as it did before, and every command
+# holds the pod.
 #
-# Every word of the command after <cwd> carries a leading ":" that is removed here. The devcontainer
-# CLI reads its command line with an option parser, which would take an argument such as "--version"
-# or "-c" for one of its own; a word that does not start with "-" is left alone.
+# Every word of the command after <cwd> carries a leading ":" that is removed here. The caller's
+# command line is parsed by `pods/exec`, which takes an argument such as "--version" or "-c" for one
+# of its own; a word that does not start with "-" is left alone.
 #
 # `run` and `shell` record the process (its id, and its start time, so that a pid that was reused
 # is never mistaken for it) in $ADAM_EXEC_DIR (default /tmp/adam-exec) and become the command. `kill`
 # stops that process and all of its descendants, found through the parent ids of /proc, which is
-# the container's own (a container has its own process namespace). Killing the `devcontainer exec`
-# client does not stop what it started inside the container; this does.
+# the container's own (a container has its own process namespace). Closing the `adam-kube-exec`
+# client does not stop what it started in the pod; this does.
 
 set -u
 

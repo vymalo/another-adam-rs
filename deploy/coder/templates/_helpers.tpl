@@ -208,13 +208,12 @@ command). Renders "true" or nothing, like coder.runsWorkers. ALLOW_COMMANDS_NEXT
 
 {{/*
 Whether a command of a run can read the GitHub App's private key: the pod authenticates as an App, whose key the
-chart always mounts as a file, and the commands run in the coder's own container (no run pods, and no Podman
-devcontainers named in config.extraEnv: the chart sets no DEVCONTAINER_* itself). The chart refuses it unless it is
-accepted, as the coder does (`WorkerConfig::commands_can_read_the_app_key`, bin/adam-coder/src/config.rs). Renders
-"true" or nothing.
+chart always mounts as a file, and the commands run in the coder's own container (no run pods: ADR 0052 removed
+every other place they could run). The chart refuses it unless it is accepted, as the coder does
+(`WorkerConfig::commands_can_read_the_app_key`, bin/adam-coder/src/config.rs). Renders "true" or nothing.
 */}}
 {{- define "coder.commandsReadTheAppKey" -}}
-{{- if and (include "coder.githubApp" .) (not (include "coder.runPods" .)) (ne (lower (trim (toString (get .Values.config.extraEnv "DEVCONTAINER_RUNTIME")))) "podman") -}}true{{- end -}}
+{{- if and (include "coder.githubApp" .) (not (include "coder.runPods" .)) -}}true{{- end -}}
 {{- end -}}
 
 {{/*

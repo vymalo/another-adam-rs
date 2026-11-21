@@ -698,7 +698,7 @@ from the file's own front matter (`{{max_check_cycles}}` and `{{scratch_check_cy
 | Access tiers | left out | adam's access tiers, which the benchmark does not set |
 | How to work | **shared** | how to do the task: find the checks, small steps, verify, fix, commit, open the pull request |
 | Starting without a repository | left out | adam's scratch projects and `publish_scratch`; the benchmark always names a repository |
-| The work environment | left out | adam's devcontainer environment, `rebuild_environment` and the `obscura` browser; OpenCode runs in the task's own container |
+| The work environment | left out | adam's run pod or its own container, `use_repository_environment` and the `obscura` browser; OpenCode runs in the task's own container |
 | A missing toolchain | **shared** | what to do when the environment lacks a toolchain, and when a project tool only needs its dependencies installed |
 | Asking the person | left out | `ask_user` and its forms; OpenCode has another question tool, which the benchmark denies |
 | Questions and conversation | left out | names `run_command` and refers to the left-out "Who you are" section |

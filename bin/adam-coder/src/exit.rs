@@ -233,13 +233,13 @@ mod tests {
         assert_eq!(coded(WorkspaceError::Auth("bad token".into())), 1);
     }
 
-    /// The work environment is the coder's own typed error: an `Io` one (the tools directory that
-    /// every devcontainer mounts cannot be written) is internal, a refusal is the deployment's.
+    /// The work environment is the coder's own typed error: an `Io` one is internal, a refusal is the
+    /// deployment's.
     #[test]
     fn a_work_environment_error_has_the_code_of_its_class() {
         let io = EnvError::from(std::io::Error::other("disk full"));
         let chained = Err::<(), _>(io)
-            .context("writing the tools every devcontainer mounts")
+            .context("making the run's environment")
             .unwrap_err();
         assert_eq!(exit_code(&chained), 70);
         assert_eq!(coded(EnvError::Refused("no".into())), 78);

@@ -1,5 +1,6 @@
-//! `adam-exec`, the script that runs in the container, executed here by `sh` (it needs a `/proc`
-//! and nothing else). The script is the one the crate embeds and mounts.
+//! `adam-exec`, the script that runs in a run pod, executed here by `sh` (it needs a `/proc` and
+//! nothing else). It moved here with ADR 0052: the coder's image copies it into the run pod's
+//! tools directory, and `adam-kube-exec` runs it through `pods/exec`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(target_os = "linux")]
 

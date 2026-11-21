@@ -143,7 +143,6 @@ fn table() -> BTreeMap<&'static str, Cases> {
         "request_repository",
         "create_repository",
         "run_checks",
-        "rebuild_environment",
         "commit_and_push",
         "open_pull_request",
         "merge_pull_request",
