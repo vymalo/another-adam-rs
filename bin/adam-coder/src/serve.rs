@@ -246,7 +246,7 @@ pub fn wire_commands(
 ///
 /// [`Local`](adam_workspace::Local) is the coder's own container, and on a desktop that **is** the
 /// person's work sandbox: adam adds no container inside it. A run pod is a pod of the run's own
-/// ([`kubernetes_environment`]).
+/// (`kubernetes_environment`).
 ///
 /// The orphan sweep is the janitor's: it asks this environment what it holds, at startup and every
 /// `WORKSPACE_SWEEP_SECS` ([`Janitor`]).
