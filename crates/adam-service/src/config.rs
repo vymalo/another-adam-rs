@@ -838,13 +838,24 @@ impl ModelConfig {
         let profiles = parse_profiles(model_aliases_file.as_deref(), problems);
         let context_window = parse_context_window(&get("MODEL_CONTEXT_WINDOW"), problems);
         if !alias.is_empty() && profiles.profile(&alias).is_none() {
-            tracing::warn!(
-                model = %alias,
-                fallback = DEFAULT_MAX_OUTPUT_TOKENS,
-                window = context_window,
-                "no model profile for this alias: its output cap is the 128,000 fallback, clamped \
-                 to the context window when one is known (ADR 0064)"
-            );
+            if model_aliases_file.is_some() {
+                tracing::warn!(
+                    model = %alias,
+                    fallback = DEFAULT_MAX_OUTPUT_TOKENS,
+                    window = context_window,
+                    "MODEL_ALIASES_FILE is set but declares no profile for this alias: its output \
+                     cap is the 128,000 fallback, clamped to the context window when one is known \
+                     (ADR 0064)"
+                );
+            } else {
+                tracing::info!(
+                    model = %alias,
+                    fallback = DEFAULT_MAX_OUTPUT_TOKENS,
+                    window = context_window,
+                    "no MODEL_ALIASES_FILE: every model's output cap is the 128,000 fallback, \
+                     clamped to the context window when one is known (ADR 0064)"
+                );
+            }
         }
         Self {
             base_url,

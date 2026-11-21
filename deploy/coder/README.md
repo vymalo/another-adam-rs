@@ -156,6 +156,13 @@ Each model call's `usage/v1` report can say the model's window, so a screen show
 | `config.maxParallelToolCalls` | `MAX_PARALLEL_TOOL_CALLS` | The most tool calls of one model turn that run at the same time: a whole number from 1 to 32 (`1` is one at a time). `null` (default) renders nothing and the binary runs 10, **so the render of a deployment that does not set it is unchanged**. An agent file's `limits.max_parallel` may lower it for that agent. The chart refuses a value outside 1 to 32 and one given beside `config.extraEnv.MAX_PARALLEL_TOOL_CALLS`; a control plane renders none |
 | `config.modelContextWindow` | `MODEL_CONTEXT_WINDOW` | The window of `config.model`, in tokens: a whole number from 1 to 9007199254740991, as a number or a string of digits (written in full, never `1e+06`). The chart refuses anything else, which the binary would refuse at startup (exit 78), and a value given beside `config.extraEnv.MODEL_CONTEXT_WINDOW`. A subagent on another alias and OpenCode report no window |
 
+**The output cap follows the window.** The coder's `agent/instructions.md` sets no output cap, so each call asks its
+model profile's cap, else 128,000, clamped to the window less 20,000 tokens and the history the agent keeps (ADR 0064).
+On the dev stack (`MODEL_CONTEXT_WINDOW=131072`, the coder's `max_history_tokens: 100000`) that is
+`131072 − 20000 − 100000 = 11072`, not 128,000. A deployment that wants the full 128,000 for a long-context model
+declares the model's real window with `config.modelContextWindow` (and gives the model a profile with
+`maxOutputTokensLimit` when the provider documents a lower maximum).
+
 ## Model profiles
 
 A deployment's models differ: one takes a reasoning level and another refuses the member, one has half the output
