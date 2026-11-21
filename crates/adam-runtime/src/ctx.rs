@@ -398,6 +398,41 @@ impl Ctx {
             .await
     }
 
+    /// Race `contenders`, run at the same time, as one journaled step `name`: the first `Ok` to
+    /// finish wins ([ADR 0062](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0062-a-race-of-steps-records-its-winner.md)).
+    ///
+    /// The step records the winner's index and value, `Ok((index, value))`, or, when every
+    /// contender failed, their errors in contender order, `Err(errors)`. An `Err` does not end the
+    /// race while another contender runs. Each contender is given its own child of the run's cancel
+    /// token: when a winner is found, the others' tokens fire and their futures are dropped. A
+    /// replay returns the record without running any contender, so the winner is the same every
+    /// time. The contract is otherwise [`step`](Self::step)'s: the effect is at-least-once until the
+    /// outcome is recorded, and a transient retry of the transition races afresh.
+    ///
+    /// # Errors
+    ///
+    /// As [`step`](Self::step), and [`AgentError::Permanent`] for a race with no contender, before
+    /// anything is journaled.
+    pub async fn step_race<T, E, F, Fut>(
+        &mut self,
+        name: &str,
+        contenders: Vec<F>,
+    ) -> Result<Result<(usize, T), Vec<E>>, AgentError>
+    where
+        T: Serialize + DeserializeOwned + Send,
+        E: Serialize + DeserializeOwned + Send,
+        F: FnOnce(CancelToken) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
+    {
+        if contenders.is_empty() {
+            return Err(AgentError::permanent(format!(
+                "the race `{name}` has no contender"
+            )));
+        }
+        let parent = self.cancel.clone();
+        self.step(name, move || race(parent, contenders)).await
+    }
+
     /// What the journal holds at `seq`, for the step `name`: `None` when nothing is recorded yet.
     async fn recorded_at(&self, seq: u64, name: &str) -> Result<Option<JournalEntry>, AgentError> {
         let found = self
@@ -657,6 +692,38 @@ where
         ))
         .with_source(e)
     })
+}
+
+/// Run `contenders` at the same time, each with its own child of `parent`: the first `Ok` wins and
+/// the others' tokens fire before their futures are dropped; with no `Ok`, every error, in
+/// contender order.
+async fn race<T, E, F, Fut>(parent: CancelToken, contenders: Vec<F>) -> Result<(usize, T), Vec<E>>
+where
+    F: FnOnce(CancelToken) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let tokens: Vec<CancelToken> = contenders.iter().map(|_| parent.child()).collect();
+    let mut running: futures::stream::FuturesUnordered<_> = contenders
+        .into_iter()
+        .zip(tokens.iter().cloned())
+        .enumerate()
+        .map(|(i, (contender, token))| async move { (i, contender(token).await) })
+        .collect();
+    let mut errors: Vec<Option<E>> = (0..tokens.len()).map(|_| None).collect();
+    while let Some((i, outcome)) = running.next().await {
+        match outcome {
+            Ok(value) => {
+                for (j, token) in tokens.iter().enumerate() {
+                    if j != i {
+                        token.cancel();
+                    }
+                }
+                return Ok((i, value));
+            }
+            Err(e) => errors[i] = Some(e),
+        }
+    }
+    Err(errors.into_iter().flatten().collect())
 }
 
 /// A step whose seq [`Ctx::reserve_steps`] took: owned, so several can run at the same time while
