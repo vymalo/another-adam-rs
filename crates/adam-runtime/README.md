@@ -111,7 +111,13 @@ keeps its whole state until its first commit under the contract, which splits it
   resolves the generation, writes the rows before the CAS with the attempt's `writer`, checks that
   all of them landed, and a commit that loses deletes its own rows and refs, so a head never names a
   partial generation and a loser cannot poison the next append. Every file artifact the head will
-  name is uploaded first: a failed put refuses the head, and the commit writes the state only.
+  name is uploaded first: a failed put refuses the head, and the commit writes the state only. An
+  **inherited** file is checked with one existence read on a split, a failed transition and a cancel:
+  one whose blob is gone (an S2a head that never stored it, or a purged blob) is left out of the head
+  and its references, and logged; the files that are there, the step's own included, stay. Its bytes
+  cannot be stored again, so refusing would retry for ever. A **delivery** writes the head it read
+  unchanged, so a later refused split still sees the missing file and refuses (the demotion cannot
+  write a v4 state without its bytes).
 * `tests/common/v4.rs` is a frozen copy of the v4 envelope. The contract release **inverts** its
   test: the tombstone and a v5 head are not v4 envelopes, and a pre-contract run's state still
   decodes. The suite also proves a cancel and a `park_again` write the head they read and the

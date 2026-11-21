@@ -1039,6 +1039,10 @@ A **file artifact's** bytes are written to the blob table under their SHA-256
 (`adam_runtime::blob_id`) and the commit references the digest (`RunUpdate::blobs`); a v4 state also
 keeps the bytes, so a reader of the old format still reads a run, while a v5 head names them by
 digest and size ([ADR 0055](decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md)).
+Before a v5 head is built by a split, a failed transition or a cancel, every file it inherits is
+checked with one `blob_stored`; one whose bytes are gone is left out of the head and its references
+(logged), because the head cannot store it again. A delivery writes the head it read unchanged, so a
+later refused split still sees the missing file and refuses rather than demoting without its bytes.
 
 ### The head and the body (schema version 5, part 2; the contract release)
 

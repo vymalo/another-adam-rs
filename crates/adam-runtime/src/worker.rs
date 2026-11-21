@@ -733,15 +733,66 @@ async fn transition(
             None => crate::blob::upload_all(&inner.store, &artifacts).await,
         };
         if uploaded.all_stored {
+            // A v5 run's inherited files are named by digest only: one whose bytes are gone (an
+            // S2a head that never stored them, or a purged blob) is left out here, before the
+            // head is built, because the head cannot store it again and refusing would retry for
+            // ever. The files that are there, the step's own included, stay.
+            let inherited = base_head
+                .as_ref()
+                .map(HeadParts::file_refs)
+                .unwrap_or_default();
+            let mut inherited_ids = Vec::with_capacity(inherited.len());
+            for (digest, _) in &inherited {
+                inherited_ids.push(digest.clone());
+            }
+            let missing = match crate::blob::missing_blobs(inner.store.clone(), inherited_ids).await
+            {
+                Ok(missing) => missing,
+                Err(e) => {
+                    tracing::error!(
+                        run = %run,
+                        error = %report(&e),
+                        "checking an inherited file's bytes failed; the run is left as it is and retried"
+                    );
+                    return false;
+                }
+            };
+            let artifacts = if missing.is_empty() {
+                artifacts
+            } else {
+                // The inherited artifacts are the first `env.artifacts.len()` entries of the
+                // merged list (a file is appended, never replaced), and their file artifacts are
+                // `inherited` in order: pair them by position, since a carried `Artifact` has no
+                // digest, only empty bytes.
+                let inherited_len = env.artifacts.len();
+                let mut file_at = 0_usize;
+                let mut kept = Vec::with_capacity(artifacts.len());
+                for (at, artifact) in artifacts.into_iter().enumerate() {
+                    if at < inherited_len && artifact.file.is_some() {
+                        let gone = inherited
+                            .get(file_at)
+                            .is_some_and(|(digest, _)| missing.contains(digest));
+                        file_at += 1;
+                        if gone {
+                            continue;
+                        }
+                    }
+                    kept.push(artifact);
+                }
+                kept
+            };
             // The head pairs its file references with this pass, so carry the list the pass saw:
             // a retry merges deliveries into the envelope, never artifacts. A v5 run's inherited
             // files are paired first, in artifact order, and the pass covers the rest.
             next.head_artifacts = Some(artifacts);
-            next.shadow_files = base_head
-                .as_ref()
-                .map(HeadParts::file_refs)
-                .unwrap_or_default();
-            next.shadow_files.extend(uploaded.files);
+            let mut shadow_files = Vec::with_capacity(inherited.len() + uploaded.files.len());
+            for (digest, size) in inherited {
+                if !missing.contains(&digest) {
+                    shadow_files.push((digest, size));
+                }
+            }
+            shadow_files.extend(uploaded.files);
+            next.shadow_files = shadow_files;
             next.shadow_blobs = uploaded.ids;
         } else {
             tracing::error!(
@@ -1385,6 +1436,19 @@ async fn commit(
         let (cur_rec, cur_env, cur_head) = match &retried {
             Some((rec, env, head)) => (rec, env, head.as_ref()),
             None => (claimed, base, base_head),
+        };
+        // A carried head must not keep naming an inherited file whose bytes are gone (an S2a
+        // expand-release head can; its full state carried the bytes). The head is built below, so
+        // check here; a store error leaves the run for its next claim. A demotion is not a carried
+        // head: it writes the whole state, and `inline_inherited_files` already refused if an
+        // inherited file's bytes were missing.
+        let pruned;
+        let cur_head = match cur_head {
+            Some(base) if next.split.is_none() && !next.split_refused => {
+                pruned = base.without_missing_files(inner.store.clone()).await?;
+                Some(&pruned)
+            }
+            other => other,
         };
         // The bytes of every file artifact this commit names go to the store before the commit
         // that names them (ADR 0055). A split's own pass (`upload_all`, in `transition`) already
