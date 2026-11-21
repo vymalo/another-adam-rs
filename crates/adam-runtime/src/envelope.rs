@@ -10,6 +10,7 @@ use adam_core::{RunId, StoreError};
 
 use crate::agent::Inbound;
 use crate::events::Artifact;
+use crate::retry::RetryRecord;
 use crate::runtime::RuntimeError;
 
 pub(crate) const VERSION: u32 = 1;
@@ -33,6 +34,15 @@ pub(crate) struct Envelope {
     /// Consecutive failed tries of the current transition.
     #[serde(default)]
     pub attempt: u32,
+    /// What a failing run recorded of its retries: the failures per key and each key's policy
+    /// (ADR 0061). Cleared by a transition that succeeds; absent from state written before it
+    /// existed, and not written while `None`; one that does not decode reads as `None`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::retry::lenient_record"
+    )]
+    pub retry: Option<RetryRecord>,
     /// Bumped by every commit a worker makes (never by `deliver`/`cancel`), so
     /// a worker can tell "only messages arrived" from "someone else advanced".
     #[serde(default)]
@@ -80,6 +90,7 @@ impl Envelope {
             inbox: Vec::new(),
             seq: 0,
             attempt: 0,
+            retry: None,
             rev: 0,
             output: Value::Null,
             error: None,
@@ -236,6 +247,13 @@ mod tests {
         );
         env.seq = 7;
         env.attempt = 2;
+        let mut record = RetryRecord::default();
+        record.fail(
+            "tool:search",
+            &crate::RetryPolicy::new(3).with_multiplier(1.5),
+        );
+        record.fail("tool:search", &crate::RetryPolicy::new(9));
+        env.retry = Some(record);
         env.rev = 3;
         env.output = serde_json::json!({"answer": 42});
         env.error = Some("not yet".into());
@@ -263,6 +281,7 @@ mod tests {
         assert_eq!(decoded.artifacts, env.artifacts);
         assert_eq!(decoded.output, env.output);
         assert_eq!(decoded.error, env.error);
+        assert_eq!(decoded.retry, env.retry);
         assert_eq!(
             (decoded.deadline, decoded.limit_secs),
             (env.deadline, env.limit_secs)
@@ -270,6 +289,63 @@ mod tests {
         assert_eq!(
             (decoded.remaining_secs, decoded.agent_wake, decoded.hb),
             (env.remaining_secs, env.agent_wake, env.hb)
+        );
+    }
+
+    /// The retry record is stored plainly (ADR 0061, decision 7), and one that does not decode is
+    /// ignored rather than failing the run: the next failure counts afresh.
+    #[test]
+    fn the_retry_record_is_plain_and_one_that_does_not_decode_is_ignored() {
+        let mut env = Envelope::new(serde_json::json!({}));
+        let mut record = RetryRecord::default();
+        let (n, policy) = record.fail(
+            "tool:pay",
+            &crate::RetryPolicy::new(2)
+                .with_backoff(
+                    std::time::Duration::from_millis(1500),
+                    std::time::Duration::from_secs(30),
+                )
+                .with_retry_on(crate::RetryClasses::of([
+                    adam_error::ErrorClass::RateLimited,
+                ])),
+        );
+        assert_eq!((n, policy.max_attempts), (1, 2));
+        env.retry = Some(record);
+        let state = env.encode().expect("encodes");
+        assert_eq!(
+            state["retry"],
+            serde_json::json!({
+                "failures": {"tool:pay": 1},
+                "policies": {"tool:pay": {
+                    "max_attempts": 2, "initial_backoff_ms": 1500, "max_backoff_ms": 30000,
+                    "multiplier": 2.0, "retry_on": ["rate-limited"]
+                }}
+            })
+        );
+
+        let mut garbled = state.clone();
+        garbled["retry"] = serde_json::json!({"failures": "many"});
+        let back = Envelope::decode(RunId::new(), &garbled).expect("the run still decodes");
+        assert_eq!(back.retry, None);
+
+        // A class this build does not know is dropped: the policy retries less, never more.
+        let mut newer = state;
+        newer["retry"]["policies"]["tool:pay"]["retry_on"] =
+            serde_json::json!(["rate-limited", "overloaded"]);
+        let mut back = Envelope::decode(RunId::new(), &newer)
+            .expect("decodes")
+            .retry
+            .expect("kept");
+        let (n, policy) = back.fail("tool:pay", &crate::RetryPolicy::new(7));
+        assert_eq!(
+            (n, policy.max_attempts),
+            (2, 2),
+            "the recorded policy, not the one asked"
+        );
+        assert_eq!(policy.retry_on.names(), ["rate-limited"]);
+        assert_eq!(
+            policy.initial_backoff,
+            std::time::Duration::from_millis(1500)
         );
     }
 

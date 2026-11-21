@@ -360,12 +360,11 @@ fn runtime(assembly: &Assembly, store: &DynStore) -> Runtime {
     assembly
         .register(Runtime::builder(store.clone()))
         .poll_interval(Duration::from_millis(20))
-        .retry(RetryPolicy {
-            max_attempts: 4,
-            initial_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(10),
-            multiplier: 1.0,
-        })
+        .retry(
+            RetryPolicy::new(4)
+                .with_backoff(Duration::from_millis(10), Duration::from_millis(10))
+                .with_multiplier(1.0),
+        )
         .build()
 }
 

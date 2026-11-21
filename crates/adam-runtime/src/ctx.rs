@@ -15,6 +15,7 @@ use crate::cancel::CancelToken;
 use crate::child::{ChildStarter, ChildStatus, news_since};
 use crate::clock::DynClock;
 use crate::events::{Artifact, DynEventSink, RunEvent};
+use crate::retry::RetryPolicy;
 use crate::runtime::Runtime;
 
 /// Journal name of [`Ctx::now_journaled`].
@@ -285,6 +286,44 @@ impl Ctx {
         let outcome = settle(&self.store, self.run, seq, name, recorded, f).await?;
         self.seq = seq + 1;
         Ok(outcome)
+    }
+
+    /// [`step`](Self::step) with its own retry policy, under `key` (ADR 0061): a recorded `Err`
+    /// that is retryable ([`Classify::is_retryable`](adam_error::Classify::is_retryable)) fails the
+    /// transition with [`AgentError::from_classified`] and
+    /// [`with_retry(key, policy)`](AgentError::with_retry), so the run retries it under `policy`
+    /// (when the policy retries the error's class) and counts its failures under `key`, apart from
+    /// any other step's. Any other `Err` is returned as `step` returns it, for the agent to decide.
+    ///
+    /// The `key` is what the failures count under: a stable name, the same in every transition
+    /// that may run the step (a step's name, never a call id). The policy is recorded at the key's
+    /// first failure and read back from the run after that, so changing it in code does not
+    /// change the retries of a run already failing.
+    ///
+    /// # Errors
+    ///
+    /// As [`step`](Self::step), plus the retryable `Err` above as [`AgentError::Transient`].
+    pub async fn step_retrying<T, E, F, Fut>(
+        &mut self,
+        name: &str,
+        key: &str,
+        policy: RetryPolicy,
+        f: F,
+    ) -> Result<Result<T, E>, AgentError>
+    where
+        T: Serialize + DeserializeOwned,
+        E: Serialize + DeserializeOwned + adam_error::Classify + Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
+    {
+        match self.step(name, f).await? {
+            Err(e) if e.is_retryable() => Err(AgentError::from_classified(
+                format!("step `{name}` failed"),
+                e,
+            )
+            .with_retry(key, policy)),
+            outcome => Ok(outcome),
+        }
     }
 
     /// Take the next `names.len()` seqs, in order, for steps that will run at the same time:

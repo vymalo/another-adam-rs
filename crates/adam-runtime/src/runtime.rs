@@ -193,9 +193,10 @@ pub struct RunView {
     pub output: Option<Value>,
     /// The reason, once `Failed` (a cancel reads `cancelled: <reason>`).
     pub error: Option<String>,
-    /// Failed tries of the current transition so far (`0` when healthy). It is
-    /// what a retry backoff is computed from; after retries are exhausted it
-    /// equals `max_attempts`.
+    /// Consecutive failed tries of the run's transitions so far, whatever their key (`0` when
+    /// healthy). A retry's backoff is computed from the failing key's own count (ADR 0061), so
+    /// after a run gives up this equals that key's `max_attempts` only when it failed under one
+    /// key; it is at most [`MAX_CONSECUTIVE_FAILURES`](crate::MAX_CONSECUTIVE_FAILURES).
     pub attempt: u32,
     /// Messages delivered but not yet consumed by the agent.
     pub pending_inbox: usize,

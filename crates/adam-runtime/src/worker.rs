@@ -30,6 +30,9 @@ use crate::erased::{ErasedAgent, Stepped};
 use crate::events::Artifact;
 use crate::head::{Claimed, Head, HeadParts, Stored};
 use crate::notify::{Delivery, Signal};
+use crate::retry::{
+    MAX_CONSECUTIVE_FAILURES, RUNTIME_RETRY_KEY, RetryRecord, StepRetry, class_name,
+};
 use crate::runtime::{Inner, MAX_COMMIT_RETRIES, Runtime, RuntimeError};
 
 type InFlight = Arc<Mutex<HashSet<RunId>>>;
@@ -474,6 +477,8 @@ struct Next {
     output: Value,
     error: Option<String>,
     attempt: u32,
+    /// The retries recorded per key (ADR 0061); `None` after a transition that succeeds.
+    retry: Option<RetryRecord>,
     seq: u64,
     /// How many inbox messages this transition consumed (a prefix).
     consumed: usize,
@@ -873,6 +878,7 @@ fn plan(
             output,
             error,
             attempt: 0,
+            retry: None,
             seq,
             consumed,
             artifacts: artifacts.clone(),
@@ -897,6 +903,7 @@ fn plan(
         output: Value::Null,
         error: Some(error),
         attempt: base.attempt,
+        retry: base.retry.clone(),
         seq,
         consumed: 0,
         artifacts: artifacts.clone(),
@@ -913,16 +920,48 @@ fn plan(
         remaining_secs: base.remaining_secs,
     };
 
-    // A transient failure: schedule the retry, or give up when the policy's
-    // attempts are used up. `hint` is a minimum wait from the error.
-    let retrying = |msg: String, hint: Option<Duration>| -> Next {
-        let failures = base.attempt.saturating_add(1);
-        let policy = &inner.cfg.retry;
-        if failures >= policy.max_attempts {
-            Next {
-                attempt: failures,
-                ..failed(format!("gave up after {failures} attempts: {msg}"))
-            }
+    // A transient failure: schedule the retry, or give up when the key's attempts or the run's
+    // ceiling are used up (ADR 0061). `hint` is a minimum wait from the error; `step` the step's
+    // own policy, else the runtime's counts under `runtime`.
+    let retrying = |msg: String,
+                    hint: Option<Duration>,
+                    class: ErrorClass,
+                    step: Option<&StepRetry>|
+     -> Next {
+        let attempt = base.attempt.saturating_add(1);
+        // A run with no record (written before records, or one that does not decode) counts what
+        // it failed so far under the runtime's key, so a run already failing does not start over.
+        let mut record = base
+            .retry
+            .clone()
+            .unwrap_or_else(|| RetryRecord::seeded(base.attempt));
+        let (key, policy) = match step {
+            Some(step) => (step.key.as_str(), &step.policy),
+            None => (RUNTIME_RETRY_KEY, &inner.cfg.retry),
+        };
+        // The key's policy as recorded at its first failure, never the code's of today.
+        let (failures, policy) = record.fail(key, policy);
+        let of_key = if key == RUNTIME_RETRY_KEY {
+            String::new()
+        } else {
+            format!(" of `{key}`")
+        };
+        let gave_up = |error: String| Next {
+            attempt,
+            retry: Some(record.clone()),
+            ..failed(error)
+        };
+        if !policy.retries(class) {
+            gave_up(format!(
+                "not retried: the policy{of_key} does not retry {}: {msg}",
+                class_name(class)
+            ))
+        } else if failures >= policy.max_attempts {
+            gave_up(format!("gave up after {failures} attempts{of_key}: {msg}"))
+        } else if attempt >= MAX_CONSECUTIVE_FAILURES {
+            gave_up(format!(
+                "gave up after {attempt} consecutive failed transitions: {msg}"
+            ))
         } else {
             let delay = match hint {
                 Some(at_least) => policy.delay_with_hint(failures, at_least),
@@ -935,14 +974,15 @@ fn plan(
                 agent: base_agent.cloned().unwrap_or(Value::Null),
                 output: Value::Null,
                 error: None,
-                attempt: failures,
+                attempt,
+                retry: Some(record.clone()),
                 // Abandon this try's journal entries so the retry runs
                 // its steps afresh (see `Ctx::step`).
                 seq,
                 consumed: 0,
                 artifacts: Vec::new(),
                 retry_detail: Some(format!(
-                    "attempt {failures} of {} failed, retrying in {delay:?}: {msg}",
+                    "attempt {failures} of {}{of_key} failed, retrying in {delay:?}: {msg}",
                     policy.max_attempts
                 )),
                 reopen: false,
@@ -987,8 +1027,22 @@ fn plan(
         Err(AgentError::Transient {
             message,
             retry_after,
+            class,
+            retry,
             source,
-        }) => retrying(with_cause(message, source.as_deref()), retry_after),
+        }) => {
+            // As `AgentError::class` reads it: a plain transient error with a hint is a rate limit.
+            let class = match (class, retry_after) {
+                (ErrorClass::Transient, Some(_)) => ErrorClass::RateLimited,
+                (class, _) => class,
+            };
+            retrying(
+                with_cause(message, source.as_deref()),
+                retry_after,
+                class,
+                retry.as_deref(),
+            )
+        }
         Err(AgentError::Permanent { message, source }) => {
             failed(with_cause(message, source.as_deref()))
         }
@@ -1131,6 +1185,7 @@ fn build_update(
         inbox: cur.inbox.iter().skip(next.consumed).cloned().collect(),
         seq: next.seq,
         attempt: next.attempt,
+        retry: next.retry.clone(),
         rev: base_rev + 1,
         output: if reopened {
             Value::Null

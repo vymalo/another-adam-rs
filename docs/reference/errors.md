@@ -100,8 +100,9 @@ flowchart LR
     StoreError -->|"Corrupt, NonDeterminism, Backend corrupt_source"| Corrupt
     StoreError -->|"Backend internal"| Internal
 
-    AgentError -->|"Transient, no retry_after"| Transient
-    AgentError -->|"Transient with retry_after"| RateLimited
+    AgentError -->|"Transient of class Transient, no retry_after"| Transient
+    AgentError -->|"Transient of class Transient with retry_after, or kept from from_classified"| RateLimited
+    AgentError -->|"Transient of class Conflict, kept from from_classified"| Conflict
     AgentError -->|Permanent| Invalid
     AgentError -->|NonDeterminism| Corrupt
     StoreError -.->|"Store(e)"| AgentError
@@ -316,9 +317,14 @@ The **first read of an image in a process** (one `(scope, SHA-256)` of the histo
 
 ## Retry
 
-The runtime retries a step that fails with a `Transient` or `RateLimited` `AgentError` with exponential
-backoff (`RetryPolicy`), waiting at least the error's `retry_after()` (a provider's `Retry-After`, capped
-at 24 hours). Any other class fails the run. A store error while stepping is decided by class: `Corrupt` and
+The runtime retries a transition that fails with a `Transient` `AgentError` (its class `Transient`,
+`RateLimited` or `Conflict`) with exponential backoff (`RetryPolicy`), waiting at least the error's
+`retry_after()` (a provider's `Retry-After`, capped at 24 hours). The policy is the step's own when the
+error carries one (`AgentError::with_retry`, `Ctx::step_retrying`; ADR 0061), else the runtime's; a policy
+retries only the classes it lists (`retry_on`, all three by default), so an error of another class fails
+the run at once. Failures are counted per step's key, under a ceiling of 100 consecutive failures, and
+the messages name the key (``gave up after 3 attempts of `fetch` ``); see the
+[adam-runtime README](../../crates/adam-runtime/README.md#retries-per-step). Any other class fails the run. A store error while stepping is decided by class: `Corrupt` and
 `Invalid` fail the run; everything else leaves the run to its lease and is logged with its class.
 
 ## Exit codes

@@ -92,3 +92,18 @@ it was, and `ToolError::Transient(String)` has no class at all (`crates/adam-llm
    `tool:<name>`, the model provider's class.
 4. `adam-agent-fs` and `adam-assembly`: `retry:` in an agent's frontmatter, checked, and bound to its tools and MCP
    servers.
+
+## Amended (2026-11-21), slice 2
+
+Built in vymalo/another-adam-rs#264. Three points read differently from the text above:
+
+- **The builder's names** are `RetryPolicy::new(attempts)`, `.with_backoff(initial, max)`, `.with_multiplier(m)`
+  and `.with_retry_on(classes)`: `backoff(failures)` already names the delay. Slices 3 and 4 use these. A
+  refused multiplier keeps the factor the policy had.
+- **The bytes.** Every failing run writes the record, the runtime's key included, so the runtime's policy is
+  recorded too (decision 5). The sentence in *Consequences* holds for a run that never fails: it writes the
+  bytes it wrote before.
+- **A record that does not decode** is ignored, as one written before records: the run's `attempt` so far is
+  counted under `runtime`, and the failing error's own policy applies with its key's count started again (the
+  ceiling still bounds it). A record keeps durations up to `i64::MAX` ms, what every store keeps, and a factor
+  JSON cannot hold as one that backs off alike.
