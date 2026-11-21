@@ -96,8 +96,8 @@ fn no_folder_preset_or_profile_value_sends_nothing() {
     assert_eq!(assembly.info()[0].reasoning_effort, None);
 }
 
-#[test]
-fn the_resolved_effort_reaches_the_request_of_a_run() {
+#[tokio::test]
+async fn the_resolved_effort_reaches_the_request_of_a_run() {
     let model = Arc::new(MockModel::new());
     model.push_text("done");
     let assembly = agent("name: coder\nmodel: large\nreasoning_effort: high")
