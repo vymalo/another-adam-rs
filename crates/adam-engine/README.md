@@ -19,7 +19,7 @@ engine.shutdown().await?;
 
 | Call | What it does | Refused with (class) |
 |---|---|---|
-| `Engine::builder(store, agent, model, alias)`, then `start()` | migrates the store, releases the leases a fixed `Limits::worker_id` holds (`Store::release_worker_leases`: the runs its last process was stepping are claimed at once; nothing with the default, `None`), binds the agent with the screen's tools of an embedded agent (`adam_ui::Ui::embedded`: `ask_user`, `show`, `ui_catalog`, `plan_*`, and `Ui::screen` as its source), gives it the model, and spawns the worker on the current tokio runtime | `NoRuntime` (`Invalid`) outside a tokio runtime; `Invalid` for a zero `lease_ttl` or a `worker_id` of `Some("")`; `WorkerIdInUse` (`Rejected`) for a fixed id another live engine of this process uses on the same store; `Store` (the store's: its migration or the release); `Invalid` for an `mcp.json` or an `a2a:` subagent, the subagents' included: the engine runs neither yet, and refuses them itself, so what it accepts does not depend on the features another crate of the build turns on in `adam-assembly`; `Agent` (the definition's, `Invalid`): an empty alias, a tool nobody registered, a secret refused |
+| `Engine::builder(store, agent, model, alias)`, then `start()` | migrates the store, releases the leases a fixed `Limits::worker_id` holds (`Store::release_worker_leases`: the runs its last process was stepping are claimed at once; nothing with the default, `None`), binds the agent with the screen's tools of an embedded agent (`adam_ui::Ui::embedded`: `ask_user`, `show`, `ui_catalog`, `plan_*`, and `Ui::screen` as its source), gives it the model, registers its scheduler and makes the store's scheduler runs match the folder's `schedules/` (see *Schedules*), and spawns the worker on the current tokio runtime | `NoRuntime` (`Invalid`) outside a tokio runtime; `Invalid` for a zero `lease_ttl` or a `worker_id` of `Some("")`; `WorkerIdInUse` (`Rejected`) for a fixed id another live engine of this process uses on the same store; `Store` (the store's: its migration or the release); `Invalid` for an `mcp.json` or an `a2a:` subagent, the subagents' included: the engine runs neither yet, and refuses them itself, so what it accepts does not depend on the features another crate of the build turns on in `adam-assembly`; `Agent` (the definition's, `Invalid`): an empty alias, a tool nobody registered, a secret refused; `Schedules` (the reconcile's class) when the scheduler runs cannot be made to match the folder |
 | `send(None, say)` | starts a run in a new conversation (`Delivered::Started`) | `Invalid` for no text or no id; `Stopped` (`Rejected`) after `shutdown` |
 | `send(Some(&conversation), say)` | the latest run of the conversation has ended: a new run that continues it, the agent starting from its state, the transcript included (`Continued`); it is still open: the message is delivered to it, as a steer while it works (`Steered`) or as the answer while it waits (`Answered`), by the state read just before. A `Say` that already started a run starts nothing (`Repeated`) | `NotFound` for a conversation the engine has no run in |
 | `steer(run, say)` | a message for a run that works: it reads it at its next step, and a run about to finish takes another step first; a waiting run takes it as its answer | `Finished` (`Rejected`) for a run that ended; `NotFound`; `Unavailable` (`Transient`) when its state moved under the call |
@@ -56,8 +56,19 @@ builder's source replaces whatever source the definition had.
 **Defaults** (`Limits`, `#[non_exhaustive]`: set its fields on `Limits::default()`): `concurrency` 4 runs stepped at
 once, `max_parallel_tools` 10 tool calls of one turn at once (an agent's file may lower it), `lease_ttl` 30 s (zero
 is refused), `event_capacity` 256 live events in the ring (1 to 65 536; the channel rounds it up to a power of two),
-`worker_id` `None` (a random id at every start; `Some("")` is refused). `Limits` is `Clone`, no longer `Copy`: it holds
-the id.
+`worker_id` `None` (a random id at every start; `Some("")` is refused), `retry` `RetryPolicy::default()` (5 attempts, 1 s
+to 60 s: the runtime's policy, for a transient failure that names none of its own, such as a model provider's outage;
+a folder's `retry:` and a tool's own policy win for their tools, [ADR
+0061](../../docs/decisions/0061-a-step-names-its-retry-policy.md)). `Limits` is `Clone` and `PartialEq`, no longer
+`Copy` (it holds the id) nor `Eq` (the policy's factor is a float).
+
+**Schedules** ([ADR 0060](../../docs/decisions/0060-schedules-are-parked-runs.md)): a folder's `schedules/` run in the
+engine as in `adam-agent`. `start` registers the agent's scheduler (`adam_schedule::SchedulerAgent`, whatever the folder
+holds, so a scheduler a folder dropped is stepped to its cancel) and reconciles before the worker starts: a schedule
+added is started, one changed is replaced, one dropped is cancelled. Each due time fires one run of the agent, the
+prompt as a person's message, which nobody answers (a question ends the call instead of parking). A firing is nobody's
+message, so it is no caller's run: `list` and `get` do not show it, as an A2A server does not; the host reads it from
+its store (conversation `adam.schedule:<agent>/<schedule>@<due time>`).
 
 **A fixed worker id makes a restart claim its old runs at once; it is opt-in.** With `worker_id: None` the engine
 releases nothing, so engines that share a store never take each other's leases, and a restarted engine waits up to
@@ -257,6 +268,10 @@ every wait is bounded by `tokio::time::timeout`:
   run, and each engine steps its own run once;
 * `a_second_live_engine_with_the_same_id_is_refused`: `WorkerIdInUse` (`Rejected`) on the same store; the same id on
   another store starts, and on the first once A has shut down;
+* `a_folders_schedule_fires_the_agent`: a folder with `schedules/soon.md` (`after: 1s`) fires a run of the agent, in
+  the store, whose model is given the prompt and whose `get` is `None`;
+  `the_hosts_retry_policy_governs_a_transient_failure`: `Limits::retry` of two attempts gives a transient model failure
+  up after two calls, not five;
 * `start_refuses_what_it_cannot_build` (a zero lease and a ring of 0 or over 65 536 too; it passes alone and with
   `--features adam-assembly/mcp,adam-assembly/remote`, the set CI's workspace build unifies) and `start_outside_a_tokio_runtime_is_refused`: fail
   closed.
