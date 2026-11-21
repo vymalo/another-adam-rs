@@ -94,7 +94,8 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.
   a `SecretSource` (the default refuses every name), and with `.tools(..)` a `ToolSet` of its own (`#[tool]`
   functions) that the files select with `tools:`. The engine reads no environment variable.
 * **Then** `start().await?`, `send`, `steer`, `answer`, `cancel`, `list`, `get`, `events`, `commands` (the folder's
-  `/name` commands, which a message expands), `files` and `file` (what a tool handed over, by SHA-256) and `shutdown`; decide from `EngineError`'s class
+  `/name` commands, which a message expands), `files` and `file` (what a tool handed over, by SHA-256), `firings` (the runs
+  `schedules/` fired, which `get`, `events` and `cancel` reach too) and `shutdown`; decide from `EngineError`'s class
   (`adam_error::Classify`), and match `RunState` and `EngineEvent` with a `_` arm (both `#[non_exhaustive]`). `events(run)` is bounded: a slow reader gets `Behind`, then a `Snapshot` read from the store.
 * **Keep the embedded set**: anything else you depend on takes `adam-a2a` without `server`, `adam-a2a-runtime` without
   `push`, `adam-assembly` (and `adam`) without `remote`, and `adam-ui` without `thread-tools`, or Cargo turns them back
