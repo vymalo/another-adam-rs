@@ -197,17 +197,22 @@ impl EngineBuilder {
     /// the cap of each model call are checked and resolved per model. Default
     /// [`ModelProfiles::default`]: no model has a profile, so an agent whose file sets an effort or
     /// a preset is refused at [`start`](Self::start) (fail closed), one that sets neither sends
-    /// none, and every cap is the folder's or 128,000.
+    /// none, and every cap is the folder's, the preset's or the profile's, then clamped to the
+    /// model's limit and the window.
     pub fn models(mut self, profiles: ModelProfiles) -> Self {
         self.profiles = profiles;
         self
     }
 
-    /// The reasoning level the agent's model calls ask for when its file sets none (ADR 0063
-    /// decision 8): the root's level for an embedded agent, as a folder's `reasoning_effort` is
-    /// for a served one. The folder's key wins over it. It must be one of the root's model's
-    /// levels ([`models`](Self::models)), or [`start`](Self::start) refuses it. Default none:
-    /// nothing is sent unless the folder, the preset or the profile sets a level.
+    /// The reasoning level the root's model calls ask for when the root's file sets none (ADR 0063
+    /// decision 8): an embedded agent's host gives the level its folder would. It **replaces**
+    /// what [`AgentDef::reasoning_effort`](adam_assembly::AgentDef::reasoning_effort) was given,
+    /// wins over the agent's `model_preset` and the profile, and loses to the root's own
+    /// `reasoning_effort`. It must be one of the root model's levels ([`models`](Self::models))
+    /// **when it applies** — when the root's file sets none; a level the file supplies is validated
+    /// instead, and a file's level the profile does not take is refused at [`start`](Self::start)
+    /// all the same. Default none: nothing is sent unless the folder, the preset or the profile
+    /// sets a level.
     pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
         self

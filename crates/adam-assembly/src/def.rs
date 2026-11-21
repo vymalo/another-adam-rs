@@ -394,10 +394,15 @@ impl AgentDef {
     }
 
     /// The root's reasoning level when its file sets none (ADR 0063 decision 8): an embedded
-    /// engine's host gives the level its folder would, and the folder's `reasoning_effort` wins
-    /// over it. It is resolved against the root's model profile exactly as a file's value is
-    /// ([`Error::ReasoningEffort`]), at [`bind`](Self::bind). A subagent always has its own file,
-    /// so this never applies to one. `None` (the default) sets nothing.
+    /// engine's host gives the level its folder would, and the root's own `reasoning_effort` wins
+    /// over it. It is the **root's only**: it never applies to a subagent, which has its own file.
+    /// It wins over the agent's `model_preset` and the profile. It is checked against the root
+    /// model's profile at [`BoundDef::model`](crate::BoundDef::model) — not at
+    /// [`bind`](Self::bind), which does not know the model — and the refusal reports the value as
+    /// `reasoning_effort` on the agent's file even when this setter supplied it
+    /// ([`EffortSource::Folder`](crate::EffortSource::Folder)): the setting is the file's, whether
+    /// a file or the host gave it, so the message names the agent and its file. A level the profile
+    /// does not take is [`Error::ReasoningEffort`]. `None` (the default) sets nothing.
     #[must_use]
     pub fn reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
         self.reasoning_effort = effort;
@@ -816,7 +821,7 @@ struct Walk<'a> {
     /// What the root's sessions run under: the deployment's, lowered by the root's file.
     session_limits: SessionLimits,
     /// The root's reasoning level when its file sets none ([`AgentDef::reasoning_effort`]),
-    /// as its wire word; a subagent's file always sets its own.
+    /// as its wire word; it never applies to a subagent, which has its own file.
     root_effort: Option<String>,
     nodes: Vec<Node>,
     remotes: Vec<Remote>,

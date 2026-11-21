@@ -11,7 +11,7 @@ let engine = Engine::builder(store, agent, model, "my-alias")   // DynStore, Age
     .secrets(my_secrets)                                         // optional: default_secrets()
     .limits(limits)                                              // optional: Limits::default()
     .models(profiles)                                            // optional: ModelProfiles::default()
-    .reasoning_effort(ReasoningEffort::High)                     // optional: the root's level
+    .reasoning_effort(ReasoningEffort::High)                     // optional: the root's level, over preset/profile
     .start()
     .await?;
 let turn = engine.send(None, Say::new("hello")).await?;          // a new conversation
@@ -21,7 +21,7 @@ engine.shutdown().await?;
 
 | Call | What it does | Refused with (class) |
 |---|---|---|
-| `Engine::builder(store, agent, model, alias)`, then `start()` | migrates the store, releases the leases a fixed `Limits::worker_id` holds (`Store::release_worker_leases`: the runs its last process was stepping are claimed at once; nothing with the default, `None`), binds the agent with the screen's tools of an embedded agent (`adam_ui::Ui::embedded`: `ask_user`, `show`, `ui_catalog`, `plan_*`, and `Ui::screen` as its source) and the host's own (`EngineBuilder::tools`, a `ToolSet`: an `FnTool`, or `#[tool]` functions from `adam = { default-features = false, features = ["macros"] }`, which keeps the embedded set; together they are the catalog the files' `tools:` selects from), gives it the model, the deployment's profiles (`EngineBuilder::models`) and the host's level for the root (`EngineBuilder::reasoning_effort`, when the folder sets none), so the folder's `reasoning_effort`, its `model_preset`, the profile and the profile's base preset resolve each agent's effort and output cap per model (ADR 0063 decision 8, ADR 0064), registers its scheduler and makes the store's scheduler runs match the folder's `schedules/` (see *Schedules*), gives the backend the folder's `commands/` (a message `/name args` is expanded from `commands/<name>.md` before it is stored, as on the server surfaces), and spawns the worker on the current tokio runtime | `NoRuntime` (`Invalid`) outside a tokio runtime; `Invalid` for a zero `lease_ttl` or a `worker_id` of `Some("")`; `WorkerIdInUse` (`Rejected`) for a fixed id another live engine of this process uses on the same store; `Store` (the store's: its migration or the release); `Invalid` for an `mcp.json` or an `a2a:` subagent, the subagents' included: the engine runs neither yet, and refuses them itself, so what it accepts does not depend on the features another crate of the build turns on in `adam-assembly`; `Agent` (the definition's, `Invalid`): an empty alias, a tool nobody registered or one registered twice, a secret refused, an effort the model's profile does not take (the folder's, the builder's or a preset's), a `model_preset` the profiles do not declare, a preset above the model's `maxOutputTokensLimit`; `Schedules` (the reconcile's class) when the scheduler runs cannot be made to match the folder |
+| `Engine::builder(store, agent, model, alias)`, then `start()` | migrates the store, releases the leases a fixed `Limits::worker_id` holds (`Store::release_worker_leases`: the runs its last process was stepping are claimed at once; nothing with the default, `None`), binds the agent with the screen's tools of an embedded agent (`adam_ui::Ui::embedded`: `ask_user`, `show`, `ui_catalog`, `plan_*`, and `Ui::screen` as its source) and the host's own (`EngineBuilder::tools`, a `ToolSet`: an `FnTool`, or `#[tool]` functions from `adam = { default-features = false, features = ["macros"] }`, which keeps the embedded set; together they are the catalog the files' `tools:` selects from), gives it the model, the deployment's profiles (`EngineBuilder::models`) and the host's level for the root (`EngineBuilder::reasoning_effort`, applied when the folder sets none and validated then; the folder's key wins, and the builder's level wins over the agent's `model_preset` and the profile), so the folder's `reasoning_effort`, its `model_preset`, the profile and the profile's base preset resolve each agent's effort and output cap per model (ADR 0063 decision 8, ADR 0064), registers its scheduler and makes the store's scheduler runs match the folder's `schedules/` (see *Schedules*), gives the backend the folder's `commands/` (a message `/name args` is expanded from `commands/<name>.md` before it is stored, as on the server surfaces), and spawns the worker on the current tokio runtime | `NoRuntime` (`Invalid`) outside a tokio runtime; `Invalid` for a zero `lease_ttl` or a `worker_id` of `Some("")`; `WorkerIdInUse` (`Rejected`) for a fixed id another live engine of this process uses on the same store; `Store` (the store's: its migration or the release); `Invalid` for an `mcp.json` or an `a2a:` subagent, the subagents' included: the engine runs neither yet, and refuses them itself, so what it accepts does not depend on the features another crate of the build turns on in `adam-assembly`; `Agent` (the definition's, `Invalid`): an empty alias, a tool nobody registered or one registered twice, a secret refused, an effort the model's profile does not take (the folder's, the builder's or a preset's), a `model_preset` the profiles do not declare, a preset above the model's `maxOutputTokensLimit`; `Schedules` (the reconcile's class) when the scheduler runs cannot be made to match the folder |
 | `send(None, say)` | starts a run in a new conversation (`Delivered::Started`) | `Invalid` for no text or no id; `Stopped` (`Rejected`) after `shutdown` |
 | `send(Some(&conversation), say)` | the latest run of the conversation has ended: a new run that continues it, the agent starting from its state, the transcript included (`Continued`); it is still open: the message is delivered to it, as a steer while it works (`Steered`) or as the answer while it waits (`Answered`), by the state read just before. A `Say` that already started a run starts nothing (`Repeated`) | `NotFound` for a conversation the engine has no run in; `Refused` (`Rejected`) for a child session that refuses it (closed, at its rounds, or its rounds already working) |
 | `steer(run, say)` | a message for a run that works: it reads it at its next step, and a run about to finish takes another step first; a waiting run takes it as its answer | `Finished` (`Rejected`) for a run that ended; `NotFound`; `Unavailable` (`Transient`) when its state moved under the call |
@@ -313,15 +313,25 @@ every wait is bounded by `tokio::time::timeout`:
 * `the_hosts_retry_policy_governs_a_transient_failure`: `Limits::retry` of two attempts gives a transient model failure
   up after two calls, not five;
 * `the_deployments_profiles_reach_an_engines_agent`: `EngineBuilder::models` with a profile that declares `low` and
-  `high`, its own `reasoningEffort: low` and `maxOutputTokens: 64000` makes the model's first request ask for
-  `low` and 64,000 (the mock used directly, not through `Rig`: `GateModel` forwards no `context_window`, so a
-  window assertion through it would silently see none);
+  `high`, its own `reasoningEffort: low` and `maxOutputTokens: 100000` makes the model's first request ask for
+  `low`, and the cap is clamped to 80,000 by a 200,000-token window (200,000 − 20,000 margin − the 100,000 default
+  history); a hand-built profile (the loader refuses a file whose cap is above its limit) with
+  `maxOutputTokens: 64000` and `maxOutputTokensLimit: 32000` asks for 32,000 (the mock used directly, not through
+  `Rig`: `GateModel` forwards no `context_window`);
 * `the_builders_level_is_the_roots_and_the_file_wins`: `EngineBuilder::reasoning_effort(high)` with a folder
   `model_preset: quick` (a preset at `low`) asks for `high`; a folder `reasoning_effort: low` beside the same
   builder value asks for `low`;
+* `the_builders_level_wins_over_the_profiles_own`: a profile with `reasoningEffort: low` and
+  `EngineBuilder::reasoning_effort(high)` asks for `high`;
+* `the_builders_level_never_reaches_a_subagent`: a root at `high` (profile `[high]`) with a subagent on another
+  alias whose profile declares only `[none]` starts, the root's calls ask for `high`, and the child's request asks
+  for none — it fails if the `parent.is_none()` guard is dropped from the seat;
 * `a_level_the_models_profile_does_not_take_stops_start`: `reasoning_effort(max)` against a profile that declares
   `low` and `high`, and a folder's `reasoning_effort` with no profiles at all, are `EngineError::Agent`
-  (`AssemblyError::ReasoningEffort`, class `Invalid`);
+  (`AssemblyError::ReasoningEffort`, class `Invalid`), the first with `set_by == EffortSource::Folder` — the
+  builder's value is reported as the agent's own `reasoning_effort`;
+* `a_preset_the_profiles_do_not_declare_stops_start`: a folder `model_preset: quick` with no `.models()` is
+  `EngineError::Agent` (`AssemblyError::UnknownModelPreset`, class `Invalid`);
 * `start_refuses_what_it_cannot_build` (a zero lease and a ring of 0 or over 65 536 too; it passes alone and with
   `--features adam-assembly/mcp,adam-assembly/remote`, the set CI's workspace build unifies) and `start_outside_a_tokio_runtime_is_refused`: fail
   closed.

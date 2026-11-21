@@ -96,8 +96,9 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.
   a `SecretSource` (the default refuses every name), with `.tools(..)` a `ToolSet` of its own (`#[tool]`
   functions) that the files select with `tools:`, with `.models(..)` the deployment's `ModelProfiles` (without
   them an agent whose file sets `reasoning_effort` or `model_preset` is refused at `start`, fail closed) and with
-  `.reasoning_effort(..)` the root's level when its file sets none (the folder's own key wins). The engine reads
-  no environment variable.
+  `.reasoning_effort(..)` the root's level when its file sets none — the folder's own key wins, the builder's level
+  wins over the agent's `model_preset` and the profile, and it is validated when it applies (a file's own level is
+  validated instead). The engine reads no environment variable.
 * **Then** `start().await?`, `send`, `steer`, `answer`, `cancel`, `list`, `get`, `events`, `commands` (the folder's
   `/name` commands, which a message expands), `files` and `file` (what a tool handed over, by SHA-256), `firings` (the runs
   `schedules/` fired, which `get`, `events` and `cancel` reach too), `helpers`, `start_session`, `sessions` and

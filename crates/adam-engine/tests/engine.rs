@@ -4,18 +4,20 @@
 //! refuses. Every wait is bounded, so a hang fails.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::time::Duration;
 
 use adam_engine::adam_agent_fs::{Dir, Strictness};
-use adam_engine::adam_assembly::{AgentDef, Error as AssemblyError};
+use adam_engine::adam_assembly::{AgentDef, EffortSource, Error as AssemblyError};
 use adam_engine::adam_core::{DynStore, MemoryStore, RunId, Store};
 use adam_engine::adam_error::{Classify, ErrorClass};
 use adam_engine::adam_llm_agent::{FnTool, ToolError, ToolOutput, ToolSet};
 use adam_engine::adam_model::{
     ContentPart, DynModel, Message as ModelMessage, MockModel, ModelClient, ModelDelta, ModelError,
-    ModelProfiles, ModelRequest, ModelResponse, ReasoningEffort, ToolCall,
+    ModelProfile, ModelProfiles, ModelRequest, ModelResponse, ReasoningEffort, ReasoningWire,
+    ToolCall,
 };
 use adam_engine::adam_runtime::{Artifact, REPLAY_EVENTS_PER_RUN, RunEvent, StepState};
 use adam_engine::{
@@ -2033,7 +2035,7 @@ async fn the_engines_first_request_stays_under_the_lean_budget() {
 // ------------------------------- ADR 0063 decision 8: the engine's profiles and its level
 
 /// The deployment's profiles as its `MODEL_ALIASES_FILE` writes them, parsed by the same loader:
-/// one model, its levels and wire, its own level, and optionally a `quick` preset.
+/// one model `m`, its levels and wire, and the optional own level, cap and `quick` preset.
 fn profiles(own_level: Option<&str>, cap: Option<u32>, quick: Option<&str>) -> ModelProfiles {
     let own = own_level.map_or_else(String::new, |level| {
         format!(r#", "reasoningEffort": "{level}""#)
@@ -2067,16 +2069,17 @@ async fn say_to_the_end(engine: &Engine, text: &str) -> RunInfo {
 }
 
 /// The deployment's profiles reach an embedded engine's agent (ADR 0063 decision 8): the model's
-/// own level is the resolved default and its `maxOutputTokens` the request's cap. The mock is
-/// used directly, not through `Rig`: `GateModel` forwards no `context_window`, so a window
-/// assertion through it would silently see none.
+/// own level is the resolved default, and the profile's cap is clamped to what the window leaves
+/// and to the model's own documented limit. The mock is used directly, not through `Rig`, whose
+/// `GateModel` forwards no `context_window`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_deployments_profiles_reach_an_engines_agent() {
-    let mock = Arc::new(MockModel::new());
+    // The window leaves 200,000 − 20,000 margin − the 100,000 default history: 80,000.
+    let mock = Arc::new(MockModel::new().with_context_window("m", 200_000));
     mock.push_text("done");
     let model: DynModel = mock.clone();
     let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
-        .models(profiles(Some("low"), Some(64_000), None))
+        .models(profiles(Some("low"), Some(100_000), None))
         .start()
         .await
         .expect("the agent starts with its model's profile");
@@ -2091,8 +2094,39 @@ async fn the_deployments_profiles_reach_an_engines_agent() {
     );
     assert_eq!(
         first.max_output_tokens,
-        Some(64_000),
-        "the profile's cap is the request's"
+        Some(80_000),
+        "the window clamps the profile's cap"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+
+    // The model's documented limit clamps it too: 64,000 asked, 32,000 allowed. The loader
+    // refuses a profile whose own cap is above its limit, so this is a hand-built `ModelProfiles`
+    // — the case `output_cap` names for one.
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .models(ModelProfiles {
+            profiles: BTreeMap::from([(
+                "m".to_owned(),
+                ModelProfile {
+                    reasoning_efforts: Some(vec![ReasoningEffort::Low, ReasoningEffort::High]),
+                    reasoning_wire: Some(ReasoningWire::ReasoningEffort),
+                    max_output_tokens: Some(64_000),
+                    max_output_tokens_limit: Some(32_000),
+                    ..ModelProfile::default()
+                },
+            )]),
+            presets: BTreeMap::new(),
+        })
+        .start()
+        .await
+        .expect("the agent starts with its model's profile");
+    say_to_the_end(&engine, "hi").await;
+    assert_eq!(
+        mock.requests()[0].max_output_tokens,
+        Some(32_000),
+        "the model's limit clamps the profile's cap"
     );
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 }
@@ -2149,7 +2183,9 @@ async fn the_builders_level_is_the_roots_and_the_file_wins() {
 
 /// A level the model's profile does not take stops `start` (ADR 0063 decision 4 and 8):
 /// `EngineError::Agent` (class `Invalid`), whether the builder set it or a folder did with no
-/// profiles at all, which pins the binaries' fail-closed behaviour as the engine's too.
+/// profiles at all, which pins the binaries' fail-closed behaviour as the engine's too. The
+/// refusal reports the value as `reasoning_effort` on the agent's file even when the builder set
+/// it (`EffortSource::Folder`), the ruled compromise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_level_the_models_profile_does_not_take_stops_start() {
     let refused = Engine::builder(
@@ -2166,10 +2202,24 @@ async fn a_level_the_models_profile_does_not_take_stops_start() {
     let EngineError::Agent(source) = &refused else {
         panic!("the agent is refused: {refused:?}");
     };
-    assert!(
-        matches!(**source, AssemblyError::ReasoningEffort { .. }),
-        "{source}"
+    let AssemblyError::ReasoningEffort {
+        effort,
+        set_by,
+        model,
+        allowed,
+        ..
+    } = &**source
+    else {
+        panic!("the refusal is about the effort: {source}");
+    };
+    assert_eq!(effort, "max");
+    assert_eq!(
+        *set_by,
+        EffortSource::Folder,
+        "the builder's value is reported as the agent's own `reasoning_effort`"
     );
+    assert_eq!(model, "m");
+    assert_eq!(allowed.as_slice(), ["low", "high"]);
     assert_eq!(refused.class(), ErrorClass::Invalid);
 
     // The folder's own key, with no profiles: nothing declares a level, so nothing may set one.
@@ -2189,9 +2239,121 @@ async fn a_level_the_models_profile_does_not_take_stops_start() {
     let EngineError::Agent(source) = &unprofiled else {
         panic!("the agent is refused: {unprofiled:?}");
     };
+    let AssemblyError::ReasoningEffort { effort, set_by, .. } = &**source else {
+        panic!("the refusal is about the effort: {source}");
+    };
+    assert_eq!(effort, "low");
+    assert_eq!(*set_by, EffortSource::Folder);
+    assert_eq!(unprofiled.class(), ErrorClass::Invalid);
+}
+
+/// The builder's level wins over the profile's own `reasoningEffort` (ADR 0063 decision 8): the
+/// profile's is the model's default, not a ceiling on the host's explicit choice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_builders_level_wins_over_the_profiles_own() {
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .models(profiles(Some("low"), None, None))
+        .reasoning_effort(ReasoningEffort::High)
+        .start()
+        .await
+        .expect("the builder's level is one of the model's");
+    say_to_the_end(&engine, "hi").await;
+    assert_eq!(
+        mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::High),
+        "the builder's level wins over the profile's own"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A folder that names a preset with no profiles to declare it stops `start` (ADR 0064):
+/// `EngineError::Agent` (`UnknownModelPreset`, class `Invalid`), as on a server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_preset_the_profiles_do_not_declare_stops_start() {
+    let presetted = agent(&[(
+        "agent/instructions.md",
+        "---\nname: chat\ndescription: Talks with the person.\nmodel_preset: quick\n---\nYou chat.\n",
+    )]);
+    let refused = Engine::builder(
+        Arc::new(MemoryStore::new()),
+        presetted,
+        MockModel::new().into_dyn(),
+        "m",
+    )
+    .start()
+    .await
+    .expect_err("no profiles declare quick");
+    let EngineError::Agent(source) = &refused else {
+        panic!("the agent is refused: {refused:?}");
+    };
     assert!(
-        matches!(**source, AssemblyError::ReasoningEffort { .. }),
+        matches!(**source, AssemblyError::UnknownModelPreset { .. }),
         "{source}"
     );
-    assert_eq!(unprofiled.class(), ErrorClass::Invalid);
+    assert_eq!(refused.class(), ErrorClass::Invalid);
+}
+
+/// The builder's level is the **root's only** (ADR 0063 decision 8): a subagent never inherits it,
+/// since every subagent has its own file. A root at `high` and a child whose model takes only
+/// `none` both start, and the child's request sends no level.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_builders_level_never_reaches_a_subagent() {
+    let def = agent(&[
+        ("agent/instructions.md", CHAT),
+        (
+            "agent/subagents/worker.md",
+            "---\ndescription: Does a piece of the work.\nmodel: child\n---\nYou work.\n",
+        ),
+    ]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![ToolCall {
+        id: "call-1".into(),
+        name: "worker".into(),
+        arguments: json!({ "message": "do the piece" }),
+        ..Default::default()
+    }]);
+    mock.push_text("the piece is done").push_text("all done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), def, model, "m")
+        .models(
+            ModelProfiles::parse_json(
+                r#"{
+                    "profiles": {
+                        "m": { "reasoningEfforts": ["high"], "reasoningWire": "reasoning_effort" },
+                        "child": { "reasoningEfforts": ["none"], "reasoningWire": "reasoning_effort" }
+                    }
+                }"#,
+            )
+            .expect("the deployment's profiles parse"),
+        )
+        .reasoning_effort(ReasoningEffort::High)
+        .start()
+        .await
+        .expect("the root's level is the root's alone");
+    let done = say_to_the_end(&engine, "hi").await;
+    assert_eq!(done.state, RunState::Done);
+    let requests = mock.requests();
+    let child = requests
+        .iter()
+        .find(|request| request.model == "child")
+        .expect("the subagent's model call");
+    assert_eq!(
+        child.reasoning_effort, None,
+        "the builder's level never reaches the subagent"
+    );
+    let roots: Vec<_> = requests
+        .iter()
+        .filter(|request| request.model == "m")
+        .collect();
+    assert_eq!(roots.len(), 2, "the parent's two turns: {requests:?}");
+    assert!(
+        roots
+            .iter()
+            .all(|request| request.reasoning_effort == Some(ReasoningEffort::High)),
+        "the root's level on every root call: {roots:?}"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 }
