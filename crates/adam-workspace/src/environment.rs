@@ -250,15 +250,8 @@ impl SandboxShape {
 pub enum EnvKind {
     /// The caller's own container.
     Local,
-    /// A dev container made from a repository's `devcontainer.json` or from a default image.
-    DevContainer {
-        /// The `devcontainer.json` it was made from; `None` for the default image.
-        source: Option<PathBuf>,
-        /// The image it runs.
-        image: String,
-    },
     /// A pod of its own in a Kubernetes cluster (`adam-env-kubernetes`), made from the deployment's
-    /// pod template: the repository's own `devcontainer.json` is not used.
+    /// pod template.
     Kubernetes {
         /// The pod's name.
         pod: String,
@@ -377,22 +370,6 @@ pub trait Environment: Send + Sync + 'static {
     /// [`EnvError`] when it cannot find out.
     async fn held_runs(&self) -> Result<Vec<String>, EnvError>;
 
-    /// Throw away what is held for `run` and make it again on the next
-    /// [`ensure`](Self::ensure): the way out of an environment that is broken (a repository's
-    /// configuration that cannot be built), once the person has decided. With `use_default`, the
-    /// repository's own configuration is ignored for the rest of the run and the default
-    /// environment is used. The run's files are not touched. Returns whether this environment has
-    /// anything of its own to make again: the default (an environment that is the caller's own
-    /// container) has not, and says `false`.
-    ///
-    /// # Errors
-    ///
-    /// As [`release`](Self::release): something that is held cannot be freed.
-    async fn rebuild(&self, run: &str, use_default: bool) -> Result<bool, EnvError> {
-        let _ = (run, use_default);
-        Ok(false)
-    }
-
     /// Make what is held for `workspace`'s run fit the slots it has **now**, right after the caller
     /// added one (a worktree, a scratch project, a project taken over from another run).
     ///
@@ -405,7 +382,7 @@ pub trait Environment: Send + Sync + 'static {
     ///
     /// It never makes anything: a run that holds nothing has nothing to seal. The default does
     /// nothing, which is right for an environment that is the caller's own container or that sees
-    /// the whole workspace ([`Local`], a devcontainer).
+    /// the whole workspace ([`Local`]).
     ///
     /// # Errors
     ///
@@ -422,7 +399,7 @@ pub trait Environment: Send + Sync + 'static {
     /// brings its own `devcontainer.json`. `None` puts the run back on the deployment's image.
     ///
     /// The default refuses: only an environment that runs a run in a pod of its own has an image of
-    /// the run's to choose (the caller's own container and a devcontainer do not), so every outside
+    /// the run's to choose (the caller's own container does not), so every outside
     /// implementation compiles unchanged and says why a call cannot work.
     ///
     /// An implementation records the choice where the run's state is and makes the pod again when it
@@ -443,7 +420,7 @@ pub trait Environment: Send + Sync + 'static {
     /// The image prefixes this environment allows a repository to name, when it runs a run's
     /// commands in a pod of its own: `Some` for run pods (the list may be empty, which allows no
     /// repository image), `None` for an environment that has no run pod image to move (the caller's
-    /// own container, a devcontainer).
+    /// own container).
     ///
     /// The default is `None`. The tool that offers a repository's own image is offered only where
     /// this is `Some` with a prefix, and the deployment's admission policy is the control that
@@ -645,7 +622,7 @@ impl EnvSession for LocalSession {
 /// This is how a process that holds secrets keeps them from the code it runs for others (a
 /// repository's checks, a command the model asked for, a coding agent): the names are the
 /// deployment's, known at startup, and a caller that builds a spec cannot forget them. Everything
-/// else is the inner environment's: describe, kill, secrets, tool paths, release, rebuild.
+/// else is the inner environment's: describe, kill, secrets, tool paths, release.
 ///
 /// ```
 /// use adam_workspace::{ExecSpec, HidingEnvironment, Local, NoProgress};
@@ -715,10 +692,6 @@ impl Environment for HidingEnvironment {
 
     async fn held_runs(&self) -> Result<Vec<String>, EnvError> {
         self.inner.held_runs().await
-    }
-
-    async fn rebuild(&self, run: &str, use_default: bool) -> Result<bool, EnvError> {
-        self.inner.rebuild(run, use_default).await
     }
 
     async fn seal(&self, workspace: &RunWorkspace) -> Result<(), EnvError> {
@@ -827,7 +800,7 @@ mod tests {
     #[test]
     fn errors_classify_as_the_port_says() {
         let transient = [
-            EnvError::Unavailable("podman is down".into()),
+            EnvError::Unavailable("the run pod is down".into()),
             EnvError::Lost,
             EnvError::Timeout {
                 phase: "build",
@@ -895,10 +868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_has_nothing_to_make_again() {
-        assert!(!Local.rebuild("any-run", false).await.unwrap());
-        assert!(!Local.rebuild("any-run", true).await.unwrap());
-    }
+    async fn local_has_nothing_to_make_again() {}
 
     fn a_run(dir: &std::path::Path) -> RunWorkspace {
         crate::Workspaces::new(dir.join("root"), Arc::new(crate::StaticToken::new("t")))
@@ -1053,7 +1023,6 @@ mod tests {
         // The rest is the inner environment's.
         assert!(env.held_runs().await.unwrap().is_empty());
         env.release("any").await.unwrap();
-        assert!(!env.rebuild("any", false).await.unwrap());
     }
 
     /// An environment whose sessions say they are metered.

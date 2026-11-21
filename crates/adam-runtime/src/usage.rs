@@ -180,10 +180,11 @@ impl UsageTotals {
 #[non_exhaustive]
 pub enum SandboxEnvironment {
     /// The coder's own container: nothing is measured.
+    ///
+    /// A report of an older coder may say `devcontainer` here (ADR 0052 removed that environment):
+    /// it is read as this one, which is not measured either, and is written as `local` from now on.
+    #[serde(alias = "devcontainer")]
     Local,
-    /// A dev container made from a repository's `devcontainer.json` or a default image: nothing is
-    /// measured.
-    Devcontainer,
     /// A pod of the run's own: the time of its commands is measured.
     Kubernetes,
 }
@@ -193,7 +194,6 @@ impl SandboxEnvironment {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
-            Self::Devcontainer => "devcontainer",
             Self::Kubernetes => "kubernetes",
         }
     }
@@ -202,7 +202,7 @@ impl SandboxEnvironment {
     /// where the run was and nothing else: *not measured*, which is not zero.
     pub fn is_measured(self) -> bool {
         match self {
-            Self::Local | Self::Devcontainer => false,
+            Self::Local => false,
             Self::Kubernetes => true,
         }
     }
@@ -452,13 +452,18 @@ mod tests {
         assert_eq!(usage.environment(), Some(SandboxEnvironment::Kubernetes));
 
         let mut local = SandboxUsage::in_environment(SandboxEnvironment::Local);
-        local.merge(&SandboxUsage::in_environment(
-            SandboxEnvironment::Devcontainer,
-        ));
-        assert_eq!(local.environment(), Some(SandboxEnvironment::Devcontainer));
+        local.merge(&SandboxUsage::in_environment(SandboxEnvironment::Local));
+        assert_eq!(local.environment(), Some(SandboxEnvironment::Local));
         assert!(!SandboxEnvironment::Local.is_measured());
-        assert!(!SandboxEnvironment::Devcontainer.is_measured());
         assert!(SandboxEnvironment::Kubernetes.is_measured());
+        // A report of an older coder that says `devcontainer` loads, and is `local` from now on.
+        let old: SandboxUsage =
+            serde_json::from_value(json!({"environment": "devcontainer"})).unwrap();
+        assert_eq!(old.environment(), Some(SandboxEnvironment::Local));
+        assert_eq!(
+            serde_json::to_value(&old).unwrap(),
+            json!({"environment": "local"})
+        );
     }
 
     #[test]

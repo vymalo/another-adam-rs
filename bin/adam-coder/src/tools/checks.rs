@@ -23,9 +23,9 @@
 //! # A failed check is not run again on the same tree
 //!
 //! When the notes hold a **failed** record for the same command, directory, slot and timeout on
-//! exactly the tree the command is about to run on, made at the current `ChecksNotes::epoch` (`run`,
-//! `rebuild_environment` and the file tools bump it; the command is told apart by the SHA-256 of its
-//! raw text, so two commands that differ only in a secret are two checks), the
+//! exactly the tree the command is about to run on, made at the current `ChecksNotes::epoch` (`run`
+//! and the file tools bump it; the command is told apart by the SHA-256 of its raw text, so two
+//! commands that differ only in a secret are two checks), the
 //! command is not run: the result quotes that run's findings, names the call that made them, spends
 //! no check cycle and emits no `checks` artifact (the earlier run's is the verdict on this tree).
 //! It is still a failure, so the gate refuses a pull request on the tree. A passing record is never
@@ -81,14 +81,17 @@ pub struct Finding {
 }
 
 /// Where a check ran, when it was not in the coder's own container: the `environment` of the
-/// `checks` artifact. Absent for a run in this container, so nothing changes for a deployment without
-/// devcontainers; a consumer that does not know the field ignores it.
+/// `checks` artifact. Absent for a run in this container, so nothing changes for a local deployment;
+/// a consumer that does not know the field ignores it.
+///
+/// `kind` is `kubernetes` (the run's own pod). A report of an older coder may say `devcontainer`
+/// with the file it was built from in `source`; this coder never makes one (ADR 0052).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentReport {
-    /// What the environment is: `devcontainer` or `kubernetes` (the run's own pod).
+    /// What the environment is: `kubernetes` (the run's own pod).
     pub kind: String,
-    /// The `devcontainer.json` it was built from, as the repository calls it; absent for the default
-    /// image.
+    /// The `devcontainer.json` a report of an older coder was built from, as the repository calls
+    /// it; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// The image it runs.
@@ -99,11 +102,6 @@ impl EnvironmentReport {
     /// What `description` says, or `None` for the coder's own container.
     pub fn of(description: &EnvDescription) -> Option<Self> {
         match &description.kind {
-            EnvKind::DevContainer { source, image } => Some(Self {
-                kind: "devcontainer".to_owned(),
-                source: source.as_deref().map(super::repository_file),
-                image: image.clone(),
-            }),
             EnvKind::Kubernetes { image, .. } => Some(Self {
                 kind: "kubernetes".to_owned(),
                 source: None,
@@ -122,7 +120,7 @@ impl EnvironmentReport {
 /// | `commit` | the 40-hex SHA of the `HEAD` of the run's workspace when the check ran; empty only when it could not be determined (`passed` is then `false`) |
 /// | `tree` | the git tree id (40 hex) of the code the check ran on, as `git add -A` would commit it; absent when it could not be computed |
 /// | `repository` | the URL of the repository of the slot the check ran in (for the verdict on a pushed commit, the repository it was pushed to); absent for a scratch project and in reports of an older coder |
-/// | `environment` | where the check ran, when that was a devcontainer or the run's own pod: `{kind, source?, image}`; absent for a run in the coder's own container and in reports of an older coder |
+/// | `environment` | where the check ran, when that was the run's own pod: `{kind, image}` (`kubernetes`); absent for a run in the coder's own container and in reports of an older coder. A report of an older coder may say `devcontainer` with a `source` |
 /// | `preexisting` | `true` when the command also fails on the base commit (`base_commit`), before the run changed anything: the failure is the repository's and the run's change did not cause it. Absent otherwise, and in reports of an older coder. `passed` is still `false`: a consumer that gates on the checks reads this to accept the failure |
 /// | `base_commit` | with `preexisting`: the commit `origin/<base>` was at when the command failed there too (40 hex) |
 /// | `summary` | one line |
@@ -463,8 +461,8 @@ pub(crate) async fn missing_tool_answer(
 /// project's dependencies are installed with the project's own command, **through
 /// `run` and not `run_checks`** (an install that passes is a green check on code
 /// nobody tested, and `run_checks` is for the project's real checks). `repeated`: the same tool was
-/// already reported, so whatever was tried did not work, and the person decides. In a devcontainer
-/// the answer says which environment lacks it and how the tool gets there (`environment`).
+/// already reported, so whatever was tried did not work, and the person decides. In a run pod the
+/// answer says which environment lacks it and how the tool gets there (`environment`).
 pub(crate) fn missing_tool_text(
     missing: &MissingTool,
     install: Option<&str>,
@@ -489,23 +487,6 @@ pub(crate) fn missing_tool_text(
         ""
     };
     let place = match environment {
-        EnvKind::DevContainer {
-            source: Some(file), ..
-        } => format!(
-            " The commands of this workspace run in the devcontainer built from `{}`: the tool \
-             has to be in that environment, so say that `{name}` must be added to it (a \
-             devcontainer feature, or its Dockerfile); once the file is changed, \
-             rebuild_environment makes the environment again.",
-            super::repository_file(file)
-        ),
-        EnvKind::DevContainer {
-            source: None,
-            image,
-        } => format!(
-            " This repository has no devcontainer, so the commands run in the default \
-             environment ({image}), which lacks `{name}`: a `.devcontainer/devcontainer.json` in \
-             the repository can provide it."
-        ),
         EnvKind::Kubernetes { pod, image } => format!(
             " The commands of this workspace run in a pod of their own ({pod}{}), made from the \
              deployment's pod template and not from the repository: the tool has to be in that \
@@ -582,8 +563,8 @@ fn unchanged_failure_text(record: &CheckRecord, command: &str, failures: u32, ma
 //   tool no longer runs anything and tells the model to stop and report.
 
 /// Run one of the project's own checks in your worktree (the commands its CI, README or
-/// Makefile run: `cargo test`, `pnpm test`, `just ci`), in the workspace's environment (the
-/// repository's own devcontainer when it has one), and get its exit code and the tail of
+/// Makefile run: `cargo test`, `pnpm test`, `just ci`), in the workspace's environment (a run pod of
+/// the run's own when the deployment runs them), and get its exit code and the tail of
 /// its output. With several repositories in the workspace, say which with `repo`. Only exit code 0 counts as passing. Every failed run uses up one of your limited
 /// check cycles and is reported as a check: never use it to look around (use run_command) or to make a file or change the worktree (use run). A
 /// failed check asked again on exactly the same unchanged code is answered from the earlier run

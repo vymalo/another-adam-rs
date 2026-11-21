@@ -81,7 +81,6 @@ flowchart TB
         ws["adam-workspace"]
         codetools["adam-code-tools"]
         gitsb["adam-git-sandbox"]
-        devc["adam-devcontainer"]
         kube["adam-env-kubernetes"]
         acp["adam-acp"]
     end
@@ -92,7 +91,6 @@ flowchart TB
     coder --> ws
     coder --> codetools
     codetools --> ws
-    coder --> devc
     coder --> kube
     coder --> acp
     agent --> service
@@ -137,7 +135,7 @@ flowchart TB
 | Layer | Crates | Job |
 |---|---|---|
 | Contracts | [`adam-error`](../crates/adam-error/README.md), [`adam-core`](../crates/adam-core/README.md), [`adam-model`](../crates/adam-model/README.md), [`adam-a2a`](../crates/adam-a2a/README.md), [`adam-host`](../crates/adam-host/README.md) | Error classes, the `Store` port and run types, the `ModelClient` port, the `TaskBackend` port with the A2A 1.0 server, the process `Role` and `Placement` with a supervisor. |
-| Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-model-openai`, [`adam-model-oauth`](../crates/adam-model-oauth/README.md), [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-code-tools`](../crates/adam-code-tools/README.md) (the file and command tools as a library, ADR 0047; moving out of the coder in steps), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-devcontainer`](../crates/adam-devcontainer/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
+| Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-model-openai`, [`adam-model-oauth`](../crates/adam-model-oauth/README.md), [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-code-tools`](../crates/adam-code-tools/README.md) (the file and command tools as a library, ADR 0047; moving out of the coder in steps), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
 | Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares. |
 | Agents and authoring | [`adam-llm-agent`](../crates/adam-llm-agent/README.md), [`adam-ui`](../crates/adam-ui/README.md), [`adam-mcp`](../crates/adam-mcp/README.md), [`adam-agent-fs`](../crates/adam-agent-fs/README.md), [`adam-assembly`](../crates/adam-assembly/README.md), [`adam-macros`](../crates/adam-macros/README.md), [`adam`](../crates/adam/README.md) | The model-and-tools loop; the screen's tools; MCP tools; the agent-folder parser; binding a folder to agents; `#[tool]`; the facade. See [Write an agent](guides/write-an-agent.md). |
 | Embedded | [`adam-engine`](../crates/adam-engine/README.md) | adam-rs in an application with no server and nothing on the network of its own ([ADR 0047](decisions/0047-adam-rs-can-be-embedded-in-an-application.md)): the embedded set, the runtime and its agent crates with `adam-a2a`'s `server`, `adam-a2a-runtime`'s `push` and `adam-ui`'s `thread-tools` off, checked by `tools/embedded-deps/check.sh`. Its API (slice 4: send, steer, answer, cancel, list, over `RuntimeTaskBackend` and a store and a model the host gives) is built; its stream of events is not yet. |
@@ -187,7 +185,6 @@ classDiagram
     EventSink <|.. NoopSink
     class Environment { <<interface>> }
     Environment <|.. Local
-    Environment <|.. DevContainer
     Environment <|.. KubeEnvironment
     class CodeHost { <<interface>> }
     CodeHost <|.. GitHub
@@ -213,7 +210,7 @@ classDiagram
 | `CodeWorkspace` | `adam-code-tools` | `ToolEnv` (`adam-coder`: the slots of a run's workspace) | `DirWorkspace` (`adam-code-tools-testkit`, the reference of its conformance cases) |
 | `CodeHost` | `adam-workspace` | `GitHub` (feature `github`) | `MemoryCodeHost` (feature `test-util`) |
 | `GitCredentials` | `adam-workspace` | `ScopedToken`, `GitHubApp` (inside `HostScoped`), `StaticToken` | none needed |
-| `Environment` | `adam-workspace` | `Local`, `DevContainer` (`adam-devcontainer`), `KubeEnvironment` (`adam-env-kubernetes`) | stub Podman, CLI and API server in the tests |
+| `Environment` | `adam-workspace` | `Local`, `KubeEnvironment` (`adam-env-kubernetes`) | a fake API server and exec seam in the tests |
 | `CallBearer` | `adam-mcp` | `GitHubReadBearer` (`adam-coder`) | test bearers |
 | `PermissionPrompt` | `adam-acp` | none (the default policy needs no prompt) | `StaticPrompt` |
 
@@ -1269,10 +1266,10 @@ The tree of enums and the exit codes are in [Errors](reference/errors.md).
 
 The coder keeps a **workspace** per run: `<root>/workspaces/<run>/`, a directory of slots, each a
 repository's worktree, a scratch project or a **reference** (a repository read beside the one the run works on and never
-written: a detached checkout that a run pod and a devcontainer mount read-only,
+written: a detached checkout that a run pod mounts read-only,
 [References](reference/workspace-and-environments.md#references)). Its commands run through the `Environment` port: in the
-coder's own container (`Local`), in the repository's devcontainer on a rootless Podman service
-(`DevContainer`), or in a Kubernetes pod of the run's own (`KubeEnvironment`).
+coder's own container (`Local`) or in a Kubernetes pod of the run's own (`KubeEnvironment`); ADR 0052 removed
+the third environment, a repository's devcontainer on a container service.
 
 Runs move between workers at every step, but a workspace lives on one worker's disk. The deployer picks
 a **placement** (`adam_host::Placement`, read from `WORKSPACE_PLACEMENT`;
@@ -1291,9 +1288,8 @@ Slots, the environments' sequences and states, and the mirror lock are in
 [Workspace and environments](reference/workspace-and-environments.md).
 
 The **package caches** (npm, pnpm, cargo) are not part of a workspace: they are one deployment-level volume at `/cache`, mounted
-by every pod that runs toolchains (the coder, its run pods, a devcontainer) and shared by all of them, off by default
-([ADR 0040](decisions/0040-a-shared-package-cache-at-cache.md); chart value `cache`,
-`DEVCONTAINER_CACHE_DIR`). Installed trees (`node_modules`, `target/`) stay in the workspace.
+by every pod that runs toolchains (the coder, its run pods) and shared by all of them, off by default
+([ADR 0040](decisions/0040-a-shared-package-cache-at-cache.md); chart value `cache`). Installed trees (`node_modules`, `target/`) stay in the workspace.
 
 The **kept output** of a long command, or of a long MCP result, is a file of the run too:
 `<root>/outputs/<run>/<id>.txt`, written by the coder's own process (never by a pod) after the text is scrubbed
@@ -1400,7 +1396,7 @@ stateDiagram-v2
 A **language server** (`file_diagnostics`, `find_definition`, `find_references`) is the same kind of process with a pipe on
 stdin: the coder holds one per run, slot, language and project root **on this worker**, spoken to in JSON-RPC with `Content-Length`
 frames, and stops it where it stops a command that keeps running (the registry is `Commands::language_servers()`, so
-the agent's step, the sweep, the janitor and `rebuild_environment` reach it with no new wiring). There is no record on the volume
+the agent's step, the sweep, the janitor and `use_repository_environment` reach it with no new wiring). There is no record on the volume
 and no beat: a run that another worker takes up starts a server there (placement `shared`; `affinity` and `isolated` keep a run where
 it is), and the first worker's server stops by itself when it is idle or its run is over. The tools, the limits and the lifecycle:
 [The coder agent](reference/coder-agent.md#language-servers).
@@ -1419,7 +1415,7 @@ sequenceDiagram
     C->>P: initialize, initialized
     T->>P: sync, then the request, within the wait
     Note over P: idle for LANGUAGE_SERVER_IDLE_SECS: its supervisor stops it
-    A->>C: stop_run, when the root run ends, a run parks on the person, or rebuild_environment runs
+    A->>C: stop_run, when the root run ends, a run parks on the person, or use_repository_environment runs
     W->>C: sweep: stop_run for a run that is over or cancelled
     J->>C: stop_run, before the release
     W->>C: stop_all, when the worker stops

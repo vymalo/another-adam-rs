@@ -168,9 +168,9 @@ pub struct ChecksNotes {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub base: Vec<BaseResult>,
     /// How many times files a check reads may have changed without the tree id changing: bumped by
-    /// `run` (which keeps files, ignored ones included), by the file tools (`write_file`,
-    /// `edit_file`, `apply_patch`: a file the project ignores does not change the tree) and by
-    /// `rebuild_environment`. A failed record is reused only while this is the epoch it ran at
+    /// `run` (which keeps files, ignored ones included) and by the file tools (`write_file`,
+    /// `edit_file`, `apply_patch`: a file the project ignores does not change the tree). A failed
+    /// record is reused only while this is the epoch it ran at
     /// ([`RunNotes::failed_check_on`]).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub epoch: u64,
@@ -229,26 +229,6 @@ pub struct MissingHit {
     pub call_id: String,
     /// The command word the shell could not find.
     pub tool: String,
-}
-
-/// What the coder remembers about the run's environment (the devcontainer the commands run in).
-///
-/// The environment itself keeps its own state on the volume (`<root>/environments/<run>/state.json`);
-/// this is what the tools need to answer without asking it, and what survives the environment being
-/// made again.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnvironmentNotes {
-    /// The person decided to go on in the default environment (`rebuild_environment` with
-    /// `use_default`): the repository's own `devcontainer.json` is not used for the rest of the run.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub use_default: bool,
-}
-
-impl EnvironmentNotes {
-    /// Nothing is remembered: the notes of a run that never left this container keep their shape.
-    fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
 }
 
 impl RunNotes {
@@ -487,9 +467,6 @@ pub struct RunNotes {
     /// answer is to ask the person, whatever the project says.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_tools: Vec<MissingHit>,
-    /// What the coder remembers about the run's environment.
-    #[serde(default, skip_serializing_if = "EnvironmentNotes::is_empty")]
-    pub environment: EnvironmentNotes,
     /// `open_pull_request` moved the continued branch to the pushed commit. From then on the
     /// branch has the run's commits, whether or not the pull request could be reported.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1458,10 +1435,11 @@ mod tests {
         }
     }
 
-    /// ADR 0038: notes written before the removal hold `environment.opencode`. They still load, and the
-    /// member is gone from the next save.
+    /// ADR 0038 removed OpenCode, and ADR 0052 removed the environment that `rebuild_environment`
+    /// chose: notes written before them hold `environment.opencode` and `environment.use_default`.
+    /// They still load, and the removed members are gone from the next save.
     #[tokio::test]
-    async fn old_notes_that_hold_the_opencode_check_load_and_drop_it_on_the_next_save() {
+    async fn old_notes_that_hold_a_removed_member_load_and_drop_it_on_the_next_save() {
         let dir = tempfile::tempdir().unwrap();
         let store = NotesStore::new(dir.path());
         let run = "11111111-2222-3333-4444-555555555555";
@@ -1473,11 +1451,10 @@ mod tests {
         )
         .unwrap();
         let notes = store.load(run).await.expect("an old file still loads");
-        assert!(notes.environment.use_default, "what is still kept is kept");
         store.save(run, &notes).await.unwrap();
         let saved = std::fs::read_to_string(&file).unwrap();
         assert!(!saved.contains("opencode"), "{saved}");
-        assert!(saved.contains("use_default"), "{saved}");
+        assert!(!saved.contains("use_default"), "{saved}");
     }
 
     #[test]

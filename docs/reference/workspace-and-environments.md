@@ -2,8 +2,8 @@
 
 Where a run's files live and where its processes run. This is the coder's side of the platform; the
 overview is in [Architecture](../architecture.md#where-a-runs-files-and-processes-live). Code:
-`crates/adam-workspace` (workspaces, `Environment`, credentials), `crates/adam-devcontainer`,
-`crates/adam-env-kubernetes`, `crates/adam-host` (`Placement`), `bin/adam-coder`.
+`crates/adam-workspace` (workspaces, `Environment`, credentials), `crates/adam-env-kubernetes`,
+`crates/adam-host` (`Placement`), `bin/adam-coder`.
 
 ## Placement: which worker holds a run's files
 
@@ -100,9 +100,8 @@ stateDiagram-v2
 ```
 
 `Reading` is a workspace that holds references and nothing to work in: a read tool works in a reference, and a tool
-that writes says there is nothing to write to. A **devcontainer** has nothing to run in there either (a reference has
-no devcontainer of its own, and `run_command` needs a repository or a project); a run pod works, and mounts the
-reference read-only.
+that writes says there is nothing to write to. `run_command` needs a repository or a project; a run pod
+works there, and mounts the reference read-only.
 
 ### References
 
@@ -173,9 +172,8 @@ stateDiagram-v2
   `ToolEnv::slot_to_write`, which refuses a slot that is not writable; a test calls each tool that writes with a
   reference. Git: the worktree refuses a commit, a push, a publication, a base checkout and a copy into it, and a
   reference has no branch and no credential to push with. The mount: a run pod gets the reference and its directory in
-  the mirror **read-only**, and so does a devcontainer.
-* **With no run pods only the first two hold.** A `run_command` in a reference runs in the coder's own container (or the
-  devcontainer): its guard undoes and refuses what changed a tracked or untracked file, `HEAD` or the git state, and
+  the mirror **read-only**.
+* **With no run pods only the first two hold.** A `run_command` in a reference runs in the coder's own container: its guard undoes and refuses what changed a tracked or untracked file, `HEAD` or the git state, and
   **cannot see a file that `.gitignore` excludes**, nor a write outside the slot. `run` and `run_checks` are refused in a
   reference. Use run pods when a reference must be unchangeable by a command.
 * **What a reference holds is somebody else's text.** Reading grants no repository, tier or consent, and its own
@@ -214,20 +212,20 @@ paths are the same in every environment, so the file tools and all git work stay
 
 | Environment | Where | Chosen by |
 |---|---|---|
-| `Local` | the coder's own container | the default |
-| `DevContainer` | the first slot's `devcontainer.json` (a default image when it has none), on a rootless Podman service, never the host's Docker socket | `DEVCONTAINER_RUNTIME=podman` (off by default; off on Kubernetes) |
-| `KubeEnvironment` | a Kubernetes pod of the run's own, made from a template the deployment mounts; the run container's image may be the repository's own ([below](#a-repositorys-own-image-adr-0052)) | `RUN_ENVIRONMENT=kubernetes` (refused with `podman`) |
+| `Local` | the coder's own container: on a desktop, the person's own work sandbox | the default |
+| `KubeEnvironment` | a Kubernetes pod of the run's own, made from a template the deployment mounts; the run container's image may be the repository's own ([below](#a-repositorys-own-image-adr-0052)) | `RUN_ENVIRONMENT=kubernetes` |
 
 It is chosen when the binary is composed, not by a plugin. A failure to make the environment is a result
 for the model (no check cycle is used); a secret is never in a description, only the names to hide.
+ADR 0052 removed the third one (a repository's devcontainer on a rootless container service): a
+deployment that still asks for it stops with exit 78, and a repository that brings its own environment
+names an image its run pod runs ([below](#a-repositorys-own-image-adr-0052)).
 
-### The repository's devcontainer
+### The environment of a run
 
-The file is untrusted and checked three times; nothing of the coder's environment enters the container;
-every step of making it is shown ([ADR 0010](../decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)
-has the sequence and the lifecycle). The coder brings in only `adam-exec`, mounted read-only: no agent binary and no secret ([ADR 0038](../decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)). It has a `rebuild_environment` tool for the way out of a file that cannot be
-used, and has its janitor release a run's environment before it removes the workspace. Why the chart does
-not turn it on: [the chart README](../../deploy/coder/README.md#devcontainers-are-off-here).
+The coder brings `adam-exec` into a run pod only (through the chart's init container), read-only: no
+agent binary and no secret ([ADR 0038](../decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)).
+Its janitor releases a run's environment before it removes the workspace.
 
 ```mermaid
 sequenceDiagram
@@ -276,12 +274,11 @@ the others see it through the record: [Several workers](coder-agent.md#several-w
 |---|---|---|---|---|
 | local | `sh -lc` in its own process group, a child of the coder | `bg-local-<n>` | the group is killed (`kill_group`), and what the leader left in the group, whatever ended the leader | it dies with the container (`tini`); a coder outside a container finds the record, and kills the pid only when its start time still matches, and what is left of its group (Linux); a registry that is dropped kills the groups it holds; the janitor kills what the records of a finished run name before it removes them |
 | run pod | `adam-exec shell` in the pod; the `adam-kube-exec` client is the coder's child | `bg-kp-<epoch>-<n>` | the client is killed, then `adam-exec kill <id>` in the pod, when the client ends by itself too (`cmd &` outlives the client); another worker's `stop_command` kills the exec id at once and asks the owner to settle it | the pod's process may live on: once the record's beat is stale (the larger of three sweeps and 60 s) the next `start_command`, `stop_command` or `list_commands` kills it by exec id, and says `gone`; the janitor's `release` deletes the pod anyway |
-| devcontainer | the same, through `devcontainer exec` | `bg-dc-<epoch>-<n>` | as for a pod | as for a pod; `release` removes the container |
 
-* **A pod made again** (a new slot, a reference, a rebuild) ends the client of a command in it. The coder cannot tell why the client
-  ended, so a command in a pod or a devcontainer that a signal ended, and that nobody asked to stop, is `stopped` with the reason
-  *its environment was made again ... or something outside ended it; start it again if it is still needed*. `rebuild_environment` stops
-  the run's commands first and says so.
+* **A pod made again** (a new slot, a reference, or another image chosen) ends the client of a command in it. The coder cannot tell why
+  the client ended, so a command in a run pod that a signal ended, and that nobody asked to stop, is `stopped` with the reason
+  *its environment was made again ... or something outside ended it; start it again if it is still needed*. `use_repository_environment`
+  stops the run's commands first and says so.
 * **`adam-exec active-fg`** counts the live records whose id does not start with `bg-`. A pod made again for a new slot asks
   `active-fg` (`free_for_new_mount`, `seal`), so a development server never holds the pod from a new repository: the pod is
   deleted with the server in it, and the client of the command ends. The idle sweep asks `active`, which counts every command,

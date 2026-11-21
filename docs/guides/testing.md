@@ -89,7 +89,7 @@ another spelling of a file's address, garbage on stdout after the start, an erro
 whose input pipe fills); the table of keys is its module doc. It logs every message it receives, so a test reads what the client sent.
 
 The tests are real processes, and **each stop point is proved by pid** (idle, park, the end of the run, a cancelled run reached by the
-sweep, `rebuild_environment`, the worker's stop, a registry that is dropped, a server that did not answer `initialize`, a start whose call is
+sweep, `use_repository_environment`, the worker's stop, a registry that is dropped, a server that did not answer `initialize`, a start whose call is
 dropped, a start that ends after its run was stopped, a server whose output stopped being messages): nothing of the server, its
 child and its grandchild is left. The registry is also driven directly (`Servers::get_or_start` with a recording `EnvSession`) for what a
 call cannot show: the bound under two concurrent starts, a server that is being stopped still counting, a call dropped while it waits for a server. Run them with the whole suite or by name:

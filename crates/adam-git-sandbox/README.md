@@ -224,7 +224,7 @@ The coder's own code paths (`RunWorkspace`, `Worktree::commit_all`, the tools' q
 * **It does not authenticate.** Whoever can connect to the socket runs `git` in the sandbox. The mode `0600` and the directory decide who
   that is.
 * **It does not stop the coder's own commands from being what they are**: a command the coder runs in its own container (a run's commands
-  in local mode, Podman or run pods off) is not made safer by this. Local mode stays **unprotected** and is documented as such.
+  in local mode or run pods off) is not made safer by this. Local mode stays **unprotected** and is documented as such.
 * **It runs one program: git.** The arguments and the environment are the client's within the allow-list, so a client can ask git for
   anything git does (`-c alias.x=!sh`, `-c core.sshCommand=...`) in the sandbox; the sandbox has nothing to protect from its client.
 * Windows and macOS: Unix sockets, process groups and `openat` are used as Linux has them.

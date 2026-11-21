@@ -12,7 +12,7 @@
 //! | `run_checks` | the project's own checks | kept (they are the project's) | yes: a cycle, a `checks` artifact, the gate |
 //!
 //! `run` runs exactly as `run_command` does: the workspace's environment (the repository's
-//! devcontainer when it has one), the login shell, a `cwd` inside the worktree, the same time limit
+//! run pod when the deployment runs them), the login shell, a `cwd` inside the worktree, the same time limit
 //! (`CHECK_TIMEOUT_SECS`) and output cap, the secrets of this process hidden from the child, and a
 //! missing tool reported as a missing toolchain. It differs in what it is held to afterwards:
 //!
@@ -45,8 +45,8 @@ use super::{Outcome, ToolEnv};
 
 /// Make something with a shell command in your worktree and keep what it changes: generate or
 /// export a file (`npm run render`, `python chart.py`, `convert a.png b.jpg`), install a project's
-/// dependencies, run a formatter, build an artifact. It runs in the workspace's environment (the
-/// repository's own devcontainer when it has one, so its tools are there), with the same time limit
+/// dependencies, run a formatter, build an artifact. It runs in the workspace's environment (a run pod
+/// of the run's own when the deployment runs them), with the same time limit
 /// as the checks, and you get the exit code, the tail of the output and the files that changed.
 /// Unlike run_command (for looking, it undoes changes) the files stay, and unlike run_checks it is
 /// not a check: it costs no check cycle and the pull request gate never sees it. It cannot touch

@@ -610,20 +610,19 @@ fn model_text() -> Arc<MockModel> {
 /// Where the commands ran when that is not measured: the environment and nothing else.
 #[tokio::test]
 async fn an_environment_that_is_not_measured_is_named_and_has_no_usage() {
-    for environment in [SandboxEnvironment::Local, SandboxEnvironment::Devcontainer] {
-        let model = model();
-        model
-            .push_response(calls_with(vec![call("c1", "unmetered")], Usage::new(1, 1)))
-            .push_response(text_with("done", Usage::new(1, 1)));
-        let rig = agent_rig(model, vec![Arc::new(Unmetered(environment))]);
-        let (id, _events) = read(&rig, plain(), "go").await;
-        let task = rig.backend.get(&plain(), &id).await.unwrap().unwrap();
-        assert_eq!(
-            sandbox(&task),
-            Some(json!({"environment": environment.as_str()})),
-            "not measured is not zero"
-        );
-    }
+    let environment = SandboxEnvironment::Local;
+    let model = model();
+    model
+        .push_response(calls_with(vec![call("c1", "unmetered")], Usage::new(1, 1)))
+        .push_response(text_with("done", Usage::new(1, 1)));
+    let rig = agent_rig(model, vec![Arc::new(Unmetered(environment))]);
+    let (id, _events) = read(&rig, plain(), "go").await;
+    let task = rig.backend.get(&plain(), &id).await.unwrap().unwrap();
+    assert_eq!(
+        sandbox(&task),
+        Some(json!({"environment": environment.as_str()})),
+        "not measured is not zero"
+    );
 }
 
 /// A task that waits carries what its commands ran so far, and once answered the whole run's.

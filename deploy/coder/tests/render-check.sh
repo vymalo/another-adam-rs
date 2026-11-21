@@ -1908,12 +1908,13 @@ helm_key --set topology=split --set runPods.enabled=true > "$out"
 check "split with run pods: the worker renders without the acceptance" dlacks StatefulSet "$accept"
 helm_key --set config.role=control-plane > "$out"
 check "a control plane runs no command and holds no key: an App renders without the acceptance" lacks "$accept|github-app"
-check "Podman devcontainers named in extraEnv are not the coder's container: no acceptance needed" \
-  helm_key --set-string config.extraEnv.DEVCONTAINER_RUNTIME=podman
-helm_key --set-string config.extraEnv.DEVCONTAINER_RUNTIME=Podman > "$out"
-check "... in any case, and the variable is still not rendered" lacks "$accept"
-check "DEVCONTAINER_RUNTIME=off in extraEnv is the coder's container: refused" \
+check "a removed DEVCONTAINER_RUNTIME in extraEnv no longer moves the commands: still refused" \
   fails helm_key --set-string config.extraEnv.DEVCONTAINER_RUNTIME=off
+helm_key --set runPods.allowCommandsNextToSecrets=true \
+  --set-string config.extraEnv.DEVCONTAINER_RUNTIME=off > "$out"
+check "... the acceptance is the only way out" envval "$accept" true
+check "... and extraEnv still carries the removed variable (the coder ignores it, with a warning)" \
+  chas 'DEVCONTAINER_RUNTIME'
 
 # The production values: run pods on, an App by owners, the key a file. They render, and nothing accepts the risk.
 prod="$chart/examples/production.values.yaml"

@@ -38,8 +38,8 @@ use super::gitcli::{
 use super::{Outcome, ToolEnv};
 
 /// Look around in your worktree with a shell command: `git branch -r`, `git log --oneline`,
-/// `ls`, `cat README.md`, `grep -rn name src`. It runs in the workspace's environment (the
-/// repository's own devcontainer when it has one, so its tools are there). You get the exit code and
+/// `ls`, `cat README.md`, `grep -rn name src`. It runs in the workspace's environment (a run pod
+/// of the run's own when the deployment runs them). You get the exit code and
 /// the tail of the output.
 /// It costs no check cycle and reports no checks, and it is for looking: changes it makes to
 /// HEAD, the branch and the working tree are undone and refused (to make a file or change the

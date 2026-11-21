@@ -1387,22 +1387,6 @@ async fn stopping_a_run_leaves_no_process_of_its_servers_not_even_a_grandchild()
 }
 
 #[tokio::test]
-async fn rebuilding_the_environment_stops_the_servers_of_the_run() {
-    let lsp = Lsp::new(script_with_tree()).await;
-    rust_project(&lsp);
-    lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
-    lsp.tree().await;
-    assert_eq!(lsp.servers().len(), 1);
-    let out = lsp.call("rebuild_environment", json!({})).await;
-    assert!(!out.is_error, "{}", out.content);
-    assert!(lsp.servers().is_empty());
-    lsp.tree_is_gone("what the rebuild left").await;
-    // The next call asks for the program again, and starts a new server.
-    lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
-    assert_eq!(lsp.servers().len(), 1);
-}
-
-#[tokio::test]
 async fn the_worker_stopping_stops_every_server() {
     let lsp = Lsp::new(script_with_tree()).await;
     rust_project(&lsp);

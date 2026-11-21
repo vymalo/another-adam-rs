@@ -32,7 +32,7 @@ async fn limits_with(environment_start: u64) -> BTreeMap<String, Option<Duration
 #[tokio::test]
 async fn every_tool_declares_its_own_bound_or_is_quick_by_construction() {
     let limits = limits_with(0).await;
-    assert_eq!(limits.len(), 36, "the whole list: {:?}", limits.keys());
+    assert_eq!(limits.len(), 35, "the whole list: {:?}", limits.keys());
     for (name, limit) in &limits {
         let quick = QUICK_TOOLS.contains(&name.as_str());
         match limit {
@@ -83,7 +83,6 @@ async fn the_limits_come_from_the_deployments_settings() {
     for command in ["run_command", "run", "run_checks"] {
         assert_eq!(secs(command), 2100 + 700 + MARGIN, "{command}");
     }
-    assert_eq!(secs("rebuild_environment"), 2100 + MARGIN);
     // A command that keeps running: the environment is made ready and the call waits for it up to
     // 120 s; stopping it, 60 s, after the environment is made ready for a command this worker does not
     // hold; listing asks for the session and reads records (the finders' deadline, 30 s).

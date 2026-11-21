@@ -25,7 +25,6 @@ adam-agent-fs = { path = "crates/adam-agent-fs", version = "0.1.0" }
 adam-code-tools = { path = "crates/adam-code-tools", version = "0.1.0" }
 adam-code-tools-testkit = { path = "crates/adam-code-tools-testkit", version = "0.1.0" }
 adam-core = { path = "crates/adam-core", version = "0.1.0" }
-adam-devcontainer = { path = "crates/adam-devcontainer", version = "0.1.0" }
 adam-env-kubernetes = { path = "crates/adam-env-kubernetes", version = "0.1.0" }
 adam-error = { path = "crates/adam-error", version = "0.1.0" }
 adam-git-sandbox = { path = "crates/adam-git-sandbox", version = "0.1.0" }
@@ -76,7 +75,7 @@ httpdate = "1"
 # nothing here uses a time zone, so no tzdb is built or read.
 jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }
 # Reads a repository's devcontainer.json (JSON with comments and trailing commas), as serde_json values
-# (adam-devcontainer).
+# (adam-workspace's reader).
 jsonc-parser = { version = "0.34", features = ["serde"] }
 # Catalog components are JSON Schema; no network resolution, so none of the default features.
 jsonschema = { version = "0.58", default-features = false }

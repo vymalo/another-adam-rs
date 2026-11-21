@@ -311,10 +311,10 @@ async fn an_environment_that_cannot_be_made_is_a_result_for_the_model_and_nothin
 
     // A runtime that is down now: worth another try.
     *rig.fake.ensure_fails.lock().unwrap() =
-        Some(|| EnvError::Unavailable("podman is not running".to_owned()));
+        Some(|| EnvError::Unavailable("the run pod is not there yet".to_owned()));
     let out = RunCommand.call(&rig.ctx, command).await;
     assert!(
-        matches!(&out, Err(ToolError::Transient(m)) if m.contains("podman is not running")),
+        matches!(&out, Err(ToolError::Transient(m)) if m.contains("the run pod is not there yet")),
         "{out:?}"
     );
 
@@ -460,7 +460,7 @@ async fn a_cancel_ends_the_wait_for_a_slot() {
 }
 
 /// Only `Unavailable` is waited for, and only where the deployment says so: a broken environment is
-/// the model's to hear at once, and the default (the devcontainer's behaviour) is not to wait.
+/// the model's to hear at once, and the default (a local deployment's behaviour) is not to wait.
 #[tokio::test]
 async fn only_unavailable_is_waited_for_and_by_default_nothing_is() {
     let fx = Fixture::new()
@@ -514,16 +514,15 @@ async fn a_cancel_stops_the_wait_for_an_environment() {
     );
 }
 
-// --------------------------------------------------------------- a broken environment, and the way out
+// --------------------------------------------------------------- a broken environment
 
-use adam_coder::tools::environment::RebuildEnvironment;
 use adam_workspace::EnvKind;
 
-fn broken_file() -> EnvError {
-    EnvError::Refused(
-        ".devcontainer/devcontainer.json: privileged is not allowed (a devcontainer may not ask for it)"
-            .to_owned(),
-    )
+fn broken_pod() -> EnvError {
+    EnvError::Build {
+        reason: "the run pod could not be made: the image cannot be pulled".to_owned(),
+        log_tail: "ErrImagePull: ghcr.io/acme/tool:1 not found".to_owned(),
+    }
 }
 
 #[tokio::test]
@@ -531,7 +530,7 @@ async fn a_broken_environment_is_a_result_that_says_to_ask_the_person_for_every_
 {
     let rig = Rig::new().await;
     rig.prepare().await;
-    *rig.fake.ensure_fails.lock().unwrap() = Some(broken_file);
+    *rig.fake.ensure_fails.lock().unwrap() = Some(broken_pod);
 
     let command = RunCommand
         .call(&rig.ctx, json!({"command": "true"}))
@@ -546,13 +545,13 @@ async fn a_broken_environment_is_a_result_that_says_to_ask_the_person_for_every_
             panic!("{tool}: a broken environment is not worth retrying: {err:?}")
         };
         assert!(
-            text.contains(".devcontainer/devcontainer.json") && text.contains("privileged"),
-            "{tool}: names the file and the problem: {text}"
+            text.contains("cannot be pulled") && text.contains("not found"),
+            "{tool}: names the problem and the log: {text}"
         );
         assert!(
             text.contains("ask_user")
-                && text.contains("rebuild_environment")
-                && text.contains("use_default: true")
+                && text.contains("use_repository_environment")
+                && text.contains("off: true")
                 && text.contains("not something to work around"),
             "{tool}: says what to do: {text}"
         );
@@ -561,10 +560,6 @@ async fn a_broken_environment_is_a_result_that_says_to_ask_the_person_for_every_
         rig.fake.session.specs.lock().unwrap().is_empty(),
         "nothing was run, in this container or anywhere"
     );
-    assert!(
-        rig.fake.rebuilt.lock().unwrap().is_empty(),
-        "the coder never rebuilds by itself: that is the person's decision"
-    );
 }
 
 #[tokio::test]
@@ -572,7 +567,7 @@ async fn an_environment_that_is_not_there_for_now_is_worth_retrying_and_is_not_b
     let rig = Rig::new().await;
     rig.prepare().await;
     *rig.fake.ensure_fails.lock().unwrap() =
-        Some(|| EnvError::Unavailable("the Podman service does not answer".to_owned()));
+        Some(|| EnvError::Unavailable("the namespace's quota is used up".to_owned()));
     let err = RunCommand
         .call(&rig.ctx, json!({"command": "true"}))
         .await
@@ -580,176 +575,17 @@ async fn an_environment_that_is_not_there_for_now_is_worth_retrying_and_is_not_b
     let ToolError::Transient(text) = err else {
         panic!("{err:?}")
     };
-    assert!(!text.contains("rebuild_environment"), "{text}");
-}
-
-#[tokio::test]
-async fn rebuilding_with_the_default_goes_on_and_the_choice_is_noted() {
-    let rig = Rig::new().await;
-    rig.prepare().await;
-    *rig.fake.ensure_fails.lock().unwrap() = Some(broken_file);
-    RunCommand
-        .call(&rig.ctx, json!({"command": "true"}))
-        .await
-        .unwrap_err();
-
-    let out = RebuildEnvironment
-        .call(&rig.ctx, json!({"use_default": true}))
-        .await
-        .unwrap();
-    assert!(!out.is_error, "{}", out.content);
-    assert!(
-        out.content.contains("made again")
-            && out.content.contains("not used for the rest of this run")
-            && out.content.contains("Say so in your final answer"),
-        "{}",
-        out.content
-    );
-    let run = rig.ctx.run_id().to_string();
-    assert_eq!(*rig.fake.rebuilt.lock().unwrap(), [(run.clone(), true)]);
-    let notes = rig.fx.env.notes.load(&run).await.unwrap();
-    assert!(notes.environment.use_default);
-
-    // The environment is there again: the command runs.
-    let looked = RunCommand
-        .call(&rig.ctx, json!({"command": "echo in=$FAKE_ENV"}))
-        .await
-        .unwrap();
-    assert!(
-        !looked.is_error && looked.content.contains("in=fake"),
-        "{}",
-        looked.content
-    );
-}
-
-#[tokio::test]
-async fn rebuilding_without_use_default_makes_it_again_from_the_file() {
-    let rig = Rig::new().await;
-    rig.prepare().await;
-    let run = rig.ctx.run_id().to_string();
-
-    let out = RebuildEnvironment.call(&rig.ctx, json!({})).await.unwrap();
-    assert!(!out.is_error, "{}", out.content);
-    assert!(
-        !out.content.contains("not used for the rest"),
-        "{}",
-        out.content
-    );
-    assert_eq!(*rig.fake.rebuilt.lock().unwrap(), [(run.clone(), false)]);
-    let notes = rig.fx.env.notes.load(&run).await.unwrap();
-    assert!(!notes.environment.use_default);
-}
-
-/// A rebuilt environment may have other tools and dependencies: the check epoch moves, so a failed
-/// check from before the rebuild is run again on the same tree.
-#[tokio::test]
-async fn a_rebuild_makes_a_failed_check_run_again_on_the_same_tree() {
-    let rig = Rig::new().await;
-    rig.prepare().await;
-    std::fs::write(rig.worktree().join("broken.flag"), "x\n").unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let counter = dir.path().join("runs");
-    let command = format!("echo x >> {}; test ! -f broken.flag", counter.display());
-    let runs = || std::fs::read_to_string(&counter).map_or(0, |text| text.lines().count());
-
-    let first = RunChecks
-        .call(&rig.ctx, json!({"command": command}))
-        .await
-        .unwrap();
-    assert!(first.is_error, "{}", first.content);
-    assert_eq!(runs(), 2, "in the worktree, then on the base");
-
-    let rebuilt = RebuildEnvironment.call(&rig.ctx, json!({})).await.unwrap();
-    assert!(!rebuilt.is_error, "{}", rebuilt.content);
-
-    let again = RunChecks
-        .call(
-            &ToolCtx::detached("tool", "call-2", Arc::new(CollectingSink::new()))
-                .with_state(rig.fx.env.clone())
-                .with_root_run(rig.ctx.run_id()),
-            json!({"command": command}),
-        )
-        .await
-        .unwrap();
-    assert!(again.is_error, "{}", again.content);
-    assert_eq!(runs(), 3, "the environment was made again");
-    assert!(
-        again.content.contains("failed check run 2 of 3"),
-        "{}",
-        again.content
-    );
-    let run = rig.ctx.run_id().to_string();
-    assert_eq!(rig.fx.env.notes.load(&run).await.unwrap().checks.epoch, 1);
-}
-
-#[tokio::test]
-async fn rebuilding_where_commands_run_in_the_coders_own_environment_says_there_is_nothing_to_rebuild()
- {
-    let rig = Rig::new().await;
-    rig.prepare().await;
-    rig.fake.rebuild_says.store(false, Ordering::SeqCst);
-    let out = RebuildEnvironment
-        .call(&rig.ctx, json!({"use_default": true}))
-        .await
-        .unwrap();
-    assert!(
-        !out.is_error && out.content.contains("Nothing was rebuilt"),
-        "{}",
-        out.content
-    );
-    assert!(
-        rig.fake.ensured.lock().unwrap().is_empty(),
-        "no environment was asked for"
-    );
-    let notes = rig
-        .fx
-        .env
-        .notes
-        .load(&rig.ctx.run_id().to_string())
-        .await
-        .unwrap();
-    assert!(!notes.environment.use_default, "nothing was decided");
-}
-
-#[tokio::test]
-async fn a_rebuild_that_fails_again_is_the_same_kind_of_result() {
-    let rig = Rig::new().await;
-    rig.prepare().await;
-    // The rebuild clears the fake's failure; a build that fails on the way is reported as steps and
-    // as the call's result, with the way out again.
-    rig.fake
-        .ensure_fails_after_rebuild
-        .lock()
-        .unwrap()
-        .replace(|| EnvError::Build {
-            reason: "the image does not build".to_owned(),
-            log_tail: "step 3/4: no such package nonesuch".to_owned(),
-        });
-    let err = RebuildEnvironment
-        .call(&rig.ctx, json!({}))
-        .await
-        .unwrap_err();
-    let ToolError::Permanent(text) = err else {
-        panic!("{err:?}")
-    };
-    assert!(
-        text.contains("does not build")
-            && text.contains("no such package nonesuch")
-            && text.contains("rebuild_environment"),
-        "{text}"
-    );
+    assert!(!text.contains("use_repository_environment"), "{text}");
 }
 
 // --------------------------------------------------------------- what a check reports, and a missing tool
 
 #[tokio::test]
-async fn the_checks_artifact_says_where_it_ran_when_that_was_a_devcontainer() {
+async fn the_checks_artifact_says_where_it_ran_when_that_was_a_run_pod() {
     let rig = Rig::new().await;
-    *rig.fake.session.kind.lock().unwrap() = Some(EnvKind::DevContainer {
-        source: Some(PathBuf::from(
-            "/work/workspaces/r/remote/.devcontainer/devcontainer.json",
-        )),
-        image: "vsc-remote-abc".to_owned(),
+    *rig.fake.session.kind.lock().unwrap() = Some(EnvKind::Kubernetes {
+        pod: "adam-run-0123456789ab".to_owned(),
+        image: Some("ghcr.io/acme/tool:1".to_owned()),
     });
     rig.prepare().await;
     let out = RunChecks
@@ -759,17 +595,13 @@ async fn the_checks_artifact_says_where_it_ran_when_that_was_a_devcontainer() {
     assert!(!out.is_error, "{}", out.content);
     assert_eq!(
         out.artifacts[0].data["environment"],
-        json!({
-            "kind": "devcontainer",
-            "source": ".devcontainer/devcontainer.json",
-            "image": "vsc-remote-abc"
-        })
+        json!({"kind": "kubernetes", "image": "ghcr.io/acme/tool:1"})
     );
 
-    // The default image has no source; the coder's own container has no `environment` at all.
-    *rig.fake.session.kind.lock().unwrap() = Some(EnvKind::DevContainer {
-        source: None,
-        image: "default:1".to_owned(),
+    // A template that names no image, and the coder's own container (which has no `environment`).
+    *rig.fake.session.kind.lock().unwrap() = Some(EnvKind::Kubernetes {
+        pod: "adam-run-0123456789ab".to_owned(),
+        image: None,
     });
     let out = RunChecks
         .call(&rig.ctx, json!({"command": "true"}))
@@ -777,7 +609,7 @@ async fn the_checks_artifact_says_where_it_ran_when_that_was_a_devcontainer() {
         .unwrap();
     assert_eq!(
         out.artifacts[0].data["environment"],
-        json!({"kind": "devcontainer", "image": "default:1"})
+        json!({"kind": "kubernetes", "image": ""})
     );
     *rig.fake.session.kind.lock().unwrap() = Some(EnvKind::Local);
     let out = RunChecks
@@ -804,45 +636,23 @@ async fn a_missing_tool_says_which_environment_lacks_it_and_how_it_gets_there() 
                 .unwrap()
         }
     };
-    *rig.fake.session.kind.lock().unwrap() = Some(EnvKind::DevContainer {
-        source: Some(PathBuf::from(
-            "/work/workspaces/r/remote/.devcontainer/devcontainer.json",
-        )),
-        image: "vsc-remote-abc".to_owned(),
+    *rig.fake.session.kind.lock().unwrap() = Some(EnvKind::Kubernetes {
+        pod: "adam-run-0123456789ab".to_owned(),
+        image: Some("ghcr.io/acme/tool:1".to_owned()),
     });
     let out = missing(&rig).await;
     assert!(out.is_error, "{}", out.content);
     assert!(
         out.content.contains("no `devbox-tool`")
-            && out.content.contains("`.devcontainer/devcontainer.json`")
+            && out.content.contains("adam-run-0123456789ab")
+            && out.content.contains("image ghcr.io/acme/tool:1")
             && out
                 .content
-                .contains("a devcontainer feature, or its Dockerfile")
-            && out.content.contains("rebuild_environment"),
+                .contains("must be added to the image the deployment uses for run pods"),
         "{}",
         out.content
     );
     assert!(out.artifacts.is_empty(), "a missing tool is not a check");
-
-    *rig.fake.session.kind.lock().unwrap() = Some(EnvKind::DevContainer {
-        source: None,
-        image: "mcr.example/base:1".to_owned(),
-    });
-    let out = RunChecks
-        .call(&rig.ctx, json!({"command": "devbox-tool --version"}))
-        .await
-        .unwrap();
-    assert!(
-        out.content.contains("has no devcontainer")
-            && out
-                .content
-                .contains("default environment (mcr.example/base:1)")
-            && out
-                .content
-                .contains("a `.devcontainer/devcontainer.json` in the repository can provide it"),
-        "{}",
-        out.content
-    );
 
     *rig.fake.session.kind.lock().unwrap() = Some(EnvKind::Local);
     let out = RunChecks
@@ -850,7 +660,7 @@ async fn a_missing_tool_says_which_environment_lacks_it_and_how_it_gets_there() 
         .await
         .unwrap();
     assert!(
-        out.content.contains("no `devbox-tool`") && !out.content.contains("devcontainer"),
+        out.content.contains("no `devbox-tool`") && !out.content.contains("run pod"),
         "this container's answer is what it always was: {}",
         out.content
     );
@@ -858,25 +668,11 @@ async fn a_missing_tool_says_which_environment_lacks_it_and_how_it_gets_there() 
 
 // --------------------------------------------------------------- the real environment, composed as the binary does
 
-/// A coder configured for devcontainers whose Podman service does not answer: its client is a script
-/// that records every call and says the service is down.
+/// A local deployment's environment is this container, and the binary says so: nothing is written to
+/// the volume for it, and no command reaches anything else (ADR 0052: no container engine).
 #[tokio::test]
-async fn a_service_that_does_not_answer_gives_the_coders_own_container_with_one_step_per_run() {
-    use std::os::unix::fs::PermissionsExt as _;
+async fn a_local_deployment_runs_its_commands_in_this_container() {
     let fx = Fixture::new().await;
-    let bin = tempfile::tempdir().unwrap();
-    let calls = bin.path().join("calls");
-    let client = bin.path().join("podman-remote");
-    std::fs::write(
-        &client,
-        format!(
-            "#!/bin/sh\necho \"$1\" >> {}\necho 'Cannot connect to Podman: connection refused' >&2\nexit 125\n",
-            calls.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
-
     let vars: std::collections::HashMap<&str, String> = [
         ("DATABASE_URL", "postgres://u:p@127.0.0.1:1/x".to_owned()),
         ("MODEL_BASE_URL", "http://127.0.0.1:9/v1".to_owned()),
@@ -885,81 +681,28 @@ async fn a_service_that_does_not_answer_gives_the_coders_own_container_with_one_
         ("GITHUB_TOKEN", "ghp_x".to_owned()),
         ("A2A_BEARER_TOKENS", "t".to_owned()),
         ("PUBLIC_URL", "http://coder.test/".to_owned()),
-        ("DEVCONTAINER_RUNTIME", "podman".to_owned()),
-        (
-            "CONTAINER_HOST",
-            "unix:///nonexistent/podman.sock".to_owned(),
-        ),
-        ("DEVCONTAINER_PODMAN", client.to_string_lossy().into_owned()),
-        ("DEVCONTAINER_PREPULL", "false".to_owned()),
-        // Removed by ADR 0038: ignored, so podman starts without it.
-        ("OPENCODE_BINARY", "/no/such/opencode".to_owned()),
     ]
     .into();
     let config = adam_coder::Config::from_lookup(|k| vars.get(k).cloned()).unwrap();
     let worker = config.worker.expect("a worker");
     let environment = adam_coder::environment_for(&worker, &fx.root)
         .await
-        .expect("a service that does not answer does not stop the start");
+        .expect("a local deployment always has an environment");
     assert!(
-        std::fs::read_dir(fx.root.join("environments/.tools"))
-            .unwrap()
-            .flatten()
-            .any(|dir| dir.path().join("adam-exec").is_file()),
-        "the tools directory is written at start"
+        !fx.root.join("environments").exists(),
+        "nothing is made for a run that runs here"
     );
-    let asked = |calls: &std::path::Path| {
-        std::fs::read_to_string(calls)
-            .unwrap_or_default()
-            .lines()
-            .count()
-    };
-    assert!(asked(&calls) >= 1, "the service was probed at start");
+    let workspace = fx.env.workspaces.run(&rig_run()).unwrap();
+    let session = environment
+        .ensure(&workspace, &adam_workspace::NoProgress)
+        .await
+        .unwrap();
+    assert_eq!(session.describe().kind, EnvKind::Local);
+}
 
-    let fake = FakeEnvironment::new(None);
-    let fx = fx.using(environment);
-    let sink = CollectingSink::new();
-    let ctx =
-        ToolCtx::detached("tool", "call-1", Arc::new(sink.clone())).with_state(fx.env.clone());
-    let rig = Rig {
-        fx,
-        fake,
-        sink,
-        ctx,
-    };
-    rig.prepare().await;
-
-    let mut asked_after = Vec::new();
-    for _ in 0..2 {
-        let out = RunCommand
-            .call(&rig.ctx, json!({"command": "echo here=$PWD"}))
-            .await
-            .unwrap();
-        assert!(
-            !out.is_error && out.content.contains("here="),
-            "the command runs in the coder's own container: {}",
-            out.content
-        );
-        asked_after.push(asked(&calls));
-    }
-    let steps: Vec<_> = rig
-        .steps()
-        .into_iter()
-        .filter(|step| step.id.starts_with("env:"))
-        .collect();
-    assert_eq!(steps.len(), 1, "exactly one fallback step: {steps:?}");
-    assert_eq!(
-        steps[0].label,
-        "The container runtime is not reachable: commands run in the coder's own environment"
-    );
-    assert_eq!(steps[0].state, StepState::Completed);
-    let detail = steps[0].detail.clone().unwrap_or_default();
-    assert!(
-        detail.contains("connection refused") && !detail.contains("sk-from-the-gateway"),
-        "the reason, without a secret: {detail}"
-    );
-    // The run stays where it fell back to: the second command did not ask the service again.
-    assert_eq!(asked_after[0], asked_after[1], "{asked_after:?}");
+/// A run id for the test above, shaped like the ones the agent uses.
+fn rig_run() -> String {
+    "018f3a2b-7c1d-7000-8000-000000000001".to_owned()
 }
 
 // ----------------------------------------------------------- variables the MCP servers refer to
@@ -1285,48 +1028,51 @@ async fn a_command_a_cancel_stopped_still_counts() {
     );
 }
 
-/// The coder's own container and a dev container are not metered: the usage says where the commands
-/// ran and nothing else, which reads as not measured and never as zero.
+/// The coder's own container is not metered: the usage says where the commands ran and nothing
+/// else, which reads as not measured and never as zero.
 #[tokio::test]
 async fn an_environment_that_is_not_metered_reports_where_and_no_time() {
-    for (kind, want) in [
-        (EnvKind::Local, SandboxEnvironment::Local),
-        (
-            EnvKind::DevContainer {
-                source: None,
-                image: "fake".to_owned(),
-            },
-            SandboxEnvironment::Devcontainer,
-        ),
-    ] {
-        let rig = Rig::new().await;
-        *rig.fake.session.kind.lock().unwrap() = Some(kind);
-        rig.prepare().await;
-        RunCommand
-            .call(&rig.ctx, json!({"command": "sleep 0.2"}))
-            .await
-            .unwrap();
-        let usage = rig.ctx.reported_sandbox();
-        assert_eq!(usage.environment(), Some(want));
-        assert!(usage.entries().is_empty(), "not measured: {usage:?}");
-    }
+    let rig = Rig::new().await;
+    *rig.fake.session.kind.lock().unwrap() = Some(EnvKind::Local);
+    rig.prepare().await;
+    RunCommand
+        .call(&rig.ctx, json!({"command": "sleep 0.2"}))
+        .await
+        .unwrap();
+    let usage = rig.ctx.reported_sandbox();
+    assert_eq!(usage.environment(), Some(SandboxEnvironment::Local));
+    assert!(usage.entries().is_empty(), "not measured: {usage:?}");
 }
 
 /// A pod that was asked for and ran nothing is a measured zero; an environment that could not be had
 /// reports nothing at all.
 #[tokio::test]
 async fn a_pod_asked_for_and_not_used_is_a_measured_zero_and_none_made_is_nothing() {
-    let rig = Rig::new().await;
-    rig.fake.session.as_pod(Some(250), Some(GIB / 2));
+    use adam_coder::tools::environment::use_repository_environment;
+
+    let fake = FakeEnvironment::in_run_pods(None, &["ghcr.io/acme/"]);
+    fake.session.as_pod(Some(250), Some(GIB / 2));
+    let fx = Fixture::new().await.using(fake.clone());
+    let sink = CollectingSink::new();
+    let ctx =
+        ToolCtx::detached("tool", "call-1", Arc::new(sink.clone())).with_state(fx.env.clone());
+    let rig = Rig {
+        fx,
+        fake,
+        sink,
+        ctx,
+    };
     rig.prepare().await;
-    // `rebuild_environment` asks for the run's session and runs no command.
-    RebuildEnvironment.call(&rig.ctx, json!({})).await.unwrap();
+    // Going back to the deployment's image asks for the run's session and runs no command.
+    use_repository_environment(&rig.fx.env, &rig.ctx, None, None, true)
+        .await
+        .unwrap();
     let usage = rig.ctx.reported_sandbox();
     assert_eq!(usage.environment(), Some(SandboxEnvironment::Kubernetes));
     assert!(usage.entries().is_empty(), "{usage:?}");
 
     let rig = Rig::new().await;
-    *rig.fake.ensure_fails.lock().unwrap() = Some(broken_file);
+    *rig.fake.ensure_fails.lock().unwrap() = Some(broken_pod);
     rig.prepare().await;
     RunCommand
         .call(&rig.ctx, json!({"command": "true"}))
