@@ -767,6 +767,7 @@ dependencies = [
  "async-trait",
  "axum",
  "rustix",
+ "rustls",
  "secrecy",
  "serde_json",
  "thiserror",

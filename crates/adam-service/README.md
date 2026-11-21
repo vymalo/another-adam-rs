@@ -180,6 +180,8 @@ from a worker not a 69.
   hidden from `Debug`.
 * `tests/model_auth.rs`: `MODEL_AUTH=injector` from the variable to the wire: the request carries `x-run-id` and no
   `authorization`, while the default `key` sends its key and no run.
+  `MODEL_CA_FILE` the same way: a TLS server on the loopback whose certificate a test CA signed (the fixtures of
+  `adam-model-openai`) is refused without the variable, nothing reaching it, and answers with it.
 * `src/exit.rs`: the exit-code table, a `HostError` deciding over its source, a binary's own classifier.
 * `src/service.rs`: `LiveSignals::local`, the defaults.
 * `tests/service.rs`: a `Service` over the in-memory store with a scripted agent: the card is served, `/healthz`
