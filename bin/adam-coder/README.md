@@ -2176,7 +2176,7 @@ way; every problem is reported at once at startup):
 | Variable | Meaning | Default |
 |---|---|---|
 | `ROLE` | what this process runs: `all`, `control-plane` or `worker` (see [Roles](#roles)) | `all` |
-| `DATABASE_URL` | Postgres for the run store | required |
+| `DATABASE_URL` | the run store: `postgres://`/`postgresql://`, `mongodb://`/`mongodb+srv://` or `sqlite://<path>` (one file, one process, `ROLE=all` only) | required |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required by `all` and `control-plane` |
 | `LISTEN_ADDR` | bind address: the A2A server, or a worker's `/healthz` listener | `0.0.0.0:8080` |
@@ -2748,7 +2748,8 @@ database of its own, so the role needs `CREATEDB`):
   model and the run goes on to a pull request; no text at all; checks then text;
   a message in the context of a parked run continues it; cancel while parked), an invented
   repository refused and the model sent to `ask_user`, a repository quoted in `untrusted` findings not
-  named while the one in the `request` fence is, an empty stop after work asking what to do next, red checks
+  named while the one in the `request` fence is, an empty stop after work asking what to do next, a turn cut at the output limit while thinking continued (never
+  a question to the person) and failing with `output limit reached while thinking` past the bound, red checks
   with cycles left then text (a question, not a failure), red checks N times (failed, findings, no PR),
   the explicit-acceptance path, ownership, the wrong bearer token (401 at the
   coder's own router; card and `/healthz` open), five crash points (inside

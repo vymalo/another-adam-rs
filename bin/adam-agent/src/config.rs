@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the one agent this process serves. **Required by every role** (there is no embedded agent), and an existing directory | required |
 //! | `ROLE` | what this process runs: `all`, `control-plane` or `worker` ([`adam_host::Role`](https://docs.rs/adam-host)) | `all` |
-//! | `DATABASE_URL` | Postgres for the run store | required |
+//! | `DATABASE_URL` | the run store: `postgres://`/`postgresql://`, `mongodb://`/`mongodb+srv://` or `sqlite://<path>` (one file, one process; `ROLE=all` only) | required |
 //! | `A2A_BEARER_TOKENS` | comma-separated tokens accepted by the A2A server | required for `all` and `control-plane`, non-empty (fail closed) |
 //! | `PUBLIC_URL` | URL clients reach the JSON-RPC endpoint at (agent card) | required for `all` and `control-plane` |
 //! | `LISTEN_ADDR` | bind address: the A2A server, or for `worker` its `/healthz` listener | `0.0.0.0:8080` |

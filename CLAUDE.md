@@ -63,6 +63,7 @@ architecture with pictures, and deploy instructions. Agent-only context lives he
   | the chart or the image | `deploy/coder/README.md`, `docs/guides/deploy-the-coder.md` |
   | compose, a mock, a scripted model, an e2e script | `docs/reference/dev-stack.md`, `docs/guides/run-locally.md`, `docs/guides/testing.md` |
   | a path a first-party skill cites | the skill (docs-check fails on a missing path) |
+  | a setting or a feature of any surface (coder, folder agent, engine, the card) | `docs/reference/parity.md`: fill every column, or list the gap |
 
 * **Short.** Short sentences, tables, no repeated explanations: link instead of copying, never copy a crate
   README. `README.md` stays about 100 lines; a guide covers one task.
