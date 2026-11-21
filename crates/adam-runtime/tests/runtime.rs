@@ -9419,10 +9419,11 @@ async fn a_failed_transition_drops_an_inherited_file_whose_bytes_are_gone() {
     );
 }
 
-/// A delivery and a cancel write the head they read: an inherited file whose bytes are gone is
-/// dropped there too, so the head never keeps naming a digest nobody can read.
+/// A delivery writes the head it read **unchanged**, so a later refused split still sees an
+/// inherited file whose bytes are gone and refuses (ADR 0055); a cancel is terminal and drops it,
+/// so the head a front reads never keeps naming a digest nobody can serve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_delivery_and_a_cancel_drop_an_inherited_file_whose_bytes_are_gone() {
+async fn a_delivery_keeps_a_missing_inherited_file_and_a_cancel_drops_it() {
     let inner: DynStore = Arc::new(MemoryStore::new());
     let lost_bytes = SVG.to_vec();
     let kept_bytes = b"<svg><circle r='2'/></svg>".to_vec();
@@ -9456,8 +9457,8 @@ async fn a_delivery_and_a_cancel_drop_an_inherited_file_whose_bytes_are_gone() {
         .collect();
     assert_eq!(
         names,
-        ["logo"],
-        "the delivery dropped the missing file and kept the present one"
+        ["chart", "logo"],
+        "the delivery writes the head it read: the demotion must still see the missing file"
     );
     assert_eq!(
         rt.view(delivered)
