@@ -488,10 +488,9 @@ pub(crate) fn missing_tool_text(
     };
     let place = match environment {
         EnvKind::Kubernetes { pod, image } => format!(
-            " The commands of this workspace run in a pod of their own ({pod}{}), made from the \
-             deployment's pod template and not from the repository: the tool has to be in that \
-             image, so say that `{name}` must be added to the image the deployment uses for run \
-             pods.",
+            " The commands of this workspace run in a pod of their own ({pod}{}): the tool has to \
+             be in the image that pod runs, so say that `{name}` must be added to it (the \
+             deployment's run-pod image, or the repository's own image when the run moved to it).",
             image
                 .as_deref()
                 .map(|image| format!(", image {image}"))

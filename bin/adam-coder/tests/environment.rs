@@ -646,9 +646,10 @@ async fn a_missing_tool_says_which_environment_lacks_it_and_how_it_gets_there() 
         out.content.contains("no `devbox-tool`")
             && out.content.contains("adam-run-0123456789ab")
             && out.content.contains("image ghcr.io/acme/tool:1")
+            && out.content.contains("the image that pod runs")
             && out
                 .content
-                .contains("must be added to the image the deployment uses for run pods"),
+                .contains("the repository's own image when the run moved to it"),
         "{}",
         out.content
     );

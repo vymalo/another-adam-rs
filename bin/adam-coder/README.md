@@ -1487,8 +1487,8 @@ refused in words: the repository's CI publishes the image.
 * **The `checks` artifact** has `environment {kind: "kubernetes", image}` when the check ran in a run pod (absent
   for this container, so nothing changes for a local deployment); a report of an older coder may say
   `devcontainer` with a `source`, and a consumer that does not know the field ignores it.
-* **A missing tool says where it is missing**: in a run pod, the tool has to be in the image the deployment uses
-  for run pods.
+* **A missing tool says where it is missing**: in a run pod, the tool has to be in the image the pod
+  runs (the deployment's, or the repository's own when the run moved to it).
 * **The janitor** releases the environment of a run **before** it removes the run's workspace, and releases what
   `held_runs()` finds for runs that are over (a crash left it).
 
