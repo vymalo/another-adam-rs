@@ -685,8 +685,10 @@ With `MODEL_INPUT_MODALITIES=text,image` (off by default, [environment](environm
 
 ## Limits and cancel
 
-`limits:` in `agent/instructions.md`: 200 model turns, 400 tool calls, 8192 output tokens per call, 100,000
-tokens of history. A run that reaches `max_turns` or `max_tool_calls` gets one closing model call in which it
+`limits:` in `agent/instructions.md`: 200 model turns, 400 tool calls, 100,000 tokens of history, and no
+output cap of its own: each call asks its model's profile's cap, else 128,000, clamped to the model's limit and
+window ([ADR 0064](../decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md)). A run
+that reaches `max_turns` or `max_tool_calls` gets one closing model call in which it
 may call no tool, and its answer ends the run with `output.limited: true` ([A2A server](a2a-server.md#a-run-that-ends-at-its-limit)).
 The coder never reads that answer as a question: **it completes only when the run has no repository or
 scratch project at all (a question, research) or already delivered** (a pull request, a shared file). With a

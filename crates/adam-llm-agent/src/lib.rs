@@ -168,7 +168,10 @@ pub use agent::{
     LlmAgentBuilder, LlmStarter, MAX_PARALLEL_LIMIT, MAX_THINKING_CUTS, THINKING_CUT_TURN,
     UNATTENDED, is_unattended, tool_retry_key,
 };
-pub use compaction::{COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize};
+pub use compaction::{
+    COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize,
+    WINDOW_MARGIN_TOKENS, summary_output_tokens,
+};
 pub use conversation::{
     ACCESS_TIER_CONTEXT_KEY, ArtifactRef, CALLER_CONTEXT_KEY, Conversation, LimitHit, LimitKind,
     MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS,

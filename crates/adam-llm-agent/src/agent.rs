@@ -30,7 +30,7 @@ use serde_json::{Map, Value, json};
 use crate::access::ToolAccess;
 use crate::compaction::{
     self, COMPACTION_TURN, CompactionReason, MAX_COMPACTIONS, OVERFLOW_OUTPUT_CHARS, PromptSize,
-    RETRY_AFTER_TURNS, SUMMARY_OUTPUT_TOKENS,
+    RETRY_AFTER_TURNS,
 };
 use crate::conversation::{
     ArtifactRef, Conversation, LimitHit, LimitKind, PendingQuestion, PendingRemote, PendingRun,
@@ -653,7 +653,10 @@ pub struct Limits {
     /// model turn whose calls would go over the limit has none of them run (each is answered
     /// "not run"), and the next call is the closing turn.
     pub max_tool_calls: u32,
-    /// Passed to the model as `max_output_tokens`; `0` leaves it to the model.
+    /// Passed to the model as `max_output_tokens`; `0` leaves it to the model. The assembly
+    /// resolves it per model from the agent's folder, its `model_preset`, the model's profile and
+    /// the 128,000 fallback, then clamps it to the model's limit and window (ADR 0064); a host that
+    /// builds an agent by hand gets this default, 4,096, and no resolution or clamp.
     pub max_output_tokens: u32,
     /// Budget for the history sent to the model, estimated as characters / 4.
     /// Over it, old tool outputs are truncated **in the stored history**, with an explicit marker,
@@ -2659,7 +2662,9 @@ impl LlmAgent {
         request.tool_choice = ToolChoice::None;
         request.prompt_cache_key = ctx.conversation_id().map(prompt_cache_key);
         request.run = Some(model_run(state, ctx).to_string());
-        request.max_output_tokens = Some(SUMMARY_OUTPUT_TOKENS);
+        request.max_output_tokens = Some(compaction::summary_output_tokens(
+            self.limits.max_output_tokens,
+        ));
         // A summary is not a reasoning choice: it asks for no level, whatever the run or the agent
         // set (ADR 0063, decision 6).
         request.reasoning_effort = None;

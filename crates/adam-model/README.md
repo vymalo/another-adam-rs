@@ -116,6 +116,7 @@ in this crate touches the file system.
 | `ModelProfile` | serde camelCase, `Default`, unknown members ignored: `reasoning_efforts`, `reasoning_wire`, `reasoning_budgets`, `reasoning_effort`, `max_output_tokens`, `max_output_tokens_limit`, `extra_body`, `preset`. A profile with only a cap or only an extra body is valid |
 | `Preset`, `ModelProfiles` | a named bundle (`reasoning_effort`, `max_output_tokens`) and the document (`profiles` by model id, `presets` by name). `profile(id)`, `preset(name)`, `preset_of(id)` |
 | `ModelProfiles::parse_json(text)` | parse and validate, **JSON only for now** (the workspace has no YAML parser). `Err(Vec<String>)` lists every problem, each naming the profile (or preset) and the key, but not the file: the caller adds the path. A file with any problem is refused whole |
+| `DEFAULT_MAX_OUTPUT_TOKENS` | 128,000: the cap a call asks for when its folder, its preset and its model's profile set none (ADR 0064). The assembly resolves it per model and clamps it to the model's limit and window; the loop's `Limits` default is the same value |
 
 The rules, all of them refusals at load: a level outside the vocabulary; an unknown wire; a duplicate level (the
 list is sorted lowest first); a budget for an undeclared level, a declared level with no budget, or a budget of

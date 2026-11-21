@@ -1870,7 +1870,8 @@ greets from the persona lines gets the run to wait without any tool, editing the
 
 One file, [`agent/instructions.md`](agent/instructions.md), holds what describes the agent, in the format of
 [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md): the frontmatter has `name` (`coder`, which must equal
-`AGENT_NAME`), `description`, `limits` (200 turns, 400 tool calls, 8192 output tokens, 100000 tokens of history),
+`AGENT_NAME`), `description`, `limits` (200 turns, 400 tool calls, 100000 tokens of history; no output cap, so the
+model's profile or the 128,000 fallback applies, ADR 0064),
 `vars.max_check_cycles` (the default, 3), `vars.scratch_check_cycles` (5), `vars.display_name` (`Adam`: the name the agent says), `vars.repository_creation` (what the prompt says about making a repository for the person: the default is the sentence for a deployment that allows it, and **when `CREATE_REPO_OWNERS` is empty `CoderAgent` replaces it with a note that there is no such tool**, that the person must create the repository and name it, and that "a new repository" is never an option of a question; a folder that does not declare the var keeps its own text) and `card:` (the A2A
 card: name `Adam`, the skills `explain`, `research`, `documents` and `coding-task`, each with tags and examples); the body is the system prompt.
 
@@ -2814,7 +2815,9 @@ database of its own, so the role needs `CREATEDB`):
   greeting rule, the plain-words answer, what it cannot do, no tool list); the prompt equals
   `tests/fixtures/agent/prompt.txt` (the **instruction snapshot**: it began as the old Rust constant, and #55 is its
   first deliberate change) for several limits, with `{{display_name}}` as `Adam`, but for its final newline, which the
-  loader drops from every body; the limits, the tool order and the model alias are the old ones; a run through a runtime on a `MockModel` sends the old system prompt, tools and `max_output_tokens` and
+  loader drops from every body; the turns, the tool calls, the tool order and the model alias are the old ones, and the cap is
+  the 128,000 fallback since the coder's file sets none (ADR 0064); a run through a runtime on a `MockModel` sends
+  the old system prompt and tools, and `max_output_tokens` 128,000, and
   journals the old step names (`model:0`, `tool:<call id>`, so a run journaled before replays); the assembly's
   card equals `agent_card`. A model alias the assembly refuses (empty, whitespace) is an error from `try_new`.
   The card is also pinned by a unit test in `src/app.rs` against `tests/fixtures/agent/card.json`, the card as the

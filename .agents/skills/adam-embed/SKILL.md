@@ -58,7 +58,9 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      `LlmAgent`; features `macros` (default), `a2a` (the card), `mcp` (`mcp.json` tools), `dev`
      (reload). `adam::include_agent!()` includes the agent directory a `build.rs` embedded with
      `adam_agent_fs::build("agent").emit()`; `AgentDef::from_manifest(AGENT)?.bind(tools![..])?
-     .state(..).model(model, alias)?` binds it. Details and the tool rules:
+     .state(..).model(model, alias)?` binds it. An `LlmAgent` built by hand (not through the assembly) gets
+     `Limits::default().max_output_tokens`, 4,096, unless it sets one: ADR 0064's profile resolution and clamp (the
+     128,000 fallback) apply through `AgentDef::bind`/`model`, not the loop. Details and the tool rules:
      `crates/adam/README.md` ("`#[tool]`", "Agent directories"), `docs/reference/agent-files.md`.
    * **A wrapper agent must delegate the split.** `adam_runtime::Agent` has provided `split`/`join`
      methods (and so does `AgentStarter`) that let a run keep its transcript in an append-only body

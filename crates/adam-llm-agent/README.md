@@ -21,7 +21,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
 | `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.reasoning_effort(Option<ReasoningEffort>)` (the level every turn asks for unless the run's context names one: see *Reasoning effort*), `.build()` |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*); it also splits and joins the conversation exactly like `LlmAgent` (`AgentStarter::split`/`join`), so a run it starts is written with a head and a body, not left in the v4 format |
-| `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
+| `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens` (the cap a call asks for; `0` leaves it to the model, and `Limits::default()` is 4,096 for a hand-built agent: the 128,000 fallback and the model's profile are resolved and clamped by the assembly, ADR 0064), `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to the helper", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) and `read_answer(call_id, args, ui, payload) -> AnswerCheck` (`Accept`, `Read(text)`, `Refuse(Refusal)` or `End(Refusal)`; the default accepts: reads the answer to the tool's own question before the model does; see *The answer is read by the tool that asked*) |
 | `ToolOutput` | `text`, `error`, `with_artifact`, `pinned()` (a compaction that drops the result copies it into its marker, see *Compaction*). A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. That check comes after the result is journaled, so a tool that may return several files it did not choose keeps its result within `ToolCtx::files_left()` (`adam_runtime::ReceivedFiles` does). `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed. `announcing(text)` (the member `answer`) makes `text` **the run's answer**, see *Announced answers*. `sandbox: SandboxUsage` is what the call reported with `ToolCtx::report_sandbox`, put there by the loop and journaled with the result (absent from a journal from before, not written while empty), see *Sandbox time* |
 | `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
@@ -47,7 +47,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `Conversation::continued(&self, text, from: RunId)`, `LlmAgent::init_continuing`, `LlmStarter::init_continuing` | the conversation of a new run that carries on this one with one more user message; what is carried, dropped and reset is in *Continuing a conversation* |
 | `Conversation::is_omission_marker(message, part)` | whether that text part is the marker (the second part of the first message while `omitted_turns` is not zero), so a rule that reads what the user said skips exactly it: the coder's `person_texts` |
 | `MAX_CARRIED_BYTES`, `OMITTED_MARKER_PREFIX` | the cap on the history a continuation carries (256 KiB of JSON), and the prefix of the marker text part that stands in for the turns dropped to fit it |
-| `COMPACTION_TURN`, `Compaction`, `CompactionReason`, `PromptSize`, `MAX_COMPACTIONS` | compaction (below): the instruction a summary request ends with, one recorded compaction (`turn`, `dropped_turns`, `reason`, `sessions`, and the facts the marker lists), why it was made (`Budget` or `Overflow`), the last call's reported prompt size, and the most compactions a run makes (8, not counting the one record a continued run carries) |
+| `COMPACTION_TURN`, `Compaction`, `CompactionReason`, `PromptSize`, `MAX_COMPACTIONS`, `WINDOW_MARGIN_TOKENS`, `summary_output_tokens` | compaction (below): the instruction a summary request ends with, one recorded compaction (`turn`, `dropped_turns`, `reason`, `sessions`, and the facts the marker lists), why it was made (`Budget` or `Overflow`), the last call's reported prompt size, and the most compactions a run makes (8, not counting the one record a continued run carries); `WINDOW_MARGIN_TOKENS` is the 20,000-token margin the budget and the assembly's cap clamp keep free; `summary_output_tokens(cap)` is `min(4,096, cap)`, or 4,096 when the cap is `0` |
 | `Tool::poll_remote`, `RemotePoll` | how a tool that returned `AwaitRemote` answers "how does the task stand": `Ready(ToolOutput)` or `Working`; the default refuses |
 | `DEFAULT_WAIT_POLL` | 60 s: how long a run waiting for a child sleeps before it reads the child itself |
 | `user_message(text)`, `MESSAGE_KIND` | build the `Inbound` that starts or continues a run |
@@ -792,6 +792,12 @@ run answers once with no tool. A closing turn with no words fails the run with t
 `tool call limit exceeded` message. The state remembers it in `Conversation::limit`. A child run that hits its limit
 is `Done`, and its parent's tool result ends with a note that the answer may be incomplete.
 
+**The output cap is the assembly's.** `Limits::default().max_output_tokens` stays 4,096 for a hand-built agent: the
+loop applies no profile and no clamp. The assembly resolves each agent's cap (the folder, its preset, the model's
+profile, then `adam_model::DEFAULT_MAX_OUTPUT_TOKENS`, 128,000) and clamps it to the model's limit and window
+(ADR 0064); the compaction budget and the summary read that resolved value (the summary asks `min(4,096, cap)`, or
+4,096 when the cap is `0`).
+
 **A turn cut while thinking is not an answer.** A model turn that ends at the output limit
 (`FinishReason::Length`) with no tool call and no visible words (empty or whitespace; the reasoning does not
 count) is not the run's answer, and whitespace is not said as `agent_text`. The loop asks again: the cut turn
@@ -1039,14 +1045,16 @@ is in [the architecture](../../docs/architecture.md#compaction-a-long-history-is
 * **When.** At the start of a step, from the committed state, with no call and no wait open: the estimate (the
   last call's reported `input_tokens`, `Conversation::last_prompt`, plus characters / 4 of what came after;
   with no report, characters / 4 of the instructions, the tools and every message) reaches the budget, the
-  smaller of `MODEL_CONTEXT_WINDOW` less 20,000 less `max_output_tokens`, and `Limits::max_history_tokens`.
+  smaller of `MODEL_CONTEXT_WINDOW` less 20,000 (`WINDOW_MARGIN_TOKENS`) less `max_output_tokens` (the cap the
+  assembly resolved for the model, ADR 0064), and `Limits::max_history_tokens`.
   With neither set there is none. Fewer than two turns to drop, a compaction at this very turn already,
   eight in the conversation, or a request that would still be over the budget with no summary at all (the
   instructions, the tools, the task and the turns that stay): no compaction, and `record_shortenings` does
   what it always did.
 * **The cut** is at a turn start, so a call keeps its result; the newest 1 to 8 turns worth at most a quarter
   of the budget stay verbatim.
-* **The summary** is the agent's own model (no tool, 4,096 output tokens), the request as it stands plus
+* **The summary** is the agent's own model (no tool, `min(4,096, cap)` output tokens, or 4,096 when the cap is
+  `0`; ADR 0064), the request as it stands plus
   `COMPACTION_TURN`; its usage is reported under its own call id. A transient failure retries the
   transition; any other failure shortens instead (`Conversation::compact_failed`: not tried again for eight
   turns). The outcome is journaled, so a replay applies it and calls no model.
