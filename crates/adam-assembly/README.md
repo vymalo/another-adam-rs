@@ -713,7 +713,8 @@ result the model can act on.
 
 A deployment that wants an agent to have more MCP servers than its folder (or its embedded copy) names does not copy
 the agent's files: it gives **one more file** in the shape of `mcp.json`, and the binary adds its servers to the root
-agent's own before `connect_mcp`. `AgentDef::with_extra_mcp_file(path)` reads it with the loader of `mcp.json`
+agent's own before `connect_mcp`. `AgentDef::with_tools(names)` narrows the root's tools as its `tools:` would (a deployment's
+choice, such as the coder's `CODER_TOOLS`; subagents keep theirs). `AgentDef::with_extra_mcp_file(path)` reads it with the loader of `mcp.json`
 (`adam_agent_fs::parse_mcp`: the same fields, `${VAR}` and `optional`), returns the definition and what the loader
 warned about, and `AgentDef::with_extra_mcp(config, path)` is the same for a config already parsed. The rules:
 

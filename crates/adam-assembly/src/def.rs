@@ -238,6 +238,15 @@ impl AgentDef {
         &self.manifest
     }
 
+    /// Narrow the root agent's tools to `names`, as its `tools:` would: a deployment's choice that
+    /// replaces what the files say (`bind` then refuses a name that is not one of its tools, with a
+    /// suggestion). Subagents keep theirs.
+    #[must_use]
+    pub fn with_tools(mut self, names: Vec<String>) -> Self {
+        self.manifest.frontmatter.tools = Some(ToolList::Named(names));
+        self
+    }
+
     /// Add the MCP servers of `extra` to the root agent's own (`mcp.json`), so that
     /// `connect_mcp` (feature `mcp`) connects both and `bind` checks the sum. The servers of
     /// subagents are untouched. A name that both have is an error and nothing is added: a file

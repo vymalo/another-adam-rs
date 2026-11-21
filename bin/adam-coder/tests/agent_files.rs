@@ -1676,3 +1676,44 @@ async fn the_coders_skills_parse_and_are_in_the_catalog() {
         format!("{}\n\n{}", expected_body(3), SKILLS.trim_end())
     );
 }
+
+/// `CODER_TOOLS=coding`: the deployment narrows the coder's own tools to the 13 a coding task needs,
+/// as a folder's `tools:` would; every name is a tool of the coder, so the bind accepts them all.
+#[tokio::test]
+async fn coder_tools_coding_narrows_the_coders_own_tools() {
+    let fx = Fixture::new().await;
+    let def = adam_coder::AgentFiles::Embedded
+        .def()
+        .unwrap()
+        .mcp_tools(adam_coder::AGENT_NAME, adam::ToolSet::new())
+        .with_tools(
+            adam_coder::config::CODING_TOOLS
+                .iter()
+                .map(|t| (*t).to_owned())
+                .collect(),
+        );
+    let model: DynModel = Arc::new(MockModel::new());
+    let agent = CoderAgent::try_from_def(
+        def,
+        model,
+        "test-model",
+        fx.env.clone(),
+        adam_coder::tools::coder_tools(&fx.env),
+    )
+    .unwrap();
+    let tools = &agent.assembly().info()[0].tools;
+    assert_eq!(
+        &tools[..adam_coder::config::CODING_TOOLS.len()],
+        adam_coder::config::CODING_TOOLS,
+        "the coding tools first, in their order"
+    );
+    for gone in [
+        "ask_user",
+        "share_file",
+        "start_scratch",
+        "publish_scratch",
+        "show",
+    ] {
+        assert!(!tools.iter().any(|t| t == gone), "{gone} is not offered");
+    }
+}

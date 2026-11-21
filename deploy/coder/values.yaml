@@ -75,6 +75,8 @@ config:
   # and the process refuses one that sets model, messages, tools, tool_choice or stream (exit 78).
   # Examples (check your gateway and model): {reasoning_effort: medium},
   # {thinking: {type: enabled}}, {chat_template_kwargs: {enable_thinking: true}}.
+  # Some gateways do not reason at all without one (a DeepSeek V4.1 gateway, 2026-11-20); in the
+  # benchmark {reasoning_effort: low} was the best value, `max` cost 1.5 to 3 times more for no gain.
   # Roles that run workers only.
   modelExtraBody: null
   # MODEL_ECHO_REASONING: send the reasoning of earlier turns back to the model, under this member

@@ -125,6 +125,10 @@ async fn build_agent(
         .def()
         .map_err(|e| *e)
         .context("reading the agent definition")?;
+    // `CODER_TOOLS`: the deployment narrows the tools; a name that is not one fails the bind (exit 78).
+    if let Some(tools) = &worker.tools {
+        def = def.with_tools(tools.clone());
+    }
     if let Some(file) = &worker.extra_mcp_file {
         let (extended, warnings) = def
             .with_extra_mcp_file(file)

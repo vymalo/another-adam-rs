@@ -69,6 +69,7 @@
 //! | `RUN_POD_IDLE_SECS` | how long no command may have used a pod before it is deleted (the next command makes another; the files are on the volume); `0` keeps it until the run ends | `900` |
 //! | `RUN_POD_WAIT_SECS` | how long a run waits, trying again with a growing pause, for a pod the cluster cannot give now (the quota is used up, no node has room), before the tool fails | `600` |
 //! | `RUN_POD_REPOSITORY_IMAGES` | with `kubernetes`: the image prefixes a repository's `devcontainer.json` may name (`use_repository_environment`, ADR 0052), comma- or space-separated; each ends with `/` (a registry path) or `:` (a tag), never a bare host. Empty: the tool is never offered and the run pods use the template's image | empty |
+//! | `CODER_TOOLS` | roles that run workers: the tools the coder offers, replacing the folder's `tools:`: `coding` for the 13 a coding task needs (`CODING_TOOLS`: reading, changing and searching files, commands, the checks, commit and pull request), or a comma-separated list of names; a name that is not a tool of the coder is refused at startup (exit 78). For a deployment that only takes coding tasks: each call sends far less (bench, 2026-11-21) | unset: every tool |
 //! | `ADAM_EXTRA_MCP_FILE` | roles that run workers: a file of extra MCP servers, in the shape of `mcp.json`, added to the agent's own (the folder's, or the embedded copy's) before they connect; it must be an existing file, and a server name the agent already has is refused at startup (exit 78). A variable it names as `${VAR}` is hidden from every process the coder starts and its value is redacted from tool output, like the `mcp.json`'s own | unset: only the agent's own servers |
 //! | `ADAM_REFERENCES_FILE` | roles that run workers: a file of references, `{"references": [{"name", "url", "branch"?, "description"}]}`: repositories the agent may **read** beside the one it works on and never write, **added** to the `references:` of the agent's own files; it must be an existing file of valid references, and a name the agent already declares is refused at startup (exit 78). See [`tools::references`](crate::tools::references) | unset: only the agent's own references |
 //! | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the coder's instructions, card, skills and subagents, read once at startup by every role ([`AgentFiles`](crate::AgentFiles)); it must exist | unset: the copy embedded in the binary |
@@ -243,6 +244,8 @@ pub struct WorkerConfig {
     /// `ADAM_EXTRA_MCP_FILE`: a file of MCP servers (the shape of `mcp.json`) added to the agent's
     /// own before they connect, an existing file. `None`: only the agent's own servers.
     pub extra_mcp_file: Option<PathBuf>,
+    /// `CODER_TOOLS`: the tools the coder offers instead of the folder's `tools:`; `None` keeps them.
+    pub tools: Option<Vec<String>>,
     /// `ADAM_REFERENCES_FILE`: a file of references (repositories read and never written) added to
     /// the agent's own, an existing file. `None`: only the agent's own.
     pub references_file: Option<PathBuf>,
@@ -944,6 +947,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("pr_draft", &self.pr_draft)
             .field("mcp", &self.mcp)
             .field("extra_mcp_file", &self.extra_mcp_file)
+            .field("tools", &self.tools)
             .field("references_file", &self.references_file)
             .field("devcontainer", &self.devcontainer)
             .field("run_environment", &self.run_environment)
@@ -1185,6 +1189,7 @@ impl WorkerConfig {
         let flag_is_valid = problems.len() == before_flag;
         let mcp = McpSettings::parse(lookup, problems);
         let extra_mcp_file = adam_service::parse_file(get, adam::EXTRA_MCP_FILE_ENV, problems);
+        let tools = parse_tools(get("CODER_TOOLS"), problems);
         let references_file =
             adam_service::parse_file(get, crate::tools::references::REFERENCES_FILE_ENV, problems);
         let allowed_repo_hosts = match get("ALLOWED_REPO_HOSTS") {
@@ -1305,6 +1310,7 @@ impl WorkerConfig {
             allow_commands_next_to_secrets,
             mcp,
             extra_mcp_file,
+            tools,
             references_file,
         };
         // The default is the safe deployment: a key a command can read is a configuration error
@@ -1416,6 +1422,44 @@ fn in_range(value: u64, name: &str, low: u64, high: u64, problems: &mut Vec<Stri
         "{name} must be from {low} to {high} (it is {value}); 0 does not turn it off"
     ));
     low
+}
+
+/// The coding profile of `CODER_TOOLS`: what a coding task needs, and nothing a conversation, a scratch
+/// project, the person's screen or a helper needs.
+pub const CODING_TOOLS: [&str; 13] = [
+    "prepare_workspace",
+    "list_files",
+    "find_files",
+    "search_files",
+    "read_file",
+    "read_files",
+    "write_file",
+    "edit_file",
+    "apply_patch",
+    "run_command",
+    "run_checks",
+    "commit_and_push",
+    "open_pull_request",
+];
+
+/// `CODER_TOOLS`: `coding`, or a comma-separated list of names; unset keeps the folder's `tools:`.
+fn parse_tools(raw: Option<String>, problems: &mut Vec<String>) -> Option<Vec<String>> {
+    let raw = raw?;
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("coding") {
+        return Some(CODING_TOOLS.iter().map(|t| (*t).to_owned()).collect());
+    }
+    let names: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if names.is_empty() {
+        problems.push("CODER_TOOLS names no tool: set `coding` or a comma-separated list".into());
+        return None;
+    }
+    Some(names)
 }
 
 #[cfg(test)]
@@ -1874,6 +1918,23 @@ mod tests {
         vars.insert("ROLE", "control-plane");
         vars.insert("GITHUB_MCP_URL", "garbage");
         assert!(parse(&vars).is_ok(), "a control plane does not read it");
+    }
+
+    #[test]
+    fn coder_tools_is_coding_or_a_list_of_names() {
+        let mut problems = Vec::new();
+        assert_eq!(parse_tools(None, &mut problems), None);
+        assert_eq!(
+            parse_tools(Some(" Coding ".into()), &mut problems),
+            Some(CODING_TOOLS.iter().map(|t| (*t).to_owned()).collect())
+        );
+        assert_eq!(
+            parse_tools(Some("run_command, read_file,".into()), &mut problems),
+            Some(vec!["run_command".to_owned(), "read_file".to_owned()])
+        );
+        assert!(problems.is_empty());
+        assert_eq!(parse_tools(Some(" , ".into()), &mut problems), None);
+        assert_eq!(problems.len(), 1, "{problems:?}");
     }
 
     #[test]
