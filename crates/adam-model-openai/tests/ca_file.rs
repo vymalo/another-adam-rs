@@ -118,7 +118,11 @@ async fn the_endpoint_is_reached_only_with_the_ca() {
     let (port, served) = tls_server();
 
     let err = client(port).complete(request()).await.unwrap_err();
-    assert!(err.to_string().contains("connection failed"), "{err}");
+    // A handshake that fails is a connection that could not be made (ADR 0067 decision 3).
+    assert!(
+        matches!(err, adam_model::ModelError::Unreachable { .. }),
+        "{err:?}"
+    );
     assert_eq!(
         served.load(Ordering::SeqCst),
         0,

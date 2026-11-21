@@ -39,8 +39,42 @@ pub(crate) fn from_http(
     }
 }
 
+/// The longest slug a problem type is read as: a word of the gateway's vocabulary, never a sentence.
+const MAX_SLUG: usize = 64;
+
+/// Whether a `Content-Type` is `application/problem+json` (RFC 9457), whatever its parameters
+/// and its case.
+pub(crate) fn is_problem_json(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|essence| {
+            essence
+                .trim()
+                .eq_ignore_ascii_case("application/problem+json")
+        })
+}
+
+/// The slug of a problem document's `type` (ADR 0067 decision 3): its last path segment
+/// (`https://gw.example/problems/run_not_bound` is `run_not_bound`), or the member as is when it
+/// holds no `/`; a `type` that ends in `/` has no last segment. A member that is not a string, is empty, or is not a short word of letters, digits,
+/// `_`, `-` and `.` gives none: the slug is the only part of a refusal's body an error keeps.
+pub(crate) fn problem_slug(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let kind = value.get("type")?.as_str()?.trim();
+    let slug = kind.rsplit('/').next().unwrap_or(kind);
+    let word = !slug.is_empty()
+        && slug.len() <= MAX_SLUG
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+    word.then(|| slug.to_owned())
+}
+
 /// Map an error object delivered inside a 200 response or mid-stream, where
 /// there is no status code to go by.
+///
+/// Such an object is the upstream model's, never the gateway's refusal: a gateway refuses before a
+/// response streams, so a refusal is always an HTTP answer ([`from_http`]), and nothing here parks.
 pub(crate) fn from_error_object(value: &Value) -> ModelError {
     let detail = error_message(value).unwrap_or_else(|| snippet(&value.to_string()));
     let message = format!("error in response body: {detail}");
@@ -214,6 +248,66 @@ mod tests {
             from_error_object(&v),
             ModelError::InvalidRequest { .. }
         ));
+    }
+
+    #[test]
+    fn a_problem_type_is_read_by_its_last_segment() {
+        let slug = |body: &str| problem_slug(body);
+        assert_eq!(
+            slug(r#"{"type":"https://gw.example/problems/run_not_bound","title":"x"}"#).as_deref(),
+            Some("run_not_bound")
+        );
+        assert_eq!(
+            slug(r#"{"type":"/problems/over_limit"}"#).as_deref(),
+            Some("over_limit")
+        );
+        assert_eq!(
+            slug(r#"{"type":"lease_expired"}"#).as_deref(),
+            Some("lease_expired")
+        );
+        assert_eq!(
+            slug(r#"{"type":"urn:x:rate-limited.v1"}"#),
+            None,
+            "a ':' is no word"
+        );
+        for none in [
+            "",
+            "not json",
+            "[]",
+            r#"{"title":"no type"}"#,
+            r#"{"type":7}"#,
+            r#"{"type":""}"#,
+            r#"{"type":"https://gw.example/"}"#,
+            r#"{"type":"/problems/over_limit/"}"#,
+            r#"{"type":"two words"}"#,
+            r#"{"type":"sk-live 0123"}"#,
+        ] {
+            assert_eq!(slug(none), None, "{none}");
+        }
+        let long = format!(r#"{{"type":"{}"}}"#, "a".repeat(MAX_SLUG + 1));
+        assert_eq!(slug(&long), None);
+        let at_cap = format!(r#"{{"type":"{}"}}"#, "a".repeat(MAX_SLUG));
+        assert_eq!(slug(&at_cap).map(|s| s.len()), Some(MAX_SLUG));
+    }
+
+    #[test]
+    fn a_problem_document_is_told_by_its_content_type() {
+        for yes in [
+            "application/problem+json",
+            "Application/Problem+JSON",
+            "application/problem+json; charset=utf-8",
+        ] {
+            assert!(is_problem_json(Some(yes)), "{yes}");
+        }
+        for no in [
+            "application/json",
+            "text/plain",
+            "",
+            "application/problem+xml",
+        ] {
+            assert!(!is_problem_json(Some(no)), "{no}");
+        }
+        assert!(!is_problem_json(None));
     }
 
     #[test]

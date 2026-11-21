@@ -83,6 +83,16 @@ Three things are missing in adam today:
      edge's own denial may carry no problem body, *unverified*).
    * `model_locked` is `ModelError::ModelLocked`, class `Rejected`, for every provider (decision 7).
 
+   *Amended 2026-11-21 (S8b-1):* what the decision left open, as built. The slug is read only from a body whose
+   `Content-Type` is `application/problem+json`, and only when it is a word of at most 64 letters, digits, `_`, `-`
+   and `.` (a `type` that ends in `/` has no last segment): it is the one part of a body an error keeps. A slug of the
+   table decides whatever the status; a slug not in it parks nothing, on a `401` or `403` too (only a refusal with no
+   slug reads as `unauthenticated`). `ModelLocked` names the request's model alias (`ModelLocked { model }`), so the
+   failure of decision 7 names it. `Refused`'s `retry_after` is its `Classify::retry_after` for a `429` alone. A TLS
+   handshake that fails is `Unreachable`, since `reqwest` reports it as a connection that could not be made; a connect
+   timeout is a timeout. `Ctx::retries_left()` counts what the runtime's own key allows an error of class `Transient`
+   that names no policy, which is what the LLM agent returns for a model call.
+
    **A gateway that cannot be reached.** The client reports a failed connection (not a timeout, not a stream cut off)
    as the new `ModelError::Unreachable`, class `Transient`, so the runtime retries it as today and a short drop costs
    seconds. Under `injector` only, when the step's retries are spent, the LLM agent parks on a timer instead of failing:

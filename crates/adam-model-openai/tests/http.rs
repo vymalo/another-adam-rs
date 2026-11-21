@@ -566,8 +566,10 @@ async fn slow_server_times_out_as_transient() {
     assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
 }
 
+/// A connection that cannot be made is `Unreachable` (ADR 0067 decision 3), still of class
+/// `Transient`, so the runtime retries it as before.
 #[tokio::test]
-async fn connection_refused_is_transient() {
+async fn connection_refused_is_unreachable_and_transient() {
     // Bind then drop, so the port is very likely closed.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -575,7 +577,7 @@ async fn connection_refused_is_transient() {
     let config = OpenAiConfig::new(format!("http://{addr}/v1"), SecretString::from(KEY));
     let client = OpenAiCompatible::new(config).unwrap();
     let err = client.complete(request()).await.unwrap_err();
-    assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
+    assert!(matches!(err, ModelError::Unreachable { .. }), "{err:?}");
     assert_eq!(err.class(), ErrorClass::Transient);
     assert!(err.is_retryable());
 
@@ -585,7 +587,7 @@ async fn connection_refused_is_transient() {
         source.downcast_ref::<reqwest::Error>().is_some(),
         "{source:?}"
     );
-    assert_eq!(err.to_string(), "transient model error: connection failed");
+    assert_eq!(err.to_string(), "the model endpoint could not be reached");
     assert!(adam_error::report(&err).len() > err.to_string().len());
 }
 
