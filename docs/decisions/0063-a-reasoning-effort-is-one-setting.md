@@ -154,6 +154,11 @@ recorded outside this repository.
    stays `Copy`. The engine has no per-message extension, so the run's effort is the session's, else the
    folder's, else the builder's explicit value, else the preset's, else the profile's, else nothing.
 
+   *Amended 2026-11-21:* `Limits` does not stay `Copy` — it is `Clone` and `PartialEq` (it holds the worker
+   id and the retry policy). The operative requirement is that `Limits` keeps the run bounds and holds no
+   model setting: the profiles and the level reach the engine through `EngineBuilder::models` and
+   `EngineBuilder::reasoning_effort`, never through `Limits`.
+
 9. **The parity table.** The feature is not done until every surface has it through its own mechanism;
    the gaps are the issues linked from `docs/reference/parity.md`, whose reasoning row this ADR updates.
 

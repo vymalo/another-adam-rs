@@ -14,6 +14,7 @@ use adam_core::{DynSecretSource, ProcessEnv};
 use adam_llm_agent::{
     DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionAgent, SessionTools, ToolSet,
 };
+use adam_model::ReasoningEffort;
 use adam_runtime::{RuntimeBuilder, SessionLimits};
 use secrecy::SecretString;
 
@@ -168,6 +169,9 @@ pub struct AgentDef {
     /// What the deployment allows of the sessions of one conversation
     /// ([`session_limits`](Self::session_limits)).
     session_limits: SessionLimits,
+    /// The root's reasoning level when its file sets none
+    /// ([`reasoning_effort`](Self::reasoning_effort)).
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl AgentDef {
@@ -188,6 +192,7 @@ impl AgentDef {
             mcp: McpBinding::default(),
             run_skills: None,
             session_limits: SessionLimits::default(),
+            reasoning_effort: None,
         })
     }
 
@@ -385,6 +390,17 @@ impl AgentDef {
     #[must_use]
     pub fn session_limits(mut self, limits: SessionLimits) -> Self {
         self.session_limits = limits;
+        self
+    }
+
+    /// The root's reasoning level when its file sets none (ADR 0063 decision 8): an embedded
+    /// engine's host gives the level its folder would, and the folder's `reasoning_effort` wins
+    /// over it. It is resolved against the root's model profile exactly as a file's value is
+    /// ([`Error::ReasoningEffort`]), at [`bind`](Self::bind). A subagent always has its own file,
+    /// so this never applies to one. `None` (the default) sets nothing.
+    #[must_use]
+    pub fn reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
         self
     }
 
@@ -652,6 +668,10 @@ impl AgentDef {
                 self.manifest.frontmatter.limits.as_ref(),
                 Some(&self.manifest.name),
             ),
+            // The host's level for the root when its file sets none (ADR 0063 decision 8).
+            root_effort: self
+                .reasoning_effort
+                .map(|effort| effort.as_str().to_owned()),
             nodes: Vec::new(),
             remotes: Vec::new(),
         };
@@ -795,6 +815,9 @@ struct Walk<'a> {
     run_skills: Option<&'a RunSkillsHandle>,
     /// What the root's sessions run under: the deployment's, lowered by the root's file.
     session_limits: SessionLimits,
+    /// The root's reasoning level when its file sets none ([`AgentDef::reasoning_effort`]),
+    /// as its wire word; a subagent's file always sets its own.
+    root_effort: Option<String>,
     nodes: Vec<Node>,
     remotes: Vec<Remote>,
 }
@@ -957,7 +980,11 @@ impl Walk<'_> {
                 .model
                 .clone()
                 .unwrap_or(ModelRef::Inherit),
-            reasoning_effort: manifest.frontmatter.reasoning_effort.clone(),
+            reasoning_effort: manifest
+                .frontmatter
+                .reasoning_effort
+                .clone()
+                .or_else(|| parent.is_none().then(|| self.root_effort.clone()).flatten()),
             model_preset: manifest.frontmatter.model_preset.clone(),
             prompt,
             tools,

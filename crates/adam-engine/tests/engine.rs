@@ -15,7 +15,7 @@ use adam_engine::adam_error::{Classify, ErrorClass};
 use adam_engine::adam_llm_agent::{FnTool, ToolError, ToolOutput, ToolSet};
 use adam_engine::adam_model::{
     ContentPart, DynModel, Message as ModelMessage, MockModel, ModelClient, ModelDelta, ModelError,
-    ModelRequest, ModelResponse, ToolCall,
+    ModelProfiles, ModelRequest, ModelResponse, ReasoningEffort, ToolCall,
 };
 use adam_engine::adam_runtime::{Artifact, REPLAY_EVENTS_PER_RUN, RunEvent, StepState};
 use adam_engine::{
@@ -2028,4 +2028,170 @@ async fn the_engines_first_request_stays_under_the_lean_budget() {
          budget for a lazy agent (ADR 0066)"
     );
     rig.stop().await;
+}
+
+// ------------------------------- ADR 0063 decision 8: the engine's profiles and its level
+
+/// The deployment's profiles as its `MODEL_ALIASES_FILE` writes them, parsed by the same loader:
+/// one model, its levels and wire, its own level, and optionally a `quick` preset.
+fn profiles(own_level: Option<&str>, cap: Option<u32>, quick: Option<&str>) -> ModelProfiles {
+    let own = own_level.map_or_else(String::new, |level| {
+        format!(r#", "reasoningEffort": "{level}""#)
+    });
+    let cap = cap.map_or_else(String::new, |cap| format!(r#", "maxOutputTokens": {cap}"#));
+    let presets = quick.map_or_else(String::new, |level| {
+        format!(r#""presets": {{ "quick": {{ "reasoningEffort": "{level}" }} }},"#)
+    });
+    ModelProfiles::parse_json(&format!(
+        r#"{{ {presets}
+            "profiles": {{
+                "m": {{ "reasoningEfforts": ["low", "high"], "reasoningWire": "reasoning_effort"{own}{cap} }}
+            }}
+        }}"#
+    ))
+    .expect("the deployment's profiles parse")
+}
+
+/// Send `text` and follow its run to its end.
+async fn say_to_the_end(engine: &Engine, text: &str) -> RunInfo {
+    let turn = engine.send(None, Say::new(text)).await.unwrap();
+    let mut events = engine.events(turn.run).await.unwrap();
+    let mut last = None;
+    while let Some(event) = timeout(WAIT, events.next()).await.expect("an event") {
+        last = Some(event.unwrap());
+    }
+    match last {
+        Some(EngineEvent::Ended(info)) => info,
+        other => panic!("the stream ended on {other:?}"),
+    }
+}
+
+/// The deployment's profiles reach an embedded engine's agent (ADR 0063 decision 8): the model's
+/// own level is the resolved default and its `maxOutputTokens` the request's cap. The mock is
+/// used directly, not through `Rig`: `GateModel` forwards no `context_window`, so a window
+/// assertion through it would silently see none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_deployments_profiles_reach_an_engines_agent() {
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .models(profiles(Some("low"), Some(64_000), None))
+        .start()
+        .await
+        .expect("the agent starts with its model's profile");
+    let done = say_to_the_end(&engine, "hi").await;
+    assert_eq!(done.state, RunState::Done);
+    let requests = mock.requests();
+    let first = requests.first().expect("one model call");
+    assert_eq!(
+        first.reasoning_effort,
+        Some(ReasoningEffort::Low),
+        "the profile's own level is the request's"
+    );
+    assert_eq!(
+        first.max_output_tokens,
+        Some(64_000),
+        "the profile's cap is the request's"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// The builder's level is the **root's** (ADR 0063 decision 8), between the folder and the preset:
+/// a folder that sets none takes the builder's over its `model_preset`'s, and a folder that sets
+/// one wins over the builder's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_builders_level_is_the_roots_and_the_file_wins() {
+    // (a) No folder key: the builder's `high` wins over the `quick` preset's `low`.
+    let presetted = agent(&[(
+        "agent/instructions.md",
+        "---\nname: chat\ndescription: Talks with the person.\nmodel_preset: quick\n---\nYou chat.\n",
+    )]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), presetted, model, "m")
+        .models(profiles(None, None, Some("low")))
+        .reasoning_effort(ReasoningEffort::High)
+        .start()
+        .await
+        .expect("the preset is declared and the builder's level is one of the model's");
+    say_to_the_end(&engine, "hi").await;
+    assert_eq!(
+        mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::High),
+        "the builder's level wins over the preset's"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+
+    // (b) The folder's `low` wins over the builder's `high`.
+    let keyed = agent(&[(
+        "agent/instructions.md",
+        "---\nname: chat\ndescription: Talks with the person.\nreasoning_effort: low\n---\nYou chat.\n",
+    )]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), keyed, model, "m")
+        .models(profiles(None, None, None))
+        .reasoning_effort(ReasoningEffort::High)
+        .start()
+        .await
+        .expect("the folder's level is one of the model's");
+    say_to_the_end(&engine, "hi").await;
+    assert_eq!(
+        mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::Low),
+        "the folder's own key wins over the builder's"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A level the model's profile does not take stops `start` (ADR 0063 decision 4 and 8):
+/// `EngineError::Agent` (class `Invalid`), whether the builder set it or a folder did with no
+/// profiles at all, which pins the binaries' fail-closed behaviour as the engine's too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_level_the_models_profile_does_not_take_stops_start() {
+    let refused = Engine::builder(
+        Arc::new(MemoryStore::new()),
+        chat(),
+        MockModel::new().into_dyn(),
+        "m",
+    )
+    .models(profiles(None, None, None))
+    .reasoning_effort(ReasoningEffort::Max)
+    .start()
+    .await
+    .expect_err("the model takes low and high, not max");
+    let EngineError::Agent(source) = &refused else {
+        panic!("the agent is refused: {refused:?}");
+    };
+    assert!(
+        matches!(**source, AssemblyError::ReasoningEffort { .. }),
+        "{source}"
+    );
+    assert_eq!(refused.class(), ErrorClass::Invalid);
+
+    // The folder's own key, with no profiles: nothing declares a level, so nothing may set one.
+    let keyed = agent(&[(
+        "agent/instructions.md",
+        "---\nname: chat\ndescription: Talks with the person.\nreasoning_effort: low\n---\nYou chat.\n",
+    )]);
+    let unprofiled = Engine::builder(
+        Arc::new(MemoryStore::new()),
+        keyed,
+        MockModel::new().into_dyn(),
+        "m",
+    )
+    .start()
+    .await
+    .expect_err("no profile declares a level");
+    let EngineError::Agent(source) = &unprofiled else {
+        panic!("the agent is refused: {unprofiled:?}");
+    };
+    assert!(
+        matches!(**source, AssemblyError::ReasoningEffort { .. }),
+        "{source}"
+    );
+    assert_eq!(unprofiled.class(), ErrorClass::Invalid);
 }
