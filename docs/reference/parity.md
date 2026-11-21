@@ -135,28 +135,28 @@ Proposed in the system and built nowhere: `network-tier/v1`, `model-relay/v1` an
 
 ## Gaps
 
-One line per gap, with the repository that should fill it. Issues are opened from this list.
+One line per gap, with the repository that should fill it and the issue that tracks it.
 
-| # | Repository | Gap |
-|---|---|---|
-| 1 | another-adam-rs | `adam-agent` lists no `access-tier/v1`: a folder agent keeps to no tier (rules per agent are ADR 0039, not built) |
-| 2 | another-adam-rs | `adam-engine`: a `Say` carries no access tier |
-| 3 | another-adam-rs | `adam-engine`: commands are not expanded (the backend is given no `Commands`) |
-| 4 | another-adam-rs | `adam-engine`: no MCP servers, and so no server loaded on demand (`when`, `use_server`) |
-| 5 | another-adam-rs | `adam-engine`: no remote (`a2a:`) subagents |
-| 6 | another-adam-rs | `adam-engine`: a host cannot list, start or close a child session |
-| 7 | another-adam-rs | `adam-engine`: the folder's schedules do not run |
-| 8 | another-adam-rs | `adam-engine`: no call reads a file artifact's bytes |
-| 9 | another-adam-rs | `adam-coder` and `adam-agent` store runs in PostgreSQL only: MongoDB is a library, SQLite is PR #245 |
-| 10 | another-adam-rs | `uploads/v1`, built by the orchestrator, is on no adam card |
-| 11 | another-adam-rs | the chart has no value for `MODEL_AUTH=device`, `SESSION_*`, `MODEL_PROMPT_CACHE_KEY`, `MODEL_INPUT_MODALITIES` and `LANGUAGE_SERVERS` (`config.extraEnv` only), and none mounts `ADAM_REFERENCES_FILE` |
-| 12 | another-adam-rs | reasoning effort as one setting (ADR 0063, PR #268): not merged; once it is, every column needs it |
-| 13 | another-agentic-system | the orchestrator knows `ui-catalog/v1` only, and adam's agents list `ui-catalog/v2`: they are sent no catalog (ADR 0075's cutover) |
-| 14 | another-agentic-system | schedules: no API makes or lists one, and a firing's run is in no thread |
-| 15 | another-agentic-system | no per-thread or per-message model or reasoning effort (`model-relay/v1` is proposed) |
-| 16 | another-agentic-platform | `model.extraBody`, `model.echoReasoning` and `model.contextWindow` are YAML only: no form, so the Platform API and `aapctl apply` refuse them |
-| 17 | another-agentic-platform | no typed field for `MAX_PARALLEL_TOOL_CALLS`, `SESSION_*`, `MODEL_PROMPT_CACHE_KEY`, `MODEL_INPUT_MODALITIES`, a device sign-in or `LANGUAGE_SERVERS`: `extraEnv` only, which is YAML only |
-| 18 | another-agentic-platform | a CRD MCP server has no `when` and no `files` |
-| 19 | another-agentic-platform | no repository images for a repository's own environment |
-| 20 | another-agentic-platform | no fields for A2A push notifications and signed cards |
-| 21 | another-agentic-platform | no field gives the coder `ADAM_REFERENCES_FILE` |
+| # | Repository | Gap | Issue |
+|---|---|---|---|
+| 1 | another-adam-rs | `adam-agent` lists no `access-tier/v1`: a folder agent keeps to no tier (rules per agent are ADR 0039, not built) | [vymalo/another-adam-rs#274](https://github.com/vymalo/another-adam-rs/issues/274) |
+| 2 | another-adam-rs | `adam-engine`: a `Say` carries no access tier | [vymalo/another-adam-rs#275](https://github.com/vymalo/another-adam-rs/issues/275) |
+| 3 | another-adam-rs | `adam-engine`: commands are not expanded (the backend is given no `Commands`) | [vymalo/another-adam-rs#276](https://github.com/vymalo/another-adam-rs/issues/276) |
+| 4 | another-adam-rs | `adam-engine`: no MCP servers, and so no server loaded on demand (`when`, `use_server`) | [vymalo/another-adam-rs#277](https://github.com/vymalo/another-adam-rs/issues/277) |
+| 5 | another-adam-rs | `adam-engine`: no remote (`a2a:`) subagents | [vymalo/another-adam-rs#278](https://github.com/vymalo/another-adam-rs/issues/278) |
+| 6 | another-adam-rs | `adam-engine`: a host cannot list, start or close a child session | [vymalo/another-adam-rs#279](https://github.com/vymalo/another-adam-rs/issues/279) |
+| 7 | another-adam-rs | `adam-engine`: the folder's schedules do not run | [vymalo/another-adam-rs#269](https://github.com/vymalo/another-adam-rs/issues/269) |
+| 8 | another-adam-rs | `adam-engine`: no call reads a file artifact's bytes | [vymalo/another-adam-rs#280](https://github.com/vymalo/another-adam-rs/issues/280) |
+| 9 | another-adam-rs | `adam-coder` and `adam-agent` store runs in PostgreSQL only: MongoDB is a library, SQLite is PR #245 | [vymalo/another-adam-rs#281](https://github.com/vymalo/another-adam-rs/issues/281) |
+| 10 | another-adam-rs | `uploads/v1`, built by the orchestrator, is on no adam card | [vymalo/another-adam-rs#282](https://github.com/vymalo/another-adam-rs/issues/282) |
+| 11 | another-adam-rs | the chart has no value for `MODEL_AUTH=device`, `SESSION_*`, `MODEL_PROMPT_CACHE_KEY`, `MODEL_INPUT_MODALITIES` and `LANGUAGE_SERVERS` (`config.extraEnv` only), and none mounts `ADAM_REFERENCES_FILE` | [vymalo/another-adam-rs#283](https://github.com/vymalo/another-adam-rs/issues/283) |
+| 12 | another-adam-rs | reasoning effort as one setting (ADR 0063, PR #268): not merged; once it is, every column needs it | [vymalo/another-adam-rs#284](https://github.com/vymalo/another-adam-rs/issues/284) |
+| 13 | another-agentic-system | the orchestrator knows `ui-catalog/v1` only, and adam's agents list `ui-catalog/v2`: they are sent no catalog (ADR 0075's cutover) | [vymalo/another-agentic-system#413](https://github.com/vymalo/another-agentic-system/issues/413) |
+| 14 | another-agentic-system | schedules: no API makes or lists one, and a firing's run is in no thread | [vymalo/another-agentic-system#414](https://github.com/vymalo/another-agentic-system/issues/414) |
+| 15 | another-agentic-system | no per-thread or per-message model or reasoning effort (`model-relay/v1` is proposed) | [vymalo/another-agentic-system#415](https://github.com/vymalo/another-agentic-system/issues/415) |
+| 16 | another-agentic-platform | `model.extraBody`, `model.echoReasoning` and `model.contextWindow` are YAML only: no form, so the Platform API and `aapctl apply` refuse them | [vymalo/another-agentic-platform#71](https://github.com/vymalo/another-agentic-platform/issues/71) |
+| 17 | another-agentic-platform | no typed field for `MAX_PARALLEL_TOOL_CALLS`, `SESSION_*`, `MODEL_PROMPT_CACHE_KEY`, `MODEL_INPUT_MODALITIES`, a device sign-in or `LANGUAGE_SERVERS`: `extraEnv` only, which is YAML only | [vymalo/another-agentic-platform#72](https://github.com/vymalo/another-agentic-platform/issues/72) |
+| 18 | another-agentic-platform | a CRD MCP server has no `when` and no `files` | [vymalo/another-agentic-platform#73](https://github.com/vymalo/another-agentic-platform/issues/73) |
+| 19 | another-agentic-platform | no repository images for a repository's own environment | [vymalo/another-agentic-platform#74](https://github.com/vymalo/another-agentic-platform/issues/74) |
+| 20 | another-agentic-platform | no fields for A2A push notifications and signed cards | [vymalo/another-agentic-platform#75](https://github.com/vymalo/another-agentic-platform/issues/75) |
+| 21 | another-agentic-platform | no field gives the coder `ADAM_REFERENCES_FILE` | [vymalo/another-agentic-platform#76](https://github.com/vymalo/another-agentic-platform/issues/76) |
