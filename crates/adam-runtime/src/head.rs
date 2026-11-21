@@ -204,7 +204,7 @@ impl Head {
     /// digest that cannot be read. An inherited file whose bytes are gone is left out (and
     /// logged): a head carries only its digest, so refusing would retry for ever. The other
     /// artifacts stay.
-    pub(crate) async fn prune_missing_files(&mut self, store: &DynStore) -> StoreResult<()> {
+    pub(crate) async fn prune_missing_files(&mut self, store: DynStore) -> StoreResult<()> {
         drop_missing_files(store, &mut self.artifacts).await
     }
 
@@ -281,7 +281,7 @@ impl HeadParts {
 
     /// This head with every file artifact whose bytes the store does not hold left out: what a
     /// commit that carries it writes, so it never names a digest that is not there.
-    pub(crate) async fn without_missing_files(&self, store: &DynStore) -> StoreResult<Self> {
+    pub(crate) async fn without_missing_files(&self, store: DynStore) -> StoreResult<Self> {
         let mut artifacts = self.artifacts.clone();
         drop_missing_files(store, &mut artifacts).await?;
         Ok(Self {
@@ -354,13 +354,15 @@ fn merge_head_artifacts(base: &[HeadArtifact], added: &[Artifact]) -> Vec<HeadAr
 /// Drop the file artifacts of `artifacts` whose digests the store does not hold; each one is
 /// logged by [`missing_blobs`](crate::blob::missing_blobs).
 async fn drop_missing_files(
-    store: &DynStore,
+    store: DynStore,
     artifacts: &mut Vec<HeadArtifact>,
 ) -> StoreResult<()> {
-    let refs = artifacts
-        .iter()
-        .filter_map(|artifact| artifact.file.as_ref())
-        .map(|file| file.digest.clone());
+    let mut refs = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts.iter() {
+        if let Some(file) = artifact.file.as_ref() {
+            refs.push(file.digest.clone());
+        }
+    }
     let missing = crate::blob::missing_blobs(store, refs).await?;
     if !missing.is_empty() {
         artifacts.retain(|artifact| {

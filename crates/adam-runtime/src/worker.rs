@@ -741,11 +741,11 @@ async fn transition(
                 .as_ref()
                 .map(HeadParts::file_refs)
                 .unwrap_or_default();
-            let missing = match crate::blob::missing_blobs(
-                &inner.store,
-                inherited.iter().map(|(digest, _)| digest.clone()),
-            )
-            .await
+            let mut inherited_ids = Vec::with_capacity(inherited.len());
+            for (digest, _) in &inherited {
+                inherited_ids.push(digest.clone());
+            }
+            let missing = match crate::blob::missing_blobs(inner.store.clone(), inherited_ids).await
             {
                 Ok(missing) => missing,
                 Err(e) => {
@@ -761,30 +761,38 @@ async fn transition(
                 artifacts
             } else {
                 // The inherited artifacts are the first `env.artifacts.len()` entries of the
-                // merged list (a file is appended, never replaced), in `inherited`'s order.
+                // merged list (a file is appended, never replaced), and their file artifacts are
+                // `inherited` in order: pair them by position, since a carried `Artifact` has no
+                // digest, only empty bytes.
                 let inherited_len = env.artifacts.len();
-                artifacts
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(at, artifact)| {
-                        *at >= inherited_len
-                            || artifact
-                                .file
-                                .as_ref()
-                                .is_none_or(|file| !missing.contains(&file.digest))
-                    })
-                    .map(|(_, artifact)| artifact)
-                    .collect()
+                let mut file_at = 0_usize;
+                let mut kept = Vec::with_capacity(artifacts.len());
+                for (at, artifact) in artifacts.into_iter().enumerate() {
+                    if at < inherited_len && artifact.file.is_some() {
+                        let gone = inherited
+                            .get(file_at)
+                            .is_some_and(|(digest, _)| missing.contains(digest));
+                        file_at += 1;
+                        if gone {
+                            continue;
+                        }
+                    }
+                    kept.push(artifact);
+                }
+                kept
             };
             // The head pairs its file references with this pass, so carry the list the pass saw:
             // a retry merges deliveries into the envelope, never artifacts. A v5 run's inherited
             // files are paired first, in artifact order, and the pass covers the rest.
             next.head_artifacts = Some(artifacts);
-            next.shadow_files = inherited
-                .into_iter()
-                .filter(|(digest, _)| !missing.contains(digest))
-                .collect();
-            next.shadow_files.extend(uploaded.files);
+            let mut shadow_files = Vec::with_capacity(inherited.len() + uploaded.files.len());
+            for (digest, size) in inherited {
+                if !missing.contains(&digest) {
+                    shadow_files.push((digest, size));
+                }
+            }
+            shadow_files.extend(uploaded.files);
+            next.shadow_files = shadow_files;
             next.shadow_blobs = uploaded.ids;
         } else {
             tracing::error!(
@@ -1437,7 +1445,7 @@ async fn commit(
         let pruned;
         let cur_head = match cur_head {
             Some(base) if next.split.is_none() && !next.split_refused => {
-                pruned = base.without_missing_files(&inner.store).await?;
+                pruned = base.without_missing_files(inner.store.clone()).await?;
                 Some(&pruned)
             }
             other => other,

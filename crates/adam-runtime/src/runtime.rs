@@ -564,7 +564,7 @@ impl Inner {
             // The head this cancel writes is the run's only copy: it must not keep naming an
             // inherited file whose bytes are gone (an S2a expand-release head can).
             if let Stored::Head(head) = &mut stored {
-                head.prune_missing_files(&self.store).await?;
+                head.prune_missing_files(self.store.clone()).await?;
             }
             // The hook receives the whole agent state. A v4 run carries it; a v5 head is joined
             // with its body here, once, so the hook never sees a head with no transcript. A set
@@ -650,7 +650,7 @@ impl Inner {
             // The head this delivery writes is the run's only copy: it must not keep naming an
             // inherited file whose bytes are gone (an S2a expand-release head can).
             if let Stored::Head(head) = &mut stored {
-                head.prune_missing_files(&self.store).await?;
+                head.prune_missing_files(self.store.clone()).await?;
             }
             let (head, state) = carried(&self.store, &stored)?;
             let mut update = RunUpdate::new(status, state);

@@ -233,8 +233,8 @@ pub(crate) async fn upload_files(store: &DynStore, artifacts: &[Artifact]) -> Ve
 /// ever. A store error is returned — whether the bytes are there is unknown, so the commit is
 /// retried rather than dropping an artifact that may still be readable.
 pub(crate) async fn missing_blobs(
-    store: &DynStore,
-    refs: impl IntoIterator<Item = BlobId>,
+    store: DynStore,
+    refs: Vec<BlobId>,
 ) -> StoreResult<HashSet<BlobId>> {
     let mut missing = HashSet::new();
     for id in refs {
