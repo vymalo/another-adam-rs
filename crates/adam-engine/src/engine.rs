@@ -12,17 +12,17 @@ use adam_a2a_runtime::{Commands, RuntimeTaskBackend, task_id_for};
 use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
 use adam_core::{DynSecretSource, DynStore, RunId};
-use adam_llm_agent::DEFAULT_MAX_PARALLEL;
+use adam_llm_agent::{DEFAULT_MAX_PARALLEL, ToolSet};
 use adam_model::DynModel;
-use adam_runtime::{BroadcastSink, RetryPolicy, Runtime, RuntimeBuilder, RuntimeError};
+use adam_runtime::{BroadcastSink, FileRef, RetryPolicy, Runtime, RuntimeBuilder, RuntimeError};
 use adam_ui::Ui;
 use tokio::sync::{RwLock, RwLockReadGuard, oneshot, watch};
 use tokio::task::AbortHandle;
 
 use crate::events::EngineSink;
 use crate::{
-    ConversationId, Delivered, EngineError, ListQuery, Page, RunEvents, RunInfo, RunState, Say,
-    Turn, default_secrets,
+    ConversationId, Delivered, EngineError, ListQuery, Page, RunEvents, RunFile, RunInfo, RunState,
+    Say, Turn, default_secrets,
 };
 
 /// The one subject every call of an engine is made as: the engine serves one person, and the
@@ -106,6 +106,7 @@ pub struct EngineBuilder {
     alias: String,
     secrets: DynSecretSource,
     limits: Limits,
+    tools: ToolSet,
 }
 
 impl std::fmt::Debug for EngineBuilder {
@@ -124,6 +125,16 @@ impl EngineBuilder {
     /// refuses every name. It replaces whatever source `agent` was given.
     pub fn secrets(mut self, secrets: DynSecretSource) -> Self {
         self.secrets = secrets;
+        self
+    }
+
+    /// The host's own tools (`#[tool]` functions, `tools!`, an `FnTool`), beside the engine's own
+    /// (`ask_user`, `show`, `ui_catalog`, the plan tools): together they are the catalog the
+    /// agent's `tools:` selects from, as on a server built with `adam-host`. Default none; a later
+    /// call replaces the set. A name used twice (one of the engine's included), or one the files
+    /// name and nobody gives, is refused at [`start`](Self::start).
+    pub fn tools(mut self, tools: ToolSet) -> Self {
+        self.tools = tools;
         self
     }
 
@@ -166,6 +177,7 @@ impl EngineBuilder {
             alias,
             secrets,
             limits,
+            tools,
         } = self;
         if limits.lease_ttl.is_zero() {
             return Err(EngineError::Invalid(
@@ -190,7 +202,7 @@ impl EngineBuilder {
         let ui = Ui::embedded();
         let assembly = agent
             .secrets(secrets)
-            .bind(ui.tools())
+            .bind(ui.tools().extend(tools))
             .map_err(|e| EngineError::Agent(Box::new(e)))?
             .tool_source(ui.screen())
             .max_parallel(limits.max_parallel_tools)
@@ -234,6 +246,7 @@ impl EngineBuilder {
         // from `commands/<name>.md` before it is stored, as on the server surfaces.
         let backend = RuntimeTaskBackend::new(runtime.clone(), events.clone(), name.clone())
             .with_commands(Commands::from_manifest(&commands));
+        let reader = runtime.clone();
 
         let (stop, stopped) = oneshot::channel::<()>();
         let running = handle.spawn(async move {
@@ -264,6 +277,7 @@ impl EngineBuilder {
                 steering: caller.clone().with_extensions([STEER_EXTENSION]),
                 caller,
                 backend,
+                runtime: reader,
                 events,
                 agent: name,
                 commands,
@@ -358,6 +372,9 @@ impl Drop for AbortOnDrop {
 
 pub(crate) struct Shared {
     backend: RuntimeTaskBackend,
+    /// What [`Engine::file`] reads a file's bytes from, once the backend has said the run is this
+    /// engine's caller's.
+    runtime: Runtime,
     /// The ring every reader of [`Engine::events`] subscribes to; the runtime emits into it through
     /// [`EngineSink`], which takes a file's bytes out.
     events: BroadcastSink,
@@ -419,6 +436,7 @@ impl Engine {
             alias: alias.into(),
             secrets: default_secrets(),
             limits: Limits::default(),
+            tools: ToolSet::new(),
         }
     }
 
@@ -634,6 +652,73 @@ impl Engine {
             next_page_token: page.next_page_token,
             total: page.total_size,
         })
+    }
+
+    /// The files the agent handed over in `run` (its file artifacts), in the order they were
+    /// emitted, without their bytes. An event withholds a file's bytes too; this list is what a
+    /// host that missed the event (or reads the run later) finds them by.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NotFound`] when this engine has no such run, and the store's failures.
+    pub async fn files(&self, run: RunId) -> Result<Vec<RunFile>, EngineError> {
+        Ok(self
+            .file_refs(run)
+            .await?
+            .into_iter()
+            .map(|(file, _)| file)
+            .collect())
+    }
+
+    /// The bytes of the file of `run` whose SHA-256 is `sha256` (a [`RunFile`]'s, or the
+    /// [`WithheldFile`](crate::WithheldFile) an event says). `None` when the run has no such
+    /// file, or its bytes are gone from the store.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NotFound`] when this engine has no such run, and the store's failures.
+    pub async fn file(&self, run: RunId, sha256: &str) -> Result<Option<Arc<[u8]>>, EngineError> {
+        let Some((_, file)) = self
+            .file_refs(run)
+            .await?
+            .into_iter()
+            .find(|(file, _)| file.sha256 == sha256)
+        else {
+            return Ok(None);
+        };
+        self.shared
+            .runtime
+            .artifact_bytes(&file)
+            .await
+            .map_err(EngineError::of_read)
+    }
+
+    /// The file artifacts of `run`, if this engine's caller may see it: one read of the run, owned
+    /// as every call checks it (a run of another caller, a schedule's firing, #289, is `NotFound`
+    /// here as it is to `get`), and no file's bytes.
+    async fn file_refs(&self, run: RunId) -> Result<Vec<(RunFile, FileRef)>, EngineError> {
+        let shared = &self.shared;
+        let view = shared
+            .backend
+            .owned_view(&shared.caller, &run.to_string())
+            .await
+            .map_err(|e| EngineError::of_backend(e, Some(run)))?
+            .ok_or_else(|| EngineError::NotFound(format!("run {run}")))?;
+        Ok(view
+            .artifacts
+            .into_iter()
+            .filter_map(|artifact| {
+                let file = artifact.file?;
+                let listed = RunFile {
+                    name: artifact.name,
+                    mime_type: artifact.mime_type,
+                    filename: file.filename.clone(),
+                    len: file.size,
+                    sha256: file.digest().as_str().to_owned(),
+                };
+                Some((listed, file))
+            })
+            .collect())
     }
 
     /// The agent's commands (`commands/<name>.md`), in name order: what a person may type as
