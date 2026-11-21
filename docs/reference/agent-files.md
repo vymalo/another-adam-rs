@@ -81,6 +81,8 @@ superset of the two custom-agent formats below.
 name: coder                    # default: CARGO_PKG_NAME (root), file name (subagents)
 description: Turns a coding task into a verified pull request.   # required on subagents
 model: coder-large             # a gateway alias; `inherit` = the parent's (default for subagents)
+reasoning_effort: low          # the level the model calls ask for by default; one the model's profile declares (ADR 0063)
+model_preset: quick            # a named preset of MODEL_ALIASES_FILE the calls start from (ADR 0064)
 tools: [prepare_workspace, run_checks, ask_user]     # or "a, b, c"; "*" = all; MCP: "linear__*"
 skills: all                    # or a list; default: every skill in this agent's skills/
 limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as limits.max_turns
@@ -118,6 +120,12 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   knows and ignores (`color`, `permissionMode`, `temperature`, `target`, `user-invocable`,
   `disable-model-invocation`, ...) get a softer "ignored by adam" warning. `build("agent").strict()`
   turns warnings into errors.
+* **Reasoning effort is per model.** `reasoning_effort` names a level the model's profile declares
+  (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; ADR 0063), and `model_preset` names a
+  preset of the deployment's `MODEL_ALIASES_FILE` (ADR 0064). The assembly resolves the default —
+  the folder's value, else the preset's, else the profile's, else the profile's base preset — and
+  refuses a level the model does not take, naming the agent and the value. Claude Code's `effort`
+  is still ignored with a warning.
 * **The tools a root agent has without writing any** are the person's screen and a plan: `ask_user`, `show`,
   `ui_catalog`, `plan_work`, `plan_check`, `plan_add` (`adam-ui`), in that order. `tools:` narrows them by name like
   any other, so **a folder with `tools:` must list `plan_*` (or `"*"`) to keep the plan**. A subagent has none of them
@@ -1132,8 +1140,8 @@ type already sets the pattern).
 
 ## Open questions
 
-* Reasoning effort, sampling and compaction: `ModelRequest` has no such fields, so the keys are
-  accepted and ignored with a warning.
+* Sampling and compaction: the folder's `temperature` and `top_p` are accepted and ignored with a
+  warning; only the reasoning effort reaches a model request so far (ADR 0063).
 * Tool approvals (`approval:`) fit roadmap 5; where the policy lives (`#[tool(...)]`, frontmatter or
   both) is open.
 * An `evals/` directory; an OpenAPI connection; subagent continuation (`task_id`) and a built-in

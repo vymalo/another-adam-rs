@@ -1489,8 +1489,9 @@ impl ToolCtx {
                 ROOT_STEP_KEY.to_owned(),
                 Value::String(root_step.to_owned()),
             );
-            // A limit on this run (the access tier, who it was sent for) is the child's too, and its
-            // own children's: the child's context starts with the protected keys of this one.
+            // A limit on this run (the access tier, who it was sent for, the reasoning effort) is
+            // the child's too, and its own children's: the child's context starts with the
+            // protected keys of this one.
             let inherited: Map<String, Value> = PROTECTED_CONTEXT_KEYS
                 .iter()
                 .filter_map(|key| {

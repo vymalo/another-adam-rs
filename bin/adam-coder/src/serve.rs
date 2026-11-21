@@ -221,9 +221,16 @@ async fn build_agent(
         .with_environment(env.environment.clone())
         .with_scratch_idle(worker.scratch_idle);
     let (janitor, sweep) = wire_commands(&env, janitor, worker);
-    let agent = CoderAgent::try_from_def(def, model, worker.model.alias.clone(), env, tools)
-        .map_err(|e| *e)
-        .context("assembling the coder agent")?;
+    let agent = CoderAgent::try_from_def_with_profiles(
+        def,
+        model,
+        worker.model.alias.clone(),
+        worker.model.profiles.clone(),
+        env,
+        tools,
+    )
+    .map_err(|e| *e)
+    .context("assembling the coder agent")?;
     Ok((agent, janitor, sweep))
 }
 
