@@ -8887,6 +8887,16 @@ async fn a_park_again_writes_the_head_it_read_and_the_tombstone() {
         .expect("start the child");
     let worker = spawn_worker(&rt);
     wait_waiting(&rt, child).await;
+    // The recording store logs a commit after the inner store has taken it, and the run reads as
+    // waiting from the inner store: wait for the step's own commit to be logged, or the reset
+    // below can come first and the step's commit (which writes a row) be read as a park-again.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while recording.commits_of(child).is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the step's commit is logged");
     let parked = inner
         .load_head(child)
         .await
