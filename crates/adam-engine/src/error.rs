@@ -77,7 +77,8 @@ pub enum EngineError {
         #[source]
         source: Option<BoxError>,
     },
-    /// The store refused or failed at `start`: its migration, or the release of the worker's leases.
+    /// The store refused or failed: at `start`, its migration or the release of the worker's
+    /// leases; or while [`file`](crate::Engine::file) read a file's bytes.
     #[error("the store failed")]
     Store(#[source] StoreError),
     /// `start` could not make the store's scheduler runs match the folder's `schedules/` (ADR
@@ -164,6 +165,22 @@ impl EngineError {
             Ok(Some(_)) => Self::Unavailable {
                 message: "the run's state changed under the call".to_owned(),
                 source: None,
+            },
+        }
+    }
+
+    /// A read of a run's file that failed ([`file`](crate::Engine::file)): the store's own error
+    /// keeps its class, anything else is a transient failure or a bug.
+    pub(crate) fn of_read(err: RuntimeError) -> Self {
+        match err {
+            RuntimeError::Store(source) => Self::Store(source),
+            err if err.is_retryable() => Self::Unavailable {
+                message: "the store, reading a file".to_owned(),
+                source: Some(Box::new(err)),
+            },
+            err => Self::Internal {
+                message: "a file could not be read".to_owned(),
+                source: Some(Box::new(err)),
             },
         }
     }

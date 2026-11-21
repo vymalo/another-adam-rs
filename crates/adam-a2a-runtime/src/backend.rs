@@ -328,6 +328,22 @@ impl RuntimeTaskBackend {
         self.child_sessions.as_ref()
     }
 
+    /// The run behind `task_id` as the runtime has it, if it exists, belongs to this agent and is
+    /// `caller`'s: the ownership check every call makes, without building a task, so no file's
+    /// bytes are read (a file artifact stays an `ArtifactRef` whose bytes
+    /// [`Runtime::artifact_bytes`] fetches). For a host that serves the run's files itself.
+    ///
+    /// # Errors
+    ///
+    /// The runtime's failures, as every call's.
+    pub async fn owned_view(
+        &self,
+        caller: &Caller,
+        task_id: &str,
+    ) -> Result<Option<RunView>, BackendError> {
+        Ok(self.owned(caller, task_id).await?.map(|(_, view, _)| view))
+    }
+
     /// The run behind `task_id` if it exists, belongs to this agent and to
     /// `caller`: `(run id, its durable view, context id)`.
     pub(crate) async fn owned(
