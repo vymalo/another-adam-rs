@@ -12,7 +12,7 @@ use std::time::Duration;
 use adam_agent_fs::Schedule;
 use adam_core::{ConversationScope, DynStore, MemoryStore, RunQuery, RunRecord, RunStatus};
 use adam_runtime::{
-    Agent, AgentError, Ctx, Inbound, ManualClock, Runtime, RuntimeError, Transition,
+    Agent, AgentError, Clock, Ctx, Inbound, ManualClock, Runtime, RuntimeError, Transition,
 };
 use adam_schedule::{
     CHANGED_REASON, REMOVED_REASON, Reconciled, SchedulerAgent, SchedulerState, reconcile,
@@ -602,6 +602,11 @@ async fn a_firing_the_store_fails_is_tried_again_and_fires_once() {
     let faulty = Arc::new(adam_store_testkit::fault::FaultyStore::new(memory));
     let store: DynStore = faulty.clone();
     let clock = ManualClock::new();
+    // Start 20 s before an hour, the window where a retry 30 s later passes the next due time.
+    let into_hour = clock.now().0.as_second().rem_euclid(3600);
+    clock.advance(Duration::from_secs(
+        u64::try_from((3600 - 20 - into_hour).rem_euclid(3600)).expect("non-negative"),
+    ));
     let rt = runtime(&store, &clock);
     let worker = spawn_worker(&rt);
     let hourly = schedule("hourly", "0 * * * *", None, "Report.");
@@ -616,7 +621,11 @@ async fn a_firing_the_store_fails_is_tried_again_and_fires_once() {
     // Only the firing creates a run from here on: fail the next one.
     faulty.fail(adam_store_testkit::fault::Method::CreateRun, 1);
 
-    clock.advance(Duration::from_secs(3600));
+    // To just past the due time, not a whole hour on: the clock starts at the wall clock, and the
+    // retry below must still come before the next due time, or it fires that one instead (a run
+    // begun 31 s before an hour did).
+    let wait = due.0.duration_since(clock.now().0) + jiff::SignedDuration::from_secs(1);
+    clock.advance(Duration::try_from(wait).expect("the due time is ahead"));
     until("the failed try", || async {
         faulty.injected(adam_store_testkit::fault::Method::CreateRun) == 1
     })
