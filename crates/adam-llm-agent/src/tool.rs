@@ -9,7 +9,7 @@ use adam_error::{Classify, ErrorClass};
 use adam_model::{ImageRef, ToolSpec};
 use adam_runtime::{
     Artifact, CancelToken, ChildStarter, DynEventSink, Emitter, Inbound, MAX_RUN_FILE_BYTES,
-    RunEvent, SandboxUsage, StepEvent, StepIcon, StepKind, StepState,
+    RetryPolicy, RunEvent, SandboxUsage, StepEvent, StepIcon, StepKind, StepState,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -110,6 +110,20 @@ pub trait Tool: Send + Sync + 'static {
         None
     }
 
+    /// The retry policy of this tool's retryable failures ([`ToolError::Transient`],
+    /// [`ToolError::Retryable`]), counted under the key `tool:<name>` apart from the other steps
+    /// of the run ([ADR 0061]). `None`, the default, leaves them to the runtime's policy. A policy
+    /// set for the tool by name ([`LlmAgentBuilder::tool_retry`](crate::LlmAgentBuilder::tool_retry),
+    /// an agent folder's `retry:`) wins over this one. `#[tool(retry(attempts = 3, backoff = "1s"))]`
+    /// writes it for a function. A tool that wraps another (see
+    /// [`ToolSet::wrap`](crate::ToolSet::wrap)) must forward it, as it forwards
+    /// [`time_limit`](Self::time_limit).
+    ///
+    /// [ADR 0061]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0061-a-step-names-its-retry-policy.md
+    fn retry_policy(&self) -> Option<RetryPolicy> {
+        None
+    }
+
     /// How a call of this tool is drawn as a step ([`RunEvent::Step`]): its kind, the label (the
     /// tool's name when it says none) and an icon. The default is a plain tool: kind `tool`, the
     /// name as the label, no icon. A tool that hands its work to another agent says
@@ -186,7 +200,8 @@ pub trait Tool: Send + Sync + 'static {
     /// [`AwaitRemote`](ToolError::AwaitRemote) fires, with the `task` the tool returned. The tool
     /// looks (a `GetTask` to an A2A agent) and answers [`RemotePoll::Ready`] with the tool result,
     /// or [`RemotePoll::Working`] to be asked again after the next interval. An `Err` is handled
-    /// as for [`call`](Self::call): [`Transient`](ToolError::Transient) retries the step,
+    /// as for [`call`](Self::call): [`Transient`](ToolError::Transient) or
+    /// [`Retryable`](ToolError::Retryable) retries the step, under the tool's policy,
     /// [`Permanent`](ToolError::Permanent) becomes an error result for the model, and the waiting
     /// variants are refused as an error result.
     ///
@@ -689,7 +704,8 @@ impl ToolOutput {
 /// old journals stay replayable. That is why it carries no `source`: a tool flattens its own
 /// cause into the message (with [`adam_error::report`]) before returning it.
 ///
-/// Classes: `Transient` is [`ErrorClass::Transient`], `Permanent` is [`ErrorClass::Invalid`]
+/// Classes: `Transient` is [`ErrorClass::Transient`], `Retryable` is its own class (`RateLimited` or
+/// `Conflict`), `Permanent` is [`ErrorClass::Invalid`]
 /// (the model asked for something that cannot work, and is told so), and `NeedsInput`, `AwaitRun`
 /// and `AwaitRemote` are [`ErrorClass::Rejected`] (valid, but they need the user, a child run, or a
 /// remote task, first).
@@ -705,6 +721,22 @@ pub enum ToolError {
     /// `AgentError::Transient` and the runtime retries it with backoff.
     #[error("transient tool error: {0}")]
     Transient(String),
+    /// Worth retrying, of a retryable class that is not `Transient`: a rate limit, a lost race
+    /// ([ADR 0061]). The run's step fails with an `AgentError::Transient` of that class, which a
+    /// policy that names its classes may retry or not. [`from_classified`](Self::from_classified)
+    /// and [`retryable`](Self::retryable) build it; a class this build does not know reads as
+    /// `transient`. A build older than the one that wrote it cannot read the journal entry: roll a
+    /// deployment forward, not back.
+    ///
+    /// [ADR 0061]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0061-a-step-names-its-retry-policy.md
+    #[error("retryable tool error: {message}")]
+    Retryable {
+        /// What happened.
+        message: String,
+        /// Its retryable class, written by name (`rate-limited`, `conflict`).
+        #[serde(with = "retryable_class")]
+        class: ErrorClass,
+    },
     /// Not worth retrying. The run continues: the message becomes an error
     /// tool result for the model.
     #[error("permanent tool error: {0}")]
@@ -791,8 +823,32 @@ impl ToolError {
         }
     }
 
+    /// A failure of `class` with `message`: [`Transient`](Self::Transient) for `Transient`,
+    /// [`Retryable`](Self::Retryable) for another retryable class (`RateLimited`, `Conflict`), and
+    /// [`Permanent`](Self::Permanent) for a class that is not retryable.
+    pub fn retryable(message: impl Into<String>, class: ErrorClass) -> Self {
+        let message = message.into();
+        match class {
+            ErrorClass::Transient => Self::Transient(message),
+            class if class.is_retryable() => Self::Retryable { message, class },
+            _ => Self::Permanent(message),
+        }
+    }
+
+    /// The message and the class of a failure worth retrying ([`Transient`](Self::Transient) or
+    /// [`Retryable`](Self::Retryable)); `None` for any other.
+    pub fn retry_parts(&self) -> Option<(&str, ErrorClass)> {
+        match self {
+            Self::Transient(message) => Some((message, ErrorClass::Transient)),
+            // Only a retryable class: one built by hand with another is not worth retrying.
+            Self::Retryable { message, class } if class.is_retryable() => Some((message, *class)),
+            _ => None,
+        }
+    }
+
     /// Turn a classified error into a tool error: a retryable one
-    /// ([`ErrorClass::is_retryable`]) becomes [`Transient`](Self::Transient),
+    /// ([`ErrorClass::is_retryable`]) becomes [`Transient`](Self::Transient), or
+    /// [`Retryable`](Self::Retryable) with its class when that is not `Transient`,
     /// anything else [`Permanent`](Self::Permanent). The message is the error
     /// and its whole source chain ([`adam_error::report`]), because a
     /// `ToolError` is journaled as text.
@@ -813,12 +869,23 @@ impl ToolError {
     /// assert_eq!(ToolError::from_classified(&Busy), ToolError::Transient("backend busy".into()));
     /// ```
     pub fn from_classified<E: Classify + 'static>(err: &E) -> Self {
-        let message = adam_error::report(err);
-        if err.is_retryable() {
-            Self::Transient(message)
-        } else {
-            Self::Permanent(message)
-        }
+        Self::retryable(adam_error::report(err), err.class())
+    }
+}
+
+/// A [`ToolError::Retryable`]'s class, by the name a retry policy writes it with.
+mod retryable_class {
+    use adam_error::ErrorClass;
+    use adam_runtime::RetryClasses;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(class: &ErrorClass, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(RetryClasses::name_of(*class).unwrap_or("transient"))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<ErrorClass, D::Error> {
+        let name = String::deserialize(d)?;
+        Ok(RetryClasses::class_named(&name).unwrap_or(ErrorClass::Transient))
     }
 }
 
@@ -826,6 +893,7 @@ impl Classify for ToolError {
     fn class(&self) -> ErrorClass {
         match self {
             Self::Transient(_) => ErrorClass::Transient,
+            Self::Retryable { class, .. } => *class,
             Self::Permanent(_) => ErrorClass::Invalid,
             Self::NeedsInput { .. }
             | Self::AwaitRun { .. }
@@ -1795,15 +1863,24 @@ mod tests {
 
     #[test]
     fn from_classified_splits_on_retryability_and_keeps_the_chain() {
-        for class in [
-            ErrorClass::Transient,
-            ErrorClass::RateLimited,
-            ErrorClass::Conflict,
-        ] {
+        assert_eq!(
+            ToolError::from_classified(&Classed(ErrorClass::Transient, Inner)),
+            ToolError::Transient("outer: inner".into()),
+        );
+        // Another retryable class is kept (ADR 0061).
+        for class in [ErrorClass::RateLimited, ErrorClass::Conflict] {
+            let e = ToolError::from_classified(&Classed(class, Inner));
             assert_eq!(
-                ToolError::from_classified(&Classed(class, Inner)),
-                ToolError::Transient("outer: inner".into()),
+                e,
+                ToolError::Retryable {
+                    message: "outer: inner".into(),
+                    class
+                },
                 "{class:?}"
+            );
+            assert_eq!(
+                (e.class(), e.retry_parts()),
+                (class, Some(("outer: inner", class)))
             );
         }
         for class in [
@@ -1817,5 +1894,48 @@ mod tests {
                 "{class:?}"
             );
         }
+    }
+
+    /// A retryable class is journaled by its name, and a journal written before keeps decoding as
+    /// it did; a class this build does not know is a transient error.
+    #[test]
+    fn a_retryable_error_is_journaled_by_its_class_name() {
+        let e = ToolError::retryable("slow down", ErrorClass::RateLimited);
+        let json = serde_json::to_value(&e).expect("serialises");
+        assert_eq!(
+            json,
+            serde_json::json!({"Retryable": {"message": "slow down", "class": "rate-limited"}})
+        );
+        assert_eq!(
+            serde_json::from_value::<ToolError>(json).expect("decodes"),
+            e
+        );
+        let newer = serde_json::json!({"Retryable": {"message": "x", "class": "overloaded"}});
+        assert_eq!(
+            serde_json::from_value::<ToolError>(newer).expect("decodes"),
+            ToolError::Retryable {
+                message: "x".into(),
+                class: ErrorClass::Transient
+            }
+        );
+        let old = serde_json::json!({"Transient": "timeout"});
+        assert_eq!(
+            serde_json::from_value::<ToolError>(old).expect("decodes"),
+            ToolError::Transient("timeout".into())
+        );
+        assert_eq!(
+            ToolError::retryable("t", ErrorClass::Transient),
+            ToolError::Transient("t".into())
+        );
+        assert_eq!(
+            ToolError::retryable("p", ErrorClass::Invalid),
+            ToolError::Permanent("p".into())
+        );
+        assert_eq!(ToolError::Permanent("p".into()).retry_parts(), None);
+        let by_hand = ToolError::Retryable {
+            message: "bad".into(),
+            class: ErrorClass::Invalid,
+        };
+        assert_eq!(by_hand.retry_parts(), None, "a class that is not retryable");
     }
 }

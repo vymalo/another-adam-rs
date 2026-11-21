@@ -453,8 +453,13 @@ of `adam-llm-agent`.
   existing struct as the whole argument object and must be the only model argument.
 * **Return:** `Result<T, E>` or a bare `T`, with `T: IntoToolOutput` and `E: Into<ToolError>`.
 * **Options:** `name = "..."`, `type = Ident`, `strict` (`deny_unknown_fields`, which also closes the
-  schema), `classify` (the error is `adam_error::Classify`: retryable becomes `ToolError::Transient`,
-  the rest `Permanent`), `asks_user` (the tool can end a call with `ToolError::NeedsInput`: the
+  schema), `classify` (the error is `adam_error::Classify`: retryable becomes `ToolError::Transient`, or
+  `ToolError::Retryable` with its class for a rate limit or a conflict, the rest `Permanent`),
+  `retry(attempts = 3, backoff = "1s", max_backoff = "30s", multiplier = 2.0, on = ["rate-limited"])` (the
+  tool's retry policy, `Tool::retry_policy`: its failures count under `tool:<name>`; `attempts` is required;
+  durations are `500ms`, `1s`, `30m`, `1h`; `on` lists `transient`, `rate-limited`, `conflict`; what is left out
+  is `RetryPolicy`'s default, 1 s, 60 s, 2.0 and all three classes;
+  [ADR 0061](../decisions/0061-a-step-names-its-retry-policy.md)), `asks_user` (the tool can end a call with `ToolError::NeedsInput`: the
   generated `Tool::asks_user` says `true`, and `bind` refuses it on a subagent), `step`, `label` and
   `icon` (how a call is drawn as a step, `Tool::step_style`: the kind, a label instead of the tool's name (give one: it is what the person reads), and an
   icon from the closed vocabulary of the orchestration layer's `steps/v1` (`opencode` is OpenCode's own); [ADR 0007](../decisions/0007-progress-as-steps-and-streamed-text.md)) and

@@ -15,9 +15,9 @@ use adam_model::{
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, CancelToken,
     ChildStarter, ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES, MAX_SESSION_PAGE,
-    RUN_FINISHED_KIND, ReservedStep, RunEvent, SESSION_CLOSE_KIND, SandboxUsage, SessionState,
-    SessionSummary, StepEvent, StepIcon, StepKind, StepState, Transition, UsageEvent, UsageTotals,
-    child_run_id,
+    RUN_FINISHED_KIND, ReservedStep, RetryPolicy, RunEvent, SESSION_CLOSE_KIND, SandboxUsage,
+    SessionState, SessionSummary, StepEvent, StepIcon, StepKind, StepState, Transition, UsageEvent,
+    UsageTotals, child_run_id,
 };
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -514,7 +514,7 @@ impl<'a> Early<'a> {
     pub(crate) async fn next(&mut self) {
         if let Some((i, finished)) = self.running.next().await {
             if let Finished::Ran { outcome, .. } = &finished {
-                self.failed |= transient_failure(&self.started[i].1, outcome).is_some();
+                self.failed |= transient_failure(&self.started[i].1, outcome, None).is_some();
             }
             self.accesses[i] = None;
             self.done[i] = Some(finished);
@@ -593,7 +593,7 @@ impl<'a> Early<'a> {
                 next = self.running.next() => match next {
                     Some((i, finished)) => {
                         if let Finished::Ran { outcome, .. } = &finished {
-                            self.failed |= transient_failure(&self.started[i].1, outcome).is_some();
+                            self.failed |= transient_failure(&self.started[i].1, outcome, None).is_some();
                         }
                         self.accesses[i] = None;
                         self.done[i] = Some(finished);
@@ -706,6 +706,16 @@ struct ModelFailure {
 }
 
 impl ModelFailure {
+    /// The retryable class the provider's error had, as recorded (ADR 0061): `RateLimited` or
+    /// `Conflict`, else `Transient` (a journal written before classes, or any other name).
+    fn retry_class(&self) -> adam_error::ErrorClass {
+        match self.class.as_deref() {
+            Some("RateLimited") => adam_error::ErrorClass::RateLimited,
+            Some("Conflict") => adam_error::ErrorClass::Conflict,
+            _ => adam_error::ErrorClass::Transient,
+        }
+    }
+
     /// The call was dropped because the run was cancelled. Not retryable: nobody is waiting for it.
     fn cancelled() -> Self {
         Self {
@@ -985,6 +995,7 @@ pub struct LlmAgentBuilder {
     session_agents: Vec<String>,
     session_reports: bool,
     max_parallel: usize,
+    tool_retry: BTreeMap<String, RetryPolicy>,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -1153,6 +1164,19 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// The retry policy of the tool `name`'s retryable failures, which wins over the tool's own
+    /// ([`Tool::retry_policy`]): what an agent folder's `retry:` sets ([ADR 0061]). A tool that
+    /// another system offers (an MCP server's `<server>__<tool>`) has no policy of its own, so this
+    /// is the only way to give it one. The failures count under the key `tool:<name>`
+    /// ([`tool_retry_key`]). A policy for a name the agent never calls is never used.
+    ///
+    /// [ADR 0061]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0061-a-step-names-its-retry-policy.md
+    #[must_use]
+    pub fn tool_retry(mut self, name: impl Into<String>, policy: RetryPolicy) -> Self {
+        self.tool_retry.insert(name.into(), policy);
+        self
+    }
+
     /// How the step of a tool call reports what the tool was given and what it answered: the
     /// arguments on the report that starts the step, the result (or the error) on the one that ends
     /// it, each scrubbed by [`StepIo::redact`] and then cut to the contract's bounds (4 KiB in, 8 KiB
@@ -1281,6 +1305,7 @@ impl LlmAgentBuilder {
             session_agents: self.session_agents.into(),
             session_reports: self.session_reports,
             max_parallel: self.max_parallel,
+            tool_retry: self.tool_retry,
             images_cache: Arc::new(Mutex::new(ImageCache::new())),
             run_chars: Arc::new(Mutex::new(RunChars::default())),
         }
@@ -1412,8 +1437,10 @@ impl LlmAgentBuilder {
 ///
 /// # Failure handling
 ///
-/// * Retryable model error (`ModelError::is_retryable`) or
-///   [`ToolError::Transient`]: `AgentError::Transient`, retried by the runtime.
+/// * Retryable model error (`ModelError::is_retryable`), [`ToolError::Transient`] or
+///   [`ToolError::Retryable`]: `AgentError::Transient` of the error's class, retried by the
+///   runtime, under the tool's policy for a tool that has one ([`Tool::retry_policy`],
+///   [`LlmAgentBuilder::tool_retry`], counted under [`tool_retry_key`]).
 ///   A `ModelError::RateLimited` that carries a `retry_after` becomes an
 ///   `AgentError::Transient` with that hint (`with_retry_after`), so the
 ///   retry waits at least that long
@@ -1451,6 +1478,8 @@ pub struct LlmAgent {
     session_reports: bool,
     /// The most tool calls of a turn that run at the same time.
     max_parallel: usize,
+    /// The retry policies set per tool by name ([`LlmAgentBuilder::tool_retry`]).
+    tool_retry: BTreeMap<String, RetryPolicy>,
     /// The bytes of the images already read and checked, by SHA-256, shared by every run of this
     /// agent: a turn reads an image file once, not once per model call.
     images_cache: Arc<Mutex<ImageCache>>,
@@ -1544,6 +1573,7 @@ impl LlmAgent {
             session_agents: Vec::new(),
             session_reports: true,
             max_parallel: DEFAULT_MAX_PARALLEL,
+            tool_retry: BTreeMap::new(),
         }
     }
 
@@ -1560,6 +1590,31 @@ impl LlmAgent {
 
     fn tool(&self, name: &str) -> Option<&DynTool> {
         self.index.get(name).map(|&i| &self.tools[i])
+    }
+
+    /// The retry policy of the tool `name`, first found: the one set by name
+    /// ([`LlmAgentBuilder::tool_retry`]), the tool's own ([`Tool::retry_policy`]); `None`: the
+    /// runtime's (ADR 0061, decision 3).
+    fn tool_retry_policy(&self, name: &str) -> Option<RetryPolicy> {
+        self.tool_retry
+            .get(name)
+            .copied()
+            .or_else(|| self.tool(name).and_then(|tool| tool.retry_policy()))
+    }
+
+    /// The runtime's error for a retryable failure of the tool `tool`: `context` and the reason,
+    /// of `class`, under the tool's policy when it has one (ADR 0061).
+    fn tool_retry_error(
+        &self,
+        tool: &str,
+        message: String,
+        class: adam_error::ErrorClass,
+    ) -> AgentError {
+        tool_transient(
+            message,
+            class,
+            self.tool_retry_policy(tool).map(|p| (tool, p)),
+        )
     }
 
     /// Whether the tool `name` pages its results: it says so ([`Tool::paged`]). Never inferred
@@ -2146,7 +2201,11 @@ impl LlmAgent {
                 if let Some(mut early) = early {
                     early.settle().await;
                 }
-                let error = AgentError::transient(format!("model call failed: {}", f.message));
+                let error = tool_transient(
+                    format!("model call failed: {}", f.message),
+                    f.retry_class(),
+                    None,
+                );
                 return Err(match f.retry_after_ms {
                     // The provider said how long to wait: the runtime waits
                     // at least that long (see `AgentError::with_retry_after`).
@@ -2573,7 +2632,11 @@ impl LlmAgent {
                 (done.summary, done.cut, state.overflow_message.take())
             }
             Err(f) if f.retryable => {
-                let error = AgentError::transient(format!("summary call failed: {}", f.message));
+                let error = tool_transient(
+                    format!("summary call failed: {}", f.message),
+                    f.retry_class(),
+                    None,
+                );
                 return Err(match f.retry_after_ms {
                     Some(ms) => error.with_retry_after(Duration::from_millis(ms)),
                     None => error,
@@ -3602,6 +3665,7 @@ impl LlmAgent {
         step: ReservedStep,
     ) -> BoxFuture<'static, (usize, Result<Finished, AgentError>)> {
         let call = call.clone();
+        let policy = self.tool_retry_policy(&call.name);
         async move {
             let Finished::Ran {
                 outcome,
@@ -3621,7 +3685,7 @@ impl LlmAgent {
                     Ok(outcome) => outcome,
                     Err(error) => return (i, Err(error)),
                 };
-            let failure = transient_failure(&call, &journaled);
+            let failure = transient_failure(&call, &journaled, policy);
             let finished = Finished::Ran {
                 outcome: Box::new(journaled),
                 unjournaled,
@@ -3674,7 +3738,7 @@ impl LlmAgent {
         let outcome: Result<ToolOutput, ToolError> = step.run(move || work).await?;
         // How it ended, said now; `conclude` says it again only if applying the result changes it.
         let live = self.say_outcome(call, notes, emitter, &outcome).await;
-        if let Some(error) = transient_failure(call, &outcome) {
+        if let Some(error) = transient_failure(call, &outcome, self.tool_retry_policy(&call.name)) {
             return Err(error);
         }
         Ok(Finished::Ran {
@@ -3754,7 +3818,12 @@ impl LlmAgent {
                 .await;
                 Live { said: None }
             }
-            Err(ToolError::Transient(reason)) => {
+            Err(
+                ToolError::Transient(reason)
+                | ToolError::Retryable {
+                    message: reason, ..
+                },
+            ) => {
                 say_with(
                     emitter,
                     silent,
@@ -4086,7 +4155,7 @@ impl LlmAgent {
         let reported = match &outcome {
             Ok(output) => output.sandbox.clone(),
             // Tried again: only the try that is kept counts.
-            Err(ToolError::Transient(_)) => SandboxUsage::new(),
+            Err(ToolError::Transient(_) | ToolError::Retryable { .. }) => SandboxUsage::new(),
             Err(_) => unjournaled
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -4159,7 +4228,11 @@ impl LlmAgent {
                 }
                 ToolResult::error(&call.id, backstop(&reason, &call.name, false).into_owned())
             }
-            Err(ToolError::Transient(reason)) => {
+            Err(error @ (ToolError::Transient(_) | ToolError::Retryable { .. })) => {
+                let (reason, class) = error.retry_parts().map_or(
+                    (String::new(), adam_error::ErrorClass::Transient),
+                    |(r, c)| (r.to_owned(), c),
+                );
                 if live.is_none() {
                     say(
                         ctx,
@@ -4174,10 +4247,11 @@ impl LlmAgent {
                     )
                     .await;
                 }
-                return Err(AgentError::transient(format!(
-                    "tool `{}` failed: {reason}",
-                    call.name
-                )));
+                return Err(self.tool_retry_error(
+                    &call.name,
+                    format!("tool `{}` failed: {reason}", call.name),
+                    class,
+                ));
             }
             // Beside other calls a question or a wait has nowhere to park: the model is told to call
             // the tool alone (its end was said as it happened).
@@ -4473,10 +4547,19 @@ impl LlmAgent {
                 owed(state, message);
                 Ok(Some(outcome))
             }
-            Err(ToolError::Transient(reason)) => Err(AgentError::transient(format!(
-                "tool `{}` failed while polling its remote task: {reason}",
-                wait.tool
-            ))),
+            Err(error @ (ToolError::Transient(_) | ToolError::Retryable { .. })) => {
+                let (reason, class) = error
+                    .retry_parts()
+                    .unwrap_or(("", adam_error::ErrorClass::Transient));
+                Err(self.tool_retry_error(
+                    &wait.tool,
+                    format!(
+                        "tool `{}` failed while polling its remote task: {reason}",
+                        wait.tool
+                    ),
+                    class,
+                ))
+            }
             Err(ToolError::Permanent(reason)) => {
                 owed(
                     state,
@@ -4987,13 +5070,39 @@ pub(crate) fn call_key(call: &ToolCall) -> String {
 fn transient_failure(
     call: &ToolCall,
     outcome: &Result<ToolOutput, ToolError>,
+    policy: Option<RetryPolicy>,
 ) -> Option<AgentError> {
-    match outcome {
-        Err(ToolError::Transient(reason)) => Some(AgentError::transient(format!(
-            "tool `{}` failed: {reason}",
-            call.name
-        ))),
-        _ => None,
+    let (reason, class) = outcome.as_ref().err()?.retry_parts()?;
+    Some(tool_transient(
+        format!("tool `{}` failed: {reason}", call.name),
+        class,
+        policy.map(|p| (call.name.as_str(), p)),
+    ))
+}
+
+/// The key a tool's failures count under: `tool:<name>`, the name and never the call id, so a tool
+/// called again in a later turn counts as the same step (ADR 0061, decision 3).
+pub fn tool_retry_key(tool: &str) -> String {
+    format!("tool:{tool}")
+}
+
+/// An `AgentError::Transient` of `class` with `message`, under `policy` (the tool's name and its
+/// policy) when there is one: a tool's retryable failure, or the model's (with no policy).
+fn tool_transient(
+    message: String,
+    class: adam_error::ErrorClass,
+    policy: Option<(&str, RetryPolicy)>,
+) -> AgentError {
+    let error = AgentError::Transient {
+        message,
+        retry_after: None,
+        class,
+        retry: None,
+        source: None,
+    };
+    match policy {
+        Some((tool, policy)) => error.with_retry(tool_retry_key(tool), policy),
+        None => error,
     }
 }
 

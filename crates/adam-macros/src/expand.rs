@@ -17,8 +17,8 @@ use syn::ext::IdentExt as _;
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned as _;
 use syn::{
-    Attribute, Error, Expr, FnArg, GenericArgument, Ident, Item, ItemFn, Lit, LitStr, Meta, Pat,
-    Path, PathArguments, Result, ReturnType, Safety, Token, Type,
+    Attribute, Error, Expr, FnArg, GenericArgument, Ident, Item, ItemFn, Lit, LitInt, LitStr, Meta,
+    Pat, Path, PathArguments, Result, ReturnType, Safety, Token, Type,
 };
 
 /// Expand `#[tool(attr)] item`.
@@ -51,9 +51,82 @@ struct Options {
     parallel: Option<LitStr>,
     path: Option<LitStr>,
     access: Option<Path>,
+    retry: Option<RetryOpts>,
 }
 
-const OPTIONS: &str = "name, type, strict, classify, asks_user, paged, crate, step, label, icon, parallel, path, access";
+const OPTIONS: &str = "name, type, strict, classify, asks_user, paged, crate, step, label, icon, parallel, path, access, retry";
+
+/// What is written inside `#[tool(retry(...))]`: the tool's retry policy (ADR 0061).
+struct RetryOpts {
+    span: Span,
+    attempts: Option<LitInt>,
+    backoff: Option<LitStr>,
+    max_backoff: Option<LitStr>,
+    multiplier: Option<Lit>,
+    on: Option<(Span, Vec<LitStr>)>,
+}
+
+const RETRY_OPTIONS: &str = "attempts, backoff, max_backoff, multiplier, on";
+
+/// `RetryPolicy::default()`'s first delay, in milliseconds: what a `retry` without `backoff` has.
+const DEFAULT_BACKOFF_MS: u64 = 1_000;
+
+/// The retryable classes a policy may name (`adam_runtime::RetryClasses`), with their
+/// `adam_error::ErrorClass` variants. The `adam` crate's tests check them against the runtime's.
+const RETRY_CLASSES: &[(&str, &str)] = &[
+    ("transient", "Transient"),
+    ("rate-limited", "RateLimited"),
+    ("conflict", "Conflict"),
+];
+
+impl Parse for RetryOpts {
+    fn parse(input: ParseStream) -> Result<Self> {
+        let mut opts = RetryOpts {
+            span: input.span(),
+            attempts: None,
+            backoff: None,
+            max_backoff: None,
+            multiplier: None,
+            on: None,
+        };
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            let seen = match key.to_string().as_str() {
+                "attempts" => opts.attempts.replace(input.parse()?).is_some(),
+                "backoff" => opts.backoff.replace(input.parse()?).is_some(),
+                "max_backoff" => opts.max_backoff.replace(input.parse()?).is_some(),
+                "multiplier" => opts.multiplier.replace(input.parse()?).is_some(),
+                "on" => {
+                    let content;
+                    let bracket = syn::bracketed!(content in input);
+                    let names = content.parse_terminated(<LitStr as Parse>::parse, Token![,])?;
+                    opts.on
+                        .replace((bracket.span.join(), names.into_iter().collect()))
+                        .is_some()
+                }
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!(
+                            "unknown `retry` option `{other}` in `#[tool]`; expected one of: {RETRY_OPTIONS}"
+                        ),
+                    ));
+                }
+            };
+            if seen {
+                return Err(Error::new(
+                    key.span(),
+                    format!("`{key}` is given twice in `retry`"),
+                ));
+            }
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        Ok(opts)
+    }
+}
 
 /// The words of `#[tool(parallel = ..)]`: what a call shares with the other calls of its turn
 /// (`adam_llm_agent::ToolAccess`).
@@ -114,6 +187,13 @@ impl Parse for Options {
                 "access" => {
                     input.parse::<Token![=]>()?;
                     opts.access.replace(Path::parse_mod_style(input)?).is_some()
+                }
+                "retry" => {
+                    let content;
+                    syn::parenthesized!(content in input);
+                    let mut retry: RetryOpts = content.parse()?;
+                    retry.span = key.span();
+                    opts.retry.replace(retry).is_some()
                 }
                 "strict" => opts.strict.replace(key.span()).is_some(),
                 "classify" => std::mem::replace(&mut opts.classify, true),
@@ -213,7 +293,19 @@ struct Analysis {
     step_style: Option<StepStyle>,
     /// `parallel`, `path` and `access`, checked: what a call shares with the others of its turn.
     access: Option<AccessDecl>,
+    /// `retry(...)`, checked: the tool's retry policy.
+    retry: Option<RetryDecl>,
     return_span: Span,
+}
+
+/// What `#[tool(retry(...))]` declares, checked: durations in milliseconds, classes as
+/// `ErrorClass` variants.
+struct RetryDecl {
+    attempts: u32,
+    backoff_ms: Option<u64>,
+    max_backoff_ms: Option<u64>,
+    multiplier: Option<f64>,
+    on: Option<Vec<Ident>>,
 }
 
 /// What `#[tool(parallel = .., path = .., access = ..)]` declares.
@@ -354,6 +446,10 @@ fn analyse(func: &ItemFn, opts: Options) -> Result<Analysis> {
     }
     let step_style = analyse_step_style(&opts, &mut errors);
     let access = analyse_access(&opts, &params, &mut errors);
+    let retry = opts
+        .retry
+        .as_ref()
+        .and_then(|retry| analyse_retry(retry, &mut errors));
     errors.finish()?;
 
     let return_span = match &sig.output {
@@ -374,8 +470,119 @@ fn analyse(func: &ItemFn, opts: Options) -> Result<Analysis> {
         paged: opts.paged,
         step_style,
         access,
+        retry,
         return_span,
     })
+}
+
+/// The checked `retry(...)` option; `None` when it has a mistake, which is pushed on `errors`.
+fn analyse_retry(opts: &RetryOpts, errors: &mut Errors) -> Option<RetryDecl> {
+    let before = errors.0.is_some();
+    let attempts = match &opts.attempts {
+        None => {
+            errors.push(
+                opts.span,
+                "`retry` in `#[tool]` needs `attempts`, the tries in all",
+            );
+            0
+        }
+        Some(lit) => match lit.base10_parse::<u32>() {
+            Ok(n) if n >= 1 => n,
+            _ => {
+                errors.push(lit.span(), "`attempts` is a whole number of at least 1");
+                0
+            }
+        },
+    };
+    let mut duration =
+        |lit: &Option<LitStr>, what: &str| {
+            lit.as_ref()
+                .and_then(|lit| match duration_ms(&lit.value()) {
+                    Some(ms) => Some(ms),
+                    None => {
+                        errors.push(
+                    lit.span(),
+                    format!("`{what}` is a duration such as \"500ms\", \"1s\", \"30m\" or \"1h\""),
+                );
+                        None
+                    }
+                })
+        };
+    let backoff_ms = duration(&opts.backoff, "backoff");
+    let max_backoff_ms = duration(&opts.max_backoff, "max_backoff");
+    // Without a `backoff`, the first delay is `RetryPolicy`'s default (1 s).
+    if let (Some(m), Some(lit)) = (max_backoff_ms, &opts.max_backoff)
+        && m < backoff_ms.unwrap_or(DEFAULT_BACKOFF_MS)
+    {
+        errors.push(
+            lit.span(),
+            if backoff_ms.is_some() {
+                "`max_backoff` is shorter than `backoff`"
+            } else {
+                "`max_backoff` is shorter than the default `backoff` (1s): give `backoff` too"
+            },
+        );
+    }
+    let multiplier = opts.multiplier.as_ref().and_then(|lit| {
+        let value = match lit {
+            Lit::Float(f) => f.base10_parse::<f64>().ok(),
+            Lit::Int(i) => i.base10_parse::<u32>().ok().map(f64::from),
+            _ => None,
+        };
+        match value {
+            Some(m) if m.is_finite() && m > 0.0 => Some(m),
+            _ => {
+                errors.push(lit.span(), "`multiplier` is a positive number, such as 2.0");
+                None
+            }
+        }
+    });
+    let on = opts.on.as_ref().and_then(|(span, names)| {
+        if names.is_empty() {
+            errors.push(*span, "`on` names at least one class: transient, rate-limited, conflict");
+            return None;
+        }
+        let mut variants: Vec<Ident> = Vec::new();
+        for name in names {
+            match RETRY_CLASSES.iter().find(|(n, _)| *n == name.value()) {
+                Some((_, variant)) => variants.push(Ident::new(variant, name.span())),
+                None => errors.push(
+                    name.span(),
+                    format!(
+                        "unknown class `{}` in `on`; expected one of: transient, rate-limited, conflict",
+                        name.value()
+                    ),
+                ),
+            }
+        }
+        Some(variants)
+    });
+    if errors.0.is_some() && !before || attempts == 0 {
+        return None;
+    }
+    Some(RetryDecl {
+        attempts,
+        backoff_ms,
+        max_backoff_ms,
+        multiplier,
+        on,
+    })
+}
+
+/// `text` as milliseconds: a whole number and a unit, `ms`, `s`, `m` or `h`.
+fn duration_ms(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let split = text.find(|c: char| !c.is_ascii_digit())?;
+    let (number, unit) = text.split_at(split);
+    let number: u64 = number.parse().ok()?;
+    let scale = match unit {
+        "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        _ => return None,
+    };
+    number.checked_mul(scale)
 }
 
 /// The checked `parallel`, `path` and `access` options; `None` when none was given. Every mistake
@@ -888,6 +1095,41 @@ impl Analysis {
             },
         });
 
+        let retry = self.retry.as_ref().map(|decl| {
+            let attempts = decl.attempts;
+            let ms = |value: Option<u64>, field: &str| match value {
+                Some(ms) => quote!(::core::time::Duration::from_millis(#ms)),
+                None => {
+                    let field = format_ident!("{field}");
+                    quote!(__policy.#field)
+                }
+            };
+            let backoff = (decl.backoff_ms.is_some() || decl.max_backoff_ms.is_some()).then(|| {
+                let initial = ms(decl.backoff_ms, "initial_backoff");
+                let max = ms(decl.max_backoff_ms, "max_backoff");
+                quote!(let __policy = __policy.with_backoff(#initial, #max);)
+            });
+            let multiplier = decl
+                .multiplier
+                .map(|m| quote!(let __policy = __policy.with_multiplier(#m);));
+            let on = decl.on.as_ref().map(|variants| {
+                quote! {
+                    let __policy = __policy.with_retry_on(#krate::__private::RetryClasses::of([
+                        #(#krate::__private::ErrorClass::#variants),*
+                    ]));
+                }
+            });
+            quote! {
+                fn retry_policy(&self) -> ::core::option::Option<#krate::__private::RetryPolicy> {
+                    let __policy = #krate::__private::RetryPolicy::new(#attempts);
+                    #backoff
+                    #multiplier
+                    #on
+                    ::core::option::Option::Some(__policy)
+                }
+            }
+        });
+
         let asks_user = self.asks_user.then(|| {
             quote! {
                 fn asks_user(&self) -> bool {
@@ -963,6 +1205,7 @@ impl Analysis {
                 #access
 
                 #step_style
+                #retry
 
                 async fn call(
                     &self,
@@ -1427,6 +1670,99 @@ mod tests {
     }
 
     #[test]
+    fn retry_writes_the_tools_policy() {
+        let out = ok(
+            quote!(retry(
+                attempts = 3,
+                backoff = "500ms",
+                max_backoff = "2m",
+                multiplier = 1.5,
+                on = ["rate-limited", "conflict"]
+            )),
+            quote! {
+                /// Look.
+                async fn look(q: String) -> String { q }
+            },
+        );
+        has(
+            &out,
+            "fn retry_policy(&self) -> ::core::option::Option<::adam::__private::RetryPolicy> {
+                let __policy = ::adam::__private::RetryPolicy::new(3u32);
+                let __policy = __policy.with_backoff(::core::time::Duration::from_millis(500u64), ::core::time::Duration::from_millis(120000u64));
+                let __policy = __policy.with_multiplier(1.5f64);
+                let __policy = __policy.with_retry_on(::adam::__private::RetryClasses::of([::adam::__private::ErrorClass::RateLimited, ::adam::__private::ErrorClass::Conflict]));
+                ::core::option::Option::Some(__policy)
+            }",
+        );
+        // What is not said keeps the default: a missing bound is the policy's own.
+        let out = ok(
+            quote!(retry(attempts = 2, backoff = "1h")),
+            quote! {
+                /// Look.
+                async fn look(q: String) -> String { q }
+            },
+        );
+        has(
+            &out,
+            "__policy.with_backoff(::core::time::Duration::from_millis(3600000u64), __policy.max_backoff);",
+        );
+        lacks(&out, "with_multiplier");
+        lacks(&out, "with_retry_on");
+        let out = ok(
+            quote!(),
+            quote! {
+                /// Look.
+                async fn look(q: String) -> String { q }
+            },
+        );
+        lacks(&out, "retry_policy");
+    }
+
+    #[test]
+    fn retry_refuses_what_is_not_a_policy() {
+        let item = quote! {
+            /// Look.
+            async fn look(q: String) -> String { q }
+        };
+        let e = err(quote!(retry(backoff = "1s")), item.clone());
+        assert!(e.contains("needs `attempts`"), "{e}");
+        let e = err(quote!(retry(attempts = 0)), item.clone());
+        assert!(e.contains("at least 1"), "{e}");
+        let e = err(quote!(retry(attempts = 2, backoff = "1 day")), item.clone());
+        assert!(e.contains("`backoff` is a duration"), "{e}");
+        let e = err(
+            quote!(retry(attempts = 2, backoff = "1m", max_backoff = "1s")),
+            item.clone(),
+        );
+        assert!(e.contains("shorter than `backoff`"), "{e}");
+        let e = err(
+            quote!(retry(attempts = 2, max_backoff = "500ms")),
+            item.clone(),
+        );
+        assert!(e.contains("shorter than the default `backoff`"), "{e}");
+        let e = err(quote!(retry(attempts = 2, multiplier = 0.0)), item.clone());
+        assert!(e.contains("positive number"), "{e}");
+        let e = err(quote!(retry(attempts = 2, on = ["invalid"])), item.clone());
+        assert!(e.contains("unknown class `invalid`"), "{e}");
+        let e = err(quote!(retry(attempts = 2, on = [])), item.clone());
+        assert!(e.contains("at least one class"), "{e}");
+        let e = err(quote!(retry(attempts = 2, tries = 3)), item.clone());
+        assert!(e.contains("unknown `retry` option `tries`"), "{e}");
+        let e = err(quote!(retry(attempts = 2, attempts = 3)), item.clone());
+        assert!(e.contains("given twice"), "{e}");
+        // Every mistake at once.
+        let e = err(quote!(retry(attempts = 0, backoff = "x", on = ["y"])), item);
+        assert!(
+            e.contains("at least 1") && e.contains("duration") && e.contains("`y`"),
+            "{e}"
+        );
+        assert_eq!(duration_ms("250ms"), Some(250));
+        assert_eq!(duration_ms("30m"), Some(1_800_000));
+        assert_eq!(duration_ms("s"), None);
+        assert_eq!(duration_ms("5"), None);
+    }
+
+    #[test]
     fn every_kind_and_icon_the_contract_has_is_accepted_and_nothing_else() {
         for kind in STEP_KINDS {
             let out = ok(
@@ -1795,7 +2131,7 @@ mod tests {
         );
         assert_eq!(
             msg,
-            "unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, paged, crate, step, label, icon, parallel, path, access"
+            "unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, paged, crate, step, label, icon, parallel, path, access, retry"
         );
         for repeated in [
             quote!(name = "a", name = "b"),
