@@ -30,8 +30,9 @@ reasoning.
 The gateway probe of 2026-11-21 is **pending the gateway credential**; when it runs, the table below
 records, for each of the 26 models the gateway lists (verified 2026-11-21 by `GET /v1/models`), no
 setting, `none`, `minimal`, `low`, `medium`, `high` and `max`, with a 64-token answer, the reasoning
-tokens and the finish reason. Each row will be *verified* on that date against `api.ai.camer.digital`, or
-*unverified* where the probe could not tell. The table is the merge blocker.
+tokens and the finish reason. Each row will be *verified* on that date against the deployment's gateway,
+or *unverified* where the probe could not tell. The table is by model family and level, names no gateway
+host, and is the merge blocker.
 
 ## Decision
 
