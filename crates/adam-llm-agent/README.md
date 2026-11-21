@@ -774,6 +774,16 @@ run answers once with no tool. A closing turn with no words fails the run with t
 `tool call limit exceeded` message. The state remembers it in `Conversation::limit`. A child run that hits its limit
 is `Done`, and its parent's tool result ends with a note that the answer may be incomplete.
 
+**A turn cut while thinking is not an answer.** A model turn that ends at the output limit
+(`FinishReason::Length`) with no tool call and no visible words (empty or whitespace; the reasoning does not
+count) is kept in the history as the model sent it (reasoning only if the client echoes it), followed by a user
+message, `THINKING_CUT_TURN`, that says the turn reached the output limit while thinking and asks the model to
+call a tool or answer without restating its reasoning; the loop takes another turn. Each one is a model call
+against `max_turns`. After `MAX_THINKING_CUTS` (2) in a row, `Conversation::thinking_cuts`, the next one fails the
+run with `model call failed: the model's output limit was reached while it was thinking, N times in a row; raise
+max_output_tokens or lower the reasoning effort` (a plain failure like the limits above: never an answer). A turn
+with words or a tool call starts the count again. A `Length` turn **with** words is still a `truncated` answer.
+
 ## Features and environment
 
 | Feature | Default | What |

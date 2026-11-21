@@ -626,6 +626,17 @@ impl<'a> Early<'a> {
 pub const CLOSING_TURN: &str = "You have used all the steps this run may take. Do not call any \
 tool. Reply in plain words: what you did, what is finished, and what is still left to do.";
 
+/// What the model is told after a turn that reached the output limit while it was still thinking:
+/// no words and no call, only reasoning. Kept in the history after that turn.
+pub const THINKING_CUT_TURN: &str = "Your last turn reached the output limit while you were \
+thinking, before you wrote anything. Do not restate your reasoning: now either call a tool or \
+answer.";
+
+/// How many turns in a row may end at the output limit with reasoning only before the run fails
+/// (each is continued with [`THINKING_CUT_TURN`] and counts as a model call against `max_turns`).
+/// A turn with words or a tool call starts the count again.
+pub const MAX_THINKING_CUTS: u32 = 2;
+
 /// Bounds on one run. A run that reaches `max_turns` or `max_tool_calls` gets one closing model
 /// call in which it may call no tool, and ends with that answer marked `limited` (the output's
 /// `limited` and `limit`); if the closing call says nothing the run fails with a message naming the
@@ -2303,6 +2314,9 @@ impl LlmAgent {
             }
             calls.push(wait);
         }
+        if !text.trim().is_empty() || !calls.is_empty() {
+            state.thinking_cuts = 0;
+        }
         if !text.is_empty() {
             let mut payload = json!({ "text": text, "turn": turn });
             // The words before a tool call are said whole, under the stream they were sent as, because
@@ -2355,6 +2369,25 @@ impl LlmAgent {
                     })),
                     early,
                 ));
+            }
+            // Reasoning that filled the output limit before any word is no answer: the model is
+            // asked again, a few times, and then the run fails (never an empty answer, never a
+            // question to the person).
+            if finish == FinishReason::Length && text.trim().is_empty() {
+                state.thinking_cuts += 1;
+                if state.thinking_cuts > MAX_THINKING_CUTS {
+                    return Ok((
+                        Flow::Fail(format!(
+                            "model call failed: the model's output limit was reached while it was \
+                             thinking, {} times in a row; raise max_output_tokens or lower the \
+                             reasoning effort",
+                            state.thinking_cuts
+                        )),
+                        early,
+                    ));
+                }
+                state.messages.push(Message::user_text(THINKING_CUT_TURN));
+                return Ok((Flow::Next, early));
             }
             let mut output = json!({
                 "text": text,

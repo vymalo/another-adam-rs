@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use adam_core::{DynStore, JournalEntry, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
     Artifact, CLOSING_TURN, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter,
-    MAX_CARRIED_BYTES, OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait, StepIo, StepStyle,
-    TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError, ToolOutput, user_message,
+    MAX_CARRIED_BYTES, MAX_THINKING_CUTS, OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait,
+    StepIo, StepStyle, THINKING_CUT_TURN, TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError,
+    ToolOutput, user_message,
 };
 use adam_model::{
     ContentPart, DynModel, FinishReason, Message, MockModel, ModelClient, ModelDelta, ModelError,
@@ -1261,6 +1262,99 @@ fn length_limited(text: &str) -> ModelResponse {
         finish: FinishReason::Length,
         ..ModelResponse::text(text)
     }
+}
+
+fn thinking_only_cut() -> ModelResponse {
+    ModelResponse {
+        finish: FinishReason::Length,
+        reasoning: Some("a long chain of thought".into()),
+        ..ModelResponse::text("")
+    }
+}
+
+#[tokio::test]
+async fn a_turn_cut_while_thinking_is_continued_not_answered() {
+    let h = Harness::new();
+    let (a, a_calls) = CountingTool::new("a");
+    let agent = h.agent().tool(a).build();
+    h.mock
+        .push_response(thinking_only_cut())
+        .push_tool_calls(vec![call("c1", "a", json!({}))])
+        .push_text("done");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("work"), None)
+        .await
+        .expect("start");
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    assert_eq!(
+        output_of(&view),
+        Some(json!({"text": "done", "artifacts": []}))
+    );
+    assert_eq!(a_calls.load(SeqCst), 1);
+    assert_eq!(
+        h.mock.requests().len(),
+        3,
+        "each continuation is a model call"
+    );
+    let state = conversation(&rt, &view).await;
+    assert_eq!(state.turns, 3);
+    assert_eq!(state.thinking_cuts, 0, "a call starts the count again");
+    assert!(
+        state
+            .messages
+            .contains(&Message::user_text(THINKING_CUT_TURN))
+    );
+    let sent = &h.mock.requests()[1].messages;
+    assert_eq!(sent.last(), Some(&Message::user_text(THINKING_CUT_TURN)));
+}
+
+#[tokio::test]
+async fn turns_cut_while_thinking_past_the_bound_fail_the_run() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    for _ in 0..=MAX_THINKING_CUTS {
+        h.mock.push_response(thinking_only_cut());
+    }
+    h.mock.push_text("never asked");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("work"), None)
+        .await
+        .expect("start");
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+
+    let error = view.error.expect("error");
+    assert!(error.contains("while it was thinking"), "{error}");
+    assert!(error.contains("3 times in a row"), "{error}");
+    assert!(view.output.is_none(), "no answer");
+    assert_eq!(h.mock.requests().len(), MAX_THINKING_CUTS as usize + 1);
+}
+
+#[tokio::test]
+async fn a_whitespace_only_length_turn_counts_as_cut_while_thinking() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock
+        .push_response(length_limited("  \n"))
+        .push_text("after");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("work"), None)
+        .await
+        .expect("start");
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(
+        output_of(&view),
+        Some(json!({"text": "after", "artifacts": []}))
+    );
 }
 
 #[tokio::test]

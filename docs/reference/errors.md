@@ -272,6 +272,11 @@ A child whose parent ended is `cancelled: the parent run ended`. Two refusals of
 turn and `limit: "repeated_call"`; a closing turn with no words fails it with `the same tool call was repeated with the same
 result and the run was stopped (doom_loop)`.
 
+A model turn that stops at the output limit with only reasoning (no words, no call) is continued with a short message, at
+most twice in a row; the third fails the run with `model call failed: the model's output limit was reached while it was
+thinking, 3 times in a row; raise max_output_tokens or lower the reasoning effort`. It is never the run's answer, so the coder
+never asks the person about it. A cut turn that has words is still an answer marked `truncated`.
+
 ### A language server that cannot answer
 
 The three tools of [the coder's language servers](coder-agent.md#language-servers) answer in words, and none of these is a failure of the run:
