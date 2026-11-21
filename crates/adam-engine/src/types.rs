@@ -309,7 +309,8 @@ impl FiringQuery {
 
 /// A run one of the agent's schedules fired: the run as [`get`](crate::Engine::get) answers it,
 /// and what fired it. Its [`RunInfo::conversation`] is the firing's own, not one to
-/// [`send`](crate::Engine::send) to: a message to it starts a conversation of the host's.
+/// [`send`](crate::Engine::send) to: a message to it is [`EngineError::NotFound`](crate::EngineError::NotFound).
+/// Not `adam_schedule::Firing`, the scheduler's record of a due time it fired.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Firing {

@@ -11,7 +11,7 @@ use adam_a2a::{BackendError, Caller, STEER_EXTENSION, TaskBackend, TaskQuery};
 use adam_a2a_runtime::{Commands, RuntimeTaskBackend, task_id_for};
 use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
-use adam_core::{ConversationScope, DynSecretSource, DynStore, RunId, RunQuery};
+use adam_core::{ConversationScope, DynSecretSource, DynStore, RunId, RunQuery, RunStatus};
 use adam_llm_agent::{DEFAULT_MAX_PARALLEL, ToolSet};
 use adam_model::DynModel;
 use adam_runtime::{
@@ -637,7 +637,7 @@ impl Engine {
                 .runtime
                 .cancel(run, FIRING_CANCEL_REASON)
                 .await
-                .map_err(EngineError::of_read)?;
+                .map_err(|e| EngineError::of_run_read(e, run))?;
         }
         let info = self.get(run).await?.ok_or_else(gone)?;
         match info.state {
@@ -863,15 +863,27 @@ impl Engine {
             else {
                 continue;
             };
-            // Read again by the runtime, which reads the lease too: a firing a worker holds is
-            // `Working`, as `get` says, not `Submitted`.
-            let Some(view) = shared
-                .runtime
-                .view(record.id)
-                .await
-                .map_err(EngineError::of_read)?
-            else {
-                continue;
+            // The record holds the state a view is built from, as `list` builds it: the lease is
+            // read only where it can still say `working`, a runnable run at version 1, so a held
+            // firing is `Working` as `get` says.
+            let lease = if record.status == RunStatus::Runnable && record.version <= 1 {
+                shared
+                    .store
+                    .lease_until(record.id)
+                    .await
+                    .map_err(EngineError::Store)?
+            } else {
+                None
+            };
+            let claimed = adam_core::claimed(record.status, lease, shared.runtime.now());
+            let id = record.id;
+            let view = match adam_runtime::view_from_record(record, claimed) {
+                Ok(view) => view,
+                Err(RuntimeError::Corrupt { .. }) => {
+                    tracing::warn!(run = %id, "a firing has an unreadable state; it is not listed");
+                    continue;
+                }
+                Err(e) => return Err(EngineError::of_run_read(e, id)),
             };
             let info = RunInfo::of(&shared.backend.unowned_task(&view))?;
             items.push(Firing { info, trigger });
@@ -895,7 +907,7 @@ impl Engine {
             .runtime
             .view(run)
             .await
-            .map_err(EngineError::of_read)?
+            .map_err(|e| EngineError::of_run_read(e, run))?
         else {
             return Ok(None);
         };
@@ -1051,6 +1063,26 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    /// The page token of `firings` reads back what it wrote: a timestamp to the nanosecond, a
+    /// schedule name with `|` in it, and it refuses a token of another filter or a malformed one.
+    #[test]
+    fn a_firing_page_token_reads_back_and_refuses_another_query() {
+        let at: adam_core::time::Timestamp = "2026-11-21T09:00:00.123456789Z".parse().unwrap();
+        let run = RunId::new();
+        for filter in ["", "daily", "a|b|c"] {
+            let token = firing_token::write(filter, at, run);
+            assert_eq!(firing_token::read(&token, filter).unwrap(), (at, run));
+            let other = firing_token::read(&token, "weekly").unwrap_err();
+            assert!(matches!(other, EngineError::Invalid(_)), "{other:?}");
+        }
+        for bad in ["", "x|y|", "2026-11-21T09:00:00Z|not-a-uuid|"] {
+            assert!(matches!(
+                firing_token::read(bad, ""),
+                Err(EngineError::Invalid(_))
+            ));
+        }
+    }
     use crate::WithheldFile;
 
     const FILE: &[u8] = b"the bytes of the file, kept with the run";

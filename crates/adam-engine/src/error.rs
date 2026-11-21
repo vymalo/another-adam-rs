@@ -185,6 +185,24 @@ impl EngineError {
         }
     }
 
+    /// A read of `run` through the runtime that failed (a schedule's firing, which the backend
+    /// does not reach): a run gone under the call is `NotFound`, the store's own error keeps its
+    /// class, anything else is a transient failure or a bug.
+    pub(crate) fn of_run_read(err: RuntimeError, run: RunId) -> Self {
+        match err {
+            RuntimeError::NotFound(_) => Self::NotFound(format!("run {run}")),
+            RuntimeError::Store(source) => Self::Store(source),
+            err if err.is_retryable() => Self::Unavailable {
+                message: "the store, reading a run".to_owned(),
+                source: Some(Box::new(err)),
+            },
+            err => Self::Internal {
+                message: "a run could not be read".to_owned(),
+                source: Some(Box::new(err)),
+            },
+        }
+    }
+
     /// The worker's end, at [`shutdown`](crate::Engine::shutdown).
     pub(crate) fn of_runtime(err: Arc<RuntimeError>) -> Self {
         if err.is_retryable() {

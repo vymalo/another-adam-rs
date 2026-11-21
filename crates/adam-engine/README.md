@@ -203,7 +203,8 @@ re-exports them:
 
 It also depends on `a2a-lf` (the A2A types, data only: ADR 0047's confirmed decision 1), `tokio` (`rt`, `sync`,
 `time`), `futures` (the `Stream` of a run's events), `async-trait` (the engine's event sink), `serde_json` (what a
-withheld file says), `thiserror` and `uuid`.
+withheld file says), `thiserror`, `uuid` and `tracing` (a firing whose state cannot be read is left out of
+`firings` with a warning, as `list` leaves out a task).
 
 ## The dependency check
 
@@ -285,9 +286,11 @@ every wait is bounded by `tokio::time::timeout`:
 * `a_folders_schedule_fires_the_agent`: a folder with `schedules/soon.md` (`after: 1s`) fires a run of the agent, in
   the store, whose model is given the prompt; it is in no `list`, and `firings` lists it, `Done`, with its output and
   trigger, as `get` answers it, and `files` reaches it;
-* `a_host_lists_and_cancels_a_working_firing`: two schedules fire, one held at the model; `firings` pages them one at a
-  time, filters by schedule and refuses a token of another query; `steer` is `NotFound`; `cancel` ends the working one
-  `Cancelled`, its `events` end with it, and a second `cancel` answers it as it is;
+* `a_host_lists_and_cancels_a_working_firing`: schedules `a` and `ab` fire, one held at the model; `firings` pages them
+  one at a time, filters by schedule (`a` never lists `ab`'s, each `total` 1) and refuses a token of another query; a
+  done firing is `Finished` to `cancel`; the schedulers are not reached by `get`; `steer`, `answer` and a `send` to a
+  firing's conversation are `NotFound`; `cancel` ends the working one `Cancelled`, its `events` end with it, and a
+  second `cancel` answers it as it is; and, in `src/engine.rs`, `a_firing_page_token_reads_back_and_refuses_another_query`;
 * `the_hosts_retry_policy_governs_a_transient_failure`: `Limits::retry` of two attempts gives a transient model failure
   up after two calls, not five;
 * `start_refuses_what_it_cannot_build` (a zero lease and a ring of 0 or over 65 536 too; it passes alone and with
