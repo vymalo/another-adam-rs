@@ -48,6 +48,12 @@ Three things are missing in adam today:
    `crates/adam-runtime/src/session.rs`) when it opens, since that is the task the orchestrator bound; a session a person
    opened directly has no opener, and its rounds name their own task, which the orchestrator binds as it binds any task
    it creates.
+   *Amended 2026-11-21 (S8a review):* a round names the task that **sent** it, not the one that opened its session:
+   `subagent_send` writes the sending task's run into the round's header, since that is the task the orchestrator
+   bound for the round (the opener's lease may be over), and a person's later round names what the latest header
+   names. Everything under a round names what the round names: its local subagents and the sessions it opens are
+   handed that run in their first message (`model_run`, written by in-process code only), so the whole tree under a
+   task or a round names one run.
    `InjectedRun` requires the run: **a call with no run is refused** before anything is sent (`InvalidRequest`, "a model
    call through the injector names no run").
 3. **A refusal is read by its problem type, and a provider says whether it parks.** The gateway answers a refusal as
@@ -186,7 +192,7 @@ Three things are missing in adam today:
 
 | Slice | What is true after it | Proof |
 |---|---|---|
-| S8a | `InjectedRun`, `MODEL_AUTH=injector`, `MODEL_CA_FILE` and the two `run` fields: every model call of a run, its subagents' and its sessions' included, carries the root's id and no `Authorization` | a scripted model behind a test gateway that records each call's headers: the root's id on every call, a subagent's and a round's included; no `Authorization`; a call with no run sends nothing; with a test CA the endpoint is reached only with `MODEL_CA_FILE` |
+| S8a | `InjectedRun`, `MODEL_AUTH=injector`, `MODEL_CA_FILE` and the two `run` fields: every model call of a run, its subagents' and its sessions' included, carries the root's id and no `Authorization` | two levels. **Requests:** the scripted `MockModel` records every `ModelRequest` of a chain of child runs, a compaction's summary call (of a root and of a child), a session's rounds (opened by a task, sent by a later task, sent by a person) and a subagent under a person's round, and each names the run decision 2 says; a message's metadata cannot change it. **Wire:** a mock HTTP server records each call's headers through `adam-model-openai` and `adam-service`: `X-Run-Id` and no `Authorization` on completions, streams and the retry after a 401; a call with no run sends nothing; a TLS server whose certificate a test CA signed is reached only with `MODEL_CA_FILE` |
 | S8b | decisions 3 to 8 | the test gateway answers each slug of the table, a slugless `401`, a refused connection and a timeout in turn: the run parks with the state and reason above, keeps its conversation, and the same call is made again after the timer, a message or `adam.resume` (which adds no turn); a timeout fails as today; `model_locked` and an unattended run that would wait fail; a parked child shows on the root and is woken through it; `MODEL_PARK_LIMIT` fails a run that never binds; `StaticBearer` fails as before; nothing of a header or body in the journal |
 | S8c | the coder's chart sets `MODEL_AUTH=injector` when its values say so | the chart's goldens; another-agentic-system#334 S10 puts the agents behind the gateway |
 

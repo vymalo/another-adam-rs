@@ -34,8 +34,8 @@ use crate::compaction::{
 };
 use crate::conversation::{
     ArtifactRef, Conversation, LimitHit, LimitKind, PendingQuestion, PendingRemote, PendingRun,
-    PendingSession, PendingWait, Repeats, asks_to_close, parse_context, parse_root_run,
-    parse_root_step, parse_session, parse_user_text,
+    PendingSession, PendingWait, Repeats, asks_to_close, parse_context, parse_model_run,
+    parse_root_run, parse_root_step, parse_session, parse_user_text,
 };
 use crate::history::{RunChars, record_shortenings};
 use crate::images::{
@@ -326,7 +326,7 @@ struct EarlyFacts {
     ctx: CtxFacts,
     /// The step's one shared copy of the run's context: every call of the turn reads the same map.
     context: Option<Arc<Map<String, Value>>>,
-    root: (Option<RunId>, Option<String>, Option<Plan>),
+    root: (Option<RunId>, Option<String>, Option<Plan>, Option<RunId>),
     kept: Arc<BTreeMap<String, String>>,
     kept_left: usize,
     files_used: u64,
@@ -405,11 +405,12 @@ impl<'a> Early<'a> {
     }
 
     /// The root, root step and plan of the run, as [`prepare`](LlmAgent::prepare) takes them.
-    fn root(&self) -> (Option<RunId>, Option<&str>, Option<&Plan>) {
+    fn root(&self) -> (Option<RunId>, Option<&str>, Option<&Plan>, Option<RunId>) {
         (
             self.facts.root.0,
             self.facts.root.1.as_deref(),
             self.facts.root.2.as_ref(),
+            self.facts.root.3,
         )
     }
 
@@ -2056,7 +2057,12 @@ impl LlmAgent {
             // The step's one shared copy, not a clone of the map: a started call reads the same
             // context as the calls that run at the turn.
             context: context.cloned(),
-            root: (state.root_run, state.root_step.clone(), state.plan.clone()),
+            root: (
+                state.root_run,
+                state.root_step.clone(),
+                state.plan.clone(),
+                model_run_of(state),
+            ),
             kept: Arc::clone(&state.kept_outputs),
             kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
             files_used: files_kept(&state.artifacts),
@@ -2837,6 +2843,7 @@ impl LlmAgent {
                     state.root_run,
                     state.root_step.as_deref(),
                     state.plan.as_ref(),
+                    model_run_of(state),
                 ),
                 &state.source_notes,
                 "report",
@@ -3216,6 +3223,7 @@ impl LlmAgent {
                         state.root_run,
                         state.root_step.as_deref(),
                         state.plan.as_ref(),
+                        model_run_of(state),
                     ),
                     &state.source_notes,
                     &call,
@@ -3495,6 +3503,7 @@ impl LlmAgent {
             state.root_run,
             state.root_step.as_deref(),
             state.plan.as_ref(),
+            model_run_of(state),
         );
         let facts_of_ctx = CtxFacts::of(ctx);
         let mut slots: Vec<Option<Slot>> = Vec::with_capacity(n);
@@ -3982,7 +3991,7 @@ impl LlmAgent {
         &self,
         ctx: &CtxFacts,
         context: Option<&Arc<Map<String, Value>>>,
-        root: (Option<RunId>, Option<&str>, Option<&Plan>),
+        root: (Option<RunId>, Option<&str>, Option<&Plan>, Option<RunId>),
         notes: &[ToolNote],
         call: &ToolCall,
         facts: CallFacts,
@@ -4102,7 +4111,7 @@ impl LlmAgent {
         &self,
         ctx: &mut Ctx,
         context: Option<&Arc<Map<String, Value>>>,
-        root: (Option<RunId>, Option<&str>, Option<&Plan>),
+        root: (Option<RunId>, Option<&str>, Option<&Plan>, Option<RunId>),
         notes: &[ToolNote],
         call: &ToolCall,
         facts: CallFacts,
@@ -4366,7 +4375,12 @@ impl LlmAgent {
         &self,
         ctx: &CtxFacts,
         context: Option<&Arc<Map<String, Value>>>,
-        (root_run, root_step, plan): (Option<RunId>, Option<&str>, Option<&Plan>),
+        (root_run, root_step, plan, model_run): (
+            Option<RunId>,
+            Option<&str>,
+            Option<&Plan>,
+            Option<RunId>,
+        ),
         notes: &[ToolNote],
         call_id: &str,
         tool: &str,
@@ -4386,6 +4400,7 @@ impl LlmAgent {
             self.style_of(tool, notes)
                 .event(tool, call_id, StepState::Running),
         )
+        .with_model_run(model_run.or(root_run).unwrap_or(ctx.run))
         .with_plan(plan.cloned())
     }
 
@@ -4544,6 +4559,7 @@ impl LlmAgent {
                     state.root_run,
                     state.root_step.as_deref(),
                     state.plan.as_ref(),
+                    model_run_of(state),
                 ),
                 &state.source_notes,
                 &wait.call_id,
@@ -4773,16 +4789,21 @@ async fn output_message(
     )
 }
 
-/// The run a model call of this run names ([`ModelRequest::run`], ADR 0067): the root run of the
-/// task that opened this run's session, else the root run this one works for, else this run. From
-/// in-process state only, never from a message's context, which a person can set.
+/// The run a model call of this run names ([`ModelRequest::run`], ADR 0067): the run its parent's
+/// calls name, else the root its session's header names (the task that sent the round), else the
+/// root run this one works for, else this run. From in-process state only, never from a message's
+/// context, which a person can set.
 fn model_run(state: &Conversation, ctx: &Ctx) -> RunId {
+    model_run_of(state).unwrap_or_else(|| ctx.run_id())
+}
+
+/// [`model_run`] when the state says one: the run the run that started this one named
+/// ([`Conversation::model_run`]), else the root its session's header names, else its root run.
+fn model_run_of(state: &Conversation) -> Option<RunId> {
     state
-        .session
-        .as_ref()
-        .and_then(|header| header.root)
+        .model_run
+        .or_else(|| state.session.as_ref().and_then(|header| header.root))
         .or(state.root_run)
-        .unwrap_or_else(|| ctx.run_id())
 }
 
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
@@ -4792,6 +4813,7 @@ fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
     let mut conversation = Conversation::new(text);
     conversation.pending_images = parse_inbound_images(&input.payload);
     conversation.root_run = parse_root_run(&input.payload);
+    conversation.model_run = parse_model_run(&input.payload);
     conversation.root_step = parse_root_step(&input.payload);
     conversation.session = parse_session(&input.payload);
     if let Some(context) = parse_context(&input.payload) {
@@ -4841,6 +4863,7 @@ fn continue_conversation(
     // A round of a session works for the run that started it, as the first one did, and says what
     // the session is.
     conversation.root_run = parse_root_run(&input.payload);
+    conversation.model_run = parse_model_run(&input.payload);
     conversation.root_step = parse_root_step(&input.payload);
     if let Some(header) = parse_session(&input.payload) {
         conversation.session = Some(header);

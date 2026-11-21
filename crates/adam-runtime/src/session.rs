@@ -187,9 +187,10 @@ pub struct SessionHeader {
     /// hashes). `0` for a header written before it existed.
     #[serde(default)]
     pub round: u32,
-    /// The root run of the run that opened the session, set when it opens and carried into every
-    /// later round: the run each round's model calls name ([ADR 0067]), since that is the task the
-    /// orchestrator bound. `None` for a session a person opened directly (its rounds name their own
+    /// The run this round's model calls name ([ADR 0067], amended): the root run of the task that
+    /// opened the session for round one, and of the task that sent it for a round a task sends,
+    /// since that is the task the orchestrator bound for the round; a person's round keeps what the
+    /// latest header says. `None` for a session a person opened directly (its rounds name their own
     /// task) and in a header written before it existed. Absent when `None`.
     ///
     /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md

@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::access::ToolAccess;
-use crate::conversation::{PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
+use crate::conversation::{
+    MODEL_RUN_KEY, PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message,
+};
 use crate::images::{ImageGate, ImageOutcome, ImagePolicy, ImageStore, KeptImage};
 use crate::kept::KeptOutput;
 use crate::plan::Plan;
@@ -920,6 +922,8 @@ pub struct ToolCtx {
     children: Option<ChildStarter>,
     context: Arc<Map<String, Value>>,
     root_run: RunId,
+    /// The run this run's model calls name (ADR 0067), handed to its children and its sessions.
+    model_run: RunId,
     /// The step of the root run this run works under, when it is a child (see
     /// `Conversation::root_step`); `None` for a run that is nobody's child.
     root_step: Option<String>,
@@ -995,6 +999,7 @@ impl ToolCtx {
             children,
             context,
             root_run: root_run.unwrap_or(run_id),
+            model_run: root_run.unwrap_or(run_id),
             root_step,
             step,
             note: None,
@@ -1350,7 +1355,25 @@ impl ToolCtx {
     #[must_use]
     pub fn with_root_run(mut self, root: RunId) -> Self {
         self.root_run = root;
+        self.model_run = root;
         self
+    }
+
+    /// Say which run this run's model calls name (ADR 0067), when it is not
+    /// [`root_run_id`](Self::root_run_id): a session's round names what its header says, and
+    /// everything under it names the same.
+    #[must_use]
+    pub(crate) fn with_model_run(mut self, run: RunId) -> Self {
+        self.model_run = run;
+        self
+    }
+
+    /// The run this run's model calls name ([`ModelRequest::run`](adam_model::ModelRequest::run),
+    /// ADR 0067), which an injector in front of the model looks the run's credential up by: the
+    /// [`root_run_id`](Self::root_run_id) of a task, the root a session's round names. A child this
+    /// call starts, and a session it opens or sends to, name it too.
+    pub fn model_run_id(&self) -> RunId {
+        self.model_run
     }
 
     /// Give the tool under test the inbound context of a run
@@ -1481,6 +1504,11 @@ impl ToolCtx {
             payload.insert(
                 ROOT_RUN_KEY.to_owned(),
                 Value::String(self.root_run.to_string()),
+            );
+            // The run the child's model calls name: this run's, so the tree names one (ADR 0067).
+            payload.insert(
+                MODEL_RUN_KEY.to_owned(),
+                Value::String(self.model_run.to_string()),
             );
             // The step of the root the child works under: this call's own when this run is the
             // root, the one this run works under when it is a child itself.

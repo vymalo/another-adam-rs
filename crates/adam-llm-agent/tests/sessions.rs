@@ -432,6 +432,26 @@ impl Rig {
     }
 }
 
+/// Starts the agent `target` as a child run and waits for it, as `SubagentTool` does.
+struct Spawn {
+    target: String,
+}
+
+#[async_trait]
+impl Tool for Spawn {
+    fn spec(&self) -> adam_model::ToolSpec {
+        adam_model::ToolSpec {
+            name: "spawn".into(),
+            description: "starts a child".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let run = ctx.start_child(&self.target, "go").await?;
+        Err(ToolError::AwaitRun { run })
+    }
+}
+
 /// An agent that keeps messages for later, as a round that talks to a remote does: its state says
 /// `queues_messages`, and it finishes when a message says `finish`.
 struct Queues(String);
@@ -778,7 +798,9 @@ mod cases {
         rig.child_mock
             .push_text("round one says 1")
             .push_text("round two says 2")
-            .push_text("the person's own says 3");
+            .push_text("round three says 3")
+            .push_text("round four says 4")
+            .push_text("the person's own says 5");
         let (parent_agent, child_agent) = (rig.parent(), rig.child());
         let rt = rig.together(&store, &parent_agent, &child_agent);
         let conv = conv_id();
@@ -812,6 +834,47 @@ mod cases {
         .unwrap();
         wait_done(&rt, round_two).await;
 
+        // A later task of the conversation sends to the session: the round names the task that
+        // sent it, the one the orchestrator bound for it (ADR 0067, amended), not the opener.
+        rig.parent_mock
+            .push_tool_calls(vec![send_call("s1", session, "from the second task")])
+            .push_tool_calls(vec![read_call("r2", session, true)])
+            .push_text("sent");
+        let second = rt
+            .start_continuing(
+                &rig.parent_name,
+                user_message("second"),
+                Some(&conv),
+                parent,
+            )
+            .await
+            .unwrap();
+        wait_done(&rt, second).await;
+        let view = session_until(&rt, &conv, session, |v| {
+            v.round == 3 && v.state == SessionState::Idle
+        })
+        .await;
+        let header = view.header.clone().expect("a header");
+        assert_eq!(header.root, Some(second), "the task that sent round three");
+
+        // A person's next round names what the latest header names.
+        let mut next = header.clone();
+        next.round = view.round + 1;
+        let round_four = RunId::new();
+        let mut message = user_message("more again");
+        message.payload["session"] = serde_json::to_value(&next).unwrap();
+        rt.start_child_continuing(
+            round_four,
+            round_four,
+            &rig.child_name,
+            message,
+            &view.conversation_id,
+            Some(view.latest_run),
+        )
+        .await
+        .unwrap();
+        wait_done(&rt, round_four).await;
+
         let theirs = start_persons_round(&rt, &rig, &conv, "asked by a person").await;
         wait_done(&rt, theirs).await;
         worker.stop().await;
@@ -819,16 +882,96 @@ mod cases {
         let named = |requests: Vec<ModelRequest>| -> Vec<Option<String>> {
             requests.into_iter().map(|r| r.run).collect()
         };
-        let root = Some(parent.to_string());
+        let (first, later) = (Some(parent.to_string()), Some(second.to_string()));
         assert_eq!(
             named(rig.child_mock.requests()),
-            vec![root.clone(), root, Some(theirs.to_string())],
-            "round one, the person's round two, and the person's own session"
+            vec![
+                first.clone(),
+                first.clone(),
+                later.clone(),
+                later.clone(),
+                Some(theirs.to_string())
+            ],
+            "round one, the person's round two, the second task's round three, the person's \
+             round four, and the person's own session"
         );
-        assert!(
-            named(rig.parent_mock.requests())
-                .iter()
-                .all(|r| r.as_deref() == Some(parent.to_string().as_str()))
+        let parents = named(rig.parent_mock.requests());
+        assert_eq!(parents.len(), 6);
+        assert!(parents[..3].iter().all(|r| *r == first), "{parents:?}");
+        assert!(parents[3..].iter().all(|r| *r == later), "{parents:?}");
+    }
+
+    /// Everything under a person's round of an agent's session names what the round names (ADR
+    /// 0067, amended): a local subagent the round starts names the root of the session's header,
+    /// not the round's own run.
+    pub async fn everything_under_a_persons_round_names_what_the_round_names(store: DynStore) {
+        let rig = Rig::new();
+        let leaf_name = uniq("leaf");
+        let leaf_mock = Arc::new(MockModel::new());
+        leaf_mock.push_text("leaf done");
+        rig.child_mock
+            .push_text("round one says 1")
+            .push_tool_calls(vec![call("sp1", "spawn", json!({}))])
+            .push_text("round two done");
+        let parent_agent = rig.parent();
+        let child_model: DynModel = rig.child_mock.clone();
+        let child_agent = LlmAgent::builder(&rig.child_name, child_model, "m")
+            .tool(Spawn {
+                target: leaf_name.clone(),
+            })
+            .build();
+        let leaf_model: DynModel = leaf_mock.clone();
+        let leaf_agent = LlmAgent::builder(&leaf_name, leaf_model, "m").build();
+        let rt = rig
+            .builder(&store, "w")
+            .agent(parent_agent)
+            .agent(child_agent)
+            .agent(leaf_agent)
+            .build();
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_tool_calls(vec![read_call("r1", session, true)])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        let view = session_until(&rt, &conv, session, |v| v.state == SessionState::Idle).await;
+
+        let mut next = view.header.clone().expect("a header");
+        next.round = view.round + 1;
+        let round_two = RunId::new();
+        let mut message = user_message("start the leaf");
+        message.payload["session"] = serde_json::to_value(&next).unwrap();
+        rt.start_child_continuing(
+            round_two,
+            round_two,
+            &rig.child_name,
+            message,
+            &view.conversation_id,
+            Some(view.latest_run),
+        )
+        .await
+        .unwrap();
+        wait_done(&rt, round_two).await;
+        let leaf = child_run_id(round_two, "sp1");
+        let leaf_state = state_of(&rt, leaf).await;
+        worker.stop().await;
+
+        let root = Some(parent.to_string());
+        let named = |m: &MockModel| m.requests().into_iter().map(|r| r.run).collect::<Vec<_>>();
+        assert_eq!(named(&rig.child_mock), vec![root.clone(); 3]);
+        assert_eq!(
+            named(&leaf_mock),
+            vec![root],
+            "the leaf names the round's root"
+        );
+        assert_eq!(leaf_state.model_run, Some(parent));
+        assert_eq!(
+            leaf_state.root_run,
+            Some(round_two),
+            "its root run stays the round, whose task hears its steps"
         );
     }
 
@@ -4602,6 +4745,7 @@ macro_rules! session_suite {
             session_suite!(@cases $make;
                 a_start_returns_at_once_and_the_turn_end_waits_for_the_report,
                 every_round_names_the_root_that_opened_its_session,
+                everything_under_a_persons_round_names_what_the_round_names,
                 a_session_report_keeps_the_prefix,
                 the_start_result_survives_a_history_far_over_budget,
                 a_read_without_wait_answers_working_and_parks_nothing,

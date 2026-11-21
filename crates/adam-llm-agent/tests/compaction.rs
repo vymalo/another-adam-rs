@@ -1502,3 +1502,78 @@ async fn a_subagent_compacts_against_its_own_budget() {
     assert_eq!(child.compactions.len(), 1, "the child compacted itself");
     assert!(child.messages[0].text().contains("CHILD SUMMARY"));
 }
+
+/// Starts the agent `target` as a child run and waits for it, as `SubagentTool` does.
+struct Spawn(&'static str);
+
+#[async_trait]
+impl Tool for Spawn {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "spawn".into(),
+            description: "starts a child".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let run = ctx.start_child(self.0, "go").await?;
+        Err(ToolError::AwaitRun { run })
+    }
+}
+
+/// A child run that compacts its history: its summary call names the top run, as its turns do
+/// (ADR 0067), never the child's own.
+#[tokio::test]
+async fn a_childs_summary_call_names_the_top_run() {
+    let top_mock = Arc::new(MockModel::new());
+    top_mock
+        .push_tool_calls(vec![call("t1", "spawn", json!({}))])
+        .push_text("top done");
+    let child_mock = Arc::new(MockModel::new());
+    script_one_compaction(&child_mock, "SUMMARY");
+    let top_model: DynModel = top_mock.clone();
+    let child_model: DynModel = child_mock.clone();
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let rt = Runtime::builder(store)
+        .agent(
+            LlmAgent::builder("top", top_model, "test-model")
+                .tool(Spawn("llm"))
+                .build(),
+        )
+        .agent(
+            LlmAgent::builder("llm", child_model, "test-model")
+                .instructions("be brief")
+                .limits(Limits {
+                    max_history_tokens: BUDGET,
+                    ..Limits::default()
+                })
+                .tool(Big)
+                .build(),
+        )
+        .poll_interval(Duration::from_millis(10))
+        .build();
+    let (stop, rx) = oneshot::channel::<()>();
+    let worker = {
+        let rt = rt.clone();
+        tokio::spawn(async move {
+            rt.run_worker(async {
+                let _ = rx.await;
+            })
+            .await
+        })
+    };
+    let top = rt.start("top", user_message("go"), None).await.unwrap();
+    let view = wait_terminal(&rt, top).await;
+    let _ = stop.send(());
+    worker.await.unwrap().unwrap();
+    assert_eq!(view.status, RunStatus::Done, "{view:#?}");
+
+    let requests = child_mock.requests();
+    let (turns, summaries) = split(&requests);
+    assert_eq!(summaries.len(), 1, "the child compacted once");
+    assert!(!turns.is_empty());
+    let child = child_run_id(top, "t1");
+    for request in &requests {
+        assert_eq!(request.run, Some(top.to_string()), "not the child {child}");
+    }
+}

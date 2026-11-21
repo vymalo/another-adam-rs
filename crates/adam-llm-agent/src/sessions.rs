@@ -612,9 +612,9 @@ impl Tool for Start {
             closed: false,
             closing: false,
             round: 1,
-            // The task that opens the session is the one the orchestrator bound: every round's
-            // model calls name it (ADR 0067).
-            root: Some(ctx.root_run_id()),
+            // The run this call's model calls name, which the orchestrator bound: the round's
+            // calls name it too (ADR 0067).
+            root: Some(ctx.model_run_id()),
         };
         let input = round_message(ctx, prompt, &header);
         starter
@@ -769,6 +769,9 @@ impl Tool for Send {
             header.round = view.round + 1;
             // The round before may have been one that only cleaned up after a cancel.
             header.closing = false;
+            // A round names the task that sent it, the one the orchestrator bound for it, not the
+            // one that opened the session, whose lease may be over (ADR 0067, amended).
+            header.root = Some(ctx.model_run_id());
             let within = self
                 .roster
                 .by_registered(&view.agent)
