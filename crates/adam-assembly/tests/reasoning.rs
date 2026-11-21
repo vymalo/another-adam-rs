@@ -188,8 +188,11 @@ fn a_word_outside_the_vocabulary_is_refused_with_the_seven_levels() {
         matches!(&error, Error::InvalidReasoningEffort { origin, .. } if origin.agent == "coder"),
         "{error}"
     );
-    assert!(error.to_string().contains("`ultra`"), "{error}");
-    assert!(error.to_string().contains("xhigh"), "{error}");
+    assert_eq!(
+        error.to_string(),
+        "agent `coder` (agent/instructions.md): `reasoning_effort`: \"ultra\" is not a reasoning \
+         effort: use none, minimal, low, medium, high, xhigh or max"
+    );
 }
 
 #[test]
