@@ -26,6 +26,9 @@
 //! provider that **requires** it (DeepSeek's thinking mode with tools, *verified 2026-10-05*) is
 //! served by a client set to echo it, which then keeps it in [`Message::Assistant::reasoning`].
 //!
+//! The other direction is [`ModelRequest::reasoning_effort`] ([ADR 0063](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0063-a-reasoning-effort-is-one-setting.md)):
+//! a caller may ask for a level, and the client sends it through the wire of the request's model
+//! profile. Absent sends nothing and leaves the model's own default.//!
 //! # Streaming a tool call
 //!
 //! A streaming client says [`ModelDelta::ToolCallComplete`] once per tool call, when its arguments

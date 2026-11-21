@@ -21,7 +21,7 @@ the provider asked to wait, and the runtime owns backoff.
 |---|---|
 | `ModelClient` (trait) | `complete(ModelRequest) -> ModelResponse` and `stream(ModelRequest) -> BoxStream<ModelDelta>`; two default methods, `provider() -> Option<&str>` (a label for reports, `openai` for the OpenAI-compatible client) and `context_window(alias) -> Option<u64>` (the window the deployment configured for that alias), both `None` unless the client says |
 | `DynModel` | `Arc<dyn ModelClient>` |
-| `ModelRequest`, `ModelResponse`, `ModelDelta` | request (`model`, `system`, `messages`, `tools`, `ToolChoice`, `max_output_tokens`, `temperature`, `metadata`, `prompt_cache_key`: a stable key per conversation, which the agent loop sets and a client may send; **new public field, breaks `ModelRequest` struct literals**: use `ModelRequest::new`), response and streamed chunks. `ModelDelta` is `#[non_exhaustive]` since `ToolCallComplete` (below): a `match` over it needs one more arm |
+| `ModelRequest`, `ModelResponse`, `ModelDelta` | request (`model`, `system`, `messages`, `tools`, `ToolChoice`, `max_output_tokens`, `temperature`, `reasoning_effort`: the level this call asks for, absent sends nothing (ADR 0063), `metadata`, `prompt_cache_key`: a stable key per conversation, which the agent loop sets and a client may send; **new public fields, break `ModelRequest` struct literals**: use `ModelRequest::new`), response and streamed chunks. `ModelDelta` is `#[non_exhaustive]` since `ToolCallComplete` (below): a `match` over it needs one more arm |
 | `Message`, `ContentPart`, `ToolCall`, `ToolSpec`, `Usage`, `FinishReason` | conversation and tool-calling types; all derive `Serialize`/`Deserialize` because a run persists its history. `ToolCall` has `new(id, name, arguments)`, `with_invalid_arguments(id, name, raw)` and `Default`; its `invalid_arguments: Option<String>` holds the raw argument text when it was not JSON (`arguments` is then `{}`). **Breaking:** a `ToolCall { id, name, arguments }` literal no longer compiles (use `ToolCall::new` or `..Default::default()`); the serialized form and the `ModelClient` trait are unchanged, and journals written before the field decode with `None` |
 | `ModelError` | `RateLimited { retry_after }`, `Transient`, `ContextLength`, `InvalidRequest`, `Auth`, `Protocol`; `#[non_exhaustive]`, see *Errors* |
 | `ReasoningEffort`, `ReasoningWire`, `ModelProfile`, `Preset`, `ModelProfiles` | the per-model profiles of `MODEL_ALIASES_FILE` (ADR 0063, ADR 0064), parsed and validated by `ModelProfiles::parse_json`; pure data, no file I/O (see [Per-model profiles](#per-model-profiles)) |
@@ -98,7 +98,7 @@ A message names an image by reference and never holds its bytes (ADR 0044).
 | `ModelRequest::image_data` (`ImageData`) | the bytes of the images `messages` name, by SHA-256, **never serialized**: the agent loop fills it inside the step that calls the model. `Debug` says how many, never the bytes. A reference with no entry is sent as `ImageRef::missing_line()` |
 | `ModelClient::input_modalities(model) -> InputModalities` | what the deployment declared the model of that alias can read: text only by default, never guessed from a name (`InputModalities::images: Option<ImageLimits { max_bytes, max_count, max_side, sources }>`, `#[non_exhaustive]`). `Arc<T>` forwards it. `MockModel::seeing_images(limits)` |
 
-**Breaking** for code that builds or matches these types: `ContentPart` gains a variant, `Message::Tool` a field and `ModelRequest` a field (`..Default::default()` or `..` fixes a literal or a pattern); `ModelClient` gains a provided method, so no implementer breaks.
+**Breaking** for code that builds or matches these types: `ContentPart` gains a variant, `Message::Tool` a field and `ModelRequest` fields (`..Default::default()` or `..` fixes a literal or a pattern); `ModelClient` gains a provided method, so no implementer breaks.
 
 ## Per-model profiles
 
@@ -123,8 +123,9 @@ wire, a wire with no efforts, or budgets without `thinking_budget`; a cap of `0`
 `model`, `messages`, `tools`, `tool_choice`, `stream`, `reasoning_effort`, `max_tokens`,
 `max_completion_tokens`). `reasoningEfforts: []` says the model takes no reasoning setting.
 
-Nothing here is applied to a request yet: the `ModelRequest` field, the wire and the cap are the following
-slices.
+`ModelRequest::reasoning_effort` carries the level a call asks for (ADR 0063); the agent loop sets it
+from the run's protected context key `vymalo.reasoningEffort`, else the agent's default. The wire that
+sends it (the model profile's `reasoningWire`) and the output cap are the following slices.
 
 ## Errors
 ## Errors

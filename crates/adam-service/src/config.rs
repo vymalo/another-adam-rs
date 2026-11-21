@@ -692,8 +692,9 @@ pub struct ModelConfig {
     /// problem naming the file and the key.
     pub model_aliases_file: Option<std::path::PathBuf>,
     /// The profiles read from [`model_aliases_file`](Self::model_aliases_file), by model id; empty
-    /// when the file is unset. The client is not yet given them (the wire slice): they are parsed,
-    /// validated and exposed here.
+    /// when the file is unset. The client is not yet given them (the wire slice); the binaries pass
+    /// them to the assembly, which resolves each agent's default reasoning effort and refuses a
+    /// level the model does not take.
     pub profiles: ModelProfiles,
     /// `MODEL_EXTRA_BODY`: members merged into every request body (a flag that makes the model
     /// emit its reasoning). Not secret, and never a member the runtime owns (`model`, `messages`,

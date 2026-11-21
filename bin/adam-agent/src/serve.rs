@@ -85,6 +85,7 @@ pub async fn serve(
         (Some(worker), Some(settings)) => Some(WorkerParts {
             model: worker.model.client().map_err(AgentError::Model)?,
             alias: &worker.model.alias,
+            profiles: worker.model.profiles.clone(),
             mcp: worker.mcp.policy(),
             options: settings.options(),
             // What a call was given and what it answered go into its step: the secrets of this
