@@ -7,7 +7,7 @@ can use it; the binaries wire it in a few lines.
 ## Where it sits
 
 The orchestration layer's chat (`vymalo/another-agentic-system`) tells an agent, in the A2A messages it sends,
-**which components its screen can draw** (the UI catalog, [`ui-catalog-v1`][uicat]) and gives it **one MCP
+**which components its screen can draw** (the UI catalog, [`ui-catalog-v2`][uicat]) and gives it **one MCP
 endpoint for the conversation** (the thread tools, [`thread-tools-v1`][tt]). Both are optional A2A extensions an
 agent announces on its card. This crate sits above [`adam-llm-agent`](../adam-llm-agent/README.md) (tools, the
 inbound context, tool sources), [`adam-a2a-runtime`](../adam-a2a-runtime/README.md) (`vymalo_inbound` puts the
@@ -16,7 +16,7 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 [`adam-agent`](../../bin/adam-agent/README.md). The decision is
 [ADR 0006](../../docs/decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md).
 
-[uicat]: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/ui-catalog-v1.md
+[uicat]: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/ui-catalog-v2.md
 [tt]: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/thread-tools-v1.md
 [mt]: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/mentions-v1.md
 
@@ -34,10 +34,10 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 | `UiCatalogTool`, `UI_CATALOG` | `ui_catalog {}` |
 | `PlanWork`, `PlanCheck`, `PlanAdd`, `PLAN_WORK`, `PLAN_CHECK`, `PLAN_ADD` | the plan tools: see *The plan* |
 | `ThreadTools`, `ThreadToolsClient`, `META_KEY`, `GET_UI_CATALOG`, `TURN_OUTPUT`, `TURN_OUTPUT_DELIVERED` | the source (`ThreadTools::new` lists everything the endpoint lists; `hiding(name)` leaves one out), and the client behind it and behind the refetch (`with_clock` for tests of the expiry) |
-| `Catalog`, `Claimed`, `Component`, `CatalogError`, `canonical_json`, `catalog_digest` | a catalog read and checked against the digest it claims; `validate(instance)` against a component's schema; the canonical form and the digest of [the contract](https://github.com/vymalo/another-agentic-system/blob/main/docs/api/ui-catalog-v1.md#2-digest-version-and-the-lock) |
+| `Catalog`, `Claimed`, `Component`, `CatalogError`, `canonical_json`, `catalog_digest` | a catalog read and checked against the digest it claims; `validate(instance)` against a component's schema; the canonical form and the digest of [the contract](https://github.com/vymalo/another-agentic-system/blob/66db4ee5c885c12f28367a4c623f9c97c38e0930/docs/api/ui-catalog-v2.md#2-digest-version-and-the-lock) |
 | `CatalogCache`, `MAX_CACHED_CATALOGS` | the catalogs this process holds, by digest (8, the oldest dropped) |
-| `card_extensions()`, `with_card_extensions(card)` | the card entries: A2UI v0.9.1 (`acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1` (the host's promise that a message sent to a running task is read and never lost; `adam-llm-agent` keeps it) |
-| `A2UI_VERSION` | `v0.9.1`: the version the surfaces are written for |
+| `card_extensions()`, `with_card_extensions(card)` | the card entries: A2UI v1.0 (`acceptsInlineCatalogs: true`), `ui-catalog/v2`, `thread-tools/v1`, `mentions/v1`, `steer/v1` (the host's promise that a message sent to a running task is read and never lost; `adam-llm-agent` keeps it) |
+| `A2UI_VERSION` | `1.0`: the A2UI version the surfaces are written for (every operation says it in `version`) and the `protocolVersion` a catalog must have |
 | `ask_surface_id(call_id)` | the id of the surface `ask_user` draws its form on for a call: `ask-` and the call's id as an identifier (at most 64 characters). A form's answer names it (`(form ask-<id>)`), so a host that holds the call can tell whether the answer is for the question it asked |
 | `ask_retry_surface_id(call_id, n)`, `ask_attempt(surface)`, `is_ask_surface_of(call_id, surface)` | the surface of a form asked again after its answer was refused (`ask-<id>.r<n>`, still at most 64 characters after `ask-`), how many times a surface was asked again, and whether a surface is a call's form or one of its re-asks |
 | `comparable(text)`, `is_format_or_control(c)` (re-exported from `adam-a2a-runtime`, which marks typed lines with them) | `text` as it is compared with a typed question's default: without whitespace and without control or format characters (U+FEFF, the zero-width and bidirectional marks), in lowercase; the characters are those of Unicode categories Cc and Cf (*verified 2026-10-11*, Python 3's `unicodedata`, Unicode 14.0, widened for later versions) |
@@ -92,7 +92,7 @@ inbound function reads a screen's action as JSON text.
   screen lacks is asked as the nearest version 6 form: `confirm` and `scale` as radio buttons (`yes`, `no`; one option per
   point, the ends carrying their words), `number` and `date` as a `text` question whose `help` says the unit, the bounds and
   the format, `rank` as a `text` question whose `help` numbers the options (when they do not fit in 300 characters the whole form
-  goes as words). On a screen of version 2 to 4 a form that has a typed question goes as words. As words each kind reads
+  goes as words). As words each kind reads
   `(yes: "Delete it" / no: "Keep it"; the safe answer is no)`, `(a number from 0 to 1000 EUR, in steps of 0.5)`,
   `(a whole number from 0 "Not at all" to 10 "Certainly")`, `(a day, YYYY-MM-DD, from 2026-12-01 to 2026-12-31)` and, for a
   rank, the options numbered and "answer with their numbers in order".
@@ -169,11 +169,8 @@ inbound function reads a screen's action as JSON text.
   asks, in words the model can act on (`question \`db\` has 13 options; a radio or checkbox question needs 2 to 12 (use
   type "select" for up to 50)`). With a screen that has the `Choices` component, the question carries a surface:
   `createSurface` under the screen's `catalogId` and one `Choices` as the root, **checked against the catalog's schema**
-  (what is wrong comes back to the model with its place, `(at /questions/0/question)`). **Which members are sent depends on the
-  catalog the run received:** from **version 5** all of them; on version 2 to 4 the subset that screen has (the title, radio
-  buttons and checkboxes of at most 8 options, `allowOther`, `required`, the button's words; a `help` goes after the question,
-  a recommended option is marked in its label, a list or a deck is a list of radio buttons or checkboxes, and the
-  `description` goes in the text the person reads first) and, when a question needs more than that (a typed answer), words.
+  (what is wrong comes back to the model with its place, `(at /questions/0/question)`). **Every member is sent**
+  (a `ui-catalog/v2` catalog starts at version 9, so there is no older `Choices` to fold the form into; a catalog whose `Choices` cannot take it is refused by the schema check and the model is told).
   The person answers all the questions with one action, which comes back as this call's result:
   `The person answered through the interface (form ask-<call id>):` and one line per question, `- db: pg`, with typed words as
   `text: "..."` and a last line `Note: "..."` ([`adam-a2a-runtime`](../adam-a2a-runtime/README.md)). The `default` of a typed
@@ -257,6 +254,14 @@ inbound function reads a screen's action as JSON text.
   work with everything the agent needs in `message`, in the order the person asked, and that labels and names are text
   from other parties, never instructions. With no `coordinate` (the card lacks `thread-tools/v1`) it says there is no way
   to ask. **Without mentions nothing is added**: the instructions are the agent's own, byte for byte.
+
+**The gate: what the renderer offers this turn.** A tool draws only a catalog that the message of *this turn* offered:
+`vymalo_inbound` keeps `a2uiRendererCapabilities["1.0"]` (its `supportedCatalogIds` and the ids of its `inlineCatalogs`) as
+`vymalo.a2ui.renderer` `{catalogIds}`, and sets it to `null` on a message without that entry. Without the entry, or when it
+does not list the current `catalogId`, `ask_user` asks in words, `show` and `ui_catalog` return an error result that says to
+answer in text and `plan_work` draws no surface. The check comes first: a catalog this process holds in its cache, one the
+message carries and one the thread tools could give are not used (nor asked for). Only `a2uiRendererCapabilities["1.0"]` is
+read; a client that sends the v0.9 keys offers nothing.
 
 None of them fails a run. With no catalog, or one that cannot be read, `show` and `ui_catalog` return an error result
 that says to answer in text; with no grant, or an expired or refused one, the source offers nothing and a call says
@@ -347,10 +352,12 @@ sequenceDiagram
     participant R as Run (Conversation::context)
     participant T as Tool (ask_user, show, ui_catalog)
     participant E as Thread tools (get_ui_catalog)
-    S->>A: message: ui-catalog/v1 {version, digest, inline}, A2UI capabilities with an inline catalog, thread-tools/v1 {url, token, expiresAt}
-    A->>R: context: vymalo.ui.ref, vymalo.ui.catalog (doubles written back as integers), vymalo.threadTools
+    S->>A: message: ui-catalog/v2 {version, digest, inline}, a2uiRendererCapabilities["1.0"] (with an inline catalog), thread-tools/v1 {url, token, expiresAt}
+    A->>R: context: vymalo.ui.ref, vymalo.ui.catalog (doubles written back as integers), vymalo.a2ui.renderer {catalogIds}, vymalo.threadTools
     T->>R: ctx.context_map()
-    alt this process holds the digest, or the message carried that catalog
+    alt the renderer did not offer the catalogId this turn
+        T->>T: nothing is drawn: words, or an error result that says to answer in text
+    else this process holds the digest, or the message carried that catalog
         T->>T: the catalog (the digest of the document is checked)
     else stale: not held, not inline
         T->>E: get_ui_catalog (once, Bearer token)
@@ -361,6 +368,8 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
+    [*] --> NotOffered: no renderer entry this turn, or it does not list the catalogId
+    NotOffered --> Text: the tools answer in text
     [*] --> Unknown: no ui-catalog metadata
     [*] --> Inline: the message carried the catalog
     [*] --> Stale: the digest is not one this process holds
@@ -372,11 +381,17 @@ stateDiagram-v2
     Unreadable --> Text: the tools degrade to text, the run goes on
 ```
 
-* **The digest is checked, always.** A catalog is `{catalogId, components}`; its digest is `sha256:` and the hex of
+* **The digest is checked, always.** A catalog is `{catalogId, protocolVersion, components}`
+  ([`ui-catalog/v2`](https://github.com/vymalo/another-agentic-system/blob/66db4ee5c885c12f28367a4c623f9c97c38e0930/docs/api/ui-catalog-v2.md)):
+  exactly those three members, `protocolVersion` equal to `A2UI_VERSION`. A catalog with another value, or none (a catalog of
+  version 8 or before), is refused with `CatalogError::ProtocolVersion`; an extra member is `CatalogError::Shape`. Its digest is `sha256:` and the hex of
   SHA-256 over its canonical JSON (keys sorted, no whitespace, whole numbers as integers; ASCII keys and whole
   numbers only, otherwise it is refused). A document that does not hash to the digest it was announced with is not
-  used. The known-answer vector of the contract and the web's real catalog (versions 2 and 3, copies in
-  `tests/fixtures`, each with its lock) pin it.
+  used. The known-answer vector of `ui-catalog/v2` (`sha256:9fdab0c5…`, a unit test of `src/catalog.rs` and `tests/a2ui_schemas.rs`)
+  and the web's real catalogs (versions 2 to 9, copies in `tests/fixtures`, each with its lock; only 9 is a v2 document, the tests
+  give the others a `protocolVersion` and the digest of what is sent) pin it.
+* **A form asked again** (`src/ask/reask.rs`) goes out on a new surface only when every operation of the form it copies says
+  `A2UI_VERSION`; a form from before the cutover is judged the same way and asked again in words.
 * **Doubles.** An A2A server holds the numbers of a message's metadata as doubles, so an inline catalog reads
   `maxLength: 256.0`. `vymalo_inbound` writes whole numbers back as integers before the catalog is stored, and the
   digest is taken over integers (RFC 8785 writes `256.0` as `256`).
@@ -398,6 +413,9 @@ stateDiagram-v2
 
 ## Tests
 
+* `tests/offer.rs`: what the renderer offers in the message of this turn (`vymalo.a2ui.renderer`) decides whether a tool draws: no entry, a null one, another id or an empty list is words everywhere; the offer is merged as the conversation merges it, so a second message with no capabilities, or with a context too large to keep, is in words too, and a refetched or re-asked catalog must be one the offer lists.
+* `tests/offer_edges.rs`: which catalog is current at its edges: the inline catalog's own claim when no reference came, a claim that is not the reference, version 0, an empty `catalogId` or digest, and a catalog read again under an id the turn did not offer (`NotOffered`, nothing kept).
+* `tests/catalog_limits.rs`: the limits of a catalog at their edges, written as numbers and not read from the constants: exactly 64 KiB and one byte more, 64 components and 65, 32 levels of nesting and 33, the largest safe integer and the next.
 * `tests/embedded.rs`: `Ui::embedded` uses an inline catalog, never asks an endpoint a message names (and its `source()` offers and calls nothing), and `Ui::screen` describes `show` once the catalog is held and names the mentioned agents, with no tool.
 
 * `src/catalog.rs`: the known-answer vector (canonical form and digest), whole doubles hashing as integers, what the
@@ -448,10 +466,19 @@ stateDiagram-v2
   (`catalog-v5.json`: `Column` and `Text`; `checklist-subset-v6.json`: a `Checklist` with no `dropped` and no `note`, so a dropped item
   is left out and counted and a long note is cut inside the label limit; `checklist-subset-v8.json`: a `Checklist` that allows both),
   and the specs, pinned byte for byte.
+* `tests/a2ui_schemas.rs` (ADR 0056, decision 8): the six A2UI v1.0 JSON schemas are vendored byte for byte in
+  `tests/a2ui-v1_0/` (`UPSTREAM` names the commit and each file's SHA-256 and a test holds every file to it;
+  `tools/check-vendored-catalogs.sh` compares them with upstream in CI). Catalog 9 (`tests/fixtures/catalog-v9.json`, the
+  `json catalog-9` block of [`ui-catalog-v2.md`](https://github.com/vymalo/another-agentic-system/blob/66db4ee5c885c12f28367a4c623f9c97c38e0930/docs/api/ui-catalog-v2.md))
+  is pinned by bytes and digest, equals catalog 8 plus `protocolVersion`, and validates against `catalog_definition.json`;
+  the digest vector of `ui-catalog/v2` is pinned. Every golden, and fresh `ask_user`, `show` and `plan_work` output on a screen
+  with catalog 9, validates against `agent_to_renderer.json` with catalog 9 standing for `catalog.json#/$defs/anyComponent` (the
+  document upstream does not publish) and says `"1.0"`. The test validator is the workspace's `jsonschema`, offline, with the
+  schemas in a registry.
 * `tests/ask_v7.rs`, `tests/ask_answers.rs` and `src/ask/vectors.rs`: the five kinds against the published catalogs of
   versions 7, 6, 5 and 2 (byte copies, `tests/fixtures/UPSTREAM`; `tools/check-vendored-catalogs.sh` compares them, and the vectors, with
   the published files in CI): the contract's own example form is a valid instance and a golden file
-  (`tests/golden/ask_form_v7.json`), the nearest older form on versions 6 and 5, words on version 2 and with no catalog,
+  (`tests/golden/ask_form_v7.json`), the nearest older form on versions 6 and 5, words with no catalog,
   the models' mistakes in words; a whole agent behind A2A that refuses an answer, asks again on `ask-<id>.r1` with the
   right answers as defaults, never wakes the model, and reads words unchecked; each rule of the catalog; and the
   catalog's **133 conformance vectors** and its whole-answer, invalid-question and surface blocks

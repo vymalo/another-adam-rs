@@ -391,12 +391,11 @@ async fn a_call_made_again_after_a_transient_failure_is_another_call() {
     let rt = Runtime::builder(store)
         .poll_interval(Duration::from_millis(20))
         .event_sink(sink.clone())
-        .retry(RetryPolicy {
-            max_attempts: 3,
-            initial_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(10),
-            multiplier: 1.0,
-        })
+        .retry(
+            RetryPolicy::new(3)
+                .with_backoff(Duration::from_millis(10), Duration::from_millis(10))
+                .with_multiplier(1.0),
+        )
         .agent(agent)
         .build();
     let run = rt.start("llm", user_message("go"), None).await.unwrap();

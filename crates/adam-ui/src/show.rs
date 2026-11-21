@@ -56,6 +56,9 @@ struct Args {
 fn unavailable(resolved: Resolved) -> Result<Arc<Catalog>, ToolOutput> {
     match resolved {
         Resolved::Found(catalog) => Ok(catalog),
+        Resolved::NotOffered => Err(ToolOutput::error(
+            "this screen did not offer a component catalog this turn; answer in text",
+        )),
         Resolved::NoCatalog => Err(ToolOutput::error(
             "this screen has no component catalog; answer in text",
         )),

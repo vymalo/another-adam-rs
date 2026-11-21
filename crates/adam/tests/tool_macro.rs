@@ -651,3 +651,49 @@ fn the_macros_words_are_the_runtimes_vocabulary() {
         assert!(StepKind::parse(kind).is_some(), "{kind}");
     }
 }
+
+// ------------------------------------------------------------------ retry
+
+/// Look something up, retried under its own policy.
+#[tool(retry(attempts = 3, backoff = "2s", max_backoff = "1m", multiplier = 3, on = ["rate-limited", "conflict"]))]
+pub async fn patient(
+    /// What to look up
+    query: String,
+) -> String {
+    query
+}
+
+/// Every retryable class, by the macro's names.
+#[tool(retry(attempts = 1, on = ["transient", "rate-limited", "conflict"]))]
+pub async fn every_class(
+    /// What
+    query: String,
+) -> String {
+    query
+}
+
+#[test]
+fn retry_writes_the_tools_policy_in_the_runtimes_terms() {
+    use adam::runtime::{RetryClasses, RetryPolicy};
+    assert_eq!(
+        Patient.retry_policy(),
+        Some(
+            RetryPolicy::new(3)
+                .with_backoff(Duration::from_secs(2), Duration::from_secs(60))
+                .with_multiplier(3.0)
+                .with_retry_on(RetryClasses::of([
+                    ErrorClass::RateLimited,
+                    ErrorClass::Conflict
+                ]))
+        )
+    );
+    // The macro's names are the runtime's, all of them.
+    let all = EveryClass.retry_policy().expect("a policy");
+    assert_eq!(all.retry_on, RetryClasses::ALL);
+    assert_eq!(
+        all.retry_on.names(),
+        ["transient", "rate-limited", "conflict"]
+    );
+    // A tool that says nothing leaves it to the runtime.
+    assert_eq!(Lookup.retry_policy(), None);
+}

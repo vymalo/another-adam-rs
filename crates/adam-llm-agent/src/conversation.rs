@@ -103,13 +103,27 @@ pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
 /// behind it, which is a limit on what it may ask for.
 pub const CALLER_CONTEXT_KEY: &str = "vymalo.caller";
 
-/// The context keys that carry a **limit on the agent**: the access tier the person picked, and
-/// who the message was sent for. A message always sets them, even when the rest of its context is
+/// The context keys that carry a **limit on the agent**: the access tier the person picked, who the
+/// message was sent for, and that nobody answers the run (`adam_runtime::UNATTENDED_CONTEXT_KEY`). A message always sets them, even when the rest of its context is
 /// over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large catalog next to a `plan` tier would
 /// lift the limit), and a child run starts with the ones its parent has
 /// ([`ToolCtx::start_child`](crate::ToolCtx::start_child)). Each value is at most
 /// [`MAX_PROTECTED_VALUE_BYTES`]; a larger one is ignored.
-pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[ACCESS_TIER_CONTEXT_KEY, CALLER_CONTEXT_KEY];
+pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[
+    ACCESS_TIER_CONTEXT_KEY,
+    CALLER_CONTEXT_KEY,
+    adam_runtime::UNATTENDED_CONTEXT_KEY,
+];
+
+/// The context key under which a message says what its renderer offers this turn (A2UI v1.0
+/// `a2uiRendererCapabilities`): `{"catalogIds": [...]}`.
+pub const RENDERER_OFFER_CONTEXT_KEY: &str = "vymalo.a2ui.renderer";
+
+/// The context keys that speak for **one message only**: a message sets them or, by saying nothing,
+/// clears them. When a message's context is over [`MAX_CONTEXT_BYTES`] and dropped, these are
+/// **deleted** (neither the earlier value nor the update stays), so a run never acts on what an
+/// earlier message offered: a turn whose offer was lost draws nothing.
+pub const PER_MESSAGE_CONTEXT_KEYS: &[&str] = &[RENDERER_OFFER_CONTEXT_KEY];
 
 /// The most serialized JSON, in bytes, that the value of a [`PROTECTED_CONTEXT_KEYS`] key may hold.
 pub const MAX_PROTECTED_VALUE_BYTES: usize = 1024;
@@ -1010,8 +1024,10 @@ impl Conversation {
     ///
     /// Returns `false` when the merged context would be larger than [`MAX_CONTEXT_BYTES`] (a warning
     /// says so: the message is still read for its text). Then **only the update's
-    /// [`PROTECTED_CONTEXT_KEYS`] are merged**, and nothing else changes: a limit the person set is
-    /// never lost to a large context. The protected keys do not count toward the limit.
+    /// [`PROTECTED_CONTEXT_KEYS`] are merged** and the [`PER_MESSAGE_CONTEXT_KEYS`] are deleted;
+    /// nothing else changes: a limit the person set is never lost to a large context, and an
+    /// earlier message's offer is never taken for this one's. The protected keys do not count
+    /// toward the limit.
     pub fn merge_context(&mut self, update: &Map<String, Value>) -> bool {
         if update.is_empty() {
             return true;
@@ -1053,6 +1069,9 @@ impl Conversation {
                 "the context of an inbound message would take the run's context over its limit: it is dropped, but for the keys that carry a limit the person set"
             );
             apply(&mut self.context, true);
+            for key in PER_MESSAGE_CONTEXT_KEYS {
+                self.context.remove(*key);
+            }
             return false;
         }
         self.context = merged;

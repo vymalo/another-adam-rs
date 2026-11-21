@@ -66,6 +66,7 @@ flowchart TB
         a2art["adam-a2a-runtime"]
         rt["adam-runtime"]
         pgn["adam-notify-postgres"]
+        sched["adam-schedule"]
     end
     subgraph contracts["Contracts"]
         a2a["adam-a2a"]
@@ -127,6 +128,8 @@ flowchart TB
     llm --> model
     rt --> core
     pgn --> rt
+    sched --> rt
+    sched --> agentfs
     pg --> core
     mongo --> core
     sqlite --> core
@@ -140,7 +143,7 @@ flowchart TB
 |---|---|---|
 | Contracts | [`adam-error`](../crates/adam-error/README.md), [`adam-core`](../crates/adam-core/README.md), [`adam-model`](../crates/adam-model/README.md), [`adam-a2a`](../crates/adam-a2a/README.md), [`adam-host`](../crates/adam-host/README.md) | Error classes, the `Store` port and run types, the `ModelClient` port, the `TaskBackend` port with the A2A 1.0 server, the process `Role` and `Placement` with a supervisor. |
 | Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-store-sqlite`, `adam-model-openai`, [`adam-model-oauth`](../crates/adam-model-oauth/README.md), [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-code-tools`](../crates/adam-code-tools/README.md) (the file and command tools as a library, ADR 0047; moving out of the coder in steps), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-devcontainer`](../crates/adam-devcontainer/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
-| Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares. |
+| Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md), [`adam-schedule`](../crates/adam-schedule/README.md) (a folder's schedules, [ADR 0060](decisions/0060-schedules-are-parked-runs.md): when they are due, the ids of their firings, each agent's scheduler `<agent>/adam.schedule` and `reconcile`; `adam-agent` and the coder run them with a `schedules` worker component, `reconcile_until_stopped`) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares. |
 | Agents and authoring | [`adam-llm-agent`](../crates/adam-llm-agent/README.md), [`adam-ui`](../crates/adam-ui/README.md), [`adam-mcp`](../crates/adam-mcp/README.md), [`adam-agent-fs`](../crates/adam-agent-fs/README.md), [`adam-assembly`](../crates/adam-assembly/README.md), [`adam-macros`](../crates/adam-macros/README.md), [`adam`](../crates/adam/README.md) | The model-and-tools loop; the screen's tools; MCP tools; the agent-folder parser; binding a folder to agents; `#[tool]`; the facade. See [Write an agent](guides/write-an-agent.md). |
 | Embedded | [`adam-engine`](../crates/adam-engine/README.md) | adam-rs in an application with no server and nothing on the network of its own ([ADR 0047](decisions/0047-adam-rs-can-be-embedded-in-an-application.md)): the embedded set, the runtime and its agent crates with `adam-a2a`'s `server`, `adam-a2a-runtime`'s `push` and `adam-ui`'s `thread-tools` off, checked by `tools/embedded-deps/check.sh`. Its API (slice 4: send, steer, answer, cancel, list, over `RuntimeTaskBackend` and a store and a model the host gives) is built; its stream of events is not yet. |
 | Binaries | [`adam-coder`](../bin/adam-coder/README.md), [`adam-agent`](../bin/adam-agent/README.md), [`adam-egress`](../bin/adam-egress/README.md) | The two agents you can run, library and binary each, over `adam-service`; and the HTTPS-only egress proxy for run pods, which uses only `adam-error` and is in the same image; the chart deploys it with the run pods, whose network policy allows nothing else out ([ADR 0042](decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)). |
@@ -876,7 +879,10 @@ stateDiagram-v2
 
 * **Retries.** A transient step failure (or a panic) is committed `Runnable` with
   `wake_at = now + delay` and `attempt + 1`. The delay is the larger of the backoff and the error's
-  `retry_after` (capped at 24 h). At `max_attempts` the run is `Failed`.
+  `retry_after` (capped at 24 h). The policy is the failing step's own when it names one, else the
+  runtime's, and the failures are counted per step's key: at that key's `max_attempts`, at 100
+  consecutive failures whatever their keys, or for a class the policy does not retry, the run is `Failed`
+  ([ADR 0061](decisions/0061-a-step-names-its-retry-policy.md)).
 * **A lease that lapses under a step.** The worker passes the run as `busy` in every `claim_due`, so the
   store never leases it to the same worker twice. Another worker may claim it; the CAS rejects the
   commit that comes second.
@@ -1028,7 +1034,8 @@ What `state` holds (JSON, versioned `v`; the layout is private to the runtime,
 | `v` | layout version: `1` is this envelope, `5` the head (below) |
 | `agent` | the agent's own state; for an `LlmAgent`, a `Conversation` (below). The whole state in `v: 1`, the head without its messages in `v: 5` |
 | `inbox` | delivered, not yet read messages (`Inbound { id, kind, payload, received_at }`) |
-| `seq`, `attempt`, `rev` | next journal seq; failed tries of this transition; bumped by each worker commit |
+| `seq`, `attempt`, `rev` | next journal seq; consecutive failed tries of the run's transitions; bumped by each worker commit |
+| `retry` | while a run fails: the failures per step's key and each key's policy, recorded at its first failure; cleared by a transition that succeeds, absent otherwise ([ADR 0061](decisions/0061-a-step-names-its-retry-policy.md)) |
 | `output`, `error` | the result of a `Done` run; the reason of a `Failed` one |
 | `artifacts` | artifacts emitted so far, committed with their transitions |
 

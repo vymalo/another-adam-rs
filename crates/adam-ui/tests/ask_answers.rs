@@ -36,13 +36,17 @@ struct Screen {
 
 fn screen(document: &str, lock: &str) -> Screen {
     let lock: Value = serde_json::from_str(lock).unwrap();
+    // The published catalogs of versions 2 to 8 have no `protocolVersion`; the screen sends them as
+    // `ui-catalog/v2` documents (the digest is of what is sent).
+    let mut document: Value = serde_json::from_str(document).unwrap();
+    document["protocolVersion"] = json!("1.0");
     Screen {
-        document: serde_json::from_str(document).unwrap(),
         claimed: Claimed {
             catalog_id: CATALOG_ID.to_owned(),
             version: u32::try_from(lock["version"].as_u64().unwrap()).unwrap(),
-            digest: lock["digest"].as_str().unwrap().to_owned(),
+            digest: adam_ui::catalog_digest(&document).unwrap(),
         },
+        document,
     }
 }
 
@@ -146,7 +150,7 @@ fn from_the_screen(text: &str, screen: &Screen) -> Message {
         UI_CATALOG_EXTENSION: {
             "catalogId": c.catalog_id, "version": f64::from(c.version), "digest": c.digest,
             "inline": true},
-        "a2uiClientCapabilities": {"v0.9.1": {
+        "a2uiRendererCapabilities": {"1.0": {
             "supportedCatalogIds": [CATALOG_ID],
             "inlineCatalogs": [as_doubles(&screen.document)]}},
     });
@@ -163,7 +167,7 @@ fn from_the_screen(text: &str, screen: &Screen) -> Message {
 }
 
 fn action(surface: &str, answers: Value) -> Message {
-    let mut part = Part::data(json!([{"version": "v0.9.1", "action": {
+    let mut part = Part::data(json!([{"version": "1.0", "action": {
         "name": "answer", "surfaceId": surface, "sourceComponentId": "root",
         "timestamp": "2026-10-01T10:00:00Z", "context": {"answers": answers}}}]))
     .with_media_type(A2UI_MEDIA_TYPE);
@@ -171,7 +175,13 @@ fn action(surface: &str, answers: Value) -> Message {
         "mimeType".to_owned(),
         json!(A2UI_MEDIA_TYPE),
     )]));
-    Message::new(Role::User, vec![part])
+    let mut message = Message::new(Role::User, vec![part]);
+    // Every message of the screen says what it offers: an answer turn that did not would be in words.
+    message.metadata = Some(HashMap::from([(
+        "a2uiRendererCapabilities".to_owned(),
+        json!({"1.0": {"supportedCatalogIds": [CATALOG_ID]}}),
+    )]));
+    message
 }
 
 /// The five questions of the contract's own examples, asked by one call.
@@ -466,6 +476,7 @@ async fn asked_on(screen: &Screen, args: Value) -> (adam_llm_agent::DynTool, Val
     let c = &screen.claimed;
     let context = json!({
         "vymalo.ui.ref": {"catalogId": c.catalog_id, "version": c.version, "digest": c.digest},
+        "vymalo.a2ui.renderer": {"catalogIds": [c.catalog_id]},
         "vymalo.ui.catalog": {
             "catalogId": c.catalog_id, "version": c.version, "digest": c.digest,
             "catalog": as_doubles(&screen.document)},
@@ -518,7 +529,11 @@ fn verdict(
 }
 
 fn payload(surface: &str, context: Value) -> Value {
-    json!({"text": "The person answered", PAYLOAD_FORM: {"surface": surface, "context": context}})
+    json!({
+        "text": "The person answered",
+        PAYLOAD_FORM: {"surface": surface, "context": context},
+        "context": {"vymalo.a2ui.renderer": {"catalogIds": [CATALOG_ID]}},
+    })
 }
 
 #[tokio::test]
@@ -617,6 +632,118 @@ async fn the_same_answer_is_refused_the_same_way_every_time() {
         again.ui.unwrap()[0]["createSurface"]["surfaceId"],
         "ask-c1.r2"
     );
+}
+
+/// A form is asked again on a new surface only when every operation of the interface it copies says the
+/// version adam writes. One from before the cutover is judged the same way, but the question comes back in
+/// words: its operations are never copied into a new surface or edited into the current version.
+#[tokio::test]
+async fn a_form_from_before_the_cutover_is_asked_again_in_words_not_on_a_new_surface() {
+    let (tool, args, ui) = asked_with_v7().await;
+    let bad = payload(
+        "ask-c1",
+        json!({"answers": with("budget", json!(["1500"]))}),
+    );
+    let current = |ui: &Value| match tool.read_answer("c1", &args, Some(ui), &bad) {
+        AnswerCheck::Refuse(refusal) => refusal,
+        other => panic!("refused: {other:?}"),
+    };
+    // As it was drawn: every operation says "1.0" and the question comes back on `.r1`.
+    assert!(current(&ui).ui.is_some());
+    // One operation that does not say "1.0", whatever it says instead, and then all of them.
+    for (what, changed) in [
+        ("the pre-cutover version", json!("v0.9.1")),
+        ("0.9", json!("0.9")),
+        ("a number", json!(1)),
+        ("none", Value::Null),
+    ] {
+        let mut old = ui.clone();
+        old[1]["version"] = changed;
+        let words = current(&old);
+        assert!(words.ui.is_none(), "{what}: not copied");
+        assert_eq!(words.rule, "above_max", "{what}: judged as before");
+        assert!(words.question.contains("1500 is above the most"), "{what}");
+    }
+    let mut every = ui.clone();
+    for operation in every.as_array_mut().unwrap() {
+        operation["version"] = json!("v0.9.1");
+    }
+    assert!(current(&every).ui.is_none());
+}
+
+/// The form is asked again on a surface only when this turn's offer lists the surface's catalog: with no
+/// offer, or one that lists another id, the question comes back in words (the answer is judged the same).
+#[tokio::test]
+async fn a_form_is_asked_again_on_a_surface_only_when_this_turns_offer_lists_its_catalog() {
+    let (tool, args, ui) = asked_with_v7().await;
+    let catalog_id = ui[0]["createSurface"]["catalogId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let answer = |offer: Option<Value>| {
+        let mut p = payload(
+            "ask-c1",
+            json!({"answers": with("budget", json!(["1500"]))}),
+        );
+        match offer {
+            Some(offer) => p["context"] = json!({"vymalo.a2ui.renderer": offer}),
+            None => p
+                .as_object_mut()
+                .unwrap()
+                .remove("context")
+                .map(drop)
+                .unwrap_or(()),
+        }
+        match tool.read_answer("c1", &args, Some(&ui), &p) {
+            AnswerCheck::Refuse(refusal) => refusal,
+            other => panic!("refused: {other:?}"),
+        }
+    };
+    assert!(
+        answer(Some(json!({"catalogIds": [catalog_id]})))
+            .ui
+            .is_some()
+    );
+    for (what, offer) in [
+        ("no offer", None),
+        ("a null offer", Some(Value::Null)),
+        (
+            "another id",
+            Some(json!({"catalogIds": ["https://example.test/other"]})),
+        ),
+        ("an empty list", Some(json!({"catalogIds": []}))),
+    ] {
+        let words = answer(offer);
+        assert!(words.ui.is_none(), "{what}: asked on a surface");
+        assert_eq!(words.rule, "above_max", "{what}: judged as before");
+    }
+}
+
+/// An interface that creates no surface names no catalog, so no offer can list it: words, even when the
+/// turn's renderer offers a catalog.
+#[tokio::test]
+async fn an_interface_that_creates_no_surface_is_asked_again_in_words() {
+    let (tool, args, mut ui) = asked_with_v7().await;
+    let catalog_id = ui[0]["createSurface"]["catalogId"].clone();
+    let mut p = payload(
+        "ask-c1",
+        json!({"answers": with("budget", json!(["1500"]))}),
+    );
+    p["context"] = json!({"vymalo.a2ui.renderer": {"catalogIds": [catalog_id]}});
+    let refuse = |ui: &Value| match tool.read_answer("c1", &args, Some(ui), &p) {
+        AnswerCheck::Refuse(refusal) => refusal,
+        other => panic!("refused: {other:?}"),
+    };
+    assert!(
+        refuse(&ui).ui.is_some(),
+        "the control: with its createSurface"
+    );
+    ui.as_array_mut()
+        .unwrap()
+        .retain(|m| m.get("createSurface").is_none());
+    let words = refuse(&ui);
+    assert!(words.ui.is_none());
+    assert_eq!(words.rule, "above_max");
 }
 
 #[tokio::test]
@@ -1113,36 +1240,22 @@ async fn what_is_carried_into_the_form_asked_again_is_something_that_form_accept
 }
 
 #[tokio::test]
-async fn the_form_asked_again_on_a_screen_without_a_description_keeps_the_description_in_its_words()
-{
+async fn the_form_asked_again_says_the_description_once() {
     let args = json!({"question": "Sure?", "description": "Because of the data.",
         "choices": [{"id": "ok", "question": "Go?", "type": "confirm"}]});
     let wrong = json!({"answers": [{"id": "ok", "values": ["maybe"]}]});
-    let say = |refusal: adam_llm_agent::Refusal| refusal.question;
-    // Version 2's Choices has no description: it is the second line of the question.
-    let v2 = screen(
-        include_str!("fixtures/catalog-v2.json"),
-        include_str!("fixtures/catalog-v2.lock.json"),
-    );
-    let (tool, args2, ui) = asked_on(&v2, args.clone()).await;
-    let AnswerCheck::Refuse(refusal) =
-        tool.read_answer("c1", &args2, Some(&ui), &payload("ask-c1", wrong.clone()))
-    else {
-        panic!("not refused")
-    };
-    assert_eq!(
-        say(refusal),
-        "The answer to \"ok\" (\"Go?\") was not used (not_offered): the answer is neither yes nor no.\n\
-         Sure?\nBecause of the data."
-    );
-    // Version 7's has one, and the words are not said twice.
+    // The screen's Choices has a description: it is not also said in the words.
     let (tool, args7, ui) = asked_on(&screen(V7, V7_LOCK), args).await;
     let AnswerCheck::Refuse(refusal) =
         tool.read_answer("c1", &args7, Some(&ui), &payload("ask-c1", wrong))
     else {
         panic!("not refused")
     };
-    assert!(say(refusal).ends_with("the answer is neither yes nor no.\nSure?"));
+    assert!(
+        refusal
+            .question
+            .ends_with("the answer is neither yes nor no.\nSure?")
+    );
 }
 
 // ---- a yes or no said in words ----

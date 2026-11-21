@@ -8,9 +8,12 @@
 //!     participant C as CatalogCache
 //!     participant E as thread tools: get_ui_catalog
 //!     T->>R: the run's inbound context
+//!     R->>R: does the renderer offer the current catalogId (vymalo.a2ui.renderer)?
 //!     R->>R: the current digest (vymalo.ui.ref, else the inline catalog's)
 //!     R->>C: a catalog with that digest?
-//!     alt cached
+//!     alt not offered
+//!         R-->>T: NotOffered (answer in text)
+//!     else cached
 //!         C-->>T: the catalog
 //!     else the message carried that catalog inline
 //!         R->>R: read it, check its digest, keep it
@@ -24,6 +27,8 @@
 //!
 //! ```mermaid
 //! stateDiagram-v2
+//!     [*] --> NotOffered: no renderer entry, or it does not list the catalog
+//!     NotOffered --> [*]: answer in text
 //!     [*] --> Unknown: no ref, no inline catalog (the screen sent none)
 //!     [*] --> Current: ref digest cached
 //!     [*] --> Inline: the message carried the catalog
@@ -37,7 +42,7 @@
 
 use std::sync::Arc;
 
-use adam_a2a_runtime::{CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
+use adam_a2a_runtime::{CONTEXT_A2UI_RENDERER, CONTEXT_UI_CATALOG, CONTEXT_UI_REF};
 use serde_json::{Map, Value};
 
 use crate::cache::CatalogCache;
@@ -51,6 +56,8 @@ const NO_THREAD_TOOLS: &str = "it cannot be read again: this agent has no thread
 /// What this process holds of the screen's catalog, before it asks anyone.
 enum Held {
     Found(Arc<Catalog>),
+    /// The renderer did not offer the catalog (or any): nothing is drawn.
+    NotOffered,
     NoCatalog,
     Stale,
 }
@@ -59,6 +66,9 @@ enum Held {
 pub(crate) enum Resolved {
     /// The catalog, read and checked.
     Found(Arc<Catalog>),
+    /// The message's renderer capabilities did not offer the current catalog, or there were none
+    /// (this turn): the agent answers in text, whatever a cache or an earlier turn holds.
+    NotOffered,
     /// The thread has no catalog: the screen sent none, so the agent answers in text.
     NoCatalog,
     /// There is one, and it could not be read now (and why, without any credential): the agent
@@ -96,6 +106,15 @@ fn claimed(entry: &Value) -> Option<Claimed> {
     })
 }
 
+/// The catalog ids the renderer offered this turn (`vymalo.a2ui.renderer`); `None` without the entry.
+fn offered_ids(context: &Map<String, Value>) -> Option<Vec<&str>> {
+    let ids = context
+        .get(CONTEXT_A2UI_RENDERER)?
+        .get("catalogIds")?
+        .as_array()?;
+    Some(ids.iter().filter_map(Value::as_str).collect())
+}
+
 impl UiState {
     #[cfg(feature = "thread-tools")]
     pub(crate) fn new(client: Arc<ThreadToolsClient>) -> Self {
@@ -118,6 +137,7 @@ impl UiState {
     pub(crate) async fn resolve(&self, context: &Map<String, Value>) -> Resolved {
         match self.held(context) {
             Held::Found(catalog) => Resolved::Found(catalog),
+            Held::NotOffered => Resolved::NotOffered,
             Held::NoCatalog => Resolved::NoCatalog,
             // Stale: this process does not hold the current catalog. Ask the endpoint for the newest.
             Held::Stale => self.refetch(context).await,
@@ -132,12 +152,16 @@ impl UiState {
     pub(crate) fn current_if_held(&self, context: &Map<String, Value>) -> Option<Arc<Catalog>> {
         match self.held(context) {
             Held::Found(catalog) => Some(catalog),
-            Held::NoCatalog | Held::Stale => None,
+            Held::NotOffered | Held::NoCatalog | Held::Stale => None,
         }
     }
 
     /// What is known of the current catalog without a request.
     fn held(&self, context: &Map<String, Value>) -> Held {
+        // This turn's offer comes first: with none, nothing is drawn, cached or not.
+        let Some(offered) = offered_ids(context) else {
+            return Held::NotOffered;
+        };
         let inline = context.get(CONTEXT_UI_CATALOG);
         // What is current: the thread's reference when the message carried one; the inline catalog's
         // own claim otherwise.
@@ -148,6 +172,9 @@ impl UiState {
         else {
             return Held::NoCatalog;
         };
+        if !offered.contains(&current.catalog_id.as_str()) {
+            return Held::NotOffered;
+        }
         if let Some(cached) = self.cache.get(&current.digest) {
             return Held::Found(cached);
         }
@@ -205,6 +232,14 @@ impl UiState {
                 return Resolved::Unreadable(error);
             }
         };
+        // The renderer's offer decides, not the endpoint: a catalog of an id this turn did not offer is
+        // never drawn with, whatever it hashes to.
+        if !offered_ids(context)
+            .is_some_and(|ids| ids.contains(&fetched.claimed.catalog_id.as_str()))
+        {
+            tracing::warn!("the endpoint's catalog is not one the renderer offered this turn");
+            return Resolved::NotOffered;
+        }
         let Some(document) = fetched.document else {
             return Resolved::Unreadable(
                 "the endpoint said the catalog is unchanged, but this process holds none".into(),
@@ -229,6 +264,7 @@ mod tests {
     /// A message that names the current catalog without carrying it, and an endpoint that has it.
     fn named_only() -> Map<String, Value> {
         let context = json!({
+            CONTEXT_A2UI_RENDERER: {"catalogIds": ["https://example.test/catalog"]},
             CONTEXT_UI_REF: {"catalogId": "https://example.test/catalog", "version": 2, "digest": "sha256:00"},
             adam_a2a_runtime::CONTEXT_THREAD_TOOLS: {
                 "url": "http://127.0.0.1:9/thread-tools", "token": "tok", "expiresAt": "2999-01-01T00:00:00Z"
@@ -245,7 +281,7 @@ mod tests {
         match state.resolve(&named_only()).await {
             Resolved::Unreadable(reason) => assert_eq!(reason, NO_THREAD_TOOLS),
             Resolved::Found(_) => panic!("a catalog was found with nothing to read it from"),
-            Resolved::NoCatalog => panic!("the message names a catalog"),
+            Resolved::NoCatalog | Resolved::NotOffered => panic!("the message names a catalog"),
         }
         assert_eq!(state.cache.len(), 0);
     }

@@ -193,7 +193,7 @@ async fn the_card_is_the_one_the_folder_declares() {
     assert_eq!(
         uris,
         [
-            adam_a2a::A2UI_EXTENSION_V0_9_1,
+            adam_a2a::A2UI_EXTENSION_V1_0,
             adam_a2a::UI_CATALOG_EXTENSION,
             adam_a2a::THREAD_TOOLS_EXTENSION,
             adam_a2a::MENTIONS_EXTENSION,
@@ -269,6 +269,70 @@ async fn a_folder_serves_its_commands() {
     assert_eq!(
         mock.requests()[0].messages[0],
         adam_model::Message::user_text("Say hi to Bob.")
+    );
+}
+
+/// A folder's schedule runs (ADR 0060): the worker runtime `agents` registers steps the scheduler,
+/// and a firing reaches the agent as a person's message whose text is the schedule's prompt.
+#[tokio::test]
+async fn a_schedule_of_the_folder_fires_the_agent() {
+    let folder = assistant();
+    let path = folder.path().join("agent/schedules/soon.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "---\nafter: 1s\n---\nSay what is due.\n").unwrap();
+    let def = def_of(&folder);
+    let schedules = def.manifest().schedules.clone();
+    assert_eq!(schedules.len(), 1);
+
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Nothing is due.");
+    let dynamic: DynModel = mock.clone();
+    let agents = build(
+        def.clone(),
+        None,
+        Some(worker(dynamic, McpPolicy::default())),
+    )
+    .await
+    .unwrap();
+    assert!(format!("{agents:?}").contains("schedules"), "{agents:?}");
+    // A control plane steps nothing, so it neither registers the scheduler nor reconciles.
+    let control = build(def.clone(), None, None).await.unwrap();
+    assert!(!format!("{control:?}").contains("schedules"), "{control:?}");
+    let store = store();
+    let service = service_over(agents, &store);
+    let done = adam_schedule::reconcile_store(store.clone(), def.name(), &schedules)
+        .await
+        .unwrap();
+    assert_eq!(done.started, ["soon"]);
+    let worker = Worker::start(&service);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let fired = loop {
+        let runs = store
+            .list_runs(&adam_core::RunQuery::new(
+                def.name(),
+                adam_core::ConversationScope::Prefix(format!("adam.schedule:{}/soon@", def.name())),
+                10,
+            ))
+            .await
+            .unwrap();
+        if let Some(run) = runs
+            .into_iter()
+            .find(|r| r.status == adam_core::RunStatus::Done)
+        {
+            break run;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the schedule did not fire"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    worker.stop().await;
+    let trigger = adam_schedule::trigger_of(fired.conversation_id.as_deref().unwrap()).unwrap();
+    assert_eq!(trigger.name, "soon");
+    assert_eq!(
+        mock.requests()[0].messages[0],
+        adam_model::Message::user_text("Say what is due.")
     );
 }
 
@@ -1151,18 +1215,26 @@ const CATALOG_V2: (&str, &str) = (
     include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.lock.json"),
 );
 
+/// The published catalog (versions 2 to 8 have no `protocolVersion`) as a screen sends it now: a
+/// `ui-catalog/v2` document, whose digest is of what is sent.
+fn catalog_v2(published: &str) -> serde_json::Value {
+    let mut catalog: serde_json::Value = serde_json::from_str(published).unwrap();
+    catalog["protocolVersion"] = json!("1.0");
+    catalog
+}
+
 /// The message the orchestrator sends from a screen that draws `catalog` (the document and its lock),
-/// with the catalog inline: the `ui-catalog/v1` metadata and the A2UI capabilities.
+/// with the catalog inline: the `ui-catalog/v2` metadata and the A2UI capabilities.
 fn from_the_screen(text: &str, (catalog, lock): (&str, &str)) -> Message {
     let lock: serde_json::Value = serde_json::from_str(lock).unwrap();
-    let catalog: serde_json::Value = serde_json::from_str(catalog).unwrap();
+    let catalog = catalog_v2(catalog);
     let mut message = user(text);
     message.metadata = Some(
         json!({
             adam_a2a::UI_CATALOG_EXTENSION: {
-                "catalogId": CATALOG_ID, "version": lock["version"], "digest": lock["digest"],
-                "inline": true},
-            "a2uiClientCapabilities": {"v0.9.1": {
+                "catalogId": CATALOG_ID, "version": lock["version"],
+                "digest": adam_ui::catalog_digest(&catalog).unwrap(), "inline": true},
+            "a2uiRendererCapabilities": {"1.0": {
                 "supportedCatalogIds": [CATALOG_ID], "inlineCatalogs": [catalog]}},
         })
         .as_object()
@@ -1304,13 +1376,13 @@ async fn the_researcher_answers_with_cards_and_a_graph_on_a_screen_that_draws_th
         .map(|c| c["component"].as_str().unwrap())
         .collect();
     assert_eq!(kinds, ["Column", "Cards", "Mermaid"]);
-    let lock: serde_json::Value = serde_json::from_str(CATALOG_V3.1).unwrap();
+    let document = catalog_v2(CATALOG_V3.0);
     let catalog = adam_ui::Catalog::from_document(
-        serde_json::from_str(CATALOG_V3.0).unwrap(),
+        document.clone(),
         &adam_ui::Claimed {
             catalog_id: CATALOG_ID.to_owned(),
             version: 3,
-            digest: lock["digest"].as_str().unwrap().to_owned(),
+            digest: adam_ui::catalog_digest(&document).unwrap(),
         },
     )
     .unwrap();
@@ -1347,7 +1419,7 @@ async fn on_a_screen_without_cards_or_a_catalog_the_researcher_answers_in_words_
         (
             "no catalog",
             user("What is async Rust?"),
-            "this screen has no component catalog; answer in text",
+            "this screen did not offer a component catalog this turn; answer in text",
         ),
     ] {
         let (done, requests) = researcher_run(message).await;

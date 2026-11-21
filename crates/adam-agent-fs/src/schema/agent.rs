@@ -132,6 +132,151 @@ pub const MAX_WORKING_SESSIONS_LIMIT: u32 = 32;
 /// The smallest and largest `limits.max_session_rounds`.
 pub const MAX_SESSION_ROUNDS_LIMIT: (u32, u32) = (2, 200);
 
+/// The most `retry.<tool>.attempts` may say (ADR 0061, decision 6).
+pub const MAX_RETRY_ATTEMPTS: u32 = 20;
+
+/// The longest `retry.<tool>.max_backoff` may say: one hour.
+pub const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+/// The first delay of a `retry` that names no `backoff`: `adam_runtime::RetryPolicy`'s default.
+pub const DEFAULT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The bound of a `retry` that names no `max_backoff`: `adam_runtime::RetryPolicy`'s default.
+pub const DEFAULT_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The classes `retry.<tool>.on` may name: `adam_runtime::RetryClasses`' names (`adam-assembly`'s
+/// tests check that they are the same).
+pub const RETRY_CLASS_NAMES: [&str; 3] = ["transient", "rate-limited", "conflict"];
+
+/// The retry policy of one tool's failures (`retry:` in the frontmatter, ADR 0061): its failures
+/// count under `tool:<name>` and are retried under this, not the runtime's policy. Absent fields
+/// keep `adam_runtime::RetryPolicy`'s default (1 s, 60 s, 2.0, every class); `attempts` is
+/// required. The loader checks the shape and the bounds ([`MAX_RETRY_ATTEMPTS`],
+/// [`MAX_RETRY_BACKOFF`]); binding checks the name against the agent's tools.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RetryDef {
+    /// The tries in all, the first included: 1 to [`MAX_RETRY_ATTEMPTS`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    /// The delay after the first failure: `500ms`, `1s`, `30m`, `1h` ([`retry_duration`]). A bare
+    /// number is kept as its text, so the loader says it lacks a unit.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "text_or_number"
+    )]
+    pub backoff: Option<String>,
+    /// The bound of any delay, at most [`MAX_RETRY_BACKOFF`] and not under `backoff`. Absent, it is
+    /// 60 s, or `backoff` when that is longer (and then the delay does not grow).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "maxBackoff",
+        alias = "max-backoff",
+        deserialize_with = "text_or_number"
+    )]
+    pub max_backoff: Option<String>,
+    /// The growth factor per further failure, a positive number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multiplier: Option<serde_json::Number>,
+    /// The classes it retries, of [`RETRY_CLASS_NAMES`]: a list, or one name or a comma-separated
+    /// string, as `tools:` takes; absent: all of them.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "names")]
+    pub on: Option<Vec<String>>,
+    /// Keys this schema does not know.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl RetryDef {
+    /// The first delay: `backoff`, else [`DEFAULT_RETRY_BACKOFF`]; `None` when `backoff` is not a
+    /// duration.
+    pub fn initial_backoff(&self) -> Option<std::time::Duration> {
+        self.backoff
+            .as_deref()
+            .map_or(Some(DEFAULT_RETRY_BACKOFF), retry_duration)
+    }
+
+    /// The bound of any delay: `max_backoff`, else [`DEFAULT_RETRY_MAX_BACKOFF`] (raised to the
+    /// first delay when that is longer); `None` when `max_backoff` is not a duration.
+    pub fn bound(&self) -> Option<std::time::Duration> {
+        match self.max_backoff.as_deref() {
+            Some(text) => retry_duration(text),
+            None => Some(
+                DEFAULT_RETRY_MAX_BACKOFF
+                    .max(self.initial_backoff().unwrap_or(DEFAULT_RETRY_BACKOFF)),
+            ),
+        }
+    }
+
+    /// The growth factor, when it is given and is a finite number.
+    pub fn factor(&self) -> Option<f64> {
+        self.multiplier
+            .as_ref()
+            .and_then(serde_json::Number::as_f64)
+            .filter(|m| m.is_finite())
+    }
+}
+
+/// A string, or a number kept as its text.
+fn text_or_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Text {
+        Text(String),
+        Number(serde_json::Number),
+    }
+    Ok(Option::<Text>::deserialize(d)?.map(|t| match t {
+        Text::Text(text) => text,
+        Text::Number(n) => n.to_string(),
+    }))
+}
+
+/// A list of names, or one string of names separated by commas.
+fn names<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Names {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(Option::<Names>::deserialize(d)?.map(|n| match n {
+        Names::One(text) => text
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Names::Many(list) => list,
+    }))
+}
+
+/// Whether `name` can name a tool in `retry:`: what a model is shown, `A-Z`, `a-z`, `0-9`, `_` and
+/// `-`, at most 64 characters. A registered tool's name, an MCP server's `<server>__<tool>` and a
+/// subagent's all are; binding checks it is one of the agent's.
+pub fn is_retry_tool_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A retry delay: a whole number and one unit, `ms`, `s`, `m` or `h` (`500ms`, `1s`, `30m`,
+/// `1h`); `None` for anything else.
+pub fn retry_duration(text: &str) -> Option<std::time::Duration> {
+    let text = text.trim();
+    let split = text.find(|c: char| !c.is_ascii_digit())?;
+    let (number, unit) = text.split_at(split);
+    let number: u64 = number.parse().ok()?;
+    let ms = match unit {
+        "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        _ => return None,
+    };
+    number.checked_mul(ms).map(std::time::Duration::from_millis)
+}
+
 /// The limits of the agent loop (`adam_llm_agent::Limits`). Absent fields keep the loop's
 /// default. Claude Code's top-level `maxTurns` is read as `max_turns`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -280,6 +425,11 @@ pub struct AgentFrontmatter {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub vars: BTreeMap<String, String>,
+    /// The retry policy per tool, by the tool's name (`<server>__<tool>` for an MCP server's):
+    /// [`RetryDef`] (ADR 0061). Each agent sets its own; none inherits. Left out of the JSON (and so
+    /// of the digest) when there is none.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub retry: BTreeMap<String, RetryDef>,
     /// The A2A card (root agent only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub card: Option<Card>,
@@ -331,6 +481,88 @@ impl AgentFrontmatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retry_reads_its_durations_and_falls_back_to_the_defaults() {
+        assert_eq!(
+            retry_duration("500ms"),
+            Some(std::time::Duration::from_millis(500))
+        );
+        assert_eq!(
+            retry_duration(" 30m "),
+            Some(std::time::Duration::from_secs(1_800))
+        );
+        assert_eq!(retry_duration("1h"), Some(MAX_RETRY_BACKOFF));
+        for bad in [
+            "",
+            "s",
+            "5",
+            "1.5s",
+            "1 s",
+            "1d",
+            "-1s",
+            "99999999999999999999h",
+        ] {
+            assert_eq!(retry_duration(bad), None, "{bad:?}");
+        }
+        let def: RetryDef = serde_json::from_value(serde_json::json!({
+            "attempts": 3, "maxBackoff": "2m", "multiplier": 1.5, "on": ["rate-limited"]
+        }))
+        .unwrap();
+        assert_eq!(def.attempts, Some(3));
+        assert_eq!(def.initial_backoff(), Some(DEFAULT_RETRY_BACKOFF));
+        assert_eq!(def.bound(), Some(std::time::Duration::from_secs(120)));
+        assert_eq!(def.factor(), Some(1.5));
+        assert_eq!(round_trip(&def), def);
+        let plain = RetryDef {
+            attempts: Some(2),
+            backoff: Some("2m".into()),
+            ..RetryDef::default()
+        };
+        assert_eq!(
+            plain.bound(),
+            Some(std::time::Duration::from_secs(120)),
+            "raised to the first delay"
+        );
+        assert_eq!(plain.factor(), None);
+        let bad = RetryDef {
+            backoff: Some("soon".into()),
+            ..RetryDef::default()
+        };
+        assert_eq!((bad.initial_backoff(), bad.bound().is_some()), (None, true));
+    }
+
+    #[test]
+    fn a_retry_takes_the_forms_a_person_writes() {
+        let def: RetryDef = serde_json::from_value(serde_json::json!({
+            "attempts": 2, "on": "rate-limited, conflict", "backoff": 30, "max-backoff": "2m",
+            "multiplier": 2
+        }))
+        .unwrap();
+        assert_eq!(
+            def.on.as_deref(),
+            Some(&["rate-limited".to_owned(), "conflict".to_owned()][..])
+        );
+        assert_eq!(
+            def.backoff.as_deref(),
+            Some("30"),
+            "a bare number is kept, for the loader to refuse"
+        );
+        assert_eq!(def.max_backoff.as_deref(), Some("2m"));
+        assert_eq!(def.factor(), Some(2.0));
+        for name in [
+            "web_search",
+            "context7__resolve-library-id",
+            "notion__API-post-search",
+            "code-reviewer",
+            "9lives",
+        ] {
+            assert!(is_retry_tool_name(name), "{name}");
+        }
+        for name in ["", "a b", "a.b", "é", &"x".repeat(65)] {
+            assert!(!is_retry_tool_name(name), "{name:?}");
+        }
+    }
 
     fn round_trip<T>(value: &T) -> T
     where

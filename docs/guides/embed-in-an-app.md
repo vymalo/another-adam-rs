@@ -23,6 +23,14 @@ The calls, their refusals and their defaults: the [crate README](../../crates/ad
 
 The engine reads no environment variable and no file it was not given.
 
+**A restart that claims its runs at once is opt-in.** By default (`Limits::worker_id: None`) every start has a random
+worker id and releases nothing, so a restarted application waits up to `lease_ttl` for the runs it was stepping. Set
+`Some(id)` only for a store no other engine shares (the application's own SQLite file once slice 3 lands, or a store
+per install): the host promises that no other live engine uses that id on the store, and `start` releases the
+leases the id holds. In one process `start` refuses a second live engine with the same id on the same store
+(`WorkerIdInUse`); it cannot see other processes, and a broken promise steps a run twice. Restarting in the same process,
+call `shutdown` first.
+
 ## The example
 
 `crates/adam-engine/examples/chat` is a terminal chat: `main.rs` builds the engine, `app.rs` is the loop (a test drives

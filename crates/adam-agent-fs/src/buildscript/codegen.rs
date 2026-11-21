@@ -188,6 +188,8 @@ impl Gen<'_> {
                 self.open(format!("{p}::EmbeddedSchedule {{"));
                 self.line(format!("name: {},", lit(&s.name)));
                 self.line(format!("cron: {},", lit(&s.cron)));
+                self.line(format!("at: {},", option(s.at.as_deref())));
+                self.line(format!("after: {},", option(s.after.as_deref())));
                 self.line(format!("timezone: {},", lit(&s.timezone)));
                 self.line(format!("agent: {},", lit(&s.agent)));
                 self.line(format!("prompt: {},", text(&s.prompt)));

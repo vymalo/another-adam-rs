@@ -285,6 +285,132 @@ fn cases() -> Vec<Case> {
             "`limits.max_minutes` is at most 1440",
         ),
         (
+            "retry without attempts",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { backoff: 1s } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search` needs `attempts`",
+        ),
+        (
+            "retry attempts over 20",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 21 } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search.attempts` is from 1 to 20; it is 21",
+        ),
+        (
+            "retry attempts of 0",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 0 } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search.attempts` is from 1 to 20",
+        ),
+        (
+            "retry backoff that is no duration",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, backoff: 1.5s } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search.backoff` is a duration",
+        ),
+        (
+            "retry max_backoff over an hour",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, max_backoff: 2h } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search.max_backoff` is at most 1h",
+        ),
+        (
+            "retry max_backoff under backoff",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, backoff: 1m, max_backoff: 30s } }\n---\nHi.\n",
+            )],
+            Error,
+            "is shorter than `backoff`",
+        ),
+        (
+            "retry backoff as a bare number",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, backoff: 30 } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search.backoff` is a duration such as `500ms`, `1s`, `30m` or `1h`; it is `30`",
+        ),
+        (
+            "retry max_backoff under the default backoff",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, max_backoff: 500ms } }\n---\nHi.\n",
+            )],
+            Error,
+            "the default `backoff` (1s)",
+        ),
+        (
+            "retry multiplier of 0",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, multiplier: 0 } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search.multiplier` is a positive number",
+        ),
+        (
+            "retry on an unknown class",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, on: [invalid] } }\n---\nHi.\n",
+            )],
+            Error,
+            "names `invalid`, which is not a retryable class",
+        ),
+        (
+            "retry on no class",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, on: [] } }\n---\nHi.\n",
+            )],
+            Error,
+            "names at least one class",
+        ),
+        (
+            "retry of a name that is no tool name",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { \"web.search\": { attempts: 3 } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.web.search` is not a tool name",
+        ),
+        (
+            "retry with an unknown key",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, tries: 2 } }\n---\nHi.\n",
+            )],
+            Error,
+            "unknown key `retry.search.tries`",
+        ),
+        with_root(
+            "retry on a remote subagent",
+            vec![(
+                "agent/subagents/far.md",
+                "---\ndescription: d\na2a: https://agents.example.com/far\nretry: { search: { attempts: 3 } }\n---\n",
+            )],
+            Warning,
+            "`retry` is ignored on a remote subagent",
+        ),
+        (
             "max_parallel of 0",
             vec![(
                 "agent/instructions.md",
@@ -766,7 +892,94 @@ fn cases() -> Vec<Case> {
             "schedule without cron",
             vec![("agent/schedules/a.md", "---\ntimezone: UTC\n---\nGo.\n")],
             Error,
-            "needs `cron`",
+            "needs one of `cron`, `at` or `after`",
+        ),
+        with_root(
+            "schedule with a blank cron",
+            vec![("agent/schedules/a.md", "---\ncron: \"  \"\n---\nGo.\n")],
+            Error,
+            "needs one of `cron`, `at` or `after`",
+        ),
+        with_root(
+            "schedule with cron and at",
+            vec![(
+                "agent/schedules/a.md",
+                "---\ncron: \"0 9 * * *\"\nat: 2026-12-24T18:00\n---\nGo.\n",
+            )],
+            Error,
+            "has `cron` and `at`",
+        ),
+        with_root(
+            "schedule with at and after",
+            vec![(
+                "agent/schedules/a.md",
+                "---\nat: 2026-12-24T18:00\nafter: 30m\n---\nGo.\n",
+            )],
+            Error,
+            "has `at` and `after`",
+        ),
+        with_root(
+            "schedule with a cron that never fires",
+            vec![(
+                "agent/schedules/a.md",
+                "---\ncron: \"0 9 30 2 *\"\n---\nGo.\n",
+            )],
+            Error,
+            "never fires",
+        ),
+        with_root(
+            "schedule with a cron item out of range",
+            vec![(
+                "agent/schedules/a.md",
+                "---\ncron: \"0 25 * * *\"\n---\nGo.\n",
+            )],
+            Error,
+            "`cron: 0 25 * * *` has the hour item `25`, which is outside 0-23",
+        ),
+        with_root(
+            "schedule with an at that is no time",
+            vec![("agent/schedules/a.md", "---\nat: tomorrow\n---\nGo.\n")],
+            Error,
+            "`at: tomorrow` is not a time",
+        ),
+        with_root(
+            "schedule with an at on a day that does not exist",
+            vec![(
+                "agent/schedules/a.md",
+                "---\nat: 2026-02-30T09:00\n---\nGo.\n",
+            )],
+            Error,
+            "is not a valid date and time",
+        ),
+        with_root(
+            "schedule with an after that is no duration",
+            vec![("agent/schedules/a.md", "---\nafter: soon\n---\nGo.\n")],
+            Error,
+            "`after: soon` is not a duration",
+        ),
+        with_root(
+            "schedule with a zero after",
+            vec![("agent/schedules/a.md", "---\nafter: 0m\n---\nGo.\n")],
+            Error,
+            "is zero",
+        ),
+        with_root(
+            "schedule with a time zone and an after",
+            vec![(
+                "agent/schedules/a.md",
+                "---\nafter: 30m\ntimezone: Europe/Berlin\n---\nGo.\n",
+            )],
+            Warning,
+            "`timezone: Europe/Berlin` is ignored: `after` counts from when the schedule starts",
+        ),
+        with_root(
+            "schedule with a time zone and an at with its offset",
+            vec![(
+                "agent/schedules/a.md",
+                "---\nat: 2026-12-24T18:00Z\ntimezone: Europe/Berlin\n---\nGo.\n",
+            )],
+            Warning,
+            "`timezone: Europe/Berlin` is ignored: `at` names its offset",
         ),
         with_root(
             "schedule with a four-field cron",
@@ -782,6 +995,15 @@ fn cases() -> Vec<Case> {
             )],
             Error,
             "not an IANA time zone",
+        ),
+        with_root(
+            "schedule with a time zone that does not exist",
+            vec![(
+                "agent/schedules/a.md",
+                "---\ncron: \"0 9 * * *\"\ntimezone: Mars/Olympus\n---\nGo.\n",
+            )],
+            Error,
+            "`timezone: Mars/Olympus` is not an IANA time zone",
         ),
         with_root(
             "schedule with an empty prompt",
@@ -872,6 +1094,119 @@ fn cases() -> Vec<Case> {
 }
 
 #[test]
+fn a_retry_per_tool_is_read_with_no_diagnostic() {
+    let dir = write(&[(
+        "agent/instructions.md",
+        "---\nname: root\nretry:\n  web_search: { attempts: 5, backoff: 2s, max_backoff: 5m, on: [rate-limited, transient] }\n  github__create_issue: { attempts: 1 }\n  context7__resolve-library-id: { attempts: 2, on: rate-limited }\n  code-reviewer: { attempts: 2 }\n---\nHi.\n",
+    )]);
+    let report = load(dir.path());
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let retry = &report.package.agents[0].frontmatter.retry;
+    assert_eq!(retry.len(), 4);
+    assert_eq!(
+        retry["context7__resolve-library-id"].on.as_deref(),
+        Some(&["rate-limited".to_owned()][..])
+    );
+    let search = &retry["web_search"];
+    assert_eq!(search.attempts, Some(5));
+    assert_eq!(search.bound(), Some(std::time::Duration::from_secs(300)));
+    assert_eq!(
+        search.on.as_deref(),
+        Some(&["rate-limited".to_owned(), "transient".to_owned()][..])
+    );
+    assert_eq!(retry["github__create_issue"].attempts, Some(1));
+}
+
+#[test]
+fn schedules_take_cron_at_or_after() {
+    let dir = write(&[
+        ("agent/instructions.md", ROOT),
+        (
+            "agent/schedules/daily.md",
+            "---\ncron: \"0 9 * * MON-FRI\"\ntimezone: Europe/Berlin\n---\nDigest.\n",
+        ),
+        (
+            "agent/schedules/eve.md",
+            "---\nat: 2026-12-24T18:00\ntimezone: Europe/Berlin\n---\nGreet.\n",
+        ),
+        (
+            "agent/schedules/launch.md",
+            "---\nat: \"2026-12-24T18:00:00+01:00\"\n---\nLaunch.\n",
+        ),
+        (
+            "agent/schedules/soon.md",
+            "---\nafter: 1h30m\n---\nFollow up.\n",
+        ),
+    ]);
+    let report = load(dir.path());
+    assert!(report.diagnostics.is_empty(), "{:#?}", report.diagnostics);
+    let root = &report.package.agents[0];
+    let got: Vec<_> = root
+        .schedules
+        .iter()
+        .map(|s| {
+            (
+                s.name.as_str(),
+                s.cron.as_str(),
+                s.at.as_deref(),
+                s.after.as_deref(),
+                s.timezone.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("daily", "0 9 * * MON-FRI", None, None, "Europe/Berlin"),
+            ("eve", "", Some("2026-12-24T18:00"), None, "Europe/Berlin"),
+            ("launch", "", Some("2026-12-24T18:00:00+01:00"), None, "UTC"),
+            ("soon", "", None, Some("1h30m"), "UTC"),
+        ]
+    );
+    let when: Vec<_> = root.schedules.iter().map(|s| s.when().unwrap()).collect();
+    assert!(
+        matches!(when[0], adam_agent_fs::When::Cron(c) if c.day_of_week(1) && !c.day_of_week(0))
+    );
+    assert!(matches!(
+        when[1],
+        adam_agent_fs::When::At(adam_agent_fs::At::Civil(_))
+    ));
+    assert!(matches!(
+        when[2],
+        adam_agent_fs::When::At(adam_agent_fs::At::Instant(_))
+    ));
+    assert_eq!(
+        when[3],
+        adam_agent_fs::When::After(std::time::Duration::from_secs(5_400))
+    );
+}
+
+#[test]
+fn two_schedule_keys_are_refused_at_the_second_in_the_file() {
+    for (front, line) in [
+        ("after: 5m\ncron: \"0 9 * * *\"\n", 3),
+        ("after: 5m\nat: 2026-12-24T18:00\n", 3),
+        (
+            "cron: \"0 9 * * *\"\ntimezone: UTC\nat: 2026-12-24T18:00\n",
+            4,
+        ),
+    ] {
+        let dir = write(&[
+            ("agent/instructions.md", ROOT),
+            ("agent/schedules/a.md", &format!("---\n{front}---\nGo.\n")),
+        ]);
+        let report = load(dir.path());
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "{front}: {:#?}",
+            report.diagnostics
+        );
+        assert_eq!(report.diagnostics[0].line, Some(line), "{front}");
+    }
+}
+
+#[test]
 fn every_invalid_directory_produces_exactly_one_diagnostic() {
     let mut failures = Vec::new();
     for (rule, files, severity, needle) in cases() {
@@ -957,7 +1292,10 @@ fn the_valid_fixture_has_no_diagnostic_and_reads_completely() {
     assert_eq!(names, ["LINEAR_API_TOKEN", "MCP_LOG_LEVEL"]);
 
     let schedules: Vec<_> = coder.schedules.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(schedules, ["daily-digest", "team/weekly"]);
+    assert_eq!(
+        schedules,
+        ["daily-digest", "follow-up", "launch", "team/weekly"]
+    );
     assert_eq!(coder.schedules[0].timezone, "Europe/Berlin");
     assert_eq!(coder.schedules[1].timezone, "UTC");
 

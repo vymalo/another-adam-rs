@@ -107,7 +107,8 @@ stateDiagram-v2
   (`tools:`, `mcp.json`, a subagent) can fail the replay of a run that is mid-turn.
 * **`ask_user` exists twice** (`adam-coder` and `adam-agent`): the coder's description names pull requests and
   this one's does not. Unifying them into a shared crate is a later slice's call.
-* **`schedules/` are read and not run**, with a warning, as in the coder.
+* **`schedules/` are read and not run**, with a warning, as in the coder. *Amended* (2026-11-20): `adam-agent` runs
+  them ([ADR 0060](0060-schedules-are-parked-runs.md), slices 5 and 6), and so does the coder.
 
 ## Alternatives considered
 

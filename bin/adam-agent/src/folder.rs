@@ -36,9 +36,6 @@ pub fn log(folder: &AgentFolder) {
     for warning in &folder.warnings {
         tracing::warn!("{warning}");
     }
-    if !folder.def.manifest().schedules.is_empty() {
-        tracing::warn!("the agent folder has schedules, which adam-agent reads but does not run");
-    }
     if !folder.def.manifest().frontmatter.references.is_empty() {
         tracing::warn!(
             "the agent folder declares references, which adam-agent reads but does not serve: only adam-coder reads them"

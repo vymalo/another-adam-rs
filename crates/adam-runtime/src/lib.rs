@@ -98,6 +98,7 @@ mod notify;
 mod retry;
 mod runtime;
 mod session;
+mod starter;
 mod step;
 mod text;
 mod usage;
@@ -125,7 +126,10 @@ pub use file::{
 };
 pub use lines::{SystemLine, is_system_line, safe_file_name};
 pub use notify::{Delivery, DynNotifier, LocalNotifier, Notifier, Signal};
-pub use retry::{MAX_RETRY_AFTER, RetryPolicy};
+pub use retry::{
+    MAX_CONSECUTIVE_FAILURES, MAX_RETRY_AFTER, RUNTIME_RETRY_KEY, RetryClasses, RetryPolicy,
+    StepRetry,
+};
 pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError, view_from_record};
 pub use session::{
     DEFAULT_SESSION_IDLE_TTL, MAX_SESSION_CONVERSATION_BYTES, MAX_SESSION_PAGE,
@@ -134,6 +138,7 @@ pub use session::{
     SessionState, SessionSummary, SessionView, closing_round_payload,
     parse_session_conversation_id, session_conversation_id, session_conversation_prefix,
 };
+pub use starter::{RunStarter, SCHEDULE_CONVERSATION_PREFIX, UNATTENDED_CONTEXT_KEY};
 pub use step::{
     MAX_STEP_DETAIL_CHARS, MAX_STEP_ID_BYTES, MAX_STEP_LABEL_CHARS, STEP_INPUT_MAX_BYTES,
     STEP_INPUT_STRING_MAX_CHARS, STEP_OUTPUT_MAX_BYTES, StepEvent, StepIcon, StepKind, StepOutput,

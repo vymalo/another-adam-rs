@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_model::ToolSpec;
+use adam_runtime::RetryPolicy;
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -49,6 +50,7 @@ pub struct FnTool {
     handler: Arc<Handler>,
     asks_user: bool,
     time_limit: Option<Duration>,
+    retry_policy: Option<RetryPolicy>,
     access: Option<Arc<AccessFn>>,
 }
 
@@ -79,6 +81,7 @@ impl FnTool {
             }),
             asks_user: false,
             time_limit: None,
+            retry_policy: None,
             access: None,
         }
     }
@@ -115,6 +118,13 @@ impl FnTool {
         self
     }
 
+    /// Retry the tool's retryable failures under `policy` ([`Tool::retry_policy`]).
+    #[must_use]
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = Some(policy);
+        self
+    }
+
     /// Start a tool whose arguments are a typed struct; needs the `schema`
     /// feature. See [`FnToolBuilder`].
     #[cfg(feature = "schema")]
@@ -146,6 +156,10 @@ impl Tool for FnTool {
 
     fn time_limit(&self) -> Option<Duration> {
         self.time_limit
+    }
+
+    fn retry_policy(&self) -> Option<RetryPolicy> {
+        self.retry_policy
     }
 
     fn access(&self, args: &Value) -> ToolAccess {
@@ -244,6 +258,7 @@ where
             ),
             asks_user: false,
             time_limit: None,
+            retry_policy: None,
             access: None,
         }
     }

@@ -1,6 +1,6 @@
 ---
 name: adam-a2a-extensions
-description: "Which A2A extensions an adam-rs agent declares and supports (A2UI v0.9.1, ui-catalog/v1, thread-tools/v1, steps/v1, text-stream/v1, mentions/v1, steer/v1, usage/v1, access-tier/v1, commands/v1, child-sessions/v1), how a client activates them, and how to add or announce one. Use when writing a client or an orchestrator for adam agents, when an agent card lacks an extension, or when adding an extension to adam-rs."
+description: "Which A2A extensions an adam-rs agent declares and supports (A2UI v1.0, ui-catalog/v2, thread-tools/v1, steps/v1, text-stream/v1, mentions/v1, steer/v1, usage/v1, access-tier/v1, commands/v1, child-sessions/v1), how a client activates them, and how to add or announce one. Use when writing a client or an orchestrator for adam agents, when an agent card lacks an extension, or when adding an extension to adam-rs."
 ---
 
 # A2A extensions of an adam agent
@@ -14,7 +14,7 @@ Every adam-rs path below is in `vymalo/another-adam-rs` at the revision you pin 
 by that revision). The source of the list is
 https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-a2a/src/extensions.rs. Contract
 files: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/steer-v1.md and its
-siblings (`ui-catalog-v1.md`, `thread-tools-v1.md`, `steps-v1.md`, `text-stream-v1.md`,
+siblings (`ui-catalog-v2.md`, `thread-tools-v1.md`, `steps-v1.md`, `text-stream-v1.md`,
 `mentions-v1.md`; verified to exist on its main on 2026-10-03; `usage-v1.md` is written in the change that implements the
 orchestrator's side, and exists on its main once that change merges).
 
@@ -31,8 +31,8 @@ orchestrator's side, and exists on its main once that change merges).
 
 | Extension | Constant | What it is | Declared by |
 |---|---|---|---|
-| A2UI v0.9.1 | `A2UI_EXTENSION_V0_9_1` | the agent sends A2UI surfaces (data parts of `application/a2ui+json`, `A2UI_MEDIA_TYPE`) and receives the renderer's capabilities and actions | `adam_ui::card_extensions()` |
-| `ui-catalog/v1` | `UI_CATALOG_EXTENSION` | the agent reads the screen's own component catalog and draws with it | `adam_ui::card_extensions()` |
+| A2UI v1.0 | `A2UI_EXTENSION_V1_0` (and `A2UI_BASIC_CATALOG_V1_0`, `ExtensionConfig::a2ui_v1_0()`) | the agent sends A2UI surfaces (data parts of `application/a2ui+json`, `A2UI_MEDIA_TYPE`) and receives the renderer's capabilities and actions (ADR 0056, A2UI v1.0 only). **A client author: every message must carry `a2uiRendererCapabilities["1.0"]` listing the catalog** (`supportedCatalogIds` or `inlineCatalogs`, a `catalogId` of at most 256 bytes), **or adam answers that turn in words**: the offer is per turn, an offer in an earlier message does not carry over, and an action answering a form is a message too | `adam_ui::card_extensions()` |
+| `ui-catalog/v2` | `UI_CATALOG_EXTENSION` | the agent reads the screen's own component catalog and draws with it | `adam_ui::card_extensions()` |
 | `thread-tools/v1` | `THREAD_TOOLS_EXTENSION` | the agent calls the per-thread tool endpoint a message announces; the `caller` claim of the grant's token (`main`, or `ask:<n>` for an agent another agent asked) is read into the context key `vymalo.caller` (`adam_a2a_runtime::asked_by_an_agent`), and an asked `adam-coder` asks nobody for consent: its consent tools return an error result instead ([ADR 0036](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md#amended-2026-10-17-an-asked-agent), *Amended 2026-10-17 (an asked agent)*). Mint the claims as the contract says: a grant whose token cannot be read counts as no person. On an asked agent's message the grant also carries `person` `{said, omitted?}`, what the person wrote in the thread ([the contract's "The `person` member"](https://github.com/vymalo/another-agentic-system/blob/main/docs/api/thread-tools-v1.md#the-person-member); vymalo/another-agentic-system#271, on its main once it merges), read into the context key `vymalo.person` (`adam_a2a_runtime::person_said`, `crates/adam-a2a-runtime/src/person.rs`; `null` for a grant without a well-formed one): an asked `adam-coder` names only the repositories those words name, never the ask's text, and names nothing without them ([ADR 0036, *Built 2026-10-17*](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md#amended-2026-10-17-an-asked-agent)) | `adam_ui::card_extensions()` |
 | `mentions/v1` | `MENTIONS_EXTENSION` | the agent reads the agents a person mentioned and asks them | `adam_ui::card_extensions()` |
 | `steer/v1` | `STEER_EXTENSION` | a message naming a `submitted` or `working` task is added to its input and read at its next step | `adam_ui::card_extensions()` |
@@ -44,7 +44,7 @@ orchestrator's side, and exists on its main once that change merges).
 | `commands/v1` | `COMMANDS_EXTENSION` | the agent serves prompt templates (`commands/<name>.md` in its folder) and lists them on the card only when it has any: `params` are `{commands: [{name, description, argumentHint?}]}` sorted by name (`CommandInfo`, `ExtensionConfig::commands`). A message names one in its metadata, `{"command": "review", "arguments": "acme/app"}` (read only when the request activated the extension; an unknown name is `InvalidParams` before anything is written), or as `/review acme/app` at the start of its text (always read; a `/word` that is no command stays plain text and `//review` is a literal `/review`). The agent expands it in `submit` (`Commands`, `RuntimeTaskBackend::with_commands`) with `$ARGUMENTS`, `$1` to `$9` and `$$` (a literal `$`), once, never for a message that carries a form's answer, and stores the expansion, so a replay never expands again. Arguments at most 4 KiB, the expansion at most 32 KiB. The prompts of the agent's MCP servers are commands too, named `<server>__<prompt>` and listed on the card with the others; their text is asked of the server when the message arrives, behind one line that names the prompt and the server, and stored like a template's expansion; what is typed after the name is the prompt's arguments, the last declared one taking the rest of the line. Only a process that connects the servers lists them: the front of `topology: split` lists none and refuses `/<server>__<prompt>` with `InvalidParams`. The consumer's contract page (`commands-v1`, in the `api` docs of another-agentic-system) is not written yet; the agent side is [`docs/reference/a2a-server.md`](https://github.com/vymalo/another-adam-rs/blob/main/docs/reference/a2a-server.md#commands-commandsv1) | `adam-coder`, `adam-agent` (from the folder's `commands/`) |
 | `child-sessions/v1` | `CHILD_SESSIONS_EXTENSION` | the agent runs its helpers as sessions a client can open: the card lists `params = {agents: [{name, description}], maxOpen}` (`ChildSessionInfo`, `ExtensionConfig::child_sessions`, `None` for no helper or `maxOpen` 0; `ChildSessions::card_extension` in `crates/adam-a2a-runtime/src/child_sessions.rs` builds it from the roster). A client that activates it (header, and `message.extensions` on a message) reads each task of the parent context with `metadata[URI].sessions`, follows each round as a task of a **child context** (`<parent context, escaped>/s/<session>`, opaque to the client), starts a session with `metadata[URI].start {agent, description, keepOpen}` on a message to the parent context (no turn of the parent), talks to one with a message to the child context, stops a round with `CancelTask` and closes with `metadata[URI].close {cancel}`. Without activation a child context or round is `InvalidParams` and a task carries nothing of it. A person's round is its own parent (`by: person`); the parent's stream says each change of a session as a status update with `metadata[URI].event` (`opened`, `round`, `reported` with `report` `done`, `failed`, `canceled` or `blocked`, `closed`; `round.state` in the A2A JSON spelling), and a round's stream carries the session object on the update that ends the round and when `closing` turns true. `RuntimeTaskBackend::with_child_sessions` serves it; `adam_service::serve` lists it on the card exactly when the backend accepted the helpers (`Agents::child_sessions`, from `AgentDef::child_sessions`). The contract is https://github.com/vymalo/another-agentic-system/blob/main/docs/api/child-sessions-v1.md; the agent side is [`docs/reference/a2a-server.md`](https://github.com/vymalo/another-adam-rs/blob/main/docs/reference/a2a-server.md#child-sessions-child-sessionsv1) | `adam-agent` and `adam-coder` list it when the root has a subagent (local or remote); `maxOpen` is the effective `SESSION_MAX_OPEN` the root's file may lower |
 
-The URIs are `https://agents.vymalo.com/a2a/extensions/<name>/v1` (A2UI has its own URI);
+The URIs are `https://agents.vymalo.com/a2a/extensions/<name>/v1` (`ui-catalog` is `v2`; A2UI has its own URI, `https://a2ui.org/a2a-extension/a2ui/v1.0`);
 read the exact strings in the file at your rev.
 
 **Pictures are not an extension.** A message may carry a picture as a standard A2A `raw` part (a PNG, JPEG, GIF
@@ -88,14 +88,14 @@ by default); otherwise it is a line of text. `docs/reference/a2a-server.md` ("Im
    8 to a form, each one of `Text`, `Image`, `Mermaid`, `Code`, `Cards`, `Callout` or `Chart` (a diff goes in `Code`). The
    agent gives the blocks the ids `q<i>-s<j>`, makes the surface a `Column` holding the form (`ask`) and the loose blocks,
    and the form's questions name them in their own `show` (ids of components of the same surface, each shown once and
-   placed nowhere else). Every block is checked on every screen (its required members, types and limits as the catalog of version 8
+   placed nowhere else). Every block is checked on every screen (its required members, types and limits as the catalog of version 9
    has them) and refused naming the member, as is a `Chart` series with other than one value per label and any control or
    format character in a text (a tab and a line break are text). A screen whose `Choices` schema has no `show` (versions 2 to 7)
    is never sent the member: the blocks it can draw go in the `Column` above the form, the rest is said in words in the
    question's text, each question's under a caption that names the question and the numbers of its blocks (the order the model
    listed them), and the model's `help` is left as written. A form asked again shows the same blocks. A client therefore sees the shown components as ordinary components of the form's surface.
    The orchestrator relays an answer and checks none of it. See `crates/adam-ui/README.md` ("The tools")
-   and the contract page `ui-catalog-v1.md` in the docs/api directory of `vymalo/another-agentic-system`;
+   and the contract page `ui-catalog-v2.md` in the docs/api directory of `vymalo/another-agentic-system`;
    `adam-a2a-runtime` (`crates/adam-a2a-runtime/README.md`) reads the messages a screen sends
    (`vymalo_inbound`), reports steps, streamed text and tokens ("Usage"), and implements steering ("Steering a
    running task": a message to a finished task is `UnsupportedOperation`, `-32004`; to a working
@@ -114,7 +114,7 @@ by default); otherwise it is a line of text. `docs/reference/a2a-server.md` ("Im
    (`adam-a2a-runtime` README, "Steering a running task").
 5. **Add a new extension to adam-rs** (the contract is first written in the docs/api
    directory of `vymalo/another-agentic-system`): an ADR in `docs/decisions/` (the existing ones:
-   `0006` for A2UI, ui-catalog and thread-tools, `0007` for steps and text-stream, `0011` for step
+   `0006` for A2UI, ui-catalog and thread-tools (`0056` moved A2UI to v1.0 only), `0007` for steps and text-stream, `0011` for step
    input and output, `0015` for mentions and long tool calls, `0016` for steer, `0032` for usage), a constant and an
    `ExtensionConfig` constructor in `crates/adam-a2a/src/extensions.rs`, the card entry
    (`adam_ui::card_extensions()` or the binary's `card_of`), the behaviour in `adam-a2a-runtime`
@@ -192,6 +192,8 @@ card URL of each agent and nothing of its extensions: read the card for those.
 
 * `crates/adam-a2a/README.md`, `crates/adam-a2a-runtime/README.md`, `crates/adam-ui/README.md`,
   `docs/decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md`,
+  `docs/decisions/0056-a2ui-v1-0-only-a-hard-cutover.md`
+  (https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0056-a2ui-v1-0-only-a-hard-cutover.md),
   `docs/decisions/0007-progress-as-steps-and-streamed-text.md`,
   `docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md`,
   `docs/decisions/0032-usage-per-model-call.md`
