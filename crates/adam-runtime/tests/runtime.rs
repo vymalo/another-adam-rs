@@ -1838,6 +1838,78 @@ mod cases {
         );
     }
 
+    /// `Ctx::retries_left` is what the worker decides: under a policy of three attempts a transition
+    /// that keeps failing sees 2, 1 and 0, and the failure of the one that saw 0 fails the run.
+    pub async fn retries_left_counts_down_to_the_failure_that_ends_the_run(store: DynStore) {
+        let name = uniq("retries-left");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let seen = seen.clone();
+                move |ctx, _state| {
+                    seen.lock().expect("lock").push(ctx.retries_left());
+                    async move { Err(AgentError::transient("unreachable")) }.boxed()
+                }
+            }),
+        );
+        let rt = builder(&store, &uniq("w"), &agent)
+            .retry(RetryPolicy::new(3).with_backoff(Duration::ZERO, Duration::ZERO))
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        assert!(
+            failed
+                .error
+                .expect("error")
+                .contains("gave up after 3 attempts: unreachable")
+        );
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            vec![Some(2), Some(1), Some(0)],
+            "one try per value, and none after the 0"
+        );
+    }
+
+    /// An agent that reads `Some(0)` knows its failure would end the run, and can do something else
+    /// (as an agent parks on an unreachable model once its retries are spent): the run is not failed.
+    pub async fn the_last_attempt_is_known_before_it_fails(store: DynStore) {
+        let name = uniq("retries-last");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let seen = seen.clone();
+                move |ctx, state| {
+                    let left = ctx.retries_left();
+                    seen.lock().expect("lock").push(left);
+                    async move {
+                        if left == Some(0) {
+                            Ok(Transition::Done {
+                                state,
+                                output: json!("waited instead"),
+                            })
+                        } else {
+                            Err(AgentError::transient("unreachable"))
+                        }
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let rt = builder(&store, &uniq("w"), &agent)
+            .retry(RetryPolicy::new(2).with_backoff(Duration::ZERO, Duration::ZERO))
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!("waited instead")));
+        assert_eq!(*seen.lock().expect("lock"), vec![Some(1), Some(0)]);
+    }
+
     /// The runtime's own policy is recorded at a run's first failure too: a worker that steps the
     /// run later under another runtime policy (a deploy in between) gives up where the first said.
     pub async fn the_runtime_policy_is_recorded_too(store: DynStore) {
@@ -8179,6 +8251,8 @@ macro_rules! runtime_suite {
                 the_recorded_policy_outlives_a_change_in_code,
                 steps_that_fail_by_turns_stop_at_the_ceiling,
                 the_runtime_policy_is_recorded_too,
+                retries_left_counts_down_to_the_failure_that_ends_the_run,
+                the_last_attempt_is_known_before_it_fails,
                 a_success_clears_the_record,
                 permanent_fails_immediately,
                 agent_fail_transition,

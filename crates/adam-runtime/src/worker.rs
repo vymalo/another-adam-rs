@@ -619,6 +619,12 @@ async fn transition(
         agent: rec.agent.clone(),
         conversation_id: rec.conversation_id.clone(),
         attempt: env.attempt,
+        retries_left: Some(crate::retry::retries_left(
+            env.attempt,
+            env.retry.as_ref(),
+            &inner.cfg.retry,
+            ErrorClass::Transient,
+        )),
         seq: env.seq,
         inbox: env.inbox.clone(),
         store: inner.store.clone(),

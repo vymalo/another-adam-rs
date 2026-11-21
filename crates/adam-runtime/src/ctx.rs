@@ -34,6 +34,8 @@ pub struct Ctx {
     run: RunId,
     conversation_id: Option<String>,
     attempt: u32,
+    /// See [`Ctx::retries_left`].
+    retries_left: Option<u32>,
     seq: u64,
     inbox: Vec<Inbound>,
     /// How many messages the inbox held when the transition began.
@@ -150,6 +152,9 @@ pub(crate) struct CtxParts {
     pub agent: String,
     pub conversation_id: Option<String>,
     pub attempt: u32,
+    /// See [`Ctx::retries_left`]: what the worker computed from the run's record and the runtime's
+    /// policy (`crate::retry::retries_left`).
+    pub retries_left: Option<u32>,
     pub seq: u64,
     pub inbox: Vec<Inbound>,
     pub store: DynStore,
@@ -166,6 +171,7 @@ impl Ctx {
             run: p.run,
             conversation_id: p.conversation_id,
             attempt: p.attempt,
+            retries_left: p.retries_left,
             seq: p.seq,
             base_inbox: p.inbox.len(),
             inbox: p.inbox,
@@ -221,6 +227,24 @@ impl Ctx {
     /// transition that succeeds.
     pub fn attempt(&self) -> u32 {
         self.attempt
+    }
+
+    /// How many more tries of this transition the runtime allows after this one, should it fail
+    /// with a transient error that names no policy of its own (class
+    /// [`Transient`](adam_error::ErrorClass::Transient), no
+    /// [`with_retry`](AgentError::with_retry), no `retry_after`: a model call that could not reach
+    /// its endpoint): `Some(0)` on the last attempt, when that failure would fail the run. The
+    /// worker computes it as it decides on that failure: the failures counted under the runtime's
+    /// key, its policy as recorded at their first, and the run's ceiling of consecutive failures
+    /// ([`MAX_CONSECUTIVE_FAILURES`](crate::MAX_CONSECUTIVE_FAILURES)). `None` when no limit
+    /// applies, which is never the case for a transition the runtime steps (the ceiling bounds every
+    /// run).
+    ///
+    /// An agent that would rather wait than fail reads it before it returns such an error
+    /// ([ADR 0067](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+    /// decision 3: an unreachable gateway parks the run once its retries are spent).
+    pub fn retries_left(&self) -> Option<u32> {
+        self.retries_left
     }
 
     /// The current time from the runtime's injected [`Clock`](crate::Clock).
@@ -896,6 +920,7 @@ mod tests {
             agent: "a".into(),
             conversation_id: None,
             attempt: 0,
+            retries_left: None,
             seq: 0,
             inbox: Vec::new(),
             store,
@@ -1087,6 +1112,7 @@ mod tests {
             agent: "a".into(),
             conversation_id: None,
             attempt: 0,
+            retries_left: None,
             seq,
             inbox: Vec::new(),
             store: store.clone(),

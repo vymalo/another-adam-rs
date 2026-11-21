@@ -357,9 +357,107 @@ impl RetryRecord {
     }
 }
 
+/// How many more tries of a transition the runtime allows after the one that runs now, should it
+/// fail with an error of `class` that names no policy of its own (counted under
+/// [`RUNTIME_RETRY_KEY`], with the runtime's policy as recorded at the key's first failure, else
+/// `runtime`): what the worker decides when that failure comes. `0` when it would give up: the
+/// policy does not retry `class`, its attempts are spent, or the run reached
+/// [`MAX_CONSECUTIVE_FAILURES`]. `attempt` and `record` are the run's as the transition began.
+pub(crate) fn retries_left(
+    attempt: u32,
+    record: Option<&RetryRecord>,
+    runtime: &RetryPolicy,
+    class: ErrorClass,
+) -> u32 {
+    let mut record = record
+        .cloned()
+        .unwrap_or_else(|| RetryRecord::seeded(attempt));
+    let (failures, policy) = record.fail(RUNTIME_RETRY_KEY, runtime);
+    if !policy.retries(class) {
+        return 0;
+    }
+    let by_policy = policy.max_attempts.saturating_sub(failures);
+    let by_ceiling = MAX_CONSECUTIVE_FAILURES.saturating_sub(attempt.saturating_add(1));
+    by_policy.min(by_ceiling)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_left_counts_down_to_the_last_attempt() {
+        let policy = RetryPolicy::new(3);
+        let transient = ErrorClass::Transient;
+        // A run that has not failed: this try and two more.
+        assert_eq!(retries_left(0, None, &policy, transient), 2);
+        // After one failure, recorded as the worker records it.
+        let mut record = RetryRecord::default();
+        record.fail(RUNTIME_RETRY_KEY, &policy);
+        assert_eq!(retries_left(1, Some(&record), &policy, transient), 1);
+        // The last attempt: nothing after it.
+        record.fail(RUNTIME_RETRY_KEY, &policy);
+        assert_eq!(retries_left(2, Some(&record), &policy, transient), 0);
+        record.fail(RUNTIME_RETRY_KEY, &policy);
+        assert_eq!(
+            retries_left(3, Some(&record), &policy, transient),
+            0,
+            "past it"
+        );
+        // A policy of one attempt never retries.
+        assert_eq!(retries_left(0, None, &RetryPolicy::none(), transient), 0);
+    }
+
+    #[test]
+    fn retries_left_reads_the_recorded_policy_the_class_and_the_ceiling() {
+        // The policy recorded at the first failure, not the runtime's of today.
+        let mut record = RetryRecord::default();
+        record.fail(RUNTIME_RETRY_KEY, &RetryPolicy::new(2));
+        assert_eq!(
+            retries_left(
+                1,
+                Some(&record),
+                &RetryPolicy::new(9),
+                ErrorClass::Transient
+            ),
+            0
+        );
+        // A run with no record counts its attempts under the runtime's key.
+        assert_eq!(
+            retries_left(2, None, &RetryPolicy::new(5), ErrorClass::Transient),
+            2
+        );
+        // Failures under another key do not count against the runtime's.
+        let mut other = RetryRecord::default();
+        other.fail("tool:fetch", &RetryPolicy::new(2));
+        assert_eq!(
+            retries_left(1, Some(&other), &RetryPolicy::new(5), ErrorClass::Transient),
+            4
+        );
+        // A class the policy does not retry is not retried at all.
+        let rate_only =
+            RetryPolicy::new(5).with_retry_on(RetryClasses::of([ErrorClass::RateLimited]));
+        assert_eq!(retries_left(0, None, &rate_only, ErrorClass::Transient), 0);
+        assert_eq!(
+            retries_left(0, None, &rate_only, ErrorClass::RateLimited),
+            4
+        );
+        // The run's ceiling of consecutive failures bounds a policy that never runs out.
+        let endless = RetryPolicy::new(u32::MAX);
+        assert_eq!(
+            retries_left(0, None, &endless, ErrorClass::Transient),
+            MAX_CONSECUTIVE_FAILURES - 1
+        );
+        assert_eq!(
+            retries_left(
+                MAX_CONSECUTIVE_FAILURES - 1,
+                None,
+                &endless,
+                ErrorClass::Transient
+            ),
+            0
+        );
+    }
 
     #[test]
     fn classes_are_the_retryable_ones_by_name() {
