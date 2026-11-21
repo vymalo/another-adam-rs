@@ -131,10 +131,11 @@ inherits nothing.
 **Retry policies.** Each name of an agent's `retry:` ([ADR 0061](../../docs/decisions/0061-a-step-names-its-retry-policy.md))
 must be one of that agent's tools once they are all bound (its own, its MCP servers', which are connected before
 `bind`, and its skill and subagent tools): another is `Error::UnknownRetryTool`, with the closest of its tools as a
-suggestion. The policy goes to the agent as `LlmAgentBuilder::tool_retry`, so it wins over the tool's own
+suggestion; an entry for a declared MCP server that gave no tools (an `optional` one that is down) is skipped with a
+warning. The policy goes to the agent as `LlmAgentBuilder::tool_retry`, so it wins over the tool's own
 `Tool::retry_policy`; `AgentInfo::retry` lists it as the file says it. Each agent has its own: a subagent does not
-inherit the root's. An entry the loader let through but that is no policy (a lenient read) is
-`Error::InvalidRetry`. Tests: `tests/retry.rs`.
+inherit the root's. An entry that is no policy, in a manifest the loader never checked (built in code, or embedded
+by another version), is `Error::InvalidRetry`. Tests: `tests/retry.rs`.
 
 **Vars.** `{{name}}` is logic-free substitution into the body of `instructions.md` and each
 `instructions/*.md`; spaces inside the braces are ignored, `{{{{` writes a literal `{{` (so a

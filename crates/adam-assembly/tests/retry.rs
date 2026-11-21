@@ -120,11 +120,11 @@ fn busy(calls: &Arc<AtomicUsize>) -> ToolSet {
     )
 }
 
-#[tokio::test]
-async fn the_files_policy_is_the_one_the_run_retries_the_tool_under() {
+/// Runs `coder` with `retry_line` against the always-busy tool and returns the failure and the calls.
+async fn run_busy(retry_line: &str, model_calls: usize) -> (String, usize) {
     let calls = Arc::new(AtomicUsize::new(0));
     let model = Arc::new(MockModel::new());
-    for _ in 0..2 {
+    for _ in 0..model_calls {
         model.push_tool_calls(vec![ToolCall {
             id: "c1".into(),
             name: "busy".into(),
@@ -134,10 +134,7 @@ async fn the_files_policy_is_the_one_the_run_retries_the_tool_under() {
     }
     let assembly = def(&[(
         INSTRUCTIONS,
-        &instructions(
-            "name: coder\nretry: { busy: { attempts: 2, backoff: 10ms, max_backoff: 10ms, on: [rate-limited] } }",
-            "Hi.",
-        ),
+        &instructions(&format!("name: coder\n{retry_line}"), "Hi."),
     )])
     .bind(busy(&calls))
     .unwrap()
@@ -160,12 +157,32 @@ async fn the_files_policy_is_the_one_the_run_retries_the_tool_under() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
     worker.stop().await;
-    let error = view.error.unwrap();
+    (view.error.unwrap(), calls.load(SeqCst))
+}
+
+#[tokio::test]
+async fn the_files_policy_is_the_one_the_run_retries_the_tool_under() {
+    let (error, calls) = run_busy(
+        "retry: { busy: { attempts: 2, backoff: 10ms, max_backoff: 10ms, on: [rate-limited] } }",
+        2,
+    )
+    .await;
     assert!(
         error.contains("gave up after 2 attempts of `tool:busy`"),
         "the file's 2, not the tool's 9 nor the runtime's: {error}"
     );
-    assert_eq!(calls.load(SeqCst), 2);
+    assert_eq!(calls, 2);
+    // `on` is the file's too: a policy that retries only transient errors fails a rate limit at once.
+    let (error, calls) = run_busy(
+        "retry: { busy: { attempts: 5, backoff: 10ms, on: transient } }",
+        1,
+    )
+    .await;
+    assert!(
+        error.contains("the policy of `tool:busy` does not retry rate-limited"),
+        "{error}"
+    );
+    assert_eq!(calls, 1);
 }
 
 /// An MCP server's tool, connected before binding, can be given a policy by its name, and a
@@ -223,4 +240,98 @@ fn the_folders_class_names_are_the_runtimes() {
         (default.initial_backoff, default.max_backoff),
         "what a file leaves out is the runtime's default"
     );
+}
+
+/// A subagent's tool is one of the parent's tools, and can be given a policy by its name.
+#[test]
+fn retry_names_a_subagent_tool() {
+    let assembly = def(&[
+        (
+            INSTRUCTIONS,
+            &instructions(
+                "name: coder\nretry: { code-reviewer: { attempts: 2 } }",
+                "Hi.",
+            ),
+        ),
+        (
+            "agent/subagents/code-reviewer.md",
+            &instructions("description: Reviews.", "Review."),
+        ),
+    ])
+    .bind(tools(&[]))
+    .unwrap()
+    .model(Arc::new(MockModel::new()), "m")
+    .unwrap();
+    assert_eq!(assembly.info()[0].retry[0].0, "code-reviewer");
+}
+
+/// A declared MCP server that gave no tools (an optional one that is down) does not stop the
+/// agent from binding: its `retry` entry waits for it.
+#[test]
+fn a_retry_for_a_server_that_gave_no_tools_is_skipped() {
+    let files = [
+        (
+            INSTRUCTIONS,
+            instructions("name: coder\nretry: { search__web: { attempts: 3 } }", "Hi."),
+        ),
+        (
+            "agent/mcp.json",
+            r#"{"mcpServers": {"search": {"type": "http", "url": "https://search.example.com/mcp"}}}"#
+                .to_owned(),
+        ),
+    ];
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    let assembly = def(&files)
+        .mcp_tools("coder", ToolSet::new())
+        .bind(tools(&[]))
+        .unwrap()
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    assert!(assembly.info()[0].retry.is_empty());
+}
+
+/// A manifest built in code is checked at bind: an entry the loader would refuse is no policy.
+#[test]
+fn a_retry_built_in_code_is_checked_at_bind() {
+    for (def_, reason) in [
+        (adam_agent_fs::RetryDef::default(), "`attempts`"),
+        (
+            adam_agent_fs::RetryDef {
+                attempts: Some(2),
+                max_backoff: Some("10h".into()),
+                ..Default::default()
+            },
+            "over 1h",
+        ),
+        (
+            adam_agent_fs::RetryDef {
+                attempts: Some(2),
+                backoff: Some("1m".into()),
+                max_backoff: Some("1s".into()),
+                ..Default::default()
+            },
+            "shorter than `backoff`",
+        ),
+        (
+            adam_agent_fs::RetryDef {
+                attempts: Some(2),
+                on: Some(vec!["invalid".into()]),
+                ..Default::default()
+            },
+            "`invalid` is not a retryable class",
+        ),
+    ] {
+        let (_dir, mut agents) =
+            common::manifests(&[(INSTRUCTIONS, &instructions("name: coder", "Hi."))]);
+        let mut manifest = agents.remove(0);
+        manifest.frontmatter.retry.insert("web_search".into(), def_);
+        let error = adam_assembly::AgentDef::from_manifest(manifest)
+            .unwrap()
+            .bind(tools(&["web_search"]))
+            .unwrap_err();
+        let Error::InvalidRetry { reason: said, .. } = &error else {
+            panic!("{error}");
+        };
+        assert!(said.contains(reason), "{said}");
+    }
 }

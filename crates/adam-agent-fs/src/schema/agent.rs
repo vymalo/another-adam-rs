@@ -159,17 +159,28 @@ pub struct RetryDef {
     /// The tries in all, the first included: 1 to [`MAX_RETRY_ATTEMPTS`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempts: Option<u32>,
-    /// The delay after the first failure: `500ms`, `1s`, `30m`, `1h` ([`retry_duration`]).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The delay after the first failure: `500ms`, `1s`, `30m`, `1h` ([`retry_duration`]). A bare
+    /// number is kept as its text, so the loader says it lacks a unit.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "text_or_number"
+    )]
     pub backoff: Option<String>,
-    /// The bound of any delay, at most [`MAX_RETRY_BACKOFF`] and not under `backoff`.
-    #[serde(skip_serializing_if = "Option::is_none", alias = "maxBackoff")]
+    /// The bound of any delay, at most [`MAX_RETRY_BACKOFF`] and not under `backoff`. Absent, it is
+    /// 60 s, or `backoff` when that is longer (and then the delay does not grow).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "maxBackoff",
+        alias = "max-backoff",
+        deserialize_with = "text_or_number"
+    )]
     pub max_backoff: Option<String>,
     /// The growth factor per further failure, a positive number.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multiplier: Option<serde_json::Number>,
-    /// The classes it retries, of [`RETRY_CLASS_NAMES`]; absent: all of them.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The classes it retries, of [`RETRY_CLASS_NAMES`]: a list, or one name or a comma-separated
+    /// string, as `tools:` takes; absent: all of them.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "names")]
     pub on: Option<Vec<String>>,
     /// Keys this schema does not know.
     #[serde(flatten)]
@@ -204,6 +215,49 @@ impl RetryDef {
             .and_then(serde_json::Number::as_f64)
             .filter(|m| m.is_finite())
     }
+}
+
+/// A string, or a number kept as its text.
+fn text_or_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Text {
+        Text(String),
+        Number(serde_json::Number),
+    }
+    Ok(Option::<Text>::deserialize(d)?.map(|t| match t {
+        Text::Text(text) => text,
+        Text::Number(n) => n.to_string(),
+    }))
+}
+
+/// A list of names, or one string of names separated by commas.
+fn names<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Names {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(Option::<Names>::deserialize(d)?.map(|n| match n {
+        Names::One(text) => text
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Names::Many(list) => list,
+    }))
+}
+
+/// Whether `name` can name a tool in `retry:`: what a model is shown, `A-Z`, `a-z`, `0-9`, `_` and
+/// `-`, at most 64 characters. A registered tool's name, an MCP server's `<server>__<tool>` and a
+/// subagent's all are; binding checks it is one of the agent's.
+pub fn is_retry_tool_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// A retry delay: a whole number and one unit, `ms`, `s`, `m` or `h` (`500ms`, `1s`, `30m`,
@@ -476,6 +530,38 @@ mod tests {
             ..RetryDef::default()
         };
         assert_eq!((bad.initial_backoff(), bad.bound().is_some()), (None, true));
+    }
+
+    #[test]
+    fn a_retry_takes_the_forms_a_person_writes() {
+        let def: RetryDef = serde_json::from_value(serde_json::json!({
+            "attempts": 2, "on": "rate-limited, conflict", "backoff": 30, "max-backoff": "2m",
+            "multiplier": 2
+        }))
+        .unwrap();
+        assert_eq!(
+            def.on.as_deref(),
+            Some(&["rate-limited".to_owned(), "conflict".to_owned()][..])
+        );
+        assert_eq!(
+            def.backoff.as_deref(),
+            Some("30"),
+            "a bare number is kept, for the loader to refuse"
+        );
+        assert_eq!(def.max_backoff.as_deref(), Some("2m"));
+        assert_eq!(def.factor(), Some(2.0));
+        for name in [
+            "web_search",
+            "context7__resolve-library-id",
+            "notion__API-post-search",
+            "code-reviewer",
+            "9lives",
+        ] {
+            assert!(is_retry_tool_name(name), "{name}");
+        }
+        for name in ["", "a b", "a.b", "é", &"x".repeat(65)] {
+            assert!(!is_retry_tool_name(name), "{name:?}");
+        }
     }
 
     fn round_trip<T>(value: &T) -> T

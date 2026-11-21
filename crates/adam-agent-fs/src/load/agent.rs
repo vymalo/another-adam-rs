@@ -10,7 +10,7 @@ use crate::schema::{
     AgentFrontmatter, DEFAULT_RETRY_BACKOFF, MAX_MINUTES_LIMIT, MAX_OPEN_SESSIONS_LIMIT,
     MAX_PARALLEL_LIMIT, MAX_RETRY_ATTEMPTS, MAX_RETRY_BACKOFF, MAX_SESSION_ROUNDS_LIMIT,
     MAX_WORKING_SESSIONS_LIMIT, ModelRef, RETRY_CLASS_NAMES, ToolList, check_references,
-    is_agent_name, is_env_name, is_tool_name, retry_duration,
+    is_agent_name, is_env_name, is_retry_tool_name, is_tool_name, retry_duration,
 };
 
 /// The most characters GitHub Copilot accepts in an agent prompt. Verified 2026-09-29,
@@ -307,10 +307,14 @@ fn check_retry(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
     }
     for (tool, def) in &fm.retry {
         let at = |what: &str| format!("`retry.{tool}{what}`");
-        if !is_tool_name(tool) {
+        if !is_retry_tool_name(tool) {
             sink.error(
                 line,
-                format!("{} is not a tool name (`a-z`, `0-9`, `_`; `<server>__<tool>` for an MCP server's)", at("")),
+                format!(
+                    "{} is not a tool name (`A-Z`, `a-z`, `0-9`, `_`, `-`, at most 64 characters; \
+                     `<server>__<tool>` for an MCP server's)",
+                    at("")
+                ),
             );
         }
         match def.attempts {
@@ -356,7 +360,7 @@ fn check_retry(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
                 format!(
                     "{} is shorter than {}",
                     at(".max_backoff"),
-                    if backoff.is_some() {
+                    if def.backoff.is_some() {
                         "`backoff`"
                     } else {
                         "the default `backoff` (1s): give `backoff` too"
@@ -395,10 +399,14 @@ fn check_retry(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
                 );
             }
         }
+        // `retry` is adam's own key: a misspelt part would leave the policy weaker than written.
         for key in def.extra.keys() {
-            sink.warn(
+            sink.error(
                 line,
-                format!("unknown key {} is ignored", at(&format!(".{key}"))),
+                format!(
+                    "unknown key {}; expected one of: attempts, backoff, max_backoff, multiplier, on",
+                    at(&format!(".{key}"))
+                ),
             );
         }
     }

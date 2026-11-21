@@ -339,6 +339,15 @@ fn cases() -> Vec<Case> {
             "is shorter than `backoff`",
         ),
         (
+            "retry backoff as a bare number",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nretry: { search: { attempts: 3, backoff: 30 } }\n---\nHi.\n",
+            )],
+            Error,
+            "`retry.search.backoff` is a duration such as `500ms`, `1s`, `30m` or `1h`; it is `30`",
+        ),
+        (
             "retry max_backoff under the default backoff",
             vec![(
                 "agent/instructions.md",
@@ -378,10 +387,10 @@ fn cases() -> Vec<Case> {
             "retry of a name that is no tool name",
             vec![(
                 "agent/instructions.md",
-                "---\nname: root\nretry: { Search: { attempts: 3 } }\n---\nHi.\n",
+                "---\nname: root\nretry: { \"web.search\": { attempts: 3 } }\n---\nHi.\n",
             )],
             Error,
-            "`retry.Search` is not a tool name",
+            "`retry.web.search` is not a tool name",
         ),
         (
             "retry with an unknown key",
@@ -389,7 +398,7 @@ fn cases() -> Vec<Case> {
                 "agent/instructions.md",
                 "---\nname: root\nretry: { search: { attempts: 3, tries: 2 } }\n---\nHi.\n",
             )],
-            Warning,
+            Error,
             "unknown key `retry.search.tries`",
         ),
         with_root(
@@ -1088,12 +1097,16 @@ fn cases() -> Vec<Case> {
 fn a_retry_per_tool_is_read_with_no_diagnostic() {
     let dir = write(&[(
         "agent/instructions.md",
-        "---\nname: root\nretry:\n  web_search: { attempts: 5, backoff: 2s, max_backoff: 5m, on: [rate-limited, transient] }\n  github__create_issue: { attempts: 1 }\n---\nHi.\n",
+        "---\nname: root\nretry:\n  web_search: { attempts: 5, backoff: 2s, max_backoff: 5m, on: [rate-limited, transient] }\n  github__create_issue: { attempts: 1 }\n  context7__resolve-library-id: { attempts: 2, on: rate-limited }\n  code-reviewer: { attempts: 2 }\n---\nHi.\n",
     )]);
     let report = load(dir.path());
     assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     let retry = &report.package.agents[0].frontmatter.retry;
-    assert_eq!(retry.len(), 2);
+    assert_eq!(retry.len(), 4);
+    assert_eq!(
+        retry["context7__resolve-library-id"].on.as_deref(),
+        Some(&["rate-limited".to_owned()][..])
+    );
     let search = &retry["web_search"];
     assert_eq!(search.attempts, Some(5));
     assert_eq!(search.bound(), Some(std::time::Duration::from_secs(300)));

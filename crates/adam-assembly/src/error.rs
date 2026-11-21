@@ -234,8 +234,8 @@ pub enum Error {
         /// The agent's tools, in order.
         available: Vec<String>,
     },
-    /// A `retry:` entry the loader did not refuse but that is not a policy (a build that read the
-    /// folder leniently).
+    /// A `retry:` entry that is not a policy, in a manifest the loader did not check: one built in
+    /// code, or embedded by another version (the loader refuses such an entry in a file).
     #[error("{origin}: `retry.{tool}` is not a retry policy: {reason}")]
     InvalidRetry {
         /// The agent and file.

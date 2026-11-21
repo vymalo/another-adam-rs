@@ -581,7 +581,11 @@ impl AgentDef {
     /// * a `{{placeholder}}` that `vars` does not declare, a var that is declared and never
     ///   used, a var with no value, a value supplied for an undeclared var, or a `{{` that is
     ///   not a placeholder;
-    /// * a value supplied for an agent the definition does not contain.
+    /// * a value supplied for an agent the definition does not contain;
+    /// * a `retry:` name that is not one of the agent's tools once they are all bound
+    ///   ([`Error::UnknownRetryTool`], with a "did you mean"; a tool of a declared MCP server that
+    ///   gave no tools is skipped with a warning), or an entry that is no policy
+    ///   ([`Error::InvalidRetry`]).
     ///
     /// The root agent gets every registered tool when it has no `tools:`; a subagent gets none
     /// (decision D3 of `docs/reference/agent-files.md`), whatever its parent has. Each agent then gets a
@@ -1381,7 +1385,27 @@ fn retry_policies(
     tools: &[(String, DynTool)],
 ) -> Result<Vec<(String, adam_agent_fs::RetryDef, adam_runtime::RetryPolicy)>, Error> {
     let mut policies = Vec::new();
+    let declared: Vec<&String> = mcp::declared(manifest)
+        .map(|config| config.servers.keys().collect())
+        .unwrap_or_default();
     for (tool, def) in &manifest.frontmatter.retry {
+        // A tool of a declared server that gave no tools (an `optional` one that is down, an empty
+        // set given in code): the server is already warned about, and its policy waits for it.
+        if let Some((server, _)) = tool.split_once("__")
+            && declared.iter().any(|d| d.as_str() == server)
+            && !tools.iter().any(|(name, _)| {
+                name.strip_prefix(server)
+                    .is_some_and(|r| r.starts_with("__"))
+            })
+        {
+            tracing::warn!(
+                agent = %origin.agent,
+                tool = %tool,
+                server = %server,
+                "the MCP server of a `retry` entry gave no tools; the entry is not used"
+            );
+            continue;
+        }
         if !tools.iter().any(|(name, _)| name == tool) {
             let available: Vec<String> = tools.iter().map(|(name, _)| name.clone()).collect();
             return Err(Error::UnknownRetryTool {
@@ -1403,6 +1427,12 @@ fn retry_policies(
         let (Some(initial), Some(bound)) = (def.initial_backoff(), def.bound()) else {
             return Err(invalid("a backoff is not a duration"));
         };
+        if initial.max(bound) > adam_agent_fs::MAX_RETRY_BACKOFF {
+            return Err(invalid("a backoff is over 1h"));
+        }
+        if def.max_backoff.is_some() && bound < initial {
+            return Err(invalid("`max_backoff` is shorter than `backoff`"));
+        }
         let mut policy = adam_runtime::RetryPolicy::new(attempts).with_backoff(initial, bound);
         if def.multiplier.is_some() {
             let factor = def

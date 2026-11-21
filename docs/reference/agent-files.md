@@ -127,11 +127,14 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   one of the agent's tool names (its own, an MCP server's `<server>__<tool>`, a skill or subagent tool) to `attempts`
   (required, 1 to 20, the tries in all), `backoff` and `max_backoff` (`500ms`, `1s`, `30m`, `1h`; at most `1h`, and
   `max_backoff` not under `backoff`, whose default is `1s`), `multiplier` (a positive number) and `on` (the classes
-  retried: `transient`, `rate-limited`, `conflict`; default all three). What is left out is the runtime's default
-  policy (`1s`, `60s`, `2.0`). The tool's failures then count under `tool:<name>`, apart from the run's other steps,
+  retried, a list or one name: `transient`, `rate-limited`, `conflict`; default all three). What is left out is the
+  runtime's default policy (`1s`, `60s`, `2.0`); a `backoff` over `60s` with no `max_backoff` is its own bound, so
+  the delay does not grow. A name is what the model is shown (`A-Z`, `a-z`, `0-9`, `_`, `-`), and a key of an entry
+  that is none of these five is an error: a misspelt one would leave the policy weaker than written. The tool's failures then count under `tool:<name>`, apart from the run's other steps,
   and are retried under this policy, which wins over the tool's own (`#[tool(retry(...))]`) and the deployment's.
   The loader checks the shape and the bounds; `bind` checks each name against the agent's tools, the MCP servers'
-  included (they are connected before binding), and refuses an unknown one with a "did you mean". Ignored, with a
+  included (they are connected before binding), and refuses an unknown one with a "did you mean"; an entry for a
+  declared server that gave no tools (an `optional` one that is down) is skipped with a warning. Ignored, with a
   warning, on a remote subagent. A policy only applies to failures the tool reports as retryable: an MCP tool's
   call that fails is an error result for the model, so its `retry:` covers little more than a refused bearer.
 * **A subagent inherits nothing** from its parent (eve's isolation boundary), and omitting `tools:`
