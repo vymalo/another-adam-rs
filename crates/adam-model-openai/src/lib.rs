@@ -39,7 +39,7 @@
 //!   times out is a timeout, and a TLS handshake that fails is `Transient`.
 //! * **Refusals** ([ADR 0067](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
 //!   decision 3). For an answer of status 400 or above the client builds a
-//!   [`Refusal`](adam_model::Refusal) (the status, the slug of an `application/problem+json`
+//!   [`Refusal`] (the status, the slug of an `application/problem+json`
 //!   body's `type`, the `Retry-After`) and asks the provider whether it parks
 //!   ([`ModelCredentials::parks`](adam_model::ModelCredentials::parks)). The slug `model_locked`
 //!   is [`ModelLocked`](adam_model::ModelError::ModelLocked) for every provider. A park is
