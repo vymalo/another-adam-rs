@@ -23,12 +23,11 @@ read_file	1331	332
 read_files	1330	332
 read_output	934	233
 read_skill_file	868	217
-rebuild_environment	1071	267
 request_repository	1431	357
 reviewer	720	180
-run	1850	462
-run_checks	1766	441
-run_command	1650	412
+run	1833	458
+run_checks	1773	443
+run_command	1633	408
 search_files	1378	344
 share_file	1840	460
 show	1549	387
