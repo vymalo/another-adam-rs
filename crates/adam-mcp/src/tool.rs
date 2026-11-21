@@ -1272,9 +1272,11 @@ mod tests {
 
     #[tokio::test]
     async fn what_is_kept_is_as_scrubbed_as_what_is_shown() {
+        // Letters no hex digit has: the kept output's id (`o-<16 hex>`) can hold any four hex
+        // digits, so a hex needle is found in it now and then.
         let mut redactor = Redactor::default();
-        redactor.add("tok-6d2f-secret");
-        let text = format!("{}tok-6d2f-secret\n{}", rows(2000), rows(2000));
+        redactor.add("tok-zq9x-secret");
+        let text = format!("{}tok-zq9x-secret\n{}", rows(2000), rows(2000));
         let output = map_result(
             &CallToolResult::success(vec![ContentBlock::text(text)]),
             &redactor,
@@ -1283,8 +1285,8 @@ mod tests {
         let ctx = ctx().with_kept(adam_llm_agent::MAX_RUN_KEPT_BYTES, Arc::default());
         let output = keep_overflow(&ctx, output).await;
         let kept = output.kept.unwrap();
-        assert!(!kept.text.contains("6d2f") && kept.text.contains("[REDACTED]"));
-        assert!(!output.content.contains("6d2f"));
+        assert!(!kept.text.contains("zq9x") && kept.text.contains("[REDACTED]"));
+        assert!(!output.content.contains("zq9x"));
     }
 
     /// A secret of the keeper's only: 6,000 whole ones early make the keeper's scrubbed text shorter
