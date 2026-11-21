@@ -629,16 +629,16 @@ An error that names no policy counts under the key `runtime` (`RUNTIME_RETRY_KEY
   ms, and a factor JSON cannot hold is kept as one that backs off alike (infinity as `f64::MAX`, NaN or a
   negative one as `0`).
 
-* `Ctx::retries_left() -> Option<u32>` says how many more tries of the transition the runtime allows after
-  this one, should it fail with a transient error that names no policy (class `Transient`, no `with_retry`,
-  no `retry_after`: what a model call that could not reach its endpoint returns): `Some(0)` on the last
-  attempt, whose failure fails the run. The worker computes it as it decides on that failure
-  (`retry::retries_left`): the failures under `runtime`, its policy as recorded at their first, a class the
-  policy does not retry (then `0`), and the ceiling. `None` would be no limit, which no transition the
-  runtime steps has. An agent that would rather wait than fail reads it first ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+* `Ctx::retries_left() -> u32` says how many more tries of the transition the runtime allows after this
+  one, should it fail with a transient error of class `Transient` that names no policy (no `with_retry`:
+  what a model call that could not reach its endpoint returns): `0` on the last attempt, whose failure
+  fails the run. It is the worker's own decision read ahead: both call `retry::decide` (the failures
+  under `runtime`, its policy as recorded at their first, a class the policy does not retry, and the
+  ceiling). An agent that would rather wait than fail reads it first ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
   decision 3, the next slice: an unreachable gateway parks the run once its retries are spent).
 
-Tests: `retry.rs` (the classes by name, the builder, `retries_left_counts_down_to_the_last_attempt`,
+Tests: `retry.rs` (the classes by name, the builder, `the_verdict_says_why_a_failure_is_not_retried`,
+`retries_left_counts_down_to_the_last_attempt`,
 `retries_left_reads_the_recorded_policy_the_class_and_the_ceiling`), `envelope.rs` and `head.rs` (the record's stored
 form, a record that does not decode, a class name dropped, a v5 head that carries it through `of`,
 `decode`, `into_parts` and `carried`), `agent.rs` (`from_classified` keeps the class, `with_retry`), and

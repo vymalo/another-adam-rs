@@ -1868,12 +1868,12 @@ mod cases {
         );
         assert_eq!(
             *seen.lock().expect("lock"),
-            vec![Some(2), Some(1), Some(0)],
+            vec![2, 1, 0],
             "one try per value, and none after the 0"
         );
     }
 
-    /// An agent that reads `Some(0)` knows its failure would end the run, and can do something else
+    /// An agent that reads `0` knows its failure would end the run, and can do something else
     /// (as an agent parks on an unreachable model once its retries are spent): the run is not failed.
     pub async fn the_last_attempt_is_known_before_it_fails(store: DynStore) {
         let name = uniq("retries-last");
@@ -1886,7 +1886,7 @@ mod cases {
                     let left = ctx.retries_left();
                     seen.lock().expect("lock").push(left);
                     async move {
-                        if left == Some(0) {
+                        if left == 0 {
                             Ok(Transition::Done {
                                 state,
                                 output: json!("waited instead"),
@@ -1907,7 +1907,7 @@ mod cases {
         let done = wait_done(&rt, run).await;
         worker.stop().await;
         assert_eq!(done.output, Some(json!("waited instead")));
-        assert_eq!(*seen.lock().expect("lock"), vec![Some(1), Some(0)]);
+        assert_eq!(*seen.lock().expect("lock"), vec![1, 0]);
     }
 
     /// The runtime's own policy is recorded at a run's first failure too: a worker that steps the

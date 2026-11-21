@@ -357,28 +357,93 @@ impl RetryRecord {
     }
 }
 
+/// What the runtime does about a transition that failed transiently (ADR 0061): the one decision,
+/// which the worker acts on and [`Ctx::retries_left`](crate::Ctx::retries_left) reads ahead.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Decision {
+    /// The run's record with the failure counted.
+    pub(crate) record: RetryRecord,
+    /// Consecutive failed transitions, this one included.
+    pub(crate) attempt: u32,
+    /// The key's failures, this one included.
+    pub(crate) failures: u32,
+    /// The key's policy, as recorded at its first failure.
+    pub(crate) policy: RetryPolicy,
+    pub(crate) verdict: Verdict,
+}
+
+/// Whether a failed transition is tried again, and why not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// The key's policy does not retry the error's class.
+    NotRetried,
+    /// The key's attempts are spent.
+    AttemptsSpent,
+    /// The run reached [`MAX_CONSECUTIVE_FAILURES`].
+    Ceiling,
+    /// Tried again.
+    Retry,
+}
+
+impl Decision {
+    /// How many more tries follow this failure: `0` unless it is retried.
+    pub(crate) fn retries_left(&self) -> u32 {
+        match self.verdict {
+            Verdict::Retry => self
+                .policy
+                .max_attempts
+                .saturating_sub(self.failures)
+                .min(MAX_CONSECUTIVE_FAILURES.saturating_sub(self.attempt)),
+            Verdict::NotRetried | Verdict::AttemptsSpent | Verdict::Ceiling => 0,
+        }
+    }
+}
+
+/// Decide on a transient failure of class `class` under `key`, whose policy is `policy` unless the
+/// run recorded one at the key's first failure. `record` and `attempt` are the run's as the
+/// transition began; a run with no record (written before records, or one that does not decode)
+/// counts what it failed so far under the runtime's key, so a run already failing does not start
+/// over.
+pub(crate) fn decide(
+    record: Option<&RetryRecord>,
+    attempt: u32,
+    key: &str,
+    policy: &RetryPolicy,
+    class: ErrorClass,
+) -> Decision {
+    let mut record = record
+        .cloned()
+        .unwrap_or_else(|| RetryRecord::seeded(attempt));
+    let attempt = attempt.saturating_add(1);
+    let (failures, policy) = record.fail(key, policy);
+    let verdict = if !policy.retries(class) {
+        Verdict::NotRetried
+    } else if failures >= policy.max_attempts {
+        Verdict::AttemptsSpent
+    } else if attempt >= MAX_CONSECUTIVE_FAILURES {
+        Verdict::Ceiling
+    } else {
+        Verdict::Retry
+    };
+    Decision {
+        record,
+        attempt,
+        failures,
+        policy,
+        verdict,
+    }
+}
+
 /// How many more tries of a transition the runtime allows after the one that runs now, should it
-/// fail with an error of `class` that names no policy of its own (counted under
-/// [`RUNTIME_RETRY_KEY`], with the runtime's policy as recorded at the key's first failure, else
-/// `runtime`): what the worker decides when that failure comes. `0` when it would give up: the
-/// policy does not retry `class`, its attempts are spent, or the run reached
-/// [`MAX_CONSECUTIVE_FAILURES`]. `attempt` and `record` are the run's as the transition began.
+/// fail with an error of `class` that names no policy of its own: [`decide`] under
+/// [`RUNTIME_RETRY_KEY`] and the runtime's policy, read ahead.
 pub(crate) fn retries_left(
     attempt: u32,
     record: Option<&RetryRecord>,
     runtime: &RetryPolicy,
     class: ErrorClass,
 ) -> u32 {
-    let mut record = record
-        .cloned()
-        .unwrap_or_else(|| RetryRecord::seeded(attempt));
-    let (failures, policy) = record.fail(RUNTIME_RETRY_KEY, runtime);
-    if !policy.retries(class) {
-        return 0;
-    }
-    let by_policy = policy.max_attempts.saturating_sub(failures);
-    let by_ceiling = MAX_CONSECUTIVE_FAILURES.saturating_sub(attempt.saturating_add(1));
-    by_policy.min(by_ceiling)
+    decide(record, attempt, RUNTIME_RETRY_KEY, runtime, class).retries_left()
 }
 
 #[cfg(test)]
@@ -406,6 +471,39 @@ mod tests {
         );
         // A policy of one attempt never retries.
         assert_eq!(retries_left(0, None, &RetryPolicy::none(), transient), 0);
+    }
+
+    #[test]
+    fn the_verdict_says_why_a_failure_is_not_retried() {
+        let transient = ErrorClass::Transient;
+        let verdict = |attempt, record: Option<&RetryRecord>, policy: &RetryPolicy, class| {
+            decide(record, attempt, "k", policy, class).verdict
+        };
+        assert_eq!(
+            verdict(0, None, &RetryPolicy::new(2), transient),
+            Verdict::Retry
+        );
+        let mut record = RetryRecord::default();
+        record.fail("k", &RetryPolicy::new(2));
+        assert_eq!(
+            verdict(1, Some(&record), &RetryPolicy::new(2), transient),
+            Verdict::AttemptsSpent
+        );
+        let rate_only =
+            RetryPolicy::new(5).with_retry_on(RetryClasses::of([ErrorClass::RateLimited]));
+        assert_eq!(verdict(0, None, &rate_only, transient), Verdict::NotRetried);
+        assert_eq!(
+            verdict(
+                MAX_CONSECUTIVE_FAILURES - 1,
+                None,
+                &RetryPolicy::new(u32::MAX),
+                transient
+            ),
+            Verdict::Ceiling
+        );
+        let d = decide(None, 3, "k", &RetryPolicy::new(5), transient);
+        assert_eq!((d.attempt, d.failures), (4, 1), "a new key starts at one");
+        assert_eq!(d.record.failures.get("k"), Some(&1));
     }
 
     #[test]
