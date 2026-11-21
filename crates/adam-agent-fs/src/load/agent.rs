@@ -7,9 +7,10 @@ use crate::diagnostic::Sink;
 use crate::frontmatter::{Split, clean_body, key_line};
 use crate::manifest::RemoteAuth;
 use crate::schema::{
-    AgentFrontmatter, MAX_MINUTES_LIMIT, MAX_OPEN_SESSIONS_LIMIT, MAX_PARALLEL_LIMIT,
-    MAX_SESSION_ROUNDS_LIMIT, MAX_WORKING_SESSIONS_LIMIT, ModelRef, ToolList, check_references,
-    is_agent_name, is_env_name, is_tool_name,
+    AgentFrontmatter, DEFAULT_RETRY_BACKOFF, MAX_MINUTES_LIMIT, MAX_OPEN_SESSIONS_LIMIT,
+    MAX_PARALLEL_LIMIT, MAX_RETRY_ATTEMPTS, MAX_RETRY_BACKOFF, MAX_SESSION_ROUNDS_LIMIT,
+    MAX_WORKING_SESSIONS_LIMIT, ModelRef, RETRY_CLASS_NAMES, ToolList, check_references,
+    is_agent_name, is_env_name, is_retry_tool_name, is_tool_name, retry_duration,
 };
 
 /// The most characters GitHub Copilot accepts in an agent prompt. Verified 2026-09-29,
@@ -96,6 +97,7 @@ pub(crate) fn parse_agent_file(
     let name = resolve_name(sink, &split, &fm, kind, path_name)?;
     check_keys(sink, &split, &fm);
     check_values(sink, &split, &fm, kind);
+    check_retry(sink, &split, &fm);
 
     if kind != FileKind::Sub
         && fm
@@ -287,6 +289,127 @@ fn invalid_name_message(name: &str, using: &str) -> String {
         "`name: {name}` is not a valid agent name (`a-z`, `0-9`, `-`, `_`; at most 64 characters, \
          starting with a letter or digit){tail}"
     )
+}
+
+/// `retry:`, the retry policy per tool (ADR 0061, decision 6): the shape and the bounds. Whether a
+/// name is one of the agent's tools is for binding, which knows them.
+fn check_retry(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
+    if fm.retry.is_empty() {
+        return;
+    }
+    let line = key_line(split, "retry");
+    if fm.a2a.is_some() {
+        sink.warn(
+            line,
+            "`retry` is ignored on a remote subagent: its tools are the remote agent's",
+        );
+        return;
+    }
+    for (tool, def) in &fm.retry {
+        let at = |what: &str| format!("`retry.{tool}{what}`");
+        if !is_retry_tool_name(tool) {
+            sink.error(
+                line,
+                format!(
+                    "{} is not a tool name (`A-Z`, `a-z`, `0-9`, `_`, `-`, at most 64 characters; \
+                     `<server>__<tool>` for an MCP server's)",
+                    at("")
+                ),
+            );
+        }
+        match def.attempts {
+            None => sink.error(
+                line,
+                format!("{} needs `attempts`, the tries in all", at("")),
+            ),
+            Some(n) if !(1..=MAX_RETRY_ATTEMPTS).contains(&n) => sink.error(
+                line,
+                format!(
+                    "{} is from 1 to {MAX_RETRY_ATTEMPTS}; it is {n}",
+                    at(".attempts")
+                ),
+            ),
+            Some(_) => {}
+        }
+        let duration = |text: &Option<String>, what: &str, sink: &mut Sink<'_>| {
+            let text = text.as_deref()?;
+            let parsed = retry_duration(text);
+            if parsed.is_none() {
+                sink.error(
+                    line,
+                    format!(
+                        "{} is a duration such as `500ms`, `1s`, `30m` or `1h`; it is `{text}`",
+                        at(what)
+                    ),
+                );
+            }
+            parsed
+        };
+        let backoff = duration(&def.backoff, ".backoff", sink);
+        let bound = duration(&def.max_backoff, ".max_backoff", sink);
+        for (value, what) in [(backoff, ".backoff"), (bound, ".max_backoff")] {
+            if value.is_some_and(|d| d > MAX_RETRY_BACKOFF) {
+                sink.error(line, format!("{} is at most 1h", at(what)));
+            }
+        }
+        if let Some(bound) = bound
+            && bound < backoff.unwrap_or(DEFAULT_RETRY_BACKOFF)
+        {
+            sink.error(
+                line,
+                format!(
+                    "{} is shorter than {}",
+                    at(".max_backoff"),
+                    if def.backoff.is_some() {
+                        "`backoff`"
+                    } else {
+                        "the default `backoff` (1s): give `backoff` too"
+                    }
+                ),
+            );
+        }
+        if def.multiplier.is_some() && !def.factor().is_some_and(|m| m > 0.0) {
+            sink.error(
+                line,
+                format!("{} is a positive number, such as 2.0", at(".multiplier")),
+            );
+        }
+        if let Some(on) = &def.on {
+            if on.is_empty() {
+                sink.error(
+                    line,
+                    format!(
+                        "{} names at least one class: {}",
+                        at(".on"),
+                        RETRY_CLASS_NAMES.join(", ")
+                    ),
+                );
+            }
+            for class in on
+                .iter()
+                .filter(|c| !RETRY_CLASS_NAMES.contains(&c.as_str()))
+            {
+                sink.error(
+                    line,
+                    format!(
+                        "{} names `{class}`, which is not a retryable class; expected one of: {}",
+                        at(".on"),
+                        RETRY_CLASS_NAMES.join(", ")
+                    ),
+                );
+            }
+        }
+        // `retry` is adam's own key: a misspelt part would leave the policy weaker than written.
+        for key in def.extra.keys() {
+            sink.error(
+                line,
+                format!(
+                    "unknown key {}; expected one of: attempts, backoff, max_backoff, multiplier, on",
+                    at(&format!(".{key}"))
+                ),
+            );
+        }
+    }
 }
 
 /// Secrets and endpoints (error), Claude and Copilot keys adam ignores (warning), the rest

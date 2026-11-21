@@ -8633,8 +8633,9 @@ async fn a_park_again_writes_the_head_it_read_and_the_tombstone() {
     worker.stop().await;
 
     // The runtime's wake and a commit can race a concurrent claim, so a CAS retry can commit the
-    // same park-again twice: every attempt is the same document, and at least one landed.
-    let commits = recording.commits();
+    // same park-again twice: every attempt is the same document, and at least one landed. The
+    // parent, woken by the same clock, commits beside it: only the child's are read.
+    let commits = recording.commits_of(child);
     assert!(!commits.is_empty(), "the run was parked again");
     for again in &commits {
         assert_eq!(again.state, Value::Null, "the state is the tombstone");

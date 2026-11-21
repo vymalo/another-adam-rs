@@ -33,6 +33,8 @@ pub struct RecordingStore {
     written: Mutex<Vec<Written>>,
     /// Every `commit_run` update, successful or not: a CAS retry shows the same attempt twice.
     attempts: Mutex<Vec<RunUpdate>>,
+    /// The run of each successful commit, in the order of the `Committed` entries of `written`.
+    committed_runs: Mutex<Vec<RunId>>,
     /// When set, the next `commit_run` answers `Conflict` without writing (a forced CAS retry).
     conflict_next: AtomicBool,
     /// Whether the wrapper reports that it keeps blobs (the inner store still does).
@@ -47,6 +49,7 @@ impl RecordingStore {
             inner,
             written: Mutex::new(Vec::new()),
             attempts: Mutex::new(Vec::new()),
+            committed_runs: Mutex::new(Vec::new()),
             conflict_next: AtomicBool::new(false),
             keeps_blobs: true,
             keeps_bodies: true,
@@ -85,6 +88,22 @@ impl RecordingStore {
             .collect()
     }
 
+    /// The successful commits' updates of `run` alone, in order: another run of the runtime (a
+    /// parent woken by the same clock) commits beside it.
+    pub fn commits_of(&self, run: RunId) -> Vec<RunUpdate> {
+        let runs = self
+            .committed_runs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        self.commits()
+            .into_iter()
+            .zip(runs)
+            .filter(|(_, of)| *of == run)
+            .map(|(update, _)| update)
+            .collect()
+    }
+
     /// Every `state` written: a create's initial state and every successful commit's state.
     pub fn states(&self) -> Vec<Value> {
         self.written()
@@ -116,6 +135,10 @@ impl RecordingStore {
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
         self.attempts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.committed_runs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
@@ -173,7 +196,14 @@ impl Store for RecordingStore {
         }
         let recorded = update.clone();
         let record = self.inner.commit_run(id, expected_version, update).await?;
-        self.record(Written::Committed(recorded));
+        // One lock order for both, so the n-th `Committed` and the n-th run stay paired.
+        let mut written = self.written.lock().unwrap_or_else(PoisonError::into_inner);
+        written.push(Written::Committed(recorded));
+        self.committed_runs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(id);
+        drop(written);
         Ok(record)
     }
 
