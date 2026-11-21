@@ -30,6 +30,13 @@ reload keeps them), and the host that runs schedules reconciles every root of th
 `generation()` moves, retired roots included (their empty list cancels their schedulers); `adam-assembly` neither
 registers the scheduler nor reconciles, so it stays free of `adam-schedule`.
 
+*Amended* (2026-11-21, the engine): `adam-engine` runs a folder's schedules too (#269, #288). `start` registers the
+agent's scheduler and calls `reconcile` once, on the engine's own runtime, before the worker starts, and a failure ends
+`start` (`EngineError::Schedules`, with the reconcile's class: a retryable one is called again by the host, and the next
+`start` finishes the work half done). A firing is nobody's message, so it is no caller's run: `Engine::list`, `get`,
+`events` and `cancel` do not reach it, as an A2A caller of the binaries does not; it lives in the host's store. A host
+that must see or stop one is #289.
+
 ## Context
 
 An agent folder may hold `schedules/<name>.md`: frontmatter `cron:` and `timezone:`, the body a prompt

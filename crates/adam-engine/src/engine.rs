@@ -14,7 +14,7 @@ use adam_assembly::AgentDef;
 use adam_core::{DynSecretSource, DynStore, RunId};
 use adam_llm_agent::DEFAULT_MAX_PARALLEL;
 use adam_model::DynModel;
-use adam_runtime::{BroadcastSink, Runtime, RuntimeBuilder, RuntimeError};
+use adam_runtime::{BroadcastSink, RetryPolicy, Runtime, RuntimeBuilder, RuntimeError};
 use adam_ui::Ui;
 use tokio::sync::{RwLock, RwLockReadGuard, oneshot, watch};
 use tokio::task::AbortHandle;
@@ -36,7 +36,7 @@ const DEFAULT_EVENT_CAPACITY: usize = 256;
 const MAX_EVENT_CAPACITY: usize = 1 << 16;
 
 /// What the engine runs within. Set the fields on [`Limits::default`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct Limits {
     /// Runs stepped at the same time (the runtime's `concurrency`). Default 4, at least 1.
@@ -76,6 +76,12 @@ pub struct Limits {
     /// a host that restarts in the same process calls `shutdown` first, which lets the steps in
     /// flight finish.
     pub worker_id: Option<String>,
+    /// The runtime's retry policy: what a transient failure that names no policy of its own (a
+    /// model provider's outage, a tool with none) is retried under ([ADR
+    /// 0061](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0061-a-step-names-its-retry-policy.md)).
+    /// A folder's `retry:` and a tool's own policy win over it for their tools. Default
+    /// [`RetryPolicy::default`]: 5 attempts, 1 s to 60 s.
+    pub retry: RetryPolicy,
 }
 
 impl Default for Limits {
@@ -86,6 +92,7 @@ impl Default for Limits {
             lease_ttl: Duration::from_secs(30),
             event_capacity: DEFAULT_EVENT_CAPACITY,
             worker_id: None,
+            retry: RetryPolicy::default(),
         }
     }
 }
@@ -127,8 +134,9 @@ impl EngineBuilder {
     }
 
     /// Migrate the store, release the leases a fixed [`Limits::worker_id`] holds in it (a restarted
-    /// engine claims its old runs at once), build the agent and start the worker on the current
-    /// tokio runtime.
+    /// engine claims its old runs at once), build the agent, register its scheduler and make the
+    /// store's scheduler runs match the folder's `schedules/` (ADR 0060), and start the worker on
+    /// the current tokio runtime.
     ///
     /// The agent gets the screen's tools of an embedded agent (`ask_user`, `show`, `ui_catalog`,
     /// `plan_*`, from `adam_ui::Ui::embedded`) and nothing on the network: a file that names an
@@ -146,7 +154,9 @@ impl EngineBuilder {
     /// * [`EngineError::Store`] when the store's migration or the release of the worker's leases
     ///   fails, with the store's class;
     /// * [`EngineError::Agent`] when the agent does not bind (an unknown tool, an MCP server, a
-    ///   remote subagent, a secret refused) or the model alias is refused.
+    ///   remote subagent, a secret refused) or the model alias is refused;
+    /// * [`EngineError::Schedules`] when the scheduler runs cannot be made to match the folder, with
+    ///   the reconcile's class: on a retryable one, call `start` again (what was done is kept).
     pub async fn start(self) -> Result<Engine, EngineError> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| EngineError::NoRuntime)?;
         let Self {
@@ -175,6 +185,7 @@ impl EngineBuilder {
         }
         refuse_what_is_not_embedded(agent.manifest(), agent.name())?;
         let name = agent.name().to_owned();
+        let schedules = agent.manifest().schedules.clone();
         let ui = Ui::embedded();
         let assembly = agent
             .secrets(secrets)
@@ -201,8 +212,19 @@ impl EngineBuilder {
             None => None,
         };
 
-        let (runtime, events) =
-            runtime_with_ring(assembly.register(Runtime::builder(store)), &limits);
+        // The folder's schedules are stepped beside the agent by its scheduler (ADR 0060), as the
+        // binaries do; it is registered whatever the folder holds, so a scheduler run a folder
+        // dropped is still stepped to its cancel.
+        let scheduler = adam_schedule::SchedulerAgent::new(&name);
+        let (runtime, events) = runtime_with_ring(
+            assembly.register(Runtime::builder(store)).agent(scheduler),
+            &limits,
+        );
+        // Make the store's scheduler runs match the folder before the worker starts: a schedule
+        // added is started, one changed is replaced, one dropped is cancelled.
+        adam_schedule::reconcile(&runtime, &name, &schedules)
+            .await
+            .map_err(EngineError::Schedules)?;
         // The backend is given the same ring, for the A2A path that streams a task
         // (`TaskBackend::subscribe`), whose file parts are built from a live event's bytes. The engine
         // never calls that path: an artifact in this ring has its bytes withheld, so a caller that
@@ -262,7 +284,8 @@ pub(crate) fn runtime_with_ring(
     let builder = builder
         .event_sink(EngineSink(events.clone()))
         .concurrency(limits.concurrency)
-        .lease_ttl(limits.lease_ttl);
+        .lease_ttl(limits.lease_ttl)
+        .retry(limits.retry);
     // `None` keeps the runtime's default, a random id.
     let builder = match &limits.worker_id {
         Some(id) => builder.worker_id(id.clone()),
