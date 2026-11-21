@@ -46,7 +46,11 @@ mod expand;
 /// `type = Ident` (the generated struct, default the function's name in
 /// `UpperCamelCase`), `strict` (unknown argument fields are an error),
 /// `classify` (the error is `adam_error::Classify`: retryable errors become
-/// `ToolError::Transient`, others `Permanent`), `asks_user` (the tool can end a call with
+/// `ToolError::Transient`, or `ToolError::Retryable` with the class for a rate limit or a conflict,
+/// others `Permanent`), `retry(attempts = 3, backoff = "1s", max_backoff = "30s",
+/// multiplier = 2.0, on = ["rate-limited"])` (the tool's retry policy, `Tool::retry_policy`:
+/// `attempts` is required, durations are `500ms`, `1s`, `30m` or `1h`, `on` lists `transient`,
+/// `rate-limited` and `conflict`, and what is left out is `RetryPolicy`'s default), `asks_user` (the tool can end a call with
 /// `ToolError::NeedsInput`: `Tool::asks_user` says `true`, and a subagent may not have it) and
 /// `step = "subagent"`, `label = "Helper"` and `icon = "agent"` (how a call is drawn as a step,
 /// `Tool::step_style`: the kind, a label instead of the tool's name, and an icon; each from the closed

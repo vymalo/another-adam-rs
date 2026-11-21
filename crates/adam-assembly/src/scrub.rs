@@ -247,6 +247,37 @@ mod tests {
         }
     }
 
+    /// A tool with a retry policy of its own, which the scrub must forward.
+    struct Patient;
+
+    #[async_trait]
+    impl Tool for Patient {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "patient".into(),
+                description: String::new(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        fn retry_policy(&self) -> Option<adam_runtime::RetryPolicy> {
+            Some(adam_runtime::RetryPolicy::new(7))
+        }
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("x"))
+        }
+    }
+
+    #[test]
+    fn the_retry_policy_is_the_wrapped_tools() {
+        let plain =
+            |tool: Arc<dyn Tool>| Scrubbed::new(tool, Arc::new(|t: &str| t.to_owned()), None);
+        assert_eq!(
+            plain(Arc::new(Patient)).retry_policy(),
+            Some(adam_runtime::RetryPolicy::new(7))
+        );
+        assert_eq!(plain(Arc::new(Reader)).retry_policy(), None);
+    }
+
     #[test]
     fn what_a_call_shares_is_what_the_wrapped_tool_says() {
         let wrapped = Scrubbed::new(
@@ -357,6 +388,14 @@ mod tests {
         assert_eq!(
             scrub.error(ToolError::Permanent("leaked s3cr3t".into())),
             ToolError::Permanent("leaked [redacted]".into())
+        );
+        // A rate limit is scrubbed and keeps its class (ADR 0061).
+        assert_eq!(
+            scrub.error(ToolError::retryable(
+                "limited s3cr3t",
+                adam_error::ErrorClass::RateLimited
+            )),
+            ToolError::retryable("limited [redacted]", adam_error::ErrorClass::RateLimited)
         );
         let wait = ToolError::AwaitSession {
             session: adam_core::RunId::new(),

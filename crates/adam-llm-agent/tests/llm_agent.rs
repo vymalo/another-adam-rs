@@ -955,6 +955,71 @@ async fn a_tools_policy_decides_its_retries_and_one_set_by_name_wins() {
     }
 }
 
+/// Beside another call of its turn, a tool's failure is still counted under its own key and policy.
+#[tokio::test]
+async fn a_tools_policy_holds_beside_other_calls() {
+    let h = Harness::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = h
+        .agent()
+        .tool(Patient(rate_limited(&calls), quick(2)))
+        .tool(fn_tool("fine", |_ctx, _| Ok(ToolOutput::text("ok"))))
+        .build();
+    for _ in 0..2 {
+        h.mock.push_tool_calls(vec![
+            call("c1", "fine", json!({})),
+            call("c2", "busy", json!({})),
+        ]);
+    }
+    let rt = h.runtime_with(&agent, "w", |b| b.retry(quick(9)));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+    let error = view.error.expect("error");
+    assert!(
+        error.contains("gave up after 2 attempts of `tool:busy`"),
+        "{error}"
+    );
+    assert_eq!(calls.load(SeqCst), 2);
+}
+
+/// A closure tool's policy (`FnTool::with_retry_policy`) governs a plain transient failure too.
+#[tokio::test]
+async fn a_closure_tools_policy_governs_a_transient_failure() {
+    let h = Harness::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool = adam_llm_agent::FnTool::raw("flaky", "Fails.", json!({"type": "object"}), {
+        let calls = calls.clone();
+        move |_ctx, _args| {
+            calls.fetch_add(1, SeqCst);
+            async { Err::<String, _>(ToolError::Transient("timeout".into())) }
+        }
+    })
+    .with_retry_policy(quick(3));
+    let agent = h.agent().tool(tool).build();
+    for _ in 0..3 {
+        h.mock.push_tool_calls(vec![call("c1", "flaky", json!({}))]);
+    }
+    let rt = h.runtime_with(&agent, "w", |b| b.retry(quick(9)));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+    let error = view.error.expect("error");
+    assert!(
+        error.contains("gave up after 3 attempts of `tool:flaky`") && error.contains("timeout"),
+        "{error}"
+    );
+    assert_eq!(calls.load(SeqCst), 3);
+}
+
 /// A tool's failure keeps its class: a policy that retries only transient errors does not retry a
 /// rate limit.
 #[tokio::test]

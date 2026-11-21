@@ -200,7 +200,8 @@ pub trait Tool: Send + Sync + 'static {
     /// [`AwaitRemote`](ToolError::AwaitRemote) fires, with the `task` the tool returned. The tool
     /// looks (a `GetTask` to an A2A agent) and answers [`RemotePoll::Ready`] with the tool result,
     /// or [`RemotePoll::Working`] to be asked again after the next interval. An `Err` is handled
-    /// as for [`call`](Self::call): [`Transient`](ToolError::Transient) retries the step,
+    /// as for [`call`](Self::call): [`Transient`](ToolError::Transient) or
+    /// [`Retryable`](ToolError::Retryable) retries the step, under the tool's policy,
     /// [`Permanent`](ToolError::Permanent) becomes an error result for the model, and the waiting
     /// variants are refused as an error result.
     ///
@@ -703,7 +704,8 @@ impl ToolOutput {
 /// old journals stay replayable. That is why it carries no `source`: a tool flattens its own
 /// cause into the message (with [`adam_error::report`]) before returning it.
 ///
-/// Classes: `Transient` is [`ErrorClass::Transient`], `Permanent` is [`ErrorClass::Invalid`]
+/// Classes: `Transient` is [`ErrorClass::Transient`], `Retryable` is its own class (`RateLimited` or
+/// `Conflict`), `Permanent` is [`ErrorClass::Invalid`]
 /// (the model asked for something that cannot work, and is told so), and `NeedsInput`, `AwaitRun`
 /// and `AwaitRemote` are [`ErrorClass::Rejected`] (valid, but they need the user, a child run, or a
 /// remote task, first).
@@ -838,7 +840,8 @@ impl ToolError {
     pub fn retry_parts(&self) -> Option<(&str, ErrorClass)> {
         match self {
             Self::Transient(message) => Some((message, ErrorClass::Transient)),
-            Self::Retryable { message, class } => Some((message, *class)),
+            // Only a retryable class: one built by hand with another is not worth retrying.
+            Self::Retryable { message, class } if class.is_retryable() => Some((message, *class)),
             _ => None,
         }
     }
@@ -1929,5 +1932,10 @@ mod tests {
             ToolError::Permanent("p".into())
         );
         assert_eq!(ToolError::Permanent("p".into()).retry_parts(), None);
+        let by_hand = ToolError::Retryable {
+            message: "bad".into(),
+            class: ErrorClass::Invalid,
+        };
+        assert_eq!(by_hand.retry_parts(), None, "a class that is not retryable");
     }
 }

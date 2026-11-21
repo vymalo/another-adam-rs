@@ -150,6 +150,8 @@ flowchart LR
     PushStoreError -->|Internal| Internal
 
     ToolError -->|Transient| Transient
+    ToolError -->|"Retryable, a rate limit"| RateLimited
+    ToolError -->|"Retryable, a conflict"| Conflict
     ToolError -->|Permanent| Invalid
     ToolError -->|NeedsInput| Rejected
 

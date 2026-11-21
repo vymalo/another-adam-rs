@@ -68,6 +68,9 @@ struct RetryOpts {
 
 const RETRY_OPTIONS: &str = "attempts, backoff, max_backoff, multiplier, on";
 
+/// `RetryPolicy::default()`'s first delay, in milliseconds: what a `retry` without `backoff` has.
+const DEFAULT_BACKOFF_MS: u64 = 1_000;
+
 /// The retryable classes a policy may name (`adam_runtime::RetryClasses`), with their
 /// `adam_error::ErrorClass` variants. The `adam` crate's tests check them against the runtime's.
 const RETRY_CLASSES: &[(&str, &str)] = &[
@@ -507,10 +510,18 @@ fn analyse_retry(opts: &RetryOpts, errors: &mut Errors) -> Option<RetryDecl> {
         };
     let backoff_ms = duration(&opts.backoff, "backoff");
     let max_backoff_ms = duration(&opts.max_backoff, "max_backoff");
-    if let (Some(b), Some(m), Some(lit)) = (backoff_ms, max_backoff_ms, &opts.max_backoff)
-        && m < b
+    // Without a `backoff`, the first delay is `RetryPolicy`'s default (1 s).
+    if let (Some(m), Some(lit)) = (max_backoff_ms, &opts.max_backoff)
+        && m < backoff_ms.unwrap_or(DEFAULT_BACKOFF_MS)
     {
-        errors.push(lit.span(), "`max_backoff` is shorter than `backoff`");
+        errors.push(
+            lit.span(),
+            if backoff_ms.is_some() {
+                "`max_backoff` is shorter than `backoff`"
+            } else {
+                "`max_backoff` is shorter than the default `backoff` (1s): give `backoff` too"
+            },
+        );
     }
     let multiplier = opts.multiplier.as_ref().and_then(|lit| {
         let value = match lit {
@@ -1724,6 +1735,11 @@ mod tests {
             item.clone(),
         );
         assert!(e.contains("shorter than `backoff`"), "{e}");
+        let e = err(
+            quote!(retry(attempts = 2, max_backoff = "500ms")),
+            item.clone(),
+        );
+        assert!(e.contains("shorter than the default `backoff`"), "{e}");
         let e = err(quote!(retry(attempts = 2, multiplier = 0.0)), item.clone());
         assert!(e.contains("positive number"), "{e}");
         let e = err(quote!(retry(attempts = 2, on = ["invalid"])), item.clone());
