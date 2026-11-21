@@ -1,6 +1,7 @@
 # 0064. Model profiles: the output cap, the extra body and presets follow the model
 
-Status: **Proposed** (2026-11-21), on the owner's words of 2026-11-21 and the coordinator's ruling of the same day.
+Status: **Accepted** (2026-11-21), on the owner's words of 2026-11-21, the coordinator's ruling of the same day, and the
+owner's answers to its two questions (below).
 
 The owner's words, which are the requirements:
 
@@ -284,10 +285,8 @@ Follow-ups in the other repositories, theirs to decide: the system maps its endp
 renders them for its agents; the platform's `ModelEndpoint` and `AgentConfig` gain profiles and its operator renders the
 file.
 
-## Open questions
+## Settled by the owner (2026-11-21)
 
-1. **The default cap.** 128,000, the median, or 65,536, the lowest current flagship cap, which no listed model refuses
-   but which a reasoning model can fill? *Recommendation*: 128,000, with a profile for each model below it.
-2. **Does a preset carry the cap?** Presets are 0063's effort bundle and this ADR adds `maxOutputTokens` to them. Keep
-   the effort alone in a preset and the cap on the profile only? *Recommendation*: both in a preset, so `thorough` is one
-   name for a task.
+1. **The default cap is 128,000.** A model whose own limit is lower has a profile with its `maxOutputTokensLimit`.
+2. **A preset carries the cap as well as the effort.** `maxOutputTokens` in a preset is still clamped to the model's
+   `maxOutputTokensLimit` and to the window.
