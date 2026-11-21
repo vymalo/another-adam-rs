@@ -173,7 +173,11 @@ Every call asks the client's `ModelCredentials` for its headers ([ADR 0058](../.
 `OpenAiConfig` by default, or the provider given with `with_credentials`, so a host can mint or renew a token at the moment
 of use, prove it over the request, or send a run's tag with no key.
 
-* The provider is told the method (`POST`), the full URL and the attempt. Its headers are sent as sensitive values and
+* The provider is told the method (`POST`), the full URL, the attempt and the request's `run` (`ModelRequest::run`), on the
+  first try and on the retry after a 401, for a completion and a stream alike. With `adam_model::InjectedRun` the call
+  carries `X-Run-Id` and no `Authorization`: the key of the `OpenAiConfig` is replaced, and a call with no run sends nothing.
+  `extra_headers` are still sent as configured, so a host that uses the injector sets no `authorization` there
+  (`adam-service` has no variable for them). Its headers are sent as sensitive values and
   replace any of the same name; `content-type`, `content-length`, `accept`, `host` and `transfer-encoding` are refused, as is
   a value that is no valid header, with `InvalidRequest` (the value is never in the error) and nothing sent.
 * A provider's error is the call's, before anything is sent: its class decides whether the runtime retries.
@@ -198,6 +202,9 @@ No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
 * `tests/credentials.rs`: the provider against a `wiremock` server: asked for every call, a 401 renewed once with the same
   body, a second 401 as the answer, the configured key never retried, a stream renewed, a proof told the method and URL, a
   provider with no key, a provider's error sent nowhere (its class kept), and the framing headers refused. Always runs.
+* `tests/injector.rs`: `InjectedRun` against a `wiremock` server: every completion and stream carries `X-Run-Id` and no
+  `Authorization` (a key in the configuration is never sent), the run is in no body, the retry after a 401 names the run
+  too, and a call with no run sends no request. Always runs.
 * `tests/wiremock_compose.rs`: the client against the `mock-openai` WireMock of `compose.yaml` (text and tool-call answers,
   streamed or not, the error scenarios), and **every scripted model** (`mock-coder`, `mock-assistant`, `mock-researcher`, `mock-painter`)
   played from its first request to its final answer both as a completion and as a stream, which must say the same, with the

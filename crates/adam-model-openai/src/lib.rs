@@ -442,8 +442,13 @@ impl OpenAiCompatible {
         self
     }
 
-    /// Send the request and return the response if it is a success.
-    async fn send(&self, body: Vec<u8>, streaming: bool) -> Result<reqwest::Response, ModelError> {
+    /// Send the request of the run `run` and return the response if it is a success.
+    async fn send(
+        &self,
+        body: Vec<u8>,
+        streaming: bool,
+        run: Option<&str>,
+    ) -> Result<reqwest::Response, ModelError> {
         let body = Bytes::from(body);
         let mut attempt = 0;
         let response = loop {
@@ -451,6 +456,7 @@ impl OpenAiCompatible {
                 method: "POST",
                 url: &self.url,
                 attempt,
+                run,
             };
             let credentials = self.credentials.headers(call).await?;
             let mut request = self
@@ -625,7 +631,7 @@ impl ModelClient for OpenAiCompatible {
     #[tracing::instrument(name = "model.complete", skip_all, fields(model = %req.model, url = %self.url))]
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
         let body = wire::build_request(&req, false, self.options())?;
-        let response = self.send(body, false).await?;
+        let response = self.send(body, false, req.run.as_deref()).await?;
         let bytes = read_body(response).await?;
         let parsed = wire::parse_completion(&bytes).map(|r| self.echoed(r));
         match &parsed {
@@ -646,7 +652,7 @@ impl ModelClient for OpenAiCompatible {
         req: ModelRequest,
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
         let body = wire::build_request(&req, true, self.options())?;
-        let response = self.send(body, true).await?;
+        let response = self.send(body, true, req.run.as_deref()).await?;
         let this = self.clone();
         Ok(sse::deltas(response.bytes_stream(), self.timeout)
             .map(move |item| {

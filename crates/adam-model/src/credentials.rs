@@ -26,6 +26,11 @@ pub struct CredentialRequest<'a> {
     pub url: &'a str,
     /// `0` for the first try, `1` for the one retry after [`AfterRejection::Retry`].
     pub attempt: u32,
+    /// The root run the call belongs to ([`ModelRequest::run`](crate::ModelRequest::run)), when the
+    /// caller named one: what [`InjectedRun`] sends ([ADR 0067]).
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    pub run: Option<&'a str>,
 }
 
 /// Why the endpoint refused a call: what a provider needs to decide whether a new credential would help.
@@ -168,6 +173,43 @@ impl ModelCredentials for StaticBearer {
     }
 }
 
+/// The name of the header [`InjectedRun`] sends.
+pub const RUN_HEADER: &str = "X-Run-Id";
+
+/// No key, the run's id instead: what `MODEL_AUTH=injector` gives ([ADR 0067]). Every call carries
+/// exactly one header, `X-Run-Id: <root run id>`, and no `Authorization`; an injector in front of
+/// the model finds the credential the run was leased and adds it upstream. The run id is an opaque
+/// capability, not a secret.
+///
+/// A call that names no run is refused with [`ModelError::InvalidRequest`] before anything is sent:
+/// there is no fallback to a key.
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InjectedRun;
+
+impl InjectedRun {
+    /// The provider.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl ModelCredentials for InjectedRun {
+    async fn headers(&self, call: CredentialRequest<'_>) -> Result<CredentialHeaders, ModelError> {
+        match call.run {
+            Some(run) if !run.is_empty() => {
+                Ok(CredentialHeaders::none().with(RUN_HEADER, SecretString::from(run.to_owned())))
+            }
+            _ => Err(ModelError::invalid_request(
+                "a model call through the injector names no run",
+            )),
+        }
+    }
+}
+
 /// A test double that mints `token-1`, `token-2`, ... and renews on a rejection: every call to
 /// [`headers`](ModelCredentials::headers) answers the current token, every [`rejected`](ModelCredentials::rejected)
 /// moves to the next one and asks for the retry. It records what it was asked, for the tests of a
@@ -237,7 +279,69 @@ mod tests {
             method: "POST",
             url: "https://models.example.test/v1/chat/completions",
             attempt: 0,
+            run: None,
         }
+    }
+
+    fn header_pairs(headers: &CredentialHeaders) -> Vec<(String, String)> {
+        headers
+            .iter()
+            .map(|(n, v)| (n.to_owned(), v.expose_secret().to_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_injector_names_the_run_and_sends_no_key() {
+        for attempt in [0, 1] {
+            let headers = InjectedRun::new()
+                .headers(CredentialRequest {
+                    run: Some("run-root-1"),
+                    attempt,
+                    ..call()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                header_pairs(&headers),
+                vec![("X-Run-Id".to_owned(), "run-root-1".to_owned())],
+                "exactly one header, and no authorization"
+            );
+        }
+        assert_eq!(RUN_HEADER, "X-Run-Id");
+    }
+
+    #[tokio::test]
+    async fn the_injector_refuses_a_call_that_names_no_run() {
+        for run in [None, Some("")] {
+            let err = InjectedRun::new()
+                .headers(CredentialRequest { run, ..call() })
+                .await
+                .expect_err("no run, nothing sent");
+            assert!(matches!(err, ModelError::InvalidRequest { .. }), "{err:?}");
+            assert!(
+                err.to_string()
+                    .contains("a model call through the injector names no run"),
+                "{err}"
+            );
+            assert!(!adam_error::Classify::is_retryable(&err));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_injector_gives_up_after_a_rejection() {
+        let after = InjectedRun::new()
+            .rejected(
+                CredentialRequest {
+                    run: Some("run-root-1"),
+                    ..call()
+                },
+                &Rejection {
+                    status: 401,
+                    ..Rejection::default()
+                },
+            )
+            .await;
+        assert_eq!(after, AfterRejection::GiveUp);
     }
 
     #[tokio::test]
