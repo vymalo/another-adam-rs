@@ -581,15 +581,12 @@ fn unchanged_failure_text(record: &CheckRecord, command: &str, failures: u32, ma
 // * A failed run costs one check cycle. After `max_check_cycles` failures the
 //   tool no longer runs anything and tells the model to stop and report.
 
-/// Run one of the project's own checks in your worktree (the commands its CI, README or
-/// Makefile run: `cargo test`, `pnpm test`, `just ci`), in the workspace's environment (the
-/// repository's own devcontainer when it has one), and get its exit code and the tail of
-/// its output. With several repositories in the workspace, say which with `repo`. Only exit code 0 counts as passing. Every failed run uses up one of your limited
-/// check cycles and is reported as a check: never use it to look around (use run_command) or to make a file or change the worktree (use run). A
-/// failed check asked again on exactly the same unchanged code is answered from the earlier run
-/// (no cycle, no new `checks` artifact, still a failure). A
-/// command the shell cannot find means the workspace lacks that tool: that is reported, costs no
-/// cycle, and is for the person to decide.
+/// Run one of the project's own checks (what its CI, README or Makefile run: `cargo test`, `pnpm
+/// test`, `just ci`) in your worktree, in the workspace's environment; returns the exit code and
+/// the tail of the output. Only exit code 0 passes. A failed run uses up one of your limited check
+/// cycles and is reported as a check: never use it to look around (run_command) or to change files
+/// (run). The same failed check on unchanged code is answered from the earlier run (no cycle). A
+/// command the shell cannot find means a missing tool: reported, no cycle, the person decides.
 #[tool(label = "Run the checks", icon = "execute", parallel = "exclusive")]
 pub async fn run_checks(
     env: State<ToolEnv>,

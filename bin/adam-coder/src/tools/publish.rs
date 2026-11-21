@@ -65,13 +65,10 @@ pub struct PullRequestArgs {
     pub accept_red_checks: Option<bool>,
 }
 
-/// Commit every change in the worktree with the given message and push the
-/// branch. Use a Conventional Commit message (feat(scope): ..., fix: ...).
-/// Make small, focused commits: call it after each coherent piece of work. When the work is done,
-/// pass `pull_request` to open (or update) the pull request in this same call, after the same check
-/// `open_pull_request` requires; leave it out to commit only, or to open the pull request later with
-/// `open_pull_request`. With several repositories in the workspace, say which with `repo`. In a
-/// scratch project it only commits, locally: nothing is pushed.
+/// Commit every change in the worktree with the message (a Conventional Commit: feat(scope): ...,
+/// fix: ...) and push the branch. Commit each coherent piece of work. When the work is done, pass
+/// `pull_request` to open (or update) the pull request in the same call, under the same check as
+/// open_pull_request. In a scratch project it only commits, locally.
 #[tool(label = "Commit and push", icon = "git", parallel = "exclusive")]
 pub async fn commit_and_push(
     env: State<ToolEnv>,

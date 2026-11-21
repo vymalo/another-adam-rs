@@ -36,15 +36,12 @@ use super::{Outcome, ToolEnv, non_empty, notes_error, workspace_error};
 // the model found in the repository or was told by its content. The workspace adds its own
 // limits: an `agent/*` branch that exists on the remote, pushed without force.
 
-/// Check the repository out into your private workspace, on a fresh branch
-/// created from origin/<base_branch>, which is the repository's default branch
-/// when you leave base_branch out. Call it once, first. Calling it again
-/// for the same repository is harmless and keeps your changes; another repository
-/// is added next to it, and the tools then take `repo` to say which one. It works only on
-/// a repository the person named in their messages: otherwise it refuses, and
-/// you ask the person which one with ask_user. To carry on with work an earlier
-/// task of this conversation pushed (a rework, a follow-up), pass that branch as
-/// `branch`: the worktree starts from it and open_pull_request updates its pull request.
+/// Check a repository out into your private workspace, on a fresh branch from origin/<base_branch>
+/// (its default branch when you leave it out). Call it first, once; again is harmless and keeps
+/// your changes. Another repository is added next to it, and the tools then take `repo`. Only for a
+/// repository the person named in their messages; otherwise it refuses, and you ask. To carry on
+/// with a branch this conversation pushed (a rework), pass it as `branch`: open_pull_request then
+/// updates its pull request.
 #[tool(label = "Prepare the workspace", icon = "git", parallel = "exclusive")]
 pub async fn prepare_workspace(
     env: State<ToolEnv>,

@@ -1,6 +1,6 @@
 {
   "name": "run_command",
-  "description": "Look around in your worktree with a shell command: `git branch -r`, `git log --oneline`, `ls`, `cat README.md`, `grep -rn name src`. It runs in the workspace's environment (the repository's own devcontainer when it has one, so its tools are there). You get the exit code and the tail of the output. It costs no check cycle and reports no checks, and it is for looking: changes it makes to HEAD, the branch and the working tree are undone and refused (to make a file or change the worktree with a command, use run; to change code, write_file, edit_file or apply_patch). Use it to look; use run_checks only for the project's real checks. Long output is kept: you get its head and tail and an id to read the rest with read_output.",
+  "description": "Look around in your worktree with a shell command (`git log --oneline`, `ls`, `cat README.md`), in the workspace's environment; returns the exit code and the tail of the output, and keeps a long output whole (its head, its tail and an id for read_output). It is for looking: no check cycle, no checks, and changes to HEAD, the branch or the working tree are undone and refused (change files with run, write_file, edit_file or apply_patch).",
   "parameters": {
     "type": "object",
     "properties": {
