@@ -303,7 +303,7 @@ impl Rig {
         ticker.abort();
         let _ = stop.send(());
         worker.await.expect("worker task");
-        (self.mock.requests(), view)
+        (of_run(run, self.mock.requests()), view)
     }
 
     /// Lose the commit of the step that makes the model call number `call` (0-based), before it
@@ -371,8 +371,30 @@ impl Rig {
         let _ = stop.send(());
         worker.await.expect("worker task");
         assert_eq!(view.status, RunStatus::Done, "{view:#?}");
-        (self.mock.requests(), conversation(&self.rt, &view).await)
+        (
+            of_run(run, self.mock.requests()),
+            conversation(&self.rt, &view).await,
+        )
     }
+}
+
+/// `requests` with the run each names cleared (ADR 0067), so two runs that make the same calls
+/// compare equal byte for byte, though their ids differ. Every call names a run, and the last one
+/// `run` (a rig's model may have served an earlier run first).
+fn of_run(run: RunId, requests: Vec<ModelRequest>) -> Vec<ModelRequest> {
+    assert_eq!(
+        requests.last().and_then(|r| r.run.clone()),
+        Some(run.to_string()),
+        "the last call names its run"
+    );
+    requests
+        .into_iter()
+        .map(|mut request| {
+            assert!(request.run.is_some(), "every call names a run");
+            request.run = None;
+            request
+        })
+        .collect()
 }
 
 async fn wait_terminal(rt: &Runtime, run: RunId) -> RunView {
