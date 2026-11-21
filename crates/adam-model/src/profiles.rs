@@ -772,10 +772,7 @@ mod tests {
             Some(Some(ReasoningEffort::Low))
         );
         assert_eq!(
-            profiles
-                .profile("small-chat")
-                .unwrap()
-                .reasoning_efforts,
+            profiles.profile("small-chat").unwrap().reasoning_efforts,
             Some(vec![])
         );
         assert!(profiles.preset_of("small-chat").is_none());
