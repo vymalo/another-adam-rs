@@ -1,6 +1,7 @@
 // The git the harness runs on the host, besides patch collection. Every call goes through `localGit` of
 // grade.mjs (`safeEnv` and the `-c` options of slice 2): no system or global configuration, none from the
 // environment, no hooks, no attributes, no fsmonitor. Nothing of an agent's tree or `.git` is read here.
+import { LEAN_RECIPE, makeLeanFolder } from './variants.mjs';
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -88,15 +89,17 @@ const preparations = new Map();
  * folder the first slot's coder has mounted would delete it), and the rename means a failed or killed preparation
  * never leaves a half-written folder at the destination. `unpack` is the extraction, so a test can fail it halfway.
  */
-export async function ensureAgentFolder({ repoDir, revision, dest, steps, folder = 'bin/adam-coder/agent', unpack = unpackAgentFolder }) {
+export async function ensureAgentFolder({ repoDir, revision, dest, steps, folder = 'bin/adam-coder/agent', unpack = unpackAgentFolder, variant = 'full', reshape = makeLeanFolder }) {
+  if (!['full', 'lean'].includes(variant)) throw new Error(`no agent folder variant ${variant}`);
+  const mark = variant === 'full' ? `${revision}:${steps}` : `${revision}:${steps}:${variant}-${LEAN_RECIPE}`;
   if (!Number.isSafeInteger(steps) || steps < 1) throw new Error('the turn limit is required: both agents are given the same one');
   if (!REV.test(revision)) throw new Error('the revision must be a full commit id');
   // One spelling of the destination for the marker, the lock, the temporary sibling and the rename: `dest/` and
   // `dest` are one folder, and `${dest}/` + `.tmp` would put the temporary inside the folder it must replace.
   const target = path.resolve(dest);
-  if (folderIsMade(target, revision, steps)) return dest;
+  if (folderIsMade(target, mark)) return dest;
   return serialized(target, async () => {
-    if (folderIsMade(target, revision, steps)) return dest;
+    if (folderIsMade(target, mark)) return dest;
     const git = localGit(repoDir);
     try {
       await git(['cat-file', '-e', `${revision}^{commit}`]);
@@ -111,8 +114,9 @@ export async function ensureAgentFolder({ repoDir, revision, dest, steps, folder
       await unpack(tarball, temp, strip);
       fs.rmSync(path.join(temp, 'mcp.json'), { force: true });
       setTurnLimit(path.join(temp, 'instructions.md'), steps);
+      if (variant === 'lean') reshape(temp);
       await new Promise((resolve) => execFile('chmod', ['-R', 'a+rX', temp], resolve));
-      fs.writeFileSync(path.join(temp, '.revision'), `${revision}:${steps}\n`);
+      fs.writeFileSync(path.join(temp, '.revision'), `${mark}\n`);
       fs.rmSync(target, { recursive: true, force: true });
       fs.renameSync(temp, target);
       return dest;
@@ -134,9 +138,9 @@ async function unpackAgentFolder(tarball, dir, strip) {
 }
 
 /** Is the folder at `dest` the one this revision and step limit make? */
-function folderIsMade(dest, revision, steps) {
+function folderIsMade(dest, mark) {
   try {
-    return fs.readFileSync(path.join(dest, '.revision'), 'utf8').trim() === `${revision}:${steps}`;
+    return fs.readFileSync(path.join(dest, '.revision'), 'utf8').trim() === mark;
   } catch {
     return false;
   }

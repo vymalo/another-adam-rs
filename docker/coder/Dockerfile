@@ -42,17 +42,14 @@
 # of its newest build on main), together with anything here that depends on it.
 # Anonymous pull verified 2026-11-19: the manifest request for this tag with an
 # anonymous ghcr.io token returned 200 and sha256:b465808bfb8a1baae5e59a429bf292726b021e3b37322f759dbda3ee2c57ed67
-# (a single linux/amd64 manifest, 7 layers, 3.05 GB compressed), and the image's config has the
-# `devcontainer.metadata` label (it is a dev container base: the default environment of the
-# coder's devcontainers, ADR 0010), /opt/obscura/bin on PATH (obscura, a headless
-# browser, vymalo/another-agentic-images#11) and the package caches under /cache
-# (CARGO_HOME=/cache/cargo; npm and pnpm by their own config files, checked on 2026-10-11;
-# vymalo/another-agentic-images#12, ADR 0040). This tag is the merge of vymalo/another-agentic-images#15 (commit 8c297d3,
-# 2026-11-17), which adds rust-analyzer, gopls, typescript-language-server and pyright: the
-# servers of the coder's language-server tools (ADR 0044, slice 17). The same build is the
-# default of DEVCONTAINER_DEFAULT_IMAGE, by its digest alone
-# (bin/adam-coder/src/config.rs: the devcontainer CLI cannot parse a tag together with a digest);
-# a test keeps this tag equal to the tag that digest was published as.
+# (a single linux/amd64 manifest, 7 layers, 3.05 GB compressed), and the image's config has
+# /opt/obscura/bin on PATH (obscura, a headless browser, vymalo/another-agentic-images#11) and
+# the package caches under /cache (CARGO_HOME=/cache/cargo; npm and pnpm by their own config
+# files, checked on 2026-10-11; vymalo/another-agentic-images#12, ADR 0040). This tag is the merge
+# of vymalo/another-agentic-images#15 (commit 8c297d3, 2026-11-17), which adds rust-analyzer,
+# gopls, typescript-language-server and pyright: the servers of the coder's language-server tools
+# (ADR 0044, slice 17). The same build is the chart's run pod image
+# (`deploy/coder/values.yaml`, by tag and digest): move both together.
 ARG WORKSPACE_TAG=1.98.1-8c297d3
 
 FROM rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS build
@@ -96,19 +93,6 @@ FROM ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a0857ec762b1ab1cece29193
 
 FROM ghcr.io/vymalo/another-agentic-images/workspace:${WORKSPACE_TAG}
 
-# The devcontainer CLI (MIT, no runtime dependencies, needs node 20 or newer: the base has 24), which
-# makes and enters a repository's devcontainer, and Podman's remote client, which it drives against
-# the rootless Podman service CONTAINER_HOST names (ADR 0010). Both are only clients: nothing in this image
-# runs containers. Verified 2026-10-01: @devcontainers/cli 0.89.0 is the newest release (npm registry).
-# The client must be the **service's own release** (5.8.7, dev/podman/Containerfile): CI's real-Podman job
-# found that a distribution's older client (Ubuntu's 4.9.3) pulls and inspects but then hangs in the CLI's
-# image build against the 5.x service. So it is the static client of containers/podman v5.8.7, pinned by
-# the release's sha256 (verified 2026-10-01), and not a distribution's package. Bump both together with
-# the service.
-ARG DEVCONTAINERS_CLI_VERSION=0.89.0
-ARG PODMAN_REMOTE_VERSION=5.8.7
-ARG PODMAN_REMOTE_SHA256=01b5ac597de2f7d55a7d52ba82c8e59df9e90355c5331849d6b7dbecf2345e7e
-
 LABEL org.opencontainers.image.source="https://github.com/vymalo/another-adam-rs" \
       org.opencontainers.image.description="adam-coder: coding task to verified pull request over A2A; adam-agent: any agent folder over A2A (entrypoint override)" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
@@ -120,26 +104,14 @@ USER root
 COPY --from=build /out/adam-coder /out/adam-agent /out/adam-kube-exec /out/adam-egress /out/adam-git-sandbox /out/adam-git /usr/local/bin/
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
 # The tools a run pod gets (ADR 0019): the chart's init container copies /opt/adam/bin/* into an emptyDir that the
-# run container mounts read-only at the same path, the layout of a devcontainer's tools directory. `adam-exec` is
-# the script the devcontainer crate embeds (one source, so the two environments cannot disagree about it); the
-# pod's image need not carry it. Nothing else is there: the coder brings no agent binary into a run (ADR 0038). The
-# OpenCode CLI of the base image stays on PATH, for people and for repositories that want it.
-COPY --chmod=0755 crates/adam-devcontainer/src/adam-exec.sh /opt/adam/bin/adam-exec
+# run container mounts read-only at the same path. `adam-exec` is the script adam-env-kubernetes ships (one
+# source); the pod's image need not carry it. Nothing else is there: the coder brings no agent binary into a run
+# (ADR 0038). The OpenCode CLI of the base image stays on PATH, for people and for repositories that want it.
+COPY --chmod=0755 crates/adam-env-kubernetes/src/adam-exec.sh /opt/adam/bin/adam-exec
 # /work holds mirrors and worktrees; the deployment mounts a volume there. The
 # base image already creates it owned by uid 10001, as does this line for a
 # base that does not.
 RUN install -d -o 10001 -g 10001 /work
-# The static client of the service's own release; `sha256sum -c` stops the build when the download is not
-# the pinned file. (Not `ADD --checksum`: the hadolint of the `lint Dockerfile` job cannot parse the flag.)
-RUN curl -fsSL -o /tmp/podman-remote.tar.gz \
-      "https://github.com/containers/podman/releases/download/v${PODMAN_REMOTE_VERSION}/podman-remote-static-linux_amd64.tar.gz" \
- && printf '%s  %s\n' "${PODMAN_REMOTE_SHA256}" /tmp/podman-remote.tar.gz > /tmp/podman-remote.sha256 \
- && sha256sum -c /tmp/podman-remote.sha256 \
- && tar -xzf /tmp/podman-remote.tar.gz -C /tmp \
- && install -m 0755 /tmp/bin/podman-remote-static-linux_amd64 /usr/local/bin/podman-remote \
- && rm -rf /tmp/podman-remote.tar.gz /tmp/podman-remote.sha256 /tmp/bin \
- && npm install -g --no-fund --no-audit "@devcontainers/cli@${DEVCONTAINERS_CLI_VERSION}"
-
 # MCP_ALLOW_STDIO is **not** set here: the image carries two agent binaries, and only the coder may start
 # local-process MCP servers if its deployment says so (the chart and compose.yaml still set it for one
 # release); `adam-agent` from this image refuses such servers unless its own deployment opts in. The coder's
@@ -149,9 +121,7 @@ RUN curl -fsSL -o /tmp/podman-remote.tar.gz \
 ENV WORKSPACE_ROOT=/work \
     LISTEN_ADDR=0.0.0.0:8080 \
     RUST_LOG=info \
-    OPENCODE_DISABLE_AUTOUPDATE=1 \
-    DEVCONTAINER_CLI=devcontainer \
-    DEVCONTAINER_PODMAN=podman-remote
+    OPENCODE_DISABLE_AUTOUPDATE=1
 
 # The runtime user of the workspace image (uid/gid 10001, `agent`).
 USER 10001
@@ -165,16 +135,14 @@ EXPOSE 8080
 # has no socket and exits 78, and the tools the agent
 # shells out to are on PATH. The GitHub MCP server
 # is there, runs, and lists the twelve read tools of the coder's allow-list over stdio with no
-# credential (a missing name would stop the coder at startup). The devcontainer CLI and Podman's client
-# run. The run pod's tools are in /opt/adam/bin (adam-exec only: no OpenCode link, ADR 0038), and adam-kube-exec
-# rejects an empty command line.
+# credential (a missing name would stop the coder at startup). The run pod's tools are in
+# /opt/adam/bin (adam-exec only: no OpenCode link, ADR 0038), and adam-kube-exec rejects an empty
+# command line.
 # obscura comes with the base; it is checked because the coder's instructions name it.
 RUN --mount=type=bind,source=docker/coder/test/github-mcp-tools.sh,target=/tmp/github-mcp-tools.sh \
     bash -lc 'set -e; \
       test "$(id -u)" = 10001; \
-      command -v adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git git opencode tini github-mcp-server devcontainer podman-remote obscura; \
-      test "$(devcontainer --version)" = "0.89.0"; \
-      podman-remote --version | grep -q "5\.8\.7"; \
+      command -v adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git git opencode tini github-mcp-server obscura; \
       github-mcp-server --version | grep -q "v1.12.2"; \
       test -x /opt/adam/bin/adam-exec; \
       test ! -e /opt/adam/bin/opencode; \

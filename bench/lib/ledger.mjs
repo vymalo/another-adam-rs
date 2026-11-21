@@ -343,11 +343,19 @@ export function foldRecords(records) {
       const key = rec.call;
       const prior = a.calls.get(key) ?? {};
       if (rec.phase === 'pending') {
-        a.calls.set(key, { ...prior, worstMicro: rec.worstMicro ?? 0 });
+        a.calls.set(key, {
+          ...prior,
+          worstMicro: rec.worstMicro ?? 0,
+          startedAt: rec.t,
+          ...(rec.prompt !== undefined ? { prompt: rec.prompt } : {}),
+          ...(Number.isInteger(rec.bytes) ? { bytes: rec.bytes } : {}),
+          ...(rec.effort !== undefined ? { effort: rec.effort } : {}),
+        });
       } else if (rec.phase === 'settled' || rec.phase === 'failed') {
         a.calls.set(key, {
           ...prior,
           costMicro: rec.costMicro ?? 0,
+          endedAt: rec.t,
           ...(Number.isInteger(rec.toolCalls) ? { toolCalls: rec.toolCalls } : {}),
           ...(Array.isArray(rec.toolNames) ? { toolNames: rec.toolNames } : {}),
         });
@@ -397,8 +405,52 @@ export function foldRecords(records) {
       for (const k of Object.keys(v.tokens)) v.tokens[k] += a.tokens[k];
       for (const k of Object.keys(v.calls)) v.calls[k] += a[k];
     }
+    v.sent = sentOf(v.attempts);
   }
   return runs;
+}
+
+/**
+ * What the calls of a run sent, from the pending records (all attempts): the request sizes, the effective reasoning settings, and the
+ * child sessions. A child session is a run of consecutive calls whose system prompt fingerprint is not the one the attempt's first
+ * call had (the main agent's): a subagent. Its time is from its first call's start to its last call's end. Ledgers older than these
+ * fields give empty lists and no sessions.
+ */
+export function sentOf(attempts) {
+  const bytes = [];
+  const efforts = new Set();
+  const children = { sessions: 0, calls: 0, ms: 0, prompts: new Set() };
+  for (const a of attempts) {
+    if (!a) continue;
+    const calls = [...a.calls.entries()].sort(([x], [y]) => x - y).map(([, c]) => c);
+    for (const c of calls) {
+      if (Number.isInteger(c.bytes)) bytes.push(c.bytes);
+      if (c.effort !== undefined) efforts.add(c.effort);
+    }
+    const main = calls[0]?.prompt;
+    if (main === undefined || main === null) continue;
+    let open = null;
+    const close = () => {
+      if (!open) return;
+      children.sessions += 1;
+      const ms = Date.parse(open.end) - Date.parse(open.start);
+      if (Number.isFinite(ms) && ms > 0) children.ms += ms;
+      open = null;
+    };
+    for (const c of calls) {
+      if (c.prompt === undefined || c.prompt === null || c.prompt === main) {
+        close();
+        continue;
+      }
+      if (open && open.prompt !== c.prompt) close();
+      if (!open) open = { prompt: c.prompt, start: c.startedAt, end: c.endedAt ?? c.startedAt };
+      else open.end = c.endedAt ?? open.end;
+      children.calls += 1;
+      children.prompts.add(c.prompt);
+    }
+    close();
+  }
+  return { bytes, efforts: [...efforts], children: { sessions: children.sessions, calls: children.calls, ms: children.ms, kinds: children.prompts.size } };
 }
 
 /**

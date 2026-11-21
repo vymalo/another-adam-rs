@@ -32,7 +32,8 @@ in a third-party component we use is best reported to that project; tell us too 
 Some limits are already written down. Reporting them privately adds nothing; a fix or a better idea is welcome as an
 ordinary issue or pull request.
 
-- The limits of run-pod isolation, including local mode and Podman, which this repository documents as not protected:
+- The limits of run-pod isolation, and of local mode (the coder's own container, where a command can read what
+  that container holds unless the deployment runs run pods), which this repository documents as not protected:
   [ADR 0041, "Known limits, not built"](docs/decisions/0041-a-run-pod-sees-only-its-own-run.md#known-limits-not-built).
 - The hardening work on the [product roadmap](https://github.com/vymalo/another-agentic-system/blob/main/ROADMAP.md):
   the tickets labelled `security`.

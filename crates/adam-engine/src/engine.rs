@@ -7,23 +7,59 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use a2a::{Message, Part, Role, Task};
-use adam_a2a::{BackendError, Caller, STEER_EXTENSION, TaskBackend, TaskQuery};
-use adam_a2a_runtime::{RuntimeTaskBackend, task_id_for};
-use adam_agent_fs::{AgentManifest, Subagent};
+use adam_a2a::{
+    BackendError, CHILD_SESSIONS_EXTENSION, Caller, STEER_EXTENSION, TaskBackend, TaskQuery,
+};
+use adam_a2a_runtime::{Commands, RuntimeTaskBackend, task_id_for};
+use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
-use adam_core::{DynSecretSource, DynStore, RunId};
-use adam_llm_agent::DEFAULT_MAX_PARALLEL;
+use adam_core::{ConversationScope, DynSecretSource, DynStore, RunId, RunQuery, RunStatus};
+use adam_llm_agent::{DEFAULT_MAX_PARALLEL, ToolSet};
 use adam_model::DynModel;
-use adam_runtime::{BroadcastSink, RetryPolicy, Runtime, RuntimeBuilder, RuntimeError};
+use adam_runtime::{
+    BroadcastSink, FileRef, RetryPolicy, RunView, Runtime, RuntimeBuilder, RuntimeError,
+    SCHEDULE_CONVERSATION_PREFIX, SessionLimits,
+};
 use adam_ui::Ui;
 use tokio::sync::{RwLock, RwLockReadGuard, oneshot, watch};
 use tokio::task::AbortHandle;
 
 use crate::events::EngineSink;
 use crate::{
-    ConversationId, Delivered, EngineError, ListQuery, Page, RunEvents, RunInfo, RunState, Say,
-    Turn, default_secrets,
+    ConversationId, Delivered, EngineError, Firing, FiringQuery, ListQuery, Page, RunEvents,
+    RunFile, RunInfo, RunState, Say, SessionHelper, SessionInfo, StartSession, Turn,
+    default_secrets,
 };
+
+/// Why a firing a host cancelled ended (#289).
+const FIRING_CANCEL_REASON: &str = "cancelled by the host";
+
+/// The page token of [`Engine::firings`]: the position of the page's last firing and the schedule
+/// the query names, so a token of another query is refused.
+mod firing_token {
+    use adam_core::RunId;
+    use adam_core::time::Timestamp;
+
+    use crate::EngineError;
+
+    pub(super) fn write(filter: &str, at: Timestamp, run: RunId) -> String {
+        format!("{at}|{run}|{filter}")
+    }
+
+    pub(super) fn read(token: &str, filter: &str) -> Result<(Timestamp, RunId), EngineError> {
+        let bad = || EngineError::Invalid("the page token is not one of this query's".to_owned());
+        let mut parts = token.splitn(3, '|');
+        let at = parts.next().and_then(|t| t.parse().ok()).ok_or_else(bad)?;
+        let run = parts
+            .next()
+            .and_then(|r| uuid::Uuid::parse_str(r).ok())
+            .map(RunId)
+            .ok_or_else(bad)?;
+        (parts.next() == Some(filter))
+            .then_some((at, run))
+            .ok_or_else(bad)
+    }
+}
 
 /// The one subject every call of an engine is made as: the engine serves one person, and the
 /// backend scopes runs to a subject. Not `anonymous`, which the backend lets continue nothing.
@@ -82,6 +118,12 @@ pub struct Limits {
     /// A folder's `retry:` and a tool's own policy win over it for their tools. Default
     /// [`RetryPolicy::default`]: 5 attempts, 1 s to 60 s.
     pub retry: RetryPolicy,
+    /// The limits of the root's child sessions (`child-sessions/v1`, ADR 0045): how many are open
+    /// and working at once in one conversation, and how many rounds one may have. The agent's
+    /// file may lower them, never raise them. Default [`SessionLimits::default`]: 16 open, 4
+    /// working, 20 rounds. It replaces what the agent's definition was given with
+    /// `AgentDef::session_limits`.
+    pub sessions: SessionLimits,
 }
 
 impl Default for Limits {
@@ -93,6 +135,7 @@ impl Default for Limits {
             event_capacity: DEFAULT_EVENT_CAPACITY,
             worker_id: None,
             retry: RetryPolicy::default(),
+            sessions: SessionLimits::default(),
         }
     }
 }
@@ -106,6 +149,7 @@ pub struct EngineBuilder {
     alias: String,
     secrets: DynSecretSource,
     limits: Limits,
+    tools: ToolSet,
 }
 
 impl std::fmt::Debug for EngineBuilder {
@@ -124,6 +168,16 @@ impl EngineBuilder {
     /// refuses every name. It replaces whatever source `agent` was given.
     pub fn secrets(mut self, secrets: DynSecretSource) -> Self {
         self.secrets = secrets;
+        self
+    }
+
+    /// The host's own tools (`#[tool]` functions, `tools!`, an `FnTool`), beside the engine's own
+    /// (`ask_user`, `show`, `ui_catalog`, the plan tools): together they are the catalog the
+    /// agent's `tools:` selects from, as on a server built with `adam-host`. Default none; a later
+    /// call replaces the set. A name used twice (one of the engine's included), or one the files
+    /// name and nobody gives, is refused at [`start`](Self::start).
+    pub fn tools(mut self, tools: ToolSet) -> Self {
+        self.tools = tools;
         self
     }
 
@@ -166,6 +220,7 @@ impl EngineBuilder {
             alias,
             secrets,
             limits,
+            tools,
         } = self;
         if limits.lease_ttl.is_zero() {
             return Err(EngineError::Invalid(
@@ -186,15 +241,18 @@ impl EngineBuilder {
         refuse_what_is_not_embedded(agent.manifest(), agent.name())?;
         let name = agent.name().to_owned();
         let schedules = agent.manifest().schedules.clone();
+        let commands = agent.manifest().commands.clone();
         let ui = Ui::embedded();
         let assembly = agent
             .secrets(secrets)
-            .bind(ui.tools())
+            .session_limits(limits.sessions)
+            .bind(ui.tools().extend(tools))
             .map_err(|e| EngineError::Agent(Box::new(e)))?
             .tool_source(ui.screen())
             .max_parallel(limits.max_parallel_tools)
             .model(model, alias)
             .map_err(|e| EngineError::Agent(Box::new(e)))?;
+        let sessions = assembly.child_sessions().cloned();
         store.migrate().await.map_err(EngineError::Store)?;
         // Held until the worker task has ended, so a second engine of this process with the same id
         // on this store is refused before its release could take this one's leases.
@@ -216,6 +274,7 @@ impl EngineBuilder {
         // binaries do; it is registered whatever the folder holds, so a scheduler run a folder
         // dropped is still stepped to its cancel.
         let scheduler = adam_schedule::SchedulerAgent::new(&name);
+        let lister = store.clone();
         let (runtime, events) = runtime_with_ring(
             assembly.register(Runtime::builder(store)).agent(scheduler),
             &limits,
@@ -229,7 +288,17 @@ impl EngineBuilder {
         // (`TaskBackend::subscribe`), whose file parts are built from a live event's bytes. The engine
         // never calls that path: an artifact in this ring has its bytes withheld, so a caller that
         // streams a task through this backend must read files from the store.
-        let backend = RuntimeTaskBackend::new(runtime.clone(), events.clone(), name.clone());
+        // The folder's commands (`commands/v1`): a message whose text is `/name args` is expanded
+        // from `commands/<name>.md` before it is stored, as on the server surfaces.
+        let backend = RuntimeTaskBackend::new(runtime.clone(), events.clone(), name.clone())
+            .with_commands(Commands::from_manifest(&commands));
+        // The helpers a person may start a session with (`child-sessions/v1`), as `adam-agent`
+        // serves them: every local subagent of the root, under the effective limits.
+        let backend = match &sessions {
+            Some(sessions) => backend.with_child_sessions(sessions.clone()),
+            None => backend,
+        };
+        let reader = runtime.clone();
 
         let (stop, stopped) = oneshot::channel::<()>();
         let running = handle.spawn(async move {
@@ -254,14 +323,41 @@ impl EngineBuilder {
             drop(claim);
             let _ = said.send(Some(how));
         });
-        let caller = Caller::new(SUBJECT);
+        // The engine's caller activates `child-sessions/v1` when the agent has helpers: a message to
+        // a session's conversation, and the listing of its rounds, are refused without it.
+        let extensions: &[&str] = if sessions.is_some() {
+            &[CHILD_SESSIONS_EXTENSION]
+        } else {
+            &[]
+        };
+        let caller = Caller::new(SUBJECT).with_extensions(extensions.iter().copied());
+        let steering = Caller::new(SUBJECT)
+            .with_extensions(extensions.iter().copied().chain([STEER_EXTENSION]));
+        let helpers = sessions
+            .iter()
+            .flat_map(|s| s.agents())
+            .map(|a| SessionHelper {
+                name: a.name.clone(),
+                description: a.description.clone(),
+            })
+            .collect();
+        let helper_agents = sessions
+            .iter()
+            .flat_map(|s| s.agents())
+            .map(|a| a.agent.clone())
+            .collect();
         Ok(Engine {
             shared: Arc::new(Shared {
-                steering: caller.clone().with_extensions([STEER_EXTENSION]),
+                steering,
+                helpers,
+                helper_agents,
                 caller,
                 backend,
+                runtime: reader,
+                store: lister,
                 events,
                 agent: name,
+                commands,
                 writes: RwLock::new(()),
                 stopping: AtomicBool::new(false),
                 worker: Worker {
@@ -353,6 +449,11 @@ impl Drop for AbortOnDrop {
 
 pub(crate) struct Shared {
     backend: RuntimeTaskBackend,
+    /// What [`Engine::file`] reads a file's bytes from, once the backend has said the run is this
+    /// engine's caller's.
+    runtime: Runtime,
+    /// What [`Engine::firings`] lists the schedule's runs from: the host's store.
+    store: DynStore,
     /// The ring every reader of [`Engine::events`] subscribes to; the runtime emits into it through
     /// [`EngineSink`], which takes a file's bytes out.
     events: BroadcastSink,
@@ -361,6 +462,13 @@ pub(crate) struct Shared {
     /// The same subject, with `steer/v1` activated: a message for a running run is delivered.
     steering: Caller,
     agent: String,
+    /// The agent's commands, from its `commands/`: what [`Engine::commands`] lists.
+    commands: Vec<Command>,
+    /// The helpers a person may start a session with: what [`Engine::helpers`] lists.
+    helpers: Vec<SessionHelper>,
+    /// Their names as registered on the runtime (`<root>/<helper>`), in the same order: what a
+    /// round's id is derived from.
+    helper_agents: Vec<String>,
     /// Held shared by every message for the length of its call, and exclusively by `shutdown` while
     /// it sets `stopping`: a message is either written before the worker is told to stop, or
     /// refused.
@@ -412,6 +520,7 @@ impl Engine {
             alias: alias.into(),
             secrets: default_secrets(),
             limits: Limits::default(),
+            tools: ToolSet::new(),
         }
     }
 
@@ -426,8 +535,9 @@ impl Engine {
     /// # Errors
     ///
     /// [`EngineError::Invalid`] for a message with no text or no id, [`EngineError::NotFound`]
-    /// for a conversation this engine has no run in, [`EngineError::Stopped`] after
-    /// [`shutdown`](Self::shutdown), and the store's failures.
+    /// for a conversation this engine has no run in, [`EngineError::Refused`] for a child session
+    /// that refuses it (closed, at its rounds, or its rounds already working), [`EngineError::Stopped`]
+    /// after [`shutdown`](Self::shutdown), and the store's failures.
     pub async fn send(
         &self,
         conversation: Option<&ConversationId>,
@@ -437,16 +547,32 @@ impl Engine {
         say.check()?;
         let shared = &self.shared;
         let context = conversation.map(|c| c.as_str().to_owned());
-        // The run this message starts, if it starts one: the backend derives it the same way, so
-        // a repeat finds the run its first attempt started.
-        let own = task_id_for(&shared.agent, SUBJECT, context.as_deref(), &say.id);
-        if let Some(info) = self.get(own).await? {
-            return Ok(Turn {
-                conversation: info.conversation.clone(),
-                run: own,
-                delivered: Delivered::Repeated,
-                info,
-            });
+        let session = conversation.filter(|c| is_session(c));
+        // The runs this message may start: at the root, a run of the agent; in a child session, a
+        // round of its helper (one of the helpers: the session's is not known before it is read).
+        // The backend derives each the same way, so a repeat finds what its first attempt started.
+        let owns: Vec<RunId> = match session {
+            Some(session) => shared
+                .helper_agents
+                .iter()
+                .map(|helper| task_id_for(helper, SUBJECT, Some(session.as_str()), &say.id))
+                .collect(),
+            None => vec![task_id_for(
+                &shared.agent,
+                SUBJECT,
+                context.as_deref(),
+                &say.id,
+            )],
+        };
+        for own in &owns {
+            if let Some(info) = self.get(*own).await? {
+                return Ok(Turn {
+                    conversation: info.conversation.clone(),
+                    run: *own,
+                    delivered: Delivered::Repeated,
+                    info,
+                });
+            }
         }
         let mut message = message(&say);
         let latest = match conversation {
@@ -462,10 +588,16 @@ impl Engine {
             .backend
             .submit(shared.caller.clone(), message, None, context)
             .await
-            .map_err(|e| EngineError::of_backend(e, None))?;
+            .map_err(|e| match e {
+                // A child session's limits or state (closed, at its rounds, its rounds working).
+                BackendError::UnsupportedOperation(why) if session.is_some() => {
+                    EngineError::Refused(why)
+                }
+                e => EngineError::of_backend(e, latest.as_ref().map(|l| l.run)),
+            })?;
         let info = RunInfo::of(&task)?;
         let delivered = match &latest {
-            _ if info.run != own => match latest {
+            _ if !owns.contains(&info.run) => match latest {
                 Some(latest) if latest.run == info.run && latest.state == RunState::Waiting => {
                     Delivered::Answered
                 }
@@ -560,7 +692,27 @@ impl Engine {
                     Expected::Open,
                 )),
             },
+            Err(BackendError::TaskNotFound(_)) => self.cancel_firing(run).await,
             Err(e) => Err(EngineError::of_backend(e, Some(run))),
+        }
+    }
+
+    /// [`cancel`](Self::cancel) of a run a schedule fired, which the backend does not reach: as
+    /// the backend cancels a caller's run, through the runtime, then read again.
+    async fn cancel_firing(&self, run: RunId) -> Result<RunInfo, EngineError> {
+        let gone = || EngineError::NotFound(format!("run {run}"));
+        let (view, _) = self.firing_view(run).await?.ok_or_else(gone)?;
+        if !view.status.is_terminal() {
+            self.shared
+                .runtime
+                .cancel(run, FIRING_CANCEL_REASON)
+                .await
+                .map_err(|e| EngineError::of_run_read(e, run))?;
+        }
+        let info = self.get(run).await?.ok_or_else(gone)?;
+        match info.state {
+            RunState::Cancelled => Ok(info),
+            state => Err(EngineError::by_state(run, Ok(Some(state)), Expected::Open)),
         }
     }
 
@@ -629,6 +781,267 @@ impl Engine {
         })
     }
 
+    /// The files the agent handed over in `run` (its file artifacts), in the order they were
+    /// emitted, without their bytes. An event withholds a file's bytes too; this list is what a
+    /// host that missed the event (or reads the run later) finds them by.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NotFound`] when this engine has no such run, and the store's failures.
+    pub async fn files(&self, run: RunId) -> Result<Vec<RunFile>, EngineError> {
+        Ok(self
+            .file_refs(run)
+            .await?
+            .into_iter()
+            .map(|(file, _)| file)
+            .collect())
+    }
+
+    /// The bytes of the file of `run` whose SHA-256 is `sha256` (a [`RunFile`]'s, or the
+    /// [`WithheldFile`](crate::WithheldFile) an event says). `None` when the run has no such
+    /// file, or its bytes are gone from the store.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NotFound`] when this engine has no such run, and the store's failures.
+    pub async fn file(&self, run: RunId, sha256: &str) -> Result<Option<Arc<[u8]>>, EngineError> {
+        let Some((_, file)) = self
+            .file_refs(run)
+            .await?
+            .into_iter()
+            .find(|(file, _)| file.sha256 == sha256)
+        else {
+            return Ok(None);
+        };
+        self.shared
+            .runtime
+            .artifact_bytes(&file)
+            .await
+            .map_err(EngineError::of_read)
+    }
+
+    /// The file artifacts of `run`, if this engine shows it (the caller's, or a firing of its
+    /// schedules, as for `get`): one read of the run, and no file's bytes.
+    async fn file_refs(&self, run: RunId) -> Result<Vec<(RunFile, FileRef)>, EngineError> {
+        let shared = &self.shared;
+        let owned = shared
+            .backend
+            .owned_view(&shared.caller, &run.to_string())
+            .await
+            .map_err(|e| EngineError::of_backend(e, Some(run)))?;
+        let view = match owned {
+            Some(view) => view,
+            None => {
+                self.firing_view(run)
+                    .await?
+                    .ok_or_else(|| EngineError::NotFound(format!("run {run}")))?
+                    .0
+            }
+        };
+        Ok(view
+            .artifacts
+            .into_iter()
+            .filter_map(|artifact| {
+                let file = artifact.file?;
+                let listed = RunFile {
+                    name: artifact.name,
+                    mime_type: artifact.mime_type,
+                    filename: file.filename.clone(),
+                    len: file.size,
+                    sha256: file.digest().as_str().to_owned(),
+                };
+                Some((listed, file))
+            })
+            .collect())
+    }
+
+    /// The helpers a person may start a child session with (`child-sessions/v1`, ADR 0045): every
+    /// local subagent of the root, with its description. Empty when the agent has none.
+    pub fn helpers(&self) -> &[SessionHelper] {
+        &self.shared.helpers
+    }
+
+    /// Start a child session of `start.helper` in `conversation`, a conversation of this engine,
+    /// with `say` as its first message: its first round is the run [`Turn`] names, in the
+    /// session's own conversation ([`Turn::conversation`]). Talk to the session with
+    /// [`send`](Self::send) to that conversation (each message to an idle session is its next
+    /// round, one to a working round is delivered into it), list its rounds with
+    /// [`list`](Self::list), and close it with [`close_session`](Self::close_session). The parent
+    /// conversation takes no turn.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Invalid`] when the agent has no helper of that name, the description is
+    /// blank, longer than 80 characters or not one line, `say` has no text, or the conversation is
+    /// a session's own; [`EngineError::NotFound`] for a conversation this engine has no run in;
+    /// [`EngineError::Refused`] for a session too many, open or working ([`Limits::sessions`]); a
+    /// repeated `say` answers the session it started (`Repeated`);
+    /// [`EngineError::Stopped`] after [`shutdown`](Self::shutdown); and the store's failures.
+    pub async fn start_session(
+        &self,
+        conversation: &ConversationId,
+        start: StartSession,
+        say: Say,
+    ) -> Result<Turn, EngineError> {
+        let _writing = self.writable().await?;
+        say.check()?;
+        let shared = &self.shared;
+        if shared.helpers.is_empty() {
+            return Err(EngineError::Invalid(
+                "this agent has no helper to start a session with".to_owned(),
+            ));
+        }
+        if is_session(conversation) {
+            return Err(EngineError::Invalid(
+                "a session's conversation holds no session: start it in the parent's".to_owned(),
+            ));
+        }
+        // The parent conversation is one of this engine's, as for `send`.
+        self.latest_run(conversation).await?;
+        // A start's first round is the session itself, its id derived from the helper, the parent
+        // conversation and the message: a repeat finds it.
+        if let Some(position) = shared.helpers.iter().position(|h| h.name == start.helper) {
+            let first = task_id_for(
+                &shared.helper_agents[position],
+                SUBJECT,
+                Some(conversation.as_str()),
+                &say.id,
+            );
+            if let Some(info) = self.get(first).await? {
+                return Ok(Turn {
+                    conversation: info.conversation.clone(),
+                    run: first,
+                    delivered: Delivered::Repeated,
+                    info,
+                });
+            }
+        }
+        let mut message = message(&say);
+        message.metadata = Some(std::collections::HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            serde_json::json!({ "start": {
+                "agent": start.helper,
+                "description": start.description,
+                "keepOpen": start.keep_open,
+            }}),
+        )]));
+        let task = shared
+            .backend
+            .submit(
+                shared.caller.clone(),
+                message,
+                None,
+                Some(conversation.as_str().to_owned()),
+            )
+            .await
+            .map_err(|e| match e {
+                BackendError::UnsupportedOperation(why) => EngineError::Refused(why),
+                e => EngineError::of_backend(e, None),
+            })?;
+        let info = RunInfo::of(&task)?;
+        Ok(Turn {
+            conversation: info.conversation.clone(),
+            run: info.run,
+            delivered: Delivered::Started,
+            info,
+        })
+    }
+
+    /// The child sessions of `conversation`: the open ones first, then the most recently closed
+    /// (at most 16 of those), as the parent task of the conversation says them.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Invalid`] for a session's own conversation, [`EngineError::NotFound`] for a
+    /// conversation this engine has not, [`EngineError::Unavailable`] when the sessions could not
+    /// be listed (it never answers "none" then), and the store's failures.
+    pub async fn sessions(
+        &self,
+        conversation: &ConversationId,
+    ) -> Result<Vec<SessionInfo>, EngineError> {
+        if is_session(conversation) {
+            return Err(EngineError::Invalid(
+                "a session's conversation holds no session".to_owned(),
+            ));
+        }
+        if self.shared.helpers.is_empty() {
+            self.latest_run(conversation).await?;
+            return Ok(Vec::new());
+        }
+        let latest = self.latest_run(conversation).await?;
+        let shared = &self.shared;
+        let task = shared
+            .backend
+            .get(&shared.caller, &latest.run.to_string())
+            .await
+            .map_err(|e| EngineError::of_backend(e, Some(latest.run)))?
+            .ok_or_else(|| EngineError::NotFound(format!("conversation {conversation}")))?;
+        let listed = task
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(CHILD_SESSIONS_EXTENSION))
+            .and_then(|entry| entry.get("sessions"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| EngineError::Unavailable {
+                message: "the sessions of the conversation could not be listed".to_owned(),
+                source: None,
+            })?;
+        listed.iter().map(SessionInfo::of).collect()
+    }
+
+    /// Close the child session whose conversation is `session` ([`SessionInfo::conversation`]): an
+    /// idle session closes by a round of its own, a working one when its round ends, or at once
+    /// with `cancel` (its round is cancelled first). The answer is the round that closes it, or
+    /// the working round. A closed session takes no more messages.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Invalid`] for a conversation that is not a session's (or no helper at all),
+    /// [`EngineError::Stopped`] after [`shutdown`](Self::shutdown), and the store's failures.
+    /// Closing a closed session answers its latest round.
+    pub async fn close_session(
+        &self,
+        session: &ConversationId,
+        cancel: bool,
+    ) -> Result<RunInfo, EngineError> {
+        let _writing = self.writable().await?;
+        let shared = &self.shared;
+        // Only a session's conversation: on any other, the close would be read as a message.
+        if shared.helpers.is_empty() || !is_session(session) {
+            return Err(EngineError::Invalid(format!(
+                "{session} is not a child session's conversation"
+            )));
+        }
+        // The close carries no text of the person's: the backend's closing round is its own.
+        let mut message = message(&Say::new("close the session"));
+        message.metadata = Some(std::collections::HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            serde_json::json!({ "close": { "cancel": cancel } }),
+        )]));
+        let task = shared
+            .backend
+            .submit(
+                shared.caller.clone(),
+                message,
+                None,
+                Some(session.as_str().to_owned()),
+            )
+            .await
+            .map_err(|e| match e {
+                BackendError::UnsupportedOperation(why) => EngineError::Refused(why),
+                e => EngineError::of_backend(e, None),
+            })?;
+        RunInfo::of(&task)
+    }
+
+    /// The agent's commands (`commands/<name>.md`), in name order: what a person may type as
+    /// `/name args`, which the engine expands from the command's template before it is stored. A
+    /// host lists them in its `/` menu with their `description` and `argument_hint`, as a client
+    /// of the server surfaces reads them from the card (`commands/v1`).
+    pub fn commands(&self) -> &[Command] {
+        &self.shared.commands
+    }
+
     /// `run` as the store has it now, or `None` when this engine has no such run.
     ///
     /// # Errors
@@ -636,14 +1049,126 @@ impl Engine {
     /// The store's failures.
     pub async fn get(&self, run: RunId) -> Result<Option<RunInfo>, EngineError> {
         let shared = &self.shared;
-        shared
+        let task = shared
             .backend
             .get(&shared.caller, &run.to_string())
             .await
-            .map_err(|e| EngineError::of_backend(e, Some(run)))?
-            .as_ref()
-            .map(RunInfo::of)
-            .transpose()
+            .map_err(|e| EngineError::of_backend(e, Some(run)))?;
+        match task {
+            Some(task) => RunInfo::of(&task).map(Some),
+            None => match self.firing_view(run).await? {
+                Some((view, _)) => RunInfo::of(&shared.backend.unowned_task(&view)).map(Some),
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// The runs the agent's `schedules/` fired (ADR 0060), the most recently updated first, each
+    /// with the schedule and the due time that fired it. A firing is nobody's message, so it is in
+    /// no [`list`](Self::list); [`get`](Self::get), [`events`](Self::events),
+    /// [`cancel`](Self::cancel), [`files`](Self::files) and [`file`](Self::file) reach it, while
+    /// [`steer`](Self::steer) and [`answer`](Self::answer) do not (nobody answers a firing).
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Invalid`] for a page token of another query, and the store's failures.
+    pub async fn firings(&self, query: FiringQuery) -> Result<Page<Firing>, EngineError> {
+        let shared = &self.shared;
+        let agent = &shared.agent;
+        let prefix = match &query.schedule {
+            // The scheduler's conversation, then `@`: only that schedule's firings, never one of a
+            // schedule whose name starts with the same text (names are escaped, `@` among them).
+            Some(name) => format!("{}@", adam_schedule::schedule_conversation_id(agent, name)),
+            None => format!("{SCHEDULE_CONVERSATION_PREFIX}{agent}/"),
+        };
+        let size = query.resolved_page_size();
+        let filter = query.schedule.as_deref().unwrap_or("");
+        let mut runs = RunQuery::new(agent.clone(), ConversationScope::Prefix(prefix), size + 1);
+        if let Some(token) = &query.page_token {
+            runs.after = Some(firing_token::read(token, filter)?);
+        }
+        let total = shared
+            .store
+            .count_runs(&runs)
+            .await
+            .map_err(EngineError::Store)?;
+        let mut records = shared
+            .store
+            .list_runs(&runs)
+            .await
+            .map_err(EngineError::Store)?;
+        let more = records.len() > size;
+        records.truncate(size);
+        let next_page_token = more
+            .then(|| records.last())
+            .flatten()
+            .map(|last| firing_token::write(filter, last.updated_at, last.id));
+        let mut items = Vec::with_capacity(records.len());
+        for record in records {
+            let Some(trigger) = record
+                .conversation_id
+                .as_deref()
+                .and_then(adam_schedule::trigger_of)
+            else {
+                continue;
+            };
+            // The record holds the state a view is built from, as `list` builds it: the lease is
+            // read only where it can still say `working`, a runnable run at version 1, so a held
+            // firing is `Working` as `get` says.
+            let lease = if record.status == RunStatus::Runnable && record.version <= 1 {
+                shared
+                    .store
+                    .lease_until(record.id)
+                    .await
+                    .map_err(EngineError::Store)?
+            } else {
+                None
+            };
+            let claimed = adam_core::claimed(record.status, lease, shared.runtime.now());
+            let id = record.id;
+            let view = match adam_runtime::view_from_record(record, claimed) {
+                Ok(view) => view,
+                Err(RuntimeError::Corrupt { .. }) => {
+                    tracing::warn!(run = %id, "a firing has an unreadable state; it is not listed");
+                    continue;
+                }
+                Err(e) => return Err(EngineError::of_run_read(e, id)),
+            };
+            let info = RunInfo::of(&shared.backend.unowned_task(&view))?;
+            items.push(Firing { info, trigger });
+        }
+        Ok(Page {
+            items,
+            next_page_token,
+            total: usize::try_from(total).unwrap_or(usize::MAX),
+        })
+    }
+
+    /// `run` as the runtime has it, when it is a run of this engine's agent that one of its
+    /// schedules fired: the one kind of run beyond the caller's that the engine shows its host
+    /// (#289). A run of another agent, a scheduler's, or a conversation of a caller is `None`.
+    async fn firing_view(
+        &self,
+        run: RunId,
+    ) -> Result<Option<(RunView, adam_schedule::Trigger)>, EngineError> {
+        let shared = &self.shared;
+        let Some(view) = shared
+            .runtime
+            .view(run)
+            .await
+            .map_err(|e| EngineError::of_run_read(e, run))?
+        else {
+            return Ok(None);
+        };
+        if view.agent != shared.agent {
+            return Ok(None);
+        }
+        let trigger = view
+            .conversation_id
+            .as_deref()
+            .and_then(adam_schedule::trigger_of)
+            .filter(|t| t.agent == shared.agent);
+        Ok(trigger.map(|t| (view, t)))
     }
 
     /// Stop the worker: nothing new is claimed, the steps in flight finish and commit, and their
@@ -731,6 +1256,11 @@ impl Engine {
     }
 }
 
+/// Whether `conversation` is a child session's own (`<parent>/s/<session>`).
+fn is_session(conversation: &ConversationId) -> bool {
+    adam_runtime::parse_session_conversation_id(conversation.as_str()).is_some()
+}
+
 /// Refuse an agent whose files, or a local subagent's, name an MCP server (`mcp.json`) or a remote
 /// (`a2a:`) subagent. The engine links no MCP client and no A2A client (ADR 0047 decision 2), and
 /// what it accepts does not depend on the features another crate of the build turns on in
@@ -787,6 +1317,26 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    /// The page token of `firings` reads back what it wrote: a timestamp to the nanosecond, a
+    /// schedule name with `|` in it, and it refuses a token of another filter or a malformed one.
+    #[test]
+    fn a_firing_page_token_reads_back_and_refuses_another_query() {
+        let at: adam_core::time::Timestamp = "2026-11-21T09:00:00.123456789Z".parse().unwrap();
+        let run = RunId::new();
+        for filter in ["", "daily", "a|b|c"] {
+            let token = firing_token::write(filter, at, run);
+            assert_eq!(firing_token::read(&token, filter).unwrap(), (at, run));
+            let other = firing_token::read(&token, "weekly").unwrap_err();
+            assert!(matches!(other, EngineError::Invalid(_)), "{other:?}");
+        }
+        for bad in ["", "x|y|", "2026-11-21T09:00:00Z|not-a-uuid|"] {
+            assert!(matches!(
+                firing_token::read(bad, ""),
+                Err(EngineError::Invalid(_))
+            ));
+        }
+    }
     use crate::WithheldFile;
 
     const FILE: &[u8] = b"the bytes of the file, kept with the run";

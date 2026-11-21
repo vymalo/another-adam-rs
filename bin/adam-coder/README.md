@@ -90,9 +90,8 @@ sequenceDiagram
 | `write_file { path, content, repo? }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path> (<slot>)` | Refused in a reference.
 | `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` | Refused in a reference.
 | `edit_file { path, old, new, replace_all?, repo? }` | replaces **exact text** in a file of the worktree, confined like `write_file` ([below](#reading-and-changing-files-itself)): `old` (blanks and line breaks included) must be in the file, once unless `replace_all`. **The exact match is tried first; when it fails, line endings and trailing spaces or tabs on a line are tolerated (leading whitespace is not), and the edit replaces the original bytes at the matched span, so the rest of the file keeps its own endings and blanks.** A file that is not there, a directory, binary or non-UTF-8 content, one over 1 MiB, an empty `old`, and `old == new` are results that say so. **When `old` is not found it changes nothing and shows the closest region**: its line numbers, two lines of context around it, the first line where it and `old` differ, and a hint when only blanks differ. A tolerant match in several places without `replace_all` is refused as a miss too. **When `old` is in the file several times and `replace_all` is not set** it says how many times and at which lines. Written like `write_file` (a new file renamed over the old, the mode kept). Progress line: `edited <path> (<slot>)` | Refused in a reference.
-| `share_file { path, repo?, name? }` | shows the person **a file of the workspace**: the file is read in this process (confined like `read_file`: relative to the slot, no `..`, nothing inside `.git`, a symlink only while it stays inside the worktree), must be a regular file of at most 4 MiB, and comes back as a **file artifact** with its media type and filename; the model's result is one line, `Shared chart.svg (1.2 KiB, image/svg+xml). To show it in your answer, write ![description](chart.svg).` (the second sentence for an image only; a third gives its SHA-256, `To use it as the picture of an \`ask_user\` option, pass image {sha256: "<hash>", alt}.`), never the bytes. It works on what a command made inside the repository's devcontainer too (the workspace is one directory). See [Sharing a file](#sharing-a-file) and [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md). Progress line: `sharing <path> (<slot>)` |
-| `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group (and tells the run's environment), output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check; a failure the base commit has too is **pre-existing** (below), not a cycle. A **failed** check asked again for the same command (by the SHA-256 of its raw text), directory, timeout and slot on exactly the same tree, at the same epoch (`run`, the file tools and `rebuild_environment` bump it), is **not run again**: the answer quotes its findings, names the call that made them, spends no cycle and emits no artifact; a pass is never reused |
-| `rebuild_environment { use_default? }` | the way out of a **broken work environment**, once the person has decided ([below](#the-work-environment-the-repositorys-devcontainer)): the run's environment is thrown away and made again now (its steps are shown under this call, and a failure is this call's result), from the repository's file as it is (`{}`) or, with `use_default: true`, from the default image for the rest of the run. The decision is the person's, so the tool is for the model to call only after it has asked (`ask_user`); the choice is kept in the run's notes (`environment.use_default`) and in the environment's own state. With no container runtime there is nothing to rebuild and it says so. Where the commands run in this container it changes nothing |
+| `share_file { path, repo?, name? }` | shows the person **a file of the workspace**: the file is read in this process (confined like `read_file`: relative to the slot, no `..`, nothing inside `.git`, a symlink only while it stays inside the worktree), must be a regular file of at most 4 MiB, and comes back as a **file artifact** with its media type and filename; the model's result is one line, `Shared chart.svg (1.2 KiB, image/svg+xml). To show it in your answer, write ![description](chart.svg).` (the second sentence for an image only; a third gives its SHA-256, `To use it as the picture of an \`ask_user\` option, pass image {sha256: "<hash>", alt}.`), never the bytes. It works on what a command made in a run pod too (the workspace is one directory). See [Sharing a file](#sharing-a-file) and [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md). Progress line: `sharing <path> (<slot>)` |
+| `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group (and tells the run's environment), output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check; a failure the base commit has too is **pre-existing** (below), not a cycle. A **failed** check asked again for the same command (by the SHA-256 of its raw text), directory, timeout and slot on exactly the same tree, at the same epoch (`run` and the file tools bump it), is **not run again**: the answer quotes its findings, names the call that made them, spends no cycle and emits no artifact; a pass is never reused |
 | `use_repository_environment { repo?, config?, off? }` | **a source's tool, not one of `coder_tools`**: ADR 0052's way for a run pod to run the image the repository's own `devcontainer.json` names. Offered only when `RUN_ENVIRONMENT=kubernetes`, `RUN_POD_REPOSITORY_IMAGES` names a prefix and a writable slot has a configuration; withheld with the reason otherwise, and a call is refused in words. It reads the file, checks the image against the prefixes, records the choice and makes the run's pod **now** (the pull and the start are this call's steps), then answers with the image, the file and the keys it ignored. `customizations.adam.image` wins; a configuration that only builds or uses Compose is refused. `off: true` goes back to the deployment's image. No lifecycle command is run and no `containerEnv`/`remoteEnv` is set by this slice: the result lists them as ignored; the digest the node pulled is not reported and a changed file does not reset the run. The choice is the pod's annotation (and the coder's memory across an idle sweep), so a restarted coder keeps it while the pod exists; it is not in the run's metadata. Tier `plan`, exclusive |
 | `commit_and_push { message, pull_request?, repo? }` | in a **scratch project**: a commit, locally, and nothing else (no push, no `branch`, no bound `checks`; it says nothing is published until the person names a repository), and a `pull_request` in the call is refused as `open_pull_request` refuses one. In a repository: `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. With `pull_request` (`title`, `body`, `accept_red_checks?`) it then opens (or updates) the pull request **in the same call**, through exactly the gate and the path of `open_pull_request` ([below](#the-rules-in-code)): artifact `pull_request` after `branch`, and a refusal leaves the commit and the push standing. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
 | `open_pull_request { title, body, accept_red_checks?, repo? }` | a scratch project has no remote: it is a result that sends the model to `publish_scratch`. In a repository, after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link). The `pull_request` of `commit_and_push` is this path, called with the slot it already resolved: one gate, one implementation |
@@ -136,7 +135,6 @@ by its name; [ADR 0027](../../docs/decisions/0027-every-tool-has-a-title-for-its
 | `start_scratch` | Start a scratch project | `write_file` | Write a file |
 | `publish_scratch` | Publish a scratch project | `apply_patch` | Apply a patch |
 | `edit_file` | Edit a file | `share_file` | Share a file |
-| `run_checks` | Run the checks | `rebuild_environment` | Rebuild the environment |
 | `commit_and_push` | Commit and push | `open_pull_request` | Open a pull request |
 | `ask_user` | Ask you | `show`, `ui_catalog` | Show on your screen, List what the screen can draw |
 | `plan_work` | Write the plan | `plan_check`, `plan_add` | Update the plan, Add to the plan |
@@ -152,7 +150,7 @@ bring its title.
 | `read` | `read_file` |
 | `search` | `list_files`, `find_files`, `search_files` |
 | `edit` | `write_file`, `edit_file`, `apply_patch` |
-| `execute` | `run_command`, `run`, `run_checks`, `rebuild_environment` |
+| `execute` | `run_command`, `run`, `run_checks` |
 | `git` | `prepare_workspace`, `commit_and_push`, `open_pull_request`, `merge_pull_request`, `rename_repository`, `create_repository`, `publish_scratch` |
 | `delete` | `delete_repository` |
 | `file` | `start_scratch`, `share_file` |
@@ -208,7 +206,6 @@ call's result. `ToolEnv::session` reports which environment the run asked for:
 |---|---|
 | a run pod (`RUN_ENVIRONMENT=kubernetes`) | `{"environment": "kubernetes", "usage": [{"cpuMillis": 250, "memoryBytes": 536870912, "commands": 12, "milliseconds": 81234}]}`; `"usage": []` when the pod was asked for and no command ran |
 | the coder's own container | `{"environment": "local"}`: not measured, never zero |
-| a dev container (Podman) | `{"environment": "devcontainer"}`: likewise |
 | no environment at all (the run only read files or talked) | no `sandbox` |
 
 The pod's idle wait, its start-up and the janitor's tail are not command time and are not counted. Like the totals, it is on the task
@@ -629,10 +626,10 @@ exit code 0
 ```
 
 * **No duration** is in a result: it is journaled, a replay returns the same bytes, and a duration would make two runs of the same command differ for nothing the model can use.
-* **Trust, in plain words.** A command that runs as the coder's user (the local environment, a Podman devcontainer) **can rewrite a kept file** (or fill its directory): the files are no safer than the notes beside them. What `read_output` returns is **no more trusted than the output of a command was**; nothing decides on it (the verdict of `run_checks` is its exit code, never the kept text). The guarantee that no secret reaches the model on a read is **the `Redacting` layer around `read_output`** (which also scrubs a secret the process learned after the keep, and one a command planted in the file), not the file store. A line of the output that starts with `[` is shown as `\x5b...`, so no line a command prints can pass for the last line of a view or of a page.
-* **Where.** `<WORKSPACE_ROOT>/outputs/<root run>/<id>.txt`, written by the coder's own process from the command's pipes (so the same in every environment: a run pod or a devcontainer never sees `outputs/`, it mounts only the slots of its run, and `read_output` reads the file here, as the read tools read the slots). Directories `0700` (opened one component at a time below the workspace root, **no link followed on the write side or the read side**; a link where `outputs` or `outputs/<run>` should be is `NOT kept`, and no message holds a path of the volume), file `0600` made in the held directory with `O_EXCL` and `O_NOFOLLOW`, written to a temporary name and renamed, a file with another hard link is not read, read as a regular file and never through a link. Nothing is in the journal, and a worker that takes the run over (or a restart) reads the same file on the shared volume. A command of the local environment, or of a Podman devcontainer, runs as the same user and could read or overwrite the files, as it can read the notes and the other slots: the files hold only what commands printed. Removed with the run by the janitor (and the directories of finished runs with no workspace left).
+* **Trust, in plain words.** A command that runs as the coder's user (the local environment) **can rewrite a kept file** (or fill its directory): the files are no safer than the notes beside them. What `read_output` returns is **no more trusted than the output of a command was**; nothing decides on it (the verdict of `run_checks` is its exit code, never the kept text). The guarantee that no secret reaches the model on a read is **the `Redacting` layer around `read_output`** (which also scrubs a secret the process learned after the keep, and one a command planted in the file), not the file store. A line of the output that starts with `[` is shown as `\x5b...`, so no line a command prints can pass for the last line of a view or of a page.
+* **Where.** `<WORKSPACE_ROOT>/outputs/<root run>/<id>.txt`, written by the coder's own process from the command's pipes (so the same in every environment: a run pod never sees `outputs/`, it mounts only the slots of its run, and `read_output` reads the file here, as the read tools read the slots). Directories `0700` (opened one component at a time below the workspace root, **no link followed on the write side or the read side**; a link where `outputs` or `outputs/<run>` should be is `NOT kept`, and no message holds a path of the volume), file `0600` made in the held directory with `O_EXCL` and `O_NOFOLLOW`, written to a temporary name and renamed, a file with another hard link is not read, read as a regular file and never through a link. Nothing is in the journal, and a worker that takes the run over (or a restart) reads the same file on the shared volume. A command of the local environment runs as the same user and could read or overwrite the files, as it can read the notes and the other slots: the files hold only what commands printed. Removed with the run by the janitor (and the directories of finished runs with no workspace left).
 * **Id.** `o-` and 16 hex characters of SHA-256(root run, call key): a call that runs again (a crash before the journal) writes the same file and returns the same bytes. `read_output` takes the run from its context and checks the id's shape before any path is built, so a run cannot name another's output.
-* **The janitor, and what is still by path.** It lists and removes kept output through no-link directory handles; a directory a command made unreadable is made private through the handle and removed, a tree nested deeper than 32 levels is removed as far as it goes, and a failure is logged once per run in a process, not at every sweep. **Known limit (it predates kept output):** the janitor's removal of a run's *workspace* (`workspace.rs`: `remove_dir_all(path)`, `remove_dir_if_exists`) is by path and follows a link a command of the local environment (or a Podman devcontainer's) put at `workspaces`, so it can remove what the link leads to; kept output is not affected, and nothing here changes it.
+* **The janitor, and what is still by path.** It lists and removes kept output through no-link directory handles; a directory a command made unreadable is made private through the handle and removed, a tree nested deeper than 32 levels is removed as far as it goes, and a failure is logged once per run in a process, not at every sweep. **Known limit (it predates kept output):** the janitor's removal of a run's *workspace* (`workspace.rs`: `remove_dir_all(path)`, `remove_dir_if_exists`) is by path and follows a link a command of the local environment put at `workspaces`, so it can remove what the link leads to; kept output is not affected, and nothing here changes it.
 * **Redaction.** The whole output is scrubbed with the process's secrets **before** it is written, and the head, the tail and every page are made from the scrubbed text: no secret it knows is on the volume, and none is split by a page boundary. The text a long output is cut from is the shell's capture, which ends wherever the limit fell, so its end may be the first half of a secret: the keeper scrubs the capture whole and again without its last **margin** bytes, and keeps what the two agree on (`adam_llm_agent::scrub_open_end`), so **no part of a secret is kept at the cut, whatever scrubbing did to the length**. The margin is `Redactor::margin()`: the longest value the redactor holds, its base64 forms included, and at least 64 KiB (a 70 KiB secret from an `mcp.json` variable is held back whole); the shell captures that margin beyond 4 MiB and holds it before the tail, and a keeper whose margin is larger than what was captured simply keeps less. Where the scrubbed text diverges from the cut one the agreement is backed off 16 bytes, so a secret that starts like `[redacted]` keeps none of itself. A command whose output is not kept (the pre-existing-failure run on the base commit, the checks) has its tail scrubbed the same way, with the margin before it; the tracked tail is cut back the same way at its start, and the head is made from a part of the capture cut back at its end. `read_output` is not a way round the redactor.
 * **Bounds.** One output keeps at most 4 MiB (the first bytes; the result says `only the first N of M bytes are kept`), a run at most 64 MiB of the files **this process names** (`o-<16 hex>.txt`; a file of another name that a command put there is not counted, a temporary file left by a crash is not counted and is removed after ten minutes; the check and the write are one at a time in a process, so two workers on one volume can overshoot by one output each); past that the result says `NOT kept (...)` and shows head and tail alone. An output over 4 MiB is **kept cut**: the shell captures 64 KiB past it and the keeper cuts that margin back (see Redaction), the view says `only the first N of M bytes are kept` (N counts the scrubbed text, M the output: the note says so); an output that is long as printed and short once scrubbed is shown whole and not kept, the last page ends with `(output cut: only the first N of M bytes are kept)`, and the count of hidden bytes says `about` when the output outgrew the capture. A line over 2,000 characters is folded onto several lines and a NUL becomes U+FFFD, so the pages reassemble the output.
 * **MCP results over 64 KiB** (the GitHub server's, a tool server's) are kept in the same place and the model gets the first page and the same id (`adam-mcp` README).
@@ -708,7 +705,7 @@ are written `\xNN` so it stays one line. A name that is not UTF-8 is listed, fou
 cannot be given back to a tool as it is shown: that is the price of a name that cannot lie. The tool descriptions say so.
 
 **Where they read.** In the coder's own process, through the slot's descriptors (`SlotDir`), never through the run's environment: a run pod or a
-devcontainer is not started for a read. Every `path` goes through `confine` (no `..`, no absolute path, nothing inside `.git`, a link only while
+pod is not started for a read. Every `path` goes through `confine` (no `..`, no absolute path, nothing inside `.git`, a link only while
 it stays inside).
 
 * `list_files` is one `getdents` of the held directory (`Dir::entries`, sorted by bytes), no `git`.
@@ -758,7 +755,7 @@ artifact; the orchestration layer keeps the bytes in its artifact store and show
   file that is not a regular file (a pipe), a missing file and a file over **4 MiB** (`MAX_ARTIFACT_FILE_BYTES`) are results
   for the model, which can shrink the file or tell the person. The bytes are read up to the cap plus one, so a file that grows
   under the call is refused, not cut. The workspace is one directory whatever environment the commands run in, so a file a
-  command made in the repository's devcontainer is shared like one the coder wrote. A file whose name holds a `:` is
+  command made in a run pod is shared like one the coder wrote. A file whose name holds a `:` is
   refused too (`Artifact::file`: a name must never read as a URL), with a result that says why.
 * **The media type** is derived from the extension and **checked against the bytes for images** (`media_type_of`, on
   `adam_runtime::checked_media_type`, the rule a `files: true` MCP server's files follow too): `.png`
@@ -868,7 +865,7 @@ A child run has an id of its own, so the tools key by the **root run** (`ToolCtx
 
 | What | Keyed by | Why |
 |---|---|---|
-| the workspace's slots, the environment session, `prepare_workspace`, `start_scratch`, `rebuild_environment` | root | a subagent works in its parent's worktree and environment |
+| the workspace's slots, the environment session, `prepare_workspace`, `start_scratch`, `use_repository_environment` | root | a subagent works in its parent's worktree and environment |
 | the run notes: check cycles and results, the repositories named and agreed to, created repositories, the credentials blocker | root | a budget or a gate that protects the pull request is counted once, on the root: a subagent has no fresh budget and passes no gate the root has not |
 | a call id in the notes (`record_missing_tool`) | the subagent's run plus the call id | model call ids are unique only within the run that made them |
 | the steps the environment shows (`env:<run>:...`) | the run that makes the call | a step belongs to the run that emits it |
@@ -1019,7 +1016,7 @@ tier, and the tools check it again against the tier in the notes.
 
 | Tier | The coder may | Forms |
 |---|---|---|
-| `plan` | read only: `read_file`, `read_files`, `list_files`, `find_files`, `search_files`, `read_output`, `run_command` (its changes are undone), `prepare_workspace`, `share_file`, `rebuild_environment`, the helpers, GitHub and web reads, `ask_user`, the plan tools (`plan_work`, `plan_check`, `plan_add`: they change nothing outside the conversation); the answer is a plan | a repository the person did not name asks |
+| `plan` | read only: `read_file`, `read_files`, `list_files`, `find_files`, `search_files`, `read_output`, `run_command` (its changes are undone), `prepare_workspace`, `share_file`, `use_repository_environment`, the helpers, GitHub and web reads, `ask_user`, the plan tools (`plan_work`, `plan_check`, `plan_add`: they change nothing outside the conversation); the answer is a plan | a repository the person did not name asks |
 | `edits` | also change files (`write_file`, `edit_file`, `apply_patch`, `run`, `run_checks`, `start_scratch`), `publish_scratch`, `commit_and_push`, `open_pull_request` | same; a bare name does **not** count as named |
 | `auto` | also `merge_pull_request` (below) and `create_repository` | a name the person wrote **alone** in their newest message (`widgets`, not a piece of a URL or a path) counts as named when exactly one owner applies; `create_repository` still asks its yes or no |
 | `bypass` (only with `MAX_ACCESS_TIER=bypass`) | also `rename_repository` and `delete_repository` | none: any repository the host allows is granted, `create_repository` asks nothing |
@@ -1118,13 +1115,13 @@ to a person who asked for a plan). Not enforceable: what an asked agent (`ask_ag
 ask for a change the tier forbids) and a server's write tool with a reading name.
 
 **The tier is not a boundary against a command.** `run_command`, `run` and `run_checks` run in the coder's own container
-when there are no run pods and `DEVCONTAINER_RUNTIME=off` (the default), as the user that can read the GitHub App's private key
+when there are no run pods (the default), as the user that can read the GitHub App's private key
 **file** (`GITHUB_APP_PRIVATE_KEY_PATH`; a key given inline is hidden from the commands): a command can read it, mint an
 installation token and act as the App at any tier, a `plan` included. **The coder refuses to start in that configuration**
 (exit 78, with every other problem of the configuration) unless the deployment accepts the risk by name with
 `ALLOW_COMMANDS_NEXT_TO_SECRETS=true`; accepted, it starts and logs a **startup warning** that says so
 (`WorkerConfig::commands_can_read_the_app_key`, [Configuration](#configuration)). The ways out that need no acceptance: run the
-commands in run pods (`RUN_ENVIRONMENT=kubernetes`) or in Podman devcontainers (`DEVCONTAINER_RUNTIME=podman`), which have no such
+commands in run pods (`RUN_ENVIRONMENT=kubernetes`), which have no such
 file. A role that runs no workers (`control-plane`) reads none of this. The
 refusal came with [vymalo/another-adam-rs#120](https://github.com/vymalo/another-adam-rs/issues/120): a deployment that ran an App
 with a key file and no run pods before it **fails to start after it**, and the
@@ -1231,7 +1228,7 @@ branch of its own, made by the first read that names it and removed with the run
   A file shared from a reference is not a result of the run (`share_file` records only the shares of a slot the run
   works in), so it does not end a scratch run as delivered.
 * **`run_command` in a reference** keeps the look-around guard (what changes a file, `HEAD` or the git state is undone and
-  refused). Without run pods (or a devcontainer, which mounts it read-only) nothing else stops a command from writing a file
+  refused). Without run pods (which mount it read-only) nothing else stops a command from writing a file
   that `.gitignore` excludes: only the tool layer protects a reference there.
 * **What a reference holds is somebody else's text**: it grants no repository, tier or consent, and its own `AGENTS.md` is
   not shown as the repository's instructions are.
@@ -1416,9 +1413,9 @@ caller, as for a form's answer and the access tier. Decision: [ADR 0036](../../d
 comes back in a process group of its own. The default is `Local`, this container, and it behaves exactly as the tools always
 did (a login shell, the same `cwd`, the same hidden secrets); a deployment composing the coder with another `Environment`
 (`ToolEnv::with_environment`, and the same value for `Janitor::with_environment`) runs the processes of a run somewhere
-else without the tools changing. `serve` composes [`adam-devcontainer`](../../crates/adam-devcontainer/README.md)'s `DevContainer`
-(`DEVCONTAINER_RUNTIME`, [below](#the-work-environment-the-repositorys-devcontainer)): with `off`, the default, a run's
-processes are in this container exactly as above; with `podman` they run in the devcontainer of the run's first repository.
+else without the tools changing. `serve` composes `Local` for `RUN_ENVIRONMENT=local` (the default) and
+`adam-env-kubernetes`'s `KubeEnvironment` for `kubernetes` ([below](#a-pod-of-its-own-for-each-run)); ADR 0052 removed the
+third environment, a repository's devcontainer on a container service.
 
 ```mermaid
 sequenceDiagram
@@ -1458,9 +1455,9 @@ stateDiagram-v2
   (ADR 0038); what the process must not see of this process's own environment is `ExecSpec.hide`:
   `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL`, `A2A_BEARER_TOKENS` and `MODEL_API_KEY`. The App's key as a *file*
   (`GITHUB_APP_PRIVATE_KEY_PATH`) is a path, not a secret, and the file is readable by the user the checks run as: **in this
-  container (no run pods, `DEVCONTAINER_RUNTIME=off`) a command can read the key and mint a token, so no access tier holds
+  container (no run pods) a command can read the key and mint a token, so no access tier holds
   against a command**; the coder refuses to start that way unless `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` accepts it (and then
-  warns at startup), and run pods or Podman devcontainers are what confine it. A name in `hide` stays hidden even when a spec sets it.
+  warns at startup), and run pods are what confine it. A name in `hide` stays hidden even when a spec sets it.
 * **A failure to make the environment is a result for the model**, worded `the work environment: <reason>` (the end of a
   failed build's output follows, scrubbed): permanent for a configuration or a build that is wrong, transient for a runtime
   that is down or too slow. Nothing ran, no check cycle was used, no `checks` artifact was emitted. A cancel of the run ends
@@ -1470,75 +1467,30 @@ stateDiagram-v2
   `run_checks` at once with the `cancelled` tool error (`RunError::Cancelled`), whatever the command was doing (a `sleep 60`
   included), and a command of a run that is cancelled already is not started.
 
-### The work environment: the repository's devcontainer
+### The work environment: this container, or a run pod of the run's own
 
-With `DEVCONTAINER_RUNTIME=podman` the commands of a run (`run_command`, `run`, `run_checks`) and everything they start run
-in the **devcontainer of the run's first repository** ([ADR 0010](../../docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md),
-[`adam-devcontainer`](../../crates/adam-devcontainer/README.md): the official devcontainer CLI against a rootless Podman service,
-never the host's Docker socket). The repository's `.devcontainer/devcontainer.json` says what it needs, and the coder's own
-image no longer has to be every repository's environment. A repository without one gets `DEVCONTAINER_DEFAULT_IMAGE` (the
-`workspace` image of `another-agentic-images`, a dev container base). The files, the paths and all git work stay in this container,
-which holds the credentials; **a path means the same inside**.
+ADR 0052 removed the third environment (a repository's devcontainer on a rootless container service), with no
+switch and no dormant code. `serve` composes `Local` for `RUN_ENVIRONMENT=local` (the default: on a desktop, the
+person's own work sandbox) and `KubeEnvironment` for `kubernetes` ([a pod of its own for each
+run](#a-pod-of-its-own-for-each-run)). A repository that brings its own environment names an **image**, which
+its run pod runs: `use_repository_environment` ([above](#tools)), offered only with run pods, an allowed image
+prefix and a configuration in a writable slot. A configuration that only builds its image or uses Compose is
+refused in words: the repository's CI publishes the image.
 
-```mermaid
-sequenceDiagram
-  participant M as the model
-  participant T as run_command, run, run_checks
-  participant E as DevContainer (adam-devcontainer)
-  participant C as devcontainer CLI, Podman service
-  participant J as janitor
-  M->>T: a command
-  T->>E: ensure(workspace, progress)
-  E->>C: read the file, check it, build, create, check the container, run its lifecycle commands
-  E-->>T: steps while it is built (Building the environment from .devcontainer/devcontainer.json)
-  E-->>T: the session
-  T->>C: devcontainer exec ... adam-exec run|shell (the command prepare made)
-  C-->>T: output and exit code
-  T-->>M: the result (a checks artifact says where it ran)
-  Note over T,C: a file that cannot be used is an error naming the file and the problem, and the person decides
-  M->>T: rebuild_environment (only after the person answered)
-  T->>E: rebuild(run, use_default), then ensure
-  J->>E: release(run) before the workspace is removed, held_runs() for what a crash left
-```
-
-```mermaid
-stateDiagram-v2
-  [*] --> Local: DEVCONTAINER_RUNTIME=off, or the service does not answer (a step says so)
-  [*] --> Building: the first command of the run needs an environment
-  Building --> Ready: built, checked, set up
-  Building --> Broken: a file that cannot be read, a refused privilege, a build or a lifecycle command that fails, a timeout
-  Broken --> Broken: every command gets the same error (the model asks the person)
-  Broken --> Building: rebuild_environment (use_default for the default image)
-  Ready --> Building: a repository joined, or the container is gone
-  Ready --> [*]: the janitor releases it
-```
-
-* **Broken is the person's decision.** A file that cannot be used (it does not parse, it asks for `privileged` or a bind mount, its image does not
-  build, a lifecycle command fails, a phase ran out of time) is a **permanent** error result for every tool that needs the environment, naming the
-  file and the key or phase (the end of the log follows, scrubbed), and ending with what to do: the model asks the person with `ask_user`
-  (fix the file, or go on in the default environment), and only after the answer calls `rebuild_environment`. There is **no silent fallback**
-  to the default image. A service that is not there (or not answering) is another thing: that run is `Local`, with a step ("The container
-  runtime is not reachable: commands run in the coder's own environment"), and the next run probes again.
-* **The steps** are the environment's own, under the tool call that needed it (`env:<run>:<step>`): `Building the environment from
-  .devcontainer/devcontainer.json (owner/name)` (its detail follows the CLI: pulling, building, the repository's lifecycle commands; it ends
-  `done` with how long it took, or `failed` with the reason), `Using the default environment (<image>)`, `Restarting the environment: <repo>
-  joined the workspace`, `The environment was lost; rebuilding it`, and the fallback lines.
-* **The `checks` artifact** has `environment {kind: "devcontainer", source?, image}` when the check ran in a devcontainer (absent for this
-  container, so nothing changes for a deployment without them); a consumer that does not know the field ignores it.
-* **A missing tool says where it is missing.** In a devcontainer built from a file: the tool has to be added to that file (a devcontainer feature, or
-  its Dockerfile), and `rebuild_environment` makes the environment again after the change. On the default image: the repository has no devcontainer,
-  and one can provide it.
-* **Secrets.** The CLI and Podman's client start from an empty environment plus an allow-list: nothing of this process's environment (`GITHUB_TOKEN`, the
-  App's key, `DATABASE_URL`, `A2A_BEARER_TOKENS`, the thread-tools token) is in a container, and `${localEnv:X}` in a repository's file is empty.
-  **No secret is mounted**: no model key, no key file ([ADR 0038](../../docs/decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)); the tools directory holds `adam-exec` alone. The untrusted file is checked three times against a
-  [policy](../../crates/adam-devcontainer/README.md#the-file-is-untrusted).
-* **Kubernetes.** The Helm chart keeps `DEVCONTAINER_RUNTIME` off ([`deploy/coder/README.md`](../../deploy/coder/README.md)): the Podman service
-  needs the same workspace volume at the same path and relaxed seccomp, which a pod does not give. A cluster has its own environment instead,
-  [a pod for each run](#a-pod-of-its-own-for-each-run) (`RUN_ENVIRONMENT=kubernetes`), which does not use the repository's `devcontainer.json`
-  and is never on together with this one.
-* **At startup** (`serve`, through `environment_for`) with `podman`: the tools directory every container mounts (`<root>/environments/.tools/`: `adam-exec` alone) is written (a failure stops the start), the service is probed (a service that does not answer is a warning: runs fall back to
-  this container until it does), and the default image is pulled in the background (`DEVCONTAINER_PREPULL`). The janitor releases the
-  environment of a run **before** it removes the run's workspace, and releases what `held_runs()` finds for runs that are over (a crash left it).
+* **A deployment that asked for the removed path fails closed.** `DEVCONTAINER_RUNTIME=podman` is exit 78 with a
+  message naming ADR 0052; every other removed variable (`DEVCONTAINER_*`, `CONTAINER_HOST`) is ignored, and the
+  process logs one warning naming it ([the variables](#configuration)).
+* **A broken environment is the deployment's.** A run pod that cannot be made is a permanent error result for
+  every tool that needs it, and ends with what to do: ask the person with `ask_user`; the deployment fixes the
+  template, the image, the quota or the policy, and `use_repository_environment` with `off: true` is the way back
+  from a repository's image that cannot start.
+* **The `checks` artifact** has `environment {kind: "kubernetes", image}` when the check ran in a run pod (absent
+  for this container, so nothing changes for a local deployment); a report of an older coder may say
+  `devcontainer` with a `source`, and a consumer that does not know the field ignores it.
+* **A missing tool says where it is missing**: in a run pod, the tool has to be in the image the pod
+  runs (the deployment's, or the repository's own when the run moved to it).
+* **The janitor** releases the environment of a run **before** it removes the run's workspace, and releases what
+  `held_runs()` finds for runs that are over (a crash left it).
 
 ### A pod of its own for each run
 
@@ -1546,9 +1498,8 @@ With `RUN_ENVIRONMENT=kubernetes` the commands of a run (`run_command`, `run`, `
 the run's own** ([ADR 0019](../../docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)), made by
 [`adam-env-kubernetes`](../../crates/adam-env-kubernetes/README.md)'s `KubeEnvironment`, so that a Rust build, an `npm install` or a Flutter build is
 bounded by the pod's memory limit (2Gi in the chart) and an out-of-memory kill takes one run's command and not the coder. The coder pod holds the files,
-git and every credential and can be small (about 1Gi). `RUN_ENVIRONMENT` is `local` (this container, or the repository's devcontainer) unless it says
-otherwise, so nothing changes for a deployment that does not opt in; `kubernetes` with `DEVCONTAINER_RUNTIME=podman` is refused at startup, with
-every other problem of the configuration (exit 78).
+git and every credential and can be small (about 1Gi). `RUN_ENVIRONMENT` is `local` (this container) unless it says otherwise, so nothing changes for a deployment that
+does not opt in.
 
 * **Where the pod comes from.** `RUN_POD_TEMPLATE_FILE`, a Pod the chart mounts: the image (the `workspace` image, by tag and digest), the resources,
   the priority class, the security context, the volumes, `MODEL_API_KEY` from the deployment's Secret and the node affinity are the deployment's; the
@@ -1575,15 +1526,16 @@ every other problem of the configuration (exit 78).
   room for are `EnvError::Unavailable`. Where this environment is on, the tool does **not** fail at once and does **not** run in this container instead:
   it tries again after 2, 4, 8, ... up to 30 seconds, for `RUN_POD_WAIT_SECS`, with a step `env:<run>:slot` ("Waiting for a slot for the run's
   environment", with the reason and what is left) that ends completed or failed, and a cancel of the run ends the wait (`ToolEnv::with_unavailable_wait`).
-  After the wait the tool's result is the transient error. The devcontainer's behaviour is unchanged: without the setting the first `Unavailable` is the
-  result at once.
+  After the wait the tool's result is the transient error. Without the setting the first `Unavailable` is the result
+  at once (a local deployment's behaviour).
 * **Its time is usage.** The template's run container requests (`resources.requests.cpu` and `memory`) are the pod's shape, read at
   startup (a request that is not a Kubernetes quantity is exit 78), and `EnvSession::sandbox_shape()` of the pod's session says it: the
   coder weights each command's time by it in the task's `sandbox` usage (see *Tokens*).
 * **The tools** are `adam-exec` alone, copied by the pod's init container into `/opt/adam/bin`: no agent binary (ADR 0038). `EnvKind::Kubernetes` is what the `checks` artifact's `environment` says
   (`kind: "kubernetes"`, the image).
-* **The repository's own `devcontainer.json` is not used** in a run pod: the template's image is the environment, and a tool that image lacks is
-  reported to the person like any missing tool.
+* **The repository's own `devcontainer.json` is not read** to make the pod: the template's image is the environment,
+  and a tool that image lacks is reported to the person like any missing tool. `use_repository_environment` moves the
+  pod to an image the repository names (ADR 0052).
 
 ### Looking around, and what it may not do
 
@@ -1674,7 +1626,7 @@ stateDiagram-v2
   its beat is older than `stale_after(sweep)`: the larger of three sweeps and 60 s (`BEAT_STALE_FLOOR_SECS`; the clocks of the workers
   are assumed to agree within that). A fresh record is listed as running, counts against `BACKGROUND_COMMANDS_MAX`, is read through
   its file, is left alone by a start of another id, and is stopped by a **stop request** in its record (and, in a pod or a
-  devcontainer, by the kill of its exec id): its owner's sweep stops it, so `stop_command` returns how it ended, or says the stop
+  run pod, by the kill of its exec id): its owner's sweep stops it, so `stop_command` returns how it ended, or says the stop
   was asked and the owner does it within a sweep. A stale one is a dead worker's: its process (by exec id, by pid with its start time,
   and what is left of its group) is killed and the record says `gone: the worker that ran it is gone; start it again`. The janitor
   settles the records of a run that is over before it removes `outputs/<run>` with the workspace.
@@ -1684,10 +1636,10 @@ stateDiagram-v2
 * **When it stops:** `stop_command`; `BACKGROUND_COMMAND_MAX_SECS`; the root run ends or any run of the tree parks on the person
   (`CoderAgent::step`: at once on the worker that holds the command, a stop request in the record of one another worker holds, carried
   out within one sweep; the end of a child run stops nothing, nor does a park on a subagent or a timer); a cancel never calls the
-  agent, so `Commands::sweep` reads the run's standing every `BACKGROUND_SWEEP_SECS` and stops what is over; `rebuild_environment`;
+  agent, so `Commands::sweep` reads the run's standing every `BACKGROUND_SWEEP_SECS` and stops what is over; `use_repository_environment`;
   the janitor's release; the worker's shutdown (`gone: the worker stopped...`; `CommandsSweep` is the component, `wire_commands`
   gives the tools, the janitor and the sweep one registry). A process group is killed whatever ended the leader, and what a pod or a
-  devcontainer holds is stopped by exec id (`CoderSettings::background_kill_wait` bounds the call). A command in a pod or a devcontainer
+  run pod holds is stopped by exec id (`CoderSettings::background_kill_wait` bounds the call). A command in a pod
   that a signal ended and nobody asked for says its environment was probably made again.
 * **Limits:** at most `BACKGROUND_COMMANDS_MAX` run at once in a run, on every worker (refused with the number and how to stop one).
   Commands belong to the **root run**: a subagent's tools reach them, and the read-only helpers cannot start one (tier `plan`). Time
@@ -2111,7 +2063,7 @@ shipped files stay in the binary and cannot disagree with it.
     service-account token and a PID namespace of its own (the chart's `git-sandbox` container with run pods: [the git sandbox](../../deploy/coder/README.md#the-git-sandbox)), so the program a repository's configuration names
     (`filter.*`, `textconv`) runs where nothing is readable that the environment hid. The `fetch`, `push` and `ls-remote` that carry the
     token stay in the coder, on the bare mirror, and the mirror's configuration is put back to what the workspace writes before each. Without the variable
-    (local mode, Podman, run pods off) git runs in the coder's container and **this is not protected**. [The split](../../crates/adam-workspace/README.md#where-git-runs-the-git-sandbox).
+    (local mode, run pods off) git runs in the coder's container and **this is not protected**. [The split](../../crates/adam-workspace/README.md#where-git-runs-the-git-sandbox).
   * The process is **non-dumpable** at startup (`harden::make_non_dumpable`, which lives in `adam-service` and is re-exported here,
     and which `adam-agent` calls too; `prctl(PR_SET_DUMPABLE, 0)` through `rustix`'s safe call), so a child of the same user without `CAP_SYS_PTRACE` cannot read `/proc/<coder pid>/environ`.
   * **Remaining**: the one invocation that carries the token (fetch, ls-remote, push) has it in its environment, and the
@@ -2166,7 +2118,6 @@ crash after it was posted and before the call was journaled posts it again when 
 With `MODEL_INPUT_MODALITIES=text,image` (off by default) `read_file` of a PNG, JPEG, GIF or WebP answers `` `shot.png` is an image (image/png, 120.0 KiB, 800×600), shown to you after this result `` and the picture follows in the history; an SVG is text and a file that is not one of the four is read as before. An image over a limit, or a source (`workspace`) the deployment does not send, is a line (or the binary notice) and never an error. The bytes are `<WORKSPACE_ROOT>/images/<scope>/<sha256>.<ext>` per conversation (`FileImages`, `src/images.rs`: private, no link followed, 64 MiB a scope, **the hash checked on the first read of a file in a process**: a file changed after that is not re-read, the checked bytes are sent), never in the journal or the state after the first step; keeping an image replaces a file planted under its name that would be refused at load (the check and the write are made one at a time in a process, so two worker processes on one volume may each overshoot a scope by one image, as for kept output); the run that keeps images in a scope notes itself in it (`owner`), and the janitor sweeps scopes on their own: one whose conversation has an open run stays whatever `SCRATCH_IDLE_DAYS` is (`0` included), an idle one goes with or without a workspace, and one nobody can place goes after 30 days (`IMAGE_SCOPE_BACKSTOP`). `without_untrusted` drops the lines the system adds about a picture, a file or a link (`is_system_line`), so they name no repository and answer no form. `Sweep` gains the field `images`. **An image is not scrubbed** ([Secrets](../../docs/reference/coder-agent.md#secrets)). Tests: `read_file_of_a_png_is_an_image_for_a_seeing_model`, `a_rewritten_image_file_is_refused_by_its_hash`, `file_images_conformance`, `images_go_with_an_idle_conversation`.
 
 ## Configuration
-## Configuration
 
 Environment variables (`src/config.rs` is the reference for the coder's own, and
 [`adam-service`](../../crates/adam-service/README.md#environment) for `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`,
@@ -2196,7 +2147,7 @@ way; every problem is reported at once at startup):
 | `GITHUB_APP_INSTALLATION_ID` | App mode: **pins** the App to one installation (a positive integer), which serves every repository, with no lookup | App mode: this or `GITHUB_APP_OWNERS`, exactly one |
 | `GITHUB_APP_OWNERS` | App mode **without a pin**: the accounts (users and organisations) the App may act for, separated by commas or spaces, compared without case, or `*` for every account the App is installed on (a startup warning; refused beside other names). The installation of each repository's owner is found with the App's JWT. The chart's `github.app.owners` | App mode: this or `GITHUB_APP_INSTALLATION_ID`, exactly one |
 | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 as GitHub gives it, or PKCS#8): a file, or inline (`\n` escapes accepted). Exactly one. Parsed at startup | one required in App mode |
-| `ALLOW_COMMANDS_NEXT_TO_SECRETS` | roles that run workers: `true` (or `1`) accepts, `false` (or `0`, the default) refuses at startup (**exit 78**), a GitHub App whose private key is a **file** (`GITHUB_APP_PRIVATE_KEY_PATH`) while the commands of a run run in this container (`RUN_ENVIRONMENT=local` with `DEVCONTAINER_RUNTIME=off`): a command runs as the user that can read the file, mints installation tokens and acts as the App at any access tier. Accepted, the coder still logs a warning. `kubernetes`, `podman`, a key given inline and a token need no acceptance and ignore it. Read as every flag of the coder is (`true`/`1`/`false`/`0`, any case); anything else is exit 78. The chart sets it from `runPods.allowCommandsNextToSecrets`; the operator takes it in `extraEnv` | `false` |
+| `ALLOW_COMMANDS_NEXT_TO_SECRETS` | roles that run workers: `true` (or `1`) accepts, `false` (or `0`, the default) refuses at startup (**exit 78**), a GitHub App whose private key is a **file** (`GITHUB_APP_PRIVATE_KEY_PATH`) while the commands of a run run in this container (`RUN_ENVIRONMENT=local`): a command runs as the user that can read the file, mints installation tokens and acts as the App at any access tier. Accepted, the coder still logs a warning. `kubernetes`, a key given inline and a token need no acceptance and ignore it. Read as every flag of the coder is (`true`/`1`/`false`/`0`, any case); anything else is exit 78. The chart sets it from `runPods.allowCommandsNextToSecrets`; the operator takes it in `extraEnv` | `false` |
 | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them. The first is also the host `owner/name` stands for when the person writes a repository that way | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
 | `GITHUB_MCP_URL` | where the GitHub MCP server is (`github-mcp-server http`, the sidecar of the pod): an http(s) URL with no credentials, of which only the origin counts. The agent folder's `github` server has to be at that origin, and the coder gives that server the credentials of each call. The chart sets it from `githubMcp.port`; `compose.yaml` points it at `mock-github-mcp`. Read by the roles that run workers | `http://127.0.0.1:8082` |
@@ -2204,7 +2155,7 @@ way; every problem is reported at once at startup):
 | `MAX_ACCESS_TIER` | the highest access tier a person may pick for a message: `plan`, `edits`, `auto` or `bypass` (exactly, lower case; anything else is exit 78). The card lists the tiers up to it, the A2A backend refuses a higher one (every role), and the tools check it against the tier in the notes. `bypass` (rename and delete repositories, no consent form) is opt-in. The chart's `accessTiers.max`, the operator's `maxAccessTier` | `auto` |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, the workspaces of runs, run notes | `/work` |
-| `GIT_SANDBOX_SOCKET` | the Unix socket of an [`adam-git-sandbox`](../../crates/adam-git-sandbox/README.md) server, an absolute path (a relative one is exit 78). Set: the `git` commands that carry **no credential** (`status`, `add`, `diff`, `commit` and its plumbing, `worktree`, `config`, the `apply` of a patch, the questions the tools ask) run **there**, in a container with no secret, because git runs what a repository's configuration names and a run controls some repositories (a scratch project, an embedded repository); `fetch`, `push` and `ls-remote` stay here, on the bare mirror, after its configuration has been checked ([`adam-workspace`](../../crates/adam-workspace/README.md#where-git-runs-the-git-sandbox)). The sandbox's container mounts `WORKSPACE_ROOT` at the same path and runs as the same user. A sandbox that cannot be reached makes those commands fail as transient; **they are not run here instead**. Unset (the default; local mode, Podman and run pods off): every `git` runs in this container, **unprotected** from the repositories a run controls. The chart sets it, to the socket of its `git-sandbox` container, whenever `runPods.enabled` is on. Read by the roles that run workers | unset |
+| `GIT_SANDBOX_SOCKET` | the Unix socket of an [`adam-git-sandbox`](../../crates/adam-git-sandbox/README.md) server, an absolute path (a relative one is exit 78). Set: the `git` commands that carry **no credential** (`status`, `add`, `diff`, `commit` and its plumbing, `worktree`, `config`, the `apply` of a patch, the questions the tools ask) run **there**, in a container with no secret, because git runs what a repository's configuration names and a run controls some repositories (a scratch project, an embedded repository); `fetch`, `push` and `ls-remote` stay here, on the bare mirror, after its configuration has been checked ([`adam-workspace`](../../crates/adam-workspace/README.md#where-git-runs-the-git-sandbox)). The sandbox's container mounts `WORKSPACE_ROOT` at the same path and runs as the same user. A sandbox that cannot be reached makes those commands fail as transient; **they are not run here instead**. Unset (the default; local mode and run pods off): every `git` runs in this container, **unprotected** from the repositories a run controls. The chart sets it, to the socket of its `git-sandbox` container, whenever `runPods.enabled` is on. Read by the roles that run workers | unset |
 | `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs ([below](#the-workspace-of-a-run)); `0` turns it off | `300` |
 | `SCRATCH_IDLE_DAYS` | how many days a scratch project outlives the last task of its conversation before the janitor removes it ([Scratch projects](#scratch-projects)); `0`: it goes with its run | `7` |
 | `WORKSPACE_PLACEMENT` | where the files of a run live: `shared`, `affinity` or `isolated` (`a2a-only` is refused; see [Workspace placement](#workspace-placement)) | `shared` |
@@ -2223,7 +2174,7 @@ way; every problem is reported at once at startup):
 | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url`. Off because the MCP client library logs the URL it dials (credentials belong in `headers`, where `${VAR}` always works); turn it on only if that log is filtered | `false` |
 | `MCP_MAX_CALL_SECS` | the longest one MCP server is waited for, a call and a connection each: what `timeoutSecs` and `connectTimeoutSecs` ask for and the defaults (60 s and 30 s) are lowered to it, and a value the file asks for is at least 1 s in `mcp.json` or the extra file (1 to 86400); a larger value is lowered to it, with a warning at startup | `900` |
 | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
-| `RUN_ENVIRONMENT` | where a run's commands run: `local` (this container, or the repository's devcontainer with `DEVCONTAINER_RUNTIME=podman`) or `kubernetes` ([a pod for each run](#a-pod-of-its-own-for-each-run)). With `kubernetes`, `DEVCONTAINER_RUNTIME=podman` is refused. Anything else: exit 78 | `local` |
+| `RUN_ENVIRONMENT` | where a run's commands run: `local` (this container: on a desktop, the person's own work sandbox) or `kubernetes` ([a pod for each run](#a-pod-of-its-own-for-each-run)). Anything else: exit 78 | `local` |
 | `RUN_POD_TEMPLATE_FILE` | with `kubernetes`: the Pod (YAML or JSON) every run pod is made from; an existing file, read and checked at startup (the chart's `runPods` ConfigMap; the run container's CPU and memory requests must be Kubernetes quantities, they are the pod's shape in the `sandbox` usage) | required with `kubernetes` |
 | `RUN_POD_NAMESPACE` | with `kubernetes`: the namespace the run pods are made in | the ServiceAccount's namespace file; required when there is none |
 | `RUN_POD_INSTANCE` | with `kubernetes`: the release's `app.kubernetes.io/instance`, which finds this deployment's pods; a label value | required with `kubernetes` |
@@ -2232,14 +2183,6 @@ way; every problem is reported at once at startup):
 | `RUN_POD_READY_TIMEOUT_SECS` | with `kubernetes`: how long a pod may take to be ready (scheduling, the first pull of the image on a node) | `300` (the chart: `600`) |
 | `RUN_POD_IDLE_SECS` | with `kubernetes`: how long no command may have used a pod (and none runs in it) before it is deleted; the next command makes another. `0` keeps it until its run ends | `900` |
 | `RUN_POD_WAIT_SECS` | with `kubernetes`: how long a run waits, trying again with a growing pause, for a pod the cluster cannot give now, before the tool fails | `600` |
-| `DEVCONTAINER_RUNTIME` | where a run's commands run: `off` (this container) or `podman` (the repository's devcontainer, on a rootless Podman service; see [The work environment](#the-work-environment-the-repositorys-devcontainer)). Anything else: exit 78 | `off` |
-| `CONTAINER_HOST` | Podman's own variable: where the service is, e.g. `unix:///run/podman/podman.sock`; **required** with `podman` | unset |
-| `DEVCONTAINER_DEFAULT_IMAGE` | the image of a repository that has no `devcontainer.json`. **Name it by digest only** (`registry/name@sha256:...`): the devcontainer CLI (0.89.0) cannot parse a reference that has both a tag and a digest ("Could not parse image name"), and then skips the image's details, the metadata that sets the remote user | the `workspace` image of `another-agentic-images` the coder is built on, by digest (`DEFAULT_DEVCONTAINER_IMAGE`; its tag, `DEFAULT_DEVCONTAINER_IMAGE_TAG`, is kept equal to the Dockerfile's `WORKSPACE_TAG` by a test) |
-| `DEVCONTAINER_NETWORK` | `inherit` (the Podman service's network, which the deployment limits) or `none` (the container has no network) | `inherit` |
-| `DEVCONTAINER_DEPLOYMENT_ID` | the label the orphan sweep finds this deployment's containers by | `WORKER_ID`, else `adam-coder` |
-| `DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS` | how long pulling, building and creating a container may take, and how long the repository's lifecycle commands may take | `1200`, `900` |
-| `DEVCONTAINER_PREPULL` | pull the default image at startup | `true` |
-| `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client (the image sets them) | `devcontainer`, `podman-remote` |
 | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the prompt, card, skills, subagents and `mcp.json`, **read once at startup by every role**; it must be an existing directory (exit 78 naming the variable otherwise). See [A folder at run time](#a-folder-at-run-time-adam_agent_dir) | unset: the copy embedded in the binary |
 | `ADAM_EXTRA_MCP_FILE` | roles that run workers: a file of extra MCP servers in the shape of `mcp.json`, **added** to the agent's own (the folder's, or the embedded copy's) before they connect; it must be an existing file (exit 78 naming the variable otherwise). A server name the agent already has is refused (exit 78, nothing is replaced). It is read with the loader of `mcp.json` (`${VAR}`, `tools`, `optional`). See [Extra MCP servers](#extra-mcp-servers-adam_extra_mcp_file) | unset: only the agent's own servers |
 | `ADAM_REFERENCES_FILE` | roles that run workers: a file `{"references": [{"name", "url", "branch"?, "description"}]}` of repositories to **read** beside the one a run works on and never write, **added** to the `references:` of the agent's files ([References](#references)); it must be an existing file of valid references whose addresses the workspaces' policy accepts (exit 78 naming the variable or the reference otherwise), and a name the agent already declares is exit 78 too | unset: only the agent's own references |
@@ -2249,7 +2192,12 @@ only (the `MCP_ALLOW_*` flags too: a control plane connects no MCP server), and 
 A control plane neither needs nor validates any of it (see [Roles](#roles)).
 
 **Removed variables.** `OPENCODE_MODEL`, `OPENCODE_COMMAND` and `OPENCODE_BINARY` are ignored, each with one warning at startup that names the variable and never its value
-([ADR 0038](../../docs/decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md); `Config::ignored`, `tests/binary.rs`: `a_removed_variable_is_logged_once_at_startup`). The checks and commands do not see `GITHUB_TOKEN`,
+([ADR 0038](../../docs/decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md); `Config::ignored`, `tests/binary.rs`: `a_removed_variable_is_logged_once_at_startup`). So are the eleven variables of the removed
+devcontainer path ([ADR 0052](../../docs/decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)):
+`CONTAINER_HOST`, `DEVCONTAINER_DEFAULT_IMAGE`, `DEVCONTAINER_NETWORK`, `DEVCONTAINER_DEPLOYMENT_ID`,
+`DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS`, `DEVCONTAINER_PREPULL`, `DEVCONTAINER_CLI`,
+`DEVCONTAINER_PODMAN`, `DEVCONTAINER_CACHE_DIR`, and `DEVCONTAINER_RUNTIME` except its `podman` value, which is **exit 78**
+(the deployment asked for the removed path). The checks and commands do not see `GITHUB_TOKEN`,
 `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL`, `A2A_BEARER_TOKENS` or `MODEL_API_KEY`.
 
 ### Workspace placement
@@ -2656,7 +2604,7 @@ database of its own, so the role needs `CREATEDB`):
   and a run at tier `plan` (settings that write nothing; a server that writes is put back and stopped; tier `edits` gets a full server), the bound of
   servers (also under two concurrent starts), a call dropped mid-write of a 3.6 MiB file, a server whose output stops being messages, a start that is dropped
   or ends after its run stopped, diagnostics under another spelling of the file's address and a server that publishes nothing, and each stop point (idle, park, the end of the run,
-  a cancelled run reached by the sweep, `rebuild_environment`, the worker's stop, a dropped registry) with a server that has a child and a grandchild,
+  a cancelled run reached by the sweep, `use_repository_environment`, the worker's stop, a dropped registry) with a server that has a child and a grandchild,
   asserted by pid; `tests/tool_specs.rs` (three specs, seven paged tools), `time_limits.rs`, `tiers.rs`, `config.rs` (three settings, exit 78),
 * **Commands that keep running** (`tests/background.rs`, real processes with short lifetimes and sweeps through the settings;
   `tests/janitor.rs`): `start_read_stop_locally` (3,000 lines then `sleep 600`: pages 1 and 2001, the
@@ -2771,10 +2719,9 @@ database of its own, so the role needs `CREATEDB`):
   `request_repository` asks nobody, the task is never `input-required` and completes, the repository the person's words name
   is named and the one only the ask's text names is not, and `vymalo.caller` and `vymalo.person` are in the run's context.
 * `tests/binary.rs`: the `adam-coder` binary as a process. All problems of a
-  bad configuration reported together with exit 78 (the `DEVCONTAINER_*` ones among them: a runtime that is neither `off` nor `podman`, `podman`
-  with no `CONTAINER_HOST`, a timeout that is not a number); with
-  `DEVCONTAINER_RUNTIME=podman` and a service that does not answer, the worker starts, writes the tools directory
-  (`adam-exec` alone, even with `OPENCODE_BINARY` set), says so, and stops cleanly; the three removed variables are logged once each, by name; Postgres unreachable at boot
+  bad configuration reported together with exit 78 (`DEVCONTAINER_RUNTIME=podman` among them, with a message naming ADR 0052);
+  `tests/no_podman.rs` checks the removed variables are ignored, the crate and the tool are gone, and the image carries neither
+  tool; the three removed OpenCode variables are logged once each, by name; Postgres unreachable at boot
   (a clear "connecting to Postgres: ..." chain in exactly one `adam-coder failed`
   line, exit 69, nothing on stderr, no password, no panic; deadpool retries the
   connection for its 30 s create timeout first); with Postgres: the card and
@@ -2945,7 +2892,7 @@ database of its own, so the role needs `CREATEDB`):
   both, an entry that is no account name), `the_installation_id_and_the_owners_are_one_or_the_other` (a pin with owners,
   owners with a token), `a_star_is_any_owner` (and not beside names), and for `ALLOW_COMMANDS_NEXT_TO_SECRETS`:
   `an_app_key_file_next_to_local_commands_is_refused_unless_it_is_accepted` (the message, exit 78, `true`/`1`/`false`/`0` in any case),
-  `the_deployments_where_a_command_cannot_read_the_key_start_without_the_override` (run pods, Podman, an inline key, a token, a control
+  `the_deployments_where_a_command_cannot_read_the_key_start_without_the_override` (run pods, an inline key, a token, a control
   plane), `a_value_of_the_override_that_is_not_a_boolean_is_a_configuration_error` and
   `the_refusal_is_reported_with_the_other_problems_and_never_on_a_guess` (a wrong `RUN_ENVIRONMENT` is the problem, not the key)), of
   `src/redact.rs` (a secret added later is scrubbed by every clone, only the latest 128 are kept,
@@ -3054,7 +3001,7 @@ database of its own, so the role needs `CREATEDB`):
 * `tests/environment.rs`, **sandbox time** (ADR 0043), against the same fake made a pod (`FakeSession::as_pod`): a command in a pod reports
   the time it ran and the pod's shape and the checks and `run_command` add to one entry; a request the pod does not make is absent; a
   command a **timeout** stopped, and one a **cancel** stopped (a call that ends in an error), still count until they were stopped;
-  a command a cancel stopped counts until it stopped; the coder's own container and a dev container report where and no
+  a command a cancel stopped counts until it stopped; the coder's own container reports where and no
   time; a pod asked for and not used is a measured zero and an environment that could not be made reports nothing. `tests/e2e.rs`
   (`the_time_of_the_coders_commands_in_a_run_pod_is_the_tasks_sandbox_usage`,
   `the_coders_commands_in_its_own_container_are_reported_as_not_measured`): over A2A, the task read after it ended carries `sandbox`.
@@ -3064,14 +3011,13 @@ database of its own, so the role needs `CREATEDB`):
   secret, a check that times out and a check that is cancelled each tell the session which command to kill, what `ensure`
   says shows as steps of the tool call with the secret scrubbed from a detail, an environment that cannot be made (a build
   that failed with its log, a runtime that is down) is a permanent or a transient result for the model that runs nothing, uses
-  no check cycle and records nothing, and is made again at the next call, and a cancel stops the wait for `ensure`. The devcontainer
-  side (slice 7b, A7b-2), against the same fake: a **broken** environment is a permanent result for `run_command` and
-  `run_checks` that names the file and the problem and says to ask the person (nothing ran, the coder never rebuilds
-  by itself), one that is only unavailable is transient and says nothing of rebuilding; `rebuild_environment` (with `use_default`: asks
-  the environment, notes the choice, makes the environment now and says so; without: makes it again from the file; with no
-  container runtime: "Nothing was rebuilt", no environment asked for; a rebuild that fails again: the same kind of result); a devcontainer that mounts only `adam-exec` and no secret (in `adam-devcontainer`'s tests)
-  a cancelled check is told to the session; the `checks` artifact's `environment` (a devcontainer's file or the default image;
-  absent for this container); a missing tool's answer in each of the three environments; and the **real** `DevContainer`, composed by `environment_for` as `serve` does it, over a Podman client that says the service is down (with `OPENCODE_BINARY` set to a file that is not there, which is ignored): the start goes on, the tools directory is written, a command runs in the coder's own container, exactly one fallback step is shown for the run, and the second command does not probe again.
+  no check cycle and records nothing, and is made again at the next call, and a cancel stops the wait for `ensure`. Against the
+  same fake: a **broken** environment is a permanent result for `run_command` and `run_checks` that names the problem and its log,
+  says to ask the person (nothing ran, the coder never makes it again by itself) and names `use_repository_environment` with
+  `off: true` as the way back from a repository's image; one that is only unavailable is transient and says nothing of a broken
+  environment; a cancelled check is told to the session; the `checks` artifact's `environment` (a run pod's image; absent for this
+  container); a missing tool's answer in each environment; and the **real** `Local`, composed by `environment_for` as `serve` does
+  it: nothing is made on the volume and the session says it is this container.
 * `tests/janitor.rs` also covers the environment: it is released before the workspace is removed (and never for an open run),
   a release that fails keeps the workspace for the next sweep, and what an environment holds for runs that are over or unknown
   is released without a workspace (`orphans`), once, leaving an open run's and a name that is no run.
@@ -3103,7 +3049,7 @@ target directory as the running test executable (derived from
 `current_exe()`), through `$CARGO`.
 
 * **Run pods, in `src/config.rs` and `tests/environment.rs`.** The configuration: `RUN_ENVIRONMENT` is `local` unless it says `kubernetes` (and the
-  run pod variables of a local deployment are not read), the defaults and every variable, `kubernetes` together with `DEVCONTAINER_RUNTIME=podman`
+  run pod variables of a local deployment are not read), the defaults and every variable, the removed variables (each ignored and named, and `DEVCONTAINER_RUNTIME=podman` refused naming ADR 0052)
   refused with exit 78, and each wrong run pod variable a problem naming it. The wait for a slot (`ToolEnv::with_unavailable_wait`): an environment that
   is unavailable for one call is waited for and then works, with the step `env:<run>:slot` running and then completed; a wait that runs out is the tool's
   transient result, bounded by the wait, with nothing run in this container; a cancel ends the wait; only `Unavailable` is waited for, and where the

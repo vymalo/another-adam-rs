@@ -7,7 +7,7 @@
 //! ```
 //!
 //! Everything after `run` or `shell` is positional and is passed on as `adam-exec` reads it (the
-//! devcontainer's script, `crates/adam-devcontainer/src/adam-exec.sh`): an exec id, the working
+//! run pod's script, `crates/adam-env-kubernetes/src/adam-exec.sh`): an exec id, the working
 //! directory, and the words of the command, each with the leading `:` that `adam-exec` removes. The
 //! options come first so that a word such as `--version` is never taken for one.
 //!

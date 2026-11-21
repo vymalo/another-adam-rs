@@ -3,10 +3,10 @@
 //!
 //! A language server is a long-running process that is written to on stdin for minutes and answers
 //! on stdout, with JSON-RPC messages framed by `Content-Length`. Whether an environment can host
-//! one is a fact about the environment: its `prepare` and the client it spawns (`adam-kube-exec`,
-//! the devcontainer CLI's `exec`) must pass stdin through, keep it open while nothing is said, and
+//! one is a fact about the environment: its `prepare` (and, for a run pod, the `adam-kube-exec`
+//! client it spawns) must pass stdin through, keep it open while nothing is said, and
 //! deliver the end of input. These functions ask exactly that of any [`EnvSession`], with `cat` as
-//! the server (bytes in, the same bytes out), so that the three environments are held to one
+//! the server (bytes in, the same bytes out), so that both environments are held to one
 //! sequence and a failure names the [`Step`] that broke:
 //!
 //! 1. [`Step::FirstMessage`]: one framed message is written and read back;

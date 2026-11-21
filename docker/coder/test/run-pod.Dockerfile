@@ -7,7 +7,7 @@
 # open decision 6; the coder container's command is replaced by a sleep, because the real coder needs a database and a model).
 # It is small on purpose: the real run image is the workspace image of another-agentic-images (2.92 GB compressed, verified
 # 2026-10-09) and the real coder image takes a Rust build, and the job tests the chart's objects and the environment, not those
-# images. adam-exec is the real script (one source with the devcontainer crate); adam-egress, and
+# images. adam-exec is the real script (one source, in adam-env-kubernetes); adam-egress, and
 # adam-git-sandbox with its relay adam-git, are the real binaries, built by the script with cargo and passed as the named build
 # contexts `egress` (a directory holding the file `adam-egress`) and `gitsandbox` (holding `adam-git-sandbox` and `adam-git`).
 # It has git because the isolation check (ADR 0041) runs git in a worktree whose mirror is mounted read-only, and the script
@@ -28,7 +28,7 @@ FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git npm tini \
  && rm -rf /var/lib/apt/lists/*
-COPY --chmod=0755 crates/adam-devcontainer/src/adam-exec.sh /opt/adam/bin/adam-exec
+COPY --chmod=0755 crates/adam-env-kubernetes/src/adam-exec.sh /opt/adam/bin/adam-exec
 COPY --from=egress --chmod=0755 adam-egress /usr/local/bin/adam-egress
 COPY --from=gitsandbox --chmod=0755 adam-git-sandbox adam-git /usr/local/bin/
 # The pod's own user, numeric, as the chart's template and its admission policy require.

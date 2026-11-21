@@ -116,7 +116,7 @@ cross-process listener: SQLite's notifier is always in-process, and MongoDB has 
 | `GITHUB_APP_INSTALLATION_ID` | **pins** the App to one installation | this or `GITHUB_APP_OWNERS`, exactly one |
 | `GITHUB_APP_OWNERS` | no pin: the accounts the App may act for (comma or space list, or `*`); the installation of each owner is found with the JWT | as above |
 | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's PEM key, a file or inline; exactly one; parsed at startup | one required in App mode |
-| `ALLOW_COMMANDS_NEXT_TO_SECRETS` | roles that run workers: `true` accepts, `false` refuses at startup (**exit 78**), a GitHub App whose key is a **file** (`GITHUB_APP_PRIVATE_KEY_PATH`) while the commands of a run run in the coder's own container (`RUN_ENVIRONMENT=local`, `DEVCONTAINER_RUNTIME=off`): a command can read the key, mint installation tokens and act as the App at any access tier. Accepted, the coder still logs a warning. Not needed with `RUN_ENVIRONMENT=kubernetes`, `DEVCONTAINER_RUNTIME=podman`, an inline key or a token. `true`/`1`/`false`/`0`; anything else is exit 78. [Upgrade note](../guides/deploy-the-coder.md#upgrading-an-app-deployment) | `false` |
+| `ALLOW_COMMANDS_NEXT_TO_SECRETS` | roles that run workers: `true` accepts, `false` refuses at startup (**exit 78**), a GitHub App whose key is a **file** (`GITHUB_APP_PRIVATE_KEY_PATH`) while the commands of a run run in the coder's own container (`RUN_ENVIRONMENT=local`): a command can read the key, mint installation tokens and act as the App at any access tier. Accepted, the coder still logs a warning. Not needed with `RUN_ENVIRONMENT=kubernetes`, an inline key or a token. `true`/`1`/`false`/`0`; anything else is exit 78. [Upgrade note](../guides/deploy-the-coder.md#upgrading-an-app-deployment) | `false` |
 | `ALLOWED_REPO_HOSTS` | hosts repositories may live on (`name` or `name:port`); the token is scoped to them; the first is what `owner/name` means | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (Enterprise: `https://<host>/api/v3`) | `https://api.github.com` |
 | `GITHUB_MCP_URL` | origin of the GitHub MCP server (the sidecar); no credentials | `http://127.0.0.1:8082` |
@@ -124,7 +124,7 @@ cross-process listener: SQLite's notifier is always in-process, and MongoDB has 
 | `MAX_ACCESS_TIER` | the highest access tier a person may pick for a message: `plan`, `edits`, `auto` or `bypass`. The card lists the tiers up to it, a higher one is refused, the tools check it again. `bypass` (rename and delete repositories, no consent form) is opt-in. Read by every role; a word that is not a tier is exit 78 | `auto` |
 | `ALLOW_LOCAL_REPOS` | accept local paths, `file://`, plain `http://`; development and tests only | `false` |
 | `WORKSPACE_ROOT` | mirrors, run workspaces, run notes | `/work` |
-| `GIT_SANDBOX_SOCKET` | the Unix socket of an `adam-git-sandbox` server (an absolute path; a relative one is exit 78). When it is set, the `git` commands that carry **no credential** (`status`, `add`, `diff`, `commit` and its plumbing, `worktree`, `config`, the `apply` of a patch, ...) run **there**, where no secret is readable, instead of in the coder's container; `fetch`, `push` and `ls-remote` stay in the coder, on the bare mirror, after its configuration has been put back to what the workspace writes (a key it did not write is removed). The sandbox's container must mount `WORKSPACE_ROOT` at the same path. A sandbox that cannot be reached makes those commands fail (retried as a transient failure): **they are never run in the coder's container instead**. The chart sets it, to the socket of its `git-sandbox` container, whenever `runPods.enabled` is on ([the chart's section](../../deploy/coder/README.md#the-git-sandbox)). Unset (the default, local mode, Podman, run pods off): git runs in the coder's container, which is **not** protected from the repositories a run controls ([the git sandbox](../../crates/adam-git-sandbox/README.md)) | unset |
+| `GIT_SANDBOX_SOCKET` | the Unix socket of an `adam-git-sandbox` server (an absolute path; a relative one is exit 78). When it is set, the `git` commands that carry **no credential** (`status`, `add`, `diff`, `commit` and its plumbing, `worktree`, `config`, the `apply` of a patch, ...) run **there**, where no secret is readable, instead of in the coder's container; `fetch`, `push` and `ls-remote` stay in the coder, on the bare mirror, after its configuration has been put back to what the workspace writes (a key it did not write is removed). The sandbox's container must mount `WORKSPACE_ROOT` at the same path. A sandbox that cannot be reached makes those commands fail (retried as a transient failure): **they are never run in the coder's container instead**. The chart sets it, to the socket of its `git-sandbox` container, whenever `runPods.enabled` is on ([the chart's section](../../deploy/coder/README.md#the-git-sandbox)). Unset (the default, local mode, run pods off): git runs in the coder's container, which is **not** protected from the repositories a run controls ([the git sandbox](../../crates/adam-git-sandbox/README.md)) | unset |
 | `WORKSPACE_PLACEMENT` | `shared`, `affinity` or `isolated` ([placement](workspace-and-environments.md#placement-which-worker-holds-a-runs-files)) | `shared` |
 | `WORKSPACE_SWEEP_SECS` | how often the janitor removes finished runs' workspaces; `0` is off | `300` |
 | `SCRATCH_IDLE_DAYS` | days a scratch project is kept after the last task of its conversation; `0`: it goes with its run ([thread-long scratch](workspace-and-environments.md#a-runs-workspace)) | `7` |
@@ -144,7 +144,7 @@ cross-process listener: SQLite's notifier is always in-process, and MongoDB has 
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `RUN_ENVIRONMENT` | `local` or `kubernetes` (a pod for each run; refused with `DEVCONTAINER_RUNTIME=podman`). With a GitHub App key file, `local` and `DEVCONTAINER_RUNTIME=off` need `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` (above) | `local` |
+| `RUN_ENVIRONMENT` | `local` (this container: on a desktop, the person's own work sandbox) or `kubernetes` (a pod for each run). With a GitHub App key file, `local` needs `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` (above) | `local` |
 | `RUN_POD_TEMPLATE_FILE` | with `kubernetes`: the Pod every run pod is made from (the chart's ConfigMap). Its run container's `resources.requests` are also the shape a command's time is weighted by in the task's `sandbox` usage ([ADR 0043](../decisions/0043-sandbox-time-as-usage.md)); a request that is not a Kubernetes quantity stops the start | required |
 | `RUN_POD_NAMESPACE` | the namespace of run pods | the ServiceAccount's namespace |
 | `RUN_POD_INSTANCE` | the release's `app.kubernetes.io/instance`, which finds this deployment's pods | required |
@@ -154,27 +154,28 @@ cross-process listener: SQLite's notifier is always in-process, and MongoDB has 
 | `RUN_POD_IDLE_SECS` | idle time before a pod is deleted; `0` keeps it until the run ends | `900` |
 | `RUN_POD_WAIT_SECS` | how long a run retries for a pod the cluster cannot give now | `600` (chart: `1020`) |
 | `RUN_POD_REPOSITORY_IMAGES` | with `kubernetes`: the image prefixes a repository's `devcontainer.json` may name for its run pod (`use_repository_environment`, [ADR 0052](../decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)), separated by commas or spaces. Each ends with `/` (a registry path such as `ghcr.io/acme/`) or `:` (a tag such as `ghcr.io/acme/tool:`), so that a bare host cannot admit a look-alike; no `*` and no `${...}`. Empty: the tool is never offered and the run pods use the template's image | empty (chart: `runPods.repositoryImages.allowedPrefixes`) |
-| `DEVCONTAINER_RUNTIME` | `off` or `podman` (the repository's devcontainer on a rootless Podman service) | `off` |
-| `CONTAINER_HOST` | Podman's own variable, e.g. `unix:///run/podman/podman.sock`; required with `podman` | unset |
-| `DEVCONTAINER_DEFAULT_IMAGE` | image for a repository with no `devcontainer.json`; **by digest only** | the `workspace` image the coder is built on |
-| `DEVCONTAINER_NETWORK` | `inherit` or `none` | `inherit` |
-| `DEVCONTAINER_DEPLOYMENT_ID` | label the orphan sweep finds this deployment's containers by | `WORKER_ID`, else `adam-coder` |
-| `DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS` | pulling, building and creating; lifecycle commands | `1200`, `900` |
-| `DEVCONTAINER_PREPULL` | pull the default image at startup | `true` |
-| `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client | `devcontainer`, `podman-remote` |
 
 ### Removed, ignored with a warning
 
-The coder no longer uses OpenCode ([ADR 0038](../decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)). These
-variables are **not read and not refused**: a deployment rendered from an older chart still sets one, and nothing is less
-safe without it. For each one that is set, the process logs one warning that names the variable (never its
-value), in every role, once the configuration is valid: a start that fails validation (exit 78) does not warn.
+The coder no longer uses OpenCode ([ADR 0038](../decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)),
+nor a repository's devcontainer on a container engine ([ADR 0052](../decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md),
+a hard cutover). These variables are **not read and not refused**: a deployment rendered from an older chart still sets
+one, and nothing is less safe without it. For each one that is set, the process logs one warning that names the variable
+(never its value), in every role, once the configuration is valid: a start that fails validation (exit 78) does not warn.
 
 | Variable | Was |
 |---|---|
 | `OPENCODE_MODEL` | model alias OpenCode used through the same gateway (default `MODEL`) |
 | `OPENCODE_COMMAND` | the ACP program and arguments (default `opencode acp`) |
-| `OPENCODE_BINARY` | with `podman`: the native OpenCode executable mounted into containers (`podman` now needs only `CONTAINER_HOST`) |
+| `OPENCODE_BINARY` | the native OpenCode executable mounted into containers |
+| `DEVCONTAINER_RUNTIME` | `off` or `podman`: where a run's commands ran. **The one exception**: the value `podman` is exit 78, with a message naming ADR 0052, because that deployment asked for the removed path. Every other value is ignored with a warning |
+| `CONTAINER_HOST` | the address of the container engine's service |
+| `DEVCONTAINER_DEFAULT_IMAGE` | the image of a repository with no `devcontainer.json` |
+| `DEVCONTAINER_NETWORK` | `inherit` or `none` |
+| `DEVCONTAINER_DEPLOYMENT_ID` | the label the orphan sweep found this deployment's containers by |
+| `DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS` | pulling, building and creating; lifecycle commands |
+| `DEVCONTAINER_PREPULL` | pull the default image at startup |
+| `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN`, `DEVCONTAINER_CACHE_DIR` | the devcontainer CLI, the container engine's client, its cache |
 
 ## Egress proxy (`adam-egress`)
 
@@ -232,10 +233,9 @@ Put these in a `.env` next to `compose.yaml`.
 | `ADAM_TEST_TABLE_PREFIX`, `ADAM_TEST_MONGO_COLLECTION_PREFIX` | the Postgres table prefix (`adam_test_`) and the MongoDB collection prefix (`adam_`) the store suite and the transcript measurement write to; set the same value on `dev/p2-measure.sh` |
 | `ADAM_TEST_REQUIRE_DB=1` | a suite whose variable is unset **fails** instead of skipping (CI sets it) |
 | `ADAM_TEST_MOCK_OPENAI_URL`, `ADAM_TEST_MOCK_GITHUB_URL`, `ADAM_TEST_MOCK_GITHUB_MCP_URL` | the tests of the real clients against the compose mocks |
-| `ADAM_TEST_DEVCONTAINER=1`, `ADAM_TEST_REQUIRE_DEVCONTAINER=1` | the devcontainer suite; the second fails instead of skipping |
 | `ADAM_TEST_KUBECONFIG`, `ADAM_TEST_REQUIRE_KUBERNETES=1` | the cluster test of `adam-env-kubernetes` (more `ADAM_TEST_KUBE_*`, among them `ADAM_TEST_KUBE_ISOLATION_MIRROR` and `_ADMIN` for the isolation scenario, in `crates/adam-env-kubernetes/tests/cluster.rs`) |
 | `ADAM_TEST_LANGUAGE_SERVERS=1`, `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` | the suite of the real language servers (`bin/adam-coder/tests/real_language_servers.rs`); a language whose server is not on `PATH` is skipped, and the second fails instead of skipping (and turns the suite on). The `image` job of `.github/workflows/coder.yml` runs it in the built image with the second |
-| `ADAM_TEST_STDIO_SILENCE_SECS` | seconds of silence with stdin open in the framed-stdio tests (local, devcontainer, run pod); default 20 |
+| `ADAM_TEST_STDIO_SILENCE_SECS` | seconds of silence with stdin open in the framed-stdio tests (local, run pod); default 20 |
 | `ADAM_TEST_REQUIRE_MOUNTS=1` | `deploy/coder/tests/git-in-run-pod.sh` (git under a run pod's mounts) fails instead of skipping when it cannot make a mount namespace (CI sets it) |
 | `ADAM_TEST_OPENAI_BASE_URL`, `ADAM_TEST_OPENAI_API_KEY`, `ADAM_TEST_OPENAI_MODEL` | a live model for `adam-model-openai/tests/live.rs` |
 | `ADAM_TEST_OPENCODE=1` | the live OpenCode test of `adam-acp` (a library no binary uses now) |

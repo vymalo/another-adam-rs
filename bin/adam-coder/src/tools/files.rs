@@ -65,7 +65,7 @@
 //! waits for it to end, and the result of the tool that added the slot says so), the directory can be
 //! renamed; the creation of a slot; the files below the slot, which these tools open relative to the
 //! descriptor they hold; `git`'s own handling of what is below the slot; and everything a command
-//! itself does. Local mode and Podman have no mounts: the slot's directory is a name there.
+//! itself does. Local mode has no mounts: the slot's directory is a name there.
 
 #[cfg(test)]
 use std::fs;

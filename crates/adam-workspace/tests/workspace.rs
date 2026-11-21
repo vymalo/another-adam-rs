@@ -4426,7 +4426,7 @@ async fn removing_a_run_whose_slot_became_a_link_does_not_remove_what_the_link_l
     // `git worktree remove` resolves a link and deletes the worktree it leads to (*verified* with
     // git 2.43.0) unless the path is the very one a worktree is registered at (then it checks that
     // the `.git` file points back, and refuses). A's slot is replaced by a link to B's, and A's
-    // `gitdir` (which a pod without the read-only mount, local mode and Podman can write) names
+    // `gitdir` (which a pod without the read-only mount, or local mode, can write) names
     // another path.
     let a_admin = a.worktree().unwrap().git_dir().unwrap().to_owned();
     std::fs::write(a_admin.join("gitdir"), "/nowhere/.git\n").unwrap();

@@ -69,7 +69,7 @@
 //! (at once on the worker that holds it, in the agent's step, and within one sweep elsewhere, which
 //! is also how a cancel is reached, since it never calls the agent); a **park on the person**
 //! (`ask_user`); the environment is made again; the janitor's release; the worker's own stop. A
-//! process group is killed, and what a pod or a devcontainer holds is stopped through
+//! process group is killed, and what a run pod holds is stopped through
 //! [`EnvSession::kill`] by exec id.
 
 use std::fmt::Write as _;
@@ -138,8 +138,8 @@ const BEAT_STALE_SWEEPS: u64 = 3;
 pub const BEAT_STALE_FLOOR_SECS: u64 = 60;
 /// What a command that is stopped because its worker stops says.
 const WORKER_STOPPED: &str = "the worker stopped; start it again if it is still needed";
-/// What a command in a pod or a devcontainer says when a signal ended it and nobody asked.
-const ENVIRONMENT_MADE_AGAIN: &str = "its environment was made again (a new repository, a reference or a rebuild) or \
+/// What a command in a run pod says when a signal ended it and nobody asked.
+const ENVIRONMENT_MADE_AGAIN: &str = "its environment was made again (a new repository or a reference) or \
      something outside ended it; start it again if it is still needed";
 /// What a command says when its worker is gone.
 const WORKER_GONE: &str = "the worker that ran it is gone; start it again";
@@ -422,7 +422,7 @@ pub(crate) struct Command {
     host: Arc<str>,
     /// How long a call to the environment's `kill` is waited for.
     kill_wait: Duration,
-    /// The environment is not this container: a pod or a devcontainer.
+    /// The environment is not this container: a run pod.
     remote: bool,
 }
 
@@ -1856,7 +1856,7 @@ async fn stop_elsewhere(env: &ToolEnv, ctx: &ToolCtx, run: &str, id: &str) -> Ou
     if !record.state.is_running() {
         return Ok(ToolOutput::text(record_view(&record, id)));
     }
-    // Another worker runs it. Its owner stops it at its next sweep; in a pod or a devcontainer the
+    // Another worker runs it. Its owner stops it at its next sweep; in a run pod the
     // exec id is killed now, so that it ends at once.
     if let Ok(session) = env.session(ctx).await {
         let exec = ExecId::new(record.exec.clone());

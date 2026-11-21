@@ -473,9 +473,11 @@ ignores the event. **This crate now depends on `adam-model`** for the data type 
 environment, `SandboxUsage::ran_command(cpu_millis, memory_bytes, milliseconds)` that one command ran in a metered one (a run
 pod; a request the pod does not make is `None`, not zero), and `merge` adds one to another (a call's report to the run's, a child's
 to its parent's): one entry per shape, at most `MAX_SANDBOX_ENTRIES` = 8 (a 9th is not counted and is logged), saturating adds, and the
-environment that measures wins. `SandboxEnvironment` is `Local`, `Devcontainer` or `Kubernetes`; only the last is measured
+environment that measures wins. `SandboxEnvironment` is `Local` or `Kubernetes`; only the last is measured
 (`is_measured`), and an unmeasured one never has an entry, which reads as *not measured* and not as zero. Serialized as
-`{"environment": ..., "usage": [...]}`, each member left out while empty, so a state from before reads.
+`{"environment": ..., "usage": [...]}`, each member left out while empty, so a state from before reads. **Breaking change
+(Rule 2):** `Devcontainer` is gone (ADR 0052); a state that says `devcontainer` still loads, as `Local` (both are not
+measured), and is written as `local` from now on.
 
 ## Several processes
 

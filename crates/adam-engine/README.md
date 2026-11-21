@@ -19,14 +19,22 @@ engine.shutdown().await?;
 
 | Call | What it does | Refused with (class) |
 |---|---|---|
-| `Engine::builder(store, agent, model, alias)`, then `start()` | migrates the store, releases the leases a fixed `Limits::worker_id` holds (`Store::release_worker_leases`: the runs its last process was stepping are claimed at once; nothing with the default, `None`), binds the agent with the screen's tools of an embedded agent (`adam_ui::Ui::embedded`: `ask_user`, `show`, `ui_catalog`, `plan_*`, and `Ui::screen` as its source), gives it the model, registers its scheduler and makes the store's scheduler runs match the folder's `schedules/` (see *Schedules*), and spawns the worker on the current tokio runtime | `NoRuntime` (`Invalid`) outside a tokio runtime; `Invalid` for a zero `lease_ttl` or a `worker_id` of `Some("")`; `WorkerIdInUse` (`Rejected`) for a fixed id another live engine of this process uses on the same store; `Store` (the store's: its migration or the release); `Invalid` for an `mcp.json` or an `a2a:` subagent, the subagents' included: the engine runs neither yet, and refuses them itself, so what it accepts does not depend on the features another crate of the build turns on in `adam-assembly`; `Agent` (the definition's, `Invalid`): an empty alias, a tool nobody registered, a secret refused; `Schedules` (the reconcile's class) when the scheduler runs cannot be made to match the folder |
+| `Engine::builder(store, agent, model, alias)`, then `start()` | migrates the store, releases the leases a fixed `Limits::worker_id` holds (`Store::release_worker_leases`: the runs its last process was stepping are claimed at once; nothing with the default, `None`), binds the agent with the screen's tools of an embedded agent (`adam_ui::Ui::embedded`: `ask_user`, `show`, `ui_catalog`, `plan_*`, and `Ui::screen` as its source) and the host's own (`EngineBuilder::tools`, a `ToolSet`: an `FnTool`, or `#[tool]` functions from `adam = { default-features = false, features = ["macros"] }`, which keeps the embedded set; together they are the catalog the files' `tools:` selects from), gives it the model, registers its scheduler and makes the store's scheduler runs match the folder's `schedules/` (see *Schedules*), gives the backend the folder's `commands/` (a message `/name args` is expanded from `commands/<name>.md` before it is stored, as on the server surfaces), and spawns the worker on the current tokio runtime | `NoRuntime` (`Invalid`) outside a tokio runtime; `Invalid` for a zero `lease_ttl` or a `worker_id` of `Some("")`; `WorkerIdInUse` (`Rejected`) for a fixed id another live engine of this process uses on the same store; `Store` (the store's: its migration or the release); `Invalid` for an `mcp.json` or an `a2a:` subagent, the subagents' included: the engine runs neither yet, and refuses them itself, so what it accepts does not depend on the features another crate of the build turns on in `adam-assembly`; `Agent` (the definition's, `Invalid`): an empty alias, a tool nobody registered or one registered twice, a secret refused; `Schedules` (the reconcile's class) when the scheduler runs cannot be made to match the folder |
 | `send(None, say)` | starts a run in a new conversation (`Delivered::Started`) | `Invalid` for no text or no id; `Stopped` (`Rejected`) after `shutdown` |
-| `send(Some(&conversation), say)` | the latest run of the conversation has ended: a new run that continues it, the agent starting from its state, the transcript included (`Continued`); it is still open: the message is delivered to it, as a steer while it works (`Steered`) or as the answer while it waits (`Answered`), by the state read just before. A `Say` that already started a run starts nothing (`Repeated`) | `NotFound` for a conversation the engine has no run in |
+| `send(Some(&conversation), say)` | the latest run of the conversation has ended: a new run that continues it, the agent starting from its state, the transcript included (`Continued`); it is still open: the message is delivered to it, as a steer while it works (`Steered`) or as the answer while it waits (`Answered`), by the state read just before. A `Say` that already started a run starts nothing (`Repeated`) | `NotFound` for a conversation the engine has no run in; `Refused` (`Rejected`) for a child session that refuses it (closed, at its rounds, or its rounds already working) |
 | `steer(run, say)` | a message for a run that works: it reads it at its next step, and a run about to finish takes another step first; a waiting run takes it as its answer | `Finished` (`Rejected`) for a run that ended; `NotFound`; `Unavailable` (`Transient`) when its state moved under the call |
 | `answer(run, say)` | the answer to the question a waiting run asked; it works again | `NotWaiting` (`Rejected`) for a run that works; `Finished` for one that ended; `NotFound`. A refusal names the state read after it, never one it did not read |
-| `cancel(run)` | ends the run `Cancelled`; a cancelled run is answered as it is | `Finished` for a run that ended otherwise; `NotFound` |
+| `cancel(run)` | ends the run `Cancelled`, a schedule's firing included; a cancelled run is answered as it is | `Finished` for a run that ended otherwise; `NotFound` |
 | `list(ListQuery)` | a `Page<RunInfo>` of the engine's runs, the most recently updated first, by cursor (`page_size`, at most 100, default 50; `conversation`; `after(token)`) | `Invalid` for a token of another query |
-| `get(run)` | the `RunInfo`, or `None` | |
+| `helpers()` | the helpers a person may start a child session with (`SessionHelper`: `name`, `description`): the root's local subagents; empty without one | |
+| `start_session(&conversation, StartSession, say)` | starts a session of a helper in the conversation (`StartSession::new(helper, description)`, `.keep_open()`), `say` its first message: a `Turn` whose `run` is the first round, in the session's own `conversation`; the parent takes no turn; the same `say` again is `Repeated`. Talk to it with `send(Some(&session_conversation), ..)` (an idle session's next round is `Delivered::Continued`, a repeat `Repeated`), list its rounds with `list`, read them with `get`, `events`, `files` | `Invalid` for no helper of that name, a blank or long description, no text, no helper at all, or a session's own conversation; `NotFound` for a conversation the engine has no run in; `Refused` (`Rejected`) for a session too many, open or working (`Limits::sessions`) |
+| `sessions(&conversation)` | the conversation's sessions (`SessionInfo`: `session`, `conversation`, `helper`, `description`, `keep_open`, `state` `Working`/`Idle`/`Closed`, `round`, `latest`), open first, then the most recently closed | `Invalid` for a session's own conversation; `NotFound` for a conversation this engine has not; `Unavailable` when they cannot be listed (never an empty list then) |
+| `close_session(&session_conversation, cancel)` | closes the session: an idle one by a round of its own, a working one when its round ends, or at once with `cancel`; closing a closed one answers its latest round, and a closed session takes no message (`send` is `Refused`) | `Invalid` for a conversation that is not a session's, or an agent with no helper (the close is never sent as a message) |
+| `get(run)` | the `RunInfo`, or `None`; a schedule's firing too (see *Schedules*) | |
+| `firings(FiringQuery)` | a `Page<Firing>` of the runs the agent's `schedules/` fired, the most recently updated first (`schedule`, `page_size`, `page_token` as for `list`): each its `RunInfo` and its `adam_schedule::Trigger` (`agent`, `name`, `due`) | `Invalid` for a page token of another query |
+| `commands()` | the agent's commands (`adam_agent_fs::Command`: `name`, `description`, `argument_hint`, `template`), in name order: what the host lists in its `/` menu, as a client reads them from the card (`commands/v1`) | |
+| `files(run)` | the files the agent handed over in the run (`RunFile`: `name`, `mime_type`, `filename`, `len`, `sha256`), in the order they were emitted, without their bytes | `NotFound` for a run this engine has not (as for `get`: a firing is one it has); `Unavailable` (`Transient`) or `Internal` when the store cannot be read |
+| `file(run, sha256)` | the bytes (`Arc<[u8]>`) of the run's file with that SHA-256, as `files` or the event's `WithheldFile` says it; `None` for no such file, or bytes gone from the store | as for `files`, and `Store` (the store's class) when the bytes cannot be read |
 | `events(run)` | `RunEvents`, a `futures::Stream` of `Result<EngineEvent, EngineError>`: the run's recent events, then the live ones, then `Ended` once the store says the run has ended; a run that has already ended gives `Ended` at once. See [A run's events](#a-runs-events) | `NotFound` for a run the engine does not have, refused at the call (the stream would have nothing to say) |
 | `shutdown()` | waits for the messages being written, then nothing new is claimed and the steps in flight finish and commit; it returns once the worker has stopped, and so does every concurrent or later call; every clone stops; reads and `cancel` still work. Dropping a `shutdown` before it is done (a timeout around it) aborts the worker, and so does dropping the last engine, as a killed process would: the next engine started with the same fixed worker id claims its runs at once, any other once their leases run out | what the worker ended with |
 
@@ -59,7 +67,8 @@ is refused), `event_capacity` 256 live events in the ring (1 to 65 536; the chan
 `worker_id` `None` (a random id at every start; `Some("")` is refused), `retry` `RetryPolicy::default()` (5 attempts, 1 s
 to 60 s: the runtime's policy, for a transient failure that names none of its own, such as a model provider's outage;
 a folder's `retry:` and a tool's own policy win for their tools, [ADR
-0061](../../docs/decisions/0061-a-step-names-its-retry-policy.md)). `Limits` is `Clone` and `PartialEq`, no longer
+0061](../../docs/decisions/0061-a-step-names-its-retry-policy.md)), `sessions` `SessionLimits::default()` (16 child sessions open
+and 4 working at once in a conversation, 20 rounds each; the agent's file may lower them; it replaces what the definition was given with `AgentDef::session_limits`). `Limits` is `Clone` and `PartialEq`, no longer
 `Copy` (it holds the id) nor `Eq` (the policy's factor is a float).
 
 **Schedules** ([ADR 0060](../../docs/decisions/0060-schedules-are-parked-runs.md)): a folder's `schedules/` run in the
@@ -67,10 +76,11 @@ engine as in `adam-agent`. `start` registers the agent's scheduler (`adam_schedu
 holds, so a scheduler a folder dropped is stepped to its cancel) and reconciles before the worker starts: a schedule
 added is started, one changed is replaced, one dropped is cancelled. Each due time fires one run of the agent, the
 prompt as a person's message, which nobody answers (a question ends the call instead of parking). A firing is nobody's
-message, so it is no caller's run: `list`, `get`, `events` and `cancel` do not reach it, as an A2A server does not to a
-caller ([#289](https://github.com/vymalo/another-adam-rs/issues/289) would let the host see and stop one); the host reads
-it from its store, its conversation `adam_schedule::fired_conversation_id(agent, schedule, due)` (the schedule's name
-escaped) and its trigger `adam_schedule::trigger_of` (re-exported as `adam_engine::adam_schedule`). A reconcile that
+message, so it is no caller's run and not in `list`, but the host owns the store and sees it all the same (#289):
+`firings` lists them with their trigger (`adam_schedule::Trigger`, re-exported as `adam_engine::adam_schedule`), and
+`get`, `events`, `cancel`, `files` and `file` reach one. `steer` and `answer` do not (`NotFound`): nobody talks to a
+firing, and its conversation (`adam_schedule::fired_conversation_id(agent, schedule, due)`) is not one to `send` to. The
+binaries are unchanged: an A2A caller still sees no firing. A reconcile that
 fails ends `start` with `Schedules`; on a retryable class, call `start` again.
 
 **A fixed worker id makes a restart claim its old runs at once; it is opt-in.** With `worker_id: None` the engine
@@ -104,8 +114,8 @@ file holds. So run **one engine per SQLite file**: that clearing takes the lease
 too, and a second engine on the file, or an in-process restart without `shutdown`, would step the first one's runs
 again.
 
-**Not yet**: a way to read a file artifact's bytes (`RunInfo` carries no artifacts yet, and an event carries none, below). The backend is
-given the engine's ring too, and its A2A streaming path (`TaskBackend::subscribe`) builds a file part from a live
+**A file the agent hands over** (a tool's file artifact) reaches the events without its bytes (below); `files(run)` lists
+the run's files and `file(run, sha256)` reads one's bytes from the store. **Not yet**: the backend is given the engine's ring too, and its A2A streaming path (`TaskBackend::subscribe`) builds a file part from a live
 event's bytes: the engine never calls it, and a future caller that streams a task through it must read files from the
 store, since the ring withholds them. Approvals are slice 5: today a run waits only on a question, and `answer`
 answers it.
@@ -198,7 +208,8 @@ re-exports them:
 
 It also depends on `a2a-lf` (the A2A types, data only: ADR 0047's confirmed decision 1), `tokio` (`rt`, `sync`,
 `time`), `futures` (the `Stream` of a run's events), `async-trait` (the engine's event sink), `serde_json` (what a
-withheld file says), `thiserror` and `uuid`.
+withheld file says), `thiserror`, `uuid` and `tracing` (a firing whose state cannot be read is left out of
+`firings` with a warning, as `list` leaves out a task).
 
 ## The dependency check
 
@@ -271,9 +282,29 @@ every wait is bounded by `tokio::time::timeout`:
   run, and each engine steps its own run once;
 * `a_second_live_engine_with_the_same_id_is_refused`: `WorkerIdInUse` (`Rejected`) on the same store; the same id on
   another store starts, and on the first once A has shut down;
+* `a_folders_command_is_expanded`: `/greet Ada Lovelace` reaches the model as `commands/greet.md`'s template, `$1` read
+  as `Ada`, `commands()` lists it with its description and hint, and an unknown `/wave Ada` reaches the model as typed;
+* `a_file_the_agent_hands_over_is_read_by_its_digest`: a host's tool (`EngineBuilder::tools`, an `FnTool`) returns a
+  file; its event withholds the bytes and says their SHA-256, `files` lists it under the same digest, `file` answers its
+  bytes, another digest is `None`, and a run the engine has not is `NotFound` to both;
+* `a_host_tool_named_as_the_engines_is_refused`: a host's `ask_user` is `DuplicateTool` (`Invalid`) at `start`;
 * `a_folders_schedule_fires_the_agent`: a folder with `schedules/soon.md` (`after: 1s`) fires a run of the agent, in
-  the store, whose model is given the prompt and whose `get` is `None`;
-  `the_hosts_retry_policy_governs_a_transient_failure`: `Limits::retry` of two attempts gives a transient model failure
+  the store, whose model is given the prompt; it is in no `list`, and `firings` lists it, `Done`, with its output and
+  trigger, as `get` answers it, and `files` reaches it;
+* `a_host_lists_and_cancels_a_working_firing`: schedules `a` and `ab` fire, one held at the model; `firings` pages them
+  one at a time, filters by schedule (`a` never lists `ab`'s, each `total` 1) and refuses a token of another query; a
+  done firing is `Finished` to `cancel`; the schedulers are not reached by `get`; `steer`, `answer` and a `send` to a
+  firing's conversation are `NotFound`; `cancel` ends the working one `Cancelled`, its `events` end with it, and a
+  second `cancel` answers it as it is; and, in `src/engine.rs`, `a_firing_page_token_reads_back_and_refuses_another_query`;
+* `a_host_starts_lists_and_closes_a_child_session`: `helpers` lists the folder's `planner`; an unknown helper is
+  `Invalid`; a kept-open session's first round is in its own conversation, the same start again is `Repeated`, and the
+  parent takes no turn; `sessions` lists it `Idle` after round 1; a `send` to it is round 2 (`Continued`), again
+  `Repeated`, and `list` has both rounds; `sessions` of the session's conversation and `close_session` of the parent's
+  are `Invalid`; `close_session` closes it and a later `send` is `Refused`; an agent without a subagent has no helper,
+  and `start_session` and `close_session` are `Invalid` there;
+* `the_hosts_session_limits_refuse_a_session_too_many`: `Limits::sessions` of one open session refuses a second start,
+  once the first is idle, with `Refused` (`Rejected`) for the open ones, and `sessions` lists one;
+* `the_hosts_retry_policy_governs_a_transient_failure`: `Limits::retry` of two attempts gives a transient model failure
   up after two calls, not five;
 * `start_refuses_what_it_cannot_build` (a zero lease and a ring of 0 or over 65 536 too; it passes alone and with
   `--features adam-assembly/mcp,adam-assembly/remote`, the set CI's workspace build unifies) and `start_outside_a_tokio_runtime_is_refused`: fail

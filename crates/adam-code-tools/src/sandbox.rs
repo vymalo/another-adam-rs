@@ -4,8 +4,8 @@
 //! exit (a timeout or a cancel kill included), is reported to the call's context
 //! ([`ToolCtx::report_sandbox`]) with the shape the pod's session says ([`EnvSession::sandbox_shape`],
 //! the requests of the template). The loop adds it to the run's state with the call's result. The
-//! coder's own container and a dev container are not metered: asking for their session reports only
-//! where the run's commands run, which reads as *not measured* and never as zero.
+//! coder's own container is not metered: asking for its session reports only where the run's commands
+//! run, which reads as *not measured* and never as zero.
 
 use std::time::Duration;
 
@@ -31,9 +31,6 @@ impl Meter {
         }
         match session.describe().kind {
             EnvKind::Local => Some(Self::Unmeasured(SandboxEnvironment::Local)),
-            EnvKind::DevContainer { .. } => {
-                Some(Self::Unmeasured(SandboxEnvironment::Devcontainer))
-            }
             _ => None,
         }
     }
