@@ -75,10 +75,12 @@ interact (the loop's handling of a reasoning-only length stop is its own change,
    `vymalo/another-agentic-platform`'s parity goldens; the PR says so.
 
 9. **The default.** The code ships with **no** default: nothing changes until a deployment sets one.
-   The recommended deployment value for the coder is **`medium`** (the bench's `low` is the reviewer's,
-   `max` the hard solver's; `medium` is the coding default), and the owner decides whether the chart
-   ships it. The extension's card `default` is the deployment's value when it sets one, and is absent
-   otherwise, so "no member sent" remains expressible.
+   The recommended deployment value for the coder is **`low`** — the only level the bench verified to
+   answer quickly (10–20 s), while `medium`, `high` and `max` ran past 32k reasoning tokens with no
+   answer at the reviewer's output budget. `medium` is the intended next step once the length-stop fix
+   (S-S5bS) and a larger output budget are proven. The owner decides whether the chart ships a default.
+   The extension's card `default` is the deployment's value when it sets one, and is absent otherwise,
+   so "no member sent" remains expressible.
 
 ## Consequences
 
@@ -105,7 +107,7 @@ interact (the loop's handling of a reasoning-only length stop is its own change,
 
 ## Open questions
 
-- The owner's default (recommendation: `medium` for the coder; off in code).
+- The owner's default (recommendation: `low` for the coder, the only level the bench verified to answer quickly; `medium` once the length-stop fix and a larger budget are proven; off in code).
 - The system and web half (read `reasoning/v1` from the live card, per message and per thread, the
   picker) and the platform field (`AgentConfig.model.reasoningEffort`, a deployment ceiling, `aapctl`)
   are separate ADRs in their repositories; they follow this contract.
