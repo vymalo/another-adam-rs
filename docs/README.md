@@ -35,6 +35,7 @@ Start with the [root README](../README.md), then the guide for what you are doin
 | [Errors](reference/errors.md) | error classes, the variant-to-class tree, A2A codes and exit codes |
 | [Store adapters](reference/store-adapters.md) | what each database adapter guarantees and how, data caveats |
 | [The local stack](reference/dev-stack.md) | compose services, mocks, scripted models |
+| [Parity of the surfaces](reference/parity.md) | every setting and feature by surface (coder, folder agent, embedded engine, orchestrator, platform), and the gaps |
 | [Roadmap](roadmap.md) | what is built and what is not |
 | [The chart](../deploy/coder/README.md) | every value of the coder's Helm chart |
 
