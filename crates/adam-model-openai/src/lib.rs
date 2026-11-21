@@ -34,6 +34,11 @@
 //!   For `stream` it bounds the wait for the response headers and then the
 //!   silence between chunks, so a long generation is never cut off while
 //!   tokens keep arriving. Expiry is [`Transient`](adam_model::ModelError::Transient).
+//! * **Response size caps.** A body over 16 MiB, an SSE line over 1 MiB, one
+//!   event's `data:` over 4 MiB, or a stream over 64 MiB is a
+//!   [`Protocol`](adam_model::ModelError::Protocol) error (class `Corrupt`),
+//!   checked before the buffer grows past the cap; the stream is then dropped.
+//!   The caps are constants, not settings.
 //! * **Secrets.** The API key lives in a [`SecretString`]; it is sent as a
 //!   sensitive `Authorization: Bearer` header and never appears in `Debug`
 //!   output, error messages or logs. Extra header *values* are hidden from
@@ -486,12 +491,57 @@ impl OpenAiCompatible {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| errors::parse_retry_after(v, SystemTime::now()));
-        let text = tokio::time::timeout(self.timeout, response.text())
+        let text = tokio::time::timeout(self.timeout, read_body(response))
             .await
             .ok()
             .and_then(Result::ok)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default();
         Err(errors::from_http(status, retry_after, &text))
+    }
+}
+
+/// The most bytes one response body may carry, read whole or streamed.
+pub(crate) const MAX_BODY_BYTES: usize = 16 << 20;
+
+/// Read a response body, refusing one over [`MAX_BODY_BYTES`] before it grows past it.
+async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>, ModelError> {
+    let mut body = BoundedBody::new(MAX_BODY_BYTES);
+    if let Some(len) = response.content_length() {
+        if len > MAX_BODY_BYTES as u64 {
+            return Err(body.over());
+        }
+    }
+    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+        body.push(&chunk)?;
+    }
+    Ok(body.bytes)
+}
+
+/// A body being read under a cap.
+struct BoundedBody {
+    bytes: Vec<u8>,
+    cap: usize,
+}
+
+impl BoundedBody {
+    fn new(cap: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            cap,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ModelError> {
+        if self.bytes.len() + chunk.len() > self.cap {
+            return Err(self.over());
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn over(&self) -> ModelError {
+        ModelError::protocol(format!("the model sent a body over {} bytes", self.cap))
     }
 }
 
@@ -575,7 +625,7 @@ impl ModelClient for OpenAiCompatible {
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
         let body = wire::build_request(&req, false, self.options())?;
         let response = self.send(body, false).await?;
-        let bytes = response.bytes().await.map_err(transport_error)?;
+        let bytes = read_body(response).await?;
         let parsed = wire::parse_completion(&bytes).map(|r| self.echoed(r));
         match &parsed {
             Ok(r) => tracing::debug!(
@@ -687,6 +737,28 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_body_is_refused_before_it_grows_past_the_cap() {
+        let mut body = BoundedBody::new(8);
+        body.push(b"12345").expect("5 of 8");
+        body.push(b"678").expect("exactly 8");
+        let err = body.push(b"9").expect_err("the 9th byte");
+        assert!(matches!(err, ModelError::Protocol { .. }), "{err:?}");
+        assert!(err.to_string().contains("over 8 bytes"), "{err}");
+        assert_eq!(body.bytes, b"12345678");
+
+        // One chunk over the cap is refused whole: nothing is copied first.
+        let mut body = BoundedBody::new(4);
+        let err = body.push(b"12345").expect_err("one chunk over");
+        assert!(err.to_string().contains("over 4 bytes"), "{err}");
+        assert!(body.bytes.is_empty());
+    }
+
+    #[test]
+    fn the_default_body_cap_is_the_documented_one() {
+        assert_eq!(MAX_BODY_BYTES, 16 << 20, "one body: 16 MiB");
     }
 
     #[test]
