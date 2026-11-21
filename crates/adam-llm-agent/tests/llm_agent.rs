@@ -1330,10 +1330,114 @@ async fn turns_cut_while_thinking_past_the_bound_fail_the_run() {
     worker.stop().await;
 
     let error = view.error.expect("error");
-    assert!(error.contains("while it was thinking"), "{error}");
-    assert!(error.contains("3 times in a row"), "{error}");
+    assert!(
+        error.starts_with("output limit reached while thinking:"),
+        "{error}"
+    );
+    assert!(error.contains("3 turns in a row"), "{error}");
     assert!(view.output.is_none(), "no answer");
     assert_eq!(h.mock.requests().len(), MAX_THINKING_CUTS as usize + 1);
+}
+
+/// A cut turn as a client that echoes reasoning reports it: the message keeps the reasoning.
+fn thinking_only_cut_echoed() -> ModelResponse {
+    let mut cut = thinking_only_cut();
+    cut.message = Message::Assistant {
+        content: Vec::new(),
+        tool_calls: Vec::new(),
+        reasoning: Some("a long chain of thought".into()),
+    };
+    cut
+}
+
+/// The messages of request 0 and request 1 of a run whose first turn is `cut` and whose second says
+/// `done`.
+async fn requests_after_a_cut(cut: ModelResponse) -> (Vec<Message>, Vec<Message>) {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock.push_response(cut).push_text("done");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("work"), None)
+        .await
+        .expect("start");
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 2);
+    (requests[0].messages.clone(), requests[1].messages.clone())
+}
+
+#[tokio::test]
+async fn a_cut_turn_that_sends_nothing_is_not_in_the_next_request() {
+    let (first, second) = requests_after_a_cut(thinking_only_cut()).await;
+    let mut want = first;
+    want.push(Message::user_text(THINKING_CUT_TURN));
+    assert_eq!(second, want, "no empty assistant message on the wire");
+}
+
+#[tokio::test]
+async fn a_cut_turn_whose_reasoning_is_echoed_stays_in_the_next_request() {
+    let (first, second) = requests_after_a_cut(thinking_only_cut_echoed()).await;
+    let mut want = first;
+    want.push(Message::Assistant {
+        content: Vec::new(),
+        tool_calls: Vec::new(),
+        reasoning: Some("a long chain of thought".into()),
+    });
+    want.push(Message::user_text(THINKING_CUT_TURN));
+    assert_eq!(second, want);
+}
+
+#[tokio::test]
+async fn a_cut_before_the_closing_turn_is_not_told_to_call_a_tool() {
+    let h = Harness::new();
+    let agent = h
+        .agent()
+        .limits(Limits {
+            max_turns: 1,
+            ..Limits::default()
+        })
+        .build();
+    h.mock
+        .push_response(thinking_only_cut())
+        .push_text("what I know");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("work"), None)
+        .await
+        .expect("start");
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 2);
+    let mut want = requests[0].messages.clone();
+    want.push(Message::user_text(CLOSING_TURN));
+    assert_eq!(requests[1].messages, want, "only the closing turn is said");
+    let state = conversation(&rt, &view).await;
+    assert!(
+        !state
+            .messages
+            .contains(&Message::user_text(THINKING_CUT_TURN))
+    );
+}
+
+#[tokio::test]
+async fn a_cut_followed_by_an_empty_stop_leaves_no_count_behind() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock.push_response(thinking_only_cut()).push_text("");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("llm", user_message("work"), None)
+        .await
+        .expect("start");
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(conversation(&rt, &view).await.thinking_cuts, 0);
 }
 
 #[tokio::test]
@@ -1354,6 +1458,11 @@ async fn a_whitespace_only_length_turn_counts_as_cut_while_thinking() {
     assert_eq!(
         output_of(&view),
         Some(json!({"text": "after", "artifacts": []}))
+    );
+    assert_eq!(
+        h.events(run),
+        vec![custom("agent_text", json!({"text": "after", "turn": 1}))],
+        "the whitespace of the cut turn is not said"
     );
 }
 

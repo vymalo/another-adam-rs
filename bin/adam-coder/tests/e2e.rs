@@ -2034,9 +2034,14 @@ async fn turns_cut_while_thinking_past_the_bound_fail_the_coder_run(store: DynSt
         seen.labels
     );
     assert!(
-        seen.saw_message("while it was thinking"),
+        seen.saw_message("output limit reached while thinking"),
         "{:#?}",
         seen.messages
+    );
+    assert_eq!(
+        mock.requests().len(),
+        adam_llm_agent::MAX_THINKING_CUTS as usize + 1,
+        "one request per cut, and none after the bound"
     );
 }
 

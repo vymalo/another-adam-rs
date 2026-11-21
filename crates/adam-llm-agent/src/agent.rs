@@ -627,10 +627,10 @@ pub const CLOSING_TURN: &str = "You have used all the steps this run may take. D
 tool. Reply in plain words: what you did, what is finished, and what is still left to do.";
 
 /// What the model is told after a turn that reached the output limit while it was still thinking:
-/// no words and no call, only reasoning. Kept in the history after that turn.
-pub const THINKING_CUT_TURN: &str = "Your last turn reached the output limit while you were \
-thinking, before you wrote anything. Do not restate your reasoning: now either call a tool or \
-answer.";
+/// no words and no call, only reasoning. Kept in the history after that turn, except when the
+/// next turn is the closing turn.
+pub const THINKING_CUT_TURN: &str = "Your last turn reached the output limit while you were still \
+thinking, before you wrote anything. Think briefly this time, then call a tool or answer.";
 
 /// How many turns in a row may end at the output limit with reasoning only before the run fails
 /// (each is continued with [`THINKING_CUT_TURN`] and counts as a model call against `max_turns`).
@@ -1677,6 +1677,7 @@ impl LlmAgent {
         // A message that reaches the run starts a new turn: what a tool announced as the answer of
         // the one before is not the answer of this one.
         if !texts.as_slice().is_empty() {
+            state.thinking_cuts = 0;
             state.announced = None;
             state.announced_final = false;
         }
@@ -2314,10 +2315,17 @@ impl LlmAgent {
             }
             calls.push(wait);
         }
-        if !text.trim().is_empty() || !calls.is_empty() {
+        // Only a turn that is continued as a cut keeps the count: any other ends or moves the run on.
+        let cut = finish == FinishReason::Length
+            && text.trim().is_empty()
+            && calls.is_empty()
+            && !unread
+            && state.limit.is_none()
+            && state.announced.is_none();
+        if !cut {
             state.thinking_cuts = 0;
         }
-        if !text.is_empty() {
+        if !text.trim().is_empty() {
             let mut payload = json!({ "text": text, "turn": turn });
             // The words before a tool call are said whole, under the stream they were sent as, because
             // nothing else will say them: the turn goes on to its tools. The answer that ends the run
@@ -2373,20 +2381,35 @@ impl LlmAgent {
             // Reasoning that filled the output limit before any word is no answer: the model is
             // asked again, a few times, and then the run fails (never an empty answer, never a
             // question to the person).
-            if finish == FinishReason::Length && text.trim().is_empty() {
+            if cut {
                 state.thinking_cuts += 1;
                 if state.thinking_cuts > MAX_THINKING_CUTS {
                     return Ok((
                         Flow::Fail(format!(
-                            "model call failed: the model's output limit was reached while it was \
-                             thinking, {} times in a row; raise max_output_tokens or lower the \
-                             reasoning effort",
+                            "output limit reached while thinking: {} turns in a row ended at the \
+                             output limit with no words and no tool call; raise max_output_tokens \
+                             or lower the reasoning effort",
                             state.thinking_cuts
                         )),
                         early,
                     ));
                 }
-                state.messages.push(Message::user_text(THINKING_CUT_TURN));
+                // A cut turn with nothing the model will see (no reasoning echoed back) would be
+                // sent as an empty assistant message, which some servers refuse: it leaves the
+                // history.
+                if matches!(
+                    state.messages.last(),
+                    Some(Message::Assistant {
+                        reasoning: None,
+                        ..
+                    })
+                ) {
+                    state.messages.pop();
+                }
+                // The next turn is the closing turn, which has its own instruction.
+                if state.turns < self.limits.max_turns {
+                    state.messages.push(Message::user_text(THINKING_CUT_TURN));
+                }
                 return Ok((Flow::Next, early));
             }
             let mut output = json!({
@@ -5643,6 +5666,34 @@ impl Agent for LlmAgent {
                 Transition::Fail { state, error }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod thinking_cut_tests {
+    use super::*;
+    use adam_model::MockModel;
+
+    #[test]
+    fn a_message_that_reaches_the_run_starts_the_count_again() {
+        let model: DynModel = Arc::new(MockModel::new());
+        let agent = LlmAgent::builder("t", model, "m").build();
+        let mut state = Conversation::new("work");
+        state.thinking_cuts = 2;
+        let message = crate::user_message("and also this");
+        agent.absorb_inbox(&mut state, vec![message], &HashMap::new());
+        assert_eq!(state.thinking_cuts, 0);
+    }
+
+    #[test]
+    fn an_unreadable_message_does_not() {
+        let model: DynModel = Arc::new(MockModel::new());
+        let agent = LlmAgent::builder("t", model, "m").build();
+        let mut state = Conversation::new("work");
+        state.thinking_cuts = 2;
+        let junk = Inbound::new("message", json!({ "nothing": true }));
+        agent.absorb_inbox(&mut state, vec![junk], &HashMap::new());
+        assert_eq!(state.thinking_cuts, 2);
     }
 }
 
