@@ -21,7 +21,8 @@ never see this crate's types. Retries are not done here: failures map onto
 | `PROVIDER` | `"openai"`: what `ModelClient::provider` says for this client, whatever gateway is behind it |
 | `ReasoningField` | `ReasoningContent` (`reasoning_content`) or `Reasoning` (`reasoning`): the member that carries reasoning when a client echoes it |
 | `MaxTokensField` | `MaxTokens` (default) or `MaxCompletionTokens`, for models that want the newer field name |
-| `OpenAiConfigError` | invalid configuration: `InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `ReservedBodyKey`, `Client`; see *Errors* |
+| `ExtraRoots`, `OpenAiCompatible::with_extra_roots(&roots)` | `MODEL_CA_FILE` ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md) decision 9): `ExtraRoots::read(path)` or `from_pem(bytes)` reads a PEM bundle and checks it with the TLS backend (a file that cannot be read, is not PEM, holds no certificate or one the backend refuses is `InvalidCaFile`); `with_extra_roots` builds the client again trusting them **beside** the default roots, for the model endpoint only. `Debug` says how many |
+| `OpenAiConfigError` | invalid configuration: `InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `ReservedBodyKey`, `InvalidCaFile` (new; the enum is `#[non_exhaustive]`), `Client`; see *Errors* |
 
 ```rust
 use std::sync::Arc;
@@ -162,8 +163,8 @@ An error object inside a `200` or a stream is `RateLimited` for a
 `rate_limit` type, `ContextLength` for a context-length code, `InvalidRequest`
 for `invalid_request` or `authentication`, and `Transient` for anything else.
 
-`OpenAiConfigError` (from `OpenAiCompatible::new` and `with_extra_body`) is `Invalid` for
-`InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey` and `ReservedBodyKey`, and `Internal` for
+`OpenAiConfigError` (from `OpenAiCompatible::new`, `with_extra_body`, `with_extra_roots` and `ExtraRoots`) is `Invalid` for
+`InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `ReservedBodyKey` and `InvalidCaFile`, and `Internal` for
 `Client` (the HTTP client could not be built; the `reqwest` error is its
 `source`). No message carries the URL, the header value or the key.
 
@@ -187,7 +188,8 @@ of use, prove it over the request, or send a run's tag with no key.
 
 ## Features and environment
 
-No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
+No Cargo features. TLS is `rustls` (workspace `reqwest` configuration), verified by the platform verifier; `with_extra_roots`
+adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by `adam-service`.
 
 ## Tests
 
@@ -205,6 +207,10 @@ No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
 * `tests/injector.rs`: `InjectedRun` against a `wiremock` server: every completion and stream carries `X-Run-Id` and no
   `Authorization` (a key in the configuration is never sent), the run is in no body, the retry after a 401 names the run
   too, and a call with no run sends no request. Always runs.
+* `tests/ca_file.rs`: a TLS server on the loopback (rustls, a test CA and a server certificate for `localhost` and
+  `127.0.0.1` in `tests/fixtures/`, valid until 2126, signing nothing else) is refused with the default roots, nothing
+  reaching it, and answers once the client trusts the CA with `with_extra_roots`; a missing file, an empty one, a key, bad
+  base64 and a block that is no certificate are each `InvalidCaFile`. Always runs.
 * `tests/wiremock_compose.rs`: the client against the `mock-openai` WireMock of `compose.yaml` (text and tool-call answers,
   streamed or not, the error scenarios), and **every scripted model** (`mock-coder`, `mock-assistant`, `mock-researcher`, `mock-painter`)
   played from its first request to its final answer both as a completion and as a stream, which must say the same, with the

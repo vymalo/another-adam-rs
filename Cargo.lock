@@ -637,6 +637,7 @@ dependencies = [
  "memchr",
  "proptest",
  "reqwest",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",

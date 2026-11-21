@@ -214,6 +214,10 @@ pub enum OpenAiConfigError {
     /// The extra request body sets a member the runtime owns.
     #[error("the extra request body may not set `{0}`: the runtime owns it")]
     ReservedBodyKey(String),
+    /// The CA file of the model endpoint (`MODEL_CA_FILE`) cannot be used: it cannot be read, is
+    /// not PEM, holds no certificate, or holds one the TLS backend refuses.
+    #[error("the model endpoint's CA file cannot be used: {0}")]
+    InvalidCaFile(String),
     /// The HTTP client could not be built (for example, no TLS backend).
     #[error("could not build the HTTP client")]
     Client(#[source] BoxError),
@@ -225,6 +229,7 @@ impl Classify for OpenAiConfigError {
             Self::InvalidBaseUrl { .. }
             | Self::InvalidHeader(_)
             | Self::InvalidApiKey
+            | Self::InvalidCaFile(_)
             | Self::ReservedBodyKey(_) => ErrorClass::Invalid,
             Self::Client(_) => ErrorClass::Internal,
         }
@@ -237,6 +242,9 @@ impl Classify for OpenAiConfigError {
 #[derive(Clone)]
 pub struct OpenAiCompatible {
     http: reqwest::Client,
+    /// What the HTTP client was built with, so [`with_extra_roots`](Self::with_extra_roots) can
+    /// build it again.
+    default_headers: HeaderMap,
     url: String,
     credentials: DynCredentials,
     timeout: Duration,
@@ -309,17 +317,12 @@ impl OpenAiCompatible {
                 .map_err(|_| OpenAiConfigError::InvalidApiKey)?;
         }
 
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .user_agent(concat!("adam-model-openai/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(config.timeout)
-            // Never replay a POST carrying credentials somewhere else.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| OpenAiConfigError::Client(Box::new(e.without_url())))?;
+        let http = build_http(&headers, config.timeout, None)
+            .map_err(|e| OpenAiConfigError::Client(Box::new(e)))?;
 
         Ok(Self {
             http,
+            default_headers: headers,
             url: format!("{base}/chat/completions"),
             credentials: Arc::new(StaticBearer::new(config.api_key.clone())),
             timeout: config.timeout,
@@ -442,6 +445,19 @@ impl OpenAiCompatible {
         self
     }
 
+    /// Trust `roots` for the model endpoint, beside the default roots (`MODEL_CA_FILE`, ADR 0067):
+    /// a gateway inside a cluster whose certificate no public root store holds. The HTTP client is
+    /// built again with them; the default roots are kept.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenAiConfigError::InvalidCaFile`] when the TLS backend refuses them.
+    pub fn with_extra_roots(mut self, roots: &ExtraRoots) -> Result<Self, OpenAiConfigError> {
+        self.http = build_http(&self.default_headers, self.timeout, Some(roots))
+            .map_err(|_| OpenAiConfigError::InvalidCaFile("the TLS backend refused it".into()))?;
+        Ok(self)
+    }
+
     /// Send the request of the run `run` and return the response if it is a success.
     async fn send(
         &self,
@@ -504,6 +520,87 @@ impl OpenAiCompatible {
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default();
         Err(errors::from_http(status, retry_after, &text))
+    }
+}
+
+/// The HTTP client of the model endpoint: `headers` on every request, no redirect, and `roots`
+/// trusted beside the default roots.
+fn build_http(
+    headers: &HeaderMap,
+    timeout: Duration,
+    roots: Option<&ExtraRoots>,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder()
+        .default_headers(headers.clone())
+        .user_agent(concat!("adam-model-openai/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(timeout)
+        // Never replay a POST carrying credentials somewhere else.
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(roots) = roots {
+        builder = builder.tls_certs_merge(roots.0.iter().cloned());
+    }
+    builder.build().map_err(reqwest::Error::without_url)
+}
+
+/// Certificates trusted for the model endpoint beside the default roots: the PEM file of
+/// `MODEL_CA_FILE` ([ADR 0067](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+/// decision 9), for [`OpenAiCompatible::with_extra_roots`]. Only the model endpoint's client
+/// trusts them. Its `Debug` says how many.
+#[derive(Clone)]
+pub struct ExtraRoots(Vec<reqwest::Certificate>);
+
+impl ExtraRoots {
+    /// The certificates of a PEM bundle. Checked here, with the TLS backend, so a bad file fails
+    /// at startup and never at the first call.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenAiConfigError::InvalidCaFile`] when the text is not PEM, holds no certificate, or
+    /// holds one the TLS backend refuses.
+    pub fn from_pem(pem: &[u8]) -> Result<Self, OpenAiConfigError> {
+        let certs = reqwest::Certificate::from_pem_bundle(pem)
+            .map_err(|_| OpenAiConfigError::InvalidCaFile("it is not PEM".into()))?;
+        if certs.is_empty() {
+            return Err(OpenAiConfigError::InvalidCaFile(
+                "it holds no certificate".into(),
+            ));
+        }
+        let roots = Self(certs);
+        build_http(&HeaderMap::new(), Duration::from_secs(1), Some(&roots)).map_err(|_| {
+            OpenAiConfigError::InvalidCaFile(
+                "it holds a certificate the TLS backend refuses".into(),
+            )
+        })?;
+        Ok(roots)
+    }
+
+    /// The certificates of the PEM file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenAiConfigError::InvalidCaFile`] when the file cannot be read, or as [`from_pem`](Self::from_pem).
+    pub fn read(path: &std::path::Path) -> Result<Self, OpenAiConfigError> {
+        let pem = std::fs::read(path)
+            .map_err(|e| OpenAiConfigError::InvalidCaFile(format!("it cannot be read: {e}")))?;
+        Self::from_pem(&pem)
+    }
+
+    /// How many certificates.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there is none (never, for a value [`from_pem`](Self::from_pem) gave).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for ExtraRoots {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ExtraRoots").field(&self.0.len()).finish()
     }
 }
 
@@ -779,6 +876,7 @@ mod tests {
             OpenAiConfigError::InvalidHeader(_) => ErrorClass::Invalid,
             OpenAiConfigError::InvalidApiKey => ErrorClass::Invalid,
             OpenAiConfigError::ReservedBodyKey(_) => ErrorClass::Invalid,
+            OpenAiConfigError::InvalidCaFile(_) => ErrorClass::Invalid,
             OpenAiConfigError::Client(_) => ErrorClass::Internal,
         };
         for e in [
@@ -789,6 +887,7 @@ mod tests {
             OpenAiConfigError::InvalidHeader("x".into()),
             OpenAiConfigError::InvalidApiKey,
             OpenAiConfigError::ReservedBodyKey("model".into()),
+            OpenAiConfigError::InvalidCaFile("x".into()),
             OpenAiConfigError::Client(Box::new(Build)),
         ] {
             assert_eq!(e.class(), expected(&e), "{e}");
