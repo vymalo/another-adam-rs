@@ -24,10 +24,6 @@ pub const INSTRUCTION: &str = "The tool calls of one reply may run at the same t
     `\"after_previous\": true` when it must start only after every call before it in the reply has \
     finished.";
 
-/// The description of the injected property.
-const DESCRIPTION: &str =
-    "Set true to run this call only after every earlier call of this reply has finished.";
-
 /// Whether the top level of `parameters` is an object schema we can add a property to: `type` is
 /// `"object"`, or there is no `type` and `properties` is an object.
 fn is_object_schema(parameters: &Value) -> bool {
@@ -62,10 +58,9 @@ pub(crate) fn prepare(specs: &mut [ToolSpec], inject: bool) -> Vec<String> {
         if let Some(parameters) = spec.parameters.as_object_mut() {
             let properties = parameters.entry("properties").or_insert_with(|| json!({}));
             if let Some(properties) = properties.as_object_mut() {
-                properties.insert(
-                    AFTER_PREVIOUS.to_owned(),
-                    json!({"type": "boolean", "description": DESCRIPTION}),
-                );
+                // No description: [`INSTRUCTION`] says what it does, once, in the system prompt, and a
+                // description here was repeated in every tool of every request (about 110 bytes each).
+                properties.insert(AFTER_PREVIOUS.to_owned(), json!({"type": "boolean"}));
             }
         }
     }

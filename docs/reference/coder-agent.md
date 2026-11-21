@@ -685,7 +685,7 @@ With `MODEL_INPUT_MODALITIES=text,image` (off by default, [environment](environm
 
 ## Limits and cancel
 
-`limits:` in `agent/instructions.md`: 200 model turns, 400 tool calls, 8192 output tokens per call, 100,000
+`limits:` in `agent/instructions.md`: 200 model turns, 400 tool calls, 32768 output tokens per call, 100,000
 tokens of history. A run that reaches `max_turns` or `max_tool_calls` gets one closing model call in which it
 may call no tool, and its answer ends the run with `output.limited: true` ([A2A server](a2a-server.md#a-run-that-ends-at-its-limit)).
 The coder never reads that answer as a question: **it completes only when the run has no repository or

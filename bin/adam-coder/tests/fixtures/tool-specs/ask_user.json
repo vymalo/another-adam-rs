@@ -1,50 +1,186 @@
 {
+  "description": "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific. `question` is always required: it is the sentence the person reads first. When the answer is one of a few options, pass `choices` instead of listing the options in your text: the person gets one form and answers every question together. Give the form a short `title` and a `description` of why you ask; give each option a short `label`, a `description` of what it means or costs, and `recommended: true` on the one you advise. A question's `type`: `single` (the default), `multiple`, `select`, `images` (each option has an `image` of a file you shared), `text`, `longText`, `confirm` (yes or no: use it for consent before something that cannot be undone), `number`, `scale`, `date` or `rank`; the fields marked with a type belong to it. A screen that lacks a type gets the nearest form. An answer that breaks a rule of the form goes back to the person, at most 5 times; words the person typed instead reach you unchecked. `show` draws what a question is about (above all before consent). With a single possible answer, or none you know, ask a plain question without `choices`.",
   "name": "ask_user",
-  "description": "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific. `question` is always required, with or without `choices`: it is the sentence the person reads first. Whenever the answer is one of a few options, pass `choices` and never write the options as a list in your text: the person gets one form with a list of options per question and answers them together; their answers come back as the result. Give the form a short `title` and a `description` of why you ask (a sentence or two of plain text). Each entry of `choices` needs its own `question`; give every option a short `label` and a `description` that says what it means or what it costs, and mark the one you recommend with `recommended: true`. A question's `type` is `single` (radio buttons, the default; 2 to 12 options), `multiple` (checkboxes; 2 to 12; `min` and `max` say how many), `select` (a searchable list; 2 to 50 options), `images` (a deck of pictures; 2 to 16 options, each with `image` {sha256, alt}: the sha256 of an image file you shared in this conversation, never a URL) or `text` / `longText` (the person types the answer; no options). Five kinds fit what a list cannot: `confirm` (a yes or no, `yesLabel` and `noLabel` name the two buttons, `default` \"yes\" or \"no\" is the safe answer; use it for consent before something that cannot be undone), `number` (a decimal, `minValue`, `maxValue`, `step`, `unit`), `scale` (a rating of whole numbers from `from`, 0 or 1, to `to`, 2 to 10, with `fromLabel` and `toLabel` for the two ends), `date` (a day, YYYY-MM-DD, `minDate`, `maxDate`) and `rank` (the person puts 2 to 12 options in order, the best first). A number, a bound and a default are decimals, like 12.5; a screen that lacks a kind gets the nearest form. The answer to a form is checked against it: one that breaks a rule (a number out of range, a day outside its bounds, a rank that is not every option once) goes back to the person to fix, at most 5 times. Words the person typed instead of using the form reach you unchecked, and you read them. A question may `show` what it is about, drawn with it: 1 to 4 blocks `{component, ...}` in `show` (`Code` for a diff, a command or a file; also `Text`, `Image` with `artifact`, the sha256 of a file you shared, and `alt`, `Mermaid`, `Cards`, `Callout`, `Chart`), 8 in all the form. Use it above all before consent, so that the person sees what they allow; a screen that cannot draw a block gets it in words. `help` is a line under the question, `default` is what is chosen at first, `allowOther` offers an \"Other\" the person can write, `freeInput` adds an \"anything else\" box. With a single possible answer, or none that you know, do not use `choices`: ask a plain question. There are at most 8 questions. An `id` or option `value` is 1 to 64 characters of letters, digits and `- _ . :`. Example: {\"question\": \"A few things I need before I start.\", \"title\": \"Before I start\", \"description\": \"The migration depends on the database, so I need to know which one.\", \"choices\": [{\"id\": \"db\", \"question\": \"Which database?\", \"options\": [{\"label\": \"Postgres\", \"description\": \"Relational, the default\", \"recommended\": true}, {\"label\": \"MongoDB\", \"description\": \"Documents, no schema\"}]}]} Without `choices` the question is plain text.",
   "parameters": {
-    "type": "object",
     "properties": {
-      "question": {
-        "type": "string",
-        "minLength": 1,
-        "description": "Required, even when `choices` is given: what you need to know, or the sentence that opens the form"
-      },
-      "title": {
-        "type": "string",
-        "description": "The form's heading: a few words (with `choices`)"
-      },
-      "description": {
-        "type": "string",
-        "description": "Why you are asking, in a sentence or two of plain text, no Markdown (with `choices`)"
-      },
       "choices": {
-        "type": "array",
-        "maxItems": 8,
-        "description": "Questions with fixed answers, asked together as one form (at most 8). Each needs `question` and, unless it is a typed answer, `options`. Omit for an open question.",
+        "description": "Questions with fixed answers, as one form. Each needs `question`, and `options` unless it is typed.",
         "items": {
-          "type": "object",
           "properties": {
-            "id": {
-              "type": "string",
-              "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
-              "description": "A short id for the question (1 to 64 letters, digits, - _ . :), used in the answer; defaults to q1, q2, ..."
+            "allowOther": {
+              "description": "Offer an \"Other\" to write in",
+              "type": "boolean"
             },
-            "question": {
-              "type": "string",
+            "default": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              ],
+              "description": "The first answer shown: option value(s) or label(s), starting words, \"yes\"/\"no\" (the safe one), a decimal, a point, a day, or every option once for rank"
+            },
+            "from": {
+              "description": "scale: the first point (1 when absent)",
+              "maximum": 1,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "fromLabel": {
+              "description": "scale: words at the first point",
+              "maxLength": 60,
               "minLength": 1,
-              "description": "Required: the question"
+              "type": "string"
             },
             "help": {
-              "type": "string",
-              "description": "A line under the question: what the options mean, or what the answer is for"
+              "description": "A line under the question",
+              "type": "string"
+            },
+            "id": {
+              "description": "Its id in the answer; q1, q2, ... when omitted",
+              "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+              "type": "string"
+            },
+            "max": {
+              "description": "Most to pick",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maxDate": {
+              "description": "date: the last day allowed",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+              "type": "string"
+            },
+            "maxValue": {
+              "description": "number: the most",
+              "type": [
+                "string",
+                "number"
+              ]
+            },
+            "min": {
+              "description": "Fewest to pick",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "minDate": {
+              "description": "date: the first day allowed",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+              "type": "string"
+            },
+            "minValue": {
+              "description": "number: the least",
+              "type": [
+                "string",
+                "number"
+              ]
+            },
+            "multiple": {
+              "description": "Several may be picked (also with select and images)",
+              "type": "boolean"
+            },
+            "noLabel": {
+              "description": "confirm: the no button",
+              "maxLength": 40,
+              "minLength": 1,
+              "type": "string"
+            },
+            "options": {
+              "description": "Each a label or an object: 2 to 12 for single, multiple and rank, 2 to 50 for select, 2 to 16 for images; none for the others",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "properties": {
+                      "description": {
+                        "description": "What it means or costs, in a short sentence",
+                        "type": "string"
+                      },
+                      "icon": {
+                        "enum": [
+                          "agent",
+                          "read",
+                          "edit",
+                          "delete",
+                          "move",
+                          "search",
+                          "execute",
+                          "think",
+                          "fetch",
+                          "web",
+                          "git",
+                          "test",
+                          "file",
+                          "tool",
+                          "opencode"
+                        ]
+                      },
+                      "image": {
+                        "description": "images only: the sha256 of an image file you shared, never a URL",
+                        "properties": {
+                          "alt": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "sha256": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "sha256",
+                          "alt"
+                        ],
+                        "type": "object"
+                      },
+                      "label": {
+                        "description": "A few words",
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "recommended": {
+                        "type": "boolean"
+                      },
+                      "value": {
+                        "description": "Its id in the answer; made from the label when omitted",
+                        "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "label"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              "maxItems": 50,
+              "type": "array"
+            },
+            "question": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "required": {
+              "description": "Must be answered (the default)",
+              "type": "boolean"
             },
             "show": {
-              "description": "What the question is about, drawn with it: 1 to 4 blocks, 8 in all the form, each {component, ...its properties}: a Code block for a diff, a command or a file, Text, Image, Mermaid, Cards, Callout or Chart. A screen that cannot draw one gets it in words",
+              "description": "Blocks drawn with the question (8 in all the form), each {component, ...}: Code for a diff, a command or a file; Text, Image (artifact: sha256, alt), Mermaid, Cards, Callout, Chart",
               "items": {
                 "additionalProperties": true,
                 "properties": {
                   "component": {
-                    "description": "One of the seven a question may show",
                     "enum": [
                       "Text",
                       "Image",
@@ -65,7 +201,27 @@
               "minItems": 1,
               "type": "array"
             },
+            "step": {
+              "description": "number: the step from the least (or 0)",
+              "type": [
+                "string",
+                "number"
+              ]
+            },
+            "to": {
+              "description": "scale, required: the last point",
+              "maximum": 10,
+              "minimum": 2,
+              "type": "integer"
+            },
+            "toLabel": {
+              "description": "scale: words at the last point",
+              "maxLength": 60,
+              "minLength": 1,
+              "type": "string"
+            },
             "type": {
+              "description": "single (radio buttons, the default), multiple (checkboxes), select (searchable list), images, text, longText, confirm, number, scale (a rating), date, rank (put the options in order)",
               "enum": [
                 "single",
                 "multiple",
@@ -78,194 +234,16 @@
                 "scale",
                 "date",
                 "rank"
-              ],
-              "description": "How it is answered: single (radio buttons, the default), multiple (checkboxes), select (a searchable list), images (a deck of pictures), text (a short typed answer), longText (a longer one), confirm (yes or no), number (a decimal), scale (a rating between two ends), date (a day), rank (put the options in order)"
-            },
-            "options": {
-              "type": "array",
-              "maxItems": 50,
-              "description": "The answers to pick from, each a label or {value, label, description, image, icon, recommended}: 2 to 12 for single, multiple and rank, 2 to 50 for select, 2 to 16 for images (each with an image); none for the other types",
-              "items": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "properties": {
-                      "description": {
-                        "description": "The option's subtitle: what it means or what it costs, in a short sentence",
-                        "type": "string"
-                      },
-                      "icon": {
-                        "description": "An icon beside the label",
-                        "enum": [
-                          "agent",
-                          "read",
-                          "edit",
-                          "delete",
-                          "move",
-                          "search",
-                          "execute",
-                          "think",
-                          "fetch",
-                          "web",
-                          "git",
-                          "test",
-                          "file",
-                          "tool",
-                          "opencode"
-                        ]
-                      },
-                      "image": {
-                        "description": "A picture of the option, for type \"images\": the sha256 of an image file you shared in this conversation, never a URL",
-                        "properties": {
-                          "alt": {
-                            "description": "What the picture shows, in words",
-                            "minLength": 1,
-                            "type": "string"
-                          },
-                          "sha256": {
-                            "pattern": "^[0-9a-f]{64}$",
-                            "type": "string"
-                          }
-                        },
-                        "required": [
-                          "sha256",
-                          "alt"
-                        ],
-                        "type": "object"
-                      },
-                      "label": {
-                        "description": "The option's title: a few words",
-                        "minLength": 1,
-                        "type": "string"
-                      },
-                      "recommended": {
-                        "description": "Mark this option as the one you recommend",
-                        "type": "boolean"
-                      },
-                      "value": {
-                        "description": "A short id for the option (1 to 64 letters, digits, - _ . :); made from the label when omitted",
-                        "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "label"
-                    ],
-                    "type": "object"
-                  }
-                ]
-              }
-            },
-            "multiple": {
-              "type": "boolean",
-              "description": "Several options may be picked (the same as type \"multiple\"; with select and images it lets several be picked)"
-            },
-            "allowOther": {
-              "type": "boolean",
-              "description": "Offer an \"Other\" the person can write"
-            },
-            "required": {
-              "type": "boolean",
-              "description": "The person must answer this one (the default)"
-            },
-            "default": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "number"
-                },
-                {
-                  "items": {
-                    "type": "string"
-                  },
-                  "type": "array"
-                }
-              ],
-              "description": "What is chosen at first: an option's value or label, or a list of them for several; the words a typed question starts with; for confirm \"yes\" or \"no\" (the safe answer), for number a decimal, for scale a point, for date a day, for rank every option's value once, in the order the list starts in"
-            },
-            "min": {
-              "type": "integer",
-              "minimum": 0,
-              "description": "The fewest options to pick, when several may be picked"
-            },
-            "max": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "The most options to pick, when several may be picked"
-            },
-            "from": {
-              "description": "scale only: the first point, 0 or 1 (1 when absent)",
-              "maximum": 1,
-              "minimum": 0,
-              "type": "integer"
-            },
-            "fromLabel": {
-              "description": "scale only: the words at the first point (Not at all)",
-              "maxLength": 60,
-              "minLength": 1,
-              "type": "string"
-            },
-            "maxDate": {
-              "description": "date only: the last day allowed, YYYY-MM-DD",
-              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
-              "type": "string"
-            },
-            "maxValue": {
-              "description": "number only: the most, a decimal",
-              "type": [
-                "string",
-                "number"
               ]
-            },
-            "minDate": {
-              "description": "date only: the first day allowed, YYYY-MM-DD",
-              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
-              "type": "string"
-            },
-            "minValue": {
-              "description": "number only: the least, a decimal like 0 or \"2.5\"",
-              "type": [
-                "string",
-                "number"
-              ]
-            },
-            "noLabel": {
-              "description": "confirm only: the words of the no button (\"No\" when absent)",
-              "maxLength": 40,
-              "minLength": 1,
-              "type": "string"
-            },
-            "step": {
-              "description": "number only: the answer is the least (or 0) plus a whole number of these, above zero",
-              "type": [
-                "string",
-                "number"
-              ]
-            },
-            "to": {
-              "description": "scale only, required: the last point, 2 to 10, above `from`",
-              "maximum": 10,
-              "minimum": 2,
-              "type": "integer"
-            },
-            "toLabel": {
-              "description": "scale only: the words at the last point (Certainly)",
-              "maxLength": 60,
-              "minLength": 1,
-              "type": "string"
             },
             "unit": {
-              "description": "number only: what the number counts, shown beside the box (EUR, kg)",
+              "description": "number: the unit (EUR, kg)",
               "maxLength": 20,
               "minLength": 1,
               "type": "string"
             },
             "yesLabel": {
-              "description": "confirm only: the words of the yes button (\"Yes\" when absent)",
+              "description": "confirm: the yes button",
               "maxLength": 40,
               "minLength": 1,
               "type": "string"
@@ -273,8 +251,15 @@
           },
           "required": [
             "question"
-          ]
-        }
+          ],
+          "type": "object"
+        },
+        "maxItems": 8,
+        "type": "array"
+      },
+      "description": {
+        "description": "Why you ask, in plain text (with `choices`)",
+        "type": "string"
       },
       "freeInput": {
         "anyOf": [
@@ -284,26 +269,34 @@
           {
             "properties": {
               "label": {
-                "description": "What the box is called",
                 "type": "string"
               },
               "placeholder": {
-                "description": "The hint inside the box",
                 "type": "string"
               }
             },
             "type": "object"
           }
         ],
-        "description": "Add an \"anything else\" box to the form; its words come back as the note of the answer"
+        "description": "An \"anything else\" box; its words come back as the answer's note"
+      },
+      "question": {
+        "description": "What you need to know, or the sentence that opens the form",
+        "minLength": 1,
+        "type": "string"
       },
       "submitLabel": {
-        "type": "string",
-        "description": "The words of the button (at most 40 characters)"
+        "description": "The button's words",
+        "type": "string"
+      },
+      "title": {
+        "description": "The form's heading (with `choices`)",
+        "type": "string"
       }
     },
     "required": [
       "question"
-    ]
+    ],
+    "type": "object"
   }
 }
