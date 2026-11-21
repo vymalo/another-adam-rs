@@ -605,7 +605,11 @@ workspace or a budget for the whole task keys it by the root. Only code in the p
 builds payloads of `text` and `context`, and a run that continues another does not inherit it. **A child starts with the
 `PROTECTED_CONTEXT_KEYS` of the run that starts it** (the access tier, who it was sent for, and so on down a chain), nothing else of its context;
 a source in a child run is told the root with `SourceCtx::root_run_id()` (`detached_under(root, context)` for tests).
-(`tests/root_run.rs` is the chain of three runs, and the limits it hands down, the tier and who the message was sent for; `tests/child_runs.rs` starts children with a `Runtime` it holds, which works too.)
+**Every model call names its root run** in `ModelRequest::run` ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)),
+the turns and the summary call of a compaction alike, which `adam_model::InjectedRun` sends as `X-Run-Id`: the root run of
+the task that opened the run's session (`SessionHeader::root`, which `subagent_start` writes), else
+`Conversation::root_run`, else the run itself. Never a message's context, which a person can set.
+(`tests/root_run.rs` is the chain of three runs, every model call of which names the top, and the limits it hands down, the tier and who the message was sent for; `tests/child_runs.rs` starts children with a `Runtime` it holds, which works too; `tests/compaction.rs` checks the summary call names the run, and `tests/sessions.rs` `every_round_names_the_root_that_opened_its_session` the rounds of a session, a person's later round to it included, and a session a person opened, whose round names itself.)
 
 ## Remote tasks
 

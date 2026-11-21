@@ -187,6 +187,14 @@ pub struct SessionHeader {
     /// hashes). `0` for a header written before it existed.
     #[serde(default)]
     pub round: u32,
+    /// The root run of the run that opened the session, set when it opens and carried into every
+    /// later round: the run each round's model calls name ([ADR 0067]), since that is the task the
+    /// orchestrator bound. `None` for a session a person opened directly (its rounds name their own
+    /// task) and in a header written before it existed. Absent when `None`.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<RunId>,
 }
 
 /// The header a round's agent state holds, if it holds one.
@@ -843,6 +851,31 @@ mod tests {
     }
 
     #[test]
+    fn a_header_names_the_root_that_opened_it_and_an_old_one_still_decodes() {
+        let id = RunId::new();
+        let old = serde_json::json!({
+            "id": id, "agent": "a", "description": "d", "keep_open": true, "round": 2
+        });
+        let decoded: SessionHeader = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.root, None, "a header stored before `root`");
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("root")
+                .is_none(),
+            "absent when None"
+        );
+        let root = RunId::new();
+        let header = SessionHeader {
+            root: Some(root),
+            ..decoded
+        };
+        let back: SessionHeader =
+            serde_json::from_value(serde_json::to_value(&header).unwrap()).unwrap();
+        assert_eq!(back.root, Some(root));
+    }
+
+    #[test]
     fn a_closing_round_says_close_and_carries_its_header() {
         let header = SessionHeader {
             id: RunId::new(),
@@ -852,6 +885,7 @@ mod tests {
             closed: true,
             closing: true,
             round: 3,
+            root: None,
         };
         let payload = closing_round_payload(&header);
         assert_eq!(payload[SESSION_CLOSE_ROUND_KEY], Value::Bool(true));
@@ -1026,6 +1060,7 @@ mod tests {
             closed,
             closing: false,
             round: 1,
+            root: None,
         }
     }
 

@@ -930,6 +930,10 @@ impl RuntimeTaskBackend {
             closed: false,
             closing: false,
             round: 1,
+            // A person's session is its own parent: no run opened it, so each round's model calls
+            // name the round's own task, which the orchestrator binds as any task it creates
+            // (ADR 0067).
+            root: None,
         };
         put_header(&mut inbound, &header).map_err(BackendError::InvalidParams)?;
         self.runtime
@@ -1242,6 +1246,7 @@ fn next_header(view: &SessionView, session: RunId) -> SessionHeader {
         closed: false,
         closing: false,
         round: 0,
+        root: None,
     });
     header.round = view.round + 1;
     // The round before may have been one that only cleaned up after a cancel.
@@ -1522,6 +1527,7 @@ mod tests {
             closed: false,
             closing: false,
             round: 1,
+            root: None,
         };
         let mut text = Inbound::new("message", json!("hi"));
         put_header(&mut text, &header).unwrap();

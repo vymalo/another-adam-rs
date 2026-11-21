@@ -738,6 +738,7 @@ async fn start_persons_round(rt: &Runtime, rig: &Rig, conversation: &str, text: 
         closed: false,
         closing: false,
         round: 1,
+        root: None,
     };
     let mut first = user_message(text);
     first.payload["session"] = serde_json::to_value(&header).unwrap();
@@ -768,6 +769,68 @@ fn starts_with(b: &[Message], a: &[Message]) -> bool {
 
 mod cases {
     use super::*;
+
+    /// Every model call of a session's rounds names the root run of the task that opened it, kept
+    /// in the session's header (ADR 0067): round 1, and a round a person sends later, whose message
+    /// names no root of its own. A session a person opened names each round's own run.
+    pub async fn every_round_names_the_root_that_opened_its_session(store: DynStore) {
+        let rig = Rig::new();
+        rig.child_mock
+            .push_text("round one says 1")
+            .push_text("round two says 2")
+            .push_text("the person's own says 3");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_tool_calls(vec![read_call("r1", session, true)])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        let view = session_until(&rt, &conv, session, |v| v.state == SessionState::Idle).await;
+        let header = view.header.clone().expect("a header");
+        assert_eq!(header.root, Some(parent), "set when the session opens");
+
+        // A person's message to the session: the next header, and no root run of its own.
+        let mut next = header.clone();
+        next.round = view.round + 1;
+        let round_two = RunId::new();
+        let mut message = user_message("more");
+        message.payload["session"] = serde_json::to_value(&next).unwrap();
+        rt.start_child_continuing(
+            round_two,
+            round_two,
+            &rig.child_name,
+            message,
+            &view.conversation_id,
+            Some(view.latest_run),
+        )
+        .await
+        .unwrap();
+        wait_done(&rt, round_two).await;
+
+        let theirs = start_persons_round(&rt, &rig, &conv, "asked by a person").await;
+        wait_done(&rt, theirs).await;
+        worker.stop().await;
+
+        let named = |requests: Vec<ModelRequest>| -> Vec<Option<String>> {
+            requests.into_iter().map(|r| r.run).collect()
+        };
+        let root = Some(parent.to_string());
+        assert_eq!(
+            named(rig.child_mock.requests()),
+            vec![root.clone(), root, Some(theirs.to_string())],
+            "round one, the person's round two, and the person's own session"
+        );
+        assert!(
+            named(rig.parent_mock.requests())
+                .iter()
+                .all(|r| r.as_deref() == Some(parent.to_string().as_str()))
+        );
+    }
 
     /// The parent's call returns at once while the child works, and the model's answer does not end
     /// the run: it waits for the round and gets the report before it ends.
@@ -2508,6 +2571,7 @@ mod cases {
             closed: false,
             closing: false,
             round: 1,
+            root: None,
         };
         let mut first = user_message("old work");
         first.payload["session"] = serde_json::to_value(&header).unwrap();
@@ -3885,6 +3949,7 @@ mod cases {
             closed: false,
             closing: true,
             round: 2,
+            root: None,
         };
         rt.start_child_continuing(
             cleanup,
@@ -4536,6 +4601,7 @@ macro_rules! session_suite {
         mod $module {
             session_suite!(@cases $make;
                 a_start_returns_at_once_and_the_turn_end_waits_for_the_report,
+                every_round_names_the_root_that_opened_its_session,
                 a_session_report_keeps_the_prefix,
                 the_start_result_survives_a_history_far_over_budget,
                 a_read_without_wait_answers_working_and_parks_nothing,

@@ -430,6 +430,12 @@ async fn a_long_run_is_summarised_once_and_keeps_the_prefix_after() {
     let marker = state.messages[0].text();
     assert!(marker.contains("SUMMARY: four results of x"), "{marker}");
     assert!(state.summary.as_deref().unwrap().contains("SUMMARY: four"));
+    // The summary call names the run as every turn does (ADR 0067).
+    assert!(
+        requests.iter().all(|r| r.run == Some(run.to_string())),
+        "{:?}",
+        requests.iter().map(|r| &r.run).collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]

@@ -291,7 +291,10 @@ its parent.
 conversation, and otherwise the latest round (`SessionView`: its status and output as a parent reads a child, its number,
 `SessionState`, whether the session takes more messages, which run started it). Whether a session is **closed** is read from
 the latest round: its `SessionHeader` (`session` in the round's agent state: id, agent, description, `keep_open`, `closed`,
-`closing`), a `SESSION_CLOSE_KIND` request waiting in its inbox, or a round that has ended in a session that is not kept open
+`closing`, `round`, and `root`: the root run of the run that opened the session, which every round's model calls name,
+[ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md); `None`
+for a session a person opened, and in a header stored before it, which still decodes; **a new public field: a
+`SessionHeader` literal needs `root`**), a `SESSION_CLOSE_KIND` request waiting in its inbox, or a round that has ended in a session that is not kept open
 (auto-close). A session whose rounds carry no header is kept open and never closes. `ChildStarter`'s session methods act on
 the conversation of the run they were made for, so a later run of the conversation reaches a session an earlier one started
 and no run reaches another conversation's. A close request is not counted as unread input (`Ctx::arrived`), so it costs no
@@ -755,3 +758,5 @@ when unset, even with `ADAM_TEST_REQUIRE_DB=1`.
 [`adam-error`](../adam-error/README.md).
 
 New in slice 4 ([ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)): `SessionLimits` (private fields with getters `max_open()`, `max_working()`, `max_rounds()`; 1-100, `max_working` 1-32 and at most open, `max_rounds` 2-200; defaults 16, 4, 20; `new`, `lowered_by`), `DEFAULT_SESSION_IDLE_TTL` (7 days), `RuntimeBuilder::session_idle_ttl` and `Runtime::session_idle_ttl`. `list_sessions` and `session_view` read a session closed (`idle_expired`) when its latest round ended at least the TTL ago and it would otherwise stay open (a session with no header included); a working round never expires, and nothing is stored. `SessionSummary::does_work()` is what the working limit counts (a round that only closes a session does not work). **Breaking:** `SessionSummary` gained `idle_expired`, so a literal of it stops compiling. Purge finished runs (`Store::purge_finished`) only after longer than the TTL. Tests: `a_session_idle_past_its_ttl_reads_closed`, `a_working_round_never_expires` in `runtime_suite!` (three stores), unit tests in `session.rs`.
+
+`SessionHeader::root` ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)): the root run of the run that opened the session, written when it opens (`adam-llm-agent`'s `subagent_start`) and carried into each later round's header. Test: `a_header_names_the_root_that_opened_it_and_an_old_one_still_decodes` in `session.rs` (a stored header without it decodes to `None`, and `None` is not written); the rounds' model calls are tested in `adam-llm-agent` (`every_round_names_the_root_that_opened_its_session`).

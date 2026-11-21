@@ -612,6 +612,9 @@ impl Tool for Start {
             closed: false,
             closing: false,
             round: 1,
+            // The task that opens the session is the one the orchestrator bound: every round's
+            // model calls name it (ADR 0067).
+            root: Some(ctx.root_run_id()),
         };
         let input = round_message(ctx, prompt, &header);
         starter
@@ -761,6 +764,7 @@ impl Tool for Send {
                 closed: false,
                 closing: false,
                 round: 0,
+                root: None,
             });
             header.round = view.round + 1;
             // The round before may have been one that only cleaned up after a cancel.
@@ -1038,6 +1042,7 @@ impl Tool for Close {
                 closed: false,
                 closing: false,
                 round: 0,
+                root: None,
             });
             header.round = view.round + 1;
             header.closed = true;

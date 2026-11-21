@@ -1990,6 +1990,7 @@ impl LlmAgent {
         request.messages = for_sending(&state.messages, image_limits.as_ref());
         request.tools = self.specs.clone();
         request.prompt_cache_key = ctx.conversation_id().map(prompt_cache_key);
+        request.run = Some(model_run(state, ctx).to_string());
         if closing {
             // The tools stay, so the prefix of the request is the one the provider has cached and
             // the calls in the history still have their tools; only the choice changes.
@@ -2619,6 +2620,7 @@ impl LlmAgent {
         request.tools = self.specs.clone();
         request.tool_choice = ToolChoice::None;
         request.prompt_cache_key = ctx.conversation_id().map(prompt_cache_key);
+        request.run = Some(model_run(state, ctx).to_string());
         request.max_output_tokens = Some(SUMMARY_OUTPUT_TOKENS);
         let model = self.model.clone();
         let ordered = self.max_parallel > 1;
@@ -4769,6 +4771,18 @@ async fn output_message(
         kept,
         kept_images,
     )
+}
+
+/// The run a model call of this run names ([`ModelRequest::run`], ADR 0067): the root run of the
+/// task that opened this run's session, else the root run this one works for, else this run. From
+/// in-process state only, never from a message's context, which a person can set.
+fn model_run(state: &Conversation, ctx: &Ctx) -> RunId {
+    state
+        .session
+        .as_ref()
+        .and_then(|header| header.root)
+        .or(state.root_run)
+        .unwrap_or_else(|| ctx.run_id())
 }
 
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
