@@ -79,6 +79,7 @@ mod client;
 mod credentials;
 mod error;
 mod mock;
+mod profiles;
 mod types;
 
 pub use adam_error::{Classify, ErrorClass};
@@ -89,6 +90,10 @@ pub use credentials::{
 };
 pub use error::ModelError;
 pub use mock::{MockModel, RecordedCall};
+pub use profiles::{
+    ModelProfile, ModelProfiles, NotAWire, NotAnEffort, Preset, RESERVED_EXTRA_BODY_KEYS,
+    ReasoningEffort, ReasoningWire,
+};
 pub use types::{
     ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, ImageData, ImageLimits, ImageOrigin,
     ImageRef, InputModalities, Message, ModelDelta, ModelRequest, ModelResponse, ToolCall,

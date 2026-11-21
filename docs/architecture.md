@@ -395,6 +395,16 @@ Rules this diagram cannot show:
 Follow-ups, `referenceTaskIds`, steering, steps and streamed text are in the
 [A2A server reference](reference/a2a-server.md).
 
+### The model's profile
+
+A deployment's models differ, so the reasoning level, the output cap and the extra body follow the model a call
+uses, not the process ([ADR 0063](decisions/0063-a-reasoning-effort-is-one-setting.md),
+[ADR 0064](decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md)).
+`MODEL_ALIASES_FILE` (JSON only for now) holds `profiles` by model id and `presets` by name; `ModelConfig` reads
+and validates it at startup (`crates/adam-service/src/config.rs`), and the types are `adam_model::ModelProfiles`
+(`crates/adam-model/src/profiles.rs`). Nothing is applied to a request yet: the request's field, the client's wire
+and the cap are the following slices.
+
 ### The tokens of each model call
 
 A completed model call is a `RunEvent::Usage`, sent to the client as a `usage/v1` report when its request activated the

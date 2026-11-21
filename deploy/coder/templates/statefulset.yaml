@@ -26,7 +26,7 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- if or .Values.podAnnotations (include "coder.extraMcp" .) (include "coder.runPods" .) }}
+      {{- if or .Values.podAnnotations (include "coder.extraMcp" .) (include "coder.modelProfiles" .) (include "coder.runPods" .) }}
       annotations:
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
@@ -34,6 +34,10 @@ spec:
         {{- if include "coder.extraMcp" . }}
         {{- /* A changed servers file is a deploy: the file is read at startup only. */}}
         checksum/extra-mcp: {{ include (print $.Template.BasePath "/extra-mcp-configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- if include "coder.modelProfiles" . }}
+        {{- /* The same for the per-model profiles file (ADR 0063, ADR 0064). */}}
+        checksum/model-profiles: {{ include (print $.Template.BasePath "/model-profiles-configmap.yaml") . | sha256sum }}
         {{- end }}
         {{- if include "coder.runPods" . }}
         {{- /* The same for the run pod template. */}}
@@ -222,6 +226,11 @@ spec:
             {{- with include "coder.modelContextWindow" . }}
             - name: MODEL_CONTEXT_WINDOW
               value: {{ . | quote }}
+            {{- end }}
+            {{- if include "coder.modelProfiles" . }}
+            {{- /* config.modelProfiles: the per-model profiles file (ADR 0063, ADR 0064). */}}
+            - name: MODEL_ALIASES_FILE
+              value: {{ include "coder.modelProfilesFile" . | quote }}
             {{- end }}
             - name: WORKERS
               value: {{ .Values.config.workers | quote }}
@@ -412,6 +421,12 @@ spec:
               mountPath: {{ include "coder.extraMcpDir" . }}
               readOnly: true
             {{- end }}
+            {{- if include "coder.modelProfiles" . }}
+            - name: model-profiles
+              mountPath: {{ include "coder.modelProfilesFile" . }}
+              subPath: model-profiles.json
+              readOnly: true
+            {{- end }}
             {{- if include "coder.runPods" . }}
             - name: run-pod
               mountPath: {{ include "coder.runPodTemplateDir" . }}
@@ -428,7 +443,7 @@ spec:
               mountPath: {{ include "coder.a2aCardSigningDir" . }}
               readOnly: true
             {{- end }}
-      {{- if or (include "coder.sharedWork" .) (include "coder.cache" .) $githubApp (include "coder.extraMcp" .) (include "coder.runPods" .) $cardSigning }}
+      {{- if or (include "coder.sharedWork" .) (include "coder.cache" .) $githubApp (include "coder.extraMcp" .) (include "coder.modelProfiles" .) (include "coder.runPods" .) $cardSigning }}
       volumes:
         {{- if include "coder.sharedWork" . }}
         - name: work
@@ -455,6 +470,13 @@ spec:
           configMap:
             name: {{ include "coder.extraMcpConfigMapName" . }}
             # Readable by the runtime user whatever fsGroup does: a mcp.json of ${VAR} references, no secret.
+            defaultMode: 0444
+        {{- end }}
+        {{- if include "coder.modelProfiles" . }}
+        - name: model-profiles
+          configMap:
+            name: {{ include "coder.modelProfilesConfigMapName" . }}
+            # The deployment's profiles file: no secret in it (a key never belongs in a model profile).
             defaultMode: 0444
         {{- end }}
         {{- if include "coder.runPods" . }}

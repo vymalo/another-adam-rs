@@ -849,6 +849,52 @@ check "a server on with config.extraEnv.ADAM_EXTRA_MCP_FILE fails (the chart set
 check "ADAM_AGENT_DIR in extraEnv is the deployment's own business again (unchanged)" \
   helm_mcp --set mcp.context7.enabled=true --set-string config.extraEnv.ADAM_AGENT_DIR=/x
 
+# The per-model profiles (values `config.modelProfiles`, ADR 0063 and ADR 0064): ONE JSON file the workers
+# read at startup (MODEL_ALIASES_FILE). Unset (an empty map) renders nothing, so the golden above is byte for
+# byte the same. JSON only for now: the chart renders the map as JSON and the binary refuses a bad file (exit 78),
+# so a value that is not a map never reaches the pod.
+check "profiles off: no ConfigMap, no MODEL_ALIASES_FILE, no checksum" \
+  lacks 'model-profiles|MODEL_ALIASES_FILE|checksum/model-profiles'
+helm_profiles() { helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 "$@"; }
+profiles_json() { doc ConfigMap "${1:-$out}" | awk '/^  model-profiles.json: \|$/ { on = 1; next } on { sub(/^    /, ""); print }'; }
+# pjqt <filter> [jq args]: true when the filter holds on the rendered model-profiles.json.
+pjqt() { filter=$1; shift; profiles_json "$out" | jq -e "$@" "$filter" >/dev/null; }
+profiles_map='{"presets":{"quick":{"reasoningEffort":"low"}},"profiles":{"coder":{"preset":"quick","reasoningEfforts":["low","medium","high","max"],"reasoningWire":"reasoning_effort","maxOutputTokensLimit":131072},"small-chat":{"reasoningEfforts":[],"maxOutputTokensLimit":65536,"extraBody":{"enable_thinking":false}}}}'
+helm_profiles --set-json "config.modelProfiles=$profiles_map" > "$out"
+check "profiles: one ConfigMap, the profiles file" count '^kind: ConfigMap$' 1
+check "profiles: it parses as JSON" pjqt '.'
+check "profiles: the presets and the models are the values" \
+  pjqt '(.presets | keys == ["quick"]) and (.profiles | keys == ["coder","small-chat"])'
+check "profiles: a preset's effort and a profile's wire are kept" \
+  pjqt '.presets.quick.reasoningEffort == "low" and .profiles.coder.reasoningWire == "reasoning_effort"'
+check "profiles: the empty list (a model that takes no level) is kept" pjqt '.profiles["small-chat"].reasoningEfforts == []'
+check "profiles: the extra body is the model's" pjqt '.profiles["small-chat"].extraBody == {"enable_thinking": false}'
+check "profiles: MODEL_ALIASES_FILE is the mounted file" dhas StatefulSet '^              value: "/etc/adam/model-profiles.json"$'
+check "profiles: ... the ConfigMap is mounted read-only there" dhas StatefulSet 'mountPath: /etc/adam/model-profiles.json$'
+check "profiles: ... the single key by subPath (a changed map rolls the pods)" dhas StatefulSet 'subPath: model-profiles.json$'
+check "profiles: ... as a volume of the ConfigMap" dhas StatefulSet 'name: coder-model-profiles$'
+check "profiles: the pod restarts when the file changes: checksum/model-profiles" dhas StatefulSet 'checksum/model-profiles: '
+check "profiles: no key is in the file (a model profile holds none)" lacks 'Bearer [A-Za-z0-9]'
+sum_profiles=$(grep 'checksum/model-profiles' "$out")
+helm_profiles --set-json 'config.modelProfiles={"profiles":{"coder":{"maxOutputTokensLimit":65536}}}' > "$out"
+check "profiles: a changed map changes the checksum" [ "$sum_profiles" != "$(grep 'checksum/model-profiles' "$out")" ]
+
+# Roles: only a worker calls a model, so only a worker gets the file.
+helm_profiles --set-json "config.modelProfiles=$profiles_map" --set topology=split > "$out"
+check "profiles split: the worker mounts the file and is told where it is" dhas StatefulSet 'name: MODEL_ALIASES_FILE$'
+check "profiles split: the front has no file" dlacks Deployment 'model-profiles|MODEL_ALIASES_FILE|checksum/model-profiles'
+helm_profiles --set-json "config.modelProfiles=$profiles_map" --set config.role=control-plane > "$out"
+check "profiles control plane: no ConfigMap, no file" lacks 'model-profiles|MODEL_ALIASES_FILE'
+
+# Guards: the value and its two sections are maps, and MODEL_ALIASES_FILE is the chart's when it mounts the file.
+check "profiles: a value that is not a map fails to render" fails helm_profiles --set-json 'config.modelProfiles="hello"'
+check "profiles: profiles that is not a map fails to render" fails helm_profiles --set-json 'config.modelProfiles={"profiles":[]}'
+check "profiles: presets that is not a map fails to render" fails helm_profiles --set-json 'config.modelProfiles={"presets":"quick"}'
+check "profiles set with config.extraEnv.MODEL_ALIASES_FILE fails (the chart sets it)" \
+  fails helm_profiles --set-json 'config.modelProfiles={"profiles":{"m":{}}}' --set-string config.extraEnv.MODEL_ALIASES_FILE=/x
+check "profiles unset with config.extraEnv.MODEL_ALIASES_FILE is the deployment's own business" \
+  helm_profiles --set-string config.extraEnv.MODEL_ALIASES_FILE=/x
+
 # config.modelBaseUrlFromSecret: the model gateway's URL (MODEL_BASE_URL) from the ExternalSecret instead of
 # config.modelBaseUrl, so a deployment keeps it out of git (the owner's decision of 2026-10-04). Off by default,
 # byte-for-byte invisible when off (the golden above). Like MODEL_API_KEY it belongs to the roles that run workers.

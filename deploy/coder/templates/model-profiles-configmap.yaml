@@ -1,0 +1,15 @@
+{{- if include "coder.modelProfiles" . }}
+# The per-model profiles (values `config.modelProfiles`, ADR 0063 and ADR 0064): one JSON file the workers read at
+# startup (MODEL_ALIASES_FILE). Per model: the reasoning levels it takes and how they are sent, its output cap, its
+# extra body, and the named presets. JSON only for now; a file that does not parse or breaks a rule stops the process
+# at startup (exit 78). It is the deployment's: no profile is shipped in this chart or in the image.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "coder.modelProfilesConfigMapName" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+data:
+  model-profiles.json: |
+    {{- include "coder.modelProfilesJson" . | nindent 4 }}
+{{- end }}

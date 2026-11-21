@@ -141,6 +141,22 @@ from service.yaml, which every render contains, so they always run.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- /* The per-model profiles (values `config.modelProfiles`, ADR 0063 and ADR 0064): one JSON file, a map. */ -}}
+{{- if and .Values.config.modelProfiles (not (kindIs "map" .Values.config.modelProfiles)) -}}
+{{- fail (printf "config.modelProfiles must be a map of model ids to profiles (the file is JSON), got %q" (toString .Values.config.modelProfiles)) -}}
+{{- end -}}
+{{- if kindIs "map" .Values.config.modelProfiles -}}
+{{- range $key := list "profiles" "presets" -}}
+{{- if hasKey $.Values.config.modelProfiles $key -}}
+{{- if not (kindIs "map" (get $.Values.config.modelProfiles $key)) -}}
+{{- fail (printf "config.modelProfiles.%s must be a map, got %q" $key (toString (get $.Values.config.modelProfiles $key))) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and (include "coder.modelProfiles" .) (hasKey .Values.config.extraEnv "MODEL_ALIASES_FILE") -}}
+{{- fail "config.modelProfiles is set and config.extraEnv sets MODEL_ALIASES_FILE: the chart sets it itself, to the file it mounts" -}}
+{{- end -}}
 {{- /* config.modelExtraBody: a JSON object (a map, or a string that parses to one); config.modelEchoReasoning: a member name. */ -}}
 {{- with include "coder.modelExtraBody" . -}}
 {{- $parsed := fromJson . -}}
