@@ -6,7 +6,6 @@ limits:
   # delegation, check and commit is a turn.
   max_turns: 200
   max_tool_calls: 400
-  max_output_tokens: 8192
   max_history_tokens: 100000
 vars:
   # The prompt tells the model the limit; the tools enforce it (see crate::tools).

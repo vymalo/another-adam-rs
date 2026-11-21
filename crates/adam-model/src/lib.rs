@@ -95,8 +95,8 @@ pub use credentials::{
 pub use error::ModelError;
 pub use mock::{MockModel, RecordedCall};
 pub use profiles::{
-    ModelProfile, ModelProfiles, NotAWire, NotAnEffort, Preset, RESERVED_EXTRA_BODY_KEYS,
-    ReasoningEffort, ReasoningWire,
+    DEFAULT_MAX_OUTPUT_TOKENS, ModelProfile, ModelProfiles, NotAWire, NotAnEffort, Preset,
+    RESERVED_EXTRA_BODY_KEYS, ReasoningEffort, ReasoningWire,
 };
 pub use types::{
     ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, ImageData, ImageLimits, ImageOrigin,

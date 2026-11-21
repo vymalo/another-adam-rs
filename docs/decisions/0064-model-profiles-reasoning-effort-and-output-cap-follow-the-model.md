@@ -290,3 +290,10 @@ file.
 1. **The default cap is 128,000.** A model whose own limit is lower has a profile with its `maxOutputTokensLimit`.
 2. **A preset carries the cap as well as the effort.** `maxOutputTokens` in a preset is still clamped to the model's
    `maxOutputTokensLimit` and to the window.
+
+## Amended 2026-11-21
+
+*Amended 2026-11-21:* **the `Limits` type keeps `max_output_tokens: u32`.** The Consequences section above announced
+it becoming optional; it does not. The assembly resolves and clamps the cap once per agent, before the loop, and hands
+the loop the final value, so the loop keeps one field and no `Option`. A folder's `0` is refused by the loader; `0`
+stays legal on the Rust `Limits` for an embedder that builds an agent by hand, where it means "the model's own".

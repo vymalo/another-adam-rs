@@ -489,13 +489,14 @@ async fn the_assembled_agent_is_what_the_hand_written_one_was() {
     // Its two skills, both left to `load_skill`: none is preloaded.
     assert_eq!(info.skills, ["discover-checks", "pull-request-text"]);
     assert!(info.preloaded.is_empty());
-    // What `coder_limits()` returned.
+    // The folder's turns and tool calls; its cap is the 128,000 fallback (no profile and no
+    // window in this test).
     assert_eq!(
         info.limits,
         Limits {
             max_turns: 200,
             max_tool_calls: 400,
-            max_output_tokens: 8192,
+            max_output_tokens: 128_000,
             max_history_tokens: 100_000,
         }
     );
@@ -610,7 +611,7 @@ async fn a_run_sends_the_old_request_and_journals_the_old_step_names() {
         plain(&first.system).as_deref(),
         Some(expected_prompt(3).as_str())
     );
-    assert_eq!(first.max_output_tokens, Some(8192));
+    assert_eq!(first.max_output_tokens, Some(128_000));
     // No message named a tier, so the run works under the default, `auto`: the model is not shown the
     // two tools that need `bypass`. Every other tool is, in the same order.
     let names: Vec<&str> = first.tools.iter().map(|t| t.name.as_str()).collect();

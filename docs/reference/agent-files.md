@@ -88,6 +88,7 @@ skills: all                    # or a list; default: every skill in this agent's
 limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as limits.max_turns
   max_turns: 200               # model calls that may be followed by tools, plus one closing turn in which it may call none (0: one call with no tools)
   max_tool_calls: 400          # over it, the turn's calls are answered "not run" and the closing turn follows
+  max_output_tokens: 64000     # the output cap this agent asks for, at least 1; absent: its preset's, the model profile's, then 128,000, clamped to the model's limit and window (ADR 0064)
   max_minutes: 30              # subagent only: the longest one run may take; 0 = no limit, at most 1440
   max_parallel: 4              # tool calls of one turn that run at once, 1 to 32: lowers MAX_PARALLEL_TOOL_CALLS for this agent, never raises it
   max_open_sessions: 8         # root only: most sessions open at once, 1 to 100; lowers SESSION_MAX_OPEN, never raises it (a larger value is lowered with a warning)
@@ -126,6 +127,14 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   the folder's value, else the preset's, else the profile's, else the profile's base preset — and
   refuses a level the model does not take, naming the agent and the value. Claude Code's `effort`
   is still ignored with a warning.
+* **The output cap is per model.** `limits.max_output_tokens` is what this agent's calls ask for;
+  without it the cap is its `model_preset`'s, else the model profile's `maxOutputTokens`, else the
+  profile's base preset, else 128,000 (ADR 0064). The result is clamped to the model's
+  `maxOutputTokensLimit` and, when the context window is known, to what the window leaves after
+  20,000 tokens and the history the agent keeps (`max_history_tokens`, or half the window when it
+  sets none). A **preset** above the model's limit is refused at startup, and a profile's own
+  `maxOutputTokens` above its limit is refused when the profiles file is read; the folder's own
+  value is clamped. `0` is refused: leave the key out to take the profile and the fallback.
 * **The tools a root agent has without writing any** are the person's screen and a plan: `ask_user`, `show`,
   `ui_catalog`, `plan_work`, `plan_check`, `plan_add` (`adam-ui`), in that order. `tools:` narrows them by name like
   any other, so **a folder with `tools:` must list `plan_*` (or `"*"`) to keep the plan**. A subagent has none of them

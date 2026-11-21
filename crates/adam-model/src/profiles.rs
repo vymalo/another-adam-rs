@@ -169,6 +169,13 @@ impl FromStr for ReasoningWire {
     }
 }
 
+/// The output cap a model call asks for when nothing else sets one ([ADR 0064](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md)):
+/// the median of the flagship models' documented maximums in 2026, written as 128,000, the lowest
+/// reading of 128K. The assembly resolves it per model and clamps it to the model's
+/// `maxOutputTokensLimit` and context window; the loop's `Limits` default is the same value for a
+/// host that builds an agent by hand.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 128_000;
+
 /// The members of a request body the runtime owns: a profile's `extraBody` may not set one.
 pub const RESERVED_EXTRA_BODY_KEYS: [&str; 8] = [
     "model",

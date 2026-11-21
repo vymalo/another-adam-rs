@@ -402,8 +402,12 @@ uses, not the process ([ADR 0063](decisions/0063-a-reasoning-effort-is-one-setti
 [ADR 0064](decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md)).
 `MODEL_ALIASES_FILE` (JSON only for now) holds `profiles` by model id and `presets` by name; `ModelConfig` reads
 and validates it at startup (`crates/adam-service/src/config.rs`), and the types are `adam_model::ModelProfiles`
-(`crates/adam-model/src/profiles.rs`). Nothing is applied to a request yet: the request's field, the client's wire
-and the cap are the following slices.
+(`crates/adam-model/src/profiles.rs`). The assembly resolves each agent's default reasoning effort from its folder,
+its `model_preset` and the profile (`crates/adam-assembly/src/assembly.rs`), and resolves and clamps its output cap
+per model: the folder's `limits.max_output_tokens`, its preset's, the profile's, the profile's base preset, then
+128,000, then the smallest of that, the model's `maxOutputTokensLimit` and what the window leaves after 20,000 tokens
+and the agent's history (`crates/adam-llm-agent/src/compaction.rs`). The client's reasoning wire and the profile's
+`extraBody` are the following slices.
 
 ### The tokens of each model call
 
@@ -750,10 +754,10 @@ stateDiagram-v2
 
 | Part | Rule |
 |---|---|
-| **Budget** | the smaller of `MODEL_CONTEXT_WINDOW` less 20,000 less `max_output_tokens`, and `limits.max_history_tokens`; none when neither is set (a window with no room left counts as none) |
+| **Budget** | the smaller of `MODEL_CONTEXT_WINDOW` less 20,000 less `max_output_tokens` (the cap resolved for the agent's model, ADR 0064), and `limits.max_history_tokens`; none when neither is set (a window with no room left counts as none) |
 | **Estimate** | the last call's reported prompt tokens plus characters / 4 of what came after; with no report, characters / 4 of the instructions, the tools and every message |
 | **Cut** | at the start of a turn (an assistant message, never the first message), so a call is never parted from its result; the newest 1 to 8 turns worth at most a quarter of the budget stay verbatim; fewer than two turns to drop, eight compactions made by the run (a run that continues another carries the earlier ones as one record, which is not one of its eight), or a request that would still be over the budget with no summary, shortens instead |
-| **Summary** | the agent's own model, the request as it stands (same system, tools and history) plus one built-in instruction as the last message, `tool_choice: none`, 4,096 output tokens, capped at 16 KiB; its usage is reported under an id of its own (`<run>-k<n>-<suffix>`); the person sees one step, "Summarise the conversation" |
+| **Summary** | the agent's own model, the request as it stands (same system, tools and history) plus one built-in instruction as the last message, `tool_choice: none`, `min(4,096, max_output_tokens)` output tokens (the run's resolved cap, ADR 0064), capped at 16 KiB; its usage is reported under an id of its own (`<run>-k<n>-<suffix>`); the person sees one step, "Summarise the conversation" |
 | **New history** | the task (the first part of the first message) verbatim, then the marker (its second part, `Conversation::is_omission_marker`), then the person's later messages verbatim (2 KiB each, 8 KiB in all, as parts of that message), then the turns that stayed |
 | **The marker's lines** | the summary, then lines **written by code** from what left: the plan, the results a tool pinned, a pointer to each kept output (built from the call's own output id), the names of the skills loaded earlier, a line that sessions exist. Text that is copied has each line that starts with `[` written `\x5b`, so it cannot forge a loop line |
 | **Sessions** | a run whose `subagent_start` was cut still waits for, and cancels, the sessions it started (`Compaction::sessions`) |

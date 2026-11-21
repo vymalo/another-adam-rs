@@ -124,6 +124,21 @@ impl fmt::Display for EffortSource {
     }
 }
 
+/// Where an agent's output cap was set, in [`Error::OutputCap`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapSource {
+    /// A preset: the agent's `model_preset`, or the base preset its model's profile names.
+    Preset(String),
+}
+
+impl fmt::Display for CapSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preset(name) => write!(f, "the preset `{name}`"),
+        }
+    }
+}
+
 /// What a subagent's tool name collides with, in [`Error::SubagentToolClash`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolClash {
@@ -419,6 +434,24 @@ pub enum Error {
         suggestion: Option<String>,
         /// The levels the model takes, lowest first; empty when it takes none.
         allowed: Vec<String>,
+    },
+    /// A preset's output cap is above the maximum the model documents for one request (ADR 0064,
+    /// decision 2): a preset is the deployment's promise, so it is refused rather than clamped.
+    #[error(
+        "{origin}: {set_by} asks {cap} output tokens, above the {limit} that model `{model}` \
+         allows: lower the preset's `maxOutputTokens`, or the model's `maxOutputTokensLimit`"
+    )]
+    OutputCap {
+        /// The agent and file whose calls would send it.
+        origin: Origin,
+        /// Where it was set.
+        set_by: CapSource,
+        /// The cap as resolved.
+        cap: u32,
+        /// The model's documented maximum for one request.
+        limit: u32,
+        /// The model alias whose profile bounds it.
+        model: String,
     },
     /// [`LlmAgent`](adam_llm_agent::LlmAgent) refused to be built: a tool needs state the
     /// composition root did not give ([`BoundDef::state`](crate::BoundDef::state)).
@@ -882,6 +915,13 @@ mod tests {
                 model: "large".into(),
                 suggestion: Some("high".into()),
                 allowed: vec!["low".into(), "high".into()],
+            },
+            Error::OutputCap {
+                origin: o.clone(),
+                set_by: CapSource::Preset("quick".into()),
+                cap: 200_000,
+                limit: 131_072,
+                model: "large".into(),
             },
             Error::UnknownSkill {
                 origin: o.clone(),

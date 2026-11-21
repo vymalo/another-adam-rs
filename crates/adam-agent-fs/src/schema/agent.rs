@@ -288,7 +288,8 @@ pub struct Limits {
     /// Most tool calls in one run.
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxToolCalls")]
     pub max_tool_calls: Option<u32>,
-    /// `max_output_tokens` passed to the model.
+    /// `max_output_tokens` passed to the model: the cap this agent asks for, at least 1 (ADR
+    /// 0064; `0` is refused). Absent: the model's profile's, then the 128,000 fallback.
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxOutputTokens")]
     pub max_output_tokens: Option<u32>,
     /// Budget for the history sent to the model.
