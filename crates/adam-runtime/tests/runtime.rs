@@ -1560,12 +1560,8 @@ mod cases {
                 }
             }),
         );
-        let policy = RetryPolicy {
-            max_attempts: 3,
-            initial_backoff: Duration::from_millis(150),
-            max_backoff: Duration::from_secs(5),
-            multiplier: 2.0,
-        };
+        let policy =
+            RetryPolicy::new(3).with_backoff(Duration::from_millis(150), Duration::from_secs(5));
         let sink = CollectingSink::new();
         let clock = FrozenClock::new();
         let rt = builder(&store, &uniq("w"), &agent)
@@ -1614,6 +1610,298 @@ mod cases {
         assert_eq!(retry_events, 2);
     }
 
+    /// An error of a step that names its policy (ADR 0061): `rate_limited` makes it a rate limit,
+    /// else it is a plain transient error.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Flaky {
+        message: String,
+        rate_limited: bool,
+    }
+
+    impl std::fmt::Display for Flaky {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for Flaky {}
+
+    impl Classify for Flaky {
+        fn class(&self) -> adam_error::ErrorClass {
+            if self.rate_limited {
+                adam_error::ErrorClass::RateLimited
+            } else {
+                adam_error::ErrorClass::Transient
+            }
+        }
+    }
+
+    /// An agent whose every transition runs `key`'s step under `policy(attempt)`, failing with a
+    /// [`Flaky`] (a rate limit when `rate_limited`), and whose `calls` count the tries.
+    fn flaky_agent(
+        name: &str,
+        calls: &Arc<AtomicUsize>,
+        rate_limited: bool,
+        policy: fn(u32) -> (&'static str, RetryPolicy),
+    ) -> FnAgent {
+        fn_agent(
+            name,
+            step_fn({
+                let calls = calls.clone();
+                move |ctx, _state| {
+                    let calls = calls.clone();
+                    async move {
+                        let (key, policy) = policy(ctx.attempt());
+                        let r: Result<u32, Flaky> = ctx
+                            .step_retrying("fetch", key, policy, || async move {
+                                calls.fetch_add(1, SeqCst);
+                                Err(Flaky {
+                                    message: "down".to_owned(),
+                                    rate_limited,
+                                })
+                            })
+                            .await?;
+                        Err(AgentError::permanent(format!("not retryable: {r:?}")))
+                    }
+                    .boxed()
+                }
+            }),
+        )
+    }
+
+    /// A step that names its policy is retried under it, not the runtime's: its backoff, its
+    /// attempts, counted under its key (ADR 0061, decisions 3 and 4).
+    pub async fn a_step_retries_under_its_own_policy(store: DynStore) {
+        let name = uniq("own-policy");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = flaky_agent(&name, &calls, false, |_| {
+            (
+                "fetch",
+                RetryPolicy::new(2).with_backoff(Duration::from_millis(70), Duration::from_secs(1)),
+            )
+        });
+        let clock = FrozenClock::new();
+        let sink = CollectingSink::new();
+        let rt = builder(&store, &uniq("w"), &agent)
+            .retry(RetryPolicy::new(9).with_backoff(Duration::from_secs(5), Duration::from_secs(5)))
+            .clock(clock.clone())
+            .event_sink(sink.clone())
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let v = wait_for(&rt, run, "a retry is scheduled", |v| {
+            v.attempt == 1 && v.wake_at.is_some()
+        })
+        .await;
+        let delay = v.wake_at.expect("wake_at") - clock.now();
+        assert_eq!(
+            delay.as_millis(),
+            70,
+            "the step's backoff, not the runtime's"
+        );
+        clock.advance(Duration::from_millis(70));
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        let error = failed.error.expect("error");
+        assert!(
+            error.contains("gave up after 2 attempts of `fetch`") && error.contains("down"),
+            "{error}"
+        );
+        assert_eq!((failed.attempt, count(&calls)), (2, 2));
+        let detail = sink
+            .events_for(run)
+            .into_iter()
+            .find_map(|e| match e {
+                RunEvent::Status {
+                    status: RunStatus::Runnable,
+                    detail: Some(d),
+                } if d.contains("retrying") => Some(d),
+                _ => None,
+            })
+            .expect("a retry event");
+        assert!(
+            detail.starts_with("attempt 1 of 2 of `fetch` failed"),
+            "{detail}"
+        );
+    }
+
+    /// A policy retries only the classes it names: a transient error under a policy that retries
+    /// rate limits fails the run at once.
+    pub async fn a_policy_retries_only_its_classes(store: DynStore) {
+        let name = uniq("classes");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = flaky_agent(&name, &calls, false, |_| {
+            (
+                "fetch",
+                RetryPolicy::new(5).with_retry_on(adam_runtime::RetryClasses::of([
+                    adam_error::ErrorClass::RateLimited,
+                ])),
+            )
+        });
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        let error = failed.error.expect("error");
+        assert!(
+            error.contains("the policy of `fetch` does not retry transient"),
+            "{error}"
+        );
+        assert_eq!(count(&calls), 1);
+
+        // The same policy retries a rate limit.
+        let name = uniq("classes-rl");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = flaky_agent(&name, &calls, true, |_| {
+            (
+                "fetch",
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::ZERO, Duration::ZERO)
+                    .with_retry_on(adam_runtime::RetryClasses::of([
+                        adam_error::ErrorClass::RateLimited,
+                    ])),
+            )
+        });
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        assert!(
+            failed
+                .error
+                .expect("error")
+                .contains("gave up after 3 attempts of `fetch`")
+        );
+        assert_eq!(count(&calls), 3);
+    }
+
+    /// A key's policy is recorded at its first failure: code that names another policy for a later
+    /// attempt (a deploy in between) does not change the retries of a run already failing.
+    pub async fn the_recorded_policy_outlives_a_change_in_code(store: DynStore) {
+        let name = uniq("recorded");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = flaky_agent(&name, &calls, false, |attempt| {
+            let attempts = if attempt == 0 { 3 } else { 10 };
+            (
+                "fetch",
+                RetryPolicy::new(attempts).with_backoff(Duration::ZERO, Duration::ZERO),
+            )
+        });
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        assert!(
+            failed
+                .error
+                .expect("error")
+                .contains("gave up after 3 attempts of `fetch`")
+        );
+        assert_eq!(
+            count(&calls),
+            3,
+            "the first failure's policy, not the later code's"
+        );
+    }
+
+    /// Two steps that fail by turns, each under a policy that never runs out, stop at the run's
+    /// ceiling of consecutive failures.
+    pub async fn steps_that_fail_by_turns_stop_at_the_ceiling(store: DynStore) {
+        let name = uniq("ceiling");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = flaky_agent(&name, &calls, false, |attempt| {
+            let key = if attempt % 2 == 0 { "a" } else { "b" };
+            (
+                key,
+                RetryPolicy::new(u32::MAX).with_backoff(Duration::ZERO, Duration::ZERO),
+            )
+        });
+        let rt = builder(&store, &uniq("w"), &agent)
+            .poll_interval(Duration::from_millis(1))
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let failed = wait_for_within(&rt, run, Duration::from_secs(120), "the ceiling", |v| {
+            v.status == RunStatus::Failed
+        })
+        .await;
+        worker.stop().await;
+        let error = failed.error.expect("error");
+        assert!(
+            error.contains(&format!(
+                "gave up after {} consecutive failed transitions",
+                adam_runtime::MAX_CONSECUTIVE_FAILURES
+            )),
+            "{error}"
+        );
+        assert_eq!(failed.attempt, adam_runtime::MAX_CONSECUTIVE_FAILURES);
+        assert_eq!(
+            count(&calls),
+            adam_runtime::MAX_CONSECUTIVE_FAILURES as usize
+        );
+    }
+
+    /// A transition that succeeds clears the record: a step that fails once between successes is
+    /// never given up on, however often that happens.
+    pub async fn a_success_clears_the_record(store: DynStore) {
+        let name = uniq("clears");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let calls = calls.clone();
+                move |ctx, state| {
+                    let calls = calls.clone();
+                    async move {
+                        let turns = state["turns"].as_u64().unwrap_or(0);
+                        if turns == 4 {
+                            return Ok(Transition::Done {
+                                state,
+                                output: json!("ok"),
+                            });
+                        }
+                        let fail = ctx.attempt() == 0;
+                        let r: Result<u32, Flaky> = ctx
+                            .step_retrying(
+                                "fetch",
+                                "fetch",
+                                RetryPolicy::new(2).with_backoff(Duration::ZERO, Duration::ZERO),
+                                || async move {
+                                    calls.fetch_add(1, SeqCst);
+                                    if fail {
+                                        Err(Flaky {
+                                            message: "once".to_owned(),
+                                            rate_limited: false,
+                                        })
+                                    } else {
+                                        Ok(1)
+                                    }
+                                },
+                            )
+                            .await?;
+                        assert!(r.is_ok());
+                        Ok(Transition::Continue(json!({"turns": turns + 1})))
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(done.attempt, 0);
+        assert_eq!(
+            count(&calls),
+            8,
+            "each of four turns failed once, then passed"
+        );
+    }
+
     /// A transient error that clears ends `Done`, with the attempt reset.
     pub async fn retry_recovers_and_resets_attempt(store: DynStore) {
         let name = uniq("recover");
@@ -1639,12 +1927,10 @@ mod cases {
             }),
         );
         let rt = builder(&store, &uniq("w"), &agent)
-            .retry(RetryPolicy {
-                max_attempts: 5,
-                initial_backoff: Duration::from_millis(20),
-                max_backoff: Duration::from_millis(100),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(5)
+                    .with_backoff(Duration::from_millis(20), Duration::from_millis(100)),
+            )
             .build();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
@@ -2962,12 +3248,10 @@ mod cases {
             }),
         );
         let rt = builder(&store, &uniq("w"), &agent)
-            .retry(RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_millis(20),
-                max_backoff: Duration::from_millis(50),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(20), Duration::from_millis(50)),
+            )
             .build();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
@@ -3104,12 +3388,10 @@ mod cases {
         let rt = builder(&store, &uniq("w"), &agent)
             .clock(clock.clone())
             .event_sink(sink.clone())
-            .retry(RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(50),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(10), Duration::from_millis(50)),
+            )
             .build();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
@@ -3188,12 +3470,9 @@ mod cases {
         let t0 = clock.now();
         let rt = builder(&store, &uniq("w"), &agent)
             .clock(clock.clone())
-            .retry(RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_secs(20),
-                max_backoff: Duration::from_secs(60),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(3).with_backoff(Duration::from_secs(20), Duration::from_secs(60)),
+            )
             .build();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
@@ -3233,12 +3512,10 @@ mod cases {
         let t0 = clock.now();
         let rt = builder(&store, &uniq("w"), &agent)
             .clock(clock.clone())
-            .retry(RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(50),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(10), Duration::from_millis(50)),
+            )
             .build();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
@@ -3285,12 +3562,10 @@ mod cases {
         let rt = builder(&store, &uniq("w"), &agent)
             .clock(clock.clone())
             .lease_ttl(Duration::from_secs(24 * 3600))
-            .retry(RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(50),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(10), Duration::from_millis(50)),
+            )
             .build();
         let t0 = clock.now();
         let run = rt.start(&name, inbound(), None).await.expect("start");
@@ -7496,12 +7771,10 @@ mod cases {
         let clock = ManualClock::new();
         let rt = builder(&store, &uniq("w"), &agent)
             .clock(clock.clone())
-            .retry(RetryPolicy {
-                max_attempts: 2,
-                initial_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(50),
-                multiplier: 2.0,
-            })
+            .retry(
+                RetryPolicy::new(2)
+                    .with_backoff(Duration::from_millis(10), Duration::from_millis(50)),
+            )
             .build();
         let run = rt
             .start(&name, Inbound::new("start", json!({"k": 2})), None)
@@ -7556,6 +7829,11 @@ macro_rules! runtime_suite {
                 timers_with_manual_clock,
                 retries_back_off_then_fail,
                 retry_recovers_and_resets_attempt,
+                a_step_retries_under_its_own_policy,
+                a_policy_retries_only_its_classes,
+                the_recorded_policy_outlives_a_change_in_code,
+                steps_that_fail_by_turns_stop_at_the_ceiling,
+                a_success_clears_the_record,
                 permanent_fails_immediately,
                 agent_fail_transition,
                 non_determinism_fails_the_run,

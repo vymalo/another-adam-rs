@@ -1437,7 +1437,8 @@ fn unattended_ending(output: &Value) -> String {
 
 /// The boundary a failed step crosses on its way to the run's failure text and the retry note:
 /// the whole error chain is flattened into the message, scrubbed of the process's secrets, and
-/// bounded ([`Redactor::failure_text`]). The retry hint survives; the source does not, because a
+/// bounded ([`Redactor::failure_text`]). The retry hint, the class and the step's retry policy
+/// survive; the source does not, because a
 /// source is exactly where a secret hides once nothing scrubs it. A `Store` error carries no model
 /// or tool text and passes through; a variant added later becomes a scrubbed permanent error.
 fn boundary_error(e: AgentError, redactor: &Redactor) -> AgentError {
@@ -1450,17 +1451,21 @@ fn boundary_error(e: AgentError, redactor: &Redactor) -> AgentError {
         redactor.failure_text(text)
     };
     match e {
+        // The class and the step's policy survive too: they decide whether it is retried, and
+        // how often (ADR 0061).
         AgentError::Transient {
             message,
             retry_after,
+            class,
+            retry,
             source,
-        } => {
-            let out = AgentError::transient(clean(message, source.as_deref()));
-            match retry_after {
-                Some(after) => out.with_retry_after(after),
-                None => out,
-            }
-        }
+        } => AgentError::Transient {
+            message: clean(message, source.as_deref()),
+            retry_after,
+            class,
+            retry,
+            source: None,
+        },
         AgentError::Permanent { message, source } => {
             AgentError::permanent(clean(message, source.as_deref()))
         }
@@ -1729,6 +1734,34 @@ mod tests {
         assert_eq!(out.retry_after(), Some(Duration::from_secs(30)));
         assert!(out.is_retryable());
         assert_eq!(text(&out), "transient error: rate limited: 429");
+
+        // A conflict stays a conflict, and the step's policy stays on it (ADR 0061).
+        let conflict = AgentError::from_classified(
+            "lost a race",
+            adam_core::StoreError::Conflict {
+                run: adam_core::RunId::new(),
+                expected: 1,
+                actual: 2,
+            },
+        )
+        .with_retry("tool:commit", adam_runtime::RetryPolicy::new(2));
+        assert_eq!(
+            conflict.class(),
+            adam_error::ErrorClass::Conflict,
+            "{conflict:?}"
+        );
+        let out = boundary_error(conflict, &redactor());
+        assert_eq!(out.class(), adam_error::ErrorClass::Conflict);
+        let AgentError::Transient {
+            retry: Some(retry), ..
+        } = &out
+        else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            (retry.key.as_str(), retry.policy.max_attempts),
+            ("tool:commit", 2)
+        );
 
         let out = boundary_error(AgentError::permanent("no"), &redactor());
         assert!(!out.is_retryable());

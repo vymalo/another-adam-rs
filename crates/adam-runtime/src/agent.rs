@@ -12,6 +12,7 @@ use adam_core::{RunId, StoreError};
 use adam_error::{BoxError, Classify, ErrorClass};
 
 use crate::ctx::Ctx;
+use crate::retry::{RetryPolicy, StepRetry};
 
 /// Something delivered to a run from the outside: a user message, an A2A
 /// message, an approval, a webhook...
@@ -83,8 +84,11 @@ pub enum Transition<S> {
 ///
 /// | Variant | Class | The run |
 /// |---|---|---|
-/// | `Transient`, no `retry_after` | `Transient` | retried after the policy's backoff |
-/// | `Transient` with `retry_after` | `RateLimited` | retried after `max(backoff, retry_after)` |
+/// | `Transient`, no `retry_after` | its `class` (`Transient` unless built by [`from_classified`](AgentError::from_classified)) | retried after the policy's backoff, when the policy retries the class |
+/// | `Transient` of class `Transient` with `retry_after` | `RateLimited` | retried after `max(backoff, retry_after)` |
+///
+/// The policy is the error's own [`StepRetry`] when it carries one ([`with_retry`](AgentError::with_retry)),
+/// else the runtime's ([ADR 0061](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0061-a-step-names-its-retry-policy.md)).
 /// | `Permanent` | `Invalid` | `Failed` |
 /// | `NonDeterminism` | `Corrupt` | `Failed` |
 /// | `Store(e)` | `e.class()` | `Failed` for `Corrupt` and `Invalid`, otherwise left to its lease |
@@ -95,7 +99,8 @@ pub enum Transition<S> {
 #[non_exhaustive]
 pub enum AgentError {
     /// Worth retrying: the runtime re-runs the transition after an
-    /// exponential backoff, up to `RetryPolicy::max_attempts`.
+    /// exponential backoff, up to `RetryPolicy::max_attempts` of the error's policy (its `retry`,
+    /// else the runtime's), when that policy retries the error's `class`.
     ///
     /// With a `retry_after` (a rate limit's `Retry-After`, a maintenance
     /// window, a job that reports when it will be ready) the runtime schedules
@@ -110,6 +115,11 @@ pub enum AgentError {
         message: String,
         /// The minimum wait before the retry, when the peer said so.
         retry_after: Option<Duration>,
+        /// The retryable class of the failure: `Transient`, `RateLimited` or `Conflict`.
+        class: ErrorClass,
+        /// The step's own policy and the key its failures count under; `None`: the runtime's,
+        /// under [`RUNTIME_RETRY_KEY`](crate::RUNTIME_RETRY_KEY).
+        retry: Option<Box<StepRetry>>,
         /// The lower error, when there is one.
         #[source]
         source: Option<BoxError>,
@@ -145,6 +155,8 @@ impl AgentError {
         Self::Transient {
             message: msg.to_string(),
             retry_after: None,
+            class: ErrorClass::Transient,
+            retry: None,
             source: None,
         }
     }
@@ -181,6 +193,19 @@ impl AgentError {
         self
     }
 
+    /// Count a [`Transient`](Self::Transient)'s failures under `key` with `policy`, the step's own
+    /// (ADR 0061): the run retries while that key's failures are under the policy's
+    /// `max_attempts` and the policy retries the error's class. The policy is recorded at the key's
+    /// first failure, so a later deploy that changes it does not change a run already failing.
+    /// Other variants are returned as they are.
+    #[must_use]
+    pub fn with_retry(mut self, key: impl Into<String>, policy: RetryPolicy) -> Self {
+        if let Self::Transient { retry, .. } = &mut self {
+            *retry = Some(Box::new(StepRetry::new(key, policy)));
+        }
+        self
+    }
+
     /// Keep `err` as the source of a `Transient`, `Permanent` or `NonDeterminism`; a `Store` is
     /// returned as it is.
     #[must_use]
@@ -195,17 +220,21 @@ impl AgentError {
     }
 
     /// Turn a classified error into the runtime's vocabulary: a retryable one becomes
-    /// [`Transient`](Self::Transient) (carrying its [`retry_after`](Classify::retry_after)),
+    /// [`Transient`](Self::Transient) (carrying its class and its [`retry_after`](Classify::retry_after)),
     /// anything else [`Permanent`](Self::Permanent). `context` is this layer's message and
     /// `err` its source, so the chain prints once.
     pub fn from_classified<E>(context: impl std::fmt::Display, err: E) -> Self
     where
         E: Classify + Send + Sync + 'static,
     {
-        let retry = err.is_retryable();
+        let class = err.class();
         let retry_after = err.retry_after();
-        let out = if retry {
-            Self::transient(context)
+        let out = if class.is_retryable() {
+            let mut out = Self::transient(context);
+            if let Self::Transient { class: c, .. } = &mut out {
+                *c = class;
+            }
+            out
         } else {
             Self::permanent(context)
         }
@@ -222,9 +251,10 @@ impl Classify for AgentError {
         match self {
             Self::Transient {
                 retry_after: Some(_),
+                class: ErrorClass::Transient,
                 ..
             } => ErrorClass::RateLimited,
-            Self::Transient { .. } => ErrorClass::Transient,
+            Self::Transient { class, .. } => *class,
             Self::Permanent { .. } => ErrorClass::Invalid,
             Self::NonDeterminism { .. } => ErrorClass::Corrupt,
             Self::Store(e) => e.class(),
@@ -468,12 +498,11 @@ mod tests {
     fn expected(e: &AgentError) -> ErrorClass {
         match e {
             AgentError::Transient {
-                retry_after: None, ..
-            } => ErrorClass::Transient,
-            AgentError::Transient {
                 retry_after: Some(_),
+                class: ErrorClass::Transient,
                 ..
             } => ErrorClass::RateLimited,
+            AgentError::Transient { class, .. } => *class,
             AgentError::Permanent { .. } => ErrorClass::Invalid,
             AgentError::NonDeterminism { .. } => ErrorClass::Corrupt,
             AgentError::Store(e) => e.class(),
@@ -517,6 +546,40 @@ mod tests {
             adam_error::report(&e),
             "transient error: model call failed: classified"
         );
+
+        let e = AgentError::from_classified("lost a race", Classified(ErrorClass::Conflict, None));
+        assert_eq!(
+            e.class(),
+            ErrorClass::Conflict,
+            "the class is kept, not only retryability"
+        );
+        let e = AgentError::from_classified(
+            "lost a race",
+            Classified(ErrorClass::Conflict, Some(Duration::from_secs(1))),
+        );
+        assert_eq!(
+            e.class(),
+            ErrorClass::Conflict,
+            "a hint does not make a conflict a rate limit"
+        );
+        let e = AgentError::from_classified("down", Classified(ErrorClass::Transient, None))
+            .with_retry("fetch", RetryPolicy::new(2));
+        let AgentError::Transient {
+            retry: Some(retry),
+            class,
+            ..
+        } = &e
+        else {
+            panic!("{e:?}");
+        };
+        assert_eq!(
+            (retry.key.as_str(), retry.policy.max_attempts, *class),
+            ("fetch", 2, ErrorClass::Transient)
+        );
+        assert!(matches!(
+            AgentError::permanent("x").with_retry("fetch", RetryPolicy::new(2)),
+            AgentError::Permanent { .. }
+        ));
 
         let e = AgentError::from_classified("bad request", Classified(ErrorClass::Invalid, None));
         assert!(matches!(e, AgentError::Permanent { .. }), "{e:?}");

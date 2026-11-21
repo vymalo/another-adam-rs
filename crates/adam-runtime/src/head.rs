@@ -22,6 +22,7 @@ use crate::artifact_ref::{ArtifactRef, FileRef};
 use crate::blob::blob_id;
 use crate::envelope::{Envelope, VERSION as FULL_VERSION};
 use crate::events::{Artifact, ArtifactFile};
+use crate::retry::RetryRecord;
 use crate::runtime::RuntimeError;
 
 /// The head's layout version. A run's `state` is `1` (the v4 envelope) or this.
@@ -89,6 +90,15 @@ pub(crate) struct Head {
     /// Consecutive failed tries of the current transition.
     #[serde(default)]
     pub attempt: u32,
+    /// What a failing run recorded of its retries: the failures per key and each key's policy
+    /// (ADR 0061). Cleared by a transition that succeeds; absent from state written before it
+    /// existed, and not written while `None`; one that does not decode reads as `None`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::retry::lenient_record"
+    )]
+    pub retry: Option<RetryRecord>,
     /// Bumped by every commit a worker makes.
     #[serde(default)]
     pub rev: u64,
@@ -141,6 +151,7 @@ impl Head {
             inbox: env.inbox.clone(),
             seq: env.seq,
             attempt: env.attempt,
+            retry: env.retry.clone(),
             rev: env.rev,
             output: env.output.clone(),
             error: env.error.clone(),
@@ -201,6 +212,7 @@ impl Head {
             inbox,
             seq,
             attempt,
+            retry,
             rev,
             output,
             error,
@@ -220,6 +232,7 @@ impl Head {
             inbox,
             seq,
             attempt,
+            retry,
             rev,
             output,
             error,
@@ -272,6 +285,7 @@ impl HeadParts {
             inbox: env.inbox.clone(),
             seq: env.seq,
             attempt: env.attempt,
+            retry: env.retry.clone(),
             rev: env.rev,
             output: env.output.clone(),
             error: env.error.clone(),
@@ -545,11 +559,31 @@ mod tests {
         env.artifacts.push(file_artifact());
         env.artifacts
             .push(Artifact::new("plan", None, json!({"steps": [1]})));
+        let mut record = RetryRecord::default();
+        record.fail("fetch", &crate::RetryPolicy::new(4));
+        env.retry = Some(record);
         env.hb = true;
         let head = Head::of(&env, json!({"turns": 3}), 2, &env.artifacts, &[]);
         assert_eq!(head.v, 5);
         assert_eq!(head.agent, json!({"turns": 3}));
         assert_eq!((head.seq, head.attempt, head.rev), (7, 1, 4));
+        assert_eq!(
+            head.retry, env.retry,
+            "a v5 run keeps its retry record (ADR 0061)"
+        );
+        let decoded =
+            Head::decode(RunId::new(), &head.encode().expect("encodes")).expect("decodes");
+        assert_eq!(decoded.retry, env.retry);
+        let (back, parts) = decoded.into_parts(json!({"turns": 3}));
+        assert_eq!(
+            back.retry, env.retry,
+            "and the envelope a transition reads has it"
+        );
+        assert_eq!(
+            parts.carried(&back, &[]).retry,
+            env.retry,
+            "and a commit carries it"
+        );
         assert_eq!(head.output, env.output);
         assert_eq!(head.error, env.error);
         assert_eq!(

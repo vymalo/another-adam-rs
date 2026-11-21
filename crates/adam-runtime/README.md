@@ -21,7 +21,7 @@ over A2A).
 | `Agent` (trait) | `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`; see *Continuing another run*), `async step(&mut Ctx, State) -> Transition<State>`, `split(&State) -> Option<(State, Vec<Value>)>` and `join(State, Vec<Value>) -> State` (both provided: the default keeps the whole state; see *The shadow*), `async on_cancelled(RunId, Value)` (provided, does nothing; see *Cancelling a run*) |
 | `AgentStarter` (trait) | the start-only half of an agent: `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`), `split`/`join` (the start-only half of the agent's, defaulted the same way), no `step`; `State` is `Serialize + DeserializeOwned`, as the agent's is (new: a starter whose state was only `Serialize` must derive `Deserialize` too, because it reads the prior state). See *Starting without stepping* |
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
-| `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
+| `AgentError` | `Transient { retry_after, class, retry, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`; `class` the retryable class; `retry` a step's own policy), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
 | `Ctx`, `Emitter`, `ReservedStep` | `Ctx::step` journals a side effect's outcome; `Ctx::reserve_steps(&names)` takes the next seqs in order for steps that run at the same time (each `ReservedStep` has `seq()`, `name()`, `is_recorded()` and `run(f)`, with `step`'s contract), and `Ctx::step_all(steps, at_once)` runs them at most `at_once` at a time and returns the outcomes in the order given (see *Steps that run at the same time*); `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::arrived()` counts the messages delivered while the transition runs, `Ctx::reopen_on_arrival()` makes a `Done` that the transition returns go on instead, and `Ctx::read_already(&ids)` names the messages the run has read, whose copies are not counted (see *A message that arrives while a run finishes*); `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children and `Ctx::child_state(run)` its agent's own state (both live reads of the run's own children only), and `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*); `Ctx::run_starter()` gives an owned `RunStarter` |
 | `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_child_continuing`, `list_sessions`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `state`, `artifact_bytes`, `header`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*), `.poll_interval(..)` (the worker's idle poll, 250 ms) and `.cancel_poll_interval(..)` (a step's cancel watch, 1 s; see *Several processes*), and the getters `worker_id()`, `claim_scope()` |
 | `Runtime::notify_parent(child, output, error)` | tells a finished child's parent (`RUN_FINISHED_KIND`, or `CHILD_REPORTED_KIND` for a session round) from the `output`/`error` the caller just committed; `child` supplies the ids, the status and the parent. The runtime calls it itself after a commit and a cancel. **Breaking:** it used to take only `&RunRecord` and decoded the child's state, which `Store::commit_run` no longer returns (`RunRecord::state` is `null`); an embedder that called it must pass the values it committed |
@@ -43,7 +43,7 @@ over A2A).
 | `ReceivedFiles`, `MAX_FILES_PER_RESULT` | the files of one tool result that another system sent (an MCP server's images and blobs, a remote agent's `raw` parts), shared as file artifacts as they are met: `new(stem, budget)`, `admit(claimed, len)` (every cap, on the length alone: call it before reading or copying the bytes), `share(claimed, filename, name, bytes)` (the line for the model), `refuse(claimed, why)`, `into_parts()` (the artifacts, and whether one was refused: then the result is an error result). What a sender says is untrusted: a file is named `<base>-<hash>.<ext>` (the sender's file name without its extension and cut to `[A-Za-z0-9._-]`, else the stem; the first 8 hexadecimal digits of the SHA-256 of the bytes, so names are unique within a run and stable on replay; the extension of the checked type), its type is the sender's, checked, its artifact name one line of at most 120 characters, and a refusal repeats the sender's type only when it is one. At most 4 MiB a file, 16 a result and `budget` in all: what the run may still share (`ToolCtx::files_left`), because the result is journaled before the loop's run cap applies ([ADR 0033](../../docs/decisions/0033-files-from-mcp-results-are-shared-files.md)) |
 | `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput`, `MAX_STEP_ID_BYTES`, `MAX_STEP_LABEL_CHARS`, `MAX_STEP_DETAIL_CHARS`, `STEP_INPUT_MAX_BYTES`, `STEP_INPUT_STRING_MAX_CHARS`, `STEP_OUTPUT_MAX_BYTES` | `RunEvent::Step`: a step of the run's work (a tool call, a sub-agent's work, a command) started, moved or ended, and which step it runs under; a tool call's step can carry what the tool was given (`input`) and answered (`output`), cut to the contract's bounds; see *Steps* |
 | `Notifier` (trait), `Signal`, `Delivery`, `LocalNotifier`, `DynNotifier` | cross-process wake-up and cancel; `RuntimeBuilder::notifier(..)`. See *Several processes* |
-| `RetryPolicy`, `MAX_RETRY_AFTER` | exponential backoff for transient errors |
+| `RetryPolicy`, `RetryClasses`, `StepRetry`, `MAX_RETRY_AFTER`, `MAX_CONSECUTIVE_FAILURES`, `RUNTIME_RETRY_KEY` | exponential backoff for transient errors, the classes a policy retries, and a step's own policy under a key; see *Retries per step* |
 | `Clock`, `SystemClock`, `ManualClock` | injectable time: `Clock::now` returns `adam_core::time::Timestamp`, the instant the whole framework uses (ADR 0057) |
 
 ```rust
@@ -561,8 +561,8 @@ decides from the class (see [`adam-error`](../adam-error/README.md)).
 
 | `AgentError` | Class | The run |
 |---|---|---|
-| `Transient`, no `retry_after` | `Transient` | retried after `RetryPolicy`'s backoff |
-| `Transient` with `retry_after` | `RateLimited` | retried after `max(backoff, retry_after)`, the hint capped at `MAX_RETRY_AFTER` |
+| `Transient`, no `retry_after` | its `class`: `Transient`, or the class `from_classified` kept (`RateLimited`, `Conflict`) | retried after the policy's backoff, when the policy retries the class |
+| `Transient` of class `Transient` with `retry_after` | `RateLimited` | retried after `max(backoff, retry_after)`, the hint capped at `MAX_RETRY_AFTER` |
 | `Permanent` | `Invalid` | `Failed` |
 | `NonDeterminism` | `Corrupt` | `Failed` |
 | `Store(e)` | `e.class()` | `Failed` for `Corrupt` and `Invalid`; otherwise left to its lease and logged with its class |
@@ -578,14 +578,46 @@ decides from the class (see [`adam-error`](../adam-error/README.md)).
 
 Build an `AgentError` with `AgentError::transient(msg)`,
 `transient_after(msg, wait)`, `permanent(msg)` or `non_determinism(msg)`, then
-`.with_retry_after(wait)` (only a `Transient` has one) and `.with_source(err)`.
-`AgentError::from_classified(context, err)` turns any classified error into a
-`Transient` (retryable, keeping its `retry_after`) or a `Permanent`, with `err`
+`.with_retry_after(wait)` and `.with_retry(key, policy)` (only a `Transient` has them) and
+`.with_source(err)`. `AgentError::from_classified(context, err)` turns any classified error into a
+`Transient` (retryable, keeping its class and its `retry_after`) or a `Permanent`, with `err`
 as the source. `TransientAfter` no longer exists. A message describes its own
 layer only; the run's stored failure text is a boundary, so the worker flattens
 `message: cause` there once. A store error that fails a run, and every store
 error the worker leaves to its lease, is logged with `adam_error::report`
 (the second also with its class and `alert`).
+
+## Retries per step
+
+A step can name its own retry policy ([ADR 0061](../../docs/decisions/0061-a-step-names-its-retry-policy.md)):
+`Ctx::step_retrying(name, key, policy, f)` is `Ctx::step` whose recorded `Err`, when retryable, fails the
+transition with `AgentError::from_classified(..).with_retry(key, policy)`; any other `Err` is the agent's.
+An error that names no policy counts under the key `runtime` (`RUNTIME_RETRY_KEY`) with the runtime's.
+
+* Build a policy with `RetryPolicy::new(attempts)`, `.with_backoff(initial, max)`, `.with_multiplier(m)` (a
+  factor that is not finite and positive is refused) and `.with_retry_on(RetryClasses::of([..]))`; it is
+  `#[non_exhaustive]`. A policy retries only the classes in `retry_on` (all three retryable ones by
+  default): a transient error of another class fails the run at once (`not retried: the policy of `key`
+  does not retry <class>`).
+* The run counts failures **per key**, and retries while that key's count is under its policy's
+  `max_attempts` and `attempt` (every consecutive failure, whatever its key) is under
+  `MAX_CONSECUTIVE_FAILURES` (100). The wait is the key's policy's backoff, lengthened by a hint and cut at
+  the deadline. The messages name the key: `attempt 1 of 3 of `fetch` failed, retrying in ..`, `gave up
+  after 3 attempts of `fetch`: ..`; the runtime's key is not named, so its messages read as before.
+* The count and each key's policy are recorded in the run's state (the v5 head, or the v4 envelope),
+  in the commit that sets `wake_at` or fails the run; the policy is recorded at the key's first failure and
+  read back after that, never recomputed. A transition that succeeds clears the record. Stored policies
+  are plain (`max_attempts`, `initial_backoff_ms`, `max_backoff_ms`, `multiplier`, `retry_on` by name:
+  `transient`, `rate-limited`, `conflict`); a class name this build does not know is dropped, and a record
+  that does not decode is ignored. A run without a record (written before it existed) counts its
+  `attempt` so far under `runtime`.
+
+Tests: `retry.rs` (the classes by name, the builder), `envelope.rs` and `head.rs` (the record's stored
+form, a record that does not decode, a class name dropped, a v5 head that carries it through `of`,
+`decode`, `into_parts` and `carried`), `agent.rs` (`from_classified` keeps the class, `with_retry`), and
+the suite's `a_step_retries_under_its_own_policy`, `a_policy_retries_only_its_classes`,
+`the_recorded_policy_outlives_a_change_in_code`, `steps_that_fail_by_turns_stop_at_the_ceiling` and
+`a_success_clears_the_record`.
 
 ## Steps that run at the same time
 

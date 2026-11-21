@@ -3213,12 +3213,10 @@ fn coder_retrying(fx: &Fixture, model: DynModel, store: DynStore, max_attempts: 
         .concurrency(opts.concurrency)
         .lease_ttl(opts.lease_ttl)
         .poll_interval(opts.poll_interval)
-        .retry(RetryPolicy {
-            max_attempts,
-            initial_backoff: Duration::from_millis(50),
-            max_backoff: Duration::from_millis(100),
-            multiplier: 2.0,
-        })
+        .retry(
+            RetryPolicy::new(max_attempts)
+                .with_backoff(Duration::from_millis(50), Duration::from_millis(100)),
+        )
         .build();
     let backend = RuntimeTaskBackend::new(runtime.clone(), events, AGENT_NAME)
         .with_poll_interval(opts.poll_interval);

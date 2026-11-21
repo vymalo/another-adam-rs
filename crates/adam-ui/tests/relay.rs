@@ -438,12 +438,11 @@ impl Rig {
             .clock(ManualClock::new())
             .poll_interval(Duration::from_millis(20))
             .lease_ttl(Duration::from_secs(1))
-            .retry(RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_millis(10),
-                max_backoff: Duration::from_millis(10),
-                multiplier: 1.0,
-            })
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(10), Duration::from_millis(10))
+                    .with_multiplier(1.0),
+            )
             .build();
         Self {
             runtime,

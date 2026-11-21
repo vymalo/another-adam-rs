@@ -863,12 +863,11 @@ async fn transient_tool_error_retries_the_step() {
         .push_tool_calls(vec![call("c1", "flaky", json!({}))])
         .push_text("ok");
     let rt = h.runtime_with(&agent, "w", |b| {
-        b.retry(RetryPolicy {
-            max_attempts: 3,
-            initial_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(10),
-            multiplier: 1.0,
-        })
+        b.retry(
+            RetryPolicy::new(3)
+                .with_backoff(Duration::from_millis(10), Duration::from_millis(10))
+                .with_multiplier(1.0),
+        )
     });
     let run = rt
         .start("llm", user_message("go"), None)
@@ -896,12 +895,11 @@ async fn transient_tool_error_retries_the_step() {
 // ---------------------------------------------------------------------------
 
 fn quick_retry(b: RuntimeBuilder) -> RuntimeBuilder {
-    b.retry(RetryPolicy {
-        max_attempts: 3,
-        initial_backoff: Duration::from_millis(10),
-        max_backoff: Duration::from_millis(10),
-        multiplier: 1.0,
-    })
+    b.retry(
+        RetryPolicy::new(3)
+            .with_backoff(Duration::from_millis(10), Duration::from_millis(10))
+            .with_multiplier(1.0),
+    )
 }
 
 #[tokio::test]
