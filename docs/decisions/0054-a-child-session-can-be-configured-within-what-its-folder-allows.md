@@ -76,12 +76,17 @@ amendment is the owner's to make there.
    | `access_tier` | a ceiling for every round | the starter's tier (the parent's, or the person's message), `MAX_ACCESS_TIER` | at most those; refused where the deployment lists no tiers | `TierSource::tier_of` and `Gated` take the minimum with the header's ceiling (`bin/adam-coder/src/tier.rs`) | next model call | 8 |
    | `report_schema` | the round's final answer is one JSON value that matches | none | draft 2020-12, at most 16 KiB, no `$ref` outside itself, compiles; local subagents only | at the final answer: two corrective turns (counted in `max_turns`) with the first three errors, then the round fails `report does not match report_schema` | next round | 9 |
    | `model` | an alias from an allow-list | the subagent file's new `models:` (its `model:` is the default and always allowed), intersected with the deployment's `MODEL_ALIASES` when set | one of that set; never an arbitrary id; refused on a remote subagent | the alias of the run's requests, window and modalities | next round | 11 |
-   | `reasoning_effort` | per request | the deployment's declaration for that alias | one of the values declared; refused when none is | a new `ModelRequest` field, sent by `adam-model-openai` | next model call | 12 |
+   | `reasoning_effort` | per request | the deployment's declaration for that alias | one of the values declared; refused when none is (amended below) | a new `ModelRequest` field, sent by `adam-model-openai` | next model call | 12 |
    | `temperature` | per request | the deployment's declaration for that alias | within the declared range; refused when none is | `ModelRequest.temperature`, set by the loop for the first time | next model call | 12 |
 
    A **remote** (`a2a:`) subagent takes `time_limit`, `max_rounds` and `instructions` (sent ahead of the first message, as
    text); every other option is refused in words: its loop is another system's. Tools the loop itself needs (`read_output`)
    are never removed by `tools` or `deny_tools`.
+
+   *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the declaration is the **model entry** in
+   `MODEL_ALIASES_FILE` (the alias's `reasoning` object: its levels and its wire), not a global variable. A folder or
+   session value must be one of that model's levels; a request outside them is refused; a model whose entry takes none
+   refuses any effort. There is **no default**: unset sends nothing. `temperature` is unchanged.
 5. **Dropped, each for a reason.**
 
    | Candidate | Why not |
@@ -304,6 +309,8 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
 **12. `reasoning_effort` and `temperature`.** Depends on 11.
 * Files: `crates/adam-model/src/types.rs`, `crates/adam-model-openai/src/wire.rs`, `agent.rs`.
 * Accepted when: the declared values are sent and others refused; an alias that declares none refuses both.
+* *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort`, the declared values are the model entry's levels, and
+  unset sends nothing (no default); `temperature` still refuses when none is declared.
 
 ## What is put to the owner
 
@@ -316,4 +323,4 @@ The work proceeds with these; a different answer is a dated note here.
 5. `context_window` has a floor (20,000 + `max_output_tokens` + 8,000); usage reports keep the model's own window.
 6. The card lists each helper's named sets (models, tools, skills); they are not secrets, and the card already lists the helpers.
 7. `model` chooses among aliases of one endpoint; several endpoints wait for the model relay.
-8. A set reasoning effort replaces a `MODEL_EXTRA_BODY` member of the same name.
+8. A set reasoning effort replaces a `MODEL_EXTRA_BODY` member of the same name *(amended 2026-11-21, ADR 0063: the members the model's wire would duplicate)*.
