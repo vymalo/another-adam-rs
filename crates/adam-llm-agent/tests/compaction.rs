@@ -94,6 +94,143 @@ impl Tool for Pinner {
     }
 }
 
+/// A group's tool, withheld until the run loads the group.
+struct Docs;
+
+#[async_trait]
+impl Tool for Docs {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "docs__search".into(),
+            description: "searches the docs".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("docs__search-out"))
+    }
+}
+
+/// A loaded group's tool that the source keeps withholding: the tier of a message did not show
+/// it, so the request that followed did not carry it and the loop journals it as removed.
+struct Read;
+
+#[async_trait]
+impl Tool for Read {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "docs__read".into(),
+            description: "reads a doc".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("docs__read-out"))
+    }
+}
+
+/// The `load__group__docs` loader of the tests.
+struct LoadDocs;
+
+#[async_trait]
+impl Tool for LoadDocs {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "load__group__docs".into(),
+            description: "loads the docs group".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let mut loaded: Vec<adam_llm_agent::Loaded> = ctx.loaded().to_vec();
+        loaded.push(adam_llm_agent::Loaded {
+            loader: "load__group__docs".into(),
+            tools: vec!["docs__search".into(), "docs__read".into()],
+            note: "the docs words".into(),
+        });
+        let mut out = ToolOutput::text("loaded the docs group\nthe docs words");
+        out.loaded = loaded;
+        Ok(out)
+    }
+}
+
+/// The group's source: withholds its members until the group is loaded, and (when `keep_read`) keeps
+/// `docs__read` withheld even then, as the access tier does for a loaded member it does not show.
+struct DocsSource {
+    keep_read: bool,
+}
+
+impl DocsSource {
+    fn loaded(&self, ctx: &adam_llm_agent::SourceCtx) -> bool {
+        ctx.loaded()
+            .iter()
+            .any(|one| one.loader == "load__group__docs")
+    }
+}
+
+#[async_trait]
+impl adam_llm_agent::ToolSource for DocsSource {
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    async fn appended(&self, ctx: &adam_llm_agent::SourceCtx) -> Vec<ToolSpec> {
+        if !self.loaded(ctx) {
+            return Vec::new();
+        }
+        vec![Docs.spec(), Read.spec()]
+    }
+
+    async fn loaders(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<adam_llm_agent::Loader> {
+        vec![adam_llm_agent::Loader {
+            name: "load__group__docs".into(),
+            holds: vec!["docs__search".into(), "docs__read".into()],
+        }]
+    }
+
+    async fn withhold(
+        &self,
+        ctx: &adam_llm_agent::SourceCtx,
+        tools: &[&str],
+    ) -> Vec<adam_llm_agent::Withheld> {
+        let mut held = Vec::new();
+        for tool in tools {
+            if ctx.removed_tools().iter().any(|removed| removed == tool) {
+                held.push(adam_llm_agent::Withheld::new(
+                    *tool,
+                    format!("`{tool}` is not available in this conversation now"),
+                ));
+                continue;
+            }
+            let withheld = !self.loaded(ctx) || (self.keep_read && *tool == "docs__read");
+            if withheld && (*tool == "docs__search" || *tool == "docs__read") {
+                held.push(adam_llm_agent::Withheld::new(
+                    *tool,
+                    format!("`{tool}` is not loaded for this run"),
+                ));
+            }
+        }
+        held
+    }
+
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        None
+    }
+}
+
+fn with_docs(builder: LlmAgentBuilder, keep_read: bool) -> LlmAgentBuilder {
+    builder
+        .tool(Docs)
+        .tool(Read)
+        .tool(LoadDocs)
+        .tool_source(DocsSource { keep_read })
+}
+
 /// Writes the plan.
 struct Planner;
 
@@ -532,6 +669,87 @@ async fn the_task_plan_pinned_results_and_kept_pointers_survive() {
     assert_eq!(
         state.plan.as_ref().unwrap().title.as_deref(),
         Some("Fix the parser")
+    );
+}
+
+/// The marker a compaction writes lists what the run loaded, written by code from the state: the
+/// loader, its tools, and its note.
+#[tokio::test]
+async fn the_recap_lists_the_loaded_tools_after_a_compaction() {
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| with_docs(b, false));
+    let run = rig.start().await;
+    rig.mock
+        .push_tool_calls(vec![call("c0", "load__group__docs", json!({}))])
+        .push_tool_calls(vec![call("c1", "docs__search", json!({}))])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_tool_calls(vec![big("c4", 1200)])
+        .push_text("SUMMARY: loaded the docs and searched them")
+        .push_tool_calls(vec![big("c5", 50)])
+        .push_text("done");
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(split(&requests).1.len(), 1, "one summary request");
+    assert_eq!(state.compactions.len(), 1, "the history was compacted");
+    assert!(state.is_omission_marker(0, 1));
+    let marker = state.messages[0].text();
+    assert!(marker.contains("load__group__docs"), "{marker}");
+    assert!(
+        marker.contains("docs__search"),
+        "the loaded tool is listed: {marker}"
+    );
+    assert!(
+        marker.contains("the docs words"),
+        "the group's note is listed: {marker}"
+    );
+    assert!(
+        !marker.contains("write_file"),
+        "a tool the run never loaded is not listed: {marker}"
+    );
+}
+
+/// A loaded tool a request did not carry is journaled as removed, left out of the recap, and a call
+/// to it is refused: lazy never widens access.
+#[tokio::test]
+async fn a_tool_removed_before_the_compaction_is_absent_from_the_recap_and_refused() {
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| with_docs(b, true));
+    let run = rig.start().await;
+    rig.mock
+        .push_tool_calls(vec![call("c0", "load__group__docs", json!({}))])
+        .push_tool_calls(vec![call("c1", "docs__search", json!({}))])
+        .push_tool_calls(vec![call("c2", "docs__read", json!({}))])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_tool_calls(vec![big("c4", 1200)])
+        .push_tool_calls(vec![big("c5", 1200)])
+        .push_text("SUMMARY: loaded and searched")
+        .push_tool_calls(vec![big("c6", 50)])
+        .push_text("done");
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "the history was compacted");
+    assert!(
+        state.removed_tools.iter().any(|tool| tool == "docs__read"),
+        "the request did not carry it: {:?}",
+        state.removed_tools
+    );
+    let marker = state.messages[0].text();
+    assert!(marker.contains("docs__search"), "{marker}");
+    assert!(
+        !marker.contains("docs__read"),
+        "a removed tool is not in the recap: {marker}"
+    );
+    // The call was refused, before the compaction and in the history the model reads.
+    let text = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("not available in this conversation now"),
+        "the removed tool is refused: {text}"
+    );
+    assert!(
+        !text.contains("docs__read-out"),
+        "the removed tool did not run: {text}"
     );
 }
 

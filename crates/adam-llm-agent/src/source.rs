@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::access::ToolAccess;
+use crate::conversation::{Loaded, Loader};
 use crate::tool::{ToolCtx, ToolError, ToolOutput};
 
 /// The most tools the sources of an agent may offer on one model turn, all sources together. The
@@ -127,7 +128,8 @@ pub struct SourceCtx {
     conversation_id: Option<String>,
     context: Arc<Map<String, Value>>,
     task: Option<Arc<str>>,
-    loaded_servers: Arc<[String]>,
+    loaded: Arc<[Loaded]>,
+    removed_tools: Arc<[String]>,
 }
 
 impl SourceCtx {
@@ -143,7 +145,8 @@ impl SourceCtx {
             conversation_id,
             context,
             task: None,
-            loaded_servers: Arc::default(),
+            loaded: Arc::default(),
+            removed_tools: Arc::default(),
         }
     }
 
@@ -206,22 +209,37 @@ impl SourceCtx {
         self.task.as_deref()
     }
 
-    /// This context with the MCP servers the run has loaded so far, in the order it loaded them
-    /// ([`Conversation::loaded_servers`](crate::Conversation::loaded_servers)): the agent sets it
-    /// on every context it makes, from the state as it stands before the turn, so a server loaded
-    /// in the turn before is not withheld from this one. A test may set it on a
+    /// This context with the groups and tools the run has loaded so far, in the order it loaded
+    /// them ([`Conversation::loaded`](crate::Conversation::loaded)): the agent sets it on every
+    /// context it makes, from the state as it stands before the turn, so a group loaded in the
+    /// turn before is not withheld from this one. A test may set it on a
     /// [`detached`](Self::detached) context.
     #[must_use]
-    pub fn with_loaded_servers(mut self, servers: impl Into<Arc<[String]>>) -> Self {
-        self.loaded_servers = servers.into();
+    pub fn with_loaded(mut self, loaded: impl Into<Arc<[Loaded]>>) -> Self {
+        self.loaded = loaded.into();
         self
     }
 
-    /// The MCP servers the run has loaded so far, in the order it loaded them: a source that
-    /// withholds a server's tools (an MCP server's `when`) stops withholding it once its name is
-    /// here, and offers its tools from [`appended`](ToolSource::appended) instead.
-    pub fn loaded_servers(&self) -> &[String] {
-        &self.loaded_servers
+    /// This context with the loaded tools a request did not carry
+    /// ([`Conversation::removed_tools`](crate::Conversation::removed_tools)): a source withholds a
+    /// call to one, whatever group it belonged to. A test may set it on a
+    /// [`detached`](Self::detached) context.
+    #[must_use]
+    pub fn with_removed_tools(mut self, removed: impl Into<Arc<[String]>>) -> Self {
+        self.removed_tools = removed.into();
+        self
+    }
+
+    /// The groups and tools the run has loaded so far, in the order it loaded them: a source that
+    /// withholds a group's tools stops withholding it once its loader is here, and offers its tools
+    /// from [`appended`](ToolSource::appended) instead.
+    pub fn loaded(&self) -> &[Loaded] {
+        &self.loaded
+    }
+
+    /// The names of loaded tools a request did not carry: a source withholds a call to one.
+    pub fn removed_tools(&self) -> &[String] {
+        &self.removed_tools
     }
 }
 
@@ -297,9 +315,20 @@ pub trait ToolSource: Send + Sync + 'static {
     /// never sorted: the second load follows the first.
     ///
     /// Read inside the journaled step of the model call, from the run's state
-    /// ([`SourceCtx::loaded_servers`]), so a replay offers the same array. The default is none,
+    /// ([`SourceCtx::loaded`]), so a replay offers the same array. The default is none,
     /// which is what a source written before this method existed offers.
     async fn appended(&self, ctx: &SourceCtx) -> Vec<ToolSpec> {
+        let _ = ctx;
+        Vec::new()
+    }
+
+    /// The loaders this source still offers on this turn, with what each holds: the run's first
+    /// turn records them in [`Conversation::loaders`](crate::Conversation::loaders), so a
+    /// compaction's marker says what is left to load without asking the live source. Read inside
+    /// the journaled step of the model call, like [`appended`](Self::appended). A loader the task
+    /// already loads is not here: it is loaded, not available. The default is none, which is what a
+    /// source written before loaders existed offers.
+    async fn loaders(&self, ctx: &SourceCtx) -> Vec<Loader> {
         let _ = ctx;
         Vec::new()
     }
@@ -316,12 +345,9 @@ pub trait ToolSource: Send + Sync + 'static {
 
     /// Words this source adds to the agent's instructions **during** the run, after everything
     /// [`instructions`](Self::instructions) says: the words of a system the run loaded during
-    /// itself ([`SourceCtx::loaded_servers`]), which must follow the prompt and never be inserted
-    /// into it, or the request before would stop being a byte prefix of the one after (ADR 0044,
-    /// decision 1). `adam-assembly`'s `McpSelect` offers a server loaded with `use_server` here, so
-    /// its section comes after the agents a person mentioned, the access tier and references.
-    /// `None`, the default, adds nothing, which is what a source written before this method
-    /// existed offers.
+    /// itself, which must follow the prompt and never be inserted into it, or the request before
+    /// would stop being a byte prefix of the one after (ADR 0044, decision 1). `None`, the default,
+    /// adds nothing, which is what a source written before this method existed offers.
     async fn appended_instructions(&self, ctx: &SourceCtx) -> Option<String> {
         let _ = ctx;
         None
@@ -466,6 +492,20 @@ fn keep_notes(notes: &mut Vec<ToolNote>, from: Vec<ToolNote>, kept: &[ToolSpec])
             notes.push(note);
         }
     }
+}
+
+/// The loaders the sources still offer on this turn, each name once, in source order: what the
+/// run's first turn records in [`Conversation::loaders`](crate::Conversation::loaders).
+pub(crate) async fn loaders_offered(sources: &[DynToolSource], ctx: &SourceCtx) -> Vec<Loader> {
+    let mut out: Vec<Loader> = Vec::new();
+    for source in sources {
+        for loader in source.loaders(ctx).await {
+            if !out.iter().any(|one| one.name == loader.name) {
+                out.push(loader);
+            }
+        }
+    }
+    out
 }
 
 /// The tools the sources say the run has loaded during itself, in their order, each name once: the

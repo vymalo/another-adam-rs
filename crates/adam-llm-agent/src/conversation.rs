@@ -321,6 +321,42 @@ pub struct Repeats {
     pub marked: u32,
 }
 
+/// One group of tools a run has loaded, as the loader that loaded it recorded it.
+///
+/// A **loader** is an own tool of the agent named `load__group__<name>` (or `load__tool__<name>`):
+/// its call returns the whole list of what the run has loaded, with its own entry added, and the
+/// loop makes that the run's durable list ([`Conversation::loaded`]) in the same commit as the
+/// result. The tools arrive on the next request, appended after every other tool of it (ADR 0044,
+/// decision 1 and ADR 0066).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Loaded {
+    /// The loader's tool name, as the call that loaded it named it: `load__group__bash`.
+    pub loader: String,
+    /// The tools it made available, in the order the request offers them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// The group's note, in one line, at most [`MAX_LOADED_NOTE_BYTES`]: what its tools are for.
+    /// A compaction copies it into its marker, so it is text a reader of the conversation keeps.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+/// A loader the run may still call: its name, and the tools a call would make available.
+///
+/// Recorded in [`Conversation::loaders`] on the run's first turn, so a compaction's marker can say
+/// what is still there to load without asking the live sources (ADR 0066, decision 6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Loader {
+    /// The loader's tool name: `load__group__bash`, `load__tool__heavy`.
+    pub name: String,
+    /// The tools a call would make available, in the order the request would offer them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holds: Vec<String>,
+}
+
+/// The most bytes a [`Loaded::note`] holds: one line of the marker a compaction writes.
+pub const MAX_LOADED_NOTE_BYTES: usize = 200;
+
 /// A [`Limits`](crate::Limits) bound a run reached.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LimitHit {
@@ -367,12 +403,38 @@ pub struct Conversation {
     /// array, never inserted, so the request before stays a byte prefix of the one after it (ADR
     /// 0044, decision 1); the turns where the array grew are
     /// [`tools_appended`](Self::tools_appended). A run that continues this one carries the list, so
-    /// its first request offers the tools the run before offered. Absent from state written before
-    /// it existed, and not written while empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// its first request offers the tools the run before offered.
+    ///
+    /// **Decoded, never written** since ADR 0066: `use_server` folded into the group loaders, and
+    /// the loaded set is [`loaded`](Self::loaded). State written before it still reads, and the
+    /// loop seeds [`loaded`](Self::loaded) from it on the first turn.
+    #[serde(default, skip_serializing)]
     pub loaded_servers: Vec<String>,
+    /// The groups and tools the run has loaded **during itself**, in the order it loaded them: one
+    /// entry per loader, with the tools the load made available and the group's one-line note. The
+    /// loop applies the whole list a loader returns ([`ToolOutput::loaded`](crate::ToolOutput::loaded))
+    /// in the same commit as its result, so a resumed run builds the same request, byte for byte
+    /// (ADR 0066, decision 5). A load appends its tools after every other tool of the request, never
+    /// inserts one, and the turns where the array grew are [`tools_appended`](Self::tools_appended).
+    /// A run that continues this one carries the list. Absent from state written before it existed,
+    /// and not written while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded: Vec<Loaded>,
+    /// The loaders the agent had on the run's first turn, recorded once: what a compaction's marker
+    /// says is still there to load, without asking the live sources. A loader the run loaded is
+    /// taken out of the marker's "available" lines ([`loaded`](Self::loaded)). Absent from state
+    /// written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaders: Vec<Loader>,
+    /// The names of loaded tools that a request did **not** carry: the tier withheld one, or the
+    /// group's definition shrank since the load. The turn transition diffs what a request offered
+    /// against [`loaded`](Self::loaded) and journals the difference, so a replay decides the same;
+    /// a compaction leaves them out of its recap, and a call to one is refused. Absent from state
+    /// written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_tools: Vec<String>,
     /// The turns (the value of [`turns`](Self::turns) when the model was asked) at whose request the
-    /// tools array grew by a server the run loaded ([`loaded_servers`](Self::loaded_servers)): the
+    /// tools array grew by a group the run loaded ([`loaded`](Self::loaded)): the
     /// only requests whose head (`system` and `tools`) is not the one before, beside
     /// [`shortenings`](Self::shortenings) and [`compactions`](Self::compactions), and the only ones
     /// where it may grow (by a suffix). A run that never loads a server records none. Absent from
@@ -1146,22 +1208,74 @@ impl Conversation {
         self.continued_within(text, from, MAX_CARRIED_BYTES)
     }
 
-    /// The run has loaded the MCP servers `servers`
-    /// ([`ToolOutput::loaded_servers`](crate::ToolOutput::loaded_servers)): each one it did not have
-    /// is added, in the order given, and the turn of the next model call — the first whose tools
-    /// array grows — is recorded, once however many servers that turn loaded. A list that adds
-    /// nothing records nothing, so a replayed step applies the same list to the state without a
-    /// second entry.
-    pub(crate) fn load_servers(&mut self, servers: Vec<String>) {
-        let before = self.loaded_servers.len();
-        for server in servers {
-            if !self.loaded_servers.contains(&server) {
-                self.loaded_servers.push(server);
+    /// The run has loaded the groups `loaded` ([`ToolOutput::loaded`](crate::ToolOutput::loaded)):
+    /// each loader it did not have is added, in the order given, and the turn of the next model
+    /// call — the first whose tools array grows — is recorded, once however many loaders that turn
+    /// loaded. A loader the state already has is **merged** by name: the tools it brings that are
+    /// not there yet are appended, and its note is replaced when the new one is not empty. A list
+    /// that adds nothing records nothing, so a replayed step applies the same list to the state
+    /// without a second entry.
+    pub(crate) fn load_groups(&mut self, loaded: Vec<Loaded>) {
+        let before = self.loaded.len();
+        let tools_before: usize = self.loaded.iter().map(|one| one.tools.len()).sum();
+        for one in loaded {
+            match self
+                .loaded
+                .iter_mut()
+                .find(|present| present.loader == one.loader)
+            {
+                Some(present) => {
+                    for tool in one.tools {
+                        if !present.tools.contains(&tool) {
+                            present.tools.push(tool);
+                        }
+                    }
+                    if !one.note.is_empty() {
+                        present.note = one.note;
+                    }
+                }
+                None => self.loaded.push(one),
             }
         }
-        if self.loaded_servers.len() > before && !self.tools_appended.contains(&self.turns) {
+        let tools_after: usize = self.loaded.iter().map(|one| one.tools.len()).sum();
+        if (self.loaded.len() > before || tools_after > tools_before)
+            && !self.tools_appended.contains(&self.turns)
+        {
             self.tools_appended.push(self.turns);
         }
+    }
+
+    /// The request about to be made carried the loaded tools `offered`
+    /// ([`ToolOutput::loaded`](crate::ToolOutput::loaded) names the run's list): every loaded tool
+    /// that is not in it is journaled as **removed**, so a replay decides the same and a compaction
+    /// does not list a tool the model was never shown (ADR 0066, decision 6). A name already in
+    /// [`removed_tools`](Self::removed_tools) stays once.
+    pub(crate) fn note_removed(&mut self, offered: &[String]) {
+        for one in &self.loaded {
+            for tool in &one.tools {
+                if !offered.contains(tool) && !self.removed_tools.contains(tool) {
+                    self.removed_tools.push(tool.clone());
+                }
+            }
+        }
+    }
+
+    /// Seed [`loaded`](Self::loaded) from a journal written before it existed: each server
+    /// `use_server` loaded is one entry, in the order it loaded them. Called on the run's first
+    /// turn only; a state that already has a loaded set is left alone, so a replay is the same.
+    pub(crate) fn seed_loaded(&mut self) {
+        if !self.loaded.is_empty() || self.loaded_servers.is_empty() {
+            return;
+        }
+        self.loaded = self
+            .loaded_servers
+            .iter()
+            .map(|server| Loaded {
+                loader: format!("use_server:{server}"),
+                tools: Vec::new(),
+                note: String::new(),
+            })
+            .collect();
     }
 
     /// The model has been given the reports of `rounds`: remember them, each once, the oldest
@@ -1325,10 +1439,14 @@ impl Conversation {
             context: self.context.clone(),
             plan: self.plan.clone(),
             session: self.session.clone(),
-            // The servers the run loaded are still loaded: its first request must offer the tools
+            // The groups the run loaded are still loaded: its first request must offer the tools
             // the run before ended with, or the array would lose them. The turns the array grew at
-            // are not carried: this run has no request before its first.
-            loaded_servers: self.loaded_servers.clone(),
+            // are not carried: this run has no request before its first. The loaders and the
+            // journaled removals are carried with them, so a compaction of this run writes the
+            // same recap.
+            loaded: self.loaded.clone(),
+            loaders: self.loaders.clone(),
+            removed_tools: self.removed_tools.clone(),
             // What code wrote into the marker (pinned results, pointers, skills, the sessions line)
             // comes along as one record, so that a compaction of this run writes it again. The
             // record does not count against this run's `MAX_COMPACTIONS`.
@@ -1366,6 +1484,93 @@ fn is_empty_images(map: &Arc<BTreeMap<String, StateImage>>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loaded(loader: &str, tools: &[&str]) -> Loaded {
+        Loaded {
+            loader: loader.to_owned(),
+            tools: tools.iter().map(|tool| (*tool).to_owned()).collect(),
+            note: format!("what {loader} is for"),
+        }
+    }
+
+    /// A load is state: the list merges by loader name, in call order, and the turn of the next
+    /// request is recorded once however many loads one turn made.
+    #[test]
+    fn a_load_merges_by_loader_name_and_records_the_turn_once() {
+        let mut state = Conversation::new("go");
+        state.turns = 3;
+        state.load_groups(vec![loaded("load__group__bash", &["run_command"])]);
+        assert_eq!(state.loaded.len(), 1);
+        assert_eq!(state.tools_appended, [3]);
+        state.load_groups(vec![
+            loaded("load__group__bash", &["run_command", "read_file"]),
+            loaded("load__group__repo", &["run_checks"]),
+        ]);
+        assert_eq!(
+            state
+                .loaded
+                .iter()
+                .map(|one| one.loader.as_str())
+                .collect::<Vec<_>>(),
+            ["load__group__bash", "load__group__repo"]
+        );
+        assert_eq!(
+            state.loaded[0].tools,
+            ["run_command", "read_file"],
+            "the second load of one group appends what is new, once"
+        );
+        assert_eq!(state.tools_appended, [3], "one turn, not two");
+        // A load that adds nothing records nothing.
+        state.turns = 4;
+        state.load_groups(vec![loaded("load__group__bash", &["run_command"])]);
+        assert_eq!(state.tools_appended, [3]);
+    }
+
+    /// A journal written before `loaded` existed names the servers `use_server` loaded: the first
+    /// turn seeds the loaded set from it, once.
+    #[test]
+    fn a_journal_before_loaded_seeds_it_from_loaded_servers() {
+        let mut old: Conversation =
+            serde_json::from_value(serde_json::json!({"loaded_servers": ["docs", "linear"]}))
+                .unwrap();
+        old.seed_loaded();
+        assert_eq!(
+            old.loaded
+                .iter()
+                .map(|one| one.loader.as_str())
+                .collect::<Vec<_>>(),
+            ["use_server:docs", "use_server:linear"]
+        );
+        let once = old.loaded.clone();
+        old.seed_loaded();
+        assert_eq!(old.loaded, once, "the seed is idempotent");
+        // And it is not written back: a new state has no `loaded_servers` member.
+        let written = serde_json::to_value(&old).unwrap();
+        assert!(written.get("loaded_servers").is_none(), "{written}");
+        assert_eq!(written["loaded"].as_array().unwrap().len(), 2);
+    }
+
+    /// The turn transition journals every loaded tool a request did not carry, once, and the
+    /// loaded set is carried into a run that continues the conversation.
+    #[test]
+    fn a_loaded_tool_a_request_did_not_carry_is_removed_once() {
+        let mut state = Conversation::new("go");
+        state.load_groups(vec![loaded(
+            "load__group__bash",
+            &["run_command", "write_file"],
+        )]);
+        state.note_removed(&["run_command".to_owned()]);
+        assert_eq!(state.removed_tools, ["write_file"]);
+        state.note_removed(&["run_command".to_owned()]);
+        assert_eq!(state.removed_tools, ["write_file"], "journaled once");
+        let next = state.continued("more", RunId::new());
+        assert_eq!(next.loaded, state.loaded);
+        assert_eq!(next.removed_tools, state.removed_tools);
+        assert!(
+            next.tools_appended.is_empty(),
+            "a new run has no request before its first"
+        );
+    }
 
     #[test]
     fn reported_rounds_keep_the_last_128_each_once_and_are_carried() {
@@ -2475,7 +2680,7 @@ mod tests {
             crate::history::TRUNCATION_MARKER_PREFIX.len(),
             crate::kept::pointer_line(id),
         );
-        let body = crate::compaction::marker_body(Some(&forged), None, &[]);
+        let body = crate::compaction::marker_body(Some(&forged), None, "", &[]);
         for line in body.lines().skip(1) {
             assert!(
                 !line.starts_with('['),

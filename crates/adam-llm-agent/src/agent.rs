@@ -33,8 +33,8 @@ use crate::compaction::{
     RETRY_AFTER_TURNS, SUMMARY_OUTPUT_TOKENS,
 };
 use crate::conversation::{
-    ArtifactRef, Conversation, LimitHit, LimitKind, PendingQuestion, PendingRemote, PendingRun,
-    PendingSession, PendingWait, Repeats, asks_to_close, parse_context, parse_root_run,
+    ArtifactRef, Conversation, LimitHit, LimitKind, Loaded, Loader, PendingQuestion, PendingRemote,
+    PendingRun, PendingSession, PendingWait, Repeats, asks_to_close, parse_context, parse_root_run,
     parse_root_step, parse_session, parse_user_text,
 };
 use crate::history::{RunChars, record_shortenings};
@@ -315,9 +315,11 @@ struct CallFacts {
     /// The words the run was started with (`Conversation::task`), for a source that decides from
     /// them: the same text at every turn and at every call.
     task: Option<Arc<str>>,
-    /// The MCP servers the run has loaded so far (`Conversation::loaded_servers`): what `use_server`
-    /// reads to refuse a second load, and what the source that withholds a server's tools reads.
-    loaded_servers: Arc<[String]>,
+    /// What the run has loaded so far (`Conversation::loaded`): what a loader reads to refuse a
+    /// second load, and what the source that withholds a group's tools reads.
+    loaded: Arc<[Loaded]>,
+    /// The loaded tools a request did not carry (`Conversation::removed_tools`).
+    removed_tools: Arc<[String]>,
 }
 
 /// What the calls of a turn that starts while the model writes need from the run, owned: taken
@@ -333,8 +335,10 @@ struct EarlyFacts {
     images: ImageGate,
     output_cut: bool,
     task: Option<Arc<str>>,
-    /// The MCP servers the run has loaded as the turn starts, for the calls that read them.
-    loaded_servers: Arc<[String]>,
+    /// What the run has loaded as the turn starts, for the calls that read it.
+    loaded: Arc<[Loaded]>,
+    /// The loaded tools a request did not carry, as the turn starts.
+    removed_tools: Arc<[String]>,
     turn: crate::early::Turn,
     /// The committed `repeats` of the run, for the doom-loop decision of the first call.
     repeats: Option<Repeats>,
@@ -482,7 +486,8 @@ impl<'a> Early<'a> {
             kept_left: self.facts.kept_left,
             images: self.facts.images.clone(),
             task: self.facts.task.clone(),
-            loaded_servers: Arc::clone(&self.facts.loaded_servers),
+            loaded: Arc::clone(&self.facts.loaded),
+            removed_tools: Arc::clone(&self.facts.removed_tools),
         };
         let mut prepared = self.agent.prepare(
             &self.facts.ctx,
@@ -805,6 +810,17 @@ struct Recorded {
     /// it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sessions_open: Option<bool>,
+    /// The loaded tools the request actually carried, in the order the run loaded them: the turn
+    /// transition journals every loaded tool that is not here as removed
+    /// ([`Conversation::removed_tools`](crate::Conversation::removed_tools)), so a replay decides
+    /// the same. Absent when nothing was loaded, and in journals written before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    offered: Vec<String>,
+    /// The loaders the sources still offered on the turn the request was made: recorded once, on
+    /// the run's first turn, in [`Conversation::loaders`](crate::Conversation::loaders). Absent
+    /// when there were none, after the first turn, and in journals written before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    loaders: Vec<Loader>,
 }
 
 /// The report of one round, read for a model call that did not ask for it: the result of a
@@ -2001,6 +2017,13 @@ impl LlmAgent {
 
         let model = self.model.clone();
         let sources = self.sources.clone();
+        let turn = state.turns;
+        if turn == 0 {
+            // A journal written before `loaded` existed names the servers `use_server` loaded: the
+            // first turn makes them the loaded set, before the first request is built, in the same
+            // commit as the first model call.
+            state.seed_loaded();
+        }
         let source_ctx = (!sources.is_empty()).then(|| {
             SourceCtx::new(
                 ctx.run_id(),
@@ -2009,9 +2032,11 @@ impl LlmAgent {
                 context.cloned().unwrap_or_default(),
             )
             .with_task(state.task())
-            .with_loaded_servers(Arc::from(state.loaded_servers.clone()))
+            .with_loaded(Arc::from(state.loaded.clone()))
+            .with_removed_tools(Arc::from(state.removed_tools.clone()))
         });
-        let turn = state.turns;
+        let loaded_now: Arc<[Loaded]> = Arc::from(state.loaded.clone());
+        let need_loaders = state.loaders.is_empty();
         let seen = state.messages.len();
         let run = ctx.run_id();
         let emitter = ctx.emitter();
@@ -2062,7 +2087,8 @@ impl LlmAgent {
             images: self.image_gate(state),
             output_cut: state.output_cut,
             task: state.task().map(Arc::from),
-            loaded_servers: Arc::from(state.loaded_servers.clone()),
+            loaded: Arc::from(state.loaded.clone()),
+            removed_tools: Arc::from(state.removed_tools.clone()),
             turn: crate::early::Turn {
                 limit: self.max_parallel,
                 closing,
@@ -2092,6 +2118,20 @@ impl LlmAgent {
                 // tools it was given.
                 let (notes, own_order) =
                     apply_sources(&sources, source_ctx.as_ref(), &mut request, ordered).await;
+                // What the request carried of the loaded set, and (on the first turn) the loaders
+                // that are still there: journaled with the answer, so a replay decides the same.
+                let offered: Vec<String> = loaded_now
+                    .iter()
+                    .flat_map(|one| one.tools.iter())
+                    .filter(|tool| request.tools.iter().any(|spec| spec.name == tool.as_str()))
+                    .cloned()
+                    .collect();
+                let loaders = match source_ctx.as_ref() {
+                    Some(ctx) if need_loaders => {
+                        crate::source::loaders_offered(&sources, ctx).await
+                    }
+                    _ => Vec::new(),
+                };
                 // The reports are appended last: after the history, which is what the request
                 // before this one started with.
                 let (reports, sessions_open) = match report_plan {
@@ -2115,6 +2155,8 @@ impl LlmAgent {
                         own_order,
                         reports,
                         sessions_open,
+                        offered,
+                        loaders,
                     });
                 }
                 // The words go out while they are written, under an id made here, inside the step, and
@@ -2146,6 +2188,8 @@ impl LlmAgent {
                     own_order,
                     reports,
                     sessions_open,
+                    offered,
+                    loaders,
                 })
             })
             .await?;
@@ -2184,7 +2228,16 @@ impl LlmAgent {
                 own_order: own,
                 reports,
                 sessions_open,
+                offered,
+                loaders,
             }) => {
+                // What the request carried is the truth of the loaded set: every loaded tool it did
+                // not carry is journaled as removed, and the first turn records the loaders that
+                // are still there.
+                state.note_removed(&offered);
+                if !loaders.is_empty() {
+                    state.loaders = loaders;
+                }
                 seen_at = seen.unwrap_or(state.messages.len());
                 own_order = own;
                 if let Some(open) = sessions_open {
@@ -2631,7 +2684,8 @@ impl LlmAgent {
                 Arc::new(state.context.clone()),
             )
             .with_task(state.task())
-            .with_loaded_servers(Arc::from(state.loaded_servers.clone()))
+            .with_loaded(Arc::from(state.loaded.clone()))
+            .with_removed_tools(Arc::from(state.removed_tools.clone()))
         });
         let run = ctx.run_id();
         let cancel = ctx.cancel_token();
@@ -2841,7 +2895,8 @@ impl LlmAgent {
                 SUBAGENT_READ,
             )
             .with_task(state.task().map(Arc::from))
-            .with_loaded_servers(Arc::from(state.loaded_servers.clone()));
+            .with_loaded(Arc::from(state.loaded.clone()))
+            .with_removed_tools(Arc::from(state.removed_tools.clone()));
         let in_history = state
             .messages
             .iter()
@@ -3224,7 +3279,8 @@ impl LlmAgent {
                         kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
                         images: self.image_gate(state),
                         task: state.task().map(Arc::from),
-                        loaded_servers: Arc::from(state.loaded_servers.clone()),
+                        loaded: Arc::from(state.loaded.clone()),
+                        removed_tools: Arc::from(state.removed_tools.clone()),
                     },
                     started,
                 )
@@ -3237,7 +3293,7 @@ impl LlmAgent {
                     answer,
                     repeat_key,
                     plan,
-                    loaded_servers,
+                    loaded,
                     kept,
                     reported,
                     pinned,
@@ -3253,8 +3309,8 @@ impl LlmAgent {
                     if let Some(plan) = plan {
                         state.plan = Some(*plan);
                     }
-                    if !loaded_servers.is_empty() {
-                        state.load_servers(loaded_servers);
+                    if !loaded.is_empty() {
+                        state.load_groups(loaded);
                     }
                     // What the call asked the run to keep, within what the run may keep: the call was
                     // told its room (`ToolCtx::kept_left`), so a result over it was never offered.
@@ -3521,7 +3577,8 @@ impl LlmAgent {
                 kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
                 images: self.image_gate(state),
                 task: state.task().map(Arc::from),
-                loaded_servers: Arc::from(state.loaded_servers.clone()),
+                loaded: Arc::from(state.loaded.clone()),
+                removed_tools: Arc::from(state.removed_tools.clone()),
             };
             let mut one = self.prepare(&facts_of_ctx, context, root, &notes, call, facts);
             match &first {
@@ -3652,7 +3709,7 @@ impl LlmAgent {
                 answer,
                 repeat_key,
                 plan,
-                loaded_servers,
+                loaded,
                 kept,
                 reported,
                 pinned,
@@ -3673,8 +3730,8 @@ impl LlmAgent {
             if let Some(plan) = plan {
                 state.plan = Some(*plan);
             }
-            if !loaded_servers.is_empty() {
-                state.load_servers(loaded_servers);
+            if !loaded.is_empty() {
+                state.load_groups(loaded);
             }
             state.keep_output(kept);
             state.keep_tool_images(kept_images);
@@ -3991,7 +4048,8 @@ impl LlmAgent {
             kept_left,
             images,
             task,
-            loaded_servers,
+            loaded,
+            removed_tools,
             ..
         } = facts;
         let note = self.source_note(notes, &call.name);
@@ -4000,7 +4058,8 @@ impl LlmAgent {
             .tool_ctx(ctx, context, root, notes, &call.id, &call.name)
             .with_note(note.cloned())
             .with_task(task.clone())
-            .with_loaded_servers(Arc::clone(&loaded_servers))
+            .with_loaded(Arc::clone(&loaded))
+            .with_removed_tools(Arc::clone(&removed_tools))
             .with_files_left((MAX_RUN_FILE_BYTES as u64).saturating_sub(files_used))
             .with_kept(kept_left, kept)
             .with_images(
@@ -4020,7 +4079,8 @@ impl LlmAgent {
                     context.cloned().unwrap_or_default(),
                 )
                 .with_task(task.as_deref())
-                .with_loaded_servers(loaded_servers),
+                .with_loaded(loaded)
+                .with_removed_tools(removed_tools),
             )
         });
         Prepared {
@@ -4229,7 +4289,7 @@ impl LlmAgent {
                     std::mem::take(&mut output.reported)
                 };
                 let pinned = output.pinned && !output.is_error;
-                let (message, artifacts, answer, plan, loaded_servers, outcome, kept, kept_images) =
+                let (message, artifacts, answer, plan, loaded, outcome, kept, kept_images) =
                     output_message(
                         ctx,
                         &call.id,
@@ -4260,7 +4320,7 @@ impl LlmAgent {
                     answer,
                     repeat_key,
                     plan,
-                    loaded_servers,
+                    loaded,
                     kept,
                     reported,
                     pinned,
@@ -4548,7 +4608,8 @@ impl LlmAgent {
                 &wait.tool,
             )
             .with_task(state.task().map(Arc::from))
-            .with_loaded_servers(Arc::from(state.loaded_servers.clone()))
+            .with_loaded(Arc::from(state.loaded.clone()))
+            .with_removed_tools(Arc::from(state.removed_tools.clone()))
             .with_files_left(
                 (MAX_RUN_FILE_BYTES as u64).saturating_sub(files_kept(&state.artifacts)),
             )
@@ -4578,7 +4639,7 @@ impl LlmAgent {
                     Self::count_rounds(ctx, state, false).await?;
                 }
                 let used = files_kept(&state.artifacts);
-                let (message, artifacts, answer, plan, loaded_servers, outcome, kept, kept_images) =
+                let (message, artifacts, answer, plan, loaded, outcome, kept, kept_images) =
                     output_message(
                         ctx,
                         &wait.call_id,
@@ -4597,8 +4658,8 @@ impl LlmAgent {
                 if let Some(plan) = plan {
                     state.plan = Some(*plan);
                 }
-                if !loaded_servers.is_empty() {
-                    state.load_servers(loaded_servers);
+                if !loaded.is_empty() {
+                    state.load_groups(loaded);
                 }
                 owed(state, message);
                 Ok(Some(outcome))
@@ -4685,7 +4746,7 @@ async fn output_message(
     Vec<ArtifactRef>,
     Option<Announcement>,
     Option<Box<Plan>>,
-    Vec<String>,
+    Vec<Loaded>,
     StepState,
     Option<Box<KeptOutput>>,
     Vec<KeptImage>,
@@ -4736,10 +4797,10 @@ async fn output_message(
         .filter(|_| !output.is_error)
         .map(|text| Announcement { text, ends_turn });
     let plan = output.plan.take().filter(|_| !output.is_error);
-    let loaded_servers = if output.is_error {
+    let loaded = if output.is_error {
         Vec::new()
     } else {
-        std::mem::take(&mut output.loaded_servers)
+        std::mem::take(&mut output.loaded)
     };
     // The images of a result that failed are not shown: the person's screen and the model read the
     // text, and an image nobody chose to send is not kept.
@@ -4764,7 +4825,7 @@ async fn output_message(
         refs,
         answer,
         plan,
-        loaded_servers,
+        loaded,
         outcome,
         kept,
         kept_images,
@@ -4950,7 +5011,7 @@ impl ToolResult {
             answer: None,
             repeat_key: None,
             plan: None,
-            loaded_servers: Vec::new(),
+            loaded: Vec::new(),
             kept: None,
             reported: Vec::new(),
             pinned: false,
@@ -4969,8 +5030,9 @@ enum ToolResult {
         repeat_key: Option<String>,
         /// The plan the tool returned, from a result that is not an error.
         plan: Option<Box<Plan>>,
-        /// The MCP servers the run has loaded, from a result that is not an error: the whole list.
-        loaded_servers: Vec<String>,
+        /// The groups and tools the run has loaded, from a result that is not an error: the whole
+        /// list.
+        loaded: Vec<Loaded>,
         /// A long output the tool asks the run to keep in its state.
         kept: Option<Box<KeptOutput>>,
         /// The rounds of sessions whose reports the result gives, from a result that is not an
@@ -5781,6 +5843,8 @@ mod failure_tests {
             own_order: Vec::new(),
             reports: Vec::new(),
             sessions_open: None,
+            offered: Vec::new(),
+            loaders: Vec::new(),
         };
         let json = serde_json::to_value(&streamed).unwrap();
         assert_eq!(json["stream"], "run-m0-a1b2c3d4");
@@ -5803,6 +5867,8 @@ mod failure_tests {
             own_order: Vec::new(),
             reports: Vec::new(),
             sessions_open: None,
+            offered: Vec::new(),
+            loaders: Vec::new(),
         };
         assert_eq!(serde_json::to_value(&plain).unwrap(), bare);
 
@@ -5817,6 +5883,8 @@ mod failure_tests {
             own_order: Vec::new(),
             reports: Vec::new(),
             sessions_open: None,
+            offered: Vec::new(),
+            loaders: Vec::new(),
         };
         let json = serde_json::to_value(&noted).unwrap();
         assert_eq!(
@@ -5838,6 +5906,8 @@ mod failure_tests {
             own_order: Vec::new(),
             reports: Vec::new(),
             sessions_open: None,
+            offered: Vec::new(),
+            loaders: Vec::new(),
         };
         let json = serde_json::to_value(&reported).unwrap();
         assert_eq!(json["call"], "run-c0-a1b2c3d4");
@@ -5863,6 +5933,8 @@ mod failure_tests {
                 output: ToolOutput::text("session s: round 1\nreport: done\n"),
             }],
             sessions_open: Some(true),
+            offered: Vec::new(),
+            loaders: Vec::new(),
         };
         let json = serde_json::to_value(&told).unwrap();
         assert_eq!(json["sessions_open"], true);
