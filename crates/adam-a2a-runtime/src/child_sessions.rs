@@ -765,9 +765,14 @@ impl RuntimeTaskBackend {
                         "a start or a close names no taskId".into(),
                     ));
                 }
+                let located = (round.run, round.view, round.context);
+                // A round parked on the model is resumed as a root task is (ADR 0067).
+                if crate::model_park::is_resume(message) {
+                    let task = self.resume(caller, located, message, context_id).await?;
+                    return Ok(Some(self.with_sessions(caller, task).await?));
+                }
                 let mut inbound = (self.inbound)(message).map_err(BackendError::InvalidParams)?;
                 self.named_tier(caller, message, &mut inbound, false)?;
-                let located = (round.run, round.view, round.context);
                 let context = context_id.map(str::to_owned);
                 self.follow_up(caller, located, inbound, task, context)
                     .await?

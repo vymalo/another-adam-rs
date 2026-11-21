@@ -53,14 +53,38 @@ pub const MAX_REFERENCES: usize = 8;
 /// |---|---|
 /// | `SendMessage` (new) | `Runtime::start_with_id` with [`task_id_for`], conversation `<subject>:<context id>` |
 /// | `SendMessage` (new) with `referenceTaskIds` | `Runtime::start_with_id_continuing` from the first reference that qualifies (see below) |
-/// | `SendMessage` with `taskId` | `Runtime::deliver` while `input-required`; and, with `steer/v1` activated, while `submitted` or `working` (see "A message for a running task") |
+/// | `SendMessage` with `taskId` | `Runtime::deliver` while `input-required`, or while the run is parked on the model (`auth-required`, or `working` on a timer); and, with `steer/v1` activated, while `submitted` or `working` (see "A message for a running task") |
+/// | `SendMessage` with `taskId` and `adam.resume: true` in its metadata | `Runtime::deliver` of a wake-up that adds nothing, only while the run is parked on the model (see "A run parked on the model") |
 /// | `submitted` | runnable, nothing committed, no worker holds it |
 /// | `working` | runnable and a worker holds the run's lease (`RunView::claimed`, from the first claim, before the first commit), or committed at least once, or parked on a timer |
-/// | `input-required` | run parked with no timer (`RunView::waiting`); the question comes from [`PromptFn`] |
+/// | `input-required` | run parked with no timer (`RunView::waiting`); the question comes from [`PromptFn`], or the reason of a park on the model |
+/// | `auth-required` | run parked on the model after a refusal of status 401 or 403; the reason is the status message |
 /// | `completed` | `Done`; `output.text` is the status message, `RunView::artifacts` are the task artifacts |
 /// | `failed` | `Failed`; the error is the status message |
 /// | `canceled` | `Failed` with `cancelled: ...` (what `Runtime::cancel` writes) |
 /// | `CancelTask` | `Runtime::cancel` |
+///
+/// # A run parked on the model
+///
+/// A run whose model call was refused, under a provider that parks ([ADR 0067]), keeps its
+/// conversation and waits to make the call again. Its task says so from the run's
+/// `state.model_wait`, with the reason as the status message:
+///
+/// | The park | Task |
+/// |---|---|
+/// | a refusal of status 401 or 403 (timer or not) | `auth-required` |
+/// | until woken (a usage limit reached) | `input-required` |
+/// | on a timer | `working`, with a status message |
+///
+/// A message with the `taskId` of such a task is delivered, timer or not; its text is the person's
+/// turn. A message whose metadata holds `adam.resume: true` is a **resume**: it may have no text, it
+/// wakes the run and adds nothing to the conversation, and a task that is not parked on the model
+/// (a finished or canceled one included) refuses it with `InvalidParams`
+/// ([`NOT_PARKED`](crate::NOT_PARKED)), writing nothing. A resume names its `taskId`. Cancelling
+/// ends the park as it ends any wait. This is a contract, written in
+/// `docs/reference/a2a-server.md`.
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
 ///
 /// # Idempotent submission
 ///
@@ -707,6 +731,44 @@ impl RuntimeTaskBackend {
         Ok(self.said(caller, &view, task))
     }
 
+    /// A resume (`adam.resume: true`, ADR 0067) to the task `task_id`, already located: it wakes a
+    /// run parked on the model and adds nothing to its conversation. Any other task, a finished or
+    /// canceled one included, is refused with [`NOT_PARKED`](crate::NOT_PARKED), and nothing is
+    /// written.
+    pub(crate) async fn resume(
+        &self,
+        caller: &Caller,
+        (run, view, context): (RunId, RunView, String),
+        message: &Message,
+        context_id: Option<&str>,
+    ) -> Result<Task, BackendError> {
+        if context_id.is_some_and(|c| c != context) {
+            return Err(BackendError::InvalidParams(
+                "contextId does not match the task".to_owned(),
+            ));
+        }
+        if !crate::model_park::parked_on_model(&view) {
+            return Err(BackendError::InvalidParams(
+                crate::model_park::NOT_PARKED.to_owned(),
+            ));
+        }
+        match self
+            .runtime
+            .deliver(run, crate::model_park::resume_inbound(message))
+            .await
+        {
+            Ok(()) => {}
+            // It ended between the read and the delivery: it is not parked on the model any more.
+            Err(RuntimeError::Finished { .. }) => {
+                return Err(BackendError::InvalidParams(
+                    crate::model_park::NOT_PARKED.to_owned(),
+                ));
+            }
+            Err(e) => return Err(map_err(e)),
+        }
+        self.woken(caller, run, &context).await
+    }
+
     /// A message to a root context or to a task of the root agent.
     async fn submit_root(
         &self,
@@ -715,6 +777,22 @@ impl RuntimeTaskBackend {
         task_id: Option<String>,
         context_id: Option<String>,
     ) -> Result<Task, BackendError> {
+        // A resume is read before the inbound function, which refuses a message with no text: it
+        // adds nothing, so neither a command nor a tier is read from it.
+        if crate::model_park::is_resume(&message) {
+            let Some(task_id) = task_id else {
+                return Err(BackendError::InvalidParams(
+                    "a resume names the task it resumes (taskId)".to_owned(),
+                ));
+            };
+            let located = self
+                .owned(caller, &task_id)
+                .await?
+                .ok_or_else(|| BackendError::TaskNotFound(task_id.clone()))?;
+            return self
+                .resume(caller, located, &message, context_id.as_deref())
+                .await;
+        }
         let mut inbound = (self.inbound)(&message).map_err(BackendError::InvalidParams)?;
         // A command is expanded here, once, and the expansion is what is stored: a replay never
         // reads the folder again. A name the agent does not serve in the metadata is refused
@@ -795,18 +873,31 @@ impl RuntimeTaskBackend {
         if steering {
             return self.steer(caller, run, &context, inbound, task_id).await;
         }
-        if !view.waiting {
+        // A run parked on the model takes a message, timer or not (ADR 0067): its text is the
+        // person's turn, and the call is made again.
+        if !view.waiting && !crate::model_park::parked_on_model(&view) {
             return Err(BackendError::InvalidParams(format!(
                 "task {task_id} is {state:?} and cannot take a follow-up"
             )));
         }
         self.runtime.deliver(run, inbound).await.map_err(map_err)?;
+        self.woken(caller, run, &context).await
+    }
 
-        // The delivery made the run runnable, so this reads `working`; make
-        // that certain even if the record is read before the commit is visible.
+    /// The task a delivery just woke: the delivery made the run runnable, so this reads `working`;
+    /// make that certain even if the record is read before the commit is visible.
+    async fn woken(
+        &self,
+        caller: &Caller,
+        run: RunId,
+        context: &str,
+    ) -> Result<Task, BackendError> {
         let view = self.view_of(run).await?;
-        let mut task = self.task_of(&view, &context).await;
-        if task.status.state == TaskState::InputRequired {
+        let mut task = self.task_of(&view, context).await;
+        if matches!(
+            task.status.state,
+            TaskState::InputRequired | TaskState::AuthRequired
+        ) {
             task.status.state = TaskState::Working;
             task.status.message = None;
             // A working task carries no totals: they are said when it ends or waits again.

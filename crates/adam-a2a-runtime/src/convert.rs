@@ -61,8 +61,9 @@ pub type InboundFn = Arc<dyn Fn(&Message) -> Result<Inbound, String> + Send + Sy
 /// The default [`PromptFn`]: `state.pending_wait.question` (what
 /// `adam_llm_agent::Conversation` stores while it waits for the user), or
 /// `state.pending_question.question` (what it stored before it could also wait
-/// for a child run, so runs parked by an older build keep their prompt) or,
-/// failing both, a string at `state.question`. A run that waits for a child run
+/// for a child run, so runs parked by an older build keep their prompt) or a
+/// string at `state.question` or, failing those, `state.model_wait.reason` (a run
+/// parked on the model until woken, ADR 0067). A run that waits for a child run
 /// has no question and is `working`, not `input-required`.
 pub fn default_prompt(view: &RunView) -> Option<String> {
     let state = &view.state;
@@ -70,6 +71,7 @@ pub fn default_prompt(view: &RunView) -> Option<String> {
         .pointer("/pending_wait/question")
         .or_else(|| state.pointer("/pending_question/question"))
         .or_else(|| state.get("question"))
+        .or_else(|| state.pointer("/model_wait/reason"))
         .and_then(Value::as_str)
         .map(str::to_owned)
 }
@@ -107,6 +109,7 @@ pub fn default_inbound(message: &Message) -> Result<Inbound, String> {
 /// |---|---|
 /// | runnable, never committed by a worker, no worker holds it (`RunView::claimed`) | `submitted` |
 /// | runnable, never committed by a worker, a worker holds it | `working` |
+/// | parked on the model after a refusal of status 401 or 403 (`state.model_wait`, ADR 0067), timer or not | `auth-required` |
 /// | runnable, or parked on a timer | `working` |
 /// | parked with no timer (`RunView::waiting`) | `input-required` |
 /// | done | `completed` |
@@ -133,6 +136,7 @@ pub fn task_state(view: &RunView) -> TaskState {
                 TaskState::Failed
             }
         }
+        RunStatus::Parked if crate::model_park::needs_auth(view) => TaskState::AuthRequired,
         RunStatus::Parked if view.waiting => TaskState::InputRequired,
         RunStatus::Parked => TaskState::Working,
         // Version 1 is the record as created: no worker has committed yet. Until one holds it, it
@@ -198,7 +202,11 @@ fn a2ui_part(ui: Value) -> Part {
 /// The message that goes with the state, if there is anything to say.
 fn status_text(view: &RunView, state: &TaskState, prompt: &PromptFn) -> Option<String> {
     match state {
-        TaskState::InputRequired => prompt(view),
+        // A run parked on the model says why, whatever the host's prompt reads (ADR 0067).
+        TaskState::InputRequired | TaskState::AuthRequired => {
+            crate::model_park::reason(view).or_else(|| prompt(view))
+        }
+        TaskState::Working => crate::model_park::reason(view),
         TaskState::Completed => view.output.as_ref().and_then(output_text),
         TaskState::Failed => view.error.clone(),
         TaskState::Canceled => view
@@ -706,6 +714,41 @@ mod tests {
             json.contains(r#""timestamp":"2026-01-02T03:04:05.120Z""#),
             "{json}"
         );
+    }
+
+    /// A run parked on the model (ADR 0067): a 401 or 403 is `auth-required`, a park until woken
+    /// `input-required`, a park on a timer `working`, each with the reason; whatever a host's
+    /// prompt says, and only while the run is parked.
+    #[test]
+    fn a_park_on_the_model_says_its_state_and_its_reason() {
+        let parked = |status: u16, waiting: bool| {
+            let mut v = view(RunStatus::Parked);
+            v.waiting = waiting;
+            v.state = json!({"model_wait": {"reason": "why", "status": status, "park": "timer"}});
+            v
+        };
+        let silent: PromptFn = Arc::new(|_| Some("the host's own words".into()));
+        for (v, state) in [
+            (parked(403, false), TaskState::AuthRequired),
+            (parked(401, true), TaskState::AuthRequired),
+            (parked(402, true), TaskState::InputRequired),
+            (parked(503, false), TaskState::Working),
+        ] {
+            assert_eq!(task_state(&v), state);
+            let status = status_of(&v, &silent);
+            assert_eq!(
+                status.message.as_ref().and_then(|m| m.text()),
+                Some("why"),
+                "{state:?}"
+            );
+        }
+        // Woken, it works and says nothing of the park.
+        let mut woken = parked(403, false);
+        woken.status = RunStatus::Runnable;
+        assert_eq!(task_state(&woken), TaskState::Working);
+        assert!(status_of(&woken, &prompt()).message.is_none());
+        // The default prompt reads the reason too.
+        assert_eq!(default_prompt(&parked(402, true)).as_deref(), Some("why"));
     }
 
     #[test]
