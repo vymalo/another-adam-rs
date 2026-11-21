@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use adam_core::{BlobId, RunId, StoreError};
+use adam_core::{BlobId, DynStore, RunId, StoreError, StoreResult};
 
 use crate::agent::Inbound;
 use crate::artifact_ref::{ArtifactRef, FileRef};
@@ -200,6 +200,14 @@ impl Head {
             .map_err(|e| StoreError::InvalidInput(format!("the head does not serialize: {e}")))
     }
 
+    /// Drop every file artifact whose bytes the store does not hold, so the head never names a
+    /// digest that cannot be read. An inherited file whose bytes are gone is left out (and
+    /// logged): a head carries only its digest, so refusing would retry for ever. The other
+    /// artifacts stay.
+    pub(crate) async fn prune_missing_files(&mut self, store: &DynStore) -> StoreResult<()> {
+        drop_missing_files(store, &mut self.artifacts).await
+    }
+
     /// The head as the full v4 envelope a transition reads, and the parts a commit carries from it.
     ///
     /// `agent` is the joined agent state and the transcript is no longer a member (it is in
@@ -271,6 +279,17 @@ impl HeadParts {
             .collect()
     }
 
+    /// This head with every file artifact whose bytes the store does not hold left out: what a
+    /// commit that carries it writes, so it never names a digest that is not there.
+    pub(crate) async fn without_missing_files(&self, store: &DynStore) -> StoreResult<Self> {
+        let mut artifacts = self.artifacts.clone();
+        drop_missing_files(store, &mut artifacts).await?;
+        Ok(Self {
+            artifacts,
+            body: self.body,
+        })
+    }
+
     /// The head a commit that does not split writes: these transcript set and artifacts, with
     /// `env`'s own members — the status the commit carries is on the record, not here — and the
     /// transition's own `added` artifacts merged in (a failed transition keeps what it emitted).
@@ -330,6 +349,28 @@ fn merge_head_artifacts(base: &[HeadArtifact], added: &[Artifact]) -> Vec<HeadAr
         artifacts.push(head);
     }
     artifacts
+}
+
+/// Drop the file artifacts of `artifacts` whose digests the store does not hold; each one is
+/// logged by [`missing_blobs`](crate::blob::missing_blobs).
+async fn drop_missing_files(
+    store: &DynStore,
+    artifacts: &mut Vec<HeadArtifact>,
+) -> StoreResult<()> {
+    let refs = artifacts
+        .iter()
+        .filter_map(|artifact| artifact.file.as_ref())
+        .map(|file| file.digest.clone());
+    let missing = crate::blob::missing_blobs(store, refs).await?;
+    if !missing.is_empty() {
+        artifacts.retain(|artifact| {
+            artifact
+                .file
+                .as_ref()
+                .is_none_or(|file| !missing.contains(&file.digest))
+        });
+    }
+    Ok(())
 }
 
 /// The head's artifacts as the runtime's [`Artifact`], with a file's bytes empty: see

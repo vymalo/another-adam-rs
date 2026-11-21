@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use adam_core::{BlobId, DynStore};
+use adam_core::{BlobId, DynStore, StoreResult};
 use sha2::{Digest as _, Sha256};
 
 use crate::events::{Artifact, ArtifactFile};
@@ -224,6 +224,32 @@ pub(crate) async fn upload_files(store: &DynStore, artifacts: &[Artifact]) -> Ve
         ids.push(id);
     }
     ids
+}
+
+/// The digests among `refs` that the store does not hold, checked once each and logged.
+///
+/// An inherited file whose bytes are gone cannot be stored again: a head carries only its digest,
+/// not its bytes. A commit that carries the file therefore leaves it out instead of refusing for
+/// ever. A store error is returned — whether the bytes are there is unknown, so the commit is
+/// retried rather than dropping an artifact that may still be readable.
+pub(crate) async fn missing_blobs(
+    store: &DynStore,
+    refs: impl IntoIterator<Item = BlobId>,
+) -> StoreResult<HashSet<BlobId>> {
+    let mut missing = HashSet::new();
+    for id in refs {
+        if missing.contains(&id) {
+            continue;
+        }
+        if !store.blob_stored(&id).await? {
+            tracing::warn!(
+                blob = %id,
+                "an inherited file artifact's bytes are not stored; the head leaves it out"
+            );
+            missing.insert(id);
+        }
+    }
+    Ok(missing)
 }
 
 /// What one [`upload_carried`] pass found: the artifacts a carried head may name, and their digests.

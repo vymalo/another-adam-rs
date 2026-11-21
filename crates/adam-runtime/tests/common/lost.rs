@@ -250,9 +250,10 @@ impl Store for LostRows {
     }
 }
 
-/// A store whose `get_blob` answers `None` for one digest and forwards the rest: an inherited
-/// file's bytes that are gone, so a refused split's demotion must not write the state as
-/// zero-byte files (it leaves the run as it is instead).
+/// A store whose blob methods answer as if one digest was purged: `blob_stored` answers `false`
+/// and `get_blob` `None` for it, and everything else forwards. An inherited file's bytes that are
+/// gone, so a refused split's demotion must not write the state as zero-byte files (it leaves the
+/// run as it is instead), and a head that carries the file must leave it out.
 pub struct LostBlob {
     inner: DynStore,
     hidden: BlobId,
@@ -425,6 +426,9 @@ impl Store for LostBlob {
     }
 
     async fn blob_stored(&self, id: &BlobId) -> StoreResult<bool> {
+        if id == &self.hidden {
+            return Ok(false);
+        }
         self.inner.blob_stored(id).await
     }
 
