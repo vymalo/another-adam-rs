@@ -60,7 +60,8 @@ pub use error::EngineError;
 pub use events::{EngineEvent, RunEvents, WithheldFile};
 pub use types::{
     ConversationId, DEFAULT_PAGE_SIZE, Delivered, Firing, FiringQuery, ListQuery, MAX_PAGE_SIZE,
-    Page, RunFile, RunInfo, RunState, Say, Turn,
+    Page, RunFile, RunInfo, RunState, Say, SessionHelper, SessionInfo, SessionState, StartSession,
+    Turn,
 };
 
 use std::sync::Arc;

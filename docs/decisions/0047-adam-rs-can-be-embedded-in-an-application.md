@@ -271,6 +271,16 @@ a fixed id is not needed for that: the file's lock proves the old process is gon
 `migrate`) clears every lease the file holds; so an application runs one engine per SQLite file, since the clearing
 also takes a live engine's leases of the same process.
 
+*Amended 2026-11-21 (#279):* **the engine serves child sessions** (ADR 0045). `adam-assembly` gains the feature
+`sessions`, `child-sessions/v1` alone: `AgentDef::child_sessions` and `Assembly::child_sessions`, over `adam-a2a` and
+`adam-a2a-runtime` without their defaults, so it brings no A2A server, client or TLS stack; `a2a` is `remote`, `sessions`
+and those crates' defaults, so a server build is unchanged, and decision 2's check still holds on `adam-engine`, which
+turns `sessions` on. The engine gives its backend the root's local subagents as helpers, its caller activates the
+extension, and a host starts, lists, talks to and closes a session (`Engine::helpers`, `start_session`, `sessions`,
+`send` to the session's conversation, `close_session`) under `Limits::sessions`, and reads a round as any run (`get`,
+`events`, `files`: `RuntimeTaskBackend::owned_view` now accepts a round of the caller's session). A remote subagent is
+still refused.
+
 ## Decisions the owner confirmed
 
 Confirmed on 2026-11-16, all six as written.

@@ -18,7 +18,7 @@ use crate::engine::Expected;
 /// | `Agent` | the agent definition's own (`Invalid` for a file that does not bind) |
 /// | `NoRuntime`, `Invalid` | `Invalid` |
 /// | `NotFound` | `NotFound` |
-/// | `NotWaiting`, `Finished`, `Stopped`, `WorkerIdInUse` | `Rejected` |
+/// | `NotWaiting`, `Finished`, `Stopped`, `WorkerIdInUse`, `Refused` | `Rejected` |
 /// | `Unavailable` (a store that is down, or a run whose state moved under the call: try again) | `Transient` |
 /// | `Store` | the store's own |
 /// | `Schedules` | the reconcile's own |
@@ -54,6 +54,11 @@ pub enum EngineError {
         /// The run.
         run: RunId,
     },
+    /// A child session's limits or state refuse the call (`child-sessions/v1`): a session too many
+    /// (open or working), a message to a closed session, one past its rounds, or one while its rounds
+    /// already work.
+    #[error("refused: {0}")]
+    Refused(String),
     /// The engine was shut down: nothing would step a run it started now.
     #[error("the engine was shut down")]
     Stopped,
@@ -105,7 +110,8 @@ impl Classify for EngineError {
             Self::NotWaiting { .. }
             | Self::Finished { .. }
             | Self::Stopped
-            | Self::WorkerIdInUse { .. } => ErrorClass::Rejected,
+            | Self::WorkerIdInUse { .. }
+            | Self::Refused(_) => ErrorClass::Rejected,
             Self::Unavailable { .. } => ErrorClass::Transient,
             Self::Store(source) => source.class(),
             Self::Schedules(source) => source.class(),
@@ -232,7 +238,8 @@ mod tests {
             EngineError::NotWaiting { .. }
             | EngineError::Finished { .. }
             | EngineError::Stopped
-            | EngineError::WorkerIdInUse { .. } => ErrorClass::Rejected,
+            | EngineError::WorkerIdInUse { .. }
+            | EngineError::Refused(_) => ErrorClass::Rejected,
             EngineError::Unavailable { .. } => ErrorClass::Transient,
             EngineError::Store(source) => source.class(),
             EngineError::Schedules(source) => source.class(),

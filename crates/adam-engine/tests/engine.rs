@@ -20,7 +20,7 @@ use adam_engine::adam_model::{
 use adam_engine::adam_runtime::{Artifact, REPLAY_EVENTS_PER_RUN, RunEvent, StepState};
 use adam_engine::{
     ConversationId, Delivered, Engine, EngineError, EngineEvent, FiringQuery, Limits, ListQuery,
-    RunEvents, RunInfo, RunState, Say, WithheldFile, default_secrets,
+    RunEvents, RunInfo, RunState, Say, SessionState, StartSession, WithheldFile, default_secrets,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -1704,5 +1704,271 @@ async fn a_host_lists_and_cancels_a_working_firing() {
         RunState::Cancelled
     );
     gate.release.notify_one();
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A host starts, talks to, lists and closes a child session (`child-sessions/v1`, #279), as a
+/// client of the binaries does: the helpers are the local subagents; a session's first round is
+/// in its own conversation and the parent takes no turn; a message to an idle kept-open session is
+/// its next round; `sessions` lists it from the parent; a close ends it, and a closed session takes
+/// no message. An unknown helper is refused, and an agent with no subagent has no helper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_starts_lists_and_closes_a_child_session() {
+    let def = agent(&[
+        ("agent/instructions.md", CHAT),
+        (
+            "agent/subagents/planner.md",
+            "---\ndescription: Plans the work.\n---\nYou plan.\n",
+        ),
+    ]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Hello.")
+        .push_text("Plan one.")
+        .push_text("Plan two.");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), def, model, "m")
+        .start()
+        .await
+        .unwrap();
+    let helpers: Vec<(&str, &str)> = engine
+        .helpers()
+        .iter()
+        .map(|h| (h.name.as_str(), h.description.as_str()))
+        .collect();
+    assert_eq!(helpers, [("planner", "Plans the work.")]);
+
+    let wait = |run: RunId, state: RunState| {
+        let engine = engine.clone();
+        async move {
+            timeout(WAIT, async {
+                loop {
+                    let info = engine.get(run).await.unwrap().expect("the run");
+                    if info.state == state {
+                        return info;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{run} never reached {state:?}"))
+        }
+    };
+    let parent = engine.send(None, Say::new("hi")).await.unwrap();
+    wait(parent.run, RunState::Done).await;
+
+    let unknown = engine
+        .start_session(
+            &parent.conversation,
+            StartSession::new("nobody", "Plan it"),
+            Say::new("plan"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.class(), ErrorClass::Invalid, "{unknown:?}");
+
+    let start = StartSession::new("planner", "Plan the trip").keep_open();
+    let first = engine
+        .start_session(
+            &parent.conversation,
+            start.clone(),
+            Say::with_id("start-1", "make a plan"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.delivered, Delivered::Started);
+    // Sent again, the same start is the session it started.
+    let again = engine
+        .start_session(
+            &parent.conversation,
+            start,
+            Say::with_id("start-1", "make a plan"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (again.delivered, again.run),
+        (Delivered::Repeated, first.run)
+    );
+    assert_ne!(
+        first.conversation, parent.conversation,
+        "a conversation of its own"
+    );
+    assert_eq!(
+        wait(first.run, RunState::Done).await.output.as_deref(),
+        Some("Plan one.")
+    );
+    let parent_runs = engine
+        .list(ListQuery::new().conversation(parent.conversation.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        parent_runs.items.len(),
+        1,
+        "the parent took no turn: {parent_runs:?}"
+    );
+
+    let listed = engine.sessions(&parent.conversation).await.unwrap();
+    let [session] = listed.as_slice() else {
+        panic!("one session: {listed:?}");
+    };
+    assert_eq!(session.conversation, first.conversation);
+    assert_eq!(
+        (session.helper.as_str(), session.description.as_str()),
+        ("planner", "Plan the trip")
+    );
+    assert!(session.keep_open);
+    assert_eq!(session.state, SessionState::Idle);
+    assert_eq!((session.round, session.latest), (1, Some(first.run)));
+
+    let second = engine
+        .send(
+            Some(&first.conversation),
+            Say::with_id("round-2", "and the return"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.delivered, Delivered::Continued);
+    assert_ne!(second.run, first.run);
+    let resent = engine
+        .send(
+            Some(&first.conversation),
+            Say::with_id("round-2", "and the return"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (resent.delivered, resent.run),
+        (Delivered::Repeated, second.run)
+    );
+    assert_eq!(
+        wait(second.run, RunState::Done).await.output.as_deref(),
+        Some("Plan two.")
+    );
+    let rounds = engine
+        .list(ListQuery::new().conversation(first.conversation.clone()))
+        .await
+        .unwrap();
+    assert_eq!(rounds.items.len(), 2, "{rounds:?}");
+
+    // A session's conversation holds no session, and a close goes to a session's conversation.
+    let nested = engine.sessions(&first.conversation).await.unwrap_err();
+    assert_eq!(nested.class(), ErrorClass::Invalid, "{nested:?}");
+    let not_a_session = engine
+        .close_session(&parent.conversation, false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        not_a_session.class(),
+        ErrorClass::Invalid,
+        "{not_a_session:?}"
+    );
+    engine
+        .close_session(&first.conversation, false)
+        .await
+        .unwrap();
+    let closed = engine.sessions(&parent.conversation).await.unwrap();
+    assert_eq!(closed[0].state, SessionState::Closed, "{closed:?}");
+    let refused = engine
+        .send(Some(&first.conversation), Say::new("one more"))
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, EngineError::Refused(_)), "{refused:?}");
+    assert_eq!(refused.class(), ErrorClass::Rejected);
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+
+    let lone = Engine::builder(
+        Arc::new(MemoryStore::new()),
+        chat(),
+        MockModel::new().into_dyn(),
+        "m",
+    )
+    .start()
+    .await
+    .unwrap();
+    assert!(lone.helpers().is_empty());
+    let none = lone
+        .start_session(
+            &parent.conversation,
+            StartSession::new("planner", "Plan it"),
+            Say::new("plan"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(none.class(), ErrorClass::Invalid, "{none:?}");
+    // With no helper a close is refused, never sent to the agent as a message.
+    let closed_nothing = lone
+        .close_session(&first.conversation, false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        closed_nothing.class(),
+        ErrorClass::Invalid,
+        "{closed_nothing:?}"
+    );
+    timeout(WAIT, lone.shutdown()).await.unwrap().unwrap();
+}
+
+/// The host's session limits hold (`Limits::sessions`, #279): with one session open at most, a
+/// second start in the same conversation is refused while the first is open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosts_session_limits_refuse_a_session_too_many() {
+    let def = agent(&[
+        ("agent/instructions.md", CHAT),
+        (
+            "agent/subagents/planner.md",
+            "---\ndescription: Plans the work.\n---\nYou plan.\n",
+        ),
+    ]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Hello.").push_text("Plan one.");
+    let model: DynModel = mock.clone();
+    let mut limits = Limits::default();
+    limits.sessions =
+        adam_engine::adam_runtime::SessionLimits::new(1, 1, 20).expect("limits in bounds");
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), def, model, "m")
+        .limits(limits)
+        .start()
+        .await
+        .unwrap();
+    let parent = engine.send(None, Say::new("hi")).await.unwrap();
+    let first = engine
+        .start_session(
+            &parent.conversation,
+            StartSession::new("planner", "One").keep_open(),
+            Say::new("plan"),
+        )
+        .await
+        .unwrap();
+    // Its round ends and it stays open, idle: `max_open`, not `max_working`, refuses the next.
+    timeout(WAIT, async {
+        while engine
+            .get(first.run)
+            .await
+            .unwrap()
+            .expect("the round")
+            .state
+            != RunState::Done
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first round ends");
+    let second = engine
+        .start_session(
+            &parent.conversation,
+            StartSession::new("planner", "Two"),
+            Say::new("plan again"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&second, EngineError::Refused(why) if why.contains("open")),
+        "{second:?}"
+    );
+    assert_eq!(second.class(), ErrorClass::Rejected);
+    let listed = engine.sessions(&parent.conversation).await.unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].conversation, first.conversation);
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 }
