@@ -76,7 +76,7 @@ amendment is the owner's to make there.
    | `access_tier` | a ceiling for every round | the starter's tier (the parent's, or the person's message), `MAX_ACCESS_TIER` | at most those; refused where the deployment lists no tiers | `TierSource::tier_of` and `Gated` take the minimum with the header's ceiling (`bin/adam-coder/src/tier.rs`) | next model call | 8 |
    | `report_schema` | the round's final answer is one JSON value that matches | none | draft 2020-12, at most 16 KiB, no `$ref` outside itself, compiles; local subagents only | at the final answer: two corrective turns (counted in `max_turns`) with the first three errors, then the round fails `report does not match report_schema` | next round | 9 |
    | `model` | an alias from an allow-list | the subagent file's new `models:` (its `model:` is the default and always allowed), intersected with the deployment's `MODEL_ALIASES` when set | one of that set; never an arbitrary id; refused on a remote subagent | the alias of the run's requests, window and modalities | next round | 11 |
-   | `reasoning_effort` | per request | the deployment's declaration for that alias | one of the values declared; refused when none is | a new `ModelRequest` field, sent by `adam-model-openai` | next model call | 12 |
+   | `reasoning_effort` | per request | the deployment's declaration for that alias | one of the values declared; refused when none is (amended below) | a new `ModelRequest` field, sent by `adam-model-openai` | next model call | 12 |
    | `temperature` | per request | the deployment's declaration for that alias | within the declared range; refused when none is | `ModelRequest.temperature`, set by the loop for the first time | next model call | 12 |
 
    A **remote** (`a2a:`) subagent takes `time_limit`, `max_rounds` and `instructions` (sent ahead of the first message, as
@@ -84,10 +84,12 @@ amendment is the owner's to make there.
    are never removed by `tools` or `deny_tools`.
 
    *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the deployment's declaration is
-   `MODEL_REASONING_EFFORT` (one value), and **unset declares the full closed list**; until `MODEL_ALIASES_FILE` carries
-   the facts per alias (slice 11), the declaration is the deployment's one model. The folder's `reasoning_effort` is a
-   **default within the declared set, not a bound**; a session or a request outside the declared set is refused.
-   `temperature` is unchanged.
+   `MODEL_REASONING_EFFORT` (a comma-separated set; a single value is a one-element set), and **unset declares the full
+   closed list**; until `MODEL_ALIASES_FILE` carries the facts per alias (slice 11), the declaration is the deployment's
+   one model, and a subagent on another alias accepts the full list. The folder's `reasoning_effort` is a **default
+   within the declared set, not a bound**; a session or a request outside the declared set is refused, and a session's
+   value wins over the inherited thread value for that child's calls. A deployment that narrows the set refuses a folder
+   outside it at load (exit 78). `temperature` is unchanged.
 5. **Dropped, each for a reason.**
 
    | Candidate | Why not |
