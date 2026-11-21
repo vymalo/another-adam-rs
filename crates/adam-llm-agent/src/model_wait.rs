@@ -12,9 +12,11 @@ use serde::{Deserialize, Serialize};
 /// The [`Inbound::kind`](adam_runtime::Inbound) of a **resume**: a message that wakes a run parked on
 /// the model and adds nothing to its conversation ([ADR 0067] decision 4). The A2A server delivers
 /// one for a message whose metadata holds `adam.resume: true`; the loop reads none of its payload.
+/// It is the runtime's wake-only kind ([`adam_runtime::RESUME_KIND`]): one that lands while the run
+/// works neither counts as a message that arrived nor reopens a run that finishes.
 ///
 /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
-pub const MODEL_RESUME_KIND: &str = "adam.resume";
+pub const MODEL_RESUME_KIND: &str = adam_runtime::RESUME_KIND;
 
 /// How long parks on a timer in a row may last, from the first of them, unless
 /// [`ModelParking::limit`] says otherwise: 24 hours.
@@ -101,6 +103,18 @@ pub struct ModelWait {
     /// When a park on a timer wakes; `None` for a park until woken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_at: Option<Timestamp>,
+}
+
+/// [`Conversation::model_wait`](crate::Conversation) read leniently: a wait this build cannot read
+/// (a [`ModelPark`] a later build added, a member of another shape) reads as none, so the rest of
+/// the conversation still loads. The run then makes its call when it next steps, which is what a
+/// wake would do.
+pub(crate) fn lenient<'de, D>(deserializer: D) -> Result<Option<ModelWait>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// A model call's failure that parks the run, as the journal records it: the status, the slug and
@@ -252,5 +266,24 @@ mod tests {
             Some(30_000)
         );
         assert_eq!(RecordedPark::of(&ModelError::unreachable()), None);
+    }
+
+    /// A state written by a later build, whose model wait this build cannot read, loads with no
+    /// model wait and everything else intact.
+    #[test]
+    fn a_model_wait_this_build_cannot_read_is_none() {
+        let state = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "go"}]}],
+            "turns": 3,
+            "model_wait": {"reason": "r", "park": "a_later_kind", "parked_since": "2026-11-21T00:00:00Z"},
+        });
+        let conversation: crate::Conversation = serde_json::from_value(state).expect("loads");
+        assert!(conversation.model_wait.is_none());
+        assert_eq!(conversation.turns, 3);
+        let readable = serde_json::json!({
+            "model_wait": {"reason": "r", "park": "timer", "parked_since": "2026-11-21T00:00:00Z"},
+        });
+        let conversation: crate::Conversation = serde_json::from_value(readable).expect("loads");
+        assert_eq!(conversation.model_wait.unwrap().park, ModelPark::Timer);
     }
 }

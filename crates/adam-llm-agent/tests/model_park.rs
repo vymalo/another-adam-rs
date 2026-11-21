@@ -63,36 +63,55 @@ impl Rig {
         configure: impl FnOnce(LlmAgentBuilder) -> LlmAgentBuilder,
     ) -> Self {
         let agent = configure(LlmAgent::builder("llm", model, "test-model")).build();
-        let store: DynStore = Arc::new(MemoryStore::new());
+        let mut rig = Self::build(mock, vec![agent], Arc::new(MemoryStore::new()));
+        rig.spawn();
+        rig
+    }
+
+    /// A runtime over `store` with `agents` registered, and no worker yet ([`spawn`](Self::spawn)).
+    fn build(mock: Arc<MockModel>, agents: Vec<LlmAgent>, store: DynStore) -> Self {
         let clock = ManualClock::new();
-        let rt = Runtime::builder(store.clone())
-            .agent(agent)
+        let mut builder = Runtime::builder(store.clone())
             .clock(clock.clone())
             .event_sink(CollectingSink::new())
             .worker_id("w")
             .poll_interval(Duration::from_millis(10))
             .lease_ttl(Duration::from_secs(10))
-            .retry(RetryPolicy::new(3).with_backoff(Duration::ZERO, Duration::ZERO))
-            .build();
-        let (stop, rx) = oneshot::channel::<()>();
-        let worker = {
-            let rt = rt.clone();
-            tokio::spawn(async move {
-                rt.run_worker(async {
-                    let _ = rx.await;
-                })
-                .await
-                .expect("worker result");
-            })
-        };
+            .retry(RetryPolicy::new(3).with_backoff(Duration::ZERO, Duration::ZERO));
+        for agent in agents {
+            builder = builder.agent(agent);
+        }
         Self {
             store,
             mock,
             clock,
-            rt,
-            stop: Some(stop),
-            worker: Some(worker),
+            rt: builder.build(),
+            stop: None,
+            worker: None,
         }
+    }
+
+    fn spawn(&mut self) {
+        let (stop, rx) = oneshot::channel::<()>();
+        let rt = self.rt.clone();
+        self.worker = Some(tokio::spawn(async move {
+            rt.run_worker(async {
+                let _ = rx.await;
+            })
+            .await
+            .expect("worker result");
+        }));
+        self.stop = Some(stop);
+    }
+
+    /// The times the run's journal recorded for its clock reads (`Ctx::now_journaled`), in order.
+    async fn journaled_nows(&self, run: RunId) -> Vec<Timestamp> {
+        let entries = self.store.journal_list(run).await.expect("journal");
+        entries
+            .into_iter()
+            .filter(|e| e.name == "ctx.now" && e.ok)
+            .map(|e| serde_json::from_value(e.payload).expect("a time"))
+            .collect()
     }
 
     async fn start(&self, conversation: Option<&str>) -> RunId {
@@ -125,7 +144,12 @@ impl Rig {
     ) -> (RunView, Conversation) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let view = self.rt.view(run).await.expect("view").expect("run exists");
+            // A child run may not exist yet.
+            let Some(view) = self.rt.view(run).await.expect("view") else {
+                assert!(Instant::now() < deadline, "the run {run} never started");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            };
             if view.status == RunStatus::Parked {
                 let state = self.state(run).await;
                 if pred(&state) {
@@ -342,11 +366,11 @@ async fn a_message_wakes_a_timer_park_and_its_text_is_added() {
     rig.stop().await;
 }
 
-/// Parks on a timer in a row back off (30 s, then 60 s) and are bounded by the limit from the first
-/// of them: past it the run fails with the last reason.
+/// Parks on a timer in a row back off (30 s, then 60 s, from the journaled time of each) and are
+/// bounded by the limit from the first of them: past it the run fails with the last reason.
 #[tokio::test]
 async fn parks_in_a_row_back_off_and_past_the_limit_the_run_fails() {
-    let rig = Rig::new(ModelParking::new(Duration::from_secs(60)));
+    let rig = Rig::new(ModelParking::new(Duration::from_secs(600)));
     for _ in 0..3 {
         rig.mock
             .push_error(refused(403, Some("lease_expired"), timer(30)));
@@ -354,6 +378,8 @@ async fn parks_in_a_row_back_off_and_past_the_limit_the_run_fails() {
     let run = rig.start(None).await;
     let (view, first) = rig.parked(run, waits_on_timer).await;
     let first = first.model_wait.unwrap();
+    let nows = rig.journaled_nows(run).await;
+    assert_eq!(nows, [first.parked_since], "dated by the journaled clock");
     assert_eq!(
         view.wake_at,
         Some(first.parked_since + span_of(Duration::from_secs(30)))
@@ -365,15 +391,15 @@ async fn parks_in_a_row_back_off_and_past_the_limit_the_run_fails() {
         .await;
     let second = second.model_wait.unwrap();
     assert_eq!(second.parked_since, first.parked_since, "one row of parks");
-    let now = view.wake_at.unwrap() - span_of(Duration::from_secs(60));
-    assert!(
-        now >= first.parked_since + span_of(Duration::from_secs(31)),
-        "the second park waits twice the first: {:?} from {:?}",
+    let nows = rig.journaled_nows(run).await;
+    assert_eq!(nows.len(), 2);
+    assert_eq!(
         view.wake_at,
-        first.parked_since
+        Some(nows[1] + span_of(Duration::from_secs(60))),
+        "the second park waits twice the first"
     );
 
-    rig.clock.advance(Duration::from_secs(61));
+    rig.clock.advance(Duration::from_secs(600));
     let view = rig.failed(run).await;
     let error = view.error.unwrap();
     assert!(
@@ -385,8 +411,152 @@ async fn parks_in_a_row_back_off_and_past_the_limit_the_run_fails() {
     rig.stop().await;
 }
 
-/// A schedule's firing has nobody to wake it: a park until woken fails it with the reason. A park
-/// on a timer still wakes on its own.
+/// A park the provider asks to be longer than the limit wakes at the limit, and the run fails then
+/// if it is refused again: it does not wait a day to fail.
+#[tokio::test]
+async fn a_park_longer_than_the_limit_wakes_at_the_limit() {
+    let rig = Rig::new(ModelParking::new(Duration::from_secs(3600)));
+    for _ in 0..2 {
+        rig.mock
+            .push_error(refused(429, Some("rate_limited"), timer(24 * 3600)));
+    }
+    let run = rig.start(None).await;
+    let (view, state) = rig.parked(run, waits_on_timer).await;
+    let since = state.model_wait.unwrap().parked_since;
+    assert_eq!(
+        view.wake_at,
+        Some(since + span_of(Duration::from_secs(3600))),
+        "clamped to the limit"
+    );
+    rig.clock.advance(Duration::from_secs(3601));
+    let error = rig.failed(run).await.error.unwrap();
+    assert!(error.contains("MODEL_PARK_LIMIT"), "{error}");
+    rig.stop().await;
+}
+
+/// A message to a park on a timer whose call is refused again: the second park of the row keeps
+/// its first time, and the message's words stay in the history for the call after.
+#[tokio::test]
+async fn a_message_to_a_park_refused_again_is_kept_and_the_row_goes_on() {
+    let rig = Rig::new(ModelParking::default());
+    rig.mock
+        .push_error(refused(503, Some("unavailable"), timer(30)))
+        .push_error(refused(503, Some("unavailable"), timer(30)))
+        .push_text("answered");
+    let run = rig.start(None).await;
+    let (_, first) = rig.parked(run, waits_on_timer).await;
+    let first = first.model_wait.unwrap();
+    rig.rt
+        .deliver(run, user_message("still there?"))
+        .await
+        .expect("deliver");
+    let (_, second) = rig
+        .parked(run, |s| s.model_wait.as_ref().is_some_and(|w| w.parks == 2))
+        .await;
+    assert_eq!(
+        second.model_wait.as_ref().unwrap().parked_since,
+        first.parked_since
+    );
+    assert_eq!(
+        second
+            .messages
+            .iter()
+            .map(Message::text)
+            .collect::<Vec<_>>(),
+        ["go", "still there?"]
+    );
+    rig.clock.advance(Duration::from_secs(61));
+    rig.done(run).await;
+    let requests = rig.mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(texts(&requests[2]), ["go", "still there?"], "read once");
+    rig.stop().await;
+}
+
+/// A park until woken and then a park on a timer are two rows: the time a person took to raise a
+/// limit is not counted against the parks on a timer.
+#[tokio::test]
+async fn a_park_until_woken_then_a_timer_park_starts_a_new_row() {
+    let rig = Rig::new(ModelParking::default());
+    rig.mock
+        .push_error(refused(402, Some("over_limit"), Park::UntilWoken))
+        .push_error(refused(403, Some("run_not_bound"), timer(30)))
+        .push_text("answered");
+    let run = rig.start(None).await;
+    let (_, woken) = rig
+        .parked(run, |s| {
+            s.model_wait
+                .as_ref()
+                .is_some_and(|w| w.park == ModelPark::UntilWoken)
+        })
+        .await;
+    let woken = woken.model_wait.unwrap();
+    rig.clock.advance(Duration::from_secs(5 * 3600));
+    rig.rt
+        .deliver(
+            run,
+            Inbound::new(MODEL_RESUME_KIND, json!({})).with_id("r-1"),
+        )
+        .await
+        .expect("deliver");
+    let (_, timed) = rig.parked(run, waits_on_timer).await;
+    let timed = timed.model_wait.unwrap();
+    assert_eq!(timed.parks, 1, "a new row");
+    let nows = rig.journaled_nows(run).await;
+    assert_eq!(nows, [woken.parked_since, timed.parked_since]);
+    assert!(timed.parked_since >= woken.parked_since + span_of(Duration::from_secs(5 * 3600)));
+    rig.clock.advance(Duration::from_secs(31));
+    rig.done(run).await;
+    rig.stop().await;
+}
+
+/// A crash between the model call's step and the commit of the park: the transition is replayed
+/// from the journal, which says the same refusal and the same time, so the park is the same (no
+/// second call, no non-determinism).
+#[tokio::test]
+async fn a_park_replayed_after_a_lost_commit_is_the_same_park() {
+    use adam_store_testkit::fault::{FaultyStore, Method};
+
+    let faulty = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+    let store: DynStore = faulty.clone();
+    let mock = Arc::new(MockModel::new());
+    let model: DynModel = mock.clone();
+    let agent = LlmAgent::builder("llm", model, "test-model")
+        .model_parking(ModelParking::default())
+        .build();
+    let mut rig = Rig::build(mock, vec![agent], store);
+    rig.mock
+        .push_error(refused(403, Some("run_not_bound"), timer(30)))
+        .push_text("answered");
+    let run = rig.start(None).await;
+    // The first commit of the run is the park's; it is lost, and the worker replays the step.
+    faulty.fail_run(Method::CommitRun, run, 1);
+    rig.spawn();
+    let (view, state) = rig.parked(run, waits_on_timer).await;
+    assert_eq!(
+        faulty.injected(Method::CommitRun),
+        1,
+        "the commit was lost once"
+    );
+    assert_eq!(rig.mock.requests().len(), 1, "the replay calls no model");
+    let wait = state.model_wait.unwrap();
+    assert_eq!(
+        rig.journaled_nows(run).await,
+        [wait.parked_since],
+        "one clock read"
+    );
+    assert_eq!(
+        view.wake_at,
+        Some(wait.parked_since + span_of(Duration::from_secs(30)))
+    );
+    rig.clock.advance(Duration::from_secs(31));
+    rig.done(run).await;
+    rig.stop().await;
+}
+
+/// A schedule's firing has nobody to wake it: a park until woken fails it with the reason, and so
+/// does a refusal of status 401 or 403 (nothing binds a firing yet). Its other parks on a timer still
+/// wake on their own.
 #[tokio::test]
 async fn an_unattended_run_fails_on_a_park_until_woken_and_waits_on_a_timer() {
     let firing = format!("{}nightly:1", adam_runtime::SCHEDULE_CONVERSATION_PREFIX);
@@ -404,9 +574,20 @@ async fn an_unattended_run_fails_on_a_park_until_woken_and_waits_on_a_timer() {
     assert!(error.contains("nobody can wake it"), "{error}");
     rig.stop().await;
 
+    // Nothing binds a firing at the gateway yet: a refusal of 401 or 403 fails it too.
+    for (status, slug) in [(403, Some("run_not_bound")), (401, None)] {
+        let rig = Rig::new(ModelParking::default());
+        rig.mock.push_error(refused(status, slug, timer(30)));
+        let run = rig.start(Some(&format!("{firing}:{status}"))).await;
+        let error = rig.failed(run).await.error.unwrap();
+        assert!(error.contains(&format!("HTTP {status}")), "{error}");
+        assert!(error.contains("nothing binds a firing"), "{error}");
+        rig.stop().await;
+    }
+
     let rig = Rig::new(ModelParking::default());
     rig.mock
-        .push_error(refused(403, Some("run_not_bound"), timer(30)))
+        .push_error(refused(503, Some("unavailable"), timer(30)))
         .push_text("answered");
     let run = rig.start(Some(&format!("{firing}:b"))).await;
     rig.parked(run, waits_on_timer).await;
@@ -563,22 +744,288 @@ async fn nothing_of_a_refusals_body_reaches_the_journal() {
     }
 }
 
-/// The time a run waits on the model is said in `parked_since`, a journaled time.
+/// A point a model call waits at until the test lets it go.
+#[derive(Default)]
+struct Gate {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+/// Wraps the mock: the `hold_on`-th call (0-based) waits at the gate.
+struct GateModel {
+    inner: Arc<MockModel>,
+    hold_on: usize,
+    calls: std::sync::atomic::AtomicUsize,
+    gate: Arc<Gate>,
+}
+
+impl GateModel {
+    async fn hold(&self) {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == self.hold_on {
+            self.gate.reached.notify_one();
+            self.gate.release.notified().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl adam_model::ModelClient for GateModel {
+    async fn complete(&self, req: ModelRequest) -> Result<adam_model::ModelResponse, ModelError> {
+        self.hold().await;
+        self.inner.complete(req).await
+    }
+
+    async fn stream(
+        &self,
+        req: ModelRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<adam_model::ModelDelta, ModelError>>,
+        ModelError,
+    > {
+        self.hold().await;
+        self.inner.stream(req).await
+    }
+}
+
+/// A resume that lands while the woken call is in flight says nothing to the run: it is a wake-up
+/// only, so the run does not take another turn after its answer. Two requests, and the run is
+/// done once.
 #[tokio::test]
-async fn the_first_park_of_a_row_is_dated_by_the_journaled_clock() {
-    let rig = Rig::new(ModelParking::default());
+async fn a_resume_that_lands_during_the_woken_call_adds_no_turn() {
+    let mock = Arc::new(MockModel::new());
+    let gate = Arc::new(Gate::default());
+    let model: DynModel = Arc::new(GateModel {
+        inner: mock.clone(),
+        hold_on: 1,
+        calls: Default::default(),
+        gate: gate.clone(),
+    });
+    let rig = Rig::over(mock, model, |b| b.model_parking(ModelParking::default()));
     rig.mock
-        .push_error(refused(403, Some("run_not_bound"), timer(30)));
-    let before = rig.clock_now();
+        .push_error(refused(402, Some("over_limit"), Park::UntilWoken))
+        .push_text("answered");
     let run = rig.start(None).await;
-    let (_, state) = rig.parked(run, waits_on_timer).await;
-    let since = state.model_wait.unwrap().parked_since;
-    assert!(since >= before, "{since} before {before}");
+    rig.parked(run, |s| s.model_wait.is_some()).await;
+    rig.rt
+        .deliver(
+            run,
+            Inbound::new(MODEL_RESUME_KIND, json!({})).with_id("r-1"),
+        )
+        .await
+        .expect("deliver");
+    tokio::time::timeout(Duration::from_secs(20), gate.reached.notified())
+        .await
+        .expect("the woken call is made");
+    rig.rt
+        .deliver(
+            run,
+            Inbound::new(MODEL_RESUME_KIND, json!({})).with_id("r-2"),
+        )
+        .await
+        .expect("a resume during the call is delivered");
+    gate.release.notify_one();
+    let view = rig.done(run).await;
+    assert_eq!(text_of(&view).as_deref(), Some("answered"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let view = rig.rt.view(run).await.unwrap().unwrap();
+    assert_eq!(view.status, RunStatus::Done, "not reopened");
+    assert_eq!(rig.mock.requests().len(), 2, "no turn after the answer");
     rig.stop().await;
 }
 
-impl Rig {
-    fn clock_now(&self) -> Timestamp {
-        adam_runtime::Clock::now(&self.clock)
+/// The parent's subagent tool: starts the child `helper` and waits for it.
+struct Spawn;
+
+#[async_trait::async_trait]
+impl adam_llm_agent::Tool for Spawn {
+    fn spec(&self) -> adam_model::ToolSpec {
+        adam_model::ToolSpec {
+            name: "sub".into(),
+            description: "hands the work to the helper".into(),
+            parameters: json!({"type": "object"}),
+        }
     }
+    async fn call(
+        &self,
+        ctx: &adam_llm_agent::ToolCtx,
+        _args: Value,
+    ) -> Result<adam_llm_agent::ToolOutput, adam_llm_agent::ToolError> {
+        let run = ctx.start_child("helper", "go").await?;
+        Err(adam_llm_agent::ToolError::AwaitRun { run })
+    }
+}
+
+/// Answers a text of the size asked, so a history reaches its budget.
+struct Big;
+
+#[async_trait::async_trait]
+impl adam_llm_agent::Tool for Big {
+    fn spec(&self) -> adam_model::ToolSpec {
+        adam_model::ToolSpec {
+            name: "big".into(),
+            description: "answers a text of the size asked".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn call(
+        &self,
+        _ctx: &adam_llm_agent::ToolCtx,
+        args: Value,
+    ) -> Result<adam_llm_agent::ToolOutput, adam_llm_agent::ToolError> {
+        let n = args["n"].as_u64().unwrap_or(10) as usize;
+        let tag = args["tag"].as_str().unwrap_or("t");
+        Ok(adam_llm_agent::ToolOutput::text(format!(
+            "{tag}:{}",
+            "x".repeat(n)
+        )))
+    }
+}
+
+fn tool_call(id: &str, name: &str, args: Value) -> adam_model::ToolCall {
+    adam_model::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args,
+        ..Default::default()
+    }
+}
+
+/// A parent `llm` with the subagent tool and a child `helper` with `big`, on one scripted model,
+/// both parking on the model.
+fn family(max_history_tokens: u32) -> Rig {
+    let mock = Arc::new(MockModel::new());
+    let model: DynModel = mock.clone();
+    let parent = LlmAgent::builder("llm", model.clone(), "test-model")
+        .tool(Spawn)
+        .model_parking(ModelParking::default())
+        .build();
+    let child = LlmAgent::builder("helper", model, "test-model")
+        .tool(Big)
+        .limits(adam_llm_agent::Limits {
+            max_history_tokens,
+            ..adam_llm_agent::Limits::default()
+        })
+        .model_parking(ModelParking::default())
+        .build();
+    let mut rig = Rig::build(mock, vec![parent, child], Arc::new(MemoryStore::new()));
+    rig.spawn();
+    rig
+}
+
+/// A subagent's run parked until woken would strand its task: nothing wakes a child. It fails
+/// naming the reason, and the parent goes on with an error result for the call.
+#[tokio::test]
+async fn a_subagent_refused_until_woken_fails_and_its_parent_goes_on() {
+    let rig = family(0);
+    rig.mock
+        .push_tool_calls(vec![tool_call("c1", "sub", json!({}))])
+        .push_error(refused(402, Some("over_limit"), Park::UntilWoken))
+        .push_text("the helper could not work");
+    let run = rig.start(None).await;
+    let view = rig.done(run).await;
+    assert_eq!(text_of(&view).as_deref(), Some("the helper could not work"));
+    let child = adam_runtime::child_run_id(run, "c1");
+    let child = rig.rt.view(child).await.unwrap().expect("the child");
+    assert_eq!(child.status, RunStatus::Failed);
+    let error = child.error.unwrap();
+    assert!(
+        error.contains("the model gateway's limit is reached (HTTP 402 over_limit)"),
+        "{error}"
+    );
+    assert!(error.contains("a subagent's"), "{error}");
+    let requests = rig.mock.requests();
+    assert_eq!(requests.len(), 3);
+    let told = requests[2]
+        .messages
+        .iter()
+        .find_map(|m| match m {
+            Message::Tool {
+                call_id,
+                content,
+                is_error,
+                ..
+            } if call_id == "c1" => Some((content.clone(), *is_error)),
+            _ => None,
+        })
+        .expect("the call's result");
+    assert!(told.1, "an error result: {told:?}");
+    assert!(told.0.contains("limit is reached"), "{told:?}");
+    rig.stop().await;
+}
+
+/// A run parked on its summary call reads the messages that woke it, keeping their words for after
+/// the summary: a child, which the runtime looks at every minute, is not stepped again (and its
+/// summary not asked for) before its own wake.
+#[tokio::test]
+async fn a_summary_parked_with_a_message_is_not_stepped_before_its_wake() {
+    let rig = family(1200);
+    let busy = || refused(503, Some("unavailable"), timer(600));
+    rig.mock
+        .push_tool_calls(vec![tool_call("c1", "sub", json!({}))])
+        .push_tool_calls(vec![tool_call(
+            "b0",
+            "big",
+            json!({"n": 1200, "tag": "b0"}),
+        )])
+        .push_tool_calls(vec![tool_call(
+            "b1",
+            "big",
+            json!({"n": 1200, "tag": "b1"}),
+        )])
+        .push_tool_calls(vec![tool_call(
+            "b2",
+            "big",
+            json!({"n": 1200, "tag": "b2"}),
+        )])
+        .push_tool_calls(vec![tool_call(
+            "b3",
+            "big",
+            json!({"n": 1200, "tag": "b3"}),
+        )])
+        .push_error(busy())
+        .push_error(busy())
+        .push_text("SUMMARY")
+        .push_text("helper done")
+        .push_text("all done")
+        .push_text("spare");
+    let run = rig.start(None).await;
+    let child = adam_runtime::child_run_id(run, "c1");
+    let (_, first) = rig.parked(child, waits_on_timer).await;
+    assert_eq!(first.model_wait.unwrap().parks, 1);
+    rig.rt
+        .deliver(child, user_message("one more thing"))
+        .await
+        .expect("deliver");
+    let (_, parked) = rig
+        .parked(child, |s| {
+            s.model_wait.as_ref().is_some_and(|w| w.parks == 2)
+        })
+        .await;
+    assert_eq!(
+        parked
+            .deferred
+            .iter()
+            .map(Message::text)
+            .collect::<Vec<_>>(),
+        ["one more thing"],
+        "the words wait for the summary"
+    );
+    assert_eq!(rig.rt.view(child).await.unwrap().unwrap().pending_inbox, 0);
+    let made = rig.mock.requests().len();
+    // The runtime's looks at the child come every minute: none of them steps it.
+    for _ in 0..3 {
+        rig.clock.advance(Duration::from_secs(61));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(rig.mock.requests().len(), made, "no call before the wake");
+    rig.clock.advance(Duration::from_secs(1200));
+    let view = rig.done(run).await;
+    assert_eq!(text_of(&view).as_deref(), Some("all done"));
+    let child = rig.state(child).await;
+    assert!(
+        child.messages.iter().any(|m| m.text() == "one more thing"),
+        "read after the summary"
+    );
+    rig.stop().await;
 }

@@ -490,7 +490,18 @@ pub struct Conversation {
     /// existed, and not written while `None`.
     ///
     /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// A wait this build cannot read (a kind of park a later build added) reads as `None`, and the
+    /// rest of the state still loads.
+    ///
+    /// **Breaking:** a new public field of a struct that is not `#[non_exhaustive]`: a
+    /// `Conversation` built with a struct literal outside the workspace needs it (or
+    /// `..Default::default()`).
+    #[serde(
+        default,
+        deserialize_with = "crate::model_wait::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub model_wait: Option<crate::ModelWait>,
     /// User messages that arrived while tool results were still owed. They are
     /// appended once the last owed result is in (a user message between an

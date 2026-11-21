@@ -1518,13 +1518,17 @@ impl LlmAgentBuilder {
 ///   wakes on its own after 30 s, doubling at each park in a row up to [`MAX_MODEL_BACKOFF`](crate::MAX_MODEL_BACKOFF), and
 ///   never sooner than the provider asked (`Retry-After`). Parks on a timer in a row are bounded by
 ///   [`ModelParking::limit`] from the first of them, on the journaled clock: past it the run fails
-///   with the last reason. A timer counts against a child run's time limit, as any timer does.
+///   with the last reason, and no wait goes past it. A timer counts against a child run's time
+///   limit, as any timer does.
 /// * **Until woken** (a usage limit reached): the run waits like a question, with no timer and its
-///   deadline paused, and never fails on its own. A run nobody can wake, a schedule's firing
-///   ([`is_unattended`]), fails instead.
+///   deadline paused, and never fails on its own. A run nobody can wake fails instead: a schedule's
+///   firing ([`is_unattended`]), and a local subagent's run (a child that is no session's round),
+///   whose parent then gets an error result. A firing also fails on a refusal of status 401 or 403,
+///   since nothing binds a firing at the gateway yet.
 /// * **Waking.** A message wakes either kind: its text is the person's turn, added before the call. A
-///   message of kind [`MODEL_RESUME_KIND`] wakes it and adds nothing. A cancel ends the park as it
-///   ends any wait.
+///   message of kind [`MODEL_RESUME_KIND`] wakes it and adds nothing (and one that lands while the
+///   run works is no arrival). A run parked on its summary call takes its inbox, the words kept in
+///   [`Conversation::deferred`] for after the summary. A cancel ends the park as it ends any wait.
 ///
 /// The journal, the run's error and what a front shows hold the reason, the status and the slug,
 /// never a header, a body or a credential.
@@ -1766,6 +1770,19 @@ impl LlmAgent {
         inbox: Vec<Inbound>,
         admitted: &HashMap<String, Vec<Item>>,
     ) -> Absorbed {
+        self.absorb_inbox_into(state, inbox, admitted, false)
+    }
+
+    /// [`absorb_inbox`](Self::absorb_inbox), with every message's words kept in
+    /// [`Conversation::deferred`] when `defer`, whatever calls are owed: a run parked on its summary
+    /// call reads them after the summary, which is asked for again from the history as it was.
+    fn absorb_inbox_into(
+        &self,
+        state: &mut Conversation,
+        inbox: Vec<Inbound>,
+        admitted: &HashMap<String, Vec<Item>>,
+        defer: bool,
+    ) -> Absorbed {
         let mut texts = Vec::new();
         for inbound in inbox {
             // A message the run has read is not read again: the orchestration layer sends the same
@@ -1859,7 +1876,7 @@ impl LlmAgent {
                     content: parts_of(&text, &items),
                 }
             };
-            if state.pending_calls.is_empty() {
+            if state.pending_calls.is_empty() && !defer {
                 state.messages.push(message);
             } else {
                 state.deferred.push(message);
@@ -1869,6 +1886,40 @@ impl LlmAgent {
             waiting: false,
             refusals,
         }
+    }
+
+    /// The inbox of a run that parks on its summary call (ADR 0067): taken, the wake-ups and notices
+    /// dropped, a request to close its session noted, and each message's words kept in
+    /// [`Conversation::deferred`], read once the summary is made.
+    async fn absorb_while_parked(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+    ) -> Result<(), AgentError> {
+        let inbox: Vec<Inbound> = ctx
+            .take_inbox()
+            .into_iter()
+            .filter(|i| {
+                !matches!(
+                    i.kind.as_str(),
+                    CHILD_REPORTED_KIND | MODEL_RESUME_KIND | RUN_FINISHED_KIND
+                )
+            })
+            .collect();
+        let (closes, inbox): (Vec<_>, Vec<_>) = inbox
+            .into_iter()
+            .partition(|i| i.kind == SESSION_CLOSE_KIND);
+        if !closes.is_empty()
+            && let Some(header) = &mut state.session
+        {
+            header.closed = true;
+        }
+        if inbox.is_empty() {
+            return Ok(());
+        }
+        let admitted = self.admit_images(ctx, state, &inbox).await?;
+        self.absorb_inbox_into(state, inbox, &admitted, true);
+        Ok(())
     }
 
     /// What the run admits as images from now on: the gate for this model, and what the history
@@ -2050,11 +2101,29 @@ impl LlmAgent {
         let detail = detail_of(reason, status, slug.as_deref());
         let previous = state.model_wait.take();
         let run = ctx.run_id();
+        let unattended = is_unattended(ctx.conversation_id(), Some(&state.context));
+        // A schedule's firing is bound at no gateway yet (ADR 0067 decision 6): its refusals of
+        // status 401 or 403 cannot be cured by waiting, and fail it.
+        if unattended && matches!(status, Some(401 | 403)) {
+            tracing::info!(%run, %detail, "the model refused a firing's call as unauthenticated: it fails");
+            return Ok(Some(Flow::Fail(format!(
+                "model call failed: {detail}; a schedule started this run, and nothing binds a firing at the model gateway"
+            ))));
+        }
         let Some(at_least) = timer else {
-            if is_unattended(ctx.conversation_id(), Some(&state.context)) {
+            if unattended {
                 tracing::info!(%run, %detail, "the model refused the call, and nobody can wake this run: it fails");
                 return Ok(Some(Flow::Fail(format!(
                     "model call failed: {detail}; a schedule started this run, so nobody can wake it"
+                ))));
+            }
+            // A local subagent's run (a child that is no session's round) is woken by nobody: a
+            // resume reaches its task, not the child, until S8b-2b forwards one. Its parent is told
+            // the call failed, and goes on.
+            if state.root_run.is_some() && state.session.is_none() {
+                tracing::info!(%run, %detail, "the model refused a subagent's call, and nothing wakes a subagent: it fails");
+                return Ok(Some(Flow::Fail(format!(
+                    "model call failed: {detail}; this run is a subagent's, so nobody can wake it"
                 ))));
             }
             let now = ctx.now_journaled().await?;
@@ -2090,7 +2159,10 @@ impl LlmAgent {
             ))));
         }
         let wait = backoff(parks, at_least);
-        let wake_at = now + adam_core::time::span_of(wait);
+        // Never past the limit: a run asked to wait longer than it may wakes at the limit, and fails
+        // then if it is refused again.
+        let wake_at = (now + adam_core::time::span_of(wait))
+            .min(parked_since + adam_core::time::span_of(self.model_parking.limit));
         tracing::info!(%run, %detail, parks, wait_secs = wait.as_secs(), "the model refused the call: the run waits on a timer");
         state.model_wait = Some(ModelWait {
             reason: reason.to_owned(),
@@ -5702,6 +5774,12 @@ impl Agent for LlmAgent {
         match self.compact_if_due(ctx, &mut state, &output_id_of).await? {
             Compacted::Made => return Ok(Transition::Continue(state)),
             Compacted::Parked(flow) => {
+                // What arrived is read now, its words kept for after the summary: a parked run with
+                // messages left in its inbox would be stepped again by every look of the runtime
+                // (a child's or a run with a deadline), making the summary call each time.
+                if !matches!(flow, Flow::Fail(_)) {
+                    self.absorb_while_parked(ctx, &mut state).await?;
+                }
                 return Ok(match flow {
                     Flow::Sleep(wake_at) => Transition::Park {
                         state,

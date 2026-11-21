@@ -705,20 +705,34 @@ for `MODEL_AUTH=injector`).
 |---|---|---|
 | When | the provider said `Park::OnTimer`, or the endpoint cannot be reached | the provider said `Park::UntilWoken` (a usage limit reached) |
 | The run | parked with `wake_at`: 30 s, doubling at each park in a row, at most 15 min (`MAX_MODEL_BACKOFF`), at least what the provider asked | parked with no timer, like a question: its deadline is paused |
-| Ends | on its own; past `ModelParking::limit` (`MODEL_PARK_LIMIT`, 24 h) from the first park of the row, on the journaled clock, the run fails with the last reason | never on its own; a schedule's firing (`is_unattended`) fails instead |
+| Ends | on its own; past `ModelParking::limit` (`MODEL_PARK_LIMIT`, 24 h) from the first park of the row, on the journaled clock, the run fails with the last reason. A wait longer than what is left of the limit ends at the limit | never on its own; a schedule's firing (`is_unattended`) and a local subagent's run (a child that is no session's round: nothing wakes it until ADR 0067 slice S8b-2b forwards a resume) fail instead, and the parent gets an error result for its call |
 | Woken by | its timer, a message (its text is the person's turn), a resume | a message, a resume |
+
+A schedule's firing also fails on a refusal of status 401 or 403: nothing binds a firing at the gateway yet (ADR 0067
+decision 6). Its other timer parks wake on their own. A subagent's timer parks stay, bounded by the limit and the child's
+time limit; the task's root shows no reason for them yet (S8b-2b adds the notice).
 
 The conversation is kept as it was before the call and `Conversation::model_wait` says why (`reason`, `status`, `slug`,
 `park`, `parked_since`, `parks`, `wake_at`). When the run wakes the **same call** is made again (a new journal position,
 so it is called); the summary call of a compaction parks and is asked for again the same way (its step says `waiting`
-with the reason). A message of kind `MODEL_RESUME_KIND` (`adam.resume`) wakes the run and adds nothing. The first call
+with the reason), and the messages that woke it are read with their words kept in `Conversation::deferred`, after
+the summary: a parked run never keeps an inbox, which the runtime's looks at a child would step every minute. A message of
+kind `MODEL_RESUME_KIND` (`adam.resume`, the runtime's wake-only `RESUME_KIND`) wakes the run and adds nothing; one that
+lands while the run works is no message that arrived and reopens nothing. The first call
 that is answered clears the wait. A cancel ends the park. `ModelError::ModelLocked` is no park: the run fails naming the
 model. A provider that does not park (`StaticBearer`) fails as before. The journal holds the reason's status and slug
 (`park` in the failure's record), never a header, a body or a credential.
 
-Tests: `tests/model_park.rs` (each kind, the backoff, the limit, a message, a resume, an unattended run, an unreachable
-endpoint, `ModelLocked`, `StaticBearer`'s errors, a cancel, and nothing of a problem document's body in the journal through
-`adam-model-openai` against a mock server), `tests/compaction.rs` `a_refused_summary_parks_the_run_and_is_asked_for_again`.
+**Breaking:** `Conversation::model_wait` is a new public field of a struct that is not `#[non_exhaustive]`: a literal
+outside the workspace needs it. A wait this build cannot read loads as none (`ModelPark` gains a kind in a later build).
+
+Tests: `tests/model_park.rs` (each kind, the backoff by the journaled times, the limit and a wake clamped to it, a message,
+one refused again, a resume, a resume during the woken call adding no turn, a row that changes kind, a replay after a lost
+commit, an unattended run, a subagent's park until woken, a parked summary with a message not stepped before its wake, an
+unreachable endpoint, `ModelLocked`, `StaticBearer`'s errors, a cancel, and nothing of a problem document's body in the
+journal through `adam-model-openai` against a mock server), `tests/compaction.rs`
+`a_refused_summary_parks_the_run_and_is_asked_for_again`, and `src/model_wait.rs` (the backoff, the reasons, a wait that
+cannot be read).
 
 Model failures are classified by `adam_model::ModelError` and journaled as a
 record of `retryable`, the flattened message (`report`, so the chain is printed
