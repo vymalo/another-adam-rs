@@ -1775,6 +1775,37 @@ mod cases {
                 .contains("gave up after 3 attempts of `fetch`")
         );
         assert_eq!(count(&calls), 3);
+
+        // A plain transient error with a hint is a rate limit: a policy that retries only
+        // transient errors does not retry it.
+        let name = uniq("classes-hint");
+        let agent = fn_agent(
+            &name,
+            step_fn(|_ctx, _state| {
+                async move {
+                    Err(
+                        AgentError::transient_after("slow down", Duration::from_millis(1))
+                            .with_retry(
+                                "fetch",
+                                RetryPolicy::new(5).with_retry_on(adam_runtime::RetryClasses::of(
+                                    [adam_error::ErrorClass::Transient],
+                                )),
+                            ),
+                    )
+                }
+                .boxed()
+            }),
+        );
+        let rt = runtime(&store, &agent);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        let error = failed.error.expect("error");
+        assert!(
+            error.contains("the policy of `fetch` does not retry rate-limited"),
+            "{error}"
+        );
     }
 
     /// A key's policy is recorded at its first failure: code that names another policy for a later
