@@ -11,6 +11,7 @@
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
@@ -52,6 +53,47 @@ pub enum AfterRejection {
     /// It would not: the call fails with the endpoint's answer.
     GiveUp,
 }
+
+/// What the endpoint answered when it refused a call (a status of 400 or above), as a provider is
+/// asked about it ([`ModelCredentials::parks`], [ADR 0067] decision 3). It holds no body and no
+/// header: the slug is the only part of the body that is read, and only from a problem document.
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Refusal {
+    /// The status code (`403`).
+    pub status: u16,
+    /// The problem type's slug (`run_not_bound`): the last path segment of the `type` member of an
+    /// `application/problem+json` body (RFC 9457), when there was one.
+    pub slug: Option<String>,
+    /// The `Retry-After` header, when there was one.
+    pub retry_after: Option<Duration>,
+}
+
+/// Whether a refused call parks its run, and how it wakes ([`ModelCredentials::parks`]).
+///
+/// Closed on purpose: whoever parks a run handles every way of waking it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Park {
+    /// Not a park: the call fails with the error it has without a park (`Auth` for a `401`, and so on).
+    No,
+    /// Park, and make the same call again after at least this long.
+    OnTimer(Duration),
+    /// Park until something outside the run wakes it (a person, the orchestrator).
+    UntilWoken,
+}
+
+/// The first wait of a park on a timer, when the endpoint says no longer one: the first step of the
+/// agent's backoff ([ADR 0067] decision 4).
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+pub const FIRST_PARK: Duration = Duration::from_secs(30);
+
+/// The slug of a refusal that says the model is not allowed at all
+/// ([`ModelError::ModelLocked`] for every provider, [ADR 0067] decision 7).
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+pub const MODEL_LOCKED_SLUG: &str = "model_locked";
 
 /// The headers of one call. Names are plain; values are secrets, never shown by `Debug`.
 #[derive(Default, Clone)]
@@ -122,6 +164,16 @@ pub trait ModelCredentials: Send + Sync + 'static {
         let _ = (call, rejection);
         AfterRejection::GiveUp
     }
+
+    /// The endpoint refused a call (a status of 400 or above): whether the run parks on it
+    /// ([ADR 0067](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+    /// decision 3). The default is [`Park::No`]: the call fails as it always has, so a wrong key is
+    /// a failed task, not a run that waits for ever. Only a provider whose refusals are cured
+    /// outside the run ([`InjectedRun`]) parks. Asked after [`rejected`](Self::rejected) gave up.
+    fn parks(&self, refusal: &Refusal) -> Park {
+        let _ = refusal;
+        Park::No
+    }
 }
 
 /// A shared, type-erased [`ModelCredentials`].
@@ -135,6 +187,10 @@ impl<T: ModelCredentials + ?Sized> ModelCredentials for Arc<T> {
 
     async fn rejected(&self, call: CredentialRequest<'_>, rejection: &Rejection) -> AfterRejection {
         (**self).rejected(call, rejection).await
+    }
+
+    fn parks(&self, refusal: &Refusal) -> Park {
+        (**self).parks(refusal)
     }
 }
 
@@ -184,6 +240,19 @@ pub const RUN_HEADER: &str = "X-Run-Id";
 /// A call that names no run is refused with [`ModelError::InvalidRequest`] before anything is sent:
 /// there is no fallback to a key.
 ///
+/// Its refusals park the run ([`parks`](ModelCredentials::parks)), by the problem type's slug:
+///
+/// | Slug | Park |
+/// |---|---|
+/// | `unauthenticated`, `run_not_bound`, `lease_expired` | [`Park::OnTimer`]`(`[`FIRST_PARK`]`)` |
+/// | `over_limit` | [`Park::UntilWoken`] |
+/// | `rate_limited`, `unavailable` | [`Park::OnTimer`] of the longer of [`FIRST_PARK`] and `Retry-After` |
+/// | none, on a `401` or `403` | [`Park::OnTimer`]`(`[`FIRST_PARK`]`)`, as `unauthenticated` (an edge's own denial may carry no problem body, *unverified*) |
+/// | `model_locked`, any other slug, no slug on any other status | [`Park::No`] |
+///
+/// A known slug decides whatever the status; `model_locked` is [`ModelError::ModelLocked`], which
+/// the client gives for every provider.
+///
 /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InjectedRun;
@@ -206,6 +275,27 @@ impl ModelCredentials for InjectedRun {
             _ => Err(ModelError::invalid_request(
                 "a model call through the injector names no run",
             )),
+        }
+    }
+
+    fn parks(&self, refusal: &Refusal) -> Park {
+        let at_least_retry_after = || {
+            Park::OnTimer(
+                refusal
+                    .retry_after
+                    .map_or(FIRST_PARK, |after| after.max(FIRST_PARK)),
+            )
+        };
+        match refusal.slug.as_deref() {
+            Some("unauthenticated" | "run_not_bound" | "lease_expired") => {
+                Park::OnTimer(FIRST_PARK)
+            }
+            Some("over_limit") => Park::UntilWoken,
+            Some("rate_limited" | "unavailable") => at_least_retry_after(),
+            // `model_locked` is no park (the client makes it `ModelLocked`), nor a slug it does not know.
+            Some(_) => Park::No,
+            None if matches!(refusal.status, 401 | 403) => Park::OnTimer(FIRST_PARK),
+            None => Park::No,
         }
     }
 }
@@ -342,6 +432,95 @@ mod tests {
             )
             .await;
         assert_eq!(after, AfterRejection::GiveUp);
+    }
+
+    fn refusal(status: u16, slug: Option<&str>, retry_after: Option<u64>) -> Refusal {
+        Refusal {
+            status,
+            slug: slug.map(str::to_owned),
+            retry_after: retry_after.map(Duration::from_secs),
+        }
+    }
+
+    /// ADR 0067 decision 3, row by row.
+    #[test]
+    fn the_injector_parks_by_the_table() {
+        let timer = |secs| Park::OnTimer(Duration::from_secs(secs));
+        let table = [
+            (refusal(401, Some("unauthenticated"), None), timer(30)),
+            (refusal(403, Some("run_not_bound"), None), timer(30)),
+            (refusal(403, Some("lease_expired"), None), timer(30)),
+            // A known slug decides, whatever the status or a Retry-After with it.
+            (refusal(403, Some("run_not_bound"), Some(600)), timer(30)),
+            (refusal(402, Some("over_limit"), None), Park::UntilWoken),
+            (
+                refusal(402, Some("over_limit"), Some(600)),
+                Park::UntilWoken,
+            ),
+            (refusal(429, Some("rate_limited"), None), timer(30)),
+            (refusal(429, Some("rate_limited"), Some(5)), timer(30)),
+            (refusal(429, Some("rate_limited"), Some(30)), timer(30)),
+            (refusal(429, Some("rate_limited"), Some(120)), timer(120)),
+            (refusal(503, Some("unavailable"), None), timer(30)),
+            (refusal(503, Some("unavailable"), Some(1)), timer(30)),
+            (refusal(503, Some("unavailable"), Some(90)), timer(90)),
+            (refusal(403, Some("model_locked"), None), Park::No),
+            // A 401 or a 403 with no slug is `unauthenticated`.
+            (refusal(401, None, None), timer(30)),
+            (refusal(403, None, None), timer(30)),
+            (refusal(403, None, Some(600)), timer(30)),
+            // Anything else is no park.
+            (refusal(401, Some("invalid_token"), None), Park::No),
+            (refusal(400, None, None), Park::No),
+            (refusal(402, None, None), Park::No),
+            (refusal(404, None, None), Park::No),
+            (refusal(429, None, Some(120)), Park::No),
+            (refusal(500, None, None), Park::No),
+            (refusal(503, None, Some(90)), Park::No),
+        ];
+        for (refusal, park) in table {
+            assert_eq!(InjectedRun::new().parks(&refusal), park, "{refusal:?}");
+        }
+        assert_eq!(FIRST_PARK, Duration::from_secs(30));
+        assert_eq!(MODEL_LOCKED_SLUG, "model_locked");
+    }
+
+    /// The default is no park: a wrong key fails as before (ADR 0058 decision 3), and an `Arc`
+    /// forwards the provider's own answer.
+    #[test]
+    fn the_other_providers_never_park() {
+        let shared: DynCredentials = Arc::new(StaticBearer::new(SecretString::from("sk-test")));
+        let injected: DynCredentials = Arc::new(InjectedRun::new());
+        for refusal in [
+            refusal(401, Some("unauthenticated"), None),
+            refusal(403, Some("run_not_bound"), None),
+            refusal(402, Some("over_limit"), None),
+            refusal(429, Some("rate_limited"), Some(120)),
+            refusal(503, Some("unavailable"), Some(90)),
+            refusal(401, None, None),
+        ] {
+            assert_eq!(
+                StaticBearer::new(SecretString::from("sk-test")).parks(&refusal),
+                Park::No
+            );
+            assert_eq!(RenewingCredentials::new().parks(&refusal), Park::No);
+            assert_eq!(shared.parks(&refusal), Park::No);
+            assert_eq!(
+                Arc::new(shared.clone()).parks(&refusal),
+                Park::No,
+                "an Arc of an Arc"
+            );
+            assert_eq!(
+                injected.parks(&refusal),
+                InjectedRun::new().parks(&refusal),
+                "an Arc forwards"
+            );
+        }
+        assert_ne!(
+            injected.parks(&refusal(401, None, None)),
+            Park::No,
+            "the forwarding is not the default"
+        );
     }
 
     #[tokio::test]
