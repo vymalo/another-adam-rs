@@ -143,8 +143,25 @@ Three things are missing in adam today:
    starts a new row, so the time a person took to raise a limit is not counted against `MODEL_PARK_LIMIT`. A resume
    names its `taskId` (one with none is `InvalidParams`), is read before the inbound function, and may have **no
    part** at all (the server lets such a message through); its text, if any, is not read. A message to a run parked
-   on its compaction's summary call is read once the summary is made. `MODEL_PARK_LIMIT` is whole seconds, or a number
-   with `s`, `m`, `h` or `d`, from 60 s to 30 d.
+   on its compaction's summary call is read once the summary is made: the run takes its inbox when it parks there, the
+   words kept for after the summary, so no message keeps a parked run being stepped. `MODEL_PARK_LIMIT` is whole
+   seconds, or a number with `s`, `m`, `h` or `d`, from 60 s to 30 d, and a park never waits past it: a wait longer than
+   what is left of the limit ends at the limit, where a refusal fails the run.
+
+   *Amended 2026-11-21 (S8b-2a review):*
+   * **A resume is a wake-up only.** It is delivered as `adam_runtime::RESUME_KIND`, which a run that works or finishes
+     does not count as a message that arrived, so a resume that lands during the woken call never adds a turn. A resume
+     is accepted only by a run that is **parked** on the model: one a message or a resume just woke, making its call
+     again, is working and answers `NOT_PARKED`.
+   * **A local subagent fails on a park until woken.** Nothing wakes a child until S8b-2b forwards a resume (decision
+     5), and its deadline is paused, so its whole task would wait for ever: a child run that is no session's round
+     fails with the reason, as an unattended run does, and its parent's model gets an error result. A child's timer
+     parks stay, bounded by `MODEL_PARK_LIMIT` and its time limit; the root shows no reason for them until S8b-2b.
+   * **An unattended run fails on a refusal of status 401 or 403** too, timer or not: nothing binds a firing at the
+     gateway yet (decision 6), so waiting cures nothing. Its other timer parks (`rate_limited`, `unavailable`, a gateway
+     that cannot be reached) still wake on their own.
+   * A model wait this build cannot read (a park kind a later build adds) loads as none, and the rest of the state with
+     it.
 5. **A child run.** A local subagent's refusal parks the child the same way, and its parent waits on it as on any child.
    * **The parent learns of it** by a notice from the child's park, as it learns of a child's reports
      (`ChildReport::from_notice`, `crates/adam-runtime/src/child.rs`), and keeps the reason with its pending child.

@@ -164,10 +164,10 @@ client is told: never a header, a body or a credential.
 
 | The message | Answer |
 |---|---|
-| with the `taskId` of a parked task, timer or not | delivered: its text is the person's turn, added before the call is made again; the answer is the task, `working` |
+| with the `taskId` of a parked task, timer or not | delivered: its text is the person's turn, added before the call is made again (for a run parked on its history's summary, after the summary is made); the answer is the task, `working` |
 | with `adam.resume: true` in its `metadata` and the `taskId` of a parked task | a **resume**: it wakes the run and adds **nothing** to the conversation. It may have no text and no part. The answer is the task, `working` |
-| a resume to any other task: one that asks a question, works, has finished or was canceled | `-32602` (`InvalidParams`), "the task is not parked on the model"; nothing is written. A resume never answers a question |
-| a resume with no `taskId` | `-32602` |
+| a resume to any other task: one that asks a question, works (a run a message or a resume just woke, making its call again, included), has finished or was canceled | `-32602` (`InvalidParams`), "the task is not parked on the model"; nothing is written. A resume never answers a question |
+| a resume with no `taskId`, in a root context or a session's | `-32602`, "a resume names the task it resumes (taskId)" |
 | `CancelTask` | ends the park, as it ends any wait |
 
 A resume is authenticated as any message and cures nothing by itself: the call it repeats goes through the gateway, and a
@@ -177,7 +177,11 @@ run still refused parks again.
 the gateway asked (`Retry-After`). Parks on a timer in a row last at most `MODEL_PARK_LIMIT` (24 hours by default, from
 the first): past it the task **fails** with the last reason. A timer park counts against a child run's time limit. A park
 until woken never fails on its own and **pauses the run's deadline**, as a question does. A schedule's firing has nobody
-to wake it: a refusal that would wait until woken fails it.
+to wake it: a refusal that would wait until woken fails it, and so does a refusal of status 401 or 403, since nothing binds a
+firing at the gateway yet. A subagent's run is woken by nobody either (a resume reaches its task, not the child, until a
+later slice forwards one): a refusal that would wait until woken fails the child with the reason, and the parent's model
+gets an error result for the call. A subagent's park on a timer stays, bounded by `MODEL_PARK_LIMIT` and its time limit;
+the root's task shows no reason for it yet. A wait longer than what is left of `MODEL_PARK_LIMIT` ends at the limit.
 
 ## A new task that continues a finished one
 
