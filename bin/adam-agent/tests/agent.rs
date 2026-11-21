@@ -2247,8 +2247,7 @@ async fn the_deployments_model_profiles_reach_the_agents_request_and_refuse_a_ba
     parts.profiles = profiles(r#"["low"]"#);
     let error = build(def_of(&folder), None, Some(parts))
         .await
-        .err()
-        .expect("high is not one of the model's levels");
+        .expect_err("high is not one of the model's levels");
     let AgentError::Assembly(error) = &error else {
         panic!("{error}");
     };
