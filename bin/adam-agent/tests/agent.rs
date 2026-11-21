@@ -19,7 +19,7 @@ use adam_agent::{
 };
 use adam_core::{DynStore, MemoryStore};
 use adam_mcp_testkit::TestHttpServer;
-use adam_model::{DynModel, MockModel, ToolCall};
+use adam_model::{DynModel, MockModel, ReasoningEffort, ToolCall};
 use adam_runtime::Runtime;
 use adam_service::{Agents, RuntimeOptions, ServeError, Service};
 use common::{
@@ -65,6 +65,7 @@ fn worker(model: DynModel, mcp: McpPolicy) -> WorkerParts<'static> {
     WorkerParts {
         model,
         alias: "test-model",
+        profiles: adam_model::ModelProfiles::default(),
         mcp,
         options: options(),
         step_io: adam_llm_agent::StepIo::default(),
@@ -2209,6 +2210,61 @@ async fn the_deployments_parallel_limit_reaches_the_agent_and_the_file_only_lowe
     });
     assert_eq!(limit(&folder, 6).await, 2, "the file lowers it");
     assert_eq!(limit(&folder, 1).await, 1, "and never raises it");
+}
+
+/// `MODEL_ALIASES_FILE`'s profiles reach the agent through `WorkerParts`: the folder's
+/// `reasoning_effort` is checked against the model's profile, and the request asks for it. A value
+/// the model does not take is a startup error naming the agent.
+#[tokio::test]
+async fn the_deployments_model_profiles_reach_the_agents_request_and_refuse_a_bad_effort() {
+    let folder = chat();
+    edit_instructions(&folder, |t| {
+        t.replacen("limits:", "reasoning_effort: high\nlimits:", 1)
+    });
+    let profiles = |efforts: &str| {
+        adam_model::ModelProfiles::parse_json(&format!(
+            r#"{{"profiles": {{"test-model": {{"reasoningEfforts": {efforts}, "reasoningWire": "reasoning_effort"}}}}}}"#
+        ))
+        .expect("valid profiles")
+    };
+
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Hi.");
+    let model: DynModel = mock.clone();
+    let mut parts = worker(model, McpPolicy::default());
+    parts.profiles = profiles(r#"["low", "high"]"#);
+    let agents = build(def_of(&folder), None, Some(parts)).await.unwrap();
+    let service = service_over(agents, &store());
+    let started = Worker::start(&service);
+    ask(&service, "hi").await;
+    started.stop().await;
+    assert_eq!(
+        mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::High),
+        "the folder's value, checked against the model's profile"
+    );
+
+    let model: DynModel = Arc::new(MockModel::new());
+    let mut parts = worker(model, McpPolicy::default());
+    parts.profiles = profiles(r#"["low"]"#);
+    let error = build(def_of(&folder), None, Some(parts))
+        .await
+        .expect_err("high is not one of the model's levels");
+    let AgentError::Assembly(error) = &error else {
+        panic!("{error}");
+    };
+    let adam::AssemblyError::ReasoningEffort {
+        origin,
+        effort,
+        model,
+        ..
+    } = &**error
+    else {
+        panic!("{error}");
+    };
+    assert_eq!(origin.agent, "chat");
+    assert_eq!(effort, "high");
+    assert_eq!(model, "test-model");
 }
 
 // ------------------------------------------------------------------ S0: the lean first request

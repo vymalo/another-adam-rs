@@ -9,11 +9,11 @@ use adam_llm_agent::{
     DEFAULT_MAX_PARALLEL, DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder,
     MAX_PARALLEL_LIMIT, SESSION_TOOLS, StepIo, ToolSource,
 };
-use adam_model::DynModel;
+use adam_model::{DynModel, ModelProfiles, ReasoningEffort};
 use adam_runtime::{RuntimeBuilder, SessionLimits};
 
 use crate::def::{Node, Remote};
-use crate::error::{AliasProblem, Error, Origin};
+use crate::error::{AliasProblem, EffortSource, Error, Origin};
 #[cfg(feature = "remote")]
 use crate::remote_session::RemoteRoundAgent;
 use crate::scrub::{Scrub, Scrubbed};
@@ -35,6 +35,7 @@ pub struct BoundDef {
     state: Vec<ApplyState>,
     sources: Vec<DynToolSource>,
     aliases: Option<Vec<String>>,
+    profiles: ModelProfiles,
     wait_poll: Option<Duration>,
     max_parallel: Option<usize>,
     session_limits: SessionLimits,
@@ -79,6 +80,7 @@ impl BoundDef {
             state: Vec::new(),
             sources: Vec::new(),
             aliases: None,
+            profiles: ModelProfiles::default(),
             wait_poll: None,
             max_parallel: None,
             session_limits,
@@ -140,6 +142,17 @@ impl BoundDef {
         S: Into<String>,
     {
         self.aliases = Some(aliases.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// The deployment's per-model profiles (ADR 0063, ADR 0064): what each model takes as a
+    /// reasoning effort and which preset it starts from. [`model`](Self::model) resolves each
+    /// agent's default effort from its folder, its `model_preset`, the profile and the profile's
+    /// preset, and refuses a value the model does not take. Without them no model has a profile, so
+    /// an agent that sets an effort is refused, and one that sets none sends none.
+    #[must_use]
+    pub fn model_profiles(mut self, profiles: ModelProfiles) -> Self {
+        self.profiles = profiles;
         self
     }
 
@@ -231,6 +244,9 @@ impl BoundDef {
     ///
     /// * [`Error::ModelAlias`] for an alias that is empty, has whitespace, or is not one of
     ///   [`model_aliases`](Self::model_aliases);
+    /// * [`Error::UnknownModelPreset`], [`Error::InvalidReasoningEffort`] or
+    ///   [`Error::ReasoningEffort`] when the effort an agent resolves to is not one of its model's
+    ///   levels ([`model_profiles`](Self::model_profiles));
     /// * [`Error::Build`] when a tool needs state that [`state`](Self::state) did not give.
     pub fn model(self, model: DynModel, alias: impl Into<String>) -> Result<Assembly, Error> {
         let default_alias = alias.into();
@@ -248,7 +264,8 @@ impl BoundDef {
                 (ModelRef::Inherit, None) => default_alias.clone(),
             };
             self.check_alias(&origin, &alias)?;
-            agents.push(self.build(node, &origin, &model, &alias)?);
+            let effort = self.default_effort(node, &origin, &alias)?;
+            agents.push(self.build(node, &origin, &model, &alias, effort)?);
             info.push(AgentInfo {
                 name: node.name.clone(),
                 parent: node
@@ -258,6 +275,7 @@ impl BoundDef {
                 description: node.description.clone(),
                 file: node.file.clone(),
                 model_alias: alias.clone(),
+                reasoning_effort: effort,
                 prompt: node.prompt.clone(),
                 tools: node.tools.iter().map(|(name, _)| name.clone()).collect(),
                 skills: node.skills.clone(),
@@ -326,6 +344,75 @@ impl BoundDef {
         }
     }
 
+    /// The effort the agent's model calls ask for by default (ADR 0063 decision 4, ADR 0064
+    /// decision 3): its `reasoning_effort`, else the preset its `model_preset` names, else the
+    /// profile's own `reasoningEffort`, else the profile's base preset. Every value must be one of
+    /// the model's levels; a model with no profile takes none.
+    fn default_effort(
+        &self,
+        node: &Node,
+        origin: &Origin,
+        alias: &str,
+    ) -> Result<Option<ReasoningEffort>, Error> {
+        let profile = self.profiles.profile(alias);
+        let allowed: &[ReasoningEffort] = profile
+            .and_then(|p| p.reasoning_efforts.as_deref())
+            .unwrap_or(&[]);
+        let preset = match node.model_preset.as_deref() {
+            Some(name) => match self.profiles.preset(name) {
+                Some(preset) => Some(preset),
+                None => {
+                    let known: Vec<String> = self.profiles.presets.keys().cloned().collect();
+                    return Err(Error::UnknownModelPreset {
+                        origin: origin.clone(),
+                        preset: name.to_owned(),
+                        suggestion: closest(name, known.iter().map(String::as_str))
+                            .map(str::to_owned),
+                        known,
+                    });
+                }
+            },
+            None => None,
+        };
+        let chosen = if let Some(word) = &node.reasoning_effort {
+            let effort = word.parse::<ReasoningEffort>().map_err(|source| {
+                Error::InvalidReasoningEffort {
+                    origin: origin.clone(),
+                    source,
+                }
+            })?;
+            Some((effort, EffortSource::Folder))
+        } else if let Some(effort) = preset.and_then(|p| p.reasoning_effort) {
+            Some((
+                effort,
+                EffortSource::Preset(node.model_preset.as_deref().unwrap_or_default().to_owned()),
+            ))
+        } else if let Some(effort) = profile.and_then(|p| p.reasoning_effort) {
+            Some((effort, EffortSource::Profile))
+        } else {
+            self.profiles
+                .preset_of(alias)
+                .and_then(|p| p.reasoning_effort)
+                .map(|effort| (effort, EffortSource::Profile))
+        };
+        let Some((effort, set_by)) = chosen else {
+            return Ok(None);
+        };
+        if !allowed.contains(&effort) {
+            let allowed: Vec<String> = allowed.iter().map(|e| e.as_str().to_owned()).collect();
+            return Err(Error::ReasoningEffort {
+                origin: origin.clone(),
+                effort: effort.as_str().to_owned(),
+                set_by,
+                model: alias.to_owned(),
+                suggestion: closest(effort.as_str(), allowed.iter().map(String::as_str))
+                    .map(str::to_owned),
+                allowed,
+            });
+        }
+        Ok(Some(effort))
+    }
+
     /// The tool as the agent gets it: a session tool is scrubbed when the deployment gave a scrub.
     fn guarded(&self, name: &str, tool: &DynTool) -> DynTool {
         match &self.scrub {
@@ -356,11 +443,13 @@ impl BoundDef {
         origin: &Origin,
         model: &DynModel,
         alias: &str,
+        effort: Option<ReasoningEffort>,
     ) -> Result<LlmAgent, Error> {
         let mut builder = LlmAgent::builder(node.name.clone(), Arc::clone(model), alias)
             .instructions(node.prompt.clone())
             .limits(node.limits)
-            .max_parallel(self.parallel_of(node));
+            .max_parallel(self.parallel_of(node))
+            .reasoning_effort(effort);
         if let Some(every) = self.wait_poll {
             builder = builder.wait_poll(every);
         }
@@ -409,6 +498,10 @@ pub struct AgentInfo {
     pub file: PathBuf,
     /// The gateway alias its model calls use.
     pub model_alias: String,
+    /// The reasoning effort its model calls ask for by default, resolved from its folder, its
+    /// `model_preset`, the model profile and the profile's preset (ADR 0063 decision 4), or `None`
+    /// when none of them sets one.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// The system prompt the model sees: the instructions with the vars substituted, then the
     /// instructions of its **eager** MCP servers, then the skills catalog and the preloaded skills.
     /// A server with a `when` adds its section to a run, when the run loads it.

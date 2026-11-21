@@ -111,6 +111,13 @@ pub const MAX_CONTEXT_BYTES: usize = 256 * 1024;
 /// (`access-tier/v1`): `{"tier": "plan" | "edits" | "auto" | "bypass"}`.
 pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
 
+/// The context key under which a message carries the reasoning effort it activated
+/// (`reasoning/v1`, ADR 0063): `{"effort": "none" | "minimal" | "low" | "medium" | "high" |
+/// "xhigh" | "max"}`. The newest message's value is the run's effort from the next model call;
+/// a continuing task and a child run inherit it. A value that is not that shape is ignored here:
+/// the front refuses it before anything is written.
+pub const REASONING_EFFORT_CONTEXT_KEY: &str = "vymalo.reasoningEffort";
+
 /// The context key under which a message says **who it was sent for** (`thread-tools/v1`): the
 /// thread's addressed agent, `{"caller": "main"}`, or an agent another agent asked, `{"caller":
 /// "ask:<n>", ..}`, read from the claims of the grant's token. A run of an asked agent has no person
@@ -118,14 +125,16 @@ pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
 pub const CALLER_CONTEXT_KEY: &str = "vymalo.caller";
 
 /// The context keys that carry a **limit on the agent**: the access tier the person picked, who the
-/// message was sent for, and that nobody answers the run (`adam_runtime::UNATTENDED_CONTEXT_KEY`). A message always sets them, even when the rest of its context is
-/// over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large catalog next to a `plan` tier would
-/// lift the limit), and a child run starts with the ones its parent has
+/// message was sent for, the reasoning effort it activated, and that nobody answers the run
+/// (`adam_runtime::UNATTENDED_CONTEXT_KEY`). A message always sets them, even when the rest of its
+/// context is over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large catalog next to a `plan`
+/// tier would lift the limit), and a child run starts with the ones its parent has
 /// ([`ToolCtx::start_child`](crate::ToolCtx::start_child)). Each value is at most
 /// [`MAX_PROTECTED_VALUE_BYTES`]; a larger one is ignored.
 pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[
     ACCESS_TIER_CONTEXT_KEY,
     CALLER_CONTEXT_KEY,
+    REASONING_EFFORT_CONTEXT_KEY,
     adam_runtime::UNATTENDED_CONTEXT_KEY,
 ];
 

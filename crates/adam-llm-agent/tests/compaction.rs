@@ -15,7 +15,7 @@ use adam_llm_agent::{
 };
 use adam_model::{
     DynModel, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
-    ToolCall, ToolChoice, ToolSpec, Usage,
+    ReasoningEffort, ToolCall, ToolChoice, ToolSpec, Usage,
 };
 use adam_runtime::{
     CollectingSink, ManualClock, RetryPolicy, RunEvent, RunView, Runtime, child_run_id,
@@ -435,6 +435,28 @@ async fn a_long_run_is_summarised_once_and_keeps_the_prefix_after() {
         requests.iter().all(|r| r.run == Some(run.to_string())),
         "{:?}",
         requests.iter().map(|r| &r.run).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn the_summary_asks_for_no_reasoning_effort_while_the_turns_do() {
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        b.reasoning_effort(Some(ReasoningEffort::High))
+    });
+    script_one_compaction(&rig.mock, "S");
+    let run = rig.start().await;
+    let (requests, _) = rig.finish(run).await;
+    let (turns, summaries) = split(&requests);
+    assert_eq!(summaries.len(), 1);
+    assert!(
+        turns
+            .iter()
+            .all(|r| r.reasoning_effort == Some(ReasoningEffort::High)),
+        "every turn asks for the agent's default"
+    );
+    assert!(
+        summaries.iter().all(|r| r.reasoning_effort.is_none()),
+        "a summary is not a reasoning choice"
     );
 }
 

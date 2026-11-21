@@ -704,6 +704,11 @@ pub(crate) struct Node {
     pub(crate) file: PathBuf,
     pub(crate) description: Option<String>,
     pub(crate) model: ModelRef,
+    /// `reasoning_effort` of the agent's file (ADR 0063): the level its model calls ask for by
+    /// default, as written. The assembly checks it against the model profile's levels.
+    pub(crate) reasoning_effort: Option<String>,
+    /// `model_preset` of the agent's file (ADR 0064): the named preset its model calls start from.
+    pub(crate) model_preset: Option<String>,
     pub(crate) prompt: String,
     pub(crate) tools: Vec<(String, DynTool)>,
     pub(crate) limits: Limits,
@@ -948,6 +953,8 @@ impl Walk<'_> {
                 .model
                 .clone()
                 .unwrap_or(ModelRef::Inherit),
+            reasoning_effort: manifest.frontmatter.reasoning_effort.clone(),
+            model_preset: manifest.frontmatter.model_preset.clone(),
             prompt,
             tools,
             limits: limits(manifest.frontmatter.limits.as_ref()),

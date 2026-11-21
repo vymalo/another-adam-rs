@@ -19,7 +19,7 @@ instructions + a model + a toolset. It is served over A2A by
 | Item | What |
 |---|---|
 | `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
-| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.build()` |
+| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.reasoning_effort(Option<ReasoningEffort>)` (the level every turn asks for unless the run's context names one: see *Reasoning effort*), `.build()` |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*); it also splits and joins the conversation exactly like `LlmAgent` (`AgentStarter::split`/`join`), so a run it starts is written with a head and a body, not left in the v4 format |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to the helper", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) and `read_answer(call_id, args, ui, payload) -> AnswerCheck` (`Accept`, `Read(text)`, `Refuse(Refusal)` or `End(Refusal)`; the default accepts: reads the answer to the tool's own question before the model does; see *The answer is read by the tool that asked*) |
@@ -141,10 +141,20 @@ change of worker keeps it, and a run that continues another starts with the one 
 (`Conversation::continued`; the new message's keys then win). Two bounds: the whole context is at most
 `MAX_CONTEXT_BYTES` (256 KiB of JSON; a message that would take it over has its context dropped, with a warning,
 and is still read for its text, **but for the keys of `PROTECTED_CONTEXT_KEYS`**, today `ACCESS_TIER_CONTEXT_KEY`
-(`vymalo.accessTier`), `CALLER_CONTEXT_KEY` (`vymalo.caller`, who the message was sent for) and `adam_runtime::UNATTENDED_CONTEXT_KEY` (`adam.unattended`, nobody answers the run: a firing of a schedule, ADR 0060): a limit on the agent is never
+(`vymalo.accessTier`), `CALLER_CONTEXT_KEY` (`vymalo.caller`, who the message was sent for),
+`REASONING_EFFORT_CONTEXT_KEY` (`vymalo.reasoningEffort`, the level the message activated, ADR 0063) and `adam_runtime::UNATTENDED_CONTEXT_KEY` (`adam.unattended`, nobody answers the run: a firing of a schedule, ADR 0060): a limit on the agent is never
 lost to a large context, does not count toward the bound, and a value over `MAX_PROTECTED_VALUE_BYTES` is ignored; and the keys of `PER_MESSAGE_CONTEXT_KEYS`, today `RENDERER_OFFER_CONTEXT_KEY` (`vymalo.a2ui.renderer`, what the renderer offers this turn), are **deleted** then, so an earlier message's offer never stands for this one's), and **an entry that is an object with an `expiresAt` (RFC 3339) is removed once
 that time has passed**, at the start of the next step (`drop_expired_context`): a credential the sender put there
 does not stay in the store after it stops working. (A run parked for hours still holds it until it next steps.)
+
+**Reasoning effort.** `ModelRequest::reasoning_effort` is set on every model turn from the run's
+`vymalo.reasoningEffort` context (`{"effort": "<level>"}`, ADR 0063), else from
+`LlmAgentBuilder::reasoning_effort` (what the agent folder, its `model_preset` or its model profile
+resolved to), else left absent, which sends nothing. The newest message wins from the agent's next
+step, a continuing task and a child run inherit it, and the compaction/summary call always sends
+`None`. The front that accepts `reasoning/v1` checks the level against the model's profile before
+anything is written; the loop ignores a value that is not a level. Whether and how the level reaches
+the provider is the client's (the model profile's `reasoningWire`).
 
 **The question's interface.** `ToolError::NeedsInput { question, ui }` may carry an interface, an array of A2UI
 messages; it is kept with the question in `PendingQuestion::ui` (`/pending_wait/ui` in the stored state), where an

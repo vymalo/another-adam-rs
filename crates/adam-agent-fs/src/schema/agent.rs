@@ -407,6 +407,17 @@ pub struct AgentFrontmatter {
     /// The model alias, or `inherit`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
+    /// The reasoning level this agent's model calls ask for by default (ADR 0063): one of
+    /// `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The loader keeps the word as
+    /// written; the assembly checks it against the levels of the model's profile and reports an
+    /// unknown one with the agent and the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// The named preset (`presets:` of the deployment's model profiles, ADR 0064) this agent's
+    /// model calls start from. The assembly resolves it and checks its effort against the model's
+    /// profile; an undeclared name is a bind error naming the agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_preset: Option<String>,
     /// The skills the catalog offers: `all` or a list. Default: every skill of the agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills: Option<SkillSelection>,
@@ -599,6 +610,8 @@ mod tests {
             description: Some("Codes.".into()),
             tools: Some(ToolList::Named(vec!["a".into()])),
             model: Some(ModelRef::Inherit),
+            reasoning_effort: Some("high".into()),
+            model_preset: Some("quick".into()),
             skills: Some(SkillSelection::All),
             preload_skills: Some(vec!["s".into()]),
             limits: Some(Limits {

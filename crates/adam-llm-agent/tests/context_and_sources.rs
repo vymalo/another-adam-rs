@@ -11,9 +11,10 @@ use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
     ACCESS_TIER_CONTEXT_KEY, CALLER_CONTEXT_KEY, Conversation, LlmAgent, LlmAgentBuilder,
     MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_SOURCE_TOOLS, PendingQuestion, PendingWait,
-    SourceCtx, Tool, ToolAccess, ToolCtx, ToolError, ToolOutput, ToolSource, user_message,
+    REASONING_EFFORT_CONTEXT_KEY, SourceCtx, Tool, ToolAccess, ToolCtx, ToolError, ToolOutput,
+    ToolSource, user_message,
 };
-use adam_model::{DynModel, Message, MockModel, ToolCall, ToolSpec};
+use adam_model::{DynModel, Message, MockModel, ReasoningEffort, ToolCall, ToolSpec};
 use adam_runtime::{Inbound, ManualClock, RetryPolicy, RunView, Runtime};
 use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
@@ -572,6 +573,99 @@ async fn a_message_with_a_large_context_and_a_tier_keeps_the_tier() {
         json!({ACCESS_TIER_CONTEXT_KEY: {"tier": "plan"}})
     );
     assert_eq!(state.messages[0], Message::user_text("hi"));
+}
+
+#[tokio::test]
+async fn a_turn_asks_for_the_agents_effort_and_the_runs_context_wins() {
+    let h = Harness::new();
+    let agent = h
+        .agent()
+        .reasoning_effort(Some(ReasoningEffort::Low))
+        .build();
+    h.mock.push_text("done");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("hi"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(
+        h.mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::Low),
+        "the agent's default when nothing else says"
+    );
+
+    // The message activated `high`: it wins over the default.
+    let h = Harness::new();
+    let agent = h
+        .agent()
+        .reasoning_effort(Some(ReasoningEffort::Low))
+        .build();
+    h.mock.push_text("done");
+    let rt = h.runtime(&agent);
+    let context = json!({REASONING_EFFORT_CONTEXT_KEY: {"effort": "high"}});
+    let run = rt
+        .start("llm", message_with("hi", context), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(
+        h.mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
+
+    // A word that is not a level is ignored, so the default stands.
+    let h = Harness::new();
+    let agent = h
+        .agent()
+        .reasoning_effort(Some(ReasoningEffort::Low))
+        .build();
+    h.mock.push_text("done");
+    let rt = h.runtime(&agent);
+    let context = json!({REASONING_EFFORT_CONTEXT_KEY: {"effort": "ultra"}});
+    let run = rt
+        .start("llm", message_with("hi", context), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(
+        h.mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::Low)
+    );
+}
+
+#[tokio::test]
+async fn a_large_message_keeps_the_effort_it_activated() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock.push_text("done");
+    let rt = h.runtime(&agent);
+    let context = json!({
+        "big": "x".repeat(MAX_CONTEXT_BYTES),
+        REASONING_EFFORT_CONTEXT_KEY: {"effort": "xhigh"},
+    });
+    let run = rt
+        .start("llm", message_with("hi", context), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    let state = conversation(&rt, &view).await;
+    assert_eq!(
+        state.context[REASONING_EFFORT_CONTEXT_KEY],
+        json!({"effort": "xhigh"})
+    );
+    assert_eq!(
+        h.mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::XHigh)
+    );
 }
 
 #[test]

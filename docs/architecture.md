@@ -814,6 +814,10 @@ stateDiagram-v2
 
 * **The newest message that names a tier wins**, from the next step; one that names none leaves it. A larger context never
   drops the tier (`PROTECTED_CONTEXT_KEYS`), and a child run starts with its parent's.
+* **The reasoning effort follows the same rule** (ADR 0063): a message that activated `reasoning/v1` writes
+  `vymalo.reasoningEffort` (`{"effort": "<level>"}`), the newest message's level is asked for from the next model
+  call, the key is protected like the tier, a child run starts with its parent's, and a compaction/summary call sends
+  none. A level the model's profile does not declare is refused by the front before anything is written.
 * **`merge_pull_request` needs more than the tier**: green checks on the commit it merges, and then either the commit is one this
   conversation pushed (it merges), or the tool asks the person itself in a form of its own and merges on their yes to that form
   (any other pull request, or one opened with red checks accepted); at `bypass` it asks nothing. It never reads what the
