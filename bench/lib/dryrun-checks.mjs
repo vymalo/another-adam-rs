@@ -3,6 +3,7 @@
 import { priceCall } from './cost.mjs';
 import { FIXED_USAGE } from './scripted-model.mjs';
 import { CALLS_PER_RUN } from './agent-script.mjs';
+import { VARIANTS } from './variants.mjs';
 
 export const EXPECTED_PASS = Object.freeze({ hello: true, 'fix-add': true, wrong: false });
 
@@ -36,8 +37,9 @@ export function checkCost(folded, { runs, prices, modelRequests }) {
   let settled = 0;
   for (const { run, agent } of runs) {
     const v = folded.get(run);
-    const want = CALLS_PER_RUN[agent] * per;
-    out.push(check(v && v.spentMicro === want, `${run} cost ${want} micro-dollars (${CALLS_PER_RUN[agent]} calls x ${per})`, `ledger says ${v?.spentMicro}`));
+    const calls = CALLS_PER_RUN[VARIANTS[agent]?.driver ?? agent];
+    const want = calls * per;
+    out.push(check(v && v.spentMicro === want, `${run} cost ${want} micro-dollars (${calls} calls x ${per})`, `ledger says ${v?.spentMicro}`));
     out.push(check(v?.calls.usageMissing === 0 && v?.calls.failed === 0 && v?.calls.refused === 0, `${run} has no call without usage, failed or refused`, JSON.stringify(v?.calls)));
     settled += v?.calls.settled ?? 0;
   }

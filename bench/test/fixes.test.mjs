@@ -376,3 +376,30 @@ test('report: an invalid grade is left out of the rates and listed; a suspect pa
   assert.match(text, /R3 \| T3 \| a \/ max \| mentions-grading \| tests\/conftest\.py \| \/runs\/R3\/model\.patch/);
   assert.match(text, /cannot be made tamper-proof/);
 });
+
+test('tool caches (.mypy_cache, .pytest_cache, __pycache__, .ruff_cache) are left out of the patch, at any depth', async (t) => {
+  const { dir, bare, base } = agentTree(t);
+  for (const d of ['.mypy_cache/3.11', '.pytest_cache/v', 'pkg/__pycache__', 'sub/.ruff_cache']) {
+    fs.mkdirSync(path.join(dir, d), { recursive: true });
+    fs.writeFileSync(path.join(dir, d, 'x.json'), 'cache\n');
+  }
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'one\ntwo\n');
+  const patch = (await collectPatch({ tree: dir, baseRepo: bare, base })).toString('utf8');
+  assert.match(patch, /\+two/);
+  assert.doesNotMatch(patch, /mypy_cache|pytest_cache|__pycache__|ruff_cache/);
+});
+
+test('untrackedHeavyDirs: the dependency and cache folders the base tracks no file under', async (t) => {
+  const { untrackedHeavyDirs, HEAVY_DIRS } = await import('../lib/agents/common.mjs');
+  const { dir, bare, base } = agentTree(t);
+  assert.deepEqual(await untrackedHeavyDirs({ dir: bare, sha: base }), [...HEAVY_DIRS], 'a base with none tracks none');
+  fs.mkdirSync(path.join(dir, 'vendor', 'node_modules', 'x'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'vendor', 'node_modules', 'x', 'i.js'), '1\n');
+  git(dir, 'add', '-A');
+  git(dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'vendored');
+  const sha = git(dir, 'rev-parse', 'HEAD').trim();
+  git(dir, 'push', '-q', bare, `HEAD:refs/heads/vendored`);
+  const kept = await untrackedHeavyDirs({ dir: bare, sha });
+  assert.ok(!kept.includes('node_modules'), 'a tracked node_modules is read, or its files would look deleted');
+  assert.ok(kept.includes('__pycache__'));
+});

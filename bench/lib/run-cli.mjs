@@ -33,11 +33,11 @@ import { digestOfRef, fetchPublic, paths, readJson } from './tasks-cli.mjs';
 import { listTasks } from './task.mjs';
 import { loadOwnSpecs, ownChecksum, ownImageTag } from './own.mjs';
 import { taskChecksum } from './upstream.mjs';
+import { makeDrivers } from './variants.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BENCH_DIR = path.join(HERE, '..');
 const REPO_DIR = path.join(BENCH_DIR, '..');
-export const AGENTS = ['adam', 'opencode'];
 export const PILOT_BLOCKS = 5;
 
 export class SelectionError extends Error {
@@ -99,7 +99,7 @@ export function loadSelected(config, p) {
  * The real harness: the stack, the meter, the ledger and the two drivers. Needs the container services; unverified here.
  * Whatever fails after the meter listens, or after the stack starts, closes the meter and brings the stack down.
  */
-export async function realHarness({ env, config, log, notice = log, keepImages = false, sharedPrompt, inject = {} }) {
+export async function realHarness({ env, config, log, notice = log, keepImages = false, sharedPrompt, prompts = null, inject = {} }) {
   if (typeof sharedPrompt !== 'string' || sharedPrompt === '') throw new Error('the shared system prompt is required: both agents are given the same one');
   const { load = loadSelected, makeStack = (o) => new Stack(o), makeMeter = createMeter } = inject;
   const home = benchHome(env);
@@ -175,10 +175,7 @@ export async function realHarness({ env, config, log, notice = log, keepImages =
       pullGraderImage,
       releaseImage,
       log,
-      agents: {
-        adam: new AdamAgent({ pins: PINS, home, repoDir: REPO_DIR, contextWindow: config.contextWindow }),
-        opencode: new OpenCodeAgent({ pins: PINS, home, contextWindow: config.contextWindow, sharedPrompt }),
-      },
+      agents: makeDrivers({ make: { adam: AdamAgent, opencode: OpenCodeAgent }, prompts: prompts ?? { owner: sharedPrompt }, agents: config.agents, common: { pins: PINS, home, repoDir: REPO_DIR, contextWindow: config.contextWindow } }),
     };
     return {
       deps,
@@ -198,7 +195,7 @@ export async function realHarness({ env, config, log, notice = log, keepImages =
 }
 
 const plans = (harness, config) => {
-  const blocks = buildBlocks({ tasks: harness.tasks, agents: AGENTS, arms: Object.keys(config.arms), seed: config.tasks.seed });
+  const blocks = buildBlocks({ tasks: harness.tasks, agents: config.agents, arms: Object.keys(config.arms), seed: config.tasks.seed });
   const opts = { selfRepo: config.tasks.selfRepo };
   return { blocks, specs: specsOf(blocks, opts), pilotSpecs: (n) => specsOf(blocks.slice(0, n), { ...opts, pilot: true }), allPilotSpecs: specsOf(blocks, { ...opts, pilot: true }) };
 };
@@ -223,16 +220,16 @@ async function cmdPilot(argv, ctx) {
   const { values } = parseArgs({ args: argv, options: { blocks: { type: 'string' }, 'keep-images': { type: 'boolean' } }, allowPositionals: false });
   ctx.keepImages = values['keep-images'] === true;
   const count = values.blocks === undefined ? PILOT_BLOCKS : Number(values.blocks);
-  const least = Math.ceil(MIN_PER_ARM / AGENTS.length);
+  const least = Math.ceil(MIN_PER_ARM / ctx.config.agents.length);
   if (!Number.isInteger(count) || count < least || count > 100) {
-    throw new SelectionError(`--blocks is a whole number from ${least} to 100: a block gives ${AGENTS.length} runs for each arm and an estimate needs ${MIN_PER_ARM}`);
+    throw new SelectionError(`--blocks is a whole number from ${least} to 100: a block gives ${ctx.config.agents.length} runs for each arm and an estimate needs ${MIN_PER_ARM}`);
   }
-  const cells = AGENTS.length * Object.keys(ctx.config.arms).length;
+  const cells = ctx.config.agents.length * Object.keys(ctx.config.arms).length;
   const blockMicro = cells * ctx.config.perRunBudgetMicro;
   if (blockMicro > ctx.config.capMicro) throw new BudgetError(`the cap (${formatUSD(ctx.config.capMicro)}) cannot hold one block of ${cells} runs at ${formatUSD(ctx.config.perRunBudgetMicro)} each: raise the cap or lower perRunBudgetUSD`);
   const file = proposalFile(ctx.home);
   fs.rmSync(file, { force: true }); // a new pilot invalidates any earlier confirmation
-  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, notice: ctx.out, keepImages: ctx.keepImages, sharedPrompt: ctx.sharedPrompt });
+  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, notice: ctx.out, keepImages: ctx.keepImages, sharedPrompt: ctx.sharedPrompt, prompts: ctx.prompts });
   try {
     const plan = plans(harness, ctx.config);
     if (count > plan.blocks.length) throw new SelectionError(`--blocks ${count} is more than the ${plan.blocks.length} selected tasks`);
@@ -249,7 +246,7 @@ async function cmdPilot(argv, ctx) {
       pilotRuns: new Set(pilotSpecs.map((s) => s.run)),
       arms: Object.keys(ctx.config.arms),
       totalTasks: plan.blocks.length,
-      agents: AGENTS.length,
+      agents: ctx.config.agents.length,
       capMicro: ctx.config.capMicro,
     });
     ctx.out(renderEstimate(estimate));
@@ -277,7 +274,7 @@ async function cmdRun(argv, ctx) {
   ctx.keepImages = values['keep-images'] === true;
   // Nothing is started, not even the stack, before the owner's confirmation is checked.
   const perArm = requireConfirmed(readJson(proposalFile(ctx.home), null), { config: ctx.config, fingerprint: ctx.fingerprint });
-  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, notice: ctx.out, keepImages: ctx.keepImages, sharedPrompt: ctx.sharedPrompt });
+  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, notice: ctx.out, keepImages: ctx.keepImages, sharedPrompt: ctx.sharedPrompt, prompts: ctx.prompts });
   try {
     const { blocks, specs } = plans(harness, ctx.config);
     const { ledger } = harness.deps;
@@ -328,7 +325,7 @@ async function releaseUnlessNeeded(deps, spec, later) {
 async function cmdRegrade(argv, ctx) {
   const { values } = parseArgs({ args: argv, options: { 'keep-images': { type: 'boolean' } }, allowPositionals: false });
   ctx.keepImages = values['keep-images'] === true;
-  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, notice: ctx.out, keepImages: ctx.keepImages, sharedPrompt: ctx.sharedPrompt });
+  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, notice: ctx.out, keepImages: ctx.keepImages, sharedPrompt: ctx.sharedPrompt, prompts: ctx.prompts });
   try {
     const plan = plans(harness, ctx.config);
     const specs = [...plan.allPilotSpecs, ...plan.specs];
@@ -361,7 +358,11 @@ export async function runCli(command, argv, { env = process.env, out = (l) => pr
     const ctx = { env, home, out, make, pins, config: loadConfig({ env }) };
     ctx.lockTexts = lockTexts ?? readLocks(paths(env));
     ctx.sharedPrompt = sharedPrompt ?? (await readSharedPrompt({ repoDir: REPO_DIR, revision: pins.coder.revision }));
-    ctx.fingerprint = configFingerprint({ config: ctx.config, pins, lockTexts: ctx.lockTexts, key: digestKey(home), sharedPrompt: ctx.sharedPrompt });
+    ctx.prompts = { owner: ctx.sharedPrompt };
+    if (ctx.config.agents.includes('opencode-prompt')) ctx.prompts.work = await readSharedPrompt({ repoDir: REPO_DIR, revision: pins.coder.revision, profile: 'work' });
+    // The prompts the cells use are part of the configuration: a ledger made with other prompts is not pooled with this one.
+    const promptsText = ctx.prompts.work === undefined ? ctx.sharedPrompt : JSON.stringify(ctx.prompts);
+    ctx.fingerprint = configFingerprint({ config: ctx.config, pins, lockTexts: ctx.lockTexts, key: digestKey(home), sharedPrompt: promptsText });
     // The ledger holds runs of one configuration only; nothing here pools two.
     assertLedgerBound(readLedger(ledgerFile(home)).records, ctx.fingerprint);
     if (command === 'pilot') return await cmdPilot(argv, ctx);

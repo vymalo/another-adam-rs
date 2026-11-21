@@ -14,7 +14,7 @@
 // (lib/tarstream.mjs through lib/stack.mjs) and what is left in a service is removed by the service.
 import fs from 'node:fs';
 import path from 'node:path';
-import { collectPatch } from '../grade.mjs';
+import { collectPatch, localGit } from '../grade.mjs';
 import { redact } from '../stack.mjs';
 
 /** The harness's infrastructure, not the agent, is what went wrong: the run is `Failed_infra` with this reason. */
@@ -27,6 +27,26 @@ export class InfraError extends Error {
 }
 
 /** The patch of the tree in `treeDir` (a directory the harness made) against the base. Nothing in the tree is run. */
+/**
+ * Folders only a package manager or a tool writes. The agent's tree is read without the ones the base does not track: they are
+ * never part of a change, and one of them can be far over the size a tree may be (element-web's node_modules failed collect,
+ * 2026-11-21). One the base tracks (a vendored node_modules) is read, or its files would look deleted.
+ */
+export const HEAVY_DIRS = Object.freeze(['node_modules', '.mypy_cache', '.pytest_cache', '__pycache__', '.ruff_cache', '.tox', '.nox']);
+const heavyOfBase = new Map();
+
+/** The names of HEAVY_DIRS that no file of the base is under, at any depth. */
+export async function untrackedHeavyDirs(base, git = localGit) {
+  const key = `${base.dir}@${base.sha}`;
+  if (!heavyOfBase.has(key)) {
+    const files = (await git(base.dir)(['ls-tree', '-r', '-z', '--name-only', base.sha])).toString('utf8').split('\0');
+    const tracked = new Set();
+    for (const f of files) for (const part of f.split('/').slice(0, -1)) if (HEAVY_DIRS.includes(part)) tracked.add(part);
+    heavyOfBase.set(key, HEAVY_DIRS.filter((d) => !tracked.has(d)));
+  }
+  return heavyOfBase.get(key);
+}
+
 export async function patchOfTree({ treeDir, base, workRoot }) {
   return collectPatch({ tree: treeDir, baseRepo: base.dir, base: base.sha, linkPrefix: base.workdir, workRoot });
 }
