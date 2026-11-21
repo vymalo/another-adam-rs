@@ -92,6 +92,8 @@ struct ChosenStore {
     store: DynStore,
     live: LiveSignals,
     notify: Option<StartNotify>,
+    /// The store's name for [`ServeError::Connect`]: what `connecting to …` says.
+    backend: &'static str,
     /// The Postgres store, whose connection is opened after the process's own checks so a
     /// misconfiguration is exit 78 whether or not the server answers.
     #[cfg(feature = "store-postgres")]
@@ -104,10 +106,24 @@ impl ChosenStore {
     async fn ready(&self) -> Result<(), ServeError> {
         #[cfg(feature = "store-postgres")]
         if let Some(pg) = &self.postgres {
-            pg.ping().await.map_err(ServeError::Connect)?;
+            pg.ping().await.map_err(|source| ServeError::Connect {
+                backend: self.backend,
+                source,
+            })?;
             Store::migrate(pg).await.map_err(ServeError::Migrate)?;
         }
         Ok(())
+    }
+}
+
+impl StoreKind {
+    /// The store's name in an error: `Postgres`, `MongoDB` or `SQLite`.
+    fn backend(&self) -> &'static str {
+        match self {
+            Self::Postgres => "Postgres",
+            Self::Sqlite { .. } => "SQLite",
+            Self::Mongo { .. } => "MongoDB",
+        }
     }
 }
 
@@ -348,8 +364,14 @@ impl std::fmt::Debug for Agents {
 #[non_exhaustive]
 pub enum ServeError {
     /// The store cannot be reached, or refuses its credentials.
-    #[error("connecting to the store")]
-    Connect(#[source] StoreError),
+    #[error("connecting to {backend}")]
+    Connect {
+        /// The store's name: `Postgres`, `MongoDB` or `SQLite`.
+        backend: &'static str,
+        /// What the store said.
+        #[source]
+        source: StoreError,
+    },
     /// The schema cannot be migrated.
     #[error("migrating the schema")]
     Migrate(#[source] StoreError),
@@ -530,14 +552,16 @@ pub fn claim_scope_for(placement: Placement) -> ClaimScope {
 /// process's own configuration is checked. SQLite opens its file and takes the process lock now,
 /// and MongoDB connects now, because both answer the store before the service is built.
 async fn choose_store(config: &ServiceConfig, kind: StoreKind) -> Result<ChosenStore, ServeError> {
+    let backend = kind.backend();
     match kind {
         #[cfg(feature = "store-postgres")]
         StoreKind::Postgres => {
             let pg_config = PgConfig::parse(config.database_url.expose_secret())
-                .map_err(ServeError::Connect)?;
-            let pool_size = pool_size_from_env().map_err(ServeError::Connect)?;
-            let pg =
-                PgStore::from_config(pg_config.clone(), pool_size).map_err(ServeError::Connect)?;
+                .map_err(|source| ServeError::Connect { backend, source })?;
+            let pool_size =
+                pool_size_from_env().map_err(|source| ServeError::Connect { backend, source })?;
+            let pg = PgStore::from_config(pg_config.clone(), pool_size)
+                .map_err(|source| ServeError::Connect { backend, source })?;
             let pool = pg.pool().clone();
             let store: DynStore = Arc::new(pg.clone());
             // Events and wake-up/cancel signals cross processes over `NOTIFY` on the store's own
@@ -556,6 +580,7 @@ async fn choose_store(config: &ServiceConfig, kind: StoreKind) -> Result<ChosenS
                 store,
                 live,
                 notify: Some(start),
+                backend,
                 postgres: Some(pg),
             })
         }
@@ -565,7 +590,8 @@ async fn choose_store(config: &ServiceConfig, kind: StoreKind) -> Result<ChosenS
         }),
         #[cfg(feature = "store-sqlite")]
         StoreKind::Sqlite { path } => {
-            let store = SqliteStore::open(&path).map_err(ServeError::Connect)?;
+            let store = SqliteStore::open(&path)
+                .map_err(|source| ServeError::Connect { backend, source })?;
             store.migrate().await.map_err(ServeError::Migrate)?;
             // One process, one file: the notifier is in-process, and there is no listener to run.
             let broadcast = adam_runtime::BroadcastSink::default();
@@ -579,6 +605,7 @@ async fn choose_store(config: &ServiceConfig, kind: StoreKind) -> Result<ChosenS
                 store: Arc::new(store),
                 live,
                 notify: None,
+                backend,
                 #[cfg(feature = "store-postgres")]
                 postgres: None,
             })
@@ -591,13 +618,14 @@ async fn choose_store(config: &ServiceConfig, kind: StoreKind) -> Result<ChosenS
         StoreKind::Mongo { database } => {
             let store = MongoStore::connect(config.database_url.expose_secret(), &database)
                 .await
-                .map_err(ServeError::Connect)?;
+                .map_err(|source| ServeError::Connect { backend, source })?;
             store.migrate().await.map_err(ServeError::Migrate)?;
             // MongoDB has no cross-process signal: workers poll.
             Ok(ChosenStore {
                 store: Arc::new(store),
                 live: LiveSignals::local(),
                 notify: None,
+                backend,
                 #[cfg(feature = "store-postgres")]
                 postgres: None,
             })
@@ -840,8 +868,23 @@ mod tests {
             StoreKind::Postgres
         );
         assert_eq!(
+            store_kind("postgres://u@h/d", Role::All).unwrap().backend(),
+            "Postgres",
+            "the error says which store it could not reach"
+        );
+        assert_eq!(
             store_kind("postgresql://u@h/d", Role::All).unwrap(),
             StoreKind::Postgres
+        );
+        assert_eq!(
+            store_kind("mongodb://h/db", Role::All).unwrap().backend(),
+            "MongoDB"
+        );
+        assert_eq!(
+            store_kind("sqlite:///tmp/adam.sqlite", Role::All)
+                .unwrap()
+                .backend(),
+            "SQLite"
         );
         assert_eq!(
             store_kind("mongodb://h/db", Role::All).unwrap(),
@@ -920,8 +963,11 @@ mod tests {
 
     #[test]
     fn the_errors_say_the_step_and_keep_the_cause_apart() {
-        let down = ServeError::Connect(StoreError::unavailable(std::io::Error::other("refused")));
-        assert_eq!(down.to_string(), "connecting to the store");
+        let down = ServeError::Connect {
+            backend: "Postgres",
+            source: StoreError::unavailable(std::io::Error::other("refused")),
+        };
+        assert_eq!(down.to_string(), "connecting to Postgres");
         assert!(std::error::Error::source(&down).is_some());
         let bind = ServeError::Bind {
             addr: "127.0.0.1:1".parse().unwrap(),

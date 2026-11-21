@@ -89,7 +89,7 @@ fn code_of(
             | ServeError::SplitRoleOnSqlite { .. } => return Some(EX_CONFIG),
             ServeError::Bind { .. } | ServeError::LocalAddr(_) => return Some(EX_OSERR),
             // The cause, next in the chain, says why.
-            ServeError::Connect(_) | ServeError::Migrate(_) => {}
+            ServeError::Connect { .. } | ServeError::Migrate(_) => {}
         }
     }
     if let Some(class) = classify(cause).or_else(|| class_of(cause)) {
@@ -178,7 +178,10 @@ mod tests {
         // Postgres refusing connections: an io::Error at the bottom, but the StoreError above it
         // is what says "unreachable", and the walk goes from the outside in.
         let io = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-        let e = ServeError::Connect(StoreError::unavailable(io));
+        let e = ServeError::Connect {
+            backend: "Postgres",
+            source: StoreError::unavailable(io),
+        };
         assert_eq!(coded(layered("starting", e)), 69);
         let io = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
         assert_eq!(coded(ServeError::Migrate(StoreError::unavailable(io))), 69);

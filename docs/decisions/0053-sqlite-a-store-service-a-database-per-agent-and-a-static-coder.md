@@ -171,7 +171,8 @@ What the pieces offer, checked on 2026-11-19:
    `tools/sqlite-probe` (CI job `sqlite-probe`, part of `lint`) resolves the adapter with `cratestack-sqlite` and
    asserts one `rusqlite` and one `libsqlite3-sys`. **Not built:** `store+http://`/`store+https://` and the store
    service of decisions 4–7. Breaking: `adam-service`'s Postgres dependencies are optional features, and
-   `ServeError::Connect`'s message is "connecting to the store", not "connecting to Postgres".
+   `ServeError::Connect` is a struct variant whose message names the backend (`connecting to Postgres`,
+   `connecting to SQLite`), not a generic "connecting to the store".
 
 ### A store service
 

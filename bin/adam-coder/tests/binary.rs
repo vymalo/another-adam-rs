@@ -2869,6 +2869,10 @@ async fn a_github_app_configuration_is_checked_at_startup_and_exits_78_with_ever
         "{err}"
     );
     assert!(
+        !err.contains("connecting to"),
+        "a configuration error stops before the store, even when DATABASE_URL is unreachable: {err}"
+    );
+    assert!(
         !err.contains(GITHUB_TOKEN) && !err.contains("BEGIN"),
         "{err}"
     );
@@ -3344,6 +3348,10 @@ async fn an_app_with_neither_installation_nor_owners_is_refused_at_startup() {
     assert!(
         chain.contains("GITHUB_APP_INSTALLATION_ID") && chain.contains("GITHUB_APP_OWNERS"),
         "{chain}"
+    );
+    assert!(
+        !chain.contains("connecting to"),
+        "a configuration error stops before the store, even when DATABASE_URL is unreachable: {chain}"
     );
     assert!(!chain.contains("BEGIN"), "{chain}");
 

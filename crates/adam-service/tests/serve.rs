@@ -250,8 +250,17 @@ async fn a_database_that_is_down_is_a_connect_error_and_exit_69() {
     let error = adam_service::serve(&config, agents("echo", &config), std::future::pending())
         .await
         .unwrap_err();
-    assert!(matches!(error, ServeError::Connect(_)), "{error:?}");
-    assert_eq!(error.to_string(), "connecting to the store");
+    assert!(
+        matches!(
+            error,
+            ServeError::Connect {
+                backend: "Postgres",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.to_string(), "connecting to Postgres");
     assert_eq!(exit_code(&error), 69);
     assert!(
         !format!("{error:?}").contains("s3cr3tpassw0rd"),
