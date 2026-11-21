@@ -9,6 +9,7 @@
 import { formatUSD } from './cost.mjs';
 import { bootstrapPairedDiff, mcnemarExact, median, percentile, seedFrom, wilson } from './stats.mjs';
 import { foldRecords } from './ledger.mjs';
+import { CRITERIA, RUBRIC_VERSION, scoresByCell } from './review.mjs';
 
 const MIN_TASKS_PER_LANGUAGE = 15;
 
@@ -234,6 +235,43 @@ export function buildReport(foldedOrRecords, opts = {}) {
   out.push(table(['Agent path', 'Tasks'], [...tasksByPath].sort(([x], [y]) => (x < y ? -1 : 1)).map(([k, ts]) => [k, ts.size])));
   out.push('\n');
   out.push(table(['Agent path', 'Agent', 'Arm', 'Runs', 'Solved', 'Rate', '95% interval (Wilson)'], [...group(rated, (v) => `${pathOf(v)} / ${cellKey(v)}`)].map(([, rs]) => rateRow([pathOf(rs[0]), rs[0].agent, rs[0].arm], rs))));
+
+  h('What each call sent, reasoning, and child sessions');
+  out.push("Per cell, Done runs. Request size is the median size of one call's body as the meter sent it (system prompt, tools and history). Uncached input is input minus cached. Reasoning is the setting the endpoint was sent (the arm's) and the reasoning tokens it reported. A child session is a subagent: consecutive calls whose system prompt is not the main agent's.\n\n");
+  const kib = (b) => (b === null ? 'n/a' : `${(b / 1024).toFixed(1)} KiB`);
+  out.push(
+    table(
+      ['Agent', 'Arm', 'Runs', 'Median request', 'First request', 'Uncached input', 'Output', 'Reasoning tokens', 'Effort sent', 'Child sessions', 'Child calls', 'Child time'],
+      [...group(counted, cellKey)].map(([, rs]) => {
+        const sizes = rs.flatMap((v) => v.sent?.bytes ?? []);
+        const firsts = rs.map((v) => v.sent?.bytes?.[0]).filter((b) => Number.isInteger(b));
+        const efforts = [...new Set(rs.flatMap((v) => v.sent?.efforts ?? []))].map((e) => (e === null ? 'none' : e)).join(', ') || 'not recorded';
+        const ch = (k) => sum(rs.map((v) => v.sent?.children?.[k] ?? 0));
+        return [
+          rs[0].agent,
+          rs[0].arm,
+          rs.length,
+          kib(sizes.length ? median(sizes) : null),
+          kib(firsts.length ? median(firsts) : null),
+          sum(rs.map((v) => v.tokens.input - v.tokens.cached)),
+          sum(rs.map((v) => v.tokens.output)),
+          sum(rs.map((v) => v.tokens.reasoning)),
+          efforts,
+          ch('sessions'),
+          ch('calls'),
+          `${Math.round(ch('ms') / 1000)} s`,
+        ];
+      }),
+    ),
+  );
+
+  h('Quality (blind review)');
+  const scored = scoresByCell(opts.reviews ?? [], everything);
+  if (scored.length === 0) out.push('No review yet: `bench review` scores every Done patch with one reviewer and one rubric, blind to the agent.\n');
+  else {
+    out.push(`Mean scores from 1 to 5, rubric ${RUBRIC_VERSION}, the configured model at reasoning max, blind to the agent and the arm (bench/lib/review.mjs). Stray files are files under tool caches in the patches, cut out before the review.\n\n`);
+    out.push(table(['Agent', 'Arm', 'Reviewed', ...CRITERIA, 'overall', 'Stray files', 'Review cost'], scored.map((c) => [c.agent, c.arm, c.n, ...[...CRITERIA, 'overall'].map((k) => c.mean[k].toFixed(2)), c.stray, formatUSD(c.costMicro)])));
+  }
 
   h('Cost, tokens, time and calls');
   out.push('Every figure of this section sums all attempts of a run (an interrupted attempt that was run again is in it), and counts only Done runs.\n\n');

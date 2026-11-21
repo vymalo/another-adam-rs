@@ -77,7 +77,12 @@ test('a plain call: the key is injected, the model rewritten, the fragment merge
   assert.deepEqual(seen.body.messages, [{ role: 'user', content: 'hi' }]);
 
   const settled = callRecords(s.ledger, 'settled');
-  assert.equal(callRecords(s.ledger, 'pending').length, 1, 'a pending record came first');
+  const pending = callRecords(s.ledger, 'pending');
+  assert.equal(pending.length, 1, 'a pending record came first');
+  assert.equal(pending[0].effort, 'high', 'the effective reasoning setting is the arm');
+  assert.equal(pending[0].askedEffort, 'low', "the agent's own is kept beside it");
+  assert.equal(pending[0].bytes, Buffer.byteLength(JSON.stringify(seen.body)), 'the size of what was sent');
+  assert.equal(pending[0].tools, 0);
   assert.equal(settled.length, 1);
   assert.equal(settled[0].costMicro, SCRIPTED_COST);
   assert.equal(settled[0].usageMissing, false);
@@ -304,6 +309,8 @@ test('prepareBody: the clamp, the default limit, n, and include_usage only for s
   assert.equal('stream_options' in clamp({ stream: false }).body, false);
   assert.deepEqual(clamp({ stream: true }).body.stream_options, { include_usage: true });
   assert.equal(clamp({ stream: true }, { max_tokens: 99999 }).body.max_tokens, 8192, 'the clamp applies to the fragment too');
+  assert.equal(prepareBody({ max_tokens: 100000 }, {}, 'm', 32768).body.max_tokens, 32768, 'limits.outputTokens moves the clamp');
+  assert.equal(prepareBody({}, {}, 'm', 32768).maxOutputTokens, 32768);
   assert.throws(() => clamp({ stream: 'yes' }), /boolean/);
 });
 
