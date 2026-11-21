@@ -98,10 +98,20 @@ Three things are missing in adam today:
      message, it never fails on its own, and the run's deadline is paused as for a question.
    * **Waking.** The A2A backend accepts a message to a task whose run has a `model_wait`, **timer or not** (today a
      message to a run on a timer is refused unless it steers). Its text, when it has any, is the person's turn added
-     before the call, as for any message to a parked run. A message whose metadata holds `adam.resume: true` wakes the
-     run and **adds nothing** to the conversation, so the orchestrator can resume a run after binding it, or after the
-     person raised the limit, without speaking for them; such a message may have no text. A resume to a run that has no
-     `model_wait` and waits on no child does nothing: it never answers a question.
+     before the call, as for any message to a parked run. A message whose metadata holds `adam.resume: true` is a
+     **resume**, agreed with another-agentic-system#334 B1 on 2026-11-21:
+     * it wakes the run and **adds nothing** to the conversation, so the orchestrator can resume a run after binding it,
+       or after the person raised the limit, without speaking for them; it may have no text;
+     * it continues the same run, so the same root run id and the same binding; it never starts a run;
+     * it is accepted only by a run with a `model_wait`, or waiting on a child that has one; any other task, a finished or
+       canceled one included, answers `InvalidParams` (`-32602`) with the reason "the task is not parked on the model",
+       and nothing is written: a resume never answers a question nor brings back a finished run;
+     * it is authenticated as any message, and it cures nothing by itself: the call it repeats goes through the gateway,
+       and a lease still refused parks the run again.
+
+     B1's side: the orchestrator binds the run at the broker when it creates the task, before adam's first call, so a call
+     only uses a lease; `run_not_bound` covers the moment between the two. A resume is no message of the person's for
+     the orchestrator's own rate limits.
    * **Cancelling** ends a parked run as it ends any wait.
 5. **A child run.** A local subagent's refusal parks the child the same way, and its parent waits on it as on any child.
    * **The parent learns of it** by a notice from the child's park, as it learns of a child's reports
@@ -159,7 +169,8 @@ Three things are missing in adam today:
   the child's notice and the forwarded resume; the "Failure handling" list. `Conversation` denies no unknown field, so a
   build rolled back past this change reads a parked run's state, without its model wait.
 * `adam-runtime`: `Ctx::retries_left()`; `SessionHeader::root`; nothing else (a park is a `wake_at`).
-* `adam-a2a-runtime`: a model park's task state and message (`convert.rs`, also its default prompt and the
+* `adam-a2a-runtime` and `docs/reference/a2a-server.md` (a section "A run parked on the model", which names
+  `adam.resume`, the contract it is; a second key of its kind would make it an extension of its own): a model park's task state and message (`convert.rs`, also its default prompt and the
   `input-required` rewrite after a delivery, `backend.rs`), `auth-required` listed (`list.rs`), a message accepted for a
   run with a `model_wait` on a timer (`backend.rs`), and `adam.resume`, which may have no text (`convert.rs` and
   `vymalo.rs`, which refuse a message with no text today).
