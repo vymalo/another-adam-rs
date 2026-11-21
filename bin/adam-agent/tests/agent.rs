@@ -2208,3 +2208,130 @@ async fn the_deployments_parallel_limit_reaches_the_agent_and_the_file_only_lowe
     assert_eq!(limit(&folder, 6).await, 2, "the file lowers it");
     assert_eq!(limit(&folder, 1).await, 1, "and never raises it");
 }
+
+// ------------------------------------------------------------------ S0: the lean first request
+
+/// The first request's bytes: the system prompt plus each tool schema as the OpenAI wire wraps it.
+fn first_request_bytes(req: &adam_model::ModelRequest) -> (usize, usize) {
+    let system = req.system.as_deref().map_or(0, str::len);
+    let tools = req
+        .tools
+        .iter()
+        .map(|t| {
+            serde_json::to_vec(&json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+            }))
+            .expect("a tool schema serialises")
+            .len()
+        })
+        .sum();
+    (system, tools)
+}
+
+/// One line per tool, sorted by name: the generated part of
+/// `plans/2026-11-21-tool-loading-table.md`. A new tool, a renamed one or a changed schema changes
+/// this table, so the golden file changes and a reviewer sees it.
+fn tool_table(req: &adam_model::ModelRequest) -> String {
+    let mut rows: Vec<(String, usize)> = req
+        .tools
+        .iter()
+        .map(|t| {
+            let bytes = serde_json::to_vec(&json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+            }))
+            .expect("a tool schema serialises")
+            .len();
+            (t.name.clone(), bytes)
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::from("# tool\tbytes\ttokens(chars/4)\n");
+    for (name, bytes) in rows {
+        out.push_str(&format!("{name}\t{bytes}\t{}\n", bytes / 4));
+    }
+    out
+}
+
+/// Compare the generated table with its golden file, or rewrite it with `UPDATE_GOLDEN=1`.
+fn check_tool_golden(generated: &str) {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/tool-tokens.txt"
+    );
+    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+        std::fs::write(path, generated).expect("the golden is writable");
+        println!("updated {path}");
+        return;
+    }
+    let golden = std::fs::read_to_string(path).unwrap_or_default();
+    assert_eq!(
+        golden, generated,
+        "the tool table changed. If the change is deliberate, regenerate it with \
+         `UPDATE_GOLDEN=1 cargo test -p adam-agent --test agent \
+         a_folder_agents_first_request_stays_under_the_lean_budget` and commit the diff; \
+         a new tool must never arrive without its row."
+    );
+}
+
+/// S0 of the lean-first-request plan (`plans/2026-11-21-lean-first-request.md`): a plain folder
+/// agent's first request is measured, pinned against growth, and held to the owner's **5,000-token**
+/// budget for a lazy agent (ADR 0066). Today it is already under it; the test says by how much and
+/// fails if a change eats the margin.
+///
+/// The plan's numbers are `cl100k` tokens; CI has no tokenizer, so the pin is in **bytes** and the
+/// print gives the repository's own estimate (`chars / 4`, about 6 % above `cl100k`). The message is
+/// not counted: it is the same "hi" in every measurement.
+#[tokio::test]
+async fn a_folder_agents_first_request_stays_under_the_lean_budget() {
+    const BASELINE_BYTES: usize = 17437; // measured 2026-11-21, `origin/main` at e62e00b
+    const GROWTH_ALLOWED: usize = 1024;
+    const LEAN_BUDGET_TOKENS: usize = 5000;
+
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Hi.");
+    let model: DynModel = mock.clone();
+    let store = store();
+    let agents = build(def_of(&chat()), None, Some(worker_parts(model)))
+        .await
+        .unwrap();
+    let service = service_over(agents, &store);
+    let worker = Worker::start(&service);
+    ask(&service, "hi").await;
+    worker.stop().await;
+
+    let first = &mock.requests()[0];
+    let (system, tools) = first_request_bytes(first);
+    let total = system + tools;
+    // Written before the asserts so one `UPDATE_GOLDEN=1` run both prints the numbers and
+    // records the table, even while the baseline is still unpinned.
+    check_tool_golden(&tool_table(first));
+    let tokens = total / 4;
+    println!(
+        "folder agent first request: system {system} B + tools {tools} B = {total} B \
+         (~{tokens} tokens at chars/4); lean budget {LEAN_BUDGET_TOKENS} tokens \
+         (~{} B), margin {} tokens; baseline {BASELINE_BYTES} B, allowed +{GROWTH_ALLOWED} B",
+        LEAN_BUDGET_TOKENS * 4,
+        LEAN_BUDGET_TOKENS.saturating_sub(tokens)
+    );
+    assert!(
+        tokens <= LEAN_BUDGET_TOKENS,
+        "the folder agent's first request is ~{tokens} tokens (chars/4), over the \
+         {LEAN_BUDGET_TOKENS}-token budget for a lazy agent (ADR 0066)"
+    );
+    assert!(
+        total <= BASELINE_BYTES + GROWTH_ALLOWED,
+        "the folder agent's first request grew to {total} B (baseline {BASELINE_BYTES} B, allowed \
+         +{GROWTH_ALLOWED} B). A deliberate growth updates the baseline in the same commit; \
+         anything else is the regression this test exists for."
+    );
+}
