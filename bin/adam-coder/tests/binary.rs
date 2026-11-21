@@ -2638,29 +2638,35 @@ async fn a_sweep_of_zero_seconds_turns_the_janitor_off() {
 // ------------------------------------------------------------------------------ ADR 0052
 
 /// A deployment that asked for Podman does not start and silently run its commands in the coder:
-/// exit 78, in words that name the variable and ADR 0052. The removed variables are otherwise
-/// ignored (the configuration unit tests list every one of them).
+/// exit 78, in words that name the variable and ADR 0052, whatever the case or the spacing of the
+/// value. The removed variables are otherwise ignored (the configuration unit tests list every one
+/// of them).
 #[tokio::test]
 async fn a_deployment_that_asked_for_podman_exits_78_naming_adr_0052() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut env = valid_env("postgres://u:p@127.0.0.1:1/x", tmp.path());
-    env.extend(
-        [
-            ("DEVCONTAINER_RUNTIME", "podman"),
-            ("CONTAINER_HOST", "unix:///run/podman/podman.sock"),
-        ]
-        .map(|(k, v)| (k.to_owned(), v.to_owned())),
-    );
-    let mut p = Proc::spawn(&env);
-    let status = p.exit_within(Duration::from_secs(30)).await;
-    assert_eq!(status.code(), Some(78), "{}", p.logs());
-    let err = failure(&p)["error"].as_str().unwrap().to_owned();
-    assert!(err.contains("DEVCONTAINER_RUNTIME=podman"), "{err}");
-    assert!(err.contains("ADR 0052"), "{err}");
-    assert!(
-        !err.contains("connecting to Postgres"),
-        "a bad configuration must stop before anything connects:\n{err}"
-    );
+    for value in ["podman", " Podman ", "PODMAN"] {
+        let mut env = valid_env("postgres://u:p@127.0.0.1:1/x", tmp.path());
+        env.extend(
+            [
+                ("DEVCONTAINER_RUNTIME", value),
+                ("CONTAINER_HOST", "unix:///run/podman/podman.sock"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        );
+        let mut p = Proc::spawn(&env);
+        let status = p.exit_within(Duration::from_secs(30)).await;
+        assert_eq!(status.code(), Some(78), "{value:?}: {}", p.logs());
+        let err = failure(&p)["error"].as_str().unwrap().to_owned();
+        assert!(
+            err.contains("DEVCONTAINER_RUNTIME=podman"),
+            "{value:?}: {err}"
+        );
+        assert!(err.contains("ADR 0052"), "{value:?}: {err}");
+        assert!(
+            !err.contains("connecting to Postgres"),
+            "{value:?}: a bad configuration must stop before anything connects:\n{err}"
+        );
+    }
 }
 
 /// ADR 0052 decision 2: every removed variable but `DEVCONTAINER_RUNTIME=podman` is **ignored with a

@@ -1386,6 +1386,27 @@ async fn stopping_a_run_leaves_no_process_of_its_servers_not_even_a_grandchild()
     lsp.tree_is_gone("what the stop left").await;
 }
 
+/// The run's image changing stops what runs in the environment it leaves: the tool stops the
+/// run's commands (and so its language servers) before the pod is made again (ADR 0052).
+#[tokio::test]
+async fn changing_the_runs_image_stops_the_servers_of_the_run() {
+    use adam_coder::tools::environment::use_repository_environment;
+    let lsp = Lsp::new(script_with_tree()).await;
+    rust_project(&lsp);
+    lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    let pids = lsp.tree().await;
+    assert!(pids.iter().all(|p| alive(*p)), "{pids:?}");
+    let out = use_repository_environment(&lsp.fx.env, &lsp.ctx, None, None, true)
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(lsp.servers().is_empty());
+    lsp.tree_is_gone("what the image change left").await;
+    // The next call asks for the program again, and starts a new server.
+    lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    assert_eq!(lsp.servers().len(), 1);
+}
+
 #[tokio::test]
 async fn the_worker_stopping_stops_every_server() {
     let lsp = Lsp::new(script_with_tree()).await;

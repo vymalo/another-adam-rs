@@ -136,6 +136,29 @@ fn the_coder_image_carries_neither_tool() {
     );
 }
 
+/// The coder image's base and the chart's run pod image are one build: the Dockerfile's
+/// `WORKSPACE_TAG` and the chart's `runPods.image.tag` move together, so a run pod gets the same
+/// toolchains as the coder. (The chart pins the digest; the tag is what the Dockerfile can name.)
+#[test]
+fn the_workspace_image_of_the_coder_and_the_chart_move_together() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dockerfile = std::fs::read_to_string(root.join("docker/coder/Dockerfile")).unwrap();
+    let tag = dockerfile
+        .lines()
+        .find_map(|line| line.strip_prefix("ARG WORKSPACE_TAG="))
+        .expect("the Dockerfile pins WORKSPACE_TAG")
+        .trim();
+    let chart = std::fs::read_to_string(root.join("deploy/coder/values.yaml")).unwrap();
+    assert!(
+        chart.contains(&format!("    tag: {tag}\n")),
+        "the chart's runPods.image.tag is the coder's WORKSPACE_TAG ({tag}): move both together"
+    );
+    assert!(
+        chart.contains("digest: sha256:"),
+        "the chart pins the run pod image by digest"
+    );
+}
+
 /// `adam-exec` is a run pod's script now: one source, in the crate that runs it, copied by both
 /// images (the coder's and the run-pod test image).
 #[test]

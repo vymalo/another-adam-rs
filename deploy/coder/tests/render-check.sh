@@ -1908,6 +1908,8 @@ helm_key --set topology=split --set runPods.enabled=true > "$out"
 check "split with run pods: the worker renders without the acceptance" dlacks StatefulSet "$accept"
 helm_key --set config.role=control-plane > "$out"
 check "a control plane runs no command and holds no key: an App renders without the acceptance" lacks "$accept|github-app"
+check "DEVCONTAINER_RUNTIME=podman in extraEnv no longer moves the commands: still refused" \
+  fails helm_key --set-string config.extraEnv.DEVCONTAINER_RUNTIME=podman
 check "a removed DEVCONTAINER_RUNTIME in extraEnv no longer moves the commands: still refused" \
   fails helm_key --set-string config.extraEnv.DEVCONTAINER_RUNTIME=off
 helm_key --set runPods.allowCommandsNextToSecrets=true \

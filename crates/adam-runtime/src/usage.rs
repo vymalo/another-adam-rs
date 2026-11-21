@@ -464,6 +464,10 @@ mod tests {
             serde_json::to_value(&old).unwrap(),
             json!({"environment": "local"})
         );
+        // A word that is neither is refused: the alias admits the one removed word, not any word.
+        let unknown = serde_json::from_value::<SandboxUsage>(json!({"environment": "podman"}))
+            .expect_err("an unknown environment is not read as local");
+        assert!(unknown.to_string().contains("unknown variant"), "{unknown}");
     }
 
     #[test]
