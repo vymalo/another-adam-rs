@@ -67,8 +67,11 @@ engine as in `adam-agent`. `start` registers the agent's scheduler (`adam_schedu
 holds, so a scheduler a folder dropped is stepped to its cancel) and reconciles before the worker starts: a schedule
 added is started, one changed is replaced, one dropped is cancelled. Each due time fires one run of the agent, the
 prompt as a person's message, which nobody answers (a question ends the call instead of parking). A firing is nobody's
-message, so it is no caller's run: `list` and `get` do not show it, as an A2A server does not; the host reads it from
-its store (conversation `adam.schedule:<agent>/<schedule>@<due time>`).
+message, so it is no caller's run: `list`, `get`, `events` and `cancel` do not reach it, as an A2A server does not to a
+caller ([#289](https://github.com/vymalo/another-adam-rs/issues/289) would let the host see and stop one); the host reads
+it from its store, its conversation `adam_schedule::fired_conversation_id(agent, schedule, due)` (the schedule's name
+escaped) and its trigger `adam_schedule::trigger_of` (re-exported as `adam_engine::adam_schedule`). A reconcile that
+fails ends `start` with `Schedules`; on a retryable class, call `start` again.
 
 **A fixed worker id makes a restart claim its old runs at once; it is opt-in.** With `worker_id: None` the engine
 releases nothing, so engines that share a store never take each other's leases, and a restarted engine waits up to

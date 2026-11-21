@@ -134,8 +134,9 @@ impl EngineBuilder {
     }
 
     /// Migrate the store, release the leases a fixed [`Limits::worker_id`] holds in it (a restarted
-    /// engine claims its old runs at once), build the agent and start the worker on the current
-    /// tokio runtime.
+    /// engine claims its old runs at once), build the agent, register its scheduler and make the
+    /// store's scheduler runs match the folder's `schedules/` (ADR 0060), and start the worker on
+    /// the current tokio runtime.
     ///
     /// The agent gets the screen's tools of an embedded agent (`ask_user`, `show`, `ui_catalog`,
     /// `plan_*`, from `adam_ui::Ui::embedded`) and nothing on the network: a file that names an
@@ -153,7 +154,9 @@ impl EngineBuilder {
     /// * [`EngineError::Store`] when the store's migration or the release of the worker's leases
     ///   fails, with the store's class;
     /// * [`EngineError::Agent`] when the agent does not bind (an unknown tool, an MCP server, a
-    ///   remote subagent, a secret refused) or the model alias is refused.
+    ///   remote subagent, a secret refused) or the model alias is refused;
+    /// * [`EngineError::Schedules`] when the scheduler runs cannot be made to match the folder, with
+    ///   the reconcile's class: on a retryable one, call `start` again (what was done is kept).
     pub async fn start(self) -> Result<Engine, EngineError> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| EngineError::NoRuntime)?;
         let Self {
