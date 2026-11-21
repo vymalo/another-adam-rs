@@ -54,8 +54,9 @@ pub enum EngineError {
         /// The run.
         run: RunId,
     },
-    /// A child session's limits or state refuse the call: a session too many, or a close of a
-    /// session that is closed (`child-sessions/v1`).
+    /// A child session's limits or state refuse the call (`child-sessions/v1`): a session too many
+    /// (open or working), a message to a closed session, one past its rounds, or one while its rounds
+    /// already work.
     #[error("refused: {0}")]
     Refused(String),
     /// The engine was shut down: nothing would step a run it started now.

@@ -277,7 +277,9 @@ also takes a live engine's leases of the same process.
 and those crates' defaults, so a server build is unchanged, and decision 2's check still holds on `adam-engine`, which
 turns `sessions` on. The engine gives its backend the root's local subagents as helpers, its caller activates the
 extension, and a host starts, lists, talks to and closes a session (`Engine::helpers`, `start_session`, `sessions`,
-`send` to the session's conversation, `close_session`) under `Limits::sessions`. A remote subagent is still refused.
+`send` to the session's conversation, `close_session`) under `Limits::sessions`, and reads a round as any run (`get`,
+`events`, `files`: `RuntimeTaskBackend::owned_view` now accepts a round of the caller's session). A remote subagent is
+still refused.
 
 ## Decisions the owner confirmed
 

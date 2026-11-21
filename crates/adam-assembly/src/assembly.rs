@@ -480,7 +480,7 @@ impl Assembly {
 
     /// What the root's A2A front serves `child-sessions/v1` for, as
     /// [`AgentDef::child_sessions`](crate::AgentDef::child_sessions) computed it when the
-    /// definition was bound: `None` when the root has no subagent. Only with the feature `a2a`.
+    /// definition was bound: `None` when the root has no subagent. Only with the feature `sessions` (which `a2a` turns on).
     #[cfg(feature = "sessions")]
     pub fn child_sessions(&self) -> Option<&adam_a2a_runtime::ChildSessions> {
         self.child_sessions.as_ref()

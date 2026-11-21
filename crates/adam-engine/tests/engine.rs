@@ -1766,15 +1766,29 @@ async fn a_host_starts_lists_and_closes_a_child_session() {
         .unwrap_err();
     assert_eq!(unknown.class(), ErrorClass::Invalid, "{unknown:?}");
 
+    let start = StartSession::new("planner", "Plan the trip").keep_open();
     let first = engine
         .start_session(
             &parent.conversation,
-            StartSession::new("planner", "Plan the trip").keep_open(),
-            Say::new("make a plan"),
+            start.clone(),
+            Say::with_id("start-1", "make a plan"),
         )
         .await
         .unwrap();
     assert_eq!(first.delivered, Delivered::Started);
+    // Sent again, the same start is the session it started.
+    let again = engine
+        .start_session(
+            &parent.conversation,
+            start,
+            Say::with_id("start-1", "make a plan"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (again.delivered, again.run),
+        (Delivered::Repeated, first.run)
+    );
     assert_ne!(
         first.conversation, parent.conversation,
         "a conversation of its own"
@@ -1807,11 +1821,25 @@ async fn a_host_starts_lists_and_closes_a_child_session() {
     assert_eq!((session.round, session.latest), (1, Some(first.run)));
 
     let second = engine
-        .send(Some(&first.conversation), Say::new("and the return"))
+        .send(
+            Some(&first.conversation),
+            Say::with_id("round-2", "and the return"),
+        )
         .await
         .unwrap();
     assert_eq!(second.delivered, Delivered::Continued);
     assert_ne!(second.run, first.run);
+    let resent = engine
+        .send(
+            Some(&first.conversation),
+            Say::with_id("round-2", "and the return"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (resent.delivered, resent.run),
+        (Delivered::Repeated, second.run)
+    );
     assert_eq!(
         wait(second.run, RunState::Done).await.output.as_deref(),
         Some("Plan two.")
@@ -1822,6 +1850,18 @@ async fn a_host_starts_lists_and_closes_a_child_session() {
         .unwrap();
     assert_eq!(rounds.items.len(), 2, "{rounds:?}");
 
+    // A session's conversation holds no session, and a close goes to a session's conversation.
+    let nested = engine.sessions(&first.conversation).await.unwrap_err();
+    assert_eq!(nested.class(), ErrorClass::Invalid, "{nested:?}");
+    let not_a_session = engine
+        .close_session(&parent.conversation, false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        not_a_session.class(),
+        ErrorClass::Invalid,
+        "{not_a_session:?}"
+    );
     engine
         .close_session(&first.conversation, false)
         .await
@@ -1832,10 +1872,8 @@ async fn a_host_starts_lists_and_closes_a_child_session() {
         .send(Some(&first.conversation), Say::new("one more"))
         .await
         .unwrap_err();
-    assert!(
-        matches!(refused, EngineError::Finished { .. }),
-        "{refused:?}"
-    );
+    assert!(matches!(refused, EngineError::Refused(_)), "{refused:?}");
+    assert_eq!(refused.class(), ErrorClass::Rejected);
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 
     let lone = Engine::builder(
@@ -1857,6 +1895,16 @@ async fn a_host_starts_lists_and_closes_a_child_session() {
         .await
         .unwrap_err();
     assert_eq!(none.class(), ErrorClass::Invalid, "{none:?}");
+    // With no helper a close is refused, never sent to the agent as a message.
+    let closed_nothing = lone
+        .close_session(&first.conversation, false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        closed_nothing.class(),
+        ErrorClass::Invalid,
+        "{closed_nothing:?}"
+    );
     timeout(WAIT, lone.shutdown()).await.unwrap().unwrap();
 }
 
@@ -1891,6 +1939,21 @@ async fn the_hosts_session_limits_refuse_a_session_too_many() {
         )
         .await
         .unwrap();
+    // Its round ends and it stays open, idle: `max_open`, not `max_working`, refuses the next.
+    timeout(WAIT, async {
+        while engine
+            .get(first.run)
+            .await
+            .unwrap()
+            .expect("the round")
+            .state
+            != RunState::Done
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first round ends");
     let second = engine
         .start_session(
             &parent.conversation,
@@ -1899,7 +1962,10 @@ async fn the_hosts_session_limits_refuse_a_session_too_many() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(second, EngineError::Refused(_)), "{second:?}");
+    assert!(
+        matches!(&second, EngineError::Refused(why) if why.contains("open")),
+        "{second:?}"
+    );
     assert_eq!(second.class(), ErrorClass::Rejected);
     let listed = engine.sessions(&parent.conversation).await.unwrap();
     assert_eq!(listed.len(), 1, "{listed:?}");

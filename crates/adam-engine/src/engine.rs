@@ -121,7 +121,8 @@ pub struct Limits {
     /// The limits of the root's child sessions (`child-sessions/v1`, ADR 0045): how many are open
     /// and working at once in one conversation, and how many rounds one may have. The agent's
     /// file may lower them, never raise them. Default [`SessionLimits::default`]: 16 open, 4
-    /// working, 20 rounds.
+    /// working, 20 rounds. It replaces what the agent's definition was given with
+    /// `AgentDef::session_limits`.
     pub sessions: SessionLimits,
 }
 
@@ -340,10 +341,16 @@ impl EngineBuilder {
                 description: a.description.clone(),
             })
             .collect();
+        let helper_agents = sessions
+            .iter()
+            .flat_map(|s| s.agents())
+            .map(|a| a.agent.clone())
+            .collect();
         Ok(Engine {
             shared: Arc::new(Shared {
                 steering,
                 helpers,
+                helper_agents,
                 caller,
                 backend,
                 runtime: reader,
@@ -459,6 +466,9 @@ pub(crate) struct Shared {
     commands: Vec<Command>,
     /// The helpers a person may start a session with: what [`Engine::helpers`] lists.
     helpers: Vec<SessionHelper>,
+    /// Their names as registered on the runtime (`<root>/<helper>`), in the same order: what a
+    /// round's id is derived from.
+    helper_agents: Vec<String>,
     /// Held shared by every message for the length of its call, and exclusively by `shutdown` while
     /// it sets `stopping`: a message is either written before the worker is told to stop, or
     /// refused.
@@ -525,8 +535,9 @@ impl Engine {
     /// # Errors
     ///
     /// [`EngineError::Invalid`] for a message with no text or no id, [`EngineError::NotFound`]
-    /// for a conversation this engine has no run in, [`EngineError::Stopped`] after
-    /// [`shutdown`](Self::shutdown), and the store's failures.
+    /// for a conversation this engine has no run in, [`EngineError::Refused`] for a child session
+    /// that refuses it (closed, at its rounds, or its rounds already working), [`EngineError::Stopped`]
+    /// after [`shutdown`](Self::shutdown), and the store's failures.
     pub async fn send(
         &self,
         conversation: Option<&ConversationId>,
@@ -536,16 +547,32 @@ impl Engine {
         say.check()?;
         let shared = &self.shared;
         let context = conversation.map(|c| c.as_str().to_owned());
-        // The run this message starts, if it starts one: the backend derives it the same way, so
-        // a repeat finds the run its first attempt started.
-        let own = task_id_for(&shared.agent, SUBJECT, context.as_deref(), &say.id);
-        if let Some(info) = self.get(own).await? {
-            return Ok(Turn {
-                conversation: info.conversation.clone(),
-                run: own,
-                delivered: Delivered::Repeated,
-                info,
-            });
+        let session = conversation.filter(|c| is_session(c));
+        // The runs this message may start: at the root, a run of the agent; in a child session, a
+        // round of its helper (one of the helpers: the session's is not known before it is read).
+        // The backend derives each the same way, so a repeat finds what its first attempt started.
+        let owns: Vec<RunId> = match session {
+            Some(session) => shared
+                .helper_agents
+                .iter()
+                .map(|helper| task_id_for(helper, SUBJECT, Some(session.as_str()), &say.id))
+                .collect(),
+            None => vec![task_id_for(
+                &shared.agent,
+                SUBJECT,
+                context.as_deref(),
+                &say.id,
+            )],
+        };
+        for own in &owns {
+            if let Some(info) = self.get(*own).await? {
+                return Ok(Turn {
+                    conversation: info.conversation.clone(),
+                    run: *own,
+                    delivered: Delivered::Repeated,
+                    info,
+                });
+            }
         }
         let mut message = message(&say);
         let latest = match conversation {
@@ -561,20 +588,20 @@ impl Engine {
             .backend
             .submit(shared.caller.clone(), message, None, context)
             .await
-            // A refusal for the conversation's state (a closed child session) names its latest
-            // run: `Finished`, not a bug.
-            .map_err(|e| EngineError::of_backend(e, latest.as_ref().map(|l| l.run)))?;
+            .map_err(|e| match e {
+                // A child session's limits or state (closed, at its rounds, its rounds working).
+                BackendError::UnsupportedOperation(why) if session.is_some() => {
+                    EngineError::Refused(why)
+                }
+                e => EngineError::of_backend(e, latest.as_ref().map(|l| l.run)),
+            })?;
         let info = RunInfo::of(&task)?;
         let delivered = match &latest {
-            _ if info.run != own => match latest {
+            _ if !owns.contains(&info.run) => match latest {
                 Some(latest) if latest.run == info.run && latest.state == RunState::Waiting => {
                     Delivered::Answered
                 }
-                Some(latest) if latest.run == info.run => Delivered::Steered,
-                // A new run that is not the one this message derives: the next round of a child
-                // session, whose ids the backend derives from the session.
-                Some(_) => Delivered::Continued,
-                None => Delivered::Started,
+                _ => Delivered::Steered,
             },
             Some(_) => Delivered::Continued,
             None => Delivered::Started,
@@ -846,7 +873,9 @@ impl Engine {
     ///
     /// [`EngineError::Invalid`] when the agent has no helper of that name, the description is
     /// blank, longer than 80 characters or not one line, `say` has no text, or the conversation is
-    /// a session's own; [`EngineError::Refused`] for a session too many ([`Limits::sessions`]);
+    /// a session's own; [`EngineError::NotFound`] for a conversation this engine has no run in;
+    /// [`EngineError::Refused`] for a session too many, open or working ([`Limits::sessions`]); a
+    /// repeated `say` answers the session it started (`Repeated`);
     /// [`EngineError::Stopped`] after [`shutdown`](Self::shutdown); and the store's failures.
     pub async fn start_session(
         &self,
@@ -861,6 +890,31 @@ impl Engine {
             return Err(EngineError::Invalid(
                 "this agent has no helper to start a session with".to_owned(),
             ));
+        }
+        if is_session(conversation) {
+            return Err(EngineError::Invalid(
+                "a session's conversation holds no session: start it in the parent's".to_owned(),
+            ));
+        }
+        // The parent conversation is one of this engine's, as for `send`.
+        self.latest_run(conversation).await?;
+        // A start's first round is the session itself, its id derived from the helper, the parent
+        // conversation and the message: a repeat finds it.
+        if let Some(position) = shared.helpers.iter().position(|h| h.name == start.helper) {
+            let first = task_id_for(
+                &shared.helper_agents[position],
+                SUBJECT,
+                Some(conversation.as_str()),
+                &say.id,
+            );
+            if let Some(info) = self.get(first).await? {
+                return Ok(Turn {
+                    conversation: info.conversation.clone(),
+                    run: first,
+                    delivered: Delivered::Repeated,
+                    info,
+                });
+            }
         }
         let mut message = message(&say);
         message.metadata = Some(std::collections::HashMap::from([(
@@ -898,12 +952,18 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// [`EngineError::NotFound`] for a conversation this engine has not, and the store's
-    /// failures.
+    /// [`EngineError::Invalid`] for a session's own conversation, [`EngineError::NotFound`] for a
+    /// conversation this engine has not, [`EngineError::Unavailable`] when the sessions could not
+    /// be listed (it never answers "none" then), and the store's failures.
     pub async fn sessions(
         &self,
         conversation: &ConversationId,
     ) -> Result<Vec<SessionInfo>, EngineError> {
+        if is_session(conversation) {
+            return Err(EngineError::Invalid(
+                "a session's conversation holds no session".to_owned(),
+            ));
+        }
         if self.shared.helpers.is_empty() {
             self.latest_run(conversation).await?;
             return Ok(Vec::new());
@@ -936,9 +996,9 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// [`EngineError::Invalid`] for a conversation that is not a session's, [`EngineError::Refused`]
-    /// for one the backend refuses for its state, [`EngineError::Stopped`] after
-    /// [`shutdown`](Self::shutdown), and the store's failures.
+    /// [`EngineError::Invalid`] for a conversation that is not a session's (or no helper at all),
+    /// [`EngineError::Stopped`] after [`shutdown`](Self::shutdown), and the store's failures.
+    /// Closing a closed session answers its latest round.
     pub async fn close_session(
         &self,
         session: &ConversationId,
@@ -946,6 +1006,12 @@ impl Engine {
     ) -> Result<RunInfo, EngineError> {
         let _writing = self.writable().await?;
         let shared = &self.shared;
+        // Only a session's conversation: on any other, the close would be read as a message.
+        if shared.helpers.is_empty() || !is_session(session) {
+            return Err(EngineError::Invalid(format!(
+                "{session} is not a child session's conversation"
+            )));
+        }
         // The close carries no text of the person's: the backend's closing round is its own.
         let mut message = message(&Say::new("close the session"));
         message.metadata = Some(std::collections::HashMap::from([(
@@ -1188,6 +1254,11 @@ impl Engine {
             ))),
         }
     }
+}
+
+/// Whether `conversation` is a child session's own (`<parent>/s/<session>`).
+fn is_session(conversation: &ConversationId) -> bool {
+    adam_runtime::parse_session_conversation_id(conversation.as_str()).is_some()
 }
 
 /// Refuse an agent whose files, or a local subagent's, name an MCP server (`mcp.json`) or a remote

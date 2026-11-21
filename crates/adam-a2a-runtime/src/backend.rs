@@ -328,8 +328,9 @@ impl RuntimeTaskBackend {
         self.child_sessions.as_ref()
     }
 
-    /// The run behind `task_id` as the runtime has it, if it exists, belongs to this agent and is
-    /// `caller`'s: the ownership check every call makes, without building a task, so no file's
+    /// The run behind `task_id` as the runtime has it, if it exists and is `caller`'s, a task of
+    /// this agent or a round of one of the caller's child sessions (with the extension activated):
+    /// the ownership check every call makes (`locate`), without building a task, so no file's
     /// bytes are read (a file artifact stays an `ArtifactRef` whose bytes
     /// [`Runtime::artifact_bytes`] fetches). For a host that serves the run's files itself.
     ///
@@ -341,7 +342,7 @@ impl RuntimeTaskBackend {
         caller: &Caller,
         task_id: &str,
     ) -> Result<Option<RunView>, BackendError> {
-        Ok(self.owned(caller, task_id).await?.map(|(_, view, _)| view))
+        Ok(self.locate(caller, task_id).await?.map(|(_, view, _)| view))
     }
 
     /// The task this backend would serve for `view`, under the run's own conversation id as its

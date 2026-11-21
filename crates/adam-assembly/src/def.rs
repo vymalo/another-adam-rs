@@ -407,7 +407,7 @@ impl AgentDef {
     /// process role and made without binding, so a control plane that never builds the agent
     /// serves the card and the sessions a worker's tools agree with.
     ///
-    /// Only with the feature `a2a`.
+    /// Only with the feature `sessions` (which `a2a` turns on).
     #[cfg(feature = "sessions")]
     pub fn child_sessions(&self) -> Option<adam_a2a_runtime::ChildSessions> {
         use adam_a2a_runtime::{ChildSessionAgent, ChildSessions};
