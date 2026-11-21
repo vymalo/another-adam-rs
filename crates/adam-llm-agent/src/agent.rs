@@ -5819,14 +5819,15 @@ mod failure_tests {
         assert_eq!(limited.retry_after_ms, Some(30_000));
         assert_eq!(limited.class.as_deref(), Some("RateLimited"));
 
-        // The journal is a boundary: the cause is flattened into the message, once.
-        let transient =
-            ModelFailure::from(ModelError::transient("connection failed").with_source(Reset));
+        // The journal is a boundary: the cause is flattened into the message, once. A connection
+        // that could not be made is what the OpenAI client reports as `Unreachable` (ADR 0067).
+        let transient = ModelFailure::from(ModelError::unreachable().with_source(Reset));
         assert!(transient.retryable);
         assert_eq!(transient.retry_after_ms, None);
+        assert_eq!(transient.class.as_deref(), Some("Transient"));
         assert_eq!(
             transient.message,
-            "transient model error: connection failed: connection reset"
+            "the model endpoint could not be reached: connection reset"
         );
 
         let auth = ModelFailure::from(ModelError::Auth("bad key".into()));
