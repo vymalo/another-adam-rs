@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use a2a::{Message, Part, Role, Task};
 use adam_a2a::{BackendError, Caller, STEER_EXTENSION, TaskBackend, TaskQuery};
-use adam_a2a_runtime::{RuntimeTaskBackend, task_id_for};
-use adam_agent_fs::{AgentManifest, Subagent};
+use adam_a2a_runtime::{Commands, RuntimeTaskBackend, task_id_for};
+use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
 use adam_core::{DynSecretSource, DynStore, RunId};
 use adam_llm_agent::DEFAULT_MAX_PARALLEL;
@@ -186,6 +186,7 @@ impl EngineBuilder {
         refuse_what_is_not_embedded(agent.manifest(), agent.name())?;
         let name = agent.name().to_owned();
         let schedules = agent.manifest().schedules.clone();
+        let commands = agent.manifest().commands.clone();
         let ui = Ui::embedded();
         let assembly = agent
             .secrets(secrets)
@@ -229,7 +230,10 @@ impl EngineBuilder {
         // (`TaskBackend::subscribe`), whose file parts are built from a live event's bytes. The engine
         // never calls that path: an artifact in this ring has its bytes withheld, so a caller that
         // streams a task through this backend must read files from the store.
-        let backend = RuntimeTaskBackend::new(runtime.clone(), events.clone(), name.clone());
+        // The folder's commands (`commands/v1`): a message whose text is `/name args` is expanded
+        // from `commands/<name>.md` before it is stored, as on the server surfaces.
+        let backend = RuntimeTaskBackend::new(runtime.clone(), events.clone(), name.clone())
+            .with_commands(Commands::from_manifest(&commands));
 
         let (stop, stopped) = oneshot::channel::<()>();
         let running = handle.spawn(async move {
@@ -262,6 +266,7 @@ impl EngineBuilder {
                 backend,
                 events,
                 agent: name,
+                commands,
                 writes: RwLock::new(()),
                 stopping: AtomicBool::new(false),
                 worker: Worker {
@@ -361,6 +366,8 @@ pub(crate) struct Shared {
     /// The same subject, with `steer/v1` activated: a message for a running run is delivered.
     steering: Caller,
     agent: String,
+    /// The agent's commands, from its `commands/`: what [`Engine::commands`] lists.
+    commands: Vec<Command>,
     /// Held shared by every message for the length of its call, and exclusively by `shutdown` while
     /// it sets `stopping`: a message is either written before the worker is told to stop, or
     /// refused.
@@ -627,6 +634,14 @@ impl Engine {
             next_page_token: page.next_page_token,
             total: page.total_size,
         })
+    }
+
+    /// The agent's commands (`commands/<name>.md`), in name order: what a person may type as
+    /// `/name args`, which the engine expands from the command's template before it is stored. A
+    /// host lists them in its `/` menu with their `description` and `argument_hint`, as a client
+    /// of the server surfaces reads them from the card (`commands/v1`).
+    pub fn commands(&self) -> &[Command] {
+        &self.shared.commands
     }
 
     /// `run` as the store has it now, or `None` when this engine has no such run.

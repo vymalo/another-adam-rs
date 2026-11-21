@@ -16,7 +16,7 @@ The calls, their refusals and their defaults: the [crate README](../../crates/ad
 | The host gives | As | Today |
 |---|---|---|
 | the store | `DynStore` | `adam_store_sqlite::SqliteStore::open(path)`, a file of the application's own that outlives the process (a killed process's runs are finished by the next one); `adam_core::MemoryStore` (a restart forgets every run) |
-| the agent | `AgentDef` | a folder read at startup (`AgentFolder::load`), or one compiled in (`include_agent!`); its `schedules/` run, each firing a run of the agent in the store (not in `list`: nobody sent it) |
+| the agent | `AgentDef` | a folder read at startup (`AgentFolder::load`), or one compiled in (`include_agent!`); its `schedules/` run, each firing a run of the agent in the store (not in `list`: nobody sent it); its `commands/` are expanded from `/name args`, and `Engine::commands()` lists them for a `/` menu |
 | the model | `DynModel`, with its credentials | any `ModelClient`: the engine links no model client and reads no key |
 | secrets the agent's files name | `SecretSource` (`EngineBuilder::secrets`) | none: `default_secrets()` refuses every name |
 | a tokio runtime | the current one at `start` | the worker runs on it |
