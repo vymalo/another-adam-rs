@@ -3,15 +3,17 @@
 //! after the run's first step is committed; the parent kills the child with `SIGKILL`, opens the
 //! same store, and its engine finishes the run without running that step again.
 //!
-//! Both halves set one fixed worker id, [`WORKER`], and the child's lease lasts an hour: the parent
-//! finishes the run in time only because its `start` releases the leases that id holds
-//! (`Store::release_worker_leases`). The promise a fixed id makes holds: the child is dead before
-//! the parent opens the store, and the store is this test's alone.
+//! The store is the SQLite store of ADR 0053 slice 3 (`adam-store-sqlite`), a file in the test's own
+//! directory: what an application embeds. The child's lease lasts an hour, so the parent finishes
+//! the run in time only because the run's lease is let go when the parent opens the store. Two
+//! things do that, and the test runs once with each worker id the host may choose:
 //!
-//! The store comes from [`durable_store`] alone. Until the SQLite store of ADR 0053 slice 3 lands
-//! it panics and the test is ignored. The pull request that adds the store changes the helper's
-//! body, the `#[ignore]`, and this crate's dev-dependencies (`adam-store-sqlite`): the helper is
-//! already `async` and returns a `Result`, so its callers stay as they are.
+//! * the engine's default, a random id ([`Limits::worker_id`] `None`): the SQLite store's lock on the
+//!   file is the process's, so the killed child's is gone, and its `migrate` clears every lease it
+//!   finds, since the lock proves no other process is alive;
+//! * a fixed id, [`WORKER`], in both halves: the parent's `start` also releases the leases that id
+//!   holds (`Store::release_worker_leases`). The promise a fixed id makes holds: the child is dead
+//!   before the parent opens the store, and the store is this test's alone.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
@@ -38,6 +40,8 @@ use tokio::time::timeout;
 
 /// Set (to the directory of the store) in the child only: the test is then the child's half.
 const CHILD: &str = "ADAM_ENGINE_TEST_RESUME_CHILD";
+/// Set in the child when both halves use the fixed worker id [`WORKER`].
+const FIXED: &str = "ADAM_ENGINE_TEST_RESUME_FIXED_ID";
 const TEST: &str = "a_killed_process_resumes_its_run";
 const WAIT: Duration = Duration::from_secs(60);
 /// The child's lease: far longer than [`WAIT`], so the parent claims the killed child's run in time
@@ -47,30 +51,29 @@ const CHILD_LEASE: Duration = Duration::from_secs(60 * 60);
 /// under it.
 const WORKER: &str = "resume-test";
 
-/// The limits of both halves: the one worker id, and the child's lease.
-fn limits() -> Limits {
+/// The limits of both halves: the child's lease, and [`WORKER`] when `fixed`, else the engine's
+/// default, a random id per start.
+fn limits(fixed: bool) -> Limits {
     let mut limits = Limits::default();
     limits.lease_ttl = CHILD_LEASE;
-    limits.worker_id = Some(WORKER.to_owned());
+    limits.worker_id = fixed.then(|| WORKER.to_owned());
     limits
 }
 
-/// The store both processes open at `path`: it must outlive the process that wrote it.
-#[allow(clippy::unused_async)] // opening the SQLite store will await
+/// The store both processes open at `path`: a SQLite file, which outlives the process that wrote it.
+#[allow(clippy::unused_async)] // the callers await it, as they would a store that connects
 async fn durable_store(path: &Path) -> Result<DynStore, Box<dyn std::error::Error>> {
-    panic!(
-        "needs a durable store: adam-store-sqlite (ADR 0053 slice 3, #362); un-ignore in the PR \
-         that adds it (it would open {})",
-        path.display()
-    )
+    Ok(Arc::new(adam_store_sqlite::SqliteStore::open(path)?))
 }
 
 #[test]
-#[ignore = "needs a durable store: adam-store-sqlite (ADR 0053 slice 3, #362); un-ignore in the PR that adds it"]
 fn a_killed_process_resumes_its_run() {
     match std::env::var_os(CHILD) {
-        Some(dir) => child(PathBuf::from(dir)),
-        None => parent(),
+        Some(dir) => child(PathBuf::from(dir), std::env::var_os(FIXED).is_some()),
+        None => {
+            parent(false);
+            parent(true);
+        }
     }
 }
 
@@ -143,7 +146,7 @@ impl ModelClient for Blocking {
 }
 
 /// The child's half: an engine on the store in `dir`, one message, and a wait to be killed.
-fn child(dir: PathBuf) {
+fn child(dir: PathBuf, fixed: bool) {
     runtime().block_on(async {
         let first = MockModel::new();
         first.push_tool_calls(vec![plan()]);
@@ -158,7 +161,7 @@ fn child(dir: PathBuf) {
             model,
             "m",
         )
-        .limits(limits())
+        .limits(limits(fixed))
         .start()
         .await
         .unwrap();
@@ -185,16 +188,20 @@ fn wait_for(dir: &Path, name: &str, child: &mut std::process::Child) -> String {
     }
 }
 
-/// The parent's half: start the child, kill it once its step is committed, and finish its run.
-fn parent() {
+/// The parent's half: start the child, kill it once its step is committed, and finish its run, both
+/// halves with the fixed worker id when `fixed`.
+fn parent(fixed: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([TEST, "--exact", "--include-ignored", "--nocapture"])
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([TEST, "--exact", "--nocapture"])
         .env(CHILD, dir.path())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stdout(Stdio::null());
+    if fixed {
+        command.env(FIXED, "1");
+    }
+    let mut child = command.spawn().unwrap();
     wait_for(dir.path(), "committed", &mut child);
     let run = RunId(uuid::Uuid::parse_str(&wait_for(dir.path(), "run", &mut child)).unwrap());
     child.kill().unwrap();
@@ -213,7 +220,7 @@ fn parent() {
             model,
             "m",
         )
-        .limits(limits())
+        .limits(limits(fixed))
         .start()
         .await
         .unwrap();

@@ -44,8 +44,9 @@ yes to a tool call): match it with a `_` arm.
 **The engine's own API is the supported one.** The crates it re-exports (`adam_a2a_runtime` and the others) are
 there for the types a host passes in (`AgentDef`, `DynModel`, `DynStore`, `SecretSource`), not as a second way in.
 
-**What the host gives.** The store (`DynStore`: `adam_core::MemoryStore` today, the SQLite adapter of slice 3 when
-it lands, which changes that one argument), the agent's definition (`AgentDef`, from `include_agent!` or a folder),
+**What the host gives.** The store (`DynStore`: `adam_store_sqlite::SqliteStore::open(path)` for a file of the
+application's own that outlives the process, or `adam_core::MemoryStore`; the engine depends on neither, so the
+host brings the one it chooses), the agent's definition (`AgentDef`, from `include_agent!` or a folder),
 the model (`DynModel`, with its credentials: ADR 0047 decision 4, [ADR
 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)) and, if the
 agent's files name secrets, a `SecretSource`. The engine reads no environment variable, no key and no file it was not
@@ -63,8 +64,9 @@ releases nothing, so engines that share a store never take each other's leases, 
 `lease_ttl` for the runs its last process was stepping. With `Some(id)` the host promises that **no other live engine,
 in any process, uses `id` on this store**, and `start` releases every lease `id` holds (`Store::release_worker_leases`)
 before the worker starts, so those runs are claimed at once (a store that does not implement the release, whose
-default does nothing, still waits). Set an id only for a store no other engine shares: the application's own SQLite
-file once slice 3 lands (its lock will allow one process per file; it is not built yet) or a store per install. A
+default does nothing, still waits). Set an id only for a store no other engine shares, such as a store per install.
+The SQLite store needs none: its lock allows one process per file, and opening the file clears every lease the
+last process held, so a restart claims its runs at once with the default too. A
 broken promise steps a run twice, its tools included: the release takes the other engine's leases, and both renew
 under the same id.
 
@@ -81,9 +83,11 @@ activated), so follow-ups, steering, answers and continuations have one implemen
 context; a send to one names its latest run in `referenceTaskIds`, which the backend continues once it has ended.
 `answer` sends the plain follow-up, which the backend takes only from a waiting run.
 
-**Not yet**: the proof that a killed process resumes its run, which needs the durable store of slice 3: it is written,
-`tests/resume_process.rs`, and ignored until then (today `a_dropped_engine_resumes_its_run` proves it in memory, below); a way
-to read a file artifact's bytes (`RunInfo` carries no artifacts yet, and an event carries none, below). The backend is
+**A killed process resumes its run** on the SQLite store: the next process to open the file finishes it, without
+running a committed step again (`tests/resume_process.rs`, below). With SQLite no fixed `worker_id` is needed: the
+store's lock on the file proves the killed process is gone, and opening it clears every lease the file holds.
+
+**Not yet**: a way to read a file artifact's bytes (`RunInfo` carries no artifacts yet, and an event carries none, below). The backend is
 given the engine's ring too, and its A2A streaming path (`TaskBackend::subscribe`) builds a file part from a live
 event's bytes: the engine never calls it, and a future caller that streams a task through it must read files from the
 store, since the ring withholds them. Approvals are slice 5: today a run waits only on a question, and `answer`
@@ -202,7 +206,7 @@ withheld file says), `thiserror` and `uuid`.
 ## Features and environment
 
 No Cargo features, no environment variables. The example reads `MODEL_BASE_URL`, `MODEL_API_KEY` and `MODEL` (its
-`main.rs`, not the engine), and `tests/resume_process.rs` reads `ADAM_ENGINE_TEST_RESUME_CHILD` in the child it starts.
+`main.rs`, not the engine), and `tests/resume_process.rs` reads `ADAM_ENGINE_TEST_RESUME_CHILD` and `ADAM_ENGINE_TEST_RESUME_FIXED_ID` in the child it starts.
 
 ## Tests
 
@@ -240,7 +244,7 @@ every wait is bounded by `tokio::time::timeout`:
   ends with it, and B's
   stream, opened while B's first model call waits at a gate (so it starts with all B did since it claimed the run),
   shows the tool's step never run again: the committed step is kept. `tests/resume_process.rs`, below, is the real
-  proof, a process killed with `SIGKILL`, waiting on the SQLite store of slice 3;
+  proof, a process killed with `SIGKILL`, on the SQLite store;
 * `a_restarted_engine_claims_its_old_runs_at_once`: A, with the fixed id `restarted` and a lease of an hour, is dropped
   mid-step, and B, the same id on the same store (started once A's worker has ended and freed the id), finishes the
   run within 5 s, which it cannot do without the release; `an_empty_worker_id_is_refused` (`Some("")`, `Invalid`);
@@ -267,15 +271,16 @@ shows what the last did, over `MemoryStore`, the example's own agent folder and 
   reply, `[done]`, then `bye`; one that ends after a question gets the question, then `bye`;
 * `quit_during_a_step_says_it_waits_for_it`: `/quit` while the model works prints the stopping line, then `bye`.
 
-`tests/resume_process.rs` (Unix), `a_killed_process_resumes_its_run`, **ignored** until the SQLite store of slice 3
-lands: the test runs its own binary again as a child (`ADAM_ENGINE_TEST_RESUME_CHILD`, read by this test only, names
-the store's directory), which sends a message whose model blocks once the run's first step (a `plan_work` call) is
-committed and says so in a file; the parent kills it with `SIGKILL`, opens the same store, and its engine finishes the
-run: both set the fixed worker id `resume-test` and the child's lease is an hour, so the parent finishes in time only by
-releasing the child's lease at start; its model, scripted for the next step only, is called once, and its request
-holds the tool's result once and ends with it, which fails if the committed step was lost. The store comes from one helper, `async fn durable_store(path) ->
-Result<DynStore, _>`, which panics until then: PR 4 changes its body, the `#[ignore]` and the dev-dependencies
-(`adam-store-sqlite`), and no call site.
+`tests/resume_process.rs` (Unix), `a_killed_process_resumes_its_run`, on a SQLite file in the test's own directory
+(`adam-store-sqlite`, a dev-dependency only, so the embedded tree is unchanged): the test runs its own binary again as
+a child (`ADAM_ENGINE_TEST_RESUME_CHILD`, read by this test only, names the store's directory), which sends a message
+whose model blocks once the run's first step (a `plan_work` call) is committed and says so in a file; the parent kills
+it with `SIGKILL`, opens the same store, and its engine finishes the run. The child's lease is an hour, so the parent
+finishes in time only because the lease is let go when it opens the store. It runs twice: with the engine's default,
+a random worker id, where the store's `migrate` clears the dead process's leases (its file lock proves the process is
+gone); and with the fixed id `resume-test` in both halves (`ADAM_ENGINE_TEST_RESUME_FIXED_ID`), where `start` releases
+that id's leases too. Each time the parent's model, scripted for the next step only, is called once, and its request
+holds the tool's result once and ends with it, which fails if the committed step was lost.
 
 In `src/`: `a_name_the_environment_has_is_refused_by_the_engines_default` (slice 2's proof),
 `the_sink_keeps_file_bytes_out_of_the_ring` and `a_withheld_file_says_its_length_and_digest` (a file's event reaches a
