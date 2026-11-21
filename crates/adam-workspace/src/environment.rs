@@ -453,7 +453,7 @@ pub trait EnvSession: Send + Sync {
     /// What a process in this environment reserves, **when the environment meters the time of its
     /// processes**: the coder reports how long each command ran, weighted by this shape, as the run's
     /// sandbox usage (ADR 0043). `None`, the default, is an environment that is not metered (the
-    /// caller's own container, a dev container): the usage says where the run was and not how long,
+    /// caller's own container): the usage says where the run was and not how long,
     /// which is *not measured* and not zero. An implementation that wraps another one must forward
     /// this ([`HidingEnvironment`] does), or the default hides the shape.
     fn sandbox_shape(&self) -> Option<SandboxShape> {

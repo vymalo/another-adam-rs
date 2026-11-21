@@ -1115,7 +1115,7 @@ to a person who asked for a plan). Not enforceable: what an asked agent (`ask_ag
 ask for a change the tier forbids) and a server's write tool with a reading name.
 
 **The tier is not a boundary against a command.** `run_command`, `run` and `run_checks` run in the coder's own container
-when there are no run pods and `DEVCONTAINER_RUNTIME=off` (the default), as the user that can read the GitHub App's private key
+when there are no run pods (the default), as the user that can read the GitHub App's private key
 **file** (`GITHUB_APP_PRIVATE_KEY_PATH`; a key given inline is hidden from the commands): a command can read it, mint an
 installation token and act as the App at any tier, a `plan` included. **The coder refuses to start in that configuration**
 (exit 78, with every other problem of the configuration) unless the deployment accepts the risk by name with
@@ -1455,7 +1455,7 @@ stateDiagram-v2
   (ADR 0038); what the process must not see of this process's own environment is `ExecSpec.hide`:
   `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL`, `A2A_BEARER_TOKENS` and `MODEL_API_KEY`. The App's key as a *file*
   (`GITHUB_APP_PRIVATE_KEY_PATH`) is a path, not a secret, and the file is readable by the user the checks run as: **in this
-  container (no run pods, `DEVCONTAINER_RUNTIME=off`) a command can read the key and mint a token, so no access tier holds
+  container (no run pods) a command can read the key and mint a token, so no access tier holds
   against a command**; the coder refuses to start that way unless `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` accepts it (and then
   warns at startup), and run pods are what confine it. A name in `hide` stays hidden even when a spec sets it.
 * **A failure to make the environment is a result for the model**, worded `the work environment: <reason>` (the end of a
@@ -3000,7 +3000,7 @@ database of its own, so the role needs `CREATEDB`):
 * `tests/environment.rs`, **sandbox time** (ADR 0043), against the same fake made a pod (`FakeSession::as_pod`): a command in a pod reports
   the time it ran and the pod's shape and the checks and `run_command` add to one entry; a request the pod does not make is absent; a
   command a **timeout** stopped, and one a **cancel** stopped (a call that ends in an error), still count until they were stopped;
-  a command a cancel stopped counts until it stopped; the coder's own container and a dev container report where and no
+  a command a cancel stopped counts until it stopped; the coder's own container reports where and no
   time; a pod asked for and not used is a measured zero and an environment that could not be made reports nothing. `tests/e2e.rs`
   (`the_time_of_the_coders_commands_in_a_run_pod_is_the_tasks_sandbox_usage`,
   `the_coders_commands_in_its_own_container_are_reported_as_not_measured`): over A2A, the task read after it ended carries `sandbox`.

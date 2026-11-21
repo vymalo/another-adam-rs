@@ -518,7 +518,7 @@ no record on the volume and no beat: a run that moves to another worker (placeme
 first one stops when it is idle or when its run ends; `affinity` or `isolated` keep a run on its worker
 ([Architecture](../architecture.md)). The server is a piped process of the run's environment: `ExecSpec::background` through
 `EnvSession::prepare`, in a process group of its own, with the variables a command does not see hidden. A run pod
-forwards stdin, held open for minutes, to it (proved in all three environments by
+forwards stdin, held open for minutes, to it (proved in both environments — this container and a run pod — by
 `adam_workspace::testing_stdio`, [Testing](../guides/testing.md)).
 
 **What a call waits for.** `wait` (1 to 120 s, 30 by default) is how long a call waits for a server that is still indexing:

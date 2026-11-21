@@ -15,8 +15,8 @@
 //!     Initializing --> Failed: no answer in 60 s, exited, or its call was dropped
 //!     Indexing --> Ready: no progress open, quiet for 300 ms
 //!     Ready --> Indexing: progress begins
-//!     Ready --> Stopped: idle, park, run over, rebuild, release, worker stops, room for another
-//!     Indexing --> Stopped: idle, park, run over, rebuild, release, worker stops, room for another
+//!     Ready --> Stopped: idle, park, run over, the environment made again, release, worker stops, room for another
+//!     Indexing --> Stopped: idle, park, run over, the environment made again, release, worker stops, room for another
 //!     Ready --> Stopped: crash, output that is not messages, no answer, wrote where it must not
 //!     Indexing --> Stopped: crash, output that is not messages, no answer, wrote where it must not
 //!     Missing --> [*]
@@ -440,8 +440,8 @@ pub enum StartError {
 }
 
 /// Kills a server that is not held yet, when the call that starts it is dropped (a time limit, a
-/// cancel): its process group here, and what the environment holds for its exec id (a pod or a
-/// dev container keeps the process and its descendants beyond this machine's reach).
+/// cancel): its process group here, and what the environment holds for its exec id (a run pod
+/// keeps the process and its descendants beyond this machine's reach).
 struct StartGuard {
     pid: Option<u32>,
     session: Arc<dyn EnvSession>,

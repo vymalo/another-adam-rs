@@ -437,7 +437,7 @@ The same object carries the compute a run's commands used. A tool reports how lo
 (`ToolCtx::report_sandbox`); the loop journals it with the call's result, adds it to `Conversation::sandbox_usage` in the
 same commit, and a parent adds its child's, as it does the tokens. `totals_metadata` writes it as the `sandbox` member beside
 `totals` when the task ends or waits: one entry per pod shape (the template's CPU and memory requests) with the commands and
-their milliseconds, and for a run in the coder's own container or a dev container only the environment, which reads as *not
+their milliseconds, and for a run in the coder's own container only the environment, which reads as *not
 measured* and never as zero ([ADR 0043](decisions/0043-sandbox-time-as-usage.md), `bin/adam-coder/src/tools/sandbox.rs`,
 `crates/adam-a2a-runtime/src/usage.rs`).
 
