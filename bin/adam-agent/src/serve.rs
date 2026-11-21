@@ -10,6 +10,7 @@
 use std::future::Future;
 
 use adam::AgentDef;
+use adam_llm_agent::ModelParking;
 
 use crate::agent::{WorkerParts, agents, card_of_folder};
 use crate::config::{Config, WorkerConfig};
@@ -92,6 +93,10 @@ pub async fn serve(
             // process (the configuration's and the environment's) are scrubbed from both.
             step_io: redact::step_io_named(&config, redact::process_vars(), &named_vars),
             max_parallel: settings.max_parallel_tool_calls,
+            // A refused model call parks the run (ADR 0067); behind the injector, so does a gateway
+            // that cannot be reached.
+            parking: ModelParking::new(worker.model.park_limit)
+                .when_unreachable(worker.model.injected_run),
         }),
         _ => None,
     };

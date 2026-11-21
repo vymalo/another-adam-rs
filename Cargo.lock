@@ -520,6 +520,7 @@ dependencies = [
  "adam-core",
  "adam-error",
  "adam-model",
+ "adam-model-openai",
  "adam-runtime",
  "adam-store-mongodb",
  "adam-store-postgres",
@@ -530,6 +531,7 @@ dependencies = [
  "jiff",
  "proptest",
  "schemars 1.2.2",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -537,6 +539,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

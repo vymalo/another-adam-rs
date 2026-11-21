@@ -112,6 +112,10 @@ async fn build_agent(
     settings.language_server_idle = worker.language_server_idle;
     settings.language_servers_max = worker.language_servers_max;
     settings.max_parallel_tool_calls = worker.max_parallel_tool_calls;
+    // A refused model call parks the run (ADR 0067); behind the injector, so does a gateway that
+    // cannot be reached.
+    settings.model_parking = adam_llm_agent::ModelParking::new(worker.model.park_limit)
+        .when_unreachable(worker.model.injected_run);
     settings.draft_pull_requests = worker.pr_draft;
     settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);
 

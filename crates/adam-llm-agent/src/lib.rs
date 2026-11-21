@@ -146,6 +146,7 @@ mod fn_tool;
 mod history;
 mod images;
 mod kept;
+mod model_wait;
 mod order;
 pub mod paging;
 mod plan;
@@ -198,6 +199,10 @@ pub use kept::{
     keep_long_cut, kept_header, kept_outputs_conformance, kept_view, output_id, output_id_of,
     page_of, pointer_line, prepare, read_pointer, scrub_open_end, scrub_open_start,
     scrubbed_for_keeping, unkept_view,
+};
+pub use model_wait::{
+    DEFAULT_MODEL_PARK_LIMIT, MAX_MODEL_BACKOFF, MODEL_RESUME_KIND, ModelPark, ModelParking,
+    ModelWait,
 };
 pub use order::{AFTER_PREVIOUS, INSTRUCTION as AFTER_PREVIOUS_INSTRUCTION};
 pub use plan::{MAX_PLAN_ITEMS, Plan, PlanItem, PlanStatus};

@@ -482,6 +482,27 @@ pub struct Conversation {
     /// only a question; state stored under that name still loads.
     #[serde(default, alias = "pending_question")]
     pub pending_wait: Option<PendingWait>,
+    /// Set while the run is parked on the model ([ADR 0067] decision 4): the model call the endpoint
+    /// refused (or could not reach) is made again when the run wakes, from the conversation as it
+    /// was before it. Beside [`pending_wait`](Self::pending_wait), not one of its kinds: it is tied
+    /// to no tool call. Cleared by the next call that is answered. In the head, so a front reads
+    /// it at `/model_wait`. Not carried to a later task; absent from state written before it
+    /// existed, and not written while `None`.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    ///
+    /// A wait this build cannot read (a kind of park a later build added) reads as `None`, and the
+    /// rest of the state still loads.
+    ///
+    /// **Breaking:** a new public field of a struct that is not `#[non_exhaustive]`: a
+    /// `Conversation` built with a struct literal outside the workspace needs it (or
+    /// `..Default::default()`).
+    #[serde(
+        default,
+        deserialize_with = "crate::model_wait::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_wait: Option<crate::ModelWait>,
     /// User messages that arrived while tool results were still owed. They are
     /// appended once the last owed result is in (a user message between an
     /// assistant tool call and its result would break the protocol).

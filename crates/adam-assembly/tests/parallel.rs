@@ -94,3 +94,26 @@ fn a_subagent_tool_runs_alone() {
     let tool = adam_assembly::SubagentTool::new("helper", "coder/helper", "Does a piece of work.");
     assert_eq!(tool.access(&serde_json::json!({})), ToolAccess::Alone);
 }
+
+/// How a run waits on a model that refused it (ADR 0067) is the deployment's, for every agent: the
+/// root and its subagents alike; without it, the loop's default.
+#[test]
+fn the_deployments_model_parking_reaches_every_agent() {
+    use adam_llm_agent::ModelParking;
+    use std::time::Duration;
+    let parking = ModelParking::new(Duration::from_secs(3600)).when_unreachable(true);
+    let assembly = family("", "")
+        .bind(tools(&[]))
+        .unwrap()
+        .model_parking(parking)
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    assert!(assembly.agents().len() >= 2);
+    for agent in assembly.agents() {
+        assert_eq!(agent.model_parking(), parking);
+    }
+    let plain = assemble(family("", ""), None);
+    for agent in plain.agents() {
+        assert_eq!(agent.model_parking(), ModelParking::default());
+    }
+}

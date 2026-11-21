@@ -64,5 +64,9 @@ required-features = ["push"]
 name = "usage"
 required-features = ["push"]
 
+[[test]]
+name = "model_park"
+required-features = ["push"]
+
 [lints]
 workspace = true
