@@ -8,13 +8,13 @@ use std::time::Duration;
 
 use a2a::{Message, Part, Role, Task};
 use adam_a2a::{BackendError, Caller, STEER_EXTENSION, TaskBackend, TaskQuery};
-use adam_a2a_runtime::{RuntimeTaskBackend, task_id_for};
-use adam_agent_fs::{AgentManifest, Subagent};
+use adam_a2a_runtime::{Commands, RuntimeTaskBackend, task_id_for};
+use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
 use adam_core::{DynSecretSource, DynStore, RunId};
 use adam_llm_agent::DEFAULT_MAX_PARALLEL;
 use adam_model::DynModel;
-use adam_runtime::{BroadcastSink, Runtime, RuntimeBuilder, RuntimeError};
+use adam_runtime::{BroadcastSink, RetryPolicy, Runtime, RuntimeBuilder, RuntimeError};
 use adam_ui::Ui;
 use tokio::sync::{RwLock, RwLockReadGuard, oneshot, watch};
 use tokio::task::AbortHandle;
@@ -36,7 +36,7 @@ const DEFAULT_EVENT_CAPACITY: usize = 256;
 const MAX_EVENT_CAPACITY: usize = 1 << 16;
 
 /// What the engine runs within. Set the fields on [`Limits::default`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct Limits {
     /// Runs stepped at the same time (the runtime's `concurrency`). Default 4, at least 1.
@@ -60,8 +60,10 @@ pub struct Limits {
     /// * `Some(id)`: **the host promises that no other live engine, in any process, uses `id` on
     ///   this store.** `start` then releases every lease `id` holds
     ///   (`Store::release_worker_leases`), so the runs the last process was stepping are claimed at
-    ///   once. Set one only for a store no other engine shares: the application's own SQLite file
-    ///   (when slice 3 lands, its lock will allow one process per file) or a store per install.
+    ///   once. Set one only for a store no other engine shares, such as a store per install. The
+    ///   SQLite store needs none: its lock allows one process per file, and `start` (its `migrate`)
+    ///   clears every lease the file holds. Run one engine per SQLite file: the clearing takes a live
+    ///   engine's leases of the same process too.
     ///   Broken, the promise costs a run stepped twice, its tools run twice: the release takes the
     ///   leases of the runs the other engine is stepping, and both renew under the same id.
     ///
@@ -74,6 +76,12 @@ pub struct Limits {
     /// a host that restarts in the same process calls `shutdown` first, which lets the steps in
     /// flight finish.
     pub worker_id: Option<String>,
+    /// The runtime's retry policy: what a transient failure that names no policy of its own (a
+    /// model provider's outage, a tool with none) is retried under ([ADR
+    /// 0061](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0061-a-step-names-its-retry-policy.md)).
+    /// A folder's `retry:` and a tool's own policy win over it for their tools. Default
+    /// [`RetryPolicy::default`]: 5 attempts, 1 s to 60 s.
+    pub retry: RetryPolicy,
 }
 
 impl Default for Limits {
@@ -84,6 +92,7 @@ impl Default for Limits {
             lease_ttl: Duration::from_secs(30),
             event_capacity: DEFAULT_EVENT_CAPACITY,
             worker_id: None,
+            retry: RetryPolicy::default(),
         }
     }
 }
@@ -125,8 +134,9 @@ impl EngineBuilder {
     }
 
     /// Migrate the store, release the leases a fixed [`Limits::worker_id`] holds in it (a restarted
-    /// engine claims its old runs at once), build the agent and start the worker on the current
-    /// tokio runtime.
+    /// engine claims its old runs at once), build the agent, register its scheduler and make the
+    /// store's scheduler runs match the folder's `schedules/` (ADR 0060), and start the worker on
+    /// the current tokio runtime.
     ///
     /// The agent gets the screen's tools of an embedded agent (`ask_user`, `show`, `ui_catalog`,
     /// `plan_*`, from `adam_ui::Ui::embedded`) and nothing on the network: a file that names an
@@ -144,7 +154,9 @@ impl EngineBuilder {
     /// * [`EngineError::Store`] when the store's migration or the release of the worker's leases
     ///   fails, with the store's class;
     /// * [`EngineError::Agent`] when the agent does not bind (an unknown tool, an MCP server, a
-    ///   remote subagent, a secret refused) or the model alias is refused.
+    ///   remote subagent, a secret refused) or the model alias is refused;
+    /// * [`EngineError::Schedules`] when the scheduler runs cannot be made to match the folder, with
+    ///   the reconcile's class: on a retryable one, call `start` again (what was done is kept).
     pub async fn start(self) -> Result<Engine, EngineError> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| EngineError::NoRuntime)?;
         let Self {
@@ -173,6 +185,8 @@ impl EngineBuilder {
         }
         refuse_what_is_not_embedded(agent.manifest(), agent.name())?;
         let name = agent.name().to_owned();
+        let schedules = agent.manifest().schedules.clone();
+        let commands = agent.manifest().commands.clone();
         let ui = Ui::embedded();
         let assembly = agent
             .secrets(secrets)
@@ -199,13 +213,27 @@ impl EngineBuilder {
             None => None,
         };
 
-        let (runtime, events) =
-            runtime_with_ring(assembly.register(Runtime::builder(store)), &limits);
+        // The folder's schedules are stepped beside the agent by its scheduler (ADR 0060), as the
+        // binaries do; it is registered whatever the folder holds, so a scheduler run a folder
+        // dropped is still stepped to its cancel.
+        let scheduler = adam_schedule::SchedulerAgent::new(&name);
+        let (runtime, events) = runtime_with_ring(
+            assembly.register(Runtime::builder(store)).agent(scheduler),
+            &limits,
+        );
+        // Make the store's scheduler runs match the folder before the worker starts: a schedule
+        // added is started, one changed is replaced, one dropped is cancelled.
+        adam_schedule::reconcile(&runtime, &name, &schedules)
+            .await
+            .map_err(EngineError::Schedules)?;
         // The backend is given the same ring, for the A2A path that streams a task
         // (`TaskBackend::subscribe`), whose file parts are built from a live event's bytes. The engine
         // never calls that path: an artifact in this ring has its bytes withheld, so a caller that
         // streams a task through this backend must read files from the store.
-        let backend = RuntimeTaskBackend::new(runtime.clone(), events.clone(), name.clone());
+        // The folder's commands (`commands/v1`): a message whose text is `/name args` is expanded
+        // from `commands/<name>.md` before it is stored, as on the server surfaces.
+        let backend = RuntimeTaskBackend::new(runtime.clone(), events.clone(), name.clone())
+            .with_commands(Commands::from_manifest(&commands));
 
         let (stop, stopped) = oneshot::channel::<()>();
         let running = handle.spawn(async move {
@@ -238,6 +266,7 @@ impl EngineBuilder {
                 backend,
                 events,
                 agent: name,
+                commands,
                 writes: RwLock::new(()),
                 stopping: AtomicBool::new(false),
                 worker: Worker {
@@ -260,7 +289,8 @@ pub(crate) fn runtime_with_ring(
     let builder = builder
         .event_sink(EngineSink(events.clone()))
         .concurrency(limits.concurrency)
-        .lease_ttl(limits.lease_ttl);
+        .lease_ttl(limits.lease_ttl)
+        .retry(limits.retry);
     // `None` keeps the runtime's default, a random id.
     let builder = match &limits.worker_id {
         Some(id) => builder.worker_id(id.clone()),
@@ -336,6 +366,8 @@ pub(crate) struct Shared {
     /// The same subject, with `steer/v1` activated: a message for a running run is delivered.
     steering: Caller,
     agent: String,
+    /// The agent's commands, from its `commands/`: what [`Engine::commands`] lists.
+    commands: Vec<Command>,
     /// Held shared by every message for the length of its call, and exclusively by `shutdown` while
     /// it sets `stopping`: a message is either written before the worker is told to stop, or
     /// refused.
@@ -602,6 +634,14 @@ impl Engine {
             next_page_token: page.next_page_token,
             total: page.total_size,
         })
+    }
+
+    /// The agent's commands (`commands/<name>.md`), in name order: what a person may type as
+    /// `/name args`, which the engine expands from the command's template before it is stored. A
+    /// host lists them in its `/` menu with their `description` and `argument_hint`, as a client
+    /// of the server surfaces reads them from the card (`commands/v1`).
+    pub fn commands(&self) -> &[Command] {
+        &self.shared.commands
     }
 
     /// `run` as the store has it now, or `None` when this engine has no such run.

@@ -88,12 +88,13 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0047-adam-rs-
 https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.md.
 
 * **The host gives everything**: `Engine::builder(store, agent, model, alias)` takes a `DynStore`
-  (`adam_core::MemoryStore` until the SQLite store of ADR 0053 slice 3 lands), an `AgentDef` (`AgentFolder::load` or
+  (`adam_store_sqlite::SqliteStore::open(path)`, a file a killed process's next start resumes, one engine per file;
+  or `adam_core::MemoryStore`), an `AgentDef` (`AgentFolder::load` or
   `include_agent!`), a `DynModel` with its credentials (the engine links no model client) and, with `.secrets(..)`,
   a `SecretSource` (the default refuses every name). The engine reads no environment variable.
-* **Then** `start().await?`, `send`, `steer`, `answer`, `cancel`, `list`, `get`, `events` and `shutdown`; decide from
-  `EngineError`'s class (`adam_error::Classify`), and match `RunState` and `EngineEvent` with a `_` arm (both
-  `#[non_exhaustive]`). `events(run)` is bounded: a slow reader gets `Behind`, then a `Snapshot` read from the store.
+* **Then** `start().await?`, `send`, `steer`, `answer`, `cancel`, `list`, `get`, `events`, `commands` (the folder's
+  `/name` commands, which a message expands) and `shutdown`; decide from `EngineError`'s class
+  (`adam_error::Classify`), and match `RunState` and `EngineEvent` with a `_` arm (both `#[non_exhaustive]`). `events(run)` is bounded: a slow reader gets `Behind`, then a `Snapshot` read from the store.
 * **Keep the embedded set**: anything else you depend on takes `adam-a2a` without `server`, `adam-a2a-runtime` without
   `push`, `adam-assembly` (and `adam`) without `remote`, and `adam-ui` without `thread-tools`, or Cargo turns them back
   on. adam-rs checks the engine's own tree with `tools/embedded-deps/check.sh`
@@ -103,7 +104,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.
 * **The worked example** is `crates/adam-engine/examples/chat` (`main.rs` builds the engine, `app.rs` is the loop a
   test drives): https://github.com/vymalo/another-adam-rs/tree/main/crates/adam-engine/examples/chat. The API and its
   refusals: https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-engine/README.md.
-* **Not yet**: a durable store (so a killed application loses its runs), approvals, the file and command tools, MCP
+* **Not yet**: approvals, the file and command tools, MCP
   servers and remote subagents (`start` refuses an agent that names them).
 
 ## Verify

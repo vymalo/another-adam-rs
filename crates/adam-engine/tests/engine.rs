@@ -1262,3 +1262,144 @@ async fn a_reader_behind_a_running_run_gets_a_snapshot() {
     }
     rig.stop().await;
 }
+
+// --- parity with the binaries (docs/reference/parity.md) -----------------------------------------
+
+/// A folder's `schedules/` run in the engine as in `adam-agent` (ADR 0060, #269): the scheduler is
+/// registered, the reconcile at `start` starts it, and the firing is a run of the agent, in the
+/// host's store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folders_schedule_fires_the_agent() {
+    let def = agent(&[
+        ("agent/instructions.md", CHAT),
+        (
+            "agent/schedules/soon.md",
+            "---\nafter: 1s\n---\nSay what is due.\n",
+        ),
+    ]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Nothing is due.");
+    let model: DynModel = mock.clone();
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let engine = Engine::builder(store.clone(), def, model, "m")
+        .start()
+        .await
+        .unwrap();
+    let fired = timeout(WAIT, async {
+        loop {
+            let runs = store
+                .list_runs(&adam_engine::adam_core::RunQuery::new(
+                    "chat",
+                    adam_engine::adam_core::ConversationScope::Prefix(
+                        "adam.schedule:chat/soon@".to_owned(),
+                    ),
+                    10,
+                ))
+                .await
+                .unwrap();
+            if let Some(run) = runs
+                .into_iter()
+                .find(|r| r.status == adam_engine::adam_core::RunStatus::Done)
+            {
+                return run;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the schedule fired");
+    // A firing is nobody's message, so it is no run of a caller's: as an A2A server does not list it
+    // to a caller, the engine's `get` does not show it; the host reads it from its store.
+    assert!(engine.get(fired.id).await.unwrap().is_none());
+    let asked = mock.requests();
+    assert!(
+        format!("{:?}", asked[0].messages).contains("Say what is due."),
+        "the firing's prompt is the person's message: {asked:?}"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// The runtime's retry policy is the host's (`Limits::retry`, #270): a transient model failure,
+/// which names no policy of its own, is given up after the host's two attempts, not five.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosts_retry_policy_governs_a_transient_failure() {
+    let mock = Arc::new(MockModel::new());
+    for _ in 0..2 {
+        mock.push_error(ModelError::transient("502"));
+    }
+    mock.push_text("never");
+    let model: DynModel = mock.clone();
+    let mut limits = Limits::default();
+    limits.retry = adam_engine::adam_runtime::RetryPolicy::new(2)
+        .with_backoff(Duration::from_millis(5), Duration::from_millis(5));
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .limits(limits)
+        .start()
+        .await
+        .unwrap();
+    let turn = engine.send(None, Say::new("hi")).await.unwrap();
+    let mut events = engine.events(turn.run).await.unwrap();
+    let mut last = None;
+    while let Some(event) = timeout(WAIT, events.next()).await.expect("an event") {
+        last = Some(event.unwrap());
+    }
+    let Some(EngineEvent::Ended(info)) = last else {
+        panic!("the stream ended on {last:?}");
+    };
+    assert_eq!(info.state, RunState::Failed);
+    assert_eq!(mock.requests().len(), 2, "two attempts, the host's");
+    assert_eq!(
+        Limits::default().retry,
+        adam_engine::adam_runtime::RetryPolicy::default()
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A folder's `commands/` are expanded in the engine as on the server surfaces (`commands/v1`,
+/// #276): `/greet Ada Lovelace` reaches the model as the command's template with `$1` (not the
+/// whole argument line), `commands()` lists it, and an
+/// unknown `/name` reaches the model as typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folders_command_is_expanded() {
+    let def = agent(&[
+        ("agent/instructions.md", CHAT),
+        (
+            "agent/commands/greet.md",
+            "---\ndescription: Greet someone.\nargument-hint: \"<name>\"\n---\nSay hello to $1, warmly.\n",
+        ),
+    ]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Hello, Ada!");
+    mock.push_text("I do not know that one.");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), def, model, "m")
+        .start()
+        .await
+        .unwrap();
+    let listed: Vec<(&str, &str)> = engine
+        .commands()
+        .iter()
+        .map(|c| (c.name.as_str(), c.description.as_str()))
+        .collect();
+    assert_eq!(listed, [("greet", "Greet someone.")]);
+    assert_eq!(
+        engine.commands()[0].argument_hint.as_deref(),
+        Some("<name>")
+    );
+
+    for (said, expected) in [
+        ("/greet Ada Lovelace", "Say hello to Ada, warmly."),
+        ("/wave Ada", "/wave Ada"),
+    ] {
+        let turn = engine.send(None, Say::new(said)).await.unwrap();
+        let mut events = engine.events(turn.run).await.unwrap();
+        while let Some(event) = timeout(WAIT, events.next()).await.expect("an event") {
+            event.unwrap();
+        }
+        let asked = mock.requests();
+        let last = asked.last().expect("a model call");
+        let text = format!("{:?}", last.messages.last());
+        assert!(text.contains(expected), "{said}: {text}");
+    }
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
