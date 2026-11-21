@@ -561,6 +561,11 @@ impl Inner {
             stored
                 .inbox_mut()
                 .retain(|i| i.kind == crate::SESSION_CLOSE_KIND);
+            // The head this cancel writes is the run's only copy: it must not keep naming an
+            // inherited file whose bytes are gone (an S2a expand-release head can).
+            if let Stored::Head(head) = &mut stored {
+                head.prune_missing_files(self.store.clone()).await?;
+            }
             // The hook receives the whole agent state. A v4 run carries it; a v5 head is joined
             // with its body here, once, so the hook never sees a head with no transcript. A set
             // that does not join is skipped: the cancel still lands, and the hook is best effort.
@@ -642,6 +647,10 @@ impl Inner {
             } else {
                 (rec.status, rec.wake_at)
             };
+            // A delivery writes the head it read **unchanged**: a later refused split must still
+            // see every inherited file the head names, or its demotion would write a v4 state
+            // without the missing bytes instead of refusing (ADR 0055). The next split, a failed
+            // transition or a cancel drops a missing inherited file.
             let (head, state) = carried(&self.store, &stored)?;
             let mut update = RunUpdate::new(status, state);
             update.head = head;

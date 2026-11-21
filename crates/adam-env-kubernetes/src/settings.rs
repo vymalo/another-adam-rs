@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use crate::invocation::DEFAULT_ADAM_EXEC;
 
-/// The directory the template mounts the tools in (`adam-exec`), read-only, in the run
-/// container: the same layout as the devcontainer's.
+/// The directory the template mounts the tools in (`adam-exec`), read-only, in the run container.
 pub const TOOLS_DIR: &str = "/opt/adam/bin";
 
 /// The name of the container the commands run in unless told otherwise.

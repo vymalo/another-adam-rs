@@ -7,7 +7,7 @@
 //! # Where they read
 //!
 //! In the coder's own process, through the slot's descriptors ([`SlotDir`]), never through the
-//! run's environment (a run pod or a devcontainer): the files are on the shared volume either way.
+//! run's environment (a run pod): the files are on the shared volume either way.
 //!
 //! * `list_files` reads **one directory**: one `getdents` of the held descriptor, no `git`.
 //! * `find_files` and `search_files` take their **candidates from `git`**: `git ls-files --cached

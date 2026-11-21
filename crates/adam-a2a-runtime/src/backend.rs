@@ -328,8 +328,9 @@ impl RuntimeTaskBackend {
         self.child_sessions.as_ref()
     }
 
-    /// The run behind `task_id` as the runtime has it, if it exists, belongs to this agent and is
-    /// `caller`'s: the ownership check every call makes, without building a task, so no file's
+    /// The run behind `task_id` as the runtime has it, if it exists and is `caller`'s, a task of
+    /// this agent or a round of one of the caller's child sessions (with the extension activated):
+    /// the ownership check every call makes (`locate`), without building a task, so no file's
     /// bytes are read (a file artifact stays an `ArtifactRef` whose bytes
     /// [`Runtime::artifact_bytes`] fetches). For a host that serves the run's files itself.
     ///
@@ -341,7 +342,21 @@ impl RuntimeTaskBackend {
         caller: &Caller,
         task_id: &str,
     ) -> Result<Option<RunView>, BackendError> {
-        Ok(self.owned(caller, task_id).await?.map(|(_, view, _)| view))
+        Ok(self.locate(caller, task_id).await?.map(|(_, view, _)| view))
+    }
+
+    /// The task this backend would serve for `view`, under the run's own conversation id as its
+    /// context and without its artifacts, **with no ownership check**: for a composition root
+    /// that decided itself that the run may be seen, as `adam-engine` shows its host a run of the
+    /// agent that a schedule fired, which is no caller's. Never answer an A2A caller with it: what
+    /// a caller may see is what [`owned_view`](Self::owned_view) and the `TaskBackend` calls say.
+    pub fn unowned_task(&self, view: &RunView) -> Task {
+        crate::convert::task_from_view(
+            view,
+            view.conversation_id.as_deref().unwrap_or_default(),
+            &self.prompt,
+            Vec::new(),
+        )
     }
 
     /// The run behind `task_id` if it exists, belongs to this agent and to

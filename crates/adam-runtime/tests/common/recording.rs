@@ -327,6 +327,10 @@ impl Store for RecordingStore {
         self.keeps_blobs
     }
 
+    async fn blob_stored(&self, id: &BlobId) -> StoreResult<bool> {
+        self.inner.blob_stored(id).await
+    }
+
     async fn put_blob(&self, id: &BlobId, bytes: &[u8]) -> StoreResult<()> {
         self.inner.put_blob(id, bytes).await
     }

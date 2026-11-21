@@ -168,6 +168,13 @@ Facts about third parties:
    and `ToolCtx` (`loaded_servers`, `task`); provided `ToolSource::appended` and
    `ToolSource::appended_instructions` (additive). The tool list of a folder
    with a triggered server gains `use_server`, and every cached prefix of such a folder breaks once at deploy.
+   *Amended 2026-11-21 ([ADR 0066](0066-a-first-request-is-lean-and-tools-load-in-groups.md)):* the one append above
+   generalises: a run may load a **group of tools** during itself with a generated loader
+   `load__<kind>__<name>` (ADR 0066). Its result is recorded in the same commit as the call, and its tools are placed
+   after every other tool in load order, so the request before stays a byte prefix of the one after it. The
+   `use_server` tool and a server's `when` fold into that mechanism (S1 and S5 of ADR 0066); until they land, this
+   amendment's text is the rule. The prompt cache still ends where the array grew, and the cost is still read from
+   the next call's `Usage::cached_input_tokens`.
 
 ### Everything that reads is paged
 
@@ -253,6 +260,10 @@ Facts about third parties:
    * **"If present" includes the repository** (answer 2): the skills of the repository a run works on (`.agents/skills`, `.claude/skills`,
      `.opencode/skills` of a slot) are listed to the model when the slot is prepared, as a message, and loaded with the same
      tool. They are text from the repository, trusted as its `AGENTS.md` is (decision 10): they grant no tool and no tier.
+   *Amended 2026-11-21 ([ADR 0066](0066-a-first-request-is-lean-and-tools-load-in-groups.md)):* progressive disclosure
+   extends from skills to **tools**: a group's loader is the index, a skill of the agent's own folder may name the
+   groups it brings, and a repository's skill still brings no tool. `load_skill` keeps its name and its one underscore;
+   the word `load` is reserved, and a server or tool named `load__…` is refused, fail closed.
 9. **Commands: yes, as prompt templates the agent serves** (the owner asked "Should it support slash commands?", answer 1). The slash is the client's; the template is the agent's, so every client of an agent gets the same commands.
    * **Where.** `commands/<name>.md` in the agent folder: a `description`, an `argument-hint`, and a body with `$ARGUMENTS`
      and `$1`, `$2`. MCP prompts become commands once the client reads them.

@@ -3,10 +3,10 @@
 //!
 //! A language server is a long-running process that is written to on stdin for minutes and answers
 //! on stdout, with JSON-RPC messages framed by `Content-Length`. Whether an environment can host
-//! one is a fact about the environment: its `prepare` and the client it spawns (`adam-kube-exec`,
-//! the devcontainer CLI's `exec`) must pass stdin through, keep it open while nothing is said, and
+//! one is a fact about the environment: its `prepare` (and, for a run pod, the `adam-kube-exec`
+//! client it spawns) must pass stdin through, keep it open while nothing is said, and
 //! deliver the end of input. These functions ask exactly that of any [`EnvSession`], with `cat` as
-//! the server (bytes in, the same bytes out), so that the three environments are held to one
+//! the server (bytes in, the same bytes out), so that both environments are held to one
 //! sequence and a failure names the [`Step`] that broke:
 //!
 //! 1. [`Step::FirstMessage`]: one framed message is written and read back;
@@ -395,7 +395,8 @@ impl Running {
         probe: &StdioProbe,
     ) -> Result<(), StdioFailure> {
         let marker = probe.probe_marker.as_deref().unwrap_or(&self.marker);
-        let found = processes_carrying(session, &probe.cwd, marker, probe.deadline).await?;
+        let found =
+            processes_carrying_until_found(session, &probe.cwd, marker, probe.deadline).await?;
         if found.is_empty() {
             return Err(fail(
                 Step::Probe,
@@ -471,36 +472,28 @@ impl Running {
             ));
         }
         // Nothing carrying the marker is left in the environment (it may take a moment to go).
-        let started = Instant::now();
-        loop {
-            let left =
-                processes_carrying(session, &probe.cwd, &self.marker, probe.deadline).await?;
-            if left.is_empty() {
-                return Ok(());
-            }
-            if started.elapsed() > probe.deadline {
-                return Err(fail(
-                    Step::Kill,
-                    format!("after the kill, still carrying the run's marker: {left:?}"),
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        let left = processes_carrying_until_gone(session, &probe.cwd, &self.marker, probe.deadline)
+            .await?;
+        if !left.is_empty() {
+            return Err(fail(
+                Step::Kill,
+                format!("after the kill, still carrying the run's marker: {left:?}"),
+            ));
         }
+        Ok(())
     }
 }
 
-/// The `/proc` entries of processes in the environment whose own environment holds `marker`
-/// (`ADAM_STDIO_PROBE=<marker>`), found with a command run through the session.
-///
-/// # Errors
-///
-/// [`Step::Probe`] when the command cannot be prepared or run.
-pub async fn processes_carrying(
+/// How long the polling forms wait between two scans.
+const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// One `/proc` scan: `None` when the command did not finish within `limit`.
+async fn scan_carrying(
     session: &dyn EnvSession,
     cwd: &std::path::Path,
     marker: &str,
-    deadline: Duration,
-) -> Result<Vec<String>, StdioFailure> {
+    limit: Duration,
+) -> Result<Option<Vec<String>>, StdioFailure> {
     let line =
         format!("grep -l -a 'ADAM_STDIO_PROBE={marker}' /proc/[0-9]*/environ 2>/dev/null; true");
     let prepared = session
@@ -511,15 +504,108 @@ pub async fn processes_carrying(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let out = tokio::time::timeout(deadline, cmd.output())
-        .await
-        .map_err(|_| fail(Step::Probe, "the probe did not end"))?
-        .map_err(|e| fail(Step::Probe, format!("the probe: {e}")))?;
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(str::to_owned)
-        .collect())
+    let out = match tokio::time::timeout(limit, cmd.output()).await {
+        Err(_) => return Ok(None),
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(fail(Step::Probe, format!("the probe: {e}"))),
+    };
+    Ok(Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_owned)
+            .collect(),
+    ))
+}
+
+/// Scan until `done` holds for what was found, or `deadline` passes: the last result.
+async fn poll_carrying(
+    session: &dyn EnvSession,
+    cwd: &std::path::Path,
+    marker: &str,
+    deadline: Duration,
+    done: impl Fn(&[String]) -> bool,
+) -> Result<Vec<String>, StdioFailure> {
+    let started = Instant::now();
+    let mut last = Vec::new();
+    loop {
+        let left = deadline.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Ok(last);
+        }
+        match scan_carrying(session, cwd, marker, left).await? {
+            Some(found) => {
+                last = found;
+                if done(&last) {
+                    return Ok(last);
+                }
+            }
+            None => return Ok(last),
+        }
+        let left = deadline.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Ok(last);
+        }
+        tokio::time::sleep(left.min(PROBE_POLL_INTERVAL)).await;
+    }
+}
+
+/// The `/proc` entries of processes in the environment whose own environment holds `marker`
+/// (`ADAM_STDIO_PROBE=<marker>`), found with a command run through the session: **one** scan, a
+/// snapshot of what was there when it ran.
+///
+/// A process that was spawned but has not `exec`ed yet does not carry the marker in
+/// `/proc/<pid>/environ`; to wait for one, use [`processes_carrying_until_found`].
+///
+/// # Errors
+///
+/// [`Step::Probe`] when the command cannot be prepared or run, or does not end within `deadline`.
+pub async fn processes_carrying(
+    session: &dyn EnvSession,
+    cwd: &std::path::Path,
+    marker: &str,
+    deadline: Duration,
+) -> Result<Vec<String>, StdioFailure> {
+    scan_carrying(session, cwd, marker, deadline)
+        .await?
+        .ok_or_else(|| fail(Step::Probe, "the probe did not end"))
+}
+
+/// [`processes_carrying`], repeated until it finds at least one process or `deadline` passes: for
+/// a process that was just spawned, whose `exec` may not have installed the marker yet.
+///
+/// The deadline bounds the whole wait, not one scan. The last result is returned: empty when
+/// nothing was found in time.
+///
+/// # Errors
+///
+/// [`Step::Probe`] when a scan cannot be prepared or run.
+pub async fn processes_carrying_until_found(
+    session: &dyn EnvSession,
+    cwd: &std::path::Path,
+    marker: &str,
+    deadline: Duration,
+) -> Result<Vec<String>, StdioFailure> {
+    poll_carrying(session, cwd, marker, deadline, |found| !found.is_empty()).await
+}
+
+/// [`processes_carrying`], repeated until it finds nothing or `deadline` passes: for a process
+/// that was killed and may take a moment to go.
+///
+/// It returns as soon as a scan finds nothing; the deadline only bounds the wait for a process
+/// that lingers. The last result is returned: non-empty when something was still there when the
+/// deadline passed.
+///
+/// # Errors
+///
+/// [`Step::Probe`] when a scan cannot be prepared or run.
+pub async fn processes_carrying_until_gone(
+    session: &dyn EnvSession,
+    cwd: &std::path::Path,
+    marker: &str,
+    deadline: Duration,
+) -> Result<Vec<String>, StdioFailure> {
+    poll_carrying(session, cwd, marker, deadline, <[String]>::is_empty).await
 }
 
 /// SIGKILL the process group led by `pid` (the shell's `kill`: this crate forbids `unsafe`).

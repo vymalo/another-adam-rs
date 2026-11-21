@@ -44,6 +44,10 @@ Behaviour (details in the crate docs, `src/lib.rs`):
 * `Retry-After` (seconds or HTTP date) surfaces in `ModelError::RateLimited`.
 * `timeout` bounds a whole `complete` call; for `stream` it bounds the wait
   for headers and then the silence between chunks.
+* Response size caps, all constants: a body over 16 MiB, an SSE line over 1 MiB,
+  one event's `data:` over 4 MiB, or a stream over 64 MiB is refused with a
+  `Protocol` error (class `Corrupt`) before the buffer grows past the cap. A
+  gateway that streams one endless line can no longer grow the process without bound.
 * The key is a `SecretString`, sent as a sensitive `Authorization: Bearer`
   header, and never appears in `Debug`, errors or logs. An empty key sends no
   header. It is the default credentials provider (`StaticBearer`), asked for each call like any other. The gateway's address is not shown either: the `Debug` of `OpenAiConfig` and of

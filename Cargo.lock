@@ -347,7 +347,6 @@ dependencies = [
  "adam-code-tools",
  "adam-code-tools-testkit",
  "adam-core",
- "adam-devcontainer",
  "adam-env-kubernetes",
  "adam-error",
  "adam-host",
@@ -406,23 +405,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "adam-devcontainer"
-version = "0.1.0"
-dependencies = [
- "adam-error",
- "adam-workspace",
- "async-trait",
- "jsonc-parser",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "adam-egress"
 version = "0.1.0"
 dependencies = [
@@ -463,6 +445,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

@@ -468,7 +468,8 @@ The same object has a `sandbox` member beside `totals` ([ADR 0043](../decisions/
 time its commands ran in a run pod: `{"environment": "kubernetes", "usage": [{"cpuMillis": 250, "memoryBytes": 536870912, "commands": 12,
 "milliseconds": 81234}]}`, one entry per pod shape (the template's requests), at most 8, written under the same rules as the totals (when the
 task ends or waits, cumulative, whoever reads it, `totals` always present, `[]` for a run that made no model call). `{"environment": "local"}`
-and `{"environment": "devcontainer"}` have no `usage`: the commands were not measured, which is not zero. A run that never asked for an
+has no `usage`: the commands were not measured, which is not zero. A report of an older coder may say
+`{"environment": "devcontainer"}` (ADR 0052 removed it): readers keep the word, and this coder never writes it. A run that never asked for an
 environment has no `sandbox`.
 
 ## Images in

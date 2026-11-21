@@ -23,7 +23,7 @@ is slow under many threads:
 
 Stage 2 is the workspace image
 (`ghcr.io/vymalo/another-agentic-images/workspace:${WORKSPACE_TAG}`) with the binaries in
-`/usr/local/bin`, the pinned `github-mcp-server`, the devcontainer CLI and Podman's remote client. It runs as
+`/usr/local/bin` and the pinned `github-mcp-server` (no devcontainer CLI and no container engine's client: ADR 0052). It runs as
 uid 10001, keeps its files in `/work` and its entrypoint is `tini -- adam-coder`. The base stays a glibc
 image because the tools in it need one; the binaries do not.
 

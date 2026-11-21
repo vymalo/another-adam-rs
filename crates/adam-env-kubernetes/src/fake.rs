@@ -1190,16 +1190,6 @@ mod tests {
         assert_eq!(fx.pod_names(), [pod_name(OTHER)]);
     }
 
-    #[tokio::test]
-    async fn rebuild_deletes_the_pod_so_that_the_next_ensure_makes_another() {
-        let fx = fixture(settings());
-        fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
-        assert!(fx.env.rebuild(RUN, false).await.unwrap());
-        assert!(fx.pod_names().is_empty());
-        fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
-        assert_eq!(fx.pod_names().len(), 1);
-    }
-
     // ----- the run's image (ADR 0052) -------------------------------------------------------------
 
     /// The image of the pod's run container.
@@ -1821,8 +1811,8 @@ mod tests {
         );
     }
 
-    /// A run that has a reference and no repository gets a pod (unlike a devcontainer, which has no
-    /// file to build from): the reference is mounted read-only and a command runs in it.
+    /// A run that has a reference and no repository gets a pod: the reference is mounted read-only
+    /// and a command runs in it.
     #[tokio::test]
     async fn a_run_with_only_a_reference_gets_a_pod_and_runs_commands_in_it() {
         let fx = fixture(settings());

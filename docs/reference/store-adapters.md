@@ -82,7 +82,8 @@ collected and the insert retried once; a live attempt with a different message i
 delta win holds across every commit of a v5 run: a failed transition writes the head it read and no
 rows, and the next split appends. A commit with `head: None` leaves the stored head and its
 `head_version` alone — the runtime passes the head for a delivery, a cancel and a park, so `None` is
-only a v4 commit (a process of the expand release). `load_head` is the observer's read
+only a v4 commit (a process of the expand release) or a refused-split demotion (which writes the
+whole v4 state and no head). `load_head` is the observer's read
 (`Runtime::view`). MongoDB answers it with one **projected** `find_one` that carries the head and the
 record's own fields, never `state`; PostgreSQL with one `SELECT` whose `state` column is
 `CASE WHEN jsonb_typeof(head) = 'object' AND (head_version = version OR state = 'null'::jsonb)

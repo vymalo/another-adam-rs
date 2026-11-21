@@ -1282,7 +1282,7 @@ async fn a_leader_that_ends_by_itself_leaves_no_child_behind() {
     until_gone("the child of the leader to be gone", &[child]).await;
 }
 
-/// In a pod or a devcontainer the client's exit does not end what `cmd &` left there: the exec id is
+/// In a run pod the client's exit does not end what `cmd &` left there: the exec id is
 /// killed in the environment on exit as well.
 #[tokio::test]
 async fn a_command_that_ends_by_itself_is_still_killed_in_the_environment() {
@@ -2012,46 +2012,13 @@ async fn a_start_that_is_dropped_before_it_has_a_supervisor_leaves_nothing_behin
     rig.stop(&rig.id_of("next")).await;
 }
 
-/// The environment is made again by `rebuild_environment`: what runs in it stops, with the reason.
-#[tokio::test]
-async fn rebuilding_the_environment_stops_the_commands_with_the_true_reason() {
-    use adam_coder::tools::environment::RebuildEnvironment;
-    let fake = FakeEnvironment::new(None);
-    let rig = Rig::from(Fixture::new().await.using(fake.clone())).await;
-    let out = rig
-        .start(
-            "start-1",
-            json!({"command": "echo up; sleep 656", "wait_for": "up", "wait": 20}),
-        )
-        .await;
-    assert!(!out.is_error, "{}", out.content);
-    let id = rig.id_of("start-1");
-    let pid = rig.pid_of(&id);
-    let rebuilt = RebuildEnvironment
-        .call(&rig.call_ctx("rebuild"), json!({}))
-        .await
-        .unwrap();
-    assert!(!rebuilt.is_error, "{}", rebuilt.content);
-    until_gone("the process", &[pid]).await;
-    until("it to be settled", || {
-        rig.states().iter().all(|(_, s)| !s.is_running())
-    })
-    .await;
-    assert!(
-        matches!(
-            &rig.states()[0].1,
-            CommandState::Stopped { why } if why.contains("its environment was made again")
-        ),
-        "{:?}",
-        rig.states()
-    );
-}
-
-/// A command in a pod or a devcontainer that a signal ended and nobody asked: the model is told the
+/// A command in a run pod that a signal ended and nobody asked: the model is told the
 /// likely reason. In this container the same signal is only a signal.
 #[tokio::test]
 async fn a_signal_nobody_asked_for_says_what_the_likely_reason_is_in_a_pod() {
     let fake = FakeEnvironment::new(None);
+    // The session is a run pod's: a signal that nobody asked for is not the caller's kill.
+    fake.session.as_pod(None, None);
     let rig = Rig::from(Fixture::new().await.using(fake.clone())).await;
     let out = rig
         .start(
@@ -2069,8 +2036,9 @@ async fn a_signal_nobody_asked_for_says_what_the_likely_reason_is_in_a_pod() {
     .await;
     let listed = rig.list().await;
     assert!(
-        listed.contains(&format!("{id} stopped: its environment was made again (a new repository, a reference or a rebuild)"))
-            && listed.contains("start it again if it is still needed"),
+        listed.contains(&format!(
+            "{id} stopped: its environment was made again (a new repository or a reference)"
+        )) && listed.contains("start it again if it is still needed"),
         "{listed}"
     );
 

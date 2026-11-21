@@ -1,21 +1,4 @@
-//! `rebuild_environment { use_default? }`: the way out of a work environment that is broken.
-//!
-//! The commands of a run (`run_command`, `run`, `run_checks`) run in the repository's devcontainer
-//! when the deployment has a container runtime ([`adam_devcontainer`](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)).
-//! A repository whose `devcontainer.json` is wrong, refused by the policy, or does not build leaves the
-//! run with an environment that is **broken**, and every command says so: there is no silent fallback
-//! to a default image, because the person may want the file fixed more than they want the work done
-//! in another environment. The model asks them (`ask_user`), and after their answer calls this tool:
-//!
-//! * `rebuild_environment {}`: the file was fixed (or the person wants it tried again, for a tool that
-//!   was added to it): the environment is thrown away and made again from the file as it is now;
-//! * `rebuild_environment { use_default: true }`: the person agreed to go on in the default
-//!   environment: the repository's own file is not used for the rest of the run.
-//!
-//! The environment is made **now**, so that its steps are shown under this call and a failure is this
-//! call's result. With no container runtime there is nothing to rebuild and the tool says so.
-//!
-//! # `use_repository_environment { repo?, config?, off? }`
+//! `use_repository_environment { repo?, config?, off? }`: a run pod of the repository's own image.
 //!
 //! ADR 0052: a run pod may run the image the repository's own `devcontainer.json` names, instead of
 //! the deployment's. The tool is **offered** by [`RepositoryEnvironmentSource`] only when it can
@@ -51,76 +34,7 @@ use adam_workspace::EnvError;
 use adam_workspace::devcontainer;
 use serde_json::Value;
 
-use super::{Outcome, ToolEnv, cancelled, environment_error, notes_error};
-
-/// Make the run's work environment again, after the person has decided what to do about a broken one.
-/// Call it only after they answered: when the commands report that the environment is broken, ask
-/// them (ask_user) whether they will fix `.devcontainer/devcontainer.json` or you should go on in the
-/// default environment, and then call this with `use_default: true` only if they chose the default.
-/// Without `use_default` the environment is built again from the repository's file as it is now (after
-/// the person fixed it, or after the file was changed to add a tool). Your files are not touched. It
-/// builds the environment before it returns, which can take minutes.
-#[tool(
-    label = "Rebuild the environment",
-    icon = "execute",
-    parallel = "exclusive"
-)]
-pub async fn rebuild_environment(
-    env: State<ToolEnv>,
-    ctx: &ToolCtx,
-    /// true only when the person chose to go on in the default environment instead of the repository's own
-    use_default: Option<bool>,
-) -> Outcome {
-    if ctx.is_cancelled() {
-        return Err(cancelled("the environment was not rebuilt"));
-    }
-    let use_default = use_default.unwrap_or(false);
-    let run = ctx.root_run_id().to_string();
-    // What runs in the environment ends with it; the reason is the true one.
-    let stale = super::background::stale_after(env.settings.background_sweep);
-    let why = "its environment was made again (rebuild_environment); start it again if it is still needed";
-    env.commands.stop_run(&run, why).await;
-    env.commands
-        .stop_run_elsewhere(&env.kept, &run, why, stale)
-        .await;
-    let made_again = env
-        .environment
-        .rebuild(&run, use_default)
-        .await
-        .map_err(|e| environment_error(&env.redactor, &e))?;
-    if !made_again {
-        return Ok(ToolOutput::text(
-            "Nothing was rebuilt: the commands of this run run in the coder's own environment (this \
-             deployment has no container runtime for work environments), so there is no separate \
-             environment to rebuild. Go on with the task.",
-        ));
-    }
-    // What the rebuilt environment will be asked again, and what the person chose. The check epoch
-    // is bumped too: a failed check record from before the rebuild is not reused, since the
-    // environment it ran in is gone (`ChecksNotes::epoch`).
-    let notes = env
-        .notes
-        .update(&run, |notes| {
-            notes.environment.use_default |= use_default;
-            notes.checks.epoch = notes.checks.epoch.saturating_add(1);
-            notes.clone()
-        })
-        .await
-        .map_err(|e| notes_error(&e))?;
-
-    // Make it now: its steps are shown under this call, and a failure is this call's result.
-    let session = env.session(ctx).await?;
-    let summary = session.describe().summary;
-    let mut text = format!("The work environment was made again: {summary}.");
-    if notes.environment.use_default {
-        text.push_str(
-            " The repository's own devcontainer.json is not used for the rest of this run: the \
-             commands run in the default environment, which the person chose. Say so in your final \
-             answer, so that the pull request's reader knows the work was checked there.",
-        );
-    }
-    Ok(ToolOutput::text(text))
-}
+use super::{Outcome, ToolEnv, cancelled, environment_error};
 
 /// The name of the tool that moves a run to its repository's image.
 pub const USE_REPOSITORY_ENVIRONMENT: &str = "use_repository_environment";
