@@ -19,7 +19,7 @@ engine.shutdown().await?;
 
 | Call | What it does | Refused with (class) |
 |---|---|---|
-| `Engine::builder(store, agent, model, alias)`, then `start()` | migrates the store, releases the leases a fixed `Limits::worker_id` holds (`Store::release_worker_leases`: the runs its last process was stepping are claimed at once; nothing with the default, `None`), binds the agent with the screen's tools of an embedded agent (`adam_ui::Ui::embedded`: `ask_user`, `show`, `ui_catalog`, `plan_*`, and `Ui::screen` as its source), gives it the model, registers its scheduler and makes the store's scheduler runs match the folder's `schedules/` (see *Schedules*), gives the backend the folder's `commands/` (a message `/name args` is expanded from `commands/<name>.md` before it is stored, as on the server surfaces), and spawns the worker on the current tokio runtime | `NoRuntime` (`Invalid`) outside a tokio runtime; `Invalid` for a zero `lease_ttl` or a `worker_id` of `Some("")`; `WorkerIdInUse` (`Rejected`) for a fixed id another live engine of this process uses on the same store; `Store` (the store's: its migration or the release); `Invalid` for an `mcp.json` or an `a2a:` subagent, the subagents' included: the engine runs neither yet, and refuses them itself, so what it accepts does not depend on the features another crate of the build turns on in `adam-assembly`; `Agent` (the definition's, `Invalid`): an empty alias, a tool nobody registered, a secret refused; `Schedules` (the reconcile's class) when the scheduler runs cannot be made to match the folder |
+| `Engine::builder(store, agent, model, alias)`, then `start()` | migrates the store, releases the leases a fixed `Limits::worker_id` holds (`Store::release_worker_leases`: the runs its last process was stepping are claimed at once; nothing with the default, `None`), binds the agent with the screen's tools of an embedded agent (`adam_ui::Ui::embedded`: `ask_user`, `show`, `ui_catalog`, `plan_*`, and `Ui::screen` as its source) and the host's own (`EngineBuilder::tools`, a `ToolSet`: `#[tool]` functions, an `FnTool`; the files select them with `tools:`), gives it the model, registers its scheduler and makes the store's scheduler runs match the folder's `schedules/` (see *Schedules*), gives the backend the folder's `commands/` (a message `/name args` is expanded from `commands/<name>.md` before it is stored, as on the server surfaces), and spawns the worker on the current tokio runtime | `NoRuntime` (`Invalid`) outside a tokio runtime; `Invalid` for a zero `lease_ttl` or a `worker_id` of `Some("")`; `WorkerIdInUse` (`Rejected`) for a fixed id another live engine of this process uses on the same store; `Store` (the store's: its migration or the release); `Invalid` for an `mcp.json` or an `a2a:` subagent, the subagents' included: the engine runs neither yet, and refuses them itself, so what it accepts does not depend on the features another crate of the build turns on in `adam-assembly`; `Agent` (the definition's, `Invalid`): an empty alias, a tool nobody registered or one registered twice, a secret refused; `Schedules` (the reconcile's class) when the scheduler runs cannot be made to match the folder |
 | `send(None, say)` | starts a run in a new conversation (`Delivered::Started`) | `Invalid` for no text or no id; `Stopped` (`Rejected`) after `shutdown` |
 | `send(Some(&conversation), say)` | the latest run of the conversation has ended: a new run that continues it, the agent starting from its state, the transcript included (`Continued`); it is still open: the message is delivered to it, as a steer while it works (`Steered`) or as the answer while it waits (`Answered`), by the state read just before. A `Say` that already started a run starts nothing (`Repeated`) | `NotFound` for a conversation the engine has no run in |
 | `steer(run, say)` | a message for a run that works: it reads it at its next step, and a run about to finish takes another step first; a waiting run takes it as its answer | `Finished` (`Rejected`) for a run that ended; `NotFound`; `Unavailable` (`Transient`) when its state moved under the call |
@@ -28,6 +28,8 @@ engine.shutdown().await?;
 | `list(ListQuery)` | a `Page<RunInfo>` of the engine's runs, the most recently updated first, by cursor (`page_size`, at most 100, default 50; `conversation`; `after(token)`) | `Invalid` for a token of another query |
 | `get(run)` | the `RunInfo`, or `None` | |
 | `commands()` | the agent's commands (`adam_agent_fs::Command`: `name`, `description`, `argument_hint`, `template`), in name order: what the host lists in its `/` menu, as a client reads them from the card (`commands/v1`) | |
+| `files(run)` | the files the agent handed over in the run (`RunFile`: `name`, `mime_type`, `filename`, `len`, `sha256`), in the order they were emitted, without their bytes | `NotFound` for a run this engine has not (a schedule's firing included, as for `get`) |
+| `file(run, sha256)` | the bytes (`Arc<[u8]>`) of the run's file with that SHA-256, as `files` or the event's `WithheldFile` says it; `None` for no such file, or bytes gone from the store | `NotFound` as for `files` |
 | `events(run)` | `RunEvents`, a `futures::Stream` of `Result<EngineEvent, EngineError>`: the run's recent events, then the live ones, then `Ended` once the store says the run has ended; a run that has already ended gives `Ended` at once. See [A run's events](#a-runs-events) | `NotFound` for a run the engine does not have, refused at the call (the stream would have nothing to say) |
 | `shutdown()` | waits for the messages being written, then nothing new is claimed and the steps in flight finish and commit; it returns once the worker has stopped, and so does every concurrent or later call; every clone stops; reads and `cancel` still work. Dropping a `shutdown` before it is done (a timeout around it) aborts the worker, and so does dropping the last engine, as a killed process would: the next engine started with the same fixed worker id claims its runs at once, any other once their leases run out | what the worker ended with |
 
@@ -105,8 +107,8 @@ file holds. So run **one engine per SQLite file**: that clearing takes the lease
 too, and a second engine on the file, or an in-process restart without `shutdown`, would step the first one's runs
 again.
 
-**Not yet**: a way to read a file artifact's bytes (`RunInfo` carries no artifacts yet, and an event carries none, below). The backend is
-given the engine's ring too, and its A2A streaming path (`TaskBackend::subscribe`) builds a file part from a live
+**A file the agent hands over** (a tool's file artifact) reaches the events without its bytes (below); `files(run)` lists
+the run's files and `file(run, sha256)` reads one's bytes from the store. **Not yet**: the backend is given the engine's ring too, and its A2A streaming path (`TaskBackend::subscribe`) builds a file part from a live
 event's bytes: the engine never calls it, and a future caller that streams a task through it must read files from the
 store, since the ring withholds them. Approvals are slice 5: today a run waits only on a question, and `answer`
 answers it.
@@ -272,10 +274,13 @@ every wait is bounded by `tokio::time::timeout`:
   run, and each engine steps its own run once;
 * `a_second_live_engine_with_the_same_id_is_refused`: `WorkerIdInUse` (`Rejected`) on the same store; the same id on
   another store starts, and on the first once A has shut down;
-* `a_folders_command_is_expanded`: `/greet Ada` reaches the model as `commands/greet.md`'s template, `commands()` lists
-  it with its description and hint, and an unknown `/wave Ada` reaches the model as typed;
+* `a_folders_command_is_expanded`: `/greet Ada Lovelace` reaches the model as `commands/greet.md`'s template, `$1` read
+  as `Ada`, `commands()` lists it with its description and hint, and an unknown `/wave Ada` reaches the model as typed;
+* `a_file_the_agent_hands_over_is_read_by_its_digest`: a host's tool (`EngineBuilder::tools`, an `FnTool`) returns a
+  file; its event withholds the bytes and says the digest, `files` lists it under the same digest, `file` answers its
+  bytes, another digest is `None`, and a run the engine has not is `NotFound` to both;
 * `a_folders_schedule_fires_the_agent`: a folder with `schedules/soon.md` (`after: 1s`) fires a run of the agent, in
-  the store, whose model is given the prompt and whose `get` is `None`;
+  the store, whose model is given the prompt and whose `get` is `None` (and `files` `NotFound`);
   `the_hosts_retry_policy_governs_a_transient_failure`: `Limits::retry` of two attempts gives a transient model failure
   up after two calls, not five;
 * `start_refuses_what_it_cannot_build` (a zero lease and a ring of 0 or over 65 536 too; it passes alone and with

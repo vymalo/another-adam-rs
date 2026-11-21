@@ -12,14 +12,15 @@ use adam_engine::adam_agent_fs::{Dir, Strictness};
 use adam_engine::adam_assembly::{AgentDef, Error as AssemblyError};
 use adam_engine::adam_core::{DynStore, MemoryStore, RunId, Store};
 use adam_engine::adam_error::{Classify, ErrorClass};
+use adam_engine::adam_llm_agent::{FnTool, ToolError, ToolOutput, ToolSet};
 use adam_engine::adam_model::{
     ContentPart, DynModel, Message as ModelMessage, MockModel, ModelClient, ModelDelta, ModelError,
     ModelRequest, ModelResponse, ToolCall,
 };
-use adam_engine::adam_runtime::{REPLAY_EVENTS_PER_RUN, RunEvent, StepState};
+use adam_engine::adam_runtime::{Artifact, REPLAY_EVENTS_PER_RUN, RunEvent, StepState};
 use adam_engine::{
     ConversationId, Delivered, Engine, EngineError, EngineEvent, Limits, ListQuery, RunEvents,
-    RunInfo, RunState, Say, default_secrets,
+    RunInfo, RunState, Say, WithheldFile, default_secrets,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -1311,6 +1312,9 @@ async fn a_folders_schedule_fires_the_agent() {
     // A firing is nobody's message, so it is no run of a caller's: as an A2A server does not list it
     // to a caller, the engine's `get` does not show it; the host reads it from its store.
     assert!(engine.get(fired.id).await.unwrap().is_none());
+    // Nor are its files (#280): the runtime is read only for a run `get` shows.
+    let hidden = engine.files(fired.id).await.unwrap_err();
+    assert_eq!(hidden.class(), ErrorClass::NotFound, "{hidden:?}");
     let asked = mock.requests();
     assert!(
         format!("{:?}", asked[0].messages).contains("Say what is due."),
@@ -1400,6 +1404,104 @@ async fn a_folders_command_is_expanded() {
         let last = asked.last().expect("a model call");
         let text = format!("{:?}", last.messages.last());
         assert!(text.contains(expected), "{said}: {text}");
+    }
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A host's own tool can hand the agent a file, and the host reads it back (#280): the event
+/// withholds its bytes and says its digest, `files` lists it, `file` answers its bytes by that
+/// digest, and another digest or a run this engine does not have is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_the_agent_hands_over_is_read_by_its_digest() {
+    const BYTES: &[u8] = b"the report, line one\nline two\n";
+    let report = FnTool::raw(
+        "write_report",
+        "Write the report as a file.",
+        json!({"type": "object", "properties": {}}),
+        |_ctx, _args| async move {
+            let file = Artifact::file("report", "text/plain", "report.txt", BYTES.to_vec())
+                .expect("a file");
+            Ok::<_, ToolError>(ToolOutput::text("written").with_artifact(file))
+        },
+    );
+    let def = agent(&[(
+        "agent/instructions.md",
+        "---\nname: chat\ntools: [write_report]\n---\nYou chat.\n",
+    )]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![ToolCall {
+        id: "report-1".into(),
+        name: "write_report".into(),
+        arguments: json!({}),
+        ..Default::default()
+    }])
+    .push_text("Here is the report.");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), def, model, "m")
+        .tools(ToolSet::new().tool(report))
+        .start()
+        .await
+        .unwrap();
+
+    let turn = engine.send(None, Say::new("Write it.")).await.unwrap();
+    let mut events = engine.events(turn.run).await.unwrap();
+    let mut withheld = Vec::new();
+    while let Some(event) = timeout(WAIT, events.next()).await.expect("an event") {
+        if let EngineEvent::Live(event) = event.unwrap() {
+            withheld.extend(WithheldFile::of(&event));
+        }
+    }
+    let [said] = withheld.as_slice() else {
+        panic!("one file event: {withheld:?}");
+    };
+    assert_eq!(said.len, BYTES.len() as u64);
+
+    let files = engine.files(turn.run).await.unwrap();
+    let [file] = files.as_slice() else {
+        panic!("one file: {files:?}");
+    };
+    assert_eq!(
+        (
+            file.name.as_str(),
+            file.mime_type.as_deref(),
+            file.filename.as_str(),
+            file.len
+        ),
+        (
+            "report",
+            Some("text/plain"),
+            "report.txt",
+            BYTES.len() as u64
+        )
+    );
+    assert_eq!(
+        file.sha256, said.sha256,
+        "the list and the event name it alike"
+    );
+    let bytes = engine
+        .file(turn.run, &said.sha256)
+        .await
+        .unwrap()
+        .expect("its bytes");
+    assert_eq!(&*bytes, BYTES);
+
+    assert!(
+        engine
+            .file(turn.run, &"0".repeat(64))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let unknown = RunId::new();
+    for refused in [
+        engine.files(unknown).await.map(|_| ()).unwrap_err(),
+        engine
+            .file(unknown, &said.sha256)
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+    ] {
+        assert_eq!(refused.class(), ErrorClass::NotFound, "{refused:?}");
     }
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 }
