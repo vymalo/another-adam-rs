@@ -1,23 +1,24 @@
 # 0063. A reasoning effort is one setting, per model, configurable end to end
 
-Status: **Proposed** (2026-11-21; accepted when the probe table is filled)
+Status: **Accepted** (2026-11-21)
 
 ## Context
 
-The model gateway reasons **not at all** when a request carries no reasoning setting, and adam sends none
-today: `MODEL_EXTRA_BODY` is the only way to set one. The owner asked for one setting, reasoning effort,
-configurable in adam and all its clients — and ruled, on 2026-11-21, that:
+The models behind the gateway differ: some reason only when a level is sent, others reason by default, and
+the level names how much. Adam sends none today: `MODEL_EXTRA_BODY` is the only way to set one. The owner
+asked for one setting, reasoning effort, configurable in adam and all its clients — and ruled, on
+2026-11-21, that:
 
 - **there is no global default** (not in the chart, the env or the code); unset means nothing is sent, while a profile or a preset may set a per-model value;
 - **the setting is per model**, because each model behind the gateway differs: a deployment's model
   configuration declares, for each model it can call, whether it takes a reasoning setting, which levels
   it accepts, and **how they are sent**;
-- the four-value vocabulary adam speaks can stay closed, but the mapping and the allowed levels belong to
-  the model's entry;
+- the vocabulary is the gateway's observed levels, closed, but the mapping and the allowed levels belong
+  to the model's profile;
 - `reasoning/v1` advertises the levels of the agent's **current model**, and a request outside them is
   refused, fail closed;
-- the precedence stays request → thread → agent folder → deployment, each level choosing among the
-  model's levels;
+- the precedence stays request → thread → agent folder → the agent's preset → the profile, each level
+  choosing among the model's levels;
 - every surface (coder, folder agent, engine, orchestrator/web, platform) gets the feature through its
   own mechanism — the parity rule.
 
@@ -27,21 +28,32 @@ continues a turn that the output limit cuts while the model is only thinking, so
 a question — the budget still bounds one turn, and the effort still trades latency and tokens for
 reasoning.
 
-The gateway probe of 2026-11-21 is **pending the gateway credential**; when it runs, the table below
-records, for each of the 26 models the gateway lists (verified 2026-11-21 by `GET /v1/models`), no
-setting, `none`, `minimal`, `low`, `medium`, `high` and `max`, with a 64-token answer, the reasoning
-tokens and the finish reason. Each row will be *verified* on that date against the deployment's gateway,
-or *unverified* where the probe could not tell. The table is by model family and level, names no gateway
-host, and is the merge blocker.
+The gateway was probed on 2026-11-21: 25 models, wire `reasoning_effort`, with no setting and every level,
+then a multi-step problem with three samples per level (about 200k tokens). **Verified 2026-11-21** on the
+deployment's gateway; the table below is by family, names no gateway host, and the full per-model table is
+recorded outside this repository.
+
+- Every model accepts every level with a 200, **except Gemini**, which returns 400 for `max` and `xhigh`.
+- `none` and `minimal` are real levels: **some models reason unless `none` is sent** (DeepSeek,
+  `adorsys-frontend`, `adorsys-researcher`), while the others reason by default and `none` turns that off.
+- There is **no graded effect** between `low`, `medium`, `high` and `max`: the real switch is off versus on.
+  Gemini is the exception (`low` answers wrong; `medium` and `high` answer right).
+- GLM (5.3, 5.3-flash, 4.7-flash) is stochastic and partly inverted; no level controls it, so its
+  `reasoningEfforts` is empty.
+- `thinking` is ignored where accepted and rejected by Gemini; the `reasoning` object is a 400 on Gemini.
+  **Only `reasoning_effort` is verified on this gateway**; the other wires are for other gateways and are
+  unverified here.
+- The owner's bench finding holds: DeepSeek v4.1-1017 at `low` answers 3/3 correctly in about a second,
+  and `max` adds nothing.
 
 ## Decision
 
-1. **The vocabulary is closed.** `ReasoningEffort` in `adam-model`: `Low`, `Medium`, `High`, `Max`,
-   spelled `low`, `medium`, `high`, `max`. Built like `AccessTier`: an `ALL` array, an exhaustive
-   `as_str` and `FromStr`, and serde `rename_all` on top, so a new variant fails to compile everywhere
-   until it is handled. `none` and `minimal` are **not** adam's vocabulary: "off" is the absence of the
-   setting. A model that takes only `none`/`minimal` is a model adam cannot ask to reason; its entry says
-   it takes none.
+1. **The vocabulary is closed.** `ReasoningEffort` in `adam-model`: `None`, `Minimal`, `Low`, `Medium`,
+   `High`, `XHigh`, `Max`, spelled `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — the
+   gateway's observed levels. Built like `AccessTier`: an `ALL` array, an exhaustive `as_str` and
+   `FromStr`, and serde `rename_all` on top, so a new variant fails to compile everywhere until it is
+   handled. `none` is a **real level**: some models reason unless it is sent. Absence sends nothing and is
+   the model's default, which may reason; a model that takes no setting has `reasoningEfforts: []`.
 
 2. **The model profile is the only seat.** Each model's profile in `MODEL_ALIASES_FILE` (the `profiles:`
    map; ADR 0054 slice 11; the output cap, `extraBody` and the `presets:` bundle are the companion ADR
@@ -49,10 +61,13 @@ host, and is the merge blocker.
    - `reasoningEfforts`: the levels it accepts, a subset of the closed vocabulary, lowest first; absent or
      empty means the model takes **no** reasoning setting.
    - `reasoningWire`: one of a closed set, and it is how a level is sent:
-     - `reasoning_effort` → `{"reasoning_effort": "<level>"}` (an OpenAI-compatible endpoint);
-     - `reasoning_object` → `{"reasoning": {"effort": "<level>"}}`;
+     - `reasoning_effort` → `{"reasoning_effort": "<level>"}` — **the only wire verified on this
+       gateway** (every family accepts it; Gemini rejects `max` and `xhigh`);
+     - `reasoning_object` → `{"reasoning": {"effort": "<level>"}}` — for another gateway, unverified here
+       (a 400 on Gemini);
      - `thinking_budget` → `{"thinking": {"type": "enabled", "budget_tokens": <n>}}`, with
-       `reasoningBudgets` mapping **every** declared level to its token budget.
+       `reasoningBudgets` mapping **every** declared level to its token budget — for another gateway,
+       unverified here (`thinking` is ignored or rejected by this one).
    - `reasoningEffort` (optional): the model's own value, one of its `reasoningEfforts`.
    - A preset in `presets:` may carry `reasoningEffort`; a profile may name one (`preset:`).
    - A level outside the vocabulary, an unknown `reasoningWire`, a duplicate level, a
@@ -154,7 +169,20 @@ host, and is the merge blocker.
 
 ## The probe, model by model (2026-11-21)
 
-<!-- PROBE-TABLE -->
+| Family (models) | `reasoning_effort` accepted | Absent reasons? | Recommended `reasoningEfforts` | Notes |
+|---|---|---|---|---|
+| DeepSeek (v4.1-flash, v4.1-flash-1017, v4-flash-0731) | all levels | **no** | `[none, low]` | `low` 3/3 correct, ~1 s; `max` adds nothing |
+| Kimi (k2.5, k2.7-code, k3.1-pro) | all levels | yes | `[none, minimal]` (k2.5, k3.1) | |
+| Gemini (3p1-flash-lite) | all except `max`, `xhigh` (400) | yes | `[none, medium]` | `low` answers wrong; `medium`/`high` right; the `reasoning` object is a 400 |
+| GLM (5.3, 5.3-flash, 4.7-flash) | all levels (200) | yes | `[]` | stochastic, partly inverted; no level controls it |
+| Qwen (3-5-9b-local) | all levels | yes | `[none, low]` | the embedding model is not a chat model |
+| MiniMax (m3, m2p5, m2.7) | all levels | yes | `[none, low]` | |
+| MiMo (v2p5-pro, v2p5, v2.6-pro, v2.6-flash) | all levels | yes | `[none, low]` | |
+| Ornith, Gemma, adorsys-* | all levels | **no** for `adorsys-frontend`/`adorsys-researcher`; yes otherwise | `[none, low]` | |
+| `qwen3-embedding-8b` | not a chat model | — | none | no profile |
+
+"all levels" is `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The recommended set is the
+cheapest reliable level per family; the full per-model table is recorded outside this repository.
 
 ## The effort's life
 
