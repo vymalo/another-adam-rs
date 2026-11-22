@@ -154,13 +154,13 @@ helm_auth > "$out"
 check "modelAuth unset: no MODEL_AUTH is rendered (the binary's default is key)" lacks 'MODEL_AUTH'
 check "modelAuth unset: the render equals the golden" cmp -s "$out" "$golden"
 for auth in key device injector; do
-  helm_auth --set config.modelAuth=$auth > "$out"
+  helm_auth --set "config.modelAuth=$auth" > "$out"
   check "modelAuth=$auth: the worker gets MODEL_AUTH=$auth" envval MODEL_AUTH "$auth"
   check "modelAuth=$auth: ... once" count 'name: MODEL_AUTH$' 1
   check "modelAuth=$auth: ... as a plain value, not a secret" dlacks ExternalSecret 'MODEL_AUTH'
 done
 for auth in device injector; do
-  helm_auth --set config.modelAuth=$auth > "$out"
+  helm_auth --set "config.modelAuth=$auth" > "$out"
   check "modelAuth=$auth: the ExternalSecret still creates MODEL_API_KEY (its value must be empty)" \
     dhas ExternalSecret '^    - secretKey: MODEL_API_KEY$'
 done
@@ -178,7 +178,7 @@ check "injector: no MODEL_CA_FILE is mounted (ADR 0067 decision 9 is a later sli
   lacks 'MODEL_CA_FILE|model-ca|ca-file'
 check "injector: still no Secret object in the render" lacks '^kind: Secret$'
 for bad in bogus oauth true; do
-  check "modelAuth $bad is refused" fails helm_auth --set config.modelAuth=$bad
+  check "modelAuth $bad is refused" fails helm_auth --set "config.modelAuth=$bad"
 done
 message=$(helm_auth --set config.modelAuth=bogus 2>&1 || true)
 check "... the error names the value and the accepted words" \
