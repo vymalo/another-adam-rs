@@ -356,6 +356,13 @@ pub struct Loader {
     /// The tools a call would make available, in the order the request would offer them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holds: Vec<String>,
+    /// The group's one-line note, so a seeded resume fills the recap's note too (a loader that
+    /// does not say leaves it empty).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    /// The note is the MCP server's own words.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub note_is_server: bool,
 }
 
 /// The most bytes a [`Loaded::note`] holds: one line of the marker a compaction writes.
@@ -457,12 +464,13 @@ pub struct Conversation {
     /// existed, and not written while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loaders: Vec<Loader>,
-    /// The names of loaded tools that a request did **not** carry: the group's definition shrank
-    /// since the load. The turn transition diffs what the sources still hold against
-    /// [`loaded`](Self::loaded) and journals the difference, so a replay decides the same; a
-    /// compaction leaves them out of its recap, and a call to one is refused. A tool the access
-    /// tier hid on one message is **not** here: the tier is per message. Absent from state written
-    /// before it existed, and not written while empty.
+    /// The loaded tools the run no longer holds: a member its group shrank out of, or a
+    /// **task-loaded** member the access tier hid (that one is permanent for the run, because it
+    /// would otherwise appear later at its registration position). An **explicit** load's
+    /// tier-hidden member is **not** here: the tier is per message, and its loader appends it again.
+    /// The turn transition journals the difference, so a replay decides the same; a compaction
+    /// leaves them out of its recap, and a call to one is refused. Absent from state written before
+    /// it existed, and not written while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_tools: Vec<String>,
     /// The loaded tools the last request carried, so a load records a growth once: the first
@@ -1319,6 +1327,10 @@ impl Conversation {
             }
             if let Some(loader) = loaders.iter().find(|loader| loader.name == one.loader) {
                 one.tools = loader.holds.clone();
+                if !loader.note.is_empty() {
+                    one.note = loader.note.clone();
+                    one.note_is_server = loader.note_is_server;
+                }
             } else if let Some(task) = task_loaded.iter().find(|task| task.loader == one.loader) {
                 // The seeded group is also one the task loads: `loaders` excludes it, and the
                 // task-loaded entry carries what it holds and its note.
@@ -1674,6 +1686,8 @@ mod tests {
             &[Loader {
                 name: "load__group__docs".into(),
                 holds: vec!["docs__search".into()],
+                note: String::new(),
+                note_is_server: false,
             }],
             &[],
         );
@@ -1715,6 +1729,8 @@ mod tests {
             &[Loader {
                 name: "load__group__docs".into(),
                 holds: vec!["docs__search".into()],
+                note: String::new(),
+                note_is_server: false,
             }],
             &[],
         );

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store as _};
+use adam_core::{DynStore, MemoryStore, RunId, RunStatus, RunUpdate, Store as _};
 use adam_llm_agent::{
     COMPACTION_TURN, Conversation, ImageStore, InboundImage, Limits, LlmAgent, LlmAgentBuilder,
     MAX_SOURCE_TOOLS, MemoryImages, ReadOutput, SourceCtx, Tool, ToolAccess, ToolCtx, ToolError,
@@ -336,6 +336,56 @@ impl Rig {
             .expect("start");
         *self.arm.run.lock().unwrap() = Some(run);
         run
+    }
+
+    /// Replace the stored state of `run` with a journal written before `loaded` existed: the
+    /// transcript kept, `turns` and `loaded_servers` set, so the worker resumes at that turn.
+    async fn seed_stored_state(
+        &self,
+        run: RunId,
+        turns: u32,
+        loaded_servers: &[&str],
+        history: usize,
+    ) {
+        let record = self
+            .store
+            .load_run(run)
+            .await
+            .expect("the stored run")
+            .expect("the run exists");
+        let mut state = record.state.clone();
+        let mut conversation: Conversation =
+            serde_json::from_value(state["agent"].clone()).expect("the agent state");
+        conversation.turns = turns;
+        for n in 0..history {
+            let id = format!("old{n}");
+            conversation.messages.push(Message::Assistant {
+                content: Vec::new(),
+                tool_calls: vec![ToolCall {
+                    id: id.clone(),
+                    name: "big".into(),
+                    arguments: json!({"n": 10, "tag": "old"}),
+                    ..Default::default()
+                }],
+                reasoning: None,
+            });
+            conversation.messages.push(Message::Tool {
+                call_id: id,
+                content: format!("old{n}:{}", "x".repeat(1200)),
+                is_error: false,
+                images: Vec::new(),
+            });
+        }
+        conversation.loaded_servers = loaded_servers.iter().map(|s| (*s).to_owned()).collect();
+        // `loaded_servers` is decoded but never written by the live state: the journal the test
+        // writes is an old one, so the key goes in by hand.
+        let mut agent = serde_json::to_value(&conversation).expect("the state");
+        agent["loaded_servers"] = json!(loaded_servers);
+        state["agent"] = agent;
+        self.store
+            .commit_run(run, record.version, RunUpdate::new(record.status, state))
+            .await
+            .expect("the seeded state");
     }
 
     /// A failed commit is retried after a backoff of the runtime's clock, which only this moves.
@@ -2350,10 +2400,17 @@ async fn a_task_selected_tool_survives_a_lost_commit() {
 struct Deferred {
     group: &'static str,
     specs: Vec<ToolSpec>,
+    note: &'static str,
+    keywords: &'static [&'static str],
 }
 
 impl Deferred {
-    fn new(group: &'static str, tools: &[&'static str]) -> Self {
+    fn new(
+        group: &'static str,
+        tools: &[&'static str],
+        note: &'static str,
+        keywords: &'static [&'static str],
+    ) -> Self {
         Self {
             group,
             specs: tools
@@ -2364,6 +2421,8 @@ impl Deferred {
                     parameters: json!({"type": "object", "properties": {}}),
                 })
                 .collect(),
+            note,
+            keywords,
         }
     }
 
@@ -2371,8 +2430,17 @@ impl Deferred {
         format!("load__group__{}", self.group)
     }
 
+    fn matches(&self, task: Option<&str>) -> bool {
+        task.is_some_and(|task| {
+            let task = task.to_lowercase();
+            self.keywords
+                .iter()
+                .any(|word| !word.is_empty() && task.contains(&word.to_lowercase()))
+        })
+    }
+
     fn loaded(&self, ctx: &SourceCtx) -> bool {
-        ctx.loaded().iter().any(|one| one.loader == self.loader())
+        self.matches(ctx.task()) || ctx.loaded().iter().any(|one| one.loader == self.loader())
     }
 }
 
@@ -2383,18 +2451,37 @@ impl ToolSource for Deferred {
     }
 
     async fn appended(&self, ctx: &SourceCtx) -> Vec<ToolSpec> {
-        if self.loaded(ctx) {
-            self.specs.clone()
-        } else {
+        // A task-loaded group is not appended: its tools were never withheld.
+        if self.matches(ctx.task()) || !self.loaded(ctx) {
             Vec::new()
+        } else {
+            self.specs.clone()
         }
     }
 
-    async fn loaders(&self, _ctx: &SourceCtx) -> Vec<adam_llm_agent::Loader> {
+    async fn loaders(&self, ctx: &SourceCtx) -> Vec<adam_llm_agent::Loader> {
+        if self.matches(ctx.task()) {
+            return Vec::new();
+        }
         vec![adam_llm_agent::Loader {
             name: self.loader(),
             holds: self.specs.iter().map(|spec| spec.name.clone()).collect(),
+            note: self.note.to_owned(),
+            note_is_server: true,
         }]
+    }
+
+    async fn loaded_by_task(&self, ctx: &SourceCtx) -> Vec<adam_llm_agent::Loaded> {
+        if self.matches(ctx.task()) {
+            vec![adam_llm_agent::Loaded {
+                loader: self.loader(),
+                tools: self.specs.iter().map(|spec| spec.name.clone()).collect(),
+                note: self.note.to_owned(),
+                note_is_server: true,
+            }]
+        } else {
+            Vec::new()
+        }
     }
 
     async fn loaded_tools(&self, ctx: &SourceCtx) -> Option<Vec<String>> {
@@ -2491,10 +2578,15 @@ impl Tool for LoadGroup {
 /// The agent with deferred groups: their tools are own tools, withheld until the run loads them.
 fn with_groups(
     builder: LlmAgentBuilder,
-    groups: &[(&'static str, &'static [&'static str], &'static str)],
+    groups: &[(
+        &'static str,
+        &'static [&'static str],
+        &'static str,
+        &'static [&'static str],
+    )],
 ) -> LlmAgentBuilder {
     let mut builder = builder.tool(Fixed("big")).tool(Fixed("handle"));
-    for (group, tools, note) in groups {
+    for (group, tools, note, keywords) in groups {
         for tool in *tools {
             builder = builder.tool(Fixed(tool));
         }
@@ -2504,7 +2596,7 @@ fn with_groups(
                 tools: tools.iter().map(|tool| (*tool).to_owned()).collect(),
                 note,
             })
-            .tool_source(Deferred::new(group, tools));
+            .tool_source(Deferred::new(group, tools, note, keywords));
     }
     builder
 }
@@ -2512,7 +2604,12 @@ fn with_groups(
 fn with_deferred(builder: LlmAgentBuilder) -> LlmAgentBuilder {
     with_groups(
         builder,
-        &[("docs", &["docs__search", "docs__read"], "the docs words")],
+        &[(
+            "docs",
+            &["docs__search", "docs__read"],
+            "the docs words",
+            &[],
+        )],
     )
 }
 
@@ -2712,8 +2809,8 @@ async fn two_loads_in_one_reply_apply_in_order() {
         with_groups(
             builder,
             &[
-                ("docs", &["docs__search"], "the docs words"),
-                ("linear", &["linear__list"], "the linear words"),
+                ("docs", &["docs__search"], "the docs words", &[]),
+                ("linear", &["linear__list"], "the linear words", &[]),
             ],
         )
     });
@@ -2762,8 +2859,8 @@ async fn two_loads_in_parallel_apply_in_order() {
         with_groups(
             builder,
             &[
-                ("docs", &["docs__search"], "the docs words"),
-                ("linear", &["linear__list"], "the linear words"),
+                ("docs", &["docs__search"], "the docs words", &[]),
+                ("linear", &["linear__list"], "the linear words", &[]),
             ],
         )
         .max_parallel(4)
@@ -2848,4 +2945,100 @@ async fn a_load_appends_to_a_prompt_another_source_already_grew() {
     );
     assert_eq!(state.tools_appended, [1]);
     assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
+}
+
+/// A seeded resume at turn 4: the restored tools are offered, the requests are a prefix, and no
+/// turn records a growth (the seed's carried set already names them).
+#[tokio::test]
+async fn a_seeded_resume_records_no_growth() {
+    let rig = Rig::new(0, with_deferred);
+    rig.mock
+        .push_tool_calls(vec![call("c1", "docs__search", json!({}))])
+        .push_text("done");
+    let run = rig.start().await;
+    rig.seed_stored_state(run, 4, &["docs"], 0).await;
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_names(&requests[0]),
+        [
+            "big",
+            "handle",
+            "load__group__docs",
+            "docs__search",
+            "docs__read"
+        ],
+        "the seeded group's tools are offered"
+    );
+    assert_eq!(
+        &requests[1].tools[..requests[0].tools.len()],
+        &requests[0].tools[..],
+        "the requests are a prefix"
+    );
+    assert!(
+        state.tools_appended.is_empty(),
+        "the seed is not a growth: {:?}",
+        state.tools_appended
+    );
+    assert_eq!(state.loaded[0].loader, "load__group__docs");
+    assert_eq!(state.loaded[0].tools, ["docs__search", "docs__read"]);
+    assert_eq!(state.loaded[0].note, "the docs words");
+    assert!(state.loaded[0].note_is_server);
+}
+
+/// A seeded group filled from a `Loader` keeps its note: the loader carries it, so the recap can
+/// label the server's words.
+#[tokio::test]
+async fn a_seeded_group_filled_from_a_loader_keeps_its_note() {
+    let rig = Rig::summarising(1000, with_deferred);
+    rig.mock.push_text("SUMMARY: seeded").push_text("done");
+    let run = rig.start_task("go").await;
+    rig.seed_stored_state(run, 4, &["docs"], 8).await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.loaded[0].note, "the docs words");
+    assert!(state.loaded[0].note_is_server);
+    let marker = state.messages[0].text();
+    assert!(
+        marker.contains("(the server's words: the docs words)"),
+        "{marker}"
+    );
+}
+
+/// A resume whose first transition compacts seeds and fills before the marker is written: the
+/// marker names the seeded group through the real transition.
+#[tokio::test]
+async fn a_resume_that_compacts_first_names_the_seeded_group() {
+    let rig = Rig::summarising(1000, with_deferred);
+    rig.mock.push_text("SUMMARY: seeded").push_text("done");
+    let run = rig.start_task("go").await;
+    rig.seed_stored_state(run, 4, &["docs"], 8).await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "the resume compacted first");
+    let marker = state.messages[0].text();
+    assert!(marker.contains("load__group__docs"), "{marker}");
+    assert!(marker.contains("docs__search"), "{marker}");
+}
+
+/// A seeded resume whose task also loads a **different** group journals that group too: the
+/// recap names every group the run's task matches, not only the seeded one.
+#[tokio::test]
+async fn a_seeded_resume_names_a_different_task_loaded_group() {
+    let rig = Rig::summarising(1000, |builder| {
+        with_groups(
+            builder,
+            &[
+                ("docs", &["docs__search"], "the docs words", &[]),
+                ("linear", &["linear__list"], "the linear words", &["linear"]),
+            ],
+        )
+    });
+    rig.mock.push_text("SUMMARY: seeded").push_text("done");
+    let run = rig.start_task("go linear").await;
+    rig.seed_stored_state(run, 4, &["docs"], 8).await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1);
+    let marker = state.messages[0].text();
+    assert!(marker.contains("load__group__docs"), "{marker}");
+    assert!(marker.contains("load__group__linear"), "{marker}");
+    assert!(marker.contains("linear__list"), "{marker}");
 }

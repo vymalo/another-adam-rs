@@ -259,6 +259,8 @@ impl Groups {
             .map(|group| Loader {
                 name: group.loader(),
                 holds: group.members.clone(),
+                note: group.short_note.clone(),
+                note_is_server: group.server.is_some(),
             })
             .collect()
     }
@@ -364,6 +366,8 @@ impl ToolSource for Groups {
                     .filter(|member| !removed.contains(member))
                     .cloned()
                     .collect(),
+                note: group.short_note.clone(),
+                note_is_server: group.server.is_some(),
             })
             .collect()
     }
@@ -621,6 +625,8 @@ mod tests {
             [Loader {
                 name: "load__group__bash".into(),
                 holds: vec!["run_command".into(), "read_file".into()],
+                note: "what bash is for".into(),
+                note_is_server: false,
             }]
         );
         assert_eq!(groups.loader_tools().len(), 1);

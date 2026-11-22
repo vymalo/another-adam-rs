@@ -265,6 +265,8 @@ impl adam_llm_agent::ToolSource for DocsSource {
                 .iter()
                 .map(|spec| spec.name.clone())
                 .collect(),
+            note: "the docs words".into(),
+            note_is_server: true,
         }]
     }
 
@@ -359,6 +361,8 @@ impl adam_llm_agent::ToolSource for RepoSource {
         vec![adam_llm_agent::Loader {
             name: "load__group__repo".into(),
             holds: vec!["repo__status".into()],
+            note: String::new(),
+            note_is_server: false,
         }]
     }
 

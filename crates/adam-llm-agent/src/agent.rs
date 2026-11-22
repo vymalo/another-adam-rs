@@ -5582,6 +5582,9 @@ impl Agent for LlmAgent {
             let loaders = crate::source::loaders_offered(&self.sources, &source_ctx).await;
             let task_loaded = crate::source::loaded_by_task(&self.sources, &source_ctx).await;
             state.fill_seeded(&loaders, &task_loaded);
+            // The task may load a group the old journal never named (a different `when` server):
+            // journal it here too, or the recap would omit it.
+            state.note_task_loaded(task_loaded);
             let carried: Vec<String> = state
                 .loaded
                 .iter()
@@ -6010,6 +6013,8 @@ mod failure_tests {
         let stale = Loader {
             name: "load__group__gone".into(),
             holds: Vec::new(),
+            note: String::new(),
+            note_is_server: false,
         };
         assert!(
             loaders_needed(0, std::slice::from_ref(&stale)),

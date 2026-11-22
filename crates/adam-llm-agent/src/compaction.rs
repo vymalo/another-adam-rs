@@ -826,6 +826,8 @@ mod tests {
         Loader {
             name: name.to_owned(),
             holds: holds.iter().map(|tool| (*tool).to_owned()).collect(),
+            note: String::new(),
+            note_is_server: false,
         }
     }
 
@@ -876,6 +878,8 @@ mod tests {
             &[Loader {
                 name: "load__group__docs".into(),
                 holds: vec!["docs__search".into()],
+                note: String::new(),
+                note_is_server: false,
             }],
             &[],
         );
