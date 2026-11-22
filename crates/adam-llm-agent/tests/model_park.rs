@@ -15,7 +15,7 @@ use adam_core::time::{Timestamp, span_of};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
     Conversation, LlmAgent, LlmAgentBuilder, MODEL_RESUME_KIND, ModelPark, ModelParking,
-    user_message,
+    PendingWait, user_message,
 };
 use adam_model::{DynModel, Message, MockModel, ModelError, ModelRequest, Park};
 use adam_runtime::{CollectingSink, Inbound, ManualClock, RetryPolicy, RunView, Runtime};
@@ -112,6 +112,23 @@ impl Rig {
             .filter(|e| e.name == "ctx.now" && e.ok)
             .map(|e| serde_json::from_value(e.payload).expect("a time"))
             .collect()
+    }
+
+    /// The model's requests, once at least `at_least` have been made.
+    async fn requests_at_least(&self, at_least: usize) -> Vec<ModelRequest> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let requests = self.mock.requests();
+            if requests.len() >= at_least {
+                return requests;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {at_least} model calls; {} were made",
+                requests.len()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     async fn start(&self, conversation: Option<&str>) -> RunId {
@@ -856,6 +873,28 @@ impl adam_llm_agent::Tool for Spawn {
     }
 }
 
+/// The subagent tool of a run whose child is `agent`: the same call as [`Spawn`], for a tree.
+struct SpawnOf(&'static str);
+
+#[async_trait::async_trait]
+impl adam_llm_agent::Tool for SpawnOf {
+    fn spec(&self) -> adam_model::ToolSpec {
+        adam_model::ToolSpec {
+            name: "sub".into(),
+            description: "hands the work to a helper".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn call(
+        &self,
+        ctx: &adam_llm_agent::ToolCtx,
+        _args: Value,
+    ) -> Result<adam_llm_agent::ToolOutput, adam_llm_agent::ToolError> {
+        let run = ctx.start_child(self.0, "go").await?;
+        Err(adam_llm_agent::ToolError::AwaitRun { run })
+    }
+}
+
 /// Answers a text of the size asked, so a history reaches its budget.
 struct Big;
 
@@ -896,6 +935,12 @@ fn tool_call(id: &str, name: &str, args: Value) -> adam_model::ToolCall {
 fn family(max_history_tokens: u32) -> Rig {
     let mock = Arc::new(MockModel::new());
     let model: DynModel = mock.clone();
+    family_over(mock, model, max_history_tokens)
+}
+
+/// [`family`] over `model`, whose answers are `mock`'s: a model that holds a call at a gate is
+/// what lets a test see a run while a call is in flight.
+fn family_over(mock: Arc<MockModel>, model: DynModel, max_history_tokens: u32) -> Rig {
     let parent = LlmAgent::builder("llm", model.clone(), "test-model")
         .tool(Spawn)
         .model_parking(ModelParking::default())
@@ -913,44 +958,359 @@ fn family(max_history_tokens: u32) -> Rig {
     rig
 }
 
-/// A subagent's run parked until woken would strand its task: nothing wakes a child. It fails
-/// naming the reason, and the parent goes on with an error result for the call.
+/// A root `llm` whose subagent is `helper`, whose own subagent is `leaf`: three runs, each parking
+/// on the model, on one scripted model.
+fn tree() -> Rig {
+    let mock = Arc::new(MockModel::new());
+    let model: DynModel = mock.clone();
+    let root = LlmAgent::builder("llm", model.clone(), "test-model")
+        .tool(SpawnOf("helper"))
+        .model_parking(ModelParking::default())
+        .build();
+    let helper = LlmAgent::builder("helper", model.clone(), "test-model")
+        .tool(SpawnOf("leaf"))
+        .model_parking(ModelParking::default())
+        .build();
+    let leaf = LlmAgent::builder("leaf", model, "test-model")
+        .model_parking(ModelParking::default())
+        .build();
+    let mut rig = Rig::build(mock, vec![root, helper, leaf], Arc::new(MemoryStore::new()));
+    rig.spawn();
+    rig
+}
+
+/// The model wait the run waits on, its own or its pending child's copy, if it has one.
+fn wait_of(state: &Conversation) -> Option<adam_llm_agent::ModelWait> {
+    match &state.pending_wait {
+        Some(adam_llm_agent::PendingWait::Run(wait)) => wait.model_wait.clone(),
+        _ => state.model_wait.clone(),
+    }
+}
+
+/// A subagent's park until woken is shown on its parent, which waits with no timer and says why; a
+/// message to the parent wakes the child through it, and its words stay at the parent (ADR 0067
+/// decision 5).
 #[tokio::test]
-async fn a_subagent_refused_until_woken_fails_and_its_parent_goes_on() {
+async fn a_parked_subagent_shows_on_its_parent_and_a_message_wakes_it_through() {
     let rig = family(0);
     rig.mock
         .push_tool_calls(vec![tool_call("c1", "sub", json!({}))])
         .push_error(refused(402, Some("over_limit"), Park::UntilWoken))
-        .push_text("the helper could not work");
+        .push_text("the helper's answer")
+        .push_text("all done");
     let run = rig.start(None).await;
-    let view = rig.done(run).await;
-    assert_eq!(text_of(&view).as_deref(), Some("the helper could not work"));
     let child = adam_runtime::child_run_id(run, "c1");
-    let child = rig.rt.view(child).await.unwrap().expect("the child");
-    assert_eq!(child.status, RunStatus::Failed);
-    let error = child.error.unwrap();
+
+    // The child parks; the parent reads its wait and waits with no timer, as on a question.
+    let (view, state) = rig
+        .parked(
+            run,
+            |s| matches!(&s.pending_wait, Some(PendingWait::Run(w)) if w.model_wait.is_some()),
+        )
+        .await;
+    assert!(view.waiting, "the parent waits like a question");
+    assert_eq!(view.wake_at, None);
+    let Some(PendingWait::Run(wait)) = state.pending_wait else {
+        panic!("the parent waits on the child")
+    };
+    let copy = wait.model_wait.expect("the copy of the child's wait");
+    assert_eq!(copy.park, ModelPark::UntilWoken);
+    assert_eq!(copy.reason, "the model gateway's limit is reached");
     assert!(
-        error.contains("the model gateway's limit is reached (HTTP 402 over_limit)"),
-        "{error}"
+        rig.rt
+            .view(child)
+            .await
+            .unwrap()
+            .expect("the child")
+            .waiting,
+        "the child parked until woken"
     );
-    assert!(error.contains("a subagent's"), "{error}");
+    assert_eq!(
+        rig.mock.requests().len(),
+        2,
+        "the parent and the child each called once"
+    );
+
+    // A message to the parent: its words stay there, and one resume goes down to the child.
+    rig.rt
+        .deliver(run, user_message("the limit is raised"))
+        .await
+        .expect("deliver");
+    let done = rig.done(run).await;
+    assert_eq!(text_of(&done).as_deref(), Some("all done"));
     let requests = rig.mock.requests();
-    assert_eq!(requests.len(), 3);
-    let told = requests[2]
-        .messages
-        .iter()
-        .find_map(|m| match m {
-            Message::Tool {
-                call_id,
-                content,
-                is_error,
-                ..
-            } if call_id == "c1" => Some((content.clone(), *is_error)),
-            _ => None,
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        texts(&requests[2]),
+        texts(&requests[1]),
+        "the child makes the same call"
+    );
+    let child = rig.state(child).await;
+    assert!(
+        child
+            .messages
+            .iter()
+            .all(|m| m.text() != "the limit is raised"),
+        "no message of the person's reached the child"
+    );
+    let parent = rig.state(run).await;
+    assert!(
+        parent
+            .messages
+            .iter()
+            .any(|m| m.text() == "the limit is raised"),
+        "the words stayed at the parent"
+    );
+    assert!(parent.pending_wait.is_none());
+    rig.stop().await;
+}
+
+/// A resume to the parent adds nothing to it and wakes the child through it: the same call is made
+/// again, and the parent's history has no turn for the resume (ADR 0067 decision 5).
+#[tokio::test]
+async fn a_resume_to_the_parent_adds_nothing_and_wakes_the_child_through_it() {
+    let rig = family(0);
+    rig.mock
+        .push_tool_calls(vec![tool_call("c1", "sub", json!({}))])
+        .push_error(refused(402, Some("over_limit"), Park::UntilWoken))
+        .push_text("the helper's answer")
+        .push_text("all done");
+    let run = rig.start(None).await;
+    rig.parked(
+        run,
+        |s| matches!(&s.pending_wait, Some(PendingWait::Run(w)) if w.model_wait.is_some()),
+    )
+    .await;
+
+    rig.rt
+        .deliver(
+            run,
+            Inbound::new(MODEL_RESUME_KIND, json!({})).with_id("r-1"),
+        )
+        .await
+        .expect("deliver");
+    let done = rig.done(run).await;
+    assert_eq!(text_of(&done).as_deref(), Some("all done"));
+    let requests = rig.mock.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(texts(&requests[2]), texts(&requests[1]));
+    let parent = rig.state(run).await;
+    assert_eq!(
+        parent
+            .messages
+            .iter()
+            .filter(|m| matches!(m, Message::User { .. }))
+            .count(),
+        1,
+        "the resume is no message of the person's"
+    );
+    rig.stop().await;
+}
+
+/// The copy of a message the parent already read wakes the child once: a sender that delivers the
+/// same id again costs no second resume, and a message with a new id still wakes the child through
+/// the parent.
+#[tokio::test]
+async fn a_copy_of_the_message_that_woke_the_parent_wakes_the_child_once() {
+    let rig = family(0);
+    rig.mock
+        .push_tool_calls(vec![tool_call("c1", "sub", json!({}))])
+        .push_error(refused(402, Some("over_limit"), Park::UntilWoken))
+        .push_error(refused(402, Some("over_limit"), Park::UntilWoken))
+        .push_text("the helper's answer")
+        .push_text("all done");
+    let run = rig.start(None).await;
+    let child = adam_runtime::child_run_id(run, "c1");
+    rig.parked(
+        run,
+        |s| matches!(&s.pending_wait, Some(PendingWait::Run(w)) if w.model_wait.is_some()),
+    )
+    .await;
+
+    // The first message wakes the child, which is refused again and parks.
+    rig.rt
+        .deliver(run, user_message("the limit is raised").with_id("m-1"))
+        .await
+        .expect("deliver");
+    rig.requests_at_least(3).await;
+    rig.wait_for(child, "the child parked again", |v| {
+        v.status == RunStatus::Parked
+    })
+    .await;
+    assert_eq!(rig.mock.requests().len(), 3);
+
+    // The same id again is a copy the parent has read: it forwards nothing.
+    rig.rt
+        .deliver(run, user_message("the limit is raised").with_id("m-1"))
+        .await
+        .expect("a copy is delivered");
+    let (view, _) = rig
+        .parked(
+            run,
+            |s| matches!(&s.pending_wait, Some(PendingWait::Run(w)) if w.model_wait.is_some()),
+        )
+        .await;
+    assert!(view.waiting);
+    assert_eq!(
+        rig.mock.requests().len(),
+        3,
+        "the copy woke nothing: the child read one resume"
+    );
+    assert_eq!(
+        rig.rt.view(child).await.unwrap().unwrap().pending_inbox,
+        0,
+        "and no resume waits in its inbox"
+    );
+
+    // A message with a new id still reaches it.
+    rig.rt
+        .deliver(run, user_message("now really raised").with_id("m-2"))
+        .await
+        .expect("deliver");
+    let done = rig.done(run).await;
+    assert_eq!(text_of(&done).as_deref(), Some("all done"));
+    assert_eq!(rig.mock.requests().len(), 5);
+    rig.stop().await;
+}
+
+/// A forwarded resume clears the parent's copy while the child works, and the parent parks on its
+/// 60 s look again (ADR 0067 decision 5).
+#[tokio::test]
+async fn a_forwarded_resume_clears_the_copy_while_the_child_works() {
+    let mock = Arc::new(MockModel::new());
+    let gate = Arc::new(Gate::default());
+    let model: DynModel = Arc::new(GateModel {
+        inner: mock.clone(),
+        hold_on: 2,
+        calls: Default::default(),
+        gate: gate.clone(),
+    });
+    let rig = family_over(mock, model, 0);
+    rig.mock
+        .push_tool_calls(vec![tool_call("c1", "sub", json!({}))])
+        .push_error(refused(402, Some("over_limit"), Park::UntilWoken))
+        .push_text("the helper's answer")
+        .push_text("all done");
+    let run = rig.start(None).await;
+    rig.parked(
+        run,
+        |s| matches!(&s.pending_wait, Some(PendingWait::Run(w)) if w.model_wait.is_some()),
+    )
+    .await;
+
+    rig.rt
+        .deliver(run, user_message("the limit is raised"))
+        .await
+        .expect("deliver");
+    tokio::time::timeout(Duration::from_secs(20), gate.reached.notified())
+        .await
+        .expect("the child's woken call is made");
+    let (view, state) = rig
+        .parked(
+            run,
+            |s| matches!(&s.pending_wait, Some(PendingWait::Run(w)) if w.model_wait.is_none()),
+        )
+        .await;
+    assert!(!view.waiting, "the child works: the parent keeps its timer");
+    assert!(view.wake_at.is_some());
+    let Some(PendingWait::Run(wait)) = state.pending_wait else {
+        panic!("the parent waits on the child")
+    };
+    assert!(wait.model_wait.is_none(), "the forwarded resume cleared it");
+    gate.release.notify_one();
+    let done = rig.done(run).await;
+    assert_eq!(text_of(&done).as_deref(), Some("all done"));
+    rig.stop().await;
+}
+
+/// A child on a timer keeps the parent's 60 s look, and the child's reason is on the parent's head
+/// for a front to read (ADR 0067 decision 5).
+#[tokio::test]
+async fn a_child_on_a_timer_keeps_the_parents_look_and_its_reason() {
+    let rig = family(0);
+    rig.mock
+        .push_tool_calls(vec![tool_call("c1", "sub", json!({}))])
+        .push_error(refused(503, Some("unavailable"), timer(600)))
+        .push_text("the helper's answer")
+        .push_text("all done");
+    let run = rig.start(None).await;
+    let (view, state) = rig
+        .parked(run, |s| {
+            matches!(&s.pending_wait, Some(PendingWait::Run(w))
+                if w.model_wait.as_ref().is_some_and(|wait| wait.park == ModelPark::Timer))
         })
-        .expect("the call's result");
-    assert!(told.1, "an error result: {told:?}");
-    assert!(told.0.contains("limit is reached"), "{told:?}");
+        .await;
+    assert!(!view.waiting, "a child on a timer is no question");
+    assert!(view.wake_at.is_some(), "the parent keeps its 60 s look");
+    let copy = wait_of(&state).expect("the copy");
+    assert_eq!(copy.reason, "the model gateway is busy");
+    let head = rig.rt.view(run).await.unwrap().unwrap().state;
+    assert_eq!(
+        head.pointer("/pending_wait/model_wait/reason"),
+        Some(&json!("the model gateway is busy")),
+        "a front reads the reason from the head"
+    );
+    rig.stop().await;
+}
+
+/// A resume reaches a grandchild one level at a time: each run forwards one to the child it waits
+/// on, and the words of the message stay at the root (ADR 0067 decision 5).
+#[tokio::test]
+async fn a_resume_reaches_a_grandchild_one_level_at_a_time() {
+    let rig = tree();
+    rig.mock
+        .push_tool_calls(vec![tool_call("c1", "sub", json!({}))])
+        .push_tool_calls(vec![tool_call("c1", "sub", json!({}))])
+        .push_error(refused(402, Some("over_limit"), Park::UntilWoken))
+        .push_text("the leaf's answer")
+        .push_text("helper done")
+        .push_text("all done");
+    let run = rig.start(None).await;
+    let helper = adam_runtime::child_run_id(run, "c1");
+    let leaf = adam_runtime::child_run_id(helper, "c1");
+
+    // The leaf parks, the helper copies its wait, and the root copies the helper's copy.
+    let (view, state) = rig
+        .parked(
+            run,
+            |s| matches!(&s.pending_wait, Some(PendingWait::Run(w)) if w.model_wait.is_some()),
+        )
+        .await;
+    assert!(view.waiting, "the root waits with no timer");
+    let copy = wait_of(&state).expect("the root's copy");
+    assert_eq!(copy.park, ModelPark::UntilWoken);
+    let helper_state = rig.state(helper).await;
+    let copied = wait_of(&helper_state).expect("the helper's copy");
+    assert_eq!(copied.reason, "the model gateway's limit is reached");
+    assert!(rig.rt.view(leaf).await.unwrap().expect("the leaf").waiting);
+
+    rig.rt
+        .deliver(run, user_message("the limit is raised").with_id("m-1"))
+        .await
+        .expect("deliver");
+    let done = rig.done(run).await;
+    assert_eq!(text_of(&done).as_deref(), Some("all done"));
+    let requests = rig.mock.requests();
+    assert_eq!(requests.len(), 6);
+    assert_eq!(
+        texts(&requests[3]),
+        texts(&requests[2]),
+        "the leaf makes the same call"
+    );
+    let leaf_state = rig.state(leaf).await;
+    assert!(
+        leaf_state
+            .messages
+            .iter()
+            .all(|m| m.text() != "the limit is raised"),
+        "the words stayed at the root"
+    );
+    let root = rig.state(run).await;
+    assert!(
+        root.messages
+            .iter()
+            .any(|m| m.text() == "the limit is raised")
+    );
     rig.stop().await;
 }
 

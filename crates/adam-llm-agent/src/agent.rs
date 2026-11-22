@@ -13,11 +13,11 @@ use adam_model::{
     ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_runtime::{
-    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, CancelToken,
-    ChildStarter, ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES, MAX_SESSION_PAGE,
-    RUN_FINISHED_KIND, ReservedStep, RetryPolicy, RunEvent, SESSION_CLOSE_KIND, SandboxUsage,
-    SessionState, SessionSummary, StepEvent, StepIcon, StepKind, StepState, Transition, UsageEvent,
-    UsageTotals, child_run_id,
+    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
+    CancelToken, ChildLook, ChildStarter, ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES,
+    MAX_SESSION_PAGE, RUN_FINISHED_KIND, ReservedStep, RetryPolicy, RunEvent, SESSION_CLOSE_KIND,
+    SandboxUsage, SessionState, SessionSummary, StepEvent, StepIcon, StepKind, StepState,
+    Transition, UsageEvent, UsageTotals, child_run_id,
 };
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -144,6 +144,15 @@ fn compaction_call_id(run: RunId, n: usize) -> String {
     let mut suffix = uuid::Uuid::new_v4().simple().to_string();
     suffix.truncate(8);
     format!("{run}-k{n}-{suffix}")
+}
+
+/// The id of the resume a run forwards to the child `child` when the inbound `waking` woke it
+/// ([ADR 0067] decision 5): derived from both, so a step that runs again writes the same id, and a
+/// child that receives the copy says nothing new.
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+fn forwarded_resume_id(waking: &str, child: RunId) -> String {
+    format!("{}:{waking}:{child}", crate::MODEL_RESUME_KIND)
 }
 
 /// `messages` with every tool output over [`OVERFLOW_OUTPUT_CHARS`] shortened, for the summary
@@ -1648,6 +1657,9 @@ struct Absorbed {
     waiting: bool,
     /// The answers a tool refused (`Tool::read_answer`), each with the call it was for.
     refusals: Vec<(String, Refusal)>,
+    /// The id of the first message the run read, if it read any: what a resume it forwards to a
+    /// child parked on the model derives its own id from (ADR 0067 decision 5).
+    read: Option<String>,
 }
 
 /// What [`LlmAgent::compact_if_due`] did.
@@ -1787,6 +1799,7 @@ impl LlmAgent {
         defer: bool,
     ) -> Absorbed {
         let mut texts = Vec::new();
+        let mut read = None;
         for inbound in inbox {
             // A message the run has read is not read again: the orchestration layer sends the same
             // one a second time after a lost lease (`steer/v1`: the `messageId` is the key).
@@ -1797,6 +1810,9 @@ impl LlmAgent {
             match parse_user_text(&inbound.payload) {
                 Ok(text) => {
                     state.note_read(&inbound.id);
+                    if read.is_none() {
+                        read = Some(inbound.id.clone());
+                    }
                     // What the message says about its sender is read along with what it says.
                     if let Some(context) = parse_context(&inbound.payload) {
                         state.merge_context(context);
@@ -1825,6 +1841,7 @@ impl LlmAgent {
                 return Absorbed {
                     waiting: true,
                     refusals,
+                    read,
                 };
             };
             let (call_id, tool, ui) = (q.call_id.clone(), q.tool.clone(), q.ui.clone());
@@ -1888,6 +1905,7 @@ impl LlmAgent {
         Absorbed {
             waiting: false,
             refusals,
+            read,
         }
     }
 
@@ -1905,7 +1923,7 @@ impl LlmAgent {
             .filter(|i| {
                 !matches!(
                     i.kind.as_str(),
-                    CHILD_REPORTED_KIND | MODEL_RESUME_KIND | RUN_FINISHED_KIND
+                    CHILD_PARKED_KIND | CHILD_REPORTED_KIND | MODEL_RESUME_KIND | RUN_FINISHED_KIND
                 )
             })
             .collect();
@@ -2120,15 +2138,6 @@ impl LlmAgent {
                     "model call failed: {detail}; a schedule started this run, so nobody can wake it"
                 ))));
             }
-            // A local subagent's run (a child that is no session's round) is woken by nobody: a
-            // resume reaches its task, not the child, until S8b-2b forwards one. Its parent is told
-            // the call failed, and goes on.
-            if state.root_run.is_some() && state.session.is_none() {
-                tracing::info!(%run, %detail, "the model refused a subagent's call, and nothing wakes a subagent: it fails");
-                return Ok(Some(Flow::Fail(format!(
-                    "model call failed: {detail}; this run is a subagent's, so nobody can wake it"
-                ))));
-            }
             let now = ctx.now_journaled().await?;
             let parked_since = match &previous {
                 Some(w) if w.park == ModelPark::UntilWoken => w.parked_since,
@@ -2215,21 +2224,16 @@ impl LlmAgent {
         status
     }
 
-    /// Where the child a run waits for stands: what its message said, or, without one, what the
-    /// store says. `None`: still working.
-    async fn settle(
-        ctx: &Ctx,
-        wait: &PendingRun,
-        notices: &[(RunId, ChildStatus)],
-    ) -> Result<Option<ChildStatus>, AgentError> {
-        if let Some((_, status)) = notices.iter().find(|(run, _)| *run == wait.run) {
-            return Ok(Some(status.clone()));
-        }
-        Ok(match ctx.child_status(wait.run).await? {
-            Some(status) if status.is_finished() => Some(status),
-            Some(_) => None,
-            None => Some(ChildStatus::vanished()),
-        })
+    /// The model wait the head of a child's state says it has (ADR 0067 decision 5): its own, or
+    /// the copy it keeps of its own child's — a park is shown through each parent, one level at a
+    /// time. `None` for a child that works or waits on something else, and for a wait this build
+    /// cannot read.
+    fn model_wait_of(head: Option<&Value>) -> Option<ModelWait> {
+        let head = head?;
+        let wait = head
+            .get("model_wait")
+            .or_else(|| head.pointer("/pending_wait/model_wait"))?;
+        serde_json::from_value(wait.clone()).ok()
     }
 
     /// One journaled model call, then the assistant message into the state.
@@ -3619,6 +3623,7 @@ impl LlmAgent {
                         call_id: call.id.clone(),
                         tool: call.name.clone(),
                         run,
+                        model_wait: None,
                     };
                     let Some((_, child)) = notices.iter().find(|(r, _)| *r == run) else {
                         ctx.emit(RunEvent::Custom {
@@ -5843,9 +5848,9 @@ impl Agent for LlmAgent {
             // A session round's report (ADR 0045) is a wake-up, not a person's words: it is
             // dropped, never shown to the model, and the report is read from the store.
             .filter(|i| i.kind != CHILD_REPORTED_KIND)
-            // A resume (ADR 0067) only wakes a run parked on the model, which then makes its call
-            // again: it adds nothing to the conversation and answers no question.
-            .filter(|i| i.kind != MODEL_RESUME_KIND)
+            // A child's park (ADR 0067 decision 5) is a wake-up too: what the child waits on is
+            // read from its record, below.
+            .filter(|i| i.kind != CHILD_PARKED_KIND)
             .partition(|i| i.kind == RUN_FINISHED_KIND);
         // A request to close the session this round belongs to: the round goes on and finishes its
         // work, and the session takes no more messages after it.
@@ -5857,6 +5862,12 @@ impl Agent for LlmAgent {
         {
             header.closed = true;
         }
+        // A resume (ADR 0067) says nothing to the run itself: it wakes a run parked on the model,
+        // which then makes its call again, and a run that waits on a child parked on the model
+        // forwards one to it (decision 5). It adds nothing to the conversation and answers no
+        // question, so it never reaches the inbox below.
+        let (resumes, inbox): (Vec<_>, Vec<_>) =
+            inbox.into_iter().partition(|i| i.kind == MODEL_RESUME_KIND);
         let notices: Vec<(RunId, ChildStatus)> = finished
             .iter()
             .filter_map(|i| {
@@ -5918,11 +5929,21 @@ impl Agent for LlmAgent {
             (!state.context.is_empty()).then(|| Arc::new(state.context.clone()));
 
         // A wait on a child ends with the child's message or, when woken without one (the timer,
-        // or a user message), with what the store says. A message that matches no wait (a
-        // duplicate of one already used, or one for a call the run is not on) is dropped here:
-        // the wait it was for has been settled, or will be, from the store.
+        // a message, a resume, or the child's park), with what the store says. A message that
+        // matches no wait (a duplicate of one already used, or one for a call the run is not on)
+        // is dropped here: the wait it was for has been settled, or will be, from the store.
         if let Some(PendingWait::Run(wait)) = state.pending_wait.clone() {
-            match Self::settle(ctx, &wait, &notices).await? {
+            // One read of the child, or the notice of its end the inbox already holds.
+            let look = match notices.iter().find(|(run, _)| *run == wait.run) {
+                Some((_, status)) => Some(ChildLook::finished(status.clone())),
+                None => ctx.child_look(wait.run).await?,
+            };
+            let finished = match &look {
+                None => Some(ChildStatus::vanished()),
+                Some(look) if look.status.is_finished() => Some(look.status.clone()),
+                Some(_) => None,
+            };
+            match finished {
                 Some(child) => {
                     let outcome = Self::answer_run(&mut state, &wait, &child);
                     Self::count_child(ctx, &mut state, wait.run).await?;
@@ -5930,7 +5951,37 @@ impl Agent for LlmAgent {
                         .await;
                 }
                 None => {
-                    let wake_at = Some(self.next_poll(ctx));
+                    // The child works or waits. What it waits on is read from the same head and
+                    // kept with the pending child (ADR 0067 decision 5).
+                    let copy = look
+                        .as_ref()
+                        .and_then(|look| Self::model_wait_of(look.head.as_ref()));
+                    // A message or a resume to this run goes down to a child parked on the model
+                    // as one resume, under an id a replay writes again. The words of a message
+                    // stay here: they are deferred above, behind the call the child answers.
+                    let waking = absorbed
+                        .read
+                        .as_deref()
+                        .or_else(|| resumes.first().map(|i| i.id.as_str()));
+                    let forwarded = match (&copy, waking) {
+                        (Some(_), Some(waking)) => {
+                            ctx.resume_child(wait.run, forwarded_resume_id(waking, wait.run))
+                                .await?;
+                            true
+                        }
+                        _ => false,
+                    };
+                    // A child parked until it is woken cannot finish on its own, so this run
+                    // waits with no timer, as it waits on a question: its task says why. A child
+                    // on a timer keeps the 60 s look, which is what a lost notice falls back on.
+                    let until_woken = !forwarded
+                        && copy
+                            .as_ref()
+                            .is_some_and(|wait| wait.park == ModelPark::UntilWoken);
+                    if let Some(PendingWait::Run(stored)) = &mut state.pending_wait {
+                        stored.model_wait = if forwarded { None } else { copy };
+                    }
+                    let wake_at = (!until_woken).then(|| self.next_poll(ctx));
                     return Ok(Transition::Park { state, wake_at });
                 }
             }

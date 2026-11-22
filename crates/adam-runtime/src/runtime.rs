@@ -19,7 +19,7 @@ use crate::agent::{Agent, AgentError, AgentStarter, Inbound};
 use crate::artifact_ref::{ArtifactRef, FileRef, FileSource};
 use crate::blob::BlobCache;
 use crate::cancel::CancelToken;
-use crate::child::{CHILD_REPORTED_KIND, ChildStatus, RUN_FINISHED_KIND};
+use crate::child::{CHILD_PARKED_KIND, CHILD_REPORTED_KIND, ChildStatus, RUN_FINISHED_KIND};
 use crate::clock::{Clock, DynClock, SystemClock};
 use crate::envelope::Envelope;
 use crate::erased::{Erased, ErasedAgent, ErasedStarter, StarterOnly};
@@ -724,6 +724,35 @@ impl Inner {
         self.sink
             .emit(run, agent, RunEvent::Status { status, detail })
             .await;
+    }
+
+    /// `child` just **parked** in a step: tell its parent
+    /// ([`CHILD_PARKED_KIND`](crate::CHILD_PARKED_KIND)), so that it reads what the child waits on
+    /// and shows it ([ADR 0067] decision 5).
+    ///
+    /// Sent after the child's own commit, like [`notify_parent`](Self::notify_parent), and best
+    /// effort the same way: a lost notice costs the parent its next timer, which is what it keeps
+    /// for every wait on a child. The runtime's own look at a parked child parks it again without
+    /// stepping it, and sends nothing: nothing changed.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    pub async fn notify_parent_parked(&self, child: &RunRecord) {
+        let Some(parent) = child.parent_id else {
+            return;
+        };
+        if child.status != RunStatus::Parked {
+            return;
+        }
+        let notice = Inbound::new(CHILD_PARKED_KIND, Value::Null).with_id(child.id.to_string());
+        match self.deliver(parent, notice).await {
+            Ok(()) => {}
+            Err(RuntimeError::Finished { .. } | RuntimeError::NotFound(_)) => {
+                tracing::debug!(child = %child.id, %parent, "the parent is finished or gone; nobody to tell");
+            }
+            Err(e) => {
+                tracing::warn!(child = %child.id, %parent, error = %adam_error::report(&e), "telling the parent of a park failed; it learns of it when its timer fires");
+            }
+        }
     }
 }
 

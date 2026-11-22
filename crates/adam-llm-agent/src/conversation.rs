@@ -198,6 +198,23 @@ pub struct PendingRun {
     pub tool: String,
     /// The child run.
     pub run: RunId,
+    /// The model wait the child had when this run last looked ([ADR 0067] decision 5), copied
+    /// from the child's head: `Some` while the child is parked on the model. The run waits on an
+    /// until-woken child with **no timer**, as it waits on a question, and keeps its 60 s look at
+    /// a timer park. Cleared when the run forwards a resume to the child, and rewritten at the
+    /// next look. In the head, so a front reads it at `/pending_wait/model_wait`; absent from
+    /// state written before it existed, and not written while `None`.
+    ///
+    /// **Breaking:** a new public field of a struct that is not `#[non_exhaustive]`: a
+    /// `PendingRun` built with a struct literal outside the workspace names it.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[serde(
+        default,
+        deserialize_with = "crate::model_wait::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_wait: Option<crate::ModelWait>,
 }
 
 /// A tool call that waits for a task on another system to finish.
@@ -1860,6 +1877,7 @@ mod tests {
                 call_id: "c1".into(),
                 tool: "reviewer".into(),
                 run,
+                model_wait: None,
             }))
         );
         assert_eq!(
@@ -1873,6 +1891,59 @@ mod tests {
         // A null field, as `Conversation::default` serializes, is no wait at all.
         let none: Conversation = serde_json::from_value(json!({"pending_question": null})).unwrap();
         assert_eq!(none.pending_wait, None);
+    }
+
+    /// The copy a parent keeps of a child's model wait (ADR 0067 decision 5) rides beside the
+    /// pending child, and a park kind this build cannot read leaves the wait itself intact.
+    #[test]
+    fn a_childs_model_wait_is_a_copy_that_reads_leniently() {
+        let run = RunId::new();
+        let wait = json!({
+            "reason": "the model gateway's limit is reached",
+            "status": 402,
+            "slug": "over_limit",
+            "park": "until_woken",
+            "parked_since": "2026-11-21T00:00:00Z",
+        });
+        let literal = json!({
+            "pending_wait": {
+                "call_id": "c1",
+                "tool": "reviewer",
+                "run": run.to_string(),
+                "model_wait": wait,
+            }
+        });
+        let c: Conversation = serde_json::from_value(literal.clone()).unwrap();
+        let Some(PendingWait::Run(waiting)) = &c.pending_wait else {
+            panic!("a wait on a child")
+        };
+        assert_eq!(
+            waiting.model_wait.as_ref().map(|w| w.park),
+            Some(crate::ModelPark::UntilWoken)
+        );
+        assert_eq!(
+            serde_json::to_value(&c).unwrap()["pending_wait"],
+            literal["pending_wait"]
+        );
+        // A park kind a later build adds reads as no copy: the wait on the child still loads.
+        let later = json!({
+            "pending_wait": {
+                "call_id": "c1",
+                "tool": "reviewer",
+                "run": run.to_string(),
+                "model_wait": {
+                    "reason": "r",
+                    "park": "a_later_kind",
+                    "parked_since": "2026-11-21T00:00:00Z",
+                },
+            }
+        });
+        let c: Conversation = serde_json::from_value(later).unwrap();
+        let Some(PendingWait::Run(waiting)) = &c.pending_wait else {
+            panic!("a wait on a child")
+        };
+        assert!(waiting.model_wait.is_none());
+        assert_eq!(waiting.call_id, "c1");
     }
 
     #[test]
