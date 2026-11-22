@@ -881,7 +881,7 @@ impl Walk<'_> {
                                 .find(|(named, _)| named == server)
                                 .map(|(_, text)| text.clone())
                         })
-                        .unwrap_or_else(|| format!("The tools of the MCP server `{server}`."));
+                        .unwrap_or_default();
                     crate::groups::Group::new(server.clone(), note, members)
                         .with_keywords(keywords.clone())
                 })
