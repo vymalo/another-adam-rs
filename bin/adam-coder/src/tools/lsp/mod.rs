@@ -1431,7 +1431,11 @@ mod tests {
         );
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(!rows[0].contains(secret), "{}", rows[0]);
-        assert!(rows[0].contains("[redacted]"), "{}", rows[0]);
+        assert!(
+            rows[0].contains("[redacted: secret removed, do not reuse]"),
+            "{}",
+            rows[0]
+        );
     }
 
     #[test]

@@ -262,7 +262,10 @@ async fn what_the_environment_says_while_it_is_made_is_shown_as_steps_of_the_too
     assert_eq!(steps[0].label, "Pulling the image");
     let detail = steps[1].detail.clone().unwrap();
     assert!(!detail.contains(common::MODEL_KEY), "scrubbed: {detail}");
-    assert!(detail.contains("[redacted]"), "{detail}");
+    assert!(
+        detail.contains("[redacted: secret removed, do not reuse]"),
+        "{detail}"
+    );
 }
 
 #[tokio::test]
@@ -820,7 +823,7 @@ fn the_names_the_coders_own_processes_need_are_never_hidden_or_redacted() {
     );
     assert_eq!(
         redactor.scrub("value-of-SEARCH_MCP_TOKEN-0123456789"),
-        "[redacted]"
+        "[redacted: secret removed, do not reuse]"
     );
     // With nothing to hide the environment is left as it is.
     let local: adam_workspace::DynEnvironment = Arc::new(adam_workspace::Local);

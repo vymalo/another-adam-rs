@@ -4,7 +4,7 @@
 //! clients can read: a command's output in an error, a
 //! check's output in the findings of a failed run, a model provider's error
 //! body (which may echo the key it rejected). A [`Redactor`] replaces the
-//! *values* of the secrets the process holds with `[redacted]`, and is applied
+//! *values* of the secrets the process holds with `[redacted: secret removed, do not reuse]`, and is applied
 //! at the boundaries: tool results and errors, the checks'
 //! progress lines, and the agent's final failure message.
 //!
@@ -26,7 +26,7 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use serde_json::Value;
 
 /// What replaces a secret.
-pub const REDACTED: &str = "[redacted]";
+pub const REDACTED: &str = adam_llm_agent::REDACTED_MARKER;
 
 /// The most a run's failure text (`RunView::error`, the A2A `Failed` status message) may carry, in
 /// bytes. Upstream bodies and a command's output can be long, and the text is shown to clients.
@@ -264,7 +264,7 @@ impl Redactor {
     /// One scan, leftmost and then longest: where values overlap, the one that starts first is
     /// replaced, and of those that start together the longest, so a value that contains another is
     /// replaced whole. The mark is not scanned again: a value that happens to read like a part of
-    /// `[redacted]` is not rewritten inside it.
+    /// `[redacted: secret removed, do not reuse]` is not rewritten inside it.
     pub fn scrub<'a>(&self, text: &'a str) -> Cow<'a, str> {
         let known = self.read();
         let Some(automaton) = &known.automaton else {
@@ -288,11 +288,36 @@ impl Redactor {
         }
     }
 
-    /// [`scrub`](Self::scrub) for an owned string.
+    /// [`scrub`](Self::scrub) for an owned string, at the **whole-value** sites: a needle is
+    /// replaced only where it is a value ([`adam_llm_agent::is_value_position`]), so a held secret
+    /// that is also an ordinary word is kept where it is an identifier (`fn postgres_handler`,
+    /// `my_postgres_pool`). The streaming [`scrub`](Self::scrub) stays conservative.
     pub fn scrub_string(&self, text: String) -> String {
-        match self.scrub(&text) {
-            Cow::Borrowed(_) => text,
-            Cow::Owned(clean) => clean,
+        let known = self.read();
+        let Some(automaton) = &known.automaton else {
+            return match sequential_scrub(&known.needles, &text) {
+                Cow::Borrowed(_) => text,
+                Cow::Owned(clean) => clean,
+            };
+        };
+        let mut out: Option<String> = None;
+        let mut copied = 0;
+        for found in automaton.find_iter(text.as_bytes()) {
+            let len = found.end() - found.start();
+            if !adam_llm_agent::is_value_position(&text, found.start(), len) {
+                continue;
+            }
+            let clean = out.get_or_insert_with(|| String::with_capacity(text.len()));
+            clean.push_str(&text[copied..found.start()]);
+            clean.push_str(REDACTED);
+            copied = found.end();
+        }
+        match out {
+            Some(mut clean) => {
+                clean.push_str(&text[copied..]);
+                clean
+            }
+            None => text,
         }
     }
 
@@ -326,7 +351,9 @@ impl Redactor {
                 let entries = std::mem::take(map);
                 for (key, mut v) in entries {
                     self.scrub_value(&mut v);
-                    map.insert(self.scrub_string(key), v);
+                    // A key is an identifier position: a held secret that is also a word (a JSON key
+                    // like `postgres`) stays, as `fn postgres_handler` does.
+                    map.insert(key, v);
                 }
             }
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -384,7 +411,10 @@ mod tests {
                 written.push_str(&scrubber.push(format!("{rest} b").as_bytes(), &scrub));
                 written.push_str(&scrubber.release(&scrub, &partial));
                 written.push_str(&scrubber.finish(&scrub));
-                assert_eq!(written, "a [redacted] b", "split at {k} of {text}");
+                assert_eq!(
+                    written, "a [redacted: secret removed, do not reuse] b",
+                    "split at {k} of {text}"
+                );
             }
         }
     }
@@ -394,16 +424,22 @@ mod tests {
         let r = Redactor::new(["sk-secret-value"]);
         assert_eq!(
             r.scrub("key sk-secret-value and again sk-secret-value."),
-            "key [redacted] and again [redacted]."
+            "key [redacted: secret removed, do not reuse] and again [redacted: secret removed, do not reuse]."
         );
         let b64 = STANDARD.encode("sk-secret-value");
         let bare = STANDARD_NO_PAD.encode("sk-secret-value");
-        assert_eq!(r.scrub(&format!("Basic {b64}")), "Basic [redacted]");
-        assert_eq!(r.scrub(&format!("Basic {bare}")), "Basic [redacted]");
+        assert_eq!(
+            r.scrub(&format!("Basic {b64}")),
+            "Basic [redacted: secret removed, do not reuse]"
+        );
+        assert_eq!(
+            r.scrub(&format!("Basic {bare}")),
+            "Basic [redacted: secret removed, do not reuse]"
+        );
         let basic = STANDARD.encode("x-access-token:sk-secret-value");
         assert_eq!(
             r.scrub(&format!("Authorization: Basic {basic}")),
-            "Authorization: Basic [redacted]"
+            "Authorization: Basic [redacted: secret removed, do not reuse]"
         );
         assert!(matches!(r.scrub("nothing here"), Cow::Borrowed(_)));
     }
@@ -431,7 +467,7 @@ mod tests {
         assert_eq!(registered, 2, "unset, empty and too short add nothing");
         assert_eq!(
             r.scrub("Bearer search-tok-9f3a1c / ctx7sk-0123456789 / abc"),
-            "Bearer [redacted] / [redacted] / abc"
+            "Bearer [redacted: secret removed, do not reuse] / [redacted: secret removed, do not reuse] / abc"
         );
     }
 
@@ -447,13 +483,16 @@ mod tests {
         }
         assert_eq!(
             r.scrub("key mcp-key-0123456789 / ghs_installation_token_0000"),
-            "key [redacted] / ghs_installation_token_0000",
+            "key [redacted: secret removed, do not reuse] / ghs_installation_token_0000",
             "the oldest token is forgotten, the key never is"
         );
-        assert_eq!(r.scrub("startup-secret-value"), "[redacted]");
+        assert_eq!(
+            r.scrub("startup-secret-value"),
+            "[redacted: secret removed, do not reuse]"
+        );
         assert_eq!(
             r.scrub(&format!("ghs_installation_token_{:04}", MAX_ADDED)),
-            "[redacted]"
+            "[redacted: secret removed, do not reuse]"
         );
         // A value first learned as a rotating one becomes permanent, and a repeat adds nothing.
         r.add("late-rotating-value");
@@ -462,25 +501,68 @@ mod tests {
         for n in 0..(MAX_ADDED + 1) {
             r.add(&format!("ghs_other_token_{n:04}"));
         }
-        assert_eq!(r.scrub("late-rotating-value"), "[redacted]");
+        assert_eq!(
+            r.scrub("late-rotating-value"),
+            "[redacted: secret removed, do not reuse]"
+        );
     }
 
     #[test]
     fn short_and_empty_values_are_ignored_and_longer_ones_win() {
         let r = Redactor::new(["", "a", "abc", "abcd-longer", "abcd"]);
         assert_eq!(r.scrub("abc a"), "abc a", "too short to be safe to replace");
-        assert_eq!(r.scrub("x abcd-longer y"), "x [redacted] y");
+        assert_eq!(
+            r.scrub("x abcd-longer y"),
+            "x [redacted: secret removed, do not reuse] y"
+        );
         assert!(Redactor::new(Vec::<String>::new()).is_empty());
     }
 
+    /// The bench's case: the database password `postgres` is a held secret **and** an ordinary
+    /// word. As a value it goes; as an identifier it stays.
     #[test]
-    fn json_values_and_keys_are_scrubbed() {
+    fn a_dictionary_word_is_redacted_as_a_value_and_kept_as_an_identifier() {
+        let r = Redactor::new(["postgres"]);
+        let marker = REDACTED;
+        assert_eq!(
+            r.scrub_string("postgres://postgres:postgres@db:5432/app".into()),
+            format!("postgres://{marker}:{marker}@db:5432/app")
+        );
+        assert_eq!(
+            r.scrub_string("password=postgres".into()),
+            format!("password={marker}")
+        );
+        assert_eq!(
+            r.scrub_string("fn postgres_handler() {}".into()),
+            "fn postgres_handler() {}"
+        );
+        assert_eq!(
+            r.scrub_string("my_postgres_pool".into()),
+            "my_postgres_pool"
+        );
+        // The streaming closure stays conservative: it replaces inside an identifier too.
+        assert_eq!(
+            r.scrub("fn postgres_handler() {}"),
+            format!("fn {marker}_handler() {{}}")
+        );
+        // A short random secret in a value is still hidden.
+        let short = Redactor::new(["x7k2"]);
+        assert_eq!(
+            short.scrub_string("token=x7k2".into()),
+            format!("token={marker}")
+        );
+    }
+
+    #[test]
+    fn json_values_are_scrubbed_and_keys_are_identifiers() {
         let r = Redactor::new(["hunter2-hunter2"]);
         let mut v = json!({"a": ["x hunter2-hunter2", 1, null], "hunter2-hunter2": {"b": "ok"}});
         r.scrub_value(&mut v);
+        // A key is an identifier position, like `fn hunter2_hunter2`: it stays. A string value is a
+        // value position: it goes.
         assert_eq!(
             v,
-            json!({"a": ["x [redacted]", 1, null], "[redacted]": {"b": "ok"}})
+            json!({"a": ["x [redacted: secret removed, do not reuse]", 1, null], "hunter2-hunter2": {"b": "ok"}})
         );
     }
 
@@ -496,17 +578,20 @@ mod tests {
         let clone = r.clone();
         assert_eq!(
             clone.scrub("ghs_minted_1 startup-secret"),
-            "ghs_minted_1 [redacted]"
+            "ghs_minted_1 [redacted: secret removed, do not reuse]"
         );
         r.add("ghs_minted_1");
         assert_eq!(
             clone.scrub("token ghs_minted_1 and startup-secret"),
-            "token [redacted] and [redacted]",
+            "token [redacted: secret removed, do not reuse] and [redacted: secret removed, do not reuse]",
             "a clone sees what was added to another"
         );
         // Its Base64 forms too, and adding it again changes nothing.
         let basic = STANDARD.encode("x-access-token:ghs_minted_1");
-        assert_eq!(clone.scrub(&format!("Basic {basic}")), "Basic [redacted]");
+        assert_eq!(
+            clone.scrub(&format!("Basic {basic}")),
+            "Basic [redacted: secret removed, do not reuse]"
+        );
         let before = format!("{r:?}");
         r.add("ghs_minted_1");
         r.add("startup-secret");
@@ -519,9 +604,12 @@ mod tests {
         assert_eq!(r.scrub("ghs_minted_1"), "ghs_minted_1", "forgotten");
         assert_eq!(
             r.scrub(&format!("ghs_minted_002 ghs_minted_{:03}", MAX_ADDED + 1)),
-            "[redacted] [redacted]"
+            "[redacted: secret removed, do not reuse] [redacted: secret removed, do not reuse]"
         );
-        assert_eq!(r.scrub("startup-secret"), "[redacted]");
+        assert_eq!(
+            r.scrub("startup-secret"),
+            "[redacted: secret removed, do not reuse]"
+        );
         // An empty redactor learns too.
         let empty = Redactor::default();
         assert!(empty.is_empty());
@@ -557,13 +645,19 @@ mod tests {
     /// Where two values overlap at different starts, the scan takes the leftmost and then the
     /// longest; the old loop took whichever needle came first in its longest-first list. Both
     /// leave no value whole. The mark is never scanned again, so a value that reads like a part of
-    /// it is not rewritten inside it (the old loop rewrote `[redacted]` itself).
+    /// it is not rewritten inside it (the old loop rewrote `[redacted: secret removed, do not reuse]` itself).
     #[test]
     fn overlapping_values_are_replaced_leftmost_then_longest_and_the_mark_is_not_rescanned() {
         let r = Redactor::new(["bcde", "abcd"]);
-        assert_eq!(r.scrub("abcde"), "[redacted]e");
+        assert_eq!(
+            r.scrub("abcde"),
+            "[redacted: secret removed, do not reuse]e"
+        );
         let r = Redactor::new(["abcd", "abcdefgh"]);
-        assert_eq!(r.scrub("x abcdefgh y"), "x [redacted] y");
+        assert_eq!(
+            r.scrub("x abcdefgh y"),
+            "x [redacted: secret removed, do not reuse] y"
+        );
         let r = Redactor::new(["reda", "secret-value"]);
         assert_eq!(r.scrub("secret-value"), REDACTED);
         assert!(!r.scrub("secret-value").contains("secret-value"));
@@ -605,6 +699,9 @@ mod tests {
             r.read().automaton.as_ref().unwrap().kind(),
             AhoCorasickKind::ContiguousNFA
         );
-        assert_eq!(r.scrub(&format!("a{secret}b")), "a[redacted]b");
+        assert_eq!(
+            r.scrub(&format!("a{secret}b")),
+            "a[redacted: secret removed, do not reuse]b"
+        );
     }
 }

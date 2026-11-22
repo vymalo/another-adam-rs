@@ -19,7 +19,7 @@ use secrecy::ExposeSecret as _;
 use crate::config::Config;
 
 /// What replaces a secret.
-pub const REDACTED: &str = "[redacted]";
+pub const REDACTED: &str = adam_llm_agent::REDACTED_MARKER;
 
 /// Shortest value that is worth (and safe) replacing: replacing every `a` of an output would
 /// destroy it and protect nothing.
@@ -97,12 +97,25 @@ pub fn secret_values_named(
     secrets
 }
 
-/// `text` with every value of `secrets` (longest first) replaced by [`REDACTED`].
+/// `text` with every value of `secrets` (longest first) replaced by [`REDACTED`] where it stands
+/// as a value ([`adam_llm_agent::is_value_position`]): a held secret that is also an ordinary word
+/// is kept where it is an identifier. `step_io` holds a whole value at once, so the rule applies.
 pub fn scrub(secrets: &[String], text: &str) -> String {
-    let mut out = text.to_owned();
-    for secret in secrets {
-        if out.contains(secret.as_str()) {
-            out = out.replace(secret.as_str(), REDACTED);
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < text.len() {
+        let matched = secrets.iter().find(|secret| {
+            text[at..].starts_with(secret.as_str())
+                && adam_llm_agent::is_value_position(text, at, secret.len())
+        });
+        if let Some(secret) = matched {
+            out.push_str(REDACTED);
+            at += secret.len();
+        } else if let Some(ch) = text[at..].chars().next() {
+            out.push(ch);
+            at += ch.len_utf8();
+        } else {
+            break;
         }
     }
     out
@@ -206,7 +219,7 @@ mod tests {
         // What a step is given is scrubbed with it: the closure `step_io_named` hands the step.
         assert_eq!(
             scrub(&secrets, "Bearer access-0123456789 on /usr/bin:/bin"),
-            "Bearer [redacted] on /usr/bin:/bin"
+            "Bearer [redacted: secret removed, do not reuse] on /usr/bin:/bin"
         );
         let io = step_io_named(&config(), vars, &named);
         assert_eq!(
@@ -270,12 +283,32 @@ mod tests {
         );
     }
 
+    /// The bench's case at the step's site: a held secret that is also a word goes where it is a
+    /// value and stays where it is an identifier.
+    #[test]
+    fn a_dictionary_word_is_redacted_as_a_value_and_kept_as_an_identifier() {
+        let secrets = vec!["postgres".to_owned()];
+        assert_eq!(
+            scrub(&secrets, "postgres://postgres:postgres@db:5432/app"),
+            format!("postgres://{REDACTED}:{REDACTED}@db:5432/app")
+        );
+        assert_eq!(
+            scrub(&secrets, "password=postgres"),
+            format!("password={REDACTED}")
+        );
+        assert_eq!(
+            scrub(&secrets, "fn postgres_handler() {}"),
+            "fn postgres_handler() {}"
+        );
+        assert_eq!(scrub(&secrets, "my_postgres_pool"), "my_postgres_pool");
+    }
+
     #[test]
     fn scrub_replaces_every_occurrence_longest_value_first() {
         let secrets = vec!["abcd-longer".to_owned(), "abcd".to_owned()];
         assert_eq!(
             scrub(&secrets, "x abcd-longer y abcd z"),
-            "x [redacted] y [redacted] z"
+            "x [redacted: secret removed, do not reuse] y [redacted: secret removed, do not reuse] z"
         );
         assert_eq!(scrub(&secrets, "nothing"), "nothing");
     }

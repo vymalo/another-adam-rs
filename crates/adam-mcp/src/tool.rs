@@ -1067,7 +1067,7 @@ mod tests {
         assert!(output.is_error, "the server said isError");
         assert_eq!(
             output.artifacts[0].file.as_ref().unwrap().bytes,
-            b"used [REDACTED]"
+            b"used [redacted: secret removed, do not reuse]"
         );
         // A file that is not text is left as it is.
         assert_eq!(
@@ -1224,9 +1224,9 @@ mod tests {
             &Redactor::default(),
             None,
         );
-        let store = Arc::new(KeptStore(Arc::new(
-            MemoryKept::new().scrubbing(move |t| t.replace(secret, "[redacted]")),
-        )));
+        let store = Arc::new(KeptStore(Arc::new(MemoryKept::new().scrubbing(move |t| {
+            t.replace(secret, "[redacted: secret removed, do not reuse]")
+        }))));
         let ctx = ctx().with_state(store.clone());
         let output = keep_overflow(&ctx, output).await;
         let id = adam_llm_agent::output_id_of(&ctx);
@@ -1285,7 +1285,12 @@ mod tests {
         let ctx = ctx().with_kept(adam_llm_agent::MAX_RUN_KEPT_BYTES, Arc::default());
         let output = keep_overflow(&ctx, output).await;
         let kept = output.kept.unwrap();
-        assert!(!kept.text.contains("zq9x") && kept.text.contains("[REDACTED]"));
+        assert!(
+            !kept.text.contains("zq9x")
+                && kept
+                    .text
+                    .contains("[redacted: secret removed, do not reuse]")
+        );
         assert!(!output.content.contains("zq9x"));
     }
 
@@ -1306,9 +1311,9 @@ mod tests {
             &Redactor::default(),
             None,
         );
-        let store = Arc::new(KeptStore(Arc::new(
-            MemoryKept::new().scrubbing(move |t| t.replace(secret, "[redacted]")),
-        )));
+        let store = Arc::new(KeptStore(Arc::new(MemoryKept::new().scrubbing(move |t| {
+            t.replace(secret, "[redacted: secret removed, do not reuse]")
+        }))));
         let ctx = ctx().with_state(store.clone());
         let output = keep_overflow(&ctx, output).await;
         assert!(output.content.contains("only the first"), "cut is said");
@@ -1332,8 +1337,9 @@ mod tests {
             }
         }
         // Something is kept: the whole secrets are replaced and the filler is there.
+        // The page escapes `[` as `\x5b`, so a kept text cannot forge a marker line.
         assert!(
-            kept_text.starts_with("\\x5bredacted]\n\\x5bredacted]\n"),
+            kept_text.starts_with("\\x5bredacted:"),
             "{}",
             &kept_text[..40]
         );
@@ -1358,7 +1364,7 @@ mod tests {
         );
         assert_eq!(
             ok.content,
-            "the token is [REDACTED], really\nand [REDACTED] again"
+            "the token is [redacted: secret removed, do not reuse], really\nand [redacted: secret removed, do not reuse] again"
         );
         let failed = map_result(
             &CallToolResult::error(vec![ContentBlock::text("denied for tok-6d2f-secret")]),
@@ -1366,7 +1372,10 @@ mod tests {
             None,
         );
         assert!(failed.is_error);
-        assert_eq!(failed.content, "denied for [REDACTED]");
+        assert_eq!(
+            failed.content,
+            "denied for [redacted: secret removed, do not reuse]"
+        );
         let structured = map_result(
             &CallToolResult::structured(serde_json::json!({"t": "tok-6d2f-secret"})),
             &redactor,
@@ -1387,6 +1396,9 @@ mod tests {
             None,
         );
         assert!(!straddling.content.contains("tok-6"), "cut before scrubbed");
-        assert!(straddling.content.contains("[REDA"), "scrubbed, then cut");
+        assert!(
+            straddling.content.contains("[redacted:"),
+            "scrubbed, then cut"
+        );
     }
 }

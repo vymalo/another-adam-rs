@@ -1679,7 +1679,10 @@ async fn secrets_in_the_output_are_not_in_the_checks_artifact() {
             "{secret} leaked to the model"
         );
     }
-    assert!(artifact.contains("[redacted]"), "{artifact}");
+    assert!(
+        artifact.contains("[redacted: secret removed, do not reuse]"),
+        "{artifact}"
+    );
 }
 
 /// A journaled step that is replayed returns the same result, so the artifact it emits is the
@@ -6240,7 +6243,7 @@ async fn a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_r
     );
     assert_eq!(
         read().await,
-        "     1\tpush with [redacted] please\n[end: 1 lines]"
+        "     1\tpush with [redacted: secret removed, do not reuse] please\n[end: 1 lines]"
     );
 }
 
@@ -6356,7 +6359,11 @@ async fn a_secret_in_a_plan_is_scrubbed_before_the_surface_cuts_it() {
             .await
             .unwrap();
         assert_clean(&made, "plan_work");
-        assert!(made.content.contains("[redacted]"), "{name}");
+        assert!(
+            made.content
+                .contains("[redacted: secret removed, do not reuse]"),
+            "{name}"
+        );
         // The reviewer's input: an item of 180 characters and a note of 40, which the label
         // `item (note: ...)` cut at 199 characters on a catalog with no `note`.
         let noted = tool("plan_check")
@@ -6368,10 +6375,20 @@ async fn a_secret_in_a_plan_is_scrubbed_before_the_surface_cuts_it() {
             .unwrap();
         assert_clean(&noted, "plan_check");
         let plan = noted.plan.clone().unwrap();
-        assert_eq!(plan.items[0].note.as_deref(), Some("[redacted]"), "{name}");
-        assert_eq!(plan.items[1].text, "use [redacted] here", "{name}");
+        assert_eq!(
+            plan.items[0].note.as_deref(),
+            Some("[redacted: secret removed, do not reuse]"),
+            "{name}"
+        );
+        assert_eq!(
+            plan.items[1].text, "use [redacted: secret removed, do not reuse] here",
+            "{name}"
+        );
         assert!(
-            plan.title.as_deref().unwrap().contains("[redacted]"),
+            plan.title
+                .as_deref()
+                .unwrap()
+                .contains("[redacted: secret removed, do not reuse]"),
             "{name}"
         );
     }
@@ -9111,7 +9128,10 @@ async fn instructions_are_redacted() {
             !content.contains("sk-live"),
             "{what}: a piece of it: {content}"
         );
-        assert!(content.contains("[redacted]"), "{what}: {content}");
+        assert!(
+            content.contains("[redacted: secret removed, do not reuse]"),
+            "{what}: {content}"
+        );
     }
     assert!(
         prepared.content.contains("\tlast line\n"),
@@ -9809,7 +9829,10 @@ async fn repository_skill_text_is_scrubbed() {
             !content.contains("sk-live"),
             "{what}: a piece of it: {content}"
         );
-        assert!(content.contains("[redacted]"), "{what}: {content}");
+        assert!(
+            content.contains("[redacted: secret removed, do not reuse]"),
+            "{what}: {content}"
+        );
     }
 }
 

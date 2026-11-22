@@ -462,7 +462,7 @@ async fn errors_scrubbed_of_expanded_values() {
     // It is the redactor that did it: the client's message repeats the URL it dialled (the
     // mutation check of this test: with the redactor turned into the identity, the key is in it).
     assert!(
-        text.contains("error sending request for url ([REDACTED])"),
+        text.contains("error sending request for url ([redacted: secret removed, do not reuse])"),
         "{text}"
     );
 }
@@ -1163,14 +1163,17 @@ async fn the_per_call_bearer_is_scrubbed_from_results() {
     )
     .await;
     assert!(!out.is_error, "{}", out.content);
-    assert_eq!(out.content, "you sent [REDACTED], and [REDACTED] alone");
+    assert_eq!(
+        out.content,
+        "you sent [redacted: secret removed, do not reuse], and [redacted: secret removed, do not reuse] alone"
+    );
     assert!(!out.content.contains(&token));
 
     // The token of the call is not the redactor's forever: a later call, with another token,
     // is scrubbed of its own (and says the earlier one, which nobody holds any more, as it is).
     let second = Scripted::token(2);
     let out = call(&tools, "t__echo", json!({"text": second.clone()})).await;
-    assert_eq!(out.content, "[REDACTED]");
+    assert_eq!(out.content, "[redacted: secret removed, do not reuse]");
     servers.shutdown().await;
 }
 

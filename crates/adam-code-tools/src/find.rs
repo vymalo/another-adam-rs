@@ -44,7 +44,7 @@
 //!
 //! The lines are scrubbed of the deployment's secrets ([`Redactor`]) **before** they are matched, so
 //! the count of matches, the files and the lines never say whether a secret matches a pattern: a
-//! secret is `[redacted]` to a search as it is to a read. (A secret that spans two lines is not
+//! secret is `[redacted: secret removed, do not reuse]` to a search as it is to a read. (A secret that spans two lines is not
 //! recognised: the limit the `Redactor` states.)
 //!
 //! # Same call, same bytes
@@ -1359,7 +1359,7 @@ mod tests {
         assert_eq!(shown_line(b"short"), "short");
     }
 
-    /// A secret is `[redacted]` to a search as to a read: the count of matches cannot be used to
+    /// A secret is `[redacted: secret removed, do not reuse]` to a search as to a read: the count of matches cannot be used to
     /// find it out, one character at a time.
     #[tokio::test]
     async fn a_search_cannot_tell_whether_a_secret_matches() {
@@ -1387,7 +1387,10 @@ mod tests {
         assert!(ask("^TOKEN=s").await.contains("[end: 0 matches]"));
         assert!(ask("s3cr3t").await.contains("[end: 0 matches]"));
         let shown = ask("TOKEN").await;
-        assert!(shown.contains(".env:1:TOKEN=[redacted]"), "{shown}");
+        assert!(
+            shown.contains(&format!(".env:1:TOKEN={}", adam_llm_agent::REDACTED_MARKER)),
+            "{shown}"
+        );
         assert!(!shown.contains("s3cr3t"), "{shown}");
         assert!(
             ask("OTHER=plain")

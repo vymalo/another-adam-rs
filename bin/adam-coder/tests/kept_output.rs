@@ -248,7 +248,11 @@ async fn a_secret_is_redacted_in_the_view_the_file_and_every_page() {
         assert!(!out.content.contains(secret), "the result holds a secret");
     }
     assert!(
-        out.content.contains("start [redacted]") && out.content.contains("end [redacted]"),
+        out.content
+            .contains("start [redacted: secret removed, do not reuse]")
+            && out
+                .content
+                .contains("end [redacted: secret removed, do not reuse]"),
         "{}",
         out.content
     );
@@ -257,7 +261,9 @@ async fn a_secret_is_redacted_in_the_view_the_file_and_every_page() {
         for secret in secrets {
             assert!(!page.contains(secret), "a page holds a secret");
         }
-        saw += page.matches("[redacted]").count();
+        saw += page
+            .matches("[redacted: secret removed, do not reuse]")
+            .count();
     }
     assert_eq!(saw, 3, "all three are replaced, not dropped");
     for file in files_under(&rig.fx.root) {
@@ -296,7 +302,10 @@ async fn a_later_secret_and_a_tampered_file_are_scrubbed_on_the_way_out() {
         .await
         .unwrap();
     assert!(
-        !wrapped.content.contains(late) && wrapped.content.contains("x [redacted]"),
+        !wrapped.content.contains(late)
+            && wrapped
+                .content
+                .contains("x [redacted: secret removed, do not reuse]"),
         "{}",
         wrapped.content
     );
@@ -311,7 +320,8 @@ async fn a_later_secret_and_a_tampered_file_are_scrubbed_on_the_way_out() {
     std::fs::write(&file, format!("tampered {GITHUB_TOKEN}\n")).unwrap();
     let page = rig.read_wrapped(&id, 1).await.content;
     assert!(
-        !page.contains(GITHUB_TOKEN) && page.contains("tampered [redacted]"),
+        !page.contains(GITHUB_TOKEN)
+            && page.contains("tampered [redacted: secret removed, do not reuse]"),
         "{page}"
     );
 }
@@ -574,7 +584,7 @@ async fn the_first_half_of_a_secret_at_the_end_of_the_capture_is_not_kept_when_s
         if file.extension().is_some_and(|e| e == "txt") {
             let text = String::from_utf8_lossy(&std::fs::read(&file).unwrap()).into_owned();
             assert_no_part(&text, "the file");
-            assert!(text.contains("[redacted]"));
+            assert!(text.contains("[redacted: secret removed, do not reuse]"));
         }
     }
 }
@@ -623,7 +633,11 @@ async fn the_tracked_tail_of_a_long_output_does_not_start_in_part_of_a_secret() 
         .await
         .unwrap();
     assert!(out.content.contains("about "), "{}", &out.content[..300]);
-    assert!(out.content.contains("[redacted]"), "the tail is shown");
+    assert!(
+        out.content
+            .contains("[redacted: secret removed, do not reuse]"),
+        "the tail is shown"
+    );
     assert_no_part(&out.content, "the tail");
 }
 
@@ -762,7 +776,8 @@ async fn an_output_that_scrubbing_shrinks_under_the_view_is_shown_whole() {
         &view[..200]
     );
     assert_eq!(
-        view.matches("[redacted]\n").count(),
+        view.matches("[redacted: secret removed, do not reuse]\n")
+            .count(),
         1000,
         "no line twice, none lost"
     );

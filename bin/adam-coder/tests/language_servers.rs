@@ -464,7 +464,12 @@ async fn a_secret_in_a_diagnostic_is_scrubbed_before_it_is_cut_or_shown() {
     rust_project(&lsp);
     let out = lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
     assert!(!out.content.contains(GITHUB_TOKEN), "{}", out.content);
-    assert!(out.content.contains("[redacted]"), "{}", out.content);
+    assert!(
+        out.content
+            .contains("[redacted: secret removed, do not reuse]"),
+        "{}",
+        out.content
+    );
 }
 
 #[tokio::test]
@@ -2506,7 +2511,12 @@ async fn a_secret_across_the_1000_character_cut_is_not_shown_in_part() {
     rust_project(&lsp);
     let out = lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
     assert!(!out.content.contains("ghp_FAKE"), "{}", out.content);
-    assert!(out.content.contains("[redacted]"), "{}", out.content);
+    assert!(
+        out.content
+            .contains("[redacted: secret removed, do not reuse]"),
+        "{}",
+        out.content
+    );
 }
 
 /// A rig whose server says `symbol` of `src/{name}.rs` (`text`, one line) is defined at `character`

@@ -1711,11 +1711,23 @@ mod redacting_tests {
         let tool = Redacting::layer(redactor)(Arc::new(Planner));
         let ctx = ToolCtx::detached("planner", "c1", Arc::new(CollectingSink::new()));
         let out = tool.call(&ctx, serde_json::json!({})).await.unwrap();
-        assert_eq!(out.content, "hook: [redacted]");
+        assert_eq!(
+            out.content,
+            "hook: [redacted: secret removed, do not reuse]"
+        );
         let plan = out.plan.unwrap();
-        assert_eq!(plan.title.as_deref(), Some("T [redacted]"));
-        assert_eq!(plan.items[0].text, "use [redacted]");
-        assert_eq!(plan.items[0].note.as_deref(), Some("[redacted]"));
+        assert_eq!(
+            plan.title.as_deref(),
+            Some("T [redacted: secret removed, do not reuse]")
+        );
+        assert_eq!(
+            plan.items[0].text,
+            "use [redacted: secret removed, do not reuse]"
+        );
+        assert_eq!(
+            plan.items[0].note.as_deref(),
+            Some("[redacted: secret removed, do not reuse]")
+        );
         assert_eq!(plan.items[1].text, "plain");
     }
 }
@@ -1755,7 +1767,10 @@ mod redacting_kept_tests {
         let ctx = ToolCtx::detached("keeps", "c1", Arc::new(adam_runtime::CollectingSink::new()));
         let out = tool.call(&ctx, Value::Null).await.unwrap();
         let kept = out.kept.unwrap();
-        assert_eq!(kept.text, "line one\nkey=[redacted]\n");
+        assert_eq!(
+            kept.text,
+            "line one\nkey=[redacted: secret removed, do not reuse]\n"
+        );
     }
 
     /// Fails with a rate limit whose message carries the key, and has a retry policy.
@@ -1798,7 +1813,7 @@ mod redacting_kept_tests {
         assert_eq!(
             error,
             ToolError::retryable(
-                "429 for key [redacted]",
+                "429 for key [redacted: secret removed, do not reuse]",
                 adam_error::ErrorClass::RateLimited
             )
         );

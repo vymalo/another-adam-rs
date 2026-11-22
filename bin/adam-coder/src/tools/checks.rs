@@ -1125,6 +1125,9 @@ mod tests {
         assert_eq!(a.mime_type.as_deref(), Some("application/json"));
         let text = a.data.to_string();
         assert!(!text.contains("ghp_secretvalue123"), "{text}");
-        assert!(text.contains("[redacted]"), "{text}");
+        assert!(
+            text.contains("[redacted: secret removed, do not reuse]"),
+            "{text}"
+        );
     }
 }
