@@ -322,6 +322,34 @@ task says `metadata[URI] = {"tier": ..}`: on the answer of `SendMessage`, on `Ge
 status update when it changes. `RuntimeTaskBackend::with_access_tiers` is the backend side; what the coder does with each tier is
 its README, *Access tiers*.
 
+## The interface language (`locale/v1`)
+
+An agent whose card lists `https://agents.vymalo.com/a2a/extensions/locale/v1` takes the person's interface language
+**for each message** ([ADR 0069](../decisions/0069-the-interface-language-is-a-hint-and-a-hint-is-all-it-is.md)). The
+card's `params` are `{"locales": [<tag>, ..], "default": <tag>}`: the languages the deployment supports — its
+configuration, not this repository's, which names none — and the one the agent answers in when a message names none.
+`adam_a2a::ExtensionConfig::locale` declares the entry and `adam_a2a::Locales` holds a validated list; a deployment
+that supports no language lists no extension.
+
+A request that **activates** the extension may carry `metadata[URI] = {"locale": "<BCP 47 tag>"}`, the shape of
+`access-tier/v1`'s `{"tier": ..}`. `adam_a2a::Locale::of_request` reads it, and only then:
+
+* a tag is read only when the request activated the extension: a message whose request did not name it carries no
+  hint, whatever its metadata says;
+* a malformed tag is refused, never passed on, and the message goes on **with no hint** — fail closed is no language
+  rather than a guessed one. The tag is well formed per RFC 5646's `langtag` and at most 64 bytes;
+* a message that names no locale leaves no hint at all, never an empty string.
+
+The hint is an instruction for the agent's **own words**, never a translation layer: nothing is translated, and a
+string a person must trust (a consent, a payment, a confirmation) is the deployment's reviewed text, in a language it
+was reviewed in, never the model's. The list is not a filter either: a well-formed tag outside it is still a hint,
+and the agent still follows the person.
+
+**Not yet surfaced in a run.** This crate validates the hint; the run's context key and the prompt source that shows
+it to the model are slices 2 and 3 of the ADR, and until they land an agent follows the person's language alone —
+which the same rule says, so nothing is wrong, only less is used. The coder's prompt already carries both rules
+(`bin/adam-coder/agent/instructions.md`).
+
 ## Child sessions (`child-sessions/v1`)
 
 A session ([ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)) is a chain of runs of a helper agent
