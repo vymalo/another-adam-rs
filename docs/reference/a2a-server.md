@@ -373,10 +373,17 @@ was reviewed in, never the model's. It is a default and not a constraint: the hi
 orchestration layer keeps it with the message, so a redelivery, a fork and a resumed run carry the same one), and a
 person who writes in another language is followed, whatever the card or the hint says.
 
-**Not yet surfaced in a run.** This crate validates the hint; the run's context key and the prompt source that shows
-it to the model are slices 2 and 3 of the ADR, and until they land an agent follows the person's language alone —
-which the same rule says, so nothing is wrong, only less is used. The coder's prompt already carries both rules
-(`bin/adam-coder/agent/instructions.md`).
+**In the run.** The backend reads the hint in `submit`, beside the tier: the tag is the run's inbound context key
+`vymalo.locale` (`CONTEXT_LOCALE` in `crates/adam-a2a-runtime/src/vymalo.rs`, a bare string), the newest activated
+message wins, and an activated message that names none — or names a malformed tag — sets it to `null`, which deletes
+it. The key is one of `adam_llm_agent::PROTECTED_CONTEXT_KEYS`, so a message whose context is over the limit and
+dropped keeps the language the person is speaking. What an agent does with it is its own prompt: the coder's carries
+the two rules (`bin/adam-coder/agent/instructions.md`, "Language" and "Never write a trusted string").
+
+**No card lists it yet.** `ExtensionConfig::locale` and the runtime half are built; the cards of `adam-coder` and
+`adam-agent` and the deployment's own tag are ADR 0069's slice 3, and the client's half is slice 4. Until a card lists
+it, no request can activate it, so no agent reads a hint and each follows the person's language — which the same rule
+says.
 
 ## Child sessions (`child-sessions/v1`)
 
