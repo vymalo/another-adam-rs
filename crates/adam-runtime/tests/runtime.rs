@@ -5141,10 +5141,15 @@ mod cases {
         })
         .await;
         wait_for(&rt, child, "the child waiting", |v| v.waiting).await;
-        // The child's park wakes the parent, which looks at it once and parks again; the cancel
-        // must find the parent waiting, not in that look (which would read the end from the store).
+        // The child's park wakes the parent, which looks at it once and parks again: the cancel
+        // must find it after that look, or the look reads the end from the store instead of the
+        // notice. The look is phase 1 of the parent's step; its park is the next one.
         wait_until("the parent's look at the parked child", || {
             count(&watch.resumes) == 1
+        })
+        .await;
+        wait_for(&rt, parent, "the parent parked after its look", |v| {
+            v.status == RunStatus::Parked
         })
         .await;
         rt.cancel(child, "not needed").await.expect("cancel");
