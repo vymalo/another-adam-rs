@@ -81,13 +81,19 @@ struct WireMessage<'a> {
 }
 
 /// The members the runtime owns on an assistant message: an opaque member of the same name is
-/// dropped, the modelled one wins.
-const MESSAGE_MODELLED_KEYS: [&str; 5] = [
+/// dropped, the modelled one wins. The output-only members (`refusal`, `audio`, `function_call`,
+/// `annotations`) are here too: they are response-only, a provider never needs them back, and
+/// keeping one would change every request that carries it.
+const MESSAGE_MODELLED_KEYS: [&str; 9] = [
     "role",
     "content",
     "tool_calls",
     "reasoning",
     "reasoning_content",
+    "refusal",
+    "audio",
+    "function_call",
+    "annotations",
 ];
 
 /// The members the runtime owns on a tool call: an opaque member of the same name is dropped, the
@@ -450,6 +456,7 @@ pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError>
         reasoning_content,
         reasoning,
         opaque,
+        ..
     } = message;
 
     let mut tool_calls = Vec::new();
@@ -482,7 +489,11 @@ pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError>
         tool_calls.push(parsed);
     }
 
-    let calls_opaque = tool_calls.iter().any(|call| call.opaque.is_some());
+    let calls_opaque = tool_calls.iter().any(|call| {
+        call.opaque
+            .as_ref()
+            .is_some_and(|members| !members.is_empty())
+    });
     let mut response = build_response(
         content_text(content),
         tool_calls,
@@ -552,6 +563,16 @@ struct ChoiceMessage {
     reasoning_content: Option<Value>,
     /// OpenRouter, Ollama, current vLLM.
     reasoning: Option<Value>,
+    /// Output-only members: a provider never needs them back, so they are consumed here and never
+    /// kept as opaque (keeping one would change every response that carries it).
+    #[serde(rename = "refusal")]
+    _refusal: Option<Value>,
+    #[serde(rename = "audio")]
+    _audio: Option<Value>,
+    #[serde(rename = "function_call")]
+    _function_call: Option<Value>,
+    #[serde(rename = "annotations")]
+    _annotations: Option<Value>,
     /// The members this client does not model (`extra_content`, and siblings), value for value.
     #[serde(flatten)]
     opaque: BTreeMap<String, Value>,
@@ -742,7 +763,17 @@ struct Delta {
     reasoning_content: Option<Value>,
     /// OpenRouter, Ollama, current vLLM.
     reasoning: Option<Value>,
-    /// Members this client does not model, read for a `message`-shaped chunk only.
+    /// Output-only members: consumed, never opaque (see [`ChoiceMessage`]).
+    #[serde(rename = "refusal")]
+    _refusal: Option<Value>,
+    #[serde(rename = "audio")]
+    _audio: Option<Value>,
+    #[serde(rename = "function_call")]
+    _function_call: Option<Value>,
+    #[serde(rename = "annotations")]
+    _annotations: Option<Value>,
+    /// Members this client does not model; a delta's and a `message`-shaped chunk's are both read
+    /// (through [`STREAM_MESSAGE_MODELLED_KEYS`]).
     #[serde(flatten)]
     opaque: BTreeMap<String, Value>,
 }
@@ -762,15 +793,11 @@ struct DeltaToolCall {
     opaque: BTreeMap<String, Value>,
 }
 
-/// The members of an assistant message the streamed format models: a member of a `message`-shaped
-/// chunk with one of these names is not opaque.
-const STREAM_MESSAGE_MODELLED_KEYS: [&str; 5] = [
-    "role",
-    "content",
-    "tool_calls",
-    "reasoning_content",
-    "reasoning",
-];
+/// The members of an assistant message the streamed format models: a member of a delta or a
+/// `message`-shaped chunk with one of these names is not opaque. The keys of
+/// [`MESSAGE_MODELLED_KEYS`], so the two paths stay aligned; `tool_call_id` is not one of them: it
+/// cannot collide with an assistant message's fields and replaying it is harmless.
+const STREAM_MESSAGE_MODELLED_KEYS: [&str; 9] = MESSAGE_MODELLED_KEYS;
 
 #[derive(Deserialize, Default)]
 struct DeltaFunction {
@@ -824,7 +851,7 @@ pub(crate) struct Assembler {
     reasoning: String,
     /// The raw reasoning value of a block the provider sent instead of text, last wins.
     reasoning_raw: Option<Value>,
-    /// The assistant message's opaque members, from a `message`-shaped chunk.
+    /// The assistant message's opaque members, from a delta or a `message`-shaped chunk.
     message_members: BTreeMap<String, Value>,
     calls: BTreeMap<usize, PartialCall>,
     finish_reason: Option<String>,
@@ -996,7 +1023,7 @@ impl Assembler {
             .message
             .tool_calls()
             .iter()
-            .any(|c| c.opaque.is_some());
+            .any(|c| c.opaque.as_ref().is_some_and(|members| !members.is_empty()));
         if (!self.message_members.is_empty() || self.reasoning_raw.is_some() || calls_opaque)
             && let Message::Assistant { provider, .. } = &mut response.message
         {

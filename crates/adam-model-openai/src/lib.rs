@@ -498,7 +498,11 @@ impl OpenAiCompatible {
             }
             // A turn with nothing left is no carrier: a response that only had a block, with echo
             // off, is the bytes it always was.
-            let calls_opaque = tool_calls.iter().any(|call| call.opaque.is_some());
+            let calls_opaque = tool_calls.iter().any(|call| {
+                call.opaque
+                    .as_ref()
+                    .is_some_and(|members| !members.is_empty())
+            });
             if provider.as_ref().is_some_and(|turn| {
                 turn.members.is_empty() && turn.reasoning.is_none() && !calls_opaque
             }) {

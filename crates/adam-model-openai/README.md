@@ -99,10 +99,16 @@ on the message and on each call, and sends it back value for value:
 
 | Direction | What |
 |---|---|
-| parse, completion | the unknown members of `choices[0].message` and of each `tool_calls[i]` (`extra_content`, and siblings) go into `Message::Assistant.provider.members` and `ToolCall.opaque`. The modelled members are not opaque: `role`, `content`, `tool_calls`, `reasoning_content`, `reasoning` on the message; `id`, `type`, `function` on the call |
+| parse, completion | the unknown members of `choices[0].message` and of each `tool_calls[i]` (`extra_content`, and siblings) go into `Message::Assistant.provider.members` and `ToolCall.opaque`. The modelled members are not opaque: `role`, `content`, `tool_calls`, `reasoning_content`, `reasoning`, and the output-only `refusal`, `audio`, `function_call`, `annotations` on the message; `id`, `type`, `function` on the call |
 | parse, stream | a delta's own unknown members go to the message (the same filter); its unknown members on a tool call are accumulated per call (last value wins per key) and reach the finished call. A final chunk shaped as a whole `message` instead of a `delta` contributes its unknown members too — no provider we test sends one, so that path is defensive |
 | build | the members go out on the assistant message and on each call **only when the turn is bound to the request's model alias and endpoint**; the modelled keys win on a collision |
 | provenance | a parse does not know either, so it leaves the turn unstamped; the client stamps `req.model` and its endpoint id in `complete` and in the streamed `Finished` |
+
+The **output-only** members (`refusal`, `audio`, `function_call`, `annotations`) are consumed and
+never stored: they are response-only, a provider never needs them back, and keeping one would change
+every request that carries it. A signature is not one of them. `tool_call_id` is not filtered — it
+cannot collide with an assistant message's fields and replaying it is harmless — and both modelled
+sets name the same keys.
 
 The endpoint id is `openai:` and the first 16 hexadecimal digits of the SHA-256 of the client's
 normalised `base_url`, computed once when the client is built. It is not a secret, but a fingerprint
@@ -258,6 +264,7 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
 * The carrier cases by name: `tests/http.rs`'s `a_tool_calls_extra_content_survives_the_next_request` (the
   Gemini repro), `a_message_level_extra_content_survives_the_next_request`,
   `a_delta_message_level_extra_content_survives_the_next_request`, `a_message_shaped_chunk_keeps_its_opaque_members`,
+  `an_output_only_delta_member_is_not_carried`,
   `streamed_tool_call_extra_content_survives_the_next_request`,
   `a_reasoning_block_is_echoed_raw_by_a_client_that_echoes_reasoning`,
   `a_reasoning_block_alone_is_not_stored_without_echo`, `a_reasoning_block_is_cleared_but_members_stay_without_echo`,

@@ -363,6 +363,18 @@ async fn a_reasoning_block_is_not_echoed_by_a_client_that_does_not() {
     let client = client(&server);
     let mut req = request();
     let first = client.complete(req.clone()).await.unwrap();
+    assert!(
+        matches!(
+            &first.message,
+            Message::Assistant {
+                provider: None,
+                reasoning: None,
+                ..
+            }
+        ),
+        "the block is not stored without echo: {:?}",
+        first.message
+    );
     req.messages.push(first.message);
     req.messages.push(Message::user_text("thanks"));
     client.complete(req).await.unwrap();
@@ -419,7 +431,6 @@ async fn a_reasoning_block_alone_is_not_stored_without_echo() {
     let requests = server.received_requests().await.expect("recording");
     let body: Value = requests[1].body_json().expect("json body");
     assert!(body["messages"][2].get("reasoning").is_none(), "{body}");
-    assert!(body["messages"][2].get("provider").is_none(), "{body}");
 }
 
 /// With echo off, a block is cleared but the opaque members stay: they are signatures, not
@@ -626,6 +637,58 @@ async fn a_delta_message_level_extra_content_survives_the_next_request() {
         body["messages"][2]["extra_content"],
         json!({"google": {"thought_signature": "delta-sig"}}),
         "{body}"
+    );
+}
+
+/// Output-only members (`refusal`, `audio`, `function_call`, `annotations`) are never opaque: a
+/// streamed turn that carries one stores no carrier, and its next request is byte-identical.
+#[tokio::test]
+async fn an_output_only_delta_member_is_not_carried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(&[
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"hi","refusal":null,"audio":null,"function_call":null,"annotations":[]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let stream = client.stream(req.clone()).await.unwrap();
+    let deltas: Vec<ModelDelta> = collect(stream)
+        .await
+        .into_iter()
+        .map(|item| item.unwrap())
+        .collect();
+    let Some(ModelDelta::Finished(response)) = deltas.last() else {
+        panic!("{deltas:?}")
+    };
+    assert!(
+        matches!(&response.message, Message::Assistant { provider: None, .. }),
+        "an output-only member is no carrier: {:?}",
+        response.message
+    );
+    req.messages.push(response.message.clone());
+    req.messages.push(Message::user_text("thanks"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(
+        body["messages"][2],
+        json!({"role": "assistant", "content": "hi"}),
+        "no output-only member goes back: {body}"
     );
 }
 
