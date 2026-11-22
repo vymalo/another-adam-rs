@@ -1282,7 +1282,10 @@ impl Tool for Redacting {
         );
         match self.inner.call(&hooked, args).await {
             Ok(mut out) => {
-                out.content = r.scrub_string(out.content);
+                // What the model reads back as code (a file, a patch, a command's output) is
+                // scrubbed at the whole-value sites: a secret that is also an ordinary word stays
+                // inside an identifier there.
+                out.content = r.scrub_values(out.content);
                 // The plan is state the loop keeps and the next plan call prints: it is scrubbed
                 // like the words that were printed from it.
                 if let Some(plan) = &mut out.plan {
@@ -1295,7 +1298,7 @@ impl Tool for Redacting {
                 // A text a tool asks the run to keep in its state (a host with no keeper) is
                 // journaled and paged back: as scrubbed as what is shown.
                 if let Some(kept) = &mut out.kept {
-                    kept.text = r.scrub_string(std::mem::take(&mut kept.text));
+                    kept.text = r.scrub_values(std::mem::take(&mut kept.text));
                 }
                 // `out.images` and `out.kept_images` are references and bytes, not text, and are not
                 // scrubbed: an image is sent only from the sources the deployment allows
@@ -1305,10 +1308,9 @@ impl Tool for Redacting {
                     // A text file may hold what the process knows to hide (a token a command
                     // printed into it); a file that is not text has no string to match.
                     if let Some(file) = &mut artifact.file
-                        && let Ok(text) = std::str::from_utf8(&file.bytes)
-                        && let std::borrow::Cow::Owned(scrubbed) = r.scrub(text)
+                        && let Ok(text) = std::str::from_utf8(&file.bytes).map(str::to_owned)
                     {
-                        file.bytes = scrubbed.into_bytes();
+                        file.bytes = r.scrub_values(text).into_bytes();
                     }
                 }
                 Ok(out)

@@ -20,8 +20,13 @@ pub const REDACTED_MARKER: &str = "[redacted: secret removed, do not reuse]";
 #[must_use]
 pub fn is_value_position(text: &str, at: usize, len: usize) -> bool {
     let bytes = text.as_bytes();
+    let Some(end) = at.checked_add(len).filter(|end| *end <= bytes.len()) else {
+        return false;
+    };
+    if !text.is_char_boundary(at) || !text.is_char_boundary(end) {
+        return false;
+    }
     let before = at == 0 || !is_identifier_byte(bytes[at - 1]);
-    let end = at + len;
     let after = end >= bytes.len() || !is_identifier_byte(bytes[end]);
     let scheme = text[end..].starts_with("://");
     before && after && !scheme

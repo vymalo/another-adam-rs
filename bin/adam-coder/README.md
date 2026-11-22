@@ -2540,7 +2540,7 @@ forms), and every installation token an App mints, from the moment it is minted 
 the credentials add each token they hand out, up to 16 at a time), with the redaction marker (`[redacted: secret removed, do not reuse]`) in tool results and errors, in the
 checks' progress lines, in the `checks` artifact's findings and summary, in the agent's final
 failure message, and in the process's own `adam-coder failed` log line.
-A value that is also an ordinary word is replaced where it stands as a value (a DSN's user and password, `password=…`) and kept where it is an identifier (`fn postgres_handler`, `my_postgres_pool`); the streaming closure that keeps long outputs replaces every occurrence, because its replacement may not depend on where a text starts. A failed step's error crosses one boundary (`boundary_error` in
+In what the model reads back as code (a tool's result, a kept output, a file an artifact carries, a step's input and output, a JSON string value) a value that is also an ordinary word is replaced where it stands as a value (a DSN's user and password, `password=…`) and kept where it is an identifier (`fn postgres_handler`, `my_postgres_pool`); a failure text, a tool error and the streaming closure that keeps long outputs replace every occurrence, because they are free text and a cut may not depend on where a text starts. A failed step's error crosses one boundary (`boundary_error` in
 `src/agent.rs`): its whole cause chain is flattened into the message, scrubbed,
 and cut to `MAX_FAILURE_TEXT` (2048 bytes, ` [truncated]` appended) *after*
 scrubbing, so a secret on the cut cannot leave its front half. The retry hint

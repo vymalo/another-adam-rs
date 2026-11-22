@@ -1070,9 +1070,11 @@ mod tests {
     async fn assert_clean(store: &FileKept, root: &Path, id: &str, what: &str) {
         let kept = std::fs::read_to_string(file_of(root, id)).unwrap();
         assert_no_part(&kept, what);
-        // Something is kept (the secrets that are whole are replaced, and the filler is there).
+        // Something is kept (the secrets that are whole are replaced, and the filler is there). A
+        // fold puts a line break wherever the mark falls, so the breaks are not part of the mark.
         assert!(
-            kept.contains("[redacted: secret removed, do not reuse]"),
+            kept.replace('\n', "")
+                .contains("[redacted: secret removed, do not reuse]"),
             "{what}: the secret is not replaced"
         );
         let mut offset = 1;

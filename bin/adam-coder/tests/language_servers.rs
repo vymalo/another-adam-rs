@@ -2511,12 +2511,9 @@ async fn a_secret_across_the_1000_character_cut_is_not_shown_in_part() {
     rust_project(&lsp);
     let out = lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
     assert!(!out.content.contains("ghp_FAKE"), "{}", out.content);
-    assert!(
-        out.content
-            .contains("[redacted: secret removed, do not reuse]"),
-        "{}",
-        out.content
-    );
+    // The mark starts 15 characters before the cut, so the cut falls inside it: its front is what
+    // is shown, and the secret's tail is not.
+    assert!(out.content.contains("[redacted: secr…"), "{}", out.content);
 }
 
 /// A rig whose server says `symbol` of `src/{name}.rs` (`text`, one line) is defined at `character`

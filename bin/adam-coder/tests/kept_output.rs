@@ -16,7 +16,7 @@ use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::shell::KEPT_OUTPUT_MAX;
 use adam_llm_agent::{KeptStore, ReadOutput, Tool, ToolCtx, ToolOutput};
 use adam_runtime::CollectingSink;
-use common::{DB_PASSWORD, Fixture, GITHUB_TOKEN, MODEL_KEY};
+use common::{DB_PASSWORD, Fixture, GITHUB_TOKEN, LONG_TOKEN, MODEL_KEY};
 use serde_json::{Value, json};
 
 struct Rig {
@@ -757,12 +757,14 @@ async fn a_secret_longer_than_64_kib_across_the_start_of_the_tail_is_not_shown_i
     }
 }
 
-/// A thousand secrets are 41 KB printed and 11 KB scrubbed: the output is long as printed and short as
-/// shown, so it is shown whole (no head, no tail overlapping it, no count of bytes not shown).
+/// Three hundred secrets of 64 bytes are 19,500 printed and 12,600 scrubbed: the output is long as
+/// printed and short as shown, so it is shown whole (no head, no tail overlapping it, no count of
+/// bytes not shown). The secret is longer than the redaction mark (41 bytes), or scrubbing would
+/// grow the output instead and it would be folded.
 #[tokio::test]
 async fn an_output_that_scrubbing_shrinks_under_the_view_is_shown_whole() {
     let rig = Rig::new().await;
-    let command = format!("yes '{GITHUB_TOKEN}' | head -n 1000");
+    let command = format!("yes '{LONG_TOKEN}' | head -n 300");
     let out = RunCommand
         .call(&rig.ctx, json!({"command": command}))
         .await
@@ -778,7 +780,7 @@ async fn an_output_that_scrubbing_shrinks_under_the_view_is_shown_whole() {
     assert_eq!(
         view.matches("[redacted: secret removed, do not reuse]\n")
             .count(),
-        1000,
+        300,
         "no line twice, none lost"
     );
 }

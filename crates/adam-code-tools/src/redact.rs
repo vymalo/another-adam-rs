@@ -217,7 +217,7 @@ impl Redactor {
     /// scrubbed from the steps too.
     pub fn step_io(&self) -> StepIo {
         let redactor = self.clone();
-        StepIo::default().redact(move |text| redactor.scrub(text).into_owned())
+        StepIo::default().redact(move |text| redactor.scrub_values(text.to_owned()))
     }
 
     /// The length in bytes of the longest value this redactor replaces, derived forms included.
@@ -288,14 +288,25 @@ impl Redactor {
         }
     }
 
+    /// [`scrub`](Self::scrub) for an owned string: every occurrence, for a message. A failure text,
+    /// a tool error and a question are free text that leaves the process, never code a model reads
+    /// back, so a secret inside a longer token is replaced too.
+    pub fn scrub_string(&self, text: String) -> String {
+        match self.scrub(&text) {
+            Cow::Borrowed(_) => text,
+            Cow::Owned(clean) => clean,
+        }
+    }
+
     /// [`scrub`](Self::scrub) for an owned string, at the **whole-value** sites: a needle is
     /// replaced only where it is a value ([`adam_llm_agent::is_value_position`]), so a held secret
     /// that is also an ordinary word is kept where it is an identifier (`fn postgres_handler`,
-    /// `my_postgres_pool`). The streaming [`scrub`](Self::scrub) stays conservative.
-    pub fn scrub_string(&self, text: String) -> String {
+    /// `my_postgres_pool`). For the text a model reads back as code: a tool's result, a kept output,
+    /// a file an artifact carries, a step's input and output, a JSON string value.
+    pub fn scrub_values(&self, text: String) -> String {
         let known = self.read();
         let Some(automaton) = &known.automaton else {
-            return match sequential_scrub(&known.needles, &text) {
+            return match sequential_scrub_values(&known.needles, &text) {
                 Cow::Borrowed(_) => text,
                 Cow::Owned(clean) => clean,
             };
@@ -324,7 +335,8 @@ impl Redactor {
     /// `text` scrubbed, then cut to [`MAX_FAILURE_TEXT`] bytes (at a character boundary, with a
     /// marker): what a run's failure text may carry out of the process. It is in this order on
     /// purpose: cutting first could leave the front half of a secret that scrubbing would then no
-    /// longer recognise.
+    /// longer recognise. The scrub is [`scrub_string`](Self::scrub_string), the message one: a
+    /// failure text goes into state and logs, never back to a model as code.
     pub fn failure_text(&self, text: String) -> String {
         let mut clean = self.scrub_string(text);
         if clean.len() > MAX_FAILURE_TEXT {
@@ -338,14 +350,11 @@ impl Redactor {
         clean
     }
 
-    /// Scrub every string (and object key) inside `value`.
+    /// Scrub every string inside `value`, at the whole-value sites
+    /// ([`scrub_values`](Self::scrub_values)); an object key is an identifier position and stays.
     pub fn scrub_value(&self, value: &mut Value) {
         match value {
-            Value::String(s) => {
-                if let Cow::Owned(clean) = self.scrub(s) {
-                    *s = clean;
-                }
-            }
+            Value::String(s) => *s = self.scrub_values(std::mem::take(s)),
             Value::Array(items) => items.iter_mut().for_each(|v| self.scrub_value(v)),
             Value::Object(map) => {
                 let entries = std::mem::take(map);
@@ -359,6 +368,33 @@ impl Redactor {
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
     }
+}
+
+/// The sequential replacement [`Redactor::scrub_values`] makes when the automaton could not be
+/// built: the same rule, one needle at a time, so a build that fails cannot change the semantics.
+fn sequential_scrub_values<'a>(needles: &[String], text: &'a str) -> Cow<'a, str> {
+    let mut out = Cow::Borrowed(text);
+    for needle in needles {
+        if out.contains(needle.as_str()) {
+            let mut next = String::with_capacity(out.len());
+            let mut at = 0;
+            while let Some(found) = out[at..].find(needle.as_str()) {
+                let start = at + found;
+                let end = start + needle.len();
+                if adam_llm_agent::is_value_position(&out, start, needle.len()) {
+                    next.push_str(&out[at..start]);
+                    next.push_str(REDACTED);
+                    at = end;
+                } else {
+                    next.push_str(&out[at..end]);
+                    at = end;
+                }
+            }
+            next.push_str(&out[at..]);
+            out = Cow::Owned(next);
+        }
+    }
+    out
 }
 
 /// The sequential replacement [`Redactor::scrub`] made before it had an automaton: kept for a
@@ -525,20 +561,25 @@ mod tests {
         let r = Redactor::new(["postgres"]);
         let marker = REDACTED;
         assert_eq!(
-            r.scrub_string("postgres://postgres:postgres@db:5432/app".into()),
+            r.scrub_values("postgres://postgres:postgres@db:5432/app".into()),
             format!("postgres://{marker}:{marker}@db:5432/app")
         );
         assert_eq!(
-            r.scrub_string("password=postgres".into()),
+            r.scrub_values("password=postgres".into()),
             format!("password={marker}")
         );
         assert_eq!(
-            r.scrub_string("fn postgres_handler() {}".into()),
+            r.scrub_values("fn postgres_handler() {}".into()),
             "fn postgres_handler() {}"
         );
         assert_eq!(
-            r.scrub_string("my_postgres_pool".into()),
+            r.scrub_values("my_postgres_pool".into()),
             "my_postgres_pool"
+        );
+        // A message takes the conservative scrub: a secret inside a longer token goes too.
+        assert_eq!(
+            r.scrub_string("fn postgres_handler() {}".into()),
+            format!("fn {marker}_handler() {{}}")
         );
         // The streaming closure stays conservative: it replaces inside an identifier too.
         assert_eq!(
@@ -548,9 +589,52 @@ mod tests {
         // A short random secret in a value is still hidden.
         let short = Redactor::new(["x7k2"]);
         assert_eq!(
-            short.scrub_string("token=x7k2".into()),
+            short.scrub_values("token=x7k2".into()),
             format!("token={marker}")
         );
+        // The fallback a failed automaton build takes keeps the rule.
+        assert_eq!(
+            sequential_scrub_values(&["postgres".into()], "fn postgres_handler() {}"),
+            "fn postgres_handler() {}"
+        );
+        assert_eq!(
+            sequential_scrub_values(
+                &["postgres".into()],
+                "postgres://postgres:postgres@db:5432/app"
+            ),
+            format!("postgres://{marker}:{marker}@db:5432/app")
+        );
+    }
+
+    /// The two whole-value sites besides a plain text result: a JSON string value and step IO. The
+    /// bench's DSN keeps its scheme and loses its user and password; the identifier stays.
+    #[test]
+    fn a_json_value_and_a_step_are_whole_values() {
+        let r = Redactor::new(["postgres"]);
+        let mut v = json!({
+            "conn": "postgres://postgres:postgres@db:5432/app",
+            "cmd": "fn postgres_handler() {}",
+        });
+        r.scrub_value(&mut v);
+        assert_eq!(
+            v["conn"],
+            json!(format!("postgres://{REDACTED}:{REDACTED}@db:5432/app"))
+        );
+        assert_eq!(v["cmd"], json!("fn postgres_handler() {}"));
+    }
+
+    /// The mark is a sentence, so a held value that is one of its words (`secret`, `removed`) is
+    /// still *inside* the mark. What the output says is the same whatever the value was, so nothing
+    /// about the secret is told: this is not a leak, and the mark says what happened.
+    #[test]
+    fn a_value_that_reads_like_a_word_of_the_mark_is_not_told_apart() {
+        let a = Redactor::new(["secret"]).scrub_values("password=secret".into());
+        let b = Redactor::new(["hunter2-hunter2"]).scrub_values("password=hunter2-hunter2".into());
+        assert_eq!(a, b);
+        assert_eq!(a, format!("password={REDACTED}"));
+        // A value that is not a word of the mark is gone from the text.
+        let c = Redactor::new(["secret"]).scrub_values("secret=1 and password=secret".into());
+        assert_eq!(c, format!("{REDACTED}=1 and password={REDACTED}"));
     }
 
     #[test]
