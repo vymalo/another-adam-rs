@@ -207,7 +207,7 @@ async fn tool_results_round_trip_into_the_next_request() {
 
 /// The bench's repro (adam-rs#322): Gemini 3 attaches `extra_content.google.thought_signature` to
 /// a tool call and refuses the next request with a 400 when it is missing. The member must go back
-/// byte for byte.
+/// value for value.
 #[tokio::test]
 async fn a_tool_calls_extra_content_survives_the_next_request() {
     let server = MockServer::start().await;
@@ -372,6 +372,111 @@ async fn a_reasoning_block_is_not_echoed_by_a_client_that_does_not() {
     assert!(body["messages"][2].get("reasoning").is_none(), "{body}");
 }
 
+/// A block-only response, with echo off: nothing of it is stored (ADR 0020), so the history is
+/// the bytes it always was.
+#[tokio::test]
+async fn a_reasoning_block_alone_is_not_stored_without_echo() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done",
+                    "reasoning": {"blocks": [{"type": "text", "text": "think"}]}},
+                "finish_reason": "stop"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let first = client.complete(req.clone()).await.unwrap();
+    assert!(
+        matches!(
+            &first.message,
+            Message::Assistant {
+                provider: None,
+                reasoning: None,
+                ..
+            }
+        ),
+        "no carrier is stored for a block with echo off: {:?}",
+        first.message
+    );
+    req.messages.push(first.message);
+    req.messages.push(Message::user_text("thanks"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert!(body["messages"][2].get("reasoning").is_none(), "{body}");
+    assert!(body["messages"][2].get("provider").is_none(), "{body}");
+}
+
+/// With echo off, a block is cleared but the opaque members stay: they are signatures, not
+/// reasoning.
+#[tokio::test]
+async fn a_reasoning_block_is_cleared_but_members_stay_without_echo() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done",
+                    "reasoning": {"blocks": [{"type": "text", "text": "think"}]},
+                    "extra_content": {"google": {"thought_signature": "kept-sig"}}},
+                "finish_reason": "stop"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let first = client.complete(req.clone()).await.unwrap();
+    let Message::Assistant {
+        provider: Some(provider),
+        ..
+    } = &first.message
+    else {
+        panic!("the members keep the carrier: {:?}", first.message)
+    };
+    assert_eq!(provider.reasoning, None, "the block is not stored");
+    assert_eq!(
+        provider.members["extra_content"],
+        json!({"google": {"thought_signature": "kept-sig"}})
+    );
+    req.messages.push(first.message);
+    req.messages.push(Message::user_text("thanks"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(
+        body["messages"][2]["extra_content"],
+        json!({"google": {"thought_signature": "kept-sig"}}),
+        "{body}"
+    );
+    assert!(body["messages"][2].get("reasoning").is_none(), "{body}");
+}
+
 /// A streamed delta's opaque member on a tool call reaches the finished call and the next request.
 #[tokio::test]
 async fn streamed_tool_call_extra_content_survives_the_next_request() {
@@ -473,6 +578,112 @@ async fn a_message_shaped_chunk_keeps_its_opaque_members() {
         body["messages"][2]["extra_content"],
         json!({"google": {"thought_signature": "final-sig"}}),
         "{body}"
+    );
+}
+
+/// A delta can carry a message-level member: it is kept and sent back, like a `message`-shaped
+/// chunk's.
+#[tokio::test]
+async fn a_delta_message_level_extra_content_survives_the_next_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(&[
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"hi","extra_content":{"google":{"thought_signature":"delta-sig"}}}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let stream = client.stream(req.clone()).await.unwrap();
+    let deltas: Vec<ModelDelta> = collect(stream)
+        .await
+        .into_iter()
+        .map(|item| item.unwrap())
+        .collect();
+    let Some(ModelDelta::Finished(response)) = deltas.last() else {
+        panic!("{deltas:?}")
+    };
+    assert_eq!(response.message.text(), "hi");
+    req.messages.push(response.message.clone());
+    req.messages.push(Message::user_text("thanks"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(
+        body["messages"][2]["extra_content"],
+        json!({"google": {"thought_signature": "delta-sig"}}),
+        "{body}"
+    );
+}
+
+/// The stamp is the request's own alias, not a constant: a first call under an alias other than
+/// the fixture's must still match on the second call.
+#[tokio::test]
+async fn the_client_stamps_the_requests_own_model_alias() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_a", "type": "function",
+                    "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"},
+                    "extra_content": {"google": {"thought_signature": "alias-sig"}}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "18C"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    req.model = "model-a".into();
+    let first = client.complete(req.clone()).await.unwrap();
+    let Message::Assistant {
+        provider: Some(provider),
+        ..
+    } = &first.message
+    else {
+        panic!("a stamped assistant message: {:?}", first.message)
+    };
+    assert_eq!(
+        provider.model, "model-a",
+        "the request's alias, not a constant"
+    );
+
+    req.messages.push(first.message);
+    req.messages.push(Message::tool_result("call_a", "18C"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(body["model"], "model-a");
+    assert_eq!(
+        body["messages"][2]["tool_calls"][0]["extra_content"],
+        json!({"google": {"thought_signature": "alias-sig"}}),
+        "a constant stamp would not match this alias: {body}"
     );
 }
 

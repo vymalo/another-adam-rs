@@ -132,7 +132,7 @@ pub fn endpoint_for_logs(url: &str) -> String {
 /// The stable id of the endpoint at `base`: `openai:` and the first 16 hexadecimal digits of the
 /// SHA-256 of the normalised base URL. A provider's opaque members go back only to the endpoint
 /// (and model alias) that produced them, and this is how a client recognises its own. It is not a
-/// credential: it is a hash, and the base URL never appears in it.
+/// secret, but a fingerprint of the base URL: it confirms a guess.
 fn endpoint_id(base: &str) -> String {
     use sha2::{Digest as _, Sha256};
     let digest = Sha256::digest(base.as_bytes());
@@ -294,7 +294,8 @@ pub struct OpenAiCompatible {
     default_headers: HeaderMap,
     url: String,
     /// The stable id of the endpoint, from its base URL: what a provider's opaque members are
-    /// bound to, beside the model alias. Never a credential.
+    /// bound to, beside the model alias. Not a secret, but a fingerprint of the base URL: it
+    /// confirms a guess.
     endpoint: String,
     credentials: DynCredentials,
     timeout: Duration,
@@ -475,13 +476,34 @@ impl OpenAiCompatible {
     }
 
     /// `response` as this client reports it: the reasoning is kept in the message only when the
-    /// client echoes it, and the provider's opaque members are stamped with the model alias and
-    /// endpoint that produced them (a parse never stamps: it does not know either).
+    /// client echoes it (a raw block is cleared otherwise, ADR 0020), and the provider's opaque
+    /// members are stamped with the model alias and endpoint that produced them (a parse never
+    /// stamps: it does not know either).
     fn echoed(&self, mut response: ModelResponse, model: &str) -> ModelResponse {
-        if self.echo_reasoning.is_some()
-            && let Message::Assistant { reasoning, .. } = &mut response.message
+        let echo = self.echo_reasoning.is_some();
+        if let Message::Assistant {
+            reasoning,
+            provider,
+            tool_calls,
+            ..
+        } = &mut response.message
         {
-            reasoning.clone_from(&response.reasoning);
+            if echo {
+                reasoning.clone_from(&response.reasoning);
+            } else if let Some(turn) = provider.as_mut() {
+                // A structured reasoning block is only meaningful when it is sent back; off (the
+                // default) nothing of it is stored (ADR 0020). The opaque members stay: they are
+                // signatures, not reasoning.
+                turn.reasoning = None;
+            }
+            // A turn with nothing left is no carrier: a response that only had a block, with echo
+            // off, is the bytes it always was.
+            let calls_opaque = tool_calls.iter().any(|call| call.opaque.is_some());
+            if provider.as_ref().is_some_and(|turn| {
+                turn.members.is_empty() && turn.reasoning.is_none() && !calls_opaque
+            }) {
+                *provider = None;
+            }
         }
         if let Message::Assistant {
             provider: Some(provider),

@@ -120,7 +120,7 @@ pub enum ToolChoice {
     Tool(String),
 }
 
-/// Opaque members a provider attached to a turn, kept byte for byte and bound to the model alias
+/// Opaque members a provider attached to a turn, kept value for value and bound to the model alias
 /// and endpoint that produced them. Never interpreted, never sent to another model.
 ///
 /// A provider may attach members this client does not model (Gemini's
@@ -134,7 +134,8 @@ pub enum ToolChoice {
 pub struct ProviderTurn {
     /// The request's model alias that produced these members.
     pub model: String,
-    /// The endpoint's stable id (the client computes it; never a credential).
+    /// The endpoint's stable id (the client computes it; not a secret, but a fingerprint of the
+    /// base URL: it confirms a guess).
     pub endpoint: String,
     /// The assistant message's members this client does not model (`extra_content`, and siblings).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -157,10 +158,16 @@ impl ProviderTurn {
         }
     }
 
-    /// Whether this turn was produced by the model alias `model` at `endpoint`: the two must both
-    /// match before any of its members is sent back.
+    /// Whether this turn was produced by the model alias `model` at `endpoint`. Both sides must be
+    /// non-empty: an unstamped turn, or a client that does not know its endpoint, matches nothing
+    /// (fail closed).
     pub fn is_bound_to(&self, model: &str, endpoint: &str) -> bool {
-        self.model == model && self.endpoint == endpoint
+        !self.model.is_empty()
+            && !self.endpoint.is_empty()
+            && !model.is_empty()
+            && !endpoint.is_empty()
+            && self.model == model
+            && self.endpoint == endpoint
     }
 }
 
@@ -186,7 +193,7 @@ pub enum Message {
         /// it is never in the stored history and never sent. It is not [`Message::text`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
-        /// The opaque members the provider attached to this turn, kept byte for byte and bound to
+        /// The opaque members the provider attached to this turn, kept value for value and bound to
         /// the model alias and endpoint that produced them ([`ProviderTurn`]). `None` when the
         /// provider sent none, so a message without them is the same bytes as before and an older
         /// journal decodes.
@@ -501,7 +508,7 @@ pub struct ToolCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalid_arguments: Option<String>,
     /// The call object's members this client does not model (`extra_content`, and siblings), kept
-    /// byte for byte. Provenance is the enclosing [`Message::Assistant`]'s
+    /// value for value. Provenance is the enclosing [`Message::Assistant`]'s
     /// [`provider`](ProviderTurn): a call's members are sent only when that turn is bound to the
     /// request's model alias and endpoint. `None` when the provider attached none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -977,6 +984,15 @@ mod tests {
         assert!(provider.is_bound_to("gw-model", "openai:0123456789abcdef"));
         assert!(!provider.is_bound_to("other", "openai:0123456789abcdef"));
         assert!(!provider.is_bound_to("gw-model", "openai:fedcba9876543210"));
+        // Fail closed when either side is empty: an unstamped turn, or a client that does not
+        // know its endpoint, matches nothing.
+        assert!(
+            !ProviderTurn::new("", "openai:0123456789abcdef")
+                .is_bound_to("", "openai:0123456789abcdef")
+        );
+        assert!(!ProviderTurn::new("gw-model", "").is_bound_to("gw-model", ""));
+        assert!(!provider.is_bound_to("", "openai:0123456789abcdef"));
+        assert!(!provider.is_bound_to("gw-model", ""));
     }
 
     #[test]

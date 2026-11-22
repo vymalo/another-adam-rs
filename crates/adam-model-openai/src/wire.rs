@@ -82,11 +82,10 @@ struct WireMessage<'a> {
 
 /// The members the runtime owns on an assistant message: an opaque member of the same name is
 /// dropped, the modelled one wins.
-const MESSAGE_MODELLED_KEYS: [&str; 6] = [
+const MESSAGE_MODELLED_KEYS: [&str; 5] = [
     "role",
     "content",
     "tool_calls",
-    "tool_call_id",
     "reasoning",
     "reasoning_content",
 ];
@@ -520,7 +519,7 @@ fn reasoning_text(candidates: &[Option<&Value>]) -> Option<String> {
 }
 
 /// The raw reasoning value when the provider sent an object or array (a reasoning block) instead
-/// of text: the first such value, byte for byte. A string, a number or `null` is not a block.
+/// of text: the first such value, value for value. A string, a number or `null` is not a block.
 fn raw_reasoning(candidates: &[Option<&Value>]) -> Option<Value> {
     candidates
         .iter()
@@ -553,7 +552,7 @@ struct ChoiceMessage {
     reasoning_content: Option<Value>,
     /// OpenRouter, Ollama, current vLLM.
     reasoning: Option<Value>,
-    /// The members this client does not model (`extra_content`, and siblings), byte for byte.
+    /// The members this client does not model (`extra_content`, and siblings), value for value.
     #[serde(flatten)]
     opaque: BTreeMap<String, Value>,
 }
@@ -885,6 +884,14 @@ impl Assembler {
                 for (position, call) in delta.tool_calls.unwrap_or_default().into_iter().enumerate()
                 {
                     self.push_tool_call(position, call, &mut out);
+                }
+                // A delta can carry the message-level members too (the same filter as a
+                // message-shaped chunk): a provider may attach them to a delta rather than a final
+                // `message`.
+                for (key, value) in delta.opaque {
+                    if !STREAM_MESSAGE_MODELLED_KEYS.contains(&key.as_str()) {
+                        self.message_members.insert(key, value);
+                    }
                 }
             }
             // A chunk shaped as a whole message rather than a delta: its opaque members are the
