@@ -188,7 +188,9 @@ Three things are missing in adam today:
    park) with the reason, never `auth-required`, since the gateway refused the child's call and not the root's. A message
    or a resume to the root is accepted (a message's text is added at the root, behind the call the child answers) and the
    root forwards **one** resume (`RESUME_KIND`) with an id derived from the waking message's id and the child's run id;
-   the copy is cleared when it forwards, and rewritten at the next look. A local subagent's park until woken no longer
+   the copy is cleared when it forwards, and rewritten at the next look. The child drops a resume whose id it has
+   read (`read_ids`) and, when that was the whole wake, parks again without a call, so a replayed forward is no second
+   call. A local subagent's park until woken no longer
    fails the child (the S8b-2a amendment's arm is gone): it waits, and only its parent's forwarded resume wakes it. The
    coder ends its background commands on an until-woken park of a child it waits on, as on its own (a timer park keeps
    them, bounded by `MODEL_PARK_LIMIT`). A notice that is lost costs the parent its next look at a timer park; for an
@@ -237,7 +239,10 @@ Three things are missing in adam today:
   connection, `MODEL_CA_FILE`.
 * `adam-llm-agent`: `Conversation::model_wait`, the park, its backoff and `MODEL_PARK_LIMIT`, the wake, the summary call,
   the child's notice and the forwarded resume; the "Failure handling" list. `Conversation` denies no unknown field, so a
-  build rolled back past this change reads a parked run's state, without its model wait.
+  build rolled back past this change reads a parked run's state, without its model wait. A parent that is not an
+  `LlmAgent` forwards no resume, so a child's park until woken now waits until a cancel (its parent's deadline failing it
+  cancels it), where S8b-2a failed it with the reason: a behaviour change for hand-written `adam-embed` agents that wait
+  on children.
 * `adam-runtime`: `Ctx::retries_left()`; `Ctx::child_look` (the caller's child in one read: its status and the head
   of its state) and `Ctx::resume_child` (a checked wake of the caller's child), `ChildLook` and `CHILD_PARKED_KIND`
   (the notice of a child's park, after its own commit); `SessionHeader::root`; nothing else (a park is a `wake_at`).

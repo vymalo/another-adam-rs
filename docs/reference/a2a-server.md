@@ -141,6 +141,10 @@ ends **`completed`**, its output (and the `artifact`-less final message) carryin
 | has a `contextId`, no `taskId` | delivered to the context's open task, or starts a new one |
 | has `referenceTaskIds` | starts from the conversation of one of them, below |
 
+The rows are read in order: a `working` task whose run is parked on the model, or waits on a parked child, is
+delivered (the second row); any other `working` task takes the fifth row, and is refused unless the request
+activated `steer/v1`.
+
 ## A run parked on the model
 
 **This section is a contract** ([ADR 0067](../decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md),
@@ -184,9 +188,15 @@ waits on it learns of it by a notice (`adam.child.parked`), reads what the child
 A refusal of status 401 or 403 is the child's: the root's task is `working` with the reason when the child is on a timer,
 never `auth-required` (the gateway refused the child's call, not the root's). A message to the root is accepted; its text
 is the root's turn, added behind the call the child answers, and the root sends the child **one resume** with an id
-derived from the waking message's id, so a replayed step writes the same one. A resume to the root is accepted as for a
+derived from the waking message's id, so a replayed step writes the same one; the child drops a copy it has read, so a
+replayed forward is no second call. A resume to the root is accepted as for a
 parked run, and goes down the same way, one level at a time: a child that waits on its own parked child forwards one to
-it. A resume to a root whose child has finished is `NOT_PARKED`, as for any run that is not parked on the model.
+it. A resume to a root that has **settled** its child — the child finished and the root answered its call — is
+`NOT_PARKED`, as for any run that is not parked on the model; between the child's end and the root's next step the
+copy is still there, so a resume is accepted and forwarded, which is harmless (the child is finished and nothing is
+woken). A client that binds runs learns of a **descendant's** refusal of status 401 or 403 from the status message —
+the root shows `working` with the child's reason, not `auth-required` — and sends its resume to the **root**, which
+forwards it; otherwise a `ListTasks` with `status=auth-required` never returns the root.
 
 **Time.** A park on a timer waits 30 s, then twice as long at each park in a row, at most 15 minutes, and never less than
 the gateway asked (`Retry-After`). Parks on a timer in a row last at most `MODEL_PARK_LIMIT` (24 hours by default, from

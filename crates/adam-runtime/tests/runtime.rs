@@ -6627,6 +6627,8 @@ mod cases {
                     }
                     let child: RunId = serde_json::from_value(state["child"].clone()).unwrap();
                     let other: RunId = serde_json::from_value(state["other"].clone()).unwrap();
+                    let corrupt: RunId =
+                        serde_json::from_value(state["corrupt"].clone()).unwrap();
                     let own = ctx.child_status(child).await?;
                     let own_look = ctx.child_look(child).await?;
                     let stranger = ctx.child_status(other).await;
@@ -6635,6 +6637,10 @@ mod cases {
                     let missing = ctx.child_status(RunId::new()).await?;
                     let missing_look = ctx.child_look(RunId::new()).await?;
                     let missing_wake = ctx.resume_child(RunId::new(), "r-2").await;
+                    // A child whose record does not decode is nothing to wake: not the parent's
+                    // failure, as a look at it reports the damage instead.
+                    let corrupt_wake = ctx.resume_child(corrupt, "r-3").await;
+                    let corrupt_look = ctx.child_look(corrupt).await?;
                     Ok(Transition::Done {
                         state,
                         output: json!({
@@ -6652,6 +6658,11 @@ mod cases {
                                 "head": look.head,
                             })),
                             "missing_wake_is_nothing": missing_wake.is_ok(),
+                            "corrupt_wake_is_nothing": corrupt_wake.is_ok(),
+                            "corrupt_look": corrupt_look.map(|look| json!({
+                                "status": look.status,
+                                "head": look.head,
+                            })),
                         }),
                     })
                 }
@@ -6664,14 +6675,29 @@ mod cases {
             .build();
         let child = RunId::new();
         let other = RunId::new();
+        let corrupt = RunId::new();
         let parent = rt
             .start(
                 &name,
-                Inbound::new("start", json!({"child": child, "other": other})),
+                Inbound::new(
+                    "start",
+                    json!({"child": child, "other": other, "corrupt": corrupt}),
+                ),
                 None,
             )
             .await
             .expect("start");
+        // A child of the parent whose state is not an envelope this build can read. It is parked,
+        // so no worker claims it and fails it: the record stays unreadable for the accessors.
+        store
+            .create_run(
+                NewRun::new(&other_name, json!({"v": 99}))
+                    .with_id(corrupt)
+                    .parent(parent)
+                    .status(RunStatus::Parked),
+            )
+            .await
+            .expect("corrupt child");
         rt.start_child(parent, child, &child_name, inbound())
             .await
             .expect("child");
@@ -6698,6 +6724,15 @@ mod cases {
         assert_eq!(out["missing"], Value::Null);
         assert_eq!(out["missing_look"], Value::Null);
         assert_eq!(out["missing_wake_is_nothing"], true);
+        assert_eq!(out["corrupt_wake_is_nothing"], true);
+        // The look reports the damage instead: the record's own status, and no head.
+        assert_eq!(
+            out["corrupt_look"]["status"]["status"],
+            json!("parked"),
+            "{}",
+            out["corrupt_look"]
+        );
+        assert!(out["corrupt_look"]["head"].is_null());
         // The stranger was not woken by the refused call: it still waits for a message.
         assert!(rt.view(other).await.unwrap().unwrap().waiting);
     }

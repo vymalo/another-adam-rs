@@ -1179,6 +1179,72 @@ async fn a_copy_of_the_message_that_woke_the_parent_wakes_the_child_once() {
     rig.stop().await;
 }
 
+/// A copy of a resume the child has read wakes it for nothing: the step that sent it ran again
+/// after a lost commit and wrote the same derived id, so the child parks again and makes **no**
+/// call. Without the receiver's dedup the copy is a second call (ADR 0067 decision 5).
+#[tokio::test]
+async fn a_copy_of_a_resume_the_child_read_makes_no_call() {
+    let rig = family(0);
+    rig.mock
+        .push_tool_calls(vec![tool_call("c1", "sub", json!({}))])
+        .push_error(refused(402, Some("over_limit"), Park::UntilWoken))
+        .push_error(refused(402, Some("over_limit"), Park::UntilWoken));
+    let run = rig.start(None).await;
+    let child = adam_runtime::child_run_id(run, "c1");
+    rig.parked(
+        run,
+        |s| matches!(&s.pending_wait, Some(PendingWait::Run(w)) if w.model_wait.is_some()),
+    )
+    .await;
+
+    // One resume wakes the child: it makes the same call and is refused again.
+    rig.rt
+        .deliver(
+            child,
+            Inbound::new(MODEL_RESUME_KIND, json!({})).with_id("r-1"),
+        )
+        .await
+        .expect("deliver");
+    rig.requests_at_least(3).await;
+    rig.wait_for(child, "the child parked again", |v| {
+        v.status == RunStatus::Parked
+    })
+    .await;
+
+    // The same id again is a copy: the child is woken, drops it, and parks without a call.
+    rig.rt
+        .deliver(
+            child,
+            Inbound::new(MODEL_RESUME_KIND, json!({})).with_id("r-1"),
+        )
+        .await
+        .expect("a copy is delivered");
+    let settled = rig
+        .wait_for(child, "the copy's wake", |v| {
+            matches!(
+                v.status,
+                RunStatus::Parked | RunStatus::Done | RunStatus::Failed
+            )
+        })
+        .await;
+    assert_eq!(
+        settled.status,
+        RunStatus::Parked,
+        "the copy made no call: the child is parked, not answered"
+    );
+    assert_eq!(
+        rig.mock.requests().len(),
+        3,
+        "the copy made no call: the child read one resume"
+    );
+    assert_eq!(
+        rig.state(child).await.model_wait.as_ref().map(|w| w.park),
+        Some(ModelPark::UntilWoken),
+        "and the child still waits on the model"
+    );
+    rig.stop().await;
+}
+
 /// A forwarded resume clears the parent's copy while the child works, and the parent parks on its
 /// 60 s look again (ADR 0067 decision 5).
 #[tokio::test]

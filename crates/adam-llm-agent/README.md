@@ -720,9 +720,11 @@ child keeps of its own child, so a grandchild is shown one level at a time. A ch
 the parent wait with **no timer**, as a question does (it cannot finish on its own); a child on a timer keeps the
 parent's `wait_poll` look, and the reason is on the parent's head at `/pending_wait/model_wait`. A message or a resume
 to the parent sends the child one `RESUME_KIND` (`Ctx::resume_child`), under an id derived from the waking message's id
-and the child's run id; the words of a message stay at the parent, and each level forwards to its own pending child. A
-child's refusal of status 401 or 403 is the child's: the root's task is `working` with the reason, never
-`auth-required`.
+and the child's run id (the child drops a copy it has read); the words of a message stay at the parent, and each level
+forwards to its own pending child. A child's refusal of status 401 or 403 is the child's: the root's task is `working`
+with the reason, never `auth-required`. A parent that is not an `LlmAgent` — a hand-written agent on `adam-embed` —
+forwards none, so a child's until-woken park waits until a cancel (the parent's deadline failing it cancels the child
+too), where S8b-2a failed the child with the reason.
 
 The conversation is kept as it was before the call and `Conversation::model_wait` says why (`reason`, `status`, `slug`,
 `park`, `parked_since`, `parks`, `wake_at`). When the run wakes the **same call** is made again (a new journal position,
@@ -743,9 +745,10 @@ Tests: `tests/model_park.rs` (each kind, the backoff by the journaled times, the
 one refused again, a resume, a resume during the woken call adding no turn, a row that changes kind, a replay after a lost
 commit, an unattended run, a parked summary with a message not stepped before its wake, an
 unreachable endpoint, `ModelLocked`, `StaticBearer`'s errors, a cancel, a parked child shown on its parent and woken
-through a message or a resume (its words staying there, a copy of the waking message waking it once, the copy cleared
-while it works, a timer child keeping the look), a grandchild reached one level at a time, and nothing of a problem document's body in the
-journal through `adam-model-openai` against a mock server), `tests/compaction.rs`
+through a message or a resume (its words staying there, a copy of the waking message waking it once, a copy of a resume
+it read making no call, the copy cleared while it works, a timer child keeping the look), a grandchild reached one level
+at a time, and nothing of a problem document's body in the journal through `adam-model-openai` against a mock
+server), `tests/compaction.rs`
 `a_refused_summary_parks_the_run_and_is_asked_for_again`, and `src/model_wait.rs` (the backoff, the reasons, a wait that
 cannot be read).
 

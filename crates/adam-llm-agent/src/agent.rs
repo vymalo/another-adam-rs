@@ -148,7 +148,7 @@ fn compaction_call_id(run: RunId, n: usize) -> String {
 
 /// The id of the resume a run forwards to the child `child` when the inbound `waking` woke it
 /// ([ADR 0067] decision 5): derived from both, so a step that runs again writes the same id, and a
-/// child that receives the copy says nothing new.
+/// child that receives the copy drops it (its `read_ids`) and makes no call.
 ///
 /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
 fn forwarded_resume_id(waking: &str, child: RunId) -> String {
@@ -1534,9 +1534,10 @@ impl LlmAgentBuilder {
 ///   limit, as any timer does.
 /// * **Until woken** (a usage limit reached): the run waits like a question, with no timer and its
 ///   deadline paused, and never fails on its own. A run nobody can wake fails instead: a schedule's
-///   firing ([`is_unattended`]), and a local subagent's run (a child that is no session's round),
-///   whose parent then gets an error result. A firing also fails on a refusal of status 401 or 403,
-///   since nothing binds a firing at the gateway yet.
+///   firing ([`is_unattended`]). A local subagent waits for the resume its parent forwards (ADR 0067
+///   decision 5); a parent that is not an `LlmAgent` forwards none, so the child waits until a cancel.
+///   A firing also fails on a refusal of status 401 or 403, since nothing binds a firing at the
+///   gateway yet.
 /// * **Waking.** A message wakes either kind: its text is the person's turn, added before the call. A
 ///   message of kind [`MODEL_RESUME_KIND`] wakes it and adds nothing (and one that lands while the
 ///   run works is no arrival). A run parked on its summary call takes its inbox, the words kept in
@@ -1560,7 +1561,7 @@ impl LlmAgentBuilder {
 /// * A refusal whose provider parks the run (`ModelError::Refused`), and, with
 ///   [`ModelParking::when_unreachable`], an endpoint that cannot be reached once the step's retries
 ///   are spent: the run parks on the model (below), and fails only past [`ModelParking::limit`], or
-///   on a park until woken in a run nobody can wake.
+///   on a park until woken in a run nobody can wake (a schedule's firing).
 /// * Other model error, `ModelError::ModelLocked` (naming the model) among them: the run fails
 ///   (`model call failed: ...`). So does a refusal under a provider that does not park
 ///   (`StaticBearer`'s `401` is `ModelError::Auth`).
@@ -5866,8 +5867,24 @@ impl Agent for LlmAgent {
         // which then makes its call again, and a run that waits on a child parked on the model
         // forwards one to it (decision 5). It adds nothing to the conversation and answers no
         // question, so it never reaches the inbox below.
+        //
+        // The id is derived from the waking message and the child, so a step that runs again (a
+        // lost commit) writes the same one: a resume whose id this run has read is a **copy**, and
+        // a copy is no wake. The ones kept are noted in the commit of this step, which consumes
+        // them; the copy of a later delivery is then recognised.
         let (resumes, inbox): (Vec<_>, Vec<_>) =
             inbox.into_iter().partition(|i| i.kind == MODEL_RESUME_KIND);
+        let mut kept = Vec::with_capacity(resumes.len());
+        let mut copies = 0_usize;
+        for resume in resumes {
+            if state.has_read(&resume.id) {
+                copies += 1;
+            } else {
+                state.note_read(&resume.id);
+                kept.push(resume);
+            }
+        }
+        let resumes = kept;
         let notices: Vec<(RunId, ChildStatus)> = finished
             .iter()
             .filter_map(|i| {
@@ -5878,6 +5895,21 @@ impl Agent for LlmAgent {
                 notice
             })
             .collect();
+        // Woken by nothing but copies of resumes this run has read: the step that sent them ran
+        // again after a lost commit. The run waits on the model as it did, with no call — a copy is
+        // not a wake. A timer that has come due is not "nothing" (the runtime woke it for the
+        // timer), and anything else in the inbox (a message, a notice, a close) is read below.
+        if copies > 0
+            && resumes.is_empty()
+            && inbox.is_empty()
+            && finished.is_empty()
+            && closes.is_empty()
+            && let Some(wait) = &state.model_wait
+            && !wait.wake_at.is_some_and(|at| at <= ctx.now())
+        {
+            let wake_at = wait.wake_at;
+            return Ok(Transition::Park { state, wake_at });
+        }
         let asked = match &state.pending_wait {
             Some(PendingWait::Question(q)) => Some((q.tool.clone(), q.call_id.clone())),
             _ => None,

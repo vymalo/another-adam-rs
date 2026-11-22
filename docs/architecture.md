@@ -1268,7 +1268,7 @@ stateDiagram-v2
     Waiting --> Waiting: a user message or a stray notice arrives (nothing answers, new timer)
     Waiting --> WaitingOnPark: adam.child.parked, the child waits until it is woken (no timer)
     Waiting --> Waiting: adam.child.parked, the child waits on a timer (its reason kept, new timer)
-    WaitingOnPark --> WaitingOnPark: a message or a resume arrives: one resume goes down, the copy is cleared, a new timer
+    WaitingOnPark --> Waiting: a message or a resume arrives: one resume goes down, the copy is cleared, a new timer
     WaitingOnPark --> Answered: adam.run.finished for this child arrives
     WaitingOnPark --> Cancelled: the parent is cancelled
     Waiting --> Cancelled: the parent is cancelled (its child follows when its worker next looks)

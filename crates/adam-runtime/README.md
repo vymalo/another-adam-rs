@@ -24,7 +24,6 @@ over A2A).
 | `AgentError` | `Transient { retry_after, class, retry, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`; `class` the retryable class; `retry` a step's own policy), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
 | `Ctx`, `Emitter`, `ReservedStep` | `Ctx::step` journals a side effect's outcome; `Ctx::reserve_steps(&names)` takes the next seqs in order for steps that run at the same time (each `ReservedStep` has `seq()`, `name()`, `is_recorded()` and `run(f)`, with `step`'s contract), and `Ctx::step_all(steps, at_once)` runs them at most `at_once` at a time and returns the outcomes in the order given (see *Steps that run at the same time*); `Ctx::step_race(name, contenders)` races them as one step and records the winner (see *A race of steps*); `Ctx::step_retrying(name, key, policy, f)` is `step` under the step's own retry policy, and `Ctx::retries_left()` how many more tries the runtime allows after this one (see *Retries per step*); `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::arrived()` counts the messages delivered while the transition runs, `Ctx::reopen_on_arrival()` makes a `Done` that the transition returns go on instead, and `Ctx::read_already(&ids)` names the messages the run has read, whose copies are not counted (see *A message that arrives while a run finishes*); `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children, `Ctx::child_look(run)` its status and the head of its state in one read, `Ctx::child_state(run)` its agent's own state (all live reads of the run's own children only), and `Ctx::resume_child(run, id)` wakes one of them with a resume (see *Child runs*); `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*); `Ctx::run_starter()` gives an owned `RunStarter` |
 | `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_child_continuing`, `list_sessions`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `state`, `artifact_bytes`, `header`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*), `.poll_interval(..)` (the worker's idle poll, 250 ms) and `.cancel_poll_interval(..)` (a step's cancel watch, 1 s; see *Several processes*), and the getters `worker_id()`, `claim_scope()` |
-| `notify_parent(child, output, error)`, `notify_parent_parked(child)` | tells a finished child's parent (`RUN_FINISHED_KIND`, or `CHILD_REPORTED_KIND` for a session round) from the `output`/`error` the caller just committed, and tells a parent that its child **parked** (`CHILD_PARKED_KIND`, no payload); `child` supplies the ids, the status and the parent. The runtime calls them itself after a commit, a park and a cancel, never from its own look at a parked child. **Breaking:** it used to take only `&RunRecord` and decoded the child's state, which `Store::commit_run` no longer returns (`RunRecord::state` is `null`); an embedder that called it must pass the values it committed |
 | `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`). `RunView::claimed` is true while a worker holds an unexpired lease on a runnable run (read with `Store::lease_until` against the runtime's clock, before the head, so a step that commits and releases between the two reads never reads as unclaimed at version 1): the first step of a run commits nothing until it ends, and this is how a reader, in any process, tells a run being stepped from one nobody has taken. `RunView::state` is the agent's **head** (a v5 run) or the whole agent state (a v4 one), `RunView::artifacts` is a `Vec<ArtifactRef>` (a file is a `FileRef`, inline or a blob), `Runtime::state(run)` joins the head and its body generation (the only full-state read), and `Runtime::artifact_bytes(&FileRef)` fetches a file's blob once into a bounded cache |
 | `RunHeader` (re-exported from `adam-core`), `Runtime::header`, `view_from_record`, `Runtime::now` | the record without its state: `Runtime::header(run)` is one `Store::run_header` call (an adapter that overrides it projects the header and the lease; the trait's default reads the lease and the record), for a reader that only needs the run's own bookkeeping (a cancel watch, a parent check; an A2A task's state also needs `waiting`, so a status poll reads `view`). `RunHeader::claimed(now)` is `RunView::claimed`'s rule, one `adam_core::claimed(..)` helper. `view_from_record(record, claimed)` builds the `RunView` of a record a caller already holds (a listing), so it does not read the run again; `Runtime::now()` is the clock to compare a lease against, so the result agrees with `view` |
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
@@ -253,9 +252,9 @@ is the child's run id (so a parent deduplicates by it) and its payload is a `Chi
 `ChildStatus::from_notice(&inbound)`.
 
 The message is a hint. It is sent after the child's commit, so a crash between the two, a failed delivery or a
-commit whose acknowledgement was lost drops it, and the child's worker only logs that. **A parent must
-therefore wait with a timer** (`Transition::Park { wake_at: Some(..) }`) — unless the child waits for a
-message, below — and, when it wakes without the
+commit whose acknowledgement was lost drops it, and the child's worker only logs that. **A parent waits with a
+timer** (`Transition::Park { wake_at: Some(..) }`) for every child that is not parked on the model until it is
+woken (below) — a child parked on a question keeps it too — and, when it wakes without the
 message, read the child with `Ctx::child_status(run)`: `Some(status)` (`is_finished()` tells if it is over),
 or `None` if the run was purged. `child_status` is a live read, not journaled, and answers only for children
 of the calling run (anything else is `AgentError::Permanent`). A parent that is finished or gone is not an
@@ -267,11 +266,18 @@ into a wake-up parked nothing and sends nothing, and the runtime's own look at a
 again without stepping it) sends nothing either. The parent reads what the child waits on with
 `Ctx::child_look(run)`, **one** read that answers the status, the result and the head of the child's state
 (its agent state without the transcript for a v5 run), so it needs none of the child's agent registered and
-never reads its history. A child that waits for a message (a question, a model park until woken) makes its
-parent wait with no timer, as a question does: such a child cannot finish on its own, so a timer would only
-re-read "still parked". `Ctx::resume_child(run, id)` wakes a child of the calling run with a resume
-(`RESUME_KIND`), and nothing else: a run wakes its own children and no others, as `child_status` reads them.
+never reads its history. A child that waits on the model until it is woken makes its
+parent wait with no timer: such a child cannot finish on its own, so a timer would only
+re-read "still parked". It can still be cancelled or woken from outside its parent's step, and then its
+notice is the only path to the parent: one lost leaves the root `input-required` with a stale reason until a
+message or a resume arrives, which wakes it, re-reads the child and settles it. `Ctx::resume_child(run, id)` wakes a
+child of the calling run with a resume (`RESUME_KIND`), and nothing else: a run wakes its own children and no
+others, as `child_status` reads them.
 A parent that is finished or gone is not an error for the child.
+
+The runtime tells a parent itself, after a child's commit, a park and a cancel (`notify_parent` and
+`notify_parent_parked`, inside the worker; an embedder does not call them). The kinds are
+`RUN_FINISHED_KIND`, `CHILD_REPORTED_KIND` for a session round, and `CHILD_PARKED_KIND` for a park.
 
 A step that runs code which cannot hold the `Ctx` (a tool of an agent) starts children with
 `Ctx::child_starter()`: an owned, cloneable `ChildStarter` for the runtime that is stepping the run, whose only

@@ -113,7 +113,7 @@ pub fn default_inbound(message: &Message) -> Result<Inbound, String> {
 /// | runnable, never committed by a worker, a worker holds it | `working` |
 /// | parked on the model after a refusal of status 401 or 403 (`state.model_wait`, ADR 0067), timer or not | `auth-required` |
 /// | runnable, or parked on a timer (its own, or a child's it waits on) | `working` |
-/// | parked with no timer (`RunView::waiting`): a question, a park until woken, or a child that is | `input-required` |
+/// | parked with no timer (`RunView::waiting`): a question, a park until woken, or a child parked until woken | `input-required` |
 /// | done | `completed` |
 /// | failed with `cancelled: ...` | `canceled` |
 /// | failed otherwise | `failed` |

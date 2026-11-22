@@ -18,10 +18,14 @@ Code: `crates/adam-runtime` (`start_child`, `child_status`, `child_look`, `resum
 * **The message is a hint, the timer is the guarantee.** The runtime sends the message after the child's
   commit, in the worker that made it. It cannot be part of that commit (the store commits one run at a
   time), so a crash or a store error in between loses it, and so does a commit whose acknowledgement is lost
-  (the worker then believes the commit failed and sends nothing). The parent therefore never waits without a
-  timer: `LlmAgentBuilder::wait_poll` (60 s by default) bounds how late it can be, and each wake without the
+  (the worker then believes the commit failed and sends nothing). The parent therefore keeps a timer for
+  every wait on a child, except one parked on the model until it is woken ([below](#a-park-on-the-model)):
+  `LlmAgentBuilder::wait_poll` (60 s by default) bounds how late it can be, and each wake without the
   message is one `load_run`. A failed send is logged at `warn`; a parent that is finished or gone is logged
-  at `debug` and is not an error.
+  at `debug` and is not an error. The exception is safe because such a child cannot finish on its own — but
+  it can still be **cancelled or woken from outside its parent's step** (a cancel by id, a delivery to the
+  child), and then the notice is the only path to the parent: one lost leaves the root `input-required` with
+  a stale reason until a message or a resume arrives, which wakes it, re-reads the child and settles it.
 * **A park is a second notice.** A child that parks sends `adam.child.parked` after its own commit (never from
   the runtime's own look at a parked child, which parks it again without stepping it), with the child's run id
   as its id and no payload. The parent reads what the child waits on from its record (`Ctx::child_look`) and
@@ -65,9 +69,10 @@ wakes the child through itself:
   what a lost notice of the child's end falls back on.
 * **The resume.** A message or a resume to a run that waits on a parked child sends that child one
   `adam.resume` (`Ctx::resume_child`, which wakes only the caller's children), under an id derived from the
-  waking message's id and the child's run id: a step that runs again writes the same one. **Only a resume goes
-  down, never text**: a message's words stay at the parent, behind the call the child answers. Each level
-  forwards to its own pending child.
+  waking message's id and the child's run id: a step that runs again writes the same one, and the child drops a
+  copy it has read (`read_ids`), so a replayed forward is no second call. **Only a resume goes down, never text**:
+  a message's words stay at the parent, behind the call the child answers. Each level forwards to its own pending
+  child.
 * **401 and 403 are the child's.** The root's task is `working` with the reason when the child is on a timer,
   never `auth-required`: the gateway refused the child's call, not the root's.
 * **The coder's commands.** An until-woken park, the run's own or a child's it waits on, ends the coder's
@@ -186,7 +191,9 @@ What the design refuses to do, and why:
 * **No timer for a child parked until it is woken.** The parent's task is `input-required`, which needs no wake, and
   such a child cannot finish on its own: a timer would only re-read "still parked". The price is that a child woken or
   cancelled from **outside** its parent's step while it waits relies on its notice, and a lost one is not cured by a look;
-  every other park of a child, and every park of the parent's own, keeps a timer.
+  every other park of a child, and every park of the parent's own, keeps a timer. For the coder, a lost
+  `adam.child.parked` means the root never steps, so `commands_end_with` never fires and its background commands run to
+  `BACKGROUND_COMMAND_MAX_SECS`; a message or a resume to the root steps it, and they stop then.
 * **No parallel fan-out of one-shot subagents yet.** An `LlmAgent` runs the calls of one model turn at the same time
   ([ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)), but a call that can park the run (a
   subagent, a remote agent) runs alone, so three subagent calls in one turn run one after the other; background
