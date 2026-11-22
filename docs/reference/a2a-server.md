@@ -134,17 +134,22 @@ ends **`completed`**, its output (and the `artifact`-less final message) carryin
 | The message | What happens |
 |---|---|
 | carries a `taskId`, the task is `input-required` | delivered to the run (`Runtime::deliver`) |
-| carries a `taskId`, the run is parked on the model (`auth-required`, or `working` on a timer) | delivered to the run: see [A run parked on the model](#a-run-parked-on-the-model) |
+| carries a `taskId`, the run is parked on the model (`auth-required`, or `working` on a timer), or waits on a parked child | delivered to the run: see [A run parked on the model](#a-run-parked-on-the-model) |
 | has `adam.resume: true` in its metadata | a resume: see [A run parked on the model](#a-run-parked-on-the-model) |
 | carries a `taskId`, the task has finished | `-32004` (`UnsupportedOperationError`) |
 | carries a `taskId`, the task is `submitted` or `working` | `-32602`, **unless the request activated `steer/v1`**: then it goes to the run's inbox, is read at its next step, and the answer is the task, still working ([ADR 0016](../decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md)) |
 | has a `contextId`, no `taskId` | delivered to the context's open task, or starts a new one |
 | has `referenceTaskIds` | starts from the conversation of one of them, below |
 
+A message with `adam.resume: true` is read as a resume whatever the task's state (the third row): it is accepted
+only by a task parked on the model, or waiting on a parked child. Otherwise the rows are read in order: a `working`
+task whose run is parked on the model, or waits on a parked child, is delivered (the second row); any other `working`
+task takes the fifth row, and is refused unless the request activated `steer/v1`.
+
 ## A run parked on the model
 
 **This section is a contract** ([ADR 0067](../decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md),
-decision 4). An orchestrator resumes a run with it after it binds the run at the gateway, or after the person raised
+decisions 4 and 5). An orchestrator resumes a run with it after it binds the run at the gateway, or after the person raised
 their limit.
 
 Behind a model gateway that refuses a call until the run is bound or the person has usage left (`MODEL_AUTH=injector`),
@@ -166,22 +171,44 @@ client is told: never a header, a body or a credential.
 |---|---|
 | with the `taskId` of a parked task, timer or not | delivered: its text is the person's turn, added before the call is made again (for a run parked on its history's summary, after the summary is made); the answer is the task, `working` |
 | with `adam.resume: true` in its `metadata` and the `taskId` of a parked task | a **resume**: it wakes the run and adds **nothing** to the conversation. It may have no text and no part. The answer is the task, `working` |
-| a resume to any other task: one that asks a question, works (a run a message or a resume just woke, making its call again, included), has finished or was canceled | `-32602` (`InvalidParams`), "the task is not parked on the model"; nothing is written. A resume never answers a question |
+| a resume to any other task: one that asks a question, works (a run a message or a resume just woke, making its call again, included), waits on a child that is not parked on the model, has finished or was canceled | `-32602` (`InvalidParams`), "the task is not parked on the model"; nothing is written. A resume never answers a question |
 | a resume with no `taskId`, in a root context or a session's | `-32602`, "a resume names the task it resumes (taskId)" |
 | `CancelTask` | ends the park, as it ends any wait |
 
 A resume is authenticated as any message and cures nothing by itself: the call it repeats goes through the gateway, and a
 run still refused parks again.
 
+**A child's park is the root's** (decision 5). A local subagent's refusal parks the child the same way, and the run that
+waits on it learns of it by a notice (`adam.child.parked`), reads what the child waits on, and shows it:
+
+| The child | The root's task | Wakes |
+|---|---|---|
+| waits until woken | `input-required` with the child's reason | a message or a resume to the root |
+| waits on a timer | `working`, with the child's reason as a status message | its own look at the child every 60 s, a message, or a resume |
+
+A refusal of status 401 or 403 is the child's: the root's task is `working` with the reason when the child is on a timer,
+never `auth-required` (the gateway refused the child's call, not the root's). A message to the root is accepted; its text
+is the root's turn, added behind the call the child answers, and the root sends the child **one resume** with an id
+derived from the waking message's id, so a replayed step writes the same one; the child drops a copy it has read, so a
+replayed forward is no second call. A resume to the root is accepted as for a
+parked run, and goes down the same way, one level at a time: a child that waits on its own parked child forwards one to
+it. A resume to a root that has **settled** its child — the child finished and the root answered its call — is
+`NOT_PARKED`, as for any run that is not parked on the model; between the child's end and the root's next step the
+copy is still there, so a resume is accepted and consumed as the root settles the wait, which is harmless (the child
+is finished and nothing is woken). A client that binds runs learns of a **descendant's** refusal of status 401 or 403
+from the status message — the root shows `working` with the child's reason, not `auth-required` — and sends its
+resume to the **root**, which forwards it; otherwise a `ListTasks` with `status=auth-required` never returns the
+root.
+
 **Time.** A park on a timer waits 30 s, then twice as long at each park in a row, at most 15 minutes, and never less than
 the gateway asked (`Retry-After`). Parks on a timer in a row last at most `MODEL_PARK_LIMIT` (24 hours by default, from
 the first): past it the task **fails** with the last reason. A timer park counts against a child run's time limit. A park
 until woken never fails on its own and **pauses the run's deadline**, as a question does. A schedule's firing has nobody
 to wake it: a refusal that would wait until woken fails it, and so does a refusal of status 401 or 403, since nothing binds a
-firing at the gateway yet. A subagent's run is woken by nobody either (a resume reaches its task, not the child, until a
-later slice forwards one): a refusal that would wait until woken fails the child with the reason, and the parent's model
-gets an error result for the call. A subagent's park on a timer stays, bounded by `MODEL_PARK_LIMIT` and its time limit;
-the root's task shows no reason for it yet. A wait longer than what is left of `MODEL_PARK_LIMIT` ends at the limit.
+firing at the gateway yet. A local subagent's park until woken waits for its parent's resume: the parent shows it and
+wakes it through the task, and its deadline is paused while it waits. A subagent's park on a timer stays, bounded by
+`MODEL_PARK_LIMIT` and its time limit, and the root's task names its reason. A wait longer than what is left of
+`MODEL_PARK_LIMIT` ends at the limit.
 
 ## A new task that continues a finished one
 

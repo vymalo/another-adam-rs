@@ -488,6 +488,15 @@ impl Stored {
         }
     }
 
+    /// The agent state a reader sees: the whole state for a v4 run, the head (without the
+    /// transcript) for a v5 one.
+    pub(crate) fn agent(&self) -> &Value {
+        match self {
+            Self::Full(envelope) => &envelope.agent,
+            Self::Head(head) => &head.agent,
+        }
+    }
+
     /// The inbox, in the variant's own document.
     pub(crate) fn inbox_mut(&mut self) -> &mut Vec<Inbound> {
         match self {

@@ -12,11 +12,11 @@ use adam_core::{DynStore, JournalEntry, RunId, StoreError};
 
 use crate::agent::{AgentError, Inbound};
 use crate::cancel::CancelToken;
-use crate::child::{ChildStarter, ChildStatus, news_since};
+use crate::child::{ChildLook, ChildStarter, ChildStatus, RESUME_KIND, news_since};
 use crate::clock::DynClock;
 use crate::events::{Artifact, DynEventSink, RunEvent};
 use crate::retry::RetryPolicy;
-use crate::runtime::Runtime;
+use crate::runtime::{Runtime, RuntimeError};
 
 /// Journal name of [`Ctx::now_journaled`].
 const NOW_STEP: &str = "ctx.now";
@@ -661,6 +661,75 @@ impl Ctx {
                 AgentError::permanent(format!("the child's record is unreadable: {e}"))
             })?;
         Ok(Some(claimed.env.agent))
+    }
+
+    /// The child run `run` as one read answers it ([`ChildLook`]): its status and result, and the
+    /// head of its state — what a parent that waits on a child reads to see whether it finished and
+    /// what it waits on (ADR 0067 decision 5). **Not journaled**, like
+    /// [`child_status`](Self::child_status).
+    ///
+    /// One `load_run`: the head is not joined with its transcript, so a parent of a v5 child needs
+    /// none of the child's agent registered, and a child's history is never read.
+    ///
+    /// `Ok(None)` when the run does not exist (a child purged after it finished).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Permanent`] when `run` is not a child of this run, as for
+    /// [`child_status`](Self::child_status). A store failure is [`AgentError::Store`].
+    pub async fn child_look(&self, run: RunId) -> Result<Option<ChildLook>, AgentError> {
+        let Some(rec) = self.store.load_run(run).await.map_err(store_error)? else {
+            return Ok(None);
+        };
+        if rec.parent_id != Some(self.run) {
+            return Err(AgentError::permanent(format!(
+                "run {run} is not a child of run {}",
+                self.run
+            )));
+        }
+        Ok(Some(ChildLook::from_record(&rec)))
+    }
+
+    /// Wake a child of this run with a **resume** ([`RESUME_KIND`]): what a run that waits on a
+    /// child parked on the model sends it when a message or a resume woke the parent itself
+    /// (ADR 0067 decision 5). The words of a message stay with the parent, so this carries none:
+    /// the child makes the call it waited to make again, and reads nothing.
+    ///
+    /// `id` is the waking message's id, derived so that a step that runs again sends the same one;
+    /// a child that has ended meanwhile is no error (nothing to wake).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Permanent`] when `run` is not a child of this run: a run wakes its own
+    /// children and no others, as [`child_status`](Self::child_status) reads them. A store failure
+    /// is [`AgentError::Store`]; a lost race for the child's record is
+    /// [`Transient`](AgentError::Transient). A child whose record does not decode is nothing to
+    /// wake, not the parent's failure (a look at it reports the damage instead).
+    pub async fn resume_child(&self, run: RunId, id: impl Into<String>) -> Result<(), AgentError> {
+        let Some(rec) = self.store.load_run(run).await.map_err(store_error)? else {
+            return Ok(());
+        };
+        if rec.parent_id != Some(self.run) {
+            return Err(AgentError::permanent(format!(
+                "run {run} is not a child of run {}",
+                self.run
+            )));
+        }
+        let inbound = Inbound::new(RESUME_KIND, serde_json::json!({})).with_id(id.into());
+        match self.runtime.deliver(run, inbound).await {
+            Ok(()) => Ok(()),
+            // It ended between the read and the delivery: there is nothing left to wake.
+            Err(RuntimeError::Finished { .. } | RuntimeError::NotFound(_)) => Ok(()),
+            // Its record does not decode: nothing can be woken, and a child's damage does not fail
+            // the parent (as a look at a corrupt child reports it instead).
+            Err(e @ RuntimeError::Corrupt { .. }) => {
+                tracing::warn!(%run, error = %e, "the child's record is unreadable; nothing to wake");
+                Ok(())
+            }
+            Err(RuntimeError::Store(e)) => Err(AgentError::Store(e)),
+            Err(RuntimeError::Agent(e)) => Err(e),
+            Err(e) => Err(AgentError::transient(e)),
+        }
     }
 
     /// A handle for starting children of this run on the runtime that steps it: owned and cloneable,

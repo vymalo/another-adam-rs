@@ -28,9 +28,19 @@ fn model_wait(view: &RunView) -> Option<&Value> {
     view.state.get("model_wait").filter(|w| w.is_object())
 }
 
-/// Whether the run is parked on the model: parked, and its state holds a model wait. A run woken a
-/// moment ago, working on the call it waited to make, is not: it is `working`, and a resume says
-/// nothing to it (the contract's refusal, `NOT_PARKED`).
+/// The model wait of the child the run waits on (`/pending_wait/model_wait`, the copy
+/// `adam_llm_agent::PendingRun` keeps of it, ADR 0067 decision 5), when it has one. The loop keeps
+/// it up to date from the child's record at each look, so a task reads it from the head.
+fn child_model_wait(view: &RunView) -> Option<&Value> {
+    view.state
+        .pointer("/pending_wait/model_wait")
+        .filter(|w| w.is_object())
+}
+
+/// Whether the run is parked on the model: parked, and its own state holds a model wait **or** it
+/// waits on a child that has one (ADR 0067 decision 5: a parked child is shown through its parent
+/// and woken through it). A run woken a moment ago, working on the call it waited to make, is not:
+/// it is `working`, and a resume says nothing to it (the contract's refusal, `NOT_PARKED`).
 pub(crate) fn parked_on_model(view: &RunView) -> bool {
     parked_now(view).is_some()
 }
@@ -38,19 +48,26 @@ pub(crate) fn parked_on_model(view: &RunView) -> bool {
 /// Whether the run waits on the model, parked: what its task's state and message come from.
 fn parked_now(view: &RunView) -> Option<&Value> {
     (view.status == RunStatus::Parked)
-        .then(|| model_wait(view))
+        .then(|| model_wait(view).or_else(|| child_model_wait(view)))
         .flatten()
 }
 
 /// Whether the run is parked on a refusal of status 401 or 403: its task is `auth-required`.
+///
+/// Only the run's **own** wait counts: a child's refusal is shown on the root as `working` with
+/// its reason, never as `auth-required` (ADR 0067 decision 5: the root is not the run the gateway
+/// refused).
 pub(crate) fn needs_auth(view: &RunView) -> bool {
-    parked_now(view)
+    (view.status == RunStatus::Parked)
+        .then(|| model_wait(view))
+        .flatten()
         .and_then(|w| w.get("status"))
         .and_then(Value::as_u64)
         .is_some_and(|s| matches!(s, 401 | 403))
 }
 
-/// The reason of a run parked on the model, as its task's status message.
+/// The reason of a run parked on the model, its own wait's or the wait of the child it waits on,
+/// as its task's status message.
 pub(crate) fn reason(view: &RunView) -> Option<String> {
     parked_now(view)?
         .get("reason")?

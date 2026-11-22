@@ -734,7 +734,8 @@ impl RuntimeTaskBackend {
     /// A resume (`adam.resume: true`, ADR 0067) to the task `task_id`, already located: it wakes a
     /// run parked on the model and adds nothing to its conversation. Any other task, a finished or
     /// canceled one included, is refused with [`NOT_PARKED`](crate::NOT_PARKED), and nothing is
-    /// written.
+    /// written. A run that waits on a child parked on the model is parked on the model for this
+    /// purpose (decision 5): its own step forwards the resume to the child.
     pub(crate) async fn resume(
         &self,
         caller: &Caller,
@@ -874,7 +875,9 @@ impl RuntimeTaskBackend {
             return self.steer(caller, run, &context, inbound, task_id).await;
         }
         // A run parked on the model takes a message, timer or not (ADR 0067): its text is the
-        // person's turn, and the call is made again.
+        // person's turn, and the call is made again. So does a run that waits on a child parked on
+        // the model (decision 5): its text stays with this run, and one resume goes down to the
+        // child.
         if !view.waiting && !crate::model_park::parked_on_model(&view) {
             return Err(BackendError::InvalidParams(format!(
                 "task {task_id} is {state:?} and cannot take a follow-up"

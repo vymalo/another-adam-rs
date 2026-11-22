@@ -1131,7 +1131,8 @@ the contract is a separate deploy (see [deploy the coder](guides/deploy-the-code
 `Conversation` (`crates/adam-llm-agent/src/conversation.rs`) has `messages`, `turns`, `tool_calls`,
 `usage`, `pending_calls`, `pending_wait` (a question for the user, a child run or a remote task),
 `deferred`, `artifacts`, `announced`, `source_notes`, `continued_from`, `omitted_turns`, `context` and
-`read_ids`. Every field has a serde default, so older state still loads. Its `split` puts `messages`
+`read_ids` (the ids of the messages and the forwarded resumes the run read). Every field has a serde default,
+so older state still loads. Its `split` puts `messages`
 in the body and everything else in the head; `Agent::split`/`join` default to no split, and a wrapper
 that delegates `init` must delegate them too: a new run of a wrapper that does not stays in the v4
 format, and a **v5 run must split** — a successful step that returns `None` on a current head is a
@@ -1216,7 +1217,9 @@ stateDiagram-v2
 
 A subagent is a child run: an agent started by a tool of another agent, with its own history, tools and
 limits, whose final answer is the result of that tool call. The runtime supplies `start_child`, the
-`adam.run.finished` message, `Ctx::child_status` and `ToolError::AwaitRun`; no scheduler. A child with a
+`adam.run.finished` message, `Ctx::child_status`, `Ctx::child_look` and `ToolError::AwaitRun`; no scheduler. A
+child that parks tells its parent with `adam.child.parked`, and a parent wakes a child parked on the model
+through itself (`Ctx::resume_child`, ADR 0067 decision 5). A child with a
 conversation (a session round, ADR 0045) reports with `adam.child.reported` instead, and
 `start_child_continuing` starts it ([Child runs](reference/child-runs.md#sessions-adr-0045-slices-1-to-4)).
 
@@ -1234,13 +1237,24 @@ sequenceDiagram
     R->>DB: create_run with parent_id, or AlreadyExists (a replay)
     J-->>P: Err(AwaitRun { run: child }), journaled
     P->>DB: commit Park, wake_at = now + 60 s, pending_wait = { c1, child }
-    C->>DB: claim, step ... terminal commit, Done or Failed
+    C->>DB: claim, step ... the model refuses: Park, wake_at = None, model_wait
     Note over C,DB: before a step and on each poll of its cancel watch the child reads the parent.<br/>Parent Failed, the child fails as cancelled by the parent run ending.<br/>Past its deadline, the child fails as cancelled by its time limit.
+    C->>R: after the commit: notify_parent_parked
+    R->>DB: deliver to the parent: adam.child.parked, id = child id, no payload
+    DB-->>P: parent is Runnable, inbox holds the notice
+    P->>R: Ctx::child_look(child): its status and the head of its state
+    R->>DB: load_run(child)
+    P->>DB: commit Park, wake_at = None, pending_wait = { c1, child, model_wait }
+    Note over P,DB: the root's task is input-required with the child's reason
+    P->>R: a message or a resume arrives: Ctx::resume_child(child, derived id)
+    R->>DB: deliver adam.resume to the child (the words stay at the parent)
+    C->>DB: claim, the same model call again
+    C->>DB: step ... terminal commit, Done or Failed
     C->>R: after the commit: notify_parent
     R->>DB: deliver to the parent: adam.run.finished, id = child id,<br/>payload { status, output or error }
     DB-->>P: parent is Runnable, inbox holds the message
     P->>P: message matches pending_wait: it becomes the tool result
-    Note over P,DB: If the message never arrives: at wake_at the parent<br/>reads the child with Ctx::child_status and answers or parks again
+    Note over P,DB: If the message never arrives: at wake_at the parent<br/>reads the child with Ctx::child_look and answers or parks again.<br/>A child on a timer keeps that wake, and one until woken has none.
 ```
 
 ```mermaid
@@ -1253,12 +1267,21 @@ stateDiagram-v2
     Waiting --> Answered: timer wake, and the child no longer exists (an error result)
     Waiting --> Waiting: timer wake, the child is still working (one read, new timer)
     Waiting --> Waiting: a user message or a stray notice arrives (nothing answers, new timer)
+    Waiting --> WaitingOnPark: adam.child.parked, the child waits until it is woken (no timer)
+    Waiting --> Waiting: adam.child.parked, the child waits on a timer (its reason kept, new timer)
+    WaitingOnPark --> Waiting: a message or a resume arrives: one resume goes down, the copy is cleared, a new timer
+    WaitingOnPark --> WaitingOnPark: a copy of a resume it read arrives: no call, the same wait
+    WaitingOnPark --> Answered: adam.run.finished for this child arrives
+    WaitingOnPark --> Cancelled: the parent is cancelled
     Waiting --> Cancelled: the parent is cancelled (its child follows when its worker next looks)
     Answered --> [*]: tool result is the child's text, or an error result
     Cancelled --> [*]
 ```
 
-The message is a hint; the parent's timer (`wait_poll`, 60 s) is the guarantee. The child id is derived
+The message is a hint; the parent's timer (`wait_poll`, 60 s) is the guarantee. A child parked on the model
+until it is woken is the one wait without a timer: such a child cannot finish on its own, so the parent parks
+with no timer too and its task says the reason, and a message or a resume to the root wakes the child through
+it (ADR 0067 decision 5). The child id is derived
 (`child_run_id(parent, key)`), so a tool that runs again asks for the same child. Cancelling a parent does
 cancel its children: a child whose parent is `Failed` is failed by its own worker, and a child started
 within a time limit is failed past it ([Cancel cascades](reference/child-runs.md#cancel-cascades-and-time-limits)). A

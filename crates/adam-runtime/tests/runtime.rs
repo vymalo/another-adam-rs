@@ -23,11 +23,11 @@ use adam_core::{
     ClaimScope, DynStore, JournalEntry, MemoryStore, NewRun, RunId, RunStatus, RunUpdate,
 };
 use adam_runtime::{
-    Agent, AgentError, AgentStarter, Artifact, BroadcastSink, CHILD_REPORTED_KIND, ChildStatus,
-    Classify, Clock, CollectingSink, Ctx, FileSource, Inbound, LocalNotifier, MAX_RETRY_AFTER,
-    ManualClock, RUN_FINISHED_KIND, RetryPolicy, RoundOutcome, RunEvent, RunView, Runtime,
-    RuntimeBuilder, RuntimeError, SessionState, Transition, child_run_id,
-    parse_session_conversation_id, session_conversation_id,
+    Agent, AgentError, AgentStarter, Artifact, BroadcastSink, CHILD_PARKED_KIND,
+    CHILD_REPORTED_KIND, ChildStatus, Classify, Clock, CollectingSink, Ctx, FileSource, Inbound,
+    LocalNotifier, MAX_RETRY_AFTER, ManualClock, RUN_FINISHED_KIND, RetryPolicy, RoundOutcome,
+    RunEvent, RunView, Runtime, RuntimeBuilder, RuntimeError, SessionState, Transition,
+    child_run_id, parse_session_conversation_id, session_conversation_id,
 };
 use adam_store_testkit::counting::CountingStore;
 use adam_store_testkit::fault::{FaultyStore, Method};
@@ -5141,6 +5141,17 @@ mod cases {
         })
         .await;
         wait_for(&rt, child, "the child waiting", |v| v.waiting).await;
+        // The child's park wakes the parent, which looks at it once and parks again: the cancel
+        // must find it after that look, or the look reads the end from the store instead of the
+        // notice. The look is phase 1 of the parent's step; its park is the next one.
+        wait_until("the parent's look at the parked child", || {
+            count(&watch.resumes) == 1
+        })
+        .await;
+        wait_for(&rt, parent, "the parent parked after its look", |v| {
+            v.status == RunStatus::Parked
+        })
+        .await;
         rt.cancel(child, "not needed").await.expect("cancel");
         let done = wait_done(&rt, parent).await;
         worker.stop().await;
@@ -5933,6 +5944,114 @@ mod cases {
         );
     }
 
+    /// A child that parks tells its parent once, and the runtime's own look at the parked child —
+    /// which parks it again without stepping it — tells it nothing more (ADR 0067 decision 5): a
+    /// notice per park, never per heartbeat. The notice names the child, as its finished notice
+    /// does.
+    pub async fn a_parked_child_tells_its_parent_once_and_a_look_tells_it_nothing(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let parks = Arc::new(AtomicUsize::new(0));
+        let cell = RtCell::default();
+        let parent_agent = {
+            let (parks, cell, child_name) = (parks.clone(), cell.clone(), child_name.clone());
+            fn_agent(
+                &name,
+                step_fn(move |ctx, state| {
+                    let (parks, cell, child_name) =
+                        (parks.clone(), cell.clone(), child_name.clone());
+                    async move {
+                        let parent = ctx.run_id();
+                        if state["phase"] != json!(1) {
+                            let rt = cell.get().expect("the runtime is set").clone();
+                            let child = child_run_id(parent, "call-1");
+                            let made: Result<bool, String> = ctx
+                                .step("start-child", move || async move {
+                                    rt.start_child(parent, child, &child_name, inbound())
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                })
+                                .await?;
+                            made.map_err(AgentError::permanent)?;
+                            return Ok(Transition::Park {
+                                state: json!({"phase": 1}),
+                                wake_at: None,
+                            });
+                        }
+                        let inbox = ctx.take_inbox();
+                        let notice = inbox.iter().find(|i| i.kind == CHILD_PARKED_KIND);
+                        parks.fetch_add(usize::from(notice.is_some()), SeqCst);
+                        let mut state = state;
+                        if let Some(notice) = notice {
+                            state["notice"] = json!(notice.id);
+                        }
+                        Ok(Transition::Park {
+                            state,
+                            wake_at: None,
+                        })
+                    }
+                    .boxed()
+                }),
+            )
+        };
+        let child_agent = {
+            let child_name = child_name.clone();
+            fn_agent(
+                &child_name,
+                step_fn(|ctx, state| {
+                    async move {
+                        let _: Result<u32, String> = ctx.step("work", || async { Ok(1) }).await?;
+                        Ok(Transition::Park {
+                            state,
+                            wake_at: None,
+                        })
+                    }
+                    .boxed()
+                }),
+            )
+        };
+        let clock = ManualClock::new();
+        let rt = family(&store, &parent_agent, &child_agent, &cell, &clock);
+        let parent = rt.start(&name, inbound(), None).await.expect("start");
+        let child = child_run_id(parent, "call-1");
+        let worker = spawn_worker(&rt);
+        // The parent starts the child in its first step, then parks: the child exists by then.
+        wait_waiting(&rt, parent).await;
+        wait_waiting(&rt, child).await;
+        // The notice wakes the parent, which reads it and parks again.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = rt.state(parent).await.expect("state").expect("the parent");
+            if state["notice"] == json!(child.to_string()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the parent never recorded the notice: {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(count(&parks), 1, "one notice, read once");
+
+        let mut version = rt.view(child).await.unwrap().unwrap().version;
+        for _ in 0..3 {
+            let seen = version;
+            clock.advance(Duration::from_secs(61));
+            version = wait_for(&rt, child, "woken and parked again", |v| v.version > seen)
+                .await
+                .version;
+        }
+        worker.stop().await;
+        assert_eq!(count(&parks), 1, "one notice per park, never per look");
+        let parent = rt.view(parent).await.unwrap().unwrap();
+        assert_eq!(parent.status, RunStatus::Parked);
+        assert!(parent.waiting, "the parent still waits on its child");
+        assert_eq!(parent.pending_inbox, 0, "and has nothing left to read");
+        assert_eq!(
+            rt.view(child).await.unwrap().unwrap().status,
+            RunStatus::Parked
+        );
+    }
+
     /// P starts a session round R and finishes `Done`; retention purges P; R still works and
     /// finishes: a parent that is not in the store is unknown, not ended.
     pub async fn a_done_parent_that_was_purged_leaves_its_open_child_running(store: DynStore) {
@@ -6489,15 +6608,18 @@ mod cases {
         );
     }
 
-    /// `Ctx::child_status` reads the caller's own children, and nobody else's: an unrelated run
-    /// is an error, a run that does not exist is `None`.
+    /// `Ctx::child_status`, `Ctx::child_look` and `Ctx::resume_child` read and wake the caller's
+    /// own children, and nobody else's: an unrelated run is an error, a run that does not exist is
+    /// `None` (and waking it is nothing).
     pub async fn child_status_reads_only_the_callers_children(store: DynStore) {
         let (name, child_name, other_name) = (uniq("parent"), uniq("child"), uniq("other"));
         let agent = fn_agent(
             &name,
             step_fn(|ctx, state| {
                 async move {
-                    if ctx.take_inbox().is_empty() {
+                    // A child's park notice is a wake-up, not the message this case waits for.
+                    let inbox = ctx.take_inbox();
+                    if !inbox.iter().any(|i| i.kind == "start") {
                         return Ok(Transition::Park {
                             state,
                             wake_at: None,
@@ -6505,15 +6627,42 @@ mod cases {
                     }
                     let child: RunId = serde_json::from_value(state["child"].clone()).unwrap();
                     let other: RunId = serde_json::from_value(state["other"].clone()).unwrap();
+                    let corrupt: RunId =
+                        serde_json::from_value(state["corrupt"].clone()).unwrap();
                     let own = ctx.child_status(child).await?;
+                    let own_look = ctx.child_look(child).await?;
                     let stranger = ctx.child_status(other).await;
+                    let stranger_look = ctx.child_look(other).await;
+                    let stranger_wake = ctx.resume_child(other, "r-1").await;
                     let missing = ctx.child_status(RunId::new()).await?;
+                    let missing_look = ctx.child_look(RunId::new()).await?;
+                    let missing_wake = ctx.resume_child(RunId::new(), "r-2").await;
+                    // A child whose record does not decode is nothing to wake: not the parent's
+                    // failure, as a look at it reports the damage instead.
+                    let corrupt_wake = ctx.resume_child(corrupt, "r-3").await;
+                    let corrupt_look = ctx.child_look(corrupt).await?;
                     Ok(Transition::Done {
                         state,
                         output: json!({
                             "own": own,
+                            "own_look": own_look.map(|look| json!({
+                                "status": look.status,
+                                "head": look.head,
+                            })),
                             "stranger_is_permanent": matches!(stranger, Err(AgentError::Permanent { .. })),
+                            "stranger_look_is_permanent": matches!(stranger_look, Err(AgentError::Permanent { .. })),
+                            "stranger_wake_is_permanent": matches!(stranger_wake, Err(AgentError::Permanent { .. })),
                             "missing": missing,
+                            "missing_look": missing_look.map(|look| json!({
+                                "status": look.status,
+                                "head": look.head,
+                            })),
+                            "missing_wake_is_nothing": missing_wake.is_ok(),
+                            "corrupt_wake_is_nothing": corrupt_wake.is_ok(),
+                            "corrupt_look": corrupt_look.map(|look| json!({
+                                "status": look.status,
+                                "head": look.head,
+                            })),
                         }),
                     })
                 }
@@ -6526,14 +6675,29 @@ mod cases {
             .build();
         let child = RunId::new();
         let other = RunId::new();
+        let corrupt = RunId::new();
         let parent = rt
             .start(
                 &name,
-                Inbound::new("start", json!({"child": child, "other": other})),
+                Inbound::new(
+                    "start",
+                    json!({"child": child, "other": other, "corrupt": corrupt}),
+                ),
                 None,
             )
             .await
             .expect("start");
+        // A child of the parent whose state is not an envelope this build can read. It is parked,
+        // so no worker claims it and fails it: the record stays unreadable for the accessors.
+        store
+            .create_run(
+                NewRun::new(&other_name, json!({"v": 99}))
+                    .with_id(corrupt)
+                    .parent(parent)
+                    .status(RunStatus::Parked),
+            )
+            .await
+            .expect("corrupt child");
         rt.start_child(parent, child, &child_name, inbound())
             .await
             .expect("child");
@@ -6550,8 +6714,27 @@ mod cases {
         worker.stop().await;
         let out = done.output.expect("output");
         assert_eq!(out["own"], json!({"status": "parked"}));
+        assert_eq!(
+            out["own_look"],
+            json!({"status": {"status": "parked"}, "head": {}})
+        );
         assert_eq!(out["stranger_is_permanent"], true);
+        assert_eq!(out["stranger_look_is_permanent"], true);
+        assert_eq!(out["stranger_wake_is_permanent"], true);
         assert_eq!(out["missing"], Value::Null);
+        assert_eq!(out["missing_look"], Value::Null);
+        assert_eq!(out["missing_wake_is_nothing"], true);
+        assert_eq!(out["corrupt_wake_is_nothing"], true);
+        // The look reports the damage instead: the record's own status, and no head.
+        assert_eq!(
+            out["corrupt_look"]["status"]["status"],
+            json!("parked"),
+            "{}",
+            out["corrupt_look"]
+        );
+        assert!(out["corrupt_look"]["head"].is_null());
+        // The stranger was not woken by the refused call: it still waits for a message.
+        assert!(rt.view(other).await.unwrap().unwrap().waiting);
     }
 
     /// A finished child that was purged before its parent looked is reported, not waited for.
@@ -6593,6 +6776,84 @@ mod cases {
         let done = wait_done(&front, parent).await;
         front_worker.stop().await;
         assert_eq!(done.output.expect("output")["via"], "gone");
+    }
+
+    /// `Ctx::resume_child` delivers a resume the caller makes to its own child, under the id it
+    /// was given, and the child reads it as a wake-up (ADR 0067 decision 5). The accessor's refusal
+    /// of a run that is not the caller's child is in `child_status_reads_only_the_callers_children`.
+    pub async fn resume_child_wakes_the_callers_child_with_its_id(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let seen = Arc::new(Mutex::new(Vec::<Inbound>::new()));
+        let child_agent = {
+            let seen = seen.clone();
+            fn_agent(
+                &child_name,
+                step_fn(move |ctx, state| {
+                    let seen = seen.clone();
+                    async move {
+                        let inbox = ctx.take_inbox();
+                        if inbox.is_empty() {
+                            return Ok(Transition::Park {
+                                state,
+                                wake_at: None,
+                            });
+                        }
+                        seen.lock().unwrap().extend(inbox);
+                        Ok(Transition::Done {
+                            state,
+                            output: json!(null),
+                        })
+                    }
+                    .boxed()
+                }),
+            )
+        };
+        let cell = RtCell::default();
+        let parent_agent = {
+            let (child_name, cell) = (child_name.clone(), cell.clone());
+            fn_agent(
+                &name,
+                step_fn(move |ctx, state| {
+                    let (child_name, cell) = (child_name.clone(), cell.clone());
+                    async move {
+                        let parent = ctx.run_id();
+                        let child = child_run_id(parent, "call-1");
+                        if state["phase"] != json!(1) {
+                            let rt = cell.get().expect("the runtime is set").clone();
+                            let made: Result<bool, String> = ctx
+                                .step("start-child", move || async move {
+                                    rt.start_child(parent, child, &child_name, inbound())
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                })
+                                .await?;
+                            made.map_err(AgentError::permanent)?;
+                            ctx.resume_child(child, "r-1").await?;
+                            return Ok(Transition::Park {
+                                state: json!({"phase": 1}),
+                                wake_at: None,
+                            });
+                        }
+                        Ok(Transition::Done {
+                            state,
+                            output: json!(null),
+                        })
+                    }
+                    .boxed()
+                }),
+            )
+        };
+        let clock = ManualClock::new();
+        let rt = family(&store, &parent_agent, &child_agent, &cell, &clock);
+        let parent = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, parent).await;
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!(null)));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].kind, adam_runtime::RESUME_KIND);
+        assert_eq!(seen[0].id, "r-1");
     }
 
     /// A finished-child message only means something to the run it is addressed to: to an
@@ -8323,6 +8584,7 @@ macro_rules! runtime_suite {
                 a_child_parked_on_a_question_is_cancelled_when_its_parent_is,
                 a_grandchild_under_a_parked_child_follows,
                 a_healthy_parked_child_is_woken_without_stepping_the_agent,
+                a_parked_child_tells_its_parent_once_and_a_look_tells_it_nothing,
                 a_done_parent_that_was_purged_leaves_its_open_child_running,
                 a_child_waiting_for_a_person_keeps_its_time_for_when_it_works,
                 a_wake_before_the_deadline_parks_again_without_stepping,
@@ -8333,6 +8595,7 @@ macro_rules! runtime_suite {
                 the_cancel_watch_polls_at_its_own_interval,
                 a_parent_that_loses_its_lease_does_not_start_or_resume_twice,
                 child_status_reads_only_the_callers_children,
+                resume_child_wakes_the_callers_child_with_its_id,
                 a_purged_child_reads_as_gone,
                 the_notice_is_an_ordinary_inbound_with_the_childs_id,
                 a_run_continues_a_finished_run_from_a_start_only_front,
