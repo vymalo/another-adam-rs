@@ -27,6 +27,7 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 | `RuntimeTaskBackend::list` (`TaskBackend::list`), `MAX_SCAN` | `ListTasks`: the caller's tasks, newest update first, by keyset cursor; see *Listing tasks* |
 | `MAX_TOKEN_COUNT` | the largest count a `usage/v1` report or total carries (2^53 - 1); see *Usage* |
 | `RuntimeTaskBackend::with_access_tiers(AccessTiers)`, `CONTEXT_ACCESS_TIER` | `access-tier/v1`: the backend reads the tier of a message that activated the extension, refuses a bad one, and says the tier a task works under; the tier is the run's context key `vymalo.accessTier` = `{"tier": ..}`; see *The access tier* |
+| `CONTEXT_LOCALE` | `locale/v1`: the person's interface language of the **latest message that activated the extension**, the run's context key `vymalo.locale` = `"fr-CM"` (a bare BCP 47 tag), set from `metadata[URI] = {"locale": "<tag>"}` and **cleared** by an activated message that names none (or names a malformed tag, which is refused rather than passed on); one of `adam_llm_agent::PROTECTED_CONTEXT_KEYS`, so a dropped context does not take it; a request that did not activate the extension changes nothing; see *The interface language* |
 | `RemoteCommand`, `CommandRefusal`, `Commands::add_remote(name, Arc<dyn RemoteCommand>)`, `Commands::expand_any`, `Commands::served()`, `Commands::refuse_prefix(prefix, why)` | a command whose text is **asked** when a message names it (an MCP server's prompt): the source gets the argument text as typed, trimmed (`expand(&str)`, and maps it itself), the source answers, and the answer is held to the same limits and `(typed)` marking and stored like a template's expansion. `CommandRefusal::Invalid` is `invalid params`, `Unavailable` the A2A `unavailable` error; a name the agent already has is not replaced (`add_remote` returns `false`). `refuse_prefix` makes a process that cannot serve a family of commands (a control plane has no MCP server) answer `invalid params` with a sentence of its own to `/<prefix>...` (typed or in the metadata) instead of letting it reach the model as text; `is_empty()` counts the refusals. `is_format_or_control` now lives in `adam-agent-fs` and is re-exported here. **Breaking:** the crate-private `apply` is async, and `Commands`' `PartialEq` compares a remote command by pointer |
 | `RuntimeTaskBackend::with_commands(Commands)`, `Commands`, `Commands::from_manifest(&[adam_agent_fs::Command])` (the one place a manifest becomes the backend's commands, used by `adam-agent` and `adam-coder`; this crate gained the `adam-agent-fs` dependency for it), `MAX_COMMAND_ARGUMENTS`, `MAX_COMMAND_EXPANSION` | `commands/v1`: the backend expands a message that names a command the agent serves, in this request, and stores the expansion; see *Commands*. An empty `Commands` is the same as none |
 | `RuntimeTaskBackend::with_child_sessions(ChildSessions)`, `ChildSessions::new(agents, max_open)`, `.with_max_rounds(n)`, `.card_extension()`, `.agents()`, `RuntimeTaskBackend::child_sessions()` (what the backend serves, `None` when never given or refused), `ChildSessionAgent::new(name, agent, description)` + `.within(duration)` + `.remote()` (a helper whose rounds work on another agent's task: a cancel of its round, or an idle expiry, is followed by a closing round that a worker steps and that sends the remote `CancelTask`; a kept-open session stays open) (and `adam_a2a::ChildSessionInfo::new(name, description)`; all three types are `#[non_exhaustive]`), `MAX_DESCRIPTION_CHARS`, `MAX_SESSION_ROUNDS` (a close is always allowed, even at the limit) | `child-sessions/v1`: a client that activates it sees the agent's sessions on the parent task, follows each round as a task of a child context, and starts, talks to, stops and closes a session; see *Child sessions*. A helper whose `agent` is not registered on the runtime is logged (`error!`) and the extension is not served. `card_extension()` is what the card lists (`None` when the contract's bounds are not met). Wired by `adam-assembly` (`AgentDef::child_sessions`), `adam-service` (`Agents::child_sessions`) and the shipped agents |
@@ -505,6 +506,29 @@ neither carries no metadata, and a task with tokens only carries the object it a
 | a backend with no `with_access_tiers` | never reads or says a tier |
 
 Unit tests in `src/tier.rs` (the validation sentences, the context) and `tests/access_tier.rs` (a real `Runtime` and `LlmAgent`: the tier reaches the run and the task, the first frame and `GetTask` say it, a caller that did not activate it reads none, every kind of bad tier is `InvalidParams` and writes no run, a message that did not activate it carries no tier and an activated reader is told the default, a backend with no tiers reads none, and a tier changed by a message sent while the task works is said once on the stream).
+
+## The interface language
+
+`locale/v1` ([ADR 0069](../../docs/decisions/0069-the-interface-language-is-a-hint-and-a-hint-is-all-it-is.md)). The backend reads it in
+`submit`, right after the inbound function and beside the tier, for an agent whose card lists the extension
+(`ExtensionConfig::locale`):
+
+| | |
+|---|---|
+| A message whose request **activated** the extension | may carry `metadata[URI] = {"locale": "<BCP 47 tag>"}`. The tag is validated and bounded (`adam_a2a::Locale`, RFC 5646's `langtag`, at most 64 bytes) and becomes the run's inbound context key `vymalo.locale` (`CONTEXT_LOCALE`), a bare string, merged like any key: the **newest message that names one wins** from the agent's next step |
+| an activated message that names **none**, or a malformed tag | the key is set to `null`, which deletes it: a run never answers in the language of a message that is no longer the newest, and a malformed tag is refused rather than passed on. Never an empty string |
+| a message that did **not** activate it | nothing is read, whatever its metadata says; the context is untouched |
+| the protection | the key is one of `adam_llm_agent::PROTECTED_CONTEXT_KEYS`: a message whose context is over `MAX_CONTEXT_BYTES` and dropped keeps it (a test in `adam-llm-agent` proves it), so a large catalog never costs the person their language |
+| never a refusal | the hint is optional: a payload that cannot carry a context is left as it is, and no message is refused for it |
+
+What the agent does with the key is the prompt's rule (the coder's `agent/instructions.md`): answer in that language, follow the person when
+they write in another one, and never write a string a person must trust (a consent, a payment) from it. The hint is not a translation layer
+and not a filter: a well-formed tag the card does not name is still read.
+
+Unit tests in `src/vymalo.rs` (the tag in the context, the clear for none and for a malformed one, the untouched context of a request that did
+not activate it, any payload shape, and the key's identity with `adam_llm_agent::LOCALE_CONTEXT_KEY` and its place among the protected keys)
+and `tests/vymalo.rs` (a real `Runtime` and `LlmAgent`: the tag reaches the run, a request that did not activate it leaves it, and an
+activated message that names none takes it away from the next job of the thread).
 
 ## Commands
 

@@ -124,17 +124,27 @@ pub const REASONING_EFFORT_CONTEXT_KEY: &str = "vymalo.reasoningEffort";
 /// behind it, which is a limit on what it may ask for.
 pub const CALLER_CONTEXT_KEY: &str = "vymalo.caller";
 
-/// The context keys that carry a **limit on the agent**: the access tier the person picked, who the
-/// message was sent for, the reasoning effort it activated, and that nobody answers the run
-/// (`adam_runtime::UNATTENDED_CONTEXT_KEY`). A message always sets them, even when the rest of its
-/// context is over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large catalog next to a `plan`
-/// tier would lift the limit), and a child run starts with the ones its parent has
+/// The context key under which a message carries the person's **interface language**
+/// (`locale/v1`, ADR 0069): the BCP 47 tag the client sent with that message, as a string
+/// (`"fr-CM"`). It is the language the agent's own words are written in, unless the person writes
+/// in another one. A message that names none clears it, so a run never answers in the language of
+/// a message that is no longer the newest.
+pub const LOCALE_CONTEXT_KEY: &str = "vymalo.locale";
+
+/// The context keys that must survive a context the run drops: the **limits on the agent** (the
+/// access tier the person picked, who the message was sent for, the reasoning effort it activated,
+/// and that nobody answers the run, `adam_runtime::UNATTENDED_CONTEXT_KEY`) and the **interface
+/// language** the person is speaking ([`LOCALE_CONTEXT_KEY`]). A message always sets them, even
+/// when the rest of its context is over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large
+/// catalog next to a `plan` tier would lift the limit, or the agent would answer in a language it
+/// picked itself), and a child run starts with the ones its parent has
 /// ([`ToolCtx::start_child`](crate::ToolCtx::start_child)). Each value is at most
 /// [`MAX_PROTECTED_VALUE_BYTES`]; a larger one is ignored.
 pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[
     ACCESS_TIER_CONTEXT_KEY,
     CALLER_CONTEXT_KEY,
     REASONING_EFFORT_CONTEXT_KEY,
+    LOCALE_CONTEXT_KEY,
     adam_runtime::UNATTENDED_CONTEXT_KEY,
 ];
 

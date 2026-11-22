@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    ACCESS_TIER_CONTEXT_KEY, CALLER_CONTEXT_KEY, Conversation, LlmAgent, LlmAgentBuilder,
-    MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_SOURCE_TOOLS, PendingQuestion, PendingWait,
-    REASONING_EFFORT_CONTEXT_KEY, SourceCtx, Tool, ToolAccess, ToolCtx, ToolError, ToolOutput,
-    ToolSource, user_message,
+    ACCESS_TIER_CONTEXT_KEY, CALLER_CONTEXT_KEY, Conversation, LOCALE_CONTEXT_KEY, LlmAgent,
+    LlmAgentBuilder, MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_SOURCE_TOOLS,
+    PendingQuestion, PendingWait, REASONING_EFFORT_CONTEXT_KEY, SourceCtx, Tool, ToolAccess,
+    ToolCtx, ToolError, ToolOutput, ToolSource, user_message,
 };
 use adam_model::{DynModel, Message, MockModel, ReasoningEffort, ToolCall, ToolSpec};
 use adam_runtime::{Inbound, ManualClock, RetryPolicy, RunView, Runtime};
@@ -531,6 +531,29 @@ fn a_limit_the_person_set_is_kept_when_the_rest_of_the_context_is_dropped() {
         Value::Object(c.context.clone()),
         json!({CALLER_CONTEXT_KEY: asked})
     );
+}
+
+/// The interface language is not a limit on the agent, but it is what the person is speaking: a
+/// message whose context is over the limit and dropped must not take it away, or the next turn
+/// answers in a language the model picked itself (ADR 0069).
+#[test]
+fn the_interface_language_survives_a_context_that_is_dropped() {
+    let obj = |v: Value| v.as_object().cloned().unwrap();
+    let mut c = Conversation::new("t");
+    assert!(c.merge_context(&obj(json!({LOCALE_CONTEXT_KEY: "fr-CM"}))));
+    // A catalog that does not fit: everything but the protected keys is dropped, the language is not.
+    assert!(!c.merge_context(&obj(json!({"catalog": "x".repeat(MAX_CONTEXT_BYTES)}))));
+    assert_eq!(c.context[LOCALE_CONTEXT_KEY], json!("fr-CM"));
+    // A context that is already full still takes it: it does not count toward the limit.
+    let mut full = Conversation::new("t");
+    let room = MAX_CONTEXT_BYTES - serde_json::to_vec(&json!({"k": ""})).unwrap().len();
+    assert!(full.merge_context(&obj(json!({"k": "x".repeat(room)}))));
+    assert!(!full.merge_context(&obj(json!({"more": 1}))));
+    assert!(full.merge_context(&obj(json!({LOCALE_CONTEXT_KEY: "ybb-CM"}))));
+    assert_eq!(full.context[LOCALE_CONTEXT_KEY], json!("ybb-CM"));
+    // `null` removes it, like any key: a message that names no language clears the one before.
+    assert!(full.merge_context(&obj(json!({LOCALE_CONTEXT_KEY: null}))));
+    assert!(!full.context.contains_key(LOCALE_CONTEXT_KEY));
 }
 
 #[test]

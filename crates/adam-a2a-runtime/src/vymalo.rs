@@ -5,7 +5,10 @@
 use std::collections::HashMap;
 
 use a2a::{Message, Part, PartContent};
-use adam_a2a::{A2UI_MEDIA_TYPE, MENTIONS_EXTENSION, THREAD_TOOLS_EXTENSION, UI_CATALOG_EXTENSION};
+use adam_a2a::{
+    A2UI_MEDIA_TYPE, Caller, LOCALE_EXTENSION, Locale, MENTIONS_EXTENSION, THREAD_TOOLS_EXTENSION,
+    UI_CATALOG_EXTENSION,
+};
 use adam_runtime::Inbound;
 use serde_json::{Map, Number, Value, json};
 
@@ -46,6 +49,14 @@ const MAX_CATALOG_ID_BYTES: usize = 256;
 /// expires at `expiresAt`.
 pub const CONTEXT_THREAD_TOOLS: &str = "vymalo.threadTools";
 
+/// The context key of the person's **interface language** (`locale/v1`, ADR 0069): the BCP 47 tag
+/// the client sent with this message, as a string (`"fr-CM"`). It is the language the agent's own
+/// words are written in, unless the person writes in another one. Set from an activated message,
+/// cleared by an activated message that names none, and one of
+/// `adam_llm_agent::PROTECTED_CONTEXT_KEYS` (a test keeps the two equal): a message whose context
+/// is too large and dropped does not take the language the person is speaking with it.
+pub const CONTEXT_LOCALE: &str = "vymalo.locale";
+
 /// The context key of the agents the person mentioned in the **latest message**:
 /// `{mentions: [{agentId, label, start?, end?, name?, cardUrl?}], coordinate?: {tool}}`
 /// (`mentions/v1`). A message that carries the orchestration layer's extensions but no mentions sets
@@ -76,6 +87,45 @@ const MAX_FORM_CONTEXT_BYTES: usize = 16 * 1024;
 
 /// The largest whole number a double holds exactly (2^53 - 1): what a catalog may contain.
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// Put the interface language `message` names into the context `inbound` carries to the run, when
+/// the request **activated** [`LOCALE_EXTENSION`] (`locale/v1`, ADR 0069).
+///
+/// The tag becomes the context key [`CONTEXT_LOCALE`], a bare string (`"fr-CM"`). A message that
+/// activated the extension and names none — or names a tag that is not well formed — **clears** the
+/// language an earlier message set (a `null`, which deletes the key): a run never answers in a
+/// language the newest message did not ask for, and a malformed tag is refused rather than passed
+/// on. A request that did not activate the extension changes nothing, whatever the metadata says.
+///
+/// It never refuses a message: the hint is optional, so a payload that cannot carry a context is
+/// left as it is.
+pub(crate) fn locale_into(caller: &Caller, message: &Message, inbound: &mut Inbound) {
+    if !caller.has_extension(LOCALE_EXTENSION) {
+        return;
+    }
+    let hint = Locale::of_request(caller, message);
+    if let Value::String(text) = &inbound.payload {
+        inbound.payload = json!({ "text": text });
+    }
+    let Some(payload) = inbound.payload.as_object_mut() else {
+        return;
+    };
+    let Some(context) = payload
+        .entry("context")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+    else {
+        return;
+    };
+    match hint {
+        Some(locale) => {
+            context.insert(CONTEXT_LOCALE.to_owned(), json!(locale.as_str()));
+        }
+        None => {
+            context.insert(CONTEXT_LOCALE.to_owned(), Value::Null);
+        }
+    }
+}
 
 /// The inbound function of an agent that serves a screen: pass it to
 /// [`RuntimeTaskBackend::with_inbound`](crate::RuntimeTaskBackend::with_inbound).
@@ -681,6 +731,92 @@ mod tests {
             Role::User,
             vec![a2ui_part(json!([{"version": "1.0", "action": action}]))],
         )
+    }
+
+    fn activated() -> Caller {
+        Caller::new("token-0").with_extensions([LOCALE_EXTENSION])
+    }
+
+    fn context_after(caller: &Caller, metadata: Value) -> Option<Value> {
+        let message = with_metadata(text_message("bonjour"), metadata);
+        let mut inbound = Inbound::new("message", json!({ "text": "bonjour" }));
+        locale_into(caller, &message, &mut inbound);
+        inbound
+            .payload
+            .get("context")
+            .map(|c| c[CONTEXT_LOCALE].clone())
+    }
+
+    #[test]
+    fn an_activated_message_puts_its_interface_language_in_the_context() {
+        assert_eq!(
+            context_after(&activated(), json!({LOCALE_EXTENSION: {"locale": "fr-CM"}})),
+            Some(json!("fr-CM"))
+        );
+        // Unknown members of the entry are ignored.
+        assert_eq!(
+            context_after(
+                &activated(),
+                json!({LOCALE_EXTENSION: {"locale": "ybb-CM", "why": "the person's"}})
+            ),
+            Some(json!("ybb-CM"))
+        );
+    }
+
+    #[test]
+    fn an_activated_message_that_names_none_clears_the_language() {
+        // Never an empty string, never a malformed tag passed on: the key is cleared.
+        for entry in [
+            json!({}),
+            json!({LOCALE_EXTENSION: {}}),
+            json!({LOCALE_EXTENSION: {"locale": ""}}),
+            json!({LOCALE_EXTENSION: {"locale": "fr CM"}}),
+            json!({LOCALE_EXTENSION: {"locale": 3}}),
+            json!({LOCALE_EXTENSION: "fr-CM"}),
+        ] {
+            assert_eq!(
+                context_after(&activated(), entry.clone()),
+                Some(Value::Null),
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_that_did_not_activate_the_extension_is_read_as_it_always_was() {
+        let plain = Caller::new("token-0");
+        for entry in [json!({LOCALE_EXTENSION: {"locale": "fr-CM"}}), json!({})] {
+            let message = with_metadata(text_message("bonjour"), entry.clone());
+            let mut inbound = Inbound::new("message", json!({ "text": "bonjour" }));
+            locale_into(&plain, &message, &mut inbound);
+            assert!(
+                inbound.payload["context"].get(CONTEXT_LOCALE).is_none(),
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_language_reaches_a_payload_of_any_shape_and_never_refuses_one() {
+        // A bare string payload becomes an object, as the tier's does.
+        let message = with_metadata(
+            text_message("bonjour"),
+            json!({LOCALE_EXTENSION: {"locale": "wes-CM"}}),
+        );
+        let mut inbound = Inbound::new("message", json!("bonjour"));
+        locale_into(&activated(), &message, &mut inbound);
+        assert_eq!(inbound.payload["text"], "bonjour");
+        assert_eq!(inbound.payload["context"][CONTEXT_LOCALE], "wes-CM");
+        // A payload that cannot carry a context is left as it is, never refused.
+        let mut inbound = Inbound::new("message", json!(3));
+        locale_into(&activated(), &message, &mut inbound);
+        assert_eq!(inbound.payload, json!(3));
+    }
+
+    #[test]
+    fn the_key_is_the_agents_and_is_never_lost_to_a_large_context() {
+        assert_eq!(CONTEXT_LOCALE, adam_llm_agent::LOCALE_CONTEXT_KEY);
+        assert!(adam_llm_agent::PROTECTED_CONTEXT_KEYS.contains(&CONTEXT_LOCALE));
     }
 
     fn with_metadata(mut message: Message, metadata: Value) -> Message {
