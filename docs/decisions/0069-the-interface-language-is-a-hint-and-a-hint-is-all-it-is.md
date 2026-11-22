@@ -30,9 +30,10 @@ A language belongs in exactly that shape.
 ### 1. `locale/v1`
 
 The URI is `https://agents.vymalo.com/a2a/extensions/locale/v1`. The card's entry is optional (`required: false`)
-and its `params` are `{"locales": [<tag>, ..], "default": <tag>}`: the languages the deployment supports, and the one
-the agent answers in when a message names none. A request that **activates** the extension may carry
-`metadata[<URI>] = {"locale": "<BCP 47 tag>"}` on the message — the shape of `access-tier/v1`'s `{"tier": ..}`.
+and its `params` are `{"locale": "<tag>"}`, one tag: **the agent's default language**, the one it answers in when a
+message names none. A request that **activates** the extension may carry `metadata[<URI>] = {"locale": "<BCP 47 tag>"}`
+on the message — **the client's hint**, one tag under the same key, the shape of `access-tier/v1`'s `{"tier": ..}`.
+Nothing else: no array of languages, no second key, no per-language member.
 
 - **Read only when activated.** A message whose request did not name the extension carries no hint, whatever its
   metadata says, exactly as a tier is not read from a message that did not activate `access-tier/v1`.
@@ -41,11 +42,14 @@ the agent answers in when a message names none. A request that **activates** the
   no language rather than a guessed one.
 - **Nothing when nothing is named.** A message that names no locale leaves no hint at all, never an empty string: an
   empty tag names no language, and a model told that the language is `""` would have to guess one.
+- **The hint belongs to its message.** The client sends it with each message and the orchestration layer keeps it with
+  the message, so a redelivery, a fork and a resumed run carry the same hint: it is this message's default, never a
+  thread-wide setting.
 
 ### 2. The hint is a prompt instruction, not a translation layer
 
-What the agent does with the hint is one rule in its instructions: answer in the interface language, and when the
-person writes in another language, follow the person for the rest of the conversation. Nothing is translated — not
+What the agent does with the hint is one rule in its instructions: answer in the interface language the message
+names, and follow the person when they write in another language. Nothing is translated — not
 a message, not a document, not a string — and there is no locale-aware formatting on the server, no template
 catalogue and no language negotiation. Code, paths, command output and file names are never translated, in any
 language.
@@ -59,29 +63,36 @@ Consent, payments, confirmations of irreversible actions and trusted components 
 the deployment**, in the languages they were reviewed in. The hint never reaches them: the agent does not write,
 translate, reword or fill one, in any language, whatever language the person writes in.
 
+In the coder's prompt the rule is one line, *a consent, a payment, a confirmation is the product's reviewed text, in
+its own language: never yours*, beside *answer in the language the interface names, and follow the person when they
+write in another*. The two lines cost 284 characters of a prompt that must stay under 30,000 (ADR 0038's test, which
+GitHub Copilot's agent-file limit sets): the next rule that goes in has to trim something first.
+
 This is the dangerous rule of the feature, and it is a rule about **capability**, not about intent: a model that
 writes a language barely must not be able to produce the text of a consent screen, because the failure is silent —
 the text looks like a language and reads like a permission. A reviewed string is reviewed once per language by a
 person; a model's translation of one is reviewed by nobody.
 
-### 4. The language list is the deployment's configuration, not code
+### 4. The language is the deployment's configuration, not code
 
-Nothing in this repository names a language: the card's `locales` is read from the deployment (an environment
+Nothing in this repository names a language: the card's `locale` is read from the deployment (an environment
 variable, a chart value, a folder), a tag it writes must be well formed or the deployment does not start (a bad
-value is exit 78, as for every variable), and an agent that supports none builds no list and lists no extension. The
-prose of this repository stays neutral about who the languages are for.
+value is exit 78, as for every variable), and a deployment that offers no language lists no extension. Which
+languages a deployment's own text exists in is its decision, and this repository's prose stays neutral about who they
+are for.
 
-### 5. The list is not a filter on the person
+### 5. The hint is a default, not a constraint
 
-A message may name a well-formed tag the deployment does not list. It is still a hint, and the agent still follows
-the person: refusing the message would break a turn for no safety gain, since a model that can write the language
-can answer in it. The list says which languages the deployment's **own reviewed text** exists in — which is exactly
-why the hint never fills that text (decision 3).
+A message may name any well-formed tag, not only the card's default. It is still a hint, and the agent still follows
+the person: refusing the message would break a turn for no safety gain, since a model that can write the language can
+answer in it. The card's one tag says what the agent answers in **when nothing is named** — never a filter on the
+person, and never a limit on the languages the deployment's **own reviewed text** exists in, which is exactly why the
+hint never fills that text (decision 3).
 
 ## Consequences
 
 - **Built in this slice:** `crates/adam-a2a` — the URI, the card entry (`ExtensionConfig::locale`), and the
-  validated reading (`Locale`, `Locales`, `Locale::of_request`), with tests for a card that lists it and one that
+  validated reading (`Locale`, `Locale::of`, `Locale::of_request`), with tests for a card that lists it and one that
   does not, a valid tag, a malformed one, a message that names none, and activation only on a card that offers it;
   the coder's prompt (`bin/adam-coder/agent/instructions.md`: the language rule and the high-risk rule);
   `docs/reference/a2a-server.md`; a parity row.
@@ -104,7 +115,7 @@ why the hint never fills that text (decision 3).
    and the parity row.
 2. `adam-a2a-runtime`: the context key `vymalo.locale`, read from an activated message and cleared by a message that
    names none, beside `access-tier/v1`'s handling.
-3. `adam-coder` and `adam-agent`: the card entry from the deployment's list, the instruction source that shows the
-   model the hint, and the list's variable in `deploy/coder`.
+3. `adam-coder` and `adam-agent`: the card entry from the deployment's own tag, the instruction source that shows the
+   model the hint, and that tag's variable in `deploy/coder`.
 4. The client half: the orchestrator sends the person's interface locale with each message, activated per message
    (`vymalo/another-agentic-system`).
