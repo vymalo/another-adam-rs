@@ -57,10 +57,11 @@ impl ReasoningEfforts {
 
     /// The set from `(agent, levels, default)` triples, each agent once (a later triple replaces an
     /// earlier one), every level re-ordered by [`ReasoningEffort::ALL`] and kept once.
-    pub fn from_agents<I, A>(agents: I) -> Self
+    pub fn from_agents<I, A, L>(agents: I) -> Self
     where
-        I: IntoIterator<Item = (A, Vec<ReasoningEffort>, Option<ReasoningEffort>)>,
+        I: IntoIterator<Item = (A, L, Option<ReasoningEffort>)>,
         A: Into<String>,
+        L: IntoIterator<Item = ReasoningEffort>,
     {
         agents
             .into_iter()
@@ -70,7 +71,8 @@ impl ReasoningEfforts {
     }
 
     /// `self` with `agent`'s entry: `levels` re-ordered by [`ReasoningEffort::ALL`] (lowest first)
-    /// with duplicates dropped, and `default` as the caller resolved it.
+    /// with duplicates dropped, and `default` when it is one of them. A default the agent does not
+    /// take is dropped: the card never advertises a level the reading would refuse.
     #[must_use]
     pub fn with_agent(
         mut self,
@@ -79,10 +81,11 @@ impl ReasoningEfforts {
         default: Option<ReasoningEffort>,
     ) -> Self {
         let named: Vec<ReasoningEffort> = levels.into_iter().collect();
-        let levels = ReasoningEffort::ALL
+        let levels: Vec<ReasoningEffort> = ReasoningEffort::ALL
             .into_iter()
             .filter(|effort| named.contains(effort))
             .collect();
+        let default = default.filter(|effort| levels.contains(effort));
         self.agents
             .insert(agent.into(), AgentEfforts { levels, default });
         self
@@ -97,8 +100,8 @@ impl ReasoningEfforts {
     }
 
     /// The default the caller resolved for `agent` (the folder's, else the preset's, else the
-    /// profile's), or `None` when none of them sets one or the agent has no entry. The caller checks
-    /// it against [`Self::levels`], as ADR 0063 requires; this type keeps what it is given.
+    /// profile's), or `None` when none of them sets one, the agent has no entry, or the value is
+    /// not one of [`Self::levels`]: a default the agent does not take is no default at all.
     pub fn default_of(&self, agent: &str) -> Option<ReasoningEffort> {
         self.agents.get(agent).and_then(|entry| entry.default)
     }
@@ -153,7 +156,8 @@ impl ReasoningEfforts {
         let effort = word.parse::<ReasoningEffort>().map_err(|_| {
             format!(
                 "agent {agent:?} was asked for reasoning effort {word:?}, which is not one of \
-                 none, minimal, low, medium, high, xhigh or max; it {}",
+                 {}; it {}",
+                all_efforts(),
                 takes(levels)
             )
         })?;
@@ -176,6 +180,19 @@ fn takes(levels: &[ReasoningEffort]) -> String {
     } else {
         let words: Vec<&str> = levels.iter().map(|effort| effort.as_str()).collect();
         format!("takes {}", words.join(", "))
+    }
+}
+
+/// The vocabulary as a refusal names it, built from [`ReasoningEffort::ALL`] so a new variant cannot
+/// leave the sentence stale: `none, minimal, low, medium, high, xhigh or max`.
+fn all_efforts() -> String {
+    let words: Vec<&str> = ReasoningEffort::ALL
+        .iter()
+        .map(|effort| effort.as_str())
+        .collect();
+    match words.split_last() {
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
     }
 }
 
@@ -243,6 +260,22 @@ mod tests {
         assert!(set.levels("nobody").is_empty());
         assert_eq!(set.default_of("nobody"), None);
         assert!(!set.honours("nobody", ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn a_default_the_agent_does_not_take_is_no_default() {
+        let set = ReasoningEfforts::new().with_agent(
+            "coder",
+            [ReasoningEffort::Low],
+            Some(ReasoningEffort::Max),
+        );
+        assert_eq!(set.default_of("coder"), None);
+        // The card never advertises a default the reading would refuse.
+        let e = crate::ExtensionConfig::reasoning(&set, "coder").expect("listed");
+        assert_eq!(
+            serde_json::Value::Object(e.params),
+            json!({"efforts": ["low"]})
+        );
     }
 
     #[test]
@@ -381,15 +414,11 @@ mod tests {
     }
 
     /// The reading takes no `Caller`: activation is the caller's gate
-    /// (`Caller::has_extension`), wired by the runtime in PR B. A message that did not activate
-    /// the extension is never read, whatever its metadata says.
+    /// (`Caller::has_extension`), wired by the runtime in PR B. This pins that `requested` is the
+    /// reading only, not a second activation gate; a caller that did not check is a wiring bug.
     #[test]
-    fn a_metadata_entry_alone_is_not_an_activation() {
+    fn the_reading_does_not_check_activation_the_caller_does() {
         let named = saying(Some(json!({ REASONING_EFFORT_MEMBER: "high" })));
-        let caller = crate::Caller::new("token-0");
-        assert!(!caller.has_extension(REASONING_EXTENSION));
-        // `requested` is the reading only: it is reached once the caller checked the activation,
-        // so a caller that did not is a wiring bug, not a second gate here.
         assert_eq!(
             efforts().requested("coder", &named),
             Ok(ReasoningEffort::High)
