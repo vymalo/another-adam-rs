@@ -1291,9 +1291,10 @@ fn expect_assembled(assembled: Result<CoderAgent, Box<AssemblyError>>) -> CoderA
 
 /// Why the commands that keep running of a run end with this step, when they do: the root run is
 /// over (done or failed), a run of the tree parks on a question to the person, who may take a
-/// while, or it parks on the model until it is woken, which the person cures by raising a limit.
-/// The end of a child run ends nothing, and a park on anything else (a subagent, a task on another
-/// system, a timer) leaves them running.
+/// while, or it parks on the model until it is woken, which the person cures by raising a limit —
+/// its own wait, or the wait of a child it waits on, which it shows and wakes (ADR 0067 decision
+/// 5). The end of a child run ends nothing, and a park on anything else (a child that is not
+/// parked on the model, a task on another system, a timer) leaves them running.
 fn commands_end_with(transition: &Transition<Conversation>, child: bool) -> Option<&'static str> {
     match transition {
         Transition::Done { .. } | Transition::Fail { .. } if !child => Some("the run ended"),
@@ -1310,6 +1311,18 @@ fn commands_end_with(transition: &Transition<Conversation>, child: bool) -> Opti
                 .model_wait
                 .as_ref()
                 .is_some_and(|wait| wait.park == ModelPark::UntilWoken) =>
+        {
+            Some("the run waits on the model until it is woken")
+        }
+        Transition::Park { state, .. }
+            if matches!(
+                &state.pending_wait,
+                Some(adam_llm_agent::PendingWait::Run(wait))
+                    if wait
+                        .model_wait
+                        .as_ref()
+                        .is_some_and(|wait| wait.park == ModelPark::UntilWoken)
+            ) =>
         {
             Some("the run waits on the model until it is woken")
         }
@@ -1615,21 +1628,35 @@ mod commands_tests {
     /// A park on the model, as the LLM agent records it (`Conversation::model_wait`): built from
     /// JSON because [`ModelWait`] is `#[non_exhaustive]`.
     fn parked_on_the_model(park: &str) -> Transition<Conversation> {
-        let wait: ModelWait = serde_json::from_value(json!({
+        Transition::Park {
+            state: Conversation {
+                model_wait: Some(model_wait(park)),
+                ..Conversation::default()
+            },
+            wake_at: None,
+        }
+    }
+
+    /// The copy a parent keeps of its child's wait (`PendingRun::model_wait`).
+    fn model_wait(park: &str) -> ModelWait {
+        serde_json::from_value(json!({
             "reason": "the person's usage limit is reached",
             "status": 402,
             "slug": "over_limit",
             "park": park,
             "parked_since": "2026-11-21T00:00:00Z",
         }))
-        .expect("the model wait reads");
-        Transition::Park {
-            state: Conversation {
-                model_wait: Some(wait),
-                ..Conversation::default()
-            },
-            wake_at: None,
-        }
+        .expect("the model wait reads")
+    }
+
+    /// A park on a child, with the wait the child had when the run last looked.
+    fn parked_on_a_child(park: Option<&str>) -> Transition<Conversation> {
+        parked(Some(PendingWait::Run(PendingRun {
+            call_id: "c".into(),
+            tool: "explorer".into(),
+            run: adam_core::RunId::new(),
+            model_wait: park.map(model_wait),
+        })))
     }
 
     #[test]
@@ -1654,6 +1681,7 @@ mod commands_tests {
                 call_id: "c".into(),
                 tool: "explorer".into(),
                 run: adam_core::RunId::new(),
+                model_wait: None,
             }),
             PendingWait::Remote(PendingRemote {
                 call_id: "c".into(),
@@ -1676,7 +1704,7 @@ mod commands_tests {
             Some("the run waits on the model until it is woken")
         );
         // A session's round that parks until woken stops the root's commands too, as its question
-        // does; a local subagent never parks until woken (the loop fails it).
+        // does.
         assert_eq!(
             commands_end_with(&parked_on_the_model("until_woken"), true),
             Some("the run waits on the model until it is woken")
@@ -1686,6 +1714,19 @@ mod commands_tests {
             commands_end_with(&parked_on_the_model("timer"), false),
             None
         );
+        // A child parked on the model until it is woken is the same wait: the parent shows it and
+        // wakes it, and the person may take a while (ADR 0067 decision 5).
+        assert_eq!(
+            commands_end_with(&parked_on_a_child(Some("until_woken")), false),
+            Some("the run waits on the model until it is woken")
+        );
+        // A child on a timer keeps them, as the run's own timer park does; so does a child that
+        // works, and one that waits on something else.
+        assert_eq!(
+            commands_end_with(&parked_on_a_child(Some("timer")), false),
+            None
+        );
+        assert_eq!(commands_end_with(&parked_on_a_child(None), false), None);
         let done = || Transition::Done {
             state: Conversation::default(),
             output: json!({}),
@@ -1908,6 +1949,7 @@ mod tests {
             content: vec![adam_model::ContentPart::text(text)],
             tool_calls: calls,
             reasoning: None,
+            provider: None,
         }
     }
 

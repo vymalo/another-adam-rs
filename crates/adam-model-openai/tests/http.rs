@@ -188,6 +188,7 @@ async fn tool_results_round_trip_into_the_next_request() {
             ..Default::default()
         }],
         reasoning: None,
+        provider: None,
     });
     req.messages.push(Message::tool_result("call_9", "18C"));
     client(&server).complete(req).await.unwrap();
@@ -201,6 +202,640 @@ async fn tool_results_round_trip_into_the_next_request() {
     assert_eq!(
         body["messages"][3],
         json!({"role": "tool", "tool_call_id": "call_9", "content": "18C"})
+    );
+}
+
+/// The bench's repro (adam-rs#322): Gemini 3 attaches `extra_content.google.thought_signature` to
+/// a tool call and refuses the next request with a 400 when it is missing. The member must go back
+/// value for value.
+#[tokio::test]
+async fn a_tool_calls_extra_content_survives_the_next_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_g", "type": "function",
+                    "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"},
+                    "extra_content": {"google": {"thought_signature": "sig-abc-123"}}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "18C"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let first = client.complete(req.clone()).await.unwrap();
+    assert_eq!(first.finish, FinishReason::ToolCalls);
+
+    req.messages.push(first.message);
+    req.messages.push(Message::tool_result("call_g", "18C"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    assert_eq!(requests.len(), 2, "two calls");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(
+        body["messages"][2]["tool_calls"][0]["extra_content"],
+        json!({"google": {"thought_signature": "sig-abc-123"}}),
+        "the member the provider attached must go back unchanged: {body}"
+    );
+}
+
+/// The message-level member of a plain answer is the same thing, for a text turn.
+#[tokio::test]
+async fn a_message_level_extra_content_survives_the_next_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Paris is sunny.",
+                    "extra_content": {"google": {"thought_signature": "msg-sig-456"}}
+                },
+                "finish_reason": "stop"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let first = client.complete(req.clone()).await.unwrap();
+    assert_eq!(first.message.text(), "Paris is sunny.");
+    req.messages.push(first.message);
+    req.messages.push(Message::user_text("thanks"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(
+        body["messages"][2]["extra_content"],
+        json!({"google": {"thought_signature": "msg-sig-456"}}),
+        "{body}"
+    );
+}
+
+/// A reasoning block (an object, not text) is carried raw and echoed in place of the text when the
+/// client is set to echo reasoning.
+#[tokio::test]
+async fn a_reasoning_block_is_echoed_raw_by_a_client_that_echoes_reasoning() {
+    let server = MockServer::start().await;
+    let block = json!({"blocks": [{"type": "text", "text": "think"}]});
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done", "reasoning": block},
+                "finish_reason": "stop"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server).with_echo_reasoning(Some(ReasoningField::Reasoning));
+    let mut req = request();
+    let first = client.complete(req.clone()).await.unwrap();
+    // A block is not reasoning text: it is not in `Message::reasoning`, only in the carrier.
+    assert_eq!(first.reasoning, None);
+    assert_eq!(first.message.reasoning(), None);
+    req.messages.push(first.message);
+    req.messages.push(Message::user_text("thanks"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(body["messages"][2]["reasoning"], block, "{body}");
+}
+
+#[tokio::test]
+async fn a_reasoning_block_is_not_echoed_by_a_client_that_does_not() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done",
+                    "reasoning": {"blocks": [{"type": "text", "text": "think"}]}},
+                "finish_reason": "stop"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let first = client.complete(req.clone()).await.unwrap();
+    assert!(
+        matches!(
+            &first.message,
+            Message::Assistant {
+                provider: None,
+                reasoning: None,
+                ..
+            }
+        ),
+        "the block is not stored without echo: {:?}",
+        first.message
+    );
+    req.messages.push(first.message);
+    req.messages.push(Message::user_text("thanks"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert!(body["messages"][2].get("reasoning").is_none(), "{body}");
+}
+
+/// A block-only response, with echo off: nothing of it is stored (ADR 0020), so the history is
+/// the bytes it always was.
+#[tokio::test]
+async fn a_reasoning_block_alone_is_not_stored_without_echo() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done",
+                    "reasoning": {"blocks": [{"type": "text", "text": "think"}]}},
+                "finish_reason": "stop"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let first = client.complete(req.clone()).await.unwrap();
+    assert!(
+        matches!(
+            &first.message,
+            Message::Assistant {
+                provider: None,
+                reasoning: None,
+                ..
+            }
+        ),
+        "no carrier is stored for a block with echo off: {:?}",
+        first.message
+    );
+    req.messages.push(first.message);
+    req.messages.push(Message::user_text("thanks"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert!(body["messages"][2].get("reasoning").is_none(), "{body}");
+}
+
+/// With echo off, a block is cleared but the opaque members stay: they are signatures, not
+/// reasoning.
+#[tokio::test]
+async fn a_reasoning_block_is_cleared_but_members_stay_without_echo() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done",
+                    "reasoning": {"blocks": [{"type": "text", "text": "think"}]},
+                    "extra_content": {"google": {"thought_signature": "kept-sig"}}},
+                "finish_reason": "stop"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let first = client.complete(req.clone()).await.unwrap();
+    let Message::Assistant {
+        provider: Some(provider),
+        ..
+    } = &first.message
+    else {
+        panic!("the members keep the carrier: {:?}", first.message)
+    };
+    assert_eq!(provider.reasoning, None, "the block is not stored");
+    assert_eq!(
+        provider.members["extra_content"],
+        json!({"google": {"thought_signature": "kept-sig"}})
+    );
+    req.messages.push(first.message);
+    req.messages.push(Message::user_text("thanks"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(
+        body["messages"][2]["extra_content"],
+        json!({"google": {"thought_signature": "kept-sig"}}),
+        "{body}"
+    );
+    assert!(body["messages"][2].get("reasoning").is_none(), "{body}");
+}
+
+/// A streamed delta's opaque member on a tool call reaches the finished call and the next request.
+#[tokio::test]
+async fn streamed_tool_call_extra_content_survives_the_next_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(&[
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_s","type":"function","extra_content":{"google":{"thought_signature":"stream-sig"}},"function":{"name":"weather","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "18C"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let stream = client.stream(req.clone()).await.unwrap();
+    let deltas: Vec<ModelDelta> = collect(stream)
+        .await
+        .into_iter()
+        .map(|item| item.unwrap())
+        .collect();
+    let Some(ModelDelta::Finished(response)) = deltas.last() else {
+        panic!("{deltas:?}")
+    };
+    assert_eq!(
+        response.message.tool_calls()[0].opaque,
+        Some(std::collections::BTreeMap::from([(
+            "extra_content".into(),
+            json!({"google": {"thought_signature": "stream-sig"}})
+        )])),
+        "the finished call keeps the member"
+    );
+
+    req.messages.push(response.message.clone());
+    req.messages.push(Message::tool_result("call_s", "18C"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(
+        body["messages"][2]["tool_calls"][0]["extra_content"],
+        json!({"google": {"thought_signature": "stream-sig"}}),
+        "{body}"
+    );
+}
+
+/// A final chunk shaped as a whole message instead of a delta: its opaque members are kept. No
+/// provider we test sends one; the path is defensive and this is its proof.
+#[tokio::test]
+async fn a_message_shaped_chunk_keeps_its_opaque_members() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(&[
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}"#,
+            r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"hi","extra_content":{"google":{"thought_signature":"final-sig"}}},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let stream = client.stream(req.clone()).await.unwrap();
+    let deltas: Vec<ModelDelta> = collect(stream)
+        .await
+        .into_iter()
+        .map(|item| item.unwrap())
+        .collect();
+    let Some(ModelDelta::Finished(response)) = deltas.last() else {
+        panic!("{deltas:?}")
+    };
+    assert_eq!(response.message.text(), "hi");
+    req.messages.push(response.message.clone());
+    req.messages.push(Message::user_text("thanks"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(
+        body["messages"][2]["extra_content"],
+        json!({"google": {"thought_signature": "final-sig"}}),
+        "{body}"
+    );
+}
+
+/// A delta can carry a message-level member: it is kept and sent back, like a `message`-shaped
+/// chunk's.
+#[tokio::test]
+async fn a_delta_message_level_extra_content_survives_the_next_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(&[
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"hi","extra_content":{"google":{"thought_signature":"delta-sig"}}}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let stream = client.stream(req.clone()).await.unwrap();
+    let deltas: Vec<ModelDelta> = collect(stream)
+        .await
+        .into_iter()
+        .map(|item| item.unwrap())
+        .collect();
+    let Some(ModelDelta::Finished(response)) = deltas.last() else {
+        panic!("{deltas:?}")
+    };
+    assert_eq!(response.message.text(), "hi");
+    req.messages.push(response.message.clone());
+    req.messages.push(Message::user_text("thanks"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(
+        body["messages"][2]["extra_content"],
+        json!({"google": {"thought_signature": "delta-sig"}}),
+        "{body}"
+    );
+}
+
+/// Output-only members (`refusal`, `audio`, `function_call`, `annotations`) are never opaque: a
+/// streamed turn that carries one stores no carrier, and its next request is byte-identical.
+#[tokio::test]
+async fn an_output_only_delta_member_is_not_carried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(&[
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"hi","refusal":null,"audio":null,"function_call":null,"annotations":[]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let stream = client.stream(req.clone()).await.unwrap();
+    let deltas: Vec<ModelDelta> = collect(stream)
+        .await
+        .into_iter()
+        .map(|item| item.unwrap())
+        .collect();
+    let Some(ModelDelta::Finished(response)) = deltas.last() else {
+        panic!("{deltas:?}")
+    };
+    assert!(
+        matches!(&response.message, Message::Assistant { provider: None, .. }),
+        "an output-only member is no carrier: {:?}",
+        response.message
+    );
+    req.messages.push(response.message.clone());
+    req.messages.push(Message::user_text("thanks"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(
+        body["messages"][2],
+        json!({"role": "assistant", "content": "hi"}),
+        "no output-only member goes back: {body}"
+    );
+}
+
+/// The stamp is the request's own alias, not a constant: a first call under an alias other than
+/// the fixture's must still match on the second call.
+#[tokio::test]
+async fn the_client_stamps_the_requests_own_model_alias() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_a", "type": "function",
+                    "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"},
+                    "extra_content": {"google": {"thought_signature": "alias-sig"}}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "18C"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    req.model = "model-a".into();
+    let first = client.complete(req.clone()).await.unwrap();
+    let Message::Assistant {
+        provider: Some(provider),
+        ..
+    } = &first.message
+    else {
+        panic!("a stamped assistant message: {:?}", first.message)
+    };
+    assert_eq!(
+        provider.model, "model-a",
+        "the request's alias, not a constant"
+    );
+
+    req.messages.push(first.message);
+    req.messages.push(Message::tool_result("call_a", "18C"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(body["model"], "model-a");
+    assert_eq!(
+        body["messages"][2]["tool_calls"][0]["extra_content"],
+        json!({"google": {"thought_signature": "alias-sig"}}),
+        "a constant stamp would not match this alias: {body}"
+    );
+}
+
+/// The frontier fallback, or a person switching model mid-run: the old model's members must never
+/// reach the new one.
+#[tokio::test]
+async fn opaque_members_are_dropped_when_the_run_changes_model() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_m", "type": "function",
+                    "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"},
+                    "extra_content": {"google": {"thought_signature": "model-a-sig"}}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "18C"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let client = client(&server);
+    let mut req = request();
+    let first = client.complete(req.clone()).await.unwrap();
+    req.model = "another-model".into();
+    req.messages.push(first.message);
+    req.messages.push(Message::tool_result("call_m", "18C"));
+    client.complete(req).await.unwrap();
+
+    let requests = server.received_requests().await.expect("recording");
+    let body: Value = requests[1].body_json().expect("json body");
+    assert_eq!(body["model"], "another-model");
+    assert!(
+        body["messages"][2]["tool_calls"][0]
+            .get("extra_content")
+            .is_none(),
+        "the old model's member reached the new one: {body}"
+    );
+}
+
+/// The same alias at another endpoint is another model as far as a signature is concerned.
+#[tokio::test]
+async fn opaque_members_are_dropped_at_another_endpoint() {
+    let first_server = MockServer::start().await;
+    mount(
+        &first_server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_e", "type": "function",
+                    "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"},
+                    "extra_content": {"google": {"thought_signature": "endpoint-a-sig"}}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        })),
+    )
+    .await;
+    let second_server = MockServer::start().await;
+    mount(
+        &second_server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "18C"}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+
+    let mut req = request();
+    let first = client(&first_server).complete(req.clone()).await.unwrap();
+    req.messages.push(first.message);
+    req.messages.push(Message::tool_result("call_e", "18C"));
+    client(&second_server).complete(req).await.unwrap();
+
+    let body = sent_body(&second_server).await;
+    assert!(
+        body["messages"][2]["tool_calls"][0]
+            .get("extra_content")
+            .is_none(),
+        "another endpoint received the first endpoint's member: {body}"
     );
 }
 
@@ -244,6 +879,7 @@ async fn an_invalid_call_is_echoed_with_empty_object_arguments() {
             "{\"city\": ",
         )],
         reasoning: None,
+        provider: None,
     });
     req.messages.push(Message::tool_error("c", "not JSON"));
     client(&server).complete(req).await.unwrap();
@@ -736,6 +1372,7 @@ async fn reasoning_goes_back_only_through_a_client_set_to_echo_it() {
                 ..Default::default()
             }],
             reasoning: Some("I should call the tool.".into()),
+            provider: None,
         });
         req.messages.push(Message::tool_result("call_1", "18C"));
         req

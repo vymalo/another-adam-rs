@@ -866,6 +866,11 @@ async fn transition(
             inner
                 .notify_parent(&committed, &next.output, next.error.as_deref())
                 .await;
+            // A stepped park is the parent's business too: it reads what the child waits on and
+            // shows it, and a message or a resume to the parent goes down to the child (ADR 0067
+            // decision 5). A commit a message turned into a wake-up parked nothing, so it says
+            // nothing; `park_again`, the runtime's own look, never comes through here.
+            inner.notify_parent_parked(&committed).await;
             true
         }
         Ok(None) => {

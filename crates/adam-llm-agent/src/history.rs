@@ -163,6 +163,12 @@ fn arguments_chars(arguments: &serde_json::Value) -> usize {
     arguments.to_string().chars().count()
 }
 
+/// Characters a carrier value takes when it is written: an opaque member, a call's member and a
+/// reasoning block are sent with the request, so they count.
+fn value_chars(value: &serde_json::Value) -> usize {
+    value.to_string().chars().count()
+}
+
 #[cfg(test)]
 thread_local! {
     /// How many tool call arguments were serialised on this thread: the test's proof that a warm
@@ -188,14 +194,28 @@ pub(crate) fn message_chars(m: &Message) -> usize {
             content,
             tool_calls,
             reasoning,
+            provider,
         } => {
-            // The reasoning a client echoes is sent, so it counts.
+            // The reasoning a client echoes is sent, so it counts; so do the carrier's opaque
+            // members, a call's own, and a raw reasoning block (all sent with the request).
+            let carrier = provider.as_ref().map_or(0, |turn| {
+                turn.members.values().map(value_chars).sum::<usize>()
+                    + turn.reasoning.as_ref().map_or(0, value_chars)
+            });
+            let opaque = tool_calls
+                .iter()
+                .filter_map(|call| call.opaque.as_ref())
+                .flat_map(|members| members.values())
+                .map(value_chars)
+                .sum::<usize>();
             reasoning.as_deref().map_or(0, |r| r.chars().count())
                 + content.iter().map(part_chars).sum::<usize>()
                 + tool_calls
                     .iter()
                     .map(|c| c.name.chars().count() + arguments_chars(&c.arguments))
                     .sum::<usize>()
+                + carrier
+                + opaque
         }
         Message::Tool {
             content, images, ..
@@ -395,8 +415,9 @@ pub(crate) fn record_shortenings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adam_model::ToolCall;
+    use adam_model::{ProviderTurn, ToolCall};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     /// `messages` after [`record_shortenings`], as a copy.
     fn fit_history(messages: &[Message], max_tokens: u32) -> Vec<Message> {
@@ -425,6 +446,7 @@ mod tests {
                 ..Default::default()
             }],
             reasoning: None,
+            provider: None,
         }
     }
 
@@ -551,6 +573,7 @@ mod tests {
                 ..Default::default()
             }],
             reasoning: None,
+            provider: None,
         }
     }
 
@@ -647,6 +670,42 @@ mod tests {
         let m = vec![Message::user_text("abcd"), call("c1")];
         // "abcd" + name "t" + "{}" = 4 + 1 + 2 = 7 chars -> 2 tokens.
         assert_eq!(estimate_tokens(&m), 2);
+    }
+
+    #[test]
+    fn the_carrier_counts_toward_the_estimate() {
+        let plain = Message::Assistant {
+            content: vec![],
+            tool_calls: vec![ToolCall::new("c", "t", json!({}))],
+            reasoning: None,
+            provider: None,
+        };
+        let mut carrier = plain.clone();
+        let member = json!({"google": {"thought_signature": "sig"}});
+        let block = json!({"blocks": [{"text": "think"}]});
+        let call_member = json!({"extra_content": {"sig": "call"}});
+        let Message::Assistant {
+            provider,
+            tool_calls,
+            ..
+        } = &mut carrier
+        else {
+            unreachable!("an assistant message")
+        };
+        let mut turn = ProviderTurn::new("m", "e");
+        turn.members = BTreeMap::from([("extra_content".into(), member.clone())]);
+        turn.reasoning = Some(block.clone());
+        *provider = Some(turn);
+        tool_calls[0].opaque = Some(BTreeMap::from([(
+            "extra_content".into(),
+            call_member.clone(),
+        )]));
+
+        // Every carrier value is sent, so it counts: a count that ignored them would give 0 here.
+        let expected = member.to_string().chars().count()
+            + block.to_string().chars().count()
+            + call_member.to_string().chars().count();
+        assert_eq!(message_chars(&carrier) - message_chars(&plain), expected);
     }
 
     const KEPT_LINE: &str = "[kept as o-0123456789abcdef: 7000 lines; read_output {\"id\":\"o-0123456789abcdef\"} reads it]";
@@ -864,6 +923,7 @@ mod tests {
                         })
                         .collect(),
                     reasoning: None,
+                    provider: None,
                 }),
                 ("[a-z]{1,3}", "\\PC{0,700}", any::<bool>()).prop_map(|(id, out, err)| {
                     if err {

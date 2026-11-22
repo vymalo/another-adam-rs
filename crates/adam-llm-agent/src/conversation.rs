@@ -198,6 +198,23 @@ pub struct PendingRun {
     pub tool: String,
     /// The child run.
     pub run: RunId,
+    /// The model wait the child had when this run last looked ([ADR 0067] decision 5), copied
+    /// from the child's head: `Some` while the child is parked on the model. The run waits on an
+    /// until-woken child with **no timer**, as it waits on a question, and keeps its 60 s look at
+    /// a timer park. Cleared when the run forwards a resume to the child, and rewritten at the
+    /// next look. In the head, so a front reads it at `/pending_wait/model_wait`; absent from
+    /// state written before it existed, and not written while `None`.
+    ///
+    /// **Breaking:** a new public field of a struct that is not `#[non_exhaustive]`: a
+    /// `PendingRun` built with a struct literal outside the workspace names it.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[serde(
+        default,
+        deserialize_with = "crate::model_wait::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_wait: Option<crate::ModelWait>,
 }
 
 /// A tool call that waits for a task on another system to finish.
@@ -639,11 +656,16 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rounds_started: Vec<String>,
     /// The ids (`Inbound::id`, an A2A `messageId`) of the messages the run has read after its first,
-    /// the last [`MAX_READ_IDS`] of them, oldest first: a message that arrives again with one of them
-    /// (the same one sent twice, as the orchestration layer does after a lost lease) is not read a
-    /// second time, whether it is still in the inbox or was read transitions ago. Part of the durable
-    /// state, so another worker and a restart keep it. Absent from state written before it existed,
-    /// and not written while empty; a run that continues another starts with none.
+    /// and of the resumes it has read (the forwarded resume's id, ADR 0067 decision 5), the last
+    /// [`MAX_READ_IDS`] of them, oldest first: a message that arrives again with one of them (the
+    /// same one sent twice, as the orchestration layer does after a lost lease) is not read a second
+    /// time, whether it is still in the inbox or was read transitions ago, and a copy of a resume is
+    /// no wake. The window is shared by both: a burst of resumes can evict an old message id, which
+    /// fails open (the old message, delivered again, is read once more, never lost), and an evicted
+    /// resume id makes the copy a kept resume, so it costs one extra call (and its step). Part of
+    /// the durable state, so another worker and
+    /// a restart keep it. Absent from state written before it existed, and not written while empty;
+    /// a run that continues another starts with none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_ids: Vec<String>,
     /// How big the last model call's prompt was, as the provider reported it, and how many messages
@@ -717,9 +739,9 @@ pub struct Conversation {
 /// history (its call id is there); one whose report was compacted away may be told once more.
 pub const MAX_REPORTED_ROUNDS: usize = 128;
 
-/// How many message ids a run remembers having read ([`Conversation::read_ids`]). A person does not
-/// steer a task a hundred times, and the oldest id is the one given up, so a retry of an old message
-/// is the only thing this can let through.
+/// How many ids a run remembers having read ([`Conversation::read_ids`]: messages and forwarded
+/// resumes together). A person does not steer a task a hundred times, and the oldest id is the one
+/// given up, so a retry of an old message is the only thing this can let through.
 pub const MAX_READ_IDS: usize = 128;
 
 impl Conversation {
@@ -1860,6 +1882,7 @@ mod tests {
                 call_id: "c1".into(),
                 tool: "reviewer".into(),
                 run,
+                model_wait: None,
             }))
         );
         assert_eq!(
@@ -1873,6 +1896,61 @@ mod tests {
         // A null field, as `Conversation::default` serializes, is no wait at all.
         let none: Conversation = serde_json::from_value(json!({"pending_question": null})).unwrap();
         assert_eq!(none.pending_wait, None);
+    }
+
+    /// The copy a parent keeps of a child's model wait (ADR 0067 decision 5) rides beside the
+    /// pending child, and a park kind this build cannot read leaves the wait itself intact.
+    #[test]
+    fn a_childs_model_wait_is_a_copy_that_reads_leniently() {
+        let run = RunId::new();
+        let wait = json!({
+            "reason": "the model gateway's limit is reached",
+            "status": 402,
+            "slug": "over_limit",
+            "park": "until_woken",
+            "parked_since": "2026-11-21T00:00:00Z",
+            // `ModelWait` writes the backoff's step even when it is zero.
+            "parks": 0,
+        });
+        let literal = json!({
+            "pending_wait": {
+                "call_id": "c1",
+                "tool": "reviewer",
+                "run": run.to_string(),
+                "model_wait": wait,
+            }
+        });
+        let c: Conversation = serde_json::from_value(literal.clone()).unwrap();
+        let Some(PendingWait::Run(waiting)) = &c.pending_wait else {
+            panic!("a wait on a child")
+        };
+        assert_eq!(
+            waiting.model_wait.as_ref().map(|w| w.park),
+            Some(crate::ModelPark::UntilWoken)
+        );
+        assert_eq!(
+            serde_json::to_value(&c).unwrap()["pending_wait"],
+            literal["pending_wait"]
+        );
+        // A park kind a later build adds reads as no copy: the wait on the child still loads.
+        let later = json!({
+            "pending_wait": {
+                "call_id": "c1",
+                "tool": "reviewer",
+                "run": run.to_string(),
+                "model_wait": {
+                    "reason": "r",
+                    "park": "a_later_kind",
+                    "parked_since": "2026-11-21T00:00:00Z",
+                },
+            }
+        });
+        let c: Conversation = serde_json::from_value(later).unwrap();
+        let Some(PendingWait::Run(waiting)) = &c.pending_wait else {
+            panic!("a wait on a child")
+        };
+        assert!(waiting.model_wait.is_none());
+        assert_eq!(waiting.call_id, "c1");
     }
 
     #[test]
@@ -1965,6 +2043,7 @@ mod tests {
             content: vec![],
             tool_calls: ids.iter().map(|id| call(id)).collect(),
             reasoning: None,
+            provider: None,
         }
     }
 

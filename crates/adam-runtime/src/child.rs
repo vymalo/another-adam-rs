@@ -43,10 +43,23 @@ pub const CHILD_REPORTED_KIND: &str = "adam.child.reported";
 /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
 pub const RESUME_KIND: &str = "adam.resume";
 
+/// [`Inbound::kind`] of the message a child run sends its parent when it **parks** ([ADR 0067]
+/// decision 5): it waits for a message, a question's answer or a model that refused it.
+///
+/// Its [`Inbound::id`] is the child's run id and its payload is not read: it is a hint that the
+/// child now waits, and the parent reads what it waits on from the child's record
+/// ([`Ctx::child_look`](crate::Ctx::child_look)). The runtime sends it after the child's own
+/// commit, like [`RUN_FINISHED_KIND`], and **not** when its own look at a parked child parks it
+/// again ([`Runtime::run_worker`](crate::Runtime::run_worker)): nothing changed then.
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+pub const CHILD_PARKED_KIND: &str = "adam.child.parked";
+
 /// How many of the messages in `inbox` after its first `base` a run that is finishing has to read:
 /// all of them but the [`RUN_FINISHED_KIND`] notices, the [`CHILD_REPORTED_KIND`] ones (a report
 /// is read from the store, by a tool or by the agent loop; a turn that a report keeps going is
-/// decided from the store at its end, not from a notice) and the [`SESSION_CLOSE_KIND`] requests (a round finishes its work and says so in its header; one that
+/// decided from the store at its end, not from a notice), the [`CHILD_PARKED_KIND`] ones (a park
+/// is read from the store too, and a run that finishes has no wait left), the [`SESSION_CLOSE_KIND`] requests (a round finishes its work and says so in its header; one that
 /// lands while the round finishes stays in its inbox, where a reader of the session finds it) and the [`RESUME_KIND`] wake-ups (they say nothing). A notice only saves a waiting parent its
 /// timer. A run that finishes has no wait left (it settled its waits from the notice or from the
 /// store), and the same notice delivered just after its commit is refused, so one that lands during
@@ -62,6 +75,7 @@ pub(crate) fn news_since(inbox: &[Inbound], base: usize, read: &[String]) -> usi
         .filter(|i| {
             i.kind != RUN_FINISHED_KIND
                 && i.kind != CHILD_REPORTED_KIND
+                && i.kind != CHILD_PARKED_KIND
                 && i.kind != SESSION_CLOSE_KIND
                 && i.kind != RESUME_KIND
                 && (i.id.is_empty() || !read.contains(&i.id))
@@ -497,6 +511,68 @@ impl ChildStatus {
     }
 }
 
+/// A child run as its parent reads it in **one** read ([ADR 0067] decision 5): the status and
+/// result a notice carries, and the head of the child's state, so that a parent sees what its
+/// child waits on without reading the child's history.
+///
+/// [`Ctx::child_look`](crate::Ctx::child_look) answers it for the calling run's own children. The
+/// head is the child's agent state without its transcript for a v5 run; `None` when the record does
+/// not decode, in which case the status says so for a terminal child, as a [`ChildStatus`] read from
+/// the same record would.
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChildLook {
+    /// The child's status and result.
+    pub status: ChildStatus,
+    /// The head of the child's state: its agent state without the transcript for a v5 run.
+    pub head: Option<Value>,
+}
+
+impl ChildLook {
+    /// A child known only by its final status (a notice the inbox already holds).
+    pub fn finished(status: ChildStatus) -> Self {
+        Self { status, head: None }
+    }
+
+    /// Read a child's record: one decode of its state gives the status, the result and the head.
+    pub(crate) fn from_record(rec: &RunRecord) -> Self {
+        match crate::head::Stored::decode(rec.id, &rec.state) {
+            Ok(stored) => {
+                let status = if rec.status.is_open() {
+                    ChildStatus {
+                        status: rec.status,
+                        output: None,
+                        error: None,
+                    }
+                } else {
+                    ChildStatus::from_parts(rec.status, stored.output(), stored.error())
+                };
+                Self {
+                    status,
+                    head: Some(stored.agent().clone()),
+                }
+            }
+            Err(e) => Self {
+                status: if rec.status.is_open() {
+                    ChildStatus {
+                        status: rec.status,
+                        output: None,
+                        error: None,
+                    }
+                } else {
+                    ChildStatus {
+                        status: RunStatus::Failed,
+                        output: None,
+                        error: Some(format!("the run's state is unreadable: {e}")),
+                    }
+                },
+                head: None,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -512,6 +588,7 @@ mod tests {
             Inbound::new(RESUME_KIND, json!({})).with_id("r-1"),
             Inbound::new(RUN_FINISHED_KIND, json!({})).with_id("c-1"),
             Inbound::new(CHILD_REPORTED_KIND, json!({})).with_id("c-2"),
+            Inbound::new(CHILD_PARKED_KIND, json!({})).with_id("c-3"),
             Inbound::new(SESSION_CLOSE_KIND, json!({})).with_id("s-1"),
             Inbound::new("message", json!({"text": "read"})).with_id("m-1"),
         ];

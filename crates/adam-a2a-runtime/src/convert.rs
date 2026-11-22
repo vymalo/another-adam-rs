@@ -64,7 +64,9 @@ pub type InboundFn = Arc<dyn Fn(&Message) -> Result<Inbound, String> + Send + Sy
 /// for a child run, so runs parked by an older build keep their prompt) or a
 /// string at `state.question` or, failing those, `state.model_wait.reason` (a run
 /// parked on the model until woken, ADR 0067). A run that waits for a child run
-/// has no question and is `working`, not `input-required`.
+/// has no question of its own: its reason comes from the child's copied wait
+/// (`model_park::reason`, ADR 0067 decision 5), and it is `working` unless that
+/// wait is until-woken.
 pub fn default_prompt(view: &RunView) -> Option<String> {
     let state = &view.state;
     state
@@ -110,11 +112,16 @@ pub fn default_inbound(message: &Message) -> Result<Inbound, String> {
 /// | runnable, never committed by a worker, no worker holds it (`RunView::claimed`) | `submitted` |
 /// | runnable, never committed by a worker, a worker holds it | `working` |
 /// | parked on the model after a refusal of status 401 or 403 (`state.model_wait`, ADR 0067), timer or not | `auth-required` |
-/// | runnable, or parked on a timer | `working` |
-/// | parked with no timer (`RunView::waiting`) | `input-required` |
+/// | runnable, or parked on a timer (its own, or a child's it waits on) | `working` |
+/// | parked with no timer (`RunView::waiting`): a question, a park until woken, or a child parked until woken | `input-required` |
 /// | done | `completed` |
 /// | failed with `cancelled: ...` | `canceled` |
 /// | failed otherwise | `failed` |
+///
+/// A child's park is the parent's: a run that waits on a child parked on the model reads the
+/// child's wait (ADR 0067 decision 5) and its task says so — `working` with the reason for a
+/// child on a timer, `input-required` with it for one until woken, and never `auth-required`
+/// (the gateway refused the child, not this run).
 ///
 /// A whole turn (the model calls and the tool calls) commits once, so the first model call of a
 /// task can last a long time with nothing committed. The lease a worker takes when it claims the
@@ -749,6 +756,45 @@ mod tests {
         assert!(status_of(&woken, &prompt()).message.is_none());
         // The default prompt reads the reason too.
         assert_eq!(default_prompt(&parked(402, true)).as_deref(), Some("why"));
+    }
+
+    /// A child's park is shown through the parent that waits on it (ADR 0067 decision 5): the copy
+    /// of its wait is the root's reason, `input-required` until woken and `working` on a timer, and
+    /// a child's 401 or 403 is never the root's `auth-required`.
+    #[test]
+    fn a_parked_child_is_shown_through_its_parent() {
+        let parked = |park: &str, status: u16, waiting: bool| {
+            let mut v = view(RunStatus::Parked);
+            v.waiting = waiting;
+            v.state = json!({"pending_wait": {
+                "call_id": "c1",
+                "tool": "explorer",
+                "run": "9a76d7bc-1e62-8362-9521-a05f6a837e5b",
+                "model_wait": {"reason": "the child's reason", "status": status, "park": park},
+            }});
+            v
+        };
+        let silent: PromptFn = Arc::new(|_| None);
+        for (v, state) in [
+            (parked("until_woken", 402, true), TaskState::InputRequired),
+            (parked("timer", 503, false), TaskState::Working),
+            // The child's refusal is not the root's: a 403 on a timer stays `working`.
+            (parked("timer", 403, false), TaskState::Working),
+        ] {
+            assert_eq!(task_state(&v), state);
+            let status = status_of(&v, &silent);
+            assert_eq!(
+                status.message.as_ref().and_then(|m| m.text()),
+                Some("the child's reason"),
+                "{state:?}"
+            );
+        }
+        // The copy is not the run's own wait: `default_prompt` has nothing to add.
+        assert_eq!(default_prompt(&parked("until_woken", 402, true)), None);
+        // A run that waits on a child with no copy is no park on the model at all.
+        let mut waiting = parked("until_woken", 402, true);
+        waiting.state = json!({"pending_wait": {"call_id": "c1", "tool": "explorer", "run": "x"}});
+        assert!(!crate::model_park::parked_on_model(&waiting));
     }
 
     #[test]

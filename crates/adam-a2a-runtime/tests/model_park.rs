@@ -614,10 +614,13 @@ async fn a_resume_while_the_woken_call_is_made_is_refused() {
     rig.stop().await;
 }
 
-/// A task on a timer that is not a park on the model (it waits for its subagent) takes neither a
-/// resume nor, without `steer/v1`, a message. A resume with no `taskId` is refused.
+/// A task waiting on a child parked on the model shows the child's reason — `input-required` for a
+/// park until woken, `working` for one on a timer — takes a resume to the root and forwards it, and
+/// a message whose words stay on the root (ADR 0067 decision 5). A resume once the child has
+/// finished is refused, and writes nothing.
 #[tokio::test]
-async fn a_task_waiting_on_a_child_takes_no_resume_and_a_resume_names_its_task() {
+async fn a_task_waiting_on_a_parked_child_shows_the_reason_and_takes_a_resume() {
+    // Until woken: the root reads `input-required` with the child's reason.
     let rig = Rig::new();
     let who = caller();
     rig.mock
@@ -627,50 +630,131 @@ async fn a_task_waiting_on_a_child_takes_no_resume_and_a_resume_names_its_task()
             arguments: json!({}),
             ..Default::default()
         }])
-        .push_error(refused(503, "unavailable", timer()));
+        .push_error(refused(402, "over_limit", Park::UntilWoken))
+        .push_text("the helper's answer")
+        .push_text("all done");
     let task = rig.start(&who, "c").await;
-    // The child parks on the model; the parent waits on the child, on a timer.
-    let child = adam_runtime::child_run_id(RunId(task.id.parse().unwrap()), "c1");
-    for _ in 0..2000 {
-        let view = rig.runtime.view(child).await.unwrap();
-        if view.is_some_and(|v| v.status == adam_core::RunStatus::Parked) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let parent = rig.wait(&who, &task.id, TaskState::Working, None).await;
-    assert_eq!(said(&parent), None, "no reason on the root yet (S8b-2b)");
+    let run = RunId(task.id.parse().unwrap());
+    let child = adam_runtime::child_run_id(run, "c1");
+    let parent = rig
+        .wait(
+            &who,
+            &task.id,
+            TaskState::InputRequired,
+            Some("the model gateway's limit is reached"),
+        )
+        .await;
+    assert!(
+        rig.runtime
+            .view(child)
+            .await
+            .unwrap()
+            .expect("the child")
+            .waiting,
+        "the child parked until woken"
+    );
+    assert_eq!(
+        said(&parent),
+        Some("the model gateway's limit is reached".into())
+    );
+
+    // A resume to the root is accepted, wakes the child through it, and the task works.
     let before = rig.written(&task).await;
-    let err = rig
+    let resumed = rig
         .backend
         .submit(who.clone(), resume("r-1"), Some(task.id.clone()), None)
         .await
-        .unwrap_err();
-    assert!(is_not_parked(&err), "{err:?}");
+        .expect("a resume to the root");
+    assert_eq!(resumed.status.state, TaskState::Working);
+    assert!(
+        rig.written(&task).await.0 > before.0,
+        "the version moved: the resume was delivered"
+    );
+    rig.wait(&who, &task.id, TaskState::Completed, Some("all done"))
+        .await;
+    let requests = rig.mock.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        texts(&requests[2]),
+        texts(&requests[1]),
+        "the child makes the same call"
+    );
+    let state = rig.runtime.state(run).await.unwrap().unwrap();
+    let conversation: adam_llm_agent::Conversation = serde_json::from_value(state).unwrap();
+    assert_eq!(
+        conversation
+            .messages
+            .iter()
+            .filter(|m| matches!(m, adam_model::Message::User { .. }))
+            .count(),
+        1,
+        "the resume is no turn of the person's"
+    );
+
+    // A resume once the child has finished: the root is not parked on the model any more.
+    let before = rig.written(&task).await;
     let err = rig
         .backend
-        .submit(
-            who.clone(),
-            user("hello", "m-2"),
-            Some(task.id.clone()),
-            None,
-        )
+        .submit(who.clone(), resume("r-2"), Some(task.id.clone()), None)
         .await
         .unwrap_err();
-    assert!(
-        matches!(&err, BackendError::InvalidParams(m) if m.contains("cannot take a follow-up")),
-        "{err:?}"
-    );
+    assert!(is_not_parked(&err), "{err:?}");
     assert_eq!(rig.written(&task).await, before, "nothing written");
-
+    // A resume with no `taskId`, in a context: it names the task it resumes.
     let err = rig
         .backend
-        .submit(who.clone(), resume("r-2"), None, Some("c".into()))
+        .submit(who.clone(), resume("r-3"), None, Some("c".into()))
         .await
         .unwrap_err();
     assert!(
         matches!(&err, BackendError::InvalidParams(m) if m.contains("names the task")),
         "{err:?}"
+    );
+    rig.stop().await;
+
+    // On a timer: the root reads `working` with the child's reason, takes a message and keeps its
+    // words there.
+    let rig = Rig::new();
+    let who = caller();
+    rig.mock
+        .push_tool_calls(vec![ToolCall {
+            id: "c1".into(),
+            name: "sub".into(),
+            arguments: json!({}),
+            ..Default::default()
+        }])
+        .push_error(refused(503, "unavailable", timer()))
+        .push_text("the helper's answer")
+        .push_text("all done");
+    let task = rig.start(&who, "c").await;
+    rig.wait(
+        &who,
+        &task.id,
+        TaskState::Working,
+        Some("the model gateway is busy"),
+    )
+    .await;
+    rig.backend
+        .submit(
+            who.clone(),
+            user("the gateway is back", "m-1"),
+            Some(task.id.clone()),
+            None,
+        )
+        .await
+        .expect("a message to the root");
+    rig.wait(&who, &task.id, TaskState::Completed, Some("all done"))
+        .await;
+    let requests = rig.mock.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        texts(&requests[3]).contains(&"the gateway is back".to_owned()),
+        "the words stayed on the root: {:?}",
+        texts(&requests[3])
+    );
+    assert!(
+        !texts(&requests[2]).contains(&"the gateway is back".to_owned()),
+        "and never reached the child"
     );
     rig.stop().await;
 }

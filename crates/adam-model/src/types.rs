@@ -120,6 +120,57 @@ pub enum ToolChoice {
     Tool(String),
 }
 
+/// Opaque members a provider attached to a turn, kept value for value and bound to the model alias
+/// and endpoint that produced them. Never interpreted, never sent to another model.
+///
+/// A provider may attach members this client does not model (Gemini's
+/// `extra_content.google.thought_signature`, and siblings) to an assistant message or to one of its
+/// tool calls. They are part of the next request's bytes or the provider refuses it, so they ride
+/// the conversation's JSON (journal, stored history, a resume, a compaction) and are sent back
+/// unchanged — but only to the model alias and endpoint that made them. A run that switches model
+/// (the frontier fallback, a person's choice) drops them: [`Message::Assistant::provider`]'s
+/// `model` and `endpoint` must both match the request's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderTurn {
+    /// The request's model alias that produced these members.
+    pub model: String,
+    /// The endpoint's stable id (the client computes it; not a secret, but a fingerprint of the
+    /// base URL: it confirms a guess).
+    pub endpoint: String,
+    /// The assistant message's members this client does not model (`extra_content`, and siblings).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub members: BTreeMap<String, Value>,
+    /// The raw reasoning value when the provider sent an object/array (a reasoning block) that
+    /// this client reduces to text; echoed back in place of the text when the client echoes
+    /// reasoning at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Value>,
+}
+
+impl ProviderTurn {
+    /// A turn with no members, bound to the model alias `model` and the endpoint id `endpoint`.
+    pub fn new(model: impl Into<String>, endpoint: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            endpoint: endpoint.into(),
+            members: BTreeMap::new(),
+            reasoning: None,
+        }
+    }
+
+    /// Whether this turn was produced by the model alias `model` at `endpoint`. Both sides must be
+    /// non-empty: an unstamped turn, or a client that does not know its endpoint, matches nothing
+    /// (fail closed).
+    pub fn is_bound_to(&self, model: &str, endpoint: &str) -> bool {
+        !self.model.is_empty()
+            && !self.endpoint.is_empty()
+            && !model.is_empty()
+            && !endpoint.is_empty()
+            && self.model == model
+            && self.endpoint == endpoint
+    }
+}
+
 /// One turn of a conversation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
@@ -142,6 +193,12 @@ pub enum Message {
         /// it is never in the stored history and never sent. It is not [`Message::text`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
+        /// The opaque members the provider attached to this turn, kept value for value and bound to
+        /// the model alias and endpoint that produced them ([`ProviderTurn`]). `None` when the
+        /// provider sent none, so a message without them is the same bytes as before and an older
+        /// journal decodes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<ProviderTurn>,
     },
     /// The result of running a tool the model asked for.
     Tool {
@@ -175,6 +232,7 @@ impl Message {
             content: vec![ContentPart::text(text)],
             tool_calls: Vec::new(),
             reasoning: None,
+            provider: None,
         }
     }
 
@@ -449,6 +507,12 @@ pub struct ToolCall {
     /// decode as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalid_arguments: Option<String>,
+    /// The call object's members this client does not model (`extra_content`, and siblings), kept
+    /// value for value. Provenance is the enclosing [`Message::Assistant`]'s
+    /// [`provider`](ProviderTurn): a call's members are sent only when that turn is bound to the
+    /// request's model alias and endpoint. `None` when the provider attached none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opaque: Option<BTreeMap<String, Value>>,
 }
 
 impl ToolCall {
@@ -459,6 +523,7 @@ impl ToolCall {
             name: name.into(),
             arguments,
             invalid_arguments: None,
+            opaque: None,
         }
     }
 
@@ -512,6 +577,7 @@ impl ModelResponse {
                 content: Vec::new(),
                 tool_calls,
                 reasoning: None,
+                provider: None,
             },
             finish: FinishReason::ToolCalls,
             usage: Usage::default(),
@@ -739,6 +805,7 @@ mod tests {
                 content: vec![ContentPart::text("checking")],
                 tool_calls: vec![tool_call()],
                 reasoning: None,
+                provider: None,
             },
             finish: FinishReason::ToolCalls,
             usage: Usage::new(12, 34)
@@ -793,11 +860,13 @@ mod tests {
             content: vec![],
             tool_calls: vec![tool_call()],
             reasoning: None,
+            provider: None,
         });
         roundtrip(Message::Assistant {
             content: vec![],
             tool_calls: vec![tool_call()],
             reasoning: Some("thinking".into()),
+            provider: None,
         });
         roundtrip(Message::tool_result("c", "out"));
         roundtrip(Message::tool_error("c", "boom"));
@@ -825,6 +894,7 @@ mod tests {
                 content: vec![ContentPart::text("yo")],
                 tool_calls: Vec::new(),
                 reasoning: None,
+                provider: None,
             })
             .unwrap()
         );
@@ -833,6 +903,7 @@ mod tests {
                 content: vec![],
                 tool_calls: Vec::new(),
                 reasoning: Some("r".into()),
+                provider: None,
             })
             .unwrap(),
             json!({"role": "assistant", "content": [], "reasoning": "r"})
@@ -843,6 +914,85 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m, Message::assistant_text("x"));
+    }
+
+    #[test]
+    fn a_provider_turn_roundtrips_and_an_older_journal_decodes() {
+        let mut call = tool_call();
+        call.opaque = Some(BTreeMap::from([(
+            "extra_content".into(),
+            json!({"google": {"thought_signature": "sig-abc-123"}}),
+        )]));
+        let mut provider = ProviderTurn::new("gw-model", "openai:0123456789abcdef");
+        provider.members = BTreeMap::from([(
+            "extra_content".into(),
+            json!({"google": {"thought_signature": "msg-sig"}}),
+        )]);
+        provider.reasoning = Some(json!({"blocks": [{"text": "thought"}]}));
+        let message = Message::Assistant {
+            content: vec![],
+            tool_calls: vec![call.clone()],
+            reasoning: None,
+            provider: Some(provider.clone()),
+        };
+        // A restart: the journal's JSON, read back, is the same message.
+        roundtrip(message.clone());
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            json["provider"]["members"]["extra_content"]["google"]["thought_signature"],
+            "msg-sig"
+        );
+        assert_eq!(
+            json["tool_calls"][0]["opaque"]["extra_content"]["google"]["thought_signature"],
+            "sig-abc-123"
+        );
+        assert_eq!(json["provider"]["model"], "gw-model");
+        assert_eq!(json["provider"]["endpoint"], "openai:0123456789abcdef");
+
+        // A journal written before the carrier existed has neither member and decodes as `None`.
+        let old: Message = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [],
+            "tool_calls": [{"id": "c", "name": "w", "arguments": {}}],
+        }))
+        .unwrap();
+        assert_eq!(
+            old,
+            Message::Assistant {
+                content: vec![],
+                tool_calls: vec![ToolCall::new("c", "w", json!({}))],
+                reasoning: None,
+                provider: None,
+            }
+        );
+        assert_eq!(old.tool_calls()[0].opaque, None);
+
+        // Absent means absent: no carrier, the same bytes as before.
+        assert_eq!(
+            serde_json::to_string(&Message::assistant_text("yo")).unwrap(),
+            r#"{"role":"assistant","content":[{"type":"text","text":"yo"}]}"#
+        );
+        assert_eq!(
+            serde_json::to_value(provider.clone()).unwrap(),
+            json!({
+                "model": "gw-model",
+                "endpoint": "openai:0123456789abcdef",
+                "members": {"extra_content": {"google": {"thought_signature": "msg-sig"}}},
+                "reasoning": {"blocks": [{"text": "thought"}]},
+            })
+        );
+        assert!(provider.is_bound_to("gw-model", "openai:0123456789abcdef"));
+        assert!(!provider.is_bound_to("other", "openai:0123456789abcdef"));
+        assert!(!provider.is_bound_to("gw-model", "openai:fedcba9876543210"));
+        // Fail closed when either side is empty: an unstamped turn, or a client that does not
+        // know its endpoint, matches nothing.
+        assert!(
+            !ProviderTurn::new("", "openai:0123456789abcdef")
+                .is_bound_to("", "openai:0123456789abcdef")
+        );
+        assert!(!ProviderTurn::new("gw-model", "").is_bound_to("gw-model", ""));
+        assert!(!provider.is_bound_to("", "openai:0123456789abcdef"));
+        assert!(!provider.is_bound_to("gw-model", ""));
     }
 
     #[test]
@@ -985,6 +1135,7 @@ mod tests {
             content: vec![ContentPart::text("a"), ContentPart::text("b")],
             tool_calls: vec![tool_call()],
             reasoning: Some("why".into()),
+            provider: None,
         };
         // Reasoning is never part of the text.
         assert_eq!(m.text(), "ab");

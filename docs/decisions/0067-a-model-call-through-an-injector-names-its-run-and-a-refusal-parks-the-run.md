@@ -157,6 +157,8 @@ Three things are missing in adam today:
      5), and its deadline is paused, so its whole task would wait for ever: a child run that is no session's round
      fails with the reason, as an unattended run does, and its parent's model gets an error result. A child's timer
      parks stay, bounded by `MODEL_PARK_LIMIT` and its time limit; the root shows no reason for them until S8b-2b.
+     *(Superseded by the S8b-2b amendment below: a child parked until woken now waits, and its parent shows it and
+     wakes it through a forwarded resume.)*
    * **An unattended run fails on a refusal of status 401 or 403** too, timer or not: nothing binds a firing at the
      gateway yet (decision 6), so waiting cures nothing. Its other timer parks (`rate_limited`, `unavailable`, a gateway
      that cannot be reached) still wake on their own.
@@ -164,14 +166,35 @@ Three things are missing in adam today:
      it.
 5. **A child run.** A local subagent's refusal parks the child the same way, and its parent waits on it as on any child.
    * **The parent learns of it** by a notice from the child's park, as it learns of a child's reports
-     (`ChildReport::from_notice`, `crates/adam-runtime/src/child.rs`), and keeps the reason with its pending child.
+     (`ChildStatus::from_report`, `crates/adam-runtime/src/child.rs`), and keeps the reason with its pending child.
    * **The root's task shows the descendant's wait:** `input-required` with its reason when the child waits until woken,
      and a status message naming it when the child waits on a timer.
    * **Only a resume goes down, never text.** A message or a resume to a run that waits on a child parked on the model
      sends that child a resume; the text of a message stays with the run that got it, as today. Each level forwards to its
      own pending child, so a grandchild is reached through its parent. The resume's message id is derived from the one
-     that woke the parent, so a replayed step sends it once.
+     that woke the parent, so a replayed step sends it again under the same id, which the child drops.
    * A child session's round is its own task and shows its own state.
+
+   *Amended 2026-11-21 (S8b-2b):* what the decision left open, as built. The notice is the inbound kind
+   `adam.child.parked`, whose id is the child's run id and whose payload is not read: the runtime sends it after a
+   **stepped** park commit only (never from its own look at a parked child, which parks it again without stepping it),
+   and a run that finishes ignores it as it ignores a finished notice. The parent reads the child in one record
+   (`Ctx::child_look`) and keeps what it waits on as a copy beside its pending child (`PendingRun::model_wait`, in the
+   head, so a front reads it at `/pending_wait/model_wait`); the copy holds the child's own model wait or the copy the
+   child keeps of **its** child, so a grandchild's park is shown one level at a time. A child's park until woken makes
+   the parent wait with **no timer**, as a question does, so `RunView::waiting` says it and the root's task is
+   `input-required` with the reason; a child's timer park keeps the parent's 60 s look and the root's task is `working`
+   with the reason. A child's refusal of status 401 or 403 is **not** the root's: the root's task stays `working` (a timer
+   park) with the reason, never `auth-required`, since the gateway refused the child's call and not the root's. A message
+   or a resume to the root is accepted (a message's text is added at the root, behind the call the child answers) and the
+   root forwards **one** resume (`RESUME_KIND`) with an id derived from the waking message's id and the child's run id;
+   the copy is cleared when it forwards, and rewritten at the next look. The child drops a resume whose id it has
+   read (`read_ids`) and, when that was the whole wake, parks again without a call, so a replayed forward is no second
+   call. A local subagent's park until woken no longer
+   fails the child (the S8b-2a amendment's arm is gone): it waits, and only its parent's forwarded resume wakes it. The
+   coder ends its background commands on an until-woken park of a child it waits on, as on its own (a timer park keeps
+   them, bounded by `MODEL_PARK_LIMIT`). A notice that is lost costs the parent its next look at a timer park; for an
+   until-woken park, the child cannot finish on its own, so no timer is kept and a lost notice is not cured by one.
 6. **Who never parks.** An **unattended** run (a schedule's firing, ADR 0060 slice 6c) has nobody to wake it: a refusal
    that would park until woken fails it with the reason, as the coder already ends a firing that would wait; a timer
    park still wakes on its own. Under `injector`, nothing binds a firing
@@ -216,15 +239,21 @@ Three things are missing in adam today:
   connection, `MODEL_CA_FILE`.
 * `adam-llm-agent`: `Conversation::model_wait`, the park, its backoff and `MODEL_PARK_LIMIT`, the wake, the summary call,
   the child's notice and the forwarded resume; the "Failure handling" list. `Conversation` denies no unknown field, so a
-  build rolled back past this change reads a parked run's state, without its model wait.
-* `adam-runtime`: `Ctx::retries_left()`; `SessionHeader::root`; nothing else (a park is a `wake_at`).
+  build rolled back past this change reads a parked run's state, without its model wait. A parent that is not an
+  `LlmAgent` forwards no resume, so a child's park until woken now waits until a cancel, where S8b-2a failed it with the
+  reason: a behaviour change for hand-written `adam-embed` agents that wait on children.
+* `adam-runtime`: `Ctx::retries_left()`; `Ctx::child_look` (the caller's child in one read: its status and the head
+  of its state) and `Ctx::resume_child` (a checked wake of the caller's child), `ChildLook` and `CHILD_PARKED_KIND`
+  (the notice of a child's park, after its own commit); `SessionHeader::root`; nothing else (a park is a `wake_at`).
 * `adam-a2a-runtime` and `docs/reference/a2a-server.md` (a section "A run parked on the model", which names
   `adam.resume`, the contract it is; a second key of its kind would make it an extension of its own): a model park's task state and message (`convert.rs`, also its default prompt and the
-  `input-required` rewrite after a delivery, `backend.rs`), `auth-required` listed (`list.rs`), a message accepted for a
+  `input-required` rewrite after a delivery, `backend.rs`), a park shown through the parent that waits on it
+  (`model_park.rs`: the copy of the child's wait is a model wait for a resume and a reason, and never
+  `auth-required`), `auth-required` listed (`list.rs`), a message accepted for a
   run with a `model_wait` on a timer (`backend.rs`), and `adam.resume`, which may have no text (`convert.rs` and
   `vymalo.rs`, which refuse a message with no text today).
-* `adam-coder`: a park until woken stops background commands as a question does; a timer park keeps them, for at most
-  `MODEL_PARK_LIMIT`.
+* `adam-coder`: a park until woken stops background commands as a question does, its own or a child's it waits on; a
+  timer park keeps them, for at most `MODEL_PARK_LIMIT`.
 * `adam-service`: `MODEL_AUTH=injector`, `MODEL_PARK_LIMIT`, `MODEL_CA_FILE` (`docs/reference/environment.md`);
   `docs/reference/parity.md` gains "model calls name their run", "a gateway's refusal parks the run" and "a CA for the
   model endpoint" for the coder, the folder agent and the engine (whose host gives its own provider, ADR 0058, and
@@ -238,7 +267,7 @@ Three things are missing in adam today:
 | S8a | `InjectedRun`, `MODEL_AUTH=injector`, `MODEL_CA_FILE` and the two `run` fields: every model call of a run, its subagents' and its sessions' included, carries the root's id and no `Authorization` | two levels. **Requests:** the scripted `MockModel` records every `ModelRequest` of a chain of child runs, a compaction's summary call (of a root and of a child), a session's rounds (opened by a task, sent by a later task, sent by a person) and a subagent under a person's round, and each names the run decision 2 says; a message's metadata cannot change it. **Wire:** a mock HTTP server records each call's headers through `adam-model-openai` and `adam-service`: `X-Run-Id` and no `Authorization` on completions, streams and the retry after a 401; a call with no run sends nothing; a TLS server whose certificate a test CA signed is reached only with `MODEL_CA_FILE` |
 | S8b-1 | the model layer of decision 3, and of decisions 7 and 8: `Refusal`, `ProblemType`, `Park`, `ModelCredentials::parks` (no park by default), `InjectedRun`'s table, `ModelError::Refused`, `ModelLocked` and `Unreachable`, `MAX_PARK`, and `Ctx::retries_left()`; nothing parks a run yet | **Unit:** each row of the table and its clamp, an unreadable type, the classes, a `Display` with no body, the worker's verdicts and `retries_left` sharing one decision. **Wire** (`adam-model-openai`, a mock server): each slug, a slugless `401` and `403`, an unreadable `type`, a `Retry-After` far ahead, `model_locked` for every provider, `StaticBearer`'s errors against goldens from before, no body in any error, a refused connection `Unreachable`, a timeout and a TLS handshake refused for its CA not; **runtime:** a policy of three attempts sees 2, 1 and 0, and the last failure fails the run |
 | S8b-2a | decisions 4, 6, 7 and 8 for a run that calls the model itself: the park, its backoff, `MODEL_PARK_LIMIT`, the summary call, the states, the message and `adam.resume` over A2A | **Agent loop** (`adam-llm-agent` `tests/model_park.rs`, a scripted model whose refusals are injected): each kind parks with its wake and keeps its conversation, the same call after the timer, a message's text added, a resume adding nothing, the backoff, the limit, an unattended run, an unreachable endpoint, `ModelLocked`, `StaticBearer`'s errors, a cancel, and no body in the journal through `adam-model-openai` against a mock server; the summary call (`tests/compaction.rs`). **A2A** (`adam-a2a-runtime` `tests/model_park.rs`): the three states and their messages, the list filter, a message to a timer park, a textless resume through the backend and over HTTP, the refusals with `-32602` and nothing written, cancel |
-| S8b-2b | decision 5 (child runs) and the coder's background commands | the test gateway answers each slug of the table, a slugless `401`, a refused connection and a timeout in turn: the run parks with the state and reason above, keeps its conversation, and the same call is made again after the timer, a message or `adam.resume` (which adds no turn); a timeout fails as today; `model_locked` and an unattended run that would wait fail; a parked child shows on the root and is woken through it; `MODEL_PARK_LIMIT` fails a run that never binds; `StaticBearer` fails as before; nothing of a header or body in the journal |
+| S8b-2b | decision 5 (child runs) and the coder's background commands | **Agent loop** (`adam-llm-agent` `tests/model_park.rs`): a subagent's park until woken shows on its parent, which waits with no timer and says why, and a message or a resume to the parent wakes the child through it (its words staying at the parent, a copy of the waking message waking it once, a forwarded resume clearing the copy, a child on a timer keeping the 60 s look); a grandchild is reached one level at a time; the test gateway's slugs, a slugless `401`, a refused connection and a timeout, `MODEL_PARK_LIMIT`, an unattended run, `ModelLocked`, `StaticBearer` and nothing of a header or body in the journal as S8b-2a built them. **A2A** (`adam-a2a-runtime` `tests/model_park.rs`): the root reads `input-required` or `working` with the descendant's reason, takes a resume and a message, and refuses a resume once the child finished. **Runtime** (`adam-runtime` `tests/runtime.rs`): the park notice is sent once per park and never by a look, and the checked accessors refuse a run that is not the caller's child. **Coder** (`bin/adam-coder`): an until-woken child stops the background commands |
 | S8c | the coder's chart sets `MODEL_AUTH=injector` when its values say so | the chart's goldens; another-agentic-system#334 S10 puts the agents behind the gateway |
 
 ## Open

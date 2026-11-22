@@ -211,14 +211,23 @@ keeps its conversation and waits to make the call again (`adam-llm-agent`, *A ru
 | until woken | `input-required`, the reason as the message (also `default_prompt`'s last fallback; a host's `PromptFn` does not hide it) |
 | on a timer | `working`, the reason as the status message |
 
+A run that **waits on a child parked on the model** is parked on the model for this purpose (ADR 0067 decision 5): its
+task reads the copy of the child's wait (`/pending_wait/model_wait`, what `adam-llm-agent` keeps), so it is
+`input-required` with the child's reason when the child waits until woken, and `working` with it when the child is on a
+timer. A child's refusal of status 401 or 403 is **never** `auth-required` on the root: the gateway refused the child's
+call, not the root's.
+
 `ListTasks` returns them by those states. A message with the `taskId` of a parked task is delivered, timer or not. A message
 whose metadata holds `adam.resume: true` (`RESUME_METADATA_KEY`) is a **resume**, read before the inbound function, so it
-may have no text: it delivers a wake-up of kind `adam.resume` that the loop drops, adding nothing. A task that is not parked
-on the model (asking, working, finished, canceled) refuses it with `InvalidParams` `NOT_PARKED` and nothing is written; a
-resume names its `taskId`. A round of a child session is resumed the same way. The contract is
+may have no text: it delivers a wake-up of kind `adam.resume` that the loop drops, adding nothing. A message or a resume
+to a run that waits on a parked child is delivered the same way: the loop sends the child one resume, and the words of a
+message stay at the root. A task that is not parked on the model (asking, working, finished, canceled, or waiting on a
+child that is not parked) refuses it with `InvalidParams` `NOT_PARKED` and nothing is written; a resume names its
+`taskId`. A round of a child session is resumed the same way. The contract is
 [`docs/reference/a2a-server.md`](../../docs/reference/a2a-server.md#a-run-parked-on-the-model). Tests: `tests/model_park.rs`
 (the three states and their messages, the list filter, a message to a timer park on `working` and `auth-required`, a textless
-resume through the backend and over HTTP with no part, the refusals with -32602 and nothing written, cancel) and the unit
+resume through the backend and over HTTP with no part, a task waiting on a parked child (its reason, a resume and a message
+accepted, a resume after the child finished refused), the refusals with -32602 and nothing written, cancel) and the unit
 tests of `src/convert.rs` (`a_park_on_the_model_says_its_state_and_its_reason`) and `src/model_park.rs`.
 
 ## Push notifications

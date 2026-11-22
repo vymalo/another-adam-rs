@@ -13,11 +13,11 @@ use adam_model::{
     ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_runtime::{
-    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, CancelToken,
-    ChildStarter, ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES, MAX_SESSION_PAGE,
-    RUN_FINISHED_KIND, ReservedStep, RetryPolicy, RunEvent, SESSION_CLOSE_KIND, SandboxUsage,
-    SessionState, SessionSummary, StepEvent, StepIcon, StepKind, StepState, Transition, UsageEvent,
-    UsageTotals, child_run_id,
+    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
+    CancelToken, ChildLook, ChildStarter, ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES,
+    MAX_SESSION_PAGE, RUN_FINISHED_KIND, ReservedStep, RetryPolicy, RunEvent, SESSION_CLOSE_KIND,
+    SandboxUsage, SessionState, SessionSummary, StepEvent, StepIcon, StepKind, StepState,
+    Transition, UsageEvent, UsageTotals, child_run_id,
 };
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -144,6 +144,15 @@ fn compaction_call_id(run: RunId, n: usize) -> String {
     let mut suffix = uuid::Uuid::new_v4().simple().to_string();
     suffix.truncate(8);
     format!("{run}-k{n}-{suffix}")
+}
+
+/// The id of the resume a run forwards to the child `child` when the inbound `waking` woke it
+/// ([ADR 0067] decision 5): derived from both, so a step that runs again writes the same id, and a
+/// child that receives the copy drops it (its `read_ids`) and makes no call.
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+fn forwarded_resume_id(waking: &str, child: RunId) -> String {
+    format!("{}:{waking}:{child}", crate::MODEL_RESUME_KIND)
 }
 
 /// `messages` with every tool output over [`OVERFLOW_OUTPUT_CHARS`] shortened, for the summary
@@ -876,6 +885,7 @@ fn report_messages(reports: &[RoundReport], paged: bool) -> Vec<Message> {
         content: Vec::new(),
         tool_calls: calls.clone(),
         reasoning: None,
+        provider: None,
     }];
     messages.extend(reports.iter().zip(&calls).map(|(r, call)| Message::Tool {
         call_id: call.id.clone(),
@@ -1525,9 +1535,10 @@ impl LlmAgentBuilder {
 ///   limit, as any timer does.
 /// * **Until woken** (a usage limit reached): the run waits like a question, with no timer and its
 ///   deadline paused, and never fails on its own. A run nobody can wake fails instead: a schedule's
-///   firing ([`is_unattended`]), and a local subagent's run (a child that is no session's round),
-///   whose parent then gets an error result. A firing also fails on a refusal of status 401 or 403,
-///   since nothing binds a firing at the gateway yet.
+///   firing ([`is_unattended`]). A local subagent waits for the resume its parent forwards (ADR 0067
+///   decision 5); a parent that is not an `LlmAgent` forwards none, so the child waits until a cancel.
+///   A firing also fails on a refusal of status 401 or 403, since nothing binds a firing at the
+///   gateway yet.
 /// * **Waking.** A message wakes either kind: its text is the person's turn, added before the call. A
 ///   message of kind [`MODEL_RESUME_KIND`] wakes it and adds nothing (and one that lands while the
 ///   run works is no arrival). A run parked on its summary call takes its inbox, the words kept in
@@ -1551,7 +1562,7 @@ impl LlmAgentBuilder {
 /// * A refusal whose provider parks the run (`ModelError::Refused`), and, with
 ///   [`ModelParking::when_unreachable`], an endpoint that cannot be reached once the step's retries
 ///   are spent: the run parks on the model (below), and fails only past [`ModelParking::limit`], or
-///   on a park until woken in a run nobody can wake.
+///   on a park until woken in a run nobody can wake (a schedule's firing).
 /// * Other model error, `ModelError::ModelLocked` (naming the model) among them: the run fails
 ///   (`model call failed: ...`). So does a refusal under a provider that does not park
 ///   (`StaticBearer`'s `401` is `ModelError::Auth`).
@@ -1648,6 +1659,9 @@ struct Absorbed {
     waiting: bool,
     /// The answers a tool refused (`Tool::read_answer`), each with the call it was for.
     refusals: Vec<(String, Refusal)>,
+    /// The id of the first message the run read, if it read any: what a resume it forwards to a
+    /// child parked on the model derives its own id from (ADR 0067 decision 5).
+    read: Option<String>,
 }
 
 /// What [`LlmAgent::compact_if_due`] did.
@@ -1787,6 +1801,7 @@ impl LlmAgent {
         defer: bool,
     ) -> Absorbed {
         let mut texts = Vec::new();
+        let mut read = None;
         for inbound in inbox {
             // A message the run has read is not read again: the orchestration layer sends the same
             // one a second time after a lost lease (`steer/v1`: the `messageId` is the key).
@@ -1797,6 +1812,9 @@ impl LlmAgent {
             match parse_user_text(&inbound.payload) {
                 Ok(text) => {
                     state.note_read(&inbound.id);
+                    if read.is_none() {
+                        read = Some(inbound.id.clone());
+                    }
                     // What the message says about its sender is read along with what it says.
                     if let Some(context) = parse_context(&inbound.payload) {
                         state.merge_context(context);
@@ -1825,6 +1843,7 @@ impl LlmAgent {
                 return Absorbed {
                     waiting: true,
                     refusals,
+                    read,
                 };
             };
             let (call_id, tool, ui) = (q.call_id.clone(), q.tool.clone(), q.ui.clone());
@@ -1888,24 +1907,26 @@ impl LlmAgent {
         Absorbed {
             waiting: false,
             refusals,
+            read,
         }
     }
 
-    /// The inbox of a run that parks on its summary call (ADR 0067): taken, the wake-ups and notices
-    /// dropped, a request to close its session noted, and each message's words kept in
+    /// The inbox of a run that asks or parks on its summary call (ADR 0067), handed in by the step
+    /// that took it before the summary (a resume is read and recorded there first): the wake-ups
+    /// and notices dropped, a request to close its session noted, and each message's words kept in
     /// [`Conversation::deferred`], read once the summary is made.
     async fn absorb_while_parked(
         &self,
         ctx: &mut Ctx,
         state: &mut Conversation,
+        inbox: Vec<Inbound>,
     ) -> Result<(), AgentError> {
-        let inbox: Vec<Inbound> = ctx
-            .take_inbox()
+        let inbox: Vec<Inbound> = inbox
             .into_iter()
             .filter(|i| {
                 !matches!(
                     i.kind.as_str(),
-                    CHILD_REPORTED_KIND | MODEL_RESUME_KIND | RUN_FINISHED_KIND
+                    CHILD_PARKED_KIND | CHILD_REPORTED_KIND | RUN_FINISHED_KIND
                 )
             })
             .collect();
@@ -2120,15 +2141,6 @@ impl LlmAgent {
                     "model call failed: {detail}; a schedule started this run, so nobody can wake it"
                 ))));
             }
-            // A local subagent's run (a child that is no session's round) is woken by nobody: a
-            // resume reaches its task, not the child, until S8b-2b forwards one. Its parent is told
-            // the call failed, and goes on.
-            if state.root_run.is_some() && state.session.is_none() {
-                tracing::info!(%run, %detail, "the model refused a subagent's call, and nothing wakes a subagent: it fails");
-                return Ok(Some(Flow::Fail(format!(
-                    "model call failed: {detail}; this run is a subagent's, so nobody can wake it"
-                ))));
-            }
             let now = ctx.now_journaled().await?;
             let parked_since = match &previous {
                 Some(w) if w.park == ModelPark::UntilWoken => w.parked_since,
@@ -2215,21 +2227,31 @@ impl LlmAgent {
         status
     }
 
-    /// Where the child a run waits for stands: what its message said, or, without one, what the
-    /// store says. `None`: still working.
-    async fn settle(
-        ctx: &Ctx,
-        wait: &PendingRun,
-        notices: &[(RunId, ChildStatus)],
-    ) -> Result<Option<ChildStatus>, AgentError> {
-        if let Some((_, status)) = notices.iter().find(|(run, _)| *run == wait.run) {
-            return Ok(Some(status.clone()));
+    /// The model wait the head of a child's state says it has (ADR 0067 decision 5): its own, or
+    /// the copy it keeps of its own child's — a park is shown through each parent, one level at a
+    /// time. `None` for a child that works or waits on something else, and for a wait this build
+    /// cannot read.
+    fn model_wait_of(head: Option<&Value>) -> Option<ModelWait> {
+        let head = head?;
+        let wait = head
+            .get("model_wait")
+            .or_else(|| head.pointer("/pending_wait/model_wait"))?;
+        serde_json::from_value(wait.clone()).ok()
+    }
+
+    /// Whether a cut turn has nothing the model would see: no reasoning text, no raw reasoning
+    /// block and no opaque members. A message with a carrier is not empty on the wire, so it stays.
+    fn cut_turn_has_nothing_to_send(message: &Message) -> bool {
+        match message {
+            Message::Assistant {
+                reasoning: None,
+                provider,
+                ..
+            } => provider
+                .as_ref()
+                .is_none_or(|turn| turn.reasoning.is_none() && turn.members.is_empty()),
+            _ => false,
         }
-        Ok(match ctx.child_status(wait.run).await? {
-            Some(status) if status.is_finished() => Some(status),
-            Some(_) => None,
-            None => Some(ChildStatus::vanished()),
-        })
     }
 
     /// One journaled model call, then the assistant message into the state.
@@ -2700,16 +2722,14 @@ impl LlmAgent {
                         early,
                     ));
                 }
-                // A cut turn with nothing the model will see (no reasoning echoed back) would be
-                // sent as an empty assistant message, which some servers refuse: it leaves the
-                // history.
-                if matches!(
-                    state.messages.last(),
-                    Some(Message::Assistant {
-                        reasoning: None,
-                        ..
-                    })
-                ) {
+                // A cut turn with nothing the model will see (no reasoning echoed back, no raw
+                // block, no carrier) would be sent as an empty assistant message, which some
+                // servers refuse: it leaves the history.
+                if state
+                    .messages
+                    .last()
+                    .is_some_and(Self::cut_turn_has_nothing_to_send)
+                {
                     state.messages.pop();
                 }
                 // The next turn is the closing turn, which has its own instruction.
@@ -3619,6 +3639,7 @@ impl LlmAgent {
                         call_id: call.id.clone(),
                         tool: call.name.clone(),
                         run,
+                        model_wait: None,
                     };
                     let Some((_, child)) = notices.iter().find(|(r, _)| *r == run) else {
                         ctx.emit(RunEvent::Custom {
@@ -5317,6 +5338,10 @@ impl ToolResult {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a turn's message is the value; boxing it would allocate for every tool answer"
+)]
 enum ToolResult {
     Answered {
         message: Message,
@@ -5757,6 +5782,50 @@ impl Agent for LlmAgent {
             self.forget_chars(ctx.run_id());
             return Ok(Transition::Done { state, output });
         }
+        // The inbox is taken once, here, before the summary: a resume that wakes a run parked on its
+        // summary is read (and its id recorded) before `compact_if_due` asks the summary again, so
+        // `absorb_while_parked` cannot consume it unrecorded and a replayed forward cannot wake the
+        // run a second time.
+        let inbox = ctx.take_inbox();
+        // A resume (ADR 0067) says nothing to the run itself: it wakes a run parked on the model,
+        // which then makes its call again, and a run that waits on a child parked on the model
+        // forwards one to it (decision 5). It adds nothing to the conversation and answers no
+        // question, so it never reaches the inbox below.
+        //
+        // The id is derived from the waking message and the child, so a step that runs again (a
+        // lost commit) writes the same one: a resume whose id this run has read is a **copy**, and
+        // a copy is no wake. The ones kept are noted in the commit of this step, which consumes
+        // them; the copy of a later delivery is then recognised.
+        let (resumes, inbox): (Vec<_>, Vec<_>) =
+            inbox.into_iter().partition(|i| i.kind == MODEL_RESUME_KIND);
+        let mut kept = Vec::with_capacity(resumes.len());
+        let mut copies = 0_usize;
+        for resume in resumes {
+            if state.has_read(&resume.id) {
+                copies += 1;
+            } else {
+                state.note_read(&resume.id);
+                kept.push(resume);
+            }
+        }
+        let resumes = kept;
+        // Woken by nothing but copies of resumes this run has read: the step that sent them ran
+        // again after a lost commit. The run waits on the model as it did, with no call — a copy is
+        // not a wake, and it does not ask a summary again either. A timer that has come due is not
+        // "nothing" (the runtime woke it for the timer), and anything else in the inbox (a message,
+        // a notice, a close) is read below.
+        let nothing_else = inbox
+            .iter()
+            .all(|i| i.kind == CHILD_PARKED_KIND || i.kind == CHILD_REPORTED_KIND);
+        if copies > 0
+            && resumes.is_empty()
+            && nothing_else
+            && let Some(wait) = &state.model_wait
+            && !wait.wake_at.is_some_and(|at| at <= ctx.now())
+        {
+            let wake_at = wait.wake_at;
+            return Ok(Transition::Park { state, wake_at });
+        }
         // The history is shortened here, in the state, from the state as it was committed: before
         // this step appends a message that arrived since (an inbox message, a deferred one, the
         // answer to a question), so a replay after a crash shortens the same way whatever arrived
@@ -5777,13 +5846,18 @@ impl Agent for LlmAgent {
         // A history that has reached the budget is summarised first, at a journaled step of its own;
         // the model is asked in the next transition, from the new history.
         match self.compact_if_due(ctx, &mut state, &output_id_of).await? {
-            Compacted::Made => return Ok(Transition::Continue(state)),
+            Compacted::Made => {
+                // What arrived while the summary was asked is read now, after it: the step took
+                // the inbox before the summary, so its words are kept for the next transition.
+                self.absorb_while_parked(ctx, &mut state, inbox).await?;
+                return Ok(Transition::Continue(state));
+            }
             Compacted::Parked(flow) => {
                 // What arrived is read now, its words kept for after the summary: a parked run with
                 // messages left in its inbox would be stepped again by every look of the runtime
                 // (a child's or a run with a deadline), making the summary call each time.
                 if !matches!(flow, Flow::Fail(_)) {
-                    self.absorb_while_parked(ctx, &mut state).await?;
+                    self.absorb_while_parked(ctx, &mut state, inbox).await?;
                 }
                 return Ok(match flow {
                     Flow::Sleep(wake_at) => Transition::Park {
@@ -5837,15 +5911,14 @@ impl Agent for LlmAgent {
                 state.compactions.len(),
             );
         }
-        let (finished, inbox): (Vec<_>, Vec<_>) = ctx
-            .take_inbox()
+        let (finished, inbox): (Vec<_>, Vec<_>) = inbox
             .into_iter()
             // A session round's report (ADR 0045) is a wake-up, not a person's words: it is
             // dropped, never shown to the model, and the report is read from the store.
             .filter(|i| i.kind != CHILD_REPORTED_KIND)
-            // A resume (ADR 0067) only wakes a run parked on the model, which then makes its call
-            // again: it adds nothing to the conversation and answers no question.
-            .filter(|i| i.kind != MODEL_RESUME_KIND)
+            // A child's park (ADR 0067 decision 5) is a wake-up too: what the child waits on is
+            // read from its record, below.
+            .filter(|i| i.kind != CHILD_PARKED_KIND)
             .partition(|i| i.kind == RUN_FINISHED_KIND);
         // A request to close the session this round belongs to: the round goes on and finishes its
         // work, and the session takes no more messages after it.
@@ -5918,11 +5991,21 @@ impl Agent for LlmAgent {
             (!state.context.is_empty()).then(|| Arc::new(state.context.clone()));
 
         // A wait on a child ends with the child's message or, when woken without one (the timer,
-        // or a user message), with what the store says. A message that matches no wait (a
-        // duplicate of one already used, or one for a call the run is not on) is dropped here:
-        // the wait it was for has been settled, or will be, from the store.
+        // a message, a resume, or the child's park), with what the store says. A message that
+        // matches no wait (a duplicate of one already used, or one for a call the run is not on)
+        // is dropped here: the wait it was for has been settled, or will be, from the store.
         if let Some(PendingWait::Run(wait)) = state.pending_wait.clone() {
-            match Self::settle(ctx, &wait, &notices).await? {
+            // One read of the child, or the notice of its end the inbox already holds.
+            let look = match notices.iter().find(|(run, _)| *run == wait.run) {
+                Some((_, status)) => Some(ChildLook::finished(status.clone())),
+                None => ctx.child_look(wait.run).await?,
+            };
+            let finished = match &look {
+                None => Some(ChildStatus::vanished()),
+                Some(look) if look.status.is_finished() => Some(look.status.clone()),
+                Some(_) => None,
+            };
+            match finished {
                 Some(child) => {
                     let outcome = Self::answer_run(&mut state, &wait, &child);
                     Self::count_child(ctx, &mut state, wait.run).await?;
@@ -5930,7 +6013,37 @@ impl Agent for LlmAgent {
                         .await;
                 }
                 None => {
-                    let wake_at = Some(self.next_poll(ctx));
+                    // The child works or waits. What it waits on is read from the same head and
+                    // kept with the pending child (ADR 0067 decision 5).
+                    let copy = look
+                        .as_ref()
+                        .and_then(|look| Self::model_wait_of(look.head.as_ref()));
+                    // A message or a resume to this run goes down to a child parked on the model
+                    // as one resume, under an id a replay writes again. The words of a message
+                    // stay here: they are deferred above, behind the call the child answers.
+                    let waking = absorbed
+                        .read
+                        .as_deref()
+                        .or_else(|| resumes.first().map(|i| i.id.as_str()));
+                    let forwarded = match (&copy, waking) {
+                        (Some(_), Some(waking)) => {
+                            ctx.resume_child(wait.run, forwarded_resume_id(waking, wait.run))
+                                .await?;
+                            true
+                        }
+                        _ => false,
+                    };
+                    // A child parked until it is woken cannot finish on its own, so this run
+                    // waits with no timer, as it waits on a question: its task says why. A child
+                    // on a timer keeps the 60 s look, which is what a lost notice falls back on.
+                    let until_woken = !forwarded
+                        && copy
+                            .as_ref()
+                            .is_some_and(|wait| wait.park == ModelPark::UntilWoken);
+                    if let Some(PendingWait::Run(stored)) = &mut state.pending_wait {
+                        stored.model_wait = if forwarded { None } else { copy };
+                    }
+                    let wake_at = (!until_woken).then(|| self.next_poll(ctx));
                     return Ok(Transition::Park { state, wake_at });
                 }
             }
@@ -6093,6 +6206,55 @@ mod thinking_cut_tests {
         let junk = Inbound::new("message", json!({ "nothing": true }));
         agent.absorb_inbox(&mut state, vec![junk], &HashMap::new());
         assert_eq!(state.thinking_cuts, 2);
+    }
+
+    #[test]
+    fn a_cut_turn_with_a_reasoning_block_or_a_carrier_stays() {
+        let mut block = Message::Assistant {
+            content: vec![],
+            tool_calls: vec![],
+            reasoning: None,
+            provider: Some(adam_model::ProviderTurn::new("m", "e")),
+        };
+        let Message::Assistant {
+            provider: Some(turn),
+            ..
+        } = &mut block
+        else {
+            unreachable!("a carrier")
+        };
+        turn.reasoning = Some(json!({"blocks": []}));
+        assert!(
+            !LlmAgent::cut_turn_has_nothing_to_send(&block),
+            "a block-only turn must not be popped before it is echoed"
+        );
+
+        let Message::Assistant {
+            provider: Some(turn),
+            ..
+        } = &mut block
+        else {
+            unreachable!("a carrier")
+        };
+        turn.reasoning = None;
+        turn.members
+            .insert("extra_content".into(), json!({"sig": 1}));
+        assert!(!LlmAgent::cut_turn_has_nothing_to_send(&block));
+
+        let empty = Message::Assistant {
+            content: vec![],
+            tool_calls: vec![],
+            reasoning: None,
+            provider: None,
+        };
+        assert!(LlmAgent::cut_turn_has_nothing_to_send(&empty));
+        let echoed = Message::Assistant {
+            content: vec![],
+            tool_calls: vec![],
+            reasoning: Some("r".into()),
+            provider: None,
+        };
+        assert!(!LlmAgent::cut_turn_has_nothing_to_send(&echoed));
     }
 }
 
@@ -6466,6 +6628,7 @@ mod compaction_gate_tests {
                     ..Default::default()
                 }],
                 reasoning: None,
+                provider: None,
             });
             state
                 .messages

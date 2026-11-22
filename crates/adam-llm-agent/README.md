@@ -406,9 +406,12 @@ middle of a call. What is new is the end of the run:
   An answer that asks for tool calls is not dropped: the calls are valid, and the next turn reads the message.
 * **A message is read once.** `Conversation::read_ids` keeps the ids (`Inbound::id`, an A2A `messageId`) of the last
   `MAX_READ_IDS` (128) messages the run has read, oldest first, and a message whose id is there is ignored, whether it is
-  still in the inbox or was read transitions ago: the orchestration layer repeats a steer after a lost lease. An empty id is
-  never remembered. Part of the durable state (serde default, not written while empty); a run that continues another starts
-  with none.
+  still in the inbox or was read transitions ago: the orchestration layer repeats a steer after a lost lease. The ids of
+  the resumes the run read are kept in the same window (the forwarded resume's id, ADR 0067 decision 5): a copy of one
+  is no wake. The window is shared, so a burst of resumes can evict an old message id; that fails open — the old message,
+  delivered again, is read once more (one extra turn), never lost — and an evicted resume id makes the copy a kept
+  resume, so it costs one extra call (and its step). An empty id is never remembered. Part of the durable state (serde
+  default, not written while empty); a run that continues another starts with none.
 
 ## Cancel
 
@@ -705,12 +708,25 @@ for `MODEL_AUTH=injector`).
 |---|---|---|
 | When | the provider said `Park::OnTimer`, or the endpoint cannot be reached | the provider said `Park::UntilWoken` (a usage limit reached) |
 | The run | parked with `wake_at`: 30 s, doubling at each park in a row, at most 15 min (`MAX_MODEL_BACKOFF`), at least what the provider asked | parked with no timer, like a question: its deadline is paused |
-| Ends | on its own; past `ModelParking::limit` (`MODEL_PARK_LIMIT`, 24 h) from the first park of the row, on the journaled clock, the run fails with the last reason. A wait longer than what is left of the limit ends at the limit | never on its own; a schedule's firing (`is_unattended`) and a local subagent's run (a child that is no session's round: nothing wakes it until ADR 0067 slice S8b-2b forwards a resume) fail instead, and the parent gets an error result for its call |
+| Ends | on its own; past `ModelParking::limit` (`MODEL_PARK_LIMIT`, 24 h) from the first park of the row, on the journaled clock, the run fails with the last reason. A wait longer than what is left of the limit ends at the limit | never on its own; a schedule's firing (`is_unattended`) fails instead, and a local subagent waits for its parent's forwarded resume ([a parked child](#a-child-parked-on-the-model)) |
 | Woken by | its timer, a message (its text is the person's turn), a resume | a message, a resume |
 
 A schedule's firing also fails on a refusal of status 401 or 403: nothing binds a firing at the gateway yet (ADR 0067
-decision 6). Its other timer parks wake on their own. A subagent's timer parks stay, bounded by the limit and the child's
-time limit; the task's root shows no reason for them yet (S8b-2b adds the notice).
+decision 6). Its other timer parks wake on their own.
+
+### A child parked on the model
+
+A local subagent's refusal parks the child, and its parent shows it and wakes it through itself (ADR 0067 decision 5).
+The child sends `adam.child.parked` after its park commit; the parent reads its record in one read (`Ctx::child_look`)
+and keeps what it waits on beside its pending child (`PendingRun::model_wait`): the child's own wait, or the copy the
+child keeps of its own child, so a grandchild is shown one level at a time. A child that waits until it is woken makes
+the parent wait with **no timer**, as a question does (it cannot finish on its own); a child on a timer keeps the
+parent's `wait_poll` look, and the reason is on the parent's head at `/pending_wait/model_wait`. A message or a resume
+to the parent sends the child one `RESUME_KIND` (`Ctx::resume_child`), under an id derived from the waking message's id
+and the child's run id (the child drops a copy it has read); the words of a message stay at the parent, and each level
+forwards to its own pending child. A child's refusal of status 401 or 403 is the child's: the root's task is `working`
+with the reason, never `auth-required`. A parent that is not an `LlmAgent` — a hand-written agent on `adam-embed` —
+forwards none, so a child's until-woken park waits until a cancel, where S8b-2a failed the child with the reason.
 
 The conversation is kept as it was before the call and `Conversation::model_wait` says why (`reason`, `status`, `slug`,
 `park`, `parked_since`, `parks`, `wake_at`). When the run wakes the **same call** is made again (a new journal position,
@@ -724,13 +740,17 @@ model. A provider that does not park (`StaticBearer`) fails as before. The journ
 (`park` in the failure's record), never a header, a body or a credential.
 
 **Breaking:** `Conversation::model_wait` is a new public field of a struct that is not `#[non_exhaustive]`: a literal
-outside the workspace needs it. A wait this build cannot read loads as none (`ModelPark` gains a kind in a later build).
+outside the workspace needs it. `PendingRun::model_wait` is the same for a wait on a child. A wait this build cannot read
+loads as none (`ModelPark` gains a kind in a later build).
 
 Tests: `tests/model_park.rs` (each kind, the backoff by the journaled times, the limit and a wake clamped to it, a message,
 one refused again, a resume, a resume during the woken call adding no turn, a row that changes kind, a replay after a lost
-commit, an unattended run, a subagent's park until woken, a parked summary with a message not stepped before its wake, an
-unreachable endpoint, `ModelLocked`, `StaticBearer`'s errors, a cancel, and nothing of a problem document's body in the
-journal through `adam-model-openai` against a mock server), `tests/compaction.rs`
+commit, an unattended run, a parked summary with a message not stepped before its wake, an
+unreachable endpoint, `ModelLocked`, `StaticBearer`'s errors, a cancel, a parked child shown on its parent and woken
+through a message or a resume (its words staying there, a copy of the waking message waking it once, a copy of a resume
+it read making no call, the copy cleared while it works, a timer child keeping the look), a grandchild reached one level
+at a time, and nothing of a problem document's body in the journal through `adam-model-openai` against a mock
+server), `tests/compaction.rs`
 `a_refused_summary_parks_the_run_and_is_asked_for_again`, and `src/model_wait.rs` (the backoff, the reasons, a wait that
 cannot be read).
 
