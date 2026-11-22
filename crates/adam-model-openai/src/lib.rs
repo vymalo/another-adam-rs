@@ -310,8 +310,9 @@ pub struct OpenAiCompatible {
     context_windows: BTreeMap<String, u64>,
     input_modalities: BTreeMap<String, InputModalities>,
     /// The deployment's per-model profiles (`MODEL_ALIASES_FILE`): what the reasoning wire applies
-    /// and what [`ModelClient::profile`] answers. Empty by default.
-    profiles: ModelProfiles,
+    /// and what [`ModelClient::profile`] answers. Empty by default. Shared, so a streamed call's
+    /// `clone` of the client is cheap.
+    profiles: Arc<ModelProfiles>,
 }
 
 /// What [`OpenAiCompatible`] says its provider is ([`ModelClient::provider`]): the protocol it
@@ -401,7 +402,7 @@ impl OpenAiCompatible {
             prompt_cache_key: false,
             context_windows: BTreeMap::new(),
             input_modalities: BTreeMap::new(),
-            profiles: ModelProfiles::default(),
+            profiles: Arc::default(),
         })
     }
 
@@ -419,10 +420,11 @@ impl OpenAiCompatible {
     /// ADR 0064): what [`ModelClient::profile`] answers, and how a request's
     /// [`reasoning_effort`](adam_model::ModelRequest::reasoning_effort) is sent — through the
     /// `reasoningWire` of the request's model, after the extra body (the crate README, *Reasoning
-    /// effort*). Empty by default: no model has a profile, and nothing is applied.
+    /// effort*). Empty by default: no model has a profile, and nothing is applied. The profiles are
+    /// shared, so cloning the client (a stream does) is cheap.
     #[must_use]
     pub fn with_profiles(mut self, profiles: ModelProfiles) -> Self {
-        self.profiles = profiles;
+        self.profiles = Arc::new(profiles);
         self
     }
 
@@ -497,7 +499,7 @@ impl OpenAiCompatible {
             echo_reasoning: self.echo_reasoning,
             prompt_cache_key: self.prompt_cache_key,
             endpoint: &self.endpoint,
-            profiles: Some(&self.profiles),
+            profiles: Some(self.profiles.as_ref()),
         }
     }
 

@@ -23,7 +23,8 @@ pub(crate) const RESERVED_BODY_KEYS: [&str; 5] =
 pub(crate) struct RequestOptions<'a> {
     pub(crate) max_tokens_field: MaxTokensField,
     /// Members merged into the body (they win over what the runtime wrote, `prompt_cache_key` included, except
-    /// [`RESERVED_BODY_KEYS`], which are refused when the client is built).
+    /// [`RESERVED_BODY_KEYS`], which are refused when the client is built, and except the members a typed
+    /// reasoning level's wire duplicates: the level wins there, ADR 0063 decision 6).
     pub(crate) extra_body: Option<&'a serde_json::Map<String, Value>>,
     /// Send the reasoning an assistant message keeps, under this name; `None` sends none.
     pub(crate) echo_reasoning: Option<ReasoningField>,
@@ -288,8 +289,10 @@ impl ReasoningMember {
                 members.remove("reasoning_effort");
                 let emptied = match members.get_mut("reasoning") {
                     Some(Value::Object(reasoning)) => {
-                        reasoning.remove("effort");
-                        reasoning.is_empty()
+                        // Only a member that held the effort "becomes empty": an object the extra
+                        // body wrote empty stays.
+                        let had_effort = reasoning.remove("effort").is_some();
+                        had_effort && reasoning.is_empty()
                     }
                     _ => false,
                 };
@@ -1338,6 +1341,12 @@ mod tests {
     fn each_wire_writes_its_own_member() {
         let mut req = request();
         req.reasoning_effort = Some(ReasoningEffort::High);
+        // Every wire's member, so each arm proves what it removed and what it left.
+        let extra = json!({
+            "reasoning_effort": "medium",
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "thinking": {"type": "enabled", "budget_tokens": 999, "clear_thinking": false}
+        });
         for wire in ReasoningWire::ALL {
             let mut profile = profile_of(&[ReasoningEffort::High], wire);
             if wire == ReasoningWire::ThinkingBudget {
@@ -1348,19 +1357,38 @@ mod tests {
                 &req,
                 RequestOptions {
                     profiles: Some(&profiles),
-                    ..RequestOptions::default()
+                    ..with(Some(extra.clone()), None)
                 },
             );
             match wire {
                 ReasoningWire::ReasoningEffort => {
                     assert_eq!(sent["reasoning_effort"], "high", "{sent}");
-                    assert!(sent.get("reasoning").is_none(), "{sent}");
-                    assert!(sent.get("thinking").is_none(), "{sent}");
+                    assert_eq!(
+                        sent["reasoning"],
+                        json!({"summary": "auto"}),
+                        "the effort goes, the object's other members stay: {sent}"
+                    );
+                    assert_eq!(
+                        sent["thinking"],
+                        json!({"type": "enabled", "budget_tokens": 999, "clear_thinking": false}),
+                        "a member of another wire stays: {sent}"
+                    );
                 }
                 ReasoningWire::ReasoningObject => {
-                    assert_eq!(sent["reasoning"], json!({"effort": "high"}), "{sent}");
-                    assert!(sent.get("reasoning_effort").is_none(), "{sent}");
-                    assert!(sent.get("thinking").is_none(), "{sent}");
+                    assert_eq!(
+                        sent["reasoning"],
+                        json!({"summary": "auto", "effort": "high"}),
+                        "{sent}"
+                    );
+                    assert!(
+                        sent.get("reasoning_effort").is_none(),
+                        "the other member of the same fact is removed: {sent}"
+                    );
+                    assert_eq!(
+                        sent["thinking"],
+                        json!({"type": "enabled", "budget_tokens": 999, "clear_thinking": false}),
+                        "{sent}"
+                    );
                 }
                 ReasoningWire::ThinkingBudget => {
                     assert_eq!(
@@ -1368,11 +1396,41 @@ mod tests {
                         json!({"type": "enabled", "budget_tokens": 8192}),
                         "{sent}"
                     );
-                    assert!(sent.get("reasoning_effort").is_none(), "{sent}");
-                    assert!(sent.get("reasoning").is_none(), "{sent}");
+                    assert_eq!(
+                        sent["reasoning_effort"], "medium",
+                        "the ADR removes only `thinking`: the extra body's effort stays: {sent}"
+                    );
+                    assert_eq!(
+                        sent["reasoning"],
+                        json!({"effort": "medium", "summary": "auto"}),
+                        "{sent}"
+                    );
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_empty_reasoning_object_the_extra_body_wrote_stays() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        let profiles = profiles_of(
+            "gw-model",
+            profile_of(&[ReasoningEffort::Low], ReasoningWire::ReasoningEffort),
+        );
+        let sent = body_of(
+            &req,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..with(Some(json!({"reasoning": {}})), None)
+            },
+        );
+        assert_eq!(
+            sent["reasoning"],
+            json!({}),
+            "an object that held no effort does not 'become empty': {sent}"
+        );
+        assert_eq!(sent["reasoning_effort"], "low");
     }
 
     #[test]

@@ -179,21 +179,27 @@ byte the one without the feature.
 
 | `reasoningWire` | Member written |
 |---|---|
-| `reasoning_effort` | `{"reasoning_effort": "<level>"}`: the only wire verified on the deployment's gateway |
-| `reasoning_object` | `{"reasoning": {"effort": "<level>"}}`, merged into the `reasoning` object the extra body already has; its other members stay |
-| `thinking_budget` | `{"thinking": {"type": "enabled", "budget_tokens": <n>}}`, `<n>` from the profile's `reasoningBudgets` for that level |
+| `reasoning_effort` | `{"reasoning_effort": "<level>"}` — **verified 2026-11-21** on the deployment's gateway (every family accepts it; Gemini rejects `max` and `xhigh`) |
+| `reasoning_object` | `{"reasoning": {"effort": "<level>"}}`, merged into the `reasoning` object the extra body already has; its other members stay. A `reasoning` member that is not an object is replaced, since the name collides: the typed level wins. **Unverified here** (a 400 on Gemini; ADR 0063) |
+| `thinking_budget` | `{"thinking": {"type": "enabled", "budget_tokens": <n>}}`, `<n>` from the profile's `reasoningBudgets` for that level. **Unverified here** (`thinking` is ignored or rejected by this gateway; ADR 0063) |
 
 The typed level is applied **after** the extra body (`MODEL_EXTRA_BODY` until ADR 0064 slice 3 replaces it with
 the profile's `extraBody`), and it removes only the members its wire would duplicate: `reasoning_effort` and
-`reasoning.effort` for the first two wires (a `reasoning` object that empties is removed), `thinking` for the
-third. Every other member stays, so a flag the model needs is not dropped. `none` is a real level and is sent
-as `"none"`; an **absent** level sends nothing. A level the profile does not declare is the assembly's to
-refuse, not the client's: the client is not a second validator.
+`reasoning.effort` for the first two wires (a `reasoning` object that held the effort and empties is removed;
+one the extra body wrote empty stays), `thinking` for the third. Every other member stays, so a flag the model
+needs is not dropped — including, for `thinking_budget`, the extra body's `reasoning_effort` and
+`reasoning.effort`, which the ADR's letter leaves in place. `none` is a real level and is sent as `"none"`; an
+**absent** level sends nothing. A level the profile does not declare is the assembly's to refuse, not the
+client's: the client is not a second validator.
 
 **Limits.** `thinking` is removed wholesale, as the ADR says: an extra body's other `thinking` members
-(`clear_thinking`, a provider's own) are lost, and merging them is a follow-up. A hand-built profile with the
-`thinking_budget` wire and no budget for the level is `ModelError::InvalidRequest`, naming the model and the
-level; the profiles loader refuses such a file at startup, so only a profile built in code reaches it.
+(`clear_thinking`, a provider's own) are lost, and merging them is a follow-up (adam-rs#330). The wires are
+asymmetric on a non-object `reasoning`: `reasoning_object` replaces it (the member name collides), while
+`reasoning_effort` leaves it (only `reasoning.effort` is its duplicate, and a non-object holds none). A
+hand-built profile with the `thinking_budget` wire and no budget for the level is
+`ModelError::InvalidRequest`, naming the model and the level; the profiles loader refuses such a file at
+startup, so only a profile built in code reaches it. The loader also refuses `none` with `thinking_budget`: the
+shape has no disabled form, so that level would send thinking **enabled**.
 
 ## Usage
 
@@ -298,6 +304,16 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
   `opaque_members_are_dropped_when_the_run_changes_model`, `opaque_members_are_dropped_at_another_endpoint` and
   `the_client_stamps_the_requests_own_model_alias`; `src/wire.rs`'s `a_bound_turns_members_go_back_and_the_modelled_keys_win`,
   `an_unbound_turn_sends_none_of_its_members` and `a_response_without_opaque_members_parses_as_before`.
+* The reasoning-wire cases by name: `src/wire.rs`'s `a_typed_level_wins_over_the_extra_body_and_keeps_its_other_members`
+  (the ADR's pinned order), `each_wire_writes_its_own_member` (all three wires, each with an extra body carrying all three
+  members), `an_emptied_reasoning_object_is_removed_and_its_other_members_stay`,
+  `an_empty_reasoning_object_the_extra_body_wrote_stays`, `the_reasoning_object_wire_keeps_the_objects_other_members`,
+  `the_thinking_budget_wire_replaces_thinking_wholesale`, `none_is_a_level_that_is_sent_and_an_absent_one_is_not`,
+  `without_a_profile_a_wire_or_a_level_the_body_is_byte_identical` and
+  `a_thinking_budget_with_no_budget_names_the_model_and_the_level`; `src/lib.rs`'s
+  `the_profiles_are_answered_for_their_models_and_debug_shows_ids_only`; `src/profiles.rs`'s
+  `the_thinking_budget_wire_refuses_the_level_none`; and `tests/model_wire.rs` in `adam-service` for the end-to-end from
+  `MODEL_ALIASES_FILE` through `ModelConfig::client()`.
 * Unit tests: `src/errors.rs` (`status_mapping`, `a_problem_type_is_read_by_its_last_segment`,
   `a_problem_document_is_told_by_its_content_type`, `retry_after_seconds_and_date`), `src/lib.rs` also
   `a_rustls_error_is_found_however_it_is_wrapped`, `src/lib.rs`
