@@ -517,8 +517,8 @@ impl ChildStatus {
 ///
 /// [`Ctx::child_look`](crate::Ctx::child_look) answers it for the calling run's own children. The
 /// head is the child's agent state without its transcript for a v5 run; `None` when the record does
-/// not decode, in which case the status says so for a terminal child (as
-/// [`ChildStatus::from_record`] does).
+/// not decode, in which case the status says so for a terminal child, as a [`ChildStatus`] read from
+/// the same record would.
 ///
 /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
 #[derive(Clone, Debug, PartialEq)]
