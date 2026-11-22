@@ -1131,7 +1131,8 @@ the contract is a separate deploy (see [deploy the coder](guides/deploy-the-code
 `Conversation` (`crates/adam-llm-agent/src/conversation.rs`) has `messages`, `turns`, `tool_calls`,
 `usage`, `pending_calls`, `pending_wait` (a question for the user, a child run or a remote task),
 `deferred`, `artifacts`, `announced`, `source_notes`, `continued_from`, `omitted_turns`, `context` and
-`read_ids`. Every field has a serde default, so older state still loads. Its `split` puts `messages`
+`read_ids` (the ids of the messages and the forwarded resumes the run read). Every field has a serde default, so
+older state still loads. Its `split` puts `messages`
 in the body and everything else in the head; `Agent::split`/`join` default to no split, and a wrapper
 that delegates `init` must delegate them too: a new run of a wrapper that does not stays in the v4
 format, and a **v5 run must split** — a successful step that returns `None` on a current head is a
@@ -1269,6 +1270,7 @@ stateDiagram-v2
     Waiting --> WaitingOnPark: adam.child.parked, the child waits until it is woken (no timer)
     Waiting --> Waiting: adam.child.parked, the child waits on a timer (its reason kept, new timer)
     WaitingOnPark --> Waiting: a message or a resume arrives: one resume goes down, the copy is cleared, a new timer
+    WaitingOnPark --> WaitingOnPark: a copy of a resume it read arrives: no call, the same wait
     WaitingOnPark --> Answered: adam.run.finished for this child arrives
     WaitingOnPark --> Cancelled: the parent is cancelled
     Waiting --> Cancelled: the parent is cancelled (its child follows when its worker next looks)

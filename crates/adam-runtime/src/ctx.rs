@@ -704,7 +704,7 @@ impl Ctx {
     /// children and no others, as [`child_status`](Self::child_status) reads them. A store failure
     /// is [`AgentError::Store`]; a lost race for the child's record is
     /// [`Transient`](AgentError::Transient). A child whose record does not decode is nothing to
-    /// wake, not the parent's failure (every other read of a child degrades the same way).
+    /// wake, not the parent's failure (a look at it reports the damage instead).
     pub async fn resume_child(&self, run: RunId, id: impl Into<String>) -> Result<(), AgentError> {
         let Some(rec) = self.store.load_run(run).await.map_err(store_error)? else {
             return Ok(());
@@ -723,7 +723,7 @@ impl Ctx {
             // Its record does not decode: nothing can be woken, and a child's damage does not fail
             // the parent (as a look at a corrupt child reports it instead).
             Err(e @ RuntimeError::Corrupt { .. }) => {
-                tracing::debug!(%run, error = %e, "the child's record is unreadable; nothing to wake");
+                tracing::warn!(%run, error = %e, "the child's record is unreadable; nothing to wake");
                 Ok(())
             }
             Err(RuntimeError::Store(e)) => Err(AgentError::Store(e)),

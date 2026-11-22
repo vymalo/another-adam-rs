@@ -406,7 +406,11 @@ middle of a call. What is new is the end of the run:
   An answer that asks for tool calls is not dropped: the calls are valid, and the next turn reads the message.
 * **A message is read once.** `Conversation::read_ids` keeps the ids (`Inbound::id`, an A2A `messageId`) of the last
   `MAX_READ_IDS` (128) messages the run has read, oldest first, and a message whose id is there is ignored, whether it is
-  still in the inbox or was read transitions ago: the orchestration layer repeats a steer after a lost lease. An empty id is
+  still in the inbox or was read transitions ago: the orchestration layer repeats a steer after a lost lease. The ids of
+  the resumes the run read are kept in the same window (the forwarded resume's id, ADR 0067 decision 5): a copy of one
+  is no wake. The window is shared, so a burst of resumes can evict an old message id; that fails open — the old message,
+  delivered again, is read once more (one extra turn), never lost — and an evicted resume id costs one extra step, not a
+  call. An empty id is
   never remembered. Part of the durable state (serde default, not written while empty); a run that continues another starts
   with none.
 
@@ -723,8 +727,7 @@ to the parent sends the child one `RESUME_KIND` (`Ctx::resume_child`), under an 
 and the child's run id (the child drops a copy it has read); the words of a message stay at the parent, and each level
 forwards to its own pending child. A child's refusal of status 401 or 403 is the child's: the root's task is `working`
 with the reason, never `auth-required`. A parent that is not an `LlmAgent` — a hand-written agent on `adam-embed` —
-forwards none, so a child's until-woken park waits until a cancel (the parent's deadline failing it cancels the child
-too), where S8b-2a failed the child with the reason.
+forwards none, so a child's until-woken park waits until a cancel, where S8b-2a failed the child with the reason.
 
 The conversation is kept as it was before the call and `Conversation::model_wait` says why (`reason`, `status`, `slug`,
 `park`, `parked_since`, `parks`, `wake_at`). When the run wakes the **same call** is made again (a new journal position,

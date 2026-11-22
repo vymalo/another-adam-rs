@@ -656,11 +656,15 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rounds_started: Vec<String>,
     /// The ids (`Inbound::id`, an A2A `messageId`) of the messages the run has read after its first,
-    /// the last [`MAX_READ_IDS`] of them, oldest first: a message that arrives again with one of them
-    /// (the same one sent twice, as the orchestration layer does after a lost lease) is not read a
-    /// second time, whether it is still in the inbox or was read transitions ago. Part of the durable
-    /// state, so another worker and a restart keep it. Absent from state written before it existed,
-    /// and not written while empty; a run that continues another starts with none.
+    /// and of the resumes it has read (the forwarded resume's id, ADR 0067 decision 5), the last
+    /// [`MAX_READ_IDS`] of them, oldest first: a message that arrives again with one of them (the
+    /// same one sent twice, as the orchestration layer does after a lost lease) is not read a second
+    /// time, whether it is still in the inbox or was read transitions ago, and a copy of a resume is
+    /// no wake. The window is shared by both: a burst of resumes can evict an old message id, which
+    /// fails open (the old message, delivered again, is read once more, never lost), and an evicted
+    /// resume id costs one extra step, not a call. Part of the durable state, so another worker and
+    /// a restart keep it. Absent from state written before it existed, and not written while empty;
+    /// a run that continues another starts with none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_ids: Vec<String>,
     /// How big the last model call's prompt was, as the provider reported it, and how many messages
@@ -734,9 +738,9 @@ pub struct Conversation {
 /// history (its call id is there); one whose report was compacted away may be told once more.
 pub const MAX_REPORTED_ROUNDS: usize = 128;
 
-/// How many message ids a run remembers having read ([`Conversation::read_ids`]). A person does not
-/// steer a task a hundred times, and the oldest id is the one given up, so a retry of an old message
-/// is the only thing this can let through.
+/// How many ids a run remembers having read ([`Conversation::read_ids`]: messages and forwarded
+/// resumes together). A person does not steer a task a hundred times, and the oldest id is the one
+/// given up, so a retry of an old message is the only thing this can let through.
 pub const MAX_READ_IDS: usize = 128;
 
 impl Conversation {

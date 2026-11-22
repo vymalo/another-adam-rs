@@ -1910,21 +1910,22 @@ impl LlmAgent {
         }
     }
 
-    /// The inbox of a run that parks on its summary call (ADR 0067): taken, the wake-ups and notices
-    /// dropped, a request to close its session noted, and each message's words kept in
+    /// The inbox of a run that asks or parks on its summary call (ADR 0067), handed in by the step
+    /// that took it before the summary (a resume is read and recorded there first): the wake-ups
+    /// and notices dropped, a request to close its session noted, and each message's words kept in
     /// [`Conversation::deferred`], read once the summary is made.
     async fn absorb_while_parked(
         &self,
         ctx: &mut Ctx,
         state: &mut Conversation,
+        inbox: Vec<Inbound>,
     ) -> Result<(), AgentError> {
-        let inbox: Vec<Inbound> = ctx
-            .take_inbox()
+        let inbox: Vec<Inbound> = inbox
             .into_iter()
             .filter(|i| {
                 !matches!(
                     i.kind.as_str(),
-                    CHILD_PARKED_KIND | CHILD_REPORTED_KIND | MODEL_RESUME_KIND | RUN_FINISHED_KIND
+                    CHILD_PARKED_KIND | CHILD_REPORTED_KIND | RUN_FINISHED_KIND
                 )
             })
             .collect();
@@ -5763,6 +5764,50 @@ impl Agent for LlmAgent {
             self.forget_chars(ctx.run_id());
             return Ok(Transition::Done { state, output });
         }
+        // The inbox is taken once, here, before the summary: a resume that wakes a run parked on its
+        // summary is read (and its id recorded) before `compact_if_due` asks the summary again, so
+        // `absorb_while_parked` cannot consume it unrecorded and a replayed forward cannot wake the
+        // run a second time.
+        let inbox = ctx.take_inbox();
+        // A resume (ADR 0067) says nothing to the run itself: it wakes a run parked on the model,
+        // which then makes its call again, and a run that waits on a child parked on the model
+        // forwards one to it (decision 5). It adds nothing to the conversation and answers no
+        // question, so it never reaches the inbox below.
+        //
+        // The id is derived from the waking message and the child, so a step that runs again (a
+        // lost commit) writes the same one: a resume whose id this run has read is a **copy**, and
+        // a copy is no wake. The ones kept are noted in the commit of this step, which consumes
+        // them; the copy of a later delivery is then recognised.
+        let (resumes, inbox): (Vec<_>, Vec<_>) =
+            inbox.into_iter().partition(|i| i.kind == MODEL_RESUME_KIND);
+        let mut kept = Vec::with_capacity(resumes.len());
+        let mut copies = 0_usize;
+        for resume in resumes {
+            if state.has_read(&resume.id) {
+                copies += 1;
+            } else {
+                state.note_read(&resume.id);
+                kept.push(resume);
+            }
+        }
+        let resumes = kept;
+        // Woken by nothing but copies of resumes this run has read: the step that sent them ran
+        // again after a lost commit. The run waits on the model as it did, with no call — a copy is
+        // not a wake, and it does not ask a summary again either. A timer that has come due is not
+        // "nothing" (the runtime woke it for the timer), and anything else in the inbox (a message,
+        // a notice, a close) is read below.
+        let nothing_else = inbox
+            .iter()
+            .all(|i| i.kind == CHILD_PARKED_KIND || i.kind == CHILD_REPORTED_KIND);
+        if copies > 0
+            && resumes.is_empty()
+            && nothing_else
+            && let Some(wait) = &state.model_wait
+            && !wait.wake_at.is_some_and(|at| at <= ctx.now())
+        {
+            let wake_at = wait.wake_at;
+            return Ok(Transition::Park { state, wake_at });
+        }
         // The history is shortened here, in the state, from the state as it was committed: before
         // this step appends a message that arrived since (an inbox message, a deferred one, the
         // answer to a question), so a replay after a crash shortens the same way whatever arrived
@@ -5783,13 +5828,18 @@ impl Agent for LlmAgent {
         // A history that has reached the budget is summarised first, at a journaled step of its own;
         // the model is asked in the next transition, from the new history.
         match self.compact_if_due(ctx, &mut state, &output_id_of).await? {
-            Compacted::Made => return Ok(Transition::Continue(state)),
+            Compacted::Made => {
+                // What arrived while the summary was asked is read now, after it: the step took
+                // the inbox before the summary, so its words are kept for the next transition.
+                self.absorb_while_parked(ctx, &mut state, inbox).await?;
+                return Ok(Transition::Continue(state));
+            }
             Compacted::Parked(flow) => {
                 // What arrived is read now, its words kept for after the summary: a parked run with
                 // messages left in its inbox would be stepped again by every look of the runtime
                 // (a child's or a run with a deadline), making the summary call each time.
                 if !matches!(flow, Flow::Fail(_)) {
-                    self.absorb_while_parked(ctx, &mut state).await?;
+                    self.absorb_while_parked(ctx, &mut state, inbox).await?;
                 }
                 return Ok(match flow {
                     Flow::Sleep(wake_at) => Transition::Park {
@@ -5843,8 +5893,7 @@ impl Agent for LlmAgent {
                 state.compactions.len(),
             );
         }
-        let (finished, inbox): (Vec<_>, Vec<_>) = ctx
-            .take_inbox()
+        let (finished, inbox): (Vec<_>, Vec<_>) = inbox
             .into_iter()
             // A session round's report (ADR 0045) is a wake-up, not a person's words: it is
             // dropped, never shown to the model, and the report is read from the store.
@@ -5863,28 +5912,6 @@ impl Agent for LlmAgent {
         {
             header.closed = true;
         }
-        // A resume (ADR 0067) says nothing to the run itself: it wakes a run parked on the model,
-        // which then makes its call again, and a run that waits on a child parked on the model
-        // forwards one to it (decision 5). It adds nothing to the conversation and answers no
-        // question, so it never reaches the inbox below.
-        //
-        // The id is derived from the waking message and the child, so a step that runs again (a
-        // lost commit) writes the same one: a resume whose id this run has read is a **copy**, and
-        // a copy is no wake. The ones kept are noted in the commit of this step, which consumes
-        // them; the copy of a later delivery is then recognised.
-        let (resumes, inbox): (Vec<_>, Vec<_>) =
-            inbox.into_iter().partition(|i| i.kind == MODEL_RESUME_KIND);
-        let mut kept = Vec::with_capacity(resumes.len());
-        let mut copies = 0_usize;
-        for resume in resumes {
-            if state.has_read(&resume.id) {
-                copies += 1;
-            } else {
-                state.note_read(&resume.id);
-                kept.push(resume);
-            }
-        }
-        let resumes = kept;
         let notices: Vec<(RunId, ChildStatus)> = finished
             .iter()
             .filter_map(|i| {
@@ -5895,21 +5922,6 @@ impl Agent for LlmAgent {
                 notice
             })
             .collect();
-        // Woken by nothing but copies of resumes this run has read: the step that sent them ran
-        // again after a lost commit. The run waits on the model as it did, with no call — a copy is
-        // not a wake. A timer that has come due is not "nothing" (the runtime woke it for the
-        // timer), and anything else in the inbox (a message, a notice, a close) is read below.
-        if copies > 0
-            && resumes.is_empty()
-            && inbox.is_empty()
-            && finished.is_empty()
-            && closes.is_empty()
-            && let Some(wait) = &state.model_wait
-            && !wait.wake_at.is_some_and(|at| at <= ctx.now())
-        {
-            let wake_at = wait.wake_at;
-            return Ok(Transition::Park { state, wake_at });
-        }
         let asked = match &state.pending_wait {
             Some(PendingWait::Question(q)) => Some((q.tool.clone(), q.call_id.clone())),
             _ => None,

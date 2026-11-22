@@ -63,9 +63,9 @@ wakes the child through itself:
   child's own, or the copy the child keeps of its own child, so a grandchild is shown one level at a time. It
   is in the head, so a front reads the reason at `/pending_wait/model_wait`; the copy is cleared when the
   parent forwards a resume and rewritten at the next look.
-* **The park.** A child that waits until it is woken makes the parent wait with **no timer**, as a question
-  does: such a child cannot finish on its own, so a timer would only re-read "still parked", and a message to
-  the root reaches its inbox anyway. A child on a timer keeps the parent's `wait_poll` look (60 s), which is
+* **The park.** A child that waits until it is woken makes the parent wait with **no timer**, as the parent
+  waits on a question: such a child cannot finish on its own, so a timer would only re-read "still parked", and a
+  message to the root reaches its inbox anyway. A child on a timer keeps the parent's `wait_poll` look (60 s), which is
   what a lost notice of the child's end falls back on.
 * **The resume.** A message or a resume to a run that waits on a parked child sends that child one
   `adam.resume` (`Ctx::resume_child`, which wakes only the caller's children), under an id derived from the
@@ -192,8 +192,10 @@ What the design refuses to do, and why:
   such a child cannot finish on its own: a timer would only re-read "still parked". The price is that a child woken or
   cancelled from **outside** its parent's step while it waits relies on its notice, and a lost one is not cured by a look;
   every other park of a child, and every park of the parent's own, keeps a timer. For the coder, a lost
-  `adam.child.parked` means the root never steps, so `commands_end_with` never fires and its background commands run to
-  `BACKGROUND_COMMAND_MAX_SECS`; a message or a resume to the root steps it, and they stop then.
+  `adam.child.parked` costs one `wait_poll` look (60 s): the root's timer fires, it reads the child's wait, and
+  `commands_end_with` stops the background commands then. The residual is a lost *finish* notice after the root has
+  copied an until-woken wait: the root has no timer then, so it never steps, and the commands run to
+  `BACKGROUND_COMMAND_MAX_SECS`.
 * **No parallel fan-out of one-shot subagents yet.** An `LlmAgent` runs the calls of one model turn at the same time
   ([ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)), but a call that can park the run (a
   subagent, a remote agent) runs alone, so three subagent calls in one turn run one after the other; background
@@ -201,8 +203,8 @@ What the design refuses to do, and why:
   side by side. Starting all the
   children first and waiting for all of them needs `pending_wait` to hold several runs.
 * **No asking tools in a subagent.** A child that parks with no timer, for instance because one of its tools asked the
-  user something, waits for an answer nobody is placed to give; the time limit above now ends it at its deadline
-  (30 minutes by default), and a cancel of the parent does not wake it. The subagent binding
+  user something, waits for an answer nobody is placed to give; a park with no timer clears its deadline, so nothing
+  ends it but a cancel (the parent's own cancel cascades to it). The subagent binding
   (`adam-assembly`) closes this at startup instead of at run time: a tool that can ask says so
   (`Tool::asks_user()`), and `bind` refuses a subagent that has one, so the situation cannot arise from an
   agent directory. A tool that returns `NeedsInput` without declaring it still parks its child, and a child

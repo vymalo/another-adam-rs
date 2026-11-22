@@ -1179,6 +1179,95 @@ async fn a_copy_of_the_message_that_woke_the_parent_wakes_the_child_once() {
     rig.stop().await;
 }
 
+/// A copy of a resume that wakes a run parked on its **summary** makes no second summary call: the
+/// step reads and records the resume before `compact_if_due` asks the summary again, so the copy
+/// parks the run as it was (ADR 0067 decision 5). Without the hoist, `absorb_while_parked` consumed
+/// the copy unrecorded and the next one asked the summary again.
+#[tokio::test]
+async fn a_copy_of_a_resume_makes_no_second_summary_call() {
+    let rig = family(1200);
+    let busy = || refused(503, Some("unavailable"), timer(600));
+    rig.mock
+        .push_tool_calls(vec![tool_call("c1", "sub", json!({}))])
+        .push_tool_calls(vec![tool_call(
+            "b0",
+            "big",
+            json!({"n": 1200, "tag": "b0"}),
+        )])
+        .push_tool_calls(vec![tool_call(
+            "b1",
+            "big",
+            json!({"n": 1200, "tag": "b1"}),
+        )])
+        .push_tool_calls(vec![tool_call(
+            "b2",
+            "big",
+            json!({"n": 1200, "tag": "b2"}),
+        )])
+        .push_tool_calls(vec![tool_call(
+            "b3",
+            "big",
+            json!({"n": 1200, "tag": "b3"}),
+        )])
+        // The summary parks; the kept resume's summary attempt; a mutant's copy's attempt.
+        .push_error(busy())
+        .push_error(busy())
+        .push_error(busy());
+    let run = rig.start(None).await;
+    let child = adam_runtime::child_run_id(run, "c1");
+    let (_, first) = rig.parked(child, waits_on_timer).await;
+    assert_eq!(first.model_wait.unwrap().parks, 1);
+    assert_eq!(
+        rig.mock.requests().len(),
+        6,
+        "the parent, four turns and the first summary"
+    );
+
+    // One resume wakes the run: it asks the summary again and is refused again.
+    rig.rt
+        .deliver(
+            child,
+            Inbound::new(MODEL_RESUME_KIND, json!({})).with_id("r-1"),
+        )
+        .await
+        .expect("deliver");
+    let (_, second) = rig
+        .parked(child, |s| {
+            s.model_wait.as_ref().is_some_and(|w| w.parks == 2)
+        })
+        .await;
+    assert_eq!(second.model_wait.unwrap().parks, 2);
+    assert_eq!(rig.mock.requests().len(), 7, "one more summary");
+
+    // The same id again is a copy: no summary, no call.
+    rig.rt
+        .deliver(
+            child,
+            Inbound::new(MODEL_RESUME_KIND, json!({})).with_id("r-1"),
+        )
+        .await
+        .expect("a copy is delivered");
+    rig.wait_for(child, "the copy's wake", |v| {
+        matches!(
+            v.status,
+            RunStatus::Parked | RunStatus::Done | RunStatus::Failed
+        )
+    })
+    .await;
+    assert_eq!(
+        rig.mock.requests().len(),
+        7,
+        "the copy asked no summary: the run read one resume"
+    );
+    let state = rig.state(child).await;
+    assert_eq!(
+        state.model_wait.as_ref().map(|w| w.parks),
+        Some(2),
+        "and the run waits on the summary as it did"
+    );
+    rig.stop().await;
+}
+
 /// A copy of a resume the child has read wakes it for nothing: the step that sent it ran again
 /// after a lost commit and wrote the same derived id, so the child parks again and makes **no**
 /// call. Without the receiver's dedup the copy is a second call (ADR 0067 decision 5).
@@ -1242,6 +1331,79 @@ async fn a_copy_of_a_resume_the_child_read_makes_no_call() {
         Some(ModelPark::UntilWoken),
         "and the child still waits on the model"
     );
+    rig.stop().await;
+}
+
+/// A copy of a resume does not swallow a timer that has come due: the run was woken for the timer,
+/// so it makes the call even though the copy says nothing (ADR 0067 decision 5). The worker is
+/// stopped while the clock passes the timer and the copy arrives, so the copy is in the inbox of
+/// the woken run before its step.
+#[tokio::test]
+async fn a_copy_of_a_resume_does_not_suppress_a_due_timer() {
+    let mut rig = family(0);
+    let busy = || refused(503, Some("unavailable"), timer(30));
+    rig.mock
+        .push_tool_calls(vec![tool_call("c1", "sub", json!({}))])
+        .push_error(busy())
+        .push_error(busy())
+        .push_error(busy());
+    let run = rig.start(None).await;
+    let child = adam_runtime::child_run_id(run, "c1");
+    let (_, first) = rig.parked(child, waits_on_timer).await;
+    assert_eq!(first.model_wait.unwrap().parks, 1);
+    // One resume wakes it: it makes the same call and is refused again, on a new timer.
+    rig.rt
+        .deliver(
+            child,
+            Inbound::new(MODEL_RESUME_KIND, json!({})).with_id("r-1"),
+        )
+        .await
+        .expect("deliver");
+    rig.parked(child, |s| {
+        s.model_wait.as_ref().is_some_and(|w| w.parks == 2)
+    })
+    .await;
+    assert_eq!(rig.mock.requests().len(), 3);
+
+    // No worker runs: the clock passes the timer, and the same id arrives as a copy. The run is
+    // woken with a timer due, so it makes the call — a copy must not swallow the timer.
+    if let Some(stop) = rig.stop.take() {
+        let _ = stop.send(());
+    }
+    if let Some(worker) = rig.worker.take() {
+        tokio::time::timeout(Duration::from_secs(10), worker)
+            .await
+            .expect("worker stops in time")
+            .expect("worker task");
+    }
+    // The second park in a row waits 60 s (the backoff doubles).
+    rig.clock.advance(Duration::from_secs(61));
+    rig.rt
+        .deliver(
+            child,
+            Inbound::new(MODEL_RESUME_KIND, json!({})).with_id("r-1"),
+        )
+        .await
+        .expect("a copy is delivered");
+    rig.spawn();
+    let view = rig
+        .wait_for(child, "the child parked again", |v| {
+            matches!(
+                v.status,
+                RunStatus::Parked | RunStatus::Done | RunStatus::Failed
+            )
+        })
+        .await;
+    assert_eq!(
+        rig.mock.requests().len(),
+        4,
+        "the due timer made the call; the child is {:?}",
+        view.status
+    );
+    rig.parked(child, |s| {
+        s.model_wait.as_ref().is_some_and(|w| w.parks == 3)
+    })
+    .await;
     rig.stop().await;
 }
 

@@ -172,7 +172,7 @@ Three things are missing in adam today:
    * **Only a resume goes down, never text.** A message or a resume to a run that waits on a child parked on the model
      sends that child a resume; the text of a message stays with the run that got it, as today. Each level forwards to its
      own pending child, so a grandchild is reached through its parent. The resume's message id is derived from the one
-     that woke the parent, so a replayed step sends it once.
+     that woke the parent, so a replayed step sends it again under the same id, which the child drops.
    * A child session's round is its own task and shows its own state.
 
    *Amended 2026-11-21 (S8b-2b):* what the decision left open, as built. The notice is the inbound kind
@@ -240,9 +240,8 @@ Three things are missing in adam today:
 * `adam-llm-agent`: `Conversation::model_wait`, the park, its backoff and `MODEL_PARK_LIMIT`, the wake, the summary call,
   the child's notice and the forwarded resume; the "Failure handling" list. `Conversation` denies no unknown field, so a
   build rolled back past this change reads a parked run's state, without its model wait. A parent that is not an
-  `LlmAgent` forwards no resume, so a child's park until woken now waits until a cancel (its parent's deadline failing it
-  cancels it), where S8b-2a failed it with the reason: a behaviour change for hand-written `adam-embed` agents that wait
-  on children.
+  `LlmAgent` forwards no resume, so a child's park until woken now waits until a cancel, where S8b-2a failed it with the
+  reason: a behaviour change for hand-written `adam-embed` agents that wait on children.
 * `adam-runtime`: `Ctx::retries_left()`; `Ctx::child_look` (the caller's child in one read: its status and the head
   of its state) and `Ctx::resume_child` (a checked wake of the caller's child), `ChildLook` and `CHILD_PARKED_KIND`
   (the notice of a child's park, after its own commit); `SessionHeader::root`; nothing else (a park is a `wake_at`).

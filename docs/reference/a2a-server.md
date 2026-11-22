@@ -141,9 +141,10 @@ ends **`completed`**, its output (and the `artifact`-less final message) carryin
 | has a `contextId`, no `taskId` | delivered to the context's open task, or starts a new one |
 | has `referenceTaskIds` | starts from the conversation of one of them, below |
 
-The rows are read in order: a `working` task whose run is parked on the model, or waits on a parked child, is
-delivered (the second row); any other `working` task takes the fifth row, and is refused unless the request
-activated `steer/v1`.
+A message with `adam.resume: true` is read as a resume whatever the task's state (the third row): it is accepted
+only by a task parked on the model, or waiting on a parked child. Otherwise the rows are read in order: a `working`
+task whose run is parked on the model, or waits on a parked child, is delivered (the second row); any other `working`
+task takes the fifth row, and is refused unless the request activated `steer/v1`.
 
 ## A run parked on the model
 
@@ -193,8 +194,8 @@ replayed forward is no second call. A resume to the root is accepted as for a
 parked run, and goes down the same way, one level at a time: a child that waits on its own parked child forwards one to
 it. A resume to a root that has **settled** its child — the child finished and the root answered its call — is
 `NOT_PARKED`, as for any run that is not parked on the model; between the child's end and the root's next step the
-copy is still there, so a resume is accepted and forwarded, which is harmless (the child is finished and nothing is
-woken). A client that binds runs learns of a **descendant's** refusal of status 401 or 403 from the status message —
+copy is still there, so a resume is accepted and consumed as the root settles the wait, which is harmless (the child
+is finished and nothing is woken). A client that binds runs learns of a **descendant's** refusal of status 401 or 403 from the status message —
 the root shows `working` with the child's reason, not `auth-required` — and sends its resume to the **root**, which
 forwards it; otherwise a `ListTasks` with `status=auth-required` never returns the root.
 
