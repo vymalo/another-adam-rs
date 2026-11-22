@@ -330,6 +330,7 @@ async fn the_words_before_a_tool_call_are_stated_as_a_working_status_with_the_st
                 ..Default::default()
             }],
             reasoning: None,
+            provider: None,
         },
         finish: FinishReason::ToolCalls,
         usage: Usage::default(),

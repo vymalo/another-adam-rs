@@ -17,6 +17,11 @@
 //! {"role":"tool","call_id":"call_1","content":"18C, sunny","is_error":false}
 //! ```
 //!
+//! An assistant message may also carry a provider's opaque members, bound to the model alias and
+//! endpoint that produced them ([`ProviderTurn`], [`ToolCall::opaque`]): they are kept byte for
+//! byte, are `None` when absent (so a history without them is the same bytes as before), and are
+//! sent back only to the same model alias and endpoint.
+//!
 //! # Reasoning
 //!
 //! A model in thinking mode writes its reasoning before its answer. It reaches a caller as
@@ -101,6 +106,6 @@ pub use profiles::{
 };
 pub use types::{
     ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, ImageData, ImageLimits, ImageOrigin,
-    ImageRef, InputModalities, Message, ModelDelta, ModelRequest, ModelResponse, ToolCall,
-    ToolChoice, ToolSpec, Usage, human_bytes, type_word,
+    ImageRef, InputModalities, Message, ModelDelta, ModelRequest, ModelResponse, ProviderTurn,
+    ToolCall, ToolChoice, ToolSpec, Usage, human_bytes, type_word,
 };

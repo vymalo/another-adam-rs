@@ -876,6 +876,7 @@ fn report_messages(reports: &[RoundReport], paged: bool) -> Vec<Message> {
         content: Vec::new(),
         tool_calls: calls.clone(),
         reasoning: None,
+        provider: None,
     }];
     messages.extend(reports.iter().zip(&calls).map(|(r, call)| Message::Tool {
         call_id: call.id.clone(),
@@ -5317,6 +5318,10 @@ impl ToolResult {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a turn's message is the value; boxing it would allocate for every tool answer"
+)]
 enum ToolResult {
     Answered {
         message: Message,
@@ -6466,6 +6471,7 @@ mod compaction_gate_tests {
                     ..Default::default()
                 }],
                 reasoning: None,
+                provider: None,
             });
             state
                 .messages

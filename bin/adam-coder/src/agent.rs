@@ -1908,6 +1908,7 @@ mod tests {
             content: vec![adam_model::ContentPart::text(text)],
             tool_calls: calls,
             reasoning: None,
+            provider: None,
         }
     }
 

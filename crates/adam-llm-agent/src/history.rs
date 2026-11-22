@@ -188,6 +188,7 @@ pub(crate) fn message_chars(m: &Message) -> usize {
             content,
             tool_calls,
             reasoning,
+            ..
         } => {
             // The reasoning a client echoes is sent, so it counts.
             reasoning.as_deref().map_or(0, |r| r.chars().count())
@@ -425,6 +426,7 @@ mod tests {
                 ..Default::default()
             }],
             reasoning: None,
+            provider: None,
         }
     }
 
@@ -551,6 +553,7 @@ mod tests {
                 ..Default::default()
             }],
             reasoning: None,
+            provider: None,
         }
     }
 
@@ -864,6 +867,7 @@ mod tests {
                         })
                         .collect(),
                     reasoning: None,
+                    provider: None,
                 }),
                 ("[a-z]{1,3}", "\\PC{0,700}", any::<bool>()).prop_map(|(id, out, err)| {
                     if err {

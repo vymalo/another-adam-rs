@@ -22,7 +22,7 @@ the provider asked to wait, and the runtime owns backoff.
 | `ModelClient` (trait) | `complete(ModelRequest) -> ModelResponse` and `stream(ModelRequest) -> BoxStream<ModelDelta>`; two default methods, `provider() -> Option<&str>` (a label for reports, `openai` for the OpenAI-compatible client) and `context_window(alias) -> Option<u64>` (the window the deployment configured for that alias), both `None` unless the client says |
 | `DynModel` | `Arc<dyn ModelClient>` |
 | `ModelRequest`, `ModelResponse`, `ModelDelta` | request (`model`, `system`, `messages`, `tools`, `ToolChoice`, `max_output_tokens`, `temperature`, `reasoning_effort`: the level this call asks for, absent sends nothing (ADR 0063), `metadata`, `prompt_cache_key`: a stable key per conversation, which the agent loop sets and a client may send; `run`: the root run the call belongs to, which the agent loop sets from in-process state and an injector reads ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)), skipped in JSON when `None`; **new public fields, break `ModelRequest` struct literals**: use `ModelRequest::new`). `ModelRequest`'s `PartialEq` and `Serialize` include `run`: two requests of different runs are not equal, and a test that compares requests of two runs clears it first. Response and streamed chunks. `ModelDelta` is `#[non_exhaustive]` since `ToolCallComplete` (below): a `match` over it needs one more arm |
-| `Message`, `ContentPart`, `ToolCall`, `ToolSpec`, `Usage`, `FinishReason` | conversation and tool-calling types; all derive `Serialize`/`Deserialize` because a run persists its history. `ToolCall` has `new(id, name, arguments)`, `with_invalid_arguments(id, name, raw)` and `Default`; its `invalid_arguments: Option<String>` holds the raw argument text when it was not JSON (`arguments` is then `{}`). **Breaking:** a `ToolCall { id, name, arguments }` literal no longer compiles (use `ToolCall::new` or `..Default::default()`); the serialized form and the `ModelClient` trait are unchanged, and journals written before the field decode with `None` |
+| `Message`, `ContentPart`, `ToolCall`, `ToolSpec`, `Usage`, `FinishReason` | conversation and tool-calling types; all derive `Serialize`/`Deserialize` because a run persists its history. `ToolCall` has `new(id, name, arguments)`, `with_invalid_arguments(id, name, raw)` and `Default`; its `invalid_arguments: Option<String>` holds the raw argument text when it was not JSON (`arguments` is then `{}`). `Message::Assistant.provider` and `ToolCall.opaque` carry a provider's opaque members, bound to the model alias and endpoint that made them (*A provider's opaque members*, below); both are `None` when absent and are not serialized then, so an older journal decodes and a message without them is the same bytes. **Breaking:** a `ToolCall { id, name, arguments }` literal no longer compiles (use `ToolCall::new` or `..Default::default()`); the serialized form and the `ModelClient` trait are unchanged, and journals written before the field decode with `None` |
 | `ModelError` | `RateLimited { retry_after }`, `Transient`, `ContextLength`, `InvalidRequest`, `Auth`, `Protocol`, `Refused { status, slug, retry_after, park }`, `ModelLocked { model }`, `Unreachable`; `#[non_exhaustive]`, see *Errors* |
 | `ReasoningEffort`, `ReasoningWire`, `ModelProfile`, `Preset`, `ModelProfiles` | the per-model profiles of `MODEL_ALIASES_FILE` (ADR 0063, ADR 0064), parsed and validated by `ModelProfiles::parse_json`; pure data, no file I/O (see [Per-model profiles](#per-model-profiles)) |
 | `Classify`, `ErrorClass` | re-exported from `adam-error`: `class()`, `is_retryable()`, `retry_after()` |
@@ -71,6 +71,32 @@ It is written only when present, so a history stored before it existed and one o
 the same bytes. **Breaking for code that builds these types with struct literals:** `ModelResponse` and
 `Message::Assistant` have a new field, and `ModelDelta` a new variant (`match`es over it need an arm).
 `MockModel::stream` replays `ModelResponse.reasoning` as a `Reasoning` delta before the text.
+
+### A provider's opaque members
+
+A provider may attach members this client does not model to an assistant message or to one of its
+tool calls — Gemini 3's `extra_content.google.thought_signature` is the one that forced this
+(adam-rs#322: without it, every second call is a 400). They are part of the next request's bytes,
+so they are kept **byte for byte** in the conversation and sent back unchanged:
+
+| Item | What |
+|---|---|
+| `ProviderTurn` | `model` (the request's model alias), `endpoint` (the client's stable id of the endpoint), `members: BTreeMap<String, Value>` (the message's unmodelled members), `reasoning: Option<Value>` (a reasoning block the provider sent as an object or array instead of text). `ProviderTurn::new(model, endpoint)` and `is_bound_to(model, endpoint)` |
+| `Message::Assistant.provider` | `Option<ProviderTurn>`; `None` when the provider attached nothing, and then not serialized |
+| `ToolCall.opaque` | `Option<BTreeMap<String, Value>>`, the call object's unmodelled members. Its provenance is the enclosing message's `provider`: a call never duplicates the alias or the endpoint |
+
+**Bound to the model that made it.** A client sends a turn's members back only when the turn's
+`model` and `endpoint` both match the request's model alias and endpoint. A run that switches
+model (the frontier fallback, a person's choice) drops the old model's members: they never reach
+another model. A turn that is not stamped matches nothing, so a client that does not know the
+endpoint sends nothing — fail closed.
+
+The carrier rides the conversation's JSON with `serde(default, skip_serializing_if)`: a journal
+written before it decodes with `None`, and a message without it is the same bytes as before. No
+store schema changes.
+
+**Limit.** `reasoning` is the raw value only: this crate has no block type, so a reasoning block
+is carried as an opaque `Value`, not as a structured turn with its own members.
 
 ### Usage
 

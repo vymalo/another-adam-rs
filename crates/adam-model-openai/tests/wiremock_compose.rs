@@ -166,6 +166,7 @@ async fn tool_call_by_keyword_and_by_header_then_final_answer() {
                 ..Default::default()
             }],
             reasoning: None,
+            provider: None,
         });
         follow_up
             .messages
@@ -443,6 +444,7 @@ async fn the_scripted_models_stream_what_they_complete() {
                 ..Default::default()
             }],
             reasoning: None,
+            provider: None,
         },
         Message::tool_result("c1", "1. A"),
     ];
@@ -522,6 +524,7 @@ async fn the_scratch_script_asks_where_to_publish_and_goes_on_when_told() {
             ..Default::default()
         }],
         reasoning: None,
+        provider: None,
     });
     history.push(Message::tool_result(
         "stop00004",
@@ -684,6 +687,7 @@ async fn the_create_repo_script_publishes_to_the_new_repository_and_stops_when_t
                 ..Default::default()
             }],
             reasoning: None,
+            provider: None,
         });
         history.push(Message::tool_result(
             "stop00004",
@@ -766,6 +770,7 @@ async fn the_coders_last_answer_arrives_over_time() {
             ..Default::default()
         }],
         reasoning: None,
+        provider: None,
     });
     history.push(Message::tool_result("coder-call-5", "ok"));
     let started = std::time::Instant::now();

@@ -631,8 +631,9 @@ pub(crate) fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adam_model::ToolCall;
+    use adam_model::{ProviderTurn, ToolCall};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn call(id: &str, name: &str, args: serde_json::Value) -> Message {
         Message::Assistant {
@@ -644,6 +645,7 @@ mod tests {
                 ..Default::default()
             }],
             reasoning: None,
+            provider: None,
         }
     }
 
@@ -1094,6 +1096,48 @@ mod tests {
                 .count(),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_compaction_keeps_the_carrier_of_the_turns_it_keeps() {
+        let mut state = history_of(4);
+        let kept_at = state.messages.len() - 2;
+        let mut provider = ProviderTurn::new("gw-model", "openai:0123456789abcdef");
+        provider.members = BTreeMap::from([(
+            "extra_content".into(),
+            json!({"google": {"thought_signature": "kept-sig"}}),
+        )]);
+        let Message::Assistant { provider: slot, .. } = &mut state.messages[kept_at] else {
+            panic!("a turn's answer");
+        };
+        *slot = Some(provider);
+
+        // Drop the first two turns; the last one stays, carrier and all.
+        apply(
+            &mut state,
+            1 + 2 * 2,
+            Some("S"),
+            CompactionReason::Budget,
+            None,
+            &same_id,
+        );
+        let kept = state
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                Message::Assistant {
+                    provider: Some(provider),
+                    ..
+                } => Some(provider),
+                _ => None,
+            })
+            .expect("the kept turn's carrier");
+        assert_eq!(
+            kept.members["extra_content"],
+            json!({"google": {"thought_signature": "kept-sig"}})
+        );
+        assert_eq!(kept.model, "gw-model");
+        assert_eq!(kept.endpoint, "openai:0123456789abcdef");
     }
 
     #[test]

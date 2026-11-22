@@ -89,6 +89,34 @@ Behaviour (details in the crate docs, `src/lib.rs`):
 * the images of a **run of tool messages** follow it in one user message, `Images from tool results: c1 shot.png; c2 b.png`, then the parts: the tool messages stay text (a tool-role message that holds an image is *unverified*), and each body's `messages` starts with the one before it;
 * an image with no bytes in `ModelRequest::image_data` is its stand-in line. A chat template that insists on string content rejects the array: the setting is off by default for that reason.
 
+## A provider's opaque members
+
+Gemini 3, behind an OpenAI-compatible endpoint, attaches an opaque
+`extra_content.google.thought_signature` to the assistant message and to each tool call it returns,
+and refuses the next request with a 400 when a tool call comes back without it (adam-rs#322: 60 of
+60 bench runs failed on their second call). This client keeps **every** member it does not model,
+on the message and on each call, and sends it back byte for byte:
+
+| Direction | What |
+|---|---|
+| parse, completion | the unknown members of `choices[0].message` and of each `tool_calls[i]` (`extra_content`, and siblings) go into `Message::Assistant.provider.members` and `ToolCall.opaque`. The modelled members are not opaque: `role`, `content`, `tool_calls`, `reasoning_content`, `reasoning` on the message; `id`, `type`, `function` on the call |
+| parse, stream | a delta's unknown members on a tool call are accumulated per call (last value wins per key) and reach the finished call. A final chunk shaped as a whole `message` instead of a `delta` contributes its unknown members too — no provider we test sends one, so that path is defensive |
+| build | the members go out on the assistant message and on each call **only when the turn is bound to the request's model alias and endpoint**; the modelled keys win on a collision |
+| provenance | a parse does not know either, so it leaves the turn unstamped; the client stamps `req.model` and its endpoint id in `complete` and in the streamed `Finished` |
+
+The endpoint id is `openai:` and the first 16 hexadecimal digits of the SHA-256 of the client's
+normalised `base_url`, computed once when the client is built. It is not a credential. A run that
+changes model or endpoint drops the old turn's members: they never reach another model. A message
+with no carrier is the bytes it always was.
+
+A **reasoning block** (a `reasoning` or `reasoning_content` value that is an object or array, not
+a string) is carried as `provider.reasoning`, raw. When the client is set to echo reasoning, that
+value goes back under the configured field **in place of** the text; when it is not, nothing of it
+is sent. `ModelResponse.reasoning` stays the text-only view.
+
+**Limit:** the block is a raw JSON value, not a typed turn with its own members. A provider whose
+block needs a shape of its own needs a new type, not this carrier.
+
 ## Reasoning
 ## Reasoning
 
@@ -99,7 +127,8 @@ A model in thinking mode sends its reasoning beside its answer, and this client 
 | stream, `choices[0].delta` | `reasoning_content` or `reasoning` (a string; the first that is not empty) | `ModelDelta::Reasoning`, then `ModelResponse.reasoning` |
 | completion, `choices[0].message` | `reasoning_content` or `reasoning` | `ModelResponse.reasoning` |
 
-A value that is not a string (a structured `reasoning` some gateways add) is ignored, and the chunk it came in still counts for its content
+A value that is not a string (a structured `reasoning` some gateways add) is not reasoning text; it is kept raw in the carrier
+(*A provider's opaque members*) and sent back only when the client echoes reasoning. The chunk it came in still counts for its content
 and calls. The reasoning is **never** the answer's text (`Message::text()`), and **by default never in the history and never sent back**:
 `ModelResponse.reasoning` is for people to read. `with_extra_body(map)` merges a JSON object into every request body at its top level
 (it wins over what the client wrote; `model`, `messages`, `tools`, `tool_choice` and `stream` are refused with
