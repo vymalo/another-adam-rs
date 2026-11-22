@@ -5141,6 +5141,12 @@ mod cases {
         })
         .await;
         wait_for(&rt, child, "the child waiting", |v| v.waiting).await;
+        // The child's park wakes the parent, which looks at it once and parks again; the cancel
+        // must find the parent waiting, not in that look (which would read the end from the store).
+        wait_until("the parent's look at the parked child", || {
+            count(&watch.resumes) == 1
+        })
+        .await;
         rt.cancel(child, "not needed").await.expect("cancel");
         let done = wait_done(&rt, parent).await;
         worker.stop().await;
