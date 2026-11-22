@@ -17,6 +17,11 @@
 //! {"role":"tool","call_id":"call_1","content":"18C, sunny","is_error":false}
 //! ```
 //!
+//! An assistant message may also carry a provider's opaque members, bound to the model alias and
+//! endpoint that produced them ([`ProviderTurn`], [`ToolCall::opaque`]): they are kept byte for
+//! byte, are `None` when absent (so a history without them is the same bytes as before), and are
+//! sent back only to the same model alias and endpoint.
+//!
 //! # Reasoning
 //!
 //! A model in thinking mode writes its reasoning before its answer. It reaches a caller as
@@ -25,6 +30,10 @@
 //! history, so a client does not send it back, with one exception that the client chooses: a
 //! provider that **requires** it (DeepSeek's thinking mode with tools, *verified 2026-10-05*) is
 //! served by a client set to echo it, which then keeps it in [`Message::Assistant::reasoning`].
+//!
+//! The other direction is [`ModelRequest::reasoning_effort`] ([ADR 0063](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0063-a-reasoning-effort-is-one-setting.md)):
+//! a caller may ask for a level, and the client sends it through the wire of the request's model
+//! profile. Absent sends nothing and leaves the model's own default.
 //!
 //! # Streaming a tool call
 //!
@@ -85,17 +94,18 @@ mod types;
 pub use adam_error::{Classify, ErrorClass};
 pub use client::{DynModel, ModelClient};
 pub use credentials::{
-    AfterRejection, CredentialHeaders, CredentialRequest, DynCredentials, ModelCredentials,
+    AfterRejection, CredentialHeaders, CredentialRequest, DynCredentials, FIRST_PARK, InjectedRun,
+    MAX_PARK, MODEL_LOCKED_SLUG, ModelCredentials, Park, ProblemType, RUN_HEADER, Refusal,
     Rejection, RenewingCredentials, StaticBearer,
 };
 pub use error::ModelError;
 pub use mock::{MockModel, RecordedCall};
 pub use profiles::{
-    ModelProfile, ModelProfiles, NotAWire, NotAnEffort, Preset, RESERVED_EXTRA_BODY_KEYS,
-    ReasoningEffort, ReasoningWire,
+    DEFAULT_MAX_OUTPUT_TOKENS, ModelProfile, ModelProfiles, NotAWire, NotAnEffort, Preset,
+    RESERVED_EXTRA_BODY_KEYS, ReasoningEffort, ReasoningWire,
 };
 pub use types::{
     ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, ImageData, ImageLimits, ImageOrigin,
-    ImageRef, InputModalities, Message, ModelDelta, ModelRequest, ModelResponse, ToolCall,
-    ToolChoice, ToolSpec, Usage, human_bytes, type_word,
+    ImageRef, InputModalities, Message, ModelDelta, ModelRequest, ModelResponse, ProviderTurn,
+    ToolCall, ToolChoice, ToolSpec, Usage, human_bytes, type_word,
 };

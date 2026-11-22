@@ -7,13 +7,13 @@ use std::time::Duration;
 use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent};
 use adam_llm_agent::{
     DEFAULT_MAX_PARALLEL, DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder,
-    MAX_PARALLEL_LIMIT, SESSION_TOOLS, StepIo, ToolSource,
+    MAX_PARALLEL_LIMIT, ModelParking, SESSION_TOOLS, StepIo, ToolSource, WINDOW_MARGIN_TOKENS,
 };
-use adam_model::DynModel;
+use adam_model::{DEFAULT_MAX_OUTPUT_TOKENS, DynModel, ModelProfiles, Preset, ReasoningEffort};
 use adam_runtime::{RuntimeBuilder, SessionLimits};
 
 use crate::def::{Node, Remote};
-use crate::error::{AliasProblem, Error, Origin};
+use crate::error::{AliasProblem, CapSource, EffortSource, Error, Origin};
 #[cfg(feature = "remote")]
 use crate::remote_session::RemoteRoundAgent;
 use crate::scrub::{Scrub, Scrubbed};
@@ -35,8 +35,10 @@ pub struct BoundDef {
     state: Vec<ApplyState>,
     sources: Vec<DynToolSource>,
     aliases: Option<Vec<String>>,
+    profiles: ModelProfiles,
     wait_poll: Option<Duration>,
     max_parallel: Option<usize>,
+    model_parking: Option<ModelParking>,
     session_limits: SessionLimits,
     #[cfg(feature = "sessions")]
     child_sessions: Option<adam_a2a_runtime::ChildSessions>,
@@ -79,8 +81,10 @@ impl BoundDef {
             state: Vec::new(),
             sources: Vec::new(),
             aliases: None,
+            profiles: ModelProfiles::default(),
             wait_poll: None,
             max_parallel: None,
+            model_parking: None,
             session_limits,
             #[cfg(feature = "sessions")]
             child_sessions: None,
@@ -143,6 +147,19 @@ impl BoundDef {
         self
     }
 
+    /// The deployment's per-model profiles (ADR 0063, ADR 0064): what each model takes as a
+    /// reasoning effort, which preset it starts from, and its output cap. [`model`](Self::model)
+    /// resolves each agent's default effort from its folder, its `model_preset`, the profile and
+    /// the profile's preset, and refuses a value the model does not take; it resolves the cap the
+    /// same way (then 128,000) and clamps it to the model's limit and window. Without them no model
+    /// has a profile, so an agent that sets an effort is refused, one that sets none sends none, and
+    /// every cap is the folder's or 128,000.
+    #[must_use]
+    pub fn model_profiles(mut self, profiles: ModelProfiles) -> Self {
+        self.profiles = profiles;
+        self
+    }
+
     /// How long an agent that waits for something (a subagent's child run, the task of a remote
     /// subagent) sleeps between looks: [`LlmAgentBuilder::wait_poll`], for every agent. The default
     /// is the loop's, 60 seconds. A child run tells its parent when it is done, so the timer is
@@ -162,6 +179,18 @@ impl BoundDef {
     #[must_use]
     pub fn max_parallel(mut self, n: usize) -> Self {
         self.max_parallel = Some(n);
+        self
+    }
+
+    /// How every agent waits on a model that refused it or could not be reached
+    /// ([`LlmAgentBuilder::model_parking`], [ADR 0067]): the deployment's `MODEL_PARK_LIMIT`, and
+    /// whether an unreachable endpoint parks (`MODEL_AUTH=injector`). Without it the loop's
+    /// default: a limit of 24 hours, and an unreachable endpoint that fails the run.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[must_use]
+    pub fn model_parking(mut self, parking: ModelParking) -> Self {
+        self.model_parking = Some(parking);
         self
     }
 
@@ -231,6 +260,11 @@ impl BoundDef {
     ///
     /// * [`Error::ModelAlias`] for an alias that is empty, has whitespace, or is not one of
     ///   [`model_aliases`](Self::model_aliases);
+    /// * [`Error::UnknownModelPreset`], [`Error::InvalidReasoningEffort`] or
+    ///   [`Error::ReasoningEffort`] when the effort an agent resolves to is not one of its model's
+    ///   levels ([`model_profiles`](Self::model_profiles));
+    /// * [`Error::OutputCap`] when a preset its `model_preset` names asks for more output tokens
+    ///   than the model documents;
     /// * [`Error::Build`] when a tool needs state that [`state`](Self::state) did not give.
     pub fn model(self, model: DynModel, alias: impl Into<String>) -> Result<Assembly, Error> {
         let default_alias = alias.into();
@@ -248,7 +282,9 @@ impl BoundDef {
                 (ModelRef::Inherit, None) => default_alias.clone(),
             };
             self.check_alias(&origin, &alias)?;
-            agents.push(self.build(node, &origin, &model, &alias)?);
+            let effort = self.default_effort(node, &origin, &alias)?;
+            let cap = self.output_cap(node, &origin, &alias, &model)?;
+            agents.push(self.build(node, &origin, &model, &alias, effort, cap)?);
             info.push(AgentInfo {
                 name: node.name.clone(),
                 parent: node
@@ -258,6 +294,7 @@ impl BoundDef {
                 description: node.description.clone(),
                 file: node.file.clone(),
                 model_alias: alias.clone(),
+                reasoning_effort: effort,
                 prompt: node.prompt.clone(),
                 tools: node.tools.iter().map(|(name, _)| name.clone()).collect(),
                 skills: node.skills.clone(),
@@ -268,7 +305,10 @@ impl BoundDef {
                     .iter()
                     .map(|(tool, def, _)| (tool.clone(), def.clone()))
                     .collect(),
-                limits: node.limits,
+                limits: Limits {
+                    max_output_tokens: cap,
+                    ..node.limits
+                },
             });
             resolved.push(alias);
         }
@@ -326,6 +366,184 @@ impl BoundDef {
         }
     }
 
+    /// The effort the agent's model calls ask for by default (ADR 0063 decision 4, ADR 0064
+    /// decision 3): its `reasoning_effort`, else the preset its `model_preset` names, else the
+    /// profile's own `reasoningEffort`, else the profile's base preset. Every value must be one of
+    /// the model's levels; a model with no profile takes none.
+    fn default_effort(
+        &self,
+        node: &Node,
+        origin: &Origin,
+        alias: &str,
+    ) -> Result<Option<ReasoningEffort>, Error> {
+        let profile = self.profiles.profile(alias);
+        let allowed: &[ReasoningEffort] = profile
+            .and_then(|p| p.reasoning_efforts.as_deref())
+            .unwrap_or(&[]);
+        let preset = self.named_preset(node, origin)?;
+        let chosen = if let Some(word) = &node.reasoning_effort {
+            let effort = word.parse::<ReasoningEffort>().map_err(|source| {
+                Error::InvalidReasoningEffort {
+                    origin: origin.clone(),
+                    source,
+                }
+            })?;
+            Some((effort, EffortSource::Folder))
+        } else if let Some(effort) = preset.and_then(|p| p.reasoning_effort) {
+            Some((
+                effort,
+                EffortSource::Preset(node.model_preset.as_deref().unwrap_or_default().to_owned()),
+            ))
+        } else if let Some(effort) = profile.and_then(|p| p.reasoning_effort) {
+            Some((effort, EffortSource::Profile))
+        } else {
+            self.profiles
+                .preset_of(alias)
+                .and_then(|p| p.reasoning_effort)
+                .map(|effort| (effort, EffortSource::Profile))
+        };
+        let Some((effort, set_by)) = chosen else {
+            return Ok(None);
+        };
+        if !allowed.contains(&effort) {
+            let allowed: Vec<String> = allowed.iter().map(|e| e.as_str().to_owned()).collect();
+            return Err(Error::ReasoningEffort {
+                origin: origin.clone(),
+                effort: effort.as_str().to_owned(),
+                set_by,
+                model: alias.to_owned(),
+                suggestion: closest(effort.as_str(), allowed.iter().map(String::as_str))
+                    .map(str::to_owned),
+                allowed,
+            });
+        }
+        Ok(Some(effort))
+    }
+
+    /// The preset the agent's `model_preset` names, when it names one (ADR 0064). An undeclared
+    /// name is refused here, whether or not another setting wins over the preset's values.
+    fn named_preset<'a>(
+        &'a self,
+        node: &Node,
+        origin: &Origin,
+    ) -> Result<Option<&'a Preset>, Error> {
+        let Some(name) = node.model_preset.as_deref() else {
+            return Ok(None);
+        };
+        match self.profiles.preset(name) {
+            Some(preset) => Ok(Some(preset)),
+            None => {
+                let known: Vec<String> = self.profiles.presets.keys().cloned().collect();
+                Err(Error::UnknownModelPreset {
+                    origin: origin.clone(),
+                    preset: name.to_owned(),
+                    suggestion: closest(name, known.iter().map(String::as_str)).map(str::to_owned),
+                    known,
+                })
+            }
+        }
+    }
+
+    /// The output cap the agent's model calls ask for (ADR 0064 decision 3): its folder's
+    /// `limits.max_output_tokens`, else the preset its `model_preset` names, else the profile's
+    /// `maxOutputTokens`, else the profile's base preset, else
+    /// [`DEFAULT_MAX_OUTPUT_TOKENS`]. The value is then clamped to the model's
+    /// `maxOutputTokensLimit` and, when the window is known, to what the window leaves after
+    /// [`WINDOW_MARGIN_TOKENS`] and the history the agent keeps (`max_history_tokens`, or half the
+    /// window when it is `0`; an omitted key keeps the 100,000 default).
+    ///
+    /// A preset above the model's limit is refused, not clamped: a preset is the deployment's
+    /// promise about the model, where the folder's value is the agent's own choice. The folder's
+    /// value is clamped, and so is the profile's, so a model that documents less than the value
+    /// never receives more than it allows.
+    fn output_cap(
+        &self,
+        node: &Node,
+        origin: &Origin,
+        alias: &str,
+        model: &DynModel,
+    ) -> Result<u32, Error> {
+        let profile = self.profiles.profile(alias);
+        let agent_preset = self.named_preset(node, origin)?;
+        let base_preset = self.profiles.preset_of(alias);
+        let limit = profile.and_then(|p| p.max_output_tokens_limit);
+        if let Some(limit) = limit {
+            for (name, preset, from_profile) in [
+                (node.model_preset.as_deref(), agent_preset, false),
+                (profile.and_then(|p| p.preset.as_deref()), base_preset, true),
+            ] {
+                if let (Some(name), Some(cap)) = (name, preset.and_then(|p| p.max_output_tokens))
+                    && cap > limit
+                {
+                    // The loader refuses a profile's named preset above its limit for a parsed
+                    // file; a hand-built `ModelProfiles` can reach it here, and the value is in
+                    // the profiles file, not in the agent's file.
+                    let origin = if from_profile {
+                        Origin::new(alias.to_owned(), "MODEL_ALIASES_FILE")
+                    } else {
+                        origin.clone()
+                    };
+                    return Err(Error::OutputCap {
+                        origin,
+                        set_by: CapSource::Preset(name.to_owned()),
+                        cap,
+                        limit,
+                        model: alias.to_owned(),
+                    });
+                }
+            }
+        }
+        // A hand-built `ModelProfiles` may hold a `0` the loader refuses; a cap of 0 is no cap, so
+        // every source is filtered and the result is at least 1.
+        let chosen = node
+            .max_output_tokens
+            .filter(|cap| *cap > 0)
+            .or(agent_preset
+                .and_then(|p| p.max_output_tokens)
+                .filter(|cap| *cap > 0))
+            .or(profile
+                .and_then(|p| p.max_output_tokens)
+                .filter(|cap| *cap > 0))
+            .or(base_preset
+                .and_then(|p| p.max_output_tokens)
+                .filter(|cap| *cap > 0))
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+        let mut cap = chosen;
+        if let Some(limit) = limit {
+            cap = cap.min(limit);
+        }
+        let window = model.context_window(alias);
+        let history = window.map(|window| {
+            if node.limits.max_history_tokens > 0 {
+                u64::from(node.limits.max_history_tokens)
+            } else {
+                window / 2
+            }
+        });
+        if let (Some(window), Some(history)) = (window, history) {
+            let room = window
+                .saturating_sub(WINDOW_MARGIN_TOKENS.saturating_add(history))
+                .max(1);
+            cap = cap.min(u32::try_from(room).unwrap_or(u32::MAX));
+        }
+        let cap = cap.max(1);
+        if cap < chosen {
+            tracing::warn!(
+                agent = %origin.agent,
+                model = alias,
+                chosen,
+                cap,
+                limit,
+                window,
+                history,
+                margin = WINDOW_MARGIN_TOKENS,
+                "the output cap is lowered to what the model allows (its maxOutputTokensLimit or \
+                 the window; ADR 0064)"
+            );
+        }
+        Ok(cap)
+    }
+
     /// The tool as the agent gets it: a session tool is scrubbed when the deployment gave a scrub.
     fn guarded(&self, name: &str, tool: &DynTool) -> DynTool {
         match &self.scrub {
@@ -356,13 +574,22 @@ impl BoundDef {
         origin: &Origin,
         model: &DynModel,
         alias: &str,
+        effort: Option<ReasoningEffort>,
+        cap: u32,
     ) -> Result<LlmAgent, Error> {
         let mut builder = LlmAgent::builder(node.name.clone(), Arc::clone(model), alias)
             .instructions(node.prompt.clone())
-            .limits(node.limits)
-            .max_parallel(self.parallel_of(node));
+            .limits(Limits {
+                max_output_tokens: cap,
+                ..node.limits
+            })
+            .max_parallel(self.parallel_of(node))
+            .reasoning_effort(effort);
         if let Some(every) = self.wait_poll {
             builder = builder.wait_poll(every);
+        }
+        if let Some(parking) = self.model_parking {
+            builder = builder.model_parking(parking);
         }
         for (tool, _, policy) in &node.retry {
             builder = builder.tool_retry(tool.clone(), *policy);
@@ -409,6 +636,10 @@ pub struct AgentInfo {
     pub file: PathBuf,
     /// The gateway alias its model calls use.
     pub model_alias: String,
+    /// The reasoning effort its model calls ask for by default, resolved from its folder, its
+    /// `model_preset`, the model profile and the profile's preset (ADR 0063 decision 4), or `None`
+    /// when none of them sets one.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// The system prompt the model sees: the instructions with the vars substituted, then the
     /// instructions of its **eager** MCP servers, then the skills catalog and the preloaded skills.
     /// A server with a `when` adds its section to a run, when the run loads it.
@@ -433,7 +664,9 @@ pub struct AgentInfo {
     /// Each is one of [`tools`](Self::tools). Part of the info because an agent that retries a
     /// tool differently behaves differently.
     pub retry: Vec<(String, adam_agent_fs::RetryDef)>,
-    /// The loop's limits.
+    /// The loop's limits, with [`max_output_tokens`](Limits::max_output_tokens) resolved for the
+    /// agent's model (ADR 0064): the folder's value, its preset's, the profile's, the fallback,
+    /// then clamped to the model's limit and window.
     pub limits: Limits,
 }
 

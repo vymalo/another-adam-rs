@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use a2a::{Message, Part, PartContent, Role, Task, TaskState};
 use adam_a2a::{
-    A2UI_MEDIA_TYPE, Caller, MENTIONS_EXTENSION, THREAD_TOOLS_EXTENSION, TaskBackend, TaskEvent,
-    UI_CATALOG_EXTENSION,
+    A2UI_MEDIA_TYPE, Caller, LOCALE_EXTENSION, MENTIONS_EXTENSION, THREAD_TOOLS_EXTENSION,
+    TaskBackend, TaskEvent, UI_CATALOG_EXTENSION,
 };
 use adam_a2a_runtime::{
-    CONTEXT_A2UI_RENDERER, CONTEXT_CALLER, CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS,
+    CONTEXT_A2UI_RENDERER, CONTEXT_CALLER, CONTEXT_LOCALE, CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS,
     CONTEXT_UI_CATALOG, CONTEXT_UI_REF, RuntimeTaskBackend, UNREADABLE_CALLER, asked_by_an_agent,
     vymalo_inbound,
 };
@@ -546,4 +546,83 @@ fn a_part_with_a_1_0_message_and_an_older_one_says_nothing() {
     let inbound = vymalo_inbound(&message).unwrap();
     assert_eq!(inbound.payload["text"], "hi");
     assert!(inbound.payload.get("form").is_none());
+}
+
+/// The interface language of an activated message is the run's context, and a message that names
+/// none takes it away: the next job of the thread never answers in the language of the one before.
+/// A message whose request did not activate the extension changes nothing (ADR 0069).
+#[tokio::test]
+async fn the_interface_language_of_an_activated_message_is_the_runs_context_and_none_clears_it() {
+    let rig = Rig::new();
+    for _ in 0..4 {
+        rig.model.push_text("ok");
+    }
+    let (stop, handle) = rig.worker();
+    let activated = || alice().with_extensions([LOCALE_EXTENSION]);
+    let naming = |tag: Option<&str>| {
+        let entry = match tag {
+            Some(tag) => json!({LOCALE_EXTENSION: {"locale": tag}}),
+            None => json!({}),
+        };
+        with_metadata(Message::new(Role::User, vec![Part::text("bonjour")]), entry)
+    };
+
+    // Activated, with a tag: the run's context holds it, as the string the model reads.
+    let one = rig
+        .backend
+        .submit(
+            activated(),
+            naming(Some("fr-CM")),
+            None,
+            Some("ctx-l".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.state(&one).await.context[CONTEXT_LOCALE],
+        json!("fr-CM")
+    );
+    wait_task(&rig, &one.id, TaskState::Completed).await;
+
+    // A message that did not activate the extension is read as it always was: the language stays.
+    let mut second = naming(Some("de-DE"));
+    second.reference_task_ids = Some(vec![one.id.clone()]);
+    let two = rig
+        .backend
+        .submit(alice(), second, None, Some("ctx-l".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.state(&two).await.context[CONTEXT_LOCALE],
+        json!("fr-CM"),
+        "a request that did not activate the extension changes nothing"
+    );
+    wait_task(&rig, &two.id, TaskState::Completed).await;
+
+    // Activated, naming none: the language is taken away, never left as an empty string.
+    let mut third = naming(None);
+    third.reference_task_ids = Some(vec![two.id.clone()]);
+    let three = rig
+        .backend
+        .submit(activated(), third, None, Some("ctx-l".into()))
+        .await
+        .unwrap();
+    assert!(
+        !rig.state(&three).await.context.contains_key(CONTEXT_LOCALE),
+        "a message that names no language clears the one before"
+    );
+    wait_task(&rig, &three.id, TaskState::Completed).await;
+
+    // Activated, with a malformed tag: refused, never passed on, and it clears like none.
+    let mut fourth = naming(Some("fr CM"));
+    fourth.reference_task_ids = Some(vec![three.id.clone()]);
+    let four = rig
+        .backend
+        .submit(activated(), fourth, None, Some("ctx-l".into()))
+        .await
+        .unwrap();
+    assert!(!rig.state(&four).await.context.contains_key(CONTEXT_LOCALE));
+    wait_task(&rig, &four.id, TaskState::Completed).await;
+    stop.send(()).unwrap();
+    handle.await.unwrap();
 }

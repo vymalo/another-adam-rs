@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { GLIBC_FILES } from '../lib/glibc.mjs';
 import { PINS, coderRef } from '../lib/pins.mjs';
 import { RUNTIME } from '../lib/runtime.mjs';
-import { Stack, StackError, coderEnvironment, redact, secretsOf, serviceNames } from '../lib/stack.mjs';
+import { Stack, StackError, TREE_READ_TIMEOUT_MS, TREE_REMOVE_TIMEOUT_MS, coderEnvironment, redact, secretsOf, serviceNames } from '../lib/stack.mjs';
 import { tmp } from './helpers.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -653,4 +653,26 @@ test('ensureGlibc copies the loader and the libraries out of the pinned coder im
   assert.ok(!seen.some((a) => a[0] === 'run' || a[0] === 'start'), 'the image is never run');
   assert.equal(await stack.ensureGlibc(), dir, 'a second call copies nothing');
   assert.equal(seen.filter((a) => a[0] === 'cp').length, GLIBC_FILES.length);
+});
+
+test('emptying a slot and removing a directory may take TREE_REMOVE_TIMEOUT_MS, reading a tree TREE_READ_TIMEOUT_MS (a large node_modules timed out at 120 s)', async (t) => {
+  const seen = [];
+  const { stack } = makeStack(t, {
+    exec: async (file, args, opts) => {
+      seen.push({ args, opts });
+      return { exitCode: 0, stdout: '', stderr: '' };
+    },
+    execBuf: async (file, args, opts) => {
+      seen.push({ args, opts, buf: true });
+      return { exitCode: 0, stdout: Buffer.alloc(1024), stderr: '', over: false };
+    },
+  });
+  await stack.resetWork(1);
+  await stack.workDir(1, '/work/bench-base', { remove: true });
+  const helpers = seen.filter((c) => c.args[0] === 'run' && !c.buf);
+  assert.equal(helpers.length, 2);
+  for (const h of helpers) assert.equal(h.opts.timeoutMs, TREE_REMOVE_TIMEOUT_MS);
+  assert.ok(TREE_REMOVE_TIMEOUT_MS >= 15 * 60 * 1000 && TREE_READ_TIMEOUT_MS >= 5 * 60 * 1000);
+  await stack.streamFrom(1, ['-cf', '-', '-C', '/work', '.'], { maxBytes: 4096 });
+  assert.equal(seen.find((c) => c.buf).opts.timeoutMs, TREE_READ_TIMEOUT_MS);
 });

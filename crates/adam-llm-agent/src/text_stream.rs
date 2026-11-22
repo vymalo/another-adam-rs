@@ -291,6 +291,10 @@ pub(crate) async fn stream_response(
 }
 
 /// What woke the stream's loop.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a streamed item is the value; boxing it would allocate for every chunk"
+)]
 enum Wake {
     /// The run was cancelled.
     Cancel,
@@ -828,6 +832,7 @@ mod tests {
                 content: vec![adam_model::ContentPart::text("Let me look.")],
                 tool_calls: vec![call],
                 reasoning: None,
+                provider: None,
             },
             finish: adam_model::FinishReason::ToolCalls,
             usage: adam_model::Usage::default(),

@@ -73,7 +73,7 @@ test('the labels an instance carries are on every run and select what it reaps a
 test('reapAll removes only the containers of its labels, then lists, and fails when one is left', async () => {
   const calls = [];
   const left = new HostContainers({ labels: { 'bench.project': 'p' }, exec: exec({ 'ps -aq': 'deadbeef\n' }, calls) });
-  await assert.rejects(left.reapAll(), /left after the reap/);
+  await assert.rejects(left.reapAll({ settleMs: 0 }), /left after the reap/);
   const ps = calls.filter((c) => c.args.includes('ps'));
   assert.deepEqual(ps[0].args, ['ps', '-aq', '--filter', 'label=bench.project=p']);
   assert.deepEqual(calls[1].args, ['rm', '-f', 'deadbeef']);
@@ -161,4 +161,31 @@ test('a run that times out is removed by name; a build argument that is not plai
   assert.deepEqual(calls.at(-1), ['rm', '-f', 'adam-bench-x']);
   const fake = new FakeContainers();
   await assert.rejects(fake.build('/c', 't', '/d', { BASE_IMAGE: 'a b' }), ContainerError);
+});
+
+test('reapAll reads the list again while the daemon is still removing a container, and fails only after the settle time', async () => {
+  // the first two lists still show the container (its removal is in progress), the third is empty
+  let lists = 0;
+  const calls = [];
+  const fake = (bin, args, opts, cb) => {
+    calls.push({ bin, args, opts });
+    if (args[0] === 'ps') {
+      lists += 1;
+      cb(null, lists <= 2 ? 'deadbeef\n' : '', '');
+    } else cb(null, '', '');
+    return { stdin: { end() {}, on() {} } };
+  };
+  const slept = [];
+  let t = 0;
+  const c = new HostContainers({ labels: { 'bench.project': 'p' }, exec: fake });
+  await c.reapAll({ settleMs: 60_000, pollMs: 5000, sleep: async (ms) => { slept.push(ms); t += ms; }, now: () => t });
+  assert.equal(lists, 3, 'listed once before the removal and twice after');
+  assert.deepEqual(slept, [5000], 'it waited once between the two lists after the removal');
+  const rm = calls.find((x) => x.args[0] === 'rm');
+  assert.equal(rm.opts.timeout, 600_000, 'the removal may take 10 minutes');
+  // one that never goes away fails once the settle time has passed
+  t = 0;
+  const stuck = new HostContainers({ labels: { 'bench.project': 'p' }, exec: exec({ 'ps -aq': 'deadbeef\n' }, []) });
+  await assert.rejects(stuck.reapAll({ settleMs: 15_000, pollMs: 5000, sleep: async (ms) => { t += ms; }, now: () => t }), /left after the reap/);
+  assert.equal(t, 15_000);
 });

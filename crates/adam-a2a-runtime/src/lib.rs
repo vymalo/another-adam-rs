@@ -39,6 +39,7 @@ mod convert;
 mod files_in;
 mod ids;
 mod list;
+mod model_park;
 mod person;
 #[cfg(feature = "push")]
 mod push;
@@ -51,6 +52,7 @@ mod usage;
 mod vymalo;
 mod words;
 
+pub use adam_a2a::RESUME_METADATA_KEY;
 pub use backend::{DEFAULT_POLL_INTERVAL, MAX_REFERENCES, RuntimeTaskBackend};
 pub use caller::{CONTEXT_CALLER, UNREADABLE_CALLER, asked_by_an_agent};
 pub use child_sessions::{
@@ -65,14 +67,16 @@ pub use convert::{
 pub use files_in::{MAX_INBOUND_IMAGE_BYTES, MAX_INBOUND_IMAGES};
 pub use ids::task_id_for;
 pub use list::MAX_SCAN;
+pub use model_park::NOT_PARKED;
 pub use person::{CONTEXT_PERSON, person_said};
 #[cfg(feature = "push")]
 pub use push::StorePushStore;
 pub use tier::CONTEXT_ACCESS_TIER;
 pub use usage::MAX_TOKEN_COUNT;
 pub use vymalo::{
-    ASK_SURFACE_PREFIX, CONTEXT_A2UI_RENDERER, CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS,
-    CONTEXT_UI_CATALOG, CONTEXT_UI_REF, MAX_ACTION_CONTEXT_CHARS, MAX_MENTIONS,
-    MAX_OFFERED_CATALOG_IDS, PAYLOAD_FORM, form_answer_surface, integral_numbers, vymalo_inbound,
+    ASK_SURFACE_PREFIX, CONTEXT_A2UI_RENDERER, CONTEXT_LOCALE, CONTEXT_MENTIONS,
+    CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF, MAX_ACTION_CONTEXT_CHARS,
+    MAX_MENTIONS, MAX_OFFERED_CATALOG_IDS, PAYLOAD_FORM, form_answer_surface, integral_numbers,
+    vymalo_inbound,
 };
 pub use words::{comparable, is_format_or_control};

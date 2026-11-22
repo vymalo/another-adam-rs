@@ -34,6 +34,10 @@ use tokio::time::timeout;
 // ---------------------------------------------------------------------------
 
 /// One thing that happens in a scripted stream, in order.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a scripted step is the value; boxing it would allocate for every step"
+)]
 enum Step {
     /// An item of the stream.
     Delta(Result<ModelDelta, ModelError>),
@@ -144,6 +148,7 @@ fn asks(calls: Vec<ToolCall>, words: &str) -> ModelResponse {
             },
             tool_calls: calls,
             reasoning: None,
+            provider: None,
         },
         finish: FinishReason::ToolCalls,
         usage: Usage::default(),

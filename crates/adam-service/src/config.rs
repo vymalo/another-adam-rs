@@ -24,8 +24,10 @@
 //! | `SESSION_IDLE_DAYS` | days a kept-open session may sit idle before it reads closed, 1 to 365; the same on every process that serves one store ([`SessionSettings::idle_ttl`]) | `7` |
 //! | `WORKER_ID` | stable identity of this worker (the lease identity; the run owner for a binary that pins runs); letters, digits, `.`, `_`, `-` | random per process |
 //! | `MODEL_BASE_URL` | OpenAI-compatible gateway, with its `/v1` prefix ([`ModelConfig`]) | required for `all` and `worker` |
-//! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required for `all` and `worker`, unless `MODEL_AUTH=device` |
-//! | `MODEL_AUTH` | `key` (the token of `MODEL_API_KEY`) or `device`: the process signs in to an OAuth 2.0 issuer with the device grant and renews its token (ADR 0058, [`ModelConfig::device_grant`]); the code and the link are a `WARN` log line at startup. With `device`, `MODEL_API_KEY` must be unset or empty | `key` |
+//! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required for `all` and `worker`, unless `MODEL_AUTH=device` or `injector` |
+//! | `MODEL_AUTH` | `key` (the token of `MODEL_API_KEY`), `device`: the process signs in to an OAuth 2.0 issuer with the device grant and renews its token (ADR 0058, [`ModelConfig::device_grant`]); the code and the link are a `WARN` log line at startup; or `injector`: no key, every model call carries `X-Run-Id: <root run id>` and no `Authorization`, for an injector in front of the model that adds the run's credential (ADR 0067, [`ModelConfig::injected_run`]). With `device` or `injector`, `MODEL_API_KEY` must be unset or empty | `key` |
+//! | `MODEL_PARK_LIMIT` | how long parks on a timer in a row may last, from the first, before the run fails with the last reason: a model call the gateway refused (or could not be reached, with `MODEL_AUTH=injector`) parks the run and is made again (ADR 0067, [`ModelConfig::park_limit`]). Whole seconds, or a number with `s`, `m`, `h` or `d` (`24h`), from 60 s to 30 d; anything else is a startup error | `24h` |
+//! | `MODEL_CA_FILE` | a PEM file of certificates trusted for the model endpoint, beside the default roots (ADR 0067, [`ModelConfig::ca_roots`]); not for the device grant's issuer. A file that cannot be read or holds no certificate is a startup error | unset (the default roots) |
 //! | `MODEL_OAUTH_ISSUER` | with `MODEL_AUTH=device`: the issuer, whose `/.well-known/openid-configuration` names the device and token endpoints (on its own origin); `https`, or `http` on a loopback address | required with `device` |
 //! | `MODEL_OAUTH_CLIENT_ID` | with `MODEL_AUTH=device`: the public client the issuer knows the process as | required with `device` |
 //! | `MODEL_OAUTH_SCOPE` | with `MODEL_AUTH=device`: the scope asked for | `offline_access` |
@@ -77,9 +79,12 @@ use adam_a2a::CardSigner;
 use adam_a2a::push::PushPolicy;
 use adam_error::{Classify, ErrorClass};
 use adam_host::Role;
-use adam_model::{DynModel, ImageLimits, ImageOrigin, InputModalities, ModelProfiles};
+use adam_model::{
+    DEFAULT_MAX_OUTPUT_TOKENS, DynModel, ImageLimits, ImageOrigin, InputModalities, ModelProfiles,
+};
 use adam_model_openai::{
-    OpenAiCompatible, OpenAiConfig, OpenAiConfigError, ReasoningField, endpoint_for_logs,
+    ExtraRoots, OpenAiCompatible, OpenAiConfig, OpenAiConfigError, ReasoningField,
+    endpoint_for_logs,
 };
 use secrecy::SecretString;
 use std::collections::BTreeSet;
@@ -684,6 +689,17 @@ pub struct ModelConfig {
     /// OAuth 2.0 device grant and renews its token (ADR 0058), used instead of `api_key`. `None`
     /// (the default) sends `api_key`.
     pub device_grant: Option<DeviceGrant>,
+    /// `MODEL_AUTH=injector`: no key; every call names its root run in `X-Run-Id` and carries no
+    /// `Authorization` ([`adam_model::InjectedRun`], ADR 0067). `api_key` is empty then.
+    pub injected_run: bool,
+    /// `MODEL_CA_FILE`: certificates trusted for the model endpoint beside the default roots, read
+    /// and checked at startup. `None` when unset.
+    pub ca_roots: Option<ExtraRoots>,
+    /// `MODEL_PARK_LIMIT`: how long parks on a timer in a row may last, from the first, before the
+    /// run fails with the last reason (ADR 0067; `adam_llm_agent::ModelParking::limit`). 24 hours
+    /// by default. A binary gives it to its agents with whether an unreachable endpoint parks,
+    /// which is [`injected_run`](Self::injected_run).
+    pub park_limit: Duration,
     /// `MODEL`: the model alias the gateway knows.
     pub alias: String,
     /// `MODEL_ALIASES_FILE`: the file of per-model profiles (ADR 0063, ADR 0064), **JSON only for
@@ -692,8 +708,10 @@ pub struct ModelConfig {
     /// problem naming the file and the key.
     pub model_aliases_file: Option<std::path::PathBuf>,
     /// The profiles read from [`model_aliases_file`](Self::model_aliases_file), by model id; empty
-    /// when the file is unset. The client is not yet given them (the wire slice): they are parsed,
-    /// validated and exposed here.
+    /// when the file is unset. [`client`](Self::client) gives them to the client, which applies a
+    /// model's `reasoningWire` to its requests (ADR 0063 decision 6); the binaries also pass them
+    /// to the assembly, which resolves each agent's default reasoning effort and output cap and
+    /// refuses a level the model does not take (ADR 0063, ADR 0064).
     pub profiles: ModelProfiles,
     /// `MODEL_EXTRA_BODY`: members merged into every request body (a flag that makes the model
     /// emit its reasoning). Not secret, and never a member the runtime owns (`model`, `messages`,
@@ -751,6 +769,9 @@ impl std::fmt::Debug for ModelConfig {
             .field("base_url", &endpoint_for_logs(&self.base_url))
             .field("alias", &self.alias)
             .field("device_grant", &self.device_grant)
+            .field("injected_run", &self.injected_run)
+            .field("ca_roots", &self.ca_roots)
+            .field("park_limit", &self.park_limit)
             // The members, not their values.
             .field(
                 "extra_body",
@@ -788,12 +809,29 @@ impl ModelConfig {
         let base_url = required("MODEL_BASE_URL");
         let alias = required("MODEL");
         let (device, device_grant) = parse_device_grant(lookup, problems);
-        let api_key = match (lookup("MODEL_API_KEY"), device) {
+        let injected_run = is_injector(lookup);
+        if injected_run {
+            // The injector signs nothing in: a device-grant setting beside it is a contradiction.
+            for name in [
+                "MODEL_OAUTH_ISSUER",
+                "MODEL_OAUTH_CLIENT_ID",
+                "MODEL_OAUTH_SCOPE",
+            ] {
+                if not_blank(lookup, name).is_some() {
+                    problems.push(format!(
+                        "{name} is for MODEL_AUTH=device: unset it with MODEL_AUTH=injector"
+                    ));
+                }
+            }
+        }
+        let keyless = device || injected_run;
+        let api_key = match (lookup("MODEL_API_KEY"), keyless) {
             (Some(v), false) => v,
             (Some(v), true) if !v.is_empty() => {
-                problems.push(
-                    "MODEL_API_KEY and MODEL_AUTH=device are exclusive: unset MODEL_API_KEY or leave it empty".into(),
-                );
+                let auth = if injected_run { "injector" } else { "device" };
+                problems.push(format!(
+                    "MODEL_API_KEY and MODEL_AUTH={auth} are exclusive: unset MODEL_API_KEY or leave it empty"
+                ));
                 String::new()
             }
             (_, true) => String::new(),
@@ -806,16 +844,38 @@ impl ModelConfig {
         };
         let model_aliases_file = parse_file(&get, "MODEL_ALIASES_FILE", problems);
         let profiles = parse_profiles(model_aliases_file.as_deref(), problems);
+        let context_window = parse_context_window(&get("MODEL_CONTEXT_WINDOW"), problems);
+        if warns_no_output_limit(model_aliases_file.as_deref(), &profiles, &alias) {
+            tracing::warn!(
+                model = %alias,
+                fallback = DEFAULT_MAX_OUTPUT_TOKENS,
+                window = context_window,
+                "MODEL_ALIASES_FILE gives no maxOutputTokensLimit for this alias: its output cap \
+                 is the 128,000 fallback, clamped to the context window when one is known \
+                 (ADR 0064)"
+            );
+        } else if model_aliases_file.is_none() && !alias.is_empty() {
+            tracing::info!(
+                model = %alias,
+                fallback = DEFAULT_MAX_OUTPUT_TOKENS,
+                window = context_window,
+                "no MODEL_ALIASES_FILE: every model's output cap is the 128,000 fallback, \
+                 clamped to the context window when one is known (ADR 0064)"
+            );
+        }
         Self {
             base_url,
             api_key: SecretString::from(api_key),
             device_grant,
+            injected_run,
+            ca_roots: parse_ca_file(&get, problems),
+            park_limit: parse_park_limit(&get("MODEL_PARK_LIMIT"), problems),
             alias,
             model_aliases_file,
             profiles,
             extra_body: parse_extra_body(&get("MODEL_EXTRA_BODY"), problems),
             echo_reasoning: parse_echo_reasoning(&get("MODEL_ECHO_REASONING"), problems),
-            context_window: parse_context_window(&get("MODEL_CONTEXT_WINDOW"), problems),
+            context_window,
             prompt_cache_key: parse_prompt_cache_key(&get("MODEL_PROMPT_CACHE_KEY"), problems),
             images: parse_images(&get, problems),
         }
@@ -837,6 +897,12 @@ impl ModelConfig {
             grant.start();
             client = client.with_credentials(std::sync::Arc::new(grant.clone()));
         }
+        if self.injected_run {
+            client = client.with_credentials(std::sync::Arc::new(adam_model::InjectedRun::new()));
+        }
+        if let Some(roots) = &self.ca_roots {
+            client = client.with_extra_roots(roots)?;
+        }
         let mut client = client
             .with_echo_reasoning(self.echo_reasoning)
             .with_prompt_cache_key(self.prompt_cache_key == PromptCacheKey::Conversation);
@@ -852,6 +918,7 @@ impl ModelConfig {
         if let Some(extra) = &self.extra_body {
             client = client.with_extra_body(extra.clone())?;
         }
+        client = client.with_profiles(self.profiles.clone());
         Ok(std::sync::Arc::new(client))
     }
 }
@@ -868,10 +935,10 @@ fn parse_device_grant(
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        None | Some("key") => return (false, None),
+        None | Some("key" | "injector") => return (false, None),
         Some("device") => {}
         Some(_) => {
-            problems.push("MODEL_AUTH must be `key` or `device`".into());
+            problems.push("MODEL_AUTH must be `key`, `device` or `injector`".into());
             return (false, None);
         }
     }
@@ -905,6 +972,31 @@ fn parse_device_grant(
         }
     };
     (true, grant)
+}
+
+/// Whether `MODEL_AUTH` is `injector` (ADR 0067).
+fn is_injector(lookup: &impl Fn(&str) -> Option<String>) -> bool {
+    not_blank(lookup, "MODEL_AUTH").is_some_and(|auth| auth.eq_ignore_ascii_case("injector"))
+}
+
+/// `MODEL_CA_FILE`: the certificates of the PEM file it names, `None` when unset. A file that
+/// cannot be read, is not PEM or holds no certificate the TLS backend accepts is a problem.
+fn parse_ca_file(
+    get: &impl Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+) -> Option<ExtraRoots> {
+    let raw = get("MODEL_CA_FILE")?;
+    let path = std::path::PathBuf::from(raw.trim());
+    match ExtraRoots::read(&path) {
+        Ok(roots) => Some(roots),
+        Err(e) => {
+            problems.push(format!(
+                "MODEL_CA_FILE {:?}: {e}",
+                path.display().to_string()
+            ));
+            None
+        }
+    }
 }
 
 /// The words of a `MODEL_*_MODALITIES` value: a comma-separated list of `text` and `image`, which
@@ -1067,6 +1159,22 @@ fn parse_profiles(path: Option<&std::path::Path>, problems: &mut Vec<String>) ->
     }
 }
 
+/// Whether the startup log warns that the alias has no `maxOutputTokensLimit` (ADR 0064): a
+/// profiles file is set and the profile gives none (or does not exist). With no file the 128,000
+/// fallback is logged at `info`, not as a warning.
+fn warns_no_output_limit(
+    model_aliases_file: Option<&std::path::Path>,
+    profiles: &ModelProfiles,
+    alias: &str,
+) -> bool {
+    model_aliases_file.is_some()
+        && !alias.is_empty()
+        && profiles
+            .profile(alias)
+            .and_then(|p| p.max_output_tokens_limit)
+            .is_none()
+}
+
 /// `MODEL_EXTRA_BODY`: a JSON object, or a problem. The message names what is wrong and never
 /// repeats the value (a parse error of `serde_json` says where, not what).
 fn parse_extra_body(
@@ -1122,6 +1230,43 @@ fn parse_context_window(raw: &Option<String>, problems: &mut Vec<String>) -> Opt
             None
         }
     }
+}
+
+/// The default of `MODEL_PARK_LIMIT`: 24 hours.
+const MODEL_PARK_LIMIT_DEFAULT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The range of `MODEL_PARK_LIMIT`: a minute to thirty days.
+const MODEL_PARK_LIMIT_RANGE: std::ops::RangeInclusive<Duration> =
+    Duration::from_secs(60)..=Duration::from_secs(30 * 24 * 60 * 60);
+
+/// `MODEL_PARK_LIMIT`: whole seconds, or a whole number with `s`, `m`, `h` or `d`, within
+/// [`MODEL_PARK_LIMIT_RANGE`].
+fn parse_park_limit(raw: &Option<String>, problems: &mut Vec<String>) -> Duration {
+    let Some(raw) = raw.as_deref().map(str::trim) else {
+        return MODEL_PARK_LIMIT_DEFAULT;
+    };
+    let (digits, unit) = match raw.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => raw.split_at(at),
+        None => (raw, "s"),
+    };
+    let scale = match unit {
+        "s" => Some(1),
+        "m" => Some(60),
+        "h" => Some(3600),
+        "d" => Some(86_400),
+        _ => None,
+    };
+    let limit = scale
+        .zip(digits.parse::<u64>().ok())
+        .and_then(|(scale, n)| n.checked_mul(scale))
+        .map(Duration::from_secs)
+        .filter(|limit| MODEL_PARK_LIMIT_RANGE.contains(limit));
+    limit.unwrap_or_else(|| {
+        problems.push(
+            "MODEL_PARK_LIMIT must be whole seconds or a whole number with `s`, `m`, `h` or `d`, from 60s to 30d, like 24h".into(),
+        );
+        MODEL_PARK_LIMIT_DEFAULT
+    })
 }
 
 /// `MODEL_ECHO_REASONING`: `reasoning_content`, `reasoning`, or off (`false`, `off`, `no`, `0`).
@@ -2019,6 +2164,57 @@ mod tests {
     }
 
     #[test]
+    fn the_no_output_limit_warning_needs_a_file_and_a_missing_limit() {
+        use std::collections::BTreeMap;
+
+        use adam_model::ModelProfile;
+
+        let alias = "large";
+        let file = std::path::Path::new("/etc/adam/model-profiles.json");
+        let empty = ModelProfiles::default();
+        let no_limit = ModelProfiles {
+            profiles: BTreeMap::from([(
+                alias.to_owned(),
+                ModelProfile {
+                    max_output_tokens: Some(64_000),
+                    ..ModelProfile::default()
+                },
+            )]),
+            presets: BTreeMap::new(),
+        };
+        let limited = ModelProfiles {
+            profiles: BTreeMap::from([(
+                alias.to_owned(),
+                ModelProfile {
+                    max_output_tokens_limit: Some(131_072),
+                    ..ModelProfile::default()
+                },
+            )]),
+            presets: BTreeMap::new(),
+        };
+        assert!(
+            warns_no_output_limit(Some(file), &empty, alias),
+            "a file with no profile for the alias"
+        );
+        assert!(
+            warns_no_output_limit(Some(file), &no_limit, alias),
+            "a profile with no limit"
+        );
+        assert!(
+            !warns_no_output_limit(Some(file), &limited, alias),
+            "a declared limit"
+        );
+        assert!(
+            !warns_no_output_limit(None, &empty, alias),
+            "no file is an info, not a warning"
+        );
+        assert!(
+            !warns_no_output_limit(Some(file), &empty, ""),
+            "an unset MODEL is not warned about"
+        );
+    }
+
+    #[test]
     fn the_profiles_file_is_read_and_a_bad_one_names_the_file_and_the_key() {
         let dir =
             std::env::temp_dir().join(format!("adam-service-profiles-{}", std::process::id()));
@@ -2079,8 +2275,14 @@ mod tests {
             "{debug}"
         );
         assert!(!debug.contains("131072"), "{debug}");
-        // The client is untouched: the wire is the next slice.
-        model.client().expect("a usable client");
+        // The client is given the profiles: it applies a model's wire and answers `profile`.
+        use adam_model::ModelClient as _;
+        let client = model.client().expect("a usable client");
+        assert_eq!(
+            client.profile("large-coder").and_then(|p| p.reasoning_wire),
+            Some(adam_model::ReasoningWire::ReasoningEffort)
+        );
+        assert!(client.profile("small").is_none(), "an undeclared alias");
 
         // An unknown level names the file, the profile and the key, and the run is refused.
         let (model, problems) = run(Some(
@@ -2358,6 +2560,129 @@ mod tests {
             model_problems(&vars).1.is_empty(),
             "loopback http is allowed"
         );
+    }
+
+    #[test]
+    fn model_park_limit_is_a_day_by_default_and_a_minute_to_thirty_days() {
+        let mut vars = model_vars();
+        assert_eq!(
+            model_problems(&vars).0.park_limit,
+            Duration::from_secs(86_400)
+        );
+        for (raw, secs) in [
+            ("3600", 3600),
+            ("90m", 5400),
+            ("2h", 7200),
+            ("60s", 60),
+            ("30d", 30 * 86_400),
+            (" 12h ", 43_200),
+        ] {
+            vars.insert("MODEL_PARK_LIMIT", raw);
+            let (model, problems) = model_problems(&vars);
+            assert!(problems.is_empty(), "{raw}: {problems:?}");
+            assert_eq!(model.park_limit, Duration::from_secs(secs), "{raw}");
+        }
+        for bad in [
+            "59",
+            "31d",
+            "0",
+            "1w",
+            "-5m",
+            "h",
+            "1.5h",
+            "24 h",
+            "99999999999999999999d",
+        ] {
+            vars.insert("MODEL_PARK_LIMIT", bad);
+            assert!(
+                mentions(&model_problems(&vars).1, "MODEL_PARK_LIMIT"),
+                "{bad} is refused"
+            );
+        }
+    }
+
+    #[test]
+    fn model_auth_injector_sends_the_run_and_refuses_a_key() {
+        let mut vars = model_vars();
+        vars.remove("MODEL_API_KEY");
+        vars.insert("MODEL_AUTH", "injector");
+        let (model, problems) = model_problems(&vars);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(model.injected_run);
+        assert!(model.device_grant.is_none());
+        model.client().expect("a usable client");
+        vars.insert("MODEL_AUTH", "Injector");
+        assert!(model_problems(&vars).0.injected_run);
+        // An empty key is accepted beside it; a key is not, and the process exits 78.
+        vars.insert("MODEL_API_KEY", "");
+        assert!(model_problems(&vars).1.is_empty());
+        vars.insert("MODEL_API_KEY", "sk-secret");
+        let (_, problems) = model_problems(&vars);
+        assert!(
+            mentions(&problems, "MODEL_API_KEY and MODEL_AUTH=injector"),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().all(|p| !p.contains("sk-secret")),
+            "{problems:?}"
+        );
+        let error = ConfigError::check(problems).unwrap_err();
+        assert_eq!(crate::exit_code(&error), 78);
+        // A device-grant setting beside the injector is a contradiction, named, and exit 78.
+        vars.insert("MODEL_API_KEY", "");
+        for name in [
+            "MODEL_OAUTH_ISSUER",
+            "MODEL_OAUTH_CLIENT_ID",
+            "MODEL_OAUTH_SCOPE",
+        ] {
+            let mut with = vars.clone();
+            with.insert(name, "https://id.example.test");
+            let (_, problems) = model_problems(&with);
+            assert!(mentions(&problems, name), "{name}: {problems:?}");
+            let error = ConfigError::check(problems).unwrap_err();
+            assert_eq!(crate::exit_code(&error), 78);
+        }
+        // `key`, the default, is not the injector.
+        vars.insert("MODEL_AUTH", "key");
+        assert!(!model_problems(&vars).0.injected_run);
+    }
+
+    #[test]
+    fn model_ca_file_is_read_at_startup_and_a_bad_one_is_78() {
+        let dir = std::env::temp_dir().join(format!("adam-service-ca-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../adam-model-openai/tests/fixtures/test-ca.pem");
+        // `Vars` holds static strings: a test may leak three short ones.
+        let ca_text: &'static str = ca.display().to_string().leak();
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, "no certificate here").unwrap();
+        let empty_text: &'static str = empty.display().to_string().leak();
+        let missing_text: &'static str = dir.join("missing.pem").display().to_string().leak();
+
+        let mut vars = model_vars();
+        let (model, problems) = model_problems(&vars);
+        assert!(problems.is_empty() && model.ca_roots.is_none());
+        vars.insert("MODEL_CA_FILE", ca_text);
+        let (model, problems) = model_problems(&vars);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(model.ca_roots.as_ref().map(ExtraRoots::len), Some(1));
+        assert!(format!("{model:?}").contains("ExtraRoots(1)"));
+        model.client().expect("a client that trusts the CA");
+
+        for (file, says) in [
+            (empty_text, "no certificate"),
+            (missing_text, "cannot be read"),
+        ] {
+            vars.insert("MODEL_CA_FILE", file);
+            let (model, problems) = model_problems(&vars);
+            assert!(model.ca_roots.is_none());
+            assert!(mentions(&problems, "MODEL_CA_FILE"), "{problems:?}");
+            assert!(problems[0].contains(says), "{problems:?}");
+            let error = ConfigError::check(problems).unwrap_err();
+            assert_eq!(crate::exit_code(&error), 78);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

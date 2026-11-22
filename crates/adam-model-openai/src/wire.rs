@@ -4,8 +4,9 @@
 use std::collections::BTreeMap;
 
 use adam_model::{
-    ContentPart, FinishReason, ImageData, ImageRef, Message, ModelDelta, ModelError, ModelRequest,
-    ModelResponse, ToolCall, ToolChoice, Usage,
+    ContentPart, FinishReason, ImageData, ImageRef, Message, ModelDelta, ModelError, ModelProfiles,
+    ModelRequest, ModelResponse, ProviderTurn, ReasoningEffort, ReasoningWire, ToolCall,
+    ToolChoice, Usage,
 };
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -23,12 +24,20 @@ pub(crate) const RESERVED_BODY_KEYS: [&str; 5] =
 pub(crate) struct RequestOptions<'a> {
     pub(crate) max_tokens_field: MaxTokensField,
     /// Members merged into the body (they win over what the runtime wrote, `prompt_cache_key` included, except
-    /// [`RESERVED_BODY_KEYS`], which are refused when the client is built).
+    /// [`RESERVED_BODY_KEYS`], which are refused when the client is built, and except the members a typed
+    /// reasoning level's wire duplicates: the level wins there, ADR 0063 decision 6).
     pub(crate) extra_body: Option<&'a serde_json::Map<String, Value>>,
     /// Send the reasoning an assistant message keeps, under this name; `None` sends none.
     pub(crate) echo_reasoning: Option<ReasoningField>,
     /// Send [`ModelRequest::prompt_cache_key`] as the body's `prompt_cache_key` (when the request has one).
     pub(crate) prompt_cache_key: bool,
+    /// The client's stable id of the endpoint it speaks to. A provider's opaque members go back
+    /// only to the endpoint (and model alias) that produced them.
+    pub(crate) endpoint: &'a str,
+    /// The deployment's per-model profiles (`MODEL_ALIASES_FILE`): the request's model profile
+    /// says how its [`reasoning_effort`](ModelRequest::reasoning_effort) is sent. `None` or a
+    /// model with no profile sends nothing.
+    pub(crate) profiles: Option<&'a ModelProfiles>,
 }
 
 // ---------------------------------------------------------------- request --
@@ -70,8 +79,32 @@ struct WireMessage<'a> {
     /// The assistant's reasoning, under the name the provider wants (`reasoning_content` or
     /// `reasoning`), only for a client set to echo it.
     #[serde(flatten)]
-    reasoning: Option<BTreeMap<&'static str, &'a str>>,
+    reasoning: Option<BTreeMap<&'static str, Value>>,
+    /// The assistant message's opaque members, only for a turn bound to the request's model alias
+    /// and endpoint. Empty contributes no member at all.
+    #[serde(flatten)]
+    opaque: BTreeMap<String, &'a Value>,
 }
+
+/// The members the runtime owns on an assistant message: an opaque member of the same name is
+/// dropped, the modelled one wins. The output-only members (`refusal`, `audio`, `function_call`,
+/// `annotations`) are here too: they are response-only, a provider never needs them back, and
+/// keeping one would change every request that carries it.
+const MESSAGE_MODELLED_KEYS: [&str; 9] = [
+    "role",
+    "content",
+    "tool_calls",
+    "reasoning",
+    "reasoning_content",
+    "refusal",
+    "audio",
+    "function_call",
+    "annotations",
+];
+
+/// The members the runtime owns on a tool call: an opaque member of the same name is dropped, the
+/// modelled one wins.
+const CALL_MODELLED_KEYS: [&str; 3] = ["id", "type", "function"];
 
 /// Serialize `req` as a chat-completions body.
 pub(crate) fn build_request(
@@ -116,6 +149,8 @@ pub(crate) fn build_request(
         messages.push(wire_message(
             message,
             options.echo_reasoning,
+            &req.model,
+            options.endpoint,
             &req.image_data,
         )?);
     }
@@ -175,18 +210,130 @@ pub(crate) fn build_request(
     };
     let not_serializable =
         |e| ModelError::invalid_request("request is not serializable").with_source(e);
-    let Some(extra) = options.extra_body.filter(|extra| !extra.is_empty()) else {
+    let extra = options.extra_body.filter(|extra| !extra.is_empty());
+    let reasoning = reasoning_member(req, options.profiles)?;
+    if extra.is_none() && reasoning.is_none() {
         return serde_json::to_vec(&wire).map_err(not_serializable);
-    };
+    }
     // The deployment's own members (a flag that makes a gateway emit reasoning) are merged over
-    // the body, at its top level.
+    // the body, at its top level. A typed level then removes what its wire would duplicate and
+    // writes the model's own member (ADR 0063 decision 6).
     let mut body = serde_json::to_value(&wire).map_err(not_serializable)?;
     if let Value::Object(members) = &mut body {
-        for (key, value) in extra {
-            members.insert(key.clone(), value.clone());
+        if let Some(extra) = extra {
+            for (key, value) in extra {
+                members.insert(key.clone(), value.clone());
+            }
+        }
+        if let Some(reasoning) = reasoning {
+            reasoning.apply(members);
         }
     }
     serde_json::to_vec(&body).map_err(not_serializable)
+}
+
+/// The member a typed level writes, once the model's profile says how (ADR 0063 decision 2).
+enum ReasoningMember {
+    /// `{"reasoning_effort": "<level>"}`.
+    Effort(&'static str),
+    /// `{"reasoning": {"effort": "<level>"}}`.
+    Object(&'static str),
+    /// `{"thinking": {"type": "enabled", "budget_tokens": <n>}}`.
+    Thinking(u32),
+}
+
+/// What a request's [`reasoning_effort`](ModelRequest::reasoning_effort) writes, from the profile
+/// of its model: `None` when the request has no level, the model has no profile, or the profile
+/// declares no wire. The assembly refuses a level the model does not take, so the client is not a
+/// second validator; it does refuse the two things `parse_json` guarantees and a hand-built profile
+/// can break: a `thinking_budget` profile with no budget for the level, and `none` with that wire,
+/// which has no disabled form.
+fn reasoning_member(
+    req: &ModelRequest,
+    profiles: Option<&ModelProfiles>,
+) -> Result<Option<ReasoningMember>, ModelError> {
+    let Some(level) = req.reasoning_effort else {
+        return Ok(None);
+    };
+    let Some(profile) = profiles.and_then(|profiles| profiles.profile(&req.model)) else {
+        return Ok(None);
+    };
+    let Some(wire) = profile.reasoning_wire else {
+        return Ok(None);
+    };
+    Ok(Some(match wire {
+        ReasoningWire::ReasoningEffort => ReasoningMember::Effort(level.as_str()),
+        ReasoningWire::ReasoningObject => ReasoningMember::Object(level.as_str()),
+        ReasoningWire::ThinkingBudget => {
+            // `none` is the level that means "do not reason", and the shape has no disabled form:
+            // the loader refuses the pairing, and a hand-built profile reaches this, the one place
+            // the invariant can be total.
+            if level == ReasoningEffort::None {
+                return Err(ModelError::invalid_request(format!(
+                    "the model {:?} cannot send reasoning effort {:?} through the `thinking_budget` wire: the wire has no disabled form",
+                    req.model,
+                    level.as_str()
+                )));
+            }
+            let budget = profile
+                .reasoning_budgets
+                .as_ref()
+                .and_then(|budgets| budgets.get(&level).copied());
+            let Some(budget) = budget else {
+                return Err(ModelError::invalid_request(format!(
+                    "the model {:?} has no thinking budget for reasoning effort {:?}",
+                    req.model,
+                    level.as_str()
+                )));
+            };
+            ReasoningMember::Thinking(budget)
+        }
+    }))
+}
+
+impl ReasoningMember {
+    /// Write the member, removing only what the extra body holds of the same fact: both
+    /// `reasoning_effort` and `reasoning.effort` for the first two wires (an emptied `reasoning`
+    /// object that held the effort goes), `thinking` wholesale for the third (ADR 0063 decision 6). Other members stay.
+    fn apply(self, members: &mut serde_json::Map<String, Value>) {
+        match self {
+            Self::Effort(level) => {
+                members.remove("reasoning_effort");
+                let emptied = match members.get_mut("reasoning") {
+                    Some(Value::Object(reasoning)) => {
+                        // Only a member that held the effort "becomes empty": an object the extra
+                        // body wrote empty stays.
+                        let had_effort = reasoning.remove("effort").is_some();
+                        had_effort && reasoning.is_empty()
+                    }
+                    _ => false,
+                };
+                if emptied {
+                    members.remove("reasoning");
+                }
+                members.insert("reasoning_effort".to_owned(), json!(level));
+            }
+            Self::Object(level) => {
+                members.remove("reasoning_effort");
+                // A member that is not an object cannot hold `effort`: the typed level wins.
+                let mut reasoning = members
+                    .get("reasoning")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                reasoning.remove("effort");
+                reasoning.insert("effort".to_owned(), json!(level));
+                members.insert("reasoning".to_owned(), Value::Object(reasoning));
+            }
+            Self::Thinking(budget) => {
+                members.remove("thinking");
+                members.insert(
+                    "thinking".to_owned(),
+                    json!({"type": "enabled", "budget_tokens": budget}),
+                );
+            }
+        }
+    }
 }
 
 fn text_message<'a>(role: &'static str, text: &str) -> WireMessage<'a> {
@@ -196,6 +343,7 @@ fn text_message<'a>(role: &'static str, text: &str) -> WireMessage<'a> {
         tool_calls: Vec::new(),
         tool_call_id: None,
         reasoning: None,
+        opaque: BTreeMap::new(),
     }
 }
 
@@ -274,12 +422,15 @@ fn tool_images_message<'a>(images: Vec<(&str, &ImageRef)>, data: &ImageData) -> 
         tool_calls: Vec::new(),
         tool_call_id: None,
         reasoning: None,
+        opaque: BTreeMap::new(),
     }
 }
 
 fn wire_message<'a>(
     message: &'a Message,
     echo: Option<ReasoningField>,
+    model: &str,
+    endpoint: &str,
     data: &ImageData,
 ) -> Result<WireMessage<'a>, ModelError> {
     Ok(match message {
@@ -292,12 +443,19 @@ fn wire_message<'a>(
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning: None,
+            opaque: BTreeMap::new(),
         },
         Message::Assistant {
             content,
             tool_calls,
             reasoning,
+            provider,
         } => {
+            // The provider's opaque members go back only to the model alias and endpoint that
+            // produced them: a run that switched model drops them.
+            let bound = provider
+                .as_ref()
+                .filter(|turn| turn.is_bound_to(model, endpoint));
             let mut wire_calls = Vec::with_capacity(tool_calls.len());
             for call in tool_calls {
                 // A call whose text was not JSON goes back as `{}`: the text is not echoed.
@@ -312,11 +470,25 @@ fn wire_message<'a>(
                         .with_source(e)
                     })?
                 };
-                wire_calls.push(json!({
-                    "id": call.id,
-                    "type": "function",
-                    "function": {"name": call.name, "arguments": arguments},
-                }));
+                let mut object = serde_json::Map::with_capacity(3);
+                object.insert("id".into(), Value::String(call.id.clone()));
+                object.insert("type".into(), Value::String("function".into()));
+                object.insert(
+                    "function".into(),
+                    json!({"name": call.name, "arguments": arguments}),
+                );
+                // The call's own members ride along only when its turn is bound; the modelled
+                // keys win on collision.
+                if bound.is_some()
+                    && let Some(opaque) = &call.opaque
+                {
+                    for (key, value) in opaque {
+                        if !CALL_MODELLED_KEYS.contains(&key.as_str()) {
+                            object.entry(key.clone()).or_insert_with(|| value.clone());
+                        }
+                    }
+                }
+                wire_calls.push(Value::Object(object));
             }
             let content = content_value(content, data);
             WireMessage {
@@ -328,12 +500,27 @@ fn wire_message<'a>(
                 tool_calls: wire_calls,
                 tool_call_id: None,
                 // Reasoning goes back only when the client was set to send it (a provider that
-                // requires it); otherwise it is never in a request, whatever the message holds.
+                // requires it); otherwise it is never in a request, whatever the message holds. A
+                // raw reasoning block goes back unchanged in place of the text, and only to the
+                // model that produced it.
                 reasoning: echo.and_then(|field| {
-                    reasoning
-                        .as_deref()
-                        .map(|text| BTreeMap::from([(field.wire_name(), text)]))
+                    let name = field.wire_name();
+                    match bound.and_then(|turn| turn.reasoning.as_ref()) {
+                        Some(raw) => Some(BTreeMap::from([(name, raw.clone())])),
+                        None => reasoning
+                            .as_deref()
+                            .map(|text| BTreeMap::from([(name, Value::String(text.to_owned()))])),
+                    }
                 }),
+                opaque: bound
+                    .map(|turn| {
+                        turn.members
+                            .iter()
+                            .filter(|(key, _)| !MESSAGE_MODELLED_KEYS.contains(&key.as_str()))
+                            .map(|(key, value)| (key.clone(), value))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }
         }
         // The chat-completions format has no error flag on tool messages, so
@@ -346,6 +533,7 @@ fn wire_message<'a>(
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id),
             reasoning: None,
+            opaque: BTreeMap::new(),
         },
     })
 }
@@ -379,50 +567,94 @@ pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError>
         .finish_reason
         .ok_or_else(|| ModelError::protocol("choice has no finish_reason"))?;
 
+    let ChoiceMessage {
+        _role,
+        content,
+        tool_calls: calls,
+        reasoning_content,
+        reasoning,
+        opaque,
+        ..
+    } = message;
+
     let mut tool_calls = Vec::new();
-    for call in message.tool_calls.unwrap_or_default() {
-        let name = call.function.name.unwrap_or_default();
-        let id = call
-            .id
-            .filter(|id| !id.is_empty())
-            .unwrap_or_else(fallback_id);
-        let arguments = match call.function.arguments {
-            None | Some(Value::Null) => json!({}),
+    for call in calls.unwrap_or_default() {
+        let WireToolCall {
+            id,
+            _type,
+            function,
+            opaque: call_opaque,
+        } = call;
+        let name = function.name.unwrap_or_default();
+        let id = id.filter(|id| !id.is_empty()).unwrap_or_else(fallback_id);
+        let mut parsed = match function.arguments {
+            None | Some(Value::Null) => ToolCall::new(id, name, json!({})),
             // Some servers send the arguments as an object instead of a string.
             Some(Value::String(raw)) => match parse_arguments(&raw) {
-                Ok(parsed) => parsed,
+                Ok(arguments) => ToolCall::new(id, name, arguments),
                 Err(raw) => {
                     check_name(&name)?;
-                    tool_calls.push(ToolCall::with_invalid_arguments(id, name, raw));
+                    let mut invalid = ToolCall::with_invalid_arguments(id, name, raw);
+                    invalid.opaque = Some(call_opaque).filter(|opaque| !opaque.is_empty());
+                    tool_calls.push(invalid);
                     continue;
                 }
             },
-            Some(other) => other,
+            Some(arguments) => ToolCall::new(id, name, arguments),
         };
-        check_name(&name)?;
-        tool_calls.push(ToolCall::new(id, name, arguments));
+        check_name(&parsed.name)?;
+        parsed.opaque = Some(call_opaque).filter(|opaque| !opaque.is_empty());
+        tool_calls.push(parsed);
     }
 
+    let calls_opaque = tool_calls.iter().any(|call| {
+        call.opaque
+            .as_ref()
+            .is_some_and(|members| !members.is_empty())
+    });
     let mut response = build_response(
-        content_text(message.content),
+        content_text(content),
         tool_calls,
         &finish,
         completion.usage.map(Usage::from).unwrap_or_default(),
     );
-    response.reasoning = reasoning_text(&[message.reasoning_content, message.reasoning]);
+    response.reasoning = reasoning_text(&[reasoning_content.as_ref(), reasoning.as_ref()]);
+    // The parse does not know the request's model alias or endpoint: the client stamps them. A
+    // provider that attached nothing leaves the message exactly as before.
+    let raw = raw_reasoning(&[reasoning_content.as_ref(), reasoning.as_ref()]);
+    if (!opaque.is_empty() || raw.is_some() || calls_opaque)
+        && let Message::Assistant { provider, .. } = &mut response.message
+    {
+        *provider = Some(ProviderTurn {
+            model: String::new(),
+            endpoint: String::new(),
+            members: opaque,
+            reasoning: raw,
+        });
+    }
     Ok(response)
 }
 
 /// The reasoning a provider sent, under whichever of the names it uses: the first that is a string
 /// that is not empty. A provider that sends the same text under two names is read once, and a
 /// value that is not a string (a structured `reasoning` some gateways add) is not reasoning text.
-fn reasoning_text(candidates: &[Option<Value>]) -> Option<String> {
+fn reasoning_text(candidates: &[Option<&Value>]) -> Option<String> {
     candidates
         .iter()
         .flatten()
-        .filter_map(Value::as_str)
+        .filter_map(|value| value.as_str())
         .find(|text| !text.is_empty())
         .map(str::to_owned)
+}
+
+/// The raw reasoning value when the provider sent an object or array (a reasoning block) instead
+/// of text: the first such value, value for value. A string, a number or `null` is not a block.
+fn raw_reasoning(candidates: &[Option<&Value>]) -> Option<Value> {
+    candidates
+        .iter()
+        .flatten()
+        .find(|value| matches!(**value, Value::Object(_) | Value::Array(_)))
+        .map(|value| (**value).clone())
 }
 
 #[derive(Deserialize)]
@@ -440,18 +672,40 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct ChoiceMessage {
+    /// Always `assistant`; modelled so it is not kept as an opaque member.
+    #[serde(rename = "role")]
+    _role: Option<String>,
     content: Option<Value>,
     tool_calls: Option<Vec<WireToolCall>>,
     /// DeepSeek, GLM, vLLM before 0.12, LiteLLM.
     reasoning_content: Option<Value>,
     /// OpenRouter, Ollama, current vLLM.
     reasoning: Option<Value>,
+    /// Output-only members: a provider never needs them back, so they are consumed here and never
+    /// kept as opaque (keeping one would change every response that carries it).
+    #[serde(rename = "refusal")]
+    _refusal: Option<Value>,
+    #[serde(rename = "audio")]
+    _audio: Option<Value>,
+    #[serde(rename = "function_call")]
+    _function_call: Option<Value>,
+    #[serde(rename = "annotations")]
+    _annotations: Option<Value>,
+    /// The members this client does not model (`extra_content`, and siblings), value for value.
+    #[serde(flatten)]
+    opaque: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
 struct WireToolCall {
     id: Option<String>,
+    /// Always `function`; modelled so it is not kept as an opaque member.
+    #[serde(rename = "type")]
+    _type: Option<String>,
     function: WireFunction,
+    /// The call's members this client does not model (`extra_content`, and siblings).
+    #[serde(flatten)]
+    opaque: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -585,6 +839,7 @@ fn build_response(
             content,
             tool_calls,
             reasoning: None,
+            provider: None,
         },
         finish,
         usage,
@@ -607,11 +862,18 @@ struct ChunkChoice {
     index: u32,
     #[serde(default)]
     delta: Option<Delta>,
+    /// Some servers send the last chunk as a whole `message` instead of a `delta`. Only its
+    /// opaque members are read: the stream's deltas already carry its text and calls.
+    #[serde(default)]
+    message: Option<Delta>,
     finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct Delta {
+    /// Always `assistant` on a delta or a message; modelled so it is not kept as an opaque member.
+    #[serde(rename = "role")]
+    _role: Option<String>,
     content: Option<String>,
     tool_calls: Option<Vec<DeltaToolCall>>,
     /// DeepSeek, GLM, vLLM before 0.12, LiteLLM. A `Value`, not a `String`: a chunk whose reasoning
@@ -619,6 +881,19 @@ struct Delta {
     reasoning_content: Option<Value>,
     /// OpenRouter, Ollama, current vLLM.
     reasoning: Option<Value>,
+    /// Output-only members: consumed, never opaque (see [`ChoiceMessage`]).
+    #[serde(rename = "refusal")]
+    _refusal: Option<Value>,
+    #[serde(rename = "audio")]
+    _audio: Option<Value>,
+    #[serde(rename = "function_call")]
+    _function_call: Option<Value>,
+    #[serde(rename = "annotations")]
+    _annotations: Option<Value>,
+    /// Members this client does not model; a delta's and a `message`-shaped chunk's are both read
+    /// (through [`STREAM_MESSAGE_MODELLED_KEYS`]).
+    #[serde(flatten)]
+    opaque: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -627,8 +902,20 @@ struct DeltaToolCall {
     #[serde(default)]
     index: Option<usize>,
     id: Option<String>,
+    /// Always `function`; modelled so it is not kept as an opaque member.
+    #[serde(rename = "type")]
+    _type: Option<String>,
     function: Option<DeltaFunction>,
+    /// The call's members this client does not model, accumulated per call.
+    #[serde(flatten)]
+    opaque: BTreeMap<String, Value>,
 }
+
+/// The members of an assistant message the streamed format models: a member of a delta or a
+/// `message`-shaped chunk with one of these names is not opaque. The keys of
+/// [`MESSAGE_MODELLED_KEYS`], so the two paths stay aligned; `tool_call_id` is not one of them: it
+/// cannot collide with an assistant message's fields and replaying it is harmless.
+const STREAM_MESSAGE_MODELLED_KEYS: [&str; 9] = MESSAGE_MODELLED_KEYS;
 
 #[derive(Deserialize, Default)]
 struct DeltaFunction {
@@ -641,6 +928,8 @@ struct PartialCall {
     id: Option<String>,
     name: String,
     arguments: String,
+    /// The call's opaque members, last value wins per key.
+    opaque: BTreeMap<String, Value>,
     started: bool,
     /// [`ModelDelta::ToolCallComplete`] was said for it: a client says it once per call.
     announced: bool,
@@ -652,10 +941,14 @@ impl PartialCall {
     fn value(&mut self) -> Result<ToolCall, ModelError> {
         check_name(&self.name)?;
         let id = self.id.get_or_insert_with(fallback_id).clone();
-        Ok(match parse_arguments(&self.arguments) {
+        let mut call = match parse_arguments(&self.arguments) {
             Ok(arguments) => ToolCall::new(id, self.name.clone(), arguments),
             Err(raw) => ToolCall::with_invalid_arguments(id, self.name.clone(), raw),
-        })
+        };
+        // Cloned, not taken: the early `ToolCallComplete` and the finished response carry the same
+        // members.
+        call.opaque = (!self.opaque.is_empty()).then(|| self.opaque.clone());
+        Ok(call)
     }
 
     /// Whether the argument text is whole: it parses as a JSON **object**. Empty text is not: the
@@ -674,6 +967,10 @@ impl PartialCall {
 pub(crate) struct Assembler {
     text: String,
     reasoning: String,
+    /// The raw reasoning value of a block the provider sent instead of text, last wins.
+    reasoning_raw: Option<Value>,
+    /// The assistant message's opaque members, from a delta or a `message`-shaped chunk.
+    message_members: BTreeMap<String, Value>,
     calls: BTreeMap<usize, PartialCall>,
     finish_reason: Option<String>,
     usage: Option<Usage>,
@@ -714,9 +1011,16 @@ impl Assembler {
         // Only the first choice is used (`n` is never requested).
         for choice in chunk.choices.into_iter().filter(|c| c.index == 0) {
             if let Some(delta) = choice.delta {
-                if let Some(thought) = reasoning_text(&[delta.reasoning_content, delta.reasoning]) {
+                if let Some(thought) =
+                    reasoning_text(&[delta.reasoning_content.as_ref(), delta.reasoning.as_ref()])
+                {
                     self.reasoning.push_str(&thought);
                     out.push(ModelDelta::Reasoning(thought));
+                }
+                if let Some(raw) =
+                    raw_reasoning(&[delta.reasoning_content.as_ref(), delta.reasoning.as_ref()])
+                {
+                    self.reasoning_raw = Some(raw);
                 }
                 if let Some(text) = delta.content.filter(|t| !t.is_empty()) {
                     self.text.push_str(&text);
@@ -725,6 +1029,29 @@ impl Assembler {
                 for (position, call) in delta.tool_calls.unwrap_or_default().into_iter().enumerate()
                 {
                     self.push_tool_call(position, call, &mut out);
+                }
+                // A delta can carry the message-level members too (the same filter as a
+                // message-shaped chunk): a provider may attach them to a delta rather than a final
+                // `message`.
+                for (key, value) in delta.opaque {
+                    if !STREAM_MESSAGE_MODELLED_KEYS.contains(&key.as_str()) {
+                        self.message_members.insert(key, value);
+                    }
+                }
+            }
+            // A chunk shaped as a whole message rather than a delta: its opaque members are the
+            // assistant message's, its text and calls are already in the deltas.
+            if let Some(message) = choice.message {
+                for (key, value) in message.opaque {
+                    if !STREAM_MESSAGE_MODELLED_KEYS.contains(&key.as_str()) {
+                        self.message_members.insert(key, value);
+                    }
+                }
+                if let Some(raw) = raw_reasoning(&[
+                    message.reasoning_content.as_ref(),
+                    message.reasoning.as_ref(),
+                ]) {
+                    self.reasoning_raw = Some(raw);
                 }
             }
             if let Some(reason) = choice.finish_reason {
@@ -750,6 +1077,10 @@ impl Assembler {
             if let Some(args) = function.arguments {
                 call.arguments.push_str(&args);
             }
+        }
+        // Last value wins per key; a member seen once is kept.
+        for (key, value) in delta.opaque {
+            call.opaque.insert(key, value);
         }
         if !call.started && !call.name.is_empty() {
             call.started = true;
@@ -805,13 +1136,29 @@ impl Assembler {
             self.usage.unwrap_or_default(),
         );
         response.reasoning = Some(self.reasoning).filter(|r| !r.is_empty());
+        // The parse does not know the request's model alias or endpoint: the client stamps them.
+        let calls_opaque = response
+            .message
+            .tool_calls()
+            .iter()
+            .any(|c| c.opaque.as_ref().is_some_and(|members| !members.is_empty()));
+        if (!self.message_members.is_empty() || self.reasoning_raw.is_some() || calls_opaque)
+            && let Message::Assistant { provider, .. } = &mut response.message
+        {
+            *provider = Some(ProviderTurn {
+                model: String::new(),
+                endpoint: String::new(),
+                members: self.message_members,
+                reasoning: self.reasoning_raw,
+            });
+        }
         Ok(response)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use adam_model::ToolSpec;
+    use adam_model::{ModelProfile, ReasoningEffort, ReasoningWire, ToolSpec};
 
     use super::*;
 
@@ -829,6 +1176,7 @@ mod tests {
                     ..Default::default()
                 }],
                 reasoning: None,
+                provider: None,
             },
             Message::tool_result("c1", "sunny"),
         ];
@@ -945,6 +1293,391 @@ mod tests {
         }
     }
 
+    fn profile_of(efforts: &[ReasoningEffort], wire: ReasoningWire) -> ModelProfile {
+        ModelProfile {
+            reasoning_efforts: Some(efforts.to_vec()),
+            reasoning_wire: Some(wire),
+            ..ModelProfile::default()
+        }
+    }
+
+    fn profiles_of(model: &str, profile: ModelProfile) -> ModelProfiles {
+        ModelProfiles {
+            profiles: BTreeMap::from([(model.to_owned(), profile)]),
+            presets: BTreeMap::new(),
+        }
+    }
+
+    fn body_of(req: &ModelRequest, options: RequestOptions<'_>) -> Value {
+        serde_json::from_slice(&build_request(req, false, options).unwrap()).unwrap()
+    }
+
+    /// The ADR's pinned order: the typed level is applied **after** the extra body, so it wins.
+    #[test]
+    fn a_typed_level_wins_over_the_extra_body_and_keeps_its_other_members() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        let profiles = profiles_of(
+            "gw-model",
+            profile_of(
+                &[ReasoningEffort::Low, ReasoningEffort::Medium],
+                ReasoningWire::ReasoningEffort,
+            ),
+        );
+        let extra = json!({"reasoning_effort": "medium", "chat_template_kwargs": {"enable_thinking": true}});
+        for stream in [false, true] {
+            let sent: Value = serde_json::from_slice(
+                &build_request(
+                    &req,
+                    stream,
+                    RequestOptions {
+                        profiles: Some(&profiles),
+                        ..with(Some(extra.clone()), None)
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            // Apply the level before the extra-body merge and this is `medium`.
+            assert_eq!(sent["reasoning_effort"], "low", "the typed level wins");
+            assert_eq!(
+                sent["chat_template_kwargs"],
+                json!({"enable_thinking": true}),
+                "the other members stay"
+            );
+            assert_eq!(sent["model"], "gw-model");
+        }
+    }
+
+    #[test]
+    fn each_wire_writes_its_own_member() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::High);
+        // Every wire's member, so each arm proves what it removed and what it left.
+        let extra = json!({
+            "reasoning_effort": "medium",
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "thinking": {"type": "enabled", "budget_tokens": 999, "clear_thinking": false}
+        });
+        for wire in ReasoningWire::ALL {
+            let mut profile = profile_of(&[ReasoningEffort::High], wire);
+            if wire == ReasoningWire::ThinkingBudget {
+                profile.reasoning_budgets = Some(BTreeMap::from([(ReasoningEffort::High, 8192)]));
+            }
+            let profiles = profiles_of("gw-model", profile);
+            let sent = body_of(
+                &req,
+                RequestOptions {
+                    profiles: Some(&profiles),
+                    ..with(Some(extra.clone()), None)
+                },
+            );
+            match wire {
+                ReasoningWire::ReasoningEffort => {
+                    assert_eq!(sent["reasoning_effort"], "high", "{sent}");
+                    assert_eq!(
+                        sent["reasoning"],
+                        json!({"summary": "auto"}),
+                        "the effort goes, the object's other members stay: {sent}"
+                    );
+                    assert_eq!(
+                        sent["thinking"],
+                        json!({"type": "enabled", "budget_tokens": 999, "clear_thinking": false}),
+                        "a member of another wire stays: {sent}"
+                    );
+                }
+                ReasoningWire::ReasoningObject => {
+                    assert_eq!(
+                        sent["reasoning"],
+                        json!({"summary": "auto", "effort": "high"}),
+                        "{sent}"
+                    );
+                    assert!(
+                        sent.get("reasoning_effort").is_none(),
+                        "the other member of the same fact is removed: {sent}"
+                    );
+                    assert_eq!(
+                        sent["thinking"],
+                        json!({"type": "enabled", "budget_tokens": 999, "clear_thinking": false}),
+                        "{sent}"
+                    );
+                }
+                ReasoningWire::ThinkingBudget => {
+                    assert_eq!(
+                        sent["thinking"],
+                        json!({"type": "enabled", "budget_tokens": 8192}),
+                        "{sent}"
+                    );
+                    assert_eq!(
+                        sent["reasoning_effort"], "medium",
+                        "the ADR removes only `thinking`: the extra body's effort stays: {sent}"
+                    );
+                    assert_eq!(
+                        sent["reasoning"],
+                        json!({"effort": "medium", "summary": "auto"}),
+                        "{sent}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_reasoning_object_the_extra_body_wrote_stays() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        let profiles = profiles_of(
+            "gw-model",
+            profile_of(&[ReasoningEffort::Low], ReasoningWire::ReasoningEffort),
+        );
+        let sent = body_of(
+            &req,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..with(Some(json!({"reasoning": {}})), None)
+            },
+        );
+        assert_eq!(
+            sent["reasoning"],
+            json!({}),
+            "an object that held no effort does not 'become empty': {sent}"
+        );
+        assert_eq!(sent["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn an_emptied_reasoning_object_is_removed_and_its_other_members_stay() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        let profiles = profiles_of(
+            "gw-model",
+            profile_of(&[ReasoningEffort::Low], ReasoningWire::ReasoningEffort),
+        );
+        let sent = body_of(
+            &req,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..with(Some(json!({"reasoning": {"effort": "medium"}})), None)
+            },
+        );
+        assert_eq!(sent["reasoning_effort"], "low");
+        assert!(sent.get("reasoning").is_none(), "{sent}");
+
+        let sent = body_of(
+            &req,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..with(
+                    Some(json!({"reasoning": {"effort": "medium", "summary": "auto"}})),
+                    None,
+                )
+            },
+        );
+        assert_eq!(sent["reasoning"], json!({"summary": "auto"}), "{sent}");
+        assert_eq!(sent["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn the_reasoning_object_wire_keeps_the_objects_other_members() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        let profiles = profiles_of(
+            "gw-model",
+            profile_of(&[ReasoningEffort::Low], ReasoningWire::ReasoningObject),
+        );
+        let sent = body_of(
+            &req,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..with(
+                    Some(json!({
+                        "reasoning_effort": "medium",
+                        "reasoning": {"effort": "medium", "summary": "auto"}
+                    })),
+                    None,
+                )
+            },
+        );
+        assert_eq!(
+            sent["reasoning"],
+            json!({"summary": "auto", "effort": "low"})
+        );
+        assert!(
+            sent.get("reasoning_effort").is_none(),
+            "the wire's duplicate is removed: {sent}"
+        );
+    }
+
+    /// `thinking` is removed wholesale, as the ADR says: an extra body's other members of it are
+    /// lost (the "merge them" idea is a follow-up).
+    #[test]
+    fn the_thinking_budget_wire_replaces_thinking_wholesale() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        let mut profile = profile_of(&[ReasoningEffort::Low], ReasoningWire::ThinkingBudget);
+        profile.reasoning_budgets = Some(BTreeMap::from([(ReasoningEffort::Low, 1024)]));
+        let profiles = profiles_of("gw-model", profile);
+        let sent = body_of(
+            &req,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..with(
+                    Some(json!({"thinking": {
+                        "type": "enabled",
+                        "budget_tokens": 999,
+                        "clear_thinking": false
+                    }})),
+                    None,
+                )
+            },
+        );
+        assert_eq!(
+            sent["thinking"],
+            json!({"type": "enabled", "budget_tokens": 1024}),
+            "{sent}"
+        );
+    }
+
+    #[test]
+    fn none_is_a_level_that_is_sent_and_an_absent_one_is_not() {
+        let profiles = profiles_of(
+            "gw-model",
+            profile_of(
+                &[ReasoningEffort::None, ReasoningEffort::Low],
+                ReasoningWire::ReasoningEffort,
+            ),
+        );
+        let mut req = request();
+        let absent = build_request(
+            &req,
+            false,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..RequestOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            absent,
+            build_request(&req, false, RequestOptions::default()).unwrap(),
+            "no level sends the bytes of no profile"
+        );
+        req.reasoning_effort = Some(ReasoningEffort::None);
+        let sent = body_of(
+            &req,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..RequestOptions::default()
+            },
+        );
+        assert_eq!(sent["reasoning_effort"], "none", "{sent}");
+    }
+
+    #[test]
+    fn without_a_profile_a_wire_or_a_level_the_body_is_byte_identical() {
+        let req = request();
+        let plain = build_request(&req, false, RequestOptions::default()).unwrap();
+        // A level and no profiles.
+        let mut levelled = request();
+        levelled.reasoning_effort = Some(ReasoningEffort::High);
+        assert_eq!(
+            build_request(&levelled, false, RequestOptions::default()).unwrap(),
+            plain
+        );
+        // A profile with no wire (a cap only).
+        let capped = profiles_of(
+            "gw-model",
+            ModelProfile {
+                max_output_tokens: Some(1000),
+                ..ModelProfile::default()
+            },
+        );
+        assert_eq!(
+            build_request(
+                &levelled,
+                false,
+                RequestOptions {
+                    profiles: Some(&capped),
+                    ..RequestOptions::default()
+                }
+            )
+            .unwrap(),
+            plain
+        );
+        // A profile with a wire, and no level.
+        let wired = profiles_of(
+            "gw-model",
+            profile_of(&[ReasoningEffort::High], ReasoningWire::ReasoningEffort),
+        );
+        for stream in [false, true] {
+            assert_eq!(
+                build_request(
+                    &req,
+                    stream,
+                    RequestOptions {
+                        profiles: Some(&wired),
+                        ..RequestOptions::default()
+                    }
+                )
+                .unwrap(),
+                build_request(&req, stream, RequestOptions::default()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_thinking_budget_with_no_budget_names_the_model_and_the_level() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::High);
+        for budgets in [None, Some(BTreeMap::from([(ReasoningEffort::Low, 1024)]))] {
+            let mut profile = profile_of(&[ReasoningEffort::High], ReasoningWire::ThinkingBudget);
+            profile.reasoning_budgets = budgets;
+            let profiles = profiles_of("gw-model", profile);
+            let err = build_request(
+                &req,
+                false,
+                RequestOptions {
+                    profiles: Some(&profiles),
+                    ..RequestOptions::default()
+                },
+            )
+            .expect_err("no budget for the level");
+            assert!(matches!(err, ModelError::InvalidRequest { .. }), "{err:?}");
+            assert!(err.to_string().contains("gw-model"), "{err}");
+            assert!(err.to_string().contains("high"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_hand_built_thinking_budget_profile_refuses_none() {
+        // `parse_json` refuses this pairing; a hand-built profile (public fields) bypasses it, so
+        // the client refuses it too: the wire has no disabled form.
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::None);
+        let mut profile = profile_of(
+            &[ReasoningEffort::None, ReasoningEffort::Low],
+            ReasoningWire::ThinkingBudget,
+        );
+        profile.reasoning_budgets = Some(BTreeMap::from([
+            (ReasoningEffort::None, 1),
+            (ReasoningEffort::Low, 1024),
+        ]));
+        let profiles = profiles_of("gw-model", profile);
+        let err = build_request(
+            &req,
+            false,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..RequestOptions::default()
+            },
+        )
+        .expect_err("none through thinking_budget");
+        assert!(matches!(err, ModelError::InvalidRequest { .. }), "{err:?}");
+        assert!(err.to_string().contains("gw-model"), "{err}");
+        assert!(err.to_string().contains("none"), "{err}");
+        assert!(err.to_string().contains("no disabled form"), "{err}");
+    }
+
     #[test]
     fn prompt_cache_key_is_sent_only_when_set() {
         let mut req = request();
@@ -1054,6 +1787,7 @@ mod tests {
                 ..Default::default()
             }],
             reasoning: Some("I should look it up".into()),
+            provider: None,
         };
         req
     }
@@ -1293,8 +2027,10 @@ mod tests {
             content: vec![],
             tool_calls: vec![call],
             reasoning: None,
+            provider: None,
         };
-        let wire = wire_message(&message, None, &ImageData::new()).unwrap();
+        let wire =
+            wire_message(&message, None, "gw-model", "openai:test", &ImageData::new()).unwrap();
         let json = serde_json::to_value(&wire).unwrap();
         assert_eq!(json["tool_calls"][0]["function"]["arguments"], "{}");
         let text = json.to_string();
@@ -1302,6 +2038,125 @@ mod tests {
             !text.contains("oops") && !text.contains("valid JSON"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_bound_turns_members_go_back_and_the_modelled_keys_win() {
+        let mut provider = ProviderTurn::new("gw-model", "openai:test");
+        provider.members = BTreeMap::from([
+            ("role".into(), json!("evil")),
+            (
+                "extra_content".into(),
+                json!({"google": {"thought_signature": "msg"}}),
+            ),
+        ]);
+        let call = ToolCall {
+            id: "c".into(),
+            name: "weather".into(),
+            arguments: json!({}),
+            opaque: Some(BTreeMap::from([
+                ("id".into(), json!("evil")),
+                ("type".into(), json!("evil")),
+                ("function".into(), json!("evil")),
+                (
+                    "extra_content".into(),
+                    json!({"google": {"thought_signature": "call"}}),
+                ),
+            ])),
+            ..Default::default()
+        };
+        let mut req = ModelRequest::new("gw-model");
+        req.messages = vec![Message::Assistant {
+            content: vec![],
+            tool_calls: vec![call],
+            reasoning: None,
+            provider: Some(provider),
+        }];
+        let options = RequestOptions {
+            endpoint: "openai:test",
+            ..RequestOptions::default()
+        };
+        let body: Value =
+            serde_json::from_slice(&build_request(&req, false, options).unwrap()).unwrap();
+        let message = &body["messages"][0];
+        assert_eq!(message["role"], "assistant", "the modelled role wins");
+        assert_eq!(
+            message["extra_content"],
+            json!({"google": {"thought_signature": "msg"}})
+        );
+        let call = &message["tool_calls"][0];
+        assert_eq!(call["id"], "c", "the modelled id wins");
+        assert_eq!(call["type"], "function", "the modelled type wins");
+        assert_eq!(call["function"]["name"], "weather");
+        assert_eq!(
+            call["extra_content"],
+            json!({"google": {"thought_signature": "call"}})
+        );
+    }
+
+    #[test]
+    fn an_unbound_turn_sends_none_of_its_members() {
+        let mut provider = ProviderTurn::new("gw-model", "openai:test");
+        provider.members = BTreeMap::from([("extra_content".into(), json!({"sig": "msg"}))]);
+        provider.reasoning = Some(json!({"blocks": []}));
+        let call = ToolCall {
+            opaque: Some(BTreeMap::from([(
+                "extra_content".into(),
+                json!({"sig": "call"}),
+            )])),
+            ..ToolCall::new("c", "weather", json!({}))
+        };
+        let mut req = ModelRequest::new("gw-model");
+        req.messages = vec![Message::Assistant {
+            content: vec![],
+            tool_calls: vec![call],
+            reasoning: Some("text".into()),
+            provider: Some(provider),
+        }];
+        let options = RequestOptions {
+            endpoint: "openai:other",
+            ..RequestOptions::default()
+        };
+        let body: Value = serde_json::from_slice(
+            &build_request(
+                &req,
+                false,
+                RequestOptions {
+                    echo_reasoning: Some(ReasoningField::Reasoning),
+                    ..options
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let message = &body["messages"][0];
+        assert!(message.get("extra_content").is_none(), "{message}");
+        assert!(
+            message["tool_calls"][0].get("extra_content").is_none(),
+            "{message}"
+        );
+        // The raw block is not sent either; the plain text is, as before.
+        assert_eq!(message["reasoning"], "text");
+    }
+
+    #[test]
+    fn a_response_without_opaque_members_parses_as_before() {
+        let body = serde_json::to_vec(&json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "hi", "tool_calls": [{
+                    "id": "c", "type": "function",
+                    "function": {"name": "weather", "arguments": "{}"}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .unwrap();
+        let response = parse_completion(&body).unwrap();
+        assert!(matches!(
+            &response.message,
+            Message::Assistant { provider: None, .. }
+        ));
+        assert_eq!(response.message.tool_calls()[0].opaque, None);
     }
 
     #[test]
@@ -1892,6 +2747,7 @@ mod tests {
                     ToolCall::new("c2", "read_file", json!({})),
                 ],
                 reasoning: None,
+                provider: None,
             },
             Message::tool_result_with_images(
                 "c1",
@@ -1964,6 +2820,7 @@ mod tests {
                 content: vec![],
                 tool_calls: vec![ToolCall::new(format!("c{turn}"), "read_file", json!({}))],
                 reasoning: None,
+                provider: None,
             });
             let sha = format!("t{turn}");
             req.messages.push(Message::tool_result_with_images(
@@ -1995,6 +2852,7 @@ mod tests {
                 content: vec![],
                 tool_calls: vec![ToolCall::new("c0", "read_file", json!({}))],
                 reasoning: None,
+                provider: None,
             },
             Message::tool_result_with_images(
                 "c0",

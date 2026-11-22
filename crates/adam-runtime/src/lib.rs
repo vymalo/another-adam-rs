@@ -111,7 +111,10 @@ pub use agent::{Agent, AgentError, AgentStarter, Inbound, Transition};
 pub use artifact_ref::{ArtifactRef, FileRef, FileSource};
 pub use blob::blob_id;
 pub use cancel::CancelToken;
-pub use child::{CHILD_REPORTED_KIND, ChildStarter, ChildStatus, RUN_FINISHED_KIND, child_run_id};
+pub use child::{
+    CHILD_PARKED_KIND, CHILD_REPORTED_KIND, ChildLook, ChildStarter, ChildStatus, RESUME_KIND,
+    RUN_FINISHED_KIND, child_run_id,
+};
 pub use clock::{Clock, DynClock, ManualClock, SystemClock};
 pub use ctx::{Ctx, Emitter, ReservedStep};
 pub use events::{

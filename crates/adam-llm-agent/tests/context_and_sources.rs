@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    ACCESS_TIER_CONTEXT_KEY, CALLER_CONTEXT_KEY, Conversation, LlmAgent, LlmAgentBuilder,
-    MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_SOURCE_TOOLS, PendingQuestion, PendingWait,
-    SourceCtx, Tool, ToolAccess, ToolCtx, ToolError, ToolOutput, ToolSource, user_message,
+    ACCESS_TIER_CONTEXT_KEY, CALLER_CONTEXT_KEY, Conversation, LOCALE_CONTEXT_KEY, LlmAgent,
+    LlmAgentBuilder, MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_SOURCE_TOOLS,
+    PendingQuestion, PendingWait, REASONING_EFFORT_CONTEXT_KEY, SourceCtx, Tool, ToolAccess,
+    ToolCtx, ToolError, ToolOutput, ToolSource, user_message,
 };
-use adam_model::{DynModel, Message, MockModel, ToolCall, ToolSpec};
+use adam_model::{DynModel, Message, MockModel, ReasoningEffort, ToolCall, ToolSpec};
 use adam_runtime::{Inbound, ManualClock, RetryPolicy, RunView, Runtime};
 use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
@@ -532,6 +533,29 @@ fn a_limit_the_person_set_is_kept_when_the_rest_of_the_context_is_dropped() {
     );
 }
 
+/// The interface language is not a limit on the agent, but it is what the person is speaking: a
+/// message whose context is over the limit and dropped must not take it away, or the next turn
+/// answers in a language the model picked itself (ADR 0069).
+#[test]
+fn the_interface_language_survives_a_context_that_is_dropped() {
+    let obj = |v: Value| v.as_object().cloned().unwrap();
+    let mut c = Conversation::new("t");
+    assert!(c.merge_context(&obj(json!({LOCALE_CONTEXT_KEY: "fr-CM"}))));
+    // A catalog that does not fit: everything but the protected keys is dropped, the language is not.
+    assert!(!c.merge_context(&obj(json!({"catalog": "x".repeat(MAX_CONTEXT_BYTES)}))));
+    assert_eq!(c.context[LOCALE_CONTEXT_KEY], json!("fr-CM"));
+    // A context that is already full still takes it: it does not count toward the limit.
+    let mut full = Conversation::new("t");
+    let room = MAX_CONTEXT_BYTES - serde_json::to_vec(&json!({"k": ""})).unwrap().len();
+    assert!(full.merge_context(&obj(json!({"k": "x".repeat(room)}))));
+    assert!(!full.merge_context(&obj(json!({"more": 1}))));
+    assert!(full.merge_context(&obj(json!({LOCALE_CONTEXT_KEY: "ybb-CM"}))));
+    assert_eq!(full.context[LOCALE_CONTEXT_KEY], json!("ybb-CM"));
+    // `null` removes it, like any key: a message that names no language clears the one before.
+    assert!(full.merge_context(&obj(json!({LOCALE_CONTEXT_KEY: null}))));
+    assert!(!full.context.contains_key(LOCALE_CONTEXT_KEY));
+}
+
 #[test]
 fn a_per_message_key_never_outlives_a_message_whose_context_is_dropped() {
     let obj = |v: Value| v.as_object().cloned().unwrap();
@@ -572,6 +596,99 @@ async fn a_message_with_a_large_context_and_a_tier_keeps_the_tier() {
         json!({ACCESS_TIER_CONTEXT_KEY: {"tier": "plan"}})
     );
     assert_eq!(state.messages[0], Message::user_text("hi"));
+}
+
+#[tokio::test]
+async fn a_turn_asks_for_the_agents_effort_and_the_runs_context_wins() {
+    let h = Harness::new();
+    let agent = h
+        .agent()
+        .reasoning_effort(Some(ReasoningEffort::Low))
+        .build();
+    h.mock.push_text("done");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("hi"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(
+        h.mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::Low),
+        "the agent's default when nothing else says"
+    );
+
+    // The message activated `high`: it wins over the default.
+    let h = Harness::new();
+    let agent = h
+        .agent()
+        .reasoning_effort(Some(ReasoningEffort::Low))
+        .build();
+    h.mock.push_text("done");
+    let rt = h.runtime(&agent);
+    let context = json!({REASONING_EFFORT_CONTEXT_KEY: {"effort": "high"}});
+    let run = rt
+        .start("llm", message_with("hi", context), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(
+        h.mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
+
+    // A word that is not a level is ignored, so the default stands.
+    let h = Harness::new();
+    let agent = h
+        .agent()
+        .reasoning_effort(Some(ReasoningEffort::Low))
+        .build();
+    h.mock.push_text("done");
+    let rt = h.runtime(&agent);
+    let context = json!({REASONING_EFFORT_CONTEXT_KEY: {"effort": "ultra"}});
+    let run = rt
+        .start("llm", message_with("hi", context), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(
+        h.mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::Low)
+    );
+}
+
+#[tokio::test]
+async fn a_large_message_keeps_the_effort_it_activated() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock.push_text("done");
+    let rt = h.runtime(&agent);
+    let context = json!({
+        "big": "x".repeat(MAX_CONTEXT_BYTES),
+        REASONING_EFFORT_CONTEXT_KEY: {"effort": "xhigh"},
+    });
+    let run = rt
+        .start("llm", message_with("hi", context), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    let state = conversation(&rt, &view).await;
+    assert_eq!(
+        state.context[REASONING_EFFORT_CONTEXT_KEY],
+        json!({"effort": "xhigh"})
+    );
+    assert_eq!(
+        h.mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::XHigh)
+    );
 }
 
 #[test]

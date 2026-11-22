@@ -214,6 +214,33 @@ from service.yaml, which every render contains, so they always run.
 {{- fail "config.modelBaseUrlFromSecret is on: externalSecrets.properties.modelBaseUrl must name the AWS property that holds the gateway's URL (model_base_url)" -}}
 {{- end -}}
 {{- end -}}
+{{- /* config.modelAuth: MODEL_AUTH, a string, one of key, device or injector (the binary folds case but not whitespace; the chart normalises before rendering). */ -}}
+{{- if not (kindIs "string" .Values.config.modelAuth) -}}
+{{- fail (printf "config.modelAuth must be a string: key, device or injector, or empty for the binary's default (key); got %q" (toString .Values.config.modelAuth)) -}}
+{{- end -}}
+{{- $modelAuth := include "coder.modelAuth" . -}}
+{{- if not (has $modelAuth (list "" "key" "device" "injector")) -}}
+{{- fail (printf "config.modelAuth must be key, device or injector (or empty for the binary's default, key), got %q" $modelAuth) -}}
+{{- end -}}
+{{- if and $modelAuth (hasKey .Values.config.extraEnv "MODEL_AUTH") -}}
+{{- fail "config.modelAuth is set and config.extraEnv sets MODEL_AUTH: set one (the chart renders MODEL_AUTH from the value)" -}}
+{{- end -}}
+{{- if include "coder.runsWorkers" . -}}
+{{- if eq $modelAuth "device" -}}
+{{- range $name := list "MODEL_OAUTH_ISSUER" "MODEL_OAUTH_CLIENT_ID" -}}
+{{- if not (trim (toString (default "" (get $.Values.config.extraEnv $name)))) -}}
+{{- fail (printf "config.modelAuth=device needs config.extraEnv.%s: the coder signs in with the device grant and refuses to start without it (exit 78)" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $modelAuth "injector" -}}
+{{- range $name := list "MODEL_OAUTH_ISSUER" "MODEL_OAUTH_CLIENT_ID" "MODEL_OAUTH_SCOPE" -}}
+{{- if hasKey $.Values.config.extraEnv $name -}}
+{{- fail (printf "config.modelAuth=injector takes no sign-in: remove config.extraEnv.%s (the coder refuses a non-empty MODEL_OAUTH_* under the injector, exit 78)" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- /* runPods (ADR 0019): a pod of its own for each active run. */ -}}
 {{- if not (kindIs "bool" .Values.runPods.enabled) -}}
 {{- fail (printf "runPods.enabled must be true or false, got %q" (toString .Values.runPods.enabled)) -}}

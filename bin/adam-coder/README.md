@@ -1634,7 +1634,8 @@ stateDiagram-v2
   runs it), or it ended: the call returns its view and starts nothing. A stale record is an earlier try that died: its process is
   killed and the command starts again, its output begun again. At most one process per id.
 * **When it stops:** `stop_command`; `BACKGROUND_COMMAND_MAX_SECS`; the root run ends or any run of the tree parks on the person
-  (`CoderAgent::step`: at once on the worker that holds the command, a stop request in the record of one another worker holds, carried
+  (`ask_user`) or on the model until it is woken (a refusal of `over_limit`, ADR 0067; `CoderAgent::step`: at once on the worker
+  that holds the command, a stop request in the record of one another worker holds, carried
   out within one sweep; the end of a child run stops nothing, nor does a park on a subagent or a timer); a cancel never calls the
   agent, so `Commands::sweep` reads the run's standing every `BACKGROUND_SWEEP_SECS` and stops what is over; `use_repository_environment`;
   the janitor's release; the worker's shutdown (`gone: the worker stopped...`; `CommandsSweep` is the component, `wire_commands`
@@ -1870,7 +1871,8 @@ greets from the persona lines gets the run to wait without any tool, editing the
 
 One file, [`agent/instructions.md`](agent/instructions.md), holds what describes the agent, in the format of
 [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md): the frontmatter has `name` (`coder`, which must equal
-`AGENT_NAME`), `description`, `limits` (200 turns, 400 tool calls, 8192 output tokens, 100000 tokens of history),
+`AGENT_NAME`), `description`, `limits` (200 turns, 400 tool calls, 100000 tokens of history; no output cap, so the
+model's profile or the 128,000 fallback applies, ADR 0064),
 `vars.max_check_cycles` (the default, 3), `vars.scratch_check_cycles` (5), `vars.display_name` (`Adam`: the name the agent says), `vars.repository_creation` (what the prompt says about making a repository for the person: the default is the sentence for a deployment that allows it, and **when `CREATE_REPO_OWNERS` is empty `CoderAgent` replaces it with a note that there is no such tool**, that the person must create the repository and name it, and that "a new repository" is never an option of a question; a folder that does not declare the var keeps its own text) and `card:` (the A2A
 card: name `Adam`, the skills `explain`, `research`, `documents` and `coding-task`, each with tags and examples); the body is the system prompt.
 
@@ -2138,7 +2140,7 @@ way; every problem is reported at once at startup):
 | `A2A_DOCS` | Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, public; `false` turns them off ([`adam-service`](../../crates/adam-service/README.md#environment)) | `true` |
 | `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and its key | required by `all` and `worker` (key may be empty) |
 | `MODEL` | model alias of the agent | required by `all` and `worker` |
-| `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request of the agent's model, for a flag that makes a gateway or model emit its reasoning: `{"reasoning_effort":"medium"}`, `{"thinking":{"type":"enabled"}}`, `{"chat_template_kwargs":{"enable_thinking":true}}`. **Not a secret** (it shows in the pod's environment). Not JSON, not an object, or a member the runtime owns (`model`, `messages`, `tools`, `tool_choice`, `stream`): exit 78 at startup, the message names the variable and never repeats the value; read by the agent's own model calls only | unset: nothing is added |
+| `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request of the agent's model, for a flag that makes a gateway or model emit its reasoning: `{"reasoning_effort":"medium"}`, `{"thinking":{"type":"enabled"}}`, `{"chat_template_kwargs":{"enable_thinking":true}}`. **Not a secret** (it shows in the pod's environment). A request's typed reasoning level wins over the members its model's `reasoningWire` would duplicate (ADR 0063 decision 6). Not JSON, not an object, or a member the runtime owns (`model`, `messages`, `tools`, `tool_choice`, `stream`): exit 78 at startup, the message names the variable and never repeats the value; read by the agent's own model calls only | unset: nothing is added |
 | `MODEL_ECHO_REASONING` | `reasoning_content` or `reasoning`: keep the model's reasoning in the run's history and send it back under that member name. For a provider that requires it (DeepSeek's thinking mode with tools answers a request without it with a 400); `false` or unset sends none, which is what almost every model wants. Anything else: exit 78 | unset: never sent |
 | `MODEL_PROMPT_CACHE_KEY` | `off` or `conversation`: send each request's `prompt_cache_key` (a hash of the conversation id cut to 32 characters), so a gateway with a prompt cache routes one conversation's requests together; a `MODEL_EXTRA_BODY` member of that name wins. Anything else: exit 78 | `off` |
 | `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; a subagent whose `model:` names another alias reports none. Anything else: exit 78 | unset: reports carry no window |
@@ -2162,6 +2164,7 @@ way; every problem is reported at once at startup):
 | `WORKER_ID` | stable identity of this worker (lease identity, and run owner when pinned): 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; **required** by `affinity` and `isolated` |
 | `WORKERS` | runs advanced concurrently | `4` |
 | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (else exit 78): the agent's `LlmAgentBuilder::max_parallel`. Which calls may overlap is each tool's declaration (ADR 0049) | `10` |
+| `MODEL_PARK_LIMIT` | how long a run may wait on the model on a timer, from the first park in a row, before it fails with the last reason: a model call the gateway refused under `MODEL_AUTH=injector` parks the run and is made again, and so does a gateway that cannot be reached once the retries are spent (ADR 0067; `CoderSettings::model_parking`, the agent's `LlmAgentBuilder::model_parking`); whole seconds or a number with `s`, `m`, `h` or `d`, 60 s to 30 d (else exit 78). A park until woken stops the background commands as a question does, the run's own or a child's it waits on (the root shows the child's reason and wakes it through a message or a resume, ADR 0067 decision 5). **Breaking:** `CoderSettings::model_parking` is a new public field: a `CoderSettings` literal needs it (or `..CoderSettings::new()`) | `24h` |
 | `MAX_CHECK_CYCLES` | failed `run_checks` in a repository before the agent must stop | `3` |
 | `SCRATCH_CHECK_CYCLES` | the same for a scratch project, counted apart (at least 1) | `5` |
 | `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks` (and of one `run_command` and one `run`): the time limit is also **the most a call's `timeout` may ask for**; the output size is what is shown of a long output, a quarter of it the head and the rest the tail (the whole is kept) | `900`, `16384` |
@@ -2618,7 +2621,7 @@ database of its own, so the role needs `CREATEDB`):
   a grandchild and assert by pid that each is gone,
   `output_is_scrubbed_before_it_is_written` (a secret of three lines split across two reads, nothing of it on the volume at any time),
   `output_stops_at_the_cap`, `the_lifetime_ends_it`, `more_than_the_maximum_is_refused`, `a_finished_root_run_stops_its_commands`,
-  `a_park_on_the_person_stops_the_commands`, `a_cancelled_run_is_reached_by_the_sweep`,
+  `a_park_on_the_person_stops_the_commands`, `a_park_until_woken_stops_the_commands`, `a_cancelled_run_is_reached_by_the_sweep`,
   `three_identical_reads_of_a_quiet_command_are_refused`, `git_changes_of_a_background_command_are_reported_at_stop`, and in
   `tests/janitor.rs` `the_sweep_stops_background_commands_before_release`. A kind scenario (a development server in a run pod,
   `curl localhost:PORT` from `run_command`, a second repository stopping it) is **not** written: only CI with a cluster could prove it.
@@ -2814,7 +2817,9 @@ database of its own, so the role needs `CREATEDB`):
   greeting rule, the plain-words answer, what it cannot do, no tool list); the prompt equals
   `tests/fixtures/agent/prompt.txt` (the **instruction snapshot**: it began as the old Rust constant, and #55 is its
   first deliberate change) for several limits, with `{{display_name}}` as `Adam`, but for its final newline, which the
-  loader drops from every body; the limits, the tool order and the model alias are the old ones; a run through a runtime on a `MockModel` sends the old system prompt, tools and `max_output_tokens` and
+  loader drops from every body; the turns, the tool calls, the tool order and the model alias are the old ones, and the cap is
+  the 128,000 fallback since the coder's file sets none (ADR 0064); a run through a runtime on a `MockModel` sends
+  the old system prompt and tools, and `max_output_tokens` 128,000, and
   journals the old step names (`model:0`, `tool:<call id>`, so a run journaled before replays); the assembly's
   card equals `agent_card`. A model alias the assembly refuses (empty, whitespace) is an error from `try_new`.
   The card is also pinned by a unit test in `src/app.rs` against `tests/fixtures/agent/card.json`, the card as the

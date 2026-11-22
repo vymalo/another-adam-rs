@@ -17,6 +17,7 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 | `RuntimeTaskBackend::new(runtime, events, agent)` | `events` must be the `BroadcastSink` the runtime was built with; `agent` is the registered name, as an agent (`.agent`) or as a start-only starter (`.starter`) |
 | `.with_poll_interval(..)`, `DEFAULT_POLL_INTERVAL` | how often a subscription re-reads the durable run: the fallback for a state change no live event announced, 2 s by default. A `Status` event (a commit) makes the pump poll at once, so this is not the latency of a run this process steps |
 | `.with_prompt(..)`, `.with_inbound(..)` | override how the `input-required` question is derived (`PromptFn`; the default reads `state.pending_wait.question`, and `state.pending_question.question` for runs parked by an older build) and how an A2A message becomes an `Inbound` (`InboundFn`) |
+| `NOT_PARKED`, `RESUME_METADATA_KEY` | a run parked on the model ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)): see [A run parked on the model](#a-run-parked-on-the-model) |
 | `default_prompt`, `default_inbound`, `task_state`, `artifact_of`, `artifact_id` | the default mappings. `default_inbound` marks a line of text that begins as a form's answer `(typed) `, as `vymalo_inbound` does ([below](#a-screen-as-the-sender)). `artifact_of(artifact: &ArtifactRef, bytes: Option<Arc<[u8]>>)`: string data is a text part, anything else a data part; an object whose `url` is an absolute `http(s)` URL also gets a `url` part after the data part (A2A v1 `Part.url`), so a client can show a link; **a file artifact is one `raw` part** (`Part.raw`: the bytes, base64 in JSON) with `mediaType` and `filename` and nothing else, so any A2A client reads a standard file artifact and no extension is involved ([ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)). A view carries a file **by reference** (`adam_runtime::FileRef`): an inline file (a v4 run) serves its own bytes, and a blob (a v5 head) serves the bytes the caller fetched with `Runtime::artifact_bytes`; a blob that is gone answers `None`, and that artifact is left out of the task. `artifact_id` is the id an artifact was given (`ArtifactRef::id`), else follows a file's name, media type, filename and its content digest, so the live event, the durable copy and the same file in a v4 or a v5 run are one artifact. **An artifact with an id is one artifact however often it changes** (a plan): `GetTask` lists it once, holding the newest, and the stream sends each change under that `artifactId` with no `append` (in A2A an update without `append` replaces the artifact with that id); a subscriber is sent an id again whenever its content differs from the **last** content it was sent under that id (so A, B, A is three updates), and remembers one entry per id. Such an artifact carries `metadata["vymalo.replaceable"] = true`, which tells a delivery cursor that its id can hold different content later. **Breaking** (from `adam-runtime`): `RunView::artifacts` is a `Vec<ArtifactRef>`, not the artifacts with inline bytes, and `artifact_of` takes a reference and the fetched bytes |
 | `vymalo_inbound`, `form_answer_surface`, `ASK_SURFACE_PREFIX`, `comparable`, `is_format_or_control`, `CONTEXT_UI_REF`, `CONTEXT_UI_CATALOG`, `CONTEXT_A2UI_RENDERER`, `MAX_OFFERED_CATALOG_IDS`, `CONTEXT_THREAD_TOOLS`, `integral_numbers` | the inbound function of an agent that serves a screen (`.with_inbound(vymalo_inbound)`): an A2UI action reads as the person's answer, and the extensions a message carries become the run's inbound context; see *A screen as the sender* |
 | `CONTEXT_CALLER`, `UNREADABLE_CALLER`, `asked_by_an_agent` | who a message was sent for, from the claims of its thread-tools token: the thread's addressed agent (a person, or a program with their token, behind it) or an agent another agent asked (nobody); see *A screen as the sender* |
@@ -26,6 +27,7 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 | `RuntimeTaskBackend::list` (`TaskBackend::list`), `MAX_SCAN` | `ListTasks`: the caller's tasks, newest update first, by keyset cursor; see *Listing tasks* |
 | `MAX_TOKEN_COUNT` | the largest count a `usage/v1` report or total carries (2^53 - 1); see *Usage* |
 | `RuntimeTaskBackend::with_access_tiers(AccessTiers)`, `CONTEXT_ACCESS_TIER` | `access-tier/v1`: the backend reads the tier of a message that activated the extension, refuses a bad one, and says the tier a task works under; the tier is the run's context key `vymalo.accessTier` = `{"tier": ..}`; see *The access tier* |
+| `CONTEXT_LOCALE` | `locale/v1`: the person's interface language of the **latest message that activated the extension**, the run's context key `vymalo.locale` = `"fr-CM"` (a bare BCP 47 tag), set from `metadata[URI] = {"locale": "<tag>"}` and **cleared** by an activated message that names none (or names a malformed tag, which is refused rather than passed on); one of `adam_llm_agent::PROTECTED_CONTEXT_KEYS`, so a dropped context does not take it; a request that did not activate the extension changes nothing; see *The interface language* |
 | `RemoteCommand`, `CommandRefusal`, `Commands::add_remote(name, Arc<dyn RemoteCommand>)`, `Commands::expand_any`, `Commands::served()`, `Commands::refuse_prefix(prefix, why)` | a command whose text is **asked** when a message names it (an MCP server's prompt): the source gets the argument text as typed, trimmed (`expand(&str)`, and maps it itself), the source answers, and the answer is held to the same limits and `(typed)` marking and stored like a template's expansion. `CommandRefusal::Invalid` is `invalid params`, `Unavailable` the A2A `unavailable` error; a name the agent already has is not replaced (`add_remote` returns `false`). `refuse_prefix` makes a process that cannot serve a family of commands (a control plane has no MCP server) answer `invalid params` with a sentence of its own to `/<prefix>...` (typed or in the metadata) instead of letting it reach the model as text; `is_empty()` counts the refusals. `is_format_or_control` now lives in `adam-agent-fs` and is re-exported here. **Breaking:** the crate-private `apply` is async, and `Commands`' `PartialEq` compares a remote command by pointer |
 | `RuntimeTaskBackend::with_commands(Commands)`, `Commands`, `Commands::from_manifest(&[adam_agent_fs::Command])` (the one place a manifest becomes the backend's commands, used by `adam-agent` and `adam-coder`; this crate gained the `adam-agent-fs` dependency for it), `MAX_COMMAND_ARGUMENTS`, `MAX_COMMAND_EXPANSION` | `commands/v1`: the backend expands a message that names a command the agent serves, in this request, and stores the expansion; see *Commands*. An empty `Commands` is the same as none |
 | `RuntimeTaskBackend::with_child_sessions(ChildSessions)`, `ChildSessions::new(agents, max_open)`, `.with_max_rounds(n)`, `.card_extension()`, `.agents()`, `RuntimeTaskBackend::child_sessions()` (what the backend serves, `None` when never given or refused), `ChildSessionAgent::new(name, agent, description)` + `.within(duration)` + `.remote()` (a helper whose rounds work on another agent's task: a cancel of its round, or an idle expiry, is followed by a closing round that a worker steps and that sends the remote `CancelTask`; a kept-open session stays open) (and `adam_a2a::ChildSessionInfo::new(name, description)`; all three types are `#[non_exhaustive]`), `MAX_DESCRIPTION_CHARS`, `MAX_SESSION_ROUNDS` (a close is always allowed, even at the limit) | `child-sessions/v1`: a client that activates it sees the agent's sessions on the parent task, follows each round as a task of a child context, and starts, talks to, stops and closes a session; see *Child sessions*. A helper whose `agent` is not registered on the runtime is logged (`error!`) and the extension is not served. `card_extension()` is what the card lists (`None` when the contract's bounds are not met). Wired by `adam-assembly` (`AgentDef::child_sessions`), `adam-service` (`Agents::child_sessions`) and the shipped agents |
@@ -72,8 +74,8 @@ starter claims nothing: its tasks stay `submitted`.
 Mapping (full table in `src/backend.rs`): a task is a run (`task_id` is the run
 id); a new `SendMessage` is `Runtime::start_with_id` (delivering to the context's open task if it has one), or
 `Runtime::start_with_id_continuing` when it references a finished task (see *Continuing a task*); a message with `taskId` is
-`Runtime::deliver`, while the task is `input-required` and, when the request activated `steer/v1`, while it is `submitted` or
-`working` (see *Steering a running task*); `CancelTask` is
+`Runtime::deliver`, while the task is `input-required` or its run is parked on the model and, when the request activated
+`steer/v1`, while it is `submitted` or `working` (see *Steering a running task*); `CancelTask` is
 `Runtime::cancel`, which also cancels the subagent runs the task is waiting for (`cancelled: the parent run ended`; a remote A2A
 subagent's task is not cancelled; `tests/cancel_cascade.rs`). Ownership is encoded in the run's durable conversation id
 (`<subject>:<context id>`), so it survives restarts with no side table, and a
@@ -197,6 +199,37 @@ its own parent (`start_child_continuing_within(S, S, ..)`): no run's end cancels
 **The access tier.** A message that activated `access-tier/v1` names a tier as for any message; a round a person starts that did
 not still gets the agent's default written, so it never runs under a tier nobody chose. A close names none. Commands are not
 expanded in a child context (they are the parent agent's).
+
+## A run parked on the model
+
+A run whose model call was refused under a provider that parks ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md))
+keeps its conversation and waits to make the call again (`adam-llm-agent`, *A run parked on the model*). Its task reads
+`state.model_wait` (`src/model_park.rs`):
+
+| The park | Task |
+|---|---|
+| a refusal of status 401 or 403, timer or not | `auth-required`, the reason as the status message |
+| until woken | `input-required`, the reason as the message (also `default_prompt`'s last fallback; a host's `PromptFn` does not hide it) |
+| on a timer | `working`, the reason as the status message |
+
+A run that **waits on a child parked on the model** is parked on the model for this purpose (ADR 0067 decision 5): its
+task reads the copy of the child's wait (`/pending_wait/model_wait`, what `adam-llm-agent` keeps), so it is
+`input-required` with the child's reason when the child waits until woken, and `working` with it when the child is on a
+timer. A child's refusal of status 401 or 403 is **never** `auth-required` on the root: the gateway refused the child's
+call, not the root's.
+
+`ListTasks` returns them by those states. A message with the `taskId` of a parked task is delivered, timer or not. A message
+whose metadata holds `adam.resume: true` (`RESUME_METADATA_KEY`) is a **resume**, read before the inbound function, so it
+may have no text: it delivers a wake-up of kind `adam.resume` that the loop drops, adding nothing. A message or a resume
+to a run that waits on a parked child is delivered the same way: the loop sends the child one resume, and the words of a
+message stay at the root. A task that is not parked on the model (asking, working, finished, canceled, or waiting on a
+child that is not parked) refuses it with `InvalidParams` `NOT_PARKED` and nothing is written; a resume names its
+`taskId`. A round of a child session is resumed the same way. The contract is
+[`docs/reference/a2a-server.md`](../../docs/reference/a2a-server.md#a-run-parked-on-the-model). Tests: `tests/model_park.rs`
+(the three states and their messages, the list filter, a message to a timer park on `working` and `auth-required`, a textless
+resume through the backend and over HTTP with no part, a task waiting on a parked child (its reason, a resume and a message
+accepted, a resume after the child finished refused), the refusals with -32602 and nothing written, cancel) and the unit
+tests of `src/convert.rs` (`a_park_on_the_model_says_its_state_and_its_reason`) and `src/model_park.rs`.
 
 ## Push notifications
 
@@ -474,6 +507,29 @@ neither carries no metadata, and a task with tokens only carries the object it a
 
 Unit tests in `src/tier.rs` (the validation sentences, the context) and `tests/access_tier.rs` (a real `Runtime` and `LlmAgent`: the tier reaches the run and the task, the first frame and `GetTask` say it, a caller that did not activate it reads none, every kind of bad tier is `InvalidParams` and writes no run, a message that did not activate it carries no tier and an activated reader is told the default, a backend with no tiers reads none, and a tier changed by a message sent while the task works is said once on the stream).
 
+## The interface language
+
+`locale/v1` ([ADR 0069](../../docs/decisions/0069-the-interface-language-is-a-hint-and-a-hint-is-all-it-is.md)). The backend reads it in
+`submit`, right after the inbound function and beside the tier, for an agent whose card lists the extension
+(`ExtensionConfig::locale`):
+
+| | |
+|---|---|
+| A message whose request **activated** the extension | may carry `metadata[URI] = {"locale": "<BCP 47 tag>"}`. The tag is validated and bounded (`adam_a2a::Locale`, RFC 5646's `langtag`, at most 64 bytes) and becomes the run's inbound context key `vymalo.locale` (`CONTEXT_LOCALE`), a bare string, merged like any key: the **newest message that names one wins** from the agent's next step |
+| an activated message that names **none**, or a malformed tag | the key is set to `null`, which deletes it: a run never answers in the language of a message that is no longer the newest, and a malformed tag is refused rather than passed on. Never an empty string |
+| a message that did **not** activate it | nothing is read, whatever its metadata says; the context is untouched |
+| the protection | the key is one of `adam_llm_agent::PROTECTED_CONTEXT_KEYS`: a message whose context is over `MAX_CONTEXT_BYTES` and dropped keeps it (a test in `adam-llm-agent` proves it), so a large catalog never costs the person their language |
+| never a refusal | the hint is optional: a payload that cannot carry a context is left as it is, and no message is refused for it |
+
+What the agent does with the key is the prompt's rule (the coder's `agent/instructions.md`): answer in that language, follow the person when
+they write in another one, and never write a string a person must trust (a consent, a payment) from it. The hint is not a translation layer
+and not a filter: a well-formed tag the card does not name is still read.
+
+Unit tests in `src/vymalo.rs` (the tag in the context, the clear for none and for a malformed one, the untouched context of a request that did
+not activate it, any payload shape, and the key's identity with `adam_llm_agent::LOCALE_CONTEXT_KEY` and its place among the protected keys)
+and `tests/vymalo.rs` (a real `Runtime` and `LlmAgent`: the tag reaches the run, a request that did not activate it leaves it, and an
+activated message that names none takes it away from the next job of the thread).
+
 ## Commands
 
 `commands/v1` (ADR 0044, decision 9; the consumer's contract page `docs/api/commands-v1.md` of `vymalo/another-agentic-system` is not written yet). With `with_commands(commands)`, for an agent whose card lists the extension (`ExtensionConfig::commands`), `submit` reads every message right after the inbound function, once, and the expansion is what is stored:
@@ -548,6 +604,10 @@ reach the client.
 No environment variables at runtime.
 
 ## Tests
+
+`tests/model_run.rs`: a message whose metadata or data part says `root_run`, `model_run` or `session` does not change the
+run its task's model calls name ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)),
+with the default inbound and with `vymalo_inbound`: the call names the task, and the state holds none of the three.
 
 `tests/backend.rs` drives the backend with a real A2A client over HTTP and a
 scripted agent (its `listing` module: the caller's tasks newest first and each state told from the others, including

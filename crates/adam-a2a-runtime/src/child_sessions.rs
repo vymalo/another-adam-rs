@@ -765,15 +765,26 @@ impl RuntimeTaskBackend {
                         "a start or a close names no taskId".into(),
                     ));
                 }
+                let located = (round.run, round.view, round.context);
+                // A round parked on the model is resumed as a root task is (ADR 0067).
+                if crate::model_park::is_resume(message) {
+                    let task = self.resume(caller, located, message, context_id).await?;
+                    return Ok(Some(self.with_sessions(caller, task).await?));
+                }
                 let mut inbound = (self.inbound)(message).map_err(BackendError::InvalidParams)?;
                 self.named_tier(caller, message, &mut inbound, false)?;
-                let located = (round.run, round.view, round.context);
                 let context = context_id.map(str::to_owned);
                 self.follow_up(caller, located, inbound, task, context)
                     .await?
             }
             (Some(task), None, _) => return Err(BackendError::TaskNotFound(task.to_owned())),
             (None, _, Some(ContextKind::Child(parent, session))) => {
+                // A resume names the round it resumes, as at the top level (ADR 0067).
+                if crate::model_park::is_resume(message) {
+                    return Err(BackendError::InvalidParams(
+                        crate::model_park::RESUME_NAMES_ITS_TASK.to_owned(),
+                    ));
+                }
                 let inbound = match asked {
                     Asked::Start(_) => {
                         return Err(BackendError::InvalidParams(
@@ -930,6 +941,10 @@ impl RuntimeTaskBackend {
             closed: false,
             closing: false,
             round: 1,
+            // A person's session is its own parent: no run opened it, so each round's model calls
+            // name the round's own task, which the orchestrator binds as any task it creates
+            // (ADR 0067).
+            root: None,
         };
         put_header(&mut inbound, &header).map_err(BackendError::InvalidParams)?;
         self.runtime
@@ -1242,6 +1257,7 @@ fn next_header(view: &SessionView, session: RunId) -> SessionHeader {
         closed: false,
         closing: false,
         round: 0,
+        root: None,
     });
     header.round = view.round + 1;
     // The round before may have been one that only cleaned up after a cancel.
@@ -1522,6 +1538,7 @@ mod tests {
             closed: false,
             closing: false,
             round: 1,
+            root: None,
         };
         let mut text = Inbound::new("message", json!("hi"));
         put_header(&mut text, &header).unwrap();

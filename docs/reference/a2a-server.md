@@ -84,7 +84,7 @@ The caller's own tasks (never another's, whatever the filters say), most recentl
 | Field | Behaviour |
 |---|---|
 | `contextId` | only that context |
-| `status` | only that state. `completed` is exact in the store; `failed`/`canceled`, `submitted`/`working` and `input-required` are told apart by reading each candidate (at most 500 runs per page: a rare filter returns a short page and a token to continue) |
+| `status` | only that state. `completed` is exact in the store; `failed`/`canceled`, `submitted`/`working`, `input-required` and `auth-required` are told apart by reading each candidate (at most 500 runs per page: a rare filter returns a short page and a token to continue) |
 | `statusTimestampAfter` | the last change at or after it (inclusive) |
 | `pageSize` | 50 by default, 1 to 100 (a larger value is clamped, zero and negative mean the default) |
 | `pageToken` | the `nextPageToken` of a page of **the same caller and filters**; anything else, forged or not, is `InvalidParams` ("invalid page token") |
@@ -134,10 +134,81 @@ ends **`completed`**, its output (and the `artifact`-less final message) carryin
 | The message | What happens |
 |---|---|
 | carries a `taskId`, the task is `input-required` | delivered to the run (`Runtime::deliver`) |
+| carries a `taskId`, the run is parked on the model (`auth-required`, or `working` on a timer), or waits on a parked child | delivered to the run: see [A run parked on the model](#a-run-parked-on-the-model) |
+| has `adam.resume: true` in its metadata | a resume: see [A run parked on the model](#a-run-parked-on-the-model) |
 | carries a `taskId`, the task has finished | `-32004` (`UnsupportedOperationError`) |
 | carries a `taskId`, the task is `submitted` or `working` | `-32602`, **unless the request activated `steer/v1`**: then it goes to the run's inbox, is read at its next step, and the answer is the task, still working ([ADR 0016](../decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md)) |
 | has a `contextId`, no `taskId` | delivered to the context's open task, or starts a new one |
 | has `referenceTaskIds` | starts from the conversation of one of them, below |
+
+A message with `adam.resume: true` is read as a resume whatever the task's state (the third row): it is accepted
+only by a task parked on the model, or waiting on a parked child. Otherwise the rows are read in order: a `working`
+task whose run is parked on the model, or waits on a parked child, is delivered (the second row); any other `working`
+task takes the fifth row, and is refused unless the request activated `steer/v1`.
+
+## A run parked on the model
+
+**This section is a contract** ([ADR 0067](../decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md),
+decisions 4 and 5). An orchestrator resumes a run with it after it binds the run at the gateway, or after the person raised
+their limit.
+
+Behind a model gateway that refuses a call until the run is bound or the person has usage left (`MODEL_AUTH=injector`),
+a refused call does not fail the run. The run keeps its conversation and waits to make **the same call** again. Its task
+shows the wait, with the reason as the status message ("the model gateway has not bound this run yet", "the model
+gateway's limit is reached", "the model gateway is busy", "the model gateway cannot be reached"). The reason is all a
+client is told: never a header, a body or a credential.
+
+| The refusal | Task state | Wakes |
+|---|---|---|
+| status 401 or 403 (not authenticated, the run not bound yet, its lease ended) | `auth-required` | on a timer, or a message, or a resume |
+| a usage limit reached (402) | `input-required` | a message or a resume only; never on its own |
+| a rate limit (429), a busy gateway (503), a gateway that cannot be reached | `working`, with the reason as a status message | on a timer, or a message, or a resume |
+
+`ListTasks` with `status` `auth-required` or `input-required` returns these tasks. A stream ends at `auth-required` and
+`input-required`, as at any interrupted state; subscribe again after the resume.
+
+| The message | Answer |
+|---|---|
+| with the `taskId` of a parked task, timer or not | delivered: its text is the person's turn, added before the call is made again (for a run parked on its history's summary, after the summary is made); the answer is the task, `working` |
+| with `adam.resume: true` in its `metadata` and the `taskId` of a parked task | a **resume**: it wakes the run and adds **nothing** to the conversation. It may have no text and no part. The answer is the task, `working` |
+| a resume to any other task: one that asks a question, works (a run a message or a resume just woke, making its call again, included), waits on a child that is not parked on the model, has finished or was canceled | `-32602` (`InvalidParams`), "the task is not parked on the model"; nothing is written. A resume never answers a question |
+| a resume with no `taskId`, in a root context or a session's | `-32602`, "a resume names the task it resumes (taskId)" |
+| `CancelTask` | ends the park, as it ends any wait |
+
+A resume is authenticated as any message and cures nothing by itself: the call it repeats goes through the gateway, and a
+run still refused parks again.
+
+**A child's park is the root's** (decision 5). A local subagent's refusal parks the child the same way, and the run that
+waits on it learns of it by a notice (`adam.child.parked`), reads what the child waits on, and shows it:
+
+| The child | The root's task | Wakes |
+|---|---|---|
+| waits until woken | `input-required` with the child's reason | a message or a resume to the root |
+| waits on a timer | `working`, with the child's reason as a status message | its own look at the child every 60 s, a message, or a resume |
+
+A refusal of status 401 or 403 is the child's: the root's task is `working` with the reason when the child is on a timer,
+never `auth-required` (the gateway refused the child's call, not the root's). A message to the root is accepted; its text
+is the root's turn, added behind the call the child answers, and the root sends the child **one resume** with an id
+derived from the waking message's id, so a replayed step writes the same one; the child drops a copy it has read, so a
+replayed forward is no second call. A resume to the root is accepted as for a
+parked run, and goes down the same way, one level at a time: a child that waits on its own parked child forwards one to
+it. A resume to a root that has **settled** its child — the child finished and the root answered its call — is
+`NOT_PARKED`, as for any run that is not parked on the model; between the child's end and the root's next step the
+copy is still there, so a resume is accepted and consumed as the root settles the wait, which is harmless (the child
+is finished and nothing is woken). A client that binds runs learns of a **descendant's** refusal of status 401 or 403
+from the status message — the root shows `working` with the child's reason, not `auth-required` — and sends its
+resume to the **root**, which forwards it; otherwise a `ListTasks` with `status=auth-required` never returns the
+root.
+
+**Time.** A park on a timer waits 30 s, then twice as long at each park in a row, at most 15 minutes, and never less than
+the gateway asked (`Retry-After`). Parks on a timer in a row last at most `MODEL_PARK_LIMIT` (24 hours by default, from
+the first): past it the task **fails** with the last reason. A timer park counts against a child run's time limit. A park
+until woken never fails on its own and **pauses the run's deadline**, as a question does. A schedule's firing has nobody
+to wake it: a refusal that would wait until woken fails it, and so does a refusal of status 401 or 403, since nothing binds a
+firing at the gateway yet. A local subagent's park until woken waits for its parent's resume: the parent shows it and
+wakes it through the task, and its deadline is paused while it waits. A subagent's park on a timer stays, bounded by
+`MODEL_PARK_LIMIT` and its time limit, and the root's task names its reason. A wait longer than what is left of
+`MODEL_PARK_LIMIT` ends at the limit.
 
 ## A new task that continues a finished one
 
@@ -277,6 +348,42 @@ is the orchestrator's to send with a tier. To a caller that activated it, a
 task says `metadata[URI] = {"tier": ..}`: on the answer of `SendMessage`, on `GetTask`, on the first frame of a stream, and in a
 status update when it changes. `RuntimeTaskBackend::with_access_tiers` is the backend side; what the coder does with each tier is
 its README, *Access tiers*.
+
+## The interface language (`locale/v1`)
+
+An agent whose card lists `https://agents.vymalo.com/a2a/extensions/locale/v1` takes the person's interface language
+**for each message** ([ADR 0069](../decisions/0069-the-interface-language-is-a-hint-and-a-hint-is-all-it-is.md)). The
+card's `params` are `{"locale": "<tag>"}`, one tag: the agent's default language, the one it answers in when a
+message names none. It is the deployment's configuration — this repository names no language — and a deployment that
+offers none lists no extension. `adam_a2a::ExtensionConfig::locale` declares the entry and `adam_a2a::Locale` is a
+validated tag.
+
+A request that **activates** the extension may carry `metadata[URI] = {"locale": "<BCP 47 tag>"}`, the shape of
+`access-tier/v1`'s `{"tier": ..}`. `adam_a2a::Locale::of_request` reads it, and only then:
+
+* a tag is read only when the request activated the extension: a message whose request did not name it carries no
+  hint, whatever its metadata says;
+* a malformed tag is refused, never passed on, and the message goes on **with no hint** — fail closed is no language
+  rather than a guessed one. The tag is well formed per RFC 5646's `langtag` and at most 64 bytes;
+* a message that names no locale leaves no hint at all, never an empty string.
+
+The hint is an instruction for the agent's **own words**, never a translation layer: nothing is translated, and a
+string a person must trust (a consent, a payment, a confirmation) is the deployment's reviewed text, in a language it
+was reviewed in, never the model's. It is a default and not a constraint: the hint belongs to its message (the
+orchestration layer keeps it with the message, so a redelivery, a fork and a resumed run carry the same one), and a
+person who writes in another language is followed, whatever the card or the hint says.
+
+**In the run.** The backend reads the hint in `submit`, beside the tier: the tag is the run's inbound context key
+`vymalo.locale` (`CONTEXT_LOCALE` in `crates/adam-a2a-runtime/src/vymalo.rs`, a bare string), the newest activated
+message wins, and an activated message that names none — or names a malformed tag — sets it to `null`, which deletes
+it. The key is one of `adam_llm_agent::PROTECTED_CONTEXT_KEYS`, so a message whose context is over the limit and
+dropped keeps the language the person is speaking. What an agent does with it is its own prompt: the coder's carries
+the two rules (`bin/adam-coder/agent/instructions.md`, "Language" and "Never write a trusted string").
+
+**No card lists it yet.** `ExtensionConfig::locale` and the runtime half are built; the cards of `adam-coder` and
+`adam-agent` and the deployment's own tag are ADR 0069's slice 3, and the client's half is slice 4. Until a card lists
+it, no request can activate it, so no agent reads a hint and each follows the person's language — which the same rule
+says.
 
 ## Child sessions (`child-sessions/v1`)
 

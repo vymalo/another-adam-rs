@@ -303,13 +303,14 @@ async fn the_embedded_fixture_runs_a_subagent_end_to_end() {
     let view = wait_done(&rt, run).await;
     assert_eq!(view.output.as_ref().unwrap()["text"], "Reviewed: LGTM");
     let requests = model.requests();
-    // The reviewer, from the fixture's own file: its prompt, its two tools, its limits.
+    // The reviewer, from the fixture's own file: its prompt, its two tools, and no cap of its own,
+    // so its request asks the 128,000 fallback (ADR 0064).
     assert_eq!(
         plain(&requests[1].system).as_deref(),
         Some("You review diffs. Report findings as a numbered list.")
     );
     assert_eq!(offered(&requests[1]), ["read_diff", "list_files"]);
-    assert_eq!(requests[1].max_output_tokens, Some(4096));
+    assert_eq!(requests[1].max_output_tokens, Some(128_000));
     assert_eq!(user_texts(&requests[1]), ["Review this diff"]);
     worker.stop().await;
 }

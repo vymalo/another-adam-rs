@@ -154,6 +154,15 @@ recorded outside this repository.
    stays `Copy`. The engine has no per-message extension, so the run's effort is the session's, else the
    folder's, else the builder's explicit value, else the preset's, else the profile's, else nothing.
 
+   *Amended 2026-11-21:* two `Limits` types are in play, and only the second is `Copy`.
+   `adam_engine::Limits` (the engine's) is `Clone + PartialEq`, not `Copy` — it holds the worker id,
+   the retry policy and the session limits — and it holds no model setting; `adam_llm_agent::Limits`,
+   the loop's per-run bounds, **is** `Copy`. The operative requirement is that the engine's `Limits`
+   keeps the run bounds and never a model setting: the profiles and the level reach the engine through
+   `EngineBuilder::models` and `EngineBuilder::reasoning_effort`, never through `Limits`. The builder's
+   level applies to **any root whose file sets none**, folder or not — the file's own
+   `reasoning_effort` wins — and never to a subagent, which has its own file.
+
 9. **The parity table.** The feature is not done until every surface has it through its own mechanism;
    the gaps are the issues linked from `docs/reference/parity.md`, whose reasoning row this ADR updates.
 
@@ -165,6 +174,9 @@ recorded outside this repository.
    | orchestrator and web | read `reasoning/v1` from the live card (never cached); send the level per message and store it per thread; the picker shows the card's levels | gap: #415 |
    | platform | `ModelEndpoint` declares the levels and the wire; `AgentConfig` picks; forms, Platform API, `aapctl` | to build (#284) |
    | another-app | the hexagonal plan's ports (private) | no column; the coordinator tracks it |
+
+   *State 2026-11-21:* the `adam-engine` row's builder seat is built (#317); the table's "to build"
+   is kept as the decision was written.
 
 ## The probe, model by model (2026-11-21)
 
@@ -260,6 +272,17 @@ there is **no global default** (a profile's or preset's `reasoningEffort` is an 
 choice; absent everywhere sends nothing). The `MODEL_EXTRA_BODY` rule is 0054's owner item 8, extended: a
 typed level removes the members the model's wire would duplicate from the profile's `extraBody` (or
 `MODEL_EXTRA_BODY` until ADR 0064 lands) and writes the model's mapping. `temperature` is unchanged.
+
+## Amended 2026-11-22
+
+*Amended 2026-11-22:* **a `thinking_budget` profile may not declare `none`.** The shape has no disabled
+form — `{"thinking": {"type": "enabled", "budget_tokens": n}}` — so a level that means "do not reason"
+would send thinking **enabled**. `reasoningEfforts` containing `none` with
+`reasoningWire: thinking_budget` is a startup error (exit 78), naming the alias and the level: leave
+`none` out or use another wire. The probe table's recommended `[none, low]` sets are for the
+`reasoning_effort` wire. A hand-built `ModelProfile` (or a direct `serde_json::from_str`) bypasses
+`parse_json`, so the client refuses the same pairing at the call (`ModelError::InvalidRequest`: the wire
+has no disabled form), and the invariant holds everywhere. (#327)
 
 ## Alternatives considered
 

@@ -15,7 +15,7 @@ use adam_llm_agent::{
 };
 use adam_model::{
     DynModel, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
-    ToolCall, ToolChoice, ToolSpec, Usage,
+    ReasoningEffort, ToolCall, ToolChoice, ToolSpec, Usage,
 };
 use adam_runtime::{
     CollectingSink, ManualClock, RetryPolicy, RunEvent, RunView, Runtime, child_run_id,
@@ -727,6 +727,75 @@ async fn a_long_run_is_summarised_once_and_keeps_the_prefix_after() {
     let marker = state.messages[0].text();
     assert!(marker.contains("SUMMARY: four results of x"), "{marker}");
     assert!(state.summary.as_deref().unwrap().contains("SUMMARY: four"));
+    // The summary call names the run as every turn does (ADR 0067).
+    assert!(
+        requests.iter().all(|r| r.run == Some(run.to_string())),
+        "{:?}",
+        requests.iter().map(|r| &r.run).collect::<Vec<_>>()
+    );
+}
+
+/// A summary call the endpoint refuses, under a provider that parks, parks the run as a turn does
+/// (ADR 0067): the history is kept as it was, the same summary is asked for again after the timer,
+/// and the answered call clears the wait.
+#[tokio::test]
+async fn a_refused_summary_parks_the_run_and_is_asked_for_again() {
+    let rig = Rig::new(BUDGET);
+    rig.mock
+        .push_tool_calls(vec![big("c0", 1200)])
+        .push_tool_calls(vec![big("c1", 1200)])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_error(ModelError::Refused {
+            status: 503,
+            slug: Some("unavailable".into()),
+            retry_after: None,
+            park: adam_model::Park::OnTimer(Duration::from_secs(30)),
+        })
+        .push_text("SUMMARY: after the park")
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    let (turns, summaries) = split(&requests);
+    assert_eq!(summaries.len(), 2, "the refused summary is asked for again");
+    assert_eq!(
+        summaries[0].messages, summaries[1].messages,
+        "from the history as it was"
+    );
+    assert_eq!(turns.len(), 5);
+    assert_eq!(state.compactions.len(), 1);
+    assert!(state.messages[0].text().contains("SUMMARY: after the park"));
+    assert!(
+        state.model_wait.is_none(),
+        "the answered call cleared the wait"
+    );
+    let waited = rig.sink.events_for(run).into_iter().any(|e| {
+        matches!(&e, RunEvent::Step(step) if step.state == adam_runtime::StepState::Waiting
+            && step.detail.as_deref() == Some("the model gateway is busy"))
+    });
+    assert!(waited, "the summary's step says why it waits");
+}
+
+#[tokio::test]
+async fn the_summary_asks_for_no_reasoning_effort_while_the_turns_do() {
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        b.reasoning_effort(Some(ReasoningEffort::High))
+    });
+    script_one_compaction(&rig.mock, "S");
+    let run = rig.start().await;
+    let (requests, _) = rig.finish(run).await;
+    let (turns, summaries) = split(&requests);
+    assert_eq!(summaries.len(), 1);
+    assert!(
+        turns
+            .iter()
+            .all(|r| r.reasoning_effort == Some(ReasoningEffort::High)),
+        "every turn asks for the agent's default"
+    );
+    assert!(
+        summaries.iter().all(|r| r.reasoning_effort.is_none()),
+        "a summary is not a reasoning choice"
+    );
 }
 
 #[tokio::test]
@@ -754,6 +823,31 @@ async fn the_summary_request_extends_the_previous_request() {
     assert_eq!(summary.tool_choice, ToolChoice::None);
     assert_eq!(summary.max_output_tokens, Some(4096));
     assert_eq!(summary.messages.last().unwrap().text(), COMPACTION_TURN);
+}
+
+#[tokio::test]
+async fn a_cap_below_the_summary_bound_is_asked_on_the_summary() {
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        b.limits(Limits {
+            max_output_tokens: 1000,
+            max_history_tokens: BUDGET,
+            ..Limits::default()
+        })
+    });
+    script_one_compaction(&rig.mock, "S");
+    let run = rig.start().await;
+    let (requests, _) = rig.finish(run).await;
+    let (turns, summaries) = split(&requests);
+    assert_eq!(summaries.len(), 1);
+    assert!(
+        turns.iter().all(|r| r.max_output_tokens == Some(1000)),
+        "every turn asks the run's cap"
+    );
+    assert_eq!(
+        summaries[0].max_output_tokens,
+        Some(1000),
+        "a summary asks no more than the run's own cap"
+    );
 }
 
 #[tokio::test]
@@ -1244,7 +1338,14 @@ async fn with_a_window_the_reported_tokens_trigger_it() {
     let reports = Rig::with(
         MockModel::new().with_context_window("test-model", 26_096),
         0,
-        |b| b,
+        // The 4,096 output cap the window arithmetic above assumes.
+        |b| {
+            b.limits(Limits {
+                max_output_tokens: 4096,
+                max_history_tokens: 0,
+                ..Limits::default()
+            })
+        },
     );
     script(&reports.mock, 2_500, true);
     let run = reports.start().await;
@@ -1258,7 +1359,14 @@ async fn with_a_window_the_reported_tokens_trigger_it() {
     let small = Rig::with(
         MockModel::new().with_context_window("test-model", 26_096),
         0,
-        |b| b,
+        // The 4,096 output cap the window arithmetic above assumes.
+        |b| {
+            b.limits(Limits {
+                max_output_tokens: 4096,
+                max_history_tokens: 0,
+                ..Limits::default()
+            })
+        },
     );
     script(&small.mock, 300, false);
     let run = small.start().await;
@@ -1485,6 +1593,7 @@ async fn a_history_over_the_budget_when_the_closing_turn_comes_is_not_compacted(
         |b| {
             b.limits(Limits {
                 max_tool_calls: 9,
+                max_output_tokens: 4096,
                 max_history_tokens: 0,
                 ..Limits::default()
             })
@@ -1592,8 +1701,15 @@ async fn a_replay_applies_the_cut_the_journal_recorded() {
     let rig = Rig::with(
         MockModel::new().with_context_window("test-model", 25_696),
         0,
-        // The window is measured to the token: no `after_previous` in the request.
-        |b| b.max_parallel(1),
+        // The window is measured to the token: no `after_previous` in the request. The 4,096 output
+        // cap is what leaves the 1,600 and 800 budgets above.
+        |b| {
+            b.max_parallel(1).limits(Limits {
+                max_output_tokens: 4096,
+                max_history_tokens: 0,
+                ..Limits::default()
+            })
+        },
     );
     for n in 0..11 {
         rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 600)]);
@@ -2102,4 +2218,79 @@ async fn a_subagent_compacts_against_its_own_budget() {
     let child = conversation(&family.rt, &child).await;
     assert_eq!(child.compactions.len(), 1, "the child compacted itself");
     assert!(child.messages[0].text().contains("CHILD SUMMARY"));
+}
+
+/// Starts the agent `target` as a child run and waits for it, as `SubagentTool` does.
+struct Spawn(&'static str);
+
+#[async_trait]
+impl Tool for Spawn {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "spawn".into(),
+            description: "starts a child".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let run = ctx.start_child(self.0, "go").await?;
+        Err(ToolError::AwaitRun { run })
+    }
+}
+
+/// A child run that compacts its history: its summary call names the top run, as its turns do
+/// (ADR 0067), never the child's own.
+#[tokio::test]
+async fn a_childs_summary_call_names_the_top_run() {
+    let top_mock = Arc::new(MockModel::new());
+    top_mock
+        .push_tool_calls(vec![call("t1", "spawn", json!({}))])
+        .push_text("top done");
+    let child_mock = Arc::new(MockModel::new());
+    script_one_compaction(&child_mock, "SUMMARY");
+    let top_model: DynModel = top_mock.clone();
+    let child_model: DynModel = child_mock.clone();
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let rt = Runtime::builder(store)
+        .agent(
+            LlmAgent::builder("top", top_model, "test-model")
+                .tool(Spawn("llm"))
+                .build(),
+        )
+        .agent(
+            LlmAgent::builder("llm", child_model, "test-model")
+                .instructions("be brief")
+                .limits(Limits {
+                    max_history_tokens: BUDGET,
+                    ..Limits::default()
+                })
+                .tool(Big)
+                .build(),
+        )
+        .poll_interval(Duration::from_millis(10))
+        .build();
+    let (stop, rx) = oneshot::channel::<()>();
+    let worker = {
+        let rt = rt.clone();
+        tokio::spawn(async move {
+            rt.run_worker(async {
+                let _ = rx.await;
+            })
+            .await
+        })
+    };
+    let top = rt.start("top", user_message("go"), None).await.unwrap();
+    let view = wait_terminal(&rt, top).await;
+    let _ = stop.send(());
+    worker.await.unwrap().unwrap();
+    assert_eq!(view.status, RunStatus::Done, "{view:#?}");
+
+    let requests = child_mock.requests();
+    let (turns, summaries) = split(&requests);
+    assert_eq!(summaries.len(), 1, "the child compacted once");
+    assert!(!turns.is_empty());
+    let child = child_run_id(top, "t1");
+    for request in &requests {
+        assert_eq!(request.run, Some(top.to_string()), "not the child {child}");
+    }
 }

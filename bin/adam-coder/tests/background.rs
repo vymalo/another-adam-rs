@@ -20,7 +20,7 @@ use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::{AGENT_NAME, CoderAgent, CoderSettings, Redactor, ToolEnv};
 use adam_core::{DynStore, MemoryStore, NewRun, RunId, RunStatus};
 use adam_llm_agent::{KeptStore, ReadOutput, Tool, ToolCtx, ToolOutput};
-use adam_model::{DynModel, MockModel, ModelError, ModelRequest};
+use adam_model::{DynModel, MockModel, ModelError, ModelRequest, Park};
 use adam_runtime::{CollectingSink, Inbound, Runtime};
 use common::{FakeEnvironment, Fixture, MODEL_KEY, call};
 use serde_json::{Value, json};
@@ -1002,8 +1002,10 @@ impl Driven {
         let model: DynModel = mock.clone();
         let agent = CoderAgent::new(model, "test-model", env);
         let store: DynStore = Arc::new(MemoryStore::new());
-        let rt = Runtime::builder(store.clone())
-            .agent(agent)
+        // The folder's subagents are registered beside the coder, as `Coder::new` does: a subagent
+        // tool finds the agent it starts a child run of.
+        let rt = agent
+            .register(Runtime::builder(store.clone()))
             .poll_interval(Duration::from_millis(20))
             .build();
         let (stop, rx) = tokio::sync::oneshot::channel::<()>();
@@ -1073,6 +1075,16 @@ fn stopped_why(fx: &Fixture, run: RunId) -> Vec<String> {
         .collect()
 }
 
+/// A refusal whose provider parks the run (ADR 0067 decision 3).
+fn refused(status: u16, slug: Option<&str>, park: Park) -> ModelError {
+    ModelError::Refused {
+        status,
+        slug: slug.map(str::to_owned),
+        retry_after: None,
+        park,
+    }
+}
+
 #[tokio::test]
 async fn a_finished_root_run_stops_its_commands() {
     let fx = Fixture::new().await;
@@ -1128,6 +1140,73 @@ async fn a_park_on_the_person_stops_the_commands() {
         stopped_why(&fx, run),
         ["the run waits for the person's answer"]
     );
+    driven.finish().await;
+}
+
+#[tokio::test]
+async fn a_park_until_woken_stops_the_commands() {
+    let fx = Fixture::new().await;
+    let url = fx.remote_url();
+    let driven = Driven::new(&fx, |m| {
+        m.push_tool_calls(vec![call(
+            "c1",
+            "prepare_workspace",
+            json!({"repo_url": url, "base_branch": "main"}),
+        )]);
+        m.push_tool_calls(vec![call(
+            "c2",
+            "start_command",
+            json!({"command": "sleep 660", "wait": 1}),
+        )]);
+        // The person's usage limit is reached: the run waits until they raise it, which may take
+        // a while, so a server nobody can use is not kept (ADR 0067).
+        m.push_error(refused(402, Some("over_limit"), Park::UntilWoken));
+    });
+    let run = driven.start(&format!("look at {url}")).await;
+    let status = driven.settle(run).await;
+    assert_eq!(status, RunStatus::Parked);
+    assert_eq!(
+        stopped_why(&fx, run),
+        ["the run waits on the model until it is woken"]
+    );
+    assert_eq!(fx.env.commands.running_count(&run.to_string()), 0);
+    driven.finish().await;
+}
+
+/// A child parked until it is woken stops the root's commands too: the root shows the child's wait
+/// and wakes it through itself (ADR 0067 decision 5).
+#[tokio::test]
+async fn a_child_parked_until_woken_stops_the_commands() {
+    let fx = Fixture::new().await;
+    let url = fx.remote_url();
+    let driven = Driven::new(&fx, |m| {
+        m.push_tool_calls(vec![call(
+            "c1",
+            "prepare_workspace",
+            json!({"repo_url": url, "base_branch": "main"}),
+        )]);
+        m.push_tool_calls(vec![call(
+            "c2",
+            "start_command",
+            json!({"command": "sleep 660", "wait": 1}),
+        )]);
+        m.push_tool_calls(vec![call(
+            "c3",
+            "explorer",
+            json!({"message": "look around"}),
+        )]);
+        // The explorer's own call is refused: it waits until the person raises the limit, and the
+        // root waits on it with no timer.
+        m.push_error(refused(402, Some("over_limit"), Park::UntilWoken));
+    });
+    let run = driven.start(&format!("look at {url}")).await;
+    let status = driven.settle(run).await;
+    assert_eq!(status, RunStatus::Parked);
+    assert_eq!(
+        stopped_why(&fx, run),
+        ["the run waits on the model until it is woken"]
+    );
+    assert_eq!(fx.env.commands.running_count(&run.to_string()), 0);
     driven.finish().await;
 }
 

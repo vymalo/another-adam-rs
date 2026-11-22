@@ -15,7 +15,7 @@
 //! `total_size` comes from [`Store::count_runs`](adam_core::Store::count_runs) over those statuses,
 //! so it is **exact** with no `status` filter, for `completed` (one status, one state) and for the
 //! states this backend never produces (`0`), and an **upper bound** for `failed`, `canceled`,
-//! `input-required`, `working` and `submitted`, whose statuses also hold runs in another state.
+//! `input-required`, `auth-required`, `working` and `submitted`, whose statuses also hold runs in another state.
 //! An exact count would read every run. The tasks of a page are always exactly the ones asked for.
 //!
 //! The scan is bounded ([`MAX_SCAN`]): a page that cannot be filled within it is returned short
@@ -43,13 +43,13 @@ fn narrowing(state: Option<&TaskState>) -> (Option<Vec<RunStatus>>, bool) {
         None => (None, true),
         Some(TaskState::Completed) => (Some(vec![RunStatus::Done]), true),
         Some(TaskState::Failed | TaskState::Canceled) => (Some(vec![RunStatus::Failed]), false),
-        Some(TaskState::InputRequired) => (Some(vec![RunStatus::Parked]), false),
+        Some(TaskState::InputRequired | TaskState::AuthRequired) => {
+            (Some(vec![RunStatus::Parked]), false)
+        }
         Some(TaskState::Working) => (Some(vec![RunStatus::Runnable, RunStatus::Parked]), false),
         Some(TaskState::Submitted) => (Some(vec![RunStatus::Runnable]), false),
-        // Never produced by this backend (`rejected`, `auth-required`) or no state at all.
-        Some(TaskState::Rejected | TaskState::AuthRequired | TaskState::Unspecified) => {
-            (Some(Vec::new()), true)
-        }
+        // Never produced by this backend (`rejected`) or no state at all.
+        Some(TaskState::Rejected | TaskState::Unspecified) => (Some(Vec::new()), true),
     }
 }
 
@@ -280,15 +280,14 @@ mod tests {
             narrowing(Some(&TaskState::Working)),
             (Some(vec![RunStatus::Runnable, RunStatus::Parked]), false)
         );
-        assert_eq!(
-            narrowing(Some(&TaskState::InputRequired)),
-            (Some(vec![RunStatus::Parked]), false)
-        );
-        for state in [
-            TaskState::Rejected,
-            TaskState::AuthRequired,
-            TaskState::Unspecified,
-        ] {
+        // `auth-required` is a run parked on the model after a 401 or 403 (ADR 0067).
+        for state in [TaskState::InputRequired, TaskState::AuthRequired] {
+            assert_eq!(
+                narrowing(Some(&state)),
+                (Some(vec![RunStatus::Parked]), false)
+            );
+        }
+        for state in [TaskState::Rejected, TaskState::Unspecified] {
             assert_eq!(
                 narrowing(Some(&state)),
                 (Some(Vec::new()), true),

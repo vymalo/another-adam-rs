@@ -146,6 +146,7 @@ mod fn_tool;
 mod history;
 mod images;
 mod kept;
+mod model_wait;
 mod order;
 pub mod paging;
 mod plan;
@@ -168,14 +169,18 @@ pub use agent::{
     LlmAgentBuilder, LlmStarter, MAX_PARALLEL_LIMIT, MAX_THINKING_CUTS, THINKING_CUT_TURN,
     UNATTENDED, is_unattended, tool_retry_key,
 };
-pub use compaction::{COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize};
+pub use compaction::{
+    COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize,
+    WINDOW_MARGIN_TOKENS, summary_output_tokens,
+};
 pub use conversation::{
-    ACCESS_TIER_CONTEXT_KEY, ArtifactRef, CALLER_CONTEXT_KEY, Conversation, LimitHit, LimitKind,
-    Loaded, Loader, MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MAX_LOADED_NOTE_BYTES,
-    MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS, MAX_REPORTED_ROUNDS, MESSAGE_KIND,
-    OMITTED_MARKER_PREFIX, PER_MESSAGE_CONTEXT_KEYS, PROTECTED_CONTEXT_KEYS, PendingQuestion,
-    PendingRemote, PendingRun, PendingSession, PendingWait, RENDERER_OFFER_CONTEXT_KEY, Repeats,
-    STOPPED_BY_THE_PERSON, loaded_note, user_message,
+    ACCESS_TIER_CONTEXT_KEY, ArtifactRef, CALLER_CONTEXT_KEY, Conversation, LOCALE_CONTEXT_KEY,
+    LimitHit, LimitKind, Loaded, Loader, MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES,
+    MAX_LOADED_NOTE_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS, MAX_REPORTED_ROUNDS,
+    MESSAGE_KIND, OMITTED_MARKER_PREFIX, PER_MESSAGE_CONTEXT_KEYS, PROTECTED_CONTEXT_KEYS,
+    PendingQuestion, PendingRemote, PendingRun, PendingSession, PendingWait,
+    REASONING_EFFORT_CONTEXT_KEY, RENDERER_OFFER_CONTEXT_KEY, Repeats, STOPPED_BY_THE_PERSON,
+    loaded_note, user_message,
 };
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]
@@ -195,6 +200,10 @@ pub use kept::{
     keep_long_cut, kept_header, kept_outputs_conformance, kept_view, output_id, output_id_of,
     page_of, pointer_line, prepare, read_pointer, scrub_open_end, scrub_open_start,
     scrubbed_for_keeping, unkept_view,
+};
+pub use model_wait::{
+    DEFAULT_MODEL_PARK_LIMIT, MAX_MODEL_BACKOFF, MODEL_RESUME_KIND, ModelPark, ModelParking,
+    ModelWait,
 };
 pub use order::{AFTER_PREVIOUS, INSTRUCTION as AFTER_PREVIOUS_INSTRUCTION};
 pub use plan::{MAX_PLAN_ITEMS, Plan, PlanItem, PlanStatus};

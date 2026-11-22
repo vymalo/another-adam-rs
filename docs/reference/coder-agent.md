@@ -315,7 +315,7 @@ stateDiagram-v2
     Starting --> Stopped: it could not be started
     Starting --> Gone: a stale record is settled
     Running --> Exited: the process ends by itself
-    Running --> Stopped: stop_command, the lifetime, the run ended, a park on the person, the environment made again, another worker took the run, a signal nobody asked for in a run pod
+    Running --> Stopped: stop_command, the lifetime, the run ended, a park on the person or on the model until it is woken, the environment made again, another worker took the run, a signal nobody asked for in a run pod
     Running --> Gone: a stale record is settled, or the worker stops
     Exited --> [*]
     Stopped --> [*]
@@ -379,7 +379,7 @@ sequenceDiagram
 | its lifetime, `BACKGROUND_COMMAND_MAX_SECS` (3,600 s) | the process's supervisor |
 | the root run ends (`Done`, `Fail`) | `CoderAgent::step`, at once on the worker that holds the command; a stop request into the record of one another worker holds, which its owner's sweep carries out within one sweep. The end of a **child** run (a subagent) stops nothing |
 | the run is cancelled, or the store does not know it | `Commands::sweep` of the owner, every `BACKGROUND_SWEEP_SECS` (15 s): a cancel never calls the agent |
-| any run of the tree parks on the person (`ask_user`) | `CoderAgent::step`, as for the end of the run: at once here, within one sweep elsewhere. A park on a subagent, a task on another system or a timer stops nothing |
+| any run of the tree parks on the person (`ask_user`) or on the model until it is woken (`over_limit`, [ADR 0067](../decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)) | `CoderAgent::step`, as for the end of the run: at once here, within one sweep elsewhere. A park on a subagent, a task on another system or a timer stops nothing |
 | the run's environment is made again | `use_repository_environment` (with its reason, at once and by request elsewhere), or a run pod made again for a new slot or a reference, which the coder does not see: the command ended by a signal nobody asked for, in a run pod, says its environment was probably made again and to start it again |
 | the janitor releases the run | `Janitor::sweep`, before `Environment::release`; and for a run that is over it settles the records that say a command runs (kills by pid with its start time, and the group) before it removes them |
 | this worker stops | the sweep component, at shutdown: `gone: the worker stopped; start it again if it is still needed`; a registry that is dropped kills the groups it holds |
@@ -685,8 +685,10 @@ With `MODEL_INPUT_MODALITIES=text,image` (off by default, [environment](environm
 
 ## Limits and cancel
 
-`limits:` in `agent/instructions.md`: 200 model turns, 400 tool calls, 8192 output tokens per call, 100,000
-tokens of history. A run that reaches `max_turns` or `max_tool_calls` gets one closing model call in which it
+`limits:` in `agent/instructions.md`: 200 model turns, 400 tool calls, 100,000 tokens of history, and no
+output cap of its own: each call asks its model's profile's cap, else 128,000, clamped to the model's limit and
+window ([ADR 0064](../decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md)). A run
+that reaches `max_turns` or `max_tool_calls` gets one closing model call in which it
 may call no tool, and its answer ends the run with `output.limited: true` ([A2A server](a2a-server.md#a-run-that-ends-at-its-limit)).
 The coder never reads that answer as a question: **it completes only when the run has no repository or
 scratch project at all (a question, research) or already delivered** (a pull request, a shared file). With a

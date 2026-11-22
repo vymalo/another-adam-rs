@@ -114,6 +114,7 @@ mod docs;
 mod extensions;
 #[cfg(feature = "server")]
 mod handler;
+mod locale;
 #[cfg(feature = "test-util")]
 mod memory;
 #[cfg(feature = "server")]
@@ -131,15 +132,18 @@ mod tier;
 
 #[cfg(feature = "server")]
 pub use auth::AuthConfig;
-pub use backend::{BackendError, Caller, DynTaskBackend, TaskBackend, TaskEvent};
+pub use backend::{
+    BackendError, Caller, DynTaskBackend, RESUME_METADATA_KEY, TaskBackend, TaskEvent, is_resume,
+};
 pub use card::{AgentCardConfig, ExtendedCardConfig, ExtensionConfig, SkillConfig};
 pub use extensions::{
     A2UI_BASIC_CATALOG_V1_0, A2UI_EXTENSION_V1_0, A2UI_MEDIA_TYPE, ACCESS_TIER_EXTENSION,
     BUILD_EXTENSION, CHILD_SESSIONS_EXTENSION, COMMANDS_EXTENSION, ChildSessionInfo, CommandInfo,
-    MENTIONS_EXTENSION, REPLACEABLE_ARTIFACT, STEER_EXTENSION, STEPS_EXTENSION,
+    LOCALE_EXTENSION, MENTIONS_EXTENSION, REPLACEABLE_ARTIFACT, STEER_EXTENSION, STEPS_EXTENSION,
     TEXT_STREAM_EXTENSION, TEXT_STREAM_KIND_REASONING, THREAD_TOOLS_EXTENSION,
     UI_CATALOG_EXTENSION, UNKNOWN_REVISION, USAGE_EXTENSION, build_version, revision_of,
 };
+pub use locale::{LOCALE_MEMBER, Locale, MAX_LOCALE_BYTES, NotALocale};
 #[cfg(feature = "test-util")]
 pub use memory::{InMemoryBackend, InMemoryConfig};
 pub use page::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, PageToken, TaskPage, TaskQuery};

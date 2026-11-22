@@ -9,6 +9,14 @@ amended in the same change set (note of 2026-10-05).
 *Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md), not built yet):* the note on
 `MODEL_EXTRA_BODY` and `OPENCODE_MODEL` is moot: the coder runs no OpenCode.
 
+*Amended 2026-11-22 ([adam-rs#322](https://github.com/vymalo/another-adam-rs/issues/322), the provider's opaque members):*
+decisions 1 and 2 are qualified, not reversed. A reasoning value that is not a string is still not reasoning text, but it is
+kept raw in `ProviderTurn.reasoning` **only when the client echoes reasoning**, and sent back under the configured field in
+place of the text, bound to the model alias and endpoint that produced it. Off (the default) nothing of it is stored: the
+client clears it before the history holds the response. The opaque members a provider attaches
+(`extra_content.google.thought_signature`, and siblings) are kept and sent back whatever the echo setting, because they are
+signatures, not reasoning.
+
 ## Context
 
 A model in thinking mode writes its reasoning before its answer, and the owner sees none of it: the model client read only

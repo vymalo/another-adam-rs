@@ -286,6 +286,7 @@ mod tests {
                     ..Default::default()
                 }],
                 reasoning: None,
+                provider: None,
             },
             finish: FinishReason::ToolCalls,
             usage: Default::default(),

@@ -15,7 +15,7 @@ use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
 use adam_core::{ConversationScope, DynSecretSource, DynStore, RunId, RunQuery, RunStatus};
 use adam_llm_agent::{DEFAULT_MAX_PARALLEL, ToolSet};
-use adam_model::DynModel;
+use adam_model::{DynModel, ModelProfiles, ReasoningEffort};
 use adam_runtime::{
     BroadcastSink, FileRef, RetryPolicy, RunView, Runtime, RuntimeBuilder, RuntimeError,
     SCHEDULE_CONVERSATION_PREFIX, SessionLimits,
@@ -149,6 +149,8 @@ pub struct EngineBuilder {
     alias: String,
     secrets: DynSecretSource,
     limits: Limits,
+    profiles: ModelProfiles,
+    reasoning_effort: Option<ReasoningEffort>,
     tools: ToolSet,
 }
 
@@ -159,6 +161,7 @@ impl std::fmt::Debug for EngineBuilder {
             .field("alias", &self.alias)
             .field("secrets", &self.secrets)
             .field("limits", &self.limits)
+            .field("reasoning_effort", &self.reasoning_effort)
             .finish_non_exhaustive()
     }
 }
@@ -187,6 +190,34 @@ impl EngineBuilder {
         self
     }
 
+    /// The deployment's per-model profiles (ADR 0063, ADR 0064): what each model takes as a
+    /// reasoning effort, which preset it starts from, and its output cap. They reach the agent's
+    /// definition as [`BoundDef::model_profiles`](adam_assembly::BoundDef::model_profiles) does:
+    /// the folder's `reasoning_effort` and `model_preset` resolve against them, and the effort and
+    /// the cap of each model call are checked and resolved per model. Default
+    /// [`ModelProfiles::default`]: no model has a profile, so an agent whose file sets an effort or
+    /// a preset is refused at [`start`](Self::start) (fail closed), one that sets neither sends
+    /// none, and every cap is the folder's, the preset's or the profile's, then clamped to the
+    /// model's limit and the window.
+    pub fn models(mut self, profiles: ModelProfiles) -> Self {
+        self.profiles = profiles;
+        self
+    }
+
+    /// The reasoning level the root's model calls ask for when the root's file sets none (ADR 0063
+    /// decision 8): an embedded agent's host gives the level its folder would. It **replaces**
+    /// what [`AgentDef::reasoning_effort`](adam_assembly::AgentDef::reasoning_effort) was given,
+    /// wins over the agent's `model_preset` and the profile, and loses to the root's own
+    /// `reasoning_effort`. It must be one of the root model's levels ([`models`](Self::models))
+    /// **when it applies** — when the root's file sets none; a level the file supplies is validated
+    /// instead, and a file's level the profile does not take is refused at [`start`](Self::start)
+    /// all the same. Default none: nothing is sent unless the folder, the preset or the profile
+    /// sets a level.
+    pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+
     /// Migrate the store, release the leases a fixed [`Limits::worker_id`] holds in it (a restarted
     /// engine claims its old runs at once), build the agent, register its scheduler and make the
     /// store's scheduler runs match the folder's `schedules/` (ADR 0060), and start the worker on
@@ -208,7 +239,10 @@ impl EngineBuilder {
     /// * [`EngineError::Store`] when the store's migration or the release of the worker's leases
     ///   fails, with the store's class;
     /// * [`EngineError::Agent`] when the agent does not bind (an unknown tool, an MCP server, a
-    ///   remote subagent, a secret refused) or the model alias is refused;
+    ///   remote subagent, a secret refused), when the model alias is refused, or when the effort,
+    ///   the `model_preset` or the output cap the agent resolves to is refused: a level its model's
+    ///   profile does not take, a preset the profiles do not declare, a preset above the model's
+    ///   limit (the folder's, the builder's and the profile's values, ADR 0063 and ADR 0064);
     /// * [`EngineError::Schedules`] when the scheduler runs cannot be made to match the folder, with
     ///   the reconcile's class: on a retryable one, call `start` again (what was done is kept).
     pub async fn start(self) -> Result<Engine, EngineError> {
@@ -220,6 +254,8 @@ impl EngineBuilder {
             alias,
             secrets,
             limits,
+            profiles,
+            reasoning_effort,
             tools,
         } = self;
         if limits.lease_ttl.is_zero() {
@@ -243,6 +279,12 @@ impl EngineBuilder {
         let schedules = agent.manifest().schedules.clone();
         let commands = agent.manifest().commands.clone();
         let ui = Ui::embedded();
+        // The host's level for an embedded agent whose file sets none (ADR 0063 decision 8): the
+        // folder's own `reasoning_effort` wins.
+        let agent = match reasoning_effort {
+            Some(effort) => agent.reasoning_effort(Some(effort)),
+            None => agent,
+        };
         let assembly = agent
             .secrets(secrets)
             .session_limits(limits.sessions)
@@ -250,6 +292,7 @@ impl EngineBuilder {
             .map_err(|e| EngineError::Agent(Box::new(e)))?
             .tool_source(ui.screen())
             .max_parallel(limits.max_parallel_tools)
+            .model_profiles(profiles)
             .model(model, alias)
             .map_err(|e| EngineError::Agent(Box::new(e)))?;
         let sessions = assembly.child_sessions().cloned();
@@ -520,6 +563,8 @@ impl Engine {
             alias: alias.into(),
             secrets: default_secrets(),
             limits: Limits::default(),
+            profiles: ModelProfiles::default(),
+            reasoning_effort: None,
             tools: ToolSet::new(),
         }
     }

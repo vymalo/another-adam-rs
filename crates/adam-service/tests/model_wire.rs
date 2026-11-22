@@ -1,10 +1,11 @@
-//! `MODEL_PROMPT_CACHE_KEY`, from the variable to the bytes on the wire: `ModelConfig::parse`, then
-//! `client()`, then a request to a local server that keeps what it was sent.
+//! `MODEL_PROMPT_CACHE_KEY` and `MODEL_ALIASES_FILE`, from the variable to the bytes on the wire:
+//! `ModelConfig::parse`, then `client()`, then a request to a local server that keeps what it was
+//! sent.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::collections::HashMap;
 
-use adam_model::{Message, ModelClient, ModelRequest};
+use adam_model::{Message, ModelClient, ModelRequest, ReasoningEffort};
 use adam_service::ModelConfig;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -50,6 +51,10 @@ async fn serve_once() -> (String, tokio::task::JoinHandle<Value>) {
 }
 
 async fn sent(extra: &[(&str, &str)]) -> Value {
+    sent_with(extra, None).await
+}
+
+async fn sent_with(extra: &[(&str, &str)], level: Option<ReasoningEffort>) -> Value {
     let (url, body) = serve_once().await;
     let mut vars: HashMap<&str, String> = HashMap::from([
         ("MODEL_BASE_URL", url),
@@ -65,6 +70,7 @@ async fn sent(extra: &[(&str, &str)]) -> Value {
     let mut request = ModelRequest::new("m");
     request.messages.push(Message::user_text("hi"));
     request.prompt_cache_key = Some("0123456789abcdef0123456789abcdef".into());
+    request.reasoning_effort = level;
     config.client().unwrap().complete(request).await.unwrap();
     body.await.unwrap()
 }
@@ -87,4 +93,46 @@ async fn an_extra_body_member_wins_over_the_key() {
     ])
     .await;
     assert_eq!(body["prompt_cache_key"], "deployment");
+}
+
+/// The profiles file is the only input: a temp `MODEL_ALIASES_FILE` gives `m` a wire, and the
+/// typed level reaches the body through it — after `MODEL_EXTRA_BODY`, which it wins over. With no
+/// file the level sends nothing, which is the bytes of today.
+#[tokio::test]
+async fn the_profiles_file_puts_the_typed_level_on_the_wire() {
+    let dir = std::env::temp_dir().join(format!("adam-model-wire-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("model-profiles.json");
+    std::fs::write(
+        &file,
+        r#"{"profiles":{"m":{"reasoningEfforts":["low","medium"],"reasoningWire":"reasoning_effort"}}}"#,
+    )
+    .unwrap();
+    let shown = file.display().to_string();
+    let level = Some(ReasoningEffort::Low);
+
+    let body = sent_with(
+        &[
+            ("MODEL_ALIASES_FILE", &shown),
+            ("MODEL_EXTRA_BODY", r#"{"reasoning_effort":"medium"}"#),
+        ],
+        level,
+    )
+    .await;
+    assert_eq!(body["reasoning_effort"], "low", "{body}");
+
+    // No file: the request's level is not a wire, so nothing is sent.
+    let body = sent_with(&[], level).await;
+    assert!(body.get("reasoning_effort").is_none(), "{body}");
+
+    // A model the file does not declare is the same as no file.
+    std::fs::write(
+        &file,
+        r#"{"profiles":{"other":{"reasoningEfforts":["low"],"reasoningWire":"reasoning_effort"}}}"#,
+    )
+    .unwrap();
+    let body = sent_with(&[("MODEL_ALIASES_FILE", &shown)], level).await;
+    assert!(body.get("reasoning_effort").is_none(), "{body}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -54,7 +54,7 @@ removed the container engine this chart never turned on; a deployment that still
 
 | Env | AWS property (default) | Rendered for |
 |---|---|---|
-| `MODEL_API_KEY` | `adam_coder_model_api_key` | roles that run workers (`all`, `worker`) |
+| `MODEL_API_KEY` | `adam_coder_model_api_key` | roles that run workers (`all`, `worker`); its value is empty with `config.modelAuth: device` or `injector`, see [Model authentication](#model-authentication) |
 | `MODEL_BASE_URL` | `model_base_url` (`externalSecrets.properties.modelBaseUrl`) | roles that run workers, only with `config.modelBaseUrlFromSecret: true`, see [The model gateway's URL from the secret](#the-model-gateways-url-from-the-secret) |
 | `GITHUB_TOKEN` | `adam_coder_github_token` | roles that run workers (`all`, `worker`), with `github.auth: token` (the default) |
 | `A2A_BEARER_TOKENS` | `adam_coder_a2a_bearer_tokens` (comma-separated) | roles that serve A2A (`all`, `control-plane`): the front with `topology: split`, not the worker |
@@ -126,6 +126,47 @@ the extra MCP servers' section): `MODEL_API_KEY`, `GITHUB_TOKEN` and `A2A_BEARER
 reaches the pods only when they restart (External Secrets refreshes the Secret every `externalSecrets.refreshInterval`, then
 `kubectl rollout restart statefulset/<release>`): the same as `MODEL_API_KEY`.
 
+## Model authentication
+
+`config.modelAuth` is `MODEL_AUTH`, how the workers authenticate to the model
+([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)). Empty by
+default: nothing is rendered and the binary's own default, `key`, sends `MODEL_API_KEY` from the `ExternalSecret`. Rendered only
+for the roles that run workers; a control plane and the split front render nothing. The value is empty by default, so the
+default render is byte for byte `tests/golden/combined.yaml`.
+
+| Value | What it does |
+|---|---|
+| `""` (default) | Nothing is rendered; `key`, the binary's default |
+| `key` | `MODEL_AUTH=key`: send `MODEL_API_KEY` |
+| `device` | `MODEL_AUTH=device`: sign in to an OAuth 2.0 issuer with the device grant ([ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)). `MODEL_OAUTH_ISSUER`, `MODEL_OAUTH_CLIENT_ID` and `MODEL_OAUTH_SCOPE` have no chart value: put them in `config.extraEnv`. For the roles that run workers, the first two are required, and the chart refuses `device` without them (the worker would exit 78) |
+| `injector` | `MODEL_AUTH=injector`: every call carries `X-Run-Id: <root run id>` and no `Authorization`; an injector in front of the model adds the run's credential ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)). No key at all; for the roles that run workers, the chart refuses any `MODEL_OAUTH_*` in `config.extraEnv` (the binary refuses a non-empty one, exit 78) |
+
+With `injector`, point `config.modelBaseUrl` at the injector (or set `config.modelBaseUrlFromSecret`): the default placeholder
+makes every run park for up to `MODEL_PARK_LIMIT` ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)), and `NOTES.txt` warns.
+
+With `device` or `injector` the binary refuses a non-empty `MODEL_API_KEY` (exit 78). The chart still renders `MODEL_API_KEY`
+from the `ExternalSecret`, so the property must stay named and its **value** in AWS must be an empty string:
+
+```yaml
+config:
+  modelAuth: injector
+externalSecrets:
+  properties:
+    modelApiKey: adam_coder_model_api_key   # its value in AWS must be empty
+```
+
+An empty `MODEL_API_KEY` is what the binary accepts; a non-empty one leaves the worker in `CrashLoopBackOff` (exit 78). The
+chart cannot read the value, so `NOTES.txt` says so. With `device` or `injector` and `externalSecrets.enabled: false` there is
+no `MODEL_API_KEY` at all, which the binary accepts too (under `key` it requires one), and there is nothing to warn about.
+
+**Refusals.** `config.modelAuth` other than the string `key`, `device`, `injector` or empty (a boolean, a number or `null` is
+refused, not read as unset); `config.extraEnv.MODEL_AUTH` beside a set `config.modelAuth` (the chart renders the variable itself);
+`device` without `config.extraEnv.MODEL_OAUTH_ISSUER` and `MODEL_OAUTH_CLIENT_ID`, and `injector` with any `MODEL_OAUTH_*` in
+`config.extraEnv` (both for the roles that run workers; the binary refuses a non-empty one under the injector).
+
+**`MODEL_CA_FILE` is not modelled yet** (ADR 0067, decision 9): the first cut is plain HTTP on the cluster's service network,
+and mounting a CA into an agent's pod is a later slice. Checks: `tests/render-check.sh`.
+
 ## The model's reasoning
 
 A model in thinking mode writes its reasoning before its answer, and the chat shows it as a collapsed "Thinking" block
@@ -155,6 +196,14 @@ Each model call's `usage/v1` report can say the model's window, so a screen show
 |---|---|---|
 | `config.maxParallelToolCalls` | `MAX_PARALLEL_TOOL_CALLS` | The most tool calls of one model turn that run at the same time: a whole number from 1 to 32 (`1` is one at a time). `null` (default) renders nothing and the binary runs 10, **so the render of a deployment that does not set it is unchanged**. An agent file's `limits.max_parallel` may lower it for that agent. The chart refuses a value outside 1 to 32 and one given beside `config.extraEnv.MAX_PARALLEL_TOOL_CALLS`; a control plane renders none |
 | `config.modelContextWindow` | `MODEL_CONTEXT_WINDOW` | The window of `config.model`, in tokens: a whole number from 1 to 9007199254740991, as a number or a string of digits (written in full, never `1e+06`). The chart refuses anything else, which the binary would refuse at startup (exit 78), and a value given beside `config.extraEnv.MODEL_CONTEXT_WINDOW`. A subagent on another alias and OpenCode report no window |
+
+**The output cap follows the window.** The coder's `agent/instructions.md` sets no output cap, so each call asks its
+model profile's cap, else 128,000, clamped to the window less 20,000 tokens and the history the agent keeps (ADR 0064).
+On the dev stack (`MODEL_CONTEXT_WINDOW=131072`, the coder's `max_history_tokens: 100000`) that is
+`131072 − 20000 − 100000 = 11072`, not 128,000. A deployment that wants the full 128,000 for a long-context model
+declares a window of at least **248,000** (128,000 + 20,000 + 100,000); below that the cap is `window − 120,000`
+(a 200,000 window leaves 80,000). It also gives the model a profile with `maxOutputTokensLimit` when the provider
+documents a lower maximum.
 
 ## Model profiles
 

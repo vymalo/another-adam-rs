@@ -5,7 +5,7 @@ the local case, the remote (A2A) case, every failure interleaving with the test 
 and what the design refuses. The picture is in [Architecture](../architecture.md#child-runs); how a
 folder declares subagents is in [Agent files](agent-files.md#subagents-at-run-time).
 
-Code: `crates/adam-runtime` (`start_child`, `child_status`, the notice), `crates/adam-llm-agent`
+Code: `crates/adam-runtime` (`start_child`, `child_status`, `child_look`, `resume_child`, the notices), `crates/adam-llm-agent`
 (`pending_wait`, `AwaitRun`, `AwaitRemote`), `crates/adam-assembly` (`SubagentTool`, `RemoteSubagentTool`).
 
 ## A local child
@@ -18,10 +18,20 @@ Code: `crates/adam-runtime` (`start_child`, `child_status`, the notice), `crates
 * **The message is a hint, the timer is the guarantee.** The runtime sends the message after the child's
   commit, in the worker that made it. It cannot be part of that commit (the store commits one run at a
   time), so a crash or a store error in between loses it, and so does a commit whose acknowledgement is lost
-  (the worker then believes the commit failed and sends nothing). The parent therefore never waits without a
-  timer: `LlmAgentBuilder::wait_poll` (60 s by default) bounds how late it can be, and each wake without the
+  (the worker then believes the commit failed and sends nothing). The parent therefore keeps a timer for
+  every wait on a child, except one parked on the model until it is woken ([below](#a-park-on-the-model)):
+  `LlmAgentBuilder::wait_poll` (60 s by default) bounds how late it can be, and each wake without the
   message is one `load_run`. A failed send is logged at `warn`; a parent that is finished or gone is logged
-  at `debug` and is not an error.
+  at `debug` and is not an error. The exception is safe because such a child cannot finish on its own — but
+  it can still be **cancelled or woken from outside its parent's step** (a cancel by id, a delivery to the
+  child), and then the notice is the only path to the parent: one lost leaves the root `input-required` with
+  a stale reason until a message or a resume arrives, which wakes it, re-reads the child and settles it.
+* **A park is a second notice.** A child that parks sends `adam.child.parked` after its own commit (never from
+  the runtime's own look at a parked child, which parks it again without stepping it), with the child's run id
+  as its id and no payload. The parent reads what the child waits on from its record (`Ctx::child_look`) and
+  keeps it beside its pending child (`PendingRun::model_wait`); a child parked on the model **until woken**
+  makes the parent wait with no timer, as a question does, and a child on a timer keeps the parent's 60 s look.
+  The notice, the copy, the park and the forwarded resume are [below](#a-park-on-the-model).
 * **The message is deduplicated by its id.** `Inbound::id` is the child's run id. The `LlmAgent` matches it
   to the run it waits for, uses it once (the wait is cleared in the same commit that consumes it) and drops
   every other: copies of a message already used, a message for a run it does not wait for, one that does not
@@ -36,9 +46,37 @@ Code: `crates/adam-runtime` (`start_child`, `child_status`, the notice), `crates
   with the stranger's output.
 * **`Conversation::pending_wait`** is what the parent is parked on: a `Question` for the user (this field was
   `pending_question`, and state stored under that name still loads) or a `Run` for a child. A2A reads a run
-  parked on a timer as `working` and only a run parked with no timer as `input-required`, so a parent
-  waiting for a child is `working`.
+  parked on a timer as `working` and only a run parked with no timer as `input-required`, so a parent waiting
+  for a child is `working` — unless the child waits until it is woken, in which case the parent waits with no
+  timer too and reads `input-required` with the child's reason (below).
 
+### A park on the model
+
+A child run's model call can park it ([ADR 0067](../decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+decisions 4 and 5, [the A2A contract](a2a-server.md#a-run-parked-on-the-model)). The parent shows the wait and
+wakes the child through itself:
+
+* **The notice.** The child sends `adam.child.parked` after its own park commit (never from the runtime's look
+  at a parked child, which parks it again without stepping it). Its id is the child's run id and its payload is
+  not read: the parent reads the child's record instead, in one read (`Ctx::child_look`).
+* **The copy.** The parent keeps the wait it read beside its pending child (`PendingRun::model_wait`): the
+  child's own, or the copy the child keeps of its own child, so a grandchild is shown one level at a time. It
+  is in the head, so a front reads the reason at `/pending_wait/model_wait`; the copy is cleared when the
+  parent forwards a resume and rewritten at the next look.
+* **The park.** A child that waits until it is woken makes the parent wait with **no timer**, as the parent
+  waits on a question: such a child cannot finish on its own, so a timer would only re-read "still parked", and a
+  message to the root reaches its inbox anyway. A child on a timer keeps the parent's `wait_poll` look (60 s),
+  which is what a lost notice of the child's end falls back on.
+* **The resume.** A message or a resume to a run that waits on a parked child sends that child one
+  `adam.resume` (`Ctx::resume_child`, which wakes only the caller's children), under an id derived from the
+  waking message's id and the child's run id: a step that runs again writes the same one, and the child drops a
+  copy it has read (`read_ids`), so a replayed forward is no second call. **Only a resume goes down, never text**:
+  a message's words stay at the parent, behind the call the child answers. Each level forwards to its own pending
+  child.
+* **401 and 403 are the child's.** The root's task is `working` with the reason when the child is on a timer,
+  never `auth-required`: the gateway refused the child's call, not the root's.
+* **The coder's commands.** An until-woken park, the run's own or a child's it waits on, ends the coder's
+  background commands as a question does; a timer park keeps them, bounded by `MODEL_PARK_LIMIT`.
 
 ## Failure interleavings
 
@@ -150,6 +188,15 @@ stateDiagram-v2
 
 What the design refuses to do, and why:
 
+* **No timer for a child parked until it is woken.** The parent's task is `input-required`, which needs no wake, and
+  such a child cannot finish on its own: a timer would only re-read "still parked". The price is that a child woken or
+  cancelled from **outside** its parent's step while it waits relies on its notice, and a lost one is not cured by a look;
+  every other park of a child keeps a timer, and so does every park of the parent's own except its own until-woken
+  model park. For the coder, a lost `adam.child.parked` costs one `wait_poll` look (60 s): the root's timer fires, it
+  reads the child's wait, and `commands_end_with` stops the background commands in that same step. The residual is a
+  lost *finish* notice after the root has copied an until-woken wait: the root has no timer then, so it never steps
+  again, the child's end is never read, and the task stays `input-required` with the child's reason until a message,
+  a resume or a cancel.
 * **No parallel fan-out of one-shot subagents yet.** An `LlmAgent` runs the calls of one model turn at the same time
   ([ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)), but a call that can park the run (a
   subagent, a remote agent) runs alone, so three subagent calls in one turn run one after the other; background
@@ -157,12 +204,14 @@ What the design refuses to do, and why:
   side by side. Starting all the
   children first and waiting for all of them needs `pending_wait` to hold several runs.
 * **No asking tools in a subagent.** A child that parks with no timer, for instance because one of its tools asked the
-  user something, waits for an answer nobody is placed to give; the time limit above now ends it at its deadline
-  (30 minutes by default), and a cancel of the parent does not wake it. The subagent binding
+  user something, waits for an answer nobody is placed to give; a park with no timer clears its deadline, so nothing
+  ends it but a cancel (the parent's own cancel cascades to it). The subagent binding
   (`adam-assembly`) closes this at startup instead of at run time: a tool that can ask says so
   (`Tool::asks_user()`), and `bind` refuses a subagent that has one, so the situation cannot arise from an
   agent directory. A tool that returns `NeedsInput` without declaring it still parks its child, and a child
-  can still be cancelled by id: the parent then gets the error result.
+  can still be cancelled by id: the parent then gets the error result. A **model** park until woken is the
+  exception: the parent shows it and wakes the child through a message or a resume ([a park on the
+  model](#a-park-on-the-model)), so it is not stranded, and its deadline is paused while it waits.
 * **The output travels whole.** The child's output is the payload of the message, then the text of the tool
   result in the parent's history. Long histories are shortened by `max_history_tokens` as for any tool output,
   in the stored conversation too (the journal keeps the whole output), and a history that reaches its budget is
@@ -410,7 +459,7 @@ round makes the session read as the round before it, or not at all.
 of an agent behind them. Such a round is **its own parent** (`start_child_continuing(id, id, ..)`): `parent_id` is its own id, so
 the worker's check of the parent (`parent_has_ended`) reads a run that has not ended, no run's end cancels it and no run waits for it
 (the turn-end wait for a working round and `end_sessions` look for rounds started by the run that is ending, `started_by == that run`). `SessionView::started_outside_a_run`
-and `SessionSummary::started_outside_a_run` say it. Its end notice goes to the round itself, which is finished by then, and is dropped (`notify_parent`, "nobody to tell"); a parent
+and `SessionSummary::started_outside_a_run` say it. Its end notice goes to the round itself, which is finished by then, and is dropped (`notify_parent`, "nobody to tell"); its park notice is not sent at all (a run that is its own parent is no child, and one delivered to itself would wake it for ever). A parent
 learns the round by reading the session, as for any round it did not start (slice 3: the parent's next listing reports it, marked as the person's). `closing_round_payload` builds the first message of a
 round that only closes a session, for the tools and for the A2A front.
 

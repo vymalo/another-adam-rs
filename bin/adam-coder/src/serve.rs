@@ -112,6 +112,10 @@ async fn build_agent(
     settings.language_server_idle = worker.language_server_idle;
     settings.language_servers_max = worker.language_servers_max;
     settings.max_parallel_tool_calls = worker.max_parallel_tool_calls;
+    // A refused model call parks the run (ADR 0067); behind the injector, so does a gateway that
+    // cannot be reached.
+    settings.model_parking = adam_llm_agent::ModelParking::new(worker.model.park_limit)
+        .when_unreachable(worker.model.injected_run);
     settings.draft_pull_requests = worker.pr_draft;
     settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);
 
@@ -221,9 +225,16 @@ async fn build_agent(
         .with_environment(env.environment.clone())
         .with_scratch_idle(worker.scratch_idle);
     let (janitor, sweep) = wire_commands(&env, janitor, worker);
-    let agent = CoderAgent::try_from_def(def, model, worker.model.alias.clone(), env, tools)
-        .map_err(|e| *e)
-        .context("assembling the coder agent")?;
+    let agent = CoderAgent::try_from_def_with_profiles(
+        def,
+        model,
+        worker.model.alias.clone(),
+        worker.model.profiles.clone(),
+        env,
+        tools,
+    )
+    .map_err(|e| *e)
+    .context("assembling the coder agent")?;
     Ok((agent, janitor, sweep))
 }
 

@@ -31,7 +31,7 @@ use crate::events::Artifact;
 use crate::head::{Claimed, Head, HeadParts, Stored};
 use crate::notify::{Delivery, Signal};
 use crate::retry::{
-    MAX_CONSECUTIVE_FAILURES, RUNTIME_RETRY_KEY, RetryRecord, StepRetry, class_name,
+    Decision, RUNTIME_RETRY_KEY, RetryRecord, StepRetry, Verdict, class_name, decide,
 };
 use crate::runtime::{Inner, MAX_COMMIT_RETRIES, Runtime, RuntimeError};
 
@@ -619,6 +619,12 @@ async fn transition(
         agent: rec.agent.clone(),
         conversation_id: rec.conversation_id.clone(),
         attempt: env.attempt,
+        retries_left: crate::retry::retries_left(
+            env.attempt,
+            env.retry.as_ref(),
+            &inner.cfg.retry,
+            ErrorClass::Transient,
+        ),
         seq: env.seq,
         inbox: env.inbox.clone(),
         store: inner.store.clone(),
@@ -860,6 +866,11 @@ async fn transition(
             inner
                 .notify_parent(&committed, &next.output, next.error.as_deref())
                 .await;
+            // A stepped park is the parent's business too: it reads what the child waits on and
+            // shows it, and a message or a resume to the parent goes down to the child (ADR 0067
+            // decision 5). A commit a message turned into a wake-up parked nothing, so it says
+            // nothing; `park_again`, the runtime's own look, never comes through here.
+            inner.notify_parent_parked(&committed).await;
             true
         }
         Ok(None) => {
@@ -979,19 +990,18 @@ fn plan(
                     class: ErrorClass,
                     step: Option<&StepRetry>|
      -> Next {
-        let attempt = base.attempt.saturating_add(1);
-        // A run with no record (written before records, or one that does not decode) counts what
-        // it failed so far under the runtime's key, so a run already failing does not start over.
-        let mut record = base
-            .retry
-            .clone()
-            .unwrap_or_else(|| RetryRecord::seeded(base.attempt));
         let (key, policy) = match step {
             Some(step) => (step.key.as_str(), &step.policy),
             None => (RUNTIME_RETRY_KEY, &inner.cfg.retry),
         };
-        // The key's policy as recorded at its first failure, never the code's of today.
-        let (failures, policy) = record.fail(key, policy);
+        // The one decision `Ctx::retries_left` reads too (`retry::decide`).
+        let Decision {
+            record,
+            attempt,
+            failures,
+            policy,
+            verdict,
+        } = decide(base.retry.as_ref(), base.attempt, key, policy, class);
         let of_key = if key == RUNTIME_RETRY_KEY {
             String::new()
         } else {
@@ -1002,50 +1012,51 @@ fn plan(
             retry: Some(record.clone()),
             ..failed(error)
         };
-        if !policy.retries(class) {
-            gave_up(format!(
+        match verdict {
+            Verdict::NotRetried => gave_up(format!(
                 "not retried: the policy{of_key} does not retry {}: {msg}",
                 class_name(class)
-            ))
-        } else if failures >= policy.max_attempts {
-            gave_up(format!("gave up after {failures} attempts{of_key}: {msg}"))
-        } else if attempt >= MAX_CONSECUTIVE_FAILURES {
-            gave_up(format!(
+            )),
+            Verdict::AttemptsSpent => {
+                gave_up(format!("gave up after {failures} attempts{of_key}: {msg}"))
+            }
+            Verdict::Ceiling => gave_up(format!(
                 "gave up after {attempt} consecutive failed transitions: {msg}"
-            ))
-        } else {
-            let delay = match hint {
-                Some(at_least) => policy.delay_with_hint(failures, at_least),
-                None => policy.backoff(failures),
-            };
-            let wake_at = inner.clock.now() + adam_core::time::span_of(delay);
-            Next {
-                status: RunStatus::Runnable,
-                wake_at: Some(wake_at),
-                agent: base_agent.cloned().unwrap_or(Value::Null),
-                output: Value::Null,
-                error: None,
-                attempt,
-                retry: Some(record.clone()),
-                // Abandon this try's journal entries so the retry runs
-                // its steps afresh (see `Ctx::step`).
-                seq,
-                consumed: 0,
-                artifacts: Vec::new(),
-                retry_detail: Some(format!(
-                    "attempt {failures} of {}{of_key} failed, retrying in {delay:?}: {msg}",
-                    policy.max_attempts
-                )),
-                reopen: false,
-                read: Vec::new(),
-                split: None,
-                generation: None,
-                split_refused: false,
-                head_artifacts: None,
-                shadow_blobs: Vec::new(),
-                shadow_files: Vec::new(),
-                deadline: base.deadline,
-                remaining_secs: base.remaining_secs,
+            )),
+            Verdict::Retry => {
+                let delay = match hint {
+                    Some(at_least) => policy.delay_with_hint(failures, at_least),
+                    None => policy.backoff(failures),
+                };
+                let wake_at = inner.clock.now() + adam_core::time::span_of(delay);
+                Next {
+                    status: RunStatus::Runnable,
+                    wake_at: Some(wake_at),
+                    agent: base_agent.cloned().unwrap_or(Value::Null),
+                    output: Value::Null,
+                    error: None,
+                    attempt,
+                    retry: Some(record.clone()),
+                    // Abandon this try's journal entries so the retry runs
+                    // its steps afresh (see `Ctx::step`).
+                    seq,
+                    consumed: 0,
+                    artifacts: Vec::new(),
+                    retry_detail: Some(format!(
+                        "attempt {failures} of {}{of_key} failed, retrying in {delay:?}: {msg}",
+                        policy.max_attempts
+                    )),
+                    reopen: false,
+                    read: Vec::new(),
+                    split: None,
+                    generation: None,
+                    split_refused: false,
+                    head_artifacts: None,
+                    shadow_blobs: Vec::new(),
+                    shadow_files: Vec::new(),
+                    deadline: base.deadline,
+                    remaining_secs: base.remaining_secs,
+                }
             }
         }
     };

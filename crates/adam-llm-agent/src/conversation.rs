@@ -43,6 +43,20 @@ pub(crate) fn parse_root_run(payload: &Value) -> Option<RunId> {
     serde_json::from_value(payload.get(ROOT_RUN_KEY)?.clone()).ok()
 }
 
+/// The key of the payload of a child's first message that names the run its model calls name
+/// ([`Conversation::model_run`], [ADR 0067]): the run its parent's calls name, so the whole tree
+/// under a task, or under a session's round, names one run. Only code in the process writes it
+/// ([`ToolCtx::start_child`](crate::ToolCtx::start_child) and the session tools), like
+/// [`ROOT_RUN_KEY`].
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+pub(crate) const MODEL_RUN_KEY: &str = "model_run";
+
+/// The run named by [`MODEL_RUN_KEY`] in an inbound payload, if it is there and is a run id.
+pub(crate) fn parse_model_run(payload: &Value) -> Option<RunId> {
+    serde_json::from_value(payload.get(MODEL_RUN_KEY)?.clone()).ok()
+}
+
 /// The key of the payload of a child's first message that names the step of the **root** run the
 /// child's work is under: the root's call of a subagent tool (`tool:<call id>`), handed down to a
 /// child's own children. Written by [`ToolCtx::start_child`](crate::ToolCtx::start_child) only, like
@@ -97,21 +111,40 @@ pub const MAX_CONTEXT_BYTES: usize = 256 * 1024;
 /// (`access-tier/v1`): `{"tier": "plan" | "edits" | "auto" | "bypass"}`.
 pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
 
+/// The context key under which a message carries the reasoning effort it activated
+/// (`reasoning/v1`, ADR 0063): `{"effort": "none" | "minimal" | "low" | "medium" | "high" |
+/// "xhigh" | "max"}`. The newest message's value is the run's effort from the next model call;
+/// a continuing task and a child run inherit it. A value that is not that shape is ignored here:
+/// the front refuses it before anything is written.
+pub const REASONING_EFFORT_CONTEXT_KEY: &str = "vymalo.reasoningEffort";
+
 /// The context key under which a message says **who it was sent for** (`thread-tools/v1`): the
 /// thread's addressed agent, `{"caller": "main"}`, or an agent another agent asked, `{"caller":
 /// "ask:<n>", ..}`, read from the claims of the grant's token. A run of an asked agent has no person
 /// behind it, which is a limit on what it may ask for.
 pub const CALLER_CONTEXT_KEY: &str = "vymalo.caller";
 
-/// The context keys that carry a **limit on the agent**: the access tier the person picked, who the
-/// message was sent for, and that nobody answers the run (`adam_runtime::UNATTENDED_CONTEXT_KEY`). A message always sets them, even when the rest of its context is
-/// over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large catalog next to a `plan` tier would
-/// lift the limit), and a child run starts with the ones its parent has
+/// The context key under which a message carries the person's **interface language**
+/// (`locale/v1`, ADR 0069): the BCP 47 tag the client sent with that message, as a string
+/// (`"fr-CM"`). It is the language the agent's own words are written in, unless the person writes
+/// in another one. A message that names none clears it, so a run never answers in the language of
+/// a message that is no longer the newest.
+pub const LOCALE_CONTEXT_KEY: &str = "vymalo.locale";
+
+/// The context keys that must survive a context the run drops: the **limits on the agent** (the
+/// access tier the person picked, who the message was sent for, the reasoning effort it activated,
+/// and that nobody answers the run, `adam_runtime::UNATTENDED_CONTEXT_KEY`) and the **interface
+/// language** the person is speaking ([`LOCALE_CONTEXT_KEY`]). A message always sets them, even
+/// when the rest of its context is over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large
+/// catalog next to a `plan` tier would lift the limit, or the agent would answer in a language it
+/// picked itself), and a child run starts with the ones its parent has
 /// ([`ToolCtx::start_child`](crate::ToolCtx::start_child)). Each value is at most
 /// [`MAX_PROTECTED_VALUE_BYTES`]; a larger one is ignored.
 pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[
     ACCESS_TIER_CONTEXT_KEY,
     CALLER_CONTEXT_KEY,
+    REASONING_EFFORT_CONTEXT_KEY,
+    LOCALE_CONTEXT_KEY,
     adam_runtime::UNATTENDED_CONTEXT_KEY,
 ];
 
@@ -175,6 +208,23 @@ pub struct PendingRun {
     pub tool: String,
     /// The child run.
     pub run: RunId,
+    /// The model wait the child had when this run last looked ([ADR 0067] decision 5), copied
+    /// from the child's head: `Some` while the child is parked on the model. The run waits on an
+    /// until-woken child with **no timer**, as it waits on a question, and keeps its 60 s look at
+    /// a timer park. Cleared when the run forwards a resume to the child, and rewritten at the
+    /// next look. In the head, so a front reads it at `/pending_wait/model_wait`; absent from
+    /// state written before it existed, and not written while `None`.
+    ///
+    /// **Breaking:** a new public field of a struct that is not `#[non_exhaustive]`: a
+    /// `PendingRun` built with a struct literal outside the workspace names it.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[serde(
+        default,
+        deserialize_with = "crate::model_wait::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_wait: Option<crate::ModelWait>,
 }
 
 /// A tool call that waits for a task on another system to finish.
@@ -567,6 +617,27 @@ pub struct Conversation {
     /// only a question; state stored under that name still loads.
     #[serde(default, alias = "pending_question")]
     pub pending_wait: Option<PendingWait>,
+    /// Set while the run is parked on the model ([ADR 0067] decision 4): the model call the endpoint
+    /// refused (or could not reach) is made again when the run wakes, from the conversation as it
+    /// was before it. Beside [`pending_wait`](Self::pending_wait), not one of its kinds: it is tied
+    /// to no tool call. Cleared by the next call that is answered. In the head, so a front reads
+    /// it at `/model_wait`. Not carried to a later task; absent from state written before it
+    /// existed, and not written while `None`.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    ///
+    /// A wait this build cannot read (a kind of park a later build added) reads as `None`, and the
+    /// rest of the state still loads.
+    ///
+    /// **Breaking:** a new public field of a struct that is not `#[non_exhaustive]`: a
+    /// `Conversation` built with a struct literal outside the workspace needs it (or
+    /// `..Default::default()`).
+    #[serde(
+        default,
+        deserialize_with = "crate::model_wait::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_wait: Option<crate::ModelWait>,
     /// User messages that arrived while tool results were still owed. They are
     /// appended once the last owed result is in (a user message between an
     /// assistant tool call and its result would break the protocol).
@@ -664,6 +735,16 @@ pub struct Conversation {
     /// Absent from state written before it existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_run: Option<RunId>,
+    /// The run this run's model calls name ([`ModelRequest::run`](adam_model::ModelRequest::run),
+    /// [ADR 0067]), when the run that started it said one: the run its parent's calls name, put in
+    /// its first message by in-process code only. `None` for a run nobody started that way; its
+    /// calls then name its session's root, else [`root_run`](Self::root_run), else itself. Absent
+    /// from state written before it existed, and not written while it is `None`; a run that
+    /// continues another does not inherit it.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_run: Option<RunId>,
     /// The step of the [`root_run`](Self::root_run) this child run works under: the root's call of a
     /// subagent tool (`tool:<call id>`), put in the child's first message by the tool that started it
     /// and handed down to the child's own children. The report of each of this run's model calls
@@ -693,11 +774,16 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rounds_started: Vec<String>,
     /// The ids (`Inbound::id`, an A2A `messageId`) of the messages the run has read after its first,
-    /// the last [`MAX_READ_IDS`] of them, oldest first: a message that arrives again with one of them
-    /// (the same one sent twice, as the orchestration layer does after a lost lease) is not read a
-    /// second time, whether it is still in the inbox or was read transitions ago. Part of the durable
-    /// state, so another worker and a restart keep it. Absent from state written before it existed,
-    /// and not written while empty; a run that continues another starts with none.
+    /// and of the resumes it has read (the forwarded resume's id, ADR 0067 decision 5), the last
+    /// [`MAX_READ_IDS`] of them, oldest first: a message that arrives again with one of them (the
+    /// same one sent twice, as the orchestration layer does after a lost lease) is not read a second
+    /// time, whether it is still in the inbox or was read transitions ago, and a copy of a resume is
+    /// no wake. The window is shared by both: a burst of resumes can evict an old message id, which
+    /// fails open (the old message, delivered again, is read once more, never lost), and an evicted
+    /// resume id makes the copy a kept resume, so it costs one extra call (and its step). Part of
+    /// the durable state, so another worker and
+    /// a restart keep it. Absent from state written before it existed, and not written while empty;
+    /// a run that continues another starts with none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_ids: Vec<String>,
     /// How big the last model call's prompt was, as the provider reported it, and how many messages
@@ -771,9 +857,9 @@ pub struct Conversation {
 /// history (its call id is there); one whose report was compacted away may be told once more.
 pub const MAX_REPORTED_ROUNDS: usize = 128;
 
-/// How many message ids a run remembers having read ([`Conversation::read_ids`]). A person does not
-/// steer a task a hundred times, and the oldest id is the one given up, so a retry of an old message
-/// is the only thing this can let through.
+/// How many ids a run remembers having read ([`Conversation::read_ids`]: messages and forwarded
+/// resumes together). A person does not steer a task a hundred times, and the oldest id is the one
+/// given up, so a retry of an old message is the only thing this can let through.
 pub const MAX_READ_IDS: usize = 128;
 
 impl Conversation {
@@ -2236,6 +2322,7 @@ mod tests {
                 call_id: "c1".into(),
                 tool: "reviewer".into(),
                 run,
+                model_wait: None,
             }))
         );
         assert_eq!(
@@ -2249,6 +2336,61 @@ mod tests {
         // A null field, as `Conversation::default` serializes, is no wait at all.
         let none: Conversation = serde_json::from_value(json!({"pending_question": null})).unwrap();
         assert_eq!(none.pending_wait, None);
+    }
+
+    /// The copy a parent keeps of a child's model wait (ADR 0067 decision 5) rides beside the
+    /// pending child, and a park kind this build cannot read leaves the wait itself intact.
+    #[test]
+    fn a_childs_model_wait_is_a_copy_that_reads_leniently() {
+        let run = RunId::new();
+        let wait = json!({
+            "reason": "the model gateway's limit is reached",
+            "status": 402,
+            "slug": "over_limit",
+            "park": "until_woken",
+            "parked_since": "2026-11-21T00:00:00Z",
+            // `ModelWait` writes the backoff's step even when it is zero.
+            "parks": 0,
+        });
+        let literal = json!({
+            "pending_wait": {
+                "call_id": "c1",
+                "tool": "reviewer",
+                "run": run.to_string(),
+                "model_wait": wait,
+            }
+        });
+        let c: Conversation = serde_json::from_value(literal.clone()).unwrap();
+        let Some(PendingWait::Run(waiting)) = &c.pending_wait else {
+            panic!("a wait on a child")
+        };
+        assert_eq!(
+            waiting.model_wait.as_ref().map(|w| w.park),
+            Some(crate::ModelPark::UntilWoken)
+        );
+        assert_eq!(
+            serde_json::to_value(&c).unwrap()["pending_wait"],
+            literal["pending_wait"]
+        );
+        // A park kind a later build adds reads as no copy: the wait on the child still loads.
+        let later = json!({
+            "pending_wait": {
+                "call_id": "c1",
+                "tool": "reviewer",
+                "run": run.to_string(),
+                "model_wait": {
+                    "reason": "r",
+                    "park": "a_later_kind",
+                    "parked_since": "2026-11-21T00:00:00Z",
+                },
+            }
+        });
+        let c: Conversation = serde_json::from_value(later).unwrap();
+        let Some(PendingWait::Run(waiting)) = &c.pending_wait else {
+            panic!("a wait on a child")
+        };
+        assert!(waiting.model_wait.is_none());
+        assert_eq!(waiting.call_id, "c1");
     }
 
     #[test]
@@ -2341,6 +2483,7 @@ mod tests {
             content: vec![],
             tool_calls: ids.iter().map(|id| call(id)).collect(),
             reasoning: None,
+            provider: None,
         }
     }
 

@@ -79,6 +79,15 @@ plane starts runs without them (see docs/architecture.md, "Roles").
 {{- end -}}
 
 {{/*
+config.modelAuth (MODEL_AUTH): `key`, `device` or `injector`. The chart normalises it before rendering
+(trim and lower case), so the binary sees one of the three words; the binary folds case but not
+whitespace. Empty means nothing is rendered and the binary's own default, `key`, applies.
+*/}}
+{{- define "coder.modelAuth" -}}
+{{- default "" .Values.config.modelAuth | toString | trim | lower -}}
+{{- end -}}
+
+{{/*
 The value of config.modelBaseUrl in values.yaml, a placeholder that is never a real gateway (the
 `.invalid` TLD is reserved, RFC 6761). It counts as "no URL given": with config.modelBaseUrlFromSecret
 the chart accepts an empty value or this one, and refuses anything else. Keep it equal to values.yaml

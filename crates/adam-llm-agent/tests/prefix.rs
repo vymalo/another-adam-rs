@@ -303,7 +303,7 @@ impl Rig {
         ticker.abort();
         let _ = stop.send(());
         worker.await.expect("worker task");
-        (self.mock.requests(), view)
+        (self.of_run(run, self.mock.requests()).await, view)
     }
 
     /// Lose the commit of the step that makes the model call number `call` (0-based), before it
@@ -368,6 +368,7 @@ impl Rig {
                     ..Default::default()
                 }],
                 reasoning: None,
+                provider: None,
             });
             conversation.messages.push(Message::Tool {
                 call_id: id,
@@ -421,7 +422,31 @@ impl Rig {
         let _ = stop.send(());
         worker.await.expect("worker task");
         assert_eq!(view.status, RunStatus::Done, "{view:#?}");
-        (self.mock.requests(), conversation(&self.rt, &view).await)
+        (
+            self.of_run(run, self.mock.requests()).await,
+            conversation(&self.rt, &view).await,
+        )
+    }
+
+    /// `requests` with the run each names cleared (ADR 0067), so two runs that make the same calls
+    /// compare equal byte for byte, though their ids differ. Every call names a run this rig
+    /// started, which its own store holds (its model may have served an earlier run first), and
+    /// the last one `run`.
+    async fn of_run(&self, run: RunId, requests: Vec<ModelRequest>) -> Vec<ModelRequest> {
+        assert_eq!(
+            requests.last().and_then(|r| r.run.clone()),
+            Some(run.to_string()),
+            "the last call names its run"
+        );
+        let mut cleared = Vec::with_capacity(requests.len());
+        for mut request in requests {
+            let named = request.run.take().expect("every call names a run");
+            let id = RunId(named.parse().expect("a run id"));
+            let view = self.rt.view(id).await.unwrap();
+            assert!(view.is_some(), "{named} is a run of this rig's store");
+            cleared.push(request);
+        }
+        cleared
     }
 }
 

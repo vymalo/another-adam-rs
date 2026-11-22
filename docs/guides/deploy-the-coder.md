@@ -105,7 +105,7 @@ against `EXPECT_REVISION`, which CI sets to the commit.
 | the CloudNativePG operator, **or** an existing Postgres | the run store; `database.enabled: false` + `database.existingSecret.name` for your own |
 | External Secrets (`ExternalSecret`, `external-secrets.io/v1`) | the three secrets below; the defaults point at one owner's `secretStoreRef` and `key`, override them |
 | a StorageClass | the PVC at `/work` (a ReadWriteMany one for `shared` or `affinity` placement) |
-| an OpenAI-compatible model gateway | `config.modelBaseUrl`, with its `/v1` prefix |
+| an OpenAI-compatible model gateway | `config.modelBaseUrl`, with its `/v1` prefix; or an injector in front of it (`config.modelAuth: injector`, ADR 0067) |
 | a GitHub token, or a GitHub App | to push and open pull requests |
 
 ## Secrets
@@ -114,7 +114,7 @@ Nothing secret is in values or in git.
 
 | Variable | AWS property (default) | For |
 |---|---|---|
-| `MODEL_API_KEY` | `adam_coder_model_api_key` | roles that run workers |
+| `MODEL_API_KEY` | `adam_coder_model_api_key` | roles that run workers; its value is empty with `config.modelAuth: device` or `injector` |
 | `GITHUB_TOKEN` | `adam_coder_github_token` | workers, with `github.auth: token` (the default) |
 | `A2A_BEARER_TOKENS` | `adam_coder_a2a_bearer_tokens` (comma-separated) | roles that serve A2A (the front, with `split`) |
 | `MODEL_BASE_URL` | `model_base_url` | only with `config.modelBaseUrlFromSecret: true`, to keep the URL out of git |
@@ -144,6 +144,7 @@ The values you will actually set:
 | Value | Decision |
 |---|---|
 | `config.modelBaseUrl`, `config.model` | the gateway and the model alias (`coder`). `config.opencodeModel` is gone with OpenCode (ADR 0038): left in a values file it changes nothing, and `NOTES.txt` says it is ignored |
+| `config.modelAuth` | how the workers authenticate: empty (default, the binary's `key`), `key`, `device` (signs in with the device grant; on the roles that run workers, `MODEL_OAUTH_ISSUER` and `MODEL_OAUTH_CLIENT_ID` are required in `config.extraEnv`, and the chart refuses `device` without them) or `injector` (ADR 0067: no key, every call names its run with `X-Run-Id`; on the workers, any `MODEL_OAUTH_*` is refused, and the base URL must point at the injector or runs park up to `MODEL_PARK_LIMIT`; set the AWS value of `externalSecrets.properties.modelApiKey` to empty). [The chart](../../deploy/coder/README.md#model-authentication) |
 | `config.publicUrl` | the URL clients reach (goes into the agent card); empty is the in-cluster Service URL |
 | `topology` | `combined` (default) or `split`. Switch with `--set topology=split`; the Service selector moves to the front once it exists, so do it at a quiet moment |
 | `replicaCount`, `workspace.placement` | more than one worker **needs** a placement (`isolated`, `affinity` or `shared`, [why](../reference/workspace-and-environments.md#placement-which-worker-holds-a-runs-files)); the chart refuses `replicaCount > 1` without one. Switching between a per-pod and a shared volume needs `kubectl delete statefulset <release>-coder --cascade=orphan` first |
@@ -156,7 +157,7 @@ The values you will actually set:
 | `a2a.push.allowedUrls`, `a2a.cardSigning.secretName` | optional A2A push notifications (the webhooks they may reach) and a signed agent card (a Secret with the key), both off by default ([the chart](../../deploy/coder/README.md#push-notifications-and-the-cards-signature-a2a)) |
 | `config.modelExtraBody`, `config.modelEchoReasoning` | to make a model emit its reasoning |
 | `config.maxParallelToolCalls` | how many tool calls of one model turn run at the same time, 1 to 32 (`MAX_PARALLEL_TOOL_CALLS`; unset: 10) |
-| `config.modelContextWindow` | the model's context window in tokens (`MODEL_CONTEXT_WINDOW`), so a screen shows how full the context is |
+| `config.modelContextWindow` | the model's context window in tokens (`MODEL_CONTEXT_WINDOW`), so a screen shows how full the context is, and the output cap's window: each call asks no more than the window less 20,000 and the history the agent keeps (ADR 0064; [the chart](../../deploy/coder/README.md#the-models-context-window)) |
 | `config.modelProfiles` | the per-model profiles (ADR 0063, ADR 0064): per model id, the reasoning levels it takes and how they are sent, its output cap, its extra body and its preset, as one JSON file (`MODEL_ALIASES_FILE`). Empty by default; a bad file stops the coder at startup (exit 78). [The chart](../../deploy/coder/README.md#model-profiles) |
 | pictures for the model | no chart key: `config.extraEnv` carries `MODEL_INPUT_MODALITIES=text,image` and the `MODEL_IMAGE_*` limits ([environment](../reference/environment.md)); off by default, and the chart renders what it always did. The coder keeps the pictures on its volume per conversation ([the coder](../reference/coder-agent.md#images)) |
 | `runPods.enabled` | [below](#run-pods). Production runs the commands of a run in run pods; [an example of the values](../../deploy/coder/examples/production.values.yaml) |
