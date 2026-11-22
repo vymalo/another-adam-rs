@@ -81,7 +81,8 @@ before you rely on a detail here.
    * `"when": {"keywords": ["linear", "ticket"]}` on a server: it becomes one **group** of tools, named after
      the server, loaded by one generated tool `load__group__<server>` (its schema is a constant). Its tools are
      **withheld** from a run whose task (the words of the first message) mentions none of the keywords, and the
-     server's instructions are the group's note, said in the load's result, not in the prompt. A successful call
+     server's instructions are the group's note: said in the load's result for an explicit load, and in the first
+     prompt for a group the task's keywords load. A successful call
      makes the group's tools available from the **next** model call, **appended** after the tools the model
      already had (never inserted), at the price of one full re-prefill of the prompt; the run's state records
      the group and the turn the tool list grew. A group with no tool the agent's `tools:` allows has **no

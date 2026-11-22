@@ -887,10 +887,11 @@ tools, named after the server, loaded by one generated tool, `load__group__<serv
   loaded. A group with no tool this agent was given (its `tools:` narrowed the server's list, or the server
   was not reachable and is `optional`) has **no loader**: its existence is not revealed.
 * **What is withheld.** A group's tools are not shown, and a call to one (the model may name a tool it was not
-  shown) is refused with a result that names the tool, the group and its loader. The server's instructions are
-  not in the agent's prompt either: they are the group's note, said in the load's result, so the prompt does
-  not grow during a run. The eager servers' instructions stay in the prompt, after the agent's own text and
-  before its skills.
+  shown) is refused with a result that names the tool, the group, its keywords and its loader. A server the task
+  does not load contributes no instructions to the prompt; the group's note is said in the load's result when the
+  run loads it, so the prompt does not grow during a run. A group the **task** loads keeps the `when` behaviour:
+  its note is in the first request's prompt. The eager servers' instructions stay in the prompt, after the
+  agent's own text and before its skills.
 * **No `paths` in this version.** The coder has no checkout before its first model call
   (`prepare_workspace` is a tool), so a path glob would have nothing to match. `when.paths` is ignored with a
   warning at load; a `when` with no `keywords` is a load error, because the server would never load.

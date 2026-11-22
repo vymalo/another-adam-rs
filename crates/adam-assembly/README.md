@@ -701,8 +701,10 @@ warning. The format is
 [`agent-files.md`](../../docs/reference/agent-files.md#a-server-loaded-only-when-the-task-asks-when).
 
 **A group and its loader.** The group's tools are the agent's own tools, **withheld** until the task holds one
-of the group's keywords or the run calls its loader. The loader's result says what arrived and the group's note
-(the server's instructions section), and the loop makes the run's list from it (`Conversation::loaded`): from the
+of the group's keywords or the run calls its loader. A group the **task** loads keeps the `when` behaviour: its
+tools stand where the agent's list puts them and its note (the server's instructions section) is in the first
+request's prompt. A group the run loads during itself says its note in the loader's result, and the loop makes
+the run's list from it (`Conversation::loaded`): from the
 **next** model call on the group stops being withheld and its tools are **appended after every other tool** of
 the request, in the order the run loaded them ([`ToolSource::appended`](../adam-llm-agent/README.md#context-and-tool-sources)).
 That is the whole point: the request before stays a byte prefix of the one after it, and the loop records the

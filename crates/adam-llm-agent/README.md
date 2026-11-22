@@ -215,7 +215,8 @@ call on ([`adam-assembly`](../adam-assembly/README.md#a-server-loaded-only-when-
 What a source gives the run during itself in **words** goes the same way (`ToolSource::appended_instructions`, default
 none): the loop appends it after every source's `instructions`, so a source's later words follow the agents a person
 mentioned, the access tier and references rather than being inserted before them. A group's note does not use it:
-the load's **result** says it, so the prompt does not grow during a run.
+an explicit load's **result** says it, so the prompt does not grow during a run, while a group the task loads says
+its note in the first prompt (the `when` behaviour).
 
 A source can also **refine** the description of the tools the model is about to be shown (`ToolSource::refine`): after
 every source has listed, each gets the turn's tools, the agent's own first, and may rewrite a `description` from what it
