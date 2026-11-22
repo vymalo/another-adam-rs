@@ -73,7 +73,9 @@
 //! * **Reasoning** (*sources and dates in the crate README*): `delta.reasoning_content` (DeepSeek, GLM,
 //!   LiteLLM) and `delta.reasoning` (OpenRouter, Ollama, current vLLM) of a stream arrive as
 //!   [`ModelDelta::Reasoning`], and `message.reasoning_content` / `message.reasoning` of a
-//!   completion as [`ModelResponse::reasoning`]; a value that is not a string is ignored. It is
+//!   completion as [`ModelResponse::reasoning`]; a value that is not a string is not reasoning
+//!   text (it is kept raw in the carrier, [`Message::Assistant`]'s `provider`, and sent back only
+//!   when the client echoes reasoning). It is
 //!   never the answer's text and, unless [`with_echo_reasoning`](OpenAiCompatible::with_echo_reasoning)
 //!   is set, never in the history and never sent back.
 //! * **[`with_prompt_cache_key`](OpenAiCompatible::with_prompt_cache_key)** (off by default) sends
@@ -125,6 +127,17 @@ pub fn endpoint_for_logs(url: &str) -> String {
         },
         Err(_) => "<set>".to_owned(),
     }
+}
+
+/// The stable id of the endpoint at `base`: `openai:` and the first 16 hexadecimal digits of the
+/// SHA-256 of the normalised base URL. A provider's opaque members go back only to the endpoint
+/// (and model alias) that produced them, and this is how a client recognises its own. It is not a
+/// secret, but a fingerprint of the base URL: it confirms a guess.
+fn endpoint_id(base: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(base.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("openai:{}", &hex[..16])
 }
 
 /// Configuration of an [`OpenAiCompatible`] client.
@@ -280,6 +293,10 @@ pub struct OpenAiCompatible {
     /// build it again.
     default_headers: HeaderMap,
     url: String,
+    /// The stable id of the endpoint, from its base URL: what a provider's opaque members are
+    /// bound to, beside the model alias. Not a secret, but a fingerprint of the base URL: it
+    /// confirms a guess.
+    endpoint: String,
     credentials: DynCredentials,
     timeout: Duration,
     max_tokens_field: MaxTokensField,
@@ -363,6 +380,7 @@ impl OpenAiCompatible {
             http,
             default_headers: headers,
             url: format!("{base}/chat/completions"),
+            endpoint: endpoint_id(base),
             credentials: Arc::new(StaticBearer::new(config.api_key.clone())),
             timeout: config.timeout,
             max_tokens_field: MaxTokensField::default(),
@@ -453,16 +471,51 @@ impl OpenAiCompatible {
             extra_body: self.extra_body.as_ref(),
             echo_reasoning: self.echo_reasoning,
             prompt_cache_key: self.prompt_cache_key,
+            endpoint: &self.endpoint,
         }
     }
 
     /// `response` as this client reports it: the reasoning is kept in the message only when the
-    /// client echoes it.
-    fn echoed(&self, mut response: ModelResponse) -> ModelResponse {
-        if self.echo_reasoning.is_some()
-            && let Message::Assistant { reasoning, .. } = &mut response.message
+    /// client echoes it (a raw block is cleared otherwise, ADR 0020), and the provider's opaque
+    /// members are stamped with the model alias and endpoint that produced them (a parse never
+    /// stamps: it does not know either).
+    fn echoed(&self, mut response: ModelResponse, model: &str) -> ModelResponse {
+        let echo = self.echo_reasoning.is_some();
+        if let Message::Assistant {
+            reasoning,
+            provider,
+            tool_calls,
+            ..
+        } = &mut response.message
         {
-            reasoning.clone_from(&response.reasoning);
+            if echo {
+                reasoning.clone_from(&response.reasoning);
+            } else if let Some(turn) = provider.as_mut() {
+                // A structured reasoning block is only meaningful when it is sent back; off (the
+                // default) nothing of it is stored (ADR 0020). The opaque members stay: they are
+                // signatures, not reasoning.
+                turn.reasoning = None;
+            }
+            // A turn with nothing left is no carrier: a response that only had a block, with echo
+            // off, is the bytes it always was.
+            let calls_opaque = tool_calls.iter().any(|call| {
+                call.opaque
+                    .as_ref()
+                    .is_some_and(|members| !members.is_empty())
+            });
+            if provider.as_ref().is_some_and(|turn| {
+                turn.members.is_empty() && turn.reasoning.is_none() && !calls_opaque
+            }) {
+                *provider = None;
+            }
+        }
+        if let Message::Assistant {
+            provider: Some(provider),
+            ..
+        } = &mut response.message
+        {
+            provider.model = model.to_owned();
+            self.endpoint.clone_into(&mut provider.endpoint);
         }
         response
     }
@@ -855,7 +908,7 @@ impl ModelClient for OpenAiCompatible {
             .send(body, false, &req.model, req.run.as_deref())
             .await?;
         let bytes = read_body(response).await?;
-        let parsed = wire::parse_completion(&bytes).map(|r| self.echoed(r));
+        let parsed = wire::parse_completion(&bytes).map(|r| self.echoed(r, &req.model));
         match &parsed {
             Ok(r) => tracing::debug!(
                 finish = ?r.finish,
@@ -878,10 +931,13 @@ impl ModelClient for OpenAiCompatible {
             .send(body, true, &req.model, req.run.as_deref())
             .await?;
         let this = self.clone();
+        let model = req.model.clone();
         Ok(sse::deltas(response.bytes_stream(), self.timeout)
             .map(move |item| {
                 item.map(|delta| match delta {
-                    ModelDelta::Finished(response) => ModelDelta::Finished(this.echoed(response)),
+                    ModelDelta::Finished(response) => {
+                        ModelDelta::Finished(this.echoed(response, &model))
+                    }
                     other => other,
                 })
             })
@@ -968,6 +1024,31 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn the_endpoint_id_is_stable_short_and_never_the_url() {
+        let first = endpoint_id("https://gw.example/v1");
+        assert_eq!(first, endpoint_id("https://gw.example/v1"), "stable");
+        assert!(first.starts_with("openai:"), "{first}");
+        assert_eq!(first.len(), "openai:".len() + 16, "{first}");
+        assert!(
+            first["openai:".len()..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
+        assert!(!first.contains("gw.example"), "{first}");
+        assert_ne!(first, endpoint_id("https://gw.example/v2"), "another path");
+        assert_ne!(
+            first,
+            endpoint_id("https://other.example/v1"),
+            "another host"
+        );
+        // The client trims a trailing slash before it hashes, so the two spellings are one
+        // endpoint.
+        let plain = OpenAiCompatible::new(config("https://x.example/v1")).unwrap();
+        let slashed = OpenAiCompatible::new(config("https://x.example/v1/")).unwrap();
+        assert_eq!(plain.endpoint, slashed.endpoint);
     }
 
     #[test]

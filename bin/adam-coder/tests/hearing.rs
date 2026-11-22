@@ -599,6 +599,7 @@ async fn a_yes_to_a_question_asked_beside_the_tool_grants_nothing() {
                     )],
                     tool_calls: vec![ask],
                     reasoning: None,
+                    provider: None,
                 };
                 m.push_response(response);
                 m.push_text("Done.");

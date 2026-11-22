@@ -9,9 +9,10 @@ use adam_llm_agent::{
     ArtifactRef, Conversation, LlmStarter, PendingQuestion, PendingWait, Plan, PlanItem,
     PlanStatus, TRUNCATION_MARKER_PREFIX,
 };
-use adam_model::{Message, ToolCall, Usage};
+use adam_model::{Message, ProviderTurn, ToolCall, Usage};
 use adam_runtime::AgentStarter;
 use serde_json::json;
+use std::collections::BTreeMap;
 
 /// `join(split(s))`, and the invariant that it re-encodes to `s` byte for byte.
 fn assert_round_trips(state: &Conversation) {
@@ -102,6 +103,7 @@ fn a_pending_wait_round_trips_in_the_head() {
         name: "ask_user".into(),
         arguments: json!({"question": "Which repository?"}),
         invalid_arguments: None,
+        opaque: None,
     }];
     state.ordered_calls = vec!["call-7".into()];
     let (head, rows) = state.split();
@@ -242,6 +244,56 @@ fn the_starter_delegates_to_the_conversation() {
         Conversation::join(head, rows).unwrap(),
         state,
         "the starter's join is the conversation's"
+    );
+}
+
+/// The carrier is part of the conversation's JSON: a resume (`split` then `join`) keeps the
+/// provider's opaque members and a call's own, byte for byte.
+#[test]
+fn a_provider_turn_and_a_calls_opaque_members_survive_a_resume() {
+    let mut state = Conversation::new("hello");
+    let mut provider = ProviderTurn::new("gw-model", "openai:0123456789abcdef");
+    provider.members = BTreeMap::from([(
+        "extra_content".into(),
+        json!({"google": {"thought_signature": "msg-sig"}}),
+    )]);
+    provider.reasoning = Some(json!({"blocks": [{"text": "thought"}]}));
+    let call = ToolCall {
+        id: "c1".into(),
+        name: "weather".into(),
+        arguments: json!({"city": "Paris"}),
+        opaque: Some(BTreeMap::from([(
+            "extra_content".into(),
+            json!({"google": {"thought_signature": "call-sig"}}),
+        )])),
+        ..Default::default()
+    };
+    state.messages.push(Message::Assistant {
+        content: vec![],
+        tool_calls: vec![call],
+        reasoning: None,
+        provider: Some(provider),
+    });
+
+    assert_round_trips(&state);
+
+    let (head, rows) = state.split();
+    assert_eq!(
+        rows[1]["provider"]["members"]["extra_content"]["google"]["thought_signature"],
+        "msg-sig"
+    );
+    assert_eq!(
+        rows[1]["tool_calls"][0]["opaque"]["extra_content"]["google"]["thought_signature"],
+        "call-sig"
+    );
+    assert_eq!(
+        rows[1]["provider"]["reasoning"],
+        json!({"blocks": [{"text": "thought"}]})
+    );
+    let joined = Conversation::join(head, rows).unwrap();
+    assert_eq!(
+        joined.messages[1].tool_calls()[0].opaque.as_ref().unwrap()["extra_content"]["google"]["thought_signature"],
+        "call-sig"
     );
 }
 

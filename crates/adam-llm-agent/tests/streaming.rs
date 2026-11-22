@@ -323,6 +323,7 @@ async fn the_words_before_a_tool_call_are_a_stream_of_their_own_and_the_answer_a
             content: vec![ContentPart::text("Let me look.")],
             tool_calls: vec![call("c1", "look")],
             reasoning: None,
+            provider: None,
         },
         finish: FinishReason::ToolCalls,
         usage: Usage::default(),

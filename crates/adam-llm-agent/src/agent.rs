@@ -876,6 +876,7 @@ fn report_messages(reports: &[RoundReport], paged: bool) -> Vec<Message> {
         content: Vec::new(),
         tool_calls: calls.clone(),
         reasoning: None,
+        provider: None,
     }];
     messages.extend(reports.iter().zip(&calls).map(|(r, call)| Message::Tool {
         call_id: call.id.clone(),
@@ -2232,6 +2233,21 @@ impl LlmAgent {
         })
     }
 
+    /// Whether a cut turn has nothing the model would see: no reasoning text, no raw reasoning
+    /// block and no opaque members. A message with a carrier is not empty on the wire, so it stays.
+    fn cut_turn_has_nothing_to_send(message: &Message) -> bool {
+        match message {
+            Message::Assistant {
+                reasoning: None,
+                provider,
+                ..
+            } => provider
+                .as_ref()
+                .is_none_or(|turn| turn.reasoning.is_none() && turn.members.is_empty()),
+            _ => false,
+        }
+    }
+
     /// One journaled model call, then the assistant message into the state.
     #[tracing::instrument(skip_all, fields(run = %ctx.run_id(), turn = state.turns))]
     async fn model_turn(
@@ -2700,16 +2716,14 @@ impl LlmAgent {
                         early,
                     ));
                 }
-                // A cut turn with nothing the model will see (no reasoning echoed back) would be
-                // sent as an empty assistant message, which some servers refuse: it leaves the
-                // history.
-                if matches!(
-                    state.messages.last(),
-                    Some(Message::Assistant {
-                        reasoning: None,
-                        ..
-                    })
-                ) {
+                // A cut turn with nothing the model will see (no reasoning echoed back, no raw
+                // block, no carrier) would be sent as an empty assistant message, which some
+                // servers refuse: it leaves the history.
+                if state
+                    .messages
+                    .last()
+                    .is_some_and(Self::cut_turn_has_nothing_to_send)
+                {
                     state.messages.pop();
                 }
                 // The next turn is the closing turn, which has its own instruction.
@@ -5317,6 +5331,10 @@ impl ToolResult {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a turn's message is the value; boxing it would allocate for every tool answer"
+)]
 enum ToolResult {
     Answered {
         message: Message,
@@ -6094,6 +6112,55 @@ mod thinking_cut_tests {
         agent.absorb_inbox(&mut state, vec![junk], &HashMap::new());
         assert_eq!(state.thinking_cuts, 2);
     }
+
+    #[test]
+    fn a_cut_turn_with_a_reasoning_block_or_a_carrier_stays() {
+        let mut block = Message::Assistant {
+            content: vec![],
+            tool_calls: vec![],
+            reasoning: None,
+            provider: Some(adam_model::ProviderTurn::new("m", "e")),
+        };
+        let Message::Assistant {
+            provider: Some(turn),
+            ..
+        } = &mut block
+        else {
+            unreachable!("a carrier")
+        };
+        turn.reasoning = Some(json!({"blocks": []}));
+        assert!(
+            !LlmAgent::cut_turn_has_nothing_to_send(&block),
+            "a block-only turn must not be popped before it is echoed"
+        );
+
+        let Message::Assistant {
+            provider: Some(turn),
+            ..
+        } = &mut block
+        else {
+            unreachable!("a carrier")
+        };
+        turn.reasoning = None;
+        turn.members
+            .insert("extra_content".into(), json!({"sig": 1}));
+        assert!(!LlmAgent::cut_turn_has_nothing_to_send(&block));
+
+        let empty = Message::Assistant {
+            content: vec![],
+            tool_calls: vec![],
+            reasoning: None,
+            provider: None,
+        };
+        assert!(LlmAgent::cut_turn_has_nothing_to_send(&empty));
+        let echoed = Message::Assistant {
+            content: vec![],
+            tool_calls: vec![],
+            reasoning: Some("r".into()),
+            provider: None,
+        };
+        assert!(!LlmAgent::cut_turn_has_nothing_to_send(&echoed));
+    }
 }
 
 #[cfg(test)]
@@ -6466,6 +6533,7 @@ mod compaction_gate_tests {
                     ..Default::default()
                 }],
                 reasoning: None,
+                provider: None,
             });
             state
                 .messages

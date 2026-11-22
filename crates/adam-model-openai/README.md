@@ -89,7 +89,48 @@ Behaviour (details in the crate docs, `src/lib.rs`):
 * the images of a **run of tool messages** follow it in one user message, `Images from tool results: c1 shot.png; c2 b.png`, then the parts: the tool messages stay text (a tool-role message that holds an image is *unverified*), and each body's `messages` starts with the one before it;
 * an image with no bytes in `ModelRequest::image_data` is its stand-in line. A chat template that insists on string content rejects the array: the setting is off by default for that reason.
 
-## Reasoning
+## A provider's opaque members
+
+Gemini 3, behind an OpenAI-compatible endpoint, attaches an opaque
+`extra_content.google.thought_signature` to the assistant message and to each tool call it returns,
+and refuses the next request with a 400 when a tool call comes back without it (adam-rs#322: 60 of
+60 bench runs failed on their second call). This client keeps **every** member it does not model,
+on the message and on each call, and sends it back value for value:
+
+| Direction | What |
+|---|---|
+| parse, completion | the unknown members of `choices[0].message` and of each `tool_calls[i]` (`extra_content`, and siblings) go into `Message::Assistant.provider.members` and `ToolCall.opaque`. The modelled members are not opaque: `role`, `content`, `tool_calls`, `reasoning_content`, `reasoning`, and the output-only `refusal`, `audio`, `function_call`, `annotations` on the message; `id`, `type`, `function` on the call |
+| parse, stream | a delta's own unknown members go to the message (the same filter); its unknown members on a tool call are accumulated per call (last value wins per key) and reach the finished call. A final chunk shaped as a whole `message` instead of a `delta` contributes its unknown members too — no provider we test sends one, so that path is defensive |
+| build | the members go out on the assistant message and on each call **only when the turn is bound to the request's model alias and endpoint**; the modelled keys win on a collision |
+| provenance | a parse does not know either, so it leaves the turn unstamped; the client stamps `req.model` and its endpoint id in `complete` and in the streamed `Finished` |
+
+The **output-only** members (`refusal`, `audio`, `function_call`, `annotations`) are consumed and
+never stored: they are response-only, a provider never needs them back, and keeping one would change
+every request that carries it. A signature is not one of them. `tool_call_id` is not filtered — it
+cannot collide with an assistant message's fields and replaying it is harmless — and both modelled
+sets name the same keys.
+
+The endpoint id is `openai:` and the first 16 hexadecimal digits of the SHA-256 of the client's
+normalised `base_url`, computed once when the client is built. It is not a secret, but a fingerprint
+of the base URL: it confirms a guess. **It cannot separate two clients on one base URL** — two
+tenants behind one gateway URL, told apart by an `extra_headers` value or a credential, are one
+endpoint to this carrier, and a signature from one would be sent to the other. A deployment that
+needs that separation must give each tenant a distinct base URL (a distinct path or host); a
+deployment-set endpoint id is a follow-up. A run that changes model or endpoint drops the old turn's
+members: they never reach another model. A message with no carrier is the bytes it always was.
+
+A **reasoning block** (a `reasoning` or `reasoning_content` value that is an object or array, not
+a string) is carried as `provider.reasoning`, raw. When the client is set to echo reasoning, that
+value goes back under the configured field **in place of** the text; when it is not, nothing of it
+is sent and the client clears it before the history holds the response (ADR 0020).
+`ModelResponse.reasoning` stays the text-only view.
+
+**Limits.** The block is a raw JSON value, not a typed turn with its own members: a provider whose
+block needs a shape of its own needs a new type, not this carrier. A member **inside** a tool call's
+`function` object (rather than beside it) is not carried: `function` is modelled (`name`,
+`arguments`). A `message`-shaped chunk contributes only its unknown members and reasoning block: its
+text and calls are not read (the stream's deltas carry them).
+
 ## Reasoning
 
 A model in thinking mode sends its reasoning beside its answer, and this client reads it:
@@ -99,9 +140,12 @@ A model in thinking mode sends its reasoning beside its answer, and this client 
 | stream, `choices[0].delta` | `reasoning_content` or `reasoning` (a string; the first that is not empty) | `ModelDelta::Reasoning`, then `ModelResponse.reasoning` |
 | completion, `choices[0].message` | `reasoning_content` or `reasoning` | `ModelResponse.reasoning` |
 
-A value that is not a string (a structured `reasoning` some gateways add) is ignored, and the chunk it came in still counts for its content
-and calls. The reasoning is **never** the answer's text (`Message::text()`), and **by default never in the history and never sent back**:
-`ModelResponse.reasoning` is for people to read. `with_extra_body(map)` merges a JSON object into every request body at its top level
+A value that is not a string (a structured `reasoning` some gateways add) is not reasoning text; when the client echoes
+reasoning it is kept raw in the carrier (*A provider's opaque members*) and sent back under the configured field. Off (the
+default) nothing of it is stored. The chunk it came in still counts for its content and calls. The reasoning is **never** the
+answer's text (`Message::text()`); the **text view is never in the history and never sent back** by default. A structured
+block lives only in the carrier, only when the client echoes reasoning (then it goes back bound to the model and endpoint);
+off, it is cleared before the response reaches the history. `ModelResponse.reasoning` is for people to read. `with_extra_body(map)` merges a JSON object into every request body at its top level
 (it wins over what the client wrote; `model`, `messages`, `tools`, `tool_choice` and `stream` are refused with
 `OpenAiConfigError::ReservedBodyKey`), which is how a deployment turns reasoning on where the model needs a flag
 (`MODEL_EXTRA_BODY` of `adam-service`).
@@ -217,6 +261,16 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
 * `tests/http.rs`: the client against a `wiremock` server (requests, streaming,
   tool calls, error mapping and classes, timeouts, source chains, reasoning in a stream and a completion, the extra body on every request, reasoning sent back only when echoed). Always
   runs, no network.
+* The carrier cases by name: `tests/http.rs`'s `a_tool_calls_extra_content_survives_the_next_request` (the
+  Gemini repro), `a_message_level_extra_content_survives_the_next_request`,
+  `a_delta_message_level_extra_content_survives_the_next_request`, `a_message_shaped_chunk_keeps_its_opaque_members`,
+  `an_output_only_delta_member_is_not_carried`,
+  `streamed_tool_call_extra_content_survives_the_next_request`,
+  `a_reasoning_block_is_echoed_raw_by_a_client_that_echoes_reasoning`,
+  `a_reasoning_block_alone_is_not_stored_without_echo`, `a_reasoning_block_is_cleared_but_members_stay_without_echo`,
+  `opaque_members_are_dropped_when_the_run_changes_model`, `opaque_members_are_dropped_at_another_endpoint` and
+  `the_client_stamps_the_requests_own_model_alias`; `src/wire.rs`'s `a_bound_turns_members_go_back_and_the_modelled_keys_win`,
+  `an_unbound_turn_sends_none_of_its_members` and `a_response_without_opaque_members_parses_as_before`.
 * Unit tests: `src/errors.rs` (`status_mapping`, `a_problem_type_is_read_by_its_last_segment`,
   `a_problem_document_is_told_by_its_content_type`, `retry_after_seconds_and_date`), `src/lib.rs` also
   `a_rustls_error_is_found_however_it_is_wrapped`, `src/lib.rs`
