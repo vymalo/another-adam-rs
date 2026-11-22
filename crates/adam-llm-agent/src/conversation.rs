@@ -662,7 +662,8 @@ pub struct Conversation {
     /// time, whether it is still in the inbox or was read transitions ago, and a copy of a resume is
     /// no wake. The window is shared by both: a burst of resumes can evict an old message id, which
     /// fails open (the old message, delivered again, is read once more, never lost), and an evicted
-    /// resume id costs one extra step, not a call. Part of the durable state, so another worker and
+    /// resume id makes the copy a kept resume, so it costs one extra call (and its step). Part of
+    /// the durable state, so another worker and
     /// a restart keep it. Absent from state written before it existed, and not written while empty;
     /// a run that continues another starts with none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

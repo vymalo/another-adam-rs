@@ -409,10 +409,9 @@ middle of a call. What is new is the end of the run:
   still in the inbox or was read transitions ago: the orchestration layer repeats a steer after a lost lease. The ids of
   the resumes the run read are kept in the same window (the forwarded resume's id, ADR 0067 decision 5): a copy of one
   is no wake. The window is shared, so a burst of resumes can evict an old message id; that fails open — the old message,
-  delivered again, is read once more (one extra turn), never lost — and an evicted resume id costs one extra step, not a
-  call. An empty id is
-  never remembered. Part of the durable state (serde default, not written while empty); a run that continues another starts
-  with none.
+  delivered again, is read once more (one extra turn), never lost — and an evicted resume id makes the copy a kept
+  resume, so it costs one extra call (and its step). An empty id is never remembered. Part of the durable state (serde
+  default, not written while empty); a run that continues another starts with none.
 
 ## Cancel
 

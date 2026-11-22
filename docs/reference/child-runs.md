@@ -191,11 +191,12 @@ What the design refuses to do, and why:
 * **No timer for a child parked until it is woken.** The parent's task is `input-required`, which needs no wake, and
   such a child cannot finish on its own: a timer would only re-read "still parked". The price is that a child woken or
   cancelled from **outside** its parent's step while it waits relies on its notice, and a lost one is not cured by a look;
-  every other park of a child, and every park of the parent's own, keeps a timer. For the coder, a lost
-  `adam.child.parked` costs one `wait_poll` look (60 s): the root's timer fires, it reads the child's wait, and
-  `commands_end_with` stops the background commands then. The residual is a lost *finish* notice after the root has
-  copied an until-woken wait: the root has no timer then, so it never steps, and the commands run to
-  `BACKGROUND_COMMAND_MAX_SECS`.
+  every other park of a child keeps a timer, and so does every park of the parent's own except its own until-woken
+  model park. For the coder, a lost `adam.child.parked` costs one `wait_poll` look (60 s): the root's timer fires, it
+  reads the child's wait, and `commands_end_with` stops the background commands in that same step. The residual is a
+  lost *finish* notice after the root has copied an until-woken wait: the root has no timer then, so it never steps
+  again, the child's end is never read, and the task stays `input-required` with the child's reason until a message,
+  a resume or a cancel.
 * **No parallel fan-out of one-shot subagents yet.** An `LlmAgent` runs the calls of one model turn at the same time
   ([ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)), but a call that can park the run (a
   subagent, a remote agent) runs alone, so three subagent calls in one turn run one after the other; background
