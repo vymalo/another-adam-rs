@@ -46,9 +46,6 @@ pub const MAX_KEYWORD_CHARS: usize = 64;
 /// state's migration and the assembly cannot disagree.
 pub const GROUP_LOADER_PREFIX: &str = adam_llm_agent::GROUP_LOADER_PREFIX;
 
-/// The most bytes of a group's short note: the one line a compaction's recap keeps.
-const SHORT_NOTE_MAX_BYTES: usize = adam_llm_agent::MAX_LOADED_NOTE_BYTES;
-
 /// A named set of tools that load together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
@@ -65,6 +62,9 @@ pub struct Group {
     pub keywords: Vec<String>,
     /// The tools it holds, in the order the request offers them.
     pub members: Vec<String>,
+    /// The MCP server whose `when` made this group, if it came from one: its name is the group's
+    /// name, and its note is the server's own words (labelled in a compaction's recap).
+    pub server: Option<String>,
 }
 
 impl Group {
@@ -78,7 +78,20 @@ impl Group {
             searchable: false,
             keywords: Vec::new(),
             members,
+            server: None,
         }
+    }
+
+    /// The group an MCP server's `when` makes: named after the server, its note the server's words.
+    pub fn for_server(
+        server: impl Into<String>,
+        note: impl Into<String>,
+        members: Vec<String>,
+    ) -> Self {
+        let server = server.into();
+        let mut group = Self::new(server.clone(), note, members);
+        group.server = Some(server);
+        group
     }
 
     /// The words that load it before the first call.
@@ -115,29 +128,11 @@ impl Group {
     }
 }
 
-/// `note` as one line, at most [`SHORT_NOTE_MAX_BYTES`]: a note with a line break or a Unicode
-/// line separator could forge a line of a compaction's marker. A note that does not fit ends with
-/// an ellipsis, so a reader knows it is not the whole note.
+/// `note` as one line, at most [`SHORT_NOTE_MAX_BYTES`], ending with an ellipsis when cut: the one
+/// rule, from `adam-llm-agent`, so a note the loop receives and a note a group builds are bounded
+/// the same way.
 fn short_note(note: &str) -> String {
-    let flat: String = note
-        .chars()
-        .map(|c| {
-            if matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
-    let flat = flat.trim();
-    if flat.len() <= SHORT_NOTE_MAX_BYTES {
-        return flat.to_owned();
-    }
-    let mut end = SHORT_NOTE_MAX_BYTES.saturating_sub('…'.len_utf8());
-    while !flat.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", flat[..end].trim_end())
+    adam_llm_agent::loaded_note(note)
 }
 
 /// Whether `name` is a group name: `^[a-z0-9]+(_[a-z0-9]+)*$`, at most [`MAX_GROUP_NAME_CHARS`].
@@ -183,8 +178,14 @@ impl Groups {
                 return Err(Error::GroupName {
                     origin: origin.clone(),
                     group: group.name,
-                    reason: "a group's name is lowercase letters and digits, single underscores \
-                             between them, at most 40 characters",
+                    reason: if group.server.is_some() {
+                        "an MCP server with a `when` has its name as its group's name: lowercase \
+                         letters and digits, single underscores between them, at most 40 \
+                         characters; rename the server"
+                    } else {
+                        "a group's name is lowercase letters and digits, single underscores \
+                         between them, at most 40 characters"
+                    },
                 });
             }
             if !group.keywords.is_empty() && !keywords_fit(&group.keywords) {
@@ -214,17 +215,16 @@ impl Groups {
                     tool: group.loader(),
                 });
             }
-            group.members.retain(|member| {
-                given
-                    .iter()
-                    .find(|(name, _)| name == member)
-                    .is_some_and(|(_, tool)| {
-                        if !specs.iter().any(|(name, _)| name == member) {
-                            specs.push((member.clone(), tool.spec()));
-                        }
-                        true
-                    })
-            });
+            let mut kept: Vec<String> = Vec::new();
+            for member in group.members.drain(..) {
+                if let Some((_, tool)) = given.iter().find(|(name, _)| name == &member) {
+                    if !specs.iter().any(|(name, _)| name == &member) {
+                        specs.push((member.clone(), tool.spec()));
+                    }
+                    kept.push(member);
+                }
+            }
+            group.members = kept;
             // A tool in two groups would be refused by one group's loader and offered by the
             // other's: a load must append it once, from one group.
             if let Some((tool, first)) = group.members.iter().find_map(|member| {
@@ -403,6 +403,7 @@ impl ToolSource for Groups {
                     .cloned()
                     .collect(),
                 note: group.short_note.clone(),
+                note_is_server: group.server.is_some(),
             })
             .collect()
     }
@@ -535,6 +536,7 @@ impl Tool for GroupLoader {
             loader,
             tools: self.group.members.clone(),
             note: self.group.short_note.clone(),
+            note_is_server: self.group.server.is_some(),
         });
         let mut text = format!(
             "Loaded the group `{}`. Its tools are available from your next call, added after the \
@@ -557,6 +559,8 @@ impl Tool for GroupLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SHORT_NOTE_MAX_BYTES: usize = adam_llm_agent::MAX_LOADED_NOTE_BYTES;
 
     fn spec(name: &str) -> ToolSpec {
         ToolSpec {
@@ -734,6 +738,7 @@ mod tests {
             loader: "load__group__docs".into(),
             tools: Vec::new(),
             note: String::new(),
+            note_is_server: true,
         }];
         let ctx = ctx(Some("a typo"), seeded);
         assert!(
@@ -805,6 +810,7 @@ mod tests {
             loader: "load__group__bash".into(),
             tools: vec!["run_command".into(), "read_file".into()],
             note: "what bash is for".into(),
+            note_is_server: false,
         }];
         assert!(
             groups
@@ -866,6 +872,7 @@ mod tests {
             loader: "load__group__bash".into(),
             tools: vec!["run_command".into()],
             note: String::new(),
+            note_is_server: false,
         }];
         let ctx = ctx(Some("a typo"), loaded).with_removed_tools(vec!["run_command".to_owned()]);
         let held = groups.withhold(&ctx, &["run_command"]).await;

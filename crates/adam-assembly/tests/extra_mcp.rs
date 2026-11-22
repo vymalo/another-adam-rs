@@ -6,9 +6,11 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use adam_agent_fs::{McpConfig, McpServer, McpSettings, McpWhen, RemoteKind};
 use adam_assembly::{AgentDef, Error};
 use adam_error::{Classify, ErrorClass};
 use adam_llm_agent::{ToolSet, user_message};
@@ -94,6 +96,41 @@ async fn extra_servers_are_connected_beside_the_agents_own() {
 
 /// `when` in the deployment's extra file is the same loader and the same selector: the server is
 /// withheld from a run whose task does not mention it, and loaded when it does.
+/// A hand-built `McpConfig` bypasses the file loader's early check: `Groups::bind` still refuses a
+/// `when` server whose name is not a group name, and its message names the server to rename.
+#[tokio::test]
+async fn a_hand_built_when_server_with_a_hyphen_name_is_refused_with_the_server_named() {
+    let server = TestHttpServer::start(None).await;
+    let config = McpConfig {
+        servers: BTreeMap::from([(
+            "my-server".to_owned(),
+            McpServer::Remote {
+                kind: RemoteKind::StreamableHttp,
+                url: server.url(),
+                headers: BTreeMap::new(),
+                tools: Some(vec!["echo".to_owned()]),
+                optional: false,
+                files: false,
+                settings: McpSettings::default(),
+                when: Some(McpWhen {
+                    keywords: vec!["x".to_owned()],
+                }),
+            },
+        )]),
+    };
+    let def = def_with_own_server(&server.url())
+        .with_extra_mcp(config, Path::new("extra.json"))
+        .unwrap()
+        .connect_mcp(&McpPolicy::default())
+        .await
+        .unwrap();
+    let error = def.bind(ToolSet::new()).unwrap_err();
+    assert!(matches!(error, Error::GroupName { .. }), "{error}");
+    let text = error.to_string();
+    assert!(text.contains("my-server"), "{text}");
+    assert!(text.contains("rename the server"), "{text}");
+}
+
 #[tokio::test]
 async fn a_when_in_the_extra_file_selects_the_extra_server() {
     let added = TestHttpServer::start_scripted(

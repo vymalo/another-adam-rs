@@ -476,7 +476,10 @@ fn one_line(note: &str) -> String {
     let flat: String = note
         .chars()
         .map(|c| {
-            if matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
+            if matches!(
+                c,
+                '\n' | '\r' | '\u{0085}' | '\u{000B}' | '\u{2028}' | '\u{2029}'
+            ) {
                 ' '
             } else {
                 c
@@ -496,7 +499,7 @@ fn one_line(note: &str) -> String {
 
 /// One line of the recap: the loader's name, the tools it holds (or loaded), and, in the full form,
 /// its note. Every line is escaped, so a name or a note cannot read as a line the loop wrote.
-fn recap_line(name: &str, holds: &[String], note: Option<&str>) -> String {
+fn recap_line(name: &str, holds: &[String], note: Option<&str>, server: bool) -> String {
     // A name from a journal is text like any other: a line break in one would forge a line.
     let name = one_line(name);
     let holds: Vec<String> = holds.iter().map(|tool| one_line(tool)).collect();
@@ -507,7 +510,15 @@ fn recap_line(name: &str, holds: &[String], note: Option<&str>) -> String {
     }
     if let Some(note) = note.map(one_line).filter(|note| !note.is_empty()) {
         line.push_str(" — ");
-        line.push_str(&note);
+        if server {
+            // A `when` server's instructions are third-party text: label them, so a reader of the
+            // marker does not take the server's words for the loop's.
+            line.push_str("(the server's words: ");
+            line.push_str(&note);
+            line.push(')');
+        } else {
+            line.push_str(&note);
+        }
     }
     escape_lines(&line)
 }
@@ -544,6 +555,7 @@ pub(crate) fn recap(loaded: &[Loaded], loaders: &[Loader], removed: &[String]) -
                     &one.loader,
                     &tools,
                     with_notes.then_some(one.note.as_str()),
+                    one.note_is_server,
                 ))
             })
             .collect()
@@ -553,7 +565,7 @@ pub(crate) fn recap(loaded: &[Loaded], loaders: &[Loader], removed: &[String]) -
         loaders
             .iter()
             .filter(|loader| !loaded_names.contains(&loader.name.as_str()))
-            .map(|loader| recap_line(&loader.name, &loader.holds, None))
+            .map(|loader| recap_line(&loader.name, &loader.holds, None, false))
             .collect()
     };
     let build = |loaded: &[String], available: &[String]| -> String {
@@ -799,6 +811,14 @@ mod tests {
             loader: loader.to_owned(),
             tools: tools.iter().map(|tool| (*tool).to_owned()).collect(),
             note: note.to_owned(),
+            note_is_server: false,
+        }
+    }
+
+    fn loaded_server(loader: &str, tools: &[&str], note: &str) -> Loaded {
+        Loaded {
+            note_is_server: true,
+            ..loaded(loader, tools, note)
         }
     }
 
@@ -842,6 +862,68 @@ mod tests {
             text.matches("load__group__bash").count(),
             1,
             "a loaded loader is not listed as available too: {text}"
+        );
+    }
+
+    /// A resume whose first transition compacts seeds and fills before the marker is written, so
+    /// the marker names the seeded group.
+    #[test]
+    fn a_resume_that_compacts_first_names_the_seeded_group() {
+        let mut state = Conversation::new("go");
+        state.loaded_servers = vec!["docs".into()];
+        state.seed_loaded();
+        state.fill_seeded(
+            &[Loader {
+                name: "load__group__docs".into(),
+                holds: vec!["docs__search".into()],
+            }],
+            &[],
+        );
+        let text = recap(&state.loaded, &state.loaders, &state.removed_tools);
+        assert!(text.contains("load__group__docs"), "{text}");
+        assert!(text.contains("docs__search"), "{text}");
+    }
+
+    /// A seeded group the task also loads is not in the loaders list (`Groups` leaves the
+    /// task-matched groups out), so it is filled from the task-loaded entry.
+    #[test]
+    fn a_seeded_group_the_task_also_loads_is_in_the_recap() {
+        let mut state = Conversation::new("read the docs");
+        state.loaded_servers = vec!["docs".into()];
+        state.seed_loaded();
+        state.fill_seeded(
+            &[],
+            &[Loaded {
+                loader: "load__group__docs".into(),
+                tools: vec!["docs__search".into()],
+                note: "the docs words".into(),
+                note_is_server: true,
+            }],
+        );
+        let text = recap(&state.loaded, &state.loaders, &state.removed_tools);
+        assert!(text.contains("load__group__docs"), "{text}");
+        assert!(text.contains("docs__search"), "{text}");
+        assert!(
+            text.contains("(the server's words: the docs words)"),
+            "{text}"
+        );
+    }
+
+    /// A `when` server's note is third-party text: the recap labels it as the server's words.
+    #[test]
+    fn the_recap_labels_a_server_note() {
+        let text = recap(
+            &[loaded_server(
+                "load__group__linear",
+                &["linear__list"],
+                "Linear words.",
+            )],
+            &[],
+            &[],
+        );
+        assert!(
+            text.contains("(the server's words: Linear words.)"),
+            "{text}"
         );
     }
 
@@ -936,6 +1018,7 @@ mod tests {
                 loader: name.clone(),
                 tools: tools.clone(),
                 note: "a note that says what this group is for".to_owned(),
+                note_is_server: false,
             });
             loaders.push(loader(&name, &refs));
         }

@@ -687,6 +687,11 @@ async fn a_folder_with_no_triggered_server_has_no_loader() {
     mock.push_text("done");
     let (requests, _) = run_task(&mock, &assembly(&mock, MCP_NO_WHEN), "fix a typo").await;
     assert!(
+        has(&requests[0], "github__search"),
+        "the eager server's tool is there: {:?}",
+        names(&requests[0])
+    );
+    assert!(
         !requests[0]
             .tools
             .iter()

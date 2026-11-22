@@ -220,9 +220,10 @@ impl SourceCtx {
         self
     }
 
-    /// This context with the loaded tools a request did not carry
-    /// ([`Conversation::removed_tools`](crate::Conversation::removed_tools)): a source withholds a
-    /// call to one, whatever group it belonged to. A test may set it on a
+    /// This context with the loaded tools the run no longer holds
+    /// ([`Conversation::removed_tools`](crate::Conversation::removed_tools)): a member its group
+    /// shrank out of, or a task-loaded member the tier hid. An explicit load's tier-hidden member
+    /// is not one. A source withholds a call to one. A test may set it on a
     /// [`detached`](Self::detached) context.
     #[must_use]
     pub fn with_removed_tools(mut self, removed: impl Into<Arc<[String]>>) -> Self {
@@ -237,7 +238,10 @@ impl SourceCtx {
         &self.loaded
     }
 
-    /// The names of loaded tools a request did not carry: a source withholds a call to one.
+    /// The loaded tools the run no longer holds: a member its group shrank out of, or a
+    /// task-loaded member the access tier hid (permanent for the run). An explicit load's
+    /// tier-hidden member is **not** here: the tier is per message. A source withholds a call to
+    /// one.
     pub fn removed_tools(&self) -> &[String] {
         &self.removed_tools
     }
@@ -536,9 +540,9 @@ pub(crate) async fn loaded_offered(
 ) -> Option<Vec<String>> {
     let mut out: Option<Vec<String>> = None;
     for source in sources {
-        let Some(tools) = source.loaded_tools(ctx).await else {
-            continue;
-        };
+        // One source that does not track its loaded tools makes the whole set unknown: the loop
+        // must fall back to what the request carried, not treat that source's tools as gone.
+        let tools = source.loaded_tools(ctx).await?;
         let out = out.get_or_insert_with(Vec::new);
         for tool in tools {
             if !out.contains(&tool) {

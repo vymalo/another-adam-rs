@@ -339,6 +339,10 @@ pub struct Loaded {
     /// A compaction copies it into its marker, so it is text a reader of the conversation keeps.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// The note is an MCP **server's own words** (a `when` server's instructions), not the agent's:
+    /// the compaction's recap labels it so a reader does not take third-party text for the loop's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub note_is_server: bool,
 }
 
 /// A loader the run may still call: its name, and the tools a call would make available.
@@ -356,6 +360,35 @@ pub struct Loader {
 
 /// The most bytes a [`Loaded::note`] holds: one line of the marker a compaction writes.
 pub const MAX_LOADED_NOTE_BYTES: usize = 200;
+
+/// `note` as a [`Loaded`] keeps it: one line (a line break or a Unicode line separator could forge
+/// a line of a compaction's marker), at most [`MAX_LOADED_NOTE_BYTES`] bytes, ending with an
+/// ellipsis when it was cut. `adam-assembly`'s groups use it, and the loop applies it to a note a
+/// custom loader wrote.
+pub fn loaded_note(note: &str) -> String {
+    let flat: String = note
+        .chars()
+        .map(|c| {
+            if matches!(
+                c,
+                '\n' | '\r' | '\u{0085}' | '\u{000B}' | '\u{2028}' | '\u{2029}'
+            ) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let flat = flat.trim();
+    if flat.len() <= MAX_LOADED_NOTE_BYTES {
+        return flat.to_owned();
+    }
+    let mut end = MAX_LOADED_NOTE_BYTES.saturating_sub('…'.len_utf8());
+    while !flat.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", flat[..end].trim_end())
+}
 
 /// A [`Limits`](crate::Limits) bound a run reached.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -397,13 +430,9 @@ pub struct Conversation {
     /// while empty, so a run that never shortens writes the bytes it always did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shortenings: Vec<u32>,
-    /// The MCP servers the run has loaded **during itself**, in the order it loaded them: a server
-    /// whose `when` the task did not match, loaded by a call to `use_server`. A server here stops
-    /// being withheld from the next model call on, and its tools are **appended** to the tools
-    /// array, never inserted, so the request before stays a byte prefix of the one after it (ADR
-    /// 0044, decision 1); the turns where the array grew are
-    /// [`tools_appended`](Self::tools_appended). A run that continues this one carries the list, so
-    /// its first request offers the tools the run before offered.
+    /// **The legacy field of the MCP servers a run loaded**: before ADR 0066 a server whose `when`
+    /// the task did not match was loaded by a call to `use_server`, and its name was kept here. The
+    /// live set is [`loaded`](Self::loaded); this field is read only to seed it.
     ///
     /// **Decoded, never written** since ADR 0066: `use_server` folded into the group loaders, and
     /// the loaded set is [`loaded`](Self::loaded). State written before it still reads; any turn
@@ -421,10 +450,11 @@ pub struct Conversation {
     /// and not written while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loaded: Vec<Loaded>,
-    /// The loaders the agent had on the run's first turn, recorded once: what a compaction's marker
-    /// says is still there to load, without asking the live sources. A loader the run loaded is
-    /// taken out of the marker's "available" lines ([`loaded`](Self::loaded)). Absent from state
-    /// written before it existed, and not written while empty.
+    /// The loaders the agent still offered on the run's **first turn**, recomputed there so a dev
+    /// reload's new catalogue replaces a stale one: what a compaction's marker says is still there
+    /// to load, without asking the live sources. A loader the run loaded is taken out of the
+    /// marker's "available" lines ([`loaded`](Self::loaded)). Absent from state written before it
+    /// existed, and not written while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loaders: Vec<Loader>,
     /// The names of loaded tools that a request did **not** carry: the group's definition shrank
@@ -1224,7 +1254,8 @@ impl Conversation {
     /// array grew at is not recorded here: the request after the load decides it
     /// ([`note_growth`](Self::note_growth)), because the tier may withhold every loaded tool.
     pub(crate) fn load_groups(&mut self, loaded: Vec<Loaded>) {
-        for one in loaded {
+        for mut one in loaded {
+            one.note = loaded_note(&one.note);
             match self
                 .loaded
                 .iter_mut()
@@ -1238,6 +1269,7 @@ impl Conversation {
                     }
                     if !one.note.is_empty() {
                         present.note = one.note;
+                        present.note_is_server = one.note_is_server;
                     }
                 }
                 None => self.loaded.push(one),
@@ -1265,7 +1297,8 @@ impl Conversation {
     /// withheld, so they record no growth, but a compaction's recap names them (ADR 0066, decision
     /// 6). A loader the state already has is left as it is.
     pub(crate) fn note_task_loaded(&mut self, loaded: Vec<Loaded>) {
-        for one in loaded {
+        for mut one in loaded {
+            one.note = loaded_note(&one.note);
             if !self
                 .loaded
                 .iter()
@@ -1279,13 +1312,19 @@ impl Conversation {
     /// Fill the tools of a seeded [`Loaded`](Self::loaded) whose loader the agent still offers:
     /// a journal written before `loaded` existed named servers, not tools, and the loaders of this
     /// turn know what each holds.
-    pub(crate) fn fill_seeded(&mut self, loaders: &[Loader]) {
+    pub(crate) fn fill_seeded(&mut self, loaders: &[Loader], task_loaded: &[Loaded]) {
         for one in &mut self.loaded {
             if !one.tools.is_empty() {
                 continue;
             }
             if let Some(loader) = loaders.iter().find(|loader| loader.name == one.loader) {
                 one.tools = loader.holds.clone();
+            } else if let Some(task) = task_loaded.iter().find(|task| task.loader == one.loader) {
+                // The seeded group is also one the task loads: `loaders` excludes it, and the
+                // task-loaded entry carries what it holds and its note.
+                one.tools = task.tools.clone();
+                one.note = task.note.clone();
+                one.note_is_server = task.note_is_server;
             }
         }
     }
@@ -1309,9 +1348,9 @@ impl Conversation {
     /// `use_server` loaded is one entry named after the group that server is, in the order it
     /// loaded them. Called whenever the loaded set is empty, so a run resumed at any turn seeds;
     /// a state that already has a loaded set is left alone, so a replay is the same.
-    pub(crate) fn seed_loaded(&mut self) {
+    pub(crate) fn seed_loaded(&mut self) -> bool {
         if !self.loaded.is_empty() || self.loaded_servers.is_empty() {
-            return;
+            return false;
         }
         self.loaded = self
             .loaded_servers
@@ -1320,8 +1359,28 @@ impl Conversation {
                 loader: format!("{}{server}", crate::GROUP_LOADER_PREFIX),
                 tools: Vec::new(),
                 note: String::new(),
+                note_is_server: true,
             })
             .collect();
+        true
+    }
+
+    /// A **task-loaded** group's member the access tier hid on this request is removed for the run:
+    /// it would otherwise appear later at its registration position, an insertion rather than the
+    /// suffix ADR 0044, decision 1 requires. An explicitly loaded group's member keeps the transient
+    /// behaviour: its loader appends, so a later request grows by a suffix. `explicit` names the
+    /// loaders the agent still offers (`loaders`), which exclude the task-matched groups.
+    pub(crate) fn note_tier_withheld(&mut self, explicit: &[String], carried: &[String]) {
+        for one in &self.loaded {
+            if explicit.iter().any(|name| name == &one.loader) {
+                continue;
+            }
+            for tool in &one.tools {
+                if !carried.contains(tool) && !self.removed_tools.contains(tool) {
+                    self.removed_tools.push(tool.clone());
+                }
+            }
+        }
     }
 
     /// The model has been given the reports of `rounds`: remember them, each once, the oldest
@@ -1548,6 +1607,7 @@ mod tests {
             loader: loader.to_owned(),
             tools: tools.iter().map(|tool| (*tool).to_owned()).collect(),
             note: format!("what {loader} is for"),
+            note_is_server: false,
         }
     }
 
@@ -1610,10 +1670,13 @@ mod tests {
         old.seed_loaded();
         assert_eq!(old.loaded, once, "the seed is idempotent");
         // The seeded entries have no tools yet: the loaders of the first turn fill them.
-        old.fill_seeded(&[Loader {
-            name: "load__group__docs".into(),
-            holds: vec!["docs__search".into()],
-        }]);
+        old.fill_seeded(
+            &[Loader {
+                name: "load__group__docs".into(),
+                holds: vec!["docs__search".into()],
+            }],
+            &[],
+        );
         assert_eq!(old.loaded[0].tools, ["docs__search"]);
         assert!(
             old.loaded[1].tools.is_empty(),
@@ -1638,6 +1701,50 @@ mod tests {
         old.seed_loaded();
         assert_eq!(old.loaded[0].loader, "load__group__docs");
         assert!(old.loaded[0].tools.is_empty());
+    }
+
+    /// A seeded resume's first request carries the restored tools; they are not a growth, and the
+    /// next turn does not record one either.
+    #[test]
+    fn a_seeded_resume_records_no_growth() {
+        let mut state: Conversation =
+            serde_json::from_value(serde_json::json!({"turns": 4, "loaded_servers": ["docs"]}))
+                .unwrap();
+        assert!(state.seed_loaded());
+        state.fill_seeded(
+            &[Loader {
+                name: "load__group__docs".into(),
+                holds: vec!["docs__search".into()],
+            }],
+            &[],
+        );
+        let carried: Vec<String> = state
+            .loaded
+            .iter()
+            .flat_map(|one| one.tools.iter().cloned())
+            .collect();
+        state.note_carried(carried.clone());
+        let grew = carried
+            .iter()
+            .any(|tool| !state.carried_tools.iter().any(|before| before == tool));
+        assert!(!grew, "the seeded tools are not new");
+        assert!(state.tools_appended.is_empty());
+    }
+
+    /// A note a custom loader wrote is bounded like a group's: one line, at most 200 bytes, with an
+    /// ellipsis when it was cut.
+    #[test]
+    fn a_load_bounds_a_custom_note() {
+        let mut state = Conversation::new("go");
+        state.load_groups(vec![Loaded {
+            loader: "load__group__x".into(),
+            tools: vec![],
+            note: "n".repeat(300),
+            note_is_server: false,
+        }]);
+        let note = &state.loaded[0].note;
+        assert!(note.len() <= MAX_LOADED_NOTE_BYTES, "{}", note.len());
+        assert!(note.ends_with('…'), "{note}");
     }
 
     /// The groups the task loaded are journaled without recording a growth: their tools were never

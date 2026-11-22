@@ -2480,6 +2480,7 @@ impl Tool for LoadGroup {
             loader,
             tools: self.tools.clone(),
             note: self.note.to_owned(),
+            note_is_server: false,
         });
         let mut out = ToolOutput::text(format!("loaded the group {}\n{}", self.group, self.note));
         out.loaded = loaded;

@@ -888,7 +888,7 @@ impl Walk<'_> {
                                 .map(|(_, text)| text.clone())
                         })
                         .unwrap_or_default();
-                    crate::groups::Group::new(server.clone(), note, members)
+                    crate::groups::Group::for_server(server.clone(), note, members)
                         .with_keywords(keywords.clone())
                 })
                 .collect();

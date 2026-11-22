@@ -953,9 +953,10 @@ pub struct ToolCtx {
     plan: Option<Arc<Plan>>,
     /// What the run has loaded as the call starts ([`loaded`](Self::loaded)).
     loaded: Arc<[Loaded]>,
-    /// The names of loaded tools a request did not carry
-    /// ([`Conversation::removed_tools`](crate::Conversation::removed_tools)): a loader refuses to
-    /// offer one again, and a call to one is refused.
+    /// The loaded tools the run no longer holds
+    /// ([`Conversation::removed_tools`](crate::Conversation::removed_tools)): a member its group
+    /// shrank out of, or a task-loaded member the tier hid. An explicit load's tier-hidden member
+    /// is not one. A loader refuses to offer one again, and a call to one is refused.
     removed_tools: Arc<[String]>,
     /// The words the run was started with ([`task`](Self::task)).
     task: Option<Arc<str>>,
@@ -1185,9 +1186,10 @@ impl ToolCtx {
         &self.loaded
     }
 
-    /// The names of loaded tools a request did not carry
-    /// ([`Conversation::removed_tools`](crate::Conversation::removed_tools)): a call to one is
-    /// refused, and a loader does not offer it again.
+    /// The loaded tools the run no longer holds
+    /// ([`Conversation::removed_tools`](crate::Conversation::removed_tools)): a member its group
+    /// shrank out of, or a task-loaded member the tier hid. A call to one is refused, and a loader
+    /// does not offer it again.
     pub fn removed_tools(&self) -> &[String] {
         &self.removed_tools
     }

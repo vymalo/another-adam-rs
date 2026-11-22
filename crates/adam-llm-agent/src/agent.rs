@@ -214,13 +214,6 @@ fn loaders_needed(turns: u32, loaders: &[Loader]) -> bool {
     turns == 0 || loaders.is_empty()
 }
 
-/// Seed a journal written before `loaded` existed: **any** turn whose loaded set is empty, not only
-/// the first, so a run resumed at turn 4 restores the tools it had. The turn is passed so the rule
-/// is testable; it is not a gate.
-fn seed_loaded_at(state: &mut Conversation, _turn: u32) {
-    state.seed_loaded();
-}
-
 /// Whether a call of `tool` acts on a session (an effect outside the run's own state).
 fn has_effect(tool: &str) -> bool {
     matches!(tool, SUBAGENT_START | SUBAGENT_SEND | SUBAGENT_CLOSE)
@@ -2085,10 +2078,8 @@ impl LlmAgent {
         let model = self.model.clone();
         let sources = self.sources.clone();
         let turn = state.turns;
-        // A journal written before `loaded` existed names the servers `use_server` loaded: any
-        // turn that finds no loaded set seeds it, before the request is built, so a run resumed at
-        // turn 4 restores the tools it had.
-        seed_loaded_at(state, turn);
+        // The step start seeded a journal written before `loaded` existed; a fresh run (or a
+        // continuation) has no seed, and its task-loaded groups are journaled here.
         let need_task_loaded = state.loaded.is_empty();
         let source_ctx = (!sources.is_empty()).then(|| {
             SourceCtx::new(
@@ -2101,7 +2092,6 @@ impl LlmAgent {
             .with_loaded(Arc::from(state.loaded.clone()))
             .with_removed_tools(Arc::from(state.removed_tools.clone()))
         });
-        let loaded_now: Arc<[Loaded]> = Arc::from(state.loaded.clone());
         let carried_before: Arc<[String]> = Arc::from(state.carried_tools.clone());
         let need_loaders = loaders_needed(state.turns, &state.loaders);
         let seen = state.messages.len();
@@ -2334,11 +2324,17 @@ impl LlmAgent {
                 // loaded set: every loaded tool it did not carry is journaled as removed, and a
                 // growth is recorded only when the final request actually grew.
                 if let Some(loaders) = loaders {
-                    state.fill_seeded(&loaders);
+                    state.fill_seeded(&loaders, &task_loaded);
                     state.loaders = loaders;
                 }
                 state.note_task_loaded(task_loaded);
                 state.note_removed(&offered);
+                let explicit: Vec<String> = state
+                    .loaders
+                    .iter()
+                    .map(|loader| loader.name.clone())
+                    .collect();
+                state.note_tier_withheld(&explicit, &carried);
                 state.note_growth(grew);
                 state.note_carried(carried);
                 seen_at = seen.unwrap_or(state.messages.len());
@@ -5570,6 +5566,29 @@ impl Agent for LlmAgent {
             };
             Some(crate::kept::output_id(&root.to_string(), &key))
         };
+        // A journal written before `loaded` existed is seeded and made whole **before** a
+        // compaction can read the recap, so the first marker names the group; any turn whose loaded
+        // set is empty seeds, not only the first, so a run resumed at turn 4 restores its tools.
+        // The first request of the resumed run carries them: it is not a growth.
+        if state.loaded.is_empty() && !state.loaded_servers.is_empty() {
+            state.seed_loaded();
+            let source_ctx = SourceCtx::new(
+                ctx.run_id(),
+                state.root_run.unwrap_or_else(|| ctx.run_id()),
+                ctx.conversation_id().map(str::to_owned),
+                Arc::new(state.context.clone()),
+            )
+            .with_task(state.task());
+            let loaders = crate::source::loaders_offered(&self.sources, &source_ctx).await;
+            let task_loaded = crate::source::loaded_by_task(&self.sources, &source_ctx).await;
+            state.fill_seeded(&loaders, &task_loaded);
+            let carried: Vec<String> = state
+                .loaded
+                .iter()
+                .flat_map(|one| one.tools.iter().cloned())
+                .collect();
+            state.note_carried(carried);
+        }
         // A history that has reached the budget is summarised first, at a journaled step of its own;
         // the model is asked in the next transition, from the new history.
         if self.compact_if_due(ctx, &mut state, &output_id_of).await? {
@@ -5927,11 +5946,61 @@ mod failure_tests {
         assert_eq!(auth.class.as_deref(), Some("Unauthenticated"));
     }
 
+    #[tokio::test]
+    async fn a_loaded_entry_from_a_source_that_does_not_track_is_not_removed_next_to_groups() {
+        struct Tracks;
+        #[async_trait]
+        impl ToolSource for Tracks {
+            async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
+                Vec::new()
+            }
+            async fn loaded_tools(&self, _ctx: &SourceCtx) -> Option<Vec<String>> {
+                Some(vec!["tracked".into()])
+            }
+            async fn call(
+                &self,
+                _ctx: &ToolCtx,
+                _name: &str,
+                _args: Value,
+            ) -> Option<Result<ToolOutput, ToolError>> {
+                None
+            }
+        }
+        struct Untracked;
+        #[async_trait]
+        impl ToolSource for Untracked {
+            async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
+                Vec::new()
+            }
+            async fn call(
+                &self,
+                _ctx: &ToolCtx,
+                _name: &str,
+                _args: Value,
+            ) -> Option<Result<ToolOutput, ToolError>> {
+                None
+            }
+        }
+        let ctx = SourceCtx::detached(Map::new()).with_loaded(vec![Loaded {
+            loader: "custom".into(),
+            tools: vec!["custom__x".into()],
+            note: String::new(),
+            note_is_server: false,
+        }]);
+        let sources: Vec<DynToolSource> = vec![Arc::new(Tracks), Arc::new(Untracked)];
+        assert!(
+            crate::source::loaded_offered(&sources, &ctx)
+                .await
+                .is_none(),
+            "one source that does not track makes the set unknown: the loop falls back"
+        );
+    }
+
     #[test]
     fn a_run_resumed_at_a_later_turn_seeds_its_loaded_set() {
         let mut state: Conversation =
             serde_json::from_value(json!({"turns": 4, "loaded_servers": ["docs"]})).unwrap();
-        seed_loaded_at(&mut state, 4);
+        assert!(state.seed_loaded());
         assert_eq!(state.loaded[0].loader, "load__group__docs");
         assert!(state.loaded[0].tools.is_empty());
     }
