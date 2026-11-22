@@ -69,11 +69,11 @@ config:
   # binary's own default, `key`, sends MODEL_API_KEY. `key` renders it explicitly; `device` signs in to an
   # OAuth 2.0 issuer with the device grant, and MODEL_OAUTH_ISSUER, MODEL_OAUTH_CLIENT_ID and
   # MODEL_OAUTH_SCOPE come from config.extraEnv (the chart has no value for them; the first two are
-  # required, and the chart refuses `device` without them); `injector` (ADR 0067) sends X-Run-Id and no
-  # Authorization, for an injector in front of the model that adds the run's credential, and refuses any
-  # MODEL_OAUTH_* beside it (exit 78). With `device` or `injector`, MODEL_API_KEY must be empty: the
-  # ExternalSecret still creates the key, so set that property's value in AWS to an empty string (the
-  # chart cannot read it; NOTES.txt says so). MODEL_CA_FILE is not modelled yet (ADR 0067 decision 9: the
+  # required on the workers, and the chart refuses `device` without them); `injector` (ADR 0067) sends X-Run-Id
+  # and no Authorization, for an injector in front of the model that adds the run's credential, and, on the
+  # workers, refuses any MODEL_OAUTH_* beside it (exit 78). With `device` or `injector`, MODEL_API_KEY must be
+  # empty: the ExternalSecret still creates the key, so set that property's value in AWS to an empty string
+  # (the chart cannot read it; NOTES.txt says so). MODEL_CA_FILE is not modelled yet (ADR 0067 decision 9: the
   # first cut is plain HTTP). Roles that run workers only; a control plane renders none.
   modelAuth: ""
   # Model alias of the agent. (config.opencodeModel, the second alias of the coder's OpenCode, is gone with

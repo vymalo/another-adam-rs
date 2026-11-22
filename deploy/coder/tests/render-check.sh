@@ -208,8 +208,14 @@ check "device without the client ID is refused" \
   fails helm_auth --set config.modelAuth=device --set-string config.extraEnv.MODEL_OAUTH_ISSUER=https://issuer.example
 check "device without the issuer is refused" \
   fails helm_auth --set config.modelAuth=device --set-string config.extraEnv.MODEL_OAUTH_CLIENT_ID=coder
+check "device with a blank MODEL_OAUTH_ISSUER is refused (it trims to unset)" \
+  fails helm_auth --set config.modelAuth=device --set-string config.extraEnv.MODEL_OAUTH_ISSUER= --set-string config.extraEnv.MODEL_OAUTH_CLIENT_ID=coder
+check "device with a blank MODEL_OAUTH_CLIENT_ID is refused" \
+  fails helm_auth --set config.modelAuth=device --set-string config.extraEnv.MODEL_OAUTH_ISSUER=https://issuer.example --set-string config.extraEnv.MODEL_OAUTH_CLIENT_ID=
 helm_auth --set config.modelAuth=device --set config.role=control-plane > "$out"
 check "a control plane with device needs no OAuth variable (it renders no model)" lacks 'MODEL_AUTH'
+helm_auth --set config.modelAuth=injector --set config.role=control-plane --set-string config.extraEnv.MODEL_OAUTH_SCOPE=offline_access > "$out"
+check "a control plane with injector and MODEL_OAUTH_SCOPE renders (the refusal is for the workers)" lacks 'MODEL_AUTH'
 for name in MODEL_OAUTH_ISSUER MODEL_OAUTH_CLIENT_ID MODEL_OAUTH_SCOPE; do
   check "injector with $name in extraEnv is refused (the worker would exit 78)" \
     fails helm_auth --set config.modelAuth=injector --set-string "config.extraEnv.$name=x"
@@ -2129,6 +2135,9 @@ check "modelAuth=device: NOTES.txt has the same empty-key note" says "$notes" "p
 check "... and says device or injector" says "$notes" '`device` or `injector`'
 check "... and says the device grant, not the injector" says "$notes" 'device grant'
 check "... and has no injector placeholder warning" fails says "$notes" 'every run would park'
+notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=sha-abc1234 --set config.modelAuth=injector --set config.role=control-plane --show-only templates/notes.yaml --debug 2>&1 || true)
+check "modelAuth=injector on a control plane: no empty-key note" fails says "$notes" 'must be EMPTY'
+check "... and no placeholder warning" fails says "$notes" 'every run would park'
 notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=sha-abc1234 --set config.modelAuth=key --show-only templates/notes.yaml --debug 2>&1 || true)
 check "modelAuth=key: NOTES.txt has no empty-key note" fails says "$notes" 'must be EMPTY'
 check "... and no placeholder warning" fails says "$notes" 'every run would park'

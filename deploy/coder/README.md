@@ -138,8 +138,8 @@ default render is byte for byte `tests/golden/combined.yaml`.
 |---|---|
 | `""` (default) | Nothing is rendered; `key`, the binary's default |
 | `key` | `MODEL_AUTH=key`: send `MODEL_API_KEY` |
-| `device` | `MODEL_AUTH=device`: sign in to an OAuth 2.0 issuer with the device grant ([ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)). `MODEL_OAUTH_ISSUER`, `MODEL_OAUTH_CLIENT_ID` and `MODEL_OAUTH_SCOPE` have no chart value: put them in `config.extraEnv`. The first two are required, and the chart refuses `device` without them (the worker would exit 78) |
-| `injector` | `MODEL_AUTH=injector`: every call carries `X-Run-Id: <root run id>` and no `Authorization`; an injector in front of the model adds the run's credential ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)). No key at all; the chart refuses any `MODEL_OAUTH_*` in `config.extraEnv` (the binary refuses a non-empty one, exit 78) |
+| `device` | `MODEL_AUTH=device`: sign in to an OAuth 2.0 issuer with the device grant ([ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)). `MODEL_OAUTH_ISSUER`, `MODEL_OAUTH_CLIENT_ID` and `MODEL_OAUTH_SCOPE` have no chart value: put them in `config.extraEnv`. For the roles that run workers, the first two are required, and the chart refuses `device` without them (the worker would exit 78) |
+| `injector` | `MODEL_AUTH=injector`: every call carries `X-Run-Id: <root run id>` and no `Authorization`; an injector in front of the model adds the run's credential ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)). No key at all; for the roles that run workers, the chart refuses any `MODEL_OAUTH_*` in `config.extraEnv` (the binary refuses a non-empty one, exit 78) |
 
 With `injector`, point `config.modelBaseUrl` at the injector (or set `config.modelBaseUrlFromSecret`): the default placeholder
 makes every run park for up to `MODEL_PARK_LIMIT` ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)), and `NOTES.txt` warns.
@@ -161,8 +161,8 @@ no `MODEL_API_KEY` at all, which the binary accepts too (under `key` it requires
 
 **Refusals.** `config.modelAuth` other than the string `key`, `device`, `injector` or empty (a boolean, a number or `null` is
 refused, not read as unset); `config.extraEnv.MODEL_AUTH` beside a set `config.modelAuth` (the chart renders the variable itself);
-`device` without `config.extraEnv.MODEL_OAUTH_ISSUER` and `MODEL_OAUTH_CLIENT_ID`; `injector` with any `MODEL_OAUTH_*` in
-`config.extraEnv` (the binary refuses a sign-in under the injector).
+`device` without `config.extraEnv.MODEL_OAUTH_ISSUER` and `MODEL_OAUTH_CLIENT_ID`, and `injector` with any `MODEL_OAUTH_*` in
+`config.extraEnv` (both for the roles that run workers; the binary refuses a non-empty one under the injector).
 
 **`MODEL_CA_FILE` is not modelled yet** (ADR 0067, decision 9): the first cut is plain HTTP on the cluster's service network,
 and mounting a CA into an agent's pod is a later slice. Checks: `tests/render-check.sh`.
