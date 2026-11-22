@@ -18,6 +18,7 @@ never see this crate's types. Retries are not done here: failures map onto
 | `OpenAiConfig` | `base_url`, `api_key: SecretString`, `timeout`, `extra_headers`; `OpenAiConfig::new(base_url, api_key)` |
 | `OpenAiCompatible::with_credentials(DynCredentials)` | the headers of every call come from this provider instead of `api_key` ([ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)); see *Credentials* below |
 | `OpenAiCompatible` | the client: `OpenAiCompatible::new(config)`, `.with_max_tokens_field(field)`, `.with_extra_body(map)` (members merged into every request), `.with_echo_reasoning(Some(field))` (send reasoning back), `.with_prompt_cache_key(true)` (send `ModelRequest::prompt_cache_key` as the body's `prompt_cache_key`; off by default; a `with_extra_body` member of the same name wins; whether every gateway accepts it is *unverified*; OpenAI's reference page could not be fetched on 2026-11-15, so the field name is *unverified* against a primary source too), `.with_context_window(alias, tokens)` (what `ModelClient::context_window` answers for that alias; nothing is sent) |
+| `OpenAiCompatible::with_profiles(ModelProfiles)` | the deployment's per-model profiles (`MODEL_ALIASES_FILE`): `ModelClient::profile` answers them, and a request's `reasoning_effort` goes out through the model's `reasoningWire`, after the extra body (*Reasoning effort*) |
 | `PROVIDER` | `"openai"`: what `ModelClient::provider` says for this client, whatever gateway is behind it |
 | `ReasoningField` | `ReasoningContent` (`reasoning_content`) or `Reasoning` (`reasoning`): the member that carries reasoning when a client echoes it |
 | `MaxTokensField` | `MaxTokens` (default) or `MaxCompletionTokens`, for models that want the newer field name |
@@ -146,7 +147,8 @@ default) nothing of it is stored. The chunk it came in still counts for its cont
 answer's text (`Message::text()`); the **text view is never in the history and never sent back** by default. A structured
 block lives only in the carrier, only when the client echoes reasoning (then it goes back bound to the model and endpoint);
 off, it is cleared before the response reaches the history. `ModelResponse.reasoning` is for people to read. `with_extra_body(map)` merges a JSON object into every request body at its top level
-(it wins over what the client wrote; `model`, `messages`, `tools`, `tool_choice` and `stream` are refused with
+(it wins over what the client wrote, except the members a typed reasoning level's wire duplicates: the level wins, below;
+`model`, `messages`, `tools`, `tool_choice` and `stream` are refused with
 `OpenAiConfigError::ReservedBodyKey`), which is how a deployment turns reasoning on where the model needs a flag
 (`MODEL_EXTRA_BODY` of `adam-service`).
 
@@ -167,6 +169,37 @@ Provider facts the parsing rests on, each *verified 2026-10-05* from the page na
 | vLLM | `reasoning` (current: "the primary field... previously `reasoning_content`, now deprecated"), a delta in a stream | model-dependent `chat_template_kwargs`: `{"thinking": true}` (DeepSeek-V3.1, Granite 3.2), `{"enable_thinking": false}` to turn off what is on by default (Qwen3); `reasoning_effort` for Gemma 4 | <https://docs.vllm.ai/en/latest/features/reasoning_outputs.html> |
 | OpenRouter | `reasoning` (a string) and `reasoning_details` (a structured array) in a message; in a stream's delta the page names `reasoning_details` (`delta.reasoning` as a string is *unverified* from the page, read as the same member) | `{"reasoning": {"effort": "low".."high" or "max_tokens": n or "exclude": true}}` | <https://openrouter.ai/docs/use-cases/reasoning-tokens> |
 | Ollama | the OpenAI-compatible endpoint takes `reasoning_effort` and `reasoning.effort`; the **name of its response field** there is *unverified* (the page says `message.thinking` for the native API only) | `reasoning_effort` | <https://docs.ollama.com/api/openai-compatibility> |
+
+## Reasoning effort
+
+A call may name a reasoning level (`ModelRequest::reasoning_effort`, ADR 0063). The client sends it **only**
+when the deployment's profiles give the request's model a `reasoningWire` (`with_profiles`;
+`MODEL_ALIASES_FILE` in `adam-service`). No profile, no wire or no level sends nothing: the body is byte for
+byte the one without the feature.
+
+| `reasoningWire` | Member written |
+|---|---|
+| `reasoning_effort` | `{"reasoning_effort": "<level>"}` — **verified 2026-11-21** on the deployment's gateway (every family accepts it; Gemini rejects `max` and `xhigh`) |
+| `reasoning_object` | `{"reasoning": {"effort": "<level>"}}`, merged into the `reasoning` object the extra body already has; its other members stay. A `reasoning` member that is not an object is replaced, since the name collides: the typed level wins. **Unverified here** (a 400 on Gemini; ADR 0063) |
+| `thinking_budget` | `{"thinking": {"type": "enabled", "budget_tokens": <n>}}`, `<n>` from the profile's `reasoningBudgets` for that level. **Unverified here** (`thinking` is ignored or rejected by this gateway; ADR 0063) |
+
+The typed level is applied **after** the extra body (`MODEL_EXTRA_BODY` until ADR 0064 slice 3 replaces it with
+the profile's `extraBody`), and it removes only the members its wire would duplicate: `reasoning_effort` and
+`reasoning.effort` for the first two wires (a `reasoning` object that held the effort and empties is removed;
+one the extra body wrote empty stays), `thinking` for the third. Every other member stays, so a flag the model
+needs is not dropped — including, for `thinking_budget`, the extra body's `reasoning_effort` and
+`reasoning.effort`, which the ADR's letter leaves in place. `none` is a real level and is sent as `"none"`; an
+**absent** level sends nothing. A level the profile does not declare is the assembly's to refuse, not the
+client's: the client is not a second validator.
+
+**Limits.** `thinking` is removed wholesale, as the ADR says: an extra body's other `thinking` members
+(`clear_thinking`, a provider's own) are lost, and merging them is a follow-up (adam-rs#330). The wires are
+asymmetric on a non-object `reasoning`: `reasoning_object` replaces it (the member name collides), while
+`reasoning_effort` leaves it (only `reasoning.effort` is its duplicate, and a non-object holds none). A
+hand-built profile with the `thinking_budget` wire and no budget for the level is
+`ModelError::InvalidRequest`, naming the model and the level; the profiles loader refuses such a file at
+startup, so only a profile built in code reaches it. The loader also refuses `none` with `thinking_budget`: the
+shape has no disabled form, so that level would send thinking **enabled**.
 
 ## Usage
 
@@ -271,6 +304,17 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
   `opaque_members_are_dropped_when_the_run_changes_model`, `opaque_members_are_dropped_at_another_endpoint` and
   `the_client_stamps_the_requests_own_model_alias`; `src/wire.rs`'s `a_bound_turns_members_go_back_and_the_modelled_keys_win`,
   `an_unbound_turn_sends_none_of_its_members` and `a_response_without_opaque_members_parses_as_before`.
+* The reasoning-wire cases by name: `src/wire.rs`'s `a_typed_level_wins_over_the_extra_body_and_keeps_its_other_members`
+  (the ADR's pinned order), `each_wire_writes_its_own_member` (all three wires, each with an extra body carrying all three
+  members), `an_emptied_reasoning_object_is_removed_and_its_other_members_stay`,
+  `an_empty_reasoning_object_the_extra_body_wrote_stays`, `the_reasoning_object_wire_keeps_the_objects_other_members`,
+  `the_thinking_budget_wire_replaces_thinking_wholesale`, `none_is_a_level_that_is_sent_and_an_absent_one_is_not`,
+  `without_a_profile_a_wire_or_a_level_the_body_is_byte_identical`,
+  `a_thinking_budget_with_no_budget_names_the_model_and_the_level` and
+  `a_hand_built_thinking_budget_profile_refuses_none`; `src/lib.rs`'s
+  `the_profiles_are_answered_for_their_models_and_debug_shows_ids_only`; `crates/adam-model/src/profiles.rs`'s
+  `the_thinking_budget_wire_refuses_the_level_none`; and `tests/model_wire.rs` in `adam-service` for the end-to-end from
+  `MODEL_ALIASES_FILE` through `ModelConfig::client()`.
 * Unit tests: `src/errors.rs` (`status_mapping`, `a_problem_type_is_read_by_its_last_segment`,
   `a_problem_document_is_told_by_its_content_type`, `retry_after_seconds_and_date`), `src/lib.rs` also
   `a_rustls_error_is_found_however_it_is_wrapped`, `src/lib.rs`

@@ -411,8 +411,9 @@ are `crates/adam-llm-agent/src/compaction.rs`). An embedded engine takes the sam
 (`EngineBuilder::models`), and its builder's level (`EngineBuilder::reasoning_effort`) sits between the folder and
 the preset: the folder's key wins over it, and it over the agent's `model_preset` and the profile
 (`crates/adam-engine/src/engine.rs`, the host's seat; `crates/adam-assembly/src/def.rs`, the root's fallback;
-`crates/adam-assembly/src/assembly.rs`, `default_effort`). The client's reasoning wire and the profile's
-`extraBody` are the following slices.
+`crates/adam-assembly/src/assembly.rs`, `default_effort`). The client sends the level through the
+model's `reasoningWire`, after `MODEL_EXTRA_BODY` and removing only the members the wire would
+duplicate (`crates/adam-model-openai/src/wire.rs`); the profile's `extraBody` is ADR 0064 slice 3.
 
 ### The tokens of each model call
 

@@ -346,6 +346,15 @@ impl ModelProfiles {
                 _ => {}
             }
             if profile.reasoning_wire == Some(ReasoningWire::ThinkingBudget) {
+                // The shape has no disabled form: a level that means "do not reason" would send
+                // `thinking: {type: enabled, ...}`, the opposite.
+                if efforts.contains(&ReasoningEffort::None) {
+                    problems.push(format!(
+                        "{}: {:?} is not available with the `thinking_budget` wire, which has no disabled form: leave it out or use another wire",
+                        at("reasoningEfforts"),
+                        ReasoningEffort::None.as_str()
+                    ));
+                }
                 match profile.reasoning_budgets.as_ref() {
                     None => problems.push(format!(
                         "{}: the `thinking_budget` wire needs a budget for every declared level",
@@ -353,7 +362,9 @@ impl ModelProfiles {
                     )),
                     Some(budgets) => {
                         for level in efforts {
-                            if !budgets.contains_key(level) {
+                            // `none` is refused above: asking for its budget would be a second
+                            // problem telling the user to do what the first forbids.
+                            if *level != ReasoningEffort::None && !budgets.contains_key(level) {
                                 problems.push(format!(
                                     "{}: {:?} is declared but has no budget",
                                     at("reasoningBudgets"),
@@ -921,6 +932,56 @@ mod tests {
         let problems = problems_of(&bad);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("thinking_budget"), "{problems:?}");
+    }
+
+    #[test]
+    fn the_thinking_budget_wire_refuses_the_level_none() {
+        // A valid file: the wire's levels, each with its budget, and no `none`.
+        let good = json!({
+            "profiles": { "m": {
+                "reasoningEfforts": ["low", "high"],
+                "reasoningWire": "thinking_budget",
+                "reasoningBudgets": { "low": 1024, "high": 8192 }
+            } }
+        });
+        let profiles = ModelProfiles::parse_json(&good.to_string()).expect("valid");
+        assert_eq!(
+            profiles.profile("m").unwrap().reasoning_efforts.as_deref(),
+            Some(&[ReasoningEffort::Low, ReasoningEffort::High][..])
+        );
+
+        // `none` would send `thinking: {type: enabled, ...}`: the shape has no disabled form.
+        let bad = json!({
+            "profiles": { "m": {
+                "reasoningEfforts": ["none", "low"],
+                "reasoningWire": "thinking_budget",
+                "reasoningBudgets": { "none": 1, "low": 1024 }
+            } }
+        });
+        let problems = problems_of(&bad);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains(r#"profiles."m".reasoningEfforts"#),
+            "{problems:?}"
+        );
+        assert!(problems[0].contains(r#""none""#), "{problems:?}");
+        assert!(problems[0].contains("thinking_budget"), "{problems:?}");
+        assert!(problems[0].contains("no disabled form"), "{problems:?}");
+        assert!(problems[0].contains("another wire"), "{problems:?}");
+
+        // The natural bad file has no budget for `none`: one problem, the refusal, never a
+        // second telling the user to budget a level the wire forbids.
+        let natural = json!({
+            "profiles": { "m": {
+                "reasoningEfforts": ["none", "low"],
+                "reasoningWire": "thinking_budget",
+                "reasoningBudgets": { "low": 1024 }
+            } }
+        });
+        let problems = problems_of(&natural);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("no disabled form"), "{problems:?}");
+        assert!(!problems[0].contains("no budget"), "{problems:?}");
     }
 
     #[test]

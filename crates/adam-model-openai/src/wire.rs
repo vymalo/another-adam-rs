@@ -4,8 +4,9 @@
 use std::collections::BTreeMap;
 
 use adam_model::{
-    ContentPart, FinishReason, ImageData, ImageRef, Message, ModelDelta, ModelError, ModelRequest,
-    ModelResponse, ProviderTurn, ToolCall, ToolChoice, Usage,
+    ContentPart, FinishReason, ImageData, ImageRef, Message, ModelDelta, ModelError, ModelProfiles,
+    ModelRequest, ModelResponse, ProviderTurn, ReasoningEffort, ReasoningWire, ToolCall,
+    ToolChoice, Usage,
 };
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,8 @@ pub(crate) const RESERVED_BODY_KEYS: [&str; 5] =
 pub(crate) struct RequestOptions<'a> {
     pub(crate) max_tokens_field: MaxTokensField,
     /// Members merged into the body (they win over what the runtime wrote, `prompt_cache_key` included, except
-    /// [`RESERVED_BODY_KEYS`], which are refused when the client is built).
+    /// [`RESERVED_BODY_KEYS`], which are refused when the client is built, and except the members a typed
+    /// reasoning level's wire duplicates: the level wins there, ADR 0063 decision 6).
     pub(crate) extra_body: Option<&'a serde_json::Map<String, Value>>,
     /// Send the reasoning an assistant message keeps, under this name; `None` sends none.
     pub(crate) echo_reasoning: Option<ReasoningField>,
@@ -32,6 +34,10 @@ pub(crate) struct RequestOptions<'a> {
     /// The client's stable id of the endpoint it speaks to. A provider's opaque members go back
     /// only to the endpoint (and model alias) that produced them.
     pub(crate) endpoint: &'a str,
+    /// The deployment's per-model profiles (`MODEL_ALIASES_FILE`): the request's model profile
+    /// says how its [`reasoning_effort`](ModelRequest::reasoning_effort) is sent. `None` or a
+    /// model with no profile sends nothing.
+    pub(crate) profiles: Option<&'a ModelProfiles>,
 }
 
 // ---------------------------------------------------------------- request --
@@ -204,18 +210,130 @@ pub(crate) fn build_request(
     };
     let not_serializable =
         |e| ModelError::invalid_request("request is not serializable").with_source(e);
-    let Some(extra) = options.extra_body.filter(|extra| !extra.is_empty()) else {
+    let extra = options.extra_body.filter(|extra| !extra.is_empty());
+    let reasoning = reasoning_member(req, options.profiles)?;
+    if extra.is_none() && reasoning.is_none() {
         return serde_json::to_vec(&wire).map_err(not_serializable);
-    };
+    }
     // The deployment's own members (a flag that makes a gateway emit reasoning) are merged over
-    // the body, at its top level.
+    // the body, at its top level. A typed level then removes what its wire would duplicate and
+    // writes the model's own member (ADR 0063 decision 6).
     let mut body = serde_json::to_value(&wire).map_err(not_serializable)?;
     if let Value::Object(members) = &mut body {
-        for (key, value) in extra {
-            members.insert(key.clone(), value.clone());
+        if let Some(extra) = extra {
+            for (key, value) in extra {
+                members.insert(key.clone(), value.clone());
+            }
+        }
+        if let Some(reasoning) = reasoning {
+            reasoning.apply(members);
         }
     }
     serde_json::to_vec(&body).map_err(not_serializable)
+}
+
+/// The member a typed level writes, once the model's profile says how (ADR 0063 decision 2).
+enum ReasoningMember {
+    /// `{"reasoning_effort": "<level>"}`.
+    Effort(&'static str),
+    /// `{"reasoning": {"effort": "<level>"}}`.
+    Object(&'static str),
+    /// `{"thinking": {"type": "enabled", "budget_tokens": <n>}}`.
+    Thinking(u32),
+}
+
+/// What a request's [`reasoning_effort`](ModelRequest::reasoning_effort) writes, from the profile
+/// of its model: `None` when the request has no level, the model has no profile, or the profile
+/// declares no wire. The assembly refuses a level the model does not take, so the client is not a
+/// second validator; it does refuse the two things `parse_json` guarantees and a hand-built profile
+/// can break: a `thinking_budget` profile with no budget for the level, and `none` with that wire,
+/// which has no disabled form.
+fn reasoning_member(
+    req: &ModelRequest,
+    profiles: Option<&ModelProfiles>,
+) -> Result<Option<ReasoningMember>, ModelError> {
+    let Some(level) = req.reasoning_effort else {
+        return Ok(None);
+    };
+    let Some(profile) = profiles.and_then(|profiles| profiles.profile(&req.model)) else {
+        return Ok(None);
+    };
+    let Some(wire) = profile.reasoning_wire else {
+        return Ok(None);
+    };
+    Ok(Some(match wire {
+        ReasoningWire::ReasoningEffort => ReasoningMember::Effort(level.as_str()),
+        ReasoningWire::ReasoningObject => ReasoningMember::Object(level.as_str()),
+        ReasoningWire::ThinkingBudget => {
+            // `none` is the level that means "do not reason", and the shape has no disabled form:
+            // the loader refuses the pairing, and a hand-built profile reaches this, the one place
+            // the invariant can be total.
+            if level == ReasoningEffort::None {
+                return Err(ModelError::invalid_request(format!(
+                    "the model {:?} cannot send reasoning effort {:?} through the `thinking_budget` wire: the wire has no disabled form",
+                    req.model,
+                    level.as_str()
+                )));
+            }
+            let budget = profile
+                .reasoning_budgets
+                .as_ref()
+                .and_then(|budgets| budgets.get(&level).copied());
+            let Some(budget) = budget else {
+                return Err(ModelError::invalid_request(format!(
+                    "the model {:?} has no thinking budget for reasoning effort {:?}",
+                    req.model,
+                    level.as_str()
+                )));
+            };
+            ReasoningMember::Thinking(budget)
+        }
+    }))
+}
+
+impl ReasoningMember {
+    /// Write the member, removing only what the extra body holds of the same fact: both
+    /// `reasoning_effort` and `reasoning.effort` for the first two wires (an emptied `reasoning`
+    /// object that held the effort goes), `thinking` wholesale for the third (ADR 0063 decision 6). Other members stay.
+    fn apply(self, members: &mut serde_json::Map<String, Value>) {
+        match self {
+            Self::Effort(level) => {
+                members.remove("reasoning_effort");
+                let emptied = match members.get_mut("reasoning") {
+                    Some(Value::Object(reasoning)) => {
+                        // Only a member that held the effort "becomes empty": an object the extra
+                        // body wrote empty stays.
+                        let had_effort = reasoning.remove("effort").is_some();
+                        had_effort && reasoning.is_empty()
+                    }
+                    _ => false,
+                };
+                if emptied {
+                    members.remove("reasoning");
+                }
+                members.insert("reasoning_effort".to_owned(), json!(level));
+            }
+            Self::Object(level) => {
+                members.remove("reasoning_effort");
+                // A member that is not an object cannot hold `effort`: the typed level wins.
+                let mut reasoning = members
+                    .get("reasoning")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                reasoning.remove("effort");
+                reasoning.insert("effort".to_owned(), json!(level));
+                members.insert("reasoning".to_owned(), Value::Object(reasoning));
+            }
+            Self::Thinking(budget) => {
+                members.remove("thinking");
+                members.insert(
+                    "thinking".to_owned(),
+                    json!({"type": "enabled", "budget_tokens": budget}),
+                );
+            }
+        }
+    }
 }
 
 fn text_message<'a>(role: &'static str, text: &str) -> WireMessage<'a> {
@@ -1040,7 +1158,7 @@ impl Assembler {
 
 #[cfg(test)]
 mod tests {
-    use adam_model::ToolSpec;
+    use adam_model::{ModelProfile, ReasoningEffort, ReasoningWire, ToolSpec};
 
     use super::*;
 
@@ -1173,6 +1291,391 @@ mod tests {
             prompt_cache_key: on,
             ..with(extra, None)
         }
+    }
+
+    fn profile_of(efforts: &[ReasoningEffort], wire: ReasoningWire) -> ModelProfile {
+        ModelProfile {
+            reasoning_efforts: Some(efforts.to_vec()),
+            reasoning_wire: Some(wire),
+            ..ModelProfile::default()
+        }
+    }
+
+    fn profiles_of(model: &str, profile: ModelProfile) -> ModelProfiles {
+        ModelProfiles {
+            profiles: BTreeMap::from([(model.to_owned(), profile)]),
+            presets: BTreeMap::new(),
+        }
+    }
+
+    fn body_of(req: &ModelRequest, options: RequestOptions<'_>) -> Value {
+        serde_json::from_slice(&build_request(req, false, options).unwrap()).unwrap()
+    }
+
+    /// The ADR's pinned order: the typed level is applied **after** the extra body, so it wins.
+    #[test]
+    fn a_typed_level_wins_over_the_extra_body_and_keeps_its_other_members() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        let profiles = profiles_of(
+            "gw-model",
+            profile_of(
+                &[ReasoningEffort::Low, ReasoningEffort::Medium],
+                ReasoningWire::ReasoningEffort,
+            ),
+        );
+        let extra = json!({"reasoning_effort": "medium", "chat_template_kwargs": {"enable_thinking": true}});
+        for stream in [false, true] {
+            let sent: Value = serde_json::from_slice(
+                &build_request(
+                    &req,
+                    stream,
+                    RequestOptions {
+                        profiles: Some(&profiles),
+                        ..with(Some(extra.clone()), None)
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            // Apply the level before the extra-body merge and this is `medium`.
+            assert_eq!(sent["reasoning_effort"], "low", "the typed level wins");
+            assert_eq!(
+                sent["chat_template_kwargs"],
+                json!({"enable_thinking": true}),
+                "the other members stay"
+            );
+            assert_eq!(sent["model"], "gw-model");
+        }
+    }
+
+    #[test]
+    fn each_wire_writes_its_own_member() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::High);
+        // Every wire's member, so each arm proves what it removed and what it left.
+        let extra = json!({
+            "reasoning_effort": "medium",
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "thinking": {"type": "enabled", "budget_tokens": 999, "clear_thinking": false}
+        });
+        for wire in ReasoningWire::ALL {
+            let mut profile = profile_of(&[ReasoningEffort::High], wire);
+            if wire == ReasoningWire::ThinkingBudget {
+                profile.reasoning_budgets = Some(BTreeMap::from([(ReasoningEffort::High, 8192)]));
+            }
+            let profiles = profiles_of("gw-model", profile);
+            let sent = body_of(
+                &req,
+                RequestOptions {
+                    profiles: Some(&profiles),
+                    ..with(Some(extra.clone()), None)
+                },
+            );
+            match wire {
+                ReasoningWire::ReasoningEffort => {
+                    assert_eq!(sent["reasoning_effort"], "high", "{sent}");
+                    assert_eq!(
+                        sent["reasoning"],
+                        json!({"summary": "auto"}),
+                        "the effort goes, the object's other members stay: {sent}"
+                    );
+                    assert_eq!(
+                        sent["thinking"],
+                        json!({"type": "enabled", "budget_tokens": 999, "clear_thinking": false}),
+                        "a member of another wire stays: {sent}"
+                    );
+                }
+                ReasoningWire::ReasoningObject => {
+                    assert_eq!(
+                        sent["reasoning"],
+                        json!({"summary": "auto", "effort": "high"}),
+                        "{sent}"
+                    );
+                    assert!(
+                        sent.get("reasoning_effort").is_none(),
+                        "the other member of the same fact is removed: {sent}"
+                    );
+                    assert_eq!(
+                        sent["thinking"],
+                        json!({"type": "enabled", "budget_tokens": 999, "clear_thinking": false}),
+                        "{sent}"
+                    );
+                }
+                ReasoningWire::ThinkingBudget => {
+                    assert_eq!(
+                        sent["thinking"],
+                        json!({"type": "enabled", "budget_tokens": 8192}),
+                        "{sent}"
+                    );
+                    assert_eq!(
+                        sent["reasoning_effort"], "medium",
+                        "the ADR removes only `thinking`: the extra body's effort stays: {sent}"
+                    );
+                    assert_eq!(
+                        sent["reasoning"],
+                        json!({"effort": "medium", "summary": "auto"}),
+                        "{sent}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_reasoning_object_the_extra_body_wrote_stays() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        let profiles = profiles_of(
+            "gw-model",
+            profile_of(&[ReasoningEffort::Low], ReasoningWire::ReasoningEffort),
+        );
+        let sent = body_of(
+            &req,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..with(Some(json!({"reasoning": {}})), None)
+            },
+        );
+        assert_eq!(
+            sent["reasoning"],
+            json!({}),
+            "an object that held no effort does not 'become empty': {sent}"
+        );
+        assert_eq!(sent["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn an_emptied_reasoning_object_is_removed_and_its_other_members_stay() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        let profiles = profiles_of(
+            "gw-model",
+            profile_of(&[ReasoningEffort::Low], ReasoningWire::ReasoningEffort),
+        );
+        let sent = body_of(
+            &req,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..with(Some(json!({"reasoning": {"effort": "medium"}})), None)
+            },
+        );
+        assert_eq!(sent["reasoning_effort"], "low");
+        assert!(sent.get("reasoning").is_none(), "{sent}");
+
+        let sent = body_of(
+            &req,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..with(
+                    Some(json!({"reasoning": {"effort": "medium", "summary": "auto"}})),
+                    None,
+                )
+            },
+        );
+        assert_eq!(sent["reasoning"], json!({"summary": "auto"}), "{sent}");
+        assert_eq!(sent["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn the_reasoning_object_wire_keeps_the_objects_other_members() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        let profiles = profiles_of(
+            "gw-model",
+            profile_of(&[ReasoningEffort::Low], ReasoningWire::ReasoningObject),
+        );
+        let sent = body_of(
+            &req,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..with(
+                    Some(json!({
+                        "reasoning_effort": "medium",
+                        "reasoning": {"effort": "medium", "summary": "auto"}
+                    })),
+                    None,
+                )
+            },
+        );
+        assert_eq!(
+            sent["reasoning"],
+            json!({"summary": "auto", "effort": "low"})
+        );
+        assert!(
+            sent.get("reasoning_effort").is_none(),
+            "the wire's duplicate is removed: {sent}"
+        );
+    }
+
+    /// `thinking` is removed wholesale, as the ADR says: an extra body's other members of it are
+    /// lost (the "merge them" idea is a follow-up).
+    #[test]
+    fn the_thinking_budget_wire_replaces_thinking_wholesale() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        let mut profile = profile_of(&[ReasoningEffort::Low], ReasoningWire::ThinkingBudget);
+        profile.reasoning_budgets = Some(BTreeMap::from([(ReasoningEffort::Low, 1024)]));
+        let profiles = profiles_of("gw-model", profile);
+        let sent = body_of(
+            &req,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..with(
+                    Some(json!({"thinking": {
+                        "type": "enabled",
+                        "budget_tokens": 999,
+                        "clear_thinking": false
+                    }})),
+                    None,
+                )
+            },
+        );
+        assert_eq!(
+            sent["thinking"],
+            json!({"type": "enabled", "budget_tokens": 1024}),
+            "{sent}"
+        );
+    }
+
+    #[test]
+    fn none_is_a_level_that_is_sent_and_an_absent_one_is_not() {
+        let profiles = profiles_of(
+            "gw-model",
+            profile_of(
+                &[ReasoningEffort::None, ReasoningEffort::Low],
+                ReasoningWire::ReasoningEffort,
+            ),
+        );
+        let mut req = request();
+        let absent = build_request(
+            &req,
+            false,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..RequestOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            absent,
+            build_request(&req, false, RequestOptions::default()).unwrap(),
+            "no level sends the bytes of no profile"
+        );
+        req.reasoning_effort = Some(ReasoningEffort::None);
+        let sent = body_of(
+            &req,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..RequestOptions::default()
+            },
+        );
+        assert_eq!(sent["reasoning_effort"], "none", "{sent}");
+    }
+
+    #[test]
+    fn without_a_profile_a_wire_or_a_level_the_body_is_byte_identical() {
+        let req = request();
+        let plain = build_request(&req, false, RequestOptions::default()).unwrap();
+        // A level and no profiles.
+        let mut levelled = request();
+        levelled.reasoning_effort = Some(ReasoningEffort::High);
+        assert_eq!(
+            build_request(&levelled, false, RequestOptions::default()).unwrap(),
+            plain
+        );
+        // A profile with no wire (a cap only).
+        let capped = profiles_of(
+            "gw-model",
+            ModelProfile {
+                max_output_tokens: Some(1000),
+                ..ModelProfile::default()
+            },
+        );
+        assert_eq!(
+            build_request(
+                &levelled,
+                false,
+                RequestOptions {
+                    profiles: Some(&capped),
+                    ..RequestOptions::default()
+                }
+            )
+            .unwrap(),
+            plain
+        );
+        // A profile with a wire, and no level.
+        let wired = profiles_of(
+            "gw-model",
+            profile_of(&[ReasoningEffort::High], ReasoningWire::ReasoningEffort),
+        );
+        for stream in [false, true] {
+            assert_eq!(
+                build_request(
+                    &req,
+                    stream,
+                    RequestOptions {
+                        profiles: Some(&wired),
+                        ..RequestOptions::default()
+                    }
+                )
+                .unwrap(),
+                build_request(&req, stream, RequestOptions::default()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_thinking_budget_with_no_budget_names_the_model_and_the_level() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::High);
+        for budgets in [None, Some(BTreeMap::from([(ReasoningEffort::Low, 1024)]))] {
+            let mut profile = profile_of(&[ReasoningEffort::High], ReasoningWire::ThinkingBudget);
+            profile.reasoning_budgets = budgets;
+            let profiles = profiles_of("gw-model", profile);
+            let err = build_request(
+                &req,
+                false,
+                RequestOptions {
+                    profiles: Some(&profiles),
+                    ..RequestOptions::default()
+                },
+            )
+            .expect_err("no budget for the level");
+            assert!(matches!(err, ModelError::InvalidRequest { .. }), "{err:?}");
+            assert!(err.to_string().contains("gw-model"), "{err}");
+            assert!(err.to_string().contains("high"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_hand_built_thinking_budget_profile_refuses_none() {
+        // `parse_json` refuses this pairing; a hand-built profile (public fields) bypasses it, so
+        // the client refuses it too: the wire has no disabled form.
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::None);
+        let mut profile = profile_of(
+            &[ReasoningEffort::None, ReasoningEffort::Low],
+            ReasoningWire::ThinkingBudget,
+        );
+        profile.reasoning_budgets = Some(BTreeMap::from([
+            (ReasoningEffort::None, 1),
+            (ReasoningEffort::Low, 1024),
+        ]));
+        let profiles = profiles_of("gw-model", profile);
+        let err = build_request(
+            &req,
+            false,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..RequestOptions::default()
+            },
+        )
+        .expect_err("none through thinking_budget");
+        assert!(matches!(err, ModelError::InvalidRequest { .. }), "{err:?}");
+        assert!(err.to_string().contains("gw-model"), "{err}");
+        assert!(err.to_string().contains("none"), "{err}");
+        assert!(err.to_string().contains("no disabled form"), "{err}");
     }
 
     #[test]

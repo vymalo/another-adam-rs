@@ -273,6 +273,17 @@ choice; absent everywhere sends nothing). The `MODEL_EXTRA_BODY` rule is 0054's 
 typed level removes the members the model's wire would duplicate from the profile's `extraBody` (or
 `MODEL_EXTRA_BODY` until ADR 0064 lands) and writes the model's mapping. `temperature` is unchanged.
 
+## Amended 2026-11-22
+
+*Amended 2026-11-22:* **a `thinking_budget` profile may not declare `none`.** The shape has no disabled
+form — `{"thinking": {"type": "enabled", "budget_tokens": n}}` — so a level that means "do not reason"
+would send thinking **enabled**. `reasoningEfforts` containing `none` with
+`reasoningWire: thinking_budget` is a startup error (exit 78), naming the alias and the level: leave
+`none` out or use another wire. The probe table's recommended `[none, low]` sets are for the
+`reasoning_effort` wire. A hand-built `ModelProfile` (or a direct `serde_json::from_str`) bypasses
+`parse_json`, so the client refuses the same pairing at the call (`ModelError::InvalidRequest`: the wire
+has no disabled form), and the invariant holds everywhere. (#327)
+
 ## Alternatives considered
 
 - **A global `MODEL_REASONING_EFFORT`** (an earlier draft): the owner rejected it — the models behind the
