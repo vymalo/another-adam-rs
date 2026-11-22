@@ -79,9 +79,9 @@ plane starts runs without them (see docs/architecture.md, "Roles").
 {{- end -}}
 
 {{/*
-config.modelAuth (MODEL_AUTH), trimmed and folded to lower case as the binary parses it (the binary
-compares it without case): `key`, `device` or `injector`. Empty means nothing is rendered and the
-binary's own default, `key`, applies.
+config.modelAuth (MODEL_AUTH): `key`, `device` or `injector`. The chart normalises it before rendering
+(trim and lower case), so the binary sees one of the three words; the binary folds case but not
+whitespace. Empty means nothing is rendered and the binary's own default, `key`, applies.
 */}}
 {{- define "coder.modelAuth" -}}
 {{- default "" .Values.config.modelAuth | toString | trim | lower -}}

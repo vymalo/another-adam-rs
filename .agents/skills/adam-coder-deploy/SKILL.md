@@ -91,13 +91,16 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      it on: a missing property fails the whole ExternalSecret sync. Chart only: the binary reads the
      env var either way, so there is no image dependency (chart README, "The model gateway's URL from the
      secret").
-   * `config.modelAuth` (`MODEL_AUTH`, ADR 0067): empty (default, the binary's `key`), `key`, `device` (with
-     `MODEL_OAUTH_*` in `config.extraEnv`) or `injector`: no key, every model call carries `X-Run-Id` and no
-     `Authorization`, and an injector in front of the model adds the run's credential. With `injector` the
-     ExternalSecret still creates `MODEL_API_KEY`, so the AWS value of `externalSecrets.properties.modelApiKey`
-     must be EMPTY (a non-empty one is exit 78; the chart warns in `NOTES.txt`, it cannot read the value).
-     Workers only. `MODEL_CA_FILE` has no chart value yet (ADR 0067 decision 9, a later slice). Chart only, no
-     image dependency (chart README, "Model authentication").
+   * `config.modelAuth` (`MODEL_AUTH`, ADR 0067): empty (default, the binary's `key`), `key`, `device` (the
+     device grant: `MODEL_OAUTH_ISSUER` and `MODEL_OAUTH_CLIENT_ID` are required in `config.extraEnv`, and the
+     chart refuses `device` without them; `MODEL_OAUTH_SCOPE` is optional) or `injector`: no key, every model
+     call carries `X-Run-Id` and no `Authorization`, an injector in front of the model adds the run's
+     credential, and any `MODEL_OAUTH_*` beside it is refused. With `device` or `injector` the ExternalSecret
+     still creates `MODEL_API_KEY`, so the AWS value of `externalSecrets.properties.modelApiKey` must be EMPTY
+     (a non-empty one is exit 78; the chart warns in `NOTES.txt`, it cannot read the value). With `injector`,
+     point `config.modelBaseUrl` at the injector or every run parks up to `MODEL_PARK_LIMIT` (`NOTES.txt`
+     warns when the placeholder is still there). Workers only. `MODEL_CA_FILE` has no chart value yet (ADR 0067
+     decision 9, a later slice). Chart only, no image dependency (chart README, "Model authentication").
    * `config.modelContextWindow` (null): `MODEL_CONTEXT_WINDOW`, the model's window in tokens, said by each usage
      report, and the output cap's window: the cap is clamped to the window less 20,000 and the coder's history
      (ADR 0064; `deploy/coder/README.md`, "The model's context window").

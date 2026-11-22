@@ -150,22 +150,33 @@ check "maxParallelToolCalls and extraEnv MAX_PARALLEL_TOOL_CALLS together are re
 # injector in front of the model that adds the run's credential.
 helm_auth() { helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 "$@"; }
 auth_says() { printf '%s\n' "$1" | grep -Eq -- "$2"; } # says, before the later helper of that name is defined
+# The device grant needs its issuer and client; the chart refuses the value without them.
+helm_device() {
+  helm_auth --set config.modelAuth=device \
+    --set-string config.extraEnv.MODEL_OAUTH_ISSUER=https://issuer.example \
+    --set-string config.extraEnv.MODEL_OAUTH_CLIENT_ID=coder "$@"
+}
 helm_auth > "$out"
 check "modelAuth unset: no MODEL_AUTH is rendered (the binary's default is key)" lacks 'MODEL_AUTH'
 check "modelAuth unset: the render equals the golden" cmp -s "$out" "$golden"
-for auth in key device injector; do
+for auth in key injector; do
   helm_auth --set "config.modelAuth=$auth" > "$out"
   check "modelAuth=$auth: the worker gets MODEL_AUTH=$auth" envval MODEL_AUTH "$auth"
   check "modelAuth=$auth: ... once" count 'name: MODEL_AUTH$' 1
   check "modelAuth=$auth: ... as a plain value, not a secret" dlacks ExternalSecret 'MODEL_AUTH'
 done
-for auth in device injector; do
-  helm_auth --set "config.modelAuth=$auth" > "$out"
-  check "modelAuth=$auth: the ExternalSecret still creates MODEL_API_KEY (its value must be empty)" \
-    dhas ExternalSecret '^    - secretKey: MODEL_API_KEY$'
-done
+helm_device > "$out"
+check "modelAuth=device: the worker gets MODEL_AUTH=device" envval MODEL_AUTH device
+check "modelAuth=device: ... once" count 'name: MODEL_AUTH$' 1
+check "modelAuth=device: ... as a plain value, not a secret" dlacks ExternalSecret 'MODEL_AUTH'
+helm_device > "$out"
+check "modelAuth=device: the ExternalSecret still creates MODEL_API_KEY (its value must be empty)" \
+  dhas ExternalSecret '^    - secretKey: MODEL_API_KEY$'
+helm_auth --set config.modelAuth=injector > "$out"
+check "modelAuth=injector: the ExternalSecret still creates MODEL_API_KEY (its value must be empty)" \
+  dhas ExternalSecret '^    - secretKey: MODEL_API_KEY$'
 helm_auth --set-string 'config.modelAuth= Injector ' > "$out"
-check "modelAuth is trimmed and case-folded, as the binary reads it" envval MODEL_AUTH injector
+check "modelAuth is trimmed and case-folded before rendering (the binary does not trim)" envval MODEL_AUTH injector
 helm_auth --set config.modelAuth=injector --set config.role=control-plane > "$out"
 check "a control plane runs no model: no MODEL_AUTH" lacks 'MODEL_AUTH'
 helm_auth --set config.modelAuth=injector --set topology=split > "$out"
@@ -177,12 +188,34 @@ check "injector: MODEL_API_KEY stays a secret reference (the chart cannot read i
 check "injector: no MODEL_CA_FILE is mounted (ADR 0067 decision 9 is a later slice)" \
   lacks 'MODEL_CA_FILE|model-ca|ca-file'
 check "injector: still no Secret object in the render" lacks '^kind: Secret$'
-for bad in bogus oauth true; do
+for bad in bogus oauth true false 0 null; do
   check "modelAuth $bad is refused" fails helm_auth --set "config.modelAuth=$bad"
 done
 message=$(helm_auth --set config.modelAuth=bogus 2>&1 || true)
 check "... the error names the value and the accepted words" \
   auth_says "$message" 'must be key, device or injector.*"bogus"'
+for bad in false 0 null; do
+  message=$(helm_auth --set "config.modelAuth=$bad" 2>&1 || true)
+  check "modelAuth $bad is not a string, and the error says so" auth_says "$message" 'must be a string'
+done
+helm_auth --set config.modelAuth= > "$out"
+check "an empty modelAuth is the unset default" lacks 'MODEL_AUTH'
+check "device without the OAuth variables is refused (the worker would exit 78)" \
+  fails helm_auth --set config.modelAuth=device
+message=$(helm_auth --set config.modelAuth=device 2>&1 || true)
+check "... the error names MODEL_OAUTH_ISSUER and exit 78" auth_says "$message" 'MODEL_OAUTH_ISSUER.*exit 78'
+check "device without the client ID is refused" \
+  fails helm_auth --set config.modelAuth=device --set-string config.extraEnv.MODEL_OAUTH_ISSUER=https://issuer.example
+check "device without the issuer is refused" \
+  fails helm_auth --set config.modelAuth=device --set-string config.extraEnv.MODEL_OAUTH_CLIENT_ID=coder
+helm_auth --set config.modelAuth=device --set config.role=control-plane > "$out"
+check "a control plane with device needs no OAuth variable (it renders no model)" lacks 'MODEL_AUTH'
+for name in MODEL_OAUTH_ISSUER MODEL_OAUTH_CLIENT_ID MODEL_OAUTH_SCOPE; do
+  check "injector with $name in extraEnv is refused (the worker would exit 78)" \
+    fails helm_auth --set config.modelAuth=injector --set-string "config.extraEnv.$name=x"
+done
+message=$(helm_auth --set config.modelAuth=injector --set-string config.extraEnv.MODEL_OAUTH_SCOPE=offline_access 2>&1 || true)
+check "... the error names the variable and exit 78" auth_says "$message" 'MODEL_OAUTH_SCOPE.*exit 78'
 check "modelAuth and extraEnv MODEL_AUTH together are refused" \
   fails helm_auth --set config.modelAuth=injector --set-string config.extraEnv.MODEL_AUTH=injector
 message=$(helm_auth --set config.modelAuth=injector --set-string config.extraEnv.MODEL_AUTH=injector 2>&1 || true)
@@ -2085,8 +2118,20 @@ check "modelAuth=injector: NOTES.txt says the ExternalSecret's model key must be
   says "$notes" "property's value must be EMPTY"
 check "... and names the property" says "$notes" 'externalSecrets.properties.modelApiKey'
 check "... and says the injector adds the run's credential (ADR 0067)" says "$notes" 'ADR 0067'
+check "... and warns that the placeholder URL makes every run park" says "$notes" 'every run would park'
+check "... naming MODEL_PARK_LIMIT" says "$notes" 'MODEL_PARK_LIMIT'
+notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=sha-abc1234 --set config.modelAuth=injector --set config.modelBaseUrl=https://injector.example/v1 --show-only templates/notes.yaml --debug 2>&1 || true)
+check "modelAuth=injector with a real URL: no placeholder warning" fails says "$notes" 'every run would park'
+notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=sha-abc1234 --set config.modelAuth=injector --set config.modelBaseUrlFromSecret=true --show-only templates/notes.yaml --debug 2>&1 || true)
+check "modelAuth=injector with the URL from the secret: no placeholder warning" fails says "$notes" 'every run would park'
+notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=sha-abc1234 --set config.modelAuth=device --set-string config.extraEnv.MODEL_OAUTH_ISSUER=https://issuer.example --set-string config.extraEnv.MODEL_OAUTH_CLIENT_ID=coder --show-only templates/notes.yaml --debug 2>&1 || true)
+check "modelAuth=device: NOTES.txt has the same empty-key note" says "$notes" "property's value must be EMPTY"
+check "... and says device or injector" says "$notes" '`device` or `injector`'
+check "... and says the device grant, not the injector" says "$notes" 'device grant'
+check "... and has no injector placeholder warning" fails says "$notes" 'every run would park'
 notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=sha-abc1234 --set config.modelAuth=key --show-only templates/notes.yaml --debug 2>&1 || true)
 check "modelAuth=key: NOTES.txt has no empty-key note" fails says "$notes" 'must be EMPTY'
+check "... and no placeholder warning" fails says "$notes" 'every run would park'
 notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=sha-abc1234 --set config.modelAuth=injector --set externalSecrets.enabled=false --show-only templates/notes.yaml --debug 2>&1 || true)
 check "modelAuth=injector without the ExternalSecret: no empty-key note" fails says "$notes" 'must be EMPTY'
 rm -rf "$notes_chart"
