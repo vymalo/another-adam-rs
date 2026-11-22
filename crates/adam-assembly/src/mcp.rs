@@ -64,8 +64,8 @@ pub(crate) struct AgentMcp {
     /// What its servers said about themselves, by server, heading included, ready to append to its
     /// instructions (empty for tools supplied by hand). Read once, when the servers were
     /// connected, so the prompt of the agent never changes during the process. A server with a
-    /// `when` contributes its section to the note of its group, which the load's result says
-    /// ([`groups`](crate::groups)).
+    /// `when` contributes its section to the note of its group: the first prompt's for a group the
+    /// task loads, the load's result for one the run loads ([`groups`](crate::groups)).
     pub(crate) instructions: Vec<(String, String)>,
     /// The prompts of its servers as commands (the root's are served; a subagent's are not).
     pub(crate) prompts: Prompts,

@@ -465,14 +465,43 @@ pub enum Error {
     },
     /// A searchable group is not built yet (ADR 0066, slice S2).
     #[error(
-        "{origin}: the group `{group}` is searchable, which is not built yet: set `searchable: \
-         false` until S2"
+        "{origin}: the group `{group}` is searchable, and this host cannot bind a searchable group \
+         until S2: build it without `searchable` for now"
     )]
     SearchableGroup {
         /// The agent and file.
         origin: Origin,
         /// The group.
         group: String,
+    },
+    /// A tool belongs to two groups. A load must append it once, from one group, and the refusal
+    /// that names the group would be ambiguous.
+    #[error(
+        "{origin}: the tool `{tool}` is in the groups `{first}` and `{second}`: a tool belongs to \
+         one group"
+    )]
+    GroupOverlap {
+        /// The agent and file.
+        origin: Origin,
+        /// The tool.
+        tool: String,
+        /// The group that already has it.
+        first: String,
+        /// The group that also names it.
+        second: String,
+    },
+    /// A tool name starts with the loaders' reserved prefix (`load__`). The loaders are own tools
+    /// named `load__group__<name>`, and an MCP tool is `<server>__<tool>`, so the names would
+    /// collide.
+    #[error(
+        "{origin}: the tool `{tool}` is reserved: the group loaders are named \
+         `load__group__<name>`, so no tool may start with `load__`; rename it"
+    )]
+    ReservedLoaderName {
+        /// The agent and file.
+        origin: Origin,
+        /// The name in conflict.
+        tool: String,
     },
     /// A subagent has a tool that asks the user a question ([`Tool::asks_user`]). A subagent runs as
     /// a child of another run, so nobody could answer, and the child would wait for ever.

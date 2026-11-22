@@ -1,6 +1,6 @@
-//! A server whose `when` did not match the task is one group, loaded by `load__group__<server>`:
-//! its tools are withheld until the task holds a keyword or the run loads the group, and its
-//! instructions are the group's note, said in the load's result.
+//! Tool groups and their loaders: a server whose `when` did not match the task is one group, loaded
+//! by `load__group__<server>`; its tools are withheld until the task holds a keyword or the run
+//! loads the group, and its instructions are the group's note.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
@@ -117,9 +117,14 @@ async fn a_keyword_that_matches_loads_the_server_and_one_that_does_not_is_withhe
         "a group the task loads is in the first request, so no turn records a growth: {:?}",
         state.tools_appended
     );
-    assert!(
-        state.loaded.is_empty(),
-        "and the state records no explicit load"
+    assert_eq!(
+        state
+            .loaded
+            .iter()
+            .map(|one| one.loader.as_str())
+            .collect::<Vec<_>>(),
+        ["load__group__linear"],
+        "the task-loaded group is journaled, for the recap"
     );
     assert_eq!(
         tool_names(&requests[0]),
@@ -238,6 +243,10 @@ async fn a_call_to_a_group_that_was_not_loaded_is_refused_and_names_the_loader()
     assert!(
         text.contains("load__group__docs"),
         "the refusal names the loader: {text}"
+    );
+    assert!(
+        text.contains("docs, documentation"),
+        "the refusal names the keywords: {text}"
     );
     assert!(
         !text.contains("docs__search-out"),
@@ -523,7 +532,15 @@ async fn a_loader_of_a_group_the_task_loaded_is_refused() {
         "it names them: {text}"
     );
     let state = state_of(&view);
-    assert!(state.loaded.is_empty());
+    assert_eq!(
+        state
+            .loaded
+            .iter()
+            .map(|one| one.loader.as_str())
+            .collect::<Vec<_>>(),
+        ["load__group__linear"],
+        "the task-loaded group is journaled, for the recap"
+    );
     assert!(state.tools_appended.is_empty());
     assert_eq!(requests[1].tools, requests[0].tools);
 }
@@ -698,7 +715,7 @@ fn a_folder_tool_named_load_is_refused_at_bind() {
         .bind(ToolSet::new().tool(common::stub("load__group__github")))
         .unwrap_err();
     assert!(
-        matches!(error, adam_assembly::Error::ReservedToolName { .. }),
+        matches!(error, adam_assembly::Error::ReservedLoaderName { .. }),
         "{error}"
     );
 }
@@ -868,5 +885,105 @@ async fn a_forbidden_tool_is_in_no_loader_and_is_refused() {
     assert!(
         !refused.contains("docs__read-out"),
         "the forbidden tool did not run: {refused}"
+    );
+}
+
+/// A `when` server whose name is a group name binds, and gets a loader: `my_server` is legal in
+/// `mcp.json` and a group name.
+#[tokio::test]
+async fn a_when_server_named_my_server_binds() {
+    const MCP_UNDERSCORE: &str = r#"{"mcpServers": {
+      "my_server": {"type": "http", "url": "https://mcp.example/x", "tools": ["echo"],
+                    "when": {"keywords": ["x"]}}
+    }}"#;
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let assembly = common::def(&[
+        (
+            "agent/instructions.md",
+            &common::instructions("name: root\ntools: ['my_server__echo']", "You are root."),
+        ),
+        ("agent/mcp.json", MCP_UNDERSCORE),
+    ])
+    .mcp_tools("root", common::tools(&["my_server__echo"]))
+    .bind(ToolSet::new())
+    .unwrap()
+    .model(mock.clone(), "default")
+    .unwrap();
+    let (requests, _) = run_task(&mock, &assembly, "fix a typo").await;
+    assert!(
+        has(&requests[0], "load__group__my_server"),
+        "{:?}",
+        names(&requests[0])
+    );
+}
+
+/// A tool in two groups is refused at bind: a load must append it once, from one group.
+#[test]
+fn a_tool_in_two_groups_is_refused_at_bind() {
+    let given: Vec<(String, adam_llm_agent::DynTool)> =
+        vec![("shared".to_owned(), Arc::new(common::stub("shared")))];
+    let error = adam_assembly::Groups::bind(
+        &adam_assembly::Origin {
+            agent: "root".into(),
+            file: "agent/instructions.md".into(),
+        },
+        vec![
+            adam_assembly::Group::new("a", "the a group", vec!["shared".to_owned()]),
+            adam_assembly::Group::new("b", "the b group", vec!["shared".to_owned()]),
+        ],
+        &given,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, adam_assembly::Error::GroupOverlap { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("belongs to one group"),
+        "{error}"
+    );
+}
+
+/// A registered `load__` tool is refused at bind even when the agent does not select it: the
+/// catalogue is the host's, and the loaders reserve the prefix.
+#[test]
+fn a_registered_load_tool_is_refused_even_unselected() {
+    let def = common::def(&[(
+        "agent/instructions.md",
+        &common::instructions("name: root\ntools: ['other']", "You are root."),
+    )]);
+    let error = def
+        .bind(
+            ToolSet::new()
+                .tool(common::stub("other"))
+                .tool(common::stub("load__x")),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, adam_assembly::Error::ReservedLoaderName { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("reserved"), "{error}");
+}
+
+/// A subagent is called as a tool named after it, so one named `load__` would collide with a
+/// loader: refused at bind.
+#[test]
+fn a_subagent_named_load_is_refused() {
+    let def = common::def(&[
+        (
+            "agent/instructions.md",
+            &common::instructions("name: root", "You are root."),
+        ),
+        (
+            "agent/subagents/load__x/instructions.md",
+            &common::instructions("description: Helps.", "You help."),
+        ),
+    ]);
+    let error = def.bind(ToolSet::new()).unwrap_err();
+    assert!(
+        matches!(error, adam_assembly::Error::ReservedLoaderName { .. }),
+        "{error}"
     );
 }

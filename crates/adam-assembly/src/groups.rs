@@ -31,8 +31,9 @@ use serde_json::{Value, json};
 
 use crate::error::{Error, Origin};
 
-/// The most characters a group's name holds.
-pub const MAX_GROUP_NAME_CHARS: usize = 40;
+/// The most characters a group's name holds: the rule `mcp.json`'s loader applies to a `when`
+/// server's name, because that name becomes its group's name.
+pub const MAX_GROUP_NAME_CHARS: usize = adam_agent_fs::MAX_GROUP_NAME_CHARS;
 
 /// The most keywords a group may hold: the bound of `mcp.json`'s `when`
 /// (`adam_agent_fs::MAX_WHEN_KEYWORDS`).
@@ -41,15 +42,9 @@ pub const MAX_KEYWORDS: usize = 16;
 /// (`adam_agent_fs::MAX_WHEN_KEYWORD_CHARS`).
 pub const MAX_KEYWORD_CHARS: usize = 64;
 
-/// The prefix of a group loader's tool name.
-pub const GROUP_LOADER_PREFIX: &str = "load__group__";
-
-/// The prefix of a loader that loads one heavy tool.
-pub const TOOL_LOADER_PREFIX: &str = "load__tool__";
-
-/// The word the loaders reserve: a registered tool whose name starts with it, or an MCP server
-/// named `load`, is refused at start (ADR 0066, decision 2).
-pub const RESERVED_PREFIX: &str = adam_llm_agent::RESERVED_LOADER_PREFIX;
+/// The prefix of a group loader's tool name: the one constant `adam-llm-agent` exports, so the
+/// state's migration and the assembly cannot disagree.
+pub const GROUP_LOADER_PREFIX: &str = adam_llm_agent::GROUP_LOADER_PREFIX;
 
 /// The most bytes of a group's short note: the one line a compaction's recap keeps.
 const SHORT_NOTE_MAX_BYTES: usize = adam_llm_agent::MAX_LOADED_NOTE_BYTES;
@@ -120,34 +115,34 @@ impl Group {
     }
 }
 
-/// `note` as one line, at most [`SHORT_NOTE_MAX_BYTES`]: a note with a line break could forge a
-/// line of a compaction's marker.
+/// `note` as one line, at most [`SHORT_NOTE_MAX_BYTES`]: a note with a line break or a Unicode
+/// line separator could forge a line of a compaction's marker. A note that does not fit ends with
+/// an ellipsis, so a reader knows it is not the whole note.
 fn short_note(note: &str) -> String {
     let flat: String = note
         .chars()
-        .map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c })
+        .map(|c| {
+            if matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let flat = flat.trim();
     if flat.len() <= SHORT_NOTE_MAX_BYTES {
         return flat.to_owned();
     }
-    let mut end = SHORT_NOTE_MAX_BYTES;
+    let mut end = SHORT_NOTE_MAX_BYTES.saturating_sub('…'.len_utf8());
     while !flat.is_char_boundary(end) {
         end -= 1;
     }
-    flat[..end].trim_end().to_owned()
+    format!("{}…", flat[..end].trim_end())
 }
 
 /// Whether `name` is a group name: `^[a-z0-9]+(_[a-z0-9]+)*$`, at most [`MAX_GROUP_NAME_CHARS`].
 pub fn name_fits(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= MAX_GROUP_NAME_CHARS
-        && name.split('_').all(|part| {
-            !part.is_empty()
-                && part
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        })
+    adam_agent_fs::group_name_fits(name)
 }
 
 /// Whether `keywords` are within the bounds `mcp.json`'s `when` sets: 1 to [`MAX_KEYWORDS`], each
@@ -214,7 +209,7 @@ impl Groups {
                 });
             }
             if given.iter().any(|(tool, _)| *tool == group.loader()) {
-                return Err(Error::ReservedToolName {
+                return Err(Error::ReservedLoaderName {
                     origin: origin.clone(),
                     tool: group.loader(),
                 });
@@ -230,6 +225,21 @@ impl Groups {
                         true
                     })
             });
+            // A tool in two groups would be refused by one group's loader and offered by the
+            // other's: a load must append it once, from one group.
+            if let Some((tool, first)) = group.members.iter().find_map(|member| {
+                groups
+                    .iter()
+                    .find(|one| one.members.contains(member))
+                    .map(|one| (member.clone(), one.name.clone()))
+            }) {
+                return Err(Error::GroupOverlap {
+                    origin: origin.clone(),
+                    tool,
+                    first,
+                    second: group.name,
+                });
+            }
             if group.members.is_empty() {
                 // Nothing this agent may load: no loader, so its existence is not revealed.
                 continue;
@@ -240,8 +250,9 @@ impl Groups {
         Ok(Self { groups, specs })
     }
 
-    /// The loaders of the groups the agent can offer, in name order, before the task is read: what
-    /// the source's [`loaders`](ToolSource::loaders) answers from, minus the groups the task loads.
+    /// The loaders of the groups the agent can offer, in name order, before the task is read: the
+    /// catalogue S2/S3 and the tests read. The run-time path is [`ToolSource::loaders`], which
+    /// leaves out the groups the task already loads.
     pub fn declared_loaders(&self) -> Vec<Loader> {
         self.groups
             .iter()
@@ -357,6 +368,45 @@ impl ToolSource for Groups {
             .collect()
     }
 
+    /// The loaded tools the groups still hold, minus the journaled removals: a member the group no
+    /// longer has is a permanent removal; one the tier hides on this message is still here.
+    async fn loaded_tools(&self, ctx: &SourceCtx) -> Option<Vec<String>> {
+        let removed = ctx.removed_tools();
+        let mut out = Vec::new();
+        for group in &self.groups {
+            if !self.is_loaded(group, ctx) {
+                continue;
+            }
+            for member in &group.members {
+                if !removed.contains(member) && !out.contains(member) {
+                    out.push(member.clone());
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// The groups the task loaded, with their members and short notes: journaled on the run's
+    /// first turn, so a compaction's recap names them. They record no growth: their tools were
+    /// never withheld.
+    async fn loaded_by_task(&self, ctx: &SourceCtx) -> Vec<Loaded> {
+        let removed = ctx.removed_tools();
+        self.groups
+            .iter()
+            .filter(|group| group.matches(ctx.task()))
+            .map(|group| Loaded {
+                loader: group.loader(),
+                tools: group
+                    .members
+                    .iter()
+                    .filter(|member| !removed.contains(member))
+                    .cloned()
+                    .collect(),
+                note: group.short_note.clone(),
+            })
+            .collect()
+    }
+
     async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
         let mut held = Vec::new();
         for tool in tools {
@@ -395,6 +445,11 @@ impl ToolSource for Groups {
         };
         for loaded in ctx.loaded() {
             if let Some(group) = self.group_of(&loaded.loader) {
+                // A task-loaded group is journaled in `loaded` for the recap, but its tools were
+                // never withheld: they stand where the agent's own list puts them, not appended.
+                if group.matches(ctx.task()) {
+                    continue;
+                }
                 for member in &group.members {
                     push(member);
                 }
@@ -595,6 +650,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, Error::SearchableGroup { .. }), "{error}");
+        let text = error.to_string();
+        assert!(
+            text.contains("cannot bind a searchable group until S2"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -618,7 +678,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(error, Error::ReservedToolName { ref tool, .. } if tool == "load__group__bash"),
+            matches!(error, Error::ReservedLoaderName { ref tool, .. } if tool == "load__group__bash"),
             "{error}"
         );
     }
@@ -631,6 +691,60 @@ mod tests {
         assert!(!keywords_fit(&["x".repeat(MAX_KEYWORD_CHARS + 1)]));
         assert!(keywords_fit(&["x".repeat(MAX_KEYWORD_CHARS)]));
         assert!(!keywords_fit(&["a\nb".into()]));
+    }
+
+    /// The refusal names at most eight keywords and says how many more, as `when`'s did.
+    #[test]
+    fn a_keyword_refusal_lists_at_most_eight_and_says_how_many_more() {
+        let keywords: Vec<String> = (0..16).map(|n| format!("k{n}")).collect();
+        let group = group("x", &["x__t"]).with_keywords(keywords);
+        let text = reason(&group, "x__t");
+        assert!(
+            text.contains("k0, k1, k2, k3, k4, k5, k6, k7 and 8 more"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("k8"),
+            "the ninth is counted, not named: {text}"
+        );
+    }
+
+    #[test]
+    fn the_short_note_ends_with_an_ellipsis_when_cut() {
+        let note = short_note(&"x".repeat(300));
+        assert!(note.ends_with('…'), "{note}");
+        assert!(note.len() <= SHORT_NOTE_MAX_BYTES, "{}", note.len());
+        assert!(note.len() > SHORT_NOTE_MAX_BYTES - 10, "{}", note.len());
+        // A Unicode line separator is flattened like a newline.
+        let note = short_note("a\u{2028}b\u{2029}c");
+        assert_eq!(note, "a b c");
+    }
+
+    /// A seeded old state's loader is the group's, so its tools are offered and a call is not
+    /// refused.
+    #[tokio::test]
+    async fn a_seeded_loaded_set_offers_the_groups_tools() {
+        let groups = Groups::bind(
+            &origin(),
+            vec![group("docs", &["docs__search"])],
+            &given(&["docs__search"]),
+        )
+        .unwrap();
+        let seeded = vec![Loaded {
+            loader: "load__group__docs".into(),
+            tools: Vec::new(),
+            note: String::new(),
+        }];
+        let ctx = ctx(Some("a typo"), seeded);
+        assert!(
+            groups.withhold(&ctx, &["docs__search"]).await.is_empty(),
+            "the seeded loader is the group's: the tool is not withheld"
+        );
+        assert_eq!(
+            groups.appended(&ctx).await[0].name,
+            "docs__search",
+            "and the tool is offered"
+        );
     }
 
     #[test]

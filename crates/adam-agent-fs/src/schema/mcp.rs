@@ -17,13 +17,36 @@ pub const MAX_WHEN_KEYWORDS: usize = 16;
 /// The longest keyword a `when` may hold, in characters.
 pub const MAX_WHEN_KEYWORD_CHARS: usize = 64;
 
+/// The most characters a `when` server's name may hold: its name becomes its group's name, and a
+/// group's name is at most 40 characters (ADR 0066).
+pub const MAX_GROUP_NAME_CHARS: usize = 40;
+
+/// Whether `name` can be a group's name: `^[a-z0-9]+(_[a-z0-9]+)*$`, at most
+/// [`MAX_GROUP_NAME_CHARS`] characters. A `when` server's name becomes its group's name, so the
+/// loader refuses a `when` server whose name does not fit; nothing is renamed, because a rename
+/// would change its tools' `<server>__<tool>` names.
+pub fn group_name_fits(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_GROUP_NAME_CHARS
+        && name.split('_').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+}
+
 /// `when` (an adam extension): the condition under which a server's tools are offered to the
 /// model.
 ///
-/// The tools of a server with a `when` are loaded only when the run's task mentions one of
-/// [`keywords`](Self::keywords), ignoring case. The test is made once, before the run's first model
-/// call, and never again: the tools a model is shown do not change during a run (ADR 0044,
-/// decision 1). A server without `when` is loaded for every run, as before the key existed.
+/// A server with a `when` is one **group** of tools (ADR 0066). Its tools are withheld from a run
+/// whose task mentions none of [`keywords`](Self::keywords), ignoring case; the task is the same
+/// text at every turn, so the test is recomputed and does not move. A run that needs the group
+/// loads it with its `load__group__<server>` loader, which appends its tools to the next request
+/// (ADR 0044, decision 1). The server's name becomes the group's name, so it must be lowercase
+/// letters and digits with single underscores, at most 40 characters
+/// ([`group_name_fits`](crate::group_name_fits)); a server without `when` is loaded for every run,
+/// as before the key existed.
 ///
 /// There are no paths in this version: the coder has no checkout before its first model call
 /// (`prepare_workspace` is a tool), so a path glob would have nothing to match.

@@ -812,8 +812,9 @@ impl Walk<'_> {
             refuse_asking_tools(&origin, &tools)?;
         }
         let mut prompt = render_prompt(&origin, manifest, self.values.get(&name))?;
-        // The servers whose `when` loads them only when the run's task mentions a keyword: their
-        // tools are withheld by the source below and their instructions do not go into the prompt.
+        // The servers whose `when` makes them groups: their tools are withheld by the source below
+        // until the task holds a keyword or the run loads the group, and their instructions are the
+        // group's note.
         let triggers: Vec<(String, Vec<String>)> = mcp::declared(manifest)
             .into_iter()
             .flat_map(|config| config.servers.iter())
@@ -825,7 +826,8 @@ impl Walk<'_> {
             .collect();
         // What the agent's MCP servers said about themselves, once, here: the prompt is the same
         // for every model call of the process, so the cached prefix holds. A triggered server's
-        // section comes from `McpSelect` at a turn, and only when the run loads it.
+        // section is its group's note: `Groups` gives it to the first prompt when the task loads
+        // the group, and to the load's result when the run loads it.
         if let Some(given) = self.mcp.get(&name) {
             let eager: Vec<(String, String)> = given
                 .instructions
@@ -839,15 +841,19 @@ impl Walk<'_> {
                 prompt.push_str(&text);
             }
         }
-        // A name under the loaders' reserved prefix is refused at bind: the loader of a group and
-        // an MCP tool would collide (ADR 0066, decision 2).
-        if let Some((reserved, _)) = tools
-            .iter()
-            .find(|(tool, _)| tool.starts_with(crate::groups::RESERVED_PREFIX))
+        // The loaders reserve `load__`: a registered tool with the prefix is refused at bind even
+        // when this agent does not select it (the catalogue is the host's), and so is a selected
+        // MCP tool (a server named `load` is refused earlier, but a hand-built config may slip).
+        if let Some(reserved) = self
+            .catalog
+            .names()
+            .into_iter()
+            .chain(tools.iter().map(|(tool, _)| tool.clone()))
+            .find(|tool| tool.starts_with(adam_llm_agent::RESERVED_LOADER_PREFIX))
         {
-            return Err(Error::ReservedToolName {
+            return Err(Error::ReservedLoaderName {
                 origin: origin.clone(),
-                tool: reserved.clone(),
+                tool: reserved,
             });
         }
         let mut sources: Vec<DynToolSource> = Vec::new();
@@ -1138,6 +1144,12 @@ fn add_subagent_tools(
             None
         };
         let sub_origin = Origin::new(format!("{}/{name}", origin.agent), file);
+        if name.starts_with(adam_llm_agent::RESERVED_LOADER_PREFIX) {
+            return Err(Error::ReservedLoaderName {
+                origin: sub_origin,
+                tool: name.to_owned(),
+            });
+        }
         if let Some(clash) = clash {
             return Err(Error::SubagentToolClash {
                 origin: sub_origin,

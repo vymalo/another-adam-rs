@@ -82,6 +82,39 @@ fn a_server_named_load_is_refused_at_start() {
     assert!(json.is_none() || json.unwrap()["servers"].get("load").is_none());
 }
 
+/// A `when` server's name becomes its group's name (ADR 0066): the loader refuses a name that is
+/// not a group name rather than renaming it, because a rename would change its tools' names.
+#[test]
+fn a_when_server_whose_name_is_not_a_group_name_is_refused() {
+    let long = "a".repeat(41);
+    for name in ["my-server".to_owned(), "MyLinear".to_owned(), long] {
+        let text = format!(
+            r#"{{"mcpServers": {{"{name}": {{"type": "http", "url": "https://mcp.example/x",
+                "tools": ["echo"], "when": {{"keywords": ["x"]}}}}}}}}"#
+        );
+        let (json, messages) = parse(&text);
+        assert!(
+            errors(&messages)
+                .iter()
+                .any(|m| m.contains("group's name") && m.contains("Rename the server")),
+            "{name}: {messages:#?}"
+        );
+        assert!(
+            json.is_none() || json.unwrap()["servers"].get(&name).is_none(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_when_server_named_my_server_is_kept() {
+    let text = r#"{"mcpServers": {"my_server": {"type": "http", "url": "https://mcp.example/x",
+        "tools": ["echo"], "when": {"keywords": ["x"]}}}}"#;
+    let (json, messages) = parse(text);
+    assert!(errors(&messages).is_empty(), "{messages:#?}");
+    assert!(json.unwrap()["servers"].get("my_server").is_some());
+}
+
 #[test]
 fn a_when_is_read_and_written_back() {
     let (json, messages) = parse(&with_when(r#"{"keywords": ["linear", "ticket"]}"#));

@@ -78,8 +78,7 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
         fail(
             sink,
             "server `load` is refused: `load` is reserved for the tool loaders \
-             (`load__group__<name>`, `load__tool__<name>`), and its tools would be mistaken for \
-             one; rename the server"
+             (`load__group__<name>`), and its tools would be mistaken for one; rename the server"
                 .to_owned(),
         );
     }
@@ -177,6 +176,18 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
             None
         }
     };
+    // A `when` server's name becomes its group's name (ADR 0066), so it must be a group name. It is
+    // refused rather than renamed: a rename would change its tools' `<server>__<tool>` names.
+    if when.is_some() && !crate::schema::group_name_fits(name) {
+        fail(
+            sink,
+            format!(
+                "server `{name}` has a `when`, so its name becomes its group's name: a group's name \
+                 is lowercase letters and digits, single underscores between them, at most 40 \
+                 characters. Rename the server."
+            ),
+        );
+    }
     let command = raw.command.as_deref().map(str::trim);
     let url = raw.url.as_deref().map(str::trim);
     let server = match (declared, command, url) {

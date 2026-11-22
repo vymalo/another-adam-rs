@@ -64,14 +64,15 @@ pub use manifest::{
 };
 pub use schema::{
     AgentFrontmatter, Card, CardSkill, CommandFrontmatter, DEFAULT_RETRY_BACKOFF,
-    DEFAULT_RETRY_MAX_BACKOFF, EnvRef, ExtendedCard, Limits, MAX_MINUTES_LIMIT,
-    MAX_OPEN_SESSIONS_LIMIT, MAX_PARALLEL_LIMIT, MAX_REFERENCES, MAX_RETRY_ATTEMPTS,
-    MAX_RETRY_BACKOFF, MAX_SESSION_ROUNDS_LIMIT, MAX_WORKING_SESSIONS_LIMIT, McpConfig, McpServer,
-    McpSettings, ModelRef, REFERENCE_BRANCH_MAX, REFERENCE_DESCRIPTION_MAX, REFERENCE_URL_MAX,
-    REFERENCES_FILE_MAX, RETRY_CLASS_NAMES, ReferenceDef, ReferencesRead, RemoteKind, RetryDef,
-    ScheduleFrontmatter, Segment, SkillFrontmatter, SkillSelection, ToolList, check_references,
-    is_agent_name, is_env_name, is_reference_name, is_retry_tool_name, is_skill_name, is_tool_name,
-    parse_references_file, read_references_leniently, retry_duration, split_env_references,
+    DEFAULT_RETRY_MAX_BACKOFF, EnvRef, ExtendedCard, Limits, MAX_GROUP_NAME_CHARS,
+    MAX_MINUTES_LIMIT, MAX_OPEN_SESSIONS_LIMIT, MAX_PARALLEL_LIMIT, MAX_REFERENCES,
+    MAX_RETRY_ATTEMPTS, MAX_RETRY_BACKOFF, MAX_SESSION_ROUNDS_LIMIT, MAX_WORKING_SESSIONS_LIMIT,
+    McpConfig, McpServer, McpSettings, ModelRef, REFERENCE_BRANCH_MAX, REFERENCE_DESCRIPTION_MAX,
+    REFERENCE_URL_MAX, REFERENCES_FILE_MAX, RETRY_CLASS_NAMES, ReferenceDef, ReferencesRead,
+    RemoteKind, RetryDef, ScheduleFrontmatter, Segment, SkillFrontmatter, SkillSelection, ToolList,
+    check_references, group_name_fits, is_agent_name, is_env_name, is_reference_name,
+    is_retry_tool_name, is_skill_name, is_tool_name, parse_references_file,
+    read_references_leniently, retry_duration, split_env_references,
 };
 pub use source::{Dir, ManifestSource};
 pub use when::{AFTER_MAX, At, Cron, When, WhenError, parse_after, parse_at, time_zone};

@@ -18,8 +18,8 @@ pub use agent::{
 };
 pub use command::CommandFrontmatter;
 pub use mcp::{
-    EnvRef, MAX_WHEN_KEYWORD_CHARS, MAX_WHEN_KEYWORDS, McpConfig, McpServer, McpSettings, McpWhen,
-    RemoteKind, Segment, split_env_references,
+    EnvRef, MAX_GROUP_NAME_CHARS, MAX_WHEN_KEYWORD_CHARS, MAX_WHEN_KEYWORDS, McpConfig, McpServer,
+    McpSettings, McpWhen, RemoteKind, Segment, group_name_fits, split_env_references,
 };
 pub use names::{is_agent_name, is_env_name, is_skill_name, is_tool_name};
 pub use reference::{

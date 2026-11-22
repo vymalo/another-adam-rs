@@ -406,7 +406,12 @@ impl Plan {
         // `_` (`a_` + `x` and `a` + `_x` would both be `a___x`, and `a_`'s tools would look like
         // `a`'s). The loader of `mcp.json` refuses these too; a config made by hand is checked
         // here.
-        if name == "load" || !name_fits(name) || name.contains("__") || name.ends_with('_') {
+        if name == "load" {
+            return Err(Error::ReservedServerName {
+                server: name.to_owned(),
+            });
+        }
+        if !name_fits(name) || name.contains("__") || name.ends_with('_') {
             return Err(Error::Name {
                 server: name.to_owned(),
                 tool: None,
@@ -787,6 +792,19 @@ mod tests {
             connect_timeout_secs: connect,
             ..McpSettings::default()
         })
+    }
+
+    /// A server named `load` has its own refusal: `load` fits `<server>__<tool>`, so the generic
+    /// name error would be false.
+    #[test]
+    fn a_server_named_load_is_refused_with_its_own_message() {
+        let error = Error::ReservedServerName {
+            server: "load".into(),
+        };
+        let text = error.to_string();
+        assert!(text.contains("reserved"), "{text}");
+        assert!(text.contains("rename the server"), "{text}");
+        assert!(!text.contains("<server>__<tool>"), "{text}");
     }
 
     /// The loaders reserve `load__` (ADR 0066, decision 2): a tool whose full name starts with it
