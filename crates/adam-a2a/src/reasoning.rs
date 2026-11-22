@@ -37,7 +37,8 @@ pub const REASONING_EFFORT_MEMBER: &str = "effort";
 /// never the literal alias: two agents may share one model and differ, and an agent may be renamed
 /// without renaming its model. The levels are the model profile's `reasoningEfforts`, kept lowest
 /// first whatever order the caller lists them in; the default is the resolved folder, preset or
-/// profile value (ADR 0063, decision 3), or none when none of them sets one.
+/// profile value (ADR 0063, decision 3), or none when none of them sets one or the value is not one
+/// of the levels.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReasoningEfforts {
     agents: HashMap<String, AgentEfforts>,
@@ -72,7 +73,9 @@ impl ReasoningEfforts {
 
     /// `self` with `agent`'s entry: `levels` re-ordered by [`ReasoningEffort::ALL`] (lowest first)
     /// with duplicates dropped, and `default` when it is one of them. A default the agent does not
-    /// take is dropped: the card never advertises a level the reading would refuse.
+    /// take is dropped **silently**: a builder has no error channel, and the assembly's chain
+    /// refuses an out-of-level default before it reaches here (ADR 0063). The card never advertises
+    /// a level the reading would refuse.
     #[must_use]
     pub fn with_agent(
         mut self,

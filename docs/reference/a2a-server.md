@@ -391,7 +391,7 @@ An agent whose card lists `https://agents.vymalo.com/a2a/extensions/reasoning/v1
 **for each message** ([ADR 0063](../decisions/0063-a-reasoning-effort-is-one-setting.md), decision 5). The card
 describes the **root** agent's model: its `params` are
 `{"efforts": [<the model's levels, lowest first>], "default"?: <the level>}`, where `default` is present only
-when the folder, the agent's preset or the model's profile resolved one. The vocabulary is
+when the folder, the agent's preset or the model's profile resolved one **and it is one of the levels**. The vocabulary is
 `adam_model::ReasoningEffort`, one closed list of seven words — `none`, `minimal`, `low`, `medium`, `high`,
 `xhigh`, `max` — and `none` is a real level, not an absence. A model whose profile takes no level (no profile,
 or `reasoningEfforts: []`) lists no extension: `adam_a2a::ExtensionConfig::reasoning` returns `None`.

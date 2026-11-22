@@ -384,7 +384,8 @@ impl ExtensionConfig {
 
     /// The `reasoning/v1` extension: the card lists the **root** model's levels, lowest first, as
     /// `params.efforts`, and the default the folder, the agent's preset or the model's profile
-    /// resolved as `params.default` (absent when none sets one). `None` when the root's model takes
+    /// resolved as `params.default` (absent when none sets one, or when the resolved value is not
+    /// one of the levels). `None` when the root's model takes
     /// no level (no profile, or `reasoningEfforts: []`): such an agent does not list the extension.
     /// Optional; the description is this repository's until the orchestration layer publishes the
     /// contract.
