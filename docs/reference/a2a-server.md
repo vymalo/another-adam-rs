@@ -195,9 +195,10 @@ parked run, and goes down the same way, one level at a time: a child that waits 
 it. A resume to a root that has **settled** its child — the child finished and the root answered its call — is
 `NOT_PARKED`, as for any run that is not parked on the model; between the child's end and the root's next step the
 copy is still there, so a resume is accepted and consumed as the root settles the wait, which is harmless (the child
-is finished and nothing is woken). A client that binds runs learns of a **descendant's** refusal of status 401 or 403 from the status message —
-the root shows `working` with the child's reason, not `auth-required` — and sends its resume to the **root**, which
-forwards it; otherwise a `ListTasks` with `status=auth-required` never returns the root.
+is finished and nothing is woken). A client that binds runs learns of a **descendant's** refusal of status 401 or 403
+from the status message — the root shows `working` with the child's reason, not `auth-required` — and sends its
+resume to the **root**, which forwards it; otherwise a `ListTasks` with `status=auth-required` never returns the
+root.
 
 **Time.** A park on a timer waits 30 s, then twice as long at each park in a row, at most 15 minutes, and never less than
 the gateway asked (`Retry-After`). Parks on a timer in a row last at most `MODEL_PARK_LIMIT` (24 hours by default, from

@@ -1131,8 +1131,8 @@ the contract is a separate deploy (see [deploy the coder](guides/deploy-the-code
 `Conversation` (`crates/adam-llm-agent/src/conversation.rs`) has `messages`, `turns`, `tool_calls`,
 `usage`, `pending_calls`, `pending_wait` (a question for the user, a child run or a remote task),
 `deferred`, `artifacts`, `announced`, `source_notes`, `continued_from`, `omitted_turns`, `context` and
-`read_ids` (the ids of the messages and the forwarded resumes the run read). Every field has a serde default, so
-older state still loads. Its `split` puts `messages`
+`read_ids` (the ids of the messages and the forwarded resumes the run read). Every field has a serde default,
+so older state still loads. Its `split` puts `messages`
 in the body and everything else in the head; `Agent::split`/`join` default to no split, and a wrapper
 that delegates `init` must delegate them too: a new run of a wrapper that does not stays in the v4
 format, and a **v5 run must split** — a successful step that returns `None` on a current head is a

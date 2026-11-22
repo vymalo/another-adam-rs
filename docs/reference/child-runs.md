@@ -65,8 +65,8 @@ wakes the child through itself:
   parent forwards a resume and rewritten at the next look.
 * **The park.** A child that waits until it is woken makes the parent wait with **no timer**, as the parent
   waits on a question: such a child cannot finish on its own, so a timer would only re-read "still parked", and a
-  message to the root reaches its inbox anyway. A child on a timer keeps the parent's `wait_poll` look (60 s), which is
-  what a lost notice of the child's end falls back on.
+  message to the root reaches its inbox anyway. A child on a timer keeps the parent's `wait_poll` look (60 s),
+  which is what a lost notice of the child's end falls back on.
 * **The resume.** A message or a resume to a run that waits on a parked child sends that child one
   `adam.resume` (`Ctx::resume_child`, which wakes only the caller's children), under an id derived from the
   waking message's id and the child's run id: a step that runs again writes the same one, and the child drops a
