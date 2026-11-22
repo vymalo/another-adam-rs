@@ -33,7 +33,23 @@
 //! * **Timeouts.** [`OpenAiConfig::timeout`] bounds a whole `complete` call.
 //!   For `stream` it bounds the wait for the response headers and then the
 //!   silence between chunks, so a long generation is never cut off while
-//!   tokens keep arriving. Expiry is [`Transient`](adam_model::ModelError::Transient).
+//!   tokens keep arriving. Expiry is [`Transient`](adam_model::ModelError::Transient). A
+//!   connection that cannot be made (refused, no route) is
+//!   [`Unreachable`](adam_model::ModelError::Unreachable), class `Transient`; a connection that
+//!   times out is a timeout, and a TLS handshake that fails is `Transient`.
+//! * **Refusals** ([ADR 0067](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+//!   decision 3). For an answer of status 400 or above the client builds a
+//!   [`Refusal`] (the status, the slug of an `application/problem+json`
+//!   body's `type`, the `Retry-After`) and asks the provider whether it parks
+//!   ([`ModelCredentials::parks`](adam_model::ModelCredentials::parks)). The slug `model_locked`
+//!   is [`ModelLocked`](adam_model::ModelError::ModelLocked) for every provider. A park is
+//!   [`Refused`](adam_model::ModelError::Refused), which holds no body and no header; no park is
+//!   the error the status always gave. An error object inside a stream is the model's and never parks.
+//! * **Response size caps.** A body over 16 MiB, an SSE line over 1 MiB, one
+//!   event's `data:` over 4 MiB, or a stream over 64 MiB is a
+//!   [`Protocol`](adam_model::ModelError::Protocol) error (class `Corrupt`),
+//!   checked before the buffer grows past the cap; the stream is then dropped.
+//!   The caps are constants, not settings.
 //! * **Secrets.** The API key lives in a [`SecretString`]; it is sent as a
 //!   sensitive `Authorization: Bearer` header and never appears in `Debug`
 //!   output, error messages or logs. Extra header *values* are hidden from
@@ -78,8 +94,9 @@ use std::time::{Duration, SystemTime};
 
 use adam_error::{BoxError, Classify, ErrorClass};
 use adam_model::{
-    AfterRejection, CredentialHeaders, CredentialRequest, DynCredentials, InputModalities, Message,
-    ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse, Rejection, StaticBearer,
+    AfterRejection, CredentialHeaders, CredentialRequest, DynCredentials, InputModalities,
+    MODEL_LOCKED_SLUG, Message, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
+    Park, Refusal, Rejection, StaticBearer,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -209,6 +226,30 @@ pub enum OpenAiConfigError {
     /// The extra request body sets a member the runtime owns.
     #[error("the extra request body may not set `{0}`: the runtime owns it")]
     ReservedBodyKey(String),
+    /// The CA file of the model endpoint (`MODEL_CA_FILE`) cannot be used: it cannot be read, is
+    /// not PEM, holds no certificate, or holds one the TLS backend refuses.
+    #[error("the model endpoint's CA file cannot be used: {reason}")]
+    InvalidCaFile {
+        /// What is wrong with it.
+        reason: String,
+        /// The reader's or the TLS backend's own error, when there is one.
+        #[source]
+        source: Option<BoxError>,
+    },
+    /// The CA file of the model endpoint is larger than [`MAX_CA_FILE_BYTES`]: no bundle of
+    /// roots is, so it is not one.
+    #[error("the model endpoint's CA file is over {limit} bytes")]
+    CaFileTooLarge {
+        /// The cap, [`MAX_CA_FILE_BYTES`].
+        limit: u64,
+    },
+    /// An entry of `extra_headers` names a header that carries a credential (`authorization`,
+    /// `proxy-authorization`): credentials come from the provider alone ([ADR 0058], and ADR 0067
+    /// decision 1: with an injector nothing in the process may send one).
+    ///
+    /// [ADR 0058]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md
+    #[error("extra header `{0}` carries a credential: credentials come from the provider")]
+    CredentialHeader(String),
     /// The HTTP client could not be built (for example, no TLS backend).
     #[error("could not build the HTTP client")]
     Client(#[source] BoxError),
@@ -220,6 +261,9 @@ impl Classify for OpenAiConfigError {
             Self::InvalidBaseUrl { .. }
             | Self::InvalidHeader(_)
             | Self::InvalidApiKey
+            | Self::InvalidCaFile { .. }
+            | Self::CaFileTooLarge { .. }
+            | Self::CredentialHeader(_)
             | Self::ReservedBodyKey(_) => ErrorClass::Invalid,
             Self::Client(_) => ErrorClass::Internal,
         }
@@ -232,6 +276,9 @@ impl Classify for OpenAiConfigError {
 #[derive(Clone)]
 pub struct OpenAiCompatible {
     http: reqwest::Client,
+    /// What the HTTP client was built with, so [`with_extra_roots`](Self::with_extra_roots) can
+    /// build it again.
+    default_headers: HeaderMap,
     url: String,
     credentials: DynCredentials,
     timeout: Duration,
@@ -290,6 +337,11 @@ impl OpenAiCompatible {
         for (name, value) in &config.extra_headers {
             let header_name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| OpenAiConfigError::InvalidHeader(name.clone()))?;
+            if header_name == reqwest::header::AUTHORIZATION
+                || header_name == reqwest::header::PROXY_AUTHORIZATION
+            {
+                return Err(OpenAiConfigError::CredentialHeader(name.clone()));
+            }
             let mut header_value = HeaderValue::from_str(value)
                 .map_err(|_| OpenAiConfigError::InvalidHeader(name.clone()))?;
             header_value.set_sensitive(true);
@@ -304,17 +356,12 @@ impl OpenAiCompatible {
                 .map_err(|_| OpenAiConfigError::InvalidApiKey)?;
         }
 
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .user_agent(concat!("adam-model-openai/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(config.timeout)
-            // Never replay a POST carrying credentials somewhere else.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| OpenAiConfigError::Client(Box::new(e.without_url())))?;
+        let http = build_http(&headers, config.timeout, None)
+            .map_err(|e| OpenAiConfigError::Client(Box::new(e)))?;
 
         Ok(Self {
             http,
+            default_headers: headers,
             url: format!("{base}/chat/completions"),
             credentials: Arc::new(StaticBearer::new(config.api_key.clone())),
             timeout: config.timeout,
@@ -437,8 +484,28 @@ impl OpenAiCompatible {
         self
     }
 
-    /// Send the request and return the response if it is a success.
-    async fn send(&self, body: Vec<u8>, streaming: bool) -> Result<reqwest::Response, ModelError> {
+    /// Trust `roots` for the model endpoint, beside the default roots (`MODEL_CA_FILE`, ADR 0067):
+    /// a gateway inside a cluster whose certificate no public root store holds. The HTTP client is
+    /// built again with them; the default roots are kept.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenAiConfigError::InvalidCaFile`] when the TLS backend refuses them.
+    pub fn with_extra_roots(mut self, roots: &ExtraRoots) -> Result<Self, OpenAiConfigError> {
+        self.http = build_http(&self.default_headers, self.timeout, Some(roots))
+            .map_err(|e| ca_error("the TLS backend refused it", Some(Box::new(e))))?;
+        Ok(self)
+    }
+
+    /// Send the request of the run `run` for the model `model` and return the response if it is a
+    /// success.
+    async fn send(
+        &self,
+        body: Vec<u8>,
+        streaming: bool,
+        model: &str,
+        run: Option<&str>,
+    ) -> Result<reqwest::Response, ModelError> {
         let body = Bytes::from(body);
         let mut attempt = 0;
         let response = loop {
@@ -446,6 +513,7 @@ impl OpenAiCompatible {
                 method: "POST",
                 url: &self.url,
                 attempt,
+                run,
             };
             let credentials = self.credentials.headers(call).await?;
             let mut request = self
@@ -486,12 +554,194 @@ impl OpenAiCompatible {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| errors::parse_retry_after(v, SystemTime::now()));
-        let text = tokio::time::timeout(self.timeout, response.text())
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let text = tokio::time::timeout(self.timeout, read_body(response))
             .await
             .ok()
             .and_then(Result::ok)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default();
+        // A refusal (ADR 0067 decision 3) is read by its problem type, and its provider says whether
+        // it parks the run. A gateway refuses before a response streams, so this is the only place
+        // a refusal is read: an error object inside a stream is the upstream model's (`sse.rs`,
+        // `errors::from_error_object`) and never parks.
+        if status.as_u16() >= 400 {
+            let refusal = Refusal::new(status.as_u16())
+                .with_problem(errors::problem_type(content_type.as_deref(), &text))
+                .with_retry_after(retry_after);
+            if refusal.slug() == Some(MODEL_LOCKED_SLUG) {
+                return Err(ModelError::ModelLocked {
+                    model: model.to_owned(),
+                });
+            }
+            match self.credentials.parks(&refusal) {
+                Park::No => {}
+                // The status, the slug and the wait only: the body and the headers stay here.
+                park => {
+                    return Err(ModelError::Refused {
+                        status: refusal.status,
+                        slug: refusal.slug().map(str::to_owned),
+                        retry_after: refusal.retry_after,
+                        park,
+                    });
+                }
+            }
+        }
         Err(errors::from_http(status, retry_after, &text))
+    }
+}
+
+/// The HTTP client of the model endpoint: `headers` on every request, no redirect, and `roots`
+/// trusted beside the default roots.
+fn build_http(
+    headers: &HeaderMap,
+    timeout: Duration,
+    roots: Option<&ExtraRoots>,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder()
+        .default_headers(headers.clone())
+        .user_agent(concat!("adam-model-openai/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(timeout)
+        // Never replay a POST carrying credentials somewhere else.
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(roots) = roots {
+        builder = builder.tls_certs_merge(roots.0.iter().cloned());
+    }
+    builder.build().map_err(reqwest::Error::without_url)
+}
+
+/// The largest CA file [`ExtraRoots::read`] reads: 1 MiB, far above any bundle of roots.
+pub const MAX_CA_FILE_BYTES: u64 = 1 << 20;
+
+fn ca_error(reason: &str, source: Option<BoxError>) -> OpenAiConfigError {
+    OpenAiConfigError::InvalidCaFile {
+        reason: reason.to_owned(),
+        source,
+    }
+}
+
+/// Certificates trusted for the model endpoint beside the default roots: the PEM file of
+/// `MODEL_CA_FILE` ([ADR 0067](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+/// decision 9), for [`OpenAiCompatible::with_extra_roots`]. Only the model endpoint's client
+/// trusts them. Its `Debug` says how many.
+#[derive(Clone)]
+pub struct ExtraRoots(Vec<reqwest::Certificate>);
+
+impl ExtraRoots {
+    /// The certificates of a PEM bundle. Checked here, with the TLS backend, so a bad file fails
+    /// at startup and never at the first call.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenAiConfigError::InvalidCaFile`] when the text is not PEM, holds no certificate, or
+    /// holds one the TLS backend refuses.
+    pub fn from_pem(pem: &[u8]) -> Result<Self, OpenAiConfigError> {
+        let certs = reqwest::Certificate::from_pem_bundle(pem)
+            .map_err(|e| ca_error("it is not PEM", Some(Box::new(e.without_url()))))?;
+        if certs.is_empty() {
+            return Err(ca_error("it holds no certificate", None));
+        }
+        let roots = Self(certs);
+        build_http(&HeaderMap::new(), Duration::from_secs(1), Some(&roots)).map_err(|e| {
+            ca_error(
+                "it holds a certificate the TLS backend refuses",
+                Some(Box::new(e)),
+            )
+        })?;
+        Ok(roots)
+    }
+
+    /// The certificates of the PEM file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenAiConfigError::InvalidCaFile`] when the file cannot be read, or as
+    /// [`from_pem`](Self::from_pem); [`OpenAiConfigError::CaFileTooLarge`] for a file over
+    /// [`MAX_CA_FILE_BYTES`], which is not read past the cap.
+    pub fn read(path: &std::path::Path) -> Result<Self, OpenAiConfigError> {
+        use std::io::Read as _;
+        let unreadable = |e: std::io::Error| {
+            let reason = format!("it cannot be read: {e}");
+            ca_error(&reason, Some(Box::new(e)))
+        };
+        let file = std::fs::File::open(path).map_err(unreadable)?;
+        let mut pem = Vec::new();
+        file.take(MAX_CA_FILE_BYTES + 1)
+            .read_to_end(&mut pem)
+            .map_err(unreadable)?;
+        if pem.len() as u64 > MAX_CA_FILE_BYTES {
+            return Err(OpenAiConfigError::CaFileTooLarge {
+                limit: MAX_CA_FILE_BYTES,
+            });
+        }
+        Self::from_pem(&pem)
+    }
+
+    /// How many certificates.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there is none (never, for a value [`from_pem`](Self::from_pem) gave).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for ExtraRoots {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ExtraRoots").field(&self.0.len()).finish()
+    }
+}
+
+/// The most bytes one response body may carry, read whole or streamed.
+pub(crate) const MAX_BODY_BYTES: usize = 16 << 20;
+
+/// Read a response body, refusing one over [`MAX_BODY_BYTES`] before it grows past it.
+async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>, ModelError> {
+    let mut body = BoundedBody::new(MAX_BODY_BYTES);
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_BODY_BYTES as u64)
+    {
+        return Err(body.over());
+    }
+    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+        body.push(&chunk)?;
+    }
+    Ok(body.bytes)
+}
+
+/// A body being read under a cap.
+struct BoundedBody {
+    bytes: Vec<u8>,
+    cap: usize,
+}
+
+impl BoundedBody {
+    fn new(cap: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            cap,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ModelError> {
+        if self.bytes.len() + chunk.len() > self.cap {
+            return Err(self.over());
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn over(&self) -> ModelError {
+        ModelError::protocol(format!("the model sent a body over {} bytes", self.cap))
     }
 }
 
@@ -540,13 +790,40 @@ fn rejection_of(response: &reqwest::Response) -> Rejection {
     }
 }
 
+/// Whether `err`'s chain holds a [`rustls::Error`]. `tokio-rustls` wraps it in an `io::Error`, and
+/// hyper-rustls wraps that in another one; an `io::Error` built around an error does not give it as
+/// its `source` (it gives that error's source), so each `io::Error` is opened with `get_ref`.
+fn is_tls_failure(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(err) = current {
+        if err.is::<rustls::Error>() {
+            return true;
+        }
+        if let Some(inner) = err
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            && is_tls_failure(inner)
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 fn transport_error(e: reqwest::Error) -> ModelError {
     // The URL is not secret, but it is noise; the key is never in it.
     let e = e.without_url();
+    // A timeout first: a connection that timed out is a timeout, never `Unreachable` (ADR 0067
+    // decision 3: a timeout keeps today's retries and failure, and never parks a run). A failed TLS
+    // handshake (a CA not trusted, a name that does not match) is no endpoint that waiting brings
+    // back: `Transient`, as before, never `Unreachable`.
     if e.is_timeout() {
         ModelError::transient("request timed out").with_source(e)
+    } else if e.is_connect() && is_tls_failure(&e) {
+        ModelError::transient("TLS handshake failed").with_source(e)
     } else if e.is_connect() {
-        ModelError::transient("connection failed").with_source(e)
+        ModelError::unreachable().with_source(e)
     } else if e.is_builder() {
         ModelError::invalid_request("the request could not be built").with_source(e)
     } else {
@@ -574,8 +851,10 @@ impl ModelClient for OpenAiCompatible {
     #[tracing::instrument(name = "model.complete", skip_all, fields(model = %req.model, url = %self.url))]
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
         let body = wire::build_request(&req, false, self.options())?;
-        let response = self.send(body, false).await?;
-        let bytes = response.bytes().await.map_err(transport_error)?;
+        let response = self
+            .send(body, false, &req.model, req.run.as_deref())
+            .await?;
+        let bytes = read_body(response).await?;
         let parsed = wire::parse_completion(&bytes).map(|r| self.echoed(r));
         match &parsed {
             Ok(r) => tracing::debug!(
@@ -595,7 +874,9 @@ impl ModelClient for OpenAiCompatible {
         req: ModelRequest,
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
         let body = wire::build_request(&req, true, self.options())?;
-        let response = self.send(body, true).await?;
+        let response = self
+            .send(body, true, &req.model, req.run.as_deref())
+            .await?;
         let this = self.clone();
         Ok(sse::deltas(response.bytes_stream(), self.timeout)
             .map(move |item| {
@@ -690,6 +971,45 @@ mod tests {
     }
 
     #[test]
+    fn a_body_is_refused_before_it_grows_past_the_cap() {
+        let mut body = BoundedBody::new(8);
+        body.push(b"12345").expect("5 of 8");
+        body.push(b"678").expect("exactly 8");
+        let err = body.push(b"9").expect_err("the 9th byte");
+        assert!(matches!(err, ModelError::Protocol { .. }), "{err:?}");
+        assert!(err.to_string().contains("over 8 bytes"), "{err}");
+        assert_eq!(body.bytes, b"12345678");
+
+        // One chunk over the cap is refused whole: nothing is copied first.
+        let mut body = BoundedBody::new(4);
+        let err = body.push(b"12345").expect_err("one chunk over");
+        assert!(err.to_string().contains("over 4 bytes"), "{err}");
+        assert!(body.bytes.is_empty());
+    }
+
+    #[test]
+    fn the_default_body_cap_is_the_documented_one() {
+        assert_eq!(MAX_BODY_BYTES, 16 << 20, "one body: 16 MiB");
+    }
+
+    #[test]
+    fn a_rustls_error_is_found_however_it_is_wrapped() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("outer")]
+        struct Outer(#[source] std::io::Error);
+        let tls = || rustls::Error::General("bad certificate".into());
+        // As tokio-rustls and hyper-rustls wrap it.
+        let wrapped =
+            std::io::Error::other(std::io::Error::new(std::io::ErrorKind::InvalidData, tls()));
+        assert!(is_tls_failure(&wrapped));
+        assert!(is_tls_failure(&Outer(wrapped)));
+        assert!(is_tls_failure(&tls()));
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert!(!is_tls_failure(&refused));
+        assert!(!is_tls_failure(&Outer(std::io::Error::other("no route"))));
+    }
+
+    #[test]
     fn config_error_class_table() {
         #[derive(Debug, thiserror::Error)]
         #[error("build")]
@@ -700,6 +1020,9 @@ mod tests {
             OpenAiConfigError::InvalidHeader(_) => ErrorClass::Invalid,
             OpenAiConfigError::InvalidApiKey => ErrorClass::Invalid,
             OpenAiConfigError::ReservedBodyKey(_) => ErrorClass::Invalid,
+            OpenAiConfigError::InvalidCaFile { .. } => ErrorClass::Invalid,
+            OpenAiConfigError::CaFileTooLarge { .. } => ErrorClass::Invalid,
+            OpenAiConfigError::CredentialHeader(_) => ErrorClass::Invalid,
             OpenAiConfigError::Client(_) => ErrorClass::Internal,
         };
         for e in [
@@ -710,6 +1033,12 @@ mod tests {
             OpenAiConfigError::InvalidHeader("x".into()),
             OpenAiConfigError::InvalidApiKey,
             OpenAiConfigError::ReservedBodyKey("model".into()),
+            OpenAiConfigError::InvalidCaFile {
+                reason: "x".into(),
+                source: None,
+            },
+            OpenAiConfigError::CaFileTooLarge { limit: 1 },
+            OpenAiConfigError::CredentialHeader("authorization".into()),
             OpenAiConfigError::Client(Box::new(Build)),
         ] {
             assert_eq!(e.class(), expected(&e), "{e}");
@@ -734,6 +1063,19 @@ mod tests {
             OpenAiCompatible::new(cfg),
             Err(OpenAiConfigError::InvalidHeader(_))
         ));
+        // A credential comes from the provider alone (ADR 0067 decision 1): no extra header may
+        // carry one, whatever its case.
+        for name in ["authorization", "Authorization", "PROXY-AUTHORIZATION"] {
+            let mut cfg = config("https://x.example/v1");
+            cfg.extra_headers.insert(name.into(), "Bearer extra".into());
+            assert!(
+                matches!(
+                    OpenAiCompatible::new(cfg),
+                    Err(OpenAiConfigError::CredentialHeader(ref n)) if n == name
+                ),
+                "{name}"
+            );
+        }
         let cfg = OpenAiConfig::new("https://x.example/v1", SecretString::from("line\nbreak"));
         assert!(matches!(
             OpenAiCompatible::new(cfg),

@@ -84,7 +84,7 @@ The caller's own tasks (never another's, whatever the filters say), most recentl
 | Field | Behaviour |
 |---|---|
 | `contextId` | only that context |
-| `status` | only that state. `completed` is exact in the store; `failed`/`canceled`, `submitted`/`working` and `input-required` are told apart by reading each candidate (at most 500 runs per page: a rare filter returns a short page and a token to continue) |
+| `status` | only that state. `completed` is exact in the store; `failed`/`canceled`, `submitted`/`working`, `input-required` and `auth-required` are told apart by reading each candidate (at most 500 runs per page: a rare filter returns a short page and a token to continue) |
 | `statusTimestampAfter` | the last change at or after it (inclusive) |
 | `pageSize` | 50 by default, 1 to 100 (a larger value is clamped, zero and negative mean the default) |
 | `pageToken` | the `nextPageToken` of a page of **the same caller and filters**; anything else, forged or not, is `InvalidParams` ("invalid page token") |
@@ -134,10 +134,54 @@ ends **`completed`**, its output (and the `artifact`-less final message) carryin
 | The message | What happens |
 |---|---|
 | carries a `taskId`, the task is `input-required` | delivered to the run (`Runtime::deliver`) |
+| carries a `taskId`, the run is parked on the model (`auth-required`, or `working` on a timer) | delivered to the run: see [A run parked on the model](#a-run-parked-on-the-model) |
+| has `adam.resume: true` in its metadata | a resume: see [A run parked on the model](#a-run-parked-on-the-model) |
 | carries a `taskId`, the task has finished | `-32004` (`UnsupportedOperationError`) |
 | carries a `taskId`, the task is `submitted` or `working` | `-32602`, **unless the request activated `steer/v1`**: then it goes to the run's inbox, is read at its next step, and the answer is the task, still working ([ADR 0016](../decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md)) |
 | has a `contextId`, no `taskId` | delivered to the context's open task, or starts a new one |
 | has `referenceTaskIds` | starts from the conversation of one of them, below |
+
+## A run parked on the model
+
+**This section is a contract** ([ADR 0067](../decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md),
+decision 4). An orchestrator resumes a run with it after it binds the run at the gateway, or after the person raised
+their limit.
+
+Behind a model gateway that refuses a call until the run is bound or the person has usage left (`MODEL_AUTH=injector`),
+a refused call does not fail the run. The run keeps its conversation and waits to make **the same call** again. Its task
+shows the wait, with the reason as the status message ("the model gateway has not bound this run yet", "the model
+gateway's limit is reached", "the model gateway is busy", "the model gateway cannot be reached"). The reason is all a
+client is told: never a header, a body or a credential.
+
+| The refusal | Task state | Wakes |
+|---|---|---|
+| status 401 or 403 (not authenticated, the run not bound yet, its lease ended) | `auth-required` | on a timer, or a message, or a resume |
+| a usage limit reached (402) | `input-required` | a message or a resume only; never on its own |
+| a rate limit (429), a busy gateway (503), a gateway that cannot be reached | `working`, with the reason as a status message | on a timer, or a message, or a resume |
+
+`ListTasks` with `status` `auth-required` or `input-required` returns these tasks. A stream ends at `auth-required` and
+`input-required`, as at any interrupted state; subscribe again after the resume.
+
+| The message | Answer |
+|---|---|
+| with the `taskId` of a parked task, timer or not | delivered: its text is the person's turn, added before the call is made again (for a run parked on its history's summary, after the summary is made); the answer is the task, `working` |
+| with `adam.resume: true` in its `metadata` and the `taskId` of a parked task | a **resume**: it wakes the run and adds **nothing** to the conversation. It may have no text and no part. The answer is the task, `working` |
+| a resume to any other task: one that asks a question, works (a run a message or a resume just woke, making its call again, included), has finished or was canceled | `-32602` (`InvalidParams`), "the task is not parked on the model"; nothing is written. A resume never answers a question |
+| a resume with no `taskId`, in a root context or a session's | `-32602`, "a resume names the task it resumes (taskId)" |
+| `CancelTask` | ends the park, as it ends any wait |
+
+A resume is authenticated as any message and cures nothing by itself: the call it repeats goes through the gateway, and a
+run still refused parks again.
+
+**Time.** A park on a timer waits 30 s, then twice as long at each park in a row, at most 15 minutes, and never less than
+the gateway asked (`Retry-After`). Parks on a timer in a row last at most `MODEL_PARK_LIMIT` (24 hours by default, from
+the first): past it the task **fails** with the last reason. A timer park counts against a child run's time limit. A park
+until woken never fails on its own and **pauses the run's deadline**, as a question does. A schedule's firing has nobody
+to wake it: a refusal that would wait until woken fails it, and so does a refusal of status 401 or 403, since nothing binds a
+firing at the gateway yet. A subagent's run is woken by nobody either (a resume reaches its task, not the child, until a
+later slice forwards one): a refusal that would wait until woken fails the child with the reason, and the parent's model
+gets an error result for the call. A subagent's park on a timer stays, bounded by `MODEL_PARK_LIMIT` and its time limit;
+the root's task shows no reason for it yet. A wait longer than what is left of `MODEL_PARK_LIMIT` ends at the limit.
 
 ## A new task that continues a finished one
 
@@ -468,7 +512,8 @@ The same object has a `sandbox` member beside `totals` ([ADR 0043](../decisions/
 time its commands ran in a run pod: `{"environment": "kubernetes", "usage": [{"cpuMillis": 250, "memoryBytes": 536870912, "commands": 12,
 "milliseconds": 81234}]}`, one entry per pod shape (the template's requests), at most 8, written under the same rules as the totals (when the
 task ends or waits, cumulative, whoever reads it, `totals` always present, `[]` for a run that made no model call). `{"environment": "local"}`
-and `{"environment": "devcontainer"}` have no `usage`: the commands were not measured, which is not zero. A run that never asked for an
+has no `usage`: the commands were not measured, which is not zero. A report of an older coder may say
+`{"environment": "devcontainer"}` (ADR 0052 removed it): readers keep the word, and this coder never writes it. A run that never asked for an
 environment has no `sandbox`.
 
 ## Images in

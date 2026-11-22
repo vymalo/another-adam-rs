@@ -129,9 +129,10 @@ fn message_extensions(request: &SendMessageRequest) -> &[String] {
     request.message.extensions.as_deref().unwrap_or_default()
 }
 
-/// A message must say something, and only users send messages to agents.
+/// A message must say something, and only users send messages to agents. A resume
+/// ([`RESUME_METADATA_KEY`](crate::RESUME_METADATA_KEY)) says nothing, and may have no part.
 fn validate(request: &SendMessageRequest) -> Result<(), A2AError> {
-    if request.message.parts.is_empty() {
+    if request.message.parts.is_empty() && !crate::is_resume(&request.message) {
         return Err(A2AError::invalid_params("message.parts must not be empty"));
     }
     if request.message.role != a2a::Role::User {
@@ -697,6 +698,24 @@ mod tests {
                 .collect(),
         );
         task
+    }
+
+    /// A message with no part is refused, unless it is a resume (adam-rs ADR 0067), which says
+    /// nothing; the backend decides whether its task takes it.
+    #[test]
+    fn only_a_resume_may_have_no_part() {
+        let request = |metadata: Option<serde_json::Value>| SendMessageRequest {
+            message: Message {
+                metadata: metadata.map(|m| [(crate::RESUME_METADATA_KEY.to_owned(), m)].into()),
+                ..Message::new(Role::User, vec![])
+            },
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        assert!(validate(&request(None)).is_err());
+        assert!(validate(&request(Some(serde_json::json!(false)))).is_err());
+        assert!(validate(&request(Some(serde_json::json!(true)))).is_ok());
     }
 
     #[test]

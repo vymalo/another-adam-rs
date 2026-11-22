@@ -21,7 +21,8 @@ never see this crate's types. Retries are not done here: failures map onto
 | `PROVIDER` | `"openai"`: what `ModelClient::provider` says for this client, whatever gateway is behind it |
 | `ReasoningField` | `ReasoningContent` (`reasoning_content`) or `Reasoning` (`reasoning`): the member that carries reasoning when a client echoes it |
 | `MaxTokensField` | `MaxTokens` (default) or `MaxCompletionTokens`, for models that want the newer field name |
-| `OpenAiConfigError` | invalid configuration: `InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `ReservedBodyKey`, `Client`; see *Errors* |
+| `ExtraRoots`, `OpenAiCompatible::with_extra_roots(&roots)` | `MODEL_CA_FILE` ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md) decision 9): `ExtraRoots::read(path)` or `from_pem(bytes)` reads a PEM bundle and checks it with the TLS backend (a file that cannot be read, is not PEM, holds no certificate or one the backend refuses is `InvalidCaFile`); `with_extra_roots` builds the client again trusting them **beside** the default roots, for the model endpoint only. `Debug` says how many |
+| `OpenAiConfigError` | invalid configuration: `InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `ReservedBodyKey`, `InvalidCaFile { reason, source }`, `CaFileTooLarge { limit }` (a file over `MAX_CA_FILE_BYTES`, 1 MiB, not read past it), `CredentialHeader` (an `extra_headers` entry named `authorization` or `proxy-authorization`), `Client`; the last four are new and the enum is `#[non_exhaustive]`; see *Errors* |
 
 ```rust
 use std::sync::Arc;
@@ -44,6 +45,10 @@ Behaviour (details in the crate docs, `src/lib.rs`):
 * `Retry-After` (seconds or HTTP date) surfaces in `ModelError::RateLimited`.
 * `timeout` bounds a whole `complete` call; for `stream` it bounds the wait
   for headers and then the silence between chunks.
+* Response size caps, all constants: a body over 16 MiB, an SSE line over 1 MiB,
+  one event's `data:` over 4 MiB, or a stream over 64 MiB is refused with a
+  `Protocol` error (class `Corrupt`) before the buffer grows past the cap. A
+  gateway that streams one endless line can no longer grow the process without bound.
 * The key is a `SecretString`, sent as a sensitive `Authorization: Bearer`
   header, and never appears in `Debug`, errors or logs. An empty key sends no
   header. It is the default credentials provider (`StaticBearer`), asked for each call like any other. The gateway's address is not shown either: the `Debug` of `OpenAiConfig` and of
@@ -63,8 +68,13 @@ Behaviour (details in the crate docs, `src/lib.rs`):
   close, never as `{}`; a provider that sends a whole call in one chunk is announced in that chunk, after its
   `ToolCallStarted`; and a provider that sends the arguments before the name is announced when the name arrives (a call
   with no name is not a call: `finish` refuses it), never skipped.
-* A transport failure (timeout, connection error) is a `Transient` that keeps
-  the `reqwest` error as its `source`; a body that is not JSON is a `Protocol`
+* A transport failure is a `Transient` that keeps the `reqwest` error as its `source`, except a connection that could
+  not be made (refused, no route, a name that does not resolve), which is `Unreachable`, of class `Transient` too. A
+  timeout, the connect timeout included, stays `Transient`, and so does a TLS handshake that failed (a `rustls::Error`
+  anywhere in the chain, `io::Error`s opened with `get_ref`): `transient model error: TLS handshake failed`, since
+  waiting cures neither a CA not trusted nor a name that does not match.
+  **Visible change:** a refused connection's message was `transient model error: connection failed` and is now
+  `the model endpoint could not be reached`; a body that is not JSON is a `Protocol`
   that keeps the parser's error. The message does not repeat the source.
 * A response that stops short is `Transient`, so the runtime retries the turn: a stream (or `[DONE]`)
   that ended with no `finish_reason`, a last chunk cut off mid-JSON, a body cut off mid-JSON. A *complete*
@@ -143,7 +153,10 @@ Failures map onto `adam_model::ModelError`, which is classified (see
 | Cause | `ModelError` | Class |
 |---|---|---|
 | HTTP 429 (`Retry-After` kept) | `RateLimited` | `RateLimited` |
-| HTTP 408, 5xx; timeout; connection failure; transport error; a stream or body that ended before the model said why it stopped | `Transient` | `Transient` |
+| a refusal the provider parks (below) | `Refused { status, slug, retry_after, park }` | by its status |
+| a refusal whose problem type is `model_locked`, for every provider | `ModelLocked { model }` | `Rejected` |
+| a connection that could not be made (`reqwest::Error::is_connect`, not a timeout, not a TLS failure) | `Unreachable` | `Transient` |
+| HTTP 408, 5xx; timeout; a failed TLS handshake; transport error; a stream or body that ended before the model said why it stopped | `Transient` | `Transient` |
 | HTTP 401, 403 | `Auth` | `Unauthenticated` |
 | HTTP 400, 413, 422 naming the context window | `ContextLength` | `Invalid` |
 | any other 4xx; a request that cannot be built | `InvalidRequest` | `Invalid` |
@@ -154,12 +167,25 @@ Failures map onto `adam_model::ModelError`, which is classified (see
 history once on it. The bodies of other providers (Anthropic-style, Gemini, llama.cpp, Ollama) are
 *unverified* and none is mapped without a captured body.
 
+**Refusals** ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+decision 3). For an answer of status 400 or above, before the table's own rows, the client builds an
+`adam_model::Refusal`: the status, the `Retry-After` (seconds or an HTTP date; a number too large for a `u64` is the
+longest wait, not none) and the problem type, read only from an `application/problem+json` body (any parameters, any
+case). It is `Absent` for no body, no `type` member or `about:blank`; a `Slug` when the `type`'s last path segment, or
+the member as is when it holds no `/`, is a word of at most 64 letters, digits, `_`, `-` and `.`; and `Unreadable` for
+any other `type` (a `urn:`, a query, a fragment, a trailing `/`, not a string) or a body that is not a JSON object,
+which `InjectedRun` never parks on. The slug `model_locked` is `ModelLocked`; otherwise the provider is asked `parks`: `No`
+keeps the table's error exactly (a key of one's own fails as before), any other answer is `Refused`, which holds no body
+and no header. `InjectedRun`'s answers are in [`adam-model`](../adam-model/README.md#refusals). A gateway refuses before a
+response streams, so an error object inside a stream is never a refusal.
+
 An error object inside a `200` or a stream is `RateLimited` for a
 `rate_limit` type, `ContextLength` for a context-length code, `InvalidRequest`
 for `invalid_request` or `authentication`, and `Transient` for anything else.
 
-`OpenAiConfigError` (from `OpenAiCompatible::new` and `with_extra_body`) is `Invalid` for
-`InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey` and `ReservedBodyKey`, and `Internal` for
+`OpenAiConfigError` (from `OpenAiCompatible::new`, `with_extra_body`, `with_extra_roots` and `ExtraRoots`) is `Invalid` for
+`InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `ReservedBodyKey`, `InvalidCaFile` (its reader's or TLS backend's
+error is its `source`), `CaFileTooLarge` and `CredentialHeader`, and `Internal` for
 `Client` (the HTTP client could not be built; the `reqwest` error is its
 `source`). No message carries the URL, the header value or the key.
 
@@ -169,7 +195,11 @@ Every call asks the client's `ModelCredentials` for its headers ([ADR 0058](../.
 `OpenAiConfig` by default, or the provider given with `with_credentials`, so a host can mint or renew a token at the moment
 of use, prove it over the request, or send a run's tag with no key.
 
-* The provider is told the method (`POST`), the full URL and the attempt. Its headers are sent as sensitive values and
+* The provider is told the method (`POST`), the full URL, the attempt and the request's `run` (`ModelRequest::run`), on the
+  first try and on the retry after a 401, for a completion and a stream alike. With `adam_model::InjectedRun` the call
+  carries `X-Run-Id` and no `Authorization`: the key of the `OpenAiConfig` is replaced, and a call with no run sends nothing.
+  No `extra_headers` entry may carry a credential: `authorization` and `proxy-authorization` (any case) are refused
+  when the client is built (`CredentialHeader`), so nothing but the provider sends one. Its headers are sent as sensitive values and
   replace any of the same name; `content-type`, `content-length`, `accept`, `host` and `transfer-encoding` are refused, as is
   a value that is no valid header, with `InvalidRequest` (the value is never in the error) and nothing sent.
 * A provider's error is the call's, before anything is sent: its class decides whether the runtime retries.
@@ -179,21 +209,46 @@ of use, prove it over the request, or send a run's tag with no key.
 
 ## Features and environment
 
-No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
+No Cargo features. TLS is `rustls` (workspace `reqwest` configuration), verified by the platform verifier; `with_extra_roots`
+adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by `adam-service`.
 
 ## Tests
 
 * `tests/http.rs`: the client against a `wiremock` server (requests, streaming,
   tool calls, error mapping and classes, timeouts, source chains, reasoning in a stream and a completion, the extra body on every request, reasoning sent back only when echoed). Always
   runs, no network.
-* Unit tests: `src/errors.rs` (`status_mapping`), `src/lib.rs`
-  (`config_error_class_table`, `debug_shows_the_gateway_by_scheme_and_host_only`,
+* Unit tests: `src/errors.rs` (`status_mapping`, `a_problem_type_is_read_by_its_last_segment`,
+  `a_problem_document_is_told_by_its_content_type`, `retry_after_seconds_and_date`), `src/lib.rs` also
+  `a_rustls_error_is_found_however_it_is_wrapped`, `src/lib.rs`
+  (`config_error_class_table`, `bad_headers_and_keys_are_rejected`, which refuses a credential in `extra_headers`,
+  `debug_shows_the_gateway_by_scheme_and_host_only`,
   `the_provider_is_openai_and_a_window_is_said_for_its_alias_only`) and `src/wire.rs` (the request shape, including several text parts
   sent as one string; the usage parts of a completion and of a stream's last chunk, absent ones, and reasoning beside a smaller
   completion count; made-up ids for calls with none: random, distinct, the same in the stream and the message).
 * `tests/credentials.rs`: the provider against a `wiremock` server: asked for every call, a 401 renewed once with the same
   body, a second 401 as the answer, the configured key never retried, a stream renewed, a proof told the method and URL, a
   provider with no key, a provider's error sent nowhere (its class kept), and the framing headers refused. Always runs.
+* `tests/injector.rs`: `InjectedRun` against a `wiremock` server: every completion and stream carries `X-Run-Id` and no
+  `Authorization` (a key in the configuration is never sent), the run is in no body, the retry after a 401 names the run
+  too, and a call with no run sends no request. Always runs.
+* `tests/refusals.rs`: refusals against a `wiremock` server: under `InjectedRun` each slug of the table, completed and
+  streamed, is `Refused` with its park, status, slug and `Retry-After` (120 s is a 120 s timer, 5 s a 30 s one) in one
+  request, and its class follows its status; a `Retry-After` in the year 9999 or too large for a `u64` parks for 24 h
+  and is kept as said, and an HTTP date two minutes ahead parks for about two minutes; a problem `type` that cannot be
+  read (`urn:`, a query, a fragment, a trailing `/`, 65 characters) parks nothing on a 401, 403 or 402, while no `type`
+  or `about:blank` on a 403 parks as `unauthenticated`; a 401 or a 403 with no body, a plain body, a JSON body that is no problem
+  document or only a `Retry-After` parks for 30 s; `model_locked` is `ModelLocked` under the injector and a fixed key; an
+  unknown slug, a slugless 500 and a 402 whose `type` is in plain JSON are today's errors; under `StaticBearer` every answer
+  is today's error, against `Display` goldens of what `errors::from_http` gave at `9f40a3b`; no `Refused` nor `ModelLocked` holds the body's
+  words or a secret in its `Display`, `Debug` or source chain; an error object inside a stream is not a refusal; a port with
+  nothing listening is `Unreachable` (class `Transient`) for a completion and a stream, and a timeout is `Transient`, not
+  `Unreachable`. Always runs.
+* `tests/ca_file.rs`: a TLS server on the loopback (rustls, a test CA and a server certificate for `localhost` and
+  `127.0.0.1` in `tests/fixtures/`, valid until 2126, signing nothing else) is refused with the default roots (`Transient`, "TLS handshake failed", never `Unreachable`), nothing
+  reaching it, and answers once the client trusts the CA with `with_extra_roots`; a missing file, an empty one, a key, bad
+  base64 and a block that is no certificate are each `InvalidCaFile`, with the cause kept as the source; a file over 1 MiB
+  is `CaFileTooLarge` and one of exactly 1 MiB is read. Always runs. The fixtures are test only: `tests/fixtures/README.md`
+  says how to make them again.
 * `tests/wiremock_compose.rs`: the client against the `mock-openai` WireMock of `compose.yaml` (text and tool-call answers,
   streamed or not, the error scenarios), and **every scripted model** (`mock-coder`, `mock-assistant`, `mock-researcher`, `mock-painter`)
   played from its first request to its final answer both as a completion and as a stream, which must say the same, with the

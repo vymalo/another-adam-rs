@@ -81,11 +81,14 @@ superset of the two custom-agent formats below.
 name: coder                    # default: CARGO_PKG_NAME (root), file name (subagents)
 description: Turns a coding task into a verified pull request.   # required on subagents
 model: coder-large             # a gateway alias; `inherit` = the parent's (default for subagents)
+reasoning_effort: low          # the level the model calls ask for by default; one the model's profile declares (ADR 0063)
+model_preset: quick            # a named preset of MODEL_ALIASES_FILE the calls start from (ADR 0064)
 tools: [prepare_workspace, run_checks, ask_user]     # or "a, b, c"; "*" = all; MCP: "linear__*"
 skills: all                    # or a list; default: every skill in this agent's skills/
 limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as limits.max_turns
   max_turns: 200               # model calls that may be followed by tools, plus one closing turn in which it may call none (0: one call with no tools)
   max_tool_calls: 400          # over it, the turn's calls are answered "not run" and the closing turn follows
+  max_output_tokens: 64000     # the output cap this agent asks for, at least 1; absent: its preset's, the model profile's, then 128,000, clamped to the model's limit and window (ADR 0064)
   max_minutes: 30              # subagent only: the longest one run may take; 0 = no limit, at most 1440
   max_parallel: 4              # tool calls of one turn that run at once, 1 to 32: lowers MAX_PARALLEL_TOOL_CALLS for this agent, never raises it
   max_open_sessions: 8         # root only: most sessions open at once, 1 to 100; lowers SESSION_MAX_OPEN, never raises it (a larger value is lowered with a warning)
@@ -118,6 +121,21 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   knows and ignores (`color`, `permissionMode`, `temperature`, `target`, `user-invocable`,
   `disable-model-invocation`, ...) get a softer "ignored by adam" warning. `build("agent").strict()`
   turns warnings into errors.
+* **Reasoning effort is per model.** `reasoning_effort` names a level the model's profile declares
+  (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; ADR 0063), and `model_preset` names a
+  preset of the deployment's `MODEL_ALIASES_FILE` (ADR 0064). The assembly resolves the default —
+  the folder's value, else the preset's, else the profile's, else the profile's base preset — and
+  refuses a level the model does not take, naming the agent and the value. An embedded engine's host
+  gives the root's level (`EngineBuilder::reasoning_effort`) when the file sets none: the file's key
+  wins. Claude Code's `effort` is still ignored with a warning.
+* **The output cap is per model.** `limits.max_output_tokens` is what this agent's calls ask for;
+  without it the cap is its `model_preset`'s, else the model profile's `maxOutputTokens`, else the
+  profile's base preset, else 128,000 (ADR 0064). The result is clamped to the model's
+  `maxOutputTokensLimit` and, when the context window is known, to what the window leaves after
+  20,000 tokens and the history the agent keeps (`max_history_tokens`, or half the window when it
+  is `0`; an omitted key keeps the 100,000 default). A **preset** above the model's limit is refused at startup, and a profile's own
+  `maxOutputTokens` above its limit is refused when the profiles file is read; the folder's own
+  value is clamped. `0` is refused: leave the key out to take the profile and the fallback.
 * **The tools a root agent has without writing any** are the person's screen and a plan: `ask_user`, `show`,
   `ui_catalog`, `plan_work`, `plan_check`, `plan_add` (`adam-ui`), in that order. `tools:` narrows them by name like
   any other, so **a folder with `tools:` must list `plan_*` (or `"*"`) to keep the plan**. A subagent has none of them
@@ -352,7 +370,7 @@ sequenceDiagram
   credential in a header, env value or URL is a warning (an error under `.strict()`).
 * **Schedules** ([ADR 0060](../decisions/0060-schedules-are-parked-runs.md)): exactly one of three keys, a
   non-empty body (the prompt of each run), and `timezone` (default `UTC`); they belong to the root agent. Read and
-  checked here; `adam-agent` and the coder run them (their READMEs, "schedules/"). A firing is the prompt as a person's message,
+  checked here; `adam-agent`, the coder and `adam-engine` run them (their READMEs, "schedules/"). A firing is the prompt as a person's message,
   sent to the agent directly: a `/command` in it is not expanded, and nobody answers it: a tool that asks the person
   (`ask_user`) is answered that nothing can be asked, and the model goes on, in the firing and in its subagents (the coder
   ends a firing that would wait, `Failed`). Write the prompt so that the agent need not ask.
@@ -1132,8 +1150,8 @@ type already sets the pattern).
 
 ## Open questions
 
-* Reasoning effort, sampling and compaction: `ModelRequest` has no such fields, so the keys are
-  accepted and ignored with a warning.
+* Sampling and compaction: the folder's `temperature` and `top_p` are accepted and ignored with a
+  warning; only the reasoning effort reaches a model request so far (ADR 0063).
 * Tool approvals (`approval:`) fit roadmap 5; where the policy lives (`#[tool(...)]`, frontmatter or
   both) is open.
 * An `evals/` directory; an OpenAPI connection; subagent continuation (`task_id`) and a built-in

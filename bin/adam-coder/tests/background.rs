@@ -20,7 +20,7 @@ use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::{AGENT_NAME, CoderAgent, CoderSettings, Redactor, ToolEnv};
 use adam_core::{DynStore, MemoryStore, NewRun, RunId, RunStatus};
 use adam_llm_agent::{KeptStore, ReadOutput, Tool, ToolCtx, ToolOutput};
-use adam_model::{DynModel, MockModel, ModelError, ModelRequest};
+use adam_model::{DynModel, MockModel, ModelError, ModelRequest, Park};
 use adam_runtime::{CollectingSink, Inbound, Runtime};
 use common::{FakeEnvironment, Fixture, MODEL_KEY, call};
 use serde_json::{Value, json};
@@ -1073,6 +1073,16 @@ fn stopped_why(fx: &Fixture, run: RunId) -> Vec<String> {
         .collect()
 }
 
+/// A refusal whose provider parks the run (ADR 0067 decision 3).
+fn refused(status: u16, slug: Option<&str>, park: Park) -> ModelError {
+    ModelError::Refused {
+        status,
+        slug: slug.map(str::to_owned),
+        retry_after: None,
+        park,
+    }
+}
+
 #[tokio::test]
 async fn a_finished_root_run_stops_its_commands() {
     let fx = Fixture::new().await;
@@ -1128,6 +1138,36 @@ async fn a_park_on_the_person_stops_the_commands() {
         stopped_why(&fx, run),
         ["the run waits for the person's answer"]
     );
+    driven.finish().await;
+}
+
+#[tokio::test]
+async fn a_park_until_woken_stops_the_commands() {
+    let fx = Fixture::new().await;
+    let url = fx.remote_url();
+    let driven = Driven::new(&fx, |m| {
+        m.push_tool_calls(vec![call(
+            "c1",
+            "prepare_workspace",
+            json!({"repo_url": url, "base_branch": "main"}),
+        )]);
+        m.push_tool_calls(vec![call(
+            "c2",
+            "start_command",
+            json!({"command": "sleep 660", "wait": 1}),
+        )]);
+        // The person's usage limit is reached: the run waits until they raise it, which may take
+        // a while, so a server nobody can use is not kept (ADR 0067).
+        m.push_error(refused(402, Some("over_limit"), Park::UntilWoken));
+    });
+    let run = driven.start(&format!("look at {url}")).await;
+    let status = driven.settle(run).await;
+    assert_eq!(status, RunStatus::Parked);
+    assert_eq!(
+        stopped_why(&fx, run),
+        ["the run waits on the model until it is woken"]
+    );
+    assert_eq!(fx.env.commands.running_count(&run.to_string()), 0);
     driven.finish().await;
 }
 
@@ -1282,7 +1322,7 @@ async fn a_leader_that_ends_by_itself_leaves_no_child_behind() {
     until_gone("the child of the leader to be gone", &[child]).await;
 }
 
-/// In a pod or a devcontainer the client's exit does not end what `cmd &` left there: the exec id is
+/// In a run pod the client's exit does not end what `cmd &` left there: the exec id is
 /// killed in the environment on exit as well.
 #[tokio::test]
 async fn a_command_that_ends_by_itself_is_still_killed_in_the_environment() {
@@ -2012,46 +2052,13 @@ async fn a_start_that_is_dropped_before_it_has_a_supervisor_leaves_nothing_behin
     rig.stop(&rig.id_of("next")).await;
 }
 
-/// The environment is made again by `rebuild_environment`: what runs in it stops, with the reason.
-#[tokio::test]
-async fn rebuilding_the_environment_stops_the_commands_with_the_true_reason() {
-    use adam_coder::tools::environment::RebuildEnvironment;
-    let fake = FakeEnvironment::new(None);
-    let rig = Rig::from(Fixture::new().await.using(fake.clone())).await;
-    let out = rig
-        .start(
-            "start-1",
-            json!({"command": "echo up; sleep 656", "wait_for": "up", "wait": 20}),
-        )
-        .await;
-    assert!(!out.is_error, "{}", out.content);
-    let id = rig.id_of("start-1");
-    let pid = rig.pid_of(&id);
-    let rebuilt = RebuildEnvironment
-        .call(&rig.call_ctx("rebuild"), json!({}))
-        .await
-        .unwrap();
-    assert!(!rebuilt.is_error, "{}", rebuilt.content);
-    until_gone("the process", &[pid]).await;
-    until("it to be settled", || {
-        rig.states().iter().all(|(_, s)| !s.is_running())
-    })
-    .await;
-    assert!(
-        matches!(
-            &rig.states()[0].1,
-            CommandState::Stopped { why } if why.contains("its environment was made again")
-        ),
-        "{:?}",
-        rig.states()
-    );
-}
-
-/// A command in a pod or a devcontainer that a signal ended and nobody asked: the model is told the
+/// A command in a run pod that a signal ended and nobody asked: the model is told the
 /// likely reason. In this container the same signal is only a signal.
 #[tokio::test]
 async fn a_signal_nobody_asked_for_says_what_the_likely_reason_is_in_a_pod() {
     let fake = FakeEnvironment::new(None);
+    // The session is a run pod's: a signal that nobody asked for is not the caller's kill.
+    fake.session.as_pod(None, None);
     let rig = Rig::from(Fixture::new().await.using(fake.clone())).await;
     let out = rig
         .start(
@@ -2069,8 +2076,9 @@ async fn a_signal_nobody_asked_for_says_what_the_likely_reason_is_in_a_pod() {
     .await;
     let listed = rig.list().await;
     assert!(
-        listed.contains(&format!("{id} stopped: its environment was made again (a new repository, a reference or a rebuild)"))
-            && listed.contains("start it again if it is still needed"),
+        listed.contains(&format!(
+            "{id} stopped: its environment was made again (a new repository or a reference)"
+        )) && listed.contains("start it again if it is still needed"),
         "{listed}"
     );
 

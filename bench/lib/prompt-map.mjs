@@ -55,7 +55,7 @@ export const SPANS = Object.freeze([
   ], to: '8. **Report.** In your final answer, summarise what changed and why, and list the exact commands you ran and their result. Never claim a check passed that you did not run.' },
   { id: 'how-9-finish', kind: 'rewrite', find: 'telling the person the pull request URL and what you verified.', to: 'telling the person what you changed and what you verified.' },
   { id: 'toolchain-which-tools', kind: 'rewrite', find: 'When `run_checks`, `run` or `run_command` says the workspace has no `mvn`', to: 'When a command says the workspace has no `mvn`' },
-  { id: 'toolchain-result-says', kind: 'drop', find: "The result says whether the\ntool has to be added to the repository's devcontainer or the repository has none. ", to: '' },
+  { id: 'toolchain-result-says', kind: 'drop', find: ["The result says whether the\ntool has to be added to the repository's devcontainer or the repository has none. ", 'The result says which\nenvironment lacks the tool and how the tool gets there. '], to: '' },
   { id: 'toolchain-ask', kind: 'rewrite', find: 'Tell the person which\ntoolchain is missing and what you needed it for, with `ask_user`, and wait for\ntheir answer.', to: `Say which\ntoolchain is missing and what you needed it for in your final answer. ${NOBODY}.` },
   { id: 'toolchain-install', kind: 'rewrite', find: "with `run` only (`run_checks` is for the\nproject's real checks: an install that passes is not a check of the code, and\nrunning it would only spend a cycle or pass the gate on nothing)", to: 'with `shell` (an install that passes is\nnot a check of the code)' },
   { id: 'ending-pull-request', kind: 'rewrite', find: '- **You opened the pull request.** Tell the person its URL and what you\n  verified. The run is then complete.', to: '- **You made the change.** Tell the person what you changed and what you\n  verified. The run is then complete.' },
@@ -75,10 +75,10 @@ const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
  * The template with the table applied, in one pass: { mapped, applied }. `applied` lists, for each substitution, its id, where it was in
  * the template (`at`, `length`) and in the mapped text (`mappedAt`, `mappedLength`), and the original and replacement text.
  */
-export function applyMap(template) {
+export function applyMap(template, spans = SPANS) {
   const edits = [];
   const count = (text, needle) => text.split(needle).length - 1;
-  for (const s of SPANS) {
+  for (const s of spans) {
     // A `find` may list the spellings of the same sentence in two revisions (re-wrapped lines): the one found exactly once is used.
     const finds = s.find === undefined ? [] : Array.isArray(s.find) ? s.find : [s.find];
     const found = finds.find((f) => count(template, f) === 1);
@@ -115,6 +115,18 @@ export function applyMap(template) {
   mapped += template.slice(from);
   return { mapped, applied };
 }
+
+/**
+ * The `work` profile (bench/README.md, "Agent variants") also gives OpenCode the "Helpers" section: adam's two subagents are, for OpenCode,
+ * its one `subagent` tool, so the section's body is rewritten to say the same advice about it.
+ */
+export const HELPERS_SPAN = Object.freeze({
+  id: 'helpers-subagent',
+  kind: 'rewrite',
+  from: 'Your subagents are `explorer`',
+  through: 'say exactly this.',
+  to: 'Your `subagent` tool starts a helper. Use one for where and how questions about a repository (file paths and line numbers) on a large or unfamiliar repository before you plan, and one to review your change against the base branch once, before you finish, on a change that is not trivial. A helper edits nothing and gives advice: you decide. A small, clear change needs neither.',
+});
 
 /** What is left of a text when the substitutions are cut out: used to show that nothing but the table changed. */
 export function withoutSubstitutions(text, applied, side) {

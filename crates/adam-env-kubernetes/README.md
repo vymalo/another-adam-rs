@@ -8,8 +8,9 @@ volume is [ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.m
 
 ## Where it sits
 
-An **implementation** of the `Environment` port, swapped at build time (a binary composes it, no plugin), next to
-[`adam-devcontainer`](../adam-devcontainer/README.md) (a Podman service). It depends on `adam-workspace` for the port and on
+An **implementation** of the `Environment` port, swapped at build time (a binary composes it, no plugin). It is the
+only one that makes anything: the other is `Local`, the caller's own container (ADR 0052 removed the third,
+`adam-devcontainer`). It depends on `adam-workspace` for the port and on
 `kube` for the cluster: it speaks to the API server itself and runs no command to do it. The coder composes it when
 `RUN_ENVIRONMENT=kubernetes` (see [its README](../../bin/adam-coder/README.md#a-pod-of-its-own-for-each-run)); the default is the
 coder's own container, so nothing changes for a deployment that does not opt in.
@@ -27,7 +28,7 @@ only says the shape; the coder spawns the commands and times them.
 
 | Item | What |
 |---|---|
-| `KubeEnvironment` | the `Environment`: `connect(Settings, PodTemplate)` (the cluster this process runs in, or `KUBECONFIG`'s), `new(Client, Settings, PodTemplate)`, `reap_idle()` (one sweep of idle pods), `reap_loop()` and `spawn_reaper()` (the sweep, for as long as the runtime lives), `pod_name(run)`. `rebuild(run, _)` deletes the pod and answers `true`; the next `ensure` makes another. `set_image(run, image)` records the image a run chose (`use_repository_environment`, ADR 0052; `None` is back to the deployment's), and the next `ensure` makes the pod again when the pod that is there runs another one, when no command runs in it; `repository_image_prefixes()` is `Some(Settings::repository_images)`. `seal(workspace)` ([below](#seal)) deletes a pod that lacks a mount the workspace needs now, when nothing runs in it, and never makes one |
+| `KubeEnvironment` | the `Environment`: `connect(Settings, PodTemplate)` (the cluster this process runs in, or `KUBECONFIG`'s), `new(Client, Settings, PodTemplate)`, `reap_idle()` (one sweep of idle pods), `reap_loop()` and `spawn_reaper()` (the sweep, for as long as the runtime lives), `pod_name(run)`. `set_image(run, image)` records the image a run chose (`use_repository_environment`, ADR 0052; `None` is back to the deployment's), and the next `ensure` makes the pod again when the pod that is there runs another one, when no command runs in it; `repository_image_prefixes()` is `Some(Settings::repository_images)`. `seal(workspace)` ([below](#seal)) deletes a pod that lacks a mount the workspace needs now, when nothing runs in it, and never makes one |
 | `PodTemplate` | the deployment's pod: `from_file(path, container, workspace_root)` or `parse(text, source, container, workspace_root)` (a Pod, or a bare PodSpec, in YAML or JSON), checked at startup, which includes finding the one mount of the workspace volume at `workspace_root` (the coder's `WORKSPACE_ROOT`, or the worker's folder under it); `mounts_for(&RunWorkspace)` (the mounts the run's workspace needs now); `render(run, name, Placement, &WorkspaceMounts, image)` fills in the name, namespace, labels and annotations, replaces that one mount by the mounts, and, when `image` is `Some`, sets the run container's image and the `adam.vymalo.com/repository-image` annotation, and nothing else; `image()`, `workspace_path()` `sandbox_shape()` is the run container's **requests** as an `adam_workspace::SandboxShape` (`cpu_millis`, `memory_bytes`; a resource with a limit and no request takes its limit, as Kubernetes does at admission; one with neither is `None`), parsed at startup by a small exact quantity reader (`250m`, `1.5`, `512Mi`, `2Gi`, `1G`, `129e6`; a fraction rounds up as Kubernetes does) |
 | `WorkspaceMounts`, `Mount`, `SlotMount`, `WorktreeDirs` | what a run pod mounts of the workspace volume ([below](#what-a-run-pod-mounts)): `plan(base, run_dir, &[SlotMount { path, generation, read_only }], &[WorktreeDirs { mirror, admin, generation, read_only }])` (pure; a slot is a direct child of `run_dir`), `iter()` (a `Mount` has `path()`, `sub_path()`, `read_only()`, `generation()`), `encode()` (the annotation's value), `missing_from(recorded)`. `plan` took the slots as a new third argument when each slot became a mount of its own. **`read_only` on both is new**: a reference (`Slot::writable()` is false) is mounted `ro`, and so is its directory in the mirror, whole (a write from the pod is `EROFS`); the line of the annotation says `ro <path>`, so a pod made when the slot was writable is made again. A struct literal of either type needs the field |
 | `Settings` | the namespace, the release's instance label, the worker, the container the commands run in (`run`), the exec client program, where `adam-exec` and the tools are in the pod, the time to be ready, the idle timeout, the sweep interval, the environment `adam-kube-exec` is started with, and the image prefixes a repository may name (`RUN_POD_REPOSITORY_IMAGES`, empty: none); `Settings::new(namespace, instance, worker)` has the defaults |
@@ -86,7 +87,12 @@ privilege escalation, a pinned `nodeName`, or an `automountServiceAccountToken` 
 
 The commands run in the container named `run`, which must mount `/opt/adam/bin` read-only from an `emptyDir` that an init
 container filled from the coder's image (`adam-exec` alone), and the workspace volume at the
-workspace root. The template names **no Secret**: a run pod gets no model key and no agent binary
+workspace root. `adam-exec` is a file of **this crate** (`src/adam-exec.sh`, ADR 0052 moved it here with its
+tests): `docker/coder/Dockerfile` copies it to `/opt/adam/bin/adam-exec`, and the chart's init container copies it
+into the pod. **Breaking change of this crate:** `adam-exec.sh` and `tests/adam_exec.rs` are here now, and
+`KubeEnvironment` no longer implements `Environment::rebuild` (the method is gone from the port; ADR 0052).
+
+The template names **no Secret**: a run pod gets no model key and no agent binary
 ([ADR 0038](../../docs/decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md); `Settings::opencode` and
 `Settings::model_key` are gone, a breaking change). **Breaking change of the template check:** a template that still names a Secret a
 container could read (a `secretKeyRef`, an `envFrom` Secret, a Secret or projected-Secret volume, in a container or an init container) is a
@@ -218,6 +224,9 @@ one line); none carries a secret, and the API server never echoes one in a refus
 
 ## Tests
 
+* **`adam-exec` itself** (`tests/adam_exec.rs`): the script is run by `sh` with a `/proc` and nothing else: the
+  arguments of `run` and `shell`, the exit code, the working directory, `kill` of a tree and of a process group,
+  a reused pid that is not touched, `active` and `active-fg`, and `chown` through the container's id map.
 * **Unit tests, no cluster.** The environment is tested over a fake API server (`src/fake.rs`): a `tower-test` mock service
   behind a real `kube::Client`, which keeps pods in memory and answers `GET`, `POST`, `DELETE` and list with the answers a test
   turns on (a quota, an admission refusal, a pod that takes some watch events to be ready, one that never schedules, an image that

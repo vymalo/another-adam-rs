@@ -115,10 +115,11 @@ flowchart LR
     AgentError -.->|"Agent(e)"| RuntimeError
     StoreError -.->|"Store(e)"| RuntimeError
 
-    ModelError -->|RateLimited| RateLimited
-    ModelError -->|Transient| Transient
+    ModelError -->|"RateLimited, Refused 429"| RateLimited
+    ModelError -->|"Transient, Unreachable, Refused 503"| Transient
     ModelError -->|"ContextLength, InvalidRequest"| Invalid
-    ModelError -->|Auth| Unauthenticated
+    ModelError -->|"Auth, Refused 401 or 403"| Unauthenticated
+    ModelError -->|"ModelLocked, Refused 402 or another status"| Rejected
     ModelError -->|Protocol| Corrupt
     OpenAiConfigError -->|"InvalidBaseUrl, InvalidHeader, InvalidApiKey"| Invalid
     OpenAiConfigError -->|Client| Internal
@@ -185,6 +186,20 @@ retries: `ModelError::is_context_overflow()` is true for it, so the loop compact
 turn fails the run, naming both. A summary request that fails for another reason after a rejection fails the
 run with that error's class and message; one that is itself too long drops the turns without a summary. Only the two shapes `adam-model-openai` maps (the code `context_length_exceeded`
 and "maximum context length") are recognised.
+
+Three model errors come from [ADR 0067](../decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+decision 3:
+
+| Variant | When | Class |
+|---|---|---|
+| `Refused { status, slug, retry_after, park }` | an answer of status 400 or above that the credential provider parks on (`ModelCredentials::parks`, today `InjectedRun` alone: the gateway's `unauthenticated`, `run_not_bound`, `lease_expired`, `over_limit`, `rate_limited`, `unavailable`, or a 401 or 403 with no problem type; never one whose `type` cannot be read) | by its status: `401`, `403` `Unauthenticated`; `402` `Rejected`; `429` `RateLimited` (`retry_after()` is its `Retry-After`); `503` `Transient`; any other `Rejected` |
+| `ModelLocked { model }` | the problem type `model_locked`, for every provider: the model is not allowed at all | `Rejected` |
+| `Unreachable` | a connection to the model endpoint could not be made (refused, no route, a name that does not resolve); a timeout, a cut stream and a failed TLS handshake stay `Transient` | `Transient` |
+
+`Refused` holds no body and no header: its message is `the model endpoint refused the call: HTTP <status>[ <slug>]`.
+A provider that does not park (a key of one's own, the device grant) keeps the errors above, so a wrong key fails as
+before. Nothing parks a run yet: the LLM agent treats these errors as any other of their class (the runtime retries a `429`,
+a `503` and `Unreachable`; the rest fail the run).
 
 ## What each class decides
 
@@ -272,6 +287,12 @@ A child whose parent ended is `cancelled: the parent run ended`. Two refusals of
 turn and `limit: "repeated_call"`; a closing turn with no words fails it with `the same tool call was repeated with the same
 result and the run was stopped (doom_loop)`.
 
+A model turn that stops at the output limit with only reasoning (no words, no call) is continued with a short message, at
+most twice in a row; the third fails the run with `output limit reached while thinking: 3 turns in a row ended at the output
+limit with no words and no tool call; raise max_output_tokens or lower the reasoning effort`. It is never the run's answer, so
+the coder never asks the person about it. A cut turn that has words is still an answer marked `truncated`. A closing turn
+that is cut with no words fails with `turn limit exceeded`.
+
 ### A language server that cannot answer
 
 The three tools of [the coder's language servers](coder-agent.md#language-servers) answer in words, and none of these is a failure of the run:
@@ -339,14 +360,28 @@ the coder's own errors in `bin/adam-coder/src/exit.rs`):
 | Code | Meaning |
 |---|---|
 | 0 | clean shutdown after SIGTERM |
-| 78 | configuration (`ConfigError`, an invalid `OpenAiConfigError`, `ServeError::Push`: push notifications are on and cannot be set up, `ServeError::ChildSessions`: the agent serves `child-sessions/v1` for a helper the process did not register (a fault of the binary, found at start; the message names the helper), a `LANGUAGE_SERVERS` that is not `on` or `off`, a `LANGUAGE_SERVER_IDLE_SECS` outside 30 to 86400 or a `LANGUAGE_SERVERS_MAX` outside 1 to 32, or a `MAX_PARALLEL_TOOL_CALLS` outside 1 to 32, or a `SESSION_MAX_OPEN` outside 1 to 100, a `SESSION_MAX_WORKING` outside 1 to 32 or, when set, above `SESSION_MAX_OPEN` (an unset one is cut down to it), a `SESSION_MAX_ROUNDS` outside 2 to 200 or a `SESSION_IDLE_DAYS` outside 1 to 365, on every role (the line names the variable), any other `Invalid` error, such as a `ReferencesError`: `ADAM_REFERENCES_FILE` that cannot be read, is not a file of references, repeats a name the agent declares, or names an address the workspaces' policy refuses). A bad `A2A_PUSH_*`, `A2A_CARD_SIGNING_*`, `MODEL_CONTEXT_WINDOW`, `MODEL_INPUT_MODALITIES`, `MODEL_OUTPUT_MODALITIES` (`image` is not built for any provider) or `MODEL_IMAGE_*` or `A2A_ALLOW_INSECURE_REMOTES` value is a `ConfigError`, and so is a `MODEL_IMAGE_*` variable set while `MODEL_INPUT_MODALITIES` lacks `image` (the line names the variable), and so is `MODEL_IMAGE_MAX_BYTES` times `MODEL_IMAGE_MAX_COUNT` over 32 MiB (the line names both: a request resends every admitted image), and so is a `BACKGROUND_COMMANDS_MAX`, `BACKGROUND_COMMAND_MAX_SECS` or `BACKGROUND_SWEEP_SECS` outside its range (`0` included: none of the three turns the bound off, because the sweep is what a cancel depends on), the message names the variable; so is `adam-coder` with a **GitHub App key file while the commands run in its own container** (a command could read the key and act as the App at any access tier; the message names the settings that change it) unless `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` accepts it, and so is a value of that variable that is no boolean; a remote subagent at plain `http` on another machine without `A2A_ALLOW_INSECURE_REMOTES`, or whose `auth` variable is unset, is an `Invalid` error of the assembly |
-| 69 | a dependency unreachable at boot (Postgres) |
+| 78 | configuration (`ConfigError`, an invalid `OpenAiConfigError`, `ServeError::Push`: push notifications are on and cannot be set up, `ServeError::ChildSessions`: the agent serves `child-sessions/v1` for a helper the process did not register (a fault of the binary, found at start; the message names the helper), `ServeError::UnsupportedScheme` / `ServeError::StoreNotBuilt` / `ServeError::SqliteWithoutPath` / `ServeError::SplitRoleOnSqlite`: `DATABASE_URL` names a store this process cannot serve (see below), a `LANGUAGE_SERVERS` that is not `on` or `off`, a `LANGUAGE_SERVER_IDLE_SECS` outside 30 to 86400 or a `LANGUAGE_SERVERS_MAX` outside 1 to 32, or a `MAX_PARALLEL_TOOL_CALLS` outside 1 to 32, or a `SESSION_MAX_OPEN` outside 1 to 100, a `SESSION_MAX_WORKING` outside 1 to 32 or, when set, above `SESSION_MAX_OPEN` (an unset one is cut down to it), a `SESSION_MAX_ROUNDS` outside 2 to 200 or a `SESSION_IDLE_DAYS` outside 1 to 365, on every role (the line names the variable), any other `Invalid` error, such as a `ReferencesError`: `ADAM_REFERENCES_FILE` that cannot be read, is not a file of references, repeats a name the agent declares, or names an address the workspaces' policy refuses). A `MODEL_ALIASES_FILE` that cannot be read, is not JSON, or breaks a rule of the per-model profiles (an unknown reasoning level or wire, a duplicate, a budget or a cap, a preset reference, a reserved `extraBody` member) is a `ConfigError` naming the file and the key. A bad `A2A_PUSH_*`, `A2A_CARD_SIGNING_*`, `MODEL_CONTEXT_WINDOW`, `MODEL_INPUT_MODALITIES`, `MODEL_OUTPUT_MODALITIES` (`image` is not built for any provider) or `MODEL_IMAGE_*` or `A2A_ALLOW_INSECURE_REMOTES` value is a `ConfigError`, and so is a `MODEL_IMAGE_*` variable set while `MODEL_INPUT_MODALITIES` lacks `image` (the line names the variable), and so is `MODEL_IMAGE_MAX_BYTES` times `MODEL_IMAGE_MAX_COUNT` over 32 MiB (the line names both: a request resends every admitted image), and so is a `BACKGROUND_COMMANDS_MAX`, `BACKGROUND_COMMAND_MAX_SECS` or `BACKGROUND_SWEEP_SECS` outside its range (`0` included: none of the three turns the bound off, because the sweep is what a cancel depends on), the message names the variable; so is `adam-coder` with a **GitHub App key file while the commands run in its own container** (a command could read the key and act as the App at any access tier; the message names the settings that change it) unless `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` accepts it, and so is a value of that variable that is no boolean, and so is `DEVCONTAINER_RUNTIME=podman` (ADR 0052 removed that path; the message names the variable and the decision, and every other removed variable is only warned about); a remote subagent at plain `http` on another machine without `A2A_ALLOW_INSECURE_REMOTES`, or whose `auth` variable is unset, is an `Invalid` error of the assembly; so is an agent folder that sets a `reasoning_effort` (or names a `model_preset` whose effort) that the model's profile does not declare, or names a `model_preset` the profiles do not declare (the message names the agent, the value and the levels the model takes), or whose `limits.max_output_tokens` is `0` (the message names the key and says to leave it out), or that names a `model_preset` whose `maxOutputTokens` is above the model's `maxOutputTokensLimit` (the message names the preset, the cap and the limit) |
+| 69 | a dependency unreachable at boot (Postgres, MongoDB or SQLite) |
 | 71 | an OS error (a port that cannot bind, a directory that cannot be created) |
 | 70 | a half of the process stopped, a panic or an internal error |
 | 1 | anything else |
 
 The failure is one structured JSON log line (`adam-coder failed`, `adam-agent failed`) with the whole
 cause chain and none of the process's secrets.
+
+### The store's exit-78 reasons
+
+`DATABASE_URL` is read once at start ([store adapters](store-adapters.md#sqlite)). Each of these is a
+`ServeError`, exit 78, and its message says which rule it broke:
+
+| Reason | Message says |
+|---|---|
+| the scheme is not `postgres`, `postgresql`, `mongodb`, `mongodb+srv` or `sqlite` | the scheme as written, and the five accepted ones |
+| the binary was built without that adapter (a library build with the feature off) | the scheme and the `store-<scheme>` feature to rebuild with |
+| `sqlite://` with no path | the shape of a URL that has one |
+| `sqlite://` with `ROLE=worker` or `ROLE=control-plane` | the role, that a SQLite file is opened by one process, and the stores a split deployment uses |
+| the SQLite file is held by another process | the file and its `<path>.lock` |
+| the SQLite file's `schema_version` is newer than the binary's | both versions, and to start the release that migrated the file |
 
 `adam-egress` (the egress proxy, [its README](../../bin/adam-egress/README.md)) ends with 0 after SIGTERM, 78 for its
 configuration and 71 when it cannot bind `EGRESS_LISTEN` (`bin/adam-egress/src/error.rs`); it logs `adam-egress failed`

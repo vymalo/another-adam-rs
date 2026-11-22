@@ -15,7 +15,7 @@
 //! | `file_diagnostics { path, repo?, wait?, offset?, limit? }`, `find_definition { path, line, symbol, occurrence?, repo?, wait? }`, `find_references { path, line, symbol, occurrence?, include_declaration?, repo?, wait?, offset?, limit? }`: what a language server says about a file; read only, kept between calls | [`lsp`] |
 //! | `share_file { path, repo?, name? }` | [`share`]: a file of the workspace, shown to the person as a file artifact |
 //! | `run_checks { command }` | [`checks`] |
-//! | `rebuild_environment { use_default? }` | [`environment`] |
+//! | `use_repository_environment { repo?, config?, off? }` | [`environment`] (offered only with run pods, an allowed image prefix and a configuration) |
 //! | `commit_and_push { message }` / `open_pull_request { title, body }` | [`publish`] |
 //! | `merge_pull_request { repo, number, method?, delete_branch? }` (tier `auto`), `rename_repository { repo, new_name }` and `delete_repository { repo, confirm }` (tier `bypass`) | [`admin`] |
 //! | `ask_user { question, choices? }`, `show { blocks, title? }`, `ui_catalog {}`, `plan_work { title?, items }`, `plan_check { id, status, note? }`, `plan_add { items, after? }` | [`adam_ui`]: the person's screen as tools, and the plan |
@@ -49,10 +49,8 @@
 //! * `edit_file`: the replacement is exact and the file is written whole, so a repeat after a
 //!   crash finds `old` gone and says so (the result of the first call is what the model had).
 //! * `share_file`: shares the file again and notes it once (`RunNotes::shared`).
-//! * `rebuild_environment`: throwing the environment away and making it again twice is the same as once (the
-//!   second call finds the first one's result and makes it once more, which costs time and nothing else); a
-//!   choice of the default image is kept in the notes and in the environment's own state, and a repeat of it
-//!   changes nothing.
+//! * `use_repository_environment`: the pod's annotation records the choice, so a repeat finds it and makes
+//!   nothing; `off: true` twice is the same as once.
 //! * `request_repository { repo_url, reason }`: it only asks. A repeat after the person's yes finds the
 //!   repository granted and says so; after a no it says so; with no answer yet it asks again.
 //! * The seal that ends `prepare_workspace`, `start_scratch` and `publish_scratch`, and the agent's
@@ -220,10 +218,8 @@ pub struct CoderSettings {
     /// setting so that a test reaches it with a little text.
     pub run_kept_max: u64,
     /// The longest `ToolEnv::session` can take to make the run's environment ready: nothing for the
-    /// coder's own container; for a devcontainer `DEVCONTAINER_UP_TIMEOUT_SECS` plus
-    /// `DEVCONTAINER_SETUP_TIMEOUT_SECS`; for run pods `RUN_POD_WAIT_SECS` plus
-    /// `RUN_POD_READY_TIMEOUT_SECS`. The time limit of a tool that makes the environment is this and
-    /// whatever else it does.
+    /// coder's own container; for run pods `RUN_POD_WAIT_SECS` plus `RUN_POD_READY_TIMEOUT_SECS`.
+    /// The time limit of a tool that makes the environment is this and whatever else it does.
     pub environment_start: Duration,
     /// Whether the three language server tools are offered (`LANGUAGE_SERVERS`, `on` by default).
     pub language_servers: bool,
@@ -233,6 +229,9 @@ pub struct CoderSettings {
     pub language_servers_max: usize,
     /// The most tool calls of one model turn that run at once (`MAX_PARALLEL_TOOL_CALLS`, 1 to 32).
     pub max_parallel_tool_calls: usize,
+    /// How a run waits on a model that refused it (ADR 0067): `MODEL_PARK_LIMIT`, and whether an
+    /// unreachable gateway parks (`MODEL_AUTH=injector`).
+    pub model_parking: adam_llm_agent::ModelParking,
 }
 
 impl Default for CoderSettings {
@@ -283,6 +282,7 @@ impl CoderSettings {
             language_server_idle: Duration::from_secs(600),
             language_servers_max: 4,
             max_parallel_tool_calls: adam_llm_agent::DEFAULT_MAX_PARALLEL,
+            model_parking: adam_llm_agent::ModelParking::default(),
         }
     }
 }
@@ -490,7 +490,7 @@ impl ToolEnv {
     /// [`ToolEnv::unavailable_wait`] is set (run pods: the quota is used up): the call is tried again
     /// after 2, 4, 8, ... up to 30 seconds, until the wait is over, and the step `env:<run>:slot` says
     /// the run waits for a slot. Without it the first such error is the tool's result, as it always
-    /// was (the devcontainer's behaviour is unchanged).
+    /// was (the local environment's behaviour is unchanged).
     pub(crate) async fn session(&self, ctx: &ToolCtx) -> Result<Arc<dyn EnvSession>, ToolError> {
         // The workspace is the root run's, so a subagent works in its parent's environment; the
         // steps it shows are the call's own, under the id of the run that makes them.
@@ -978,7 +978,6 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         files::EditFile,
         share::ShareFile,
         checks::RunChecks,
-        environment::RebuildEnvironment,
         publish::CommitAndPush,
         publish::OpenPullRequest,
         admin::MergePullRequest,
@@ -1169,7 +1168,6 @@ pub const QUICK_TOOLS: [&str; 16] = [
 /// | tool | its own bound |
 /// |---|---|
 /// | `run_command`, `run`, `run_checks` | the environment is made ready (`environment_start`) and the command runs (`CHECK_TIMEOUT_SECS`) |
-/// | `rebuild_environment` | the environment is made ready (`environment_start`) |
 /// | `start_command` | the environment is made ready and the call waits for the command at most 120 s |
 /// | `stop_command` | the environment is made ready (for a command this worker does not hold) and the call waits for the process 60 s |
 /// | `list_commands` | the environment is asked for its session, and the records are read |
@@ -1180,7 +1178,6 @@ fn own_limit(name: &str, settings: &CoderSettings) -> Option<Duration> {
     let environment = settings.environment_start;
     let bound = match name {
         "run_command" | "run" | "run_checks" => environment + settings.check_timeout,
-        "rebuild_environment" => environment,
         // The environment is made ready, and the call waits at most 120 s for the command.
         "start_command" => {
             environment + Duration::from_secs(background::MAX_WAIT_SECS.unsigned_abs())
@@ -1357,13 +1354,14 @@ pub(crate) fn workspace_error(e: &WorkspaceError) -> ToolError {
 }
 
 /// What the model is told when the environment of the run cannot be made and will not be made by
-/// asking again (a repository's `devcontainer.json` that is wrong, refused, or does not build).
-const BROKEN_ENVIRONMENT: &str = "\n\nThe environment is broken and stays broken until the person \
-decides, so this is not something to work around: do not run the command another way, and do not \
-look for the tool elsewhere. Ask the person with ask_user, in plain words, what is wrong and what \
-you can do: they can fix the file in the repository (then you call rebuild_environment), or you can \
-go on in the default environment (rebuild_environment with use_default: true). Call \
-rebuild_environment only after they have answered.";
+/// asking again (a run pod template the cluster refuses, an image that cannot be pulled, a quota).
+const BROKEN_ENVIRONMENT: &str = "\n\nThe environment is broken and stays broken until the \
+deployment or the person changes it, so this is not something to work around: do not run the command \
+another way, and do not look for the tool elsewhere. Ask the person with ask_user, in plain words, \
+what is wrong and what you can do: the deployment must fix what the environment is made from (the \
+run pod template, the namespace's quota or policy). If this run moved to a repository's image and \
+that image cannot start, use_repository_environment with off: true puts it back on the \
+deployment's image.";
 
 /// The failure of [`ToolEnv::session`]: [`environment_error`], and for an environment that cannot be
 /// made at all (its file is wrong, refused or does not build; a phase that ran out of time, which
@@ -1389,8 +1387,8 @@ pub(crate) fn session_error(redactor: &Redactor, e: &EnvError) -> ToolError {
     ToolError::Permanent(text)
 }
 
-/// The file a devcontainer was built from, as the repository calls it: the part of `path` that starts
-/// at `.devcontainer` (`.devcontainer/devcontainer.json`, `.devcontainer.json`).
+/// The file a repository's environment was read from, as the repository calls it: the part of `path`
+/// that starts at `.devcontainer` (`.devcontainer/devcontainer.json`, `.devcontainer.json`).
 pub(crate) fn repository_file(path: &std::path::Path) -> String {
     let names: Vec<String> = path
         .components()

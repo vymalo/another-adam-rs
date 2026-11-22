@@ -58,7 +58,7 @@ Every value below is made up.
 | `keyEnv` | the environment variable that holds the key (default `BENCH_MODEL_API_KEY`) |
 | `concurrency` | runs at once, 1 to 8 (default 2) |
 | `contextWindow` | **required**: the model's context window; both agents are given this one value |
-| `limits` | optional, the same for both agents: `minutes` (the time limit of a run, 50), `steps` (adam's turn limit and OpenCode's `steps`, 200) and `cancelGraceSeconds` (60) |
+| `limits` | optional, the same for both agents: `minutes` (the time limit of a run, 50), `steps` (adam's turn limit and OpenCode's `steps`, 200), `cancelGraceSeconds` (60) and `outputTokens` (the meter's clamp of every call's output, and OpenCode's output limit, 8192; a reasoning arm needs more: at 8192 the reasoning used it all and no answer came, 2026-11-21) |
 | `timeouts` | optional: the meter's first-byte and idle timeouts in seconds |
 | `tasks` | optional: task sources and grading, see Tasks |
 
@@ -478,7 +478,7 @@ them equal.
 
 | Pin | Value | |
 |---|---|---|
-| coder image | `ghcr.io/vymalo/another-adam-rs/coder:sha-e46c8f4@sha256:60b2…5744`, revision `e46c8f405b68…` | *verified 2026-11-19*: the digest by an anonymous manifest request to `ghcr.io` for the tag the `coder` workflow pushed for main `e46c8f4`, the revision from the image's `org.opencontainers.image.revision` label |
+| coder image | `ghcr.io/vymalo/another-adam-rs/coder:sha-35af9f4@sha256:7b4c…3bd4`, revision `35af9f40eaeb…` | *verified 2026-11-21*: the digest by an anonymous manifest request to `ghcr.io` for the tag the `coder` workflow pushed for main `35af9f4` (an anonymous `docker pull` of it works), the revision from the image's `org.opencontainers.image.revision` label; it has adam#273 (a turn cut while thinking is continued) |
 | OpenCode V2 | `@opencode/cli` 2.3.0, platform package `@opencode/cli-linux-x64`, integrity `sha512-8T3K…FFg==` | *verified 2026-11-17* on `registry.npmjs.org`: the newest 2.x at least three days old (2.3.0 was published 2026-11-13, the platform package at 08:43 UTC, `@opencode/cli` at 08:54); the integrity is of the exact tarball that is mounted and was computed again from the download; the tarball holds `package/bin/opencode`, a 250 MB native executable (`@opencode/cli` itself has only a `postinstall` that picks a platform package and a launcher; nothing is installed at run time) |
 
 |  | adam-coder | OpenCode |
@@ -638,6 +638,46 @@ sequenceDiagram
     R->>D: cleanup(ctx)
 ```
 
+## Agent variants
+
+Decided by the owner on 2026-11-20. The configuration's `agents` lists the cells to run (default `adam` and `opencode`, the
+two of ADR 0048); each runs in every arm. One agent is allowed, for a run that compares models or arms, not agents. `lib/variants.mjs` defines them:
+
+| Variant | Driver | What it is given |
+|---|---|---|
+| `adam` | adam | adam-coder as it ships: its whole `instructions.md` and every tool (42 at the pin) |
+| `adam-lean` | adam | the same binary, with an agent folder whose `tools:` offers 13 coding tools (`LEAN_TOOLS`) and whose prompt keeps the opening paragraphs and the four work sections (`LEAN_SECTIONS`); no subagents or skills; variables only the dropped sections read are removed (adam refuses an unused one, exit 78) |
+| `opencode` | OpenCode | its built-in prompt plus the `owner` profile: the four shared sections below |
+| `opencode-prompt` | OpenCode | its built-in prompt plus the `work` profile: the four sections and "Helpers", where adam's `explorer` and `reviewer` become OpenCode's `subagent` tool |
+| `opencode-bare` | OpenCode | its built-in prompt only |
+
+The prompts are read from adam's file **at the pinned coder revision**, so a later change to `instructions.md` does not change a
+cell. adam-lean's folder is made again when its recipe changes (`LEAN_RECIPE` in the folder's marker). What one call sends,
+measured in the dry run with `BENCH_DRYRUN_REQUESTS_DIR` (2026-11-20, pin `e46c8f4`): `adam` 94 KB (prompt 31 KB, 42 tools
+62 KB), `adam-lean` 31 KB (11 KB, 15 tools 20 KB), `opencode` 25 KB, `opencode-prompt` 26 KB, `opencode-bare` 20 KB.
+
+**Reasoning arms.** An arm's fragment wins over what an agent sends, so both drivers get the same setting. At
+the owner's gateway (*verified 2026-11-20* by direct calls) a request **without** `reasoning_effort` reasons not at all,
+`low` and `max` are both accepted, and `max` used more reasoning tokens than `low` on the same question (about 920 against
+550 to 800). The meter records per call the setting it sent (`effort`) and the agent's own (`askedEffort`).
+
+**Per call**, the meter's pending record also has the request size (`bytes`), the number of tools offered (`tools`) and a
+fingerprint of the system prompt (`prompt`, a hash, never the text). The fold turns the fingerprints into **child sessions**:
+consecutive calls whose prompt is not the attempt's first call's are a subagent's; the report counts sessions, their calls and
+their time per cell.
+
+**Collecting a tree.** The agent's working tree is read without the dependency and cache folders (`HEAVY_DIRS` in
+`lib/agents/common.mjs`: `node_modules`, `.mypy_cache`, `__pycache__`, ...) that the base tracks no file under, and the
+patch leaves the tool caches out (`TOOL_CACHES` in `lib/grade.mjs`): element-web's `node_modules` was over the tree's size
+limit, and a `.mypy_cache` over the patch's. A folder the base tracks is read, or its files would look deleted.
+
+**Quality review.** `bench review` scores every Done run's patch with the configured model at `max`, one rubric for every
+cell (`lib/review.mjs`: correctness, tests, design, scope, hygiene, docs, overall, 1 to 5), blind to the agent, the arm and the
+run id, in a seeded order that mixes the cells. Files under tool caches (`.mypy_cache`, `.pytest_cache`, `__pycache__`, ...)
+are cut out first and counted as stray files. Results go to `$BENCH_HOME/reviews.jsonl`; a run reviewed with the same patch and
+rubric is not sent again; the spend counts against the cap with the ledger's. The report's "Quality (blind review)" section
+shows the means per cell.
+
 ## The shared system prompt
 
 Both agents get the same guidance on **doing the task**, so the comparison is not biased by one of them having a better prompt. adam's
@@ -658,7 +698,7 @@ from the file's own front matter (`{{max_check_cycles}}` and `{{scratch_check_cy
 | Access tiers | left out | adam's access tiers, which the benchmark does not set |
 | How to work | **shared** | how to do the task: find the checks, small steps, verify, fix, commit, open the pull request |
 | Starting without a repository | left out | adam's scratch projects and `publish_scratch`; the benchmark always names a repository |
-| The work environment | left out | adam's devcontainer environment, `rebuild_environment` and the `obscura` browser; OpenCode runs in the task's own container |
+| The work environment | left out | adam's run pod or its own container, `use_repository_environment` and the `obscura` browser; OpenCode runs in the task's own container |
 | A missing toolchain | **shared** | what to do when the environment lacks a toolchain, and when a project tool only needs its dependencies installed |
 | Asking the person | left out | `ask_user` and its forms; OpenCode has another question tool, which the benchmark denies |
 | Questions and conversation | left out | names `run_command` and refers to the left-out "Who you are" section |
@@ -707,7 +747,7 @@ renamed like `read_file`.
 | how-8-pull-request | rewritten | 8. **Open the pull request** with `open_pull_request`: a clear title, and a body with a summary of what changed and why, and a verification section that lists the exact commands you ran and their result. Never claim a check passed that you did not run. (in a later revision: 8. **Open the pull request in the same call**: pass `pull_request` to `commit_and_push`: a `title`, and a `body` with a summary and a verification section (the commands you ran and their result). Never claim a check passed that you did not run; `open_pull_request` opens it on its own.) | 8. **Report.** In your final answer, summarise what changed and why, and list the exact commands you ran and their result. Never claim a check passed that you did not run. |
 | how-9-finish | rewritten | telling the person the pull request URL and what you verified. | telling the person what you changed and what you verified. |
 | toolchain-which-tools | rewritten | When `run_checks`, `run` or `run_command` says the workspace has no `mvn` | When a command says the workspace has no `mvn` |
-| toolchain-result-says | dropped | The result says whether the tool has to be added to the repository's devcontainer or the repository has none. | (nothing) |
+| toolchain-result-says | dropped | The result says which environment lacks the tool and how the tool gets there. (before pin `35af9f4`: The result says whether the tool has to be added to the repository's devcontainer or the repository has none.) | (nothing) |
 | toolchain-ask | rewritten | Tell the person which toolchain is missing and what you needed it for, with `ask_user`, and wait for their answer. | Say which toolchain is missing and what you needed it for in your final answer. Nobody can answer questions in this run. |
 | toolchain-install | rewritten | with `run` only (`run_checks` is for the project's real checks: an install that passes is not a check of the code, and running it would only spend a cycle or pass the gate on nothing) | with `shell` (an install that passes is not a check of the code) |
 | ending-pull-request | rewritten | - **You opened the pull request.** Tell the person its URL and what you verified. The run is then complete. | - **You made the change.** Tell the person what you changed and what you verified. The run is then complete. |

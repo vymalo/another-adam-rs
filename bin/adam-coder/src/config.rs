@@ -8,7 +8,7 @@
 //! | Variable | Meaning | Default |
 //! |---|---|---|
 //! | `ROLE` | what this process runs: `all`, `control-plane` or `worker` ([`adam_host::Role`]) | `all` |
-//! | `DATABASE_URL` | Postgres for the run store (`adam-store-postgres`) | required |
+//! | `DATABASE_URL` | the run store: `postgres://`/`postgresql://`, `mongodb://`/`mongodb+srv://` or `sqlite://<path>` (one file, one process; `ROLE=all` only) | required |
 //! | `A2A_BEARER_TOKENS` | comma-separated tokens accepted by the A2A server | required for `all` and `control-plane`, non-empty (fail closed) |
 //! | `PUBLIC_URL` | URL clients reach the JSON-RPC endpoint at (agent card) | required for `all` and `control-plane` |
 //! | `LISTEN_ADDR` | bind address: the A2A server, or for `worker` its `/healthz` listener | `0.0.0.0:8080` |
@@ -20,7 +20,7 @@
 //! | `GITHUB_APP_INSTALLATION_ID` | the installation's ID, a positive integer: **pins** the App to that one installation, which serves every repository (no lookup) | App mode: this or `GITHUB_APP_OWNERS`, exactly one |
 //! | `GITHUB_APP_OWNERS` | the accounts (users and organisations, comma- or space-separated, compared without case) the App may act for, **without a pin**: the installation of each repository's owner is found with the App's JWT. `*` is every account the App is installed on (a startup warning: a public App can be installed by anyone). Refused with a pin and in token mode (exit 78) | App mode: this or `GITHUB_APP_INSTALLATION_ID`, exactly one |
 //! | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 or PKCS#8), as a file or inline (`\n` escapes accepted); exactly one; parsed at startup | one required in App mode |
-//! | `ALLOW_COMMANDS_NEXT_TO_SECRETS` | roles that run workers: `true` accepts, and `false` (the default) refuses at startup (exit 78), a GitHub App whose private key is a **file** (`GITHUB_APP_PRIVATE_KEY_PATH`) while the commands of a run run in this container (`RUN_ENVIRONMENT=local` with `DEVCONTAINER_RUNTIME=off`): a command runs as the user that can read the file, so it can mint installation tokens and act as the App at any access tier, a `plan` included. The coder still logs a warning when it is accepted. Nothing else reads it: `kubernetes`, `podman` and a key given inline (`GITHUB_APP_PRIVATE_KEY`) need no override. `true`, `1`, `false` and `0` (any case); anything else is exit 78 | `false` |
+//! | `ALLOW_COMMANDS_NEXT_TO_SECRETS` | roles that run workers: `true` accepts, and `false` (the default) refuses at startup (exit 78), a GitHub App whose private key is a **file** (`GITHUB_APP_PRIVATE_KEY_PATH`) while the commands of a run run in this container (`RUN_ENVIRONMENT=local`): a command runs as the user that can read the file, so it can mint installation tokens and act as the App at any access tier, a `plan` included. The coder still logs a warning when it is accepted. Nothing else reads it: `kubernetes` and a key given inline (`GITHUB_APP_PRIVATE_KEY`) need no override. `true`, `1`, `false` and `0` (any case); anything else is exit 78 | `false` |
 //! | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them; the first is the host `owner/name` stands for | `github.com` |
 //! | `CREATE_REPO_OWNERS` | comma- or space-separated owners (users or organisations) `create_repository` may create repositories for, after the person agrees (not under the `bypass` access tier). A list restricts to exactly these. Empty: a GitHub App creates for the accounts it acts for (**not** with `GITHUB_APP_OWNERS=*`: list the owners), a token creates nothing (the tool is off) | empty |
 //! | `MAX_ACCESS_TIER` | the highest access tier a person may pick for a message: `plan`, `edits`, `auto` or `bypass` ([`tier`](crate::tier)). The card lists the tiers up to it and the tools check it again. `bypass` (rename and delete repositories, no consent form) is the deployment's opt-in. Read by every role | `auto` |
@@ -51,15 +51,7 @@
 //! | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url` (headers may always) | `false` |
 //! | `MCP_MAX_CALL_SECS` | the longest one MCP server is waited for, a call and a connection each: what `timeoutSecs` and `connectTimeoutSecs` ask for and the defaults (60 s and 30 s) are lowered to it, and a value the file asks for is at least 1 s (1 to 86400); a larger value is lowered to it, with a warning at startup | `900` |
 //! | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
-//! | `DEVCONTAINER_RUNTIME` | where a run's commands run: `off` (this container) or `podman` (the repository's devcontainer, on a rootless Podman service, [ADR 0010](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)) | `off` |
-//! | `CONTAINER_HOST` | Podman's own variable: where the service is, `unix:///run/podman/podman.sock`; required with `podman` | unset |
-//! | `DEVCONTAINER_DEFAULT_IMAGE` | the image of a repository that has no `devcontainer.json`; **by digest only** (`name@sha256:...`): the devcontainer CLI cannot parse a tag together with a digest | the `workspace` image of `another-agentic-images` ([`DEFAULT_DEVCONTAINER_IMAGE`]) |
-//! | `DEVCONTAINER_NETWORK` | `inherit` (the Podman service's network) or `none` (the container has no network) | `inherit` |
-//! | `DEVCONTAINER_DEPLOYMENT_ID` | the label the orphan sweep finds this deployment's containers by | `WORKER_ID`, else `adam-coder` |
-//! | `DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS` | how long pulling, building and creating the container may take, and how long the repository's lifecycle commands may take | `1200`, `900` |
-//! | `DEVCONTAINER_PREPULL` | pull the default image at startup | `true` |
-//! | `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client (set by the image) | `devcontainer`, `podman-remote` |
-//! | `RUN_ENVIRONMENT` | where a run's commands run: `local` (this container, or the repository's devcontainer with `DEVCONTAINER_RUNTIME=podman`) or `kubernetes` (a pod of its own for each run, [ADR 0019](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)); `kubernetes` with `DEVCONTAINER_RUNTIME=podman` is refused (exit 78) | `local` |
+//! | `RUN_ENVIRONMENT` | where a run's commands run: `local` (this container: on a desktop, the person's own work sandbox) or `kubernetes` (a pod of its own for each run, [ADR 0019](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)) | `local` |
 //! | `RUN_POD_TEMPLATE_FILE` | with `kubernetes`: the Pod (YAML or JSON) every run pod is made from: image, resources, priority class, security context, volumes, variables from Secrets, node affinity; the chart mounts it; an existing file | required with `kubernetes` |
 //! | `RUN_POD_NAMESPACE` | the namespace of the run pods: the coder's own | the ServiceAccount's namespace file; required when there is none |
 //! | `RUN_POD_INSTANCE` | the release's `app.kubernetes.io/instance`: the label that finds this deployment's pods; a label value | required with `kubernetes` |
@@ -90,9 +82,17 @@
 //!
 //! # Removed variables
 //!
-//! `OPENCODE_MODEL`, `OPENCODE_COMMAND` and `OPENCODE_BINARY` were the coder's OpenCode (ADR 0038). They are
-//! ignored, not refused: nothing is less safe without them, and a deployment rendered from an older chart still
-//! sets one. Each one that is set is named in [`Config::ignored`], and the process logs one warning for it.
+//! `OPENCODE_MODEL`, `OPENCODE_COMMAND` and `OPENCODE_BINARY` were the coder's OpenCode (ADR 0038).
+//! `DEVCONTAINER_*`, `CONTAINER_HOST` were the repository's devcontainer on a rootless Podman
+//! service ([ADR 0052](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md),
+//! a hard cutover). They are ignored, not refused: nothing is less safe without them, and a
+//! deployment rendered from an older chart still sets one. Each one that is set is named in
+//! [`Config::ignored`], and the process logs one warning for it.
+//!
+//! The one exception is `DEVCONTAINER_RUNTIME=podman`: that value **asked for the Podman path**, and
+//! a deployment that asked for it must not start and silently run its commands in the coder. It is a
+//! configuration error (exit 78) that names ADR 0052. Every other value of the variable is ignored
+//! with a warning, like the rest.
 //!
 //! # Workspace placement
 //!
@@ -125,19 +125,35 @@ use std::time::Duration;
 
 use adam::AGENT_DIR_ENV;
 use adam_a2a::AccessTier;
-use adam_devcontainer::{Network, Runtime, Settings};
 use adam_host::Placement;
 pub use adam_service::{ConfigError, McpSettings};
 use adam_service::{
-    ModelConfig, ServiceConfig, WorkerSettings, endpoint_for_logs, is_worker_id, parse_flag,
-    parse_or,
+    ModelConfig, ServiceConfig, WorkerSettings, endpoint_for_logs, parse_flag, parse_or,
 };
 use adam_workspace::{AppKey, AppOwners, WorkspaceError};
 use secrecy::{ExposeSecret as _, SecretString};
 use url::Url;
 
-/// The variables of the coder's OpenCode, removed by ADR 0038: ignored when set.
-const REMOVED_VARIABLES: [&str; 3] = ["OPENCODE_MODEL", "OPENCODE_COMMAND", "OPENCODE_BINARY"];
+/// The variables the coder no longer uses: ignored when set, and named once at startup.
+///
+/// `OPENCODE_MODEL`, `OPENCODE_COMMAND` and `OPENCODE_BINARY` were the coder's OpenCode (ADR 0038);
+/// the rest were the Podman devcontainer path (ADR 0052). `DEVCONTAINER_RUNTIME` is read apart,
+/// because one of its values is refused rather than ignored.
+const REMOVED_VARIABLES: [&str; 13] = [
+    "OPENCODE_MODEL",
+    "OPENCODE_COMMAND",
+    "OPENCODE_BINARY",
+    "DEVCONTAINER_DEFAULT_IMAGE",
+    "DEVCONTAINER_NETWORK",
+    "DEVCONTAINER_DEPLOYMENT_ID",
+    "DEVCONTAINER_UP_TIMEOUT_SECS",
+    "DEVCONTAINER_SETUP_TIMEOUT_SECS",
+    "DEVCONTAINER_PREPULL",
+    "DEVCONTAINER_CLI",
+    "DEVCONTAINER_PODMAN",
+    "DEVCONTAINER_CACHE_DIR",
+    "CONTAINER_HOST",
+];
 
 /// The binary's configuration.
 #[derive(Clone)]
@@ -154,8 +170,8 @@ pub struct Config {
     /// What stepping a run needs: the model, GitHub, the workspaces and the checks. `Some` exactly
     /// when [`Role::runs_workers`](adam_host::Role::runs_workers); a control plane holds none of it.
     pub worker: Option<WorkerConfig>,
-    /// The removed variables (`OPENCODE_MODEL`, `OPENCODE_COMMAND`, `OPENCODE_BINARY`) that are
-    /// set, by name and never by value: ignored, and logged once at startup.
+    /// The removed variables (`OPENCODE_*`, `DEVCONTAINER_*`, `CONTAINER_HOST`) that are set, by
+    /// name and never by value: ignored, and logged once at startup.
     pub ignored: Vec<&'static str>,
 }
 
@@ -246,10 +262,7 @@ pub struct WorkerConfig {
     /// `ADAM_REFERENCES_FILE`: a file of references (repositories read and never written) added to
     /// the agent's own, an existing file. `None`: only the agent's own.
     pub references_file: Option<PathBuf>,
-    /// `DEVCONTAINER_*`: where the run's commands run.
-    pub devcontainer: DevcontainerConfig,
-    /// `RUN_ENVIRONMENT` and `RUN_POD_*`: this container (with the devcontainers above), or a pod of
-    /// its own for each run.
+    /// `RUN_ENVIRONMENT` and `RUN_POD_*`: this container, or a pod of its own for each run.
     pub run_environment: RunEnvironment,
     /// `ALLOW_COMMANDS_NEXT_TO_SECRETS`: the deployment accepts that a command can read a secret
     /// that is a file of this container (see [`WorkerConfig::commands_can_read_the_app_key`]).
@@ -261,7 +274,7 @@ pub struct WorkerConfig {
 /// fail to compile wherever the environment is composed.
 #[derive(Debug, Clone)]
 pub enum RunEnvironment {
-    /// In this container, or in the repository's devcontainer: [`DevcontainerConfig`] says which.
+    /// In this container: on a desktop, the person's own work sandbox.
     Local,
     /// In a pod of the run's own ([ADR 0019](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)).
     Kubernetes(RunPodsConfig),
@@ -269,13 +282,11 @@ pub enum RunEnvironment {
 
 impl RunEnvironment {
     /// The longest the environment of a run can take to be made ready: nothing in the coder's own
-    /// container, `DEVCONTAINER_UP_TIMEOUT_SECS` and `DEVCONTAINER_SETUP_TIMEOUT_SECS` for a
-    /// devcontainer, `RUN_POD_WAIT_SECS` and `RUN_POD_READY_TIMEOUT_SECS` for run pods. The time limit
+    /// container, `RUN_POD_WAIT_SECS` and `RUN_POD_READY_TIMEOUT_SECS` for run pods. The time limit
     /// of a tool that makes the environment ready is this and the work it does after.
-    pub fn start_bound(&self, devcontainer: &DevcontainerConfig) -> Duration {
+    pub fn start_bound(&self) -> Duration {
         match self {
-            Self::Local if devcontainer.runtime == Runtime::Off => Duration::ZERO,
-            Self::Local => devcontainer.up_timeout + devcontainer.setup_timeout,
+            Self::Local => Duration::ZERO,
             Self::Kubernetes(pods) => pods.wait + pods.ready_timeout,
         }
     }
@@ -326,17 +337,7 @@ impl RunPodsConfig {
         settings
     }
 
-    fn parse(
-        get: &impl Fn(&str) -> Option<String>,
-        devcontainer: &DevcontainerConfig,
-        problems: &mut Vec<String>,
-    ) -> Option<Self> {
-        if devcontainer.runtime == Runtime::Podman {
-            problems.push(
-                "RUN_ENVIRONMENT=kubernetes and DEVCONTAINER_RUNTIME=podman are both set: a run's commands run in a pod of its own or in the repository's devcontainer, not both; set DEVCONTAINER_RUNTIME=off"
-                    .into(),
-            );
-        }
+    fn parse(get: &impl Fn(&str) -> Option<String>, problems: &mut Vec<String>) -> Option<Self> {
         let before = problems.len();
         let template_file = match get("RUN_POD_TEMPLATE_FILE").map(|v| v.trim().to_owned()) {
             None => {
@@ -442,18 +443,15 @@ fn parse_repository_images(raw: &str, problems: &mut Vec<String>) -> Vec<String>
 }
 
 impl RunEnvironment {
-    fn parse(
-        get: &impl Fn(&str) -> Option<String>,
-        devcontainer: &DevcontainerConfig,
-        problems: &mut Vec<String>,
-    ) -> Self {
+    fn parse(get: &impl Fn(&str) -> Option<String>, problems: &mut Vec<String>) -> Self {
         match get("RUN_ENVIRONMENT")
             .map(|v| v.trim().to_ascii_lowercase())
             .as_deref()
         {
             None | Some("local") => Self::Local,
-            Some("kubernetes") => RunPodsConfig::parse(get, devcontainer, problems)
-                .map_or(Self::Local, Self::Kubernetes),
+            Some("kubernetes") => {
+                RunPodsConfig::parse(get, problems).map_or(Self::Local, Self::Kubernetes)
+            }
             Some(other) => {
                 problems.push(format!(
                     "RUN_ENVIRONMENT must be local or kubernetes, got {other:?}"
@@ -462,165 +460,6 @@ impl RunEnvironment {
             }
         }
     }
-}
-
-/// The image of a repository that has no `devcontainer.json` when `DEVCONTAINER_DEFAULT_IMAGE` is not
-/// set: the `workspace` image of `vymalo/another-agentic-images`, **by digest only**: the devcontainer
-/// CLI (0.89.0) cannot parse a reference that has both a tag and a digest ("Could not parse image name"),
-/// and then skips the image's details, the metadata that sets the remote user. It is the image this
-/// binary's own is built on ([`DEFAULT_DEVCONTAINER_IMAGE_TAG`] is its tag, which a test keeps equal to the
-/// `WORKSPACE_TAG` of `docker/coder/Dockerfile`), and it is a dev container base: its
-/// `devcontainer.metadata` label names the user. *Verified 2026-11-19*: an anonymous ghcr.io token and a
-/// manifest request for the tag returned this digest (linux/amd64), and its config blob has the label and
-/// `CARGO_HOME=/cache/cargo`. It is the merge of vymalo/another-agentic-images#15, with the four language
-/// servers the tools of `src/tools/lsp` use (ADR 0044, slice 17).
-pub const DEFAULT_DEVCONTAINER_IMAGE: &str = "ghcr.io/vymalo/another-agentic-images/workspace@sha256:b465808bfb8a1baae5e59a429bf292726b021e3b37322f759dbda3ee2c57ed67";
-
-/// The tag [`DEFAULT_DEVCONTAINER_IMAGE`]'s digest was published as: not part of the reference (see
-/// there), but what a person reads to know which build it is, and what a test keeps with the Dockerfile.
-pub const DEFAULT_DEVCONTAINER_IMAGE_TAG: &str = "1.98.1-8c297d3";
-
-/// The devcontainer variables of a worker: see the table at the top of this module.
-#[derive(Debug, Clone)]
-pub struct DevcontainerConfig {
-    /// `DEVCONTAINER_RUNTIME`.
-    pub runtime: Runtime,
-    /// `CONTAINER_HOST`; `Some` whenever the runtime is [`Runtime::Podman`].
-    pub container_host: Option<String>,
-    /// `DEVCONTAINER_DEFAULT_IMAGE`.
-    pub default_image: String,
-    /// `DEVCONTAINER_NETWORK`.
-    pub network: Network,
-    /// `DEVCONTAINER_DEPLOYMENT_ID`.
-    pub deployment_id: String,
-    /// `DEVCONTAINER_UP_TIMEOUT_SECS`.
-    pub up_timeout: Duration,
-    /// `DEVCONTAINER_SETUP_TIMEOUT_SECS`.
-    pub setup_timeout: Duration,
-    /// `DEVCONTAINER_PREPULL`.
-    pub prepull: bool,
-    /// `DEVCONTAINER_CLI`.
-    pub cli: PathBuf,
-    /// `DEVCONTAINER_PODMAN`.
-    pub podman: PathBuf,
-}
-
-impl DevcontainerConfig {
-    /// The settings of [`adam_devcontainer::DevContainer`] for the workspace root `root`.
-    pub fn settings(&self, root: PathBuf) -> Settings {
-        let mut settings = Settings::new(root);
-        settings.runtime = self.runtime;
-        settings.cli.clone_from(&self.cli);
-        settings.podman.clone_from(&self.podman);
-        settings.container_host = self.container_host.clone().unwrap_or_default();
-        settings.default_image.clone_from(&self.default_image);
-        settings.network = self.network;
-        settings.deployment.clone_from(&self.deployment_id);
-        settings.up_timeout = self.up_timeout;
-        settings.setup_timeout = self.setup_timeout;
-        settings
-    }
-
-    /// Read the variables, adding a problem per invalid one. Without a runtime (`off`) nothing that
-    /// needs the file system or the service is checked.
-    fn parse(
-        get: &impl Fn(&str) -> Option<String>,
-        worker_id: Option<&str>,
-        problems: &mut Vec<String>,
-    ) -> Self {
-        let runtime = match get("DEVCONTAINER_RUNTIME")
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            None | Some("off") => Runtime::Off,
-            Some("podman") => Runtime::Podman,
-            Some(other) => {
-                problems.push(format!(
-                    "DEVCONTAINER_RUNTIME must be off or podman, got {other:?}"
-                ));
-                Runtime::Off
-            }
-        };
-        let container_host = get("CONTAINER_HOST").map(|h| h.trim().to_owned());
-        if runtime == Runtime::Podman {
-            match container_host.as_deref() {
-                None => problems.push(
-                    "CONTAINER_HOST is required with DEVCONTAINER_RUNTIME=podman: where the Podman service is, such as unix:///run/podman/podman.sock"
-                        .into(),
-                ),
-                Some(host) if !is_container_host(host) => problems.push(format!(
-                    "CONTAINER_HOST {host:?} is not a Podman service address (unix://, tcp:// or ssh:// and a path or host)"
-                )),
-                Some(_) => {}
-            }
-        }
-        let default_image = get("DEVCONTAINER_DEFAULT_IMAGE")
-            .map(|i| i.trim().to_owned())
-            .unwrap_or_else(|| DEFAULT_DEVCONTAINER_IMAGE.to_owned());
-        if default_image.chars().any(char::is_whitespace) || default_image.starts_with(['-', ':']) {
-            problems.push(format!(
-                "DEVCONTAINER_DEFAULT_IMAGE {default_image:?} is not an image reference (one word with no spaces, such as `registry/name@sha256:<digest>`)"
-            ));
-        }
-        let network = match get("DEVCONTAINER_NETWORK")
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            None | Some("inherit") => Network::Inherit,
-            Some("none") => Network::None,
-            Some(other) => {
-                problems.push(format!(
-                    "DEVCONTAINER_NETWORK must be inherit or none, got {other:?}"
-                ));
-                Network::Inherit
-            }
-        };
-        let deployment_id = get("DEVCONTAINER_DEPLOYMENT_ID")
-            .map(|v| v.trim().to_owned())
-            .or_else(|| worker_id.map(str::to_owned))
-            .unwrap_or_else(|| "adam-coder".to_owned());
-        if !is_worker_id(&deployment_id) {
-            problems.push(format!(
-                "DEVCONTAINER_DEPLOYMENT_ID {deployment_id:?} is not a label value (letters, digits, `.`, `_` and `-`, up to 128, not starting with `.`)"
-            ));
-        }
-        let up_timeout = Duration::from_secs(
-            parse_or(get, "DEVCONTAINER_UP_TIMEOUT_SECS", 1200u64, problems).max(1),
-        );
-        let setup_timeout = Duration::from_secs(
-            parse_or(get, "DEVCONTAINER_SETUP_TIMEOUT_SECS", 900u64, problems).max(1),
-        );
-        // On unless it says otherwise.
-        let prepull = if get("DEVCONTAINER_PREPULL").is_none() {
-            true
-        } else {
-            parse_flag(get, "DEVCONTAINER_PREPULL", problems)
-        };
-        Self {
-            runtime,
-            container_host,
-            default_image,
-            network,
-            deployment_id,
-            up_timeout,
-            setup_timeout,
-            prepull,
-            cli: PathBuf::from(
-                get("DEVCONTAINER_CLI").unwrap_or_else(|| "devcontainer".to_owned()),
-            ),
-            podman: PathBuf::from(
-                get("DEVCONTAINER_PODMAN").unwrap_or_else(|| "podman-remote".to_owned()),
-            ),
-        }
-    }
-}
-
-/// Whether `host` can be Podman's `CONTAINER_HOST`: `unix:///path`, `tcp://host:port` or `ssh://...`.
-fn is_container_host(host: &str) -> bool {
-    ["unix://", "tcp://", "ssh://"].iter().any(|scheme| {
-        host.strip_prefix(scheme)
-            .is_some_and(|rest| !rest.is_empty())
-    })
 }
 
 /// How the coder authenticates to GitHub, chosen per installation: **exactly one** of a personal
@@ -945,7 +784,6 @@ impl std::fmt::Debug for WorkerConfig {
             .field("mcp", &self.mcp)
             .field("extra_mcp_file", &self.extra_mcp_file)
             .field("references_file", &self.references_file)
-            .field("devcontainer", &self.devcontainer)
             .field("run_environment", &self.run_environment)
             .field(
                 "allow_commands_next_to_secrets",
@@ -1013,9 +851,30 @@ impl Config {
             None => None,
         };
 
+        // ADR 0052, a hard cutover: a deployment that asked for the Podman path must not start and
+        // silently run its commands in this container. Every other removed variable is ignored.
+        if get("DEVCONTAINER_RUNTIME")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("podman"))
+        {
+            problems.push(
+                "DEVCONTAINER_RUNTIME=podman is refused: the coder runs no container engine and no \
+                 repository's devcontainer. ADR 0052 removes the Podman path with no switch and no \
+                 dormant code; a run's commands run in this container (RUN_ENVIRONMENT=local) or in \
+                 a run pod of its own (RUN_ENVIRONMENT=kubernetes), and a repository that brings its \
+                 own environment publishes an image and names it (use_repository_environment). \
+                 Remove DEVCONTAINER_RUNTIME and CONTAINER_HOST from the deployment"
+                    .into(),
+            );
+        }
+
         let ignored = REMOVED_VARIABLES
             .into_iter()
             .filter(|name| get(name).is_some())
+            .chain(
+                ["DEVCONTAINER_RUNTIME"]
+                    .into_iter()
+                    .filter(|name| get(name).is_some()),
+            )
             .collect();
 
         ConfigError::check(problems)?;
@@ -1031,10 +890,10 @@ impl Config {
 
 impl WorkerConfig {
     /// Whether a command a run starts can read the GitHub App's private key: the credentials are an
-    /// App whose key is a **file** and the commands run in this container (no run pod, and
-    /// `DEVCONTAINER_RUNTIME=off`), as the user that holds the file. Then any access tier, a `plan`
-    /// too, can mint an installation token and do what the App may. A run pod or a Podman
-    /// devcontainer has no such file, and a key given inline is hidden from the commands.
+    /// App whose key is a **file** and the commands run in this container (`RUN_ENVIRONMENT=local`),
+    /// as the user that holds the file. Then any access tier, a `plan` too, can mint an installation
+    /// token and do what the App may. A run pod has no such file, and a key given inline is hidden
+    /// from the commands.
     ///
     /// Reading the configuration refuses this unless `ALLOW_COMMANDS_NEXT_TO_SECRETS` accepts it
     /// ([`WorkerConfig::allow_commands_next_to_secrets`]), so a worker that is running has either
@@ -1042,7 +901,6 @@ impl WorkerConfig {
     pub fn commands_can_read_the_app_key(&self) -> bool {
         matches!(&self.github, GitHubAuth::App(app) if app.key_file)
             && matches!(self.run_environment, RunEnvironment::Local)
-            && self.devcontainer.runtime == Runtime::Off
     }
 
     /// The folder this worker keeps mirrors and worktrees in: `WORKSPACE_ROOT` itself, or with
@@ -1261,8 +1119,7 @@ impl WorkerConfig {
             },
         };
         let before_environment = problems.len();
-        let devcontainer = DevcontainerConfig::parse(get, settings.worker_id.as_deref(), problems);
-        let run_environment = RunEnvironment::parse(get, &devcontainer, problems);
+        let run_environment = RunEnvironment::parse(get, problems);
         let environment_is_known = problems.len() == before_environment;
 
         // `github`, `github_api_url` and `github_mcp_url` are `None` only after a problem was
@@ -1300,7 +1157,6 @@ impl WorkerConfig {
             git_author_email: get("GIT_AUTHOR_EMAIL")
                 .unwrap_or_else(|| "adam-coder@users.noreply.github.com".to_owned()),
             pr_draft,
-            devcontainer,
             run_environment,
             allow_commands_next_to_secrets,
             mcp,
@@ -1327,10 +1183,10 @@ impl WorkerConfig {
 /// not accepted it (`ALLOW_COMMANDS_NEXT_TO_SECRETS`): why, and every way out.
 const COMMANDS_NEXT_TO_THE_APP_KEY: &str = "refusing to start with the GitHub App's private key in a file \
     (GITHUB_APP_PRIVATE_KEY_PATH) next to the commands of a run (run_command, run, run_checks): they run \
-    in this container (RUN_ENVIRONMENT=local, DEVCONTAINER_RUNTIME=off) as the user that can read the file, so a \
+    in this container (RUN_ENVIRONMENT=local) as the user that can read the file, so a \
     command can read the key, mint installation tokens and act as the App at any access tier, a `plan` included. \
-    Change one of these: run the commands in run pods (RUN_ENVIRONMENT=kubernetes) or in Podman devcontainers \
-    (DEVCONTAINER_RUNTIME=podman), or accept the risk with ALLOW_COMMANDS_NEXT_TO_SECRETS=true";
+    Change one of these: run the commands in run pods (RUN_ENVIRONMENT=kubernetes), or accept the risk \
+    with ALLOW_COMMANDS_NEXT_TO_SECRETS=true";
 
 /// `GITHUB_APP_OWNERS`: account names separated by commas or white space, compared without case, or
 /// `*` alone for every account the App is installed on. A name that is no account name, `*` beside
@@ -2892,112 +2748,72 @@ mod tests {
         assert!(parse_owned(&vars).is_err(), "a worker does");
     }
 
-    // -------------------------------------------------------------------- devcontainers
+    // ------------------------------------------------------ the removed devcontainer variables
 
     fn parse_dc(vars: &HashMap<&'static str, String>) -> Result<Config, ConfigError> {
         Config::from_lookup(|k| vars.get(k).cloned())
-    }
-
-    fn devcontainer_of(vars: &HashMap<&'static str, String>) -> DevcontainerConfig {
-        parse_dc(vars)
-            .expect("valid")
-            .worker
-            .expect("a worker")
-            .devcontainer
     }
 
     fn owned_full() -> HashMap<&'static str, String> {
         full().into_iter().map(|(k, v)| (k, v.to_owned())).collect()
     }
 
+    /// ADR 0052's breaking-changes table: each removed variable is ignored, not refused, and each one
+    /// that is set is listed by name so the process can warn about it.
     #[test]
-    fn devcontainers_are_off_by_default_and_the_other_defaults_are_the_documented_ones() {
-        let dc = devcontainer_of(&owned_full());
-        assert_eq!(dc.runtime, Runtime::Off);
-        assert_eq!(dc.container_host, None);
-        assert_eq!(dc.default_image, DEFAULT_DEVCONTAINER_IMAGE);
-        assert_eq!(dc.network, Network::Inherit);
-        assert_eq!(dc.deployment_id, "adam-coder");
-        assert_eq!(dc.up_timeout, Duration::from_secs(1200));
-        assert_eq!(dc.setup_timeout, Duration::from_secs(900));
-        assert!(dc.prepull);
-        assert_eq!(dc.cli, PathBuf::from("devcontainer"));
-        assert_eq!(dc.podman, PathBuf::from("podman-remote"));
-        // Without a runtime nothing that needs the service or the file system is checked.
-        let mut vars = owned_full();
-        vars.insert("CONTAINER_HOST", "not an address".into());
-        assert!(parse_dc(&vars).is_ok());
-    }
-
-    /// The default image is the base image of this binary's own image (`WORKSPACE_TAG`) and the chart's run pod
-    /// image, by tag and digest.
-    #[test]
-    fn the_default_devcontainer_image_is_the_workspace_image_the_coder_is_built_on() {
-        let dockerfile = include_str!("../../../docker/coder/Dockerfile");
-        let tag = dockerfile
-            .lines()
-            .find_map(|l| l.strip_prefix("ARG WORKSPACE_TAG="))
-            .expect("the Dockerfile pins WORKSPACE_TAG")
-            .trim();
-        let (name, digest) = DEFAULT_DEVCONTAINER_IMAGE
-            .split_once("@sha256:")
-            .expect("a digest");
-        assert_eq!(
-            name, "ghcr.io/vymalo/another-agentic-images/workspace",
-            "by digest only: the devcontainer CLI cannot parse a tag together with a digest"
-        );
-        assert_eq!(
-            DEFAULT_DEVCONTAINER_IMAGE_TAG, tag,
-            "WORKSPACE_TAG and DEFAULT_DEVCONTAINER_IMAGE move together"
-        );
-        assert_eq!(digest.len(), 64);
-        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
-        let chart = include_str!("../../../deploy/coder/values.yaml");
-        assert!(
-            chart.contains(&format!("digest: sha256:{digest}")),
-            "the chart's runPods.image is the same build: move both digests together"
-        );
-    }
-
-    #[test]
-    fn podman_needs_only_the_service() {
-        let mut vars = owned_full();
-        vars.insert("DEVCONTAINER_RUNTIME", " Podman ".into());
-        vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
-        vars.insert("DEVCONTAINER_NETWORK", "none".into());
-        vars.insert(
+    fn every_removed_devcontainer_variable_is_ignored_and_listed() {
+        assert!(parse_dc(&owned_full()).unwrap().ignored.is_empty());
+        let removed = [
             "DEVCONTAINER_DEFAULT_IMAGE",
-            "registry.example/base:1".into(),
-        );
-        vars.insert("DEVCONTAINER_DEPLOYMENT_ID", "coder-a".into());
-        vars.insert("DEVCONTAINER_UP_TIMEOUT_SECS", "60".into());
-        vars.insert("DEVCONTAINER_SETUP_TIMEOUT_SECS", "30".into());
-        vars.insert("DEVCONTAINER_PREPULL", "false".into());
-        vars.insert("DEVCONTAINER_CLI", "/usr/local/bin/devcontainer".into());
-        vars.insert("DEVCONTAINER_PODMAN", "/usr/bin/podman-remote".into());
-        let dc = devcontainer_of(&vars);
-        assert_eq!(dc.runtime, Runtime::Podman);
-        assert_eq!(
-            dc.container_host.as_deref(),
-            Some("unix:///run/podman/podman.sock")
-        );
-        assert_eq!(dc.network, Network::None);
-        assert_eq!(dc.default_image, "registry.example/base:1");
-        assert_eq!(dc.deployment_id, "coder-a");
-        assert_eq!(dc.up_timeout, Duration::from_secs(60));
-        assert_eq!(dc.setup_timeout, Duration::from_secs(30));
-        assert!(!dc.prepull);
-        // Making the environment of a run takes at most the two phases together.
-        assert_eq!(
-            RunEnvironment::Local.start_bound(&dc),
-            Duration::from_secs(90)
-        );
-        // The settings the environment is made with.
-        let settings = dc.settings(PathBuf::from("/work"));
-        assert_eq!(settings.runtime, Runtime::Podman);
-        assert_eq!(settings.container_host, "unix:///run/podman/podman.sock");
-        assert_eq!(settings.deployment, "coder-a");
-        assert_eq!(settings.network, Network::None);
+            "DEVCONTAINER_NETWORK",
+            "DEVCONTAINER_DEPLOYMENT_ID",
+            "DEVCONTAINER_UP_TIMEOUT_SECS",
+            "DEVCONTAINER_SETUP_TIMEOUT_SECS",
+            "DEVCONTAINER_PREPULL",
+            "DEVCONTAINER_CLI",
+            "DEVCONTAINER_PODMAN",
+            "DEVCONTAINER_CACHE_DIR",
+            "CONTAINER_HOST",
+        ];
+        for name in removed {
+            let mut vars = owned_full();
+            vars.insert(name, "anything".into());
+            let config =
+                parse_dc(&vars).unwrap_or_else(|e| panic!("{name} is ignored, not refused: {e}"));
+            assert_eq!(config.ignored, [name], "{name}");
+        }
+        // `DEVCONTAINER_RUNTIME` is read apart: every value but `podman` is ignored like the rest.
+        let mut vars = owned_full();
+        vars.insert("DEVCONTAINER_RUNTIME", "off".into());
+        assert_eq!(parse_dc(&vars).unwrap().ignored, ["DEVCONTAINER_RUNTIME"]);
+        // A blank value is unset.
+        let mut vars = owned_full();
+        vars.insert("DEVCONTAINER_RUNTIME", "  ".into());
+        assert!(parse_dc(&vars).unwrap().ignored.is_empty());
+    }
+
+    /// ADR 0052 decision 2: a deployment that asked for Podman does not start and silently run its
+    /// commands in this container. Exit 78, naming the variable and the ADR. Every role refuses: the
+    /// deployment is one configuration.
+    #[test]
+    fn podman_is_refused_naming_adr_0052() {
+        for role in ["all", "worker", "control-plane"] {
+            let mut vars = owned_full();
+            vars.insert("ROLE", role.into());
+            vars.insert("DEVCONTAINER_RUNTIME", " Podman ".into());
+            vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
+            let error =
+                parse_dc(&vars).expect_err("a deployment that asked for Podman does not start");
+            let all = error.problems.join("\n");
+            assert!(all.contains("DEVCONTAINER_RUNTIME=podman"), "{role}: {all}");
+            assert!(all.contains("ADR 0052"), "{role}: {all}");
+            assert!(!all.contains("  "), "{role}: no runs of spaces: {all}");
+            assert_eq!(
+                crate::exit_code(&anyhow::Error::from(error)),
+                crate::exit::EX_CONFIG,
+                "{role}: exit 78"
+            );
+        }
     }
 
     /// ADR 0038: the three variables of the coder's OpenCode are not read, not checked and not
@@ -3009,8 +2825,6 @@ mod tests {
         vars.insert("OPENCODE_MODEL", "coder-large".into());
         vars.insert("OPENCODE_COMMAND", "opencode acp".into());
         vars.insert("OPENCODE_BINARY", "/no/such/file".into());
-        vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
-        vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
         let config = parse_dc(&vars).expect("a removed variable is not a failure");
         assert_eq!(
             config.ignored,
@@ -3082,12 +2896,11 @@ mod tests {
         assert_eq!(pods.wait, Duration::from_secs(600));
         assert!(pods.repository_images.is_empty(), "none allowed by default");
         // A pod is waited for (a slot) and then made ready.
-        let dc = devcontainer_of(&owned_full());
         assert_eq!(
-            RunEnvironment::Kubernetes(pods.clone()).start_bound(&dc),
+            RunEnvironment::Kubernetes(pods.clone()).start_bound(),
             Duration::from_secs(900)
         );
-        assert_eq!(RunEnvironment::Local.start_bound(&dc), Duration::ZERO);
+        assert_eq!(RunEnvironment::Local.start_bound(), Duration::ZERO);
         // The settings of the environment.
         let settings = pods.settings("coder-0");
         assert_eq!(settings.namespace, "coder-ns");
@@ -3165,174 +2978,6 @@ mod tests {
             };
             assert_eq!(pods.repository_images, [good]);
         }
-    }
-
-    #[test]
-    fn kubernetes_with_the_podman_devcontainers_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut vars = kubernetes_vars(dir.path());
-        vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
-        vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
-        let problems = kube_problems(&vars);
-        assert!(
-            problems
-                .iter()
-                .any(|p| p.contains("RUN_ENVIRONMENT=kubernetes")
-                    && p.contains("DEVCONTAINER_RUNTIME=podman")),
-            "{problems:?}"
-        );
-        // A configuration error is exit code 78, with the other problems of the file.
-        let error = parse_dc(&vars).unwrap_err();
-        assert_eq!(
-            crate::exit_code(&anyhow::Error::from(error)),
-            crate::exit::EX_CONFIG
-        );
-    }
-
-    #[test]
-    fn the_run_pod_variables_that_are_wrong_are_problems_naming_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let cases: [(&str, Option<&str>, &str); 8] = [
-            (
-                "RUN_POD_TEMPLATE_FILE",
-                None,
-                "RUN_POD_TEMPLATE_FILE is required",
-            ),
-            (
-                "RUN_POD_TEMPLATE_FILE",
-                Some("/no/such/pod.yaml"),
-                "not an existing file",
-            ),
-            (
-                "RUN_POD_NAMESPACE",
-                Some(" "),
-                "RUN_POD_NAMESPACE is required",
-            ),
-            ("RUN_POD_INSTANCE", None, "RUN_POD_INSTANCE is required"),
-            ("RUN_POD_INSTANCE", Some("-bad-"), "not a label value"),
-            (
-                "RUN_POD_CONTAINER",
-                Some("two words"),
-                "not a container name",
-            ),
-            ("RUN_POD_IDLE_SECS", Some("soon"), "RUN_POD_IDLE_SECS"),
-            (
-                "RUN_ENVIRONMENT",
-                Some("docker"),
-                "must be local or kubernetes",
-            ),
-        ];
-        for (name, value, expected) in cases {
-            let mut vars = kubernetes_vars(dir.path());
-            match value {
-                Some(value) => vars.insert(name, value.to_owned()),
-                None => vars.remove(name),
-            };
-            let problems = kube_problems(&vars);
-            assert!(
-                problems.iter().any(|p| p.contains(expected)),
-                "{name}={value:?}: {problems:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_deployment_label_follows_the_worker_id_unless_it_is_set() {
-        let mut vars = owned_full();
-        vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
-        vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
-        vars.insert("WORKER_ID", "coder-0".into());
-        assert_eq!(devcontainer_of(&vars).deployment_id, "coder-0");
-        vars.insert("DEVCONTAINER_DEPLOYMENT_ID", "pool-a".into());
-        assert_eq!(devcontainer_of(&vars).deployment_id, "pool-a");
-    }
-
-    #[test]
-    fn an_invalid_devcontainer_variable_is_a_problem_naming_it() {
-        let cases: [(&str, &str, &str); 8] = [
-            (
-                "DEVCONTAINER_RUNTIME",
-                "docker",
-                "DEVCONTAINER_RUNTIME must be off or podman",
-            ),
-            (
-                "DEVCONTAINER_NETWORK",
-                "host",
-                "DEVCONTAINER_NETWORK must be inherit or none",
-            ),
-            (
-                "DEVCONTAINER_UP_TIMEOUT_SECS",
-                "soon",
-                "DEVCONTAINER_UP_TIMEOUT_SECS is invalid",
-            ),
-            (
-                "DEVCONTAINER_SETUP_TIMEOUT_SECS",
-                "-3",
-                "DEVCONTAINER_SETUP_TIMEOUT_SECS is invalid",
-            ),
-            (
-                "DEVCONTAINER_PREPULL",
-                "maybe",
-                "DEVCONTAINER_PREPULL must be true or false",
-            ),
-            (
-                "DEVCONTAINER_DEPLOYMENT_ID",
-                "a b",
-                "DEVCONTAINER_DEPLOYMENT_ID",
-            ),
-            (
-                "DEVCONTAINER_DEFAULT_IMAGE",
-                "two words",
-                "DEVCONTAINER_DEFAULT_IMAGE",
-            ),
-            ("CONTAINER_HOST", "podman.sock", "CONTAINER_HOST"),
-        ];
-        for (name, value, expected) in cases {
-            let mut vars = owned_full();
-            vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
-            vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
-            vars.insert(name, value.to_owned());
-            if name == "DEVCONTAINER_RUNTIME" {
-                vars.insert(name, value.to_owned());
-            }
-            let err = parse_dc(&vars).unwrap_err();
-            assert!(
-                err.problems.iter().any(|p| p.starts_with(expected)),
-                "{name}={value}: {:?}",
-                err.problems
-            );
-            assert_eq!(err.class(), ErrorClass::Invalid, "{name}");
-        }
-    }
-
-    #[test]
-    fn podman_without_an_address_is_refused() {
-        let mut vars = owned_full();
-        vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
-        let err = parse_dc(&vars).unwrap_err();
-        let all = err.problems.join("\n");
-        // A message a person pastes into a report has no runs of spaces (a re-wrapping slip, #68).
-        assert!(!all.contains("  "), "{all}");
-        assert!(
-            all.contains("CONTAINER_HOST is required with DEVCONTAINER_RUNTIME=podman"),
-            "{all}"
-        );
-        assert_eq!(
-            err.problems.len(),
-            1,
-            "nothing else is asked of podman: {all}"
-        );
-    }
-
-    #[test]
-    fn a_control_plane_runs_no_commands_and_neither_reads_nor_checks_the_devcontainer_variables() {
-        let mut vars = owned_full();
-        vars.insert("ROLE", "control-plane".into());
-        vars.insert("DEVCONTAINER_RUNTIME", "docker".into());
-        vars.insert("DEVCONTAINER_NETWORK", "host".into());
-        assert!(parse_dc(&vars).is_ok());
-        vars.insert("ROLE", "worker".into());
-        assert!(parse_dc(&vars).is_err(), "a worker does");
     }
 
     /// `MAX_ACCESS_TIER` caps the tiers a person may pick: `auto` unless the deployment says more
@@ -3461,10 +3106,8 @@ mod tests {
         for part in [
             "GITHUB_APP_PRIVATE_KEY_PATH",
             "RUN_ENVIRONMENT=local",
-            "DEVCONTAINER_RUNTIME=off",
             "any access tier, a `plan` included",
             "RUN_ENVIRONMENT=kubernetes",
-            "DEVCONTAINER_RUNTIME=podman",
             "ALLOW_COMMANDS_NEXT_TO_SECRETS=true",
         ] {
             assert!(message.contains(part), "{part:?} missing from: {message}");
@@ -3527,18 +3170,6 @@ mod tests {
         ));
         assert!(!worker.commands_can_read_the_app_key());
         assert!(!worker.allow_commands_next_to_secrets);
-
-        // Podman devcontainers: the repository's container has no such file either.
-        let mut vars = app_key_file_next_to_local_commands(dir.path());
-        vars.extend([
-            ("DEVCONTAINER_RUNTIME".to_owned(), "podman".to_owned()),
-            (
-                "CONTAINER_HOST".to_owned(),
-                "unix:///run/podman/podman.sock".to_owned(),
-            ),
-        ]);
-        let worker = parse_owned(&vars).unwrap().worker.unwrap();
-        assert!(!worker.commands_can_read_the_app_key());
 
         // A key given inline is not a file: nothing is refused.
         let key = TestAppKey::generate();

@@ -131,7 +131,9 @@ mod tier;
 
 #[cfg(feature = "server")]
 pub use auth::AuthConfig;
-pub use backend::{BackendError, Caller, DynTaskBackend, TaskBackend, TaskEvent};
+pub use backend::{
+    BackendError, Caller, DynTaskBackend, RESUME_METADATA_KEY, TaskBackend, TaskEvent, is_resume,
+};
 pub use card::{AgentCardConfig, ExtendedCardConfig, ExtensionConfig, SkillConfig};
 pub use extensions::{
     A2UI_BASIC_CATALOG_V1_0, A2UI_EXTENSION_V1_0, A2UI_MEDIA_TYPE, ACCESS_TIER_EXTENSION,

@@ -168,6 +168,14 @@ jobs:
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set mcp.websearch.url=https://search.example.com/mcp --set mcp.context7.enabled=true \
             --set topology=split --set front.replicas=2 > "$RUNNER_TEMP/rendered-mcp-split.yaml"
+          # The per-model profiles (config.modelProfiles, ADR 0063 and ADR 0064): the profiles ConfigMap, its
+          # volume and MODEL_ALIASES_FILE, and a changed map in the split worker.
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set-json 'config.modelProfiles={"presets":{"quick":{"reasoningEffort":"low"}},"profiles":{"coder":{"preset":"quick","reasoningEfforts":["low","max"],"reasoningWire":"reasoning_effort","maxOutputTokensLimit":131072}}}' \
+            > "$RUNNER_TEMP/rendered-model-profiles.yaml"
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set-json 'config.modelProfiles={"profiles":{"coder":{"maxOutputTokensLimit":65536}}}' \
+            --set topology=split > "$RUNNER_TEMP/rendered-model-profiles-split.yaml"
           # The gateway's URL from the ExternalSecret (config.modelBaseUrlFromSecret): a secretKeyRef and one more
           # key in the ExternalSecret, in the combined pod and in the split worker.
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \

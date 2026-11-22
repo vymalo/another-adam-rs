@@ -7,7 +7,7 @@ image:
   # Bumped on every green build of main by .github/workflows/coder.yml
   # (`sha-<first 7 of the commit>`). A plain key so the workflow can edit it.
   # sha-0000000 is the placeholder that exists before the first build.
-  tag: sha-f0ecdc8
+  tag: sha-6622e90
   pullPolicy: IfNotPresent
 
 # The image package may be private; name a pull secret here if so.
@@ -86,6 +86,20 @@ config:
   # 9007199254740991 (a number or a string of digits). Each call's usage report says it, so a screen
   # shows how full the context is. null (default): reports carry no window. Roles that run workers only.
   modelContextWindow: null
+  # The per-model profiles (ADR 0063 and ADR 0064), one JSON file the workers read at startup
+  # (MODEL_ALIASES_FILE): per model id, the reasoning levels it takes and how they are sent
+  # (`reasoningEfforts`, `reasoningWire`, `reasoningBudgets`, `reasoningEffort`), its output cap
+  # (`maxOutputTokens`, `maxOutputTokensLimit`), the members merged into its requests only
+  # (`extraBody`), and the preset it starts from (`preset`); and the named `presets` bundle.
+  # Empty (default): no file, nothing changes. A map; the chart renders it as JSON (JSON only for
+  # now) in a ConfigMap mounted at /etc/adam/model-profiles.json, and refuses config.extraEnv.
+  # MODEL_ALIASES_FILE beside it. A file that does not parse or breaks a rule stops the process at
+  # startup (exit 78), naming the file and the key. Roles that run workers only. Example:
+  #   modelProfiles:
+  #     presets: { quick: { reasoningEffort: low } }
+  #     profiles:
+  #       coder: { preset: quick, reasoningEfforts: [low, medium, high, max], reasoningWire: reasoning_effort, maxOutputTokensLimit: 131072 }
+  modelProfiles: {}
   # URL clients reach the JSON-RPC endpoint at (goes into the agent card).
   # Empty: the in-cluster Service URL.
   publicUrl: ""

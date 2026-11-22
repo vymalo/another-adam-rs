@@ -2635,123 +2635,98 @@ async fn a_sweep_of_zero_seconds_turns_the_janitor_off() {
     db.finish().await;
 }
 
-// ------------------------------------------------------------------------------ devcontainers
+// ------------------------------------------------------------------------------ ADR 0052
 
-/// The devcontainer variables are checked before anything connects: a value that is not one, a
-/// runtime with no service address. Exit 78, with the variable named.
+/// A deployment that asked for Podman does not start and silently run its commands in the coder:
+/// exit 78, in words that name the variable and ADR 0052, whatever the case or the spacing of the
+/// value. The removed variables are otherwise ignored (the configuration unit tests list every one
+/// of them).
 #[tokio::test]
-async fn a_bad_devcontainer_configuration_exits_78_naming_the_variable() {
+async fn a_deployment_that_asked_for_podman_exits_78_naming_adr_0052() {
     let tmp = tempfile::tempdir().unwrap();
-    let cases: [(&str, Vec<(&str, String)>); 4] = [
-        (
-            "DEVCONTAINER_RUNTIME must be off or podman",
-            vec![("DEVCONTAINER_RUNTIME", "docker".into())],
-        ),
-        (
-            "DEVCONTAINER_NETWORK must be inherit or none",
-            vec![("DEVCONTAINER_NETWORK", "host".into())],
-        ),
-        (
-            "CONTAINER_HOST is required with DEVCONTAINER_RUNTIME=podman",
-            vec![("DEVCONTAINER_RUNTIME", "podman".into())],
-        ),
-        (
-            "DEVCONTAINER_UP_TIMEOUT_SECS is invalid",
-            vec![("DEVCONTAINER_UP_TIMEOUT_SECS", "later".into())],
-        ),
-    ];
-    for (wants, vars) in cases {
+    for value in ["podman", " Podman ", "PODMAN"] {
         let mut env = valid_env("postgres://u:p@127.0.0.1:1/x", tmp.path());
-        env.extend(vars.into_iter().map(|(k, v)| (k.to_owned(), v)));
+        env.extend(
+            [
+                ("DEVCONTAINER_RUNTIME", value),
+                ("CONTAINER_HOST", "unix:///run/podman/podman.sock"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        );
         let mut p = Proc::spawn(&env);
         let status = p.exit_within(Duration::from_secs(30)).await;
-        assert_eq!(status.code(), Some(78), "{wants}: {}", p.logs());
+        assert_eq!(status.code(), Some(78), "{value:?}: {}", p.logs());
         let err = failure(&p)["error"].as_str().unwrap().to_owned();
-        assert!(err.contains(wants), "{wants:?} missing from:\n{err}");
+        assert!(
+            err.contains("DEVCONTAINER_RUNTIME=podman"),
+            "{value:?}: {err}"
+        );
+        assert!(err.contains("ADR 0052"), "{value:?}: {err}");
         assert!(
             !err.contains("connecting to Postgres"),
-            "a bad configuration must stop before anything connects:\n{err}"
+            "{value:?}: a bad configuration must stop before anything connects:\n{err}"
         );
     }
 }
 
-/// With devcontainers on and the Podman service not answering, the worker starts anyway: it writes
-/// the tools every devcontainer would mount, says that the service does not answer, and stops
-/// cleanly on SIGTERM. (A run then goes on in the coder's own container, with a step: the
-/// environment's own tests.) The service may start after the coder.
+/// ADR 0052 decision 2: every removed variable but `DEVCONTAINER_RUNTIME=podman` is **ignored with a
+/// warning**, once, naming the variable and never its value (ADR 0038's rule). (The Postgres address
+/// is unreachable: the warnings come before anything connects.)
 #[tokio::test]
-async fn a_worker_with_devcontainers_on_starts_when_the_service_does_not_answer() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+async fn every_removed_devcontainer_variable_is_warned_about_once_without_its_value() {
     let tmp = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().join("work");
-    // A client that says the service is down, as it would for a socket that is not there.
-    let client = tmp.path().join("podman-remote");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::write(
-            &client,
-            "#!/bin/sh\necho 'Cannot connect to Podman: connection refused' >&2\nexit 125\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let mut env = valid_env(&db.url(), &workspace);
+    let mut env = valid_env("postgres://adam:p@127.0.0.1:1/adam", tmp.path());
     env.extend(
         [
-            ("DEVCONTAINER_RUNTIME", "podman".to_owned()),
-            (
-                "CONTAINER_HOST",
-                "unix:///nonexistent/podman.sock".to_owned(),
-            ),
-            ("DEVCONTAINER_PODMAN", client.to_string_lossy().into_owned()),
-            ("DEVCONTAINER_PREPULL", "false".to_owned()),
-            // Removed by ADR 0038: set and ignored, so podman starts without an OpenCode.
-            ("OPENCODE_BINARY", "/no/such/opencode".to_owned()),
+            ("DEVCONTAINER_NETWORK", "VALUE-NOT-LOGGED-1"),
+            ("DEVCONTAINER_DEFAULT_IMAGE", "VALUE-NOT-LOGGED-2"),
+            ("CONTAINER_HOST", "VALUE-NOT-LOGGED-3"),
+            ("DEVCONTAINER_RUNTIME", "off"),
         ]
-        .map(|(k, v)| (k.to_owned(), v)),
+        .map(|(k, v)| (k.to_owned(), v.to_owned())),
     );
     let mut p = Proc::spawn(&env);
-    p.ready().await;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !p.stdout().contains("the Podman service does not answer") {
-        assert!(
-            Instant::now() < deadline,
-            "it never said the service does not answer\n{}",
-            p.logs()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let out = p.stdout();
-    assert!(out.contains("devcontainers are on"), "{out}");
-    assert!(
-        !out.contains(A2A_TOKEN) && !out.contains(GITHUB_TOKEN),
-        "nothing secret is logged: {out}"
-    );
-    let tools = workspace.join("environments/.tools");
-    let written: Vec<_> = std::fs::read_dir(&tools)
-        .expect("the tools directory is written at startup")
-        .flatten()
-        .collect();
-    assert_eq!(written.len(), 1, "{written:?}");
-    let dir = written[0].path();
-    assert!(dir.join("adam-exec").is_file(), "{dir:?}");
-    assert!(
-        !dir.join("opencode").exists(),
-        "no OpenCode is mounted into a devcontainer: {dir:?}"
-    );
-    p.sigterm().await;
+    let status = p.exit_within(Duration::from_secs(45)).await;
     assert_eq!(
-        p.exit_within(Duration::from_secs(15)).await.code(),
-        Some(0),
-        "{}",
+        status.code(),
+        Some(69),
+        "the removed variables are no configuration error; only Postgres is unreachable:\n{}",
         p.logs()
     );
-    db.finish().await;
+    let out = p.stdout();
+    for name in [
+        "DEVCONTAINER_NETWORK",
+        "DEVCONTAINER_DEFAULT_IMAGE",
+        "CONTAINER_HOST",
+        "DEVCONTAINER_RUNTIME",
+    ] {
+        let warned: Vec<Value> = out
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|log| {
+                log["fields"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with(&format!("{name} is set and ignored")))
+            })
+            .collect();
+        assert_eq!(warned.len(), 1, "{name}: one line:\n{out}");
+        assert_eq!(warned[0]["level"], "WARN", "{name}");
+        assert_eq!(warned[0]["fields"]["variable"], name);
+        assert!(
+            warned[0]["fields"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("ADR 0052"),
+            "{name}: {}",
+            warned[0]
+        );
+    }
+    assert!(
+        !out.contains("VALUE-NOT-LOGGED"),
+        "no value is logged:\n{out}"
+    );
+    assert!(!p.stderr().contains("VALUE-NOT-LOGGED"), "{}", p.stderr());
 }
-
-// ------------------------------------------------------ GitHub credentials, per installation
 
 /// `valid_env` for a GitHub App installation instead of a token: `GITHUB_TOKEN` is gone, and the key
 /// is a file under `dir` (what a deployment mounts).
@@ -2867,6 +2842,10 @@ async fn a_github_app_configuration_is_checked_at_startup_and_exits_78_with_ever
     assert!(
         err.contains("GITHUB_TOKEN and the GITHUB_APP_* variables are both set"),
         "{err}"
+    );
+    assert!(
+        !err.contains("connecting to"),
+        "a configuration error stops before the store, even when DATABASE_URL is unreachable: {err}"
     );
     assert!(
         !err.contains(GITHUB_TOKEN) && !err.contains("BEGIN"),
@@ -3002,7 +2981,6 @@ async fn an_app_key_file_next_to_local_commands_is_refused_at_startup_unless_acc
         "GITHUB_APP_PRIVATE_KEY_PATH",
         "any access tier, a `plan` included",
         "RUN_ENVIRONMENT=kubernetes",
-        "DEVCONTAINER_RUNTIME=podman",
         "ALLOW_COMMANDS_NEXT_TO_SECRETS=true",
     ] {
         assert!(err.contains(part), "{part:?} missing from:\n{err}");
@@ -3344,6 +3322,10 @@ async fn an_app_with_neither_installation_nor_owners_is_refused_at_startup() {
     assert!(
         chain.contains("GITHUB_APP_INSTALLATION_ID") && chain.contains("GITHUB_APP_OWNERS"),
         "{chain}"
+    );
+    assert!(
+        !chain.contains("connecting to"),
+        "a configuration error stops before the store, even when DATABASE_URL is unreachable: {chain}"
     );
     assert!(!chain.contains("BEGIN"), "{chain}");
 

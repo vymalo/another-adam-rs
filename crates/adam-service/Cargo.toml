@@ -1,6 +1,6 @@
 [package]
 name = "adam-service"
-description = "The A2A service shared by every agent binary: the Postgres store, the runtime and its workers, the A2A router, notifications, the process's common configuration and exit codes"
+description = "The A2A service shared by every agent binary: the run store chosen from DATABASE_URL, the runtime and its workers, the A2A router, notifications, the process's common configuration and exit codes"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
@@ -9,7 +9,13 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = []
+# Every adapter is on in the binaries; a library build can take only the one it needs. The
+# `postgres` arm brings the notification listener, the `sqlite` and `mongodb` arms poll or use the
+# in-process notifier (ADR 0053, decision 3).
+default = ["store-postgres", "store-sqlite", "store-mongodb"]
+store-postgres = ["dep:adam-notify-postgres", "dep:adam-postgres", "dep:adam-store-postgres"]
+store-sqlite = ["dep:adam-store-sqlite"]
+store-mongodb = ["dep:adam-store-mongodb"]
 # `McpSettings`: the deployment's policy for the MCP servers of an agent folder (`MCP_ALLOW_*`).
 mcp = ["dep:adam-mcp", "dep:adam-agent-fs"]
 
@@ -25,10 +31,12 @@ adam-mcp = { workspace = true, optional = true }
 adam-model.workspace = true
 adam-model-oauth.workspace = true
 adam-model-openai.workspace = true
-adam-notify-postgres.workspace = true
-adam-postgres.workspace = true
+adam-notify-postgres = { workspace = true, optional = true }
+adam-postgres = { workspace = true, optional = true }
 adam-runtime.workspace = true
-adam-store-postgres.workspace = true
+adam-store-mongodb = { workspace = true, optional = true }
+adam-store-postgres = { workspace = true, optional = true }
+adam-store-sqlite = { workspace = true, optional = true }
 async-trait.workspace = true
 axum.workspace = true
 rustix = { version = "1", default-features = false, features = ["process", "std"] }
@@ -45,6 +53,10 @@ url.workspace = true
 a2a-client-lf.workspace = true
 # `generate_signing_key_pem`, for the tests of the card-signing settings.
 adam-a2a = { workspace = true, features = ["test-util"] }
+# The Postgres tests use the store directly, whatever features the library is built with.
+adam-store-postgres.workspace = true
+# The TLS server of the `MODEL_CA_FILE` test; already in the tree under reqwest.
+rustls.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }

@@ -13,7 +13,7 @@
 //!   the slot, no `..`, nothing inside `.git`, and a symlink is followed only while it stays inside
 //!   the worktree; the file is opened relative to the slot's directory as the coder opened it, so a
 //!   slot or a directory swapped for a link while the tool works is not followed. The files are the
-//!   workspace's, so what a command produced inside the repository's devcontainer is there like
+//!   workspace's, so what a command produced in a run pod is there like
 //!   any other file.
 //! * It must be a regular file of at most [`MAX_ARTIFACT_FILE_BYTES`] (4 MiB). A bigger one is a
 //!   result for the model, who can shrink it or say so. A run may also share only so many bytes in

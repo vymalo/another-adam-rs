@@ -4,22 +4,25 @@
 //! refuses. Every wait is bounded, so a hang fails.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::time::Duration;
 
 use adam_engine::adam_agent_fs::{Dir, Strictness};
-use adam_engine::adam_assembly::{AgentDef, Error as AssemblyError};
+use adam_engine::adam_assembly::{AgentDef, EffortSource, Error as AssemblyError};
 use adam_engine::adam_core::{DynStore, MemoryStore, RunId, Store};
 use adam_engine::adam_error::{Classify, ErrorClass};
+use adam_engine::adam_llm_agent::{FnTool, ToolError, ToolOutput, ToolSet};
 use adam_engine::adam_model::{
-    ContentPart, DynModel, Message as ModelMessage, MockModel, ModelClient, ModelDelta, ModelError,
-    ModelRequest, ModelResponse, ToolCall,
+    ContentPart, DynModel, InputModalities, Message as ModelMessage, MockModel, ModelClient,
+    ModelDelta, ModelError, ModelProfile, ModelProfiles, ModelRequest, ModelResponse,
+    ReasoningEffort, ReasoningWire, ToolCall,
 };
-use adam_engine::adam_runtime::{REPLAY_EVENTS_PER_RUN, RunEvent, StepState};
+use adam_engine::adam_runtime::{Artifact, REPLAY_EVENTS_PER_RUN, RunEvent, StepState};
 use adam_engine::{
-    ConversationId, Delivered, Engine, EngineError, EngineEvent, Limits, ListQuery, RunEvents,
-    RunInfo, RunState, Say, default_secrets,
+    ConversationId, Delivered, Engine, EngineError, EngineEvent, FiringQuery, Limits, ListQuery,
+    RunEvents, RunInfo, RunState, Say, SessionState, StartSession, WithheldFile, default_secrets,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -97,6 +100,18 @@ impl ModelClient for GateModel {
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
         self.hold().await;
         self.inner.stream(req).await
+    }
+
+    fn provider(&self) -> Option<&str> {
+        self.inner.provider()
+    }
+
+    fn context_window(&self, model: &str) -> Option<u64> {
+        self.inner.context_window(model)
+    }
+
+    fn input_modalities(&self, model: &str) -> InputModalities {
+        self.inner.input_modalities(model)
     }
 }
 
@@ -1261,4 +1276,1096 @@ async fn a_reader_behind_a_running_run_gets_a_snapshot() {
         other => panic!("the stream ended on {other:?}"),
     }
     rig.stop().await;
+}
+
+// --- parity with the binaries (docs/reference/parity.md) -----------------------------------------
+
+/// A folder's `schedules/` run in the engine as in `adam-agent` (ADR 0060, #269, #289): the scheduler is
+/// registered, the reconcile at `start` starts it, and the firing is a run of the agent, in the
+/// host's store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folders_schedule_fires_the_agent() {
+    let def = agent(&[
+        ("agent/instructions.md", CHAT),
+        (
+            "agent/schedules/soon.md",
+            "---\nafter: 1s\n---\nSay what is due.\n",
+        ),
+    ]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Nothing is due.");
+    let model: DynModel = mock.clone();
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let engine = Engine::builder(store.clone(), def, model, "m")
+        .start()
+        .await
+        .unwrap();
+    let fired = timeout(WAIT, async {
+        loop {
+            let runs = store
+                .list_runs(&adam_engine::adam_core::RunQuery::new(
+                    "chat",
+                    adam_engine::adam_core::ConversationScope::Prefix(
+                        "adam.schedule:chat/soon@".to_owned(),
+                    ),
+                    10,
+                ))
+                .await
+                .unwrap();
+            if let Some(run) = runs
+                .into_iter()
+                .find(|r| r.status == adam_engine::adam_core::RunStatus::Done)
+            {
+                return run;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the schedule fired");
+    // A firing is nobody's message, so it is in no caller's `list`; the engine shows it to its host
+    // all the same (#289): `firings` lists it with its trigger, and `get` and `files` reach it.
+    let listed = engine.list(ListQuery::new()).await.unwrap();
+    assert!(listed.items.is_empty(), "{listed:?}");
+    let firings = engine.firings(FiringQuery::new()).await.unwrap();
+    let [firing] = firings.items.as_slice() else {
+        panic!("one firing: {firings:?}");
+    };
+    assert_eq!(firing.info.run, fired.id);
+    assert_eq!(firing.info.state, RunState::Done);
+    assert_eq!(firing.info.output.as_deref(), Some("Nothing is due."));
+    assert_eq!(
+        (firing.trigger.agent.as_str(), firing.trigger.name.as_str()),
+        ("chat", "soon")
+    );
+    assert_eq!(firings.total, 1);
+    assert_eq!(
+        engine.get(fired.id).await.unwrap().as_ref(),
+        Some(&firing.info)
+    );
+    assert!(engine.files(fired.id).await.unwrap().is_empty());
+    let asked = mock.requests();
+    assert!(
+        format!("{:?}", asked[0].messages).contains("Say what is due."),
+        "the firing's prompt is the person's message: {asked:?}"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// The runtime's retry policy is the host's (`Limits::retry`, #270): a transient model failure,
+/// which names no policy of its own, is given up after the host's two attempts, not five.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosts_retry_policy_governs_a_transient_failure() {
+    let mock = Arc::new(MockModel::new());
+    for _ in 0..2 {
+        mock.push_error(ModelError::transient("502"));
+    }
+    mock.push_text("never");
+    let model: DynModel = mock.clone();
+    let mut limits = Limits::default();
+    limits.retry = adam_engine::adam_runtime::RetryPolicy::new(2)
+        .with_backoff(Duration::from_millis(5), Duration::from_millis(5));
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .limits(limits)
+        .start()
+        .await
+        .unwrap();
+    let turn = engine.send(None, Say::new("hi")).await.unwrap();
+    let mut events = engine.events(turn.run).await.unwrap();
+    let mut last = None;
+    while let Some(event) = timeout(WAIT, events.next()).await.expect("an event") {
+        last = Some(event.unwrap());
+    }
+    let Some(EngineEvent::Ended(info)) = last else {
+        panic!("the stream ended on {last:?}");
+    };
+    assert_eq!(info.state, RunState::Failed);
+    assert_eq!(mock.requests().len(), 2, "two attempts, the host's");
+    assert_eq!(
+        Limits::default().retry,
+        adam_engine::adam_runtime::RetryPolicy::default()
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A folder's `commands/` are expanded in the engine as on the server surfaces (`commands/v1`,
+/// #276): `/greet Ada Lovelace` reaches the model as the command's template with `$1` (not the
+/// whole argument line), `commands()` lists it, and an
+/// unknown `/name` reaches the model as typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folders_command_is_expanded() {
+    let def = agent(&[
+        ("agent/instructions.md", CHAT),
+        (
+            "agent/commands/greet.md",
+            "---\ndescription: Greet someone.\nargument-hint: \"<name>\"\n---\nSay hello to $1, warmly.\n",
+        ),
+    ]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Hello, Ada!");
+    mock.push_text("I do not know that one.");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), def, model, "m")
+        .start()
+        .await
+        .unwrap();
+    let listed: Vec<(&str, &str)> = engine
+        .commands()
+        .iter()
+        .map(|c| (c.name.as_str(), c.description.as_str()))
+        .collect();
+    assert_eq!(listed, [("greet", "Greet someone.")]);
+    assert_eq!(
+        engine.commands()[0].argument_hint.as_deref(),
+        Some("<name>")
+    );
+
+    for (said, expected) in [
+        ("/greet Ada Lovelace", "Say hello to Ada, warmly."),
+        ("/wave Ada", "/wave Ada"),
+    ] {
+        let turn = engine.send(None, Say::new(said)).await.unwrap();
+        let mut events = engine.events(turn.run).await.unwrap();
+        while let Some(event) = timeout(WAIT, events.next()).await.expect("an event") {
+            event.unwrap();
+        }
+        let asked = mock.requests();
+        let last = asked.last().expect("a model call");
+        let text = format!("{:?}", last.messages.last());
+        assert!(text.contains(expected), "{said}: {text}");
+    }
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A host's own tool can hand the agent a file, and the host reads it back (#280): the event
+/// withholds its bytes and says its digest, `files` lists it, `file` answers its bytes by that
+/// digest, and another digest or a run this engine does not have is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_the_agent_hands_over_is_read_by_its_digest() {
+    const BYTES: &[u8] = b"the report, line one\nline two\n";
+    let report = FnTool::raw(
+        "write_report",
+        "Write the report as a file.",
+        json!({"type": "object", "properties": {}}),
+        |_ctx, _args| async move {
+            let file = Artifact::file("report", "text/plain", "report.txt", BYTES.to_vec())
+                .expect("a file");
+            Ok::<_, ToolError>(ToolOutput::text("written").with_artifact(file))
+        },
+    );
+    let def = agent(&[(
+        "agent/instructions.md",
+        "---\nname: chat\ntools: [write_report]\n---\nYou chat.\n",
+    )]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![ToolCall {
+        id: "report-1".into(),
+        name: "write_report".into(),
+        arguments: json!({}),
+        ..Default::default()
+    }])
+    .push_text("Here is the report.");
+    // The first model call waits until the reader is subscribed, so its stream holds the file.
+    let gate = Arc::new(Gate::default());
+    let model: DynModel = Arc::new(GateModel {
+        inner: mock.clone(),
+        hold_on: Some(0),
+        calls: AtomicUsize::new(0),
+        gate: gate.clone(),
+    });
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), def, model, "m")
+        .tools(ToolSet::new().tool(report))
+        .start()
+        .await
+        .unwrap();
+
+    let turn = engine.send(None, Say::new("Write it.")).await.unwrap();
+    gate.wait_reached().await;
+    let mut events = engine.events(turn.run).await.unwrap();
+    gate.release.notify_one();
+    let mut withheld = Vec::new();
+    while let Some(event) = timeout(WAIT, events.next()).await.expect("an event") {
+        if let EngineEvent::Live(event) = event.unwrap() {
+            withheld.extend(WithheldFile::of(&event));
+        }
+    }
+    let [said] = withheld.as_slice() else {
+        panic!("one file event: {withheld:?}");
+    };
+    assert_eq!(said.len, BYTES.len() as u64);
+    let digest = Artifact::file("report", "text/plain", "report.txt", BYTES.to_vec())
+        .expect("a file")
+        .file_sha256()
+        .expect("a digest");
+    assert_eq!(said.sha256, digest, "the event says the bytes' SHA-256");
+
+    let files = engine.files(turn.run).await.unwrap();
+    let [file] = files.as_slice() else {
+        panic!("one file: {files:?}");
+    };
+    assert_eq!(
+        (
+            file.name.as_str(),
+            file.mime_type.as_deref(),
+            file.filename.as_str(),
+            file.len
+        ),
+        (
+            "report",
+            Some("text/plain"),
+            "report.txt",
+            BYTES.len() as u64
+        )
+    );
+    assert_eq!(
+        file.sha256, said.sha256,
+        "the list and the event name it alike"
+    );
+    let bytes = engine
+        .file(turn.run, &said.sha256)
+        .await
+        .unwrap()
+        .expect("its bytes");
+    assert_eq!(&*bytes, BYTES);
+
+    assert!(
+        engine
+            .file(turn.run, &"0".repeat(64))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let unknown = RunId::new();
+    for refused in [
+        engine.files(unknown).await.map(|_| ()).unwrap_err(),
+        engine
+            .file(unknown, &said.sha256)
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+    ] {
+        assert_eq!(refused.class(), ErrorClass::NotFound, "{refused:?}");
+    }
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A host's tool named as one of the engine's own is refused at `start` (`DuplicateTool`), never
+/// put in the other's place.
+#[tokio::test]
+async fn a_host_tool_named_as_the_engines_is_refused() {
+    let ask = FnTool::raw(
+        "ask_user",
+        "Not the engine's.",
+        json!({"type": "object", "properties": {}}),
+        |_ctx, _args| async move { Ok::<_, ToolError>(ToolOutput::text("mine")) },
+    );
+    let refused = Engine::builder(
+        Arc::new(MemoryStore::new()),
+        chat(),
+        MockModel::new().into_dyn(),
+        "m",
+    )
+    .tools(ToolSet::new().tool(ask))
+    .start()
+    .await
+    .expect_err("start refuses it");
+    assert!(
+        matches!(&refused, EngineError::Agent(e) if matches!(**e, AssemblyError::DuplicateTool { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(refused.class(), ErrorClass::Invalid);
+}
+
+/// A host sees and stops a firing that works (#289): two schedules fire, `firings` pages them and
+/// filters by schedule (`a` never lists `ab`'s), a token of another query is refused, `events`
+/// streams the working one and `cancel` ends it `Cancelled`, a done one is `Finished` to `cancel`, the
+/// schedulers are not reached, and `steer`, `answer` and a `send` to its conversation do not reach a
+/// firing (nobody talks to one).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_lists_and_cancels_a_working_firing() {
+    let def = agent(&[
+        ("agent/instructions.md", CHAT),
+        ("agent/schedules/a.md", "---\nafter: 1s\n---\nSay hello.\n"),
+        ("agent/schedules/ab.md", "---\nafter: 1s\n---\nSay bye.\n"),
+    ]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("one").push_text("two");
+    let gate = Arc::new(Gate::default());
+    let model: DynModel = Arc::new(GateModel {
+        inner: mock.clone(),
+        hold_on: Some(0),
+        calls: AtomicUsize::new(0),
+        gate: gate.clone(),
+    });
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let engine = Engine::builder(store.clone(), def, model, "m")
+        .start()
+        .await
+        .unwrap();
+    // The first firing's model call waits at the gate: it works until it is cancelled.
+    gate.wait_reached().await;
+    let all = timeout(WAIT, async {
+        loop {
+            let page = engine.firings(FiringQuery::new()).await.unwrap();
+            // The other firing's model call is not held: wait until it is done, so the one that
+            // works is the held one, not one about to finish.
+            let state = |s| {
+                page.items
+                    .iter()
+                    .any(|f: &adam_engine::Firing| f.info.state == s)
+            };
+            if page.total == 2 && state(RunState::Done) && state(RunState::Working) {
+                return page;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both schedules fired");
+    let working = all
+        .items
+        .iter()
+        .find(|f| f.info.state == RunState::Working)
+        .expect("one firing works")
+        .clone();
+
+    let first = engine
+        .firings(FiringQuery::new().page_size(1))
+        .await
+        .unwrap();
+    let token = first.next_page_token.clone().expect("a second page");
+    let second = engine
+        .firings(FiringQuery::new().page_size(1).after(token.clone()))
+        .await
+        .unwrap();
+    let mut paged: Vec<RunId> = first
+        .items
+        .iter()
+        .chain(&second.items)
+        .map(|f| f.info.run)
+        .collect();
+    let mut every: Vec<RunId> = all.items.iter().map(|f| f.info.run).collect();
+    paged.sort();
+    every.sort();
+    assert_eq!(paged, every, "two pages of one hold both firings");
+    assert!(second.next_page_token.is_none());
+    let foreign = engine
+        .firings(FiringQuery::new().schedule("a").page_size(1).after(token))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.class(), ErrorClass::Invalid, "{foreign:?}");
+    for name in ["a", "ab"] {
+        let only = engine
+            .firings(FiringQuery::new().schedule(name))
+            .await
+            .unwrap();
+        let names: Vec<&str> = only.items.iter().map(|f| f.trigger.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [name],
+            "the filter {name:?} lists only its own firing"
+        );
+        assert_eq!(only.total, 1);
+    }
+    let done = all
+        .items
+        .iter()
+        .find(|f| f.info.state == RunState::Done)
+        .expect("one firing is done");
+    let ended = engine.cancel(done.info.run).await.unwrap_err();
+    assert!(matches!(ended, EngineError::Finished { .. }), "{ended:?}");
+    // The schedulers are the engine's own work, not firings: neither listed nor reached.
+    let schedulers = store
+        .list_runs(&adam_engine::adam_core::RunQuery::new(
+            adam_engine::adam_schedule::scheduler_agent_name("chat"),
+            adam_engine::adam_core::ConversationScope::Prefix("adam.schedule:chat/".to_owned()),
+            10,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(schedulers.len(), 2, "{schedulers:?}");
+    for scheduler in &schedulers {
+        assert!(engine.get(scheduler.id).await.unwrap().is_none());
+    }
+
+    let refused = engine
+        .steer(working.info.run, Say::new("stop that"))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.class(), ErrorClass::NotFound, "{refused:?}");
+    let unanswered = engine
+        .answer(working.info.run, Say::new("yes"))
+        .await
+        .unwrap_err();
+    assert_eq!(unanswered.class(), ErrorClass::NotFound, "{unanswered:?}");
+    let sent = engine
+        .send(Some(&working.info.conversation), Say::new("hello"))
+        .await
+        .unwrap_err();
+    assert_eq!(sent.class(), ErrorClass::NotFound, "{sent:?}");
+    let mut events = engine.events(working.info.run).await.unwrap();
+    let cancelled = engine.cancel(working.info.run).await.unwrap();
+    assert_eq!(cancelled.state, RunState::Cancelled);
+    let (heard, error) = read_all(&mut events).await;
+    assert!(error.is_none(), "{error:?}");
+    assert!(
+        matches!(heard.last(), Some(EngineEvent::Ended(info)) if info.state == RunState::Cancelled),
+        "{heard:?}"
+    );
+    // Cancelling it again answers it as it is.
+    assert_eq!(
+        engine.cancel(working.info.run).await.unwrap().state,
+        RunState::Cancelled
+    );
+    gate.release.notify_one();
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A host starts, talks to, lists and closes a child session (`child-sessions/v1`, #279), as a
+/// client of the binaries does: the helpers are the local subagents; a session's first round is
+/// in its own conversation and the parent takes no turn; a message to an idle kept-open session is
+/// its next round; `sessions` lists it from the parent; a close ends it, and a closed session takes
+/// no message. An unknown helper is refused, and an agent with no subagent has no helper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_starts_lists_and_closes_a_child_session() {
+    let def = agent(&[
+        ("agent/instructions.md", CHAT),
+        (
+            "agent/subagents/planner.md",
+            "---\ndescription: Plans the work.\n---\nYou plan.\n",
+        ),
+    ]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Hello.")
+        .push_text("Plan one.")
+        .push_text("Plan two.");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), def, model, "m")
+        .start()
+        .await
+        .unwrap();
+    let helpers: Vec<(&str, &str)> = engine
+        .helpers()
+        .iter()
+        .map(|h| (h.name.as_str(), h.description.as_str()))
+        .collect();
+    assert_eq!(helpers, [("planner", "Plans the work.")]);
+
+    let wait = |run: RunId, state: RunState| {
+        let engine = engine.clone();
+        async move {
+            timeout(WAIT, async {
+                loop {
+                    let info = engine.get(run).await.unwrap().expect("the run");
+                    if info.state == state {
+                        return info;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{run} never reached {state:?}"))
+        }
+    };
+    let parent = engine.send(None, Say::new("hi")).await.unwrap();
+    wait(parent.run, RunState::Done).await;
+
+    let unknown = engine
+        .start_session(
+            &parent.conversation,
+            StartSession::new("nobody", "Plan it"),
+            Say::new("plan"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.class(), ErrorClass::Invalid, "{unknown:?}");
+
+    let start = StartSession::new("planner", "Plan the trip").keep_open();
+    let first = engine
+        .start_session(
+            &parent.conversation,
+            start.clone(),
+            Say::with_id("start-1", "make a plan"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.delivered, Delivered::Started);
+    // Sent again, the same start is the session it started.
+    let again = engine
+        .start_session(
+            &parent.conversation,
+            start,
+            Say::with_id("start-1", "make a plan"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (again.delivered, again.run),
+        (Delivered::Repeated, first.run)
+    );
+    assert_ne!(
+        first.conversation, parent.conversation,
+        "a conversation of its own"
+    );
+    assert_eq!(
+        wait(first.run, RunState::Done).await.output.as_deref(),
+        Some("Plan one.")
+    );
+    let parent_runs = engine
+        .list(ListQuery::new().conversation(parent.conversation.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        parent_runs.items.len(),
+        1,
+        "the parent took no turn: {parent_runs:?}"
+    );
+
+    let listed = engine.sessions(&parent.conversation).await.unwrap();
+    let [session] = listed.as_slice() else {
+        panic!("one session: {listed:?}");
+    };
+    assert_eq!(session.conversation, first.conversation);
+    assert_eq!(
+        (session.helper.as_str(), session.description.as_str()),
+        ("planner", "Plan the trip")
+    );
+    assert!(session.keep_open);
+    assert_eq!(session.state, SessionState::Idle);
+    assert_eq!((session.round, session.latest), (1, Some(first.run)));
+
+    let second = engine
+        .send(
+            Some(&first.conversation),
+            Say::with_id("round-2", "and the return"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.delivered, Delivered::Continued);
+    assert_ne!(second.run, first.run);
+    let resent = engine
+        .send(
+            Some(&first.conversation),
+            Say::with_id("round-2", "and the return"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (resent.delivered, resent.run),
+        (Delivered::Repeated, second.run)
+    );
+    assert_eq!(
+        wait(second.run, RunState::Done).await.output.as_deref(),
+        Some("Plan two.")
+    );
+    let rounds = engine
+        .list(ListQuery::new().conversation(first.conversation.clone()))
+        .await
+        .unwrap();
+    assert_eq!(rounds.items.len(), 2, "{rounds:?}");
+
+    // A session's conversation holds no session, and a close goes to a session's conversation.
+    let nested = engine.sessions(&first.conversation).await.unwrap_err();
+    assert_eq!(nested.class(), ErrorClass::Invalid, "{nested:?}");
+    let not_a_session = engine
+        .close_session(&parent.conversation, false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        not_a_session.class(),
+        ErrorClass::Invalid,
+        "{not_a_session:?}"
+    );
+    engine
+        .close_session(&first.conversation, false)
+        .await
+        .unwrap();
+    let closed = engine.sessions(&parent.conversation).await.unwrap();
+    assert_eq!(closed[0].state, SessionState::Closed, "{closed:?}");
+    let refused = engine
+        .send(Some(&first.conversation), Say::new("one more"))
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, EngineError::Refused(_)), "{refused:?}");
+    assert_eq!(refused.class(), ErrorClass::Rejected);
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+
+    let lone = Engine::builder(
+        Arc::new(MemoryStore::new()),
+        chat(),
+        MockModel::new().into_dyn(),
+        "m",
+    )
+    .start()
+    .await
+    .unwrap();
+    assert!(lone.helpers().is_empty());
+    let none = lone
+        .start_session(
+            &parent.conversation,
+            StartSession::new("planner", "Plan it"),
+            Say::new("plan"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(none.class(), ErrorClass::Invalid, "{none:?}");
+    // With no helper a close is refused, never sent to the agent as a message.
+    let closed_nothing = lone
+        .close_session(&first.conversation, false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        closed_nothing.class(),
+        ErrorClass::Invalid,
+        "{closed_nothing:?}"
+    );
+    timeout(WAIT, lone.shutdown()).await.unwrap().unwrap();
+}
+
+/// The host's session limits hold (`Limits::sessions`, #279): with one session open at most, a
+/// second start in the same conversation is refused while the first is open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosts_session_limits_refuse_a_session_too_many() {
+    let def = agent(&[
+        ("agent/instructions.md", CHAT),
+        (
+            "agent/subagents/planner.md",
+            "---\ndescription: Plans the work.\n---\nYou plan.\n",
+        ),
+    ]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Hello.").push_text("Plan one.");
+    let model: DynModel = mock.clone();
+    let mut limits = Limits::default();
+    limits.sessions =
+        adam_engine::adam_runtime::SessionLimits::new(1, 1, 20).expect("limits in bounds");
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), def, model, "m")
+        .limits(limits)
+        .start()
+        .await
+        .unwrap();
+    let parent = engine.send(None, Say::new("hi")).await.unwrap();
+    let first = engine
+        .start_session(
+            &parent.conversation,
+            StartSession::new("planner", "One").keep_open(),
+            Say::new("plan"),
+        )
+        .await
+        .unwrap();
+    // Its round ends and it stays open, idle: `max_open`, not `max_working`, refuses the next.
+    timeout(WAIT, async {
+        while engine
+            .get(first.run)
+            .await
+            .unwrap()
+            .expect("the round")
+            .state
+            != RunState::Done
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first round ends");
+    let second = engine
+        .start_session(
+            &parent.conversation,
+            StartSession::new("planner", "Two"),
+            Say::new("plan again"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&second, EngineError::Refused(why) if why.contains("open")),
+        "{second:?}"
+    );
+    assert_eq!(second.class(), ErrorClass::Rejected);
+    let listed = engine.sessions(&parent.conversation).await.unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].conversation, first.conversation);
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+// ------------------------------------------------------------------ S0: the lean first request
+
+/// The first request's bytes: the system prompt plus each tool schema as the OpenAI wire wraps it.
+fn first_request_bytes(req: &ModelRequest) -> (usize, usize) {
+    let system = req.system.as_deref().map_or(0, str::len);
+    let tools = req
+        .tools
+        .iter()
+        .map(|t| {
+            serde_json::to_vec(&json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+            }))
+            .expect("a tool schema serialises")
+            .len()
+        })
+        .sum();
+    (system, tools)
+}
+
+/// S0 of the lean-first-request plan (`plans/2026-11-21-lean-first-request.md`): an embedded
+/// engine's first request is held to the owner's **5,000-token** budget for a lazy agent
+/// (ADR 0066), with the same assembly as a plain folder agent. The message is not counted: it is
+/// the same "Hi" in every measurement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_engines_first_request_stays_under_the_lean_budget() {
+    const BUDGET_TOKENS: usize = 5000;
+
+    let rig = Rig::new(None).await;
+    rig.mock
+        .push_text("Hello. What would you like me to work on?");
+    let turn = rig.engine.send(None, Say::new("Hi")).await.unwrap();
+    rig.wait(turn.run, RunState::Done).await;
+
+    let first = &rig.mock.requests()[0];
+    let (system, tools) = first_request_bytes(first);
+    let total = system + tools;
+    let tokens = total / 4;
+    println!(
+        "engine first request: system {system} B + tools {tools} B = {total} B \
+         (~{tokens} tokens at chars/4); lean budget {BUDGET_TOKENS} tokens \
+         (~{} B), margin {} tokens",
+        BUDGET_TOKENS * 4,
+        BUDGET_TOKENS.saturating_sub(tokens)
+    );
+    assert!(
+        tokens <= BUDGET_TOKENS,
+        "the engine's first request is ~{tokens} tokens (chars/4), over the {BUDGET_TOKENS}-token \
+         budget for a lazy agent (ADR 0066)"
+    );
+    rig.stop().await;
+}
+
+// ------------------------------- ADR 0063 decision 8: the engine's profiles and its level
+
+/// The deployment's profiles as its `MODEL_ALIASES_FILE` writes them, parsed by the same loader:
+/// one model `m`, its levels and wire, and the optional own level, cap and `quick` preset.
+fn profiles(own_level: Option<&str>, cap: Option<u32>, quick: Option<&str>) -> ModelProfiles {
+    let own = own_level.map_or_else(String::new, |level| {
+        format!(r#", "reasoningEffort": "{level}""#)
+    });
+    let cap = cap.map_or_else(String::new, |cap| format!(r#", "maxOutputTokens": {cap}"#));
+    let presets = quick.map_or_else(String::new, |level| {
+        format!(r#""presets": {{ "quick": {{ "reasoningEffort": "{level}" }} }},"#)
+    });
+    ModelProfiles::parse_json(&format!(
+        r#"{{ {presets}
+            "profiles": {{
+                "m": {{ "reasoningEfforts": ["low", "high"], "reasoningWire": "reasoning_effort"{own}{cap} }}
+            }}
+        }}"#
+    ))
+    .expect("the deployment's profiles parse")
+}
+
+/// Send `text` and follow its run to its end.
+async fn say_to_the_end(engine: &Engine, text: &str) -> RunInfo {
+    let turn = engine.send(None, Say::new(text)).await.unwrap();
+    let mut events = engine.events(turn.run).await.unwrap();
+    let mut last = None;
+    while let Some(event) = timeout(WAIT, events.next()).await.expect("an event") {
+        last = Some(event.unwrap());
+    }
+    match last {
+        Some(EngineEvent::Ended(info)) => info,
+        other => panic!("the stream ended on {other:?}"),
+    }
+}
+
+/// The deployment's profiles reach an embedded engine's agent (ADR 0063 decision 8): the model's
+/// own level is the resolved default, and the profile's cap is clamped to what the window leaves
+/// and to the model's own documented limit. The mock is used directly, not through `Rig`, whose
+/// `GateModel` forwards no `context_window`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_deployments_profiles_reach_an_engines_agent() {
+    // The window leaves 200,000 − 20,000 margin − the 100,000 default history: 80,000.
+    let mock = Arc::new(MockModel::new().with_context_window("m", 200_000));
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .models(profiles(Some("low"), Some(100_000), None))
+        .start()
+        .await
+        .expect("the agent starts with its model's profile");
+    let done = say_to_the_end(&engine, "hi").await;
+    assert_eq!(done.state, RunState::Done);
+    let requests = mock.requests();
+    let first = requests.first().expect("one model call");
+    assert_eq!(
+        first.reasoning_effort,
+        Some(ReasoningEffort::Low),
+        "the profile's own level is the request's"
+    );
+    assert_eq!(
+        first.max_output_tokens,
+        Some(80_000),
+        "the window clamps the profile's cap"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+
+    // The model's documented limit clamps it too: 64,000 asked, 32,000 allowed. The loader
+    // refuses a profile whose own cap is above its limit, so this is a hand-built `ModelProfiles`
+    // — the case `output_cap` names for one.
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .models(ModelProfiles {
+            profiles: BTreeMap::from([(
+                "m".to_owned(),
+                ModelProfile {
+                    reasoning_efforts: Some(vec![ReasoningEffort::Low, ReasoningEffort::High]),
+                    reasoning_wire: Some(ReasoningWire::ReasoningEffort),
+                    max_output_tokens: Some(64_000),
+                    max_output_tokens_limit: Some(32_000),
+                    ..ModelProfile::default()
+                },
+            )]),
+            presets: BTreeMap::new(),
+        })
+        .start()
+        .await
+        .expect("the agent starts with its model's profile");
+    say_to_the_end(&engine, "hi").await;
+    assert_eq!(
+        mock.requests()[0].max_output_tokens,
+        Some(32_000),
+        "the model's limit clamps the profile's cap"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// The builder's level is the **root's** (ADR 0063 decision 8), between the folder and the preset:
+/// a folder that sets none takes the builder's over its `model_preset`'s, and a folder that sets
+/// one wins over the builder's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_builders_level_is_the_roots_and_the_file_wins() {
+    // (a) No folder key: the builder's `high` wins over the `quick` preset's `low`.
+    let presetted = agent(&[(
+        "agent/instructions.md",
+        "---\nname: chat\ndescription: Talks with the person.\nmodel_preset: quick\n---\nYou chat.\n",
+    )]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), presetted, model, "m")
+        .models(profiles(None, None, Some("low")))
+        .reasoning_effort(ReasoningEffort::High)
+        .start()
+        .await
+        .expect("the preset is declared and the builder's level is one of the model's");
+    say_to_the_end(&engine, "hi").await;
+    assert_eq!(
+        mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::High),
+        "the builder's level wins over the preset's"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+
+    // (b) The folder's `low` wins over the builder's `high`.
+    let keyed = agent(&[(
+        "agent/instructions.md",
+        "---\nname: chat\ndescription: Talks with the person.\nreasoning_effort: low\n---\nYou chat.\n",
+    )]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), keyed, model, "m")
+        .models(profiles(None, None, None))
+        .reasoning_effort(ReasoningEffort::High)
+        .start()
+        .await
+        .expect("the folder's level is one of the model's");
+    say_to_the_end(&engine, "hi").await;
+    assert_eq!(
+        mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::Low),
+        "the folder's own key wins over the builder's"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A level the model's profile does not take stops `start` (ADR 0063 decision 4 and 8):
+/// `EngineError::Agent` (class `Invalid`), whether the builder set it or a folder did with no
+/// profiles at all, which pins the binaries' fail-closed behaviour as the engine's too. The
+/// refusal reports the value as `reasoning_effort` on the agent's file even when the builder set
+/// it (`EffortSource::Folder`), the ruled compromise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_level_the_models_profile_does_not_take_stops_start() {
+    let refused = Engine::builder(
+        Arc::new(MemoryStore::new()),
+        chat(),
+        MockModel::new().into_dyn(),
+        "m",
+    )
+    .models(profiles(None, None, None))
+    .reasoning_effort(ReasoningEffort::Max)
+    .start()
+    .await
+    .expect_err("the model takes low and high, not max");
+    let EngineError::Agent(source) = &refused else {
+        panic!("the agent is refused: {refused:?}");
+    };
+    let AssemblyError::ReasoningEffort {
+        effort,
+        set_by,
+        model,
+        allowed,
+        ..
+    } = &**source
+    else {
+        panic!("the refusal is about the effort: {source}");
+    };
+    assert_eq!(effort, "max");
+    assert_eq!(
+        *set_by,
+        EffortSource::Folder,
+        "the builder's value is reported as the agent's own `reasoning_effort`"
+    );
+    assert_eq!(model, "m");
+    assert_eq!(allowed.as_slice(), ["low", "high"]);
+    assert_eq!(refused.class(), ErrorClass::Invalid);
+
+    // The folder's own key, with no profiles: nothing declares a level, so nothing may set one.
+    let keyed = agent(&[(
+        "agent/instructions.md",
+        "---\nname: chat\ndescription: Talks with the person.\nreasoning_effort: low\n---\nYou chat.\n",
+    )]);
+    let unprofiled = Engine::builder(
+        Arc::new(MemoryStore::new()),
+        keyed,
+        MockModel::new().into_dyn(),
+        "m",
+    )
+    .start()
+    .await
+    .expect_err("no profile declares a level");
+    let EngineError::Agent(source) = &unprofiled else {
+        panic!("the agent is refused: {unprofiled:?}");
+    };
+    let AssemblyError::ReasoningEffort { effort, set_by, .. } = &**source else {
+        panic!("the refusal is about the effort: {source}");
+    };
+    assert_eq!(effort, "low");
+    assert_eq!(*set_by, EffortSource::Folder);
+    assert_eq!(unprofiled.class(), ErrorClass::Invalid);
+}
+
+/// The builder's level wins over the profile's own `reasoningEffort` (ADR 0063 decision 8): the
+/// profile's is the model's default, not a ceiling on the host's explicit choice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_builders_level_wins_over_the_profiles_own() {
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .models(profiles(Some("low"), None, None))
+        .reasoning_effort(ReasoningEffort::High)
+        .start()
+        .await
+        .expect("the builder's level is one of the model's");
+    say_to_the_end(&engine, "hi").await;
+    assert_eq!(
+        mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::High),
+        "the builder's level wins over the profile's own"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A folder that names a preset with no profiles to declare it stops `start` (ADR 0064):
+/// `EngineError::Agent` (`UnknownModelPreset`, class `Invalid`), as on a server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_preset_the_profiles_do_not_declare_stops_start() {
+    let presetted = agent(&[(
+        "agent/instructions.md",
+        "---\nname: chat\ndescription: Talks with the person.\nmodel_preset: quick\n---\nYou chat.\n",
+    )]);
+    let refused = Engine::builder(
+        Arc::new(MemoryStore::new()),
+        presetted,
+        MockModel::new().into_dyn(),
+        "m",
+    )
+    .start()
+    .await
+    .expect_err("no profiles declare quick");
+    let EngineError::Agent(source) = &refused else {
+        panic!("the agent is refused: {refused:?}");
+    };
+    assert!(
+        matches!(**source, AssemblyError::UnknownModelPreset { .. }),
+        "{source}"
+    );
+    assert_eq!(refused.class(), ErrorClass::Invalid);
+}
+
+/// The builder's level is the **root's only** (ADR 0063 decision 8): a subagent never inherits it,
+/// since every subagent has its own file. A root at `high` and a child whose model takes only
+/// `none` both start, and the child's request sends no level.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_builders_level_never_reaches_a_subagent() {
+    let def = agent(&[
+        ("agent/instructions.md", CHAT),
+        (
+            "agent/subagents/worker.md",
+            "---\ndescription: Does a piece of the work.\nmodel: child\n---\nYou work.\n",
+        ),
+    ]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![ToolCall {
+        id: "call-1".into(),
+        name: "worker".into(),
+        arguments: json!({ "message": "do the piece" }),
+        ..Default::default()
+    }]);
+    mock.push_text("the piece is done").push_text("all done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), def, model, "m")
+        .models(
+            ModelProfiles::parse_json(
+                r#"{
+                    "profiles": {
+                        "m": { "reasoningEfforts": ["high"], "reasoningWire": "reasoning_effort" },
+                        "child": { "reasoningEfforts": ["none"], "reasoningWire": "reasoning_effort" }
+                    }
+                }"#,
+            )
+            .expect("the deployment's profiles parse"),
+        )
+        .reasoning_effort(ReasoningEffort::High)
+        .start()
+        .await
+        .expect("the root's level is the root's alone");
+    let done = say_to_the_end(&engine, "hi").await;
+    assert_eq!(done.state, RunState::Done);
+    let requests = mock.requests();
+    let child = requests
+        .iter()
+        .find(|request| request.model == "child")
+        .expect("the subagent's model call");
+    assert_eq!(
+        child.reasoning_effort, None,
+        "the builder's level never reaches the subagent"
+    );
+    let roots: Vec<_> = requests
+        .iter()
+        .filter(|request| request.model == "m")
+        .collect();
+    assert_eq!(roots.len(), 2, "the parent's two turns: {requests:?}");
+    assert!(
+        roots
+            .iter()
+            .all(|request| request.reasoning_effort == Some(ReasoningEffort::High)),
+        "the root's level on every root call: {roots:?}"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 }

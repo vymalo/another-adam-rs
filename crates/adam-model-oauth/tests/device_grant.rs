@@ -5,7 +5,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use adam_model::{AfterRejection, CredentialRequest, ModelCredentials, ModelError, Rejection};
+use adam_model::{
+    AfterRejection, CredentialRequest, ModelCredentials, ModelError, Park, Refusal, Rejection,
+};
 use adam_model_oauth::{DeviceGrant, DeviceGrantSettings, SignInCode, SignInPrompt};
 use secrecy::ExposeSecret;
 use serde_json::json;
@@ -31,6 +33,7 @@ fn call() -> CredentialRequest<'static> {
         method: "POST",
         url: "https://models.example.test/v1/chat/completions",
         attempt: 0,
+        run: None,
     }
 }
 
@@ -114,6 +117,24 @@ fn grant(server: &MockServer, prompt: Arc<Shown>, renew_before: Duration) -> Dev
     settings.renew_before = renew_before;
     settings.sign_in_wait = Duration::from_secs(20);
     DeviceGrant::new(settings, prompt).unwrap()
+}
+
+/// A person's own sign-in never parks a run (ADR 0067 decision 3): a refusal fails as before.
+#[tokio::test]
+async fn the_device_grant_never_parks() {
+    let grant = grant(
+        &server().await,
+        Arc::new(Shown::default()),
+        Duration::from_secs(60),
+    );
+    for refusal in [
+        Refusal::new(401),
+        Refusal::new(403).with_slug("run_not_bound"),
+        Refusal::new(402).with_slug("over_limit"),
+        Refusal::new(429).with_slug("rate_limited"),
+    ] {
+        assert_eq!(grant.parks(&refusal), Park::No, "{refusal:?}");
+    }
 }
 
 async fn requests_to(server: &MockServer, p: &str) -> usize {

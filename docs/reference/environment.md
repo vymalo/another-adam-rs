@@ -12,13 +12,31 @@ The roles that run workers (`all`, `worker`) read everything below except where 
 A `control-plane` reads only `ROLE`, `DATABASE_URL`, `ADAM_PG_POOL_SIZE`, `NOTIFY_LOCAL_ONLY`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR`,
 `ADAM_AGENT_DIR`, the `SESSION_*` limits and the optional `A2A_PUSH_*`, `A2A_CARD_SIGNING_*` and `A2A_DOCS`, and a chart may set the rest for every role.
 
+### The store `DATABASE_URL` selects
+
+`adam-service` chooses the adapter from the scheme ([ADR 0053](../decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md),
+decision 3). Every adapter is built into the binaries; a library build can take only the one it
+needs (`store-postgres`, `store-sqlite`, `store-mongodb` features of `adam-service`).
+
+| `DATABASE_URL` | Store | Signals across processes | Roles |
+|---|---|---|---|
+| `postgres://…`, `postgresql://…` | `adam-store-postgres` | `LISTEN`/`NOTIFY` (`adam-notify-postgres`) | `all`, `control-plane`, `worker` |
+| `mongodb://…`, `mongodb+srv://…` | `adam-store-mongodb`; the path is the database (`adam` when it names none) | none: workers poll | `all`, `control-plane`, `worker` |
+| `sqlite://<path>` | `adam-store-sqlite`; one file, one process, WAL | in-process (`LocalNotifier`) | **`all` only** |
+| anything else | — | — | exit 78, naming the scheme |
+
+`sqlite:///var/lib/adam/adam.sqlite` is an absolute path; `sqlite://adam.sqlite` and
+`sqlite://./adam.sqlite` are relative to the process's working directory; `sqlite://` with no path
+is exit 78. The file's `<path>.lock` refuses a second process, and a file stamped with a schema
+version newer than the binary's is refused ([store adapters](store-adapters.md#sqlite)).
+
 ## Both binaries (`adam-service`)
 
 | Variable | Meaning | Default |
 |---|---|---|
 | `ROLE` | `all`, `control-plane` or `worker` | `all` |
-| `DATABASE_URL` | Postgres for the run store | required |
-| `ADAM_PG_POOL_SIZE` | connections in the Postgres store's pool, **per process** (2 to 65535; one is refused because an `adam-notify-postgres` listener holds a connection for the process's lifetime, so a one-connection pool would leave none for a query; **two is the floor, not a size to run** — the default 16 is the intended size). Read by `adam-store-postgres` when it connects, not by `adam-service`'s own configuration: a value that is not an integer in range fails that connect at startup | `16` |
+| `DATABASE_URL` | the run store: `postgres://` or `postgresql://` (PostgreSQL), `mongodb://` or `mongodb+srv://` (MongoDB; its path is the database, `adam` when absent), or `sqlite://<path>` (one SQLite file, one process). Any other scheme is exit 78, and so is `sqlite://` with `ROLE=worker` or `ROLE=control-plane` ([the store each scheme selects](#the-store-database_url-selects)) | required |
+| `ADAM_PG_POOL_SIZE` | **Postgres only**: connections in the Postgres store's pool, **per process** (2 to 65535; one is refused because an `adam-notify-postgres` listener holds a connection for the process's lifetime, so a one-connection pool would leave none for a query; **two is the floor, not a size to run** — the default 16 is the intended size). Read by `adam-store-postgres` when it connects, not by `adam-service`'s own configuration: a value that is not an integer in range fails that connect at startup | `16` |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens; **none = no server** | required by `all`, `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (goes in the agent card) | required by `all`, `control-plane` |
 | `LISTEN_ADDR` | the A2A server, or a worker's `/healthz` | `0.0.0.0:8080` |
@@ -29,15 +47,18 @@ A `control-plane` reads only `ROLE`, `DATABASE_URL`, `ADAM_PG_POOL_SIZE`, `NOTIF
 | `SESSION_MAX_ROUNDS` | the most rounds one session may have, a close included, 2 to 200; `limits.max_session_rounds` may lower it | `20` |
 | `SESSION_IDLE_DAYS` | days a kept-open session may sit idle (its latest round ended, nobody wrote to it) before it **reads closed**: it takes no message and frees its place under `SESSION_MAX_OPEN`; a round that works never expires. 1 to 365. Set it the same on every process that serves one database, and purge finished runs only after longer than this | `7` |
 | `WORKER_ID` | lease identity: 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; required by `affinity`, `isolated` |
-| `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and key | required by `all`, `worker` (key may be empty; not with `MODEL_AUTH=device`) |
-| `MODEL_AUTH` | `key` (send `MODEL_API_KEY`) or `device`: sign in to an OAuth 2.0 issuer with the device grant and renew the token ([ADR 0058](../decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md), [`adam-model-oauth`](../../crates/adam-model-oauth/README.md)). The code and the link are a `WARN` log line at startup (`sign in to use the model: open … and enter the code …`); a model call waits for the sign-in at most 120 s, then is retried. A denied or expired code, or a refused renewal, makes every call fail until a restart. With `device`, a non-empty `MODEL_API_KEY` is exit 78; anything but `key` or `device` is exit 78 | `key` |
+| `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and key | required by `all`, `worker` (key may be empty; not with `MODEL_AUTH=device` or `injector`) |
+| `MODEL_AUTH` | `key` (send `MODEL_API_KEY`) or `device`: sign in to an OAuth 2.0 issuer with the device grant and renew the token ([ADR 0058](../decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md), [`adam-model-oauth`](../../crates/adam-model-oauth/README.md)). The code and the link are a `WARN` log line at startup (`sign in to use the model: open … and enter the code …`); a model call waits for the sign-in at most 120 s, then is retried. A denied or expired code, or a refused renewal, makes every call fail until a restart. With `device`, a non-empty `MODEL_API_KEY` is exit 78. `injector` ([ADR 0067](../decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)): no key at all; every model call carries `X-Run-Id: <root run id>` and no `Authorization`, for an injector in front of the model that adds the run's credential; a subagent's calls name the root of its task, and a session's round the task that sent it (the opener for round one); a non-empty `MODEL_API_KEY`, or any `MODEL_OAUTH_*`, beside it is exit 78. Anything but `key`, `device` or `injector` is exit 78 | `key` |
+| `MODEL_CA_FILE` | a PEM file of certificates trusted for the model endpoint, beside the default roots (not for the device grant's issuer; ADR 0067); a file that cannot be read, is not PEM or holds no certificate is exit 78 | unset: the default roots |
+| `MODEL_PARK_LIMIT` | how long a run may wait on the model on a timer, from the first park in a row, before it fails with the last reason ([ADR 0067](../decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)): a model call the gateway refused under a provider that parks (`MODEL_AUTH=injector`) does not fail the run, which waits 30 s, then twice as long at each park in a row up to 15 min, and makes the same call again; behind the injector a gateway that cannot be reached parks too, once the retries are spent. A park until woken (a usage limit reached) is not counted: it never fails on its own, and pauses the run's deadline. Whole seconds, or a number with `s`, `m`, `h` or `d` (`24h`), from 60 s to 30 d; anything else is exit 78. See [the A2A server](a2a-server.md#a-run-parked-on-the-model) | `24h` |
 | `MODEL_OAUTH_ISSUER` | with `device`: the issuer; its `/.well-known/openid-configuration` names the device and token endpoints, which must be on its origin. `https`, or `http` on a loopback address (else exit 78) | required with `device` |
 | `MODEL_OAUTH_CLIENT_ID`, `MODEL_OAUTH_SCOPE` | with `device`: the public client the issuer knows the process as, and the scope asked for | client required with `device`; scope `offline_access` |
 | `MODEL` | the agent's model alias | required by `all`, `worker` |
+| `MODEL_ALIASES_FILE` | the per-model profiles (ADR 0063, ADR 0064): **JSON only for now** (the workspace has no YAML parser), one object with `profiles` (by model id) and `presets` (by name). A profile declares the reasoning levels the model takes and how they are sent (`reasoningEfforts`, `reasoningWire`, `reasoningBudgets`, `reasoningEffort`), its output cap (`maxOutputTokens`, `maxOutputTokensLimit`), the members merged into its requests only (`extraBody`), and the preset it starts from (`preset`); `reasoningEfforts: []` says the model takes none. Read and validated at startup: a file that cannot be read, is not JSON, or breaks a rule (an unknown level or wire, a duplicate level, a budget that is not for `thinking_budget` or misses a level, an effort outside the model's levels, an unknown preset, a cap of 0 or above the limit, a reserved `extraBody` member) is exit 78, naming the file and the key. The assembly resolves each agent's default effort from its folder's `reasoning_effort`, its `model_preset`, the profile and the profile's preset, and refuses a level the model does not take; the output cap is resolved the same way — the folder's `limits.max_output_tokens`, the preset's, the profile's, the profile's base preset, then 128,000 — and clamped to `maxOutputTokensLimit` and to the window less 20,000 and the history the agent keeps (the reasoning wire and the extra body are the following slices). A process whose `MODEL_ALIASES_FILE` declares no `maxOutputTokensLimit` for `MODEL` (no profile, or one without the key) warns at startup, naming the 128,000 fallback and the window; with no profiles file the same fallback is logged at `info`. The chart mounts it from `config.modelProfiles` | unset: no model has a profile |
 | `MODEL_EXTRA_BODY` | JSON object merged into every chat request, e.g. `{"reasoning_effort":"medium"}`; **not a secret**; may not set `model`, `messages`, `tools`, `tool_choice`, `stream` | unset |
 | `MODEL_ECHO_REASONING` | `reasoning_content` or `reasoning`: send earlier reasoning back under that name (DeepSeek thinking mode with tools needs it) | unset |
 | `MODEL_PROMPT_CACHE_KEY` | `off` or `conversation`: with `conversation` every request carries `prompt_cache_key`, the first 32 hex digits of the SHA-256 of the conversation id (never the id; an unsalted hash, so whoever can guess an id can confirm it, and it goes only to the model provider), so a gateway with a prompt cache routes the requests of one conversation together. A `MODEL_EXTRA_BODY` member of the same name wins. Off by default: that a gateway accepts the member is *unverified*; anything else: exit 78 | `off` |
-| `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): the `contextWindow` of each `usage/v1` call report on that alias, so a screen shows how full the context is ([ADR 0032](../decisions/0032-usage-per-model-call.md)). **It also sets when the history is compacted**: at the window less 20,000 tokens less `max_output_tokens`, or at `limits.max_history_tokens` when that is smaller ([Compaction](../architecture.md#compaction-a-long-history-is-summarised-once)); a subagent whose `model:` names another alias has none (reports nothing, compacts at its own `max_history_tokens`); anything else is a startup problem (exit 78). The chart sets it from `config.modelContextWindow` | unset: reports carry no window |
+| `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): the `contextWindow` of each `usage/v1` call report on that alias, so a screen shows how full the context is ([ADR 0032](../decisions/0032-usage-per-model-call.md)). **It also sets when the history is compacted**: at the window less 20,000 tokens less `max_output_tokens`, or at `limits.max_history_tokens` when that is smaller ([Compaction](../architecture.md#compaction-a-long-history-is-summarised-once)); a subagent whose `model:` names another alias has none (reports nothing, compacts at its own `max_history_tokens`). **It also clamps the output cap**: no call asks for more than the window leaves after 20,000 tokens and the history the agent keeps (ADR 0064). Anything else is a startup problem (exit 78). The chart sets it from `config.modelContextWindow` | unset: reports carry no window |
 | `MODEL_INPUT_MODALITIES` | `text` or `text,image`: what the model `MODEL` names can read. With `image`, an image the person sends or a tool returns reaches the model as a `data:` URL part, within the four limits below; without it the model is given one line of text in the image's place. What is sent follows these settings **now**, so changing one changes the prompt once for a conversation that holds images. Never guessed from a model name; it is the model `MODEL` names only, so a subagent on another alias stays text only ([images](a2a-server.md#images-in)) | `text` |
 | `MODEL_IMAGE_MAX_BYTES` | the most bytes of one image sent (1 to 4194304) | `1048576` |
 | `MODEL_IMAGE_MAX_COUNT` | the most images one run's history holds (1 to 32): the ninth is a stand-in, the first eight stay. `MODEL_IMAGE_MAX_BYTES` times this may be at most 32 MiB, since a request resends every admitted image; over that is exit 78 naming both | `8` |
@@ -72,8 +93,9 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 
 `adam-coder`, in every role (`all`, `control-plane`, `worker`): the `notify` component. Both binaries'
 shared configuration parses the variable, so a bad value is exit 78 in either; `adam-agent` runs no
-`notify` component, so the value has no effect there. Source: `crates/adam-notify-postgres/src/lib.rs`,
-[the crate README](../../crates/adam-notify-postgres/README.md).
+`notify` component, so the value has no effect there. It also has no effect on a store without a
+cross-process listener: SQLite's notifier is always in-process, and MongoDB has none. Source:
+`crates/adam-notify-postgres/src/lib.rs`, [the crate README](../../crates/adam-notify-postgres/README.md).
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -97,7 +119,7 @@ shared configuration parses the variable, so a bad value is exit 78 in either; `
 | `GITHUB_APP_INSTALLATION_ID` | **pins** the App to one installation | this or `GITHUB_APP_OWNERS`, exactly one |
 | `GITHUB_APP_OWNERS` | no pin: the accounts the App may act for (comma or space list, or `*`); the installation of each owner is found with the JWT | as above |
 | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's PEM key, a file or inline; exactly one; parsed at startup | one required in App mode |
-| `ALLOW_COMMANDS_NEXT_TO_SECRETS` | roles that run workers: `true` accepts, `false` refuses at startup (**exit 78**), a GitHub App whose key is a **file** (`GITHUB_APP_PRIVATE_KEY_PATH`) while the commands of a run run in the coder's own container (`RUN_ENVIRONMENT=local`, `DEVCONTAINER_RUNTIME=off`): a command can read the key, mint installation tokens and act as the App at any access tier. Accepted, the coder still logs a warning. Not needed with `RUN_ENVIRONMENT=kubernetes`, `DEVCONTAINER_RUNTIME=podman`, an inline key or a token. `true`/`1`/`false`/`0`; anything else is exit 78. [Upgrade note](../guides/deploy-the-coder.md#upgrading-an-app-deployment) | `false` |
+| `ALLOW_COMMANDS_NEXT_TO_SECRETS` | roles that run workers: `true` accepts, `false` refuses at startup (**exit 78**), a GitHub App whose key is a **file** (`GITHUB_APP_PRIVATE_KEY_PATH`) while the commands of a run run in the coder's own container (`RUN_ENVIRONMENT=local`): a command can read the key, mint installation tokens and act as the App at any access tier. Accepted, the coder still logs a warning. Not needed with `RUN_ENVIRONMENT=kubernetes`, an inline key or a token. `true`/`1`/`false`/`0`; anything else is exit 78. [Upgrade note](../guides/deploy-the-coder.md#upgrading-an-app-deployment) | `false` |
 | `ALLOWED_REPO_HOSTS` | hosts repositories may live on (`name` or `name:port`); the token is scoped to them; the first is what `owner/name` means | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (Enterprise: `https://<host>/api/v3`) | `https://api.github.com` |
 | `GITHUB_MCP_URL` | origin of the GitHub MCP server (the sidecar); no credentials | `http://127.0.0.1:8082` |
@@ -105,7 +127,7 @@ shared configuration parses the variable, so a bad value is exit 78 in either; `
 | `MAX_ACCESS_TIER` | the highest access tier a person may pick for a message: `plan`, `edits`, `auto` or `bypass`. The card lists the tiers up to it, a higher one is refused, the tools check it again. `bypass` (rename and delete repositories, no consent form) is opt-in. Read by every role; a word that is not a tier is exit 78 | `auto` |
 | `ALLOW_LOCAL_REPOS` | accept local paths, `file://`, plain `http://`; development and tests only | `false` |
 | `WORKSPACE_ROOT` | mirrors, run workspaces, run notes | `/work` |
-| `GIT_SANDBOX_SOCKET` | the Unix socket of an `adam-git-sandbox` server (an absolute path; a relative one is exit 78). When it is set, the `git` commands that carry **no credential** (`status`, `add`, `diff`, `commit` and its plumbing, `worktree`, `config`, the `apply` of a patch, ...) run **there**, where no secret is readable, instead of in the coder's container; `fetch`, `push` and `ls-remote` stay in the coder, on the bare mirror, after its configuration has been put back to what the workspace writes (a key it did not write is removed). The sandbox's container must mount `WORKSPACE_ROOT` at the same path. A sandbox that cannot be reached makes those commands fail (retried as a transient failure): **they are never run in the coder's container instead**. The chart sets it, to the socket of its `git-sandbox` container, whenever `runPods.enabled` is on ([the chart's section](../../deploy/coder/README.md#the-git-sandbox)). Unset (the default, local mode, Podman, run pods off): git runs in the coder's container, which is **not** protected from the repositories a run controls ([the git sandbox](../../crates/adam-git-sandbox/README.md)) | unset |
+| `GIT_SANDBOX_SOCKET` | the Unix socket of an `adam-git-sandbox` server (an absolute path; a relative one is exit 78). When it is set, the `git` commands that carry **no credential** (`status`, `add`, `diff`, `commit` and its plumbing, `worktree`, `config`, the `apply` of a patch, ...) run **there**, where no secret is readable, instead of in the coder's container; `fetch`, `push` and `ls-remote` stay in the coder, on the bare mirror, after its configuration has been put back to what the workspace writes (a key it did not write is removed). The sandbox's container must mount `WORKSPACE_ROOT` at the same path. A sandbox that cannot be reached makes those commands fail (retried as a transient failure): **they are never run in the coder's container instead**. The chart sets it, to the socket of its `git-sandbox` container, whenever `runPods.enabled` is on ([the chart's section](../../deploy/coder/README.md#the-git-sandbox)). Unset (the default, local mode, run pods off): git runs in the coder's container, which is **not** protected from the repositories a run controls ([the git sandbox](../../crates/adam-git-sandbox/README.md)) | unset |
 | `WORKSPACE_PLACEMENT` | `shared`, `affinity` or `isolated` ([placement](workspace-and-environments.md#placement-which-worker-holds-a-runs-files)) | `shared` |
 | `WORKSPACE_SWEEP_SECS` | how often the janitor removes finished runs' workspaces; `0` is off | `300` |
 | `SCRATCH_IDLE_DAYS` | days a scratch project is kept after the last task of its conversation; `0`: it goes with its run ([thread-long scratch](workspace-and-environments.md#a-runs-workspace)) | `7` |
@@ -125,7 +147,7 @@ shared configuration parses the variable, so a bad value is exit 78 in either; `
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `RUN_ENVIRONMENT` | `local` or `kubernetes` (a pod for each run; refused with `DEVCONTAINER_RUNTIME=podman`). With a GitHub App key file, `local` and `DEVCONTAINER_RUNTIME=off` need `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` (above) | `local` |
+| `RUN_ENVIRONMENT` | `local` (this container: on a desktop, the person's own work sandbox) or `kubernetes` (a pod for each run). With a GitHub App key file, `local` needs `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` (above) | `local` |
 | `RUN_POD_TEMPLATE_FILE` | with `kubernetes`: the Pod every run pod is made from (the chart's ConfigMap). Its run container's `resources.requests` are also the shape a command's time is weighted by in the task's `sandbox` usage ([ADR 0043](../decisions/0043-sandbox-time-as-usage.md)); a request that is not a Kubernetes quantity stops the start | required |
 | `RUN_POD_NAMESPACE` | the namespace of run pods | the ServiceAccount's namespace |
 | `RUN_POD_INSTANCE` | the release's `app.kubernetes.io/instance`, which finds this deployment's pods | required |
@@ -135,27 +157,28 @@ shared configuration parses the variable, so a bad value is exit 78 in either; `
 | `RUN_POD_IDLE_SECS` | idle time before a pod is deleted; `0` keeps it until the run ends | `900` |
 | `RUN_POD_WAIT_SECS` | how long a run retries for a pod the cluster cannot give now | `600` (chart: `1020`) |
 | `RUN_POD_REPOSITORY_IMAGES` | with `kubernetes`: the image prefixes a repository's `devcontainer.json` may name for its run pod (`use_repository_environment`, [ADR 0052](../decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)), separated by commas or spaces. Each ends with `/` (a registry path such as `ghcr.io/acme/`) or `:` (a tag such as `ghcr.io/acme/tool:`), so that a bare host cannot admit a look-alike; no `*` and no `${...}`. Empty: the tool is never offered and the run pods use the template's image | empty (chart: `runPods.repositoryImages.allowedPrefixes`) |
-| `DEVCONTAINER_RUNTIME` | `off` or `podman` (the repository's devcontainer on a rootless Podman service) | `off` |
-| `CONTAINER_HOST` | Podman's own variable, e.g. `unix:///run/podman/podman.sock`; required with `podman` | unset |
-| `DEVCONTAINER_DEFAULT_IMAGE` | image for a repository with no `devcontainer.json`; **by digest only** | the `workspace` image the coder is built on |
-| `DEVCONTAINER_NETWORK` | `inherit` or `none` | `inherit` |
-| `DEVCONTAINER_DEPLOYMENT_ID` | label the orphan sweep finds this deployment's containers by | `WORKER_ID`, else `adam-coder` |
-| `DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS` | pulling, building and creating; lifecycle commands | `1200`, `900` |
-| `DEVCONTAINER_PREPULL` | pull the default image at startup | `true` |
-| `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client | `devcontainer`, `podman-remote` |
 
 ### Removed, ignored with a warning
 
-The coder no longer uses OpenCode ([ADR 0038](../decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)). These
-variables are **not read and not refused**: a deployment rendered from an older chart still sets one, and nothing is less
-safe without it. For each one that is set, the process logs one warning that names the variable (never its
-value), in every role, once the configuration is valid: a start that fails validation (exit 78) does not warn.
+The coder no longer uses OpenCode ([ADR 0038](../decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)),
+nor a repository's devcontainer on a container engine ([ADR 0052](../decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md),
+a hard cutover). These variables are **not read and not refused**: a deployment rendered from an older chart still sets
+one, and nothing is less safe without it. For each one that is set, the process logs one warning that names the variable
+(never its value), in every role, once the configuration is valid: a start that fails validation (exit 78) does not warn.
 
 | Variable | Was |
 |---|---|
 | `OPENCODE_MODEL` | model alias OpenCode used through the same gateway (default `MODEL`) |
 | `OPENCODE_COMMAND` | the ACP program and arguments (default `opencode acp`) |
-| `OPENCODE_BINARY` | with `podman`: the native OpenCode executable mounted into containers (`podman` now needs only `CONTAINER_HOST`) |
+| `OPENCODE_BINARY` | the native OpenCode executable mounted into containers |
+| `DEVCONTAINER_RUNTIME` | `off` or `podman`: where a run's commands ran. **The one exception**: the value `podman` is exit 78, with a message naming ADR 0052, because that deployment asked for the removed path. Every other value is ignored with a warning |
+| `CONTAINER_HOST` | the address of the container engine's service |
+| `DEVCONTAINER_DEFAULT_IMAGE` | the image of a repository with no `devcontainer.json` |
+| `DEVCONTAINER_NETWORK` | `inherit` or `none` |
+| `DEVCONTAINER_DEPLOYMENT_ID` | the label the orphan sweep found this deployment's containers by |
+| `DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS` | pulling, building and creating; lifecycle commands |
+| `DEVCONTAINER_PREPULL` | pull the default image at startup |
+| `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN`, `DEVCONTAINER_CACHE_DIR` | the devcontainer CLI, the container engine's client, its cache |
 
 ## Egress proxy (`adam-egress`)
 
@@ -213,14 +236,14 @@ Put these in a `.env` next to `compose.yaml`.
 | `ADAM_TEST_TABLE_PREFIX`, `ADAM_TEST_MONGO_COLLECTION_PREFIX` | the Postgres table prefix (`adam_test_`) and the MongoDB collection prefix (`adam_`) the store suite and the transcript measurement write to; set the same value on `dev/p2-measure.sh` |
 | `ADAM_TEST_REQUIRE_DB=1` | a suite whose variable is unset **fails** instead of skipping (CI sets it) |
 | `ADAM_TEST_MOCK_OPENAI_URL`, `ADAM_TEST_MOCK_GITHUB_URL`, `ADAM_TEST_MOCK_GITHUB_MCP_URL` | the tests of the real clients against the compose mocks |
-| `ADAM_TEST_DEVCONTAINER=1`, `ADAM_TEST_REQUIRE_DEVCONTAINER=1` | the devcontainer suite; the second fails instead of skipping |
 | `ADAM_TEST_KUBECONFIG`, `ADAM_TEST_REQUIRE_KUBERNETES=1` | the cluster test of `adam-env-kubernetes` (more `ADAM_TEST_KUBE_*`, among them `ADAM_TEST_KUBE_ISOLATION_MIRROR` and `_ADMIN` for the isolation scenario, in `crates/adam-env-kubernetes/tests/cluster.rs`) |
 | `ADAM_TEST_LANGUAGE_SERVERS=1`, `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` | the suite of the real language servers (`bin/adam-coder/tests/real_language_servers.rs`); a language whose server is not on `PATH` is skipped, and the second fails instead of skipping (and turns the suite on). The `image` job of `.github/workflows/coder.yml` runs it in the built image with the second |
-| `ADAM_TEST_STDIO_SILENCE_SECS` | seconds of silence with stdin open in the framed-stdio tests (local, devcontainer, run pod); default 20 |
+| `ADAM_TEST_STDIO_SILENCE_SECS` | seconds of silence with stdin open in the framed-stdio tests (local, run pod); default 20 |
 | `ADAM_TEST_REQUIRE_MOUNTS=1` | `deploy/coder/tests/git-in-run-pod.sh` (git under a run pod's mounts) fails instead of skipping when it cannot make a mount namespace (CI sets it) |
 | `ADAM_TEST_OPENAI_BASE_URL`, `ADAM_TEST_OPENAI_API_KEY`, `ADAM_TEST_OPENAI_MODEL` | a live model for `adam-model-openai/tests/live.rs` |
 | `ADAM_TEST_OPENCODE=1` | the live OpenCode test of `adam-acp` (a library no binary uses now) |
 | `ADAM_ENGINE_TEST_RESUME_CHILD` | set by `crates/adam-engine/tests/resume_process.rs` on the child process it starts (the store's directory); never set it yourself |
+| `ADAM_ENGINE_TEST_RESUME_FIXED_ID` | set by the same test on the child it starts when both halves use the fixed worker id; never set it yourself |
 | `ADAM_TRYBUILD=1` | the rustc-worded half of the `#[tool]` compile tests |
 | `ADAM_UPDATE_GOLDEN=1` | regenerate the codegen golden of `adam-agent-fs` |
 

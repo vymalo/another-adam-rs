@@ -429,6 +429,15 @@ fn cases() -> Vec<Case> {
             "`limits.max_parallel` is from 1 to 32",
         ),
         (
+            "max_output_tokens of 0",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_output_tokens: 0 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_output_tokens` is at least 1",
+        ),
+        (
             "max_open_sessions of 0",
             vec![(
                 "agent/instructions.md",
@@ -1457,6 +1466,26 @@ fn a_skill_with_an_error_is_left_out_and_its_siblings_stay() {
     assert_eq!(skills, ["good"]);
     assert!(!report.is_ok());
     assert!(report.into_package(Strictness::Lenient).is_err());
+}
+
+#[test]
+fn the_reasoning_keys_are_read_and_the_effort_key_stays_ignored() {
+    let dir = write(&[(
+        "agent/instructions.md",
+        "---\nname: root\nreasoning_effort: high\nmodel_preset: quick\neffort: high\n---\nHi.\n",
+    )]);
+    let report = load(dir.path());
+    assert!(report.is_ok(), "{:?}", report.diagnostics);
+    // `effort` is Claude Code's spelling: the softer "ignored by adam" warning, not "unknown".
+    let warnings: Vec<String> = report.warnings().map(ToString::to_string).collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("`effort` is a Claude Code or Copilot key that adam ignores"),
+        "{warnings:?}"
+    );
+    let front = &report.package.agents[0].frontmatter;
+    assert_eq!(front.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(front.model_preset.as_deref(), Some("quick"));
 }
 
 #[test]

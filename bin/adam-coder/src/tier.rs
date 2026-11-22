@@ -110,7 +110,6 @@ pub fn known(tool: &str) -> Option<AccessTier> {
         | "stop_command"
         | "list_commands"
         | "share_file"
-        | "rebuild_environment"
         | "use_repository_environment"
         | "ask_user"
         | "show"

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use adam_error::{Classify, ErrorClass};
 use adam_llm_agent::BuildError;
+use adam_model::NotAnEffort;
 
 use crate::template::TemplateProblem;
 
@@ -99,6 +100,42 @@ impl fmt::Display for SkillField {
             Self::Skills => "skills",
             Self::PreloadSkills => "preload_skills",
         })
+    }
+}
+
+/// Where an agent's resolved reasoning effort was set, in [`Error::ReasoningEffort`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffortSource {
+    /// The agent's own `reasoning_effort` in its frontmatter.
+    Folder,
+    /// A preset its `model_preset` names.
+    Preset(String),
+    /// The model profile: its own `reasoningEffort` or its base preset's.
+    Profile,
+}
+
+impl fmt::Display for EffortSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Folder => f.write_str("`reasoning_effort`"),
+            Self::Preset(name) => write!(f, "the preset `{name}`"),
+            Self::Profile => f.write_str("the model profile"),
+        }
+    }
+}
+
+/// Where an agent's output cap was set, in [`Error::OutputCap`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapSource {
+    /// A preset: the agent's `model_preset`, or the base preset its model's profile names.
+    Preset(String),
+}
+
+impl fmt::Display for CapSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preset(name) => write!(f, "the preset `{name}`"),
+        }
     }
 }
 
@@ -348,6 +385,73 @@ pub enum Error {
         alias: String,
         /// Why it was refused.
         problem: AliasProblem,
+    },
+    /// The agent's `reasoning_effort` is not one of the seven levels (ADR 0063).
+    #[error("{origin}: `reasoning_effort`: {source}")]
+    InvalidReasoningEffort {
+        /// The agent and file that set it.
+        origin: Origin,
+        /// What is wrong, naming the word and the seven levels.
+        #[source]
+        source: NotAnEffort,
+    },
+    /// The agent's `model_preset` names a preset the deployment's model profiles do not declare
+    /// (ADR 0064).
+    #[error(
+        "{origin}: `model_preset` names `{preset}`, which the model profiles do not declare{}; declared: {}",
+        hint(.suggestion.as_deref()),
+        list(.known)
+    )]
+    UnknownModelPreset {
+        /// The agent and file that name it.
+        origin: Origin,
+        /// The preset as written.
+        preset: String,
+        /// The closest declared preset, when one is close.
+        suggestion: Option<String>,
+        /// Every declared preset, sorted.
+        known: Vec<String>,
+    },
+    /// A reasoning effort the agent resolves to is not one of the levels of its model's profile
+    /// (ADR 0063, decision 4): its own `reasoning_effort`, a preset its `model_preset` names, or
+    /// the model profile's (its own value or its base preset's).
+    #[error(
+        "{origin}: {set_by} sets reasoning effort `{effort}`, which model `{model}` does not take{}; \
+         it takes: {}",
+        hint(.suggestion.as_deref()),
+        list(.allowed)
+    )]
+    ReasoningEffort {
+        /// The agent and file whose calls would send it.
+        origin: Origin,
+        /// The level as resolved, by its wire word.
+        effort: String,
+        /// Where it was set.
+        set_by: EffortSource,
+        /// The model alias whose profile bounds it.
+        model: String,
+        /// The closest level the model takes, when one is close.
+        suggestion: Option<String>,
+        /// The levels the model takes, lowest first; empty when it takes none.
+        allowed: Vec<String>,
+    },
+    /// A preset's output cap is above the maximum the model documents for one request (ADR 0064,
+    /// decision 2): a preset is the deployment's promise, so it is refused rather than clamped.
+    #[error(
+        "{origin}: {set_by} asks {cap} output tokens, above the {limit} that model `{model}` \
+         allows: lower the preset's `maxOutputTokens`, or the model's `maxOutputTokensLimit`"
+    )]
+    OutputCap {
+        /// The agent and file whose calls would send it.
+        origin: Origin,
+        /// Where it was set.
+        set_by: CapSource,
+        /// The value the preset asked for.
+        cap: u32,
+        /// The model's documented maximum for one request.
+        limit: u32,
+        /// The model alias whose profile bounds it.
+        model: String,
     },
     /// [`LlmAgent`](adam_llm_agent::LlmAgent) refused to be built: a tool needs state the
     /// composition root did not give ([`BoundDef::state`](crate::BoundDef::state)).
@@ -793,6 +897,31 @@ mod tests {
                     suggestion: Some("bigger".into()),
                     allowed: vec!["bigger".into()],
                 },
+            },
+            Error::UnknownModelPreset {
+                origin: o.clone(),
+                preset: "quik".into(),
+                suggestion: Some("quick".into()),
+                known: vec!["quick".into()],
+            },
+            Error::InvalidReasoningEffort {
+                origin: o.clone(),
+                source: NotAnEffort("ultra".into()),
+            },
+            Error::ReasoningEffort {
+                origin: o.clone(),
+                effort: "max".into(),
+                set_by: EffortSource::Preset("quick".into()),
+                model: "large".into(),
+                suggestion: Some("high".into()),
+                allowed: vec!["low".into(), "high".into()],
+            },
+            Error::OutputCap {
+                origin: o.clone(),
+                set_by: CapSource::Preset("quick".into()),
+                cap: 200_000,
+                limit: 131_072,
+                model: "large".into(),
             },
             Error::UnknownSkill {
                 origin: o.clone(),

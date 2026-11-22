@@ -83,8 +83,7 @@ where no secret is readable and `adam-git` the relay that stands in for git, [`c
 smoke-tested in the image and run by the chart, with run pods, as a container of the coder's pod that mounts the same work volume and holds no secret;
 a deployment without run pods that sets `GIT_SANDBOX_SOCKET` runs the server itself); it takes the official `github-mcp-server` binary (pinned by tag and digest); and the runtime is the
 `workspace` image of `vymalo/another-agentic-images` (Rust, Flutter/Dart, Node, git, tini, the obscura
-headless browser), pinned by an immutable tag, with those binaries, the devcontainer CLI and Podman's remote client
-added. It runs as uid 10001, listens on `0.0.0.0:8080`, keeps its files in `/work`, and its entrypoint is
+headless browser), pinned by an immutable tag, with those binaries added. It runs as uid 10001, listens on `0.0.0.0:8080`, keeps its files in `/work`, and its entrypoint is
 `tini -- adam-coder` (`tini` forwards SIGTERM and reaps children). Tags are `sha-<7>` of the commit. The binaries are smoke-tested in CI
 (`docker/coder/test/`). Static linking brings no certificates: the binaries that speak HTTPS (`adam-coder`,
 `adam-agent`, `adam-kube-exec`) still read the system's CA bundle for HTTPS (the `workspace` base has one), so
@@ -157,7 +156,8 @@ The values you will actually set:
 | `a2a.push.allowedUrls`, `a2a.cardSigning.secretName` | optional A2A push notifications (the webhooks they may reach) and a signed agent card (a Secret with the key), both off by default ([the chart](../../deploy/coder/README.md#push-notifications-and-the-cards-signature-a2a)) |
 | `config.modelExtraBody`, `config.modelEchoReasoning` | to make a model emit its reasoning |
 | `config.maxParallelToolCalls` | how many tool calls of one model turn run at the same time, 1 to 32 (`MAX_PARALLEL_TOOL_CALLS`; unset: 10) |
-| `config.modelContextWindow` | the model's context window in tokens (`MODEL_CONTEXT_WINDOW`), so a screen shows how full the context is |
+| `config.modelContextWindow` | the model's context window in tokens (`MODEL_CONTEXT_WINDOW`), so a screen shows how full the context is, and the output cap's window: each call asks no more than the window less 20,000 and the history the agent keeps (ADR 0064; [the chart](../../deploy/coder/README.md#the-models-context-window)) |
+| `config.modelProfiles` | the per-model profiles (ADR 0063, ADR 0064): per model id, the reasoning levels it takes and how they are sent, its output cap, its extra body and its preset, as one JSON file (`MODEL_ALIASES_FILE`). Empty by default; a bad file stops the coder at startup (exit 78). [The chart](../../deploy/coder/README.md#model-profiles) |
 | pictures for the model | no chart key: `config.extraEnv` carries `MODEL_INPUT_MODALITIES=text,image` and the `MODEL_IMAGE_*` limits ([environment](../reference/environment.md)); off by default, and the chart renders what it always did. The coder keeps the pictures on its volume per conversation ([the coder](../reference/coder-agent.md#images)) |
 | `runPods.enabled` | [below](#run-pods). Production runs the commands of a run in run pods; [an example of the values](../../deploy/coder/examples/production.values.yaml) |
 | `runPods.allowCommandsNextToSecrets` | `false` (default). `true` accepts that, with an App and no run pods, a command can read the App's key file; only for an upgrade you cannot finish yet: [upgrading](#upgrading-an-app-deployment) |
@@ -255,8 +255,8 @@ There is nothing to configure but its memory (`runPods.gitSandbox.resources`, 1G
 sandbox still reads and writes the whole work volume) and how it is checked: [chart README, "The git sandbox"](../../deploy/coder/README.md#the-git-sandbox).
 
 Details and what is unverified on the owner's cluster:
-[chart README, "Run pods"](../../deploy/coder/README.md#run-pods). The repository's devcontainer is **not** used
-on Kubernetes ([why](../../deploy/coder/README.md#devcontainers-are-off-here)).
+[chart README, "Run pods"](../../deploy/coder/README.md#run-pods). A repository's own environment is an image its run
+pod runs, never a build ([ADR 0052](../decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)).
 
 ## Upgrading an App deployment
 
@@ -302,6 +302,15 @@ Things to know:
 * A key given **inline** (`GITHUB_APP_PRIVATE_KEY`) is not a file and is not refused. The chart never uses it.
 * To see whether a release is affected, run `helm template` with its values: it fails if it is. A pod that is already failing
   says `refusing to start with the GitHub App's private key in a file` in its log.
+
+## Upgrading from the devcontainer variables
+
+[ADR 0052](../decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md) removed the
+repository's devcontainer on a container service, with no switch. A deployment that still sets
+`DEVCONTAINER_RUNTIME=podman` in `config.extraEnv` **stops the coder** (exit 78, naming the variable and the decision):
+remove it and `CONTAINER_HOST` before moving `image.tag`. Every other removed variable (`DEVCONTAINER_*`) is ignored,
+with one warning at startup that names it. A repository that needs its own tools names an image its run pod runs
+(`runPods.repositoryImages.allowedPrefixes` and `use_repository_environment`, [Run pods](#run-pods)).
 
 ## A package cache shared by pods
 

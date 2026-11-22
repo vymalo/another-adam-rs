@@ -24,6 +24,7 @@ decision 11), so they start in any x86-64 Linux image whatever its C library. Th
 | `PersistentVolumeClaim` | `cache.create` only: `<release>-coder-cache`, ReadWriteMany, deleted with the release, see [The package cache](#the-package-cache) |
 | `ConfigMap`, `ServiceAccount`, `Role`, `RoleBinding`, `PriorityClass`, `ResourceQuota`, `ValidatingAdmissionPolicy` and its binding, a second `NetworkPolicy`, the egress proxy (a `Deployment`, a `Service`, a `PodDisruptionBudget`, a `ServiceAccount`, a `ConfigMap` and a third `NetworkPolicy`), and, in the coder pod, the `git-sandbox` container | `runPods.enabled` only, on the roles that run workers: a pod of its own for each active run, see [Run pods](#run-pods) |
 | `ConfigMap` | `mcp.websearch.url` set or `mcp.context7.enabled` only: `<release>-coder-mcp`, one file of extra MCP servers in the shape of `mcp.json`, mounted in the pods that run workers and named by `ADAM_EXTRA_MCP_FILE`, see [Extra MCP servers](#extra-mcp-servers-web-search-and-context7) |
+| `ConfigMap` | `config.modelProfiles` non-empty only: `<release>-coder-model-profiles`, the per-model profiles file (`model-profiles.json`, JSON only for now) mounted in the pods that run workers at `/etc/adam/model-profiles.json` and named by `MODEL_ALIASES_FILE`, see [Model profiles](#model-profiles) |
 
 ```sh
 helm lint deploy/coder
@@ -38,25 +39,16 @@ main (`deploy/coder/bump-tag.sh`, also run as a dry run on pull requests). The i
 `ADAM_BUILD_REVISION`, so the agent card's `version` ends in `+<sha7>` and `build/v1` says the commit and the digest of the
 agent's files ([ADR 0028](../../docs/decisions/0028-the-card-says-which-build-answers.md)): the tag and the card agree.
 
-## Devcontainers are off here
+## Where a run's commands run
 
-The coder image carries the devcontainer CLI and Podman's client, and the coder can run a repository's commands and checks in
-that repository's `devcontainer.json` on a rootless Podman service (`DEVCONTAINER_RUNTIME=podman`, [ADR 0010](../../docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)).
-**The chart does not turn it on, and sets none of the `DEVCONTAINER_*` variables**: the default, `off`, keeps every command in the coder's own
-pod, as before. Why a pod cannot have it yet:
-
-* The Podman service must see the coder's `/work` volume **at the same path** (a bind source is resolved by the service), so it is a
-  container of the same pod (a sidecar sharing the volume) or of a pod on the same node and claim.
-* A rootless Podman inside a container needs a seccomp profile that allows `unshare`, `clone` and `mount`, and `systempaths=unconfined`
-  (`dev/podman/README.md`). In Kubernetes that is a custom or `Unconfined` seccomp profile and an unmasked `/proc`, which the Pod Security
-  Standards' `baseline` level does not allow a workload (*unverified*: from memory of the standards, and this cluster's admission policy was
-  not looked at), so it needs the cluster's agreement.
-* The service is the trust boundary and sees every run's files: a deployment that has it should have the platform's sandbox
-  provider (`another-agentic-platform`) make one environment per run, not one shared service.
-
-Until then a repository's devcontainer is not used on Kubernetes (the chart's own answer is [a pod for each run](#run-pods), which uses the
-deployment's image and not the repository's file): a run whose first repository has one says so in a step ("This repository has
-a devcontainer, but this deployment runs without a container runtime"), and a tool that only the devcontainer has is reported as missing.
+The chart's default keeps every command in the coder's own pod (`RUN_ENVIRONMENT=local`). With
+[run pods](#run-pods) on, each run's commands run in a pod of its own. A repository that brings its own
+environment is an **image**, not a build: `use_repository_environment` runs the run's commands in the
+image its `devcontainer.json` names, once the deployment allows the image's registry
+(`runPods.repositoryImages.allowedPrefixes`, empty by default). [ADR 0052](../../docs/decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)
+removed the container engine this chart never turned on; a deployment that still sets
+`DEVCONTAINER_RUNTIME` has it ignored with a warning, and `DEVCONTAINER_RUNTIME=podman` stops the coder
+(exit 78).
 
 ## Secrets
 
@@ -163,6 +155,46 @@ Each model call's `usage/v1` report can say the model's window, so a screen show
 |---|---|---|
 | `config.maxParallelToolCalls` | `MAX_PARALLEL_TOOL_CALLS` | The most tool calls of one model turn that run at the same time: a whole number from 1 to 32 (`1` is one at a time). `null` (default) renders nothing and the binary runs 10, **so the render of a deployment that does not set it is unchanged**. An agent file's `limits.max_parallel` may lower it for that agent. The chart refuses a value outside 1 to 32 and one given beside `config.extraEnv.MAX_PARALLEL_TOOL_CALLS`; a control plane renders none |
 | `config.modelContextWindow` | `MODEL_CONTEXT_WINDOW` | The window of `config.model`, in tokens: a whole number from 1 to 9007199254740991, as a number or a string of digits (written in full, never `1e+06`). The chart refuses anything else, which the binary would refuse at startup (exit 78), and a value given beside `config.extraEnv.MODEL_CONTEXT_WINDOW`. A subagent on another alias and OpenCode report no window |
+
+**The output cap follows the window.** The coder's `agent/instructions.md` sets no output cap, so each call asks its
+model profile's cap, else 128,000, clamped to the window less 20,000 tokens and the history the agent keeps (ADR 0064).
+On the dev stack (`MODEL_CONTEXT_WINDOW=131072`, the coder's `max_history_tokens: 100000`) that is
+`131072 − 20000 − 100000 = 11072`, not 128,000. A deployment that wants the full 128,000 for a long-context model
+declares a window of at least **248,000** (128,000 + 20,000 + 100,000); below that the cap is `window − 120,000`
+(a 200,000 window leaves 80,000). It also gives the model a profile with `maxOutputTokensLimit` when the provider
+documents a lower maximum.
+
+## Model profiles
+
+A deployment's models differ: one takes a reasoning level and another refuses the member, one has half the output
+limit of the next. `config.modelProfiles` is the file that says so, per model id (ADR 0063 and ADR 0064). Rendered
+only for the roles that run workers; empty by default (nothing is rendered, and the default render is byte for byte
+`tests/golden/combined.yaml`).
+
+| Value | Variable | What |
+|---|---|---|
+| `config.modelProfiles` | `MODEL_ALIASES_FILE` | The per-model profiles, a map rendered as **JSON only for now**: `presets` (by name: `reasoningEffort`, `maxOutputTokens`) and `profiles` (by model id: `reasoningEfforts`, `reasoningWire`, `reasoningBudgets`, `reasoningEffort`, `maxOutputTokens`, `maxOutputTokensLimit`, `extraBody`, `preset`). The chart refuses a value that is not a map (or whose `profiles`/`presets` is not one) and one given beside `config.extraEnv.MODEL_ALIASES_FILE`; the binary refuses a file that cannot be read or breaks a rule at startup (exit 78), naming the file and the key. The file is the deployment's: none is shipped in the chart or the image |
+
+```yaml
+config:
+  modelProfiles:
+    presets:
+      quick: { reasoningEffort: low }
+    profiles:
+      coder:
+        preset: quick
+        reasoningEfforts: [low, medium, high, max]
+        reasoningWire: reasoning_effort
+        maxOutputTokensLimit: 131072
+      small-chat:
+        reasoningEfforts: []
+        maxOutputTokensLimit: 65536
+        extraBody: { enable_thinking: false }
+```
+
+The chart writes it as JSON in a ConfigMap (`<release>-coder-model-profiles`, key `model-profiles.json`), mounts its `model-profiles.json` key at
+`/etc/adam/model-profiles.json` (by `subPath`) and sets `MODEL_ALIASES_FILE` to it; a changed map changes the pod template's
+`checksum/model-profiles`, so the pods roll. A key never belongs in a profile. Checks: `tests/render-check.sh`.
 
 ## Topology
 
@@ -448,7 +480,7 @@ repositories, no consent form for a repository) is opt-in**: set `accessTiers.ma
 credentials you are willing to see used that way. Do not also set `config.extraEnv.MAX_ACCESS_TIER`: the chart refuses the render
 (it would override the cap).
 
-**The tier is not a boundary against a command.** With `runPods.enabled: false` and no Podman devcontainers (the default),
+**The tier is not a boundary against a command.** With `runPods.enabled: false` (the default),
 `run_command`, `run` and `run_checks` run **in the coder's own container**, as the user that holds the GitHub App's
 private key (a mounted file, `/var/run/secrets/github-app/private-key.pem`; the chart always uses the file form). A command can read it, mint an installation token
 and do whatever the App may, at any tier, a `plan` included. **So an App needs run pods: the chart refuses to render
@@ -791,7 +823,7 @@ flowchart LR
 * **Values** (`runPods.gitSandbox`): `resources` (a memory limit is required), `tmpSize` (`64Mi`), `maxCommands` (`GIT_SANDBOX_MAX_COMMANDS`, 64). There is **no switch to turn it off**: it is on with
   `runPods.enabled`, the mode where a run's commands leave the coder's container too. `config.extraEnv` may not set `GIT_SANDBOX_SOCKET` while it is on.
 * **Without run pods nothing changes and nothing is protected**: no sandbox container, no `GIT_SANDBOX_SOCKET`, the pod automounts no token (as it did not), and git runs in the coder's
-  container next to the secrets, as the run's commands do. Local mode and Podman are the same. A deployment that runs its own sandbox sets `GIT_SANDBOX_SOCKET` in `config.extraEnv` itself.
+  container next to the secrets, as the run's commands do. A deployment that runs its own sandbox sets `GIT_SANDBOX_SOCKET` in `config.extraEnv` itself.
 * **Upgrading from a chart that gave run pods the model key (ADR 0038): move the pod template and the coder pin together.** The coder now
   refuses, at startup (exit 78, `<template path>: container run has the variable MODEL_API_KEY from a Secret (secretKeyRef): a run pod
   holds no Secret (ADR 0038), so a template from an older chart that gives the model key must be replaced`), a template with any `secretKeyRef`,
@@ -806,7 +838,7 @@ flowchart LR
 **Not covered** (ADR 0041): a program the sandbox runs can still **read and write the whole work volume**, every run's files and every mirror, as the coder's git could (closing that needs
 git per run, in the run pod, with another commit path), and the integrity of other people's branches in a shared mirror waits for a mirror per person
 ([#122](https://github.com/vymalo/another-adam-rs/issues/122)); a writer already in the sandbox can change the mirror's configuration between the repair and a network command's read of it
-(a window inside one task, under the mirror lock); local mode, Podman and run pods off.
+(a window inside one task, under the mirror lock); local mode and run pods off.
 
 **Checked by** `tests/render-check.sh` (the sandbox exists with run pods and not without, in no role that starts no commands; no Secret volume, `envFrom` or variable from a Secret; the
 work volume at the same path; no user of its own, the pod's applies to both; a read-only root file system; the token a projected volume of the coder container alone and the pod automounting

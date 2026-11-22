@@ -14,6 +14,7 @@ use adam_core::{DynSecretSource, ProcessEnv};
 use adam_llm_agent::{
     DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionAgent, SessionTools, ToolSet,
 };
+use adam_model::ReasoningEffort;
 use adam_runtime::{RuntimeBuilder, SessionLimits};
 use secrecy::SecretString;
 
@@ -168,6 +169,9 @@ pub struct AgentDef {
     /// What the deployment allows of the sessions of one conversation
     /// ([`session_limits`](Self::session_limits)).
     session_limits: SessionLimits,
+    /// The root's reasoning level when its file sets none
+    /// ([`reasoning_effort`](Self::reasoning_effort)).
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl AgentDef {
@@ -188,6 +192,7 @@ impl AgentDef {
             mcp: McpBinding::default(),
             run_skills: None,
             session_limits: SessionLimits::default(),
+            reasoning_effort: None,
         })
     }
 
@@ -388,6 +393,22 @@ impl AgentDef {
         self
     }
 
+    /// The root's reasoning level when its file sets none (ADR 0063 decision 8): an embedded
+    /// engine's host gives the level its folder would, and the root's own `reasoning_effort` wins
+    /// over it. It is the **root's only**: it never applies to a subagent, which has its own file.
+    /// It wins over the agent's `model_preset` and the profile. It is checked against the root
+    /// model's profile at [`BoundDef::model`](crate::BoundDef::model) — not at
+    /// [`bind`](Self::bind), which does not know the model — and the refusal reports the value as
+    /// `reasoning_effort` on the agent's file even when this setter supplied it
+    /// ([`EffortSource::Folder`](crate::EffortSource::Folder)): the setting is the file's, whether
+    /// a file or the host gave it, so the message names the agent and its file. A level the profile
+    /// does not take is [`Error::ReasoningEffort`]. `None` (the default) sets nothing.
+    #[must_use]
+    pub fn reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
     /// The limits the sessions of the root agent run under: the deployment's
     /// ([`session_limits`](Self::session_limits)) lowered by the root's file. Pure, and the same
     /// on every process role, so a control plane that serves the card without binding the agent
@@ -407,8 +428,8 @@ impl AgentDef {
     /// process role and made without binding, so a control plane that never builds the agent
     /// serves the card and the sessions a worker's tools agree with.
     ///
-    /// Only with the feature `a2a`.
-    #[cfg(feature = "a2a")]
+    /// Only with the feature `sessions` (which `a2a` turns on).
+    #[cfg(feature = "sessions")]
     pub fn child_sessions(&self) -> Option<adam_a2a_runtime::ChildSessions> {
         use adam_a2a_runtime::{ChildSessionAgent, ChildSessions};
         let limits = self.effective_session_limits();
@@ -623,7 +644,7 @@ impl AgentDef {
     /// The first problem found, in the order above; see [`Error`].
     pub fn bind(self, tools: ToolSet) -> Result<BoundDef, Error> {
         let catalog = Catalog::new(&tools)?;
-        #[cfg(feature = "a2a")]
+        #[cfg(feature = "sessions")]
         let child_sessions = self.child_sessions();
         // An agent given MCP tools that the definition does not contain: a typo, found before the
         // walk, so that the message is about the name and not about a server that "is not
@@ -652,6 +673,10 @@ impl AgentDef {
                 self.manifest.frontmatter.limits.as_ref(),
                 Some(&self.manifest.name),
             ),
+            // The host's level for the root when its file sets none (ADR 0063 decision 8).
+            root_effort: self
+                .reasoning_effort
+                .map(|effort| effort.as_str().to_owned()),
             nodes: Vec::new(),
             remotes: Vec::new(),
         };
@@ -675,7 +700,7 @@ impl AgentDef {
         }
         let root = self.manifest.name.clone();
         let bound = BoundDef::new(self.manifest, nodes, remotes, session_limits);
-        #[cfg(feature = "a2a")]
+        #[cfg(feature = "sessions")]
         let bound = bound.with_child_sessions(child_sessions);
         #[cfg(feature = "mcp")]
         let bound = bound.with_prompt_commands(
@@ -704,9 +729,18 @@ pub(crate) struct Node {
     pub(crate) file: PathBuf,
     pub(crate) description: Option<String>,
     pub(crate) model: ModelRef,
+    /// `reasoning_effort` of the agent's file (ADR 0063): the level its model calls ask for by
+    /// default, as written. The assembly checks it against the model profile's levels.
+    pub(crate) reasoning_effort: Option<String>,
+    /// `model_preset` of the agent's file (ADR 0064): the named preset its model calls start from.
+    pub(crate) model_preset: Option<String>,
     pub(crate) prompt: String,
     pub(crate) tools: Vec<(String, DynTool)>,
     pub(crate) limits: Limits,
+    /// `limits.max_output_tokens` of the agent's file, as written (ADR 0064): the cap the agent
+    /// asks for, before the preset, the model's profile and the fallback. `None` when the file
+    /// says nothing.
+    pub(crate) max_output_tokens: Option<u32>,
     /// `limits.max_parallel` of the agent's file: it lowers the deployment's setting for this agent.
     pub(crate) max_parallel: Option<usize>,
     /// `retry:` of the agent's file: the retry policy per tool, by name, each one of its tools
@@ -786,6 +820,9 @@ struct Walk<'a> {
     run_skills: Option<&'a RunSkillsHandle>,
     /// What the root's sessions run under: the deployment's, lowered by the root's file.
     session_limits: SessionLimits,
+    /// The root's reasoning level when its file sets none ([`AgentDef::reasoning_effort`]),
+    /// as its wire word; it never applies to a subagent, which has its own file.
+    root_effort: Option<String>,
     nodes: Vec<Node>,
     remotes: Vec<Remote>,
 }
@@ -948,9 +985,20 @@ impl Walk<'_> {
                 .model
                 .clone()
                 .unwrap_or(ModelRef::Inherit),
+            reasoning_effort: manifest
+                .frontmatter
+                .reasoning_effort
+                .clone()
+                .or_else(|| parent.is_none().then(|| self.root_effort.clone()).flatten()),
+            model_preset: manifest.frontmatter.model_preset.clone(),
             prompt,
             tools,
             limits: limits(manifest.frontmatter.limits.as_ref()),
+            max_output_tokens: manifest
+                .frontmatter
+                .limits
+                .as_ref()
+                .and_then(|file| file.max_output_tokens),
             max_parallel: manifest
                 .frontmatter
                 .limits

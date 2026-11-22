@@ -566,8 +566,10 @@ async fn slow_server_times_out_as_transient() {
     assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
 }
 
+/// A connection that cannot be made is `Unreachable` (ADR 0067 decision 3), still of class
+/// `Transient`, so the runtime retries it as before.
 #[tokio::test]
-async fn connection_refused_is_transient() {
+async fn connection_refused_is_unreachable_and_transient() {
     // Bind then drop, so the port is very likely closed.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -575,7 +577,7 @@ async fn connection_refused_is_transient() {
     let config = OpenAiConfig::new(format!("http://{addr}/v1"), SecretString::from(KEY));
     let client = OpenAiCompatible::new(config).unwrap();
     let err = client.complete(request()).await.unwrap_err();
-    assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
+    assert!(matches!(err, ModelError::Unreachable { .. }), "{err:?}");
     assert_eq!(err.class(), ErrorClass::Transient);
     assert!(err.is_retryable());
 
@@ -585,7 +587,7 @@ async fn connection_refused_is_transient() {
         source.downcast_ref::<reqwest::Error>().is_some(),
         "{source:?}"
     );
-    assert_eq!(err.to_string(), "transient model error: connection failed");
+    assert_eq!(err.to_string(), "the model endpoint could not be reached");
     assert!(adam_error::report(&err).len() > err.to_string().len());
 }
 
@@ -897,4 +899,45 @@ async fn the_prompt_cache_key_is_sent_only_by_a_client_built_to_send_it() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn a_body_over_the_cap_is_a_protocol_error() {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_raw(vec![b'x'; (16 << 20) + 1], "application/json"),
+    )
+    .await;
+    let err = client(&server)
+        .complete(request())
+        .await
+        .expect_err("over 16 MiB");
+    assert!(matches!(err, ModelError::Protocol { .. }), "{err:?}");
+    assert!(err.to_string().contains("over 16777216 bytes"), "{err}");
+    assert_eq!(err.class(), ErrorClass::Corrupt);
+}
+
+#[tokio::test]
+async fn a_stream_line_over_the_cap_is_a_protocol_error() {
+    let server = MockServer::start().await;
+    let mut body = b"data: ".to_vec();
+    body.extend_from_slice(&vec![b'x'; 1 << 20]);
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
+    )
+    .await;
+    let mut stream = client(&server)
+        .stream(request())
+        .await
+        .expect("the response headers");
+    let err = stream
+        .next()
+        .await
+        .expect("one item")
+        .expect_err("over 1 MiB");
+    assert!(matches!(err, ModelError::Protocol { .. }), "{err:?}");
+    assert!(err.to_string().contains("over 1048576 bytes"), "{err}");
+    assert!(stream.next().await.is_none(), "the stream stops after it");
 }

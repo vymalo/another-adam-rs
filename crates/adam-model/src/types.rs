@@ -4,6 +4,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::ReasoningEffort;
+
 /// One request to a model.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ModelRequest {
@@ -27,6 +29,12 @@ pub struct ModelRequest {
     /// Sampling temperature.
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// How much the model should reason for this call (ADR 0063), when the caller sets a level.
+    /// Absent sends nothing and leaves the model's own default, which may reason. The client sends
+    /// it through the wire of the request's model profile; a level that profile does not declare is
+    /// refused before the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Forwarded as request metadata where the backend supports it.
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
@@ -36,6 +44,10 @@ pub struct ModelRequest {
     /// wire is the client's choice. Never the id itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    /// The id of the root run this call belongs to, from in-process state (never a message's
+    /// context), which an injector in front of the model reads to find the run's credential (ADR 0067).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
     /// The bytes of the images that `messages` name ([`ImageRef::sha256`]), for a client that can
     /// send them. The agent loop fills it inside the step that calls the model and never journals
     /// it: it is not serialized, so neither a journal nor a stored history ever holds a byte of an
@@ -753,9 +765,24 @@ mod tests {
         req.tool_choice = ToolChoice::Tool("weather".into());
         req.max_output_tokens = Some(256);
         req.temperature = Some(0.5);
+        req.reasoning_effort = Some(ReasoningEffort::High);
         req.metadata.insert("run".into(), "r1".into());
         roundtrip(req);
         roundtrip(ModelRequest::default());
+    }
+
+    #[test]
+    fn a_reasoning_effort_is_written_only_when_one_is_set_and_the_old_shape_reads() {
+        let plain = serde_json::to_value(ModelRequest::new("m")).unwrap();
+        assert!(plain.get("reasoning_effort").is_none(), "{plain}");
+        let mut req = ModelRequest::new("m");
+        req.reasoning_effort = Some(ReasoningEffort::XHigh);
+        assert_eq!(
+            serde_json::to_value(&req).unwrap()["reasoning_effort"],
+            json!("xhigh")
+        );
+        let old: ModelRequest = serde_json::from_value(json!({"model": "m"})).unwrap();
+        assert_eq!(old.reasoning_effort, None);
     }
 
     #[test]

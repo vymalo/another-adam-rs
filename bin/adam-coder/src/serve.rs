@@ -28,7 +28,6 @@ use std::future::Future;
 use std::sync::Arc;
 
 use adam_a2a::AccessTier;
-use adam_devcontainer::{DevContainer, Runtime};
 use adam_model::DynModel;
 use adam_service::{Agents, RuntimeOptions, claim_scope_for};
 use adam_workspace::{DynCodeHost, DynEnvironment, GitHub, GitIdentity};
@@ -64,8 +63,8 @@ async fn build_agent(
              (run_command, run, run_checks) run in this container as the user that can read it: a \
              command can read the key and mint installation tokens, so NO access tier holds against a command, \
              a `plan` included. ALLOW_COMMANDS_NEXT_TO_SECRETS=true accepted this; to remove it run the commands in \
-             run pods (RUN_ENVIRONMENT=kubernetes) or in Podman devcontainers (DEVCONTAINER_RUNTIME=podman), or \
-             use a token with the permissions you can live with"
+             run pods (RUN_ENVIRONMENT=kubernetes), or use a token with the permissions you can live \
+             with"
         );
     }
 
@@ -104,7 +103,7 @@ async fn build_agent(
     settings.create_for_installed_owners = worker.github.names_its_accounts();
     settings.max_access_tier = max_access_tier;
     settings.check_timeout = worker.check_timeout;
-    settings.environment_start = worker.run_environment.start_bound(&worker.devcontainer);
+    settings.environment_start = worker.run_environment.start_bound();
     settings.check_output_tail = worker.check_output_tail;
     settings.background_commands_max = worker.background_commands_max;
     settings.background_command_max = worker.background_command_max;
@@ -113,6 +112,10 @@ async fn build_agent(
     settings.language_server_idle = worker.language_server_idle;
     settings.language_servers_max = worker.language_servers_max;
     settings.max_parallel_tool_calls = worker.max_parallel_tool_calls;
+    // A refused model call parks the run (ADR 0067); behind the injector, so does a gateway that
+    // cannot be reached.
+    settings.model_parking = adam_llm_agent::ModelParking::new(worker.model.park_limit)
+        .when_unreachable(worker.model.injected_run);
     settings.draft_pull_requests = worker.pr_draft;
     settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);
 
@@ -222,9 +225,16 @@ async fn build_agent(
         .with_environment(env.environment.clone())
         .with_scratch_idle(worker.scratch_idle);
     let (janitor, sweep) = wire_commands(&env, janitor, worker);
-    let agent = CoderAgent::try_from_def(def, model, worker.model.alias.clone(), env, tools)
-        .map_err(|e| *e)
-        .context("assembling the coder agent")?;
+    let agent = CoderAgent::try_from_def_with_profiles(
+        def,
+        model,
+        worker.model.alias.clone(),
+        worker.model.profiles.clone(),
+        env,
+        tools,
+    )
+    .map_err(|e| *e)
+    .context("assembling the coder agent")?;
     Ok((agent, janitor, sweep))
 }
 
@@ -242,33 +252,31 @@ pub fn wire_commands(
     )
 }
 
-/// Where this worker's runs run their commands: the repository's devcontainer, on the
-/// rootless Podman service `CONTAINER_HOST` names, or this container.
+/// Where this worker's runs run their commands: in this container (the default), or in a pod of the
+/// run's own.
 ///
-/// [`DevContainer`] is the environment either way: with `DEVCONTAINER_RUNTIME=off` it is the coder's own
-/// container and says, once per run, that a repository's devcontainer is not used here. With `podman`
-/// it starts up like this:
-///
-/// 1. the tools directory every devcontainer mounts (`adam-exec`) is written,
-///    which fails the start: a binary that cannot be read is a mistake of the deployment;
-/// 2. the service is probed. **A service that does not answer does not stop the coder**: it may start
-///    after it, and every run probes again (at most every 30 seconds) and falls back to this container,
-///    with a step that says so, until it answers;
-/// 3. the default image is pulled in the background (`DEVCONTAINER_PREPULL`), so that the first run
-///    that needs it does not wait for it.
+/// [`Local`](adam_workspace::Local) is the coder's own container, and on a desktop that **is** the
+/// person's work sandbox: adam adds no container inside it. A run pod is a pod of the run's own
+/// (`kubernetes_environment`).
 ///
 /// The orphan sweep is the janitor's: it asks this environment what it holds, at startup and every
 /// `WORKSPACE_SWEEP_SECS` ([`Janitor`]).
 ///
 /// # Errors
 ///
-/// The tools directory cannot be written (a volume that refuses): the process does not start. Nothing else here fails it.
+/// A run pod template that cannot be read or is not usable, or no cluster to talk to. Nothing here
+/// fails a deployment whose commands run in this container.
 pub async fn environment_for(
     worker: &WorkerConfig,
     root: &std::path::Path,
 ) -> anyhow::Result<DynEnvironment> {
     match &worker.run_environment {
-        RunEnvironment::Local => local_environment(worker, root).await,
+        RunEnvironment::Local => {
+            tracing::info!(
+                "commands run in this container; a repository's own environment is a run pod of its image"
+            );
+            Ok(Arc::new(adam_workspace::Local))
+        }
         RunEnvironment::Kubernetes(pods) => kubernetes_environment(worker, pods, root).await,
     }
 }
@@ -314,56 +322,6 @@ async fn kubernetes_environment(
     Ok(Arc::new(environment))
 }
 
-/// The coder's own container, or the repository's devcontainer (`DEVCONTAINER_RUNTIME`).
-async fn local_environment(
-    worker: &WorkerConfig,
-    root: &std::path::Path,
-) -> anyhow::Result<DynEnvironment> {
-    let config = &worker.devcontainer;
-    let environment = DevContainer::new(config.settings(root.to_path_buf()));
-    if config.runtime == Runtime::Podman {
-        let tools = environment
-            .install_tools()
-            .await
-            .context("writing the tools every devcontainer mounts")?;
-        tracing::info!(
-            runtime = "podman",
-            host = config.container_host.as_deref(),
-            default_image = %config.default_image,
-            network = ?config.network,
-            deployment = %config.deployment_id,
-            tools = %tools.display(),
-            "devcontainers are on"
-        );
-        match environment.probe().await {
-            Ok(()) => tracing::info!("the Podman service answers"),
-            Err(e) => tracing::warn!(
-                error = %adam_error::report(&e),
-                "the Podman service does not answer; runs go on in this container until it does"
-            ),
-        }
-        if config.prepull {
-            let pulling = environment.clone();
-            let image = config.default_image.clone();
-            tokio::spawn(async move {
-                match pulling.prepull().await {
-                    Ok(()) => tracing::info!(%image, "the default devcontainer image is pulled"),
-                    Err(e) => tracing::warn!(
-                        %image,
-                        error = %adam_error::report(&e),
-                        "cannot pull the default devcontainer image; the first run that needs it will"
-                    ),
-                }
-            });
-        }
-    } else {
-        tracing::info!(
-            "DEVCONTAINER_RUNTIME=off: commands run in this container; a repository's devcontainer is not used"
-        );
-    }
-    Ok(Arc::new(environment))
-}
-
 /// The runtime options of a worker: its id, how many runs at once, and whose runs it claims (its own
 /// only, for a placement that keeps a run's files on one worker).
 fn options_of(worker: &WorkerConfig) -> RuntimeOptions {
@@ -398,12 +356,15 @@ pub async fn serve(
     // in it stops the process (exit 78) with every diagnostic, whether or not the database is up.
     let files = AgentFiles::load(config.agent_dir.as_deref()).context("reading the agent files")?;
     files.log();
-    // The variables of the coder's OpenCode (ADR 0038): ignored, and said once, by name only.
+    // The removed variables (ADR 0038's OpenCode, ADR 0052's devcontainer): ignored, and said once,
+    // by name only.
     for name in &config.ignored {
-        tracing::warn!(
-            variable = %name,
-            "{name} is set and ignored: the coder no longer uses OpenCode (ADR 0038); remove it"
-        );
+        let why = if name.starts_with("DEVCONTAINER_") || *name == "CONTAINER_HOST" {
+            "the coder no longer runs a repository's devcontainer (ADR 0052)"
+        } else {
+            "the coder no longer uses OpenCode (ADR 0038)"
+        };
+        tracing::warn!(variable = %name, "{name} is set and ignored: {why}; remove it");
     }
 
     // What a person may open a session on (`child-sessions/v1`): the root's helpers with the

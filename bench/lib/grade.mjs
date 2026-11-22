@@ -201,6 +201,12 @@ async function copyTree(tree, work, git) {
  * The base's `.gitignore` decides what is left out (the agent's changes to it are dropped); nested repositories
  * are not entered.
  */
+/**
+ * Directories only a tool writes (type checkers, test runners, interpreters): never part of a change, and left out of every patch.
+ * A run's Open Library patch was over 5 MB of `.mypy_cache` and failed `collect` (2026-11-20).
+ */
+export const TOOL_CACHES = Object.freeze(['.mypy_cache', '.pytest_cache', '__pycache__', '.ruff_cache']);
+
 export async function collectPatch({ tree, baseRepo, base, maxBytes = MAX_PATCH_BYTES, linkPrefix = '/app', workRoot = os.tmpdir() }) {
   if (!/^[0-9a-f]{40}$/.test(base)) throw new Error('the base must be a full commit id');
   const scratch = fs.mkdtempSync(path.join(workRoot, 'collect-'));
@@ -214,7 +220,7 @@ export async function collectPatch({ tree, baseRepo, base, maxBytes = MAX_PATCH_
     const exclude = await adapterSymlinks(git, base, linkPrefix);
     await copyTree(tree, work, git);
     await git(['add', '-A']);
-    const specs = exclude.map((p) => `:(exclude,literal)${p}`);
+    const specs = [...exclude.map((p) => `:(exclude,literal)${p}`), ...TOOL_CACHES.map((d) => `:(exclude,glob)**/${d}/**`)];
     return await git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', base, '--', '.', ...specs], { maxBytes });
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });

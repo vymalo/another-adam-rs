@@ -19,14 +19,15 @@ instructions + a model + a toolset. It is served over A2A by
 | Item | What |
 |---|---|
 | `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
-| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.build()` |
+| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.reasoning_effort(Option<ReasoningEffort>)` (the level every turn asks for unless the run's context names one: see *Reasoning effort*), `.model_parking(ModelParking)` (how a run waits on a model that refused it: see *A run parked on the model*), `.build()` |
+| `ModelParking`, `ModelWait`, `ModelPark`, `MODEL_RESUME_KIND`, `DEFAULT_MODEL_PARK_LIMIT`, `MAX_MODEL_BACKOFF` | a run parked on the model (ADR 0067): `ModelParking::new(limit).when_unreachable(bool)`, the default a limit of 24 h and an unreachable endpoint that fails as before; `Conversation::model_wait` is the `ModelWait` of a parked run (`reason`, `status`, `slug`, `park`, `parked_since`, `parks`, `wake_at`); see *A run parked on the model* |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*); it also splits and joins the conversation exactly like `LlmAgent` (`AgentStarter::split`/`join`), so a run it starts is written with a head and a body, not left in the v4 format |
-| `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
+| `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens` (the cap a call asks for; `0` leaves it to the model, and `Limits::default()` is 4,096 for a hand-built agent: the 128,000 fallback and the model's profile are resolved and clamped by the assembly, ADR 0064), `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to the helper", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) and `read_answer(call_id, args, ui, payload) -> AnswerCheck` (`Accept`, `Read(text)`, `Refuse(Refusal)` or `End(Refusal)`; the default accepts: reads the answer to the tool's own question before the model does; see *The answer is read by the tool that asked*) |
 | `ToolOutput` | `text`, `error`, `with_artifact`, `pinned()` (a compaction that drops the result copies it into its marker, see *Compaction*). A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. That check comes after the result is journaled, so a tool that may return several files it did not choose keeps its result within `ToolCtx::files_left()` (`adam_runtime::ReceivedFiles` does). `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed. `announcing(text)` (the member `answer`) makes `text` **the run's answer**, see *Announced answers*. `sandbox: SandboxUsage` is what the call reported with `ToolCtx::report_sandbox`, put there by the loop and journaled with the result (absent from a journal from before, not written while empty), see *Sandbox time* |
 | `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
 | `StepIo` | how a call's step reports its input and output: `StepIo::default().redact(\|text\| ..).input_max(n).output_max(n)`, or `StepIo::off()`; given to the builder with `step_io(..)` (see *Steps*) |
-| `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `start_child(agent, message)` (starts it on the runtime that steps the run), `root_run_id()` (the run whose work this one serves: the top of the chain of parents for a child run, the run itself otherwise), `with_root_run(id)` for tests, `step_id()` (`tool:<call id>`), `note()` (what the source that offered the tool said of it, `ToolNote`), `parent_step_id()` / `under_step(id)` (the step this call runs under; none for a call of the model's own), `report_step(StepEvent)` (a step that runs under this call's), `emit_progress` (an update of the call's own step, the text in its detail), `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, `context(key)` / `context_map()` (the run's inbound context, see *Context and tool sources*), `files_left()` (the bytes of files the run may still share: 6 MiB less what it kept, as the call began; the loop sets it with `with_files_left` for every call and poll, a detached context has the whole 6 MiB), `report_sandbox(&SandboxUsage)` (the time this call's commands ran in a sandbox, see *Sandbox time*) with `reported_sandbox()` to read it back, and for tests `detached(..).with_state(..).with_context(..)` |
+| `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `start_child(agent, message)` (starts it on the runtime that steps the run), `root_run_id()` (the run whose work this one serves: the top of the chain of parents for a child run, the run itself otherwise), `model_run_id()` (the run this run's model calls name, ADR 0067: the root run, or what a session's round names; handed to its children and sessions), `with_root_run(id)` for tests, `step_id()` (`tool:<call id>`), `note()` (what the source that offered the tool said of it, `ToolNote`), `parent_step_id()` / `under_step(id)` (the step this call runs under; none for a call of the model's own), `report_step(StepEvent)` (a step that runs under this call's), `emit_progress` (an update of the call's own step, the text in its detail), `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, `context(key)` / `context_map()` (the run's inbound context, see *Context and tool sources*), `files_left()` (the bytes of files the run may still share: 6 MiB less what it kept, as the call began; the loop sets it with `with_files_left` for every call and poll, a detached context has the whole 6 MiB), `report_sandbox(&SandboxUsage)` (the time this call's commands ran in a sandbox, see *Sandbox time*) with `reported_sandbox()` to read it back, and for tests `detached(..).with_state(..).with_context(..)` |
 | `ToolError` | `Transient`, `Retryable { message, class }` (a rate limit or a conflict, see *Errors*), `Permanent`, `NeedsInput { question, ui }` (parks the run; A2A reports `input-required`; in a run nobody answers, a firing of a schedule or a child of one (a conversation under `adam.schedule:`, or `adam.unattended: true` in its context, a protected key children inherit: `is_unattended`), it parks nothing: the call's step fails with the reason and its result is `UNATTENDED` and the question, so the model goes on (ADR 0060); `ui` is an interface that comes with the question; build one with `ToolError::needs_input(q)` or `needs_input_with_ui(q, ui)`), `AwaitRun { run }` (the result is a child run's outcome; the run parks with a timer, A2A reports `working`), `AwaitRemote { task, timeout_ms }` (the result is the outcome of a task on another system, polled on the timer), `AwaitSession { session }` (the result is the report of a child session's round; the run parks on a `PendingWait::Session`, see *Child sessions*); `#[non_exhaustive]`, see *Errors* |
 | `LlmAgentBuilder::state`, `try_build`, `tools` | `state(Arc<T>)` shares a value with the tools (one per type); `try_build() -> Result<LlmAgent, BuildError>` fails on a tool whose `required_state` was not given (`BuildError::MissingState`) or on two tools with one name (`BuildError::DuplicateTool`); `tools(ToolSet)` registers a group. `build()` is unchanged (last duplicate wins, no state check) |
 | `State<T>`, `StateKey`, `Extensions` | a cheap `Arc` handle that derefs to `T`; the key of a state type; the typed map behind them |
@@ -43,11 +44,11 @@ instructions + a model + a toolset. It is served over A2A by
 | `Listing`, `ToolNote`, `Conversation::source_notes` | what a source says about a tool it lists: the system behind it **reports each call as a step itself** (`reports_step`, so the agent reports none), how long a call may run (`timeout_ms`) and what its step is called (`label`); kept in the run's state with the model's answer, so a later call, on another worker, reads it without listing again |
 | `Conversation::context`, `merge_context`, `drop_expired_context`, `MAX_CONTEXT_BYTES` | what the messages of the run say about their sender, merged key by key (`null` deletes), bounded, with expiring entries; see *Context and tool sources* |
 | `SessionTools`, `SessionAgent`, `SESSION_TOOLS`, `SUBAGENT_START` .. `SUBAGENT_LIST`, `MAX_OPEN_SESSIONS`, `MAX_SESSION_ROUNDS`, `LlmAgentBuilder::session_agents` | the five tools that run a subagent in the background as a session (ADR 0045), and the wait a turn makes for the sessions it started: see *Child sessions* |
-| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `PendingSession`, `ArtifactRef` | what `Runtime::state(run)` deserializes into (the whole state); `Runtime::view(run).state` is its **head** — the same shape with `messages` empty (ADR 0055); `Conversation::split`/`join` are the `Agent` hook that keeps `messages` in the body and everything else in the head (see the runtime's *The head and the body*); `PendingQuestion::ui` is the interface that came with the question (absent when there is none, and in state stored before it existed); `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on, and `Conversation::omitted_turns` how many turns of earlier conversation were left out to meet the cap (both absent otherwise, and in state stored before they existed), `Conversation::root_run` the top of a child run's parent chain (absent for a run that is nobody's child, and in state stored before it existed) |
+| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `PendingSession`, `ArtifactRef` | what `Runtime::state(run)` deserializes into (the whole state); `Runtime::view(run).state` is its **head** — the same shape with `messages` empty (ADR 0055); `Conversation::split`/`join` are the `Agent` hook that keeps `messages` in the body and everything else in the head (see the runtime's *The head and the body*); `PendingQuestion::ui` is the interface that came with the question (absent when there is none, and in state stored before it existed); `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on, and `Conversation::omitted_turns` how many turns of earlier conversation were left out to meet the cap (both absent otherwise, and in state stored before they existed), `Conversation::root_run` the top of a child run's parent chain (absent for a run that is nobody's child, and in state stored before it existed), `Conversation::model_run` the run its model calls name when its parent said one (ADR 0067; absent otherwise and in older state) |
 | `Conversation::continued(&self, text, from: RunId)`, `LlmAgent::init_continuing`, `LlmStarter::init_continuing` | the conversation of a new run that carries on this one with one more user message; what is carried, dropped and reset is in *Continuing a conversation* |
 | `Conversation::is_omission_marker(message, part)` | whether that text part is the marker (the second part of the first message while `omitted_turns` is not zero), so a rule that reads what the user said skips exactly it: the coder's `person_texts` |
 | `MAX_CARRIED_BYTES`, `OMITTED_MARKER_PREFIX` | the cap on the history a continuation carries (256 KiB of JSON), and the prefix of the marker text part that stands in for the turns dropped to fit it |
-| `COMPACTION_TURN`, `Compaction`, `CompactionReason`, `PromptSize`, `MAX_COMPACTIONS` | compaction (below): the instruction a summary request ends with, one recorded compaction (`turn`, `dropped_turns`, `reason`, `sessions`, and the facts the marker lists), why it was made (`Budget` or `Overflow`), the last call's reported prompt size, and the most compactions a run makes (8, not counting the one record a continued run carries) |
+| `COMPACTION_TURN`, `Compaction`, `CompactionReason`, `PromptSize`, `MAX_COMPACTIONS`, `WINDOW_MARGIN_TOKENS`, `summary_output_tokens` | compaction (below): the instruction a summary request ends with, one recorded compaction (`turn`, `dropped_turns`, `reason`, `sessions`, and the facts the marker lists), why it was made (`Budget` or `Overflow`), the last call's reported prompt size, and the most compactions a run makes (8, not counting the one record a continued run carries); `WINDOW_MARGIN_TOKENS` is the 20,000-token margin the budget and the assembly's cap clamp keep free; `summary_output_tokens(cap)` is `min(4,096, cap)`, or 4,096 when the cap is `0` |
 | `Tool::poll_remote`, `RemotePoll` | how a tool that returned `AwaitRemote` answers "how does the task stand": `Ready(ToolOutput)` or `Working`; the default refuses |
 | `DEFAULT_WAIT_POLL` | 60 s: how long a run waiting for a child sleeps before it reads the child itself |
 | `user_message(text)`, `MESSAGE_KIND` | build the `Inbound` that starts or continues a run |
@@ -141,10 +142,20 @@ change of worker keeps it, and a run that continues another starts with the one 
 (`Conversation::continued`; the new message's keys then win). Two bounds: the whole context is at most
 `MAX_CONTEXT_BYTES` (256 KiB of JSON; a message that would take it over has its context dropped, with a warning,
 and is still read for its text, **but for the keys of `PROTECTED_CONTEXT_KEYS`**, today `ACCESS_TIER_CONTEXT_KEY`
-(`vymalo.accessTier`), `CALLER_CONTEXT_KEY` (`vymalo.caller`, who the message was sent for) and `adam_runtime::UNATTENDED_CONTEXT_KEY` (`adam.unattended`, nobody answers the run: a firing of a schedule, ADR 0060): a limit on the agent is never
+(`vymalo.accessTier`), `CALLER_CONTEXT_KEY` (`vymalo.caller`, who the message was sent for),
+`REASONING_EFFORT_CONTEXT_KEY` (`vymalo.reasoningEffort`, the level the message activated, ADR 0063) and `adam_runtime::UNATTENDED_CONTEXT_KEY` (`adam.unattended`, nobody answers the run: a firing of a schedule, ADR 0060): a limit on the agent is never
 lost to a large context, does not count toward the bound, and a value over `MAX_PROTECTED_VALUE_BYTES` is ignored; and the keys of `PER_MESSAGE_CONTEXT_KEYS`, today `RENDERER_OFFER_CONTEXT_KEY` (`vymalo.a2ui.renderer`, what the renderer offers this turn), are **deleted** then, so an earlier message's offer never stands for this one's), and **an entry that is an object with an `expiresAt` (RFC 3339) is removed once
 that time has passed**, at the start of the next step (`drop_expired_context`): a credential the sender put there
 does not stay in the store after it stops working. (A run parked for hours still holds it until it next steps.)
+
+**Reasoning effort.** `ModelRequest::reasoning_effort` is set on every model turn from the run's
+`vymalo.reasoningEffort` context (`{"effort": "<level>"}`, ADR 0063), else from
+`LlmAgentBuilder::reasoning_effort` (what the agent folder, its `model_preset` or its model profile
+resolved to), else left absent, which sends nothing. The newest message wins from the agent's next
+step, a continuing task and a child run inherit it, and the compaction/summary call always sends
+`None`. The front that accepts `reasoning/v1` checks the level against the model's profile before
+anything is written; the loop ignores a value that is not a level. Whether and how the level reaches
+the provider is the client's (the model profile's `reasoningWire`).
 
 **The question's interface.** `ToolError::NeedsInput { question, ui }` may carry an interface, an array of A2UI
 messages; it is kept with the question in `PendingQuestion::ui` (`/pending_wait/ui` in the stored state), where an
@@ -605,7 +616,15 @@ workspace or a budget for the whole task keys it by the root. Only code in the p
 builds payloads of `text` and `context`, and a run that continues another does not inherit it. **A child starts with the
 `PROTECTED_CONTEXT_KEYS` of the run that starts it** (the access tier, who it was sent for, and so on down a chain), nothing else of its context;
 a source in a child run is told the root with `SourceCtx::root_run_id()` (`detached_under(root, context)` for tests).
-(`tests/root_run.rs` is the chain of three runs, and the limits it hands down, the tier and who the message was sent for; `tests/child_runs.rs` starts children with a `Runtime` it holds, which works too.)
+**Every model call names its root run** in `ModelRequest::run` ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)),
+the turns and the summary call of a compaction alike, which `adam_model::InjectedRun` sends as `X-Run-Id`: the run its
+parent named (`Conversation::model_run`, from the `model_run` key of its first message, which only in-process code
+writes), else its session's root (`SessionHeader::root`: `subagent_start` writes the opener's, `subagent_send` the
+sending task's, so a round names the task that sent it), else `Conversation::root_run`, else the run itself. A tool
+reads it as `ToolCtx::model_run_id()`, and every child it starts and every session it opens or sends to is handed it,
+so the whole tree under a task or a round names one run; `root_run` (whose task hears a subagent's steps) is unchanged.
+Never a message's context, which a person can set.
+(`tests/root_run.rs` is the chain of three runs, every model call of which names the top, and the limits it hands down, the tier and who the message was sent for; `tests/child_runs.rs` starts children with a `Runtime` it holds, which works too; `tests/compaction.rs` checks the summary call names the run, a child's included (`a_childs_summary_call_names_the_top_run`), and `tests/sessions.rs` `every_round_names_the_root_that_opened_its_session` the rounds of a session (round one, a person's later round, a round a later task sends, which names that task, and a person's round after it) and a session a person opened, whose round names itself; `everything_under_a_persons_round_names_what_the_round_names` a subagent under a person's round; `tests/prefix.rs` checks each request names a run of its rig; `adam-a2a-runtime`'s `tests/model_run.rs` that a message's metadata and data parts cannot name the run.)
 
 ## Remote tasks
 
@@ -674,6 +693,46 @@ while a remote task is polled. A model provider's retryable error keeps its clas
 `RateLimited`), under the runtime's policy. Tests: `tests/llm_agent.rs`
 `a_tools_policy_decides_its_retries_and_one_set_by_name_wins`, `a_tools_failure_keeps_its_class`,
 `a_model_rate_limit_keeps_its_class`, and `tool.rs` `a_retryable_error_is_journaled_by_its_class_name`.
+
+### A run parked on the model
+
+A refusal whose provider parks the run (`adam_model::ModelError::Refused`, [ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+decisions 4, 6 to 8) does not fail it. Neither does an endpoint that cannot be reached (`ModelError::Unreachable`) once the
+step's retries are spent (`Ctx::retries_left() == 0`), when `ModelParking::when_unreachable` is set (`adam-service` sets it
+for `MODEL_AUTH=injector`).
+
+| | Park on a timer | Park until woken |
+|---|---|---|
+| When | the provider said `Park::OnTimer`, or the endpoint cannot be reached | the provider said `Park::UntilWoken` (a usage limit reached) |
+| The run | parked with `wake_at`: 30 s, doubling at each park in a row, at most 15 min (`MAX_MODEL_BACKOFF`), at least what the provider asked | parked with no timer, like a question: its deadline is paused |
+| Ends | on its own; past `ModelParking::limit` (`MODEL_PARK_LIMIT`, 24 h) from the first park of the row, on the journaled clock, the run fails with the last reason. A wait longer than what is left of the limit ends at the limit | never on its own; a schedule's firing (`is_unattended`) and a local subagent's run (a child that is no session's round: nothing wakes it until ADR 0067 slice S8b-2b forwards a resume) fail instead, and the parent gets an error result for its call |
+| Woken by | its timer, a message (its text is the person's turn), a resume | a message, a resume |
+
+A schedule's firing also fails on a refusal of status 401 or 403: nothing binds a firing at the gateway yet (ADR 0067
+decision 6). Its other timer parks wake on their own. A subagent's timer parks stay, bounded by the limit and the child's
+time limit; the task's root shows no reason for them yet (S8b-2b adds the notice).
+
+The conversation is kept as it was before the call and `Conversation::model_wait` says why (`reason`, `status`, `slug`,
+`park`, `parked_since`, `parks`, `wake_at`). When the run wakes the **same call** is made again (a new journal position,
+so it is called); the summary call of a compaction parks and is asked for again the same way (its step says `waiting`
+with the reason), and the messages that woke it are read with their words kept in `Conversation::deferred`, after
+the summary: a parked run never keeps an inbox, which the runtime's looks at a child would step every minute. A message of
+kind `MODEL_RESUME_KIND` (`adam.resume`, the runtime's wake-only `RESUME_KIND`) wakes the run and adds nothing; one that
+lands while the run works is no message that arrived and reopens nothing. The first call
+that is answered clears the wait. A cancel ends the park. `ModelError::ModelLocked` is no park: the run fails naming the
+model. A provider that does not park (`StaticBearer`) fails as before. The journal holds the reason's status and slug
+(`park` in the failure's record), never a header, a body or a credential.
+
+**Breaking:** `Conversation::model_wait` is a new public field of a struct that is not `#[non_exhaustive]`: a literal
+outside the workspace needs it. A wait this build cannot read loads as none (`ModelPark` gains a kind in a later build).
+
+Tests: `tests/model_park.rs` (each kind, the backoff by the journaled times, the limit and a wake clamped to it, a message,
+one refused again, a resume, a resume during the woken call adding no turn, a row that changes kind, a replay after a lost
+commit, an unattended run, a subagent's park until woken, a parked summary with a message not stepped before its wake, an
+unreachable endpoint, `ModelLocked`, `StaticBearer`'s errors, a cancel, and nothing of a problem document's body in the
+journal through `adam-model-openai` against a mock server), `tests/compaction.rs`
+`a_refused_summary_parks_the_run_and_is_asked_for_again`, and `src/model_wait.rs` (the backoff, the reasons, a wait that
+cannot be read).
 
 Model failures are classified by `adam_model::ModelError` and journaled as a
 record of `retryable`, the flattened message (`report`, so the chain is printed
@@ -773,6 +832,27 @@ with nothing new in the history ends with exactly the stored output again (`Conv
 run answers once with no tool. A closing turn with no words fails the run with the `turn limit exceeded` or
 `tool call limit exceeded` message. The state remembers it in `Conversation::limit`. A child run that hits its limit
 is `Done`, and its parent's tool result ends with a note that the answer may be incomplete.
+
+**The output cap is the assembly's.** `Limits::default().max_output_tokens` stays 4,096 for a hand-built agent: the
+loop applies no profile and no clamp. The assembly resolves each agent's cap (the folder, its preset, the model's
+profile, then `adam_model::DEFAULT_MAX_OUTPUT_TOKENS`, 128,000) and clamps it to the model's limit and window
+(ADR 0064); the compaction budget and the summary read that resolved value (the summary asks `min(4,096, cap)`, or
+4,096 when the cap is `0`).
+
+**A turn cut while thinking is not an answer.** A model turn that ends at the output limit
+(`FinishReason::Length`) with no tool call and no visible words (empty or whitespace; the reasoning does not
+count) is not the run's answer, and whitespace is not said as `agent_text`. The loop asks again: the cut turn
+leaves the history unless the client echoes its reasoning (then it stays, so the history matches what the provider
+expects; otherwise it would be sent as an empty assistant message, which some servers refuse), and a user message,
+`THINKING_CUT_TURN`, says the turn reached the output limit while still thinking and asks the model to think briefly,
+then call a tool or answer. When the next turn is the closing turn (the cut was the last turn `max_turns` allows) that
+message is not added: the closing turn's own instruction follows. Each continuation is a model call against
+`max_turns`. After `MAX_THINKING_CUTS` (2) in a row, `Conversation::thinking_cuts`, the next one fails the run with
+`output limit reached while thinking: N turns in a row ended at the output limit with no words and no tool call;
+raise max_output_tokens or lower the reasoning effort` (a plain failure like the limits above: never an answer). Any
+turn that is not such a cut, and any message that reaches the run, starts the count again. A `Length` turn **with**
+words is still a `truncated` answer. A closing turn that is itself cut with no words fails with the usual
+`turn limit exceeded` message, not this one.
 
 ## Features and environment
 
@@ -1006,14 +1086,16 @@ is in [the architecture](../../docs/architecture.md#compaction-a-long-history-is
 * **When.** At the start of a step, from the committed state, with no call and no wait open: the estimate (the
   last call's reported `input_tokens`, `Conversation::last_prompt`, plus characters / 4 of what came after;
   with no report, characters / 4 of the instructions, the tools and every message) reaches the budget, the
-  smaller of `MODEL_CONTEXT_WINDOW` less 20,000 less `max_output_tokens`, and `Limits::max_history_tokens`.
+  smaller of `MODEL_CONTEXT_WINDOW` less 20,000 (`WINDOW_MARGIN_TOKENS`) less `max_output_tokens` (the cap the
+  assembly resolved for the model, ADR 0064), and `Limits::max_history_tokens`.
   With neither set there is none. Fewer than two turns to drop, a compaction at this very turn already,
   eight in the conversation, or a request that would still be over the budget with no summary at all (the
   instructions, the tools, the task and the turns that stay): no compaction, and `record_shortenings` does
   what it always did.
 * **The cut** is at a turn start, so a call keeps its result; the newest 1 to 8 turns worth at most a quarter
   of the budget stay verbatim.
-* **The summary** is the agent's own model (no tool, 4,096 output tokens), the request as it stands plus
+* **The summary** is the agent's own model (no tool, `min(4,096, cap)` output tokens, or 4,096 when the cap is
+  `0`; ADR 0064), the request as it stands plus
   `COMPACTION_TURN`; its usage is reported under its own call id. A transient failure retries the
   transition; any other failure shortens instead (`Conversation::compact_failed`: not tried again for eight
   turns). The outcome is journaled, so a replay applies it and calls no model.

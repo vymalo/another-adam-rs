@@ -1,0 +1,27 @@
+[package]
+name = "adam-store-sqlite"
+description = "SQLite store for adam-rs durable agents: one file, one process, WAL"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-core.workspace = true
+adam-error.workspace = true
+async-trait.workspace = true
+jiff.workspace = true
+rusqlite.workspace = true
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+uuid.workspace = true
+
+[dev-dependencies]
+adam-store-testkit.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

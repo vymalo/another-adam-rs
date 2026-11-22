@@ -10,6 +10,31 @@ use futures::stream::{self, StreamExt};
 
 use crate::wire::Assembler;
 
+/// The most bytes one SSE line may carry.
+pub(crate) const MAX_LINE_BYTES: usize = 1 << 20;
+/// The most bytes one event's `data:` lines may total.
+pub(crate) const MAX_EVENT_BYTES: usize = 4 << 20;
+/// The most bytes one streamed response body may carry.
+pub(crate) const MAX_STREAM_BYTES: usize = 64 << 20;
+
+/// The caps a stream is read under. Tests lower them; a deployment keeps the defaults.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Limits {
+    pub(crate) line: usize,
+    pub(crate) event: usize,
+    pub(crate) stream: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            line: MAX_LINE_BYTES,
+            event: MAX_EVENT_BYTES,
+            stream: MAX_STREAM_BYTES,
+        }
+    }
+}
+
 /// Incremental SSE parser. Only `data:` fields matter for chat completions;
 /// comments (`:` lines), `event:`, `id:` and `retry:` are ignored.
 #[derive(Default)]
@@ -18,11 +43,21 @@ pub(crate) struct SseParser {
     line: Vec<u8>,
     /// `data:` lines of the event being built.
     data: Vec<String>,
+    /// Bytes those lines carry, so the event cap is checked without joining them.
+    data_bytes: usize,
+    limits: Limits,
 }
 
 impl SseParser {
+    pub(crate) fn with_limits(limits: Limits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
     /// Feed bytes; returns the payload of every event completed by them.
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, ModelError> {
         let mut events = Vec::new();
         let mut rest = bytes;
         while let Some(end) = memchr::memchr(b'\n', rest) {
@@ -30,38 +65,47 @@ impl SseParser {
             // A whole line in this chunk is handled where it lies: only a line cut by a chunk
             // boundary is carried in `self.line`.
             if self.line.is_empty() {
-                self.handle_line(segment, &mut events);
+                if segment.len() > self.limits.line {
+                    return Err(over_line(self.limits.line));
+                }
+                self.handle_line(segment, &mut events)?;
             } else {
+                if self.line.len() + segment.len() > self.limits.line {
+                    return Err(over_line(self.limits.line));
+                }
                 self.line.extend_from_slice(segment);
                 let line = std::mem::take(&mut self.line);
-                self.handle_line(&line, &mut events);
+                self.handle_line(&line, &mut events)?;
             }
             rest = &after[1..];
         }
+        if self.line.len() + rest.len() > self.limits.line {
+            return Err(over_line(self.limits.line));
+        }
         self.line.extend_from_slice(rest);
-        events
+        Ok(events)
     }
 
     /// The connection closed: an event without its blank-line terminator is
     /// still delivered.
-    pub(crate) fn finish(&mut self) -> Vec<String> {
+    pub(crate) fn finish(&mut self) -> Result<Vec<String>, ModelError> {
         let mut events = Vec::new();
         if !self.line.is_empty() {
             let line = std::mem::take(&mut self.line);
-            self.handle_line(&line, &mut events);
+            self.handle_line(&line, &mut events)?;
         }
         self.dispatch(&mut events);
-        events
+        Ok(events)
     }
 
-    fn handle_line(&mut self, line: &[u8], events: &mut Vec<String>) {
+    fn handle_line(&mut self, line: &[u8], events: &mut Vec<String>) -> Result<(), ModelError> {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             self.dispatch(events);
-            return;
+            return Ok(());
         }
         if line[0] == b':' {
-            return;
+            return Ok(());
         }
         let (field, value) = match line.iter().position(|&b| b == b':') {
             Some(i) => {
@@ -71,16 +115,36 @@ impl SseParser {
             None => (line, &b""[..]),
         };
         if field == b"data" {
+            // The join adds a newline between lines; count it so the cap is the payload's size.
+            let added = value.len() + usize::from(!self.data.is_empty());
+            if self.data_bytes + added > self.limits.event {
+                return Err(over_event(self.limits.event));
+            }
+            self.data_bytes += added;
             self.data.push(String::from_utf8_lossy(value).into_owned());
         }
+        Ok(())
     }
 
     fn dispatch(&mut self, events: &mut Vec<String>) {
         if !self.data.is_empty() {
             events.push(self.data.join("\n"));
             self.data.clear();
+            self.data_bytes = 0;
         }
     }
+}
+
+fn over_line(cap: usize) -> ModelError {
+    ModelError::protocol(format!("the model stream sent a line over {cap} bytes"))
+}
+
+fn over_event(cap: usize) -> ModelError {
+    ModelError::protocol(format!("the model stream sent an event over {cap} bytes"))
+}
+
+fn over_stream(cap: usize) -> ModelError {
+    ModelError::protocol(format!("the model stream sent over {cap} bytes"))
 }
 
 struct State<S> {
@@ -90,6 +154,8 @@ struct State<S> {
     pending: VecDeque<ModelDelta>,
     failure: Option<ModelError>,
     idle: Duration,
+    limits: Limits,
+    received: usize,
     done: bool,
 }
 
@@ -160,13 +226,29 @@ where
     B: AsRef<[u8]> + Send,
     E: std::error::Error + Send + Sync + 'static,
 {
+    deltas_with_limits(bytes, idle, Limits::default())
+}
+
+/// [`deltas`] under explicit caps; the tests lower them.
+pub(crate) fn deltas_with_limits<S, B, E>(
+    bytes: S,
+    idle: Duration,
+    limits: Limits,
+) -> impl Stream<Item = Result<ModelDelta, ModelError>> + Send + 'static
+where
+    S: Stream<Item = Result<B, E>> + Send + 'static,
+    B: AsRef<[u8]> + Send,
+    E: std::error::Error + Send + Sync + 'static,
+{
     let state = State {
         bytes: Box::pin(bytes),
-        parser: SseParser::default(),
+        parser: SseParser::with_limits(limits),
         assembler: Some(Assembler::default()),
         pending: VecDeque::new(),
         failure: None,
         idle,
+        limits,
+        received: 0,
         done: false,
     };
     stream::unfold(state, |mut st| async move {
@@ -189,18 +271,28 @@ where
                     st.fail(ModelError::transient("stream interrupted").with_source(e));
                 }
                 Ok(Some(Ok(chunk))) => {
-                    let events = st.parser.push(chunk.as_ref());
-                    st.handle_events(events, false);
-                }
-                Ok(None) => {
-                    let events = st.parser.finish();
-                    st.handle_events(events, true);
-                    // Some servers close without `[DONE]`; that is fine as long
-                    // as they said why they stopped (checked by `finalize`).
-                    if !st.done {
-                        st.finalize();
+                    let chunk = chunk.as_ref();
+                    st.received = st.received.saturating_add(chunk.len());
+                    if st.received > st.limits.stream {
+                        st.fail(over_stream(st.limits.stream));
+                        continue;
+                    }
+                    match st.parser.push(chunk) {
+                        Ok(events) => st.handle_events(events, false),
+                        Err(e) => st.fail(e),
                     }
                 }
+                Ok(None) => match st.parser.finish() {
+                    Ok(events) => {
+                        st.handle_events(events, true);
+                        // Some servers close without `[DONE]`; that is fine as long
+                        // as they said why they stopped (checked by `finalize`).
+                        if !st.done {
+                            st.finalize();
+                        }
+                    }
+                    Err(e) => st.fail(e),
+                },
             }
         }
     })
@@ -215,8 +307,8 @@ mod tests {
 
     fn parse(input: &str) -> Vec<String> {
         let mut p = SseParser::default();
-        let mut out = p.push(input.as_bytes());
-        out.extend(p.finish());
+        let mut out = p.push(input.as_bytes()).expect("under the caps");
+        out.extend(p.finish().expect("under the caps"));
         out
     }
 
@@ -301,12 +393,12 @@ mod tests {
         for &cut in cuts {
             let cut = cut.min(input.len());
             if cut > from {
-                out.extend(parser.push(&input[from..cut]));
+                out.extend(parser.push(&input[from..cut]).expect("under the caps"));
                 from = cut;
             }
         }
-        out.extend(parser.push(&input[from..]));
-        out.extend(parser.finish());
+        out.extend(parser.push(&input[from..]).expect("under the caps"));
+        out.extend(parser.finish().expect("under the caps"));
         out
     }
 
@@ -364,9 +456,9 @@ mod tests {
     #[test]
     fn a_chunk_ending_on_cr_completes_the_line_on_the_next() {
         let mut p = SseParser::default();
-        assert!(p.push(b"data: a\r").is_empty());
-        assert!(p.push(b"\n\r").is_empty());
-        assert_eq!(p.push(b"\n"), ["a"]);
+        assert!(p.push(b"data: a\r").expect("under the caps").is_empty());
+        assert!(p.push(b"\n\r").expect("under the caps").is_empty());
+        assert_eq!(p.push(b"\n").expect("under the caps"), ["a"]);
 
         // CRLF everywhere, cut between every `\r` and `\n` and elsewhere.
         let input = b"data: a\r\n\r\ndata: b\r\n\r\ndata: c";
@@ -398,11 +490,98 @@ mod tests {
         let input = "data: h\u{e9}llo \u{1f600}\n\ndata: [DONE]\n\n".as_bytes();
         for split in 0..input.len() {
             let mut p = SseParser::default();
-            let mut out = p.push(&input[..split]);
-            out.extend(p.push(&input[split..]));
-            out.extend(p.finish());
+            let mut out = p.push(&input[..split]).expect("under the caps");
+            out.extend(p.push(&input[split..]).expect("under the caps"));
+            out.extend(p.finish().expect("under the caps"));
             assert_eq!(out, ["h\u{e9}llo \u{1f600}", "[DONE]"], "split at {split}");
         }
+    }
+
+    fn limits(line: usize, event: usize, stream: usize) -> Limits {
+        Limits {
+            line,
+            event,
+            stream,
+        }
+    }
+
+    #[test]
+    fn the_default_caps_are_the_documented_ones() {
+        let l = Limits::default();
+        assert_eq!(l.line, 1 << 20, "one line: 1 MiB");
+        assert_eq!(l.event, 4 << 20, "one event: 4 MiB");
+        assert_eq!(l.stream, 64 << 20, "one stream: 64 MiB");
+    }
+
+    #[test]
+    fn a_line_over_the_cap_is_refused_before_it_grows() {
+        // A whole line in one chunk, newline included.
+        let mut p = SseParser::with_limits(limits(8, 1 << 10, 1 << 20));
+        let err = p.push(b"data: abc\n").expect_err("a 9-byte line");
+        assert!(matches!(err, ModelError::Protocol { .. }), "{err:?}");
+        assert!(err.to_string().contains("over 8 bytes"), "{err}");
+
+        // The same line cut by chunk boundaries, refused on the byte that crosses the cap.
+        let mut p = SseParser::with_limits(limits(8, 1 << 10, 1 << 20));
+        assert!(p.push(b"data: ab").is_ok(), "8 bytes so far");
+        let err = p.push(b"c").expect_err("the 9th byte");
+        assert!(err.to_string().contains("over 8 bytes"), "{err}");
+
+        // And when the newline arrives in a later chunk, the joined line is refused too.
+        let mut p = SseParser::with_limits(limits(8, 1 << 10, 1 << 20));
+        assert!(p.push(b"data: ab").is_ok(), "8 bytes so far");
+        let err = p.push(b"c\n").expect_err("the 9th byte and its newline");
+        assert!(err.to_string().contains("over 8 bytes"), "{err}");
+
+        // A line of exactly the cap is accepted, and the event ends at the blank line.
+        let mut p = SseParser::with_limits(limits(8, 1 << 10, 1 << 20));
+        assert!(p.push(b"data: ab\n").expect("exactly 8 bytes").is_empty());
+        assert_eq!(p.push(b"\n").expect("the event ends"), ["ab"]);
+    }
+
+    #[test]
+    fn an_event_over_the_cap_is_refused_and_the_next_event_starts_clean() {
+        // Values of 10 bytes each, an event cap of 16.
+        let mut p = SseParser::with_limits(limits(1 << 10, 16, 1 << 20));
+        assert!(p.push(b"data: 0123456789\n").is_ok(), "10 of 16");
+        let err = p.push(b"data: 0123456789\n").expect_err("20 of 16");
+        assert!(err.to_string().contains("over 16 bytes"), "{err}");
+
+        // A dispatched event resets the count: two 10-byte events in a row are fine.
+        let mut p = SseParser::with_limits(limits(1 << 10, 16, 1 << 20));
+        assert_eq!(
+            p.push(b"data: 0123456789\n\n").expect("one event"),
+            ["0123456789"]
+        );
+        assert_eq!(
+            p.push(b"data: 0123456789\n\n").expect("the next event"),
+            ["0123456789"]
+        );
+
+        // The newline the join adds is counted: 10 + 1 + 10 is over a cap of 20, while the
+        // values alone (20) are not.
+        let mut p = SseParser::with_limits(limits(1 << 10, 20, 1 << 20));
+        assert!(p.push(b"data: 0123456789\n").is_ok(), "10 of 20");
+        assert!(
+            p.push(b"data: 0123456789\n").is_err(),
+            "the join byte makes 21"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_over_the_cap_is_refused() {
+        let comments = |n: usize| Ok::<_, std::io::Error>(vec![b':'; n]);
+        let out: Vec<_> = deltas_with_limits(
+            stream::iter(vec![comments(40), comments(40)]),
+            Duration::from_secs(5),
+            limits(1 << 10, 1 << 10, 64),
+        )
+        .collect()
+        .await;
+        assert_eq!(out.len(), 1, "{out:?}");
+        let err = out[0].as_ref().expect_err("over the stream cap");
+        assert!(matches!(err, ModelError::Protocol { .. }), "{err:?}");
+        assert!(err.to_string().contains("over 64 bytes"), "{err}");
     }
 
     fn byte_stream(
@@ -604,10 +783,10 @@ mod tests {
             let mut out = Vec::new();
             let mut from = 0;
             for cut in cuts.into_iter().chain([input.len()]) {
-                out.extend(parser.push(&input[from..cut]));
+                out.extend(parser.push(&input[from..cut]).expect("under the caps"));
                 from = cut;
             }
-            out.extend(parser.finish());
+            out.extend(parser.finish().expect("under the caps"));
             out
         }
 

@@ -9,7 +9,7 @@
 // Which sections are shared is a table (`SECTIONS`), decided by a person and recorded in bench/README.md and ADR 0048. A section the
 // table does not know is an error: a new revision of the pin that adds or renames a section must be decided before it is run.
 import { localGit } from './grade.mjs';
-import { applyMap } from './prompt-map.mjs';
+import { HELPERS_SPAN, SPANS, applyMap } from './prompt-map.mjs';
 
 export const INSTRUCTIONS_PATH = 'bin/adam-coder/agent/instructions.md';
 export const PREAMBLE = '(the opening paragraphs, before the first heading)';
@@ -29,12 +29,22 @@ export const SECTIONS = Object.freeze({
   'Access tiers': { shared: false, why: "adam's access tiers (plan, edits, auto, bypass), which the benchmark does not set" },
   'How to work': { shared: true, owner: true, why: 'how to do the task: discover the checks, small steps, verify, fix, commit and open the pull request in one call' },
   'Starting without a repository': { shared: false, why: "adam's scratch projects, publish_scratch and repository creation: the benchmark always names a repository" },
-  'The work environment': { shared: false, why: "adam's devcontainer environment, rebuild_environment and the obscura browser; OpenCode runs in the task's own container" },
+  'The work environment': { shared: false, why: "adam's run pod or its own container, use_repository_environment and the obscura browser; OpenCode runs in the task's own container" },
   'A missing toolchain': { shared: true, owner: true, why: 'what to do when the environment lacks a toolchain, and when a project tool only needs its dependencies installed' },
   'Asking the person': { shared: false, why: 'ask_user and its forms; OpenCode has a different question tool, which the benchmark denies' },
   'Questions and conversation': { shared: false, why: 'names run_command and refers to the "Who you are" section, which is left out' },
   'Ending your turn': { shared: true, owner: true, why: 'how a turn ends: the pull request, an answer, a delivered file, a question' },
   'Rules you must not break': { shared: true, owner: true, why: 'never open a pull request on red checks, run the checks again after a change, stay within the task, no secrets' },
+});
+
+/**
+ * What OpenCode is given, by profile: `owner` is the four sections the owner named (the default, and what the `opencode` variant got
+ * until 2026-11-20); `work` adds "Helpers", the one other section that is about doing a coding task (decided by the owner 2026-11-20;
+ * the others are adam's persona, its chat and product features, its devcontainer environment and its own tool guide).
+ */
+export const PROFILES = Object.freeze({
+  owner: { extra: [], spans: SPANS },
+  work: { extra: ['Helpers'], spans: [...SPANS, HELPERS_SPAN] },
 });
 
 /** The body of the file (after the front matter) cut into its sections: [{ heading, raw }]. `raw` starts at the heading line. */
@@ -80,14 +90,16 @@ export function namedTools(raw, tools) {
  * front matter gives filled in, and is what OpenCode receives. Throws when a section is not in the table, or a kept section reads a variable the
  * file does not give.
  */
-export function sharedPrompt(instructions) {
+export function sharedPrompt(instructions, { profile = 'owner' } = {}) {
+  const chosen = PROFILES[profile];
+  if (!chosen) throw new Error(`no prompt profile ${profile}: ${Object.keys(PROFILES).join(' or ')}`);
   const sections = sectionsOf(instructions);
   for (const s of sections) if (!Object.hasOwn(SECTIONS, s.heading)) throw new Error(`the section "${s.heading}" of adam's instructions has no decision: add it to SECTIONS in bench/lib/shared-prompt.mjs (shared or left out, and why)`);
-  const kept = sections.filter((s) => SECTIONS[s.heading].shared);
+  const kept = sections.filter((s) => SECTIONS[s.heading].shared || chosen.extra.includes(s.heading));
   const missing = Object.keys(SECTIONS).filter((h) => !sections.some((s) => s.heading === h));
   if (missing.length > 0) throw new Error(`adam's instructions no longer have the section(s) ${missing.join(', ')}: update SECTIONS`);
   const template = kept.map((s) => s.raw).join('');
-  const { mapped, applied } = applyMap(template);
+  const { mapped, applied } = applyMap(template, chosen.spans);
   const left = namedTools(mapped, adamToolNames(instructions));
   if (left.length > 0) throw new Error(`the mapped text still names adam's tool(s) ${left.join(', ')}: add them to bench/lib/prompt-map.mjs (a name OpenCode has, or a span that rewrites or drops the sentence)`);
   const vars = frontMatterVars(instructions);
@@ -110,6 +122,6 @@ export async function readInstructionsAt({ repoDir, revision }) {
 }
 
 /** The shared prompt text of the pinned revision. */
-export async function readSharedPrompt({ repoDir, revision }) {
-  return sharedPrompt(await readInstructionsAt({ repoDir, revision })).text;
+export async function readSharedPrompt({ repoDir, revision, profile = 'owner' }) {
+  return sharedPrompt(await readInstructionsAt({ repoDir, revision }), { profile }).text;
 }

@@ -208,13 +208,12 @@ command). Renders "true" or nothing, like coder.runsWorkers. ALLOW_COMMANDS_NEXT
 
 {{/*
 Whether a command of a run can read the GitHub App's private key: the pod authenticates as an App, whose key the
-chart always mounts as a file, and the commands run in the coder's own container (no run pods, and no Podman
-devcontainers named in config.extraEnv: the chart sets no DEVCONTAINER_* itself). The chart refuses it unless it is
-accepted, as the coder does (`WorkerConfig::commands_can_read_the_app_key`, bin/adam-coder/src/config.rs). Renders
-"true" or nothing.
+chart always mounts as a file, and the commands run in the coder's own container (no run pods: ADR 0052 removed
+every other place they could run). The chart refuses it unless it is accepted, as the coder does
+(`WorkerConfig::commands_can_read_the_app_key`, bin/adam-coder/src/config.rs). Renders "true" or nothing.
 */}}
 {{- define "coder.commandsReadTheAppKey" -}}
-{{- if and (include "coder.githubApp" .) (not (include "coder.runPods" .)) (ne (lower (trim (toString (get .Values.config.extraEnv "DEVCONTAINER_RUNTIME")))) "podman") -}}true{{- end -}}
+{{- if and (include "coder.githubApp" .) (not (include "coder.runPods" .)) -}}true{{- end -}}
 {{- end -}}
 
 {{/*
@@ -436,4 +435,26 @@ environment when a worker starts, never values: SEARCH_MCP_TOKEN and CONTEXT7_AP
 {{- $_ := set $servers "context7" $server -}}
 {{- end -}}
 {{- toPrettyJson (dict "mcpServers" $servers) -}}
+{{- end -}}
+
+{{/*
+The per-model profiles (values `config.modelProfiles`, ADR 0063 and ADR 0064): one JSON file of profiles and presets,
+read at startup by the pods that run workers (MODEL_ALIASES_FILE). Unset (an empty map) renders nothing, so the goldens
+are unchanged. JSON only for now: the binary refuses a file that does not parse.
+*/}}
+{{- define "coder.modelProfiles" -}}
+{{- if and .Values.config.modelProfiles (include "coder.runsWorkers" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/* Name of the ConfigMap that holds the profiles file. */}}
+{{- define "coder.modelProfilesConfigMapName" -}}
+{{- printf "%s-model-profiles" (include "coder.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/* Where it is mounted, and MODEL_ALIASES_FILE. */}}
+{{- define "coder.modelProfilesFile" -}}/etc/adam/model-profiles.json{{- end -}}
+
+{{/* The file: the value as pretty JSON. */}}
+{{- define "coder.modelProfilesJson" -}}
+{{- toPrettyJson .Values.config.modelProfiles -}}
 {{- end -}}

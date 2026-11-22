@@ -120,6 +120,7 @@ async fn a_child_of_a_child_sees_the_top_run_and_a_top_run_sees_itself() {
         }
         builder.build()
     };
+    let models = [top_model.clone(), mid_model.clone(), leaf_model.clone()];
     let rt = Runtime::builder(store)
         .poll_interval(Duration::from_millis(20))
         .agent(agent("top", top_model, Some("mid")))
@@ -166,6 +167,23 @@ async fn a_child_of_a_child_sees_the_top_run_and_a_top_run_sees_itself() {
     // It is in the stored state of the children, so a restart or another worker reads the same.
     assert_eq!(mid_state.root_run, Some(top));
     assert_eq!(leaf_state.root_run, Some(top), "the top, not the parent");
+
+    // Every model call of the chain names the top run, the one the orchestrator bound (ADR 0067):
+    // a child's calls name the root, never the child's own run.
+    let named: Vec<Vec<Option<String>>> = models
+        .iter()
+        .map(|m| m.requests().into_iter().map(|r| r.run).collect())
+        .collect();
+    let top_id = Some(top.to_string());
+    assert_eq!(
+        named,
+        vec![
+            vec![top_id.clone(); 3],
+            vec![top_id.clone(); 3],
+            vec![top_id.clone(); 2],
+        ],
+        "top, mid and leaf: every call names {top}"
+    );
 }
 
 #[test]

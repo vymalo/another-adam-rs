@@ -21,13 +21,16 @@ the provider asked to wait, and the runtime owns backoff.
 |---|---|
 | `ModelClient` (trait) | `complete(ModelRequest) -> ModelResponse` and `stream(ModelRequest) -> BoxStream<ModelDelta>`; two default methods, `provider() -> Option<&str>` (a label for reports, `openai` for the OpenAI-compatible client) and `context_window(alias) -> Option<u64>` (the window the deployment configured for that alias), both `None` unless the client says |
 | `DynModel` | `Arc<dyn ModelClient>` |
-| `ModelRequest`, `ModelResponse`, `ModelDelta` | request (`model`, `system`, `messages`, `tools`, `ToolChoice`, `max_output_tokens`, `temperature`, `metadata`, `prompt_cache_key`: a stable key per conversation, which the agent loop sets and a client may send; **new public field, breaks `ModelRequest` struct literals**: use `ModelRequest::new`), response and streamed chunks. `ModelDelta` is `#[non_exhaustive]` since `ToolCallComplete` (below): a `match` over it needs one more arm |
+| `ModelRequest`, `ModelResponse`, `ModelDelta` | request (`model`, `system`, `messages`, `tools`, `ToolChoice`, `max_output_tokens`, `temperature`, `reasoning_effort`: the level this call asks for, absent sends nothing (ADR 0063), `metadata`, `prompt_cache_key`: a stable key per conversation, which the agent loop sets and a client may send; `run`: the root run the call belongs to, which the agent loop sets from in-process state and an injector reads ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)), skipped in JSON when `None`; **new public fields, break `ModelRequest` struct literals**: use `ModelRequest::new`). `ModelRequest`'s `PartialEq` and `Serialize` include `run`: two requests of different runs are not equal, and a test that compares requests of two runs clears it first. Response and streamed chunks. `ModelDelta` is `#[non_exhaustive]` since `ToolCallComplete` (below): a `match` over it needs one more arm |
 | `Message`, `ContentPart`, `ToolCall`, `ToolSpec`, `Usage`, `FinishReason` | conversation and tool-calling types; all derive `Serialize`/`Deserialize` because a run persists its history. `ToolCall` has `new(id, name, arguments)`, `with_invalid_arguments(id, name, raw)` and `Default`; its `invalid_arguments: Option<String>` holds the raw argument text when it was not JSON (`arguments` is then `{}`). **Breaking:** a `ToolCall { id, name, arguments }` literal no longer compiles (use `ToolCall::new` or `..Default::default()`); the serialized form and the `ModelClient` trait are unchanged, and journals written before the field decode with `None` |
-| `ModelError` | `RateLimited { retry_after }`, `Transient`, `ContextLength`, `InvalidRequest`, `Auth`, `Protocol`; `#[non_exhaustive]`, see *Errors* |
+| `ModelError` | `RateLimited { retry_after }`, `Transient`, `ContextLength`, `InvalidRequest`, `Auth`, `Protocol`, `Refused { status, slug, retry_after, park }`, `ModelLocked { model }`, `Unreachable`; `#[non_exhaustive]`, see *Errors* |
+| `ReasoningEffort`, `ReasoningWire`, `ModelProfile`, `Preset`, `ModelProfiles` | the per-model profiles of `MODEL_ALIASES_FILE` (ADR 0063, ADR 0064), parsed and validated by `ModelProfiles::parse_json`; pure data, no file I/O (see [Per-model profiles](#per-model-profiles)) |
 | `Classify`, `ErrorClass` | re-exported from `adam-error`: `class()`, `is_retryable()`, `retry_after()` |
-| `ModelCredentials` (trait), `DynCredentials` | where the credentials of a model call come from, **asked for every call** ([ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)): `headers(CredentialRequest { method, url, attempt }) -> CredentialHeaders` and `rejected(call, &Rejection { status, www_authenticate, dpop_nonce }) -> AfterRejection` (`Retry` or `GiveUp`, the default). A host mints, renews or proves a credential at the moment of use (a token renewed from the person's session, a DPoP proof over the method and URL), or gives a header with no key at all (an injector's run tag). Its errors are its choice of class: `Auth` when the person must act, `Transient` when the issuer did not answer. `Arc<T>` forwards it |
+| `ModelCredentials` (trait), `DynCredentials` | where the credentials of a model call come from, **asked for every call** ([ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)): `headers(CredentialRequest { method, url, attempt, run }) -> CredentialHeaders` (`run` is the request's `ModelRequest::run`; **a new field: a `CredentialRequest` literal outside the workspace breaks**) and `rejected(call, &Rejection { status, www_authenticate, dpop_nonce }) -> AfterRejection` (`Retry` or `GiveUp`, the default), and the provided `parks(&Refusal) -> Park` (`Park::No` by default, so no implementer breaks: see *Refusals*). A host mints, renews or proves a credential at the moment of use (a token renewed from the person's session, a DPoP proof over the method and URL), or gives a header with no key at all (an injector's run tag). Its errors are its choice of class: `Auth` when the person must act, `Transient` when the issuer did not answer. `Arc<T>` forwards it, `parks` included: **a decorator of a provider must forward `parks` too**, or it answers the default `Park::No` and its provider's refusals stop parking |
 | `CredentialHeaders` | the headers of one call: `none()`, `bearer(&token)`, `.with(name, value)` (a later one of the same name replaces it, case-insensitive); values are `SecretString`, `Debug` shows the names only |
 | `StaticBearer` | a fixed bearer, the same for every call (an empty one sends no header): what `MODEL_API_KEY` gives. It gives up on a rejection |
+| `InjectedRun`, `RUN_HEADER` | `MODEL_AUTH=injector` ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)): no key, exactly one header, `X-Run-Id: <run>`, and no `Authorization`, for an injector in front of the model that adds the run's credential. A call with no run (or an empty one) is refused with `InvalidRequest` ("a model call through the injector names no run"), so nothing is sent. It gives up on a rejection |
+| `Refusal`, `ProblemType`, `Park`, `FIRST_PARK`, `MAX_PARK`, `MODEL_LOCKED_SLUG` | what a client asks `parks` about: `Refusal { status, problem, retry_after }` (no body, no header; `#[non_exhaustive]`, built with `Refusal::new(status)`, `.with_slug(..)`, `.with_problem(..)`, `.with_retry_after(..)`, read with `.slug()`), whose `problem` is `ProblemType::Absent` (no problem document, no `type`, `about:blank`), `Slug(word)` or `Unreadable` (a `type` that is there and is no word); the answer, `Park::No`, `OnTimer(Duration)` or `UntilWoken` (closed on purpose); `FIRST_PARK` is 30 s, the first step of the agent's backoff, and `MAX_PARK` 24 h, the longest timer whatever `Retry-After` says; `MODEL_LOCKED_SLUG` is `model_locked` (see *Refusals*) |
 | `RenewingCredentials` | a test double: `token-1`, `token-2`, ... moved on by each rejection, which it asks to retry; `issued()`, `rejections()` |
 | `MockModel`, `RecordedCall` | scripted `ModelClient` that records requests; always compiled, no feature flag; `.with_provider(label)` and `.with_context_window(alias, n)` say what a real client would |
 
@@ -97,7 +100,35 @@ A message names an image by reference and never holds its bytes (ADR 0044).
 | `ModelRequest::image_data` (`ImageData`) | the bytes of the images `messages` name, by SHA-256, **never serialized**: the agent loop fills it inside the step that calls the model. `Debug` says how many, never the bytes. A reference with no entry is sent as `ImageRef::missing_line()` |
 | `ModelClient::input_modalities(model) -> InputModalities` | what the deployment declared the model of that alias can read: text only by default, never guessed from a name (`InputModalities::images: Option<ImageLimits { max_bytes, max_count, max_side, sources }>`, `#[non_exhaustive]`). `Arc<T>` forwards it. `MockModel::seeing_images(limits)` |
 
-**Breaking** for code that builds or matches these types: `ContentPart` gains a variant, `Message::Tool` a field and `ModelRequest` a field (`..Default::default()` or `..` fixes a literal or a pattern); `ModelClient` gains a provided method, so no implementer breaks.
+**Breaking** for code that builds or matches these types: `ContentPart` gains a variant, `Message::Tool` a field and `ModelRequest` fields (`..Default::default()` or `..` fixes a literal or a pattern); `ModelClient` gains a provided method, so no implementer breaks.
+
+## Per-model profiles
+
+`MODEL_ALIASES_FILE` (ADR 0063, ADR 0064) declares, for each model a deployment can call, whether it takes a
+reasoning setting, which levels it accepts, how they are sent, its output cap and the members merged into its
+requests only. The types live here; the file is read by the binary (`adam-service`'s `ModelConfig`), and nothing
+in this crate touches the file system.
+
+| Item | What |
+|---|---|
+| `ReasoningEffort` | `None`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max`, spelled `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Closed on purpose, `ALL` lowest first, exhaustive `as_str`/`FromStr`, serde lower case, `Ord` in that order. `none` is a real level (some models reason unless it is sent); **absent** sends nothing |
+| `ReasoningWire` | `ReasoningEffort` (`{"reasoning_effort": ...}`, the only one verified on the deployment's gateway), `ReasoningObject` (`{"reasoning": {"effort": ...}}`), `ThinkingBudget` (`{"thinking": {"type": "enabled", "budget_tokens": n}}`); serde snake case |
+| `ModelProfile` | serde camelCase, `Default`, unknown members ignored: `reasoning_efforts`, `reasoning_wire`, `reasoning_budgets`, `reasoning_effort`, `max_output_tokens`, `max_output_tokens_limit`, `extra_body`, `preset`. A profile with only a cap or only an extra body is valid |
+| `Preset`, `ModelProfiles` | a named bundle (`reasoning_effort`, `max_output_tokens`) and the document (`profiles` by model id, `presets` by name). `profile(id)`, `preset(name)`, `preset_of(id)` |
+| `ModelProfiles::parse_json(text)` | parse and validate, **JSON only for now** (the workspace has no YAML parser). `Err(Vec<String>)` lists every problem, each naming the profile (or preset) and the key, but not the file: the caller adds the path. A file with any problem is refused whole |
+| `DEFAULT_MAX_OUTPUT_TOKENS` | 128,000: the cap a call asks for when its folder, its preset and its model's profile set none (ADR 0064). The assembly resolves it per model and clamps it to the model's limit and window; the loop's `Limits` default is the same value |
+
+The rules, all of them refusals at load: a level outside the vocabulary; an unknown wire; a duplicate level (the
+list is sorted lowest first); a budget for an undeclared level, a declared level with no budget, or a budget of
+`0`; an effort outside the model's levels (a profile's own, or a preset's); an unknown preset; efforts without a
+wire, a wire with no efforts, or budgets without `thinking_budget`; a cap of `0`, or above
+`maxOutputTokensLimit` (a preset's too); an `extra_body` member the runtime owns (`RESERVED_EXTRA_BODY_KEYS`:
+`model`, `messages`, `tools`, `tool_choice`, `stream`, `reasoning_effort`, `max_tokens`,
+`max_completion_tokens`). `reasoningEfforts: []` says the model takes no reasoning setting.
+
+`ModelRequest::reasoning_effort` carries the level a call asks for (ADR 0063); the agent loop sets it
+from the run's protected context key `vymalo.reasoningEffort`, else the agent's default. The wire that
+sends it (the model profile's `reasoningWire`) and the output cap are the following slices.
 
 ## Errors
 ## Errors
@@ -112,15 +143,40 @@ A message names an image by reference and never holds its bytes (ADR 0044).
 | `ContextLength`, `InvalidRequest { message, source }` | `Invalid` | no |
 | `Auth` | `Unauthenticated` | no |
 | `Protocol { message, source }` | `Corrupt` | no |
+| `Refused { status, slug, retry_after, park }` | by its status: `401`, `403` `Unauthenticated`; `402` `Rejected`; `429` `RateLimited`; `503` `Transient`; any other `Rejected` | `429` and `503` only (`retry_after()` is its `retry_after` for a `429`) |
+| `ModelLocked { model }` | `Rejected` | no |
+| `Unreachable { source }` | `Transient` | yes, with backoff |
 
 `Transient`, `InvalidRequest` and `Protocol` keep the transport's or decoder's
 error as their `source`, and their message does not repeat it. Build them with
 `ModelError::transient(msg)`, `invalid_request(msg)` and `protocol(msg)`, then
 `.with_source(err)`; a variant that has no source ignores `with_source`.
-`retry_after()` is set only by `RateLimited`. `is_context_overflow()` is true for
+`retry_after()` is set only by `RateLimited` and a `Refused` of status `429`. `Refused` holds no body
+and no header: its `Display` is `the model endpoint refused the call: HTTP <status>[ <slug>]`, and it has
+no source. `Unreachable` (`ModelError::unreachable()`) is a connection that could not be made, never a
+timeout nor a stream cut off. `is_context_overflow()` is true for
 `ContextLength` alone: its class stays `Invalid` (the same request never succeeds), and the
 agent loop decides from the predicate that a shorter history is worth one more try. `ModelError` is no longer `Clone`
 or `PartialEq`: match on the variant or the class.
+
+## Refusals
+
+[ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+decision 3. A client that gets an answer of status 400 or above builds a `Refusal` and asks its provider
+`parks(&refusal)`. `Park::No` keeps the error the call always had (`StaticBearer`, the device grant and
+`RenewingCredentials` answer it, so a wrong key fails as before); any other answer is `Refused { .., park }`.
+The slug `model_locked` is `ModelLocked` for every provider. Nothing parks a run yet: callers fail the new
+errors as any other of their class (the LLM agent's park is the next slice).
+
+`InjectedRun` answers by the slug, whatever the status:
+
+| Slug | Park |
+|---|---|
+| `unauthenticated`, `run_not_bound`, `lease_expired` | `OnTimer(FIRST_PARK)` |
+| `over_limit` | `UntilWoken` |
+| `rate_limited`, `unavailable` | `OnTimer` of `Retry-After`, clamped to `FIRST_PARK ..= MAX_PARK` |
+| none (`ProblemType::Absent`), on a `401` or `403` | `OnTimer(FIRST_PARK)`, as `unauthenticated` (*unverified* that an edge's denial has no problem body) |
+| `model_locked`, another slug, a `type` that cannot be read (`ProblemType::Unreadable`), none on another status | `No` |
 
 ## Features and environment
 
@@ -131,8 +187,10 @@ None.
 Doctests (the crate docs run as tests in CI's `cargo test --doc`) and unit
 tests in `src/error.rs` (`class_table`,
 `retry_after_comes_from_the_rate_limit_only`,
-`a_source_is_kept_and_printed_once`), `src/credentials.rs` (a fixed key and an empty one, giving up, `Debug` without values, a header replaced by name, the double's renewal), `src/mock.rs` and `src/types.rs` (the usage accounting:
-`a_part_above_its_total_is_added_in_and_one_within_it_is_left`, `usages_add_part_by_part_and_saturate`). No external
+`a_source_is_kept_and_printed_once`), `src/credentials.rs` (a fixed key and an empty one, giving up, `Debug` without values, a header replaced by name, the double's renewal; the injector's one header on both attempts, its refusal of a call with no run, and its giving up; `the_injector_parks_by_the_table` (with the clamp to `MAX_PARK`), `an_unreadable_problem_type_parks_nothing`, `the_other_providers_never_park`), `src/error.rs` also `a_refusal_is_classed_by_its_status`, `a_refusals_retry_after_is_said_for_a_rate_limit_only` and `a_refusal_shows_its_status_and_slug_only`, `src/mock.rs` and `src/types.rs` (the usage accounting:
+`a_part_above_its_total_is_added_in_and_one_within_it_is_left`, `usages_add_part_by_part_and_saturate`), and
+`src/profiles.rs` (the seven levels and the three wires, the ADR 0064 example, and every refusal: an unknown level or
+wire, a duplicate, the budgets, the caps, the preset references, the reserved extra-body members). No external
 service, no environment variables. [`adam-model-openai`](../adam-model-openai/README.md)
 tests a real implementation against a mock HTTP server.
 

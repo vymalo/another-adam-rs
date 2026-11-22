@@ -43,6 +43,20 @@ pub(crate) fn parse_root_run(payload: &Value) -> Option<RunId> {
     serde_json::from_value(payload.get(ROOT_RUN_KEY)?.clone()).ok()
 }
 
+/// The key of the payload of a child's first message that names the run its model calls name
+/// ([`Conversation::model_run`], [ADR 0067]): the run its parent's calls name, so the whole tree
+/// under a task, or under a session's round, names one run. Only code in the process writes it
+/// ([`ToolCtx::start_child`](crate::ToolCtx::start_child) and the session tools), like
+/// [`ROOT_RUN_KEY`].
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+pub(crate) const MODEL_RUN_KEY: &str = "model_run";
+
+/// The run named by [`MODEL_RUN_KEY`] in an inbound payload, if it is there and is a run id.
+pub(crate) fn parse_model_run(payload: &Value) -> Option<RunId> {
+    serde_json::from_value(payload.get(MODEL_RUN_KEY)?.clone()).ok()
+}
+
 /// The key of the payload of a child's first message that names the step of the **root** run the
 /// child's work is under: the root's call of a subagent tool (`tool:<call id>`), handed down to a
 /// child's own children. Written by [`ToolCtx::start_child`](crate::ToolCtx::start_child) only, like
@@ -97,6 +111,13 @@ pub const MAX_CONTEXT_BYTES: usize = 256 * 1024;
 /// (`access-tier/v1`): `{"tier": "plan" | "edits" | "auto" | "bypass"}`.
 pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
 
+/// The context key under which a message carries the reasoning effort it activated
+/// (`reasoning/v1`, ADR 0063): `{"effort": "none" | "minimal" | "low" | "medium" | "high" |
+/// "xhigh" | "max"}`. The newest message's value is the run's effort from the next model call;
+/// a continuing task and a child run inherit it. A value that is not that shape is ignored here:
+/// the front refuses it before anything is written.
+pub const REASONING_EFFORT_CONTEXT_KEY: &str = "vymalo.reasoningEffort";
+
 /// The context key under which a message says **who it was sent for** (`thread-tools/v1`): the
 /// thread's addressed agent, `{"caller": "main"}`, or an agent another agent asked, `{"caller":
 /// "ask:<n>", ..}`, read from the claims of the grant's token. A run of an asked agent has no person
@@ -104,14 +125,16 @@ pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
 pub const CALLER_CONTEXT_KEY: &str = "vymalo.caller";
 
 /// The context keys that carry a **limit on the agent**: the access tier the person picked, who the
-/// message was sent for, and that nobody answers the run (`adam_runtime::UNATTENDED_CONTEXT_KEY`). A message always sets them, even when the rest of its context is
-/// over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large catalog next to a `plan` tier would
-/// lift the limit), and a child run starts with the ones its parent has
+/// message was sent for, the reasoning effort it activated, and that nobody answers the run
+/// (`adam_runtime::UNATTENDED_CONTEXT_KEY`). A message always sets them, even when the rest of its
+/// context is over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large catalog next to a `plan`
+/// tier would lift the limit), and a child run starts with the ones its parent has
 /// ([`ToolCtx::start_child`](crate::ToolCtx::start_child)). Each value is at most
 /// [`MAX_PROTECTED_VALUE_BYTES`]; a larger one is ignored.
 pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[
     ACCESS_TIER_CONTEXT_KEY,
     CALLER_CONTEXT_KEY,
+    REASONING_EFFORT_CONTEXT_KEY,
     adam_runtime::UNATTENDED_CONTEXT_KEY,
 ];
 
@@ -459,6 +482,27 @@ pub struct Conversation {
     /// only a question; state stored under that name still loads.
     #[serde(default, alias = "pending_question")]
     pub pending_wait: Option<PendingWait>,
+    /// Set while the run is parked on the model ([ADR 0067] decision 4): the model call the endpoint
+    /// refused (or could not reach) is made again when the run wakes, from the conversation as it
+    /// was before it. Beside [`pending_wait`](Self::pending_wait), not one of its kinds: it is tied
+    /// to no tool call. Cleared by the next call that is answered. In the head, so a front reads
+    /// it at `/model_wait`. Not carried to a later task; absent from state written before it
+    /// existed, and not written while `None`.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    ///
+    /// A wait this build cannot read (a kind of park a later build added) reads as `None`, and the
+    /// rest of the state still loads.
+    ///
+    /// **Breaking:** a new public field of a struct that is not `#[non_exhaustive]`: a
+    /// `Conversation` built with a struct literal outside the workspace needs it (or
+    /// `..Default::default()`).
+    #[serde(
+        default,
+        deserialize_with = "crate::model_wait::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_wait: Option<crate::ModelWait>,
     /// User messages that arrived while tool results were still owed. They are
     /// appended once the last owed result is in (a user message between an
     /// assistant tool call and its result would break the protocol).
@@ -486,6 +530,11 @@ pub struct Conversation {
     /// existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<Plan>,
+    /// Turns in a row that stopped at the output limit with reasoning only (no words, no call): the
+    /// loop continues them and fails the run past [`MAX_THINKING_CUTS`](crate::MAX_THINKING_CUTS).
+    /// Absent from state written before it existed, and not written while `0`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub thinking_cuts: u32,
     /// The latest model turn stopped at the output limit (`FinishReason::Length`): a call of it whose
     /// arguments are not JSON is most likely cut off, and its error says so. Absent from state
     /// written before it existed, and not written while `false`.
@@ -551,6 +600,16 @@ pub struct Conversation {
     /// Absent from state written before it existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_run: Option<RunId>,
+    /// The run this run's model calls name ([`ModelRequest::run`](adam_model::ModelRequest::run),
+    /// [ADR 0067]), when the run that started it said one: the run its parent's calls name, put in
+    /// its first message by in-process code only. `None` for a run nobody started that way; its
+    /// calls then name its session's root, else [`root_run`](Self::root_run), else itself. Absent
+    /// from state written before it existed, and not written while it is `None`; a run that
+    /// continues another does not inherit it.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_run: Option<RunId>,
     /// The step of the [`root_run`](Self::root_run) this child run works under: the root's call of a
     /// subagent tool (`tool:<call id>`), put in the child's first message by the tool that started it
     /// and handed down to the child's own children. The report of each of this run's model calls

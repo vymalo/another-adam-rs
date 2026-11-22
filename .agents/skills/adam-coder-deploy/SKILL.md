@@ -36,9 +36,9 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
    target), statically linked with `mimalloc` as the global allocator, so they start in any x86-64 Linux
    image whatever its C library (ADR 0053 decision 11); stage 2 is the workspace image
    `ghcr.io/vymalo/another-agentic-images/workspace:${WORKSPACE_TAG}` (the `ARG WORKSPACE_TAG` is
-   an immutable `<rust toolchain>-<sha7>` tag; it moves together with the default devcontainer image's digest in
-   `bin/adam-coder/src/config.rs` and `runPods.image` of the chart) with the binaries, the pinned
-   `github-mcp-server`, the devcontainer CLI and Podman's remote client added. Runtime user is
+   an immutable `<rust toolchain>-<sha7>` tag; it moves together with `runPods.image` of the chart) with the
+   binaries and the pinned `github-mcp-server` added. The image carries no devcontainer CLI and no container
+   engine's client (ADR 0052). Runtime user is
    uid 10001, `/work` is the workspace volume, `EXPOSE 8080`, entrypoint
    `tini -- adam-coder`. The build argument `ADAM_BUILD_REVISION` (CI passes the commit) is baked into the
    binaries and shows on the card as the version's `+<sha7>` and in `build/v1` (ADR 0028). Tool pins carry a "verified <date>" comment: move a tag, its digest and
@@ -73,7 +73,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      `bypass` is opt-in. An App's key is readable by the commands of a run in the coder's own container, so the coder refuses to
      start that way (exit 78) and the chart refuses to render `github.auth: app` with `runPods.enabled: false`, unless
      `runPods.allowCommandsNextToSecrets: true` (`ALLOW_COMMANDS_NEXT_TO_SECRETS=true`) accepts the risk: use run pods
-     (`deploy/coder/examples/production.values.yaml`) or Podman.
+     (`deploy/coder/examples/production.values.yaml`).
    * `githubMcp` (default on): the official GitHub MCP server as a **native sidecar** (an init
      container with `restartPolicy: Always`, Kubernetes 1.29+) of every pod that runs workers,
      `github-mcp-server http --read-only` on 127.0.0.1:8082 from the coder's own image. It holds no
@@ -91,7 +91,9 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      it on: a missing property fails the whole ExternalSecret sync. Chart only: the binary reads the
      env var either way, so there is no image dependency (chart README, "The model gateway's URL from the
      secret").
-   * `config.modelContextWindow` (null): `MODEL_CONTEXT_WINDOW`, the model's window in tokens, said by each usage report.
+   * `config.modelContextWindow` (null): `MODEL_CONTEXT_WINDOW`, the model's window in tokens, said by each usage
+     report, and the output cap's window: the cap is clamped to the window less 20,000 and the coder's history
+     (ADR 0064; `deploy/coder/README.md`, "The model's context window").
    * `mcp.websearch.url` (our web search MCP Service, in cluster) and `mcp.context7.enabled` (hosted
      Context7), both off by default and byte-for-byte invisible when off. With either on, the chart renders
      ONE file of servers (a ConfigMap in the shape of `mcp.json`, no copy of the agent's prompt) and sets
@@ -109,8 +111,8 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      trust (ADR 0040, `docs/decisions/0040-a-shared-package-cache-at-cache.md`; chart README, "The package cache").
      The image must be on the workspace base `1.98.1-8c297d3` or later, which has the caches under `/cache`.
    * No Ingress: the service is cluster-internal and reached over A2A with a bearer token.
-   * Devcontainers are off on Kubernetes (README "Devcontainers are off here"). Its own answer is
-     `runPods.enabled` (off by default and then invisible): each active run's processes run in a pod of its own
+   * A repository's own environment is a run pod of its image, never a container engine in the coder
+     (ADR 0052). The chart's answer is `runPods.enabled` (off by default and then invisible): each active run's processes run in a pod of its own
      (`RUN_ENVIRONMENT=kubernetes`, ADR 0019, `docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md`). The
      chart renders the pod template (a ConfigMap; image, resources and volumes are values), a `PriorityClass` and a
      `ResourceQuota` scoped to it (a quota cannot select pods by label), a ServiceAccount with a Role for `pods` and

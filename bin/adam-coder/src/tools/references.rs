@@ -335,20 +335,9 @@ pub enum SlotUse {
 /// What the coder's tool `name` does with slots, or `None` for a tool nobody classified.
 pub fn slot_use(name: &str) -> Option<SlotUse> {
     Some(match name {
-        "prepare_workspace"
-        | "start_scratch"
-        | "request_repository"
-        | "create_repository"
-        | "rebuild_environment"
-        | "read_output"
-        | "stop_command"
-        | "list_commands"
-        | "ask_user"
-        | "show"
-        | "ui_catalog"
-        | "plan_work"
-        | "plan_check"
-        | "plan_add" => SlotUse::NoSlot,
+        "prepare_workspace" | "start_scratch" | "request_repository" | "create_repository"
+        | "read_output" | "stop_command" | "list_commands" | "ask_user" | "show" | "ui_catalog"
+        | "plan_work" | "plan_check" | "plan_add" => SlotUse::NoSlot,
         "read_file" | "read_files" | "list_files" | "find_files" | "search_files"
         | "share_file" | "run_command" | "file_diagnostics" | "find_definition"
         | "find_references" => SlotUse::Reads,

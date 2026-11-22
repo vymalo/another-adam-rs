@@ -77,12 +77,12 @@ flowchart TB
     subgraph impls["Implementations"]
         pg["adam-store-postgres"]
         mongo["adam-store-mongodb"]
+        sqlite["adam-store-sqlite"]
         openai["adam-model-openai"]
         oauth["adam-model-oauth"]
         ws["adam-workspace"]
         codetools["adam-code-tools"]
         gitsb["adam-git-sandbox"]
-        devc["adam-devcontainer"]
         kube["adam-env-kubernetes"]
         acp["adam-acp"]
     end
@@ -93,7 +93,6 @@ flowchart TB
     coder --> ws
     coder --> codetools
     codetools --> ws
-    coder --> devc
     coder --> kube
     coder --> acp
     agent --> service
@@ -131,17 +130,17 @@ flowchart TB
     sched --> agentfs
     pg --> core
     mongo --> core
+    sqlite --> core
     openai --> model
     ws --> gitsb
-    devc --> ws
     kube --> ws
 ```
 
 | Layer | Crates | Job |
 |---|---|---|
 | Contracts | [`adam-error`](../crates/adam-error/README.md), [`adam-core`](../crates/adam-core/README.md), [`adam-model`](../crates/adam-model/README.md), [`adam-a2a`](../crates/adam-a2a/README.md), [`adam-host`](../crates/adam-host/README.md) | Error classes, the `Store` port and run types, the `ModelClient` port, the `TaskBackend` port with the A2A 1.0 server, the process `Role` and `Placement` with a supervisor. |
-| Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-model-openai`, [`adam-model-oauth`](../crates/adam-model-oauth/README.md), [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-code-tools`](../crates/adam-code-tools/README.md) (the file and command tools as a library, ADR 0047; moving out of the coder in steps), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-devcontainer`](../crates/adam-devcontainer/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
-| Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md), [`adam-schedule`](../crates/adam-schedule/README.md) (a folder's schedules, [ADR 0060](decisions/0060-schedules-are-parked-runs.md): when they are due, the ids of their firings, each agent's scheduler `<agent>/adam.schedule` and `reconcile`; `adam-agent` and the coder run them with a `schedules` worker component, `reconcile_until_stopped`) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares. |
+| Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-store-sqlite`, `adam-model-openai`, [`adam-model-oauth`](../crates/adam-model-oauth/README.md), [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-code-tools`](../crates/adam-code-tools/README.md) (the file and command tools as a library, ADR 0047; moving out of the coder in steps), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
+| Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md), [`adam-schedule`](../crates/adam-schedule/README.md) (a folder's schedules, [ADR 0060](decisions/0060-schedules-are-parked-runs.md): when they are due, the ids of their firings, each agent's scheduler `<agent>/adam.schedule` and `reconcile`; `adam-agent` and the coder run them with a `schedules` worker component, `reconcile_until_stopped`, and `adam-engine` with one `reconcile` at `start`) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares. |
 | Agents and authoring | [`adam-llm-agent`](../crates/adam-llm-agent/README.md), [`adam-ui`](../crates/adam-ui/README.md), [`adam-mcp`](../crates/adam-mcp/README.md), [`adam-agent-fs`](../crates/adam-agent-fs/README.md), [`adam-assembly`](../crates/adam-assembly/README.md), [`adam-macros`](../crates/adam-macros/README.md), [`adam`](../crates/adam/README.md) | The model-and-tools loop; the screen's tools; MCP tools; the agent-folder parser; binding a folder to agents; `#[tool]`; the facade. See [Write an agent](guides/write-an-agent.md). |
 | Embedded | [`adam-engine`](../crates/adam-engine/README.md) | adam-rs in an application with no server and nothing on the network of its own ([ADR 0047](decisions/0047-adam-rs-can-be-embedded-in-an-application.md)): the embedded set, the runtime and its agent crates with `adam-a2a`'s `server`, `adam-a2a-runtime`'s `push` and `adam-ui`'s `thread-tools` off, checked by `tools/embedded-deps/check.sh`. Its API (slice 4: send, steer, answer, cancel, list, over `RuntimeTaskBackend` and a store and a model the host gives) is built; its stream of events is not yet. |
 | Binaries | [`adam-coder`](../bin/adam-coder/README.md), [`adam-agent`](../bin/adam-agent/README.md), [`adam-egress`](../bin/adam-egress/README.md) | The two agents you can run, library and binary each, over `adam-service`; and the HTTPS-only egress proxy for run pods, which uses only `adam-error` and is in the same image; the chart deploys it with the run pods, whose network policy allows nothing else out ([ADR 0042](decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)). |
@@ -168,6 +167,7 @@ classDiagram
     Store <|.. MemoryStore
     Store <|.. PgStore
     Store <|.. MongoStore
+    Store <|.. SqliteStore
     class ModelClient { <<interface>> }
     ModelClient <|.. OpenAiCompatible
     ModelClient <|.. MockModel
@@ -190,7 +190,6 @@ classDiagram
     EventSink <|.. NoopSink
     class Environment { <<interface>> }
     Environment <|.. Local
-    Environment <|.. DevContainer
     Environment <|.. KubeEnvironment
     class CodeHost { <<interface>> }
     CodeHost <|.. GitHub
@@ -204,7 +203,7 @@ classDiagram
 
 | Port | Defined in | Real implementations | Doubles |
 |---|---|---|---|
-| `Store` | `adam-core` | `PgStore`, `MongoStore` | `MemoryStore` (reference), `FaultyStore` and `CountingStore` (testkit) |
+| `Store` | `adam-core` | `PgStore`, `MongoStore`, `SqliteStore` | `MemoryStore` (reference), `FaultyStore` and `CountingStore` (testkit) |
 | `ModelClient` | `adam-model` | `OpenAiCompatible` (`adam-model-openai`) | `MockModel` |
 | `ModelCredentials` | `adam-model` | `StaticBearer` (`MODEL_API_KEY`), `DeviceGrant` (`adam-model-oauth`, `MODEL_AUTH=device`); a host's own: a renewed token, a proof, an injector's tag ([ADR 0058](decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)) | `RenewingCredentials` |
 | `TaskBackend` | `adam-a2a` | `RuntimeTaskBackend` (`adam-a2a-runtime`) | `InMemoryBackend` (feature `test-util`) |
@@ -216,7 +215,7 @@ classDiagram
 | `CodeWorkspace` | `adam-code-tools` | `ToolEnv` (`adam-coder`: the slots of a run's workspace) | `DirWorkspace` (`adam-code-tools-testkit`, the reference of its conformance cases) |
 | `CodeHost` | `adam-workspace` | `GitHub` (feature `github`) | `MemoryCodeHost` (feature `test-util`) |
 | `GitCredentials` | `adam-workspace` | `ScopedToken`, `GitHubApp` (inside `HostScoped`), `StaticToken` | none needed |
-| `Environment` | `adam-workspace` | `Local`, `DevContainer` (`adam-devcontainer`), `KubeEnvironment` (`adam-env-kubernetes`) | stub Podman, CLI and API server in the tests |
+| `Environment` | `adam-workspace` | `Local`, `KubeEnvironment` (`adam-env-kubernetes`) | a fake API server and exec seam in the tests |
 | `CallBearer` | `adam-mcp` | `GitHubReadBearer` (`adam-coder`) | test bearers |
 | `PermissionPrompt` | `adam-acp` | none (the default policy needs no prompt) | `StaticPrompt` |
 
@@ -234,7 +233,8 @@ Rules the code follows:
 ## Processes and roles
 
 `adam-service`'s `serve(ServiceConfig, Agents, shutdown)` is the whole process. A binary builds its
-agent and hands over `Agents { name, card, register, options }`; `serve` connects the store, builds
+agent and hands over `Agents { name, card, register, options }`; `serve` chooses the store from
+`DATABASE_URL` (Postgres, MongoDB or SQLite), connects it, builds
 the runtime, the A2A router and the signals, and registers the components of the role with an
 `adam_host::Host`. `main` is `serve(Config::from_env(), sigterm)`.
 
@@ -260,10 +260,10 @@ flowchart LR
 
     subgraph svc["adam-service: serve(ServiceConfig, Agents, shutdown)"]
         direction LR
-        pg["PgConfig::parse once, PgStore::from_config (lazy),<br/>then ping + migrate() as DynStore"]
-        pgn["PgNotify::new(store pool, PgConfig, BroadcastSink)<br/>LiveSignals: PgEventSink + PgNotifier"]
+        pg["DATABASE_URL's scheme:<br/>PgStore (lazy, ping + migrate),<br/>SqliteStore (open + migrate) or<br/>MongoStore (connect + migrate)"]
+        pgn["Postgres only: PgNotify::new(store pool, PgConfig, BroadcastSink)<br/>LiveSignals: PgEventSink + PgNotifier<br/>SQLite: LocalNotifier; MongoDB: polling"]
         service["Service::new_with(register(Runtime::builder(store)), name, options, live)"]
-        rtm["Runtime<br/>PgEventSink as EventSink, PgNotifier as Notifier"]
+        rtm["Runtime<br/>the store's EventSink and Notifier"]
         bk["RuntimeTaskBackend"]
         router["A2aServer::router<br/>card + backend + AuthConfig"]
         cp["control-plane component a2a-server<br/>axum::serve"]
@@ -395,6 +395,25 @@ Rules this diagram cannot show:
 Follow-ups, `referenceTaskIds`, steering, steps and streamed text are in the
 [A2A server reference](reference/a2a-server.md).
 
+### The model's profile
+
+A deployment's models differ, so the reasoning level, the output cap and the extra body follow the model a call
+uses, not the process ([ADR 0063](decisions/0063-a-reasoning-effort-is-one-setting.md),
+[ADR 0064](decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md)).
+`MODEL_ALIASES_FILE` (JSON only for now) holds `profiles` by model id and `presets` by name; `ModelConfig` reads
+and validates it at startup (`crates/adam-service/src/config.rs`), and the types are `adam_model::ModelProfiles`
+(`crates/adam-model/src/profiles.rs`). The assembly resolves each agent's default reasoning effort from its folder,
+its `model_preset` and the profile (`crates/adam-assembly/src/assembly.rs`), and resolves and clamps its output cap
+per model: the folder's `limits.max_output_tokens`, its preset's, the profile's, the profile's base preset, then
+128,000, then the smallest of that, the model's `maxOutputTokensLimit` and what the window leaves after 20,000 tokens
+and the agent's history (`crates/adam-assembly/src/assembly.rs`, `output_cap`; the margin and the compaction budget
+are `crates/adam-llm-agent/src/compaction.rs`). An embedded engine takes the same profiles from its host
+(`EngineBuilder::models`), and its builder's level (`EngineBuilder::reasoning_effort`) sits between the folder and
+the preset: the folder's key wins over it, and it over the agent's `model_preset` and the profile
+(`crates/adam-engine/src/engine.rs`, the host's seat; `crates/adam-assembly/src/def.rs`, the root's fallback;
+`crates/adam-assembly/src/assembly.rs`, `default_effort`). The client's reasoning wire and the profile's
+`extraBody` are the following slices.
+
 ### The tokens of each model call
 
 A completed model call is a `RunEvent::Usage`, sent to the client as a `usage/v1` report when its request activated the
@@ -441,7 +460,7 @@ The same object carries the compute a run's commands used. A tool reports how lo
 (`ToolCtx::report_sandbox`); the loop journals it with the call's result, adds it to `Conversation::sandbox_usage` in the
 same commit, and a parent adds its child's, as it does the tokens. `totals_metadata` writes it as the `sandbox` member beside
 `totals` when the task ends or waits: one entry per pod shape (the template's CPU and memory requests) with the commands and
-their milliseconds, and for a run in the coder's own container or a dev container only the environment, which reads as *not
+their milliseconds, and for a run in the coder's own container only the environment, which reads as *not
 measured* and never as zero ([ADR 0043](decisions/0043-sandbox-time-as-usage.md), `bin/adam-coder/src/tools/sandbox.rs`,
 `crates/adam-a2a-runtime/src/usage.rs`).
 
@@ -740,10 +759,10 @@ stateDiagram-v2
 
 | Part | Rule |
 |---|---|
-| **Budget** | the smaller of `MODEL_CONTEXT_WINDOW` less 20,000 less `max_output_tokens`, and `limits.max_history_tokens`; none when neither is set (a window with no room left counts as none) |
+| **Budget** | the smaller of `MODEL_CONTEXT_WINDOW` less 20,000 less `max_output_tokens` (the cap resolved for the agent's model, ADR 0064), and `limits.max_history_tokens`; none when neither is set (a window with no room left counts as none) |
 | **Estimate** | the last call's reported prompt tokens plus characters / 4 of what came after; with no report, characters / 4 of the instructions, the tools and every message |
 | **Cut** | at the start of a turn (an assistant message, never the first message), so a call is never parted from its result; the newest 1 to 8 turns worth at most a quarter of the budget stay verbatim; fewer than two turns to drop, eight compactions made by the run (a run that continues another carries the earlier ones as one record, which is not one of its eight), or a request that would still be over the budget with no summary, shortens instead |
-| **Summary** | the agent's own model, the request as it stands (same system, tools and history) plus one built-in instruction as the last message, `tool_choice: none`, 4,096 output tokens, capped at 16 KiB; its usage is reported under an id of its own (`<run>-k<n>-<suffix>`); the person sees one step, "Summarise the conversation" |
+| **Summary** | the agent's own model, the request as it stands (same system, tools and history) plus one built-in instruction as the last message, `tool_choice: none`, `min(4,096, cap)` output tokens, or 4,096 when the cap is `0` (the run's resolved cap, ADR 0064), capped at 16 KiB; its usage is reported under an id of its own (`<run>-k<n>-<suffix>`); the person sees one step, "Summarise the conversation" |
 | **New history** | the task (the first part of the first message) verbatim, then the marker (its second part, `Conversation::is_omission_marker`), then the person's later messages verbatim (2 KiB each, 8 KiB in all, as parts of that message), then the turns that stayed |
 | **The marker's lines** | the summary, then lines **written by code** from what left: the plan, the results a tool pinned, a pointer to each kept output (built from the call's own output id), the names of the skills loaded earlier, a line that sessions exist. Text that is copied has each line that starts with `[` written `\x5b`, so it cannot forge a loop line |
 | **Sessions** | a run whose `subagent_start` was cut still waits for, and cancels, the sessions it started (`Compaction::sessions`) |
@@ -804,6 +823,10 @@ stateDiagram-v2
 
 * **The newest message that names a tier wins**, from the next step; one that names none leaves it. A larger context never
   drops the tier (`PROTECTED_CONTEXT_KEYS`), and a child run starts with its parent's.
+* **The reasoning effort follows the same rule** (ADR 0063): a message that activated `reasoning/v1` writes
+  `vymalo.reasoningEffort` (`{"effort": "<level>"}`), the newest message's level is asked for from the next model
+  call, the key is protected like the tier, a child run starts with its parent's, and a compaction/summary call sends
+  none. A level the model's profile does not declare is refused by the front before anything is written.
 * **`merge_pull_request` needs more than the tier**: green checks on the commit it merges, and then either the commit is one this
   conversation pushed (it merges), or the tool asks the person itself in a form of its own and merges on their yes to that form
   (any other pull request, or one opened with red checks accepted); at `bypass` it asks nothing. It never reads what the
@@ -912,16 +935,18 @@ never shown as `submitted` again. A front that holds only the starter claims not
 
 ## Data: the run store
 
-Six tables (PostgreSQL) or collections (MongoDB), prefixed `adam_` by default, plus a `meta` table with
+Six tables (PostgreSQL and SQLite) or collections (MongoDB), prefixed `adam_` by default, plus a `meta` table with
 the schema version: `push` holds A2A push-notification configurations (schema version 3), `blob`
 and `run_blob` hold a run's file bytes and the digests it references (schema version 5, part 1), and
 `body` holds a run's transcript beside the `head` and `head_version` of a run (schema version 5,
-part 2; version 6 on PostgreSQL). Both adapters keep them: MongoDB in the run document and the
-`adam_body` collection, PostgreSQL in `runs.head`/`runs.head_version` and the `adam_body` table —
-on PostgreSQL the head, the rows, the references and the CAS are one transaction, while MongoDB
-writes the rows first, checks they all landed, then CASes. `state` is JSONB in Postgres and a real BSON document in
-MongoDB; in the **contract release** it is the tombstone (`null`) for a run whose head is current,
-and the whole v4 envelope only for a run that has not split yet (ADR 0055).
+part 2; version 6 on PostgreSQL). The adapters keep them: MongoDB in the run document and the
+`adam_body` collection, PostgreSQL in `runs.head`/`runs.head_version` and the `adam_body` table,
+written in the same transaction as the CAS; SQLite in the same columns as PostgreSQL, in one
+`BEGIN IMMEDIATE` transaction. `state` is JSONB in Postgres, a real BSON document in MongoDB and
+JSON text in SQLite; in the **contract release** it is the tombstone (`null`) for a run whose head
+is current, and the whole v4 envelope only for a run that has not split yet (ADR 0055). A SQLite
+file is opened by one process and holds no cross-process signals
+([store adapters](reference/store-adapters.md#sqlite)).
 
 ```mermaid
 erDiagram
@@ -1037,6 +1062,10 @@ A **file artifact's** bytes are written to the blob table under their SHA-256
 (`adam_runtime::blob_id`) and the commit references the digest (`RunUpdate::blobs`); a v4 state also
 keeps the bytes, so a reader of the old format still reads a run, while a v5 head names them by
 digest and size ([ADR 0055](decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md)).
+Before a v5 head is built by a split, a failed transition or a cancel, every file it inherits is
+checked with one `blob_stored`; one whose bytes are gone is left out of the head and its references
+(logged), because the head cannot store it again. A delivery writes the head it read unchanged, so a
+later refused split still sees the missing file and refuses rather than demoting without its bytes.
 
 ### The head and the body (schema version 5, part 2; the contract release)
 
@@ -1048,14 +1077,16 @@ is the one full-state read, joining the head and the generation it names: the he
 
 `Store::load_run`, `load_head`, `claim_due`, `open_run_for_conversation` and `list_runs` answer the
 **same document**: the head when `head_version == version`, the whole `state` otherwise (a v4 run, or
-a head a later commit did not rebuild). The step path joins the head and the rows the claim read; a
+a head a later commit did not rebuild). A tombstoned run whose head is behind the version serves the
+head, the only readable document. The step path joins the head and the rows the claim read; a
 delivery, a cancel and a `park_again` write the head they read, so the head stays current and the
-next split appends to the same generation. Both adapters keep the head and the body: MongoDB in the
+next split appends to the same generation. The adapters keep the head and the body: MongoDB in the
 run document and the `adam_body` collection, PostgreSQL in `runs.head`/`runs.head_version` and the
 `adam_body` table. A PostgreSQL commit that writes a head or a body is
 one transaction — the run row locked `FOR UPDATE`, the version check, the rows, the refs and the CAS
 — so a foreign attempt's duplicate slot is resolved inside it (identical: adopted; older than the
-5-minute orphan grace: collected and retried once; live and different: `Conflict`).
+5-minute orphan grace: collected and retried once; live and different: `Conflict`). SQLite does the
+same in one `BEGIN IMMEDIATE` transaction.
 The head is the envelope with `v: 5`, `agent` reduced to the agent's head, file artifacts by
 reference, and a `body` member naming one generation; the rows are the messages.
 
@@ -1296,10 +1327,10 @@ The tree of enums and the exit codes are in [Errors](reference/errors.md).
 
 The coder keeps a **workspace** per run: `<root>/workspaces/<run>/`, a directory of slots, each a
 repository's worktree, a scratch project or a **reference** (a repository read beside the one the run works on and never
-written: a detached checkout that a run pod and a devcontainer mount read-only,
+written: a detached checkout that a run pod mounts read-only,
 [References](reference/workspace-and-environments.md#references)). Its commands run through the `Environment` port: in the
-coder's own container (`Local`), in the repository's devcontainer on a rootless Podman service
-(`DevContainer`), or in a Kubernetes pod of the run's own (`KubeEnvironment`).
+coder's own container (`Local`) or in a Kubernetes pod of the run's own (`KubeEnvironment`); ADR 0052 removed
+the third environment, a repository's devcontainer on a container service.
 
 Runs move between workers at every step, but a workspace lives on one worker's disk. The deployer picks
 a **placement** (`adam_host::Placement`, read from `WORKSPACE_PLACEMENT`;
@@ -1318,9 +1349,8 @@ Slots, the environments' sequences and states, and the mirror lock are in
 [Workspace and environments](reference/workspace-and-environments.md).
 
 The **package caches** (npm, pnpm, cargo) are not part of a workspace: they are one deployment-level volume at `/cache`, mounted
-by every pod that runs toolchains (the coder, its run pods, a devcontainer) and shared by all of them, off by default
-([ADR 0040](decisions/0040-a-shared-package-cache-at-cache.md); chart value `cache`,
-`DEVCONTAINER_CACHE_DIR`). Installed trees (`node_modules`, `target/`) stay in the workspace.
+by every pod that runs toolchains (the coder, its run pods) and shared by all of them, off by default
+([ADR 0040](decisions/0040-a-shared-package-cache-at-cache.md); chart value `cache`). Installed trees (`node_modules`, `target/`) stay in the workspace.
 
 The **kept output** of a long command, or of a long MCP result, is a file of the run too:
 `<root>/outputs/<run>/<id>.txt`, written by the coder's own process (never by a pod) after the text is scrubbed
@@ -1427,7 +1457,7 @@ stateDiagram-v2
 A **language server** (`file_diagnostics`, `find_definition`, `find_references`) is the same kind of process with a pipe on
 stdin: the coder holds one per run, slot, language and project root **on this worker**, spoken to in JSON-RPC with `Content-Length`
 frames, and stops it where it stops a command that keeps running (the registry is `Commands::language_servers()`, so
-the agent's step, the sweep, the janitor and `rebuild_environment` reach it with no new wiring). There is no record on the volume
+the agent's step, the sweep, the janitor and `use_repository_environment` reach it with no new wiring). There is no record on the volume
 and no beat: a run that another worker takes up starts a server there (placement `shared`; `affinity` and `isolated` keep a run where
 it is), and the first worker's server stops by itself when it is idle or its run is over. The tools, the limits and the lifecycle:
 [The coder agent](reference/coder-agent.md#language-servers).
@@ -1446,7 +1476,7 @@ sequenceDiagram
     C->>P: initialize, initialized
     T->>P: sync, then the request, within the wait
     Note over P: idle for LANGUAGE_SERVER_IDLE_SECS: its supervisor stops it
-    A->>C: stop_run, when the root run ends, a run parks on the person, or rebuild_environment runs
+    A->>C: stop_run, when the root run ends, a run parks on the person, or use_repository_environment runs
     W->>C: sweep: stop_run for a run that is over or cancelled
     J->>C: stop_run, before the release
     W->>C: stop_all, when the worker stops

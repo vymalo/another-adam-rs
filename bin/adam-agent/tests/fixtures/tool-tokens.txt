@@ -1,0 +1,7 @@
+# tool	bytes	tokens(chars/4)
+ask_user	10003	2500
+plan_add	699	174
+plan_check	964	241
+plan_work	1211	302
+show	1549	387
+ui_catalog	474	118
