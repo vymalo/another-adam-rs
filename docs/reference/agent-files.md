@@ -894,8 +894,10 @@ tools, named after the server, loaded by one generated tool, `load__group__<serv
   shown) is refused with a result that names the tool, the group, its keywords and its loader. A server the task
   does not load contributes no instructions to the prompt; the group's note is said in the load's result when the
   run loads it, so the prompt does not grow during a run. A group the **task** loads keeps the `when` behaviour:
-  its note is in the first request's prompt. The eager servers' instructions stay in the prompt, after the
-  agent's own text and before its skills.
+  its note is in the first request's prompt. A member a **task-loaded** group loses to the access tier is
+  **removed for the run** (it would otherwise appear later at its registration position, an insertion rather
+  than a suffix); an explicitly loaded group's member is only hidden for that message. The eager servers'
+  instructions stay in the prompt, after the agent's own text and before its skills.
 * **No `paths` in this version.** The coder has no checkout before its first model call
   (`prepare_workspace` is a tool), so a path glob would have nothing to match. `when.paths` is ignored with a
   warning at load; a `when` with no `keywords` is a load error, because the server would never load.
