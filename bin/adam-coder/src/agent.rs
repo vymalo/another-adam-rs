@@ -1675,8 +1675,12 @@ mod commands_tests {
             commands_end_with(&parked_on_the_model("until_woken"), false),
             Some("the run waits on the model until it is woken")
         );
-        // A child's park until woken stops the root's commands too, as its question does.
-        assert!(commands_end_with(&parked_on_the_model("until_woken"), true).is_some());
+        // A session's round that parks until woken stops the root's commands too, as its question
+        // does; a local subagent never parks until woken (the loop fails it).
+        assert_eq!(
+            commands_end_with(&parked_on_the_model("until_woken"), true),
+            Some("the run waits on the model until it is woken")
+        );
         // A timer park keeps them: `MODEL_PARK_LIMIT` ends the run.
         assert_eq!(
             commands_end_with(&parked_on_the_model("timer"), false),
