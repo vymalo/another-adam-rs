@@ -79,12 +79,14 @@ Rules worth knowing:
 * **The agent already has** `ask_user`, `show` and `ui_catalog` (the person's screen), `plan_work`, `plan_check` and
   `plan_add` (a plan: a checklist the person sees; tell the agent in its instructions when to plan, for example for
   work of three or more steps; with a `tools:` list, name `plan_*` to keep them), the tools of its MCP
-  servers (`<server>__<tool>`), `load_skill` and `read_skill_file` when it has skills (a folder with no `skills:` has every skill it holds; `skills: []` turns them off; the name is a plain string and a long skill is read page by page), and one tool per subagent.
+  servers (`<server>__<tool>`), one `load__group__<server>` per MCP server with a `when` (the group's tools load when the task holds one of its keywords or the model calls the loader), `load_skill` and `read_skill_file` when it has skills (a folder with no `skills:` has every skill it holds; `skills: []` turns them off; the name is a plain string and a long skill is read page by page), and one tool per subagent.
 * **MCP**: credentials go in `headers` as `${VAR}`; `tools` is an allow-list; `"optional": true` lets a server be
   down; `"files": true` hands the images and documents its tools return (a browser's screenshot and PDF) to the
   person as files of the run, the model reading one line each. Which kinds of server are allowed is the
   **deployment's** decision (`MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS`), not the file's.
-  `ADAM_EXTRA_MCP_FILE` adds servers without copying the folder. A server entry can also set `timeoutSecs` and
+  `ADAM_EXTRA_MCP_FILE` adds servers without copying the folder. `"when": {"keywords": ["…"]}` makes a server
+  one group, loaded by `load__group__<server>`; the server's name becomes the group's name, so it is lowercase
+  letters and digits with single underscores, at most 40 characters. A server entry can also set `timeoutSecs` and
   `connectTimeoutSecs` (capped by the deployment), `"instructions": false` (what the server says about itself is
   otherwise added to the agent's instructions, quoted) and `"prompts": false` (its prompts are otherwise commands
   `/<server>__<prompt>`); see [the reference](../reference/agent-files.md#timeouts-instructions-and-prompts).

@@ -79,7 +79,9 @@ before you rely on a detail here.
      Naming a skipped optional server's tools in the agent's `tools:` (`search__*`) makes the folder exit 78,
      so leave an optional server's tools out of `tools:` or make the server required.
    * `"when": {"keywords": ["linear", "ticket"]}` on a server: it becomes one **group** of tools, named after
-     the server, loaded by one generated tool `load__group__<server>` (its schema is a constant). Its tools are
+     the server, loaded by one generated tool `load__group__<server>` (its schema is a constant). The server's
+     name becomes the group's name, so it is lowercase letters and digits with single underscores, at most 40
+     characters: `my-linear` and `MyLinear` are refused at load, naming the server, and nothing is renamed. Its tools are
      **withheld** from a run whose task (the words of the first message) mentions none of the keywords, and the
      server's instructions are the group's note: said in the load's result for an explicit load, and in the first
      prompt for a group the task's keywords load. A successful call

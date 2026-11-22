@@ -70,7 +70,8 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 | `RemoteRoundAgent` (feature `remote`) | the `Agent` (and `AgentStarter`) that works the rounds of a session on a remote subagent of the root, registered as `<root>/<subagent>`; `with_wait_poll(Duration)` (`BoundDef::wait_poll` sets it). See [Remote sessions](#remote-sessions) |
 | `RemoteRoundStarter` (feature `remote`) | its start-only twin, `new(name)`: makes the same round state (`init`, `init_continuing`) with no endpoint and no credential; `AgentDef::session_starters` registers it |
 | `Assembly::prompt_commands()` (feature `mcp`) | the prompts of the **root's** MCP servers as commands (`adam_mcp::PromptCommand`), read once when the servers were connected; a subagent's give none. `adam-service` adds them to the backend and the card ([adam-mcp](../adam-mcp/README.md#prompts-as-commands)) |
-| `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `prompt` (rendered, with the skills catalog and the instructions of its MCP servers), `tools` (own, `use_server` when one of its servers has a `when`, skill tools, then one per subagent, local or remote, then the five session tools of the root when it has a subagent, local or remote: what the model is offered), `skills`, `preloaded`, `when`, `limits`: what an `LlmAgent` was made from, comparable |
+| `Group`, `Groups` | a named set of tools that load together (ADR 0066): `Group::new(name, note, members)`, `with_keywords`, `searchable` (refused until S2), `loader()`; `Groups::bind(&Origin, defs, &[(String, DynTool)])` drops every member the agent was not given (an empty group has no loader), refuses a bad name, two groups of one name, a searchable group, a tool in two groups, a loader name a tool already has, and a reserved `load__` name; `loaders()` (the catalogue), `loader_tools()` (one `load__group__<name>` per group). `Groups` is a `ToolSource`: it withholds a group's members until the task's keywords or the run's load, appends a loaded group after every other tool, and journals the task-loaded groups and the loaders. Constants: `GROUP_LOADER_PREFIX`, `MAX_GROUP_NAME_CHARS`, `MAX_KEYWORDS`, `MAX_KEYWORD_CHARS`, `name_fits`, `keywords_fit`; the reserved prefix is `adam_llm_agent::RESERVED_LOADER_PREFIX` |
+| `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `prompt` (rendered, with the skills catalog and the instructions of its eager MCP servers), `tools` (own, one `load__group__<server>` per server with a `when`, skill tools, then one per subagent, local or remote, then the five session tools of the root when it has a subagent, local or remote: what the model is offered), `skills`, `preloaded`, `when`, `limits`: what an `LlmAgent` was made from, comparable |
 | `RemoteInfo` | a remote (`a2a:`) subagent, as data (its tool is in `AgentInfo::tools` like a local subagent's) |
 | `LiveAssembly`, `LiveBuilder`, `Watch` (feature `dev`) | dev reload: `LiveAssembly::builder(dir, model, alias)` then `tools`, `configure`, `configure_bound`, `strictness`, `default_name`, `debounce`, `connect_mcp(&McpPolicy)` (feature `mcp`), `load()`; on the handle `register(RuntimeBuilder)`, `reload()`, `watch()`, `generation()`, `schedules()`, `last_error()`, `info()`, `retired()`, `runs_on_previous_tools()`, `dir()` |
 | `Reloaded`, `ToolChange`, `ReloadError`, `WatchError` (feature `dev`) | what a reload did (`generation`, `changed`, `tool_changes`, `retired`), why it changed nothing (`Load(Error)` with `diagnostics()`, `NeedsRestart { added }`), why a watcher did not start |
@@ -261,6 +262,10 @@ same tool results.
 | a selected skill's files were not supplied | `SkillFilesUnavailable` |
 | a skill bundles more than 1 MiB | `SkillTooLarge` (also from `resources_from`) |
 | a registered tool called `load_skill` or `read_skill_file` on an agent with skills | `ReservedToolName` |
+| a registered tool, selected tool or subagent whose name starts with `load__` | `ReservedLoaderName` |
+| a group's name or keywords do not fit, or two groups have one name | `GroupName` |
+| a searchable group (S2 is not built yet) | `SearchableGroup` |
+| one tool in two groups | `GroupOverlap` |
 
 `tools:` does not filter the skill tools; `skills: []` turns them off. Both are ordinary tools, so their
 results are journaled with the step that ran them.
@@ -714,8 +719,10 @@ what it cost is the next call's `Usage::cached_input_tokens`, which only the pro
 changes nothing: a loader called twice, and one whose group the task already loaded. A group with no member the
 agent was given (its `tools:` narrowed the server's list, or an `optional` server was not reachable) has **no
 loader**: lazy never widens access, and its existence is not revealed. `Groups::bind` refuses a group name that
-does not fit `^[a-z0-9]+(_[a-z0-9]+)*$` (at most 40 characters), two groups of one name, and a searchable group
-until S2. The loaders reserve the word `load`: a server named `load` is refused at start, and a registered tool
+does not fit `^[a-z0-9]+(_[a-z0-9]+)*$` (at most 40 characters), two groups of one name, a tool in two groups, a
+reserved `load__` name, and a searchable group until S2. A `when` server's name becomes its group's name, so
+`adam-agent-fs` refuses a `when` server whose name is not one at load, naming the server and saying to rename it;
+nothing is renamed, because a rename would change its tools' `<server>__<tool>` names. The loaders reserve the word `load`: a server named `load` is refused at start, and a registered tool
 whose name starts with `load__` is refused at bind.
 
 ### Extra MCP servers (`ADAM_EXTRA_MCP_FILE`)

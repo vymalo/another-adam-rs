@@ -267,9 +267,15 @@ Three results the loop writes itself, as error results the run goes on from (`ad
 | The third call in a row of a tool with the same arguments when the two before gave the same result, or both were errors (`doom_loop`) | `Not run: this is the third call in a row of `{tool}` with the same arguments, and the last two gave the same result. Calling it again will not change it. Change your approach: other arguments, another tool, or answer with what you know.` |
 | A call runs past its tool's time limit (300 s unless declared). The call's token fires, the tool has 5 s to stop, and the text is journaled, so a replay never waits | `` `{tool}` did not finish within {N} s and was stopped. What it had done is not undone: look at the state again before relying on it, and try a smaller step. `` (`{N} ms` under a second) |
 | A child run is past its `limits.max_minutes` | the parent reads `the run failed: cancelled: time limit: the run did not finish within 30 min` |
+| A call to a tool of a group the run has not loaded | `` `{tool}` is not loaded for this run: it belongs to the group `{group}`, which the task loads when it mentions one of its keywords ({keywords}). Call `load__group__{group}` to load the group, and its tools are available from your next call. `` (the keywords are left out when the group has none) |
+| A call to a loaded tool the group no longer holds | `` `{tool}` was loaded earlier and is not available in this conversation now: the request that followed left it out. Do not call it again; use what you have. `` |
 
-A child whose parent ended is `cancelled: the parent run ended`. Two refusals of a repeated call end the run with its closing
-turn and `limit: "repeated_call"`; a closing turn with no words fails it with `the same tool call was repeated with the same
+A child whose parent ended is `cancelled: the parent run ended`. A `when` server whose name is not a group name
+(lowercase letters and digits, single underscores, at most 40), a server named `load`, a registered or selected
+tool or a subagent named `load__…`, a searchable group, a tool in two groups and a group name or keyword outside
+its bounds are **exit 78** at bind, each with its own message naming the file and what to change.
+
+Two refusals of a repeated call end the run with its closing turn and `limit: "repeated_call"`; a closing turn with no words fails it with `the same tool call was repeated with the same
 result and the run was stopped (doom_loop)`.
 
 A model turn that stops at the output limit with only reasoning (no words, no call) is continued with a short message, at

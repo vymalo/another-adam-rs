@@ -255,12 +255,15 @@ by `McpPolicy::thread_tools_max_call` (`THREAD_TOOLS_MAX_CALL_SECS`, 3600 s). A 
 * **`parallel`** (an adam extension, on unless `false`). MCP tools now run at the same time by default; a server with a session (a browser, a cursor, a file being written then read) needs `"parallel": false` in mcp.json before you take this revision. An `McpTool` declares `ToolAccess::Independent` (it shares nothing with the turn's other calls, so the calls of a reply run at the same time, up to the agent's limit); `false` on the server makes it `Alone`. A tool whose result carries files (`files: true`) takes their bytes from the room the turn's calls share the moment it has them (`ToolCtx::spend_files_of`, a compare-and-swap): of two calls that run together, a file that no longer fits is dropped with the loop's "Not shared" line instead of being journaled. Its schema is the server's (`Tool::schema_is_foreign`): a property the server calls `after_previous` is kept and passed through. Test: `tests/server_settings.rs` (`mcp_tools_are_independent_unless_the_server_says_parallel_false`).
 * **`instructions`, `prompts`** (adam extensions, on unless `false`): see *Server instructions* and *Prompts as commands* below.
 * **`when`** (an adam extension) is **not this crate's**: the file is parsed by `adam-agent-fs`
-  ([`McpWhen`](../adam-agent-fs/README.md)) and `adam-assembly` decides which server a run loads, withholding
-  the tools of the others and adding their instructions only when they load. `connect` still connects and lists
+  ([`McpWhen`](../adam-agent-fs/README.md)) and `adam-assembly`'s `Groups` decides which group a run loads,
+  withholding the tools of the others and giving their instructions to the first prompt (a task-loaded group) or
+  to the load's result (an explicit one). `connect` still connects and lists
   every server of the file, so a server that a run never loads costs its connection and its listing, not its
   tools. See [agent files](../../docs/reference/agent-files.md#a-server-loaded-only-when-the-task-asks-when).
 * **Names say whose tool it is.** A server name has no `__` and does not end in `_` (`Error::Name`, also in
-  `adam-agent-fs`), and a tool name does not start with `_` (an error in an allow-list, skipped with a warning
+  `adam-agent-fs`); a server named `load` is refused (`Error::ReservedServerName`), because `load` is reserved for
+  the group loaders and its tools would be named `load__<tool>`; a tool whose full name starts with `load__` is
+  left out with a warning (`tool_fits`); and a tool name does not start with `_` (an error in an allow-list, skipped with a warning
   without one): otherwise `a` + `_x` and `a_` + `x` would both be `a___x`, `linear__*` would also select the
   tools of a server `linear_`, and the first `__` would not end the server's name.
 * **What the model sees.** The description is the server's, else its title, else `` `<tool>` from the MCP server

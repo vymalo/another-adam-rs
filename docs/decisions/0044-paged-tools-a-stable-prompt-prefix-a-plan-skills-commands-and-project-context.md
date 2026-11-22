@@ -176,6 +176,13 @@ Facts about third parties:
    amendment's text is the rule. The prompt cache still ends where the array grew, and the cost is still read from
    the next call's `Usage::cached_input_tokens`.
 
+   *Amended 2026-11-22 (S1 of ADR 0066, landed):* `use_server` is gone. A server's `when` is one group, loaded by
+   `load__group__<server>`, and the state is `Conversation::loaded` (a `Loaded` per loader, with its tools and note)
+   plus `loaders` and `removed_tools`; `Conversation::loaded_servers` is decoded and never written. The mechanism
+   above is unchanged: a load appends after every other tool, the turn the final request grew at is recorded in
+   `Conversation::tools_appended` (a tier-hidden load records none), and the cost is the next call's cached tokens.
+   The person's own servers as groups (S5) remain.
+
 ### Everything that reads is paged
 
 2. **One paging convention for every tool that reads.** Input: `offset` and `limit`. Output: the page, then one last line that

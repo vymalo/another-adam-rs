@@ -280,11 +280,15 @@ The prompts of an agent's MCP servers are commands too, named `<server>__<prompt
   `files: true` (an adam extension, a boolean, default `false`) shares the images, audio clips and blobs of the
   server's results as files of the run ([below](#files-from-a-server-files-true)). `timeoutSecs` and
   `connectTimeoutSecs`, `instructions` and `prompts` (adam extensions) are [below](#timeouts-instructions-and-prompts).
-* `when: { "keywords": ["…"] }` (an adam extension) loads the server's tools **only when the run's task
-  mentions one of its keywords**, ignoring case; a server without `when` is loaded for every run. The test is
-  made from the words of the run's first message, before its first model call; a run that needs a server the task
-  did not name loads it with the fixed tool `use_server { name }`, which **appends** the server's tools to the next
-  request and never inserts them ([below](#a-server-loaded-only-when-the-task-asks-when)).
+* `when: { "keywords": ["…"] }` (an adam extension) makes the server one **group** of tools, loaded by the
+  generated tool `load__group__<server>`; its tools are **withheld** from a run whose task mentions none of its
+  keywords, ignoring case, and a server without `when` is loaded for every run. The test is made from the words
+  of the run's first message, before its first model call; a run that needs the group loads it with its loader,
+  which **appends** the group's tools to the next request and never inserts them
+  ([below](#a-server-loaded-only-when-the-task-asks-when)). A `when` server's **name becomes its group's name**,
+  so it is lowercase letters and digits with single underscores between them, at most 40 characters: a name such
+  as `my-linear` or `MyLinear` is refused at load, naming the server, and nothing is renamed (a rename would
+  change its tools' `<server>__<tool>` names).
   `paths` is **not** supported in this version and is ignored with a warning: the coder has no checkout before
   its first model call (`prepare_workspace` is a tool), so a path glob would have nothing to match. A `when`
   still needs `keywords`; one without is a load error and the server is left out.
