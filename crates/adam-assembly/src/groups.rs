@@ -154,9 +154,7 @@ pub fn keywords_fit(keywords: &[String]) -> bool {
         && keywords.iter().all(|word| {
             let count = word.chars().count();
             (1..=MAX_KEYWORD_CHARS).contains(&count)
-                && !word
-                    .chars()
-                    .any(|c| c.is_control() || matches!(c, '\u{200b}'..='\u{200f}'))
+                && !word.chars().any(adam_agent_fs::is_format_or_control)
         })
 }
 
@@ -287,9 +285,22 @@ impl Groups {
 
 /// What the model is told when it calls a tool of a group that is not loaded.
 fn reason(group: &Group, tool: &str) -> String {
+    let words: Vec<&str> = group.keywords.iter().take(8).map(String::as_str).collect();
+    let more = group.keywords.len().saturating_sub(words.len());
+    let when = match (words.is_empty(), more) {
+        (true, _) => String::new(),
+        (false, 0) => format!(
+            ", which the task loads when it mentions one of its keywords ({})",
+            words.join(", ")
+        ),
+        (false, n) => format!(
+            ", which the task loads when it mentions one of its keywords ({} and {n} more)",
+            words.join(", ")
+        ),
+    };
     format!(
-        "`{tool}` is not loaded for this run: it belongs to the group `{}`. Call `{}` to load the \
-         group, and its tools are available from your next call.",
+        "`{tool}` is not loaded for this run: it belongs to the group `{}`{when}. Call `{}` to load \
+         the group, and its tools are available from your next call.",
         group.name,
         group.loader()
     )
