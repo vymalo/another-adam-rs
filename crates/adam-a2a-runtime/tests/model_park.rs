@@ -700,6 +700,16 @@ async fn a_task_waiting_on_a_parked_child_shows_the_reason_and_takes_a_resume() 
         .unwrap_err();
     assert!(is_not_parked(&err), "{err:?}");
     assert_eq!(rig.written(&task).await, before, "nothing written");
+    // A resume with no `taskId`, in a context: it names the task it resumes.
+    let err = rig
+        .backend
+        .submit(who.clone(), resume("r-3"), None, Some("c".into()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, BackendError::InvalidParams(m) if m.contains("names the task")),
+        "{err:?}"
+    );
     rig.stop().await;
 
     // On a timer: the root reads `working` with the child's reason, takes a message and keeps its

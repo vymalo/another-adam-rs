@@ -6004,12 +6004,20 @@ mod cases {
         let child = child_run_id(parent, "call-1");
         let worker = spawn_worker(&rt);
         wait_waiting(&rt, child).await;
-        wait_until("the parent to be told of the park", || count(&parks) == 1).await;
-        assert_eq!(
-            rt.state(parent).await.unwrap().unwrap()["notice"],
-            json!(child.to_string()),
-            "the notice names the child"
-        );
+        // The notice wakes the parent, which reads it and parks again.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = rt.state(parent).await.expect("state").expect("the parent");
+            if state["notice"] == json!(child.to_string()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the parent never recorded the notice: {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(count(&parks), 1, "one notice, read once");
 
         let mut version = rt.view(child).await.unwrap().unwrap().version;
         for _ in 0..3 {
