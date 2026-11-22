@@ -24,6 +24,7 @@ use crate::convert::{
 use crate::ids::task_id_for;
 use crate::subscribe;
 use crate::tier;
+use crate::vymalo;
 
 /// Default interval at which a subscription re-reads the durable run: the fallback, for a state
 /// change that no live event announced. Two seconds, because the events are the mechanism: a
@@ -819,6 +820,9 @@ impl RuntimeTaskBackend {
             let named = tier::requested(&message, tiers).map_err(BackendError::InvalidParams)?;
             tier::put(&mut inbound, named).map_err(BackendError::InvalidParams)?;
         }
+        // A message that activated `locale/v1` names the interface language of this message, or
+        // names none and takes an earlier one away; one that did not is read as it always was.
+        vymalo::locale_into(caller, &message, &mut inbound);
 
         let Some(task_id) = task_id else {
             let Joined { run, context, view } = self

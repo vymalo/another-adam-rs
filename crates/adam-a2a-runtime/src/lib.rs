@@ -74,8 +74,9 @@ pub use push::StorePushStore;
 pub use tier::CONTEXT_ACCESS_TIER;
 pub use usage::MAX_TOKEN_COUNT;
 pub use vymalo::{
-    ASK_SURFACE_PREFIX, CONTEXT_A2UI_RENDERER, CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS,
-    CONTEXT_UI_CATALOG, CONTEXT_UI_REF, MAX_ACTION_CONTEXT_CHARS, MAX_MENTIONS,
-    MAX_OFFERED_CATALOG_IDS, PAYLOAD_FORM, form_answer_surface, integral_numbers, vymalo_inbound,
+    ASK_SURFACE_PREFIX, CONTEXT_A2UI_RENDERER, CONTEXT_LOCALE, CONTEXT_MENTIONS,
+    CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF, MAX_ACTION_CONTEXT_CHARS,
+    MAX_MENTIONS, MAX_OFFERED_CATALOG_IDS, PAYLOAD_FORM, form_answer_surface, integral_numbers,
+    vymalo_inbound,
 };
 pub use words::{comparable, is_format_or_control};

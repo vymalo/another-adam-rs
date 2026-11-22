@@ -17,6 +17,7 @@
 //! | `access-tier/v1` | [`ACCESS_TIER_EXTENSION`] | the person picks how much the agent may do alone for each message (`plan`, `edits`, `auto`, `bypass`); the agent keeps to it and says which tier it worked under |
 //! | `commands/v1` | [`COMMANDS_EXTENSION`] | the card lists the prompt templates the agent serves; a message names one and the agent expands it before it is stored |
 //! | `child-sessions/v1` | [`CHILD_SESSIONS_EXTENSION`] | the card lists the helpers a person may start a session with; a client that activates it sees the agent's sessions, follows their rounds as tasks, and starts, talks to and closes one |
+//! | `locale/v1` | [`LOCALE_EXTENSION`] | a message names the person's interface language (a BCP 47 tag) and the agent answers in it, unless the person writes in another; a hint for the agent's own words, never a translation layer (ADR 0069) |
 //!
 //! The contracts are the orchestration layer's (`docs/api/ui-catalog-v2.md`,
 //! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md`,
@@ -26,6 +27,7 @@
 use serde_json::json;
 
 use crate::card::ExtensionConfig;
+use crate::locale::Locale;
 use crate::tier::AccessTiers;
 
 /// The media type of a data part that carries A2UI messages, in `mediaType` (A2A 1.0) and in the
@@ -105,6 +107,15 @@ pub const COMMANDS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/c
 /// is this repository's side.
 pub const CHILD_SESSIONS_EXTENSION: &str =
     "https://agents.vymalo.com/a2a/extensions/child-sessions/v1";
+
+/// The URI of the `locale/v1` extension: a message that activates it names the person's interface
+/// language, in its metadata under this URI, as `{"locale": "<BCP 47 tag>"}` — the client's hint,
+/// one tag, for that message. The card's `params` are `{"locale": "<tag>"}`, one tag: the agent's
+/// default language, the one it answers in when a message names none. The hint is an instruction
+/// for the agent's own words, never a translation layer, and a malformed tag is refused rather than
+/// passed on ([`crate::Locale`]). ADR 0069 is this repository's side; the tag is the deployment's
+/// configuration.
+pub const LOCALE_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/locale/v1";
 
 /// One helper of the card's `child-sessions/v1` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +357,20 @@ impl ExtensionConfig {
             .insert("agents".into(), serde_json::Value::Array(listed));
         extension.params.insert("maxOpen".into(), json!(max_open));
         Some(extension)
+    }
+
+    /// The `locale/v1` extension: `params` are `{"locale": "<tag>"}`, one tag, the agent's
+    /// **default** language — the one it answers in when a message names none. It is the
+    /// deployment's own tag ([`Locale`], already validated): this repository names no language, and
+    /// a deployment that offers none lists no extension. Optional; the description is this
+    /// repository's until the orchestration layer publishes the contract.
+    pub fn locale(default: &Locale) -> Self {
+        let mut extension = Self::new(LOCALE_EXTENSION);
+        extension.description = Some("Answers in the interface language the message names.".into());
+        extension
+            .params
+            .insert("locale".into(), json!(default.as_str()));
+        extension
     }
 
     /// The `mentions/v1` extension: the agent reads the agents a person mentioned in a message and
@@ -615,5 +640,68 @@ mod tests {
     #[test]
     fn a_card_without_commands_does_not_list_the_extension() {
         assert!(ExtensionConfig::commands(&[]).is_none());
+    }
+
+    fn default_language() -> crate::Locale {
+        crate::Locale::parse("en-CM").expect("a well-formed tag")
+    }
+
+    #[test]
+    fn the_locale_entry_is_the_deployment_default_language() {
+        let e = ExtensionConfig::locale(&default_language());
+        assert_eq!(e.uri, LOCALE_EXTENSION);
+        assert_eq!(
+            LOCALE_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/locale/v1"
+        );
+        assert!(
+            !e.required,
+            "a client that does not know it must still talk to the agent"
+        );
+        assert_eq!(
+            e.description.as_deref(),
+            Some("Answers in the interface language the message names.")
+        );
+        assert_eq!(
+            serde_json::Value::Object(e.params),
+            json!({"locale": "en-CM"})
+        );
+        // One tag, and it is the deployment's: another deployment says another.
+        let fr = crate::Locale::parse("fr-CM").expect("a well-formed tag");
+        assert_eq!(
+            serde_json::Value::Object(ExtensionConfig::locale(&fr).params),
+            json!({"locale": "fr-CM"})
+        );
+    }
+
+    /// The extension is activatable only on a card that lists it: the URIs a card offers are the
+    /// ones its entries name, and nothing else switches it on.
+    #[cfg(feature = "server")]
+    #[test]
+    fn the_locale_is_activated_only_on_a_card_that_lists_it() {
+        let with = crate::AgentCardConfig::new(
+            "coder",
+            "Codes",
+            "http://127.0.0.1:8080/".parse().expect("a URL"),
+            "0.1.0",
+        )
+        .with_extension(ExtensionConfig::locale(&default_language()));
+        assert_eq!(
+            crate::activation::activated(&with.extension_uris(), [LOCALE_EXTENSION], []),
+            [LOCALE_EXTENSION]
+        );
+        // A card that lists something else offers nothing: the same request activates nothing.
+        let without = crate::AgentCardConfig::new(
+            "coder",
+            "Codes",
+            "http://127.0.0.1:8080/".parse().expect("a URL"),
+            "0.1.0",
+        )
+        .with_extension(ExtensionConfig::usage());
+        assert!(
+            crate::activation::activated(&without.extension_uris(), [LOCALE_EXTENSION], [])
+                .is_empty()
+        );
+        assert_eq!(without.extension_uris(), [USAGE_EXTENSION.to_owned()]);
     }
 }

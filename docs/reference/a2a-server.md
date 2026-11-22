@@ -349,6 +349,42 @@ task says `metadata[URI] = {"tier": ..}`: on the answer of `SendMessage`, on `Ge
 status update when it changes. `RuntimeTaskBackend::with_access_tiers` is the backend side; what the coder does with each tier is
 its README, *Access tiers*.
 
+## The interface language (`locale/v1`)
+
+An agent whose card lists `https://agents.vymalo.com/a2a/extensions/locale/v1` takes the person's interface language
+**for each message** ([ADR 0069](../decisions/0069-the-interface-language-is-a-hint-and-a-hint-is-all-it-is.md)). The
+card's `params` are `{"locale": "<tag>"}`, one tag: the agent's default language, the one it answers in when a
+message names none. It is the deployment's configuration — this repository names no language — and a deployment that
+offers none lists no extension. `adam_a2a::ExtensionConfig::locale` declares the entry and `adam_a2a::Locale` is a
+validated tag.
+
+A request that **activates** the extension may carry `metadata[URI] = {"locale": "<BCP 47 tag>"}`, the shape of
+`access-tier/v1`'s `{"tier": ..}`. `adam_a2a::Locale::of_request` reads it, and only then:
+
+* a tag is read only when the request activated the extension: a message whose request did not name it carries no
+  hint, whatever its metadata says;
+* a malformed tag is refused, never passed on, and the message goes on **with no hint** — fail closed is no language
+  rather than a guessed one. The tag is well formed per RFC 5646's `langtag` and at most 64 bytes;
+* a message that names no locale leaves no hint at all, never an empty string.
+
+The hint is an instruction for the agent's **own words**, never a translation layer: nothing is translated, and a
+string a person must trust (a consent, a payment, a confirmation) is the deployment's reviewed text, in a language it
+was reviewed in, never the model's. It is a default and not a constraint: the hint belongs to its message (the
+orchestration layer keeps it with the message, so a redelivery, a fork and a resumed run carry the same one), and a
+person who writes in another language is followed, whatever the card or the hint says.
+
+**In the run.** The backend reads the hint in `submit`, beside the tier: the tag is the run's inbound context key
+`vymalo.locale` (`CONTEXT_LOCALE` in `crates/adam-a2a-runtime/src/vymalo.rs`, a bare string), the newest activated
+message wins, and an activated message that names none — or names a malformed tag — sets it to `null`, which deletes
+it. The key is one of `adam_llm_agent::PROTECTED_CONTEXT_KEYS`, so a message whose context is over the limit and
+dropped keeps the language the person is speaking. What an agent does with it is its own prompt: the coder's carries
+the two rules (`bin/adam-coder/agent/instructions.md`, "Language" and "Never write a trusted string").
+
+**No card lists it yet.** `ExtensionConfig::locale` and the runtime half are built; the cards of `adam-coder` and
+`adam-agent` and the deployment's own tag are ADR 0069's slice 3, and the client's half is slice 4. Until a card lists
+it, no request can activate it, so no agent reads a hint and each follows the person's language — which the same rule
+says.
+
 ## Child sessions (`child-sessions/v1`)
 
 A session ([ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)) is a chain of runs of a helper agent
