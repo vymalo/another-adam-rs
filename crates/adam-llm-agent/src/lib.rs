@@ -211,8 +211,8 @@ pub use source::{
 pub use state::{Extensions, State, StateKey};
 pub use step_io::StepIo;
 pub use tool::{
-    AnswerCheck, DEFAULT_TOOL_TIME_LIMIT, DynTool, RESERVED_LOADER_PREFIX, Refusal, RemotePoll,
-    StepStyle, TOOL_STOP_GRACE, Tool, ToolCtx, ToolError, ToolOutput,
+    AnswerCheck, DEFAULT_TOOL_TIME_LIMIT, DynTool, GROUP_LOADER_PREFIX, RESERVED_LOADER_PREFIX,
+    Refusal, RemotePoll, StepStyle, TOOL_STOP_GRACE, Tool, ToolCtx, ToolError, ToolOutput,
 };
 pub use toolset::ToolSet;
 pub use typed::{IntoToolOutput, IntoToolResult, Json, parse_args};

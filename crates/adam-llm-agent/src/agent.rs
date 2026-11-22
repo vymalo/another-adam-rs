@@ -75,13 +75,41 @@ async fn apply_sources(
     source_ctx: Option<&SourceCtx>,
     request: &mut ModelRequest,
     inject: bool,
-) -> (Vec<ToolNote>, Vec<String>) {
-    let notes = match source_ctx {
+) -> Sourced {
+    let (notes, offered, carried) = match source_ctx {
         Some(source_ctx) => offered_by(sources, source_ctx, request).await,
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new(), Vec::new()),
     };
     let own = order::prepare(&mut request.tools, inject);
-    (notes, own)
+    Sourced {
+        notes,
+        own_order: own,
+        offered,
+        carried,
+    }
+}
+
+/// What [`apply_sources`] read of the request: the notes of the sources, the tools whose schema has
+/// `after_previous`, and the loaded tools the request carried **before** and **after** a source
+/// withheld any. The two sets differ when the access tier hides a loaded tool on this message:
+/// that is not a removal, so only the final set decides a growth, and only the first decides what
+/// the run no longer holds.
+struct Sourced {
+    notes: Vec<ToolNote>,
+    own_order: Vec<String>,
+    offered: Vec<String>,
+    carried: Vec<String>,
+}
+
+/// The loaded tools `request` carries, in the run's load order.
+fn carried_loaded(source_ctx: &SourceCtx, request: &ModelRequest) -> Vec<String> {
+    source_ctx
+        .loaded()
+        .iter()
+        .flat_map(|one| one.tools.iter())
+        .filter(|tool| request.tools.iter().any(|spec| spec.name == tool.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// The sources' part of [`apply_sources`].
@@ -89,7 +117,7 @@ async fn offered_by(
     sources: &[DynToolSource],
     source_ctx: &SourceCtx,
     request: &mut ModelRequest,
-) -> Vec<ToolNote> {
+) -> (Vec<ToolNote>, Vec<String>, Vec<String>) {
     let (more, notes) = offered(sources, source_ctx, &request.tools).await;
     request.tools.extend(more);
     // What a source has already given the run during itself goes at the end, after everything:
@@ -104,6 +132,13 @@ async fn offered_by(
         request.tools.extend(appended);
     }
     refined(sources, source_ctx, &mut request.tools).await;
+    // What the sources still hold, before the tier holds anything back: a tool it hides on this
+    // message is not one the run lost, while a tool a group no longer holds is. A source that does
+    // not track its loaded tools falls back to what the request carried before the withhold.
+    let offered = match crate::source::loaded_offered(sources, source_ctx).await {
+        Some(tools) => tools,
+        None => carried_loaded(source_ctx, request),
+    };
     // What a source holds back is not shown, the agent's own tools included.
     let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
     let held = withheld(sources, source_ctx, &names).await;
@@ -112,6 +147,7 @@ async fn offered_by(
             .tools
             .retain(|t| !held.iter().any(|h| h.tool == t.name));
     }
+    let carried = carried_loaded(source_ctx, request);
     // What the sources add to the instructions (the agents a person mentioned).
     if let Some(more) = instructed(sources, source_ctx).await {
         request.system = Some(match request.system.take() {
@@ -119,7 +155,7 @@ async fn offered_by(
             _ => more,
         });
     }
-    notes
+    (notes, offered, carried)
 }
 
 /// The summary call of a compaction as the journal records it: the summary (none when the model said
@@ -169,6 +205,20 @@ fn shortened_for_overflow(messages: &[Message]) -> Vec<Message> {
             other => other.clone(),
         })
         .collect()
+}
+
+/// Whether a model turn recomputes the loaders: every run's first turn (so a dev reload's new
+/// catalogue replaces a stale one), and any turn whose state has none (a journal written before
+/// they existed).
+fn loaders_needed(turns: u32, loaders: &[Loader]) -> bool {
+    turns == 0 || loaders.is_empty()
+}
+
+/// Seed a journal written before `loaded` existed: **any** turn whose loaded set is empty, not only
+/// the first, so a run resumed at turn 4 restores the tools it had. The turn is passed so the rule
+/// is testable; it is not a gate.
+fn seed_loaded_at(state: &mut Conversation, _turn: u32) {
+    state.seed_loaded();
 }
 
 /// Whether a call of `tool` acts on a session (an effect outside the run's own state).
@@ -810,17 +860,34 @@ struct Recorded {
     /// it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sessions_open: Option<bool>,
-    /// The loaded tools the request actually carried, in the order the run loaded them: the turn
-    /// transition journals every loaded tool that is not here as removed
-    /// ([`Conversation::removed_tools`](crate::Conversation::removed_tools)), so a replay decides
-    /// the same. Absent when nothing was loaded, and in journals written before it existed.
+    /// The loaded tools the request actually carried **before a source withheld any**, in the order
+    /// the run loaded them: the turn transition journals every loaded tool the sources no longer
+    /// hold as removed ([`Conversation::removed_tools`](crate::Conversation::removed_tools)), so a
+    /// replay decides the same. Absent when nothing was loaded, and in journals written before it
+    /// existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     offered: Vec<String>,
-    /// The loaders the sources still offered on the turn the request was made: recorded once, on
-    /// the run's first turn, in [`Conversation::loaders`](crate::Conversation::loaders). Absent
-    /// when there were none, after the first turn, and in journals written before it existed.
+    /// The loaded tools the **final** request carried: compared with the previous request's set to
+    /// decide whether this turn's request grew (a load, not a tier hide). Absent when nothing was
+    /// loaded, and in journals written before it existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    loaders: Vec<Loader>,
+    carried: Vec<String>,
+    /// The loaders the sources still offered on the turn the request was made: recomputed on every
+    /// run's first turn and recorded in [`Conversation::loaders`](crate::Conversation::loaders), so
+    /// a dev reload's new catalogue replaces a stale one. `None` on the other turns (nothing to
+    /// record), and in journals written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loaders: Option<Vec<Loader>>,
+    /// The groups the **task** loaded, journaled on the run's first turn so a compaction's recap
+    /// names them. Absent when there were none, after the first turn, and in journals written
+    /// before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    task_loaded: Vec<Loaded>,
+    /// The final request grew by a loaded group's tools (the tier did not hide all of them): the
+    /// turn transition records it in [`Conversation::tools_appended`](crate::Conversation::tools_appended).
+    /// Absent when it did not, and in journals written before it existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    grew: bool,
 }
 
 /// The report of one round, read for a model call that did not ask for it: the result of a
@@ -2018,12 +2085,11 @@ impl LlmAgent {
         let model = self.model.clone();
         let sources = self.sources.clone();
         let turn = state.turns;
-        if turn == 0 {
-            // A journal written before `loaded` existed names the servers `use_server` loaded: the
-            // first turn makes them the loaded set, before the first request is built, in the same
-            // commit as the first model call.
-            state.seed_loaded();
-        }
+        // A journal written before `loaded` existed names the servers `use_server` loaded: any
+        // turn that finds no loaded set seeds it, before the request is built, so a run resumed at
+        // turn 4 restores the tools it had.
+        seed_loaded_at(state, turn);
+        let need_task_loaded = state.loaded.is_empty();
         let source_ctx = (!sources.is_empty()).then(|| {
             SourceCtx::new(
                 ctx.run_id(),
@@ -2036,7 +2102,8 @@ impl LlmAgent {
             .with_removed_tools(Arc::from(state.removed_tools.clone()))
         });
         let loaded_now: Arc<[Loaded]> = Arc::from(state.loaded.clone());
-        let need_loaders = state.loaders.is_empty();
+        let carried_before: Arc<[String]> = Arc::from(state.carried_tools.clone());
+        let need_loaders = loaders_needed(state.turns, &state.loaders);
         let seen = state.messages.len();
         let run = ctx.run_id();
         let emitter = ctx.emitter();
@@ -2116,22 +2183,45 @@ impl LlmAgent {
                 // The sources are read here, inside the step, so that a replay of a turn whose model
                 // call is recorded does not read them again: only the answer is journaled, not the
                 // tools it was given.
-                let (notes, own_order) =
-                    apply_sources(&sources, source_ctx.as_ref(), &mut request, ordered).await;
-                // What the request carried of the loaded set, and (on the first turn) the loaders
-                // that are still there: journaled with the answer, so a replay decides the same.
-                let offered: Vec<String> = loaded_now
-                    .iter()
-                    .flat_map(|one| one.tools.iter())
-                    .filter(|tool| request.tools.iter().any(|spec| spec.name == tool.as_str()))
-                    .cloned()
-                    .collect();
+                let Sourced {
+                    notes,
+                    own_order,
+                    offered,
+                    mut carried,
+                } = apply_sources(&sources, source_ctx.as_ref(), &mut request, ordered).await;
                 let loaders = match source_ctx.as_ref() {
                     Some(ctx) if need_loaders => {
-                        crate::source::loaders_offered(&sources, ctx).await
+                        Some(crate::source::loaders_offered(&sources, ctx).await)
+                    }
+                    _ => None,
+                };
+                let task_loaded = match source_ctx.as_ref() {
+                    Some(ctx) if need_task_loaded => {
+                        crate::source::loaded_by_task(&sources, ctx).await
                     }
                     _ => Vec::new(),
                 };
+                // A task-loaded group is journaled only after this call, so the first request's
+                // carried set would not name its tools: add them, or the next turn would record a
+                // growth the first request already made.
+                if turn == 0 {
+                    for one in &task_loaded {
+                        for tool in &one.tools {
+                            if !carried.contains(tool)
+                                && request.tools.iter().any(|spec| spec.name == *tool)
+                            {
+                                carried.push(tool.clone());
+                            }
+                        }
+                    }
+                }
+                // The growth is judged on the final request, so a tier that hides every loaded
+                // tool records none; the loaders and the task-loaded groups are journaled on the
+                // first turn, with the answer, so a replay decides the same.
+                let grew = turn > 0
+                    && carried
+                        .iter()
+                        .any(|tool| !carried_before.iter().any(|before| before == tool));
                 // The reports are appended last: after the history, which is what the request
                 // before this one started with.
                 let (reports, sessions_open) = match report_plan {
@@ -2156,7 +2246,10 @@ impl LlmAgent {
                         reports,
                         sessions_open,
                         offered,
+                        carried,
                         loaders,
+                        task_loaded,
+                        grew,
                     });
                 }
                 // The words go out while they are written, under an id made here, inside the step, and
@@ -2189,7 +2282,10 @@ impl LlmAgent {
                     reports,
                     sessions_open,
                     offered,
+                    carried,
                     loaders,
+                    task_loaded,
+                    grew,
                 })
             })
             .await?;
@@ -2229,15 +2325,22 @@ impl LlmAgent {
                 reports,
                 sessions_open,
                 offered,
+                carried,
                 loaders,
+                task_loaded,
+                grew,
             }) => {
-                // What the request carried is the truth of the loaded set: every loaded tool it did
-                // not carry is journaled as removed, and the first turn records the loaders that
-                // are still there.
-                state.note_removed(&offered);
-                if !loaders.is_empty() {
+                // What the request carried **before the tier withheld any** is the truth of the
+                // loaded set: every loaded tool it did not carry is journaled as removed, and a
+                // growth is recorded only when the final request actually grew.
+                if let Some(loaders) = loaders {
+                    state.fill_seeded(&loaders);
                     state.loaders = loaders;
                 }
+                state.note_task_loaded(task_loaded);
+                state.note_removed(&offered);
+                state.note_growth(grew);
+                state.note_carried(carried);
                 seen_at = seen.unwrap_or(state.messages.len());
                 own_order = own;
                 if let Some(open) = sessions_open {
@@ -5824,6 +5927,32 @@ mod failure_tests {
         assert_eq!(auth.class.as_deref(), Some("Unauthenticated"));
     }
 
+    #[test]
+    fn a_run_resumed_at_a_later_turn_seeds_its_loaded_set() {
+        let mut state: Conversation =
+            serde_json::from_value(json!({"turns": 4, "loaded_servers": ["docs"]})).unwrap();
+        seed_loaded_at(&mut state, 4);
+        assert_eq!(state.loaded[0].loader, "load__group__docs");
+        assert!(state.loaded[0].tools.is_empty());
+    }
+
+    #[test]
+    fn the_loaders_are_recomputed_on_a_runs_first_turn() {
+        let stale = Loader {
+            name: "load__group__gone".into(),
+            holds: Vec::new(),
+        };
+        assert!(
+            loaders_needed(0, std::slice::from_ref(&stale)),
+            "a run's first turn recomputes, even over a carried list"
+        );
+        assert!(loaders_needed(4, &[]), "an old journal has none to keep");
+        assert!(
+            !loaders_needed(4, std::slice::from_ref(&stale)),
+            "a run in flight keeps what its first turn recorded"
+        );
+    }
+
     /// A model call recorded before words could be streamed is a bare response: it reads as a call
     /// whose words were not streamed; one recorded now carries the stream, and says nothing of it when
     /// there is none.
@@ -5844,7 +5973,10 @@ mod failure_tests {
             reports: Vec::new(),
             sessions_open: None,
             offered: Vec::new(),
-            loaders: Vec::new(),
+            carried: Vec::new(),
+            loaders: None,
+            task_loaded: Vec::new(),
+            grew: false,
         };
         let json = serde_json::to_value(&streamed).unwrap();
         assert_eq!(json["stream"], "run-m0-a1b2c3d4");
@@ -5868,7 +6000,10 @@ mod failure_tests {
             reports: Vec::new(),
             sessions_open: None,
             offered: Vec::new(),
-            loaders: Vec::new(),
+            carried: Vec::new(),
+            loaders: None,
+            task_loaded: Vec::new(),
+            grew: false,
         };
         assert_eq!(serde_json::to_value(&plain).unwrap(), bare);
 
@@ -5884,7 +6019,10 @@ mod failure_tests {
             reports: Vec::new(),
             sessions_open: None,
             offered: Vec::new(),
-            loaders: Vec::new(),
+            carried: Vec::new(),
+            loaders: None,
+            task_loaded: Vec::new(),
+            grew: false,
         };
         let json = serde_json::to_value(&noted).unwrap();
         assert_eq!(
@@ -5907,7 +6045,10 @@ mod failure_tests {
             reports: Vec::new(),
             sessions_open: None,
             offered: Vec::new(),
-            loaders: Vec::new(),
+            carried: Vec::new(),
+            loaders: None,
+            task_loaded: Vec::new(),
+            grew: false,
         };
         let json = serde_json::to_value(&reported).unwrap();
         assert_eq!(json["call"], "run-c0-a1b2c3d4");
@@ -5934,7 +6075,10 @@ mod failure_tests {
             }],
             sessions_open: Some(true),
             offered: Vec::new(),
-            loaders: Vec::new(),
+            carried: Vec::new(),
+            loaders: None,
+            task_loaded: Vec::new(),
+            grew: false,
         };
         let json = serde_json::to_value(&told).unwrap();
         assert_eq!(json["sessions_open"], true);

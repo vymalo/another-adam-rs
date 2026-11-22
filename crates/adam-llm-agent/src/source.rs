@@ -333,6 +333,26 @@ pub trait ToolSource: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// The groups the run's **task** loaded, with what each holds: journaled on the run's first
+    /// turn ([`Conversation::note_task_loaded`](crate::Conversation::note_task_loaded)), so a
+    /// compaction's recap names them. They record no growth: their tools were never withheld. The
+    /// default is none, which is what a source written before groups existed offers.
+    async fn loaded_by_task(&self, ctx: &SourceCtx) -> Vec<Loaded> {
+        let _ = ctx;
+        Vec::new()
+    }
+
+    /// The loaded tools this source **still holds**, as the source knows them: a group's current
+    /// members, minus the journaled removals. The loop journals a loaded tool that is not here as
+    /// removed (the group shrank); a tool the access tier hides on this message is still here,
+    /// because the tier is per message. `None`, the default, says the source does not track its
+    /// loaded tools, and the loop falls back to what the request carried before a source withheld
+    /// any.
+    async fn loaded_tools(&self, ctx: &SourceCtx) -> Option<Vec<String>> {
+        let _ = ctx;
+        None
+    }
+
     /// Words to add to the agent's instructions on this turn, when the run's context calls for them
     /// (the agents a person mentioned, for instance). `None`, the default, adds nothing. Like
     /// [`specs`](Self::specs) it runs only when the model is really called, inside the journaled
@@ -492,6 +512,41 @@ fn keep_notes(notes: &mut Vec<ToolNote>, from: Vec<ToolNote>, kept: &[ToolSpec])
             notes.push(note);
         }
     }
+}
+
+/// The groups the sources say the task loaded, each loader once, in source order: what the run's
+/// first turn journals in [`Conversation::loaded`](crate::Conversation::loaded).
+pub(crate) async fn loaded_by_task(sources: &[DynToolSource], ctx: &SourceCtx) -> Vec<Loaded> {
+    let mut out: Vec<Loaded> = Vec::new();
+    for source in sources {
+        for one in source.loaded_by_task(ctx).await {
+            if !out.iter().any(|present| present.loader == one.loader) {
+                out.push(one);
+            }
+        }
+    }
+    out
+}
+
+/// The loaded tools the sources still hold, each name once, in source order: `None` when no source
+/// tracks them.
+pub(crate) async fn loaded_offered(
+    sources: &[DynToolSource],
+    ctx: &SourceCtx,
+) -> Option<Vec<String>> {
+    let mut out: Option<Vec<String>> = None;
+    for source in sources {
+        let Some(tools) = source.loaded_tools(ctx).await else {
+            continue;
+        };
+        let out = out.get_or_insert_with(Vec::new);
+        for tool in tools {
+            if !out.contains(&tool) {
+                out.push(tool);
+            }
+        }
+    }
+    out
 }
 
 /// The loaders the sources still offer on this turn, each name once, in source order: what the

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store as _};
 use adam_llm_agent::{
     COMPACTION_TURN, Conversation, ImageStore, InboundImage, Limits, LlmAgent, LlmAgentBuilder,
-    MAX_SOURCE_TOOLS, MemoryImages, ReadOutput, SourceCtx, Tool, ToolCtx, ToolError, ToolOutput,
-    ToolSource, Withheld, keep_image, user_message, user_message_with_images,
+    MAX_SOURCE_TOOLS, MemoryImages, ReadOutput, SourceCtx, Tool, ToolAccess, ToolCtx, ToolError,
+    ToolOutput, ToolSource, Withheld, keep_image, user_message, user_message_with_images,
 };
 use adam_model::{
     DynModel, ImageLimits, ImageOrigin, InputModalities, Message, MockModel, ModelClient,
@@ -2397,6 +2397,21 @@ impl ToolSource for Deferred {
         }]
     }
 
+    async fn loaded_tools(&self, ctx: &SourceCtx) -> Option<Vec<String>> {
+        Some(if self.loaded(ctx) {
+            self.specs.iter().map(|spec| spec.name.clone()).collect()
+        } else {
+            Vec::new()
+        })
+    }
+
+    /// The group's words reach the prompt only when the run has loaded it, and then they follow
+    /// everything: the trait's append-words mechanism.
+    async fn appended_instructions(&self, ctx: &SourceCtx) -> Option<String> {
+        self.loaded(ctx)
+            .then(|| format!("## {}\n\n> {} words", self.group, self.group))
+    }
+
     async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
         if self.loaded(ctx) {
             return Vec::new();
@@ -2439,6 +2454,10 @@ impl LoadGroup {
 
 #[async_trait]
 impl Tool for LoadGroup {
+    fn access(&self, _args: &Value) -> ToolAccess {
+        ToolAccess::Independent
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: self.loader(),
@@ -2730,5 +2749,102 @@ async fn two_loads_in_one_reply_apply_in_order() {
         [1],
         "the array grew once, at one request"
     );
+    assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
+}
+
+/// Two loaders in **parallel** (no `after_previous`, `max_parallel` above one): each reads the
+/// turn-start state, so each result carries only its own entry; the loop merges them by name in
+/// call order.
+#[tokio::test]
+async fn two_loads_in_parallel_apply_in_order() {
+    let rig = Rig::new(0, |builder| {
+        with_groups(
+            builder,
+            &[
+                ("docs", &["docs__search"], "the docs words"),
+                ("linear", &["linear__list"], "the linear words"),
+            ],
+        )
+        .max_parallel(4)
+    });
+    rig.mock
+        .push_tool_calls(vec![
+            call("c1", "load__group__docs", json!({})),
+            call("c2", "load__group__linear", json!({})),
+        ])
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(
+        state
+            .loaded
+            .iter()
+            .map(|one| one.loader.as_str())
+            .collect::<Vec<_>>(),
+        ["load__group__docs", "load__group__linear"],
+        "the merge follows the model's call order, whatever finished first"
+    );
+    assert_eq!(
+        tool_names(&requests[1]),
+        [
+            "big",
+            "handle",
+            "load__group__docs",
+            "load__group__linear",
+            "docs__search",
+            "linear__list"
+        ],
+        "both groups' tools are appended"
+    );
+}
+
+/// A load appends to the prompt even when a source **after** the one that grows contributes words
+/// of its own: the loaded source's section must follow everything the request before carried,
+/// never sit between two parts of it.
+#[tokio::test]
+async fn a_load_appends_to_a_prompt_another_source_already_grew() {
+    struct Always;
+
+    #[async_trait]
+    impl ToolSource for Always {
+        async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        async fn instructions(&self, _ctx: &SourceCtx) -> Option<String> {
+            Some("the person named helper".into())
+        }
+
+        async fn call(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: Value,
+        ) -> Option<Result<ToolOutput, ToolError>> {
+            None
+        }
+    }
+
+    let rig = Rig::new(0, |builder| with_deferred(builder).tool_source(Always));
+    rig.mock
+        .push_tool_calls(vec![call("c1", "load__group__docs", json!({}))])
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    let before = requests[0].system.as_deref().unwrap_or_default();
+    let after = requests[1].system.as_deref().unwrap_or_default();
+    assert!(
+        before.ends_with("the person named helper"),
+        "the other source's words are in the prompt from the first request: {before:?}"
+    );
+    assert!(
+        after.starts_with(before),
+        "the system prompt at the load is the one before it plus a suffix: {after:?}"
+    );
+    assert!(
+        after.ends_with("> docs words"),
+        "the loaded group's words follow everything: {after:?}"
+    );
+    assert_eq!(state.tools_appended, [1]);
     assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
 }

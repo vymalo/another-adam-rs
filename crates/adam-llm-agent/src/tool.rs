@@ -25,10 +25,14 @@ use crate::plan::Plan;
 use crate::source::ToolNote;
 use crate::state::{Extensions, State, StateKey};
 
-/// The prefix the tool loaders reserve: `load__group__<name>` and `load__tool__<name>`. A tool of
-/// an MCP server or of a conversation whose full name starts with it is left out with a warning,
-/// and a registered tool whose name starts with it is refused at bind, because an MCP tool is
-/// `<server>__<tool>` and the names would collide (ADR 0066, decision 2).
+/// The prefix of a group loader's tool name: `load__group__<name>`.
+pub const GROUP_LOADER_PREFIX: &str = "load__group__";
+
+/// The prefix the group loaders reserve: `load__group__<name>` (ADR 0066, decision 2). A tool of an
+/// MCP server or of a conversation
+/// whose full name starts with it is left out with a warning, and a registered tool whose name
+/// starts with it is refused at bind, because an MCP tool is `<server>__<tool>` and the names would
+/// collide.
 pub const RESERVED_LOADER_PREFIX: &str = "load__";
 
 /// The longest a call of a tool that declares no [`Tool::time_limit`] may run: 300 s.
@@ -499,7 +503,7 @@ pub struct ToolOutput {
     /// error, in the same commit as the result, and records the turn of the next request in
     /// [`Conversation::tools_appended`](crate::Conversation::tools_appended); a replay takes the
     /// list from the journal. A load appends its tools to the tools array, never inserts them (ADR
-    /// 0044, decision 1). Only a loader (`load__group__…`, `load__tool__…`) sets it. Never read from
+    /// 0044, decision 1). Only a group loader (`load__group__…`) sets it. Never read from
     /// an error result.
     ///
     /// Absent from a journal written before it existed, and not written while empty.

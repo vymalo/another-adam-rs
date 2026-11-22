@@ -65,8 +65,7 @@ pub(crate) const RECAP_MAX_BYTES: usize = 2048;
 pub(crate) const RECAP_MAX_LINES: usize = 50;
 
 /// The first line of the recap's section of what the run loaded.
-const RECAP_LOADED: &str =
-    "Tools loaded earlier (they are still available; load one again to read its note):";
+const RECAP_LOADED: &str = "Tools loaded (they are still offered; call them directly):";
 
 /// The first line of the recap's section of what is still there to load.
 const RECAP_AVAILABLE: &str = "Loaders still available (call one to load its tools):";
@@ -476,7 +475,13 @@ pub(crate) fn summarised_header(turns: u32) -> String {
 fn one_line(note: &str) -> String {
     let flat: String = note
         .chars()
-        .map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c })
+        .map(|c| {
+            if matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let flat = flat.trim();
     if flat.len() <= crate::MAX_LOADED_NOTE_BYTES {
@@ -492,6 +497,9 @@ fn one_line(note: &str) -> String {
 /// One line of the recap: the loader's name, the tools it holds (or loaded), and, in the full form,
 /// its note. Every line is escaped, so a name or a note cannot read as a line the loop wrote.
 fn recap_line(name: &str, holds: &[String], note: Option<&str>) -> String {
+    // A name from a journal is text like any other: a line break in one would forge a line.
+    let name = one_line(name);
+    let holds: Vec<String> = holds.iter().map(|tool| one_line(tool)).collect();
     let mut line = format!("- {name}");
     if !holds.is_empty() {
         line.push_str(": ");
@@ -505,9 +513,14 @@ fn recap_line(name: &str, holds: &[String], note: Option<&str>) -> String {
 }
 
 /// What a compaction's marker says about the loaded tools: one line per loaded group or tool, with
-/// the tools the load made available minus the journaled removals, and one line per loader still
-/// available. Written by **code** from the saved state, never from the model's summary, so a replay
-/// writes the same lines (ADR 0066, decision 6).
+/// the tools the load made available minus the **permanent** removals, and one line per loader
+/// still available. Written by **code** from the saved state, never from the model's summary, so a
+/// replay writes the same lines (ADR 0066, decision 6).
+///
+/// Two kinds of absence are kept apart. A tool the group no longer holds is in
+/// [`removed_tools`](crate::Conversation::removed_tools) and is left out here for good. A tool the
+/// access tier hid on one message is **not** a removal: the tier is per message, the tool is still
+/// loaded, and it is listed here because a later message may show it.
 ///
 /// It is bounded: past [`RECAP_MAX_BYTES`] or [`RECAP_MAX_LINES`], the notes go; past the lines,
 /// the newest loaded groups are kept and the oldest left out.
@@ -819,6 +832,10 @@ mod tests {
             "a removed tool is not listed: {text}"
         );
         assert!(text.contains("commands and files"), "{text}");
+        assert!(
+            text.contains("Tools loaded (they are still offered; call them directly)"),
+            "the line does not ask for a refused second load: {text}"
+        );
         assert!(text.contains("load__group__repo"), "{text}");
         assert!(text.contains("run_checks"), "{text}");
         assert_eq!(
@@ -828,18 +845,53 @@ mod tests {
         );
     }
 
-    /// A tool that was never loaded is not in the recap, and neither is a loader the agent has not.
+    /// A tool that was never loaded is not in the recap; a loader that is still there is, with the
+    /// tools it holds, under its own line.
     #[test]
     fn a_tool_never_loaded_is_not_listed() {
         let text = recap(
             &[loaded("load__group__bash", &["run_command"], "")],
-            &[loader("load__group__bash", &["run_command"])],
+            &[
+                loader("load__group__bash", &["run_command"]),
+                loader("load__group__repo", &["run_checks"]),
+            ],
             &[],
         );
         assert!(text.contains("run_command"), "{text}");
+        assert!(
+            text.contains("Loaders still available"),
+            "the available section is there: {text}"
+        );
+        assert!(text.contains("load__group__repo"), "{text}");
+        assert!(text.contains("run_checks"), "{text}");
         assert!(!text.contains("write_file"), "{text}");
-        assert!(!text.contains("load__group__repo"), "{text}");
         assert!(recap(&[], &[], &[]).is_empty());
+    }
+
+    /// A removed tool is absent for good; a tool a request did not carry **because the tier hid
+    /// it** is not a removal and stays listed: the tier is per message.
+    #[test]
+    fn a_transiently_withheld_tool_is_not_a_removal() {
+        let text = recap(
+            &[loaded(
+                "load__group__bash",
+                &["run_command", "write_file"],
+                "",
+            )],
+            &[loader("load__group__bash", &["run_command", "write_file"])],
+            &[],
+        );
+        assert!(text.contains("write_file"), "{text}");
+        let text = recap(
+            &[loaded(
+                "load__group__bash",
+                &["run_command", "write_file"],
+                "",
+            )],
+            &[loader("load__group__bash", &["run_command", "write_file"])],
+            &["write_file".to_owned()],
+        );
+        assert!(!text.contains("write_file"), "{text}");
     }
 
     /// A note with a line break cannot forge a line of the marker: it is flattened and escaped.
