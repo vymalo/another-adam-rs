@@ -10,7 +10,7 @@ use adam_a2a_runtime::{
 };
 use adam_core::RunId;
 use adam_error::report;
-use adam_llm_agent::{Conversation, DynTool, LlmStarter, PendingWait, ToolSet};
+use adam_llm_agent::{Conversation, DynTool, LlmStarter, ModelPark, PendingWait, ToolSet};
 use adam_model::{DynModel, Message, ToolCall};
 use adam_runtime::{
     Agent, AgentError, AgentStarter, Ctx, Inbound, RUN_FINISHED_KIND, RunEvent, RuntimeBuilder,
@@ -1290,9 +1290,10 @@ fn expect_assembled(assembled: Result<CoderAgent, Box<AssemblyError>>) -> CoderA
 }
 
 /// Why the commands that keep running of a run end with this step, when they do: the root run is
-/// over (done or failed), or a run of the tree parks on a question to the person, who may take a
-/// while. The end of a child run ends nothing, and a park on anything else (a subagent, a task on
-/// another system, a timer) leaves them running.
+/// over (done or failed), a run of the tree parks on a question to the person, who may take a
+/// while, or it parks on the model until it is woken, which the person cures by raising a limit.
+/// The end of a child run ends nothing, and a park on anything else (a subagent, a task on another
+/// system, a timer) leaves them running.
 fn commands_end_with(transition: &Transition<Conversation>, child: bool) -> Option<&'static str> {
     match transition {
         Transition::Done { .. } | Transition::Fail { .. } if !child => Some("the run ended"),
@@ -1303,6 +1304,14 @@ fn commands_end_with(transition: &Transition<Conversation>, child: bool) -> Opti
             ) =>
         {
             Some("the run waits for the person's answer")
+        }
+        Transition::Park { state, .. }
+            if state
+                .model_wait
+                .as_ref()
+                .is_some_and(|wait| wait.park == ModelPark::UntilWoken) =>
+        {
+            Some("the run waits on the model until it is woken")
         }
         _ => None,
     }
@@ -1587,7 +1596,9 @@ mod tier_tests {
 mod commands_tests {
     //! When the commands that keep running of a run end with a step.
 
-    use adam_llm_agent::{PendingQuestion, PendingRemote, PendingRun, PendingSession, PendingWait};
+    use adam_llm_agent::{
+        ModelWait, PendingQuestion, PendingRemote, PendingRun, PendingSession, PendingWait,
+    };
 
     use super::*;
 
@@ -1601,8 +1612,28 @@ mod commands_tests {
         }
     }
 
+    /// A park on the model, as the LLM agent records it (`Conversation::model_wait`): built from
+    /// JSON because [`ModelWait`] is `#[non_exhaustive]`.
+    fn parked_on_the_model(park: &str) -> Transition<Conversation> {
+        let wait: ModelWait = serde_json::from_value(json!({
+            "reason": "the person's usage limit is reached",
+            "status": 402,
+            "slug": "over_limit",
+            "park": park,
+            "parked_since": "2026-11-21T00:00:00Z",
+        }))
+        .expect("the model wait reads");
+        Transition::Park {
+            state: Conversation {
+                model_wait: Some(wait),
+                ..Conversation::default()
+            },
+            wake_at: None,
+        }
+    }
+
     #[test]
-    fn a_question_to_the_person_and_the_end_of_the_root_run_stop_them_and_nothing_else_does() {
+    fn a_wait_on_the_person_or_until_woken_and_the_end_of_the_root_run_stop_them() {
         let question = || {
             PendingWait::Question(PendingQuestion {
                 call_id: "c".into(),
@@ -1639,6 +1670,22 @@ mod commands_tests {
             assert_eq!(commands_end_with(&parked(Some(wait)), false), None);
         }
         assert_eq!(commands_end_with(&parked(None), false), None, "a timer");
+        // A park until woken stops them too: the person may take a while to raise the limit.
+        assert_eq!(
+            commands_end_with(&parked_on_the_model("until_woken"), false),
+            Some("the run waits on the model until it is woken")
+        );
+        // A session's round that parks until woken stops the root's commands too, as its question
+        // does; a local subagent never parks until woken (the loop fails it).
+        assert_eq!(
+            commands_end_with(&parked_on_the_model("until_woken"), true),
+            Some("the run waits on the model until it is woken")
+        );
+        // A timer park keeps them: `MODEL_PARK_LIMIT` ends the run.
+        assert_eq!(
+            commands_end_with(&parked_on_the_model("timer"), false),
+            None
+        );
         let done = || Transition::Done {
             state: Conversation::default(),
             output: json!({}),

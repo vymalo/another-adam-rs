@@ -68,7 +68,8 @@
 //! `stop_command`; its lifetime (`BACKGROUND_COMMAND_MAX_SECS`); the **root run is no longer open**
 //! (at once on the worker that holds it, in the agent's step, and within one sweep elsewhere, which
 //! is also how a cancel is reached, since it never calls the agent); a **park on the person**
-//! (`ask_user`); the environment is made again; the janitor's release; the worker's own stop. A
+//! (`ask_user`) or **on the model until it is woken** (a refusal of `over_limit`, ADR 0067); the
+//! environment is made again; the janitor's release; the worker's own stop. A
 //! process group is killed, and what a run pod holds is stopped through
 //! [`EnvSession::kill`] by exec id.
 
