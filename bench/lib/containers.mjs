@@ -249,11 +249,18 @@ export class HostContainers {
   }
 
   /** Every container of this instance, removed by force; then the list is read and must be empty. */
-  async reapAll() {
+  async reapAll({ removeTimeoutMs = 10 * 60 * 1000, settleMs = 5 * 60 * 1000, pollMs = 5000, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now } = {}) {
     const ids = await this.#ids();
-    if (ids.length > 0) await this.#call(['rm', '-f', ...ids], { timeoutMs: 120_000 });
-    const left = await this.#ids();
-    if (left.length > 0) throw new ContainerError('containers are left after the reap');
+    if (ids.length > 0) await this.#call(['rm', '-f', ...ids], { timeoutMs: removeTimeoutMs });
+    // A container with a large writable layer can still be listed while the daemon removes it: the list is read again
+    // until it is empty, for a while, before the reap is called failed.
+    const until = now() + settleMs;
+    for (;;) {
+      const left = await this.#ids();
+      if (left.length === 0) return;
+      if (now() >= until) throw new ContainerError('containers are left after the reap');
+      await sleep(pollMs);
+    }
   }
 
   /** What this instance holds, running or not: [{ image, id, labels, names }]. */

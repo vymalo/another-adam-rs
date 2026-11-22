@@ -34,6 +34,13 @@ export const SLOTS = 2;
 /** The pusher's scratch directory on the slot's work volume (compose.yaml mounts it at /scratch). */
 export const PUSHER_SCRATCH = '/work/pusher-scratch';
 export const COMPOSE_TIMEOUT_MS = 2 * 60 * 1000;
+/**
+ * Removing or reading a whole tree (a task's \`node_modules\`, a work directory of an earlier run) can take minutes on a slow
+ * disk; at 120 s the docker client gave up, the daemon logged "request cancelled by client", and the run was Failed_infra
+ * (exit 125, no message): 10 of 75 runs on 2026-11-21/22, all at 120 s or later, on element-web and the task after it.
+ */
+export const TREE_REMOVE_TIMEOUT_MS = 30 * 60 * 1000;
+export const TREE_READ_TIMEOUT_MS = 10 * 60 * 1000;
 export const DEFAULT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const SAFE_VALUE = /^[^\n\r\0$"'\\]*$/;
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -377,7 +384,7 @@ export class Stack {
     const kept = keep.map((n) => `! -name ${n} `).join('');
     // root inside the helper is the host user under rootless Docker: it can remove the harness's own directories,
     // whatever user wrote in them; the helper mounts the work directory only.
-    const r = await this.helper(slot, `find /work -mindepth 1 -maxdepth 1 ! -name .gitbox ${kept}-exec rm -rf {} + ; mkdir -p /work/workspaces /work/.gitbox && chmod 777 /work/workspaces /work/.gitbox`, { user: '0:0' });
+    const r = await this.helper(slot, `find /work -mindepth 1 -maxdepth 1 ! -name .gitbox ${kept}-exec rm -rf {} + ; mkdir -p /work/workspaces /work/.gitbox && chmod 777 /work/workspaces /work/.gitbox`, { user: '0:0', timeoutMs: TREE_REMOVE_TIMEOUT_MS });
     if (r.exitCode !== 0) throw new StackError(`the work directory of slot ${slot} could not be emptied (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
     const left = (await this.listDir(slot, '/work')).filter((n) => !['workspaces', '.gitbox', ...keep].includes(n));
     if (left.length > 0) throw new StackError(`the work volume still holds ${left.join(', ')}`);
@@ -415,12 +422,12 @@ export class Stack {
       }
       return;
     }
-    const r = await this.helper(slot, `chmod -R u+rwX ${dir} 2>/dev/null; rm -rf ${dir}; test ! -e ${dir}`, { user: '0:0' });
+    const r = await this.helper(slot, `chmod -R u+rwX ${dir} 2>/dev/null; rm -rf ${dir}; test ! -e ${dir}`, { user: '0:0', timeoutMs: TREE_REMOVE_TIMEOUT_MS });
     if (r.exitCode !== 0) throw new StackError(`the directory ${dir} could not be removed (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
   }
 
   /** A program's stdout, as bytes, from a helper container that mounts the work directory read-only. */
-  async streamFrom(slot, argv, { maxBytes, timeoutMs = COMPOSE_TIMEOUT_MS } = {}) {
+  async streamFrom(slot, argv, { maxBytes, timeoutMs = TREE_READ_TIMEOUT_MS } = {}) {
     const r = await this.execBuf('docker', ['run', '--rm', '--pull=never', '--network=none', '--user', runtimeUser(), '--entrypoint', '/bin/tar', '-v', `${this.workRoot(slot)}:/work:ro`, this.coderImage, ...argv], { env: this.dockerEnv(), timeoutMs, maxBytes });
     if (r.over) throw new StackError('the output of a container is larger than the limit');
     return r;
