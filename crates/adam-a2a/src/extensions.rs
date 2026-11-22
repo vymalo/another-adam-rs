@@ -1,6 +1,6 @@
 //! The A2A extensions an agent that draws on a screen declares: the URIs, and the card entries.
 //!
-//! Twelve extensions, each optional (a client that does not know one ignores it), detected by the
+//! Fourteen extensions, each optional (a client that does not know one ignores it), detected by the
 //! client from the card it reads, and removable without breaking plain A2A:
 //!
 //! | Extension | URI | What it is |
@@ -18,6 +18,7 @@
 //! | `commands/v1` | [`COMMANDS_EXTENSION`] | the card lists the prompt templates the agent serves; a message names one and the agent expands it before it is stored |
 //! | `child-sessions/v1` | [`CHILD_SESSIONS_EXTENSION`] | the card lists the helpers a person may start a session with; a client that activates it sees the agent's sessions, follows their rounds as tasks, and starts, talks to and closes one |
 //! | `locale/v1` | [`LOCALE_EXTENSION`] | a message names the person's interface language (a BCP 47 tag) and the agent answers in it, unless the person writes in another; a hint for the agent's own words, never a translation layer (ADR 0069) |
+//! | `reasoning/v1` | [`REASONING_EXTENSION`] | the card lists the root model's reasoning levels and the resolved default, and an activated message names one (`effort`); a level the model does not take is refused (ADR 0063, decision 5) |
 //!
 //! The contracts are the orchestration layer's (`docs/api/ui-catalog-v2.md`,
 //! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md`,
@@ -28,6 +29,7 @@ use serde_json::json;
 
 use crate::card::ExtensionConfig;
 use crate::locale::Locale;
+use crate::reasoning::ReasoningEfforts;
 use crate::tier::AccessTiers;
 
 /// The media type of a data part that carries A2UI messages, in `mediaType` (A2A 1.0) and in the
@@ -116,6 +118,13 @@ pub const CHILD_SESSIONS_EXTENSION: &str =
 /// passed on ([`crate::Locale`]). ADR 0069 is this repository's side; the tag is the deployment's
 /// configuration.
 pub const LOCALE_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/locale/v1";
+
+/// The URI of the `reasoning/v1` extension: a message that activates it names the reasoning effort
+/// of the model, in its metadata under this URI, as `{"effort": "<one of the model's levels>"}`.
+/// The card's `params` are `{"efforts": [<the root model's levels, lowest first>], "default"?: <the
+/// resolved default>}`, and a model that takes no level lists no extension. The reading is
+/// [`crate::ReasoningEfforts`] (ADR 0063, decision 5).
+pub const REASONING_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/reasoning/v1";
 
 /// One helper of the card's `child-sessions/v1` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,6 +382,36 @@ impl ExtensionConfig {
         extension
     }
 
+    /// The `reasoning/v1` extension: the card lists the **root** model's levels, lowest first, as
+    /// `params.efforts`, and the default the folder, the agent's preset or the model's profile
+    /// resolved as `params.default` (absent when none sets one). `None` when the root's model takes
+    /// no level (no profile, or `reasoningEfforts: []`): such an agent does not list the extension.
+    /// Optional; the description is this repository's until the orchestration layer publishes the
+    /// contract.
+    pub fn reasoning(efforts: &ReasoningEfforts, root_agent: &str) -> Option<Self> {
+        let levels = efforts.levels(root_agent);
+        if levels.is_empty() {
+            return None;
+        }
+        let mut extension = Self::new(REASONING_EXTENSION);
+        extension.description = Some("Reasons at the effort the message names.".into());
+        extension.params.insert(
+            "efforts".into(),
+            json!(
+                levels
+                    .iter()
+                    .map(|effort| effort.as_str())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        if let Some(default) = efforts.default_of(root_agent) {
+            extension
+                .params
+                .insert("default".into(), json!(default.as_str()));
+        }
+        Some(extension)
+    }
+
     /// The `mentions/v1` extension: the agent reads the agents a person mentioned in a message and
     /// asks them. Optional, no parameters; the description is the contract's.
     pub fn mentions() -> Self {
@@ -392,6 +431,7 @@ pub const REPLACEABLE_ARTIFACT: &str = "vymalo.replaceable";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adam_model::ReasoningEffort;
 
     /// The metadata key is part of the wire: clients and delivery cursors read it by name.
     #[test]
@@ -474,6 +514,10 @@ mod tests {
             "https://a2ui.org/a2a-extension/a2ui/v1.0"
         );
         assert_eq!(A2UI_MEDIA_TYPE, "application/a2ui+json");
+        assert_eq!(
+            REASONING_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/reasoning/v1"
+        );
     }
 
     #[test]
@@ -700,6 +744,94 @@ mod tests {
         .with_extension(ExtensionConfig::usage());
         assert!(
             crate::activation::activated(&without.extension_uris(), [LOCALE_EXTENSION], [])
+                .is_empty()
+        );
+        assert_eq!(without.extension_uris(), [USAGE_EXTENSION.to_owned()]);
+    }
+
+    /// `coder` takes low and high, defaulting to low.
+    fn reasoning_efforts() -> ReasoningEfforts {
+        ReasoningEfforts::new().with_agent(
+            "coder",
+            [ReasoningEffort::High, ReasoningEffort::Low],
+            Some(ReasoningEffort::Low),
+        )
+    }
+
+    #[test]
+    fn the_reasoning_entry_is_the_root_models_levels_and_default() {
+        let e = ExtensionConfig::reasoning(&reasoning_efforts(), "coder").expect("listed");
+        assert_eq!(e.uri, REASONING_EXTENSION);
+        assert_eq!(
+            REASONING_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/reasoning/v1"
+        );
+        assert!(
+            !e.required,
+            "a client that does not know it must still talk to the agent"
+        );
+        assert_eq!(
+            e.description.as_deref(),
+            Some("Reasons at the effort the message names.")
+        );
+        // The levels are lowest first even when the set lists them unsorted, and the default is
+        // the resolved one.
+        assert_eq!(
+            serde_json::Value::Object(e.params),
+            json!({"efforts": ["low", "high"], "default": "low"})
+        );
+        // No default when none was resolved: the member is absent, never null.
+        let no_default = ReasoningEfforts::new().with_agent(
+            "coder",
+            [ReasoningEffort::Max, ReasoningEffort::Low],
+            None,
+        );
+        assert_eq!(
+            serde_json::Value::Object(
+                ExtensionConfig::reasoning(&no_default, "coder")
+                    .expect("listed")
+                    .params
+            ),
+            json!({"efforts": ["low", "max"]})
+        );
+    }
+
+    #[test]
+    fn a_model_that_takes_no_level_lists_no_reasoning_extension() {
+        // No entry at all, an entry with no level, and another agent's levels: none is the root's.
+        assert!(ExtensionConfig::reasoning(&ReasoningEfforts::new(), "coder").is_none());
+        let empty = ReasoningEfforts::new().with_agent("coder", [], Some(ReasoningEffort::Low));
+        assert!(ExtensionConfig::reasoning(&empty, "coder").is_none());
+        let other = ReasoningEfforts::new().with_agent("writer", [ReasoningEffort::Low], None);
+        assert!(ExtensionConfig::reasoning(&other, "coder").is_none());
+    }
+
+    /// The extension is activatable only on a card that lists it: the URIs a card offers are the
+    /// ones its entries name, and nothing else switches it on.
+    #[cfg(feature = "server")]
+    #[test]
+    fn the_reasoning_is_activated_only_on_a_card_that_lists_it() {
+        let with = crate::AgentCardConfig::new(
+            "coder",
+            "Codes",
+            "http://127.0.0.1:8080/".parse().expect("a URL"),
+            "0.1.0",
+        )
+        .with_extension(ExtensionConfig::reasoning(&reasoning_efforts(), "coder").expect("listed"));
+        assert_eq!(
+            crate::activation::activated(&with.extension_uris(), [REASONING_EXTENSION], []),
+            [REASONING_EXTENSION]
+        );
+        // A card that lists something else offers nothing: the same request activates nothing.
+        let without = crate::AgentCardConfig::new(
+            "coder",
+            "Codes",
+            "http://127.0.0.1:8080/".parse().expect("a URL"),
+            "0.1.0",
+        )
+        .with_extension(ExtensionConfig::usage());
+        assert!(
+            crate::activation::activated(&without.extension_uris(), [REASONING_EXTENSION], [])
                 .is_empty()
         );
         assert_eq!(without.extension_uris(), [USAGE_EXTENSION.to_owned()]);
