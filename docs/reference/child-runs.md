@@ -449,7 +449,7 @@ round makes the session read as the round before it, or not at all.
 of an agent behind them. Such a round is **its own parent** (`start_child_continuing(id, id, ..)`): `parent_id` is its own id, so
 the worker's check of the parent (`parent_has_ended`) reads a run that has not ended, no run's end cancels it and no run waits for it
 (the turn-end wait for a working round and `end_sessions` look for rounds started by the run that is ending, `started_by == that run`). `SessionView::started_outside_a_run`
-and `SessionSummary::started_outside_a_run` say it. Its end notice goes to the round itself, which is finished by then, and is dropped (`notify_parent`, "nobody to tell"); a parent
+and `SessionSummary::started_outside_a_run` say it. Its end notice goes to the round itself, which is finished by then, and is dropped (`notify_parent`, "nobody to tell"); its park notice is not sent at all (a run that is its own parent is no child, and one delivered to itself would wake it for ever). A parent
 learns the round by reading the session, as for any round it did not start (slice 3: the parent's next listing reports it, marked as the person's). `closing_round_payload` builds the first message of a
 round that only closes a session, for the tools and for the A2A front.
 

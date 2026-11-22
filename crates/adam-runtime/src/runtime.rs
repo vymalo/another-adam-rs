@@ -737,7 +737,9 @@ impl Inner {
     ///
     /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
     pub async fn notify_parent_parked(&self, child: &RunRecord) {
-        let Some(parent) = child.parent_id else {
+        // A run that is its own parent (a person's session round, ADR 0045) has nobody to tell: a
+        // notice delivered to itself would wake it, and its next park would send another, for ever.
+        let Some(parent) = child.parent_id.filter(|parent| *parent != child.id) else {
             return;
         };
         if child.status != RunStatus::Parked {

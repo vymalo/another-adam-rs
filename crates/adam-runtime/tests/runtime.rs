@@ -6003,6 +6003,8 @@ mod cases {
         let parent = rt.start(&name, inbound(), None).await.expect("start");
         let child = child_run_id(parent, "call-1");
         let worker = spawn_worker(&rt);
+        // The parent starts the child in its first step, then parks: the child exists by then.
+        wait_waiting(&rt, parent).await;
         wait_waiting(&rt, child).await;
         // The notice wakes the parent, which reads it and parks again.
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -6604,7 +6606,9 @@ mod cases {
             &name,
             step_fn(|ctx, state| {
                 async move {
-                    if ctx.take_inbox().is_empty() {
+                    // A child's park notice is a wake-up, not the message this case waits for.
+                    let inbox = ctx.take_inbox();
+                    if !inbox.iter().any(|i| i.kind == "start") {
                         return Ok(Transition::Park {
                             state,
                             wake_at: None,

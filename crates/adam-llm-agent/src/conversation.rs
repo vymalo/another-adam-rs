@@ -1904,6 +1904,8 @@ mod tests {
             "slug": "over_limit",
             "park": "until_woken",
             "parked_since": "2026-11-21T00:00:00Z",
+            // `ModelWait` writes the backoff's step even when it is zero.
+            "parks": 0,
         });
         let literal = json!({
             "pending_wait": {
