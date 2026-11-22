@@ -273,7 +273,7 @@ Three results the loop writes itself, as error results the run goes on from (`ad
 A child whose parent ended is `cancelled: the parent run ended`. A `when` server whose name is not a group name
 (lowercase letters and digits, single underscores, at most 40), a server named `load`, a registered or selected
 tool or a subagent named `load__…`, a searchable group, a tool in two groups and a group name or keyword outside
-its bounds are **exit 78** at bind, each with its own message naming the file and what to change.
+its bounds are **exit 78** — the `when`-name and `load`-server refusals at **load**, the rest at **bind** — each with its own message naming the file and what to change.
 
 Two refusals of a repeated call end the run with its closing turn and `limit: "repeated_call"`; a closing turn with no words fails it with `the same tool call was repeated with the same
 result and the run was stopped (doom_loop)`.
