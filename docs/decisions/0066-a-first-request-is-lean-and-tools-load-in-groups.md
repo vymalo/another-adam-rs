@@ -49,6 +49,19 @@ revealed, and a call to a tool that is not loaded is refused as a withheld tool 
 `find_tools` and `load_tools` are **dropped**: the loaders are the index, and a searchable group's loader is the
 search.
 
+**Amended 2026-11-22 (S1).** `load__tool__<name>` is not built in S1: it lands with S3, where the coder's
+heavy tools need it. The access tier is applied **per message, after the load**, and is not a group filter: a
+tier-forbidden member stays out of that message's request, is **not** a removal, and a later message at a higher
+tier offers it again. The loader names the group's members, including one the current message's tier does not
+show; the loop, not the group, withholds it.
+
+**Amended 2026-11-22 (S1, second pass).** A **task-loaded** group's member the tier hides on a
+message is **removed for the run**, not hidden for one message: it would otherwise appear later at its
+registration position, an insertion rather than the suffix ADR 0044, decision 1 requires. An
+explicitly loaded group's member keeps the transient behaviour, because its loader appends it. The
+recap therefore omits the task-loaded member (and says nothing it cannot keep), while an explicit
+load's tier-hidden member stays listed.
+
 ### 3. The coder's groups
 
 | Group | Loader | Searchable | Contents |

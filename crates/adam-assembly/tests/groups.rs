@@ -1,6 +1,6 @@
-//! `mcp.json` `when`: a server's tools are decided from the task before the run's first model
-//! call and never again; a call to a server that was not loaded is refused, and its instructions
-//! do not reach the prompt.
+//! Tool groups and their loaders: a server whose `when` did not match the task is one group, loaded
+//! by `load__group__<server>`; its tools are withheld until the task holds a keyword or the run
+//! loads the group, and its instructions are the group's note.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
@@ -108,19 +108,46 @@ async fn a_keyword_that_matches_loads_the_server_and_one_that_does_not_is_withhe
     mock.push_tool_calls(vec![call("c1", "linear__list_issues")])
         .push_tool_calls(vec![call("c2", "github__search")])
         .push_text("done");
-    let (requests, _) =
+    let (requests, view) =
         run_task(&mock, &assembly(&mock, MCP), "please fix the linear ticket").await;
     assert_eq!(requests.len(), 3, "two calls and the answer");
+    let state = state_of(&view);
+    assert!(
+        state.tools_appended.is_empty(),
+        "a group the task loads is in the first request, so no turn records a growth: {:?}",
+        state.tools_appended
+    );
+    assert_eq!(
+        state
+            .loaded
+            .iter()
+            .map(|one| one.loader.as_str())
+            .collect::<Vec<_>>(),
+        ["load__group__linear"],
+        "the task-loaded group is journaled, for the recap"
+    );
+    assert_eq!(
+        tool_names(&requests[0]),
+        [
+            "github__search",
+            "linear__list_issues",
+            "load__group__docs",
+            "load__group__linear",
+            "read_output"
+        ],
+        "a tool the task's keyword loaded stands where the agent's own list puts it, not at the end"
+    );
     for request in &requests {
         assert_eq!(
             names(request),
             [
                 "github__search",
                 "linear__list_issues",
-                "read_output",
-                "use_server"
+                "load__group__docs",
+                "load__group__linear",
+                "read_output"
             ],
-            "the eager server, the one whose keyword the task holds, and the loader, at every turn"
+            "the eager server, the one whose keyword the task holds, and the loaders, at every turn"
         );
     }
     for pair in requests.windows(2) {
@@ -143,7 +170,17 @@ async fn a_server_with_no_when_is_eager() {
     let (requests, _) = run_task(&mock, &assembly(&mock, MCP), "fix a typo").await;
     assert_eq!(
         names(&requests[0]),
-        ["github__search", "read_output", "use_server"]
+        [
+            "github__search",
+            "load__group__docs",
+            "load__group__linear",
+            "read_output"
+        ]
+    );
+    assert!(
+        !has(&requests[0], "docs__search"),
+        "a triggered server's tool is withheld: {:?}",
+        names(&requests[0])
     );
 }
 
@@ -154,7 +191,12 @@ async fn an_empty_task_loads_only_the_eager_servers() {
     let (requests, _) = run_task(&mock, &assembly(&mock, MCP), "").await;
     assert_eq!(
         names(&requests[0]),
-        ["github__search", "read_output", "use_server"]
+        [
+            "github__search",
+            "load__group__docs",
+            "load__group__linear",
+            "read_output"
+        ]
     );
 }
 
@@ -169,28 +211,38 @@ async fn the_keyword_match_ignores_case() {
         [
             "github__search",
             "linear__list_issues",
-            "read_output",
-            "use_server"
+            "load__group__docs",
+            "load__group__linear",
+            "read_output"
         ]
     );
 }
 
 #[tokio::test]
-async fn a_call_to_a_server_that_was_not_loaded_is_refused_and_names_the_reason() {
+async fn a_call_to_a_group_that_was_not_loaded_is_refused_and_names_the_loader() {
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call("c1", "docs__search")])
         .push_text("done");
     let (requests, _) = run_task(&mock, &assembly(&mock, MCP), "fix a typo").await;
     assert_eq!(
         names(&requests[0]),
-        ["github__search", "read_output", "use_server"]
+        [
+            "github__search",
+            "load__group__docs",
+            "load__group__linear",
+            "read_output"
+        ]
     );
     let last = requests[1].messages.last().unwrap();
     let text = format!("{last:?}");
     assert!(text.contains("not loaded for this run"), "{text}");
     assert!(
-        text.contains("the MCP server `docs`"),
-        "the refusal names the server, not only the tool: {text}"
+        text.contains("the group `docs`"),
+        "the refusal names the group, not only the tool: {text}"
+    );
+    assert!(
+        text.contains("load__group__docs"),
+        "the refusal names the loader: {text}"
     );
     assert!(
         text.contains("docs, documentation"),
@@ -198,7 +250,7 @@ async fn a_call_to_a_server_that_was_not_loaded_is_refused_and_names_the_reason(
     );
     assert!(
         !text.contains("docs__search-out"),
-        "the server did not run: {text}"
+        "the tool did not run: {text}"
     );
 }
 
@@ -285,12 +337,12 @@ async fn a_subagent_selects_on_its_own_task_not_the_parents() {
     }
     assert_eq!(
         child_tools("read the docs", "fix a typo").await,
-        ["read_output", "use_server"],
+        ["load__group__docs", "read_output"],
         "the parent's task does not select the child's server"
     );
     assert_eq!(
         child_tools("fix a typo", "read the docs").await,
-        ["docs__search", "read_output", "use_server"],
+        ["docs__search", "load__group__docs", "read_output"],
         "the child's own task selects it"
     );
 }
@@ -380,7 +432,7 @@ async fn a_folder_with_no_when_keeps_the_head_it_had() {
     );
 }
 
-// --- the fallback: `use_server` loads a server during the run -----------------------------------
+// --- the loaders: a group loads during the run ------------------------------------------------
 
 /// The tools a request offered, by name, in the order the model saw them.
 fn tool_names(request: &ModelRequest) -> Vec<String> {
@@ -391,31 +443,37 @@ fn state_of(view: &RunView) -> Conversation {
     serde_json::from_value(view.state.clone()).expect("state is a Conversation")
 }
 
-/// A call to `use_server` appends the server's tools to the **next** request, once, and the state
-/// records the list and the turn the head moved. The tools array is the one before it plus a
-/// suffix: a load never inserts into the cached start of a request (ADR 0044, decision 1).
+/// A call to a group's loader appends the group's tools to the **next** request, once, and the
+/// state records the loader and the turn the head moved. The tools array is the one before it plus
+/// a suffix: a load never inserts into the cached start of a request (ADR 0044, decision 1).
 #[tokio::test]
-async fn use_server_appends_a_triggered_servers_tools_to_the_next_call() {
+async fn a_group_load_appends_its_tools_and_records_the_turn() {
     let mock = Arc::new(MockModel::new());
-    mock.push_tool_calls(vec![call_with("c1", "use_server", json!({"name": "docs"}))])
+    mock.push_tool_calls(vec![call_with("c1", "load__group__docs", json!({}))])
         .push_tool_calls(vec![call("c2", "docs__search")])
         .push_text("done");
     let (requests, view) = run_task(&mock, &assembly(&mock, MCP), "fix a typo").await;
     assert_eq!(requests.len(), 3, "the load, the call and the answer");
     assert_eq!(
         tool_names(&requests[0]),
-        ["github__search", "use_server", "read_output"],
-        "the triggered server's tools are not shown before the run loads it"
+        [
+            "github__search",
+            "load__group__docs",
+            "load__group__linear",
+            "read_output"
+        ],
+        "the group's tools are not shown before the run loads it"
     );
     assert_eq!(
         tool_names(&requests[1]),
         [
             "github__search",
-            "use_server",
+            "load__group__docs",
+            "load__group__linear",
             "read_output",
             "docs__search"
         ],
-        "the next request is the one before it plus the server's tools, at the end"
+        "the next request is the one before it plus the group's tools, at the end"
     );
     assert_eq!(
         &requests[1].tools[..requests[0].tools.len()],
@@ -424,10 +482,12 @@ async fn use_server_appends_a_triggered_servers_tools_to_the_next_call() {
     );
     assert_eq!(
         requests[2].tools, requests[1].tools,
-        "the tools do not move again, and the server's appears once"
+        "the tools do not move again, and the group's tool appears once"
     );
     let state = state_of(&view);
-    assert_eq!(state.loaded_servers, ["docs"]);
+    assert_eq!(state.loaded.len(), 1, "{:?}", state.loaded);
+    assert_eq!(state.loaded[0].loader, "load__group__docs");
+    assert_eq!(state.loaded[0].tools, ["docs__search"]);
     assert_eq!(
         state.tools_appended,
         [1],
@@ -441,39 +501,29 @@ async fn use_server_appends_a_triggered_servers_tools_to_the_next_call() {
     );
 }
 
-/// An unknown server is refused with the names the folder declares, and nothing moves.
+/// A loader of a name no group has is an unknown tool, and nothing moves.
 #[tokio::test]
-async fn use_server_refuses_an_unknown_server() {
+async fn a_call_to_an_unknown_loader_is_refused() {
     let mock = Arc::new(MockModel::new());
-    mock.push_tool_calls(vec![call_with("c1", "use_server", json!({"name": "nope"}))])
+    mock.push_tool_calls(vec![call_with("c1", "load__group__nope", json!({}))])
         .push_text("done");
     let (requests, view) = run_task(&mock, &assembly(&mock, MCP), "fix a typo").await;
     let last = requests[1].messages.last().expect("the result");
     let text = last.text();
-    assert!(text.contains("no MCP server `nope`"), "{text}");
-    assert!(text.contains("github"), "it names the servers: {text}");
-    assert!(text.contains("docs"), "it names the servers: {text}");
+    assert!(text.contains("load__group__nope"), "{text}");
     let state = state_of(&view);
-    assert!(
-        state.loaded_servers.is_empty(),
-        "{:?}",
-        state.loaded_servers
-    );
+    assert!(state.loaded.is_empty(), "{:?}", state.loaded);
     assert!(state.tools_appended.is_empty());
     assert_eq!(requests[1].tools, requests[0].tools);
 }
 
-/// A server the task already loaded is refused: its tools are in the list, and loading it again
+/// A group the task already loaded is refused: its tools are in the list, and loading it again
 /// would move them.
 #[tokio::test]
-async fn use_server_refuses_a_server_the_task_already_loaded() {
+async fn a_loader_of_a_group_the_task_loaded_is_refused() {
     let mock = Arc::new(MockModel::new());
-    mock.push_tool_calls(vec![call_with(
-        "c1",
-        "use_server",
-        json!({"name": "linear"}),
-    )])
-    .push_text("done");
+    mock.push_tool_calls(vec![call_with("c1", "load__group__linear", json!({}))])
+        .push_text("done");
     let (requests, view) = run_task(&mock, &assembly(&mock, MCP), "fix the linear ticket").await;
     let text = requests[1].messages.last().expect("the result").text();
     assert!(text.contains("already loaded"), "{text}");
@@ -482,38 +532,40 @@ async fn use_server_refuses_a_server_the_task_already_loaded() {
         "it names them: {text}"
     );
     let state = state_of(&view);
-    assert!(state.loaded_servers.is_empty());
+    assert_eq!(
+        state
+            .loaded
+            .iter()
+            .map(|one| one.loader.as_str())
+            .collect::<Vec<_>>(),
+        ["load__group__linear"],
+        "the task-loaded group is journaled, for the recap"
+    );
     assert!(state.tools_appended.is_empty());
     assert_eq!(requests[1].tools, requests[0].tools);
 }
 
-/// A server with no `when` is eager: there is nothing to load, and the tool says so.
+/// A server with no `when` is eager: it has no loader, and its tool is in the first request.
 #[tokio::test]
-async fn use_server_refuses_an_eager_server() {
+async fn an_eager_server_has_no_loader() {
     let mock = Arc::new(MockModel::new());
-    mock.push_tool_calls(vec![call_with(
-        "c1",
-        "use_server",
-        json!({"name": "github"}),
-    )])
-    .push_text("done");
-    let (requests, view) = run_task(&mock, &assembly(&mock, MCP), "fix a typo").await;
-    let text = requests[1].messages.last().expect("the result").text();
-    assert!(text.contains("always loaded"), "{text}");
+    mock.push_text("done");
+    let (requests, _) = run_task(&mock, &assembly(&mock, MCP), "fix a typo").await;
     assert!(
         requests[0].tools.iter().any(|t| t.name == "github__search"),
         "the eager server's tool is already there"
     );
-    let state = state_of(&view);
-    assert!(state.loaded_servers.is_empty());
-    assert_eq!(requests[1].tools, requests[0].tools);
+    assert!(
+        !has(&requests[0], "load__group__github"),
+        "an eager server has nothing to load: {:?}",
+        names(&requests[0])
+    );
 }
 
-/// A triggered server that offered no tool when the agent started (an `optional` server that was
-/// not reachable, or an allow-list that selects nothing) is refused, and nothing is recorded: the
-/// run does not wait for a server that will never answer.
+/// A triggered server whose tools the agent's `tools:` did not select has no loader: a group left
+/// empty reveals nothing and offers nothing.
 #[tokio::test]
-async fn use_server_refuses_a_server_that_offered_no_tools() {
+async fn a_group_with_no_allowed_member_has_no_loader() {
     const UNREACHABLE: &str = r#"{"mcpServers": {
       "github": {"type": "http", "url": "https://mcp.example/github", "tools": ["search"]},
       "docs": {"type": "http", "url": "https://mcp.example/docs", "tools": ["search"],
@@ -532,25 +584,23 @@ async fn use_server_refuses_a_server_that_offered_no_tools() {
     .unwrap()
     .model(mock.clone(), "default")
     .unwrap();
-    mock.push_tool_calls(vec![call_with("c1", "use_server", json!({"name": "docs"}))])
-        .push_text("done");
-    let (requests, view) = run_task(&mock, &assembly, "fix a typo").await;
-    let text = requests[1].messages.last().expect("the result").text();
-    assert!(text.contains("offered no tools"), "{text}");
-    assert!(text.contains("`docs`"), "{text}");
-    let state = state_of(&view);
-    assert!(state.loaded_servers.is_empty());
-    assert!(state.tools_appended.is_empty());
-    assert_eq!(requests[1].tools, requests[0].tools);
+    mock.push_text("done");
+    let (requests, _) = run_task(&mock, &assembly, "fix a typo").await;
+    assert_eq!(names(&requests[0]), ["github__search", "read_output"]);
+    assert!(
+        !has(&requests[0], "load__group__docs"),
+        "a group with no member the agent has gets no loader: {:?}",
+        names(&requests[0])
+    );
 }
 
-/// A server the run loaded is refused the second time: the list is the state, and a second load
+/// A loader the run called is refused the second time: the list is the state, and a second load
 /// would append the same tools twice.
 #[tokio::test]
-async fn use_server_refuses_a_server_it_already_loaded() {
+async fn a_loader_called_twice_is_refused() {
     let mock = Arc::new(MockModel::new());
-    mock.push_tool_calls(vec![call_with("c1", "use_server", json!({"name": "docs"}))])
-        .push_tool_calls(vec![call_with("c2", "use_server", json!({"name": "docs"}))])
+    mock.push_tool_calls(vec![call_with("c1", "load__group__docs", json!({}))])
+        .push_tool_calls(vec![call_with("c2", "load__group__docs", json!({}))])
         .push_text("done");
     let (requests, view) = run_task(&mock, &assembly(&mock, MCP), "fix a typo").await;
     let text = requests[2].messages.last().expect("the result").text();
@@ -560,16 +610,16 @@ async fn use_server_refuses_a_server_it_already_loaded() {
         "the refused load did not append anything"
     );
     let state = state_of(&view);
-    assert_eq!(state.loaded_servers, ["docs"]);
+    assert_eq!(state.loaded.len(), 1);
     assert_eq!(state.tools_appended, [1], "one turn, not two");
 }
 
 /// A load costs one full re-prefill, and the result says so; no number is invented (the cost is
 /// the next call's `cached_input_tokens`, which only the provider reports).
 #[tokio::test]
-async fn use_server_says_the_next_call_re_reads_the_prompt() {
+async fn a_group_load_says_the_next_call_re_reads_the_prompt() {
     let mock = Arc::new(MockModel::new());
-    mock.push_tool_calls(vec![call_with("c1", "use_server", json!({"name": "docs"}))])
+    mock.push_tool_calls(vec![call_with("c1", "load__group__docs", json!({}))])
         .push_text("done");
     let (requests, _) = run_task(&mock, &assembly(&mock, MCP), "fix a typo").await;
     let text = requests[1].messages.last().expect("the result").text();
@@ -585,16 +635,15 @@ async fn use_server_says_the_next_call_re_reads_the_prompt() {
         !text.chars().any(|c| c.is_ascii_digit()),
         "the tool invents no number: {text}"
     );
-    // The step the person sees carries the same words (the loop's step output is the result).
     assert!(text.contains("docs__search"), "it names the tools: {text}");
 }
 
-/// The load is a step of the run, and the step's output names the server and the tools it added:
+/// The load is a step of the run, and the step's output names the group and the tools it added:
 /// the cost is visible to the person, not only in the model's history.
 #[tokio::test]
-async fn the_load_is_a_step_that_names_the_server() {
+async fn the_load_is_a_step_that_names_the_group() {
     let mock = Arc::new(MockModel::new());
-    mock.push_tool_calls(vec![call_with("c1", "use_server", json!({"name": "docs"}))])
+    mock.push_tool_calls(vec![call_with("c1", "load__group__docs", json!({}))])
         .push_text("done");
     let assembly = assembly(&mock, MCP);
     let store: adam_core::DynStore = Arc::new(adam_core::MemoryStore::new());
@@ -623,62 +672,69 @@ async fn the_load_is_a_step_that_names_the_server() {
         .iter()
         .find(|step| step.id == "tool:c1" && step.output.is_some())
         .expect("the load's step ended");
-    assert_eq!(load.label, "Load an MCP server");
+    assert_eq!(load.label, "Load a group of tools");
     let output = load.output.as_ref().expect("the step ended");
     assert!(!output.error, "{output:?}");
     assert!(output.text.contains("docs"), "{output:?}");
     assert!(output.text.contains("docs__search"), "{output:?}");
 }
 
-/// A folder with no triggered server has no `use_server`: the fixed tool is there only when there
-/// is something to load.
+/// A folder with no triggered server has no loader: the tools are there only when there is
+/// something to load.
 #[tokio::test]
-async fn a_folder_with_no_triggered_server_has_no_use_server() {
+async fn a_folder_with_no_triggered_server_has_no_loader() {
     let mock = Arc::new(MockModel::new());
     mock.push_text("done");
     let (requests, _) = run_task(&mock, &assembly(&mock, MCP_NO_WHEN), "fix a typo").await;
     assert!(
-        !has(&requests[0], "use_server"),
+        has(&requests[0], "github__search"),
+        "the eager server's tool is there: {:?}",
+        names(&requests[0])
+    );
+    assert!(
+        !requests[0]
+            .tools
+            .iter()
+            .any(|t| t.name.starts_with("load__")),
         "{:?}",
         names(&requests[0])
     );
 }
 
-/// A folder's own tool that already has the name is refused at bind: the fixed loader is added
-/// under it, and one name would stand for two tools.
+/// A registered tool whose name starts with `load__` is refused at bind: the loaders reserve the
+/// prefix, and an MCP tool is `<server>__<tool>`, so the names would collide.
 #[test]
-fn a_folder_tool_named_use_server_is_refused_at_bind() {
+fn a_folder_tool_named_load_is_refused_at_bind() {
     let def = common::def(&[
         (
             "agent/instructions.md",
-            &common::instructions("name: root\ntools: ['use_server']", "You are root."),
+            &common::instructions(
+                "name: root\ntools: ['load__group__github']",
+                "You are root.",
+            ),
         ),
         ("agent/mcp.json", MCP),
     ]);
     let error = def
         .mcp_tools("root", common::tools(&["github__search"]))
-        .bind(ToolSet::new().tool(common::stub("use_server")))
+        .bind(ToolSet::new().tool(common::stub("load__group__github")))
         .unwrap_err();
     assert!(
-        matches!(error, adam_assembly::Error::ReservedToolName { .. }),
+        matches!(error, adam_assembly::Error::ReservedLoaderName { .. }),
         "{error}"
     );
 }
 
-/// Two loads in one turn: the tools array grows once, at the next request, by both servers in
+/// Two loads in one turn: the tools array grows once, at the next request, by both groups in
 /// the order the calls ran, and the state records that one turn once.
 #[tokio::test]
 async fn two_loads_in_one_turn_append_both_in_order_and_record_the_turn_once() {
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![
-        call_with("c1", "use_server", json!({"name": "docs"})),
+        call_with("c1", "load__group__docs", json!({})),
         // `after_previous` puts the second load in its own segment, after the first: its result
-        // then carries the whole list, the first server included, as the sequential path does.
-        call_with(
-            "c2",
-            "use_server",
-            json!({"name": "linear", "after_previous": true}),
-        ),
+        // then carries the whole list, the first group included, as the sequential path does.
+        call_with("c2", "load__group__linear", json!({"after_previous": true})),
     ])
     .push_text("done");
     let (requests, view) = run_task(&mock, &assembly(&mock, MCP), "fix a typo").await;
@@ -686,15 +742,23 @@ async fn two_loads_in_one_turn_append_both_in_order_and_record_the_turn_once() {
         tool_names(&requests[1]),
         [
             "github__search",
-            "use_server",
+            "load__group__docs",
+            "load__group__linear",
             "read_output",
             "docs__search",
             "linear__list_issues"
         ],
-        "both servers' tools, in the order the calls ran"
+        "both groups' tools, in the order the calls ran"
     );
     let state = state_of(&view);
-    assert_eq!(state.loaded_servers, ["docs", "linear"]);
+    assert_eq!(
+        state
+            .loaded
+            .iter()
+            .map(|one| one.loader.as_str())
+            .collect::<Vec<_>>(),
+        ["load__group__docs", "load__group__linear"]
+    );
     assert_eq!(
         state.tools_appended,
         [1],
@@ -702,12 +766,12 @@ async fn two_loads_in_one_turn_append_both_in_order_and_record_the_turn_once() {
     );
 }
 
-/// The list is carried into a run that continues the conversation: its first request offers the
-/// tools the run before ended with, at the end, and loading them again is refused.
+/// The loaded set is carried into a run that continues the conversation: its first request offers
+/// the tools the run before ended with, at the end, and loading them again is refused.
 #[tokio::test]
-async fn a_continued_run_keeps_the_servers_the_run_loaded() {
+async fn a_continued_run_keeps_the_groups_the_run_loaded() {
     let mock = Arc::new(MockModel::new());
-    mock.push_tool_calls(vec![call_with("c1", "use_server", json!({"name": "docs"}))])
+    mock.push_tool_calls(vec![call_with("c1", "load__group__docs", json!({}))])
         .push_text("first")
         .push_text("second");
     let assembly = assembly(&mock, MCP);
@@ -726,9 +790,8 @@ async fn a_continued_run_keeps_the_servers_the_run_loaded() {
     worker.stop().await;
     let state = state_of(&view);
     assert_eq!(
-        state.loaded_servers,
-        ["docs"],
-        "the continuation carries the list"
+        state.loaded[0].loader, "load__group__docs",
+        "the continuation carries the loaded set"
     );
     let requests = mock.requests();
     let first = requests
@@ -748,14 +811,14 @@ async fn a_continued_run_keeps_the_servers_the_run_loaded() {
             .into_iter()
             .chain(["docs__search".to_owned()])
             .collect::<Vec<_>>(),
-        "the continuation's first request ends with the loaded server's tools"
+        "the continuation's first request ends with the loaded group's tools"
     );
 }
 
 /// A load offers only the tools this agent's `tools:` selected: the server may offer more, and the
 /// agent was never given them, so appending them would show tools no call could run.
 #[tokio::test]
-async fn use_server_loads_only_the_tools_the_agent_selects() {
+async fn a_group_holds_only_the_tools_the_agent_selects() {
     const MCP_TWO: &str = r#"{"mcpServers": {
       "docs": {"type": "http", "url": "https://mcp.example/docs", "tools": ["search", "read"],
                "when": {"keywords": ["docs"]}}
@@ -773,16 +836,159 @@ async fn use_server_loads_only_the_tools_the_agent_selects() {
     .unwrap()
     .model(mock.clone(), "default")
     .unwrap();
-    mock.push_tool_calls(vec![call_with("c1", "use_server", json!({"name": "docs"}))])
+    mock.push_tool_calls(vec![call_with("c1", "load__group__docs", json!({}))])
         .push_text("done");
     let (requests, view) = run_task(&mock, &assembly, "fix a typo").await;
     assert_eq!(
         tool_names(&requests[1]),
-        ["use_server", "read_output", "docs__search"],
+        ["load__group__docs", "read_output", "docs__search"],
         "the selected tool is appended; the one `tools:` left out is not"
     );
     let text = requests[1].messages.last().expect("the result").text();
     assert!(text.contains("docs__search"), "{text}");
     assert!(!text.contains("docs__read"), "{text}");
-    assert_eq!(state_of(&view).loaded_servers, ["docs"]);
+    assert_eq!(state_of(&view).loaded[0].tools, ["docs__search"]);
+}
+
+/// A tool the agent's `tools:` did not select is in no loader, and a call to it is refused: lazy
+/// never widens access, and a forbidden tool's existence is not revealed by a loader.
+#[tokio::test]
+async fn a_forbidden_tool_is_in_no_loader_and_is_refused() {
+    const MCP_TWO: &str = r#"{"mcpServers": {
+      "docs": {"type": "http", "url": "https://mcp.example/docs", "tools": ["search", "read"],
+               "when": {"keywords": ["docs"]}}
+    }}"#;
+    let mock = Arc::new(MockModel::new());
+    let assembly = common::def(&[
+        (
+            "agent/instructions.md",
+            &common::instructions("name: root\ntools: ['docs__search']", "You are root."),
+        ),
+        ("agent/mcp.json", MCP_TWO),
+    ])
+    .mcp_tools("root", common::tools(&["docs__search", "docs__read"]))
+    .bind(ToolSet::new())
+    .unwrap()
+    .model(mock.clone(), "default")
+    .unwrap();
+    mock.push_tool_calls(vec![call_with("c1", "load__group__docs", json!({}))])
+        .push_tool_calls(vec![call("c2", "docs__read")])
+        .push_text("done");
+    let (requests, _) = run_task(&mock, &assembly, "fix a typo").await;
+    let load = requests[1]
+        .messages
+        .last()
+        .expect("the load's result")
+        .text();
+    assert!(load.contains("docs__search"), "{load}");
+    assert!(
+        !load.contains("docs__read"),
+        "the forbidden tool is not in the load's result: {load}"
+    );
+    let refused = requests[2].messages.last().expect("the refusal").text();
+    assert!(refused.contains("docs__read"), "{refused}");
+    assert!(
+        !refused.contains("docs__read-out"),
+        "the forbidden tool did not run: {refused}"
+    );
+}
+
+/// A `when` server whose name is a group name binds, and gets a loader: `my_server` is legal in
+/// `mcp.json` and a group name.
+#[tokio::test]
+async fn a_when_server_named_my_server_binds() {
+    const MCP_UNDERSCORE: &str = r#"{"mcpServers": {
+      "my_server": {"type": "http", "url": "https://mcp.example/x", "tools": ["echo"],
+                    "when": {"keywords": ["x"]}}
+    }}"#;
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let assembly = common::def(&[
+        (
+            "agent/instructions.md",
+            &common::instructions("name: root\ntools: ['my_server__echo']", "You are root."),
+        ),
+        ("agent/mcp.json", MCP_UNDERSCORE),
+    ])
+    .mcp_tools("root", common::tools(&["my_server__echo"]))
+    .bind(ToolSet::new())
+    .unwrap()
+    .model(mock.clone(), "default")
+    .unwrap();
+    let (requests, _) = run_task(&mock, &assembly, "fix a typo").await;
+    assert!(
+        has(&requests[0], "load__group__my_server"),
+        "{:?}",
+        names(&requests[0])
+    );
+}
+
+/// A tool in two groups is refused at bind: a load must append it once, from one group.
+#[test]
+fn a_tool_in_two_groups_is_refused_at_bind() {
+    let given: Vec<(String, adam_llm_agent::DynTool)> =
+        vec![("shared".to_owned(), Arc::new(common::stub("shared")))];
+    let error = adam_assembly::Groups::bind(
+        &adam_assembly::Origin {
+            agent: "root".into(),
+            file: "agent/instructions.md".into(),
+        },
+        vec![
+            adam_assembly::Group::new("a", "the a group", vec!["shared".to_owned()]),
+            adam_assembly::Group::new("b", "the b group", vec!["shared".to_owned()]),
+        ],
+        &given,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, adam_assembly::Error::GroupOverlap { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("belongs to one group"),
+        "{error}"
+    );
+}
+
+/// A registered `load__` tool is refused at bind even when the agent does not select it: the
+/// catalogue is the host's, and the loaders reserve the prefix.
+#[test]
+fn a_registered_load_tool_is_refused_even_unselected() {
+    let def = common::def(&[(
+        "agent/instructions.md",
+        &common::instructions("name: root\ntools: ['other']", "You are root."),
+    )]);
+    let error = def
+        .bind(
+            ToolSet::new()
+                .tool(common::stub("other"))
+                .tool(common::stub("load__x")),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, adam_assembly::Error::ReservedLoaderName { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("reserved"), "{error}");
+}
+
+/// A subagent is called as a tool named after it, so one named `load__` would collide with a
+/// loader: refused at bind.
+#[test]
+fn a_subagent_named_load_is_refused() {
+    let def = common::def(&[
+        (
+            "agent/instructions.md",
+            &common::instructions("name: root", "You are root."),
+        ),
+        (
+            "agent/subagents/load__x/instructions.md",
+            &common::instructions("description: Helps.", "You help."),
+        ),
+    ]);
+    let error = def.bind(ToolSet::new()).unwrap_err();
+    assert!(
+        matches!(error, adam_assembly::Error::ReservedLoaderName { .. }),
+        "{error}"
+    );
 }

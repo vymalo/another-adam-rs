@@ -527,11 +527,12 @@ pub enum Error {
         /// The limit.
         limit: u64,
     },
-    /// The agent has skills, so it gets the tools `load_skill` and `read_skill_file`, and a
-    /// registered tool already has one of those names.
+    /// A tool the agent gets from its own definition has a name a registered tool already has: the
+    /// skills' `load_skill` and `read_skill_file`, a group's `load__group__<name>` loader, or the
+    /// reserved `load__` prefix.
     #[error(
-        "{origin}: the agent has skills, which bring a tool called `{tool}`, but a tool with that \
-         name is registered too: rename it, or leave it out of `tools`, or set `skills: []`"
+        "{origin}: the agent brings a tool called `{tool}`, but a tool with that name is registered \
+         too: rename it, or leave it out of `tools`"
     )]
     ReservedToolName {
         /// The agent and file.
@@ -555,6 +556,56 @@ pub enum Error {
         tool: String,
         /// What it collides with.
         clash: ToolClash,
+    },
+    /// A group's name or keywords do not fit, or two groups have one name (ADR 0066).
+    #[error("{origin}: the group `{group}` is refused: {reason}")]
+    GroupName {
+        /// The agent and file.
+        origin: Origin,
+        /// The group.
+        group: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// A searchable group is not built yet (ADR 0066, slice S2).
+    #[error(
+        "{origin}: the group `{group}` is searchable, and this host cannot bind a searchable group \
+         until S2: build it without `searchable` for now"
+    )]
+    SearchableGroup {
+        /// The agent and file.
+        origin: Origin,
+        /// The group.
+        group: String,
+    },
+    /// A tool belongs to two groups. A load must append it once, from one group, and the refusal
+    /// that names the group would be ambiguous.
+    #[error(
+        "{origin}: the tool `{tool}` is in the groups `{first}` and `{second}`: a tool belongs to \
+         one group"
+    )]
+    GroupOverlap {
+        /// The agent and file.
+        origin: Origin,
+        /// The tool.
+        tool: String,
+        /// The group that already has it.
+        first: String,
+        /// The group that also names it.
+        second: String,
+    },
+    /// A tool name starts with the loaders' reserved prefix (`load__`). The loaders are own tools
+    /// named `load__group__<name>`, and an MCP tool is `<server>__<tool>`, so the names would
+    /// collide.
+    #[error(
+        "{origin}: the tool `{tool}` is reserved: the group loaders are named \
+         `load__group__<name>`, so no tool may start with `load__`; rename it"
+    )]
+    ReservedLoaderName {
+        /// The agent and file.
+        origin: Origin,
+        /// The name in conflict.
+        tool: String,
     },
     /// A subagent has a tool that asks the user a question ([`Tool::asks_user`]). A subagent runs as
     /// a child of another run, so nobody could answer, and the child would wait for ever.

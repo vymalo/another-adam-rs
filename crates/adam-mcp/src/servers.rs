@@ -406,6 +406,11 @@ impl Plan {
         // `_` (`a_` + `x` and `a` + `_x` would both be `a___x`, and `a_`'s tools would look like
         // `a`'s). The loader of `mcp.json` refuses these too; a config made by hand is checked
         // here.
+        if name == "load" {
+            return Err(Error::ReservedServerName {
+                server: name.to_owned(),
+            });
+        }
         if !name_fits(name) || name.contains("__") || name.ends_with('_') {
             return Err(Error::Name {
                 server: name.to_owned(),
@@ -629,7 +634,11 @@ fn name_fits(name: &str) -> bool {
 /// tool's own name does not start with `_` (with a server name that does not end in one, the first
 /// `__` then always ends the server's name, and a name says whose tool it is).
 fn tool_fits(server: &str, tool: &str) -> bool {
-    !tool.is_empty() && !tool.starts_with('_') && name_fits(&format!("{server}__{tool}"))
+    let full = format!("{server}__{tool}");
+    !tool.is_empty()
+        && !tool.starts_with('_')
+        && !full.starts_with(adam_llm_agent::RESERVED_LOADER_PREFIX)
+        && name_fits(&full)
 }
 
 /// A tool chosen from a server's list: its name on the server and what the model is shown.
@@ -783,6 +792,28 @@ mod tests {
             connect_timeout_secs: connect,
             ..McpSettings::default()
         })
+    }
+
+    /// A server named `load` has its own refusal: `load` fits `<server>__<tool>`, so the generic
+    /// name error would be false.
+    #[test]
+    fn a_server_named_load_is_refused_with_its_own_message() {
+        let error = Error::ReservedServerName {
+            server: "load".into(),
+        };
+        let text = error.to_string();
+        assert!(text.contains("reserved"), "{text}");
+        assert!(text.contains("rename the server"), "{text}");
+        assert!(!text.contains("<server>__<tool>"), "{text}");
+    }
+
+    /// The loaders reserve `load__` (ADR 0066, decision 2): a tool whose full name starts with it
+    /// is left out with a warning, never shown as a loader.
+    #[test]
+    fn a_server_tool_named_load_is_left_out_with_a_warning() {
+        assert!(!tool_fits("load", "search"));
+        assert!(!tool_fits("load", "group__bash"));
+        assert!(tool_fits("docs", "search"));
     }
 
     #[test]

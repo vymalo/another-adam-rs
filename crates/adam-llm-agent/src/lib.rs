@@ -175,11 +175,12 @@ pub use compaction::{
 };
 pub use conversation::{
     ACCESS_TIER_CONTEXT_KEY, ArtifactRef, CALLER_CONTEXT_KEY, Conversation, LOCALE_CONTEXT_KEY,
-    LimitHit, LimitKind, MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES,
-    MAX_READ_IDS, MAX_REPORTED_ROUNDS, MESSAGE_KIND, OMITTED_MARKER_PREFIX,
-    PER_MESSAGE_CONTEXT_KEYS, PROTECTED_CONTEXT_KEYS, PendingQuestion, PendingRemote, PendingRun,
-    PendingSession, PendingWait, REASONING_EFFORT_CONTEXT_KEY, RENDERER_OFFER_CONTEXT_KEY, Repeats,
-    STOPPED_BY_THE_PERSON, user_message,
+    LimitHit, LimitKind, Loaded, Loader, MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES,
+    MAX_LOADED_NOTE_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS, MAX_REPORTED_ROUNDS,
+    MESSAGE_KIND, OMITTED_MARKER_PREFIX, PER_MESSAGE_CONTEXT_KEYS, PROTECTED_CONTEXT_KEYS,
+    PendingQuestion, PendingRemote, PendingRun, PendingSession, PendingWait,
+    REASONING_EFFORT_CONTEXT_KEY, RENDERER_OFFER_CONTEXT_KEY, Repeats, STOPPED_BY_THE_PERSON,
+    loaded_note, user_message,
 };
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]
@@ -219,8 +220,8 @@ pub use source::{
 pub use state::{Extensions, State, StateKey};
 pub use step_io::StepIo;
 pub use tool::{
-    AnswerCheck, DEFAULT_TOOL_TIME_LIMIT, DynTool, Refusal, RemotePoll, StepStyle, TOOL_STOP_GRACE,
-    Tool, ToolCtx, ToolError, ToolOutput,
+    AnswerCheck, DEFAULT_TOOL_TIME_LIMIT, DynTool, GROUP_LOADER_PREFIX, RESERVED_LOADER_PREFIX,
+    Refusal, RemotePoll, StepStyle, TOOL_STOP_GRACE, Tool, ToolCtx, ToolError, ToolOutput,
 };
 pub use toolset::ToolSet;
 pub use typed::{IntoToolOutput, IntoToolResult, Json, parse_args};
