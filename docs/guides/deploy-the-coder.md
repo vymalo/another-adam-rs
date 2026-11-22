@@ -105,7 +105,7 @@ against `EXPECT_REVISION`, which CI sets to the commit.
 | the CloudNativePG operator, **or** an existing Postgres | the run store; `database.enabled: false` + `database.existingSecret.name` for your own |
 | External Secrets (`ExternalSecret`, `external-secrets.io/v1`) | the three secrets below; the defaults point at one owner's `secretStoreRef` and `key`, override them |
 | a StorageClass | the PVC at `/work` (a ReadWriteMany one for `shared` or `affinity` placement) |
-| an OpenAI-compatible model gateway | `config.modelBaseUrl`, with its `/v1` prefix |
+| an OpenAI-compatible model gateway | `config.modelBaseUrl`, with its `/v1` prefix; or an injector in front of it (`config.modelAuth: injector`, ADR 0067) |
 | a GitHub token, or a GitHub App | to push and open pull requests |
 
 ## Secrets
@@ -114,7 +114,7 @@ Nothing secret is in values or in git.
 
 | Variable | AWS property (default) | For |
 |---|---|---|
-| `MODEL_API_KEY` | `adam_coder_model_api_key` | roles that run workers |
+| `MODEL_API_KEY` | `adam_coder_model_api_key` | roles that run workers; its value is empty with `config.modelAuth: device` or `injector` |
 | `GITHUB_TOKEN` | `adam_coder_github_token` | workers, with `github.auth: token` (the default) |
 | `A2A_BEARER_TOKENS` | `adam_coder_a2a_bearer_tokens` (comma-separated) | roles that serve A2A (the front, with `split`) |
 | `MODEL_BASE_URL` | `model_base_url` | only with `config.modelBaseUrlFromSecret: true`, to keep the URL out of git |
@@ -144,6 +144,7 @@ The values you will actually set:
 | Value | Decision |
 |---|---|
 | `config.modelBaseUrl`, `config.model` | the gateway and the model alias (`coder`). `config.opencodeModel` is gone with OpenCode (ADR 0038): left in a values file it changes nothing, and `NOTES.txt` says it is ignored |
+| `config.modelAuth` | how the workers authenticate: empty (default, the binary's `key`), `key`, `device` (signs in with the device grant; on the roles that run workers, `MODEL_OAUTH_ISSUER` and `MODEL_OAUTH_CLIENT_ID` are required in `config.extraEnv`, and the chart refuses `device` without them) or `injector` (ADR 0067: no key, every call names its run with `X-Run-Id`; on the workers, any `MODEL_OAUTH_*` is refused, and the base URL must point at the injector or runs park up to `MODEL_PARK_LIMIT`; set the AWS value of `externalSecrets.properties.modelApiKey` to empty). [The chart](../../deploy/coder/README.md#model-authentication) |
 | `config.publicUrl` | the URL clients reach (goes into the agent card); empty is the in-cluster Service URL |
 | `topology` | `combined` (default) or `split`. Switch with `--set topology=split`; the Service selector moves to the front once it exists, so do it at a quiet moment |
 | `replicaCount`, `workspace.placement` | more than one worker **needs** a placement (`isolated`, `affinity` or `shared`, [why](../reference/workspace-and-environments.md#placement-which-worker-holds-a-runs-files)); the chart refuses `replicaCount > 1` without one. Switching between a per-pod and a shared volume needs `kubectl delete statefulset <release>-coder --cascade=orphan` first |
