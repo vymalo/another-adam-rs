@@ -24,6 +24,9 @@ Citations are `repo:path:line`: `adam:` is this repository at `99f64b2` (except 
 whose citations are at the head: `config.rs:975`, `:980`, `:1233`, `credentials.rs:323`, `agent.rs:5148`,
 `lib.rs:535`, `:547`, `sessions.rs:617`; the reasoning-wire cells added in
 [#327](https://github.com/vymalo/another-adam-rs/pull/327), whose citation is at the head: `wire.rs:251`;
+the reasoning-extension cells added in
+[#331](https://github.com/vymalo/another-adam-rs/pull/331), whose citations are at the head:
+`extensions.rs:127`, `:391`, `reasoning.rs:124`;
 and the profile's `contextWindow` cell added in
 [#314](https://github.com/vymalo/another-adam-rs/pull/314), whose citation is at the head:
 `profiles.rs:198`; the pin is not moved), `sys:` another-agentic-system at `ebcee350`,
