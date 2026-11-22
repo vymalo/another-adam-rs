@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 
 use adam_model::{
     ContentPart, FinishReason, ImageData, ImageRef, Message, ModelDelta, ModelError, ModelProfiles,
-    ModelRequest, ModelResponse, ProviderTurn, ReasoningWire, ToolCall, ToolChoice, Usage,
+    ModelRequest, ModelResponse, ProviderTurn, ReasoningEffort, ReasoningWire, ToolCall,
+    ToolChoice, Usage,
 };
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -244,8 +245,9 @@ enum ReasoningMember {
 /// What a request's [`reasoning_effort`](ModelRequest::reasoning_effort) writes, from the profile
 /// of its model: `None` when the request has no level, the model has no profile, or the profile
 /// declares no wire. The assembly refuses a level the model does not take, so the client is not a
-/// second validator; it does refuse a `thinking_budget` profile with no budget for the level,
-/// which no file can declare but a hand-built profile can.
+/// second validator; it does refuse the two things `parse_json` guarantees and a hand-built profile
+/// can break: a `thinking_budget` profile with no budget for the level, and `none` with that wire,
+/// which has no disabled form.
 fn reasoning_member(
     req: &ModelRequest,
     profiles: Option<&ModelProfiles>,
@@ -263,6 +265,16 @@ fn reasoning_member(
         ReasoningWire::ReasoningEffort => ReasoningMember::Effort(level.as_str()),
         ReasoningWire::ReasoningObject => ReasoningMember::Object(level.as_str()),
         ReasoningWire::ThinkingBudget => {
+            // `none` is the level that means "do not reason", and the shape has no disabled form:
+            // the loader refuses the pairing, and a hand-built profile reaches this, the one place
+            // the invariant can be total.
+            if level == ReasoningEffort::None {
+                return Err(ModelError::invalid_request(format!(
+                    "the model {:?} cannot send reasoning effort {:?} through the `thinking_budget` wire: the wire has no disabled form",
+                    req.model,
+                    level.as_str()
+                )));
+            }
             let budget = profile
                 .reasoning_budgets
                 .as_ref()
@@ -282,7 +294,7 @@ fn reasoning_member(
 impl ReasoningMember {
     /// Write the member, removing only what the extra body holds of the same fact: both
     /// `reasoning_effort` and `reasoning.effort` for the first two wires (an emptied `reasoning`
-    /// object goes), `thinking` wholesale for the third (ADR 0063 decision 6). Other members stay.
+    /// object that held the effort goes), `thinking` wholesale for the third (ADR 0063 decision 6). Other members stay.
     fn apply(self, members: &mut serde_json::Map<String, Value>) {
         match self {
             Self::Effort(level) => {
@@ -1634,6 +1646,36 @@ mod tests {
             assert!(err.to_string().contains("gw-model"), "{err}");
             assert!(err.to_string().contains("high"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_hand_built_thinking_budget_profile_refuses_none() {
+        // `parse_json` refuses this pairing; a hand-built profile (public fields) bypasses it, so
+        // the client refuses it too: the wire has no disabled form.
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::None);
+        let mut profile = profile_of(
+            &[ReasoningEffort::None, ReasoningEffort::Low],
+            ReasoningWire::ThinkingBudget,
+        );
+        profile.reasoning_budgets = Some(BTreeMap::from([
+            (ReasoningEffort::None, 1),
+            (ReasoningEffort::Low, 1024),
+        ]));
+        let profiles = profiles_of("gw-model", profile);
+        let err = build_request(
+            &req,
+            false,
+            RequestOptions {
+                profiles: Some(&profiles),
+                ..RequestOptions::default()
+            },
+        )
+        .expect_err("none through thinking_budget");
+        assert!(matches!(err, ModelError::InvalidRequest { .. }), "{err:?}");
+        assert!(err.to_string().contains("gw-model"), "{err}");
+        assert!(err.to_string().contains("none"), "{err}");
+        assert!(err.to_string().contains("no disabled form"), "{err}");
     }
 
     #[test]

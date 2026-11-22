@@ -52,9 +52,10 @@ pub trait ModelClient: Send + Sync + 'static {
     /// its output cap, its extra body. `None` (the default) when nobody declared one, and then
     /// nothing of a profile is applied.
     ///
-    /// Hosts will read it to resolve a call's settings — the per-call output cap of ADR 0064
-    /// slice 5, which is not built — and the OpenAI-compatible client reads it to send a request's
-    /// reasoning level through the model's wire.
+    /// Hosts will read it to resolve a call's settings — the cap resolved per call once the model
+    /// is chosen at run time (ADR 0064 slice 5, not built; the cap itself is built per agent, slice
+    /// 2) — and the OpenAI-compatible client reads it to send a request's reasoning level through
+    /// the model's wire.
     fn profile(&self, model: &str) -> Option<&ModelProfile> {
         let _ = model;
         None

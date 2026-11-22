@@ -362,7 +362,9 @@ impl ModelProfiles {
                     )),
                     Some(budgets) => {
                         for level in efforts {
-                            if !budgets.contains_key(level) {
+                            // `none` is refused above: asking for its budget would be a second
+                            // problem telling the user to do what the first forbids.
+                            if *level != ReasoningEffort::None && !budgets.contains_key(level) {
                                 problems.push(format!(
                                     "{}: {:?} is declared but has no budget",
                                     at("reasoningBudgets"),
@@ -966,6 +968,20 @@ mod tests {
         assert!(problems[0].contains("thinking_budget"), "{problems:?}");
         assert!(problems[0].contains("no disabled form"), "{problems:?}");
         assert!(problems[0].contains("another wire"), "{problems:?}");
+
+        // The natural bad file has no budget for `none`: one problem, the refusal, never a
+        // second telling the user to budget a level the wire forbids.
+        let natural = json!({
+            "profiles": { "m": {
+                "reasoningEfforts": ["none", "low"],
+                "reasoningWire": "thinking_budget",
+                "reasoningBudgets": { "low": 1024 }
+            } }
+        });
+        let problems = problems_of(&natural);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("no disabled form"), "{problems:?}");
+        assert!(!problems[0].contains("no budget"), "{problems:?}");
     }
 
     #[test]

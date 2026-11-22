@@ -309,9 +309,10 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
   members), `an_emptied_reasoning_object_is_removed_and_its_other_members_stay`,
   `an_empty_reasoning_object_the_extra_body_wrote_stays`, `the_reasoning_object_wire_keeps_the_objects_other_members`,
   `the_thinking_budget_wire_replaces_thinking_wholesale`, `none_is_a_level_that_is_sent_and_an_absent_one_is_not`,
-  `without_a_profile_a_wire_or_a_level_the_body_is_byte_identical` and
-  `a_thinking_budget_with_no_budget_names_the_model_and_the_level`; `src/lib.rs`'s
-  `the_profiles_are_answered_for_their_models_and_debug_shows_ids_only`; `src/profiles.rs`'s
+  `without_a_profile_a_wire_or_a_level_the_body_is_byte_identical`,
+  `a_thinking_budget_with_no_budget_names_the_model_and_the_level` and
+  `a_hand_built_thinking_budget_profile_refuses_none`; `src/lib.rs`'s
+  `the_profiles_are_answered_for_their_models_and_debug_shows_ids_only`; `crates/adam-model/src/profiles.rs`'s
   `the_thinking_budget_wire_refuses_the_level_none`; and `tests/model_wire.rs` in `adam-service` for the end-to-end from
   `MODEL_ALIASES_FILE` through `ModelConfig::client()`.
 * Unit tests: `src/errors.rs` (`status_mapping`, `a_problem_type_is_read_by_its_last_segment`,
