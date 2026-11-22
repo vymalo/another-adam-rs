@@ -5,7 +5,7 @@ the local case, the remote (A2A) case, every failure interleaving with the test 
 and what the design refuses. The picture is in [Architecture](../architecture.md#child-runs); how a
 folder declares subagents is in [Agent files](agent-files.md#subagents-at-run-time).
 
-Code: `crates/adam-runtime` (`start_child`, `child_status`, the notice), `crates/adam-llm-agent`
+Code: `crates/adam-runtime` (`start_child`, `child_status`, `child_look`, `resume_child`, the notices), `crates/adam-llm-agent`
 (`pending_wait`, `AwaitRun`, `AwaitRemote`), `crates/adam-assembly` (`SubagentTool`, `RemoteSubagentTool`).
 
 ## A local child
@@ -24,18 +24,10 @@ Code: `crates/adam-runtime` (`start_child`, `child_status`, the notice), `crates
   at `debug` and is not an error.
 * **A park is a second notice.** A child that parks sends `adam.child.parked` after its own commit (never from
   the runtime's own look at a parked child, which parks it again without stepping it), with the child's run id
-  as its id and no payload. The parent reads what the child waits on from its record (`Ctx::child_look`, one
-  read of the status and the head) and keeps it beside its pending child (`PendingRun::model_wait`), so a front
-  reads the reason at `/pending_wait/model_wait`. A child parked on the model **until woken** makes the parent
-  wait with no timer, as a question does: such a child cannot finish on its own, so a timer would only re-read
-  "still parked", and the message that wakes the root reaches its inbox regardless. A child on a timer keeps
-  the parent's 60 s look, which is the fallback for the lost notice of its end.
-* **Only a resume goes down.** A message or a resume to a run that waits on a child parked on the model sends
-  that child one `adam.resume`, under an id derived from the waking message's id and the child's run id (a
-  replay writes the same one); the words of a message stay at the parent, behind the call the child answers.
-  Each level forwards to its own pending child, so a grandchild is reached one level at a time. The copy is
-  cleared when the parent forwards, and rewritten at its next look. A child's refusal of status 401 or 403 is
-  the child's: the root's task is `working` with the reason, never `auth-required`.
+  as its id and no payload. The parent reads what the child waits on from its record (`Ctx::child_look`) and
+  keeps it beside its pending child (`PendingRun::model_wait`); a child parked on the model **until woken**
+  makes the parent wait with no timer, as a question does, and a child on a timer keeps the parent's 60 s look.
+  The notice, the copy, the park and the forwarded resume are [below](#a-park-on-the-model).
 * **The message is deduplicated by its id.** `Inbound::id` is the child's run id. The `LlmAgent` matches it
   to the run it waits for, uses it once (the wait is cleared in the same commit that consumes it) and drops
   every other: copies of a message already used, a message for a run it does not wait for, one that does not
@@ -80,7 +72,6 @@ wakes the child through itself:
   never `auth-required`: the gateway refused the child's call, not the root's.
 * **The coder's commands.** An until-woken park, the run's own or a child's it waits on, ends the coder's
   background commands as a question does; a timer park keeps them, bounded by `MODEL_PARK_LIMIT`.
-
 
 ## Failure interleavings
 

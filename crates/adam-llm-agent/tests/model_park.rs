@@ -1138,17 +1138,23 @@ async fn a_copy_of_the_message_that_woke_the_parent_wakes_the_child_once() {
     })
     .await;
     assert_eq!(rig.mock.requests().len(), 3);
+    // The parent committed the forward (it has read m-1) and copied the new wait.
+    rig.parked(run, |s| {
+        s.read_ids.iter().any(|id| id == "m-1")
+            && matches!(&s.pending_wait, Some(PendingWait::Run(w)) if w.model_wait.is_some())
+    })
+    .await;
 
     // The same id again is a copy the parent has read: it forwards nothing.
+    let before = rig.rt.view(run).await.unwrap().unwrap().version;
     rig.rt
         .deliver(run, user_message("the limit is raised").with_id("m-1"))
         .await
         .expect("a copy is delivered");
-    let (view, _) = rig
-        .parked(
-            run,
-            |s| matches!(&s.pending_wait, Some(PendingWait::Run(w)) if w.model_wait.is_some()),
-        )
+    let view = rig
+        .wait_for(run, "the parent parked after the copy", |v| {
+            v.version > before && v.status == RunStatus::Parked
+        })
         .await;
     assert!(view.waiting);
     assert_eq!(
