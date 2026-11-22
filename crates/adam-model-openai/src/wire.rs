@@ -765,16 +765,12 @@ struct DeltaToolCall {
 
 /// The members of an assistant message the streamed format models: a member of a `message`-shaped
 /// chunk with one of these names is not opaque.
-const STREAM_MESSAGE_MODELLED_KEYS: [&str; 9] = [
+const STREAM_MESSAGE_MODELLED_KEYS: [&str; 5] = [
     "role",
     "content",
     "tool_calls",
-    "function_call",
     "reasoning_content",
     "reasoning",
-    "refusal",
-    "annotations",
-    "audio",
 ];
 
 #[derive(Deserialize, Default)]
