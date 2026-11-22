@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
-use crate::{InputModalities, ModelDelta, ModelError, ModelRequest, ModelResponse};
+use crate::{InputModalities, ModelDelta, ModelError, ModelProfile, ModelRequest, ModelResponse};
 
 /// A language model behind some API.
 ///
@@ -46,6 +46,19 @@ pub trait ModelClient: Send + Sync + 'static {
         let _ = model;
         InputModalities::text_only()
     }
+
+    /// The deployment's profile of the model the alias `model` names, when it declared one
+    /// (`MODEL_ALIASES_FILE`, ADR 0063 and ADR 0064): its reasoning levels and how they are sent,
+    /// its output cap, its extra body. `None` (the default) when nobody declared one, and then
+    /// nothing of a profile is applied.
+    ///
+    /// Hosts read it to resolve a call's settings (the per-call output cap, ADR 0064 slice 5), and
+    /// the OpenAI-compatible client reads it to send a request's reasoning level through the
+    /// model's wire.
+    fn profile(&self, model: &str) -> Option<&ModelProfile> {
+        let _ = model;
+        None
+    }
 }
 
 /// A shared, type-erased [`ModelClient`].
@@ -75,12 +88,16 @@ impl<T: ModelClient + ?Sized> ModelClient for Arc<T> {
     fn input_modalities(&self, model: &str) -> InputModalities {
         (**self).input_modalities(model)
     }
+
+    fn profile(&self, model: &str) -> Option<&ModelProfile> {
+        (**self).profile(model)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ImageLimits, ImageOrigin, MockModel};
+    use crate::{ImageLimits, ImageOrigin, MockModel, ReasoningEffort, ReasoningWire};
 
     #[test]
     fn arc_forwards_input_modalities() {
@@ -98,5 +115,45 @@ mod tests {
         // A client that says nothing is text only.
         let blind: DynModel = Arc::new(MockModel::new());
         assert_eq!(blind.input_modalities("m"), InputModalities::text_only());
+    }
+
+    /// A client that answers a profile for one alias, to test the forward.
+    struct Profiled(ModelProfile);
+
+    #[async_trait]
+    impl ModelClient for Profiled {
+        async fn complete(&self, _req: ModelRequest) -> Result<ModelResponse, ModelError> {
+            Err(ModelError::invalid_request(
+                "a test client completes nothing",
+            ))
+        }
+
+        async fn stream(
+            &self,
+            _req: ModelRequest,
+        ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+            Err(ModelError::invalid_request("a test client streams nothing"))
+        }
+
+        fn profile(&self, model: &str) -> Option<&ModelProfile> {
+            (model == "m").then_some(&self.0)
+        }
+    }
+
+    #[test]
+    fn arc_forwards_the_profile() {
+        let profile = ModelProfile {
+            reasoning_efforts: Some(vec![ReasoningEffort::Low]),
+            reasoning_wire: Some(ReasoningWire::ReasoningEffort),
+            ..ModelProfile::default()
+        };
+        let shared: DynModel = Arc::new(Profiled(profile.clone()));
+        assert_eq!(shared.profile("m"), Some(&profile));
+        assert_eq!(shared.profile("other"), None);
+        let twice: Arc<DynModel> = Arc::new(shared);
+        assert_eq!(twice.profile("m"), Some(&profile));
+        // A client that says nothing has no profile.
+        let plain: DynModel = Arc::new(MockModel::new());
+        assert_eq!(plain.profile("m"), None);
     }
 }

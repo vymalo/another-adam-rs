@@ -708,9 +708,10 @@ pub struct ModelConfig {
     /// problem naming the file and the key.
     pub model_aliases_file: Option<std::path::PathBuf>,
     /// The profiles read from [`model_aliases_file`](Self::model_aliases_file), by model id; empty
-    /// when the file is unset. The client is not yet given them (the wire slice); the binaries pass
-    /// them to the assembly, which resolves each agent's default reasoning effort and output cap
-    /// and refuses a level the model does not take (ADR 0063, ADR 0064).
+    /// when the file is unset. [`client`](Self::client) gives them to the client, which applies a
+    /// model's `reasoningWire` to its requests (ADR 0063 decision 6); the binaries also pass them
+    /// to the assembly, which resolves each agent's default reasoning effort and output cap and
+    /// refuses a level the model does not take (ADR 0063, ADR 0064).
     pub profiles: ModelProfiles,
     /// `MODEL_EXTRA_BODY`: members merged into every request body (a flag that makes the model
     /// emit its reasoning). Not secret, and never a member the runtime owns (`model`, `messages`,
@@ -917,6 +918,7 @@ impl ModelConfig {
         if let Some(extra) = &self.extra_body {
             client = client.with_extra_body(extra.clone())?;
         }
+        client = client.with_profiles(self.profiles.clone());
         Ok(std::sync::Arc::new(client))
     }
 }
@@ -2273,8 +2275,14 @@ mod tests {
             "{debug}"
         );
         assert!(!debug.contains("131072"), "{debug}");
-        // The client is untouched: the wire is the next slice.
-        model.client().expect("a usable client");
+        // The client is given the profiles: it applies a model's wire and answers `profile`.
+        use adam_model::ModelClient as _;
+        let client = model.client().expect("a usable client");
+        assert_eq!(
+            client.profile("large-coder").and_then(|p| p.reasoning_wire),
+            Some(adam_model::ReasoningWire::ReasoningEffort)
+        );
+        assert!(client.profile("small").is_none(), "an undeclared alias");
 
         // An unknown level names the file, the profile and the key, and the run is refused.
         let (model, problems) = run(Some(

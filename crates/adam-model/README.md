@@ -125,6 +125,7 @@ A message names an image by reference and never holds its bytes (ADR 0044).
 | `Message::Tool { images }` | the images a tool returned (default empty, not serialized while empty: a history with no image is the same bytes as before, and an older journal decodes). `Message::images()`, `tool_result_with_images`, `user_with_images` |
 | `ModelRequest::image_data` (`ImageData`) | the bytes of the images `messages` name, by SHA-256, **never serialized**: the agent loop fills it inside the step that calls the model. `Debug` says how many, never the bytes. A reference with no entry is sent as `ImageRef::missing_line()` |
 | `ModelClient::input_modalities(model) -> InputModalities` | what the deployment declared the model of that alias can read: text only by default, never guessed from a name (`InputModalities::images: Option<ImageLimits { max_bytes, max_count, max_side, sources }>`, `#[non_exhaustive]`). `Arc<T>` forwards it. `MockModel::seeing_images(limits)` |
+| `ModelClient::profile(model) -> Option<&ModelProfile>` | the deployment's profile of the model that alias names (`MODEL_ALIASES_FILE`), `None` by default: nothing of a profile is applied. `Arc<T>` forwards it. Hosts read it (the per-call output cap, ADR 0064 slice 5); the OpenAI-compatible client sends a request's level through its wire |
 
 **Breaking** for code that builds or matches these types: `ContentPart` gains a variant, `Message::Tool` a field and `ModelRequest` fields (`..Default::default()` or `..` fixes a literal or a pattern); `ModelClient` gains a provided method, so no implementer breaks.
 
@@ -153,8 +154,11 @@ wire, a wire with no efforts, or budgets without `thinking_budget`; a cap of `0`
 `max_completion_tokens`). `reasoningEfforts: []` says the model takes no reasoning setting.
 
 `ModelRequest::reasoning_effort` carries the level a call asks for (ADR 0063); the agent loop sets it
-from the run's protected context key `vymalo.reasoningEffort`, else the agent's default. The wire that
-sends it (the model profile's `reasoningWire`) and the output cap are the following slices.
+from the run's protected context key `vymalo.reasoningEffort`, else the agent's default. The
+OpenAI-compatible client sends it through the model profile's `reasoningWire`, after the extra body,
+which it wins over where the two would duplicate a member (`crates/adam-model-openai/README.md`,
+*Reasoning effort*); a model with no profile or no wire sends nothing. The profile's `extra_body` is
+ADR 0064 slice 3.
 
 ## Errors
 ## Errors

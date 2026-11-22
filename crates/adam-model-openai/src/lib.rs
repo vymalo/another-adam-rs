@@ -82,6 +82,10 @@
 //!   a request's `prompt_cache_key`; a member of the extra body of the same name wins.
 //! * **[`with_extra_body`](OpenAiCompatible::with_extra_body)** merges a JSON object into every
 //!   request, for a flag that makes a model emit reasoning.
+//! * **[`with_profiles`](OpenAiCompatible::with_profiles)** gives the client the deployment's
+//!   per-model profiles (`MODEL_ALIASES_FILE`, ADR 0063 and ADR 0064): a request's
+//!   `reasoning_effort` goes out through the profile's `reasoningWire`, after the extra body, which
+//!   it wins over where the two would duplicate a member.
 
 #![warn(missing_docs)]
 
@@ -97,8 +101,8 @@ use std::time::{Duration, SystemTime};
 use adam_error::{BoxError, Classify, ErrorClass};
 use adam_model::{
     AfterRejection, CredentialHeaders, CredentialRequest, DynCredentials, InputModalities,
-    MODEL_LOCKED_SLUG, Message, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
-    Park, Refusal, Rejection, StaticBearer,
+    MODEL_LOCKED_SLUG, Message, ModelClient, ModelDelta, ModelError, ModelProfile, ModelProfiles,
+    ModelRequest, ModelResponse, Park, Refusal, Rejection, StaticBearer,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -305,6 +309,9 @@ pub struct OpenAiCompatible {
     prompt_cache_key: bool,
     context_windows: BTreeMap<String, u64>,
     input_modalities: BTreeMap<String, InputModalities>,
+    /// The deployment's per-model profiles (`MODEL_ALIASES_FILE`): what the reasoning wire applies
+    /// and what [`ModelClient::profile`] answers. Empty by default.
+    profiles: ModelProfiles,
 }
 
 /// What [`OpenAiCompatible`] says its provider is ([`ModelClient::provider`]): the protocol it
@@ -331,6 +338,11 @@ impl fmt::Debug for OpenAiCompatible {
             .field("prompt_cache_key", &self.prompt_cache_key)
             .field("context_windows", &self.context_windows)
             .field("input_modalities", &self.input_modalities)
+            // The model ids, never a profile's values.
+            .field(
+                "profiles",
+                &self.profiles.profiles.keys().collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -389,6 +401,7 @@ impl OpenAiCompatible {
             prompt_cache_key: false,
             context_windows: BTreeMap::new(),
             input_modalities: BTreeMap::new(),
+            profiles: ModelProfiles::default(),
         })
     }
 
@@ -399,6 +412,17 @@ impl OpenAiCompatible {
     #[must_use]
     pub fn with_context_window(mut self, model: impl Into<String>, window: u64) -> Self {
         self.context_windows.insert(model.into(), window);
+        self
+    }
+
+    /// Give the client the deployment's per-model profiles (`MODEL_ALIASES_FILE`, ADR 0063 and
+    /// ADR 0064): what [`ModelClient::profile`] answers, and how a request's
+    /// [`reasoning_effort`](adam_model::ModelRequest::reasoning_effort) is sent — through the
+    /// `reasoningWire` of the request's model, after the extra body (the crate README, *Reasoning
+    /// effort*). Empty by default: no model has a profile, and nothing is applied.
+    #[must_use]
+    pub fn with_profiles(mut self, profiles: ModelProfiles) -> Self {
+        self.profiles = profiles;
         self
     }
 
@@ -418,8 +442,9 @@ impl OpenAiCompatible {
     }
 
     /// Members merged into the body of **every** request, at its top level (they win over what
-    /// the client wrote): a flag that makes a gateway or a model emit its reasoning, for example
-    /// `{"reasoning_effort": "medium"}`, `{"thinking": {"type": "enabled"}}` or
+    /// the client wrote, except the members a typed reasoning level's wire duplicates, where the
+    /// level wins: ADR 0063 decision 6): a flag that makes a gateway or a model emit its reasoning,
+    /// for example `{"reasoning_effort": "medium"}`, `{"thinking": {"type": "enabled"}}` or
     /// `{"chat_template_kwargs": {"enable_thinking": true}}`. Not secret: it is sent as written
     /// and is not hidden from `Debug` beyond its member names. An empty object is no extra body.
     ///
@@ -472,6 +497,7 @@ impl OpenAiCompatible {
             echo_reasoning: self.echo_reasoning,
             prompt_cache_key: self.prompt_cache_key,
             endpoint: &self.endpoint,
+            profiles: Some(&self.profiles),
         }
     }
 
@@ -901,6 +927,10 @@ impl ModelClient for OpenAiCompatible {
             .unwrap_or_default()
     }
 
+    fn profile(&self, model: &str) -> Option<&ModelProfile> {
+        self.profiles.profile(model)
+    }
+
     #[tracing::instrument(name = "model.complete", skip_all, fields(model = %req.model, url = %self.url))]
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
         let body = wire::build_request(&req, false, self.options())?;
@@ -980,6 +1010,30 @@ mod tests {
         let shared: adam_model::DynModel = std::sync::Arc::new(client);
         assert_eq!(shared.provider(), Some("openai"));
         assert_eq!(shared.context_window("glm-5.3"), Some(131_072));
+    }
+
+    #[test]
+    fn the_profiles_are_answered_for_their_models_and_debug_shows_ids_only() {
+        let profiles = ModelProfiles::parse_json(
+            r#"{"profiles":{"large":{"reasoningEfforts":["low","medium"],"reasoningWire":"reasoning_effort"}}}"#,
+        )
+        .unwrap();
+        let client = OpenAiCompatible::new(config("https://x.example/v1")).unwrap();
+        assert_eq!(client.profile("large"), None, "no profiles by default");
+        let client = client.with_profiles(profiles);
+        assert_eq!(
+            client.profile("large").and_then(|p| p.reasoning_wire),
+            Some(adam_model::ReasoningWire::ReasoningEffort)
+        );
+        assert_eq!(client.profile("small"), None);
+        // The ids, never a profile's values.
+        let shown = format!("{client:?}");
+        assert!(shown.contains("large"), "{shown}");
+        assert!(!shown.contains("reasoning_effort"), "{shown}");
+        // A `DynModel` forwards it.
+        let shared: adam_model::DynModel = std::sync::Arc::new(client);
+        assert!(shared.profile("large").is_some());
+        assert!(shared.profile("small").is_none());
     }
 
     #[test]
