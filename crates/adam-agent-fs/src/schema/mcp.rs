@@ -53,7 +53,7 @@ pub fn group_name_fits(name: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct McpWhen {
     /// The words, any one of which loads the server's tools when the task holds it, ignoring case:
-    /// 1 to [`MAX_WHEN_KEYWORDS`], each 1 to [`MAX_WHEN_KEYWORD_CHARS`] characters, no control or
+    /// 1 to `MAX_WHEN_KEYWORDS`, each 1 to `MAX_WHEN_KEYWORD_CHARS` characters, no control or
     /// format character.
     pub keywords: Vec<String>,
 }

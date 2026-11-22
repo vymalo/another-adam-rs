@@ -338,7 +338,7 @@ pub trait ToolSource: Send + Sync + 'static {
     }
 
     /// The groups the run's **task** loaded, with what each holds: journaled on the run's first
-    /// turn ([`Conversation::note_task_loaded`](crate::Conversation::note_task_loaded)), so a
+    /// turn (`Conversation::note_task_loaded`), so a
     /// compaction's recap names them. They record no growth: their tools were never withheld. The
     /// default is none, which is what a source written before groups existed offers.
     async fn loaded_by_task(&self, ctx: &SourceCtx) -> Vec<Loaded> {
