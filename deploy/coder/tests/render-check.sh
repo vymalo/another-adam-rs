@@ -154,7 +154,7 @@ auth_says() { printf '%s\n' "$1" | grep -Eq -- "$2"; } # says, before the later 
 helm_device() {
   helm_auth --set config.modelAuth=device \
     --set-string config.extraEnv.MODEL_OAUTH_ISSUER=https://issuer.example \
-    --set-string config.extraEnv.MODEL_OAUTH_CLIENT_ID=coder "$@"
+    --set-string config.extraEnv.MODEL_OAUTH_CLIENT_ID=coder
 }
 helm_auth > "$out"
 check "modelAuth unset: no MODEL_AUTH is rendered (the binary's default is key)" lacks 'MODEL_AUTH'
