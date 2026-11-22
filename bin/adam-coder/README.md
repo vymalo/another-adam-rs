@@ -1634,7 +1634,8 @@ stateDiagram-v2
   runs it), or it ended: the call returns its view and starts nothing. A stale record is an earlier try that died: its process is
   killed and the command starts again, its output begun again. At most one process per id.
 * **When it stops:** `stop_command`; `BACKGROUND_COMMAND_MAX_SECS`; the root run ends or any run of the tree parks on the person
-  (`CoderAgent::step`: at once on the worker that holds the command, a stop request in the record of one another worker holds, carried
+  (`ask_user`) or on the model until it is woken (a refusal of `over_limit`, ADR 0067; `CoderAgent::step`: at once on the worker
+  that holds the command, a stop request in the record of one another worker holds, carried
   out within one sweep; the end of a child run stops nothing, nor does a park on a subagent or a timer); a cancel never calls the
   agent, so `Commands::sweep` reads the run's standing every `BACKGROUND_SWEEP_SECS` and stops what is over; `use_repository_environment`;
   the janitor's release; the worker's shutdown (`gone: the worker stopped...`; `CommandsSweep` is the component, `wire_commands`
@@ -2163,7 +2164,7 @@ way; every problem is reported at once at startup):
 | `WORKER_ID` | stable identity of this worker (lease identity, and run owner when pinned): 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; **required** by `affinity` and `isolated` |
 | `WORKERS` | runs advanced concurrently | `4` |
 | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (else exit 78): the agent's `LlmAgentBuilder::max_parallel`. Which calls may overlap is each tool's declaration (ADR 0049) | `10` |
-| `MODEL_PARK_LIMIT` | how long a run may wait on the model on a timer, from the first park in a row, before it fails with the last reason: a model call the gateway refused under `MODEL_AUTH=injector` parks the run and is made again, and so does a gateway that cannot be reached once the retries are spent (ADR 0067; `CoderSettings::model_parking`, the agent's `LlmAgentBuilder::model_parking`); whole seconds or a number with `s`, `m`, `h` or `d`, 60 s to 30 d (else exit 78). A park until woken does not yet stop the background commands as a question does (ADR 0067 slice S8b-2b). **Breaking:** `CoderSettings::model_parking` is a new public field: a `CoderSettings` literal needs it (or `..CoderSettings::new()`) | `24h` |
+| `MODEL_PARK_LIMIT` | how long a run may wait on the model on a timer, from the first park in a row, before it fails with the last reason: a model call the gateway refused under `MODEL_AUTH=injector` parks the run and is made again, and so does a gateway that cannot be reached once the retries are spent (ADR 0067; `CoderSettings::model_parking`, the agent's `LlmAgentBuilder::model_parking`); whole seconds or a number with `s`, `m`, `h` or `d`, 60 s to 30 d (else exit 78). A park until woken stops the background commands as a question does. **Breaking:** `CoderSettings::model_parking` is a new public field: a `CoderSettings` literal needs it (or `..CoderSettings::new()`) | `24h` |
 | `MAX_CHECK_CYCLES` | failed `run_checks` in a repository before the agent must stop | `3` |
 | `SCRATCH_CHECK_CYCLES` | the same for a scratch project, counted apart (at least 1) | `5` |
 | `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks` (and of one `run_command` and one `run`): the time limit is also **the most a call's `timeout` may ask for**; the output size is what is shown of a long output, a quarter of it the head and the rest the tail (the whole is kept) | `900`, `16384` |
@@ -2620,7 +2621,7 @@ database of its own, so the role needs `CREATEDB`):
   a grandchild and assert by pid that each is gone,
   `output_is_scrubbed_before_it_is_written` (a secret of three lines split across two reads, nothing of it on the volume at any time),
   `output_stops_at_the_cap`, `the_lifetime_ends_it`, `more_than_the_maximum_is_refused`, `a_finished_root_run_stops_its_commands`,
-  `a_park_on_the_person_stops_the_commands`, `a_cancelled_run_is_reached_by_the_sweep`,
+  `a_park_on_the_person_stops_the_commands`, `a_park_until_woken_stops_the_commands`, `a_cancelled_run_is_reached_by_the_sweep`,
   `three_identical_reads_of_a_quiet_command_are_refused`, `git_changes_of_a_background_command_are_reported_at_stop`, and in
   `tests/janitor.rs` `the_sweep_stops_background_commands_before_release`. A kind scenario (a development server in a run pod,
   `curl localhost:PORT` from `run_command`, a second repository stopping it) is **not** written: only CI with a cluster could prove it.
