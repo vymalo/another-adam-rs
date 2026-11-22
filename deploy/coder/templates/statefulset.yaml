@@ -214,6 +214,11 @@ spec:
               {{- end }}
             - name: MODEL
               value: {{ .Values.config.model | quote }}
+            {{- with include "coder.modelAuth" . }}
+            {{- /* config.modelAuth: key, device or injector (MODEL_AUTH). */}}
+            - name: MODEL_AUTH
+              value: {{ . | quote }}
+            {{- end }}
             {{- with include "coder.modelExtraBody" . }}
             {{- /* config.modelExtraBody: a JSON object merged into every model request (not a secret). */}}
             - name: MODEL_EXTRA_BODY

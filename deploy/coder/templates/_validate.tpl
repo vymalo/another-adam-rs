@@ -214,6 +214,14 @@ from service.yaml, which every render contains, so they always run.
 {{- fail "config.modelBaseUrlFromSecret is on: externalSecrets.properties.modelBaseUrl must name the AWS property that holds the gateway's URL (model_base_url)" -}}
 {{- end -}}
 {{- end -}}
+{{- /* config.modelAuth: MODEL_AUTH, one of key, device or injector (the binary folds case; the helper does too). */ -}}
+{{- $modelAuth := include "coder.modelAuth" . -}}
+{{- if not (has $modelAuth (list "" "key" "device" "injector")) -}}
+{{- fail (printf "config.modelAuth must be key, device or injector (or empty for the binary's default, key), got %q" $modelAuth) -}}
+{{- end -}}
+{{- if and $modelAuth (hasKey .Values.config.extraEnv "MODEL_AUTH") -}}
+{{- fail "config.modelAuth is set and config.extraEnv sets MODEL_AUTH: set one (the chart renders MODEL_AUTH from the value)" -}}
+{{- end -}}
 {{- /* runPods (ADR 0019): a pod of its own for each active run. */ -}}
 {{- if not (kindIs "bool" .Values.runPods.enabled) -}}
 {{- fail (printf "runPods.enabled must be true or false, got %q" (toString .Values.runPods.enabled)) -}}

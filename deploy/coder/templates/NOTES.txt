@@ -28,6 +28,15 @@ runs that worker owned are stranded: only a shared placement (`workspace.placeme
 reachable from another worker.
 {{- end }}
 
+{{- if and (eq (include "coder.modelAuth" .) "injector") .Values.externalSecrets.enabled (include "coder.runsWorkers" .) }}
+
+Model auth: injector (MODEL_AUTH). The workers send X-Run-Id and no Authorization; an injector in front of
+the model adds the run's credential (ADR 0067). The ExternalSecret still copies MODEL_API_KEY from
+externalSecrets.properties.modelApiKey ({{ .Values.externalSecrets.properties.modelApiKey }}), and that
+property's value must be EMPTY: the coder refuses to start with a non-empty key under the injector (exit 78).
+The chart cannot read the value.
+{{- end }}
+
 {{- if include "coder.githubApp" . }}
 
 GitHub: App {{ include "coder.githubAppId" . }}, installation {{ include "coder.githubAppInstallationId" . }}. The coder trades a JWT signed with

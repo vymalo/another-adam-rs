@@ -91,6 +91,13 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      it on: a missing property fails the whole ExternalSecret sync. Chart only: the binary reads the
      env var either way, so there is no image dependency (chart README, "The model gateway's URL from the
      secret").
+   * `config.modelAuth` (`MODEL_AUTH`, ADR 0067): empty (default, the binary's `key`), `key`, `device` (with
+     `MODEL_OAUTH_*` in `config.extraEnv`) or `injector`: no key, every model call carries `X-Run-Id` and no
+     `Authorization`, and an injector in front of the model adds the run's credential. With `injector` the
+     ExternalSecret still creates `MODEL_API_KEY`, so the AWS value of `externalSecrets.properties.modelApiKey`
+     must be EMPTY (a non-empty one is exit 78; the chart warns in `NOTES.txt`, it cannot read the value).
+     Workers only. `MODEL_CA_FILE` has no chart value yet (ADR 0067 decision 9, a later slice). Chart only, no
+     image dependency (chart README, "Model authentication").
    * `config.modelContextWindow` (null): `MODEL_CONTEXT_WINDOW`, the model's window in tokens, said by each usage
      report, and the output cap's window: the cap is clamped to the window less 20,000 and the coder's history
      (ADR 0064; `deploy/coder/README.md`, "The model's context window").

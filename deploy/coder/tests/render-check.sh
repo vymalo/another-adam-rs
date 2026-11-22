@@ -144,6 +144,56 @@ for bad in 0 -1 33 2.5 lots true; do
 done
 check "maxParallelToolCalls and extraEnv MAX_PARALLEL_TOOL_CALLS together are refused" \
   fails helm_reasoning --set config.maxParallelToolCalls=6 --set-string config.extraEnv.MAX_PARALLEL_TOOL_CALLS=6
+# MODEL_AUTH (ADR 0067): how the workers authenticate to the model. Empty by default (nothing is rendered and
+# the binary's own default, `key`, applies), so the golden above does not move; `key`, `device` or `injector`
+# render the word on the roles that run workers. `injector` sends X-Run-Id and no Authorization, for an
+# injector in front of the model that adds the run's credential.
+helm_auth() { helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 "$@"; }
+auth_says() { printf '%s\n' "$1" | grep -Eq -- "$2"; } # says, before the later helper of that name is defined
+helm_auth > "$out"
+check "modelAuth unset: no MODEL_AUTH is rendered (the binary's default is key)" lacks 'MODEL_AUTH'
+check "modelAuth unset: the render equals the golden" cmp -s "$out" "$golden"
+for auth in key device injector; do
+  helm_auth --set config.modelAuth=$auth > "$out"
+  check "modelAuth=$auth: the worker gets MODEL_AUTH=$auth" envval MODEL_AUTH "$auth"
+  check "modelAuth=$auth: ... once" count 'name: MODEL_AUTH$' 1
+  check "modelAuth=$auth: ... as a plain value, not a secret" dlacks ExternalSecret 'MODEL_AUTH'
+done
+for auth in device injector; do
+  helm_auth --set config.modelAuth=$auth > "$out"
+  check "modelAuth=$auth: the ExternalSecret still creates MODEL_API_KEY (its value must be empty)" \
+    dhas ExternalSecret '^    - secretKey: MODEL_API_KEY$'
+done
+helm_auth --set-string 'config.modelAuth= Injector ' > "$out"
+check "modelAuth is trimmed and case-folded, as the binary reads it" envval MODEL_AUTH injector
+helm_auth --set config.modelAuth=injector --set config.role=control-plane > "$out"
+check "a control plane runs no model: no MODEL_AUTH" lacks 'MODEL_AUTH'
+helm_auth --set config.modelAuth=injector --set topology=split > "$out"
+check "split: the worker has MODEL_AUTH" dhas StatefulSet 'name: MODEL_AUTH$'
+check "split: the front has none" dlacks Deployment 'MODEL_AUTH'
+helm_auth --set config.modelAuth=injector > "$out"
+check "injector: MODEL_API_KEY stays a secret reference (the chart cannot read its value)" \
+  dhas StatefulSet 'name: MODEL_API_KEY$'
+check "injector: no MODEL_CA_FILE is mounted (ADR 0067 decision 9 is a later slice)" \
+  lacks 'MODEL_CA_FILE|model-ca|ca-file'
+check "injector: still no Secret object in the render" lacks '^kind: Secret$'
+for bad in bogus oauth true; do
+  check "modelAuth $bad is refused" fails helm_auth --set config.modelAuth=$bad
+done
+message=$(helm_auth --set config.modelAuth=bogus 2>&1 || true)
+check "... the error names the value and the accepted words" \
+  auth_says "$message" 'must be key, device or injector.*"bogus"'
+check "modelAuth and extraEnv MODEL_AUTH together are refused" \
+  fails helm_auth --set config.modelAuth=injector --set-string config.extraEnv.MODEL_AUTH=injector
+message=$(helm_auth --set config.modelAuth=injector --set-string config.extraEnv.MODEL_AUTH=injector 2>&1 || true)
+check "... the error names both" auth_says "$message" 'config.modelAuth is set and config.extraEnv sets MODEL_AUTH'
+check "modelAuth unset with extraEnv MODEL_AUTH is the deployment's own business" \
+  helm_auth --set-string config.extraEnv.MODEL_AUTH=injector
+check "injector still needs the property name (its value, not the property, is what is empty)" \
+  fails helm_auth --set config.modelAuth=injector --set externalSecrets.properties.modelApiKey=null
+helm_auth --set config.modelAuth=injector --set externalSecrets.enabled=false > "$out"
+check "injector without the ExternalSecret: MODEL_AUTH is there" dhas StatefulSet 'name: MODEL_AUTH$'
+check "... and no MODEL_API_KEY" lacks 'MODEL_API_KEY'
 # The checks below read the default render again.
 helm_reasoning > "$out"
 
@@ -2030,6 +2080,15 @@ notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=
 check "config.opencodeModel set: NOTES.txt warns" says "$notes" 'config.opencodeModel is set and ignored'
 notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=sha-abc1234 --show-only templates/notes.yaml --debug 2>&1 || true)
 check "config.opencodeModel unset: NOTES.txt does not warn" fails says "$notes" 'opencodeModel'
+notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=sha-abc1234 --set config.modelAuth=injector --show-only templates/notes.yaml --debug 2>&1 || true)
+check "modelAuth=injector: NOTES.txt says the ExternalSecret's model key must be empty" \
+  says "$notes" "property's value must be EMPTY"
+check "... and names the property" says "$notes" 'externalSecrets.properties.modelApiKey'
+check "... and says the injector adds the run's credential (ADR 0067)" says "$notes" 'ADR 0067'
+notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=sha-abc1234 --set config.modelAuth=key --show-only templates/notes.yaml --debug 2>&1 || true)
+check "modelAuth=key: NOTES.txt has no empty-key note" fails says "$notes" 'must be EMPTY'
+notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=sha-abc1234 --set config.modelAuth=injector --set externalSecrets.enabled=false --show-only templates/notes.yaml --debug 2>&1 || true)
+check "modelAuth=injector without the ExternalSecret: no empty-key note" fails says "$notes" 'must be EMPTY'
 rm -rf "$notes_chart"
 
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi
