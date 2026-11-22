@@ -14,7 +14,10 @@
 //! every call, so the tools array does not move and `tools_appended` records nothing.
 //!
 //! The loader's own schema and description are constants (the group's name and its short note, never
-//! a member count), so the tool list of a run never depends on what a group happens to hold.
+//! a member count), so the tool list of a run never depends on what a group happens to hold. A
+//! group the **task** loads is the `when` behaviour: its tools stand where the agent's list puts
+//! them and its note reaches the first request's prompt. A group the run loads during itself says
+//! its note in the load's result, so the prompt does not grow mid-run.
 
 use std::sync::Arc;
 
@@ -320,6 +323,20 @@ impl ToolSource for Groups {
         // The tools are the agent's own (`bind` put them there); this source only decides which of
         // them a run may see.
         Vec::new()
+    }
+
+    /// The notes of the groups the **task** loaded, in name order: the `when` behaviour, whose
+    /// instructions reached the prompt of a matching run. A group the run loads during itself is
+    /// not here: its note is in the load's result, so the prompt does not grow mid-run.
+    async fn instructions(&self, ctx: &SourceCtx) -> Option<String> {
+        let sections: Vec<(String, String)> = self
+            .groups
+            .iter()
+            .filter(|group| group.matches(ctx.task()))
+            .map(|group| (group.name.clone(), group.note.clone()))
+            .collect();
+        let text = crate::mcp::join_sections(&sections);
+        (!text.is_empty()).then_some(text)
     }
 
     async fn loaders(&self, ctx: &SourceCtx) -> Vec<Loader> {
