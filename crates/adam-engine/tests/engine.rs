@@ -2369,3 +2369,231 @@ async fn the_builders_level_never_reaches_a_subagent() {
     );
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 }
+
+// ------------------------------- ADR 0064 amended 2026-11-23: a model per Say, and a fallback
+
+/// Two profiled models: `m` (the engine's own) and `lite`, with its own cap and level.
+fn two_models() -> ModelProfiles {
+    ModelProfiles::parse_json(
+        r#"{ "profiles": {
+            "m": { "reasoningEfforts": ["low", "high"], "reasoningWire": "reasoning_effort" },
+            "lite": { "reasoningEfforts": ["low"], "reasoningWire": "reasoning_effort",
+                      "reasoningEffort": "low", "maxOutputTokens": 4096 }
+        } }"#,
+    )
+    .expect("the profiles parse")
+}
+
+/// A `Say` that names a model with a profile is answered by it, with that profile's cap and level;
+/// one that names a model without a profile is refused before anything is written, and so is any
+/// alias when the engine was given no profiles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_say_names_a_model_and_the_engine_refuses_one_with_no_profile() {
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .models(two_models())
+        .start()
+        .await
+        .expect("starts");
+
+    let refused = engine
+        .send(None, Say::new("hi").with_model("unknown"))
+        .await
+        .expect_err("a model with no profile is refused");
+    let EngineError::Invalid(why) = &refused else {
+        panic!("expected Invalid, got {refused:?}");
+    };
+    assert!(why.contains("`unknown`") && why.contains("lite"), "{why}");
+    assert!(mock.requests().is_empty(), "nothing reached the model");
+
+    let turn = engine
+        .send(None, Say::new("hi").with_model("lite"))
+        .await
+        .expect("a profiled model is accepted");
+    let mut events = engine.events(turn.run).await.unwrap();
+    while timeout(WAIT, events.next())
+        .await
+        .expect("an event")
+        .is_some()
+    {}
+    let requests = mock.requests();
+    assert_eq!(requests[0].model, "lite");
+    assert_eq!(requests[0].max_output_tokens, Some(4096));
+    assert_eq!(requests[0].reasoning_effort, Some(ReasoningEffort::Low));
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+
+    // No profiles at all: only the agent's own alias is a choice.
+    let model: DynModel = Arc::new(MockModel::new());
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .start()
+        .await
+        .expect("starts");
+    let refused = engine
+        .send(None, Say::new("hi").with_model("lite"))
+        .await
+        .expect_err("no profiles, no choice");
+    assert!(matches!(refused, EngineError::Invalid(_)), "{refused:?}");
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A folder's `model_fallback` reaches the engine's agent: the locked model's call is made again
+/// to the fallback. A fallback that is the agent's own model stops `start`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folders_model_fallback_switches_once_in_an_engine() {
+    let with = |fallback: &str| {
+        agent(&[(
+            "agent/instructions.md",
+            &format!(
+                "---\nname: chat\ndescription: Talks with the person.\nmodel_fallback: {fallback}\n---\nYou chat.\n"
+            ),
+        )])
+    };
+    let mock = Arc::new(MockModel::new());
+    mock.push_error(adam_model::ModelError::ModelLocked { model: "m".into() })
+        .push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), with("lite"), model, "m")
+        .models(two_models())
+        .start()
+        .await
+        .expect("starts");
+    let done = say_to_the_end(&engine, "hi").await;
+    assert_eq!(done.state, RunState::Done);
+    let models: Vec<String> = mock.requests().iter().map(|r| r.model.clone()).collect();
+    assert_eq!(models, ["m", "lite"]);
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+
+    let model: DynModel = Arc::new(MockModel::new());
+    let refused = Engine::builder(Arc::new(MemoryStore::new()), with("m"), model, "m")
+        .models(two_models())
+        .start()
+        .await
+        .expect_err("a fallback that is the agent's own model");
+    assert!(matches!(refused, EngineError::Agent(_)), "{refused:?}");
+}
+
+/// A model with a profile that no agent can be bound to (its preset's cap is above its own limit)
+/// is no choice: the engine refuses it at `Say` time and writes nothing, instead of answering on
+/// the default model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_say_may_not_name_a_model_the_agent_cannot_bind() {
+    let mut profiles = two_models();
+    profiles.presets.insert(
+        "huge".to_owned(),
+        adam_engine::adam_model::Preset {
+            max_output_tokens: Some(5_000),
+            ..Default::default()
+        },
+    );
+    profiles.profiles.insert(
+        "tight".to_owned(),
+        ModelProfile {
+            preset: Some("huge".to_owned()),
+            max_output_tokens_limit: Some(1_000),
+            ..ModelProfile::default()
+        },
+    );
+    let mock = Arc::new(MockModel::new());
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .models(profiles)
+        .start()
+        .await
+        .expect("starts");
+    let refused = engine
+        .send(None, Say::new("hi").with_model("tight"))
+        .await
+        .expect_err("a model the agent cannot be bound to is no choice");
+    assert!(matches!(refused, EngineError::Invalid(_)), "{refused:?}");
+    assert!(mock.requests().is_empty(), "nothing reached the model");
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// After the run switched to its fallback, a message that names a model is refused with an error
+/// that says so, never dropped; a message that names none still reaches the run. The pick does not
+/// carry into the conversation's next run, which starts on the agent's own model again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_model_picked_after_the_switch_is_refused_and_the_next_run_starts_on_the_agents_own() {
+    let folder = agent(&[(
+        "agent/instructions.md",
+        "---\nname: chat\ndescription: Talks with the person.\nmodel_fallback: lite\n---\nYou chat.\n",
+    )]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_error(ModelError::ModelLocked { model: "m".into() })
+        .push_tool_calls(vec![ask("Which colour?")])
+        .push_text("blue it is")
+        .push_text("second run");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), folder, model, "m")
+        .models(two_models())
+        .start()
+        .await
+        .expect("starts");
+    let turn = engine.send(None, Say::new("pick for me")).await.unwrap();
+    timeout(WAIT, async {
+        loop {
+            let info = engine.get(turn.run).await.unwrap().expect("the run");
+            if info.state == RunState::Waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the run waits on its question, on the fallback");
+
+    for refused in [
+        engine
+            .answer(turn.run, Say::new("blue").with_model("m"))
+            .await
+            .map(drop),
+        engine
+            .steer(turn.run, Say::new("blue").with_model("m"))
+            .await
+            .map(drop),
+        engine
+            .send(Some(&turn.conversation), Say::new("blue").with_model("m"))
+            .await
+            .map(drop),
+    ] {
+        let refused = refused.expect_err("a pick after the switch is refused");
+        let EngineError::Refused(why) = &refused else {
+            panic!("expected Refused, got {refused:?}");
+        };
+        assert!(why.contains("`m`") && why.contains("`lite`"), "{why}");
+    }
+    engine.answer(turn.run, Say::new("blue")).await.unwrap();
+    let done = timeout(WAIT, async {
+        loop {
+            let info = engine.get(turn.run).await.unwrap().expect("the run");
+            if info.state == RunState::Done {
+                return info;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("done");
+    assert_eq!(done.output.as_deref(), Some("blue it is"));
+
+    engine
+        .send(Some(&turn.conversation), Say::new("again"))
+        .await
+        .unwrap();
+    timeout(WAIT, async {
+        while mock.requests().len() < 4 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the second run asks");
+    let models: Vec<String> = mock.requests().iter().map(|r| r.model.clone()).collect();
+    assert_eq!(
+        models,
+        ["m", "lite", "lite", "m"],
+        "the pick does not carry over"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}

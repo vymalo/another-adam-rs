@@ -33,12 +33,18 @@ before you rely on a detail here.
    * `name`: the registered name, which is the key of the agent's stored runs. Renaming it
      strands the runs of the old name. Two folders with the same `name` share their runs.
    * `description` (or `card.description`): the A2A card needs one.
-   * `card:` (`name`, `skills` with `id`, `name`, `description`, `tags`, `examples`), `limits:`
-     (`max_turns`, `max_tool_calls`, `max_output_tokens` — the cap this agent asks for, at least 1;
+   * `card:` (`name`, `skills` with `id`, `name`, `description`, `tags`, `examples`), `limits:`     (`max_turns`, `max_tool_calls`, `max_output_tokens` — the cap this agent asks for, at least 1;
      absent, its preset's, the model's profile's, then 128,000, clamped to the model's limit and
      window, ADR 0064 — and `max_history_tokens`), `model:` (an alias,
-     only when it should not be `MODEL`), `tools:` (optional selection; `linear__*` takes a
+     only when it should not be `MODEL`), `model_fallback:` (overrides the `fallback` of the agent's `model_preset` and of
+     its model's profile in `MODEL_ALIASES_FILE`: the alias the run continues on, once, when the endpoint refuses
+     `model` as locked; not the agent's own alias, else exit 78; a subagent resolves its own, so an `inherit` subagent
+     takes its model's profile fallback and needs no key; ADR 0064 amended 2026-11-23), `tools:` (optional selection; `linear__*` takes a
      server's tools; an unknown name is refused with a suggestion).
+   * **A model per message is the deployment's offer, not a folder key.** When `MODEL_ALIASES_FILE` profiles more than one
+     model, a served `ROLE=all` agent lists `model-pick/v1` with the aliases it may be bound to, other than its own, and
+     a message that activates it names one (`metadata[URI] = {"model": ..}`); an alias outside the list is refused as
+     `model_not_offered` before anything runs (ADR 0064, amended 2026-11-23; the client side is `adam-a2a-extensions`).
    * `vars:` are the `{{placeholders}}` of the body. Every var needs a value in the file. A var
      declared without a value, a var the body does not use, or a placeholder not declared, stops
      the process at startup.

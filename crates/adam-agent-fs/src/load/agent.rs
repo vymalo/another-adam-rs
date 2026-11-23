@@ -666,6 +666,7 @@ fn remote_spec(
         ("model", fm.model.is_some()),
         ("reasoning_effort", fm.reasoning_effort.is_some()),
         ("model_preset", fm.model_preset.is_some()),
+        ("model_fallback", fm.model_fallback.is_some()),
         ("skills", fm.skills.is_some()),
         ("preload_skills", fm.preload_skills.is_some()),
         ("limits", fm.limits.is_some()),

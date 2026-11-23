@@ -734,6 +734,9 @@ pub(crate) struct Node {
     pub(crate) reasoning_effort: Option<String>,
     /// `model_preset` of the agent's file (ADR 0064): the named preset its model calls start from.
     pub(crate) model_preset: Option<String>,
+    /// `model_fallback` of the agent's file (ADR 0064, amended 2026-11-23): the alias its run
+    /// continues on, once, when its model is locked.
+    pub(crate) model_fallback: Option<String>,
     pub(crate) prompt: String,
     pub(crate) tools: Vec<(String, DynTool)>,
     pub(crate) limits: Limits,
@@ -987,6 +990,7 @@ impl Walk<'_> {
                 .clone()
                 .or_else(|| parent.is_none().then(|| self.root_effort.clone()).flatten()),
             model_preset: manifest.frontmatter.model_preset.clone(),
+            model_fallback: manifest.frontmatter.model_fallback.clone(),
             prompt,
             tools,
             limits: limits(manifest.frontmatter.limits.as_ref()),

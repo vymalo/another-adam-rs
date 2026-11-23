@@ -169,6 +169,53 @@ fn a_deployment_can_list_the_aliases_it_serves() {
         .unwrap();
 }
 
+/// A root that names `model_fallback: <alias>` (ADR 0064, amended 2026-11-23).
+fn with_fallback(alias: &str) -> AgentDef {
+    def(&[(
+        INSTRUCTIONS,
+        &instructions(&format!("name: coder\nmodel_fallback: {alias}"), "Root."),
+    )])
+}
+
+#[test]
+fn a_model_fallback_is_checked_like_an_alias_and_may_not_be_the_agents_own() {
+    // Its own model: a switch would change nothing.
+    let error = with_fallback("gateway")
+        .bind(ToolSet::new())
+        .unwrap()
+        .model(mock(), "gateway")
+        .unwrap_err();
+    let Error::ModelAlias { alias, problem, .. } = &error else {
+        panic!("{error}");
+    };
+    assert_eq!(
+        (alias.as_str(), problem),
+        ("gateway", &AliasProblem::SameAsModel)
+    );
+
+    // An alias the deployment does not serve is refused, naming the agent.
+    let error = with_fallback("lite-typo")
+        .bind(ToolSet::new())
+        .unwrap()
+        .model_aliases(["gateway", "lite"])
+        .model(mock(), "gateway")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("model alias `lite-typo`: not one of the aliases"),
+        "{error}"
+    );
+
+    // A served one binds.
+    with_fallback("lite")
+        .bind(ToolSet::new())
+        .unwrap()
+        .model_aliases(["gateway", "lite"])
+        .model(mock(), "gateway")
+        .unwrap();
+}
+
 // --- state ---------------------------------------------------------------------------------
 
 struct Env;

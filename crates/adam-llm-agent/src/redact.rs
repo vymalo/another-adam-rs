@@ -32,6 +32,15 @@ pub fn is_value_position(text: &str, at: usize, len: usize) -> bool {
     before && after && !scheme
 }
 
+/// Whether `needle` is an **ordinary word**: lowercase ASCII letters only, so that it can stand as an
+/// identifier in code (`postgres`, `password`). Only such a value takes [`is_value_position`]; a token
+/// with a digit, a capital, `_`, `-` or a Base64 form cannot be an identifier, so it is replaced
+/// wherever it stands.
+#[must_use]
+pub fn is_ordinary_word(needle: &str) -> bool {
+    !needle.is_empty() && needle.bytes().all(|b| b.is_ascii_lowercase())
+}
+
 fn is_identifier_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }

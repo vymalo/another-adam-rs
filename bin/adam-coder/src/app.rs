@@ -60,11 +60,13 @@ impl Coder {
         live: LiveSignals,
     ) -> Self {
         let tiers = crate::tier::honoured_up_to(agent.max_access_tier());
+        let choices = adam_a2a::ModelChoices::from_aliases(agent.model_choices());
         let builder = agent.register(Runtime::builder(store));
         Self::from_service(
             Service::new_with(builder, AGENT_NAME, options, live)
                 .with_inbound(screen_inbound())
                 .with_access_tiers(Some(tiers))
+                .with_model_choices(Some(choices))
                 .with_commands(Some(crate::files::embedded_commands())),
         )
     }
@@ -130,7 +132,18 @@ impl Coder {
 
     /// [`router`](Self::router) with the card the caller made, usually
     /// [`agent_card_from`] over the files the process runs.
-    pub fn router_with_card(&self, card: AgentCardConfig, auth: AuthConfig) -> Router {
+    pub fn router_with_card(&self, mut card: AgentCardConfig, auth: AuthConfig) -> Router {
+        // The backend is what reads a pick, so its card is what lists the choices: a card that
+        // already lists `model-pick/v1` (a composition of its own) keeps its own entry.
+        if let Some(choices) = self.backend.model_choices()
+            && let Some(extension) = adam_a2a::ExtensionConfig::model_pick(choices)
+            && !card
+                .extensions
+                .iter()
+                .any(|listed| listed.uri == extension.uri)
+        {
+            card.extensions.push(extension);
+        }
         adam_service::router(&self.backend, card, auth)
     }
 }

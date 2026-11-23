@@ -385,6 +385,90 @@ the two rules (`bin/adam-coder/agent/instructions.md`, "Language" and "Never wri
 it, no request can activate it, so no agent reads a hint and each follows the person's language — which the same rule
 says.
 
+## The reasoning effort (`reasoning/v1`)
+
+An agent whose card lists `https://agents.vymalo.com/a2a/extensions/reasoning/v1` takes a reasoning effort
+**for each message** ([ADR 0063](../decisions/0063-a-reasoning-effort-is-one-setting.md), decision 5). The card
+describes the **root** agent's model: its `params` are
+`{"efforts": [<the model's levels, lowest first>], "default"?: <the level>}`, where `default` is present only
+when the folder, the agent's preset or the model's profile resolved one **and it is one of the levels**. The vocabulary is
+`adam_model::ReasoningEffort`, one closed list of seven words — `none`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max` — and `none` is a real level, not an absence. A model whose profile takes no level (no profile,
+or `reasoningEfforts: []`) lists no extension: `adam_a2a::ExtensionConfig::reasoning` returns `None`.
+
+A request that **activates** the extension **must** carry `metadata[URI] = {"effort": "<one of the model's
+levels>"}` on the message. `adam_a2a::ReasoningEfforts::requested` reads it and returns the refusal sentence
+for every other shape; the runtime turns that into `InvalidParams` (`-32602`) before anything is written
+(PR B):
+
+* a missing entry;
+* an entry that is not an object;
+* a missing or non-string `effort`;
+* a word outside the seven (`"High"`, `"ultra"`, `""`);
+* a level the agent's model does not take.
+
+The sentence names the agent and its levels, so a client can offer what the card lists. Other members of the
+entry are ignored. A message that does not activate the extension carries no effort, whatever its metadata
+says: activation is the caller's check (`Caller::has_extension`), as for every extension, and the runtime
+wires it in PR B.
+
+**In the run.** The key is built: `vymalo.reasoningEffort` (`{"effort": ..}`) is
+`adam_llm_agent::REASONING_EFFORT_CONTEXT_KEY`, one of `PROTECTED_CONTEXT_KEYS`, read on every model turn
+(`crates/adam-llm-agent/src/agent.rs`), so a message whose context is too large and dropped keeps it; it
+carries into a continuing task of the same thread and into a child run, and a new thread starts at the
+resolved default. **PR B writes it from an activated message** (the newest wins), calls `requested` against
+the model of the run it reaches (the root's for the root context, the child's for a child context; the card
+always describes the root's), and adds the echo: a caller that activated the extension is echoed the effort in
+the task's `metadata[URI]` on the answer of `SendMessage`, on `GetTask`, on the first frame of a stream, and in
+a status update when it changes — the access tier's echo shape. The extension can only set: no member clears
+an effort. A subagent's `subagent_start` value is checked against the subagent's profile (PR B); a helper's
+`child-sessions/v1` `config` bounds and the platform's forms are later slices.
+
+**No card lists it yet.** `ExtensionConfig::reasoning` and the reading are built; the cards of `adam-coder` and
+`adam-agent` and the runtime's write are PR B (ADR 0063, decision 5). Until a card lists it, no request can
+activate it, so no agent reads an effort and every run keeps the folder, preset or profile value it always
+had.
+
+## The model a message picks (`model-pick/v1`)
+
+An agent whose card lists `https://agents.vymalo.com/a2a/extensions/model-pick/v1` takes a model
+**for each message** ([ADR 0064](../decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md),
+amended 2026-11-23). The card's `params` are `{"choices": ["<alias>", ..]}`, the aliases the
+deployment offers this agent — the profiles of `MODEL_ALIASES_FILE` minus the agent's own model —
+each once. An agent the deployment gives one model offers
+nothing and lists no extension: `adam_a2a::ExtensionConfig::model_pick` returns `None`, and
+`adam_service::serve` adds the entry only when the backend serves a non-empty list.
+
+A request that **activates** the extension **must** carry `metadata[URI] = {"model": "<alias>"}`
+on the message. `adam_a2a::ModelChoices::requested` reads it and returns the refusal sentence for
+every other shape; the runtime turns that into `InvalidParams` (`-32602`) before anything is
+written:
+
+* a missing entry;
+* an entry that is not an object;
+* a missing, blank or non-string `model`;
+* an alias the card does not offer.
+
+The sentence begins with the code `model_not_offered` and names the choices, so a client can tell
+it from any other refusal and offer what the card lists. Other members of the entry are ignored. A
+message that does not activate the extension carries no pick, whatever its metadata says:
+activation is the caller's check (`Caller::has_extension`), as for every extension.
+
+**In the run.** The backend reads the pick in `submit`, beside the tier: the alias is the run's
+inbound context key `vymalo.model` (`CONTEXT_MODEL` in `crates/adam-a2a-runtime/src/model_pick.rs`),
+`{"model": ..}`, and the newest message that names one wins. The agent loop already reads that key
+on every model turn (`crates/adam-llm-agent/src/agent.rs`), and honours it only for a model it was
+given a binding for: the assembly gives a served agent its choices (`BoundDef::allow_model_choice`,
+which `adam-agent` and the coder call). The pick is **not** an authorisation: the call goes through
+the deployment's gateway as any other, so `model_locked` still refuses it there (ADR 0067) and the
+run switches to its fallback if it has one. **Caller identity is unchanged**: a pick is read from an
+authenticated message like every other extension, and the card is what bounds it.
+
+**Which processes list it.** A process that both serves A2A and runs workers (`ROLE=all`, the
+default): it assembles the agent, and the choices it advertises are the root's bindings. A
+`control-plane` process of the split topology lists nothing yet — it assembles no agent and reads no
+profiles file — so a deployment that wants a pick runs `ROLE=all` for now.
+
 ## Child sessions (`child-sessions/v1`)
 
 A session ([ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)) is a chain of runs of a helper agent

@@ -28,6 +28,15 @@ docker compose down -v                              # stop and forget all state 
 
 All services and mocks: [the local stack](../reference/dev-stack.md).
 
+## Two stacks side by side
+
+`compose.yaml` pins no project `name:`: Compose names the project after the checkout's directory, so
+each git worktree gets its own containers, network and volumes (`another-adam-rs` in the main clone,
+`wt-a` for `/tmp/wt-a`). `docker compose down -v` in one worktree removes only its own volumes.
+Host ports are shared: start the second stack with other ports, for example
+`POSTGRES_PORT=15432 MONGODB_PORT=37017 CODER_PORT=18080 docker compose up -d --wait`.
+`sh tools/check-compose-project.sh` checks that two checkouts give two names (also in CI).
+
 ## Send the coder a task
 
 ```sh

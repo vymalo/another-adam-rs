@@ -139,6 +139,18 @@ jobs:
       - run: tools/embedded-deps/check.sh
       - run: tools/embedded-deps/check.sh self-test
 
+  # A host that installs its own TLS provider builds adam-model-openai and adam-model-oauth without their
+  # defaults and must not link aws-lc-rs. The self-test plants it back and expects the check to fail.
+  tls-provider:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: tools/tls-provider/check.sh
+      - run: tools/tls-provider/check.sh self-test
+
   # ADR 0053 decision 2: an application that keeps its own state on cratestack links one sqlite3.
   # The probe resolves `adam-store-sqlite` together with `cratestack-sqlite` and asserts one
   # `rusqlite` and one `libsqlite3-sys`; its own workspace keeps cratestack (Rust 1.98) out of the
@@ -414,6 +426,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Two checkouts get two project names
+        run: sh tools/check-compose-project.sh
       - name: Compose files are valid
         run: |
           docker compose config -q

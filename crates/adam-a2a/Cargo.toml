@@ -32,6 +32,9 @@ test-util = ["dep:tokio-stream"]
 [dependencies]
 adam-core.workspace = true
 adam-error.workspace = true
+# The reasoning vocabulary (`ReasoningEffort`, ADR 0063): one closed list of seven words, not a
+# second copy in the extension's wire.
+adam-model.workspace = true
 a2a-lf.workspace = true
 # Signs the agent card (ES256, EdDSA) and reads the PEM of its key; already in the tree under rustls.
 aws-lc-rs = { workspace = true, optional = true }
@@ -40,7 +43,7 @@ rustls-pki-types = { workspace = true, optional = true }
 ryu-js = { workspace = true, optional = true }
 # Push-notification delivery: one client that never follows a redirect and only connects to the
 # addresses the guarded resolver allows.
-reqwest = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, features = ["rustls"] }
 uuid = { workspace = true, optional = true }
 a2a-server-lf = { workspace = true, optional = true }
 async-trait.workspace = true

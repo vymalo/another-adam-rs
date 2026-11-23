@@ -206,7 +206,8 @@ fn is_true(b: &bool) -> bool {
 /// The budget of the history in tokens: what a request may hold before the run is compacted. From
 /// the model's context window: the window less [`WINDOW_MARGIN_TOKENS`] and the output the request
 /// asks for; from [`Limits::max_history_tokens`](crate::Limits): that. The smaller when both are
-/// set; `None` when neither is (or a window is too small to leave any room).
+/// set; `None` when neither is. A known window with no room left is a budget of 1 token, so
+/// compaction fires and the request fails honestly instead of running with no limit.
 pub(crate) fn budget(
     window: Option<u64>,
     max_output_tokens: u32,
@@ -214,7 +215,7 @@ pub(crate) fn budget(
 ) -> Option<usize> {
     let from_window = window
         .map(|w| w.saturating_sub(WINDOW_MARGIN_TOKENS + u64::from(max_output_tokens)))
-        .filter(|left| *left > 0)
+        .map(|left| left.max(1))
         .and_then(|left| usize::try_from(left).ok());
     let from_limit = (max_history_tokens > 0).then_some(max_history_tokens as usize);
     match (from_window, from_limit) {
@@ -1129,8 +1130,14 @@ mod tests {
         assert_eq!(budget(Some(128_000), 4096, 0), Some(128_000 - 24_096));
         assert_eq!(budget(Some(128_000), 4096, 50_000), Some(50_000));
         assert_eq!(budget(Some(128_000), 4096, 200_000), Some(103_904));
-        // A window with no room left says nothing.
-        assert_eq!(budget(Some(10_000), 4096, 0), None);
+        // A known window with no room left is a minimal budget, never "no limit".
+        assert_eq!(budget(Some(10_000), 4096, 0), Some(1));
+    }
+
+    #[test]
+    fn a_known_window_with_no_room_does_not_fall_back_to_the_history_limit() {
+        // MODEL_CONTEXT_WINDOW=16384 with the output cap clamped to 1.
+        assert_eq!(budget(Some(16_384), 1, 100_000), Some(1));
     }
 
     #[test]

@@ -651,6 +651,15 @@ fn cases() -> Vec<Case> {
             Warning,
             "`tools` is ignored on a remote subagent",
         ),
+        with_root(
+            "model_fallback on a remote subagent",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\na2a: https://example.com/card\nmodel_fallback: lite\n---\n",
+            )],
+            Warning,
+            "`model_fallback` is ignored on a remote subagent",
+        ),
         // --- skills
         with_root(
             "skill name differs from its directory",
@@ -1486,6 +1495,24 @@ fn the_reasoning_keys_are_read_and_the_effort_key_stays_ignored() {
     let front = &report.package.agents[0].frontmatter;
     assert_eq!(front.reasoning_effort.as_deref(), Some("high"));
     assert_eq!(front.model_preset.as_deref(), Some("quick"));
+}
+
+#[test]
+fn model_fallback_is_a_known_key() {
+    let dir = write(&[(
+        "agent/instructions.md",
+        "---\nname: root\nmodel_fallback: lite\n---\nHi.\n",
+    )]);
+    let report = load(dir.path());
+    assert!(report.is_ok(), "{:?}", report.diagnostics);
+    assert_eq!(report.warnings().count(), 0, "{:?}", report.diagnostics);
+    assert_eq!(
+        report.package.agents[0]
+            .frontmatter
+            .model_fallback
+            .as_deref(),
+        Some("lite")
+    );
 }
 
 #[test]

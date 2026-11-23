@@ -9,7 +9,6 @@
 # See docs/guides/run-locally.md to use it and docs/reference/dev-stack.md for the endpoints,
 # the mocks, their scenario switches and the scripted models.
 
-name: adam-rs
 
 x-wiremock: &wiremock
   # 3.13.2 is the newest 3.x release; the tag exists on Docker Hub (verified

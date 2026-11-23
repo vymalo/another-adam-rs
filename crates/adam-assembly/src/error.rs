@@ -50,11 +50,14 @@ fn portable(path: &Path) -> String {
 
 /// Why a model alias was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AliasProblem {
     /// The alias is empty (or only blanks).
     Empty,
     /// The alias has whitespace or a control character: a gateway alias is one token.
     NotAToken,
+    /// A `model_fallback` that is the agent's own model: the switch would change nothing.
+    SameAsModel,
     /// [`BoundDef::model_aliases`](crate::BoundDef::model_aliases) lists the aliases the
     /// deployment serves, and this is not one of them.
     NotAllowed {
@@ -72,6 +75,9 @@ impl fmt::Display for AliasProblem {
             Self::NotAToken => {
                 f.write_str("a gateway alias is one token: no whitespace or control characters")
             }
+            Self::SameAsModel => f.write_str(
+                "the fallback is the agent's own model, so a switch would change nothing",
+            ),
             Self::NotAllowed {
                 suggestion,
                 allowed,
