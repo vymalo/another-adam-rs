@@ -2461,3 +2461,25 @@ async fn a_folder_agents_first_request_stays_under_the_lean_budget() {
          anything else is the regression this test exists for."
     );
 }
+
+/// The shipped examples say how their tools load (ADR 0066, decision 1): the chat persona starts
+/// lean, and the three agents whose tools are their job opt out.
+#[test]
+fn the_shipped_examples_say_how_their_tools_load() {
+    use adam::agent_fs::ToolsLoading;
+
+    let loading = |name: &str| {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../dev/agents")
+            .join(name);
+        folder::load(&dir)
+            .unwrap_or_else(|e| panic!("the shipped {name} folder loads: {e}"))
+            .def
+            .manifest()
+            .frontmatter
+            .tools_loading
+    };
+    assert_eq!(loading("assistant"), ToolsLoading::Lazy);
+    assert_eq!(loading("researcher"), ToolsLoading::Eager);
+    assert_eq!(loading("painter"), ToolsLoading::Eager);
+}

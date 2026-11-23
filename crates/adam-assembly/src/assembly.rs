@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent};
+use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent, ToolsLoading};
 use adam_llm_agent::{
     DEFAULT_MAX_PARALLEL, DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder,
     MAX_PARALLEL_LIMIT, ModelBinding, ModelParking, SESSION_TOOLS, StepIo, ToolSource,
@@ -329,6 +329,7 @@ impl BoundDef {
                 skills: node.skills.clone(),
                 preloaded: node.preloaded.clone(),
                 when: node.when.clone(),
+                tools_loading: node.tools_loading,
                 retry: node
                     .retry
                     .iter()
@@ -824,6 +825,9 @@ pub struct AgentInfo {
     /// differently: its tools are withheld from a run the task does not select, and its
     /// instructions are added only to such a run.
     pub when: Vec<(String, Vec<String>)>,
+    /// `tools_loading` of its file (ADR 0066, decision 1): whether every tool is offered or a run
+    /// loads them in groups. An `eager` agent with a `when` server withholds nothing.
+    pub tools_loading: ToolsLoading,
     /// `retry:` of its file: the retry policy per tool, by name, as the file says it (ADR 0061).
     /// Each is one of [`tools`](Self::tools). Part of the info because an agent that retries a
     /// tool differently behaves differently.

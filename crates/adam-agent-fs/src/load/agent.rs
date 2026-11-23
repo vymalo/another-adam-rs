@@ -9,8 +9,8 @@ use crate::manifest::RemoteAuth;
 use crate::schema::{
     AgentFrontmatter, DEFAULT_RETRY_BACKOFF, MAX_MINUTES_LIMIT, MAX_OPEN_SESSIONS_LIMIT,
     MAX_PARALLEL_LIMIT, MAX_RETRY_ATTEMPTS, MAX_RETRY_BACKOFF, MAX_SESSION_ROUNDS_LIMIT,
-    MAX_WORKING_SESSIONS_LIMIT, ModelRef, RETRY_CLASS_NAMES, ToolList, check_references,
-    is_agent_name, is_env_name, is_retry_tool_name, is_tool_name, retry_duration,
+    MAX_WORKING_SESSIONS_LIMIT, ModelRef, RETRY_CLASS_NAMES, ToolList, ToolsLoading,
+    check_references, is_agent_name, is_env_name, is_retry_tool_name, is_tool_name, retry_duration,
 };
 
 /// The most characters GitHub Copilot accepts in an agent prompt. Verified 2026-09-29,
@@ -663,6 +663,7 @@ fn remote_spec(
     };
     let local_only: Vec<&str> = [
         ("tools", fm.tools.is_some()),
+        ("tools_loading", fm.tools_loading != ToolsLoading::Lazy),
         ("model", fm.model.is_some()),
         ("reasoning_effort", fm.reasoning_effort.is_some()),
         ("model_preset", fm.model_preset.is_some()),

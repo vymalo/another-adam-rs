@@ -40,7 +40,9 @@ before you rely on a detail here.
      its model's profile in `MODEL_ALIASES_FILE`: the alias the run continues on, once, when the endpoint refuses
      `model` as locked; not the agent's own alias, else exit 78; a subagent resolves its own, so an `inherit` subagent
      takes its model's profile fallback and needs no key; ADR 0064 amended 2026-11-23), `tools:` (optional selection; `linear__*` takes a
-     server's tools; an unknown name is refused with a suggestion).
+     server's tools; an unknown name is refused with a suggestion), `tools_loading:` (`eager` offers every tool in every request, a
+     server's `when` included; `lazy`, the default, starts lean and loads tools in groups; `searchable` behaves as `lazy` until
+     searchable groups land; ADR 0066).
    * **A model per message is the deployment's offer, not a folder key.** When `MODEL_ALIASES_FILE` profiles more than one
      model, a served `ROLE=all` agent lists `model-pick/v1` with the aliases it may be bound to, other than its own, and
      a message that activates it names one (`metadata[URI] = {"model": ..}`); an alias outside the list is refused as

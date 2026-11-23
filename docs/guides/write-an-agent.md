@@ -59,6 +59,7 @@ agent/
 | `model_fallback:` | overrides the preset's and the profile's `fallback`: the alias the run continues on, once, when the endpoint refuses the agent's model as locked; not the agent's own alias (ADR 0064, amended 2026-11-23) |
 | `vars:` | defaults for `{{placeholders}}` in the body; an undeclared or unused one stops startup |
 | `tools:` | optional selection among the agent's tools; `linear__*` takes a server's tools; an unknown name is refused with a suggestion |
+| `tools_loading:` | `eager` puts every tool in every request, as before the key existed, including a server whose `mcp.json` entry has a `when`; `lazy` (the default) starts lean and lets a run load tools in groups (ADR 0066). `searchable` is accepted and behaves as `lazy` until searchable groups land |
 | `skills:`, `preload_skills:` | which skills the model sees, and which are put in the prompt whole |
 
 Rules worth knowing:

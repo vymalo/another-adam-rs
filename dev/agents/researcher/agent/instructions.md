@@ -1,6 +1,7 @@
 ---
 name: researcher
 description: "A researcher: it searches the web for a question and answers with the sources it found, each one a link. It does not work on repositories."
+tools_loading: eager
 limits:
   max_turns: 20
   max_output_tokens: 2048
