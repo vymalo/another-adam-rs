@@ -33,10 +33,10 @@ use crate::compaction::{
     RETRY_AFTER_TURNS,
 };
 use crate::conversation::{
-    ArtifactRef, Conversation, LimitHit, LimitKind, Loaded, Loader, PendingQuestion, PendingRemote,
-    PendingRun, PendingSession, PendingWait, REASONING_EFFORT_CONTEXT_KEY, Repeats, asks_to_close,
-    parse_context, parse_model_run, parse_root_run, parse_root_step, parse_session,
-    parse_user_text,
+    ArtifactRef, Conversation, LimitHit, LimitKind, Loaded, Loader, MODEL_CONTEXT_KEY, ModelSwitch,
+    PendingQuestion, PendingRemote, PendingRun, PendingSession, PendingWait,
+    REASONING_EFFORT_CONTEXT_KEY, Repeats, asks_to_close, parse_context, parse_model_run,
+    parse_root_run, parse_root_step, parse_session, parse_user_text,
 };
 use crate::history::{RunChars, record_shortenings};
 use crate::images::{
@@ -760,6 +760,54 @@ fn context_effort(context: Option<&Arc<Map<String, Value>>>) -> Option<Reasoning
         .ok()
 }
 
+/// The model a run's call may be bound to besides the agent's own, with what its profile resolves
+/// for it: the alias, the output cap and the default reasoning level (ADR 0064, amended 2026-11-23).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelBinding {
+    /// The gateway alias the request names.
+    pub alias: String,
+    /// The output cap of a request to it, resolved and clamped as the agent's own is
+    /// (`Limits::max_output_tokens`; `0` leaves it to the model).
+    pub max_output_tokens: u32,
+    /// The reasoning level its requests ask for unless the run's context names one.
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl ModelBinding {
+    /// A binding to `alias` with the output cap `max_output_tokens` and no reasoning level.
+    pub fn new(alias: impl Into<String>, max_output_tokens: u32) -> Self {
+        Self {
+            alias: alias.into(),
+            max_output_tokens,
+            reasoning_effort: None,
+        }
+    }
+
+    /// The same binding with the default reasoning level `effort`.
+    #[must_use]
+    pub fn reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+}
+
+/// The model alias the run's context names ([`MODEL_CONTEXT_KEY`]): the `model` member of
+/// `{"model": "<alias>"}`. A value of another shape is ignored.
+fn context_model(context: &Map<String, Value>) -> Option<&str> {
+    context
+        .get(MODEL_CONTEXT_KEY)?
+        .get("model")?
+        .as_str()
+        .filter(|alias| !alias.is_empty())
+}
+
+/// The model a model call of a run is made to: its alias, output cap and default reasoning level.
+struct LiveModel<'a> {
+    alias: &'a str,
+    max_output_tokens: u32,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
 /// What a turn that a cancel ended says. The run is `Failed` with the reason the canceller gave
 /// (`cancelled: <reason>`, written by `Runtime::cancel`); this text is only ever dropped with the
 /// commit that carries it, and shows up in logs.
@@ -802,6 +850,11 @@ struct ModelFailure {
     /// spent. Absent from journals written before, which decode as `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     unreachable: bool,
+    /// The endpoint does not allow the model the request named ([`ModelError::ModelLocked`], ADR
+    /// 0067 decision 7): the model's alias. A run with a fallback continues on it, once. Absent from
+    /// journals written before, and for every other failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    locked: Option<String>,
 }
 
 impl ModelFailure {
@@ -826,6 +879,7 @@ impl ModelFailure {
             refused: false,
             park: None,
             unreachable: false,
+            locked: None,
         }
     }
 }
@@ -852,6 +906,10 @@ impl From<ModelError> for ModelFailure {
             refused: e.class() == adam_error::ErrorClass::Invalid && !e.is_context_overflow(),
             park: RecordedPark::of(&e),
             unreachable: matches!(e, ModelError::Unreachable { .. }),
+            locked: match &e {
+                ModelError::ModelLocked { model } => Some(model.clone()),
+                _ => None,
+            },
         }
     }
 }
@@ -1130,6 +1188,8 @@ pub struct LlmAgentBuilder {
     tool_retry: BTreeMap<String, RetryPolicy>,
     reasoning_effort: Option<ReasoningEffort>,
     model_parking: ModelParking,
+    fallback: Option<ModelBinding>,
+    choices: Vec<ModelBinding>,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -1322,6 +1382,27 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// The model the run continues on, once, when a model call of it is refused with
+    /// [`ModelError::ModelLocked`] (ADR 0064, amended 2026-11-23): an agent folder's `model_fallback`,
+    /// resolved by the assembly with its profile. The run says so as a step, reports the calls after
+    /// it under this alias, and never switches back; a second `ModelLocked` fails the run naming
+    /// both models. Without one, a locked model fails the run as before.
+    #[must_use]
+    pub fn model_fallback(mut self, fallback: ModelBinding) -> Self {
+        self.fallback = Some(fallback);
+        self
+    }
+
+    /// The models a message may pick for its run ([`MODEL_CONTEXT_KEY`]), each with its resolved
+    /// profile values. A context that names another alias, or an agent given none, is ignored: the
+    /// agent's own model answers. The assembly gives them to an embedding engine only, never to a
+    /// served agent, whose callers may not choose what a run costs.
+    #[must_use]
+    pub fn model_choices(mut self, choices: Vec<ModelBinding>) -> Self {
+        self.choices = choices;
+        self
+    }
+
     /// How a run waits on a model that refused it or could not be reached ([ADR 0067]): how long
     /// parks on a timer in a row may last (24 hours by default), and whether an unreachable
     /// endpoint parks at all (no, by default). See "A run parked on the model" on [`LlmAgent`].
@@ -1464,6 +1545,8 @@ impl LlmAgentBuilder {
             tool_retry: self.tool_retry,
             reasoning_effort: self.reasoning_effort,
             model_parking: self.model_parking,
+            fallback: self.fallback,
+            choices: self.choices.into(),
             images_cache: Arc::new(Mutex::new(ImageCache::new())),
             run_chars: Arc::new(Mutex::new(RunChars::default())),
         }
@@ -1681,6 +1764,10 @@ pub struct LlmAgent {
     reasoning_effort: Option<ReasoningEffort>,
     /// How a run waits on a model that refused it ([`LlmAgentBuilder::model_parking`]).
     model_parking: ModelParking,
+    /// The model a run continues on when its model is locked ([`LlmAgentBuilder::model_fallback`]).
+    fallback: Option<ModelBinding>,
+    /// The models a message may pick ([`LlmAgentBuilder::model_choices`]).
+    choices: Arc<[ModelBinding]>,
     /// The bytes of the images already read and checked, by SHA-256, shared by every run of this
     /// agent: a turn reads an image file once, not once per model call.
     images_cache: Arc<Mutex<ImageCache>>,
@@ -1793,6 +1880,8 @@ impl LlmAgent {
             tool_retry: BTreeMap::new(),
             reasoning_effort: None,
             model_parking: ModelParking::default(),
+            fallback: None,
+            choices: Vec::new(),
         }
     }
 
@@ -2025,7 +2114,10 @@ impl LlmAgent {
     /// What the run admits as images from now on: the gate for this model, and what the history
     /// holds, so that a call admits the images the run has room for and no more.
     fn image_gate(&self, state: &Conversation) -> ImageGate {
-        let limits = self.model.input_modalities(&self.model_alias).images;
+        let limits = self
+            .model
+            .input_modalities(self.live_model(state).alias)
+            .images;
         let keeps_in_state = self.extensions.get::<ImageStore>().is_none();
         let room = keeps_in_state.then(|| MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()));
         let journal_left = keeps_in_state
@@ -2161,6 +2253,79 @@ impl LlmAgent {
             .map(jiff::SignedDuration::from_millis)
             .unwrap_or(jiff::SignedDuration::MAX);
         Ok(now + every)
+    }
+
+    /// The model a model call of this run is made to now: after a switch, the fallback; else the
+    /// one the run's context names when the agent was given a binding for it; else the agent's own.
+    fn live_model(&self, state: &Conversation) -> LiveModel<'_> {
+        let bound = if state.model_switch.is_some() {
+            self.fallback.as_ref()
+        } else {
+            context_model(&state.context)
+                .and_then(|alias| self.choices.iter().find(|b| b.alias == alias))
+        };
+        match bound {
+            Some(b) => LiveModel {
+                alias: &b.alias,
+                max_output_tokens: b.max_output_tokens,
+                reasoning_effort: b.reasoning_effort,
+            },
+            None => LiveModel {
+                alias: &self.model_alias,
+                max_output_tokens: self.limits.max_output_tokens,
+                reasoning_effort: self.reasoning_effort,
+            },
+        }
+    }
+
+    /// What a model call the endpoint refused as locked does (ADR 0064, amended 2026-11-23): the
+    /// first time, with a fallback, the run switches to it, says so as a step, and asks the turn
+    /// again; a lock on the fallback, or with no fallback, fails the run.
+    async fn switched_on_lock(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        locked: &str,
+        message: &str,
+    ) -> Flow {
+        let Some(fallback) = &self.fallback else {
+            return Flow::Fail(format!("model call failed: {message}"));
+        };
+        if let Some(switch) = &state.model_switch {
+            return Flow::Fail(format!(
+                "model call failed: {message}: `{locked}` is the fallback of `{}`, which the \
+                 endpoint did not allow either, and a run switches once",
+                switch.from
+            ));
+        }
+        let from = self.live_model(state).alias.to_owned();
+        let to = fallback.alias.clone();
+        if from == to {
+            return Flow::Fail(format!(
+                "model call failed: {message}: `{locked}` is also the fallback of this agent, so \
+                 there is no other model to continue on"
+            ));
+        }
+        tracing::info!(run = %ctx.run_id(), %from, %to, "the endpoint does not allow the model: the run continues on its fallback");
+        ctx.emit(RunEvent::Step(
+            StepEvent::new(
+                format!("model-switch:{}", state.turns),
+                StepKind::Tool,
+                "Switched model",
+                StepState::Completed,
+            )
+            .with_icon(StepIcon::Think)
+            .with_detail(format!(
+                "The model `{from}` is not allowed; this run continues on `{to}`"
+            )),
+        ))
+        .await;
+        state.model_switch = Some(ModelSwitch {
+            from,
+            to,
+            turn: state.turns,
+        });
+        Flow::Next
     }
 
     /// What a model call that failed with `failure` does when it parks the run ([ADR 0067]
@@ -2363,11 +2528,13 @@ impl LlmAgent {
             });
         }
         let closing = state.limit.is_some();
-        let mut request = ModelRequest::new(self.model_alias.clone());
+        let live = self.live_model(state);
+        let live_alias = live.alias.to_owned();
+        let mut request = ModelRequest::new(live_alias.clone());
         request.system = self.instructions.clone();
         // What is sent about an image is decided here, from the reference and the deployment's
         // settings now, and recorded nowhere: the same settings give the same lines every turn.
-        let image_limits = self.model.input_modalities(&self.model_alias).images;
+        let image_limits = self.model.input_modalities(&live_alias).images;
         request.messages = for_sending(&state.messages, image_limits.as_ref());
         request.tools = self.specs.clone();
         request.prompt_cache_key = ctx.conversation_id().map(prompt_cache_key);
@@ -2378,10 +2545,9 @@ impl LlmAgent {
             request.tool_choice = ToolChoice::None;
             request.messages.push(Message::user_text(CLOSING_TURN));
         }
-        request.max_output_tokens =
-            (self.limits.max_output_tokens > 0).then_some(self.limits.max_output_tokens);
+        request.max_output_tokens = (live.max_output_tokens > 0).then_some(live.max_output_tokens);
         // What the newest message activated wins over the agent's resolved default (ADR 0063).
-        request.reasoning_effort = context_effort(context).or(self.reasoning_effort);
+        request.reasoning_effort = context_effort(context).or(live.reasoning_effort);
 
         let model = self.model.clone();
         let sources = self.sources.clone();
@@ -2603,7 +2769,8 @@ impl LlmAgent {
             Ok(r) => {
                 let usage = r.response.usage.accounted();
                 let call = r.call.clone().unwrap_or_else(|| old_call_id(run, turn));
-                self.report_usage(ctx, state, call, usage).await;
+                self.report_usage(ctx, state, call, &live_alias, usage)
+                    .await;
                 usage
             }
             Err(_) => adam_model::Usage::default(),
@@ -2721,10 +2888,11 @@ impl LlmAgent {
                 return Ok((flow, early));
             }
             Err(f) => {
-                return Ok((
-                    Flow::Fail(format!("model call failed: {}", f.message)),
-                    early,
-                ));
+                let flow = match &f.locked {
+                    Some(locked) => self.switched_on_lock(ctx, state, locked, &f.message).await,
+                    None => Flow::Fail(format!("model call failed: {}", f.message)),
+                };
+                return Ok((flow, early));
             }
         };
 
@@ -2738,7 +2906,7 @@ impl LlmAgent {
         state.usage = state.usage.saturating_add(usage);
         state
             .usage_totals
-            .add(self.model.provider(), &self.model_alias, usage);
+            .add(self.model.provider(), &live_alias, usage);
         // What the provider counted of the prompt this call sent: the next estimate starts from it.
         state.last_prompt = (usage.input_tokens > 0).then_some(PromptSize {
             input_tokens: usage.input_tokens,
@@ -2934,10 +3102,11 @@ impl LlmAgent {
     }
 
     /// The budget of the history, in tokens (see [`compaction::budget`]).
-    fn history_budget(&self) -> Option<usize> {
+    fn history_budget(&self, state: &Conversation) -> Option<usize> {
+        let live = self.live_model(state);
         compaction::budget(
-            self.model.context_window(&self.model_alias),
-            self.limits.max_output_tokens,
+            self.model.context_window(live.alias),
+            live.max_output_tokens,
             self.limits.max_history_tokens,
         )
     }
@@ -2971,7 +3140,7 @@ impl LlmAgent {
             return None;
         }
         let estimate = self.estimated_tokens(state);
-        let limit = match (reason, self.history_budget()) {
+        let limit = match (reason, self.history_budget(state)) {
             (CompactionReason::Budget, budget) => budget.unwrap_or(estimate),
             (CompactionReason::Overflow, budget) => budget.unwrap_or(estimate).min(estimate),
         };
@@ -2981,7 +3150,7 @@ impl LlmAgent {
     /// Whether the committed state is due for a compaction: the estimate has reached the budget, and
     /// nothing says otherwise (a compaction at this very turn, a summary that failed a few turns ago).
     fn compaction_due(&self, state: &Conversation) -> bool {
-        let Some(budget) = self.history_budget() else {
+        let Some(budget) = self.history_budget(state) else {
             return false;
         };
         state
@@ -3082,12 +3251,14 @@ impl LlmAgent {
         };
         ctx.emit(RunEvent::Step(step(StepState::Running))).await;
 
-        let mut request = ModelRequest::new(self.model_alias.clone());
+        let live = self.live_model(state);
+        let live_alias = live.alias.to_owned();
+        let mut request = ModelRequest::new(live_alias.clone());
         request.system = self.instructions.clone();
         // The summary request is the request before it and one more message, so a provider's cache
         // serves it: its images are the ones the last request sent. A history that a provider
         // rejected as too long is sent shorter, with each image said in a few words.
-        let image_limits = self.model.input_modalities(&self.model_alias).images;
+        let image_limits = self.model.input_modalities(&live_alias).images;
         request.messages = match reason {
             CompactionReason::Budget => for_sending(&state.messages, image_limits.as_ref()),
             CompactionReason::Overflow => {
@@ -3099,9 +3270,7 @@ impl LlmAgent {
         request.tool_choice = ToolChoice::None;
         request.prompt_cache_key = ctx.conversation_id().map(prompt_cache_key);
         request.run = Some(model_run(state, ctx).to_string());
-        request.max_output_tokens = Some(compaction::summary_output_tokens(
-            self.limits.max_output_tokens,
-        ));
+        request.max_output_tokens = Some(compaction::summary_output_tokens(live.max_output_tokens));
         // A summary is not a reasoning choice: it asks for no level, whatever the run or the agent
         // set (ADR 0063, decision 6).
         request.reasoning_effort = None;
@@ -3175,18 +3344,33 @@ impl LlmAgent {
             }
             return Ok(Compacted::Parked(flow));
         }
+        // A summary the endpoint refuses as locked switches the run as a turn does: the summary is
+        // asked for again of the fallback in the next transition, from the history as it is.
+        if let Err(f) = &recorded
+            && let Some(locked) = &f.locked
+        {
+            let flow = self.switched_on_lock(ctx, state, locked, &f.message).await;
+            if matches!(flow, Flow::Next) {
+                state.compact_next = asked;
+            }
+            ctx.emit(RunEvent::Step(
+                step(StepState::Failed).with_detail(format!("the model `{locked}` is not allowed")),
+            ))
+            .await;
+            return Ok(Compacted::Parked(flow));
+        }
         if !matches!(&recorded, Err(f) if f.retryable) {
             state.model_wait = None;
         }
         let (summary, cut_at, rejected) = match recorded {
             Ok(done) => {
                 // The call was made and counts, whatever its summary is worth.
-                self.report_usage(ctx, state, done.call.clone(), done.usage)
+                self.report_usage(ctx, state, done.call.clone(), &live_alias, done.usage)
                     .await;
                 state.usage = state.usage.saturating_add(done.usage);
                 state
                     .usage_totals
-                    .add(self.model.provider(), &self.model_alias, done.usage);
+                    .add(self.model.provider(), &live_alias, done.usage);
                 (done.summary, done.cut, state.overflow_message.take())
             }
             Err(f) if f.retryable => {
@@ -3271,13 +3455,14 @@ impl LlmAgent {
         ctx: &Ctx,
         state: &Conversation,
         call: String,
+        alias: &str,
         usage: adam_model::Usage,
     ) {
-        let mut event = UsageEvent::new(call, &self.model_alias, usage);
+        let mut event = UsageEvent::new(call, alias, usage);
         if let Some(provider) = self.model.provider() {
             event = event.with_provider(provider);
         }
-        if let Some(window) = self.model.context_window(&self.model_alias) {
+        if let Some(window) = self.model.context_window(alias) {
             event = event.with_context_window(window);
         }
         if let Some(step) = &state.root_step {
@@ -6047,6 +6232,8 @@ impl Agent for LlmAgent {
                     self.absorb_while_parked(ctx, &mut state, inbox).await?;
                 }
                 return Ok(match flow {
+                    // A switch to the fallback: the summary is asked of it in the next transition.
+                    Flow::Next => Transition::Continue(state),
                     Flow::Sleep(wake_at) => Transition::Park {
                         state,
                         wake_at: Some(wake_at),

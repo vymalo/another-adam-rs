@@ -101,7 +101,10 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.
   them an agent whose file sets `reasoning_effort` or `model_preset` is refused at `start`, fail closed) and with
   `.reasoning_effort(..)` the root's level when its file sets none — the folder's own key wins, the builder's level
   wins over the agent's `model_preset` and the profile, and it is validated when it applies (a file's own level is
-  validated instead). The engine reads no environment variable.
+  validated instead). `Say::with_model(alias)` asks that a message's run be answered by a model that has a
+  profile there (anything else is `EngineError::Invalid`, nothing written; the choice holds for the run until
+  a later message names another), and a folder's `model_fallback:` is the alias a run continues on, once, when
+  the endpoint refuses its model as locked (ADR 0064, amended 2026-11-23). The engine reads no environment variable.
 * **Then** `start().await?`, `send`, `steer`, `answer`, `cancel`, `list`, `get`, `events`, `commands` (the folder's
   `/name` commands, which a message expands), `files` and `file` (what a tool handed over, by SHA-256), `firings` (the runs
   `schedules/` fired, which `get`, `events` and `cancel` reach too), `helpers`, `start_session`, `sessions` and

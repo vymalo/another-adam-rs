@@ -167,8 +167,8 @@ pub use access::{ToolAccess, Use, UseMode, path_scope};
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{
     BuildError, CLOSING_TURN, DEFAULT_MAX_PARALLEL, DEFAULT_WAIT_POLL, Limits, LlmAgent,
-    LlmAgentBuilder, LlmStarter, MAX_PARALLEL_LIMIT, MAX_THINKING_CUTS, THINKING_CUT_TURN,
-    UNATTENDED, is_unattended, tool_retry_key,
+    LlmAgentBuilder, LlmStarter, MAX_PARALLEL_LIMIT, MAX_THINKING_CUTS, ModelBinding,
+    THINKING_CUT_TURN, UNATTENDED, is_unattended, tool_retry_key,
 };
 pub use compaction::{
     COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize,
@@ -178,10 +178,10 @@ pub use conversation::{
     ACCESS_TIER_CONTEXT_KEY, ArtifactRef, CALLER_CONTEXT_KEY, Conversation, LOCALE_CONTEXT_KEY,
     LimitHit, LimitKind, Loaded, Loader, MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES,
     MAX_LOADED_NOTE_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS, MAX_REPORTED_ROUNDS,
-    MESSAGE_KIND, OMITTED_MARKER_PREFIX, PER_MESSAGE_CONTEXT_KEYS, PROTECTED_CONTEXT_KEYS,
-    PendingQuestion, PendingRemote, PendingRun, PendingSession, PendingWait,
-    REASONING_EFFORT_CONTEXT_KEY, RENDERER_OFFER_CONTEXT_KEY, Repeats, STOPPED_BY_THE_PERSON,
-    loaded_note, user_message,
+    MESSAGE_KIND, MODEL_CONTEXT_KEY, ModelSwitch, OMITTED_MARKER_PREFIX, PER_MESSAGE_CONTEXT_KEYS,
+    PROTECTED_CONTEXT_KEYS, PendingQuestion, PendingRemote, PendingRun, PendingSession,
+    PendingWait, REASONING_EFFORT_CONTEXT_KEY, RENDERER_OFFER_CONTEXT_KEY, Repeats,
+    STOPPED_BY_THE_PERSON, loaded_note, user_message,
 };
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]

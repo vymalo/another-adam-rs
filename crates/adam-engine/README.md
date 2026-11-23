@@ -40,8 +40,9 @@ engine.shutdown().await?;
 | `events(run)` | `RunEvents`, a `futures::Stream` of `Result<EngineEvent, EngineError>`: the run's recent events, then the live ones, then `Ended` once the store says the run has ended; a run that has already ended gives `Ended` at once. See [A run's events](#a-runs-events) | `NotFound` for a run the engine does not have, refused at the call (the stream would have nothing to say) |
 | `shutdown()` | waits for the messages being written, then nothing new is claimed and the steps in flight finish and commit; it returns once the worker has stopped, and so does every concurrent or later call; every clone stops; reads and `cancel` still work. Dropping a `shutdown` before it is done (a timeout around it) aborts the worker, and so does dropping the last engine, as a killed process would: the next engine started with the same fixed worker id claims its runs at once, any other once their leases run out | what the worker ended with |
 
-The types are the engine's own: `Say { id, text }` (the id makes a send idempotent: the same `Say` again reaches
-the run its first attempt started), `Turn { conversation, run, delivered, info }`, `Delivered` (`Started`, `Continued`, `Steered`, `Answered`,
+The types are the engine's own: `Say { id, text, model }` (the id makes a send idempotent: the same `Say` again reaches
+the run its first attempt started; `Say::with_model(alias)` asks that the run be answered by `alias` with its profile's cap and
+level, refused as `EngineError::Invalid`, nothing written, when the root agent cannot be bound to it (not its own alias, and no profile in `EngineBuilder::models` that resolves for it), and as `EngineError::Refused` once the run has switched to its fallback; ADR 0064 amended 2026-11-23), `Turn { conversation, run, delivered, info }`, `Delivered` (`Started`, `Continued`, `Steered`, `Answered`,
 `Repeated`: a closed enum, so a new way of delivering breaks a `match` on purpose), `RunInfo { run, conversation,
 state, question, output, error }`, `RunState` (`Submitted`, `Working`, `Waiting`, `Done`, `Failed`, `Cancelled`),
 `ConversationId`, `ListQuery`, `Page<T>`, `Limits`, `EngineEvent`, `RunEvents` and `EngineError`, which implements
