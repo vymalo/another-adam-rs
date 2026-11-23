@@ -1524,9 +1524,9 @@ mod tests {
     fn default_locale_is_a_well_formed_tag_or_a_startup_problem() {
         assert!(parse(&full()).expect("valid").default_locale.is_none());
         let mut vars = full();
-        vars.insert("DEFAULT_LOCALE", "fr-CM");
+        vars.insert("DEFAULT_LOCALE", "fr-FR");
         let c = parse(&vars).expect("valid");
-        assert_eq!(c.default_locale.expect("a tag").as_str(), "fr-CM");
+        assert_eq!(c.default_locale.expect("a tag").as_str(), "fr-FR");
         for bad in ["fr_CM", "not a tag", "x-private", "toolongsubtagxx"] {
             let mut vars = full();
             vars.insert("DEFAULT_LOCALE", bad);

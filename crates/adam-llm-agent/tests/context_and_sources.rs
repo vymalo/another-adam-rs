@@ -540,17 +540,17 @@ fn a_limit_the_person_set_is_kept_when_the_rest_of_the_context_is_dropped() {
 fn the_interface_language_survives_a_context_that_is_dropped() {
     let obj = |v: Value| v.as_object().cloned().unwrap();
     let mut c = Conversation::new("t");
-    assert!(c.merge_context(&obj(json!({LOCALE_CONTEXT_KEY: "fr-CM"}))));
+    assert!(c.merge_context(&obj(json!({LOCALE_CONTEXT_KEY: "fr-FR"}))));
     // A catalog that does not fit: everything but the protected keys is dropped, the language is not.
     assert!(!c.merge_context(&obj(json!({"catalog": "x".repeat(MAX_CONTEXT_BYTES)}))));
-    assert_eq!(c.context[LOCALE_CONTEXT_KEY], json!("fr-CM"));
+    assert_eq!(c.context[LOCALE_CONTEXT_KEY], json!("fr-FR"));
     // A context that is already full still takes it: it does not count toward the limit.
     let mut full = Conversation::new("t");
     let room = MAX_CONTEXT_BYTES - serde_json::to_vec(&json!({"k": ""})).unwrap().len();
     assert!(full.merge_context(&obj(json!({"k": "x".repeat(room)}))));
     assert!(!full.merge_context(&obj(json!({"more": 1}))));
-    assert!(full.merge_context(&obj(json!({LOCALE_CONTEXT_KEY: "ybb-CM"}))));
-    assert_eq!(full.context[LOCALE_CONTEXT_KEY], json!("ybb-CM"));
+    assert!(full.merge_context(&obj(json!({LOCALE_CONTEXT_KEY: "fur-IT"}))));
+    assert_eq!(full.context[LOCALE_CONTEXT_KEY], json!("fur-IT"));
     // `null` removes it, like any key: a message that names no language clears the one before.
     assert!(full.merge_context(&obj(json!({LOCALE_CONTEXT_KEY: null}))));
     assert!(!full.context.contains_key(LOCALE_CONTEXT_KEY));
