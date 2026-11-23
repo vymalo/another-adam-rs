@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use a2a::{Message, Task, TaskState};
 use adam_a2a::{
-    ACCESS_TIER_EXTENSION, AccessTiers, BackendError, COMMANDS_EXTENSION, Caller, STEER_EXTENSION,
-    TaskBackend, TaskEvent, TaskPage, TaskQuery,
+    ACCESS_TIER_EXTENSION, AccessTiers, BackendError, COMMANDS_EXTENSION, Caller,
+    MODEL_PICK_EXTENSION, ModelChoices, STEER_EXTENSION, TaskBackend, TaskEvent, TaskPage,
+    TaskQuery,
 };
 use adam_core::{RunId, StoreError};
 use adam_error::ErrorClass;
@@ -22,6 +23,7 @@ use crate::convert::{
     task_from_view,
 };
 use crate::ids::task_id_for;
+use crate::model_pick;
 use crate::subscribe;
 use crate::tier;
 use crate::vymalo;
@@ -177,6 +179,17 @@ pub const MAX_REFERENCES: usize = 8;
 /// it again in a status update when it changes. The state of the run is the truth: the tier said is
 /// the one in its context, else the agent's default.
 ///
+/// # The model a message picks (`model-pick/v1`)
+///
+/// With [`with_model_choices`](Self::with_model_choices), a message whose request **activated**
+/// [`MODEL_PICK_EXTENSION`] must name one of the models the card offers in its metadata under that
+/// URI, or it is refused (`InvalidParams`, whose sentence begins `model_not_offered`, before
+/// anything is written). The alias reaches the run as the context key
+/// [`CONTEXT_MODEL`](crate::CONTEXT_MODEL), which the agent loop reads on every model turn; a
+/// message that does not activate the extension carries no pick, whatever its metadata says. The
+/// pick is a request, not an authorisation: the model call goes through the deployment's gateway,
+/// which still refuses a locked model (`model_locked`, ADR 0067).
+///
 /// # Commands (`commands/v1`)
 ///
 /// With [`with_commands`](Self::with_commands), a message that names a command the agent serves is
@@ -234,6 +247,9 @@ pub struct RuntimeTaskBackend {
     pub(crate) inbound: InboundFn,
     /// The tiers of `access-tier/v1` this agent honours, when its card declares them.
     pub(crate) access_tiers: Option<AccessTiers>,
+    /// The models of `model-pick/v1` this agent offers a message to pick, when its card lists
+    /// them.
+    pub(crate) model_choices: Option<ModelChoices>,
     /// The commands of `commands/v1` this agent serves, when its card lists them.
     pub(crate) commands: Option<crate::Commands>,
     /// The helpers of `child-sessions/v1` this agent serves, when its card lists them.
@@ -260,6 +276,7 @@ impl RuntimeTaskBackend {
             prompt: Arc::new(default_prompt),
             inbound: Arc::new(default_inbound),
             access_tiers: None,
+            model_choices: None,
             commands: None,
             child_sessions: None,
         }
@@ -317,6 +334,21 @@ impl RuntimeTaskBackend {
     pub fn with_access_tiers(mut self, tiers: AccessTiers) -> Self {
         self.access_tiers = Some(tiers);
         self
+    }
+
+    /// Serve `model-pick/v1` for an agent whose card offers `choices`
+    /// ([`ExtensionConfig::model_pick`](adam_a2a::ExtensionConfig::model_pick)): see "The model a
+    /// message picks" in the type's documentation. Without it the extension is never read, whatever
+    /// a request names.
+    #[must_use]
+    pub fn with_model_choices(mut self, choices: ModelChoices) -> Self {
+        self.model_choices = Some(choices).filter(|choices| !choices.is_empty());
+        self
+    }
+
+    /// The models this backend offers a message to pick, when it serves `model-pick/v1`.
+    pub fn model_choices(&self) -> Option<&ModelChoices> {
+        self.model_choices.as_ref()
     }
 
     /// Serve `commands/v1` for an agent whose card lists `commands`
@@ -823,6 +855,17 @@ impl RuntimeTaskBackend {
         // A message that activated `locale/v1` names the interface language of this message, or
         // names none and takes an earlier one away; one that did not is read as it always was.
         vymalo::locale_into(caller, &message, &mut inbound);
+        // A message that activated `model-pick/v1` names the model of its run, one the card
+        // offers; anything else is refused before anything is written, and the pick rides the
+        // run's context to the loop.
+        if let Some(choices) = &self.model_choices
+            && caller.has_extension(MODEL_PICK_EXTENSION)
+        {
+            let alias = choices
+                .requested(&message)
+                .map_err(BackendError::InvalidParams)?;
+            model_pick::put(&mut inbound, &alias).map_err(BackendError::InvalidParams)?;
+        }
 
         let Some(task_id) = task_id else {
             let Joined { run, context, view } = self

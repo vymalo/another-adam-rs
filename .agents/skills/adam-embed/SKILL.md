@@ -52,7 +52,10 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      `adam_service::serve(&ServiceConfig, agents, shutdown)`, or for a composition of your own.
      `adam_agent::folder::load(path)`, `card_of`, `assemble` are the pieces
      (`bin/adam-agent/README.md`, "Library"). `bin/adam-agent` is `publish = false`: depend on it
-     by git rev too.
+     by git rev too. Served that way it also takes a per-message model pick (`model-pick/v1`) when
+     the deployment profiles more than one model; a hand-built `LlmAgent` honours `vymalo.model`
+     only if you give it `LlmAgentBuilder::model_choices(..)` and your front writes the key, as
+     `RuntimeTaskBackend::with_model_choices` does (ADR 0064, amended 2026-11-23).
    * **Your own agent with Rust tools**: depend on the `adam` facade
      (`crates/adam/README.md`): `use adam::prelude::*` gives `#[tool]`, `tools!`, `Tool`, `State`,
      `LlmAgent`; features `macros` (default), `a2a` (the card), `mcp` (`mcp.json` tools), `dev`

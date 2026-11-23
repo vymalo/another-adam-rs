@@ -395,6 +395,9 @@ pub async fn serve(
             // The prompts of the MCP servers the deployment adds (`ADAM_EXTRA_MCP_FILE`) are
             // commands too; the coder's own `github` server has a bearer per call and gives none.
             let prompts = agent.assembly().prompt_commands().to_vec();
+            // The models a message may pick (`model-pick/v1`): the root's choices, the same list
+            // its card advertises.
+            let choices = adam_a2a::ModelChoices::from_aliases(agent.model_choices());
             (
                 Agents::new(AGENT_NAME, move |builder| {
                     agent
@@ -402,6 +405,7 @@ pub async fn serve(
                         .agent(adam_schedule::SchedulerAgent::new(AGENT_NAME))
                 })
                 .options(options_of(worker))
+                .model_choices(choices)
                 // Beside the runtime's worker: the sweep of the workspaces of finished runs.
                 .worker_component("janitor", move |store, stop| janitor.run(store, stop))
                 // The commands that keep running: stopped with their run, whatever ended it.

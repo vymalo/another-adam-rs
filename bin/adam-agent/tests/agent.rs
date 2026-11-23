@@ -82,11 +82,15 @@ fn service_over(agents: Agents, store: &DynStore) -> Service {
         register,
         options,
         inbound,
+        access_tiers,
+        model_choices,
         commands,
         ..
     } = agents;
     Service::new(register(Runtime::builder(store.clone())), name, &options)
         .with_inbound(inbound)
+        .with_access_tiers(access_tiers)
+        .with_model_choices(model_choices)
         .with_commands(commands)
 }
 
@@ -2263,6 +2267,72 @@ async fn the_deployments_model_profiles_reach_the_agents_request_and_refuse_a_ba
     assert_eq!(origin.agent, "chat");
     assert_eq!(effort, "high");
     assert_eq!(model, "test-model");
+}
+
+/// A deployment that profiles a second model offers it: `model-pick/v1`'s choices reach the
+/// backend, and a message that names one is answered by that model. An alias the card does not
+/// offer is refused before anything is written.
+#[tokio::test]
+async fn a_served_agent_offers_the_deployments_other_models_and_takes_a_pick() {
+    use adam_a2a::{MODEL_NOT_OFFERED, MODEL_PICK_EXTENSION};
+    use adam_model::ModelProfiles;
+    use std::collections::HashMap;
+
+    let folder = chat();
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Hi.");
+    let model: DynModel = mock.clone();
+    let mut parts = worker(model, McpPolicy::default());
+    parts.profiles = ModelProfiles::parse_json(
+        r#"{"profiles": {"test-model": {}, "alias-a": {"maxOutputTokens": 2048}}}"#,
+    )
+    .expect("valid profiles");
+    let agents = build(def_of(&folder), None, Some(parts)).await.unwrap();
+    // The root's choices are what the card advertises: its own model is not one of them.
+    assert_eq!(
+        agents
+            .model_choices
+            .as_ref()
+            .expect("the deployment offers a model")
+            .aliases(),
+        ["alias-a"]
+    );
+    let service = service_over(agents, &store());
+    let started = Worker::start(&service);
+
+    let picking = || Caller::new("token-0").with_extensions([MODEL_PICK_EXTENSION]);
+    let naming = |text: &str, alias: &str| {
+        let mut message = user(text);
+        message.metadata = Some(HashMap::from([(
+            MODEL_PICK_EXTENSION.to_owned(),
+            json!({"model": alias}),
+        )]));
+        message
+    };
+    let task = service
+        .backend
+        .submit(picking(), naming("hi", "alias-a"), None, None)
+        .await
+        .expect("an offered model");
+    wait_for(&service, &task.id, TaskState::Completed).await;
+    assert_eq!(mock.requests()[0].model, "alias-a");
+    assert_eq!(
+        mock.requests()[0].max_output_tokens,
+        Some(2048),
+        "the picked model's own cap"
+    );
+
+    let error = service
+        .backend
+        .submit(picking(), naming("hi", "alias-b"), None, None)
+        .await
+        .expect_err("not offered");
+    assert!(
+        matches!(&error, adam_a2a::BackendError::InvalidParams(m)
+            if m.starts_with(MODEL_NOT_OFFERED) && m.contains("alias-a")),
+        "{error:?}"
+    );
+    started.stop().await;
 }
 
 // ------------------------------------------------------------------ S0: the lean first request

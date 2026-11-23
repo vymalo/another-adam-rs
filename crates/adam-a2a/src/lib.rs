@@ -117,6 +117,7 @@ mod handler;
 mod locale;
 #[cfg(feature = "test-util")]
 mod memory;
+mod model_pick;
 #[cfg(feature = "server")]
 mod openapi;
 mod page;
@@ -140,14 +141,15 @@ pub use card::{AgentCardConfig, ExtendedCardConfig, ExtensionConfig, SkillConfig
 pub use extensions::{
     A2UI_BASIC_CATALOG_V1_0, A2UI_EXTENSION_V1_0, A2UI_MEDIA_TYPE, ACCESS_TIER_EXTENSION,
     BUILD_EXTENSION, CHILD_SESSIONS_EXTENSION, COMMANDS_EXTENSION, ChildSessionInfo, CommandInfo,
-    LOCALE_EXTENSION, MENTIONS_EXTENSION, REASONING_EXTENSION, REPLACEABLE_ARTIFACT,
-    STEER_EXTENSION, STEPS_EXTENSION, TEXT_STREAM_EXTENSION, TEXT_STREAM_KIND_REASONING,
-    THREAD_TOOLS_EXTENSION, UI_CATALOG_EXTENSION, UNKNOWN_REVISION, USAGE_EXTENSION, build_version,
-    revision_of,
+    LOCALE_EXTENSION, MENTIONS_EXTENSION, MODEL_PICK_EXTENSION, REASONING_EXTENSION,
+    REPLACEABLE_ARTIFACT, STEER_EXTENSION, STEPS_EXTENSION, TEXT_STREAM_EXTENSION,
+    TEXT_STREAM_KIND_REASONING, THREAD_TOOLS_EXTENSION, UI_CATALOG_EXTENSION, UNKNOWN_REVISION,
+    USAGE_EXTENSION, build_version, revision_of,
 };
 pub use locale::{LOCALE_MEMBER, Locale, MAX_LOCALE_BYTES, NotALocale};
 #[cfg(feature = "test-util")]
 pub use memory::{InMemoryBackend, InMemoryConfig};
+pub use model_pick::{MODEL_NOT_OFFERED, MODEL_PICK_MEMBER, ModelChoices};
 pub use page::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, PageToken, TaskPage, TaskQuery};
 pub use reasoning::{REASONING_EFFORT_MEMBER, ReasoningEfforts};
 #[cfg(feature = "server")]

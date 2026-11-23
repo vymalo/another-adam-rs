@@ -390,8 +390,23 @@ impl CoderAgent {
             Some(found) => bound.state(found),
             None => bound,
         };
-        let assembly = bound.model_profiles(profiles).model(model, model_alias)?;
+        let assembly = bound
+            .model_profiles(profiles)
+            // A served coder takes the model a message picks (`model-pick/v1`): its card lists the
+            // choices and the backend refuses anything outside them (ADR 0064, amended 2026-11-23).
+            .allow_model_choice()
+            .model(model, model_alias)?;
         Ok(Self { assembly, env })
+    }
+
+    /// The models a message may pick for its run (`model-pick/v1`): the root's choices, the same
+    /// list its card advertises. Empty when the deployment offers no other model.
+    pub fn model_choices(&self) -> Vec<String> {
+        self.assembly
+            .info()
+            .first()
+            .map(|root| root.model_choices.clone())
+            .unwrap_or_default()
     }
 
     /// The highest access tier the agent's tools allow (`MAX_ACCESS_TIER`): what the A2A backend

@@ -371,3 +371,49 @@ preset override it); decision 3 takes the fallback's cap and level from its own 
 follow the live model; the lock on a summary call, the fallback equal to the live model and the engine's per-agent check
 and post-switch refusal are in decisions 5 and 8. **Mixed workers:** a worker that does not know `model_switch` reads a
 run that switched as one that did not, and asks the locked model again, so roll forward only.
+
+## Amended 2026-11-23: a served agent takes a per-message model pick (`model-pick/v1`)
+
+*Amended 2026-11-23:* **slice 7, the served half of decision 5's slice.** Decision 8 above gives a model per message to
+the **engine** (`Say::with_model`) and states that "a served agent's front does not" allow a choice, and review R7 on
+[adam#338](https://github.com/vymalo/another-adam-rs/pull/338) pinned that: the coder and a folder agent deliberately
+took no per-message pick. **This amendment narrows R7**: from now on they take one, through the `model-pick/v1` A2A
+extension only. The context key, its shape and the run binding are decision 8's, unchanged; what is new is the served
+front's reading and the card entry that lets a client offer the choices. It is an amendment, not a new ADR: it changes
+what a served run is answered by, which is this ADR's subject, and claims no number.
+
+1. **The extension and its card entry.** URI `https://agents.vymalo.com/a2a/extensions/model-pick/v1`, aligned with the
+   system's ADR 0086 (`docs/api/model-pick-v1.md`): the card's `params` are `{"choices": ["<alias>", ..]}` — the
+   aliases the deployment offers this agent, each once, in the order the assembly lists them — and a message names one
+   as `metadata[URI] = {"model": "<alias>"}`. The reading is `adam_a2a::ModelChoices`; `ExtensionConfig::model_pick` builds
+   the entry. **Only aliases the deployment lists:** the list is the profiles of `MODEL_ALIASES_FILE` minus the
+   agent's own model (and minus whatever `BoundDef::model_aliases` hides), filtered by what this agent can actually be
+   bound to — the same `Assembly` choices the loop takes. A deployment with one model offers none, and an agent with no
+   choice lists no extension (`model_pick` returns `None`), so no client sees a pick it cannot make.
+2. **Refused outside the list.** A message whose request activated the extension must name one of the choices, or it is
+   `InvalidParams` before anything is written. The refusal is typed: its sentence begins with the code
+   `model_not_offered` and names the choices. A missing entry, a non-object, a missing, blank or non-string `model` are
+   the same refusal. A message that did not activate the extension carries no pick, whatever its metadata says.
+3. **It is the run binding, not a second one.** The alias becomes the run's context key `vymalo.model` (`{"model":
+   alias}`), the one decision 8 already defines, and the loop applies it exactly as `Say::with_model` does: that
+   model's cap and level, from its profile. The choice holds for the thread's runs until a later message names another;
+   a run that switched to its fallback does not pick again. Absent an activated message the key is untouched.
+4. **The gateway keeps enforcing tiers.** A pick chooses a model, it does not allow it. The call goes through the
+   deployment's gateway as every other, so `model_locked` ([ADR 0067](0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md))
+   still refuses it there and the slice-6 amendment's decision 4 (the switch) still applies; a pick never bypasses that check.
+5. **Caller identity is unchanged.** The pick is read from an authenticated message like every other extension
+   (`Caller::has_extension`), the backend refuses what the card does not offer, and nothing new is trusted. The card is
+   the bound on what a caller may ask for.
+6. **Where it is served.** `adam-agent` and `adam-coder` call `BoundDef::allow_model_choice` on the served assembly
+   and pass the root's choices to `adam_service::Agents::model_choices`, which hands them to the backend and lists the
+   extension on the card **only when the backend serves a non-empty list**. A `control-plane` process of the split
+   topology assembles no agent and reads no profiles file, so it lists nothing yet; a deployment that wants a pick runs
+   `ROLE=all`. That limitation is a follow-up, not a silent default.
+7. **Companions.** The parity row for a picked model changes (the coder and folder-agent columns no longer say "no
+   per-message pick"), gap 15 of [parity](../reference/parity.md) is rewritten, and `docs/reference/a2a-server.md`,
+   `crates/adam-a2a/README.md`, `crates/adam-a2a-runtime/README.md`, `crates/adam-service/README.md` and the
+   `adam-a2a-extensions`, `adam-agent-folder` and `adam-embed` skills carry the extension.
+
+Slice 7 is accepted when an offered pick is the model a served run's request names (against a mock model client, never a
+live provider), an alias outside the card's choices is `model_not_offered` with no run written, and a request that did
+not activate the extension, or a card that lists none, leaves the pick unread.

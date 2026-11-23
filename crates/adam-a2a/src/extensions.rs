@@ -1,6 +1,6 @@
 //! The A2A extensions an agent that draws on a screen declares: the URIs, and the card entries.
 //!
-//! Fourteen extensions, each optional (a client that does not know one ignores it), detected by the
+//! Fifteen extensions, each optional (a client that does not know one ignores it), detected by the
 //! client from the card it reads, and removable without breaking plain A2A:
 //!
 //! | Extension | URI | What it is |
@@ -19,6 +19,7 @@
 //! | `child-sessions/v1` | [`CHILD_SESSIONS_EXTENSION`] | the card lists the helpers a person may start a session with; a client that activates it sees the agent's sessions, follows their rounds as tasks, and starts, talks to and closes one |
 //! | `locale/v1` | [`LOCALE_EXTENSION`] | a message names the person's interface language (a BCP 47 tag) and the agent answers in it, unless the person writes in another; a hint for the agent's own words, never a translation layer (ADR 0069) |
 //! | `reasoning/v1` | [`REASONING_EXTENSION`] | the card lists the root model's reasoning levels and the resolved default, and an activated message names one (`effort`); a level the model does not take is refused (ADR 0063, decision 5) |
+//! | `model-pick/v1` | [`MODEL_PICK_EXTENSION`] | the card lists the model aliases the deployment offers, and an activated message names one (`model`) for its run; an alias outside the list is refused as `model_not_offered` (ADR 0064, amended 2026-11-23) |
 //!
 //! The contracts are the orchestration layer's (`docs/api/ui-catalog-v2.md`,
 //! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md`,
@@ -125,6 +126,12 @@ pub const LOCALE_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/loc
 /// resolved default>}`, and a model that takes no level lists no extension. The reading is
 /// [`crate::ReasoningEfforts`] (ADR 0063, decision 5).
 pub const REASONING_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/reasoning/v1";
+
+/// The URI of the `model-pick/v1` extension: a message that activates it names the model alias its
+/// run is answered by, in its metadata under this URI, as `{"model": "<alias>"}`. The card's
+/// `params` are `{"choices": [<the aliases the deployment offers>]}`, each once; an agent with one
+/// alias lists no extension. The reading is [`crate::ModelChoices`] (ADR 0064, amended 2026-11-23).
+pub const MODEL_PICK_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/model-pick/v1";
 
 /// One helper of the card's `child-sessions/v1` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,6 +428,23 @@ impl ExtensionConfig {
             Some("Reads the agents a person mentioned in a message, and asks them.".into());
         extension
     }
+
+    /// The `model-pick/v1` extension: the card lists the model aliases the deployment offers for a
+    /// message's run, `params.choices`, each once. `None` when the
+    /// agent offers none (a deployment with one alias): such an agent does not list the extension.
+    /// Optional; the description is this repository's until the orchestration layer publishes the
+    /// contract.
+    pub fn model_pick(choices: &crate::ModelChoices) -> Option<Self> {
+        if choices.is_empty() {
+            return None;
+        }
+        let mut extension = Self::new(MODEL_PICK_EXTENSION);
+        extension.description = Some("Answers with the model the message names.".into());
+        extension
+            .params
+            .insert("choices".into(), json!(choices.aliases()));
+        Some(extension)
+    }
 }
 
 /// The member of an artifact's `metadata` that says its id is **its own and kept**: the run replaces
@@ -518,6 +542,10 @@ mod tests {
         assert_eq!(
             REASONING_EXTENSION,
             "https://agents.vymalo.com/a2a/extensions/reasoning/v1"
+        );
+        assert_eq!(
+            MODEL_PICK_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/model-pick/v1"
         );
     }
 
@@ -794,6 +822,58 @@ mod tests {
                     .params
             ),
             json!({"efforts": ["low", "max"]})
+        );
+    }
+
+    #[test]
+    fn the_model_pick_entry_is_the_deployments_choices() {
+        let choices = crate::ModelChoices::from_aliases(["alias-b", "alias-a"]);
+        let e = ExtensionConfig::model_pick(&choices).expect("listed");
+        assert_eq!(e.uri, MODEL_PICK_EXTENSION);
+        assert!(
+            !e.required,
+            "a client that does not know it must still talk to the agent"
+        );
+        assert_eq!(
+            e.description.as_deref(),
+            Some("Answers with the model the message names.")
+        );
+        assert_eq!(
+            serde_json::Value::Object(e.params),
+            json!({"choices": ["alias-b", "alias-a"]})
+        );
+        // An agent that offers no model lists nothing: a deployment with one alias has no choice.
+        assert!(ExtensionConfig::model_pick(&crate::ModelChoices::new()).is_none());
+    }
+
+    /// The extension is activatable only on a card that lists it: the URIs a card offers are the
+    /// ones its entries name, and nothing else switches it on.
+    #[cfg(feature = "server")]
+    #[test]
+    fn the_model_pick_is_activated_only_on_a_card_that_lists_it() {
+        let choices = crate::ModelChoices::from_aliases(["alias-a"]);
+        let with = crate::AgentCardConfig::new(
+            "coder",
+            "Codes",
+            "http://127.0.0.1:8080/".parse().expect("a URL"),
+            "0.1.0",
+        )
+        .with_extension(ExtensionConfig::model_pick(&choices).expect("listed"));
+        assert_eq!(
+            crate::activation::activated(&with.extension_uris(), [MODEL_PICK_EXTENSION], []),
+            [MODEL_PICK_EXTENSION]
+        );
+        // A card that lists something else offers nothing: the same request activates nothing.
+        let without = crate::AgentCardConfig::new(
+            "coder",
+            "Codes",
+            "http://127.0.0.1:8080/".parse().expect("a URL"),
+            "0.1.0",
+        )
+        .with_extension(ExtensionConfig::usage());
+        assert!(
+            crate::activation::activated(&without.extension_uris(), [MODEL_PICK_EXTENSION], [])
+                .is_empty()
         );
     }
 
