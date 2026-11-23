@@ -126,7 +126,7 @@ pub const CALLER_CONTEXT_KEY: &str = "vymalo.caller";
 
 /// The context key under which a message carries the person's **interface language**
 /// (`locale/v1`, ADR 0069): the BCP 47 tag the client sent with that message, as a string
-/// (`"fr-CM"`). It is the language the agent's own words are written in, unless the person writes
+/// (`"fr-FR"`). It is the language the agent's own words are written in, unless the person writes
 /// in another one. A message that names none clears it, so a run never answers in the language of
 /// a message that is no longer the newest.
 pub const LOCALE_CONTEXT_KEY: &str = "vymalo.locale";

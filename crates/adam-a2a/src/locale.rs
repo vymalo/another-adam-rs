@@ -32,11 +32,11 @@ use crate::Caller;
 use crate::extensions::LOCALE_EXTENSION;
 
 /// The longest tag kept, in bytes. A well-formed tag of an interface language is far shorter
-/// (`fr-CM`, `zh-Hant-TW`, `de-CH-1901`), and the bound is what keeps a message from carrying a
+/// (`fr-FR`, `zh-Hant-TW`, `de-CH-1901`), and the bound is what keeps a message from carrying a
 /// paragraph where a language belongs. A longer tag is refused, never cut.
 pub const MAX_LOCALE_BYTES: usize = 64;
 
-/// The member of the entry under [`LOCALE_EXTENSION`] that carries the tag: `{"locale": "fr-CM"}`.
+/// The member of the entry under [`LOCALE_EXTENSION`] that carries the tag: `{"locale": "fr-FR"}`.
 /// It is part of the wire: clients and agents read it by name.
 pub const LOCALE_MEMBER: &str = "locale";
 
@@ -249,10 +249,10 @@ mod tests {
     fn the_languages_of_a_deployment_are_well_formed_tags() {
         // The shapes a deployment writes: a language and a region, a script, variants, private use.
         for tag in [
-            "en-CM",
-            "fr-CM",
-            "wes-CM",
-            "ybb-CM",
+            "en-GB",
+            "fr-FR",
+            "gsw-CH",
+            "fur-IT",
             "en",
             "de-CH-1901",
             "zh-Hant-TW",
@@ -261,7 +261,7 @@ mod tests {
             "es-419",
             "en-US-x-twain",
             "en-a-bbb",
-            "FR-cm",
+            "FR-fr",
         ] {
             let locale = Locale::parse(tag).unwrap_or_else(|e| panic!("{tag}: {e}"));
             assert_eq!(locale.as_str(), tag, "kept as it came");
@@ -281,14 +281,14 @@ mod tests {
         for bad in [
             "",
             " ",
-            " fr-CM",
-            "fr-CM ",
+            " fr-FR",
+            "fr-FR ",
             "fr_CM",
             "fr CM",
             "-fr",
             "fr-",
             "fr--CM",
-            "fr-CM\n",
+            "fr-FR\n",
             "123",
             "f",
             "i-klingon",
@@ -298,8 +298,8 @@ mod tests {
             "x",
             "en-x",
             "en-a",
-            "fr-CM;q=1",
-            "fr-CM,en",
+            "fr-FR;q=1",
+            "fr-FR,en",
             "fr-\u{00e9}",
         ] {
             assert_eq!(
@@ -329,27 +329,27 @@ mod tests {
     #[test]
     fn the_entry_names_the_tag_and_nothing_else_does() {
         assert_eq!(
-            Locale::of(&metadata(json!({"locale": "fr-CM"}))),
-            Some(Locale::parse("fr-CM").unwrap())
+            Locale::of(&metadata(json!({"locale": "fr-FR"}))),
+            Some(Locale::parse("fr-FR").unwrap())
         );
         // Unknown members of the entry are ignored.
         assert_eq!(
             Locale::of(&metadata(
-                json!({"locale": "ybb-CM", "why": "the person's"})
+                json!({"locale": "fur-IT", "why": "the person's"})
             )),
-            Some(Locale::parse("ybb-CM").unwrap())
+            Some(Locale::parse("fur-IT").unwrap())
         );
         // Never an empty string, never a malformed tag, never another shape.
         for entry in [
             json!({"locale": ""}),
             json!({"locale": "  "}),
-            json!({"locale": "fr-CM "}),
+            json!({"locale": "fr-FR "}),
             json!({"locale": 3}),
             json!({"locale": null}),
             json!({}),
-            json!({"tag": "fr-CM"}),
-            json!("fr-CM"),
-            json!(["fr-CM"]),
+            json!({"tag": "fr-FR"}),
+            json!("fr-FR"),
+            json!(["fr-FR"]),
             json!(null),
         ] {
             assert_eq!(Locale::of(&metadata(entry.clone())), None, "{entry}");
@@ -359,10 +359,10 @@ mod tests {
 
     #[test]
     fn only_a_request_that_activated_the_extension_reads_a_tag() {
-        let named = saying(Some(json!({"locale": "wes-CM"})));
+        let named = saying(Some(json!({"locale": "gsw-CH"})));
         assert_eq!(
             Locale::of_request(&activated(), &named).map(|l| l.as_str().to_owned()),
-            Some("wes-CM".to_owned())
+            Some("gsw-CH".to_owned())
         );
         // Not activated: the entry is not read, whatever it says.
         assert_eq!(Locale::of_request(&Caller::new("token-0"), &named), None);
