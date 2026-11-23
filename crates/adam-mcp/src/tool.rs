@@ -1336,12 +1336,15 @@ mod tests {
                 None => break,
             }
         }
-        // Something is kept: the whole secrets are replaced and the filler is there.
-        // The page escapes `[` as `\x5b`, so a kept text cannot forge a marker line.
+        // Something is kept: the whole secrets are replaced and the filler is there. The page
+        // escapes `[` as `\x5b`, so a kept text cannot forge a marker line: the first two lines are
+        // the two secrets, escaped, whole.
         assert!(
-            kept_text.starts_with("\\x5bredacted:"),
+            kept_text.starts_with(
+                "\\x5bredacted: secret removed, do not reuse]\n\\x5bredacted: secret removed, do not reuse]\n"
+            ),
             "{}",
-            &kept_text[..40]
+            &kept_text[..120]
         );
         assert!(
             kept_text.matches("aaaaaaaa").count() > 1000,
