@@ -100,6 +100,7 @@ cross-process listener: SQLite's notifier is always in-process, and MongoDB has 
 | Variable | Meaning | Default |
 |---|---|---|
 | `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0` (any case): keep this process's events local. `emit` delivers them to the in-process sink and does not encode, queue or `NOTIFY` them; every process's listener drops an event of its own origin anyway. Signals (wake-ups, cancels) still cross. One **process** (`ROLE=all`, one pod): with `topology: split` (a front and its workers, even one replica each) it silences the live events between them, whose state changes still reach a subscriber's 2 s fallback poll. A deployment choice, never detected. Anything else: a startup problem, exit 78 | `false` |
+| `DEFAULT_LOCALE` | the agent's default language, one well-formed BCP 47 tag (at most 64 bytes): the card lists `locale/v1` with it ([ADR 0069](../decisions/0069-the-interface-language-is-a-hint-and-a-hint-is-all-it-is.md)). Unset: the card lists nothing. A malformed tag: a startup problem, exit 78. Read by every role that serves A2A. In the chart: `config.extraEnv` | unset |
 
 ## Agent folder (both binaries)
 

@@ -124,6 +124,7 @@ hint never fills that text (decision 3).
    cleared by a message that names none, beside `access-tier/v1`'s handling, and among the protected keys so a
    dropped context keeps it. **Built.**
 3. `adam-coder` and `adam-agent`: the card entry from the deployment's own tag and that tag's variable in
-   `deploy/coder`.
+   `deploy/coder`. **Built.** The variable is `DEFAULT_LOCALE`, read by `adam-service` for every binary and
+   role (a malformed tag exits 78); the chart carries it through `config.extraEnv`, with no value of its own.
 4. The client half: the orchestrator sends the person's interface locale with each message, activated per message,
    and keeps it with the message (`vymalo/another-agentic-system`).
