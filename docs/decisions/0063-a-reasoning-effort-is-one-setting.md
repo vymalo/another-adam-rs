@@ -284,6 +284,14 @@ would send thinking **enabled**. `reasoningEfforts` containing `none` with
 `parse_json`, so the client refuses the same pairing at the call (`ModelError::InvalidRequest`: the wire
 has no disabled form), and the invariant holds everywhere. (#327)
 
+## Amended 2026-11-22 (decision 5, the map's key)
+
+*Amended 2026-11-22:* decision 5 says `ReasoningEfforts` maps "each alias" to its model's levels. It is keyed by
+the **agent registration name** — the `AgentInfo` name, which carries its `model_alias` — not the literal alias: two
+agents may share one model alias and differ, an agent may be renamed without renaming its model, and both the card
+entry and the reading name the agent whose model answers. The levels are still the model's `reasoningEfforts`,
+lowest first; nothing else in decision 5 changes.
+
 ## Alternatives considered
 
 - **A global `MODEL_REASONING_EFFORT`** (an earlier draft): the owner rejected it — the models behind the

@@ -100,3 +100,8 @@ No Cargo features. The environment variables are `adam-service`'s (`MODEL_AUTH`,
 [ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md),
 [`adam-model`](../adam-model/README.md), [`adam-model-openai`](../adam-model-openai/README.md),
 [`adam-service`](../adam-service/README.md).
+
+## TLS provider
+
+The feature `aws-lc` (default) turns on reqwest's aws-lc-rs provider and `adam-model-openai/aws-lc`. A host
+that installs its own provider uses `default-features = false`; see `adam-model-openai`'s README.

@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# The TLS provider (aws-lc-rs) reqwest and rustls link. On by default; a host that installs its own
+# (ring, the platform's) builds with `default-features = false`.
+default = ["aws-lc"]
+aws-lc = ["reqwest/rustls", "rustls/aws_lc_rs"]
+
 [dependencies]
 adam-error.workspace = true
 adam-model.workspace = true

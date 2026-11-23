@@ -38,7 +38,7 @@ uuid.workspace = true
 # The example's model client and stdin are the host's (`examples/chat`): dev-dependencies only, so the
 # embedded check (normal dependencies) never sees them.
 [dev-dependencies]
-adam-model-openai.workspace = true
+adam-model-openai = { workspace = true, features = ["aws-lc"] }
 secrecy.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread", "time"] }

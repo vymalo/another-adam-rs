@@ -208,7 +208,7 @@ pub use model_wait::{
 };
 pub use order::{AFTER_PREVIOUS, INSTRUCTION as AFTER_PREVIOUS_INSTRUCTION};
 pub use plan::{MAX_PLAN_ITEMS, Plan, PlanItem, PlanStatus};
-pub use redact::{REDACTED_MARKER, is_value_position};
+pub use redact::{REDACTED_MARKER, is_ordinary_word, is_value_position};
 #[cfg(feature = "schema")]
 pub use schema::{ToolSpecExt, spec_for};
 pub use sessions::{
