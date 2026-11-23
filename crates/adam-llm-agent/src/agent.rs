@@ -33,10 +33,10 @@ use crate::compaction::{
     RETRY_AFTER_TURNS,
 };
 use crate::conversation::{
-    ArtifactRef, Conversation, LimitHit, LimitKind, Loaded, Loader, MODEL_CONTEXT_KEY, ModelSwitch,
-    PendingQuestion, PendingRemote, PendingRun, PendingSession, PendingWait,
-    REASONING_EFFORT_CONTEXT_KEY, Repeats, asks_to_close, parse_context, parse_model_run,
-    parse_root_run, parse_root_step, parse_session, parse_user_text,
+    ArtifactRef, Conversation, LOCALE_CONTEXT_KEY, LimitHit, LimitKind, Loaded, Loader,
+    MODEL_CONTEXT_KEY, ModelSwitch, PendingQuestion, PendingRemote, PendingRun, PendingSession,
+    PendingWait, REASONING_EFFORT_CONTEXT_KEY, Repeats, asks_to_close, parse_context,
+    parse_model_run, parse_root_run, parse_root_step, parse_session, parse_user_text,
 };
 use crate::history::{RunChars, record_shortenings};
 use crate::images::{
@@ -688,6 +688,36 @@ impl<'a> Early<'a> {
 /// `max_turns` or `max_tool_calls`. Sent after the history, as a user message that is not kept in it.
 pub const CLOSING_TURN: &str = "You have used all the steps this run may take. Do not call any \
 tool. Reply in plain words: what you did, what is finished, and what is still left to do.";
+
+/// What the model is told about the language the person's interface names (`locale/v1`, ADR 0069).
+/// Sent before the closing turn, as a user message that is not kept in the history, and never in
+/// `system`: the stable prefix of ADR 0044 keeps its bytes, so a provider's prompt cache still hits,
+/// and the language belongs to the message that named it.
+pub fn interface_language_turn(tag: &str) -> String {
+    format!(
+        "The person's interface language is {tag}: answer in it, and follow the person when they \
+write in another language. Never translate code, paths or command output."
+    )
+}
+
+/// The most bytes of a tag this module prints: `adam_a2a::Locale`'s bound, restated here because
+/// this crate does not depend on the A2A layer.
+pub const MAX_INTERFACE_LANGUAGE_BYTES: usize = 64;
+
+/// The interface language a run's context names ([`LOCALE_CONTEXT_KEY`]), when it is one to print: a
+/// string of at most [`MAX_INTERFACE_LANGUAGE_BYTES`] bytes of ASCII letters, digits or `-` (the
+/// characters of a BCP 47 `langtag`). A value that is anything else is ignored and nothing is sent, so
+/// nothing a tool wrote can become a line of the prompt.
+pub fn interface_language(context: &Map<String, Value>) -> Option<&str> {
+    context
+        .get(LOCALE_CONTEXT_KEY)
+        .and_then(Value::as_str)
+        .filter(|tag| {
+            !tag.is_empty()
+                && tag.len() <= MAX_INTERFACE_LANGUAGE_BYTES
+                && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
 
 /// What the model is told after a turn that reached the output limit while it was still thinking:
 /// no words and no call, only reasoning. Kept in the history after that turn, except when the
@@ -2536,6 +2566,14 @@ impl LlmAgent {
         // settings now, and recorded nowhere: the same settings give the same lines every turn.
         let image_limits = self.model.input_modalities(&live_alias).images;
         request.messages = for_sending(&state.messages, image_limits.as_ref());
+        // The language the person's interface names (ADR 0069) is a turn of its own, after the
+        // history and never in `system`: the stable prefix of ADR 0044 is the same bytes on every
+        // turn of a conversation, and a language belongs to the message that named it.
+        if let Some(tag) = context.and_then(|c| interface_language(c)) {
+            request
+                .messages
+                .push(Message::user_text(interface_language_turn(tag)));
+        }
         request.tools = self.specs.clone();
         request.prompt_cache_key = ctx.conversation_id().map(prompt_cache_key);
         request.run = Some(model_run(state, ctx).to_string());
