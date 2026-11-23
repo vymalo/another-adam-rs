@@ -151,6 +151,15 @@ lost to a large context, do not count toward the bound, and a value over `MAX_PR
 that time has passed**, at the start of the next step (`drop_expired_context`): a credential the sender put there
 does not stay in the store after it stops working. (A run parked for hours still holds it until it next steps.)
 
+**The interface language.** When the run's context names `LOCALE_CONTEXT_KEY` (`vymalo.locale`, a BCP 47 tag,
+ADR 0069) and the value is a string of at most `MAX_INTERFACE_LANGUAGE_BYTES` (64) bytes of ASCII letters, digits or
+`-`, every model turn carries one more **user message after the history**, `interface_language_turn(tag)` ("The
+person's interface language is fr-FR: answer in it, and follow the person when they write in another language. Never
+translate code, paths or command output."). It is not kept in the history, it is never part of `system`, so the stable
+prefix keeps its bytes and a provider's prompt cache still hits (ADR 0044), and a value that is anything else — a
+number, an object, a tag with a space or a line break, a longer string — sends nothing at all: nothing a tool wrote can
+become a line of the prompt. `interface_language(context)` is the check, public for tests.
+
 **Reasoning effort.** `ModelRequest::reasoning_effort` is set on every model turn from the run's
 `vymalo.reasoningEffort` context (`{"effort": "<level>"}`, ADR 0063), else from
 `LlmAgentBuilder::reasoning_effort` (what the agent folder, its `model_preset` or its model profile
@@ -1048,6 +1057,7 @@ changes; everything else only appends):
 | A recorded shortening | `record_shortenings`, the turns in `Conversation::shortenings` |
 | A recorded compaction: the request after it is the first of a new prefix (the summary request itself extends the one before it and is no model turn) | `compact_if_due`, the turns in `Conversation::compactions` |
 | The closing turn: appended to the request only, never kept, so a run reopened after it does not start with that request | `model_turn` (`CLOSING_TURN`) |
+| The interface-language turn: appended to the request only, never kept, and never in `system`, so it costs the prefix nothing | `model_turn` (`interface_language_turn`) |
 | A source's tools change: its listing, `refine` (the `show` description once the conversation's catalog is held), `withhold` (the access tier) | `offered`, `refined`, `withheld` in `src/source.rs` |
 | **A load during the run** (`load__group__<name>`): the loaded group's tools are appended, so the head grows by a suffix and the next request re-reads the whole prompt. The only recorded head break that is not a shortening or a compaction | `appended_by` in `src/source.rs`, the turns in `Conversation::tools_appended` |
 | The cap pushes a tool out when a new one sorts before it | `offered` (`MAX_SOURCE_TOOLS`) |
