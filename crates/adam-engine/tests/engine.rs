@@ -2554,10 +2554,7 @@ async fn a_model_picked_after_the_switch_is_refused_and_the_next_run_starts_on_t
             .await
             .map(drop),
         engine
-            .send(
-                Some(&turn.conversation),
-                Say::new("blue").with_model("m"),
-            )
+            .send(Some(&turn.conversation), Say::new("blue").with_model("m"))
             .await
             .map(drop),
     ] {
@@ -2593,6 +2590,10 @@ async fn a_model_picked_after_the_switch_is_refused_and_the_next_run_starts_on_t
     .await
     .expect("the second run asks");
     let models: Vec<String> = mock.requests().iter().map(|r| r.model.clone()).collect();
-    assert_eq!(models, ["m", "lite", "lite", "m"], "the pick does not carry over");
+    assert_eq!(
+        models,
+        ["m", "lite", "lite", "m"],
+        "the pick does not carry over"
+    );
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 }

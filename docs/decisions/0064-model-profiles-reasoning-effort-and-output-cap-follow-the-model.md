@@ -316,18 +316,24 @@ decision 7 leaves the switch to "the profile's fallback model" and fails the run
 This ADR's "fallback" is the 128,000 output cap, so no slice owned the switch. It is this one. It is an amendment, not a
 new ADR: it changes what a profiled model's calls resolve to, which is this ADR's subject, and claims no number.
 
-1. **The fallback is declared in the agent's file.** `model_fallback: <alias>` in the frontmatter of a root or a subagent
-   (a local-only key, warned on a remote subagent). A subagent follows its **own** file's value; none is inherited from
-   its parent. The seat is the folder because the agent knows what a lesser model may still do for it; a deployment-wide
-   default in a profile (`fallback`) is not built and would be a later slice.
-2. **Validation at start.** The alias goes through the same check as `model:` (not empty, one token, one of
+1. **The fallback's seat is the profile, with the folder as an override** (the order effort resolves in). The alias is, in
+   order: the agent's `model_fallback:` (a local-only key, warned on a remote subagent), then the `fallback` of the preset
+   its `model_preset` names, then the `fallback` of its model's profile in `MODEL_ALIASES_FILE`, then of that profile's
+   base preset. A profile's `fallback` names another profile of the same document (a file that names itself or a model
+   with no profile is exit 78). The profile is the seat because a shared folder that named one deployment's alias would
+   stop every other deployment at start; the folder overrides it for an agent that knows what a lesser model may still
+   do. A subagent resolves its **own** chain: nothing is inherited from its parent, so an `inherit` subagent takes its
+   (inherited) model's profile fallback and needs no key of its own.
+2. **Validation at start.** The resolved alias goes through the same check as `model:` (not empty, one token, one of
    `model_aliases` when the deployment lists them) and must differ from the agent's own alias
    (`AliasProblem::SameAsModel`). A refusal is the assembly's `Error::ModelAlias` naming the agent and its file, which
    every host turns into exit 78 (the engine's `start` returns `EngineError::Agent`).
-3. **What the fallback resolves to.** Its output cap, resolved as decision 3 does for the fallback model (the folder's
-   `limits.max_output_tokens`, the agent's preset, the fallback's profile, then 128,000, clamped to the fallback's own
-   limit and window). Its reasoning level is the fallback's **own** profile's (`reasoningEffort`, else its base
-   preset's), never the folder's: the folder's level was chosen for the agent's model, which the fallback may not take.
+3. **What the fallback resolves to.** Its output cap and its reasoning level are the fallback's **own**: its profile's
+   `maxOutputTokens`, else its base preset's, else 128,000, clamped to its own `maxOutputTokensLimit` and window (the
+   history it leaves room for is at most half of that window); and its profile's `reasoningEffort`, else its base preset's,
+   which must be one of the fallback's levels. The folder's `limits.max_output_tokens`, its `reasoning_effort` and its
+   `model_preset` are for the agent's own model and are not carried over. After the switch the compaction budget, the
+   window the history is cut to and the image limits are the **live** model's, not the agent's.
 4. **The switch.** When a model call is refused with `ModelError::ModelLocked`
    ([ADR 0067](0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md) decision 7), a run
    with a fallback records the switch in its state (`Conversation::model_switch`: `from`, `to`, the turn), says it as
@@ -336,7 +342,9 @@ new ADR: it changes what a profiled model's calls resolve to, which is this ADR'
    refusal, makes no call to the locked model, and builds the same requests. A run with no fallback fails as before,
    naming the model.
 5. **Once, and never back.** After the switch every call of the run, the summary call of a compaction included, names the
-   fallback with its cap and level; the run does not try the first model again. A second `ModelLocked`, on the fallback,
+   fallback with its cap and level; the run does not try the first model again. A lock on a **compaction summary** call
+   switches the run the same way, and the summary is asked of the fallback in the next transition. A fallback that is
+   the model the run is on already (a message picked it) fails the run at once, with no second call. A second `ModelLocked`, on the fallback,
    fails the run: `model call failed: <the refusal>: `<fallback>` is the fallback of `<first>`, which the endpoint did
    not allow either, and a run switches once`. A subagent's run switches on its own.
 6. **The step.** Label `Switched model`, state `Completed`, detail ``The model `<from>` is not allowed; this run continues
@@ -344,13 +352,22 @@ new ADR: it changes what a profiled model's calls resolve to, which is this ADR'
 7. **Usage.** A `usage/v1` event names the model the call was made to, so the calls after the switch name the fallback; the
    refused call reports none (no tokens were taken). `UsageTotals` count under the same alias.
 8. **A message may name a model (decision 5's slice, narrowed).** `Say::with_model(alias)` in the engine asks that the
-   run be answered by `alias`, with that profile's cap and level. The engine refuses an alias that has no profile in
-   `EngineBuilder::models` (`EngineError::Invalid`, nothing written), and every alias when it was given none. It travels
+   run be answered by `alias`, with that profile's cap and level. The engine refuses at `Say` time any alias the root
+   agent cannot be bound to: not its own, and not a profiled model whose cap and level resolve for it
+   (`EngineError::Invalid`, nothing written). After the run switched, a message that names a model is refused with
+   `EngineError::Refused` (never silently ignored); the pick does not carry into the conversation's next run, which
+   starts on the agent's own model again. It travels
    as the context key `vymalo.model` (`{"model": alias}`), which only an agent **given choices** honours: the assembly
    gives them when the host calls `BoundDef::allow_model_choice` (the engine does, a served agent's front does not), so a
    remote caller cannot choose what a run costs. The choice holds for the run until a later message names another; the
-   fallback switch overrides it. Not built: the compaction's budget still derives from the agent's own window and cap.
+   fallback switch overrides it.
 
 Slice 6 is accepted when a scripted run whose model answers `model_locked` continues on the fallback with its cap and
 level, the step and the usage say so, and a replay after a lost commit asks the locked model nothing more; a second lock
-fails the run naming both models; and the engine refuses a `Say` that names a model with no profile.
+fails the run naming both models; and the engine refuses a `Say` that names a model the agent cannot bind.
+
+*Amended 2026-11-23 (review of the slice):* decision 1 moved the seat from the folder to the profile (the folder and the
+preset override it); decision 3 takes the fallback's cap and level from its own profile and makes the compaction budget
+follow the live model; the lock on a summary call, the fallback equal to the live model and the engine's per-agent check
+and post-switch refusal are in decisions 5 and 8. **Mixed workers:** a worker that does not know `model_switch` reads a
+run that switched as one that did not, and asks the locked model again, so roll forward only.

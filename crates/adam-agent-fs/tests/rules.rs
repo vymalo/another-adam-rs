@@ -651,6 +651,15 @@ fn cases() -> Vec<Case> {
             Warning,
             "`tools` is ignored on a remote subagent",
         ),
+        with_root(
+            "model_fallback on a remote subagent",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\na2a: https://example.com/card\nmodel_fallback: lite\n---\n",
+            )],
+            Warning,
+            "`model_fallback` is ignored on a remote subagent",
+        ),
         // --- skills
         with_root(
             "skill name differs from its directory",

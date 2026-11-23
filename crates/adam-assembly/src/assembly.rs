@@ -459,10 +459,11 @@ impl BoundDef {
     /// which must be one of the model's levels.
     fn own_effort(&self, origin: &Origin, alias: &str) -> Result<Option<ReasoningEffort>, Error> {
         let profile = self.profiles.profile(alias);
-        let Some(effort) = profile
-            .and_then(|p| p.reasoning_effort)
-            .or_else(|| self.profiles.preset_of(alias).and_then(|p| p.reasoning_effort))
-        else {
+        let Some(effort) = profile.and_then(|p| p.reasoning_effort).or_else(|| {
+            self.profiles
+                .preset_of(alias)
+                .and_then(|p| p.reasoning_effort)
+        }) else {
             return Ok(None);
         };
         let allowed: Vec<ReasoningEffort> = profile

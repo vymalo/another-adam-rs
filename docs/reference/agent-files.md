@@ -83,7 +83,7 @@ description: Turns a coding task into a verified pull request.   # required on s
 model: coder-large             # a gateway alias; `inherit` = the parent's (default for subagents)
 reasoning_effort: low          # the level the model calls ask for by default; one the model's profile declares (ADR 0063)
 model_preset: quick            # a named preset of MODEL_ALIASES_FILE the calls start from (ADR 0064)
-model_fallback: coder-lite     # the alias the run continues on, once, if the endpoint refuses `model` as locked (ADR 0064)
+model_fallback: coder-lite     # overrides the preset's and the profile's `fallback`: the alias the run continues on, once, if the endpoint refuses `model` as locked (ADR 0064)
 tools: [prepare_workspace, run_checks, ask_user]     # or "a, b, c"; "*" = all; MCP: "linear__*"
 skills: all                    # or a list; default: every skill in this agent's skills/
 limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as limits.max_turns
@@ -134,8 +134,10 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
 * **A locked model switches once.** `model_fallback` names the alias a run continues on when the endpoint refuses
   its model as not allowed (`model_locked`, ADR 0067). The run says it as a step (`Switched model`), reports
   its later calls under the fallback, takes the fallback's cap and its profile's own reasoning level, and never goes back;
-  a second refusal fails it naming both models. The alias is checked like `model:` and may not be the agent's own
-  (exit 78). A subagent follows its own file's key; nothing is inherited (ADR 0064, amended 2026-11-23).
+  a second refusal fails it naming both models. The alias is the file's `model_fallback`, else the `fallback` of its
+  `model_preset`, else of its model's profile in `MODEL_ALIASES_FILE`; it is checked like `model:` and may not be the
+  agent's own (exit 78). A subagent resolves its own: an `inherit` subagent takes its model's profile fallback, and
+  nothing is inherited from the parent's file (ADR 0064, amended 2026-11-23).
 * **The output cap is per model.** `limits.max_output_tokens` is what this agent's calls ask for;
   without it the cap is its `model_preset`'s, else the model profile's `maxOutputTokens`, else the
   profile's base preset, else 128,000 (ADR 0064). The result is clamped to the model's

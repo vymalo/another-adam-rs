@@ -205,6 +205,10 @@ Three things are missing in adam today:
    `ModelError::ModelLocked`, class `Rejected`: the switch to the profile's fallback model is the model profiles' slice
    ([ADR 0064](0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md)); until that switch is built the
    run fails naming the model.
+
+   *Amended 2026-11-23:* the switch is built (ADR 0064, slice 6, amended). The fallback's seat is the profile's `fallback`
+   in `MODEL_ALIASES_FILE`, as this decision says, with the preset's and the agent's `model_fallback:` overriding it.
+   A run with no fallback still fails naming the model.
 8. **What a park records.** The journal, the step's error and the task's message hold the reason, the status and the
    slug. Never a header, never the body, never a credential. A refusal's report is built from those three fields, not
    from the body the client read.

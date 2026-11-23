@@ -42,7 +42,7 @@ engine.shutdown().await?;
 
 The types are the engine's own: `Say { id, text, model }` (the id makes a send idempotent: the same `Say` again reaches
 the run its first attempt started; `Say::with_model(alias)` asks that the run be answered by `alias` with its profile's cap and
-level, refused as `EngineError::Invalid` when `EngineBuilder::models` holds no profile for it, ADR 0064 amended 2026-11-23), `Turn { conversation, run, delivered, info }`, `Delivered` (`Started`, `Continued`, `Steered`, `Answered`,
+level, refused as `EngineError::Invalid`, nothing written, when the root agent cannot be bound to it (not its own alias, and no profile in `EngineBuilder::models` that resolves for it), and as `EngineError::Refused` once the run has switched to its fallback; ADR 0064 amended 2026-11-23), `Turn { conversation, run, delivered, info }`, `Delivered` (`Started`, `Continued`, `Steered`, `Answered`,
 `Repeated`: a closed enum, so a new way of delivering breaks a `match` on purpose), `RunInfo { run, conversation,
 state, question, output, error }`, `RunState` (`Submitted`, `Working`, `Waiting`, `Done`, `Failed`, `Cancelled`),
 `ConversationId`, `ListQuery`, `Page<T>`, `Limits`, `EngineEvent`, `RunEvents` and `EngineError`, which implements

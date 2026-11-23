@@ -91,9 +91,15 @@ fn the_fallback_is_the_folders_then_the_presets_then_the_profiles() {
 #[test]
 fn a_profile_may_not_name_itself_or_an_unprofiled_model_as_its_fallback() {
     let own = ModelProfiles::parse_json(r#"{"profiles": {"a": {"fallback": "a"}}}"#).unwrap_err();
-    assert!(own.iter().any(|p| p.contains("its own fallback")), "{own:?}");
+    assert!(
+        own.iter().any(|p| p.contains("its own fallback")),
+        "{own:?}"
+    );
     let gone = ModelProfiles::parse_json(r#"{"profiles": {"a": {"fallback": "b"}}}"#).unwrap_err();
-    assert!(gone.iter().any(|p| p.contains("has no profile")), "{gone:?}");
+    assert!(
+        gone.iter().any(|p| p.contains("has no profile")),
+        "{gone:?}"
+    );
 }
 
 /// A fallback that is the agent's own model, from any seat, stops the build.

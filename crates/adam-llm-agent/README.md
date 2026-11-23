@@ -750,14 +750,13 @@ loads as none (`ModelPark` gains a kind in a later build).
 **A locked model** (ADR 0064, amended 2026-11-23). An agent built with `.model_fallback(ModelBinding::new(alias, cap)
 .reasoning_effort(..))` (the assembly builds it from the folder's `model_fallback:`) answers a `ModelError::ModelLocked`
 by recording `Conversation::model_switch` (`ModelSwitch { from, to, turn }`), emitting the step `Switched model`, and asking
-the same turn again of the fallback, with its cap and level, in the next transition. Every later call of the run (the
-compaction summary too) names the fallback, `usage/v1` names it, and the run never goes back. A `ModelLocked` on the
-fallback fails the run naming both models; an agent with no fallback fails as before. `ModelFailure` journals the locked
+the same turn again of the fallback, with its cap and level, in the next transition. Every later call of the run names the fallback, and so do the compaction budget (the live model's window and cap), the image limits and the summary call; a `ModelLocked` on a summary call switches the run too, and the summary is asked of the fallback in the next transition; `usage/v1` names it, and the run never goes back. A `ModelLocked` on the
+fallback fails the run naming both models; an agent with no fallback fails as before; a fallback that is the model the run is on already (a message picked it) fails the run at once, with no second call. `ModelFailure` journals the locked
 alias, so a replay finds the same refusal and makes no call. `.model_choices(..)` gives the models a message may pick with
 the context key `MODEL_CONTEXT_KEY` (`vymalo.model`, `{"model": alias}`); an alias without a binding, or an agent without
 choices, is ignored. **Breaking:** `Conversation::model_switch` is a new public field of a struct that is not
 `#[non_exhaustive]`. Tests: `tests/model_fallback.rs` (the switch, no switch back, a second lock, no fallback, a message's
-pick, a replay after a lost commit).
+pick, a replay after a lost commit, a smaller fallback's window, a lock on a budget and on an overflow summary, a fallback equal to the live model).
 
 Tests: `tests/model_park.rs` (each kind, the backoff by the journaled times, the limit and a wake clamped to it, a message,
 one refused again, a resume, a resume during the woken call adding no turn, a row that changes kind, a replay after a lost

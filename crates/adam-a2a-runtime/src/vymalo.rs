@@ -813,6 +813,28 @@ mod tests {
         assert_eq!(inbound.payload, json!(3));
     }
 
+    /// A served agent's front never reads the model a run is asked of: only the embedded engine's
+    /// own inbound does (ADR 0064, amended 2026-11-23), so a remote caller cannot choose what a run
+    /// costs by sending `vymalo.model`.
+    #[test]
+    fn a_served_front_ignores_the_model_a_message_names() {
+        let message = with_metadata(
+            text_message("hi"),
+            json!({adam_llm_agent::MODEL_CONTEXT_KEY: {"model": "lite"}}),
+        );
+        for inbound in [
+            vymalo_inbound(&message).unwrap(),
+            crate::default_inbound(&message).unwrap(),
+        ] {
+            let context = inbound.payload.get("context");
+            assert!(
+                context.is_none_or(|c| c.get(adam_llm_agent::MODEL_CONTEXT_KEY).is_none()),
+                "{:?}",
+                inbound.payload
+            );
+        }
+    }
+
     #[test]
     fn the_key_is_the_agents_and_is_never_lost_to_a_large_context() {
         assert_eq!(CONTEXT_LOCALE, adam_llm_agent::LOCALE_CONTEXT_KEY);

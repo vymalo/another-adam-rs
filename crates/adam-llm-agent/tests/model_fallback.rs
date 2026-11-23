@@ -365,7 +365,12 @@ fn is_summary(request: &ModelRequest) -> bool {
 
 /// The tokens a request holds, estimated as the agent does (characters / 4).
 fn tokens(request: &ModelRequest) -> usize {
-    request.messages.iter().map(|m| m.text().len()).sum::<usize>() / 4
+    request
+        .messages
+        .iter()
+        .map(|m| m.text().len())
+        .sum::<usize>()
+        / 4
 }
 
 /// After the switch the compaction budget, and so what the fallback is sent, are the fallback's own
@@ -385,7 +390,8 @@ async fn a_smaller_fallback_is_sent_a_history_that_fits_its_own_window() {
             .model_fallback(ModelBinding::new(LITE, 1024))
     });
     for n in 0..20 {
-        rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 14_000)]);
+        rig.mock
+            .push_tool_calls(vec![big(&format!("c{n}"), 14_000)]);
     }
     rig.mock
         .push_error(locked(BASE))

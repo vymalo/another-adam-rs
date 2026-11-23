@@ -3353,9 +3353,9 @@ impl LlmAgent {
             if matches!(flow, Flow::Next) {
                 state.compact_next = asked;
             }
-            ctx.emit(RunEvent::Step(step(StepState::Failed).with_detail(format!(
-                "the model `{locked}` is not allowed"
-            ))))
+            ctx.emit(RunEvent::Step(
+                step(StepState::Failed).with_detail(format!("the model `{locked}` is not allowed")),
+            ))
             .await;
             return Ok(Compacted::Parked(flow));
         }

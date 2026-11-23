@@ -772,6 +772,7 @@ mod tests {
                 json!(false),
             )])),
             preset: Some("quick".into()),
+            fallback: Some("other".into()),
         };
         roundtrip(profile.clone());
         assert_eq!(

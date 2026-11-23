@@ -56,7 +56,7 @@ agent/
 | `model:` | a gateway alias, when it should not be `MODEL`; `inherit` takes the parent's |
 | `reasoning_effort:` | the reasoning level the agent's model calls ask for by default: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, one the model's profile declares (ADR 0063); a message's `reasoning/v1` activation still wins per turn |
 | `model_preset:` | a named preset of the deployment's `MODEL_ALIASES_FILE` (`presets:`) the agent's model calls start from (ADR 0064) |
-| `model_fallback:` | the alias the run continues on, once, when the endpoint refuses the agent's model as locked; not the agent's own alias; a subagent names its own (ADR 0064, amended 2026-11-23) |
+| `model_fallback:` | overrides the preset's and the profile's `fallback`: the alias the run continues on, once, when the endpoint refuses the agent's model as locked; not the agent's own alias (ADR 0064, amended 2026-11-23) |
 | `vars:` | defaults for `{{placeholders}}` in the body; an undeclared or unused one stops startup |
 | `tools:` | optional selection among the agent's tools; `linear__*` takes a server's tools; an unknown name is refused with a suggestion |
 | `skills:`, `preload_skills:` | which skills the model sees, and which are put in the prompt whole |

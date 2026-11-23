@@ -37,9 +37,10 @@ before you rely on a detail here.
      (`max_turns`, `max_tool_calls`, `max_output_tokens` — the cap this agent asks for, at least 1;
      absent, its preset's, the model's profile's, then 128,000, clamped to the model's limit and
      window, ADR 0064 — and `max_history_tokens`), `model:` (an alias,
-     only when it should not be `MODEL`), `model_fallback:` (the alias the run continues on, once, when
-     the endpoint refuses `model` as locked; not the agent's own alias, else exit 78; a subagent names
-     its own, nothing is inherited; ADR 0064 amended 2026-11-23), `tools:` (optional selection; `linear__*` takes a
+     only when it should not be `MODEL`), `model_fallback:` (overrides the `fallback` of the agent's `model_preset` and of
+     its model's profile in `MODEL_ALIASES_FILE`: the alias the run continues on, once, when the endpoint refuses
+     `model` as locked; not the agent's own alias, else exit 78; a subagent resolves its own, so an `inherit` subagent
+     takes its model's profile fallback and needs no key; ADR 0064 amended 2026-11-23), `tools:` (optional selection; `linear__*` takes a
      server's tools; an unknown name is refused with a suggestion).
    * `vars:` are the `{{placeholders}}` of the body. Every var needs a value in the file. A var
      declared without a value, a var the body does not use, or a placeholder not declared, stops
