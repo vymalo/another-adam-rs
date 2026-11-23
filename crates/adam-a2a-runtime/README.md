@@ -27,6 +27,7 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 | `RuntimeTaskBackend::list` (`TaskBackend::list`), `MAX_SCAN` | `ListTasks`: the caller's tasks, newest update first, by keyset cursor; see *Listing tasks* |
 | `MAX_TOKEN_COUNT` | the largest count a `usage/v1` report or total carries (2^53 - 1); see *Usage* |
 | `RuntimeTaskBackend::with_access_tiers(AccessTiers)`, `CONTEXT_ACCESS_TIER` | `access-tier/v1`: the backend reads the tier of a message that activated the extension, refuses a bad one, and says the tier a task works under; the tier is the run's context key `vymalo.accessTier` = `{"tier": ..}`; see *The access tier* |
+| `RuntimeTaskBackend::with_model_choices(ModelChoices)`, `RuntimeTaskBackend::model_choices()`, `CONTEXT_MODEL` | `model-pick/v1`: the backend reads the model alias of a message that activated the extension, refuses one the card does not offer as `model_not_offered`, and the alias is the run's context key `vymalo.model` = `{"model": ..}`; see *The model a message picks* |
 | `CONTEXT_LOCALE` | `locale/v1`: the person's interface language of the **latest message that activated the extension**, the run's context key `vymalo.locale` = `"fr-FR"` (a bare BCP 47 tag), set from `metadata[URI] = {"locale": "<tag>"}` and **cleared** by an activated message that names none (or names a malformed tag, which is refused rather than passed on); one of `adam_llm_agent::PROTECTED_CONTEXT_KEYS`, so a dropped context does not take it; a request that did not activate the extension changes nothing; see *The interface language* |
 | `RemoteCommand`, `CommandRefusal`, `Commands::add_remote(name, Arc<dyn RemoteCommand>)`, `Commands::expand_any`, `Commands::served()`, `Commands::refuse_prefix(prefix, why)` | a command whose text is **asked** when a message names it (an MCP server's prompt): the source gets the argument text as typed, trimmed (`expand(&str)`, and maps it itself), the source answers, and the answer is held to the same limits and `(typed)` marking and stored like a template's expansion. `CommandRefusal::Invalid` is `invalid params`, `Unavailable` the A2A `unavailable` error; a name the agent already has is not replaced (`add_remote` returns `false`). `refuse_prefix` makes a process that cannot serve a family of commands (a control plane has no MCP server) answer `invalid params` with a sentence of its own to `/<prefix>...` (typed or in the metadata) instead of letting it reach the model as text; `is_empty()` counts the refusals. `is_format_or_control` now lives in `adam-agent-fs` and is re-exported here. **Breaking:** the crate-private `apply` is async, and `Commands`' `PartialEq` compares a remote command by pointer |
 | `RuntimeTaskBackend::with_commands(Commands)`, `Commands`, `Commands::from_manifest(&[adam_agent_fs::Command])` (the one place a manifest becomes the backend's commands, used by `adam-agent` and `adam-coder`; this crate gained the `adam-agent-fs` dependency for it), `MAX_COMMAND_ARGUMENTS`, `MAX_COMMAND_EXPANSION` | `commands/v1`: the backend expands a message that names a command the agent serves, in this request, and stores the expansion; see *Commands*. An empty `Commands` is the same as none |
@@ -507,10 +508,28 @@ neither carries no metadata, and a task with tokens only carries the object it a
 
 Unit tests in `src/tier.rs` (the validation sentences, the context) and `tests/access_tier.rs` (a real `Runtime` and `LlmAgent`: the tier reaches the run and the task, the first frame and `GetTask` say it, a caller that did not activate it reads none, every kind of bad tier is `InvalidParams` and writes no run, a message that did not activate it carries no tier and an activated reader is told the default, a backend with no tiers reads none, and a tier changed by a message sent while the task works is said once on the stream).
 
+## The model a message picks
+
+`model-pick/v1` ([ADR 0064](../../docs/decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md), amended
+2026-11-23). With `with_model_choices(choices)`, for an agent whose card lists the extension
+(`ExtensionConfig::model_pick`), `submit` reads every message right after the inbound function and beside the tier:
+
+| | |
+|---|---|
+| A message whose request **activated** the extension (`Caller::extensions`) | must carry `metadata[URI] = {"model": "<alias>"}`, one of the card's `choices`. Anything else (no entry, an entry that is not an object, a `model` that is missing, blank or not a string, or an alias the card does not offer) is **`InvalidParams`** (A2A `-32602`) whose sentence begins `model_not_offered` and names the choices, **before anything is written**: no task, no run |
+| the pick of an accepted message | the run's inbound context key `vymalo.model` = `{"model": ..}` (`CONTEXT_MODEL`), merged like any key: the **newest message that names one wins** from the agent's next step, and a message that names none leaves it. This holds for a message to an open task too. The agent loop honours it only for a model it was given a binding for; the assembly gives it those choices (`BoundDef::allow_model_choice`, which `adam-agent` and the coder do) |
+| a message that did **not** activate it | no pick is read, whatever its metadata says; the context is untouched |
+| a backend with no `with_model_choices`, or one given no choice | never reads a pick: a deployment with one model offers none, and its card lists no extension |
+| never an authorisation | the pick chooses the model, it does not allow it: the call goes through the deployment's gateway as any other, and a locked model is refused there (`model_locked`, ADR 0067) and the run may switch to its fallback |
+
+Unit tests in `src/model_pick.rs` (the context, any payload shape, the key's identity with `adam_llm_agent::MODEL_CONTEXT_KEY`)
+and `tests/model_pick.rs` (a real `Runtime` and `LlmAgent` with a `MockModel`: an offered pick is the model request's alias and cap, an
+alias outside the choices is `InvalidParams` and writes no run, a backend that serves no choices leaves the pick unread, and a message
+that did not activate the extension carries no pick).
+
 ## The interface language
 
-`locale/v1` ([ADR 0069](../../docs/decisions/0069-the-interface-language-is-a-hint-and-a-hint-is-all-it-is.md)). The backend reads it in
-`submit`, right after the inbound function and beside the tier, for an agent whose card lists the extension
+`locale/v1` ([ADR 0069](../../docs/decisions/0069-the-interface-language-is-a-hint-and-a-hint-is-all-it-is.md)). The backend reads it in`submit`, right after the inbound function and beside the tier, for an agent whose card lists the extension
 (`ExtensionConfig::locale`):
 
 | | |

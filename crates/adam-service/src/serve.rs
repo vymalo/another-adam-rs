@@ -210,6 +210,11 @@ pub struct Agents {
     /// the tier a task works under. `None`: the extension is never read or said. Only the roles
     /// that serve A2A use it.
     pub access_tiers: Option<adam_a2a::AccessTiers>,
+    /// The models the agent offers a message to pick (`model-pick/v1`), when its card lists them:
+    /// the backend then reads the pick of a message that activated the extension and refuses one
+    /// outside the choices. `None`: the extension is never read. Only the roles that serve A2A use
+    /// it.
+    pub model_choices: Option<adam_a2a::ModelChoices>,
     /// The commands the agent's card lists (`commands/v1`), when it lists any: the backend then
     /// expands a message that names one. `None`: the extension is never read. Only the roles that
     /// serve A2A use it.
@@ -238,6 +243,7 @@ impl Agents {
             options: RuntimeOptions::default(),
             inbound: None,
             access_tiers: None,
+            model_choices: None,
             commands: None,
             child_sessions: None,
             components: Vec::new(),
@@ -312,6 +318,18 @@ impl Agents {
 }
 
 impl Agents {
+    /// The agent offers `choices` of `model-pick/v1`: list them on the card
+    /// ([`ExtensionConfig::model_pick`](adam_a2a::ExtensionConfig::model_pick)) and the backend
+    /// reads the pick of a message that activated it. See
+    /// [`Agents::model_choices`](struct@Agents#structfield.model_choices).
+    #[must_use]
+    pub fn model_choices(mut self, choices: adam_a2a::ModelChoices) -> Self {
+        self.model_choices = Some(choices);
+        self
+    }
+}
+
+impl Agents {
     /// The agent serves `commands` (`commands/v1`): list them on the card
     /// ([`ExtensionConfig::commands`](adam_a2a::ExtensionConfig::commands)) and the backend
     /// expands a message that names one. See [`Agents::commands`](struct@Agents#structfield.commands).
@@ -340,6 +358,7 @@ impl std::fmt::Debug for Agents {
             .field("options", &self.options)
             .field("inbound", &self.inbound.is_some())
             .field("access_tiers", &self.access_tiers)
+            .field("model_choices", &self.model_choices)
             .field("commands", &self.commands.as_ref().map(|c| !c.is_empty()))
             .field("child_sessions", &self.child_sessions.is_some())
             .field(
@@ -695,6 +714,7 @@ async fn run(
         options,
         inbound,
         access_tiers,
+        model_choices,
         commands,
         child_sessions,
         components,
@@ -720,6 +740,7 @@ async fn run(
     )
     .with_inbound(inbound)
     .with_access_tiers(access_tiers)
+    .with_model_choices(model_choices)
     .with_commands(commands)
     .with_child_sessions(child_sessions.clone());
     // The card lists the extension if and only if this process serves it.
@@ -727,6 +748,11 @@ async fn run(
     if let (Some(card), Some(locale)) = (card.as_mut(), &config.default_locale) {
         card.extensions
             .push(adam_a2a::ExtensionConfig::locale(locale));
+    }
+    if let (Some(card), Some(choices)) = (card.as_mut(), service.model_choices())
+        && let Some(extension) = adam_a2a::ExtensionConfig::model_pick(choices)
+    {
+        card.extensions.push(extension);
     }
     if role.runs_control_plane()
         && let Some(sessions) = &child_sessions

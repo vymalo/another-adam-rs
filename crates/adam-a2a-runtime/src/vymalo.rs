@@ -813,9 +813,10 @@ mod tests {
         assert_eq!(inbound.payload, json!(3));
     }
 
-    /// A served agent's front never reads the model a run is asked of: only the embedded engine's
-    /// own inbound does (ADR 0064, amended 2026-11-23), so a remote caller cannot choose what a run
-    /// costs by sending `vymalo.model`.
+    /// The inbound function never reads the model a message names: `vymalo.model` reaches a run
+    /// through `model-pick/v1` only, which the backend writes from an activated message and only
+    /// for an alias the card offers (ADR 0064, amended 2026-11-23). A message's metadata alone
+    /// therefore cannot choose what a run costs.
     #[test]
     fn a_served_front_ignores_the_model_a_message_names() {
         let message = with_metadata(

@@ -40,6 +40,7 @@ mod files_in;
 mod ids;
 mod list;
 mod model_park;
+mod model_pick;
 mod person;
 #[cfg(feature = "push")]
 mod push;
@@ -68,6 +69,7 @@ pub use files_in::{MAX_INBOUND_IMAGE_BYTES, MAX_INBOUND_IMAGES};
 pub use ids::task_id_for;
 pub use list::MAX_SCAN;
 pub use model_park::NOT_PARKED;
+pub use model_pick::CONTEXT_MODEL;
 pub use person::{CONTEXT_PERSON, person_said};
 #[cfg(feature = "push")]
 pub use push::StorePushStore;
