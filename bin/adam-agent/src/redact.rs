@@ -105,7 +105,9 @@ pub fn scrub(secrets: &[String], text: &str) -> String {
     let mut at = 0;
     while at < text.len() {
         let matched = secrets.iter().find(|secret| {
-            text[at..].starts_with(secret.as_str())
+            // An empty needle would match here and advance nothing: the loop would never end.
+            !secret.is_empty()
+                && text[at..].starts_with(secret.as_str())
                 && adam_llm_agent::is_value_position(text, at, secret.len())
         });
         if let Some(secret) = matched {
@@ -311,5 +313,11 @@ mod tests {
             "x [redacted: secret removed, do not reuse] y [redacted: secret removed, do not reuse] z"
         );
         assert_eq!(scrub(&secrets, "nothing"), "nothing");
+        // An empty needle matches everywhere and advances nothing: it is skipped, not looped on.
+        assert_eq!(scrub(&["".to_owned()], "nothing"), "nothing");
+        assert_eq!(
+            scrub(&["".to_owned(), "abcd".to_owned()], "x abcd"),
+            "x [redacted: secret removed, do not reuse]"
+        );
     }
 }

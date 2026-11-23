@@ -292,30 +292,48 @@ impl Redactor {
     /// a tool error and a question are free text that leaves the process, never code a model reads
     /// back, so a secret inside a longer token is replaced too.
     pub fn scrub_string(&self, text: String) -> String {
-        match self.scrub(&text) {
-            Cow::Borrowed(_) => text,
-            Cow::Owned(clean) => clean,
-        }
+        self.scrub_once(&text, false).unwrap_or(text)
     }
 
-    /// [`scrub`](Self::scrub) for an owned string, at the **whole-value** sites: a needle is
+    /// [`scrub`](Self::scrub) for an owned string, at the **whole-value** sites: an ordinary word is
     /// replaced only where it is a value ([`adam_llm_agent::is_value_position`]), so a held secret
     /// that is also an ordinary word is kept where it is an identifier (`fn postgres_handler`,
     /// `my_postgres_pool`). For the text a model reads back as code: a tool's result, a kept output,
     /// a file an artifact carries, a step's input and output, a JSON string value.
+    ///
+    /// Only an ordinary word takes the rule: a value with a digit, a capital, `_`, `-` or a Base64
+    /// form is never an identifier in code, and is replaced wherever it stands — the bench's
+    /// `cG9zdGdyZXM=` glued to other text included.
     pub fn scrub_values(&self, text: String) -> String {
+        self.scrub_once(&text, true).unwrap_or(text)
+    }
+
+    /// `text` scrubbed once, leftmost and then longest, with `values_only` choosing the whole-value
+    /// rule for ordinary words; `None` when nothing was replaced. A mark already in the text is not
+    /// scanned again: a scrub that runs twice (the coder settles an output, then the redacting
+    /// layer scrubs the result) must not rewrite the mark it wrote, and a registered value that is
+    /// a word of the mark (`secret`) would otherwise nest inside it.
+    fn scrub_once(&self, text: &str, values_only: bool) -> Option<String> {
         let known = self.read();
         let Some(automaton) = &known.automaton else {
-            return match sequential_scrub_values(&known.needles, &text) {
-                Cow::Borrowed(_) => text,
-                Cow::Owned(clean) => clean,
+            return match sequential_scrub_values(&known.needles, text, values_only) {
+                Cow::Borrowed(_) => None,
+                Cow::Owned(clean) => Some(clean),
             };
         };
         let mut out: Option<String> = None;
         let mut copied = 0;
         for found in automaton.find_iter(text.as_bytes()) {
             let len = found.end() - found.start();
-            if !adam_llm_agent::is_value_position(&text, found.start(), len) {
+            let word = known
+                .needles
+                .get(found.pattern().as_usize())
+                .is_some_and(|needle| is_ordinary_word(needle));
+            if inside_the_mark(text, found.start())
+                || (values_only
+                    && word
+                    && !adam_llm_agent::is_value_position(text, found.start(), len))
+            {
                 continue;
             }
             let clean = out.get_or_insert_with(|| String::with_capacity(text.len()));
@@ -323,13 +341,10 @@ impl Redactor {
             clean.push_str(REDACTED);
             copied = found.end();
         }
-        match out {
-            Some(mut clean) => {
-                clean.push_str(&text[copied..]);
-                clean
-            }
-            None => text,
-        }
+        out.map(|mut clean| {
+            clean.push_str(&text[copied..]);
+            clean
+        })
     }
 
     /// `text` scrubbed, then cut to [`MAX_FAILURE_TEXT`] bytes (at a character boundary, with a
@@ -360,8 +375,8 @@ impl Redactor {
                 let entries = std::mem::take(map);
                 for (key, mut v) in entries {
                     self.scrub_value(&mut v);
-                    // A key is an identifier position: a held secret that is also a word (a JSON key
-                    // like `postgres`) stays, as `fn postgres_handler` does.
+                    // A key is not scrubbed: it names a field (S-4G7Y's ruling). A held value that
+                    // is also a word (`postgres`) would otherwise rename the field.
                     map.insert(key, v);
                 }
             }
@@ -370,31 +385,54 @@ impl Redactor {
     }
 }
 
-/// The sequential replacement [`Redactor::scrub_values`] makes when the automaton could not be
-/// built: the same rule, one needle at a time, so a build that fails cannot change the semantics.
-fn sequential_scrub_values<'a>(needles: &[String], text: &'a str) -> Cow<'a, str> {
+/// The sequential replacement [`Redactor::scrub_once`] makes when the automaton could not be
+/// built: the same two rules, one needle at a time, so a build that fails cannot change the
+/// semantics.
+fn sequential_scrub_values<'a>(
+    needles: &[String],
+    text: &'a str,
+    values_only: bool,
+) -> Cow<'a, str> {
     let mut out = Cow::Borrowed(text);
     for needle in needles {
-        if out.contains(needle.as_str()) {
-            let mut next = String::with_capacity(out.len());
-            let mut at = 0;
-            while let Some(found) = out[at..].find(needle.as_str()) {
-                let start = at + found;
-                let end = start + needle.len();
-                if adam_llm_agent::is_value_position(&out, start, needle.len()) {
-                    next.push_str(&out[at..start]);
-                    next.push_str(REDACTED);
-                    at = end;
-                } else {
-                    next.push_str(&out[at..end]);
-                    at = end;
-                }
-            }
-            next.push_str(&out[at..]);
-            out = Cow::Owned(next);
+        if !out.contains(needle.as_str()) {
+            continue;
         }
+        let rule = values_only && is_ordinary_word(needle);
+        let mut next = String::with_capacity(out.len());
+        let mut at = 0;
+        while let Some(found) = out[at..].find(needle.as_str()) {
+            let start = at + found;
+            let end = start + needle.len();
+            next.push_str(&out[at..start]);
+            if rule && !adam_llm_agent::is_value_position(&out, start, needle.len())
+                || inside_the_mark(&out, start)
+            {
+                next.push_str(&out[start..end]);
+            } else {
+                next.push_str(REDACTED);
+            }
+            at = end;
+        }
+        next.push_str(&out[at..]);
+        out = Cow::Owned(next);
     }
     out
+}
+
+/// Whether `needle` is an ordinary word: lowercase ASCII letters only, so that it can be an
+/// identifier in code (`postgres`, `password`). A token with a digit, a capital, `_`, `-` or a
+/// Base64 form cannot be one, and is replaced wherever it stands.
+fn is_ordinary_word(needle: &str) -> bool {
+    !needle.is_empty() && needle.bytes().all(|b| b.is_ascii_lowercase())
+}
+
+/// Whether `at` falls inside a [`REDACTED`] mark already in `text`: the mark starts at most
+/// `REDACTED.len() - 1` bytes before `at`, so the text before it ends with one of the mark's proper
+/// prefixes. (The mark is ASCII, so every prefix is a string slice.)
+fn inside_the_mark(text: &str, at: usize) -> bool {
+    let head = &text[..at];
+    (1..REDACTED.len()).any(|k| head.len() >= k && head.ends_with(&REDACTED[..k]))
 }
 
 /// The sequential replacement [`Redactor::scrub`] made before it had an automaton: kept for a
@@ -594,16 +632,59 @@ mod tests {
         );
         // The fallback a failed automaton build takes keeps the rule.
         assert_eq!(
-            sequential_scrub_values(&["postgres".into()], "fn postgres_handler() {}"),
+            sequential_scrub_values(&["postgres".into()], "fn postgres_handler() {}", true),
             "fn postgres_handler() {}"
         );
         assert_eq!(
             sequential_scrub_values(
                 &["postgres".into()],
-                "postgres://postgres:postgres@db:5432/app"
+                "postgres://postgres:postgres@db:5432/app",
+                true
             ),
             format!("postgres://{marker}:{marker}@db:5432/app")
         );
+        // The message rule takes the identifier too, and a mark already there is not rewritten.
+        assert_eq!(
+            sequential_scrub_values(&["postgres".into()], "fn postgres_handler() {}", false),
+            format!("fn {marker}_handler() {{}}")
+        );
+        assert_eq!(
+            sequential_scrub_values(&["secret".into()], &format!("a {marker} b"), true),
+            format!("a {marker} b")
+        );
+    }
+
+    /// A value that is not an ordinary word is never an identifier, so it is replaced wherever it
+    /// stands: a Base64 form glued to other text (`x cG9zdGdyZXM=abc`) is not kept because the byte
+    /// after it is a letter.
+    #[test]
+    fn a_base64_form_glued_to_text_is_still_replaced() {
+        let r = Redactor::new(["postgres"]);
+        let b64 = STANDARD.encode("postgres");
+        assert_eq!(
+            r.scrub_values(format!("x {b64}abc")),
+            format!("x {REDACTED}abc")
+        );
+        // The bare word is an ordinary one: as an identifier it stays, as a value it goes.
+        assert_eq!(
+            r.scrub_values("fn postgres_handler() {}".into()),
+            "fn postgres_handler() {}"
+        );
+    }
+
+    /// A scrub that runs twice (the coder settles an output, then the redacting layer scrubs the
+    /// result) does not rewrite the mark it wrote, even when a registered value is a word of it.
+    #[test]
+    fn the_mark_is_idempotent() {
+        let r = Redactor::new(["secret"]);
+        for once in [
+            r.scrub_values("password=secret".into()),
+            r.scrub_string("password=secret".into()),
+        ] {
+            assert_eq!(once, format!("password={REDACTED}"));
+            assert_eq!(r.scrub_values(once.clone()), once);
+            assert_eq!(r.scrub_string(once.clone()), once);
+        }
     }
 
     /// The two whole-value sites besides a plain text result: a JSON string value and step IO. The
