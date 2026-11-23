@@ -1,7 +1,6 @@
 # 0069. The interface language is a hint, and a hint is all it is
 
-Status: **Accepted** (2026-11-22). The owner decided on 2026-11-22, in the plan `2026-11-22-languages.md` of
-`another-context` (decisions 14 to 17), that an agent answers in the interface language by default and in the person's
+Status: **Accepted** (2026-11-22). The owner decided on 2026-11-22 that an agent answers in the interface language by default and in the person's
 own language when they write in another, and that the languages a deployment offers are its configuration. This ADR
 is the adam-rs side; the client half is the orchestration layer's.
 
