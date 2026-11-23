@@ -1,7 +1,6 @@
 # 0069. The interface language is a hint, and a hint is all it is
 
-Status: **Accepted** (2026-11-22). The owner decided on 2026-11-22, in the plan `2026-11-22-languages.md` of
-`another-context` (decisions 14 to 17), that an agent answers in the interface language by default and in the person's
+Status: **Accepted** (2026-11-22). The owner decided on 2026-11-22 that an agent answers in the interface language by default and in the person's
 own language when they write in another, and that the languages a deployment offers are its configuration. This ADR
 is the adam-rs side; the client half is the orchestration layer's.
 
@@ -124,6 +123,7 @@ hint never fills that text (decision 3).
    cleared by a message that names none, beside `access-tier/v1`'s handling, and among the protected keys so a
    dropped context keeps it. **Built.**
 3. `adam-coder` and `adam-agent`: the card entry from the deployment's own tag and that tag's variable in
-   `deploy/coder`.
+   `deploy/coder`. **Built.** The variable is `DEFAULT_LOCALE`, read by `adam-service` for every binary and
+   role (a malformed tag exits 78); the chart carries it through `config.extraEnv`, with no value of its own.
 4. The client half: the orchestrator sends the person's interface locale with each message, activated per message,
    and keeps it with the message (`vymalo/another-agentic-system`).

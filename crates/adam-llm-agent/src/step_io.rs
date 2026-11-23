@@ -28,11 +28,11 @@ type Redact = Arc<dyn Fn(&str) -> String + Send + Sync>;
 /// How a tool call's step reports its input and output: what is scrubbed first, and how much is kept.
 ///
 /// ```
-/// use adam_llm_agent::StepIo;
+/// use adam_llm_agent::{StepIo, REDACTED_MARKER};
 ///
 /// // Scrub a value this process holds, and keep less than the contract allows.
 /// let io = StepIo::default()
-///     .redact(|text| text.replace("hunter2-hunter2", "[redacted]"))
+///     .redact(|text| text.replace("hunter2-hunter2", REDACTED_MARKER))
 ///     .output_max(2048);
 /// # let _ = io;
 /// ```
@@ -79,7 +79,8 @@ impl StepIo {
 
     /// Scrub every string of a call's arguments (and every key) and of its result with `redact`
     /// before they are sent. It sees one string at a time and must return it with what is secret
-    /// replaced (by `[redacted]`, say); it is called on every call of every tool, so it should be
+    /// replaced (by [`REDACTED_MARKER`](crate::REDACTED_MARKER), say); it is called on every call of every
+    /// tool, so it should be
     /// cheap, and it must not fail.
     #[must_use]
     pub fn redact(mut self, redact: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
@@ -160,9 +161,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::REDACTED_MARKER;
 
     fn secret_out(text: &str) -> String {
-        text.replace("hunter2-hunter2", "[redacted]")
+        text.replace("hunter2-hunter2", crate::REDACTED_MARKER)
     }
 
     #[test]
@@ -178,7 +180,11 @@ mod tests {
         assert_eq!(max, STEP_INPUT_MAX_BYTES);
         assert_eq!(
             Value::Object(input),
-            json!({"url": "https://u:[redacted]@h/x", "headers": {"[redacted]": ["a [redacted] b", 3]}, "n": 1})
+            json!({
+                "url": format!("https://u:{REDACTED_MARKER}@h/x"),
+                "headers": {REDACTED_MARKER: [format!("a {REDACTED_MARKER} b"), 3]},
+                "n": 1
+            })
         );
     }
 

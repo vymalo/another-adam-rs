@@ -103,7 +103,7 @@ async fn declared_env_expanded_into_child() {
     // credential). `(unset)` or a different text would not have been replaced.
     let greeting = call(&tools, "t__env", json!({"name": "GREETING"})).await;
     assert!(!greeting.is_error, "{}", greeting.content);
-    assert_eq!(greeting.content, "[REDACTED]");
+    assert_eq!(greeting.content, adam_llm_agent::REDACTED_MARKER);
     assert!(!greeting.content.contains("hello"));
     // A default written in the file is not a secret: it is in the file already.
     assert_eq!(
@@ -325,7 +325,13 @@ async fn stderr_is_logged_without_expanded_values() {
     })
     .await;
     let text = logs.text();
-    assert!(text.contains("echoing the variable: [REDACTED]"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "echoing the variable: {}",
+            adam_llm_agent::REDACTED_MARKER
+        )),
+        "{text}"
+    );
     assert!(!text.contains(secret), "the secret is in the logs");
     servers.shutdown().await;
 }

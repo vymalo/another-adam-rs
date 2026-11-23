@@ -94,6 +94,292 @@ impl Tool for Pinner {
     }
 }
 
+/// A group's tool, withheld until the run loads the group.
+struct Docs;
+
+#[async_trait]
+impl Tool for Docs {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "docs__search".into(),
+            description: "searches the docs".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("docs__search-out"))
+    }
+}
+
+/// A loaded group's tool that the source keeps withholding: the tier of a message did not show
+/// it, so the request that followed did not carry it and the loop journals it as removed.
+struct Read;
+
+#[async_trait]
+impl Tool for Read {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "docs__read".into(),
+            description: "reads a doc".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("docs__read-out"))
+    }
+}
+
+/// A third group member: the access tier hides it once, without the group shrinking.
+struct Page;
+
+#[async_trait]
+impl Tool for Page {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "docs__page".into(),
+            description: "reads a page".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("docs__page-out"))
+    }
+}
+
+/// The `load__group__docs` loader of the tests.
+struct LoadDocs;
+
+#[async_trait]
+impl Tool for LoadDocs {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "load__group__docs".into(),
+            description: "loads the docs group".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let mut loaded: Vec<adam_llm_agent::Loaded> = ctx.loaded().to_vec();
+        loaded.push(adam_llm_agent::Loaded {
+            loader: "load__group__docs".into(),
+            tools: vec![
+                "docs__search".into(),
+                "docs__read".into(),
+                "docs__page".into(),
+            ],
+            note: "the docs words".into(),
+            note_is_server: true,
+        });
+        let mut out = ToolOutput::text("loaded the docs group\nthe docs words");
+        out.loaded = loaded;
+        Ok(out)
+    }
+}
+
+/// The group's source: withholds its members until the group is loaded, and can hide one member
+/// like the access tier does (`transient`, once), leave one out of the group (`shrunk`), or hide
+/// them all (`hide_all`).
+struct DocsSource {
+    /// Withhold `docs__page` on the first request after the load, then allow it: the tier of a low
+    /// message, which is per message and not a removal for an explicit load.
+    transient: Arc<AtomicBool>,
+    /// `docs__read` left the group: the definition shrank, so it is a permanent removal.
+    shrunk: bool,
+    /// The task's keywords load the group: its tools are never withheld, and the recap must name it.
+    by_task: bool,
+    /// The tier hides every member on this request: the request does not grow.
+    hide_all: bool,
+}
+
+impl DocsSource {
+    fn loaded(&self, ctx: &adam_llm_agent::SourceCtx) -> bool {
+        (self.by_task
+            && ctx
+                .task()
+                .is_some_and(|task| task.to_lowercase().contains("docs")))
+            || ctx
+                .loaded()
+                .iter()
+                .any(|one| one.loader == "load__group__docs")
+    }
+
+    fn members(&self) -> Vec<ToolSpec> {
+        let mut members = vec![Docs.spec(), Page.spec()];
+        if !self.shrunk {
+            members.insert(1, Read.spec());
+        }
+        members
+    }
+}
+
+#[async_trait]
+impl adam_llm_agent::ToolSource for DocsSource {
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    async fn appended(&self, ctx: &adam_llm_agent::SourceCtx) -> Vec<ToolSpec> {
+        if self.by_task || !self.loaded(ctx) {
+            Vec::new()
+        } else {
+            self.members()
+        }
+    }
+
+    async fn loaded_by_task(&self, ctx: &adam_llm_agent::SourceCtx) -> Vec<adam_llm_agent::Loaded> {
+        if self.by_task && self.loaded(ctx) {
+            vec![adam_llm_agent::Loaded {
+                loader: "load__group__docs".into(),
+                tools: self
+                    .members()
+                    .iter()
+                    .map(|spec| spec.name.clone())
+                    .collect(),
+                note: "the docs words".into(),
+                note_is_server: true,
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn loaded_tools(&self, ctx: &adam_llm_agent::SourceCtx) -> Option<Vec<String>> {
+        Some(if self.loaded(ctx) {
+            self.members()
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect()
+        } else {
+            Vec::new()
+        })
+    }
+
+    async fn loaders(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<adam_llm_agent::Loader> {
+        if self.by_task {
+            return Vec::new();
+        }
+        vec![adam_llm_agent::Loader {
+            name: "load__group__docs".into(),
+            holds: self
+                .members()
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect(),
+            note: "the docs words".into(),
+            note_is_server: true,
+        }]
+    }
+
+    async fn withhold(
+        &self,
+        ctx: &adam_llm_agent::SourceCtx,
+        tools: &[&str],
+    ) -> Vec<adam_llm_agent::Withheld> {
+        let mut held = Vec::new();
+        for tool in tools {
+            if ctx.removed_tools().iter().any(|removed| removed == tool) {
+                held.push(adam_llm_agent::Withheld::new(
+                    *tool,
+                    format!("`{tool}` is not available in this conversation now"),
+                ));
+                continue;
+            }
+            if !self.loaded(ctx) {
+                if *tool == "docs__search" || *tool == "docs__read" || *tool == "docs__page" {
+                    held.push(adam_llm_agent::Withheld::new(
+                        *tool,
+                        format!("`{tool}` is not loaded for this run"),
+                    ));
+                }
+                continue;
+            }
+            if self.hide_all {
+                held.push(adam_llm_agent::Withheld::new(
+                    *tool,
+                    format!("`{tool}` is not shown by this message's access tier"),
+                ));
+                continue;
+            }
+            if self.shrunk && *tool == "docs__read" {
+                held.push(adam_llm_agent::Withheld::new(
+                    *tool,
+                    format!("`{tool}` is not loaded for this run"),
+                ));
+                continue;
+            }
+            if *tool == "docs__page" && self.transient.swap(false, SeqCst) {
+                held.push(adam_llm_agent::Withheld::new(
+                    *tool,
+                    format!("`{tool}` is not shown by this message's access tier"),
+                ));
+            }
+        }
+        held
+    }
+
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        None
+    }
+}
+
+fn with_docs(
+    builder: LlmAgentBuilder,
+    transient: Arc<AtomicBool>,
+    shrunk: bool,
+    by_task: bool,
+    hide_all: bool,
+) -> LlmAgentBuilder {
+    builder
+        .tool(Docs)
+        .tool(Read)
+        .tool(Page)
+        .tool(LoadDocs)
+        .tool_source(DocsSource {
+            transient,
+            shrunk,
+            by_task,
+            hide_all,
+        })
+}
+
+/// A source whose group is never loaded: the recap lists its loader under "Loaders still
+/// available".
+struct RepoSource;
+
+#[async_trait]
+impl adam_llm_agent::ToolSource for RepoSource {
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    async fn loaders(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<adam_llm_agent::Loader> {
+        vec![adam_llm_agent::Loader {
+            name: "load__group__repo".into(),
+            holds: vec!["repo__status".into()],
+            note: String::new(),
+            note_is_server: false,
+        }]
+    }
+
+    async fn loaded_tools(&self, _ctx: &adam_llm_agent::SourceCtx) -> Option<Vec<String>> {
+        Some(Vec::new())
+    }
+
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        None
+    }
+}
+
 /// Writes the plan.
 struct Planner;
 
@@ -301,6 +587,17 @@ impl Rig {
 
     async fn start(&self) -> RunId {
         self.start_in(None).await
+    }
+
+    /// Start with a task of the test's choosing, for the keyword trigger.
+    async fn start_task(&self, task: &str) -> RunId {
+        let run = self
+            .rt
+            .start("llm", user_message(task), None)
+            .await
+            .expect("start");
+        *self.arm.run.lock().unwrap() = Some(run);
+        run
     }
 
     /// A failed commit is retried after a backoff of the runtime's clock, which only this moves.
@@ -627,6 +924,316 @@ async fn the_task_plan_pinned_results_and_kept_pointers_survive() {
         state.plan.as_ref().unwrap().title.as_deref(),
         Some("Fix the parser")
     );
+}
+
+/// The marker a compaction writes lists what the run loaded, written by code from the state: the
+/// loader, its tools, and its note.
+#[tokio::test]
+async fn the_recap_lists_the_loaded_tools_after_a_compaction() {
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        with_docs(b, Arc::new(AtomicBool::new(false)), false, false, false).tool_source(RepoSource)
+    });
+    let run = rig.start().await;
+    rig.mock
+        .push_tool_calls(vec![call("c0", "load__group__docs", json!({}))])
+        .push_tool_calls(vec![call("c1", "docs__search", json!({}))])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_tool_calls(vec![big("c4", 1200)])
+        .push_text("SUMMARY: loaded the docs and searched them")
+        .push_tool_calls(vec![big("c5", 50)])
+        .push_text("done");
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(split(&requests).1.len(), 1, "one summary request");
+    assert_eq!(state.compactions.len(), 1, "the history was compacted");
+    assert!(state.is_omission_marker(0, 1));
+    let marker = state.messages[0].text();
+    assert!(marker.contains("load__group__docs"), "{marker}");
+    assert!(
+        marker.contains("docs__search"),
+        "the loaded tool is listed: {marker}"
+    );
+    assert!(
+        marker.contains("the docs words"),
+        "the group's note is listed: {marker}"
+    );
+    assert!(
+        !marker.contains("big"),
+        "a tool the run never loaded is not listed: {marker}"
+    );
+    assert!(
+        marker.contains("Loaders still available"),
+        "the loader that is still there is listed: {marker}"
+    );
+    assert!(marker.contains("load__group__repo"), "{marker}");
+}
+
+/// A loaded tool a request did not carry is journaled as removed, left out of the recap, and a call
+/// to it is refused: lazy never widens access.
+#[tokio::test]
+async fn a_tool_removed_before_the_compaction_is_absent_from_the_recap_and_refused() {
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        with_docs(b, Arc::new(AtomicBool::new(false)), true, false, false)
+    });
+    let run = rig.start().await;
+    rig.mock
+        .push_tool_calls(vec![call("c0", "load__group__docs", json!({}))])
+        .push_tool_calls(vec![call("c1", "docs__search", json!({}))])
+        .push_tool_calls(vec![call("c2", "docs__read", json!({}))])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_tool_calls(vec![big("c4", 1200)])
+        .push_tool_calls(vec![big("c5", 1200)])
+        .push_text("SUMMARY: loaded and searched")
+        .push_tool_calls(vec![big("c6", 50)])
+        .push_text("done");
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "the history was compacted");
+    assert!(
+        state.removed_tools.iter().any(|tool| tool == "docs__read"),
+        "the request did not carry it: {:?}",
+        state.removed_tools
+    );
+    let marker = state.messages[0].text();
+    assert!(marker.contains("docs__search"), "{marker}");
+    assert!(
+        !marker.contains("docs__read"),
+        "a removed tool is not in the recap: {marker}"
+    );
+    // The call was refused, before the compaction and in the history the model reads.
+    let text = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("not available in this conversation now"),
+        "the removed tool is refused: {text}"
+    );
+    assert!(
+        !text.contains("docs__read-out"),
+        "the removed tool did not run: {text}"
+    );
+}
+
+/// A tool the tier hides on one message is not a removal: the request after it carries the tool
+/// again, the recap still lists it, and the tool runs.
+#[tokio::test]
+async fn a_transiently_withheld_tool_is_not_a_removal() {
+    let transient = Arc::new(AtomicBool::new(true));
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        with_docs(b, Arc::clone(&transient), false, false, false)
+    });
+    let run = rig.start().await;
+    rig.mock
+        .push_tool_calls(vec![call("c0", "load__group__docs", json!({}))])
+        .push_tool_calls(vec![call("c1", "docs__search", json!({}))])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_tool_calls(vec![big("c4", 1200)])
+        .push_text("SUMMARY: loaded and searched")
+        .push_tool_calls(vec![call("c5", "docs__page", json!({}))])
+        .push_text("done");
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "the history was compacted");
+    assert!(
+        state.removed_tools.is_empty(),
+        "the tier hid it on one message, it is not removed: {:?}",
+        state.removed_tools
+    );
+    let marker = state.messages[0].text();
+    assert!(
+        marker.contains("docs__page"),
+        "the recap still lists it: {marker}"
+    );
+    let text = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("docs__page-out"),
+        "a later request carried it and it ran: {text}"
+    );
+    assert!(
+        !text.contains("not available in this conversation now"),
+        "it was never refused as removed: {text}"
+    );
+}
+
+/// A load whose tools the tier hides on the request after it records no growth: the final request
+/// did not carry them.
+#[tokio::test]
+async fn a_load_whose_tools_are_all_hidden_records_no_growth() {
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        with_docs(b, Arc::new(AtomicBool::new(false)), false, false, true)
+    });
+    let run = rig.start().await;
+    rig.mock
+        .push_tool_calls(vec![call("c0", "load__group__docs", json!({}))])
+        .push_text("done");
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.loaded.len(), 1);
+    assert!(
+        state.tools_appended.is_empty(),
+        "the request did not grow: {:?}",
+        state.tools_appended
+    );
+}
+
+/// A tier hide and a shrink in one run: the shrunk member is removed, the tier-hidden one is not
+/// (the explicit load appends it again), and the recap tells them apart.
+#[tokio::test]
+async fn a_tier_hide_and_a_shrink_in_one_run() {
+    let transient = Arc::new(AtomicBool::new(true));
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        with_docs(b, Arc::clone(&transient), true, false, false)
+    });
+    let run = rig.start().await;
+    rig.mock
+        .push_tool_calls(vec![call("c0", "load__group__docs", json!({}))])
+        .push_tool_calls(vec![call("c1", "docs__search", json!({}))])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_tool_calls(vec![big("c4", 1200)])
+        .push_text("SUMMARY: loaded")
+        .push_tool_calls(vec![call("c5", "docs__page", json!({}))])
+        .push_text("done");
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(
+        state.removed_tools,
+        ["docs__read"],
+        "only the shrunk member is removed"
+    );
+    let marker = state.messages[0].text();
+    assert!(marker.contains("docs__page"), "{marker}");
+    assert!(!marker.contains("docs__read"), "{marker}");
+    let text = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("docs__page-out"), "{text}");
+}
+
+/// A task-loaded member the tier hides is permanent: it would otherwise appear later at its
+/// registration position, an insertion rather than a suffix (ADR 0044, decision 1).
+#[tokio::test]
+async fn a_task_loaded_tier_hide_is_permanent() {
+    let transient = Arc::new(AtomicBool::new(true));
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        with_docs(b, Arc::clone(&transient), false, true, false)
+    });
+    let run = rig.start_task("read the docs").await;
+    rig.mock
+        .push_tool_calls(vec![big("c0", 1200)])
+        .push_tool_calls(vec![big("c1", 1200)])
+        .push_tool_calls(vec![call("c2", "docs__page", json!({}))])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_tool_calls(vec![big("c4", 1200)])
+        .push_text("SUMMARY: read the docs")
+        .push_tool_calls(vec![big("c5", 50)])
+        .push_text("done");
+    let (requests, state) = rig.finish(run).await;
+    assert!(
+        state.removed_tools.iter().any(|tool| tool == "docs__page"),
+        "the tier-hidden task member is removed: {:?}",
+        state.removed_tools
+    );
+    let marker = state.messages[0].text();
+    assert!(!marker.contains("docs__page"), "{marker}");
+    let text = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("not available in this conversation now"),
+        "the removed member is refused: {text}"
+    );
+    assert!(!text.contains("docs__page-out"), "{text}");
+}
+
+/// A group the task's keywords loaded is journaled on the first turn, so the recap names it, and
+/// it records no growth: its tools were never withheld.
+#[tokio::test]
+async fn the_recap_names_a_task_loaded_group() {
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        with_docs(b, Arc::new(AtomicBool::new(false)), false, true, false)
+    });
+    let run = rig.start_task("read the docs").await;
+    rig.mock
+        .push_tool_calls(vec![big("c0", 1200)])
+        .push_tool_calls(vec![big("c1", 1200)])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_text("SUMMARY: read the docs")
+        .push_tool_calls(vec![big("c4", 50)])
+        .push_text("done");
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "the history was compacted");
+    assert!(
+        state.tools_appended.is_empty(),
+        "a task-loaded group records no growth: {:?}",
+        state.tools_appended
+    );
+    let marker = state.messages[0].text();
+    assert!(
+        marker.contains("load__group__docs"),
+        "the recap names the group: {marker}"
+    );
+    assert!(marker.contains("docs__search"), "{marker}");
+    assert!(
+        !marker.contains("Loaders still available"),
+        "it is loaded, not available: {marker}"
+    );
+}
+
+/// A lost commit around the compaction after a load replays the same history, the same loaded set
+/// and the same recap: the recap is a pure function of the saved state.
+#[tokio::test]
+async fn a_compaction_after_a_load_replays_the_same_bytes() {
+    fn push(mock: &MockModel) {
+        mock.push_tool_calls(vec![call("c0", "load__group__docs", json!({}))])
+            .push_tool_calls(vec![call("c1", "docs__search", json!({}))])
+            .push_tool_calls(vec![big("c2", 1200)])
+            .push_tool_calls(vec![big("c3", 1200)])
+            .push_tool_calls(vec![big("c4", 1200)])
+            .push_text("SUMMARY: loaded and searched")
+            .push_tool_calls(vec![big("c5", 50)])
+            .push_text("done");
+    }
+    let baseline = {
+        let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+            with_docs(b, Arc::new(AtomicBool::new(false)), false, false, false)
+        });
+        push(&rig.mock);
+        let run = rig.start().await;
+        rig.finish(run).await
+    };
+    assert_eq!(baseline.1.compactions.len(), 1, "the history was compacted");
+    assert_eq!(baseline.1.loaded.len(), 1);
+    for call in [5, 6] {
+        let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+            with_docs(b, Arc::new(AtomicBool::new(false)), false, false, false)
+        });
+        push(&rig.mock);
+        rig.lose_the_commit_after_call(call, true);
+        let run = rig.start().await;
+        let (_, state) = rig.finish(run).await;
+        let label = format!("lost commit after call {call}");
+        assert_eq!(rig.arm.store.injected(Method::CommitRun), 1, "{label}");
+        assert_eq!(state.messages, baseline.1.messages, "{label}");
+        assert_eq!(state.loaded, baseline.1.loaded, "{label}");
+        assert_eq!(state.tools_appended, baseline.1.tools_appended, "{label}");
+        assert!(
+            state.messages[0].text().contains("load__group__docs"),
+            "{label}: the recap survived"
+        );
+    }
 }
 
 /// Every tool result follows the assistant message that called it, in every request and in the end.

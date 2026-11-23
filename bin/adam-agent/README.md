@@ -85,7 +85,7 @@ whose messages carry none of that is not affected. **Every tool call is a step**
 title a person reads (`Ask you`, an MCP tool's own `title`, a subagent's name capitalised, [ADR 0027](../../docs/decisions/0027-every-tool-has-a-title-for-its-step.md)); running, then completed, failed or waiting for the person; with the
 call's arguments as `input` and its result as `output`, cut to 4 KiB and 8 KiB and **scrubbed of this process's secrets first**: the model's
 key, the A2A tokens, the password of `DATABASE_URL` and the value of every environment variable whose name says it is a secret, which is
-where the `${VAR}` values of an `mcp.json` come from; `redact::step_io`, [ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md))
+where the `${VAR}` values of an `mcp.json` come from; a secret is replaced where it stands as a value (`password=…`, a DSN's user and password) and kept where it is an identifier (`fn postgres_handler`), and the mark says `[redacted: secret removed, do not reuse]`; `redact::step_io`, [ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md))
 to a client that activates `steps/v1` (the
 orchestration layer's chat does when the card lists it), and a line of text to one that does not
 ([ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md)): the MCP tools of the folder, `show`,

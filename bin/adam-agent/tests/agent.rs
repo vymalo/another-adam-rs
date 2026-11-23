@@ -974,14 +974,10 @@ async fn an_mcp_tools_step_carries_its_title_input_and_output_without_the_proces
     };
     // Under the title the server gave the tool, not `test__echo`.
     assert_eq!(report(false)["label"], "Echo it back");
-    assert_eq!(
-        report(false)["input"],
-        json!({"text": "found [redacted] and [redacted] and [redacted]"})
-    );
-    assert_eq!(
-        report(true)["output"],
-        json!({"text": "found [redacted] and [redacted] and [redacted]"})
-    );
+    let marker = adam_agent::redact::REDACTED;
+    let scrubbed = format!("found {marker} and {marker} and {marker}");
+    assert_eq!(report(false)["input"], json!({"text": scrubbed}));
+    assert_eq!(report(true)["output"], json!({"text": scrubbed}));
     // What the model was told is what the tool answered: the copy for the observer is the one scrubbed.
     let everything = serde_json::to_string(&reports).unwrap();
     for secret in [FROM_THE_ENVIRONMENT, MODEL_KEY, NAMED_ONLY, MCP_TOKEN] {

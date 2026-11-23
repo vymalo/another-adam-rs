@@ -724,6 +724,10 @@ async fn run(
     .with_child_sessions(child_sessions.clone());
     // The card lists the extension if and only if this process serves it.
     let mut card = card;
+    if let (Some(card), Some(locale)) = (card.as_mut(), &config.default_locale) {
+        card.extensions
+            .push(adam_a2a::ExtensionConfig::locale(locale));
+    }
     if role.runs_control_plane()
         && let Some(sessions) = &child_sessions
     {

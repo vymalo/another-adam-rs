@@ -134,9 +134,12 @@ pub const GITHUB_TOKEN: &str = "ghp_FAKEtoken0123456789abcdefghijklmnop";
 pub const MODEL_KEY: &str = "sk-live-0123456789abcdefSECRETKEY";
 pub const A2A_TOKEN: &str = "coder-test-token";
 pub const DB_PASSWORD: &str = "pg-pa55w0rd-very-secret";
+/// A token longer than the redaction mark: what an output that scrubbing shrinks under the view
+/// needs (a shorter secret grows it, since the mark is longer).
+pub const LONG_TOKEN: &str = "ghp_FAKElongtoken0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJK";
 
 /// Every secret value above.
-pub const SECRETS: [&str; 4] = [GITHUB_TOKEN, MODEL_KEY, A2A_TOKEN, DB_PASSWORD];
+pub const SECRETS: [&str; 5] = [GITHUB_TOKEN, MODEL_KEY, A2A_TOKEN, DB_PASSWORD, LONG_TOKEN];
 
 /// The directory of the slot of the fixture's repository (`remote.git`) in a run's workspace: the
 /// repository's name.

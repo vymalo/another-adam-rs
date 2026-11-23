@@ -248,7 +248,10 @@ mod tests {
         let (out, redactor) = expand(&env, "t=${VAULT_TOKEN}").unwrap();
         assert_eq!(out, "t=from-vault");
         // What the source gave is hidden like any variable's value.
-        assert_eq!(redactor.scrub("said from-vault"), "said [REDACTED]");
+        assert_eq!(
+            redactor.scrub("said from-vault"),
+            "said [redacted: secret removed, do not reuse]"
+        );
         // Its `Missing` is the reference's, with or without a default.
         assert!(matches!(
             expand(&env, "${PATH}").unwrap_err(),
@@ -328,7 +331,7 @@ mod tests {
         assert_eq!(out, "Bearer abc-123-secret");
         assert_eq!(
             redactor.scrub("bad header `Bearer abc-123-secret`, key abc-123-secret"),
-            "bad header `[REDACTED]`, key [REDACTED]"
+            "bad header `[redacted: secret removed, do not reuse]`, key [redacted: secret removed, do not reuse]"
         );
         let (_, redactor) = expand(&Env::new(), &format!("${{{UNSET}:-info}}")).unwrap();
         assert_eq!(redactor.scrub("info"), "info");

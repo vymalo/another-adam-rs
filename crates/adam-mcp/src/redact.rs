@@ -13,7 +13,7 @@
 use url::Url;
 
 /// What replaces a secret in a message.
-pub(crate) const REDACTED: &str = "[REDACTED]";
+pub(crate) const REDACTED: &str = adam_llm_agent::REDACTED_MARKER;
 
 /// The values one server's messages must not contain, longest first (so `Bearer abc` goes before
 /// `abc`).
@@ -98,7 +98,7 @@ mod tests {
         redactor.add("");
         assert_eq!(
             redactor.scrub("sent `Bearer abc123`, then abc123 again"),
-            "sent `[REDACTED]`, then [REDACTED] again"
+            "sent `[redacted: secret removed, do not reuse]`, then [redacted: secret removed, do not reuse] again"
         );
         assert_eq!(redactor.scrub("nothing here"), "nothing here");
         // `abc123`, `Bearer abc123`, and the latter as a URL prints it (`%20`) and a form has it (`+`).
@@ -118,7 +118,10 @@ mod tests {
             "a b/ü&\"q\"",
         ] {
             let scrubbed = redactor.scrub(shown);
-            assert!(scrubbed.contains("[REDACTED]"), "{shown} -> {scrubbed}");
+            assert!(
+                scrubbed.contains("[redacted: secret removed, do not reuse]"),
+                "{shown} -> {scrubbed}"
+            );
             assert!(
                 !scrubbed.contains("%C3%BC") && !scrubbed.contains("ü"),
                 "{shown} -> {scrubbed}"
@@ -130,6 +133,9 @@ mod tests {
     fn a_short_secret_is_still_redacted_and_garbles_what_it_matches() {
         let mut redactor = Redactor::default();
         redactor.add("ab");
-        assert_eq!(redactor.scrub("a table"), "a t[REDACTED]le");
+        assert_eq!(
+            redactor.scrub("a table"),
+            "a t[redacted: secret removed, do not reuse]le"
+        );
     }
 }

@@ -162,7 +162,10 @@ mod tests {
         ] {
             let error = check("linear", text, false, &redactor).unwrap_err();
             let shown = error.to_string();
-            assert!(shown.contains("[REDACTED]"), "{shown}");
+            assert!(
+                shown.contains("[redacted: secret removed, do not reuse]"),
+                "{shown}"
+            );
             for leaked in ["tok-91ac", "sp%20ace", "sp ace", "%C3%BC", "ü"] {
                 assert!(!shown.contains(leaked), "{leaked} in {shown}");
             }

@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store as _};
+use adam_core::{DynStore, MemoryStore, RunId, RunStatus, RunUpdate, Store as _};
 use adam_llm_agent::{
     COMPACTION_TURN, Conversation, ImageStore, InboundImage, Limits, LlmAgent, LlmAgentBuilder,
-    MAX_SOURCE_TOOLS, MemoryImages, ReadOutput, SourceCtx, Tool, ToolCtx, ToolError, ToolOutput,
-    ToolSource, Withheld, keep_image, user_message, user_message_with_images,
+    MAX_SOURCE_TOOLS, MemoryImages, ReadOutput, SourceCtx, Tool, ToolAccess, ToolCtx, ToolError,
+    ToolOutput, ToolSource, Withheld, keep_image, user_message, user_message_with_images,
 };
 use adam_model::{
     DynModel, ImageLimits, ImageOrigin, InputModalities, Message, MockModel, ModelClient,
@@ -336,6 +336,57 @@ impl Rig {
             .expect("start");
         *self.arm.run.lock().unwrap() = Some(run);
         run
+    }
+
+    /// Replace the stored state of `run` with a journal written before `loaded` existed: the
+    /// transcript kept, `turns` and `loaded_servers` set, so the worker resumes at that turn.
+    async fn seed_stored_state(
+        &self,
+        run: RunId,
+        turns: u32,
+        loaded_servers: &[&str],
+        history: usize,
+    ) {
+        let record = self
+            .store
+            .load_run(run)
+            .await
+            .expect("the stored run")
+            .expect("the run exists");
+        let mut state = record.state.clone();
+        let mut conversation: Conversation =
+            serde_json::from_value(state["agent"].clone()).expect("the agent state");
+        conversation.turns = turns;
+        for n in 0..history {
+            let id = format!("old{n}");
+            conversation.messages.push(Message::Assistant {
+                content: Vec::new(),
+                tool_calls: vec![ToolCall {
+                    id: id.clone(),
+                    name: "big".into(),
+                    arguments: json!({"n": 10, "tag": "old"}),
+                    ..Default::default()
+                }],
+                reasoning: None,
+                provider: None,
+            });
+            conversation.messages.push(Message::Tool {
+                call_id: id,
+                content: format!("old{n}:{}", "x".repeat(1200)),
+                is_error: false,
+                images: Vec::new(),
+            });
+        }
+        conversation.loaded_servers = loaded_servers.iter().map(|s| (*s).to_owned()).collect();
+        // `loaded_servers` is decoded but never written by the live state: the journal the test
+        // writes is an old one, so the key goes in by hand.
+        let mut agent = serde_json::to_value(&conversation).expect("the state");
+        agent["loaded_servers"] = json!(loaded_servers);
+        state["agent"] = agent;
+        self.store
+            .commit_run(run, record.version, RunUpdate::new(record.status, state))
+            .await
+            .expect("the seeded state");
     }
 
     /// A failed commit is retried after a backoff of the runtime's clock, which only this moves.
@@ -2368,19 +2419,25 @@ async fn a_task_selected_tool_survives_a_lost_commit() {
     }
 }
 
-/// A server of MCP-like tools the run loads during itself, as `adam-assembly`'s `McpSelect` does
-/// for a server whose `when` the task did not match: withheld until the run's state names it,
-/// then appended after every other tool. `big` and `handle` are the agent's own tools; `docs__*`
-/// are this "server"'s.
+/// A group of tools the run loads during itself, as `adam-assembly`'s `Groups` does: withheld
+/// until the run's state names the group's loader, then appended after every other tool. `big` and
+/// `handle` are the agent's own tools; `docs__*` are this group's.
 struct Deferred {
-    server: &'static str,
+    group: &'static str,
     specs: Vec<ToolSpec>,
+    note: &'static str,
+    keywords: &'static [&'static str],
 }
 
 impl Deferred {
-    fn new(server: &'static str, tools: &[&str]) -> Self {
+    fn new(
+        group: &'static str,
+        tools: &[&'static str],
+        note: &'static str,
+        keywords: &'static [&'static str],
+    ) -> Self {
         Self {
-            server,
+            group,
             specs: tools
                 .iter()
                 .map(|name| ToolSpec {
@@ -2389,11 +2446,26 @@ impl Deferred {
                     parameters: json!({"type": "object", "properties": {}}),
                 })
                 .collect(),
+            note,
+            keywords,
         }
     }
 
+    fn loader(&self) -> String {
+        format!("load__group__{}", self.group)
+    }
+
+    fn matches(&self, task: Option<&str>) -> bool {
+        task.is_some_and(|task| {
+            let task = task.to_lowercase();
+            self.keywords
+                .iter()
+                .any(|word| !word.is_empty() && task.contains(&word.to_lowercase()))
+        })
+    }
+
     fn loaded(&self, ctx: &SourceCtx) -> bool {
-        ctx.loaded_servers().iter().any(|name| name == self.server)
+        self.matches(ctx.task()) || ctx.loaded().iter().any(|one| one.loader == self.loader())
     }
 }
 
@@ -2404,18 +2476,52 @@ impl ToolSource for Deferred {
     }
 
     async fn appended(&self, ctx: &SourceCtx) -> Vec<ToolSpec> {
-        if self.loaded(ctx) {
+        // A task-loaded group is not appended: its tools were never withheld.
+        if self.matches(ctx.task()) || !self.loaded(ctx) {
+            Vec::new()
+        } else {
             self.specs.clone()
+        }
+    }
+
+    async fn loaders(&self, ctx: &SourceCtx) -> Vec<adam_llm_agent::Loader> {
+        if self.matches(ctx.task()) {
+            return Vec::new();
+        }
+        vec![adam_llm_agent::Loader {
+            name: self.loader(),
+            holds: self.specs.iter().map(|spec| spec.name.clone()).collect(),
+            note: self.note.to_owned(),
+            note_is_server: true,
+        }]
+    }
+
+    async fn loaded_by_task(&self, ctx: &SourceCtx) -> Vec<adam_llm_agent::Loaded> {
+        if self.matches(ctx.task()) {
+            vec![adam_llm_agent::Loaded {
+                loader: self.loader(),
+                tools: self.specs.iter().map(|spec| spec.name.clone()).collect(),
+                note: self.note.to_owned(),
+                note_is_server: true,
+            }]
         } else {
             Vec::new()
         }
     }
 
-    /// The server's words reach the prompt only when the run has loaded it, and then they follow
-    /// everything: a load appends to the system prompt as it appends to the tools.
+    async fn loaded_tools(&self, ctx: &SourceCtx) -> Option<Vec<String>> {
+        Some(if self.loaded(ctx) {
+            self.specs.iter().map(|spec| spec.name.clone()).collect()
+        } else {
+            Vec::new()
+        })
+    }
+
+    /// The group's words reach the prompt only when the run has loaded it, and then they follow
+    /// everything: the trait's append-words mechanism.
     async fn appended_instructions(&self, ctx: &SourceCtx) -> Option<String> {
         self.loaded(ctx)
-            .then(|| format!("## {}\n\n> {} words", self.server, self.server))
+            .then(|| format!("## {}\n\n> {} words", self.group, self.group))
     }
 
     async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
@@ -2444,52 +2550,95 @@ impl ToolSource for Deferred {
     }
 }
 
-/// The `use_server` tool of `adam-assembly`, in miniature: a fixed tool whose result says which
-/// servers the run has loaded, which the loop applies to the state.
-struct Load {
-    server: &'static str,
+/// The `load__group__<name>` tool of `adam-assembly`, in miniature: a fixed tool whose result says
+/// what the run has loaded, which the loop applies to the state.
+struct LoadGroup {
+    group: &'static str,
+    tools: Vec<String>,
+    note: &'static str,
+}
+
+impl LoadGroup {
+    fn loader(&self) -> String {
+        format!("load__group__{}", self.group)
+    }
 }
 
 #[async_trait]
-impl Tool for Load {
+impl Tool for LoadGroup {
+    fn access(&self, _args: &Value) -> ToolAccess {
+        ToolAccess::Independent
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "use_server".into(),
-            description: "loads an MCP server's tools".into(),
+            name: self.loader(),
+            description: format!("loads the `{}` group", self.group),
             parameters: json!({
                 "type": "object",
-                "properties": {"name": {"type": "string"}},
-                "required": ["name"],
+                "properties": {},
                 "additionalProperties": false
             }),
         }
     }
 
-    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
-        if args["name"].as_str() != Some(self.server) {
-            return Ok(ToolOutput::error("no such server"));
-        }
-        if ctx.loaded_servers().iter().any(|name| name == self.server) {
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let loader = self.loader();
+        if ctx.loaded().iter().any(|one| one.loader == loader) {
             return Ok(ToolOutput::error("already loaded"));
         }
-        let mut loaded: Vec<String> = ctx.loaded_servers().to_vec();
-        loaded.push(self.server.to_owned());
-        let mut out = ToolOutput::text(format!("loaded {}", self.server));
-        out.loaded_servers = loaded;
+        let mut loaded: Vec<adam_llm_agent::Loaded> = ctx.loaded().to_vec();
+        loaded.push(adam_llm_agent::Loaded {
+            loader,
+            tools: self.tools.clone(),
+            note: self.note.to_owned(),
+            note_is_server: false,
+        });
+        let mut out = ToolOutput::text(format!("loaded the group {}\n{}", self.group, self.note));
+        out.loaded = loaded;
         Ok(out)
     }
 }
 
-/// The agent with a deferred "server": its tools are own tools, withheld until the run loads it.
-fn with_deferred(builder: LlmAgentBuilder) -> LlmAgentBuilder {
+/// The agent with deferred groups: their tools are own tools, withheld until the run loads them.
+fn with_groups(
+    builder: LlmAgentBuilder,
+    groups: &[(
+        &'static str,
+        &'static [&'static str],
+        &'static str,
+        &'static [&'static str],
+    )],
+) -> LlmAgentBuilder {
+    let mut builder = builder.tool(Fixed("big")).tool(Fixed("handle"));
+    for (group, tools, note, keywords) in groups {
+        for tool in *tools {
+            builder = builder.tool(Fixed(tool));
+        }
+        builder = builder
+            .tool(LoadGroup {
+                group,
+                tools: tools.iter().map(|tool| (*tool).to_owned()).collect(),
+                note,
+            })
+            .tool_source(Deferred::new(group, tools, note, keywords));
+    }
     builder
-        .tool(Fixed("docs__search"))
-        .tool(Fixed("docs__read"))
-        .tool(Load { server: "docs" })
-        .tool_source(Deferred::new("docs", &["docs__search", "docs__read"]))
 }
 
-/// An own tool that answers `<name>-out`, for the server's tools.
+fn with_deferred(builder: LlmAgentBuilder) -> LlmAgentBuilder {
+    with_groups(
+        builder,
+        &[(
+            "docs",
+            &["docs__search", "docs__read"],
+            "the docs words",
+            &[],
+        )],
+    )
+}
+
+/// An own tool that answers `<name>-out`, for a group's tools.
 struct Fixed(&'static str);
 
 #[async_trait]
@@ -2512,14 +2661,14 @@ fn tool_names(request: &ModelRequest) -> Vec<String> {
     request.tools.iter().map(|t| t.name.clone()).collect()
 }
 
-/// A `use_server` call appends the server's tools to the next request, once, and the state records
-/// the list and the turn the head moved: the tools array is the one before it plus a suffix, never
-/// an insertion, and the messages still start with the ones before.
+/// A group load appends the group's tools to the next request, once, and the state records the
+/// loader and the turn the head moved: the tools array is the one before it plus a suffix, never an
+/// insertion, and the messages still start with the ones before.
 #[tokio::test]
-async fn a_load_appends_the_servers_tools_and_records_the_turn() {
+async fn a_group_load_appends_its_tools_and_records_the_turn() {
     let rig = Rig::new(0, with_deferred);
     rig.mock
-        .push_tool_calls(vec![call("c1", "use_server", json!({"name": "docs"}))])
+        .push_tool_calls(vec![call("c1", "load__group__docs", json!({}))])
         .push_tool_calls(vec![call("c2", "docs__search", json!({}))])
         .push_text("done");
     let run = rig.start().await;
@@ -2527,13 +2676,19 @@ async fn a_load_appends_the_servers_tools_and_records_the_turn() {
     assert_eq!(requests.len(), 3);
     assert_eq!(
         tool_names(&requests[0]),
-        ["big", "handle", "use_server"],
-        "the server's tools are not shown before the run loads it"
+        ["big", "handle", "load__group__docs"],
+        "the group's tools are not shown before the run loads it"
     );
     assert_eq!(
         tool_names(&requests[1]),
-        ["big", "handle", "use_server", "docs__search", "docs__read"],
-        "the next request is the one before it plus the server's tools"
+        [
+            "big",
+            "handle",
+            "load__group__docs",
+            "docs__search",
+            "docs__read"
+        ],
+        "the next request is the one before it plus the group's tools"
     );
     assert_eq!(
         &requests[1].tools[..requests[0].tools.len()],
@@ -2544,25 +2699,19 @@ async fn a_load_appends_the_servers_tools_and_records_the_turn() {
         requests[2].tools, requests[1].tools,
         "the tools do not move again, and appear once"
     );
-    let before = requests[0].system.as_deref().unwrap_or_default();
-    let after = requests[1].system.as_deref().unwrap_or_default();
-    assert!(
-        after.starts_with(before),
-        "the system prompt at the load is the one before it plus a suffix: {after:?}"
-    );
-    assert!(
-        after.ends_with("> docs words"),
-        "the loaded server's words follow the prompt: {after:?}"
-    );
-    assert!(
-        !before.contains("docs words"),
-        "they were not there before the load: {before:?}"
-    );
     assert_eq!(
-        requests[2].system, requests[1].system,
-        "the prompt does not move again"
+        state.loaded.len(),
+        1,
+        "the load is one entry: {:?}",
+        state.loaded
     );
-    assert_eq!(state.loaded_servers, ["docs"]);
+    assert_eq!(state.loaded[0].loader, "load__group__docs");
+    assert_eq!(state.loaded[0].tools, ["docs__search", "docs__read"]);
+    assert_eq!(state.loaded[0].note, "the docs words");
+    assert_eq!(
+        state.loaders[0].name, "load__group__docs",
+        "the loaders are recorded on the first turn"
+    );
     assert_eq!(
         state.tools_appended,
         [1],
@@ -2576,12 +2725,16 @@ async fn a_load_appends_the_servers_tools_and_records_the_turn() {
     // The call to the loaded tool ran: its result is in the last request.
     let text = format!("{:?}", requests[2].messages);
     assert!(text.contains("docs__search-out"), "{text}");
+    assert!(
+        text.contains("the docs words"),
+        "the note is in the load's result: {text}"
+    );
 }
 
-/// A run that never loads a server records no break: the head is the same bytes at every request
+/// A run that never loads a group records no break: the head is the same bytes at every request
 /// and the state has no member for a load.
 #[tokio::test]
-async fn a_run_that_never_loads_a_server_records_no_break() {
+async fn a_run_that_never_loads_a_group_records_no_break() {
     let rig = Rig::new(0, with_deferred);
     rig.mock
         .push_tool_calls(vec![big("c0", 5)])
@@ -2589,20 +2742,21 @@ async fn a_run_that_never_loads_a_server_records_no_break() {
         .push_text("done");
     let run = rig.start().await;
     let (requests, state) = rig.finish(run).await;
-    assert!(state.loaded_servers.is_empty());
+    assert!(state.loaded.is_empty());
     assert!(state.tools_appended.is_empty());
     assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
     let written = serde_json::to_value(&state).unwrap();
-    assert!(written.get("loaded_servers").is_none(), "{written}");
+    assert!(written.get("loaded").is_none(), "{written}");
     assert!(written.get("tools_appended").is_none(), "{written}");
 }
 
 /// The load is state: a run whose commit is lost after the load replays the same list, the same
-/// requests and the same recorded turn, and the server's tools appear once.
+/// requests and the same recorded turn, and the group's tools appear once. A resumed run builds the
+/// same bytes.
 #[tokio::test]
-async fn a_resumed_run_reproduces_the_loaded_list() {
+async fn a_killed_run_resumes_with_the_same_bytes() {
     fn push_script(mock: &MockModel) {
-        mock.push_tool_calls(vec![call("c1", "use_server", json!({"name": "docs"}))])
+        mock.push_tool_calls(vec![call("c1", "load__group__docs", json!({}))])
             .push_tool_calls(vec![call("c2", "docs__search", json!({}))])
             .push_text("done");
     }
@@ -2612,7 +2766,7 @@ async fn a_resumed_run_reproduces_the_loaded_list() {
         let run = rig.start().await;
         rig.finish(run).await
     };
-    assert_eq!(baseline.1.loaded_servers, ["docs"]);
+    assert_eq!(baseline.1.loaded.len(), 1);
     for call in [0, 1] {
         for after_apply in [false, true] {
             let rig = Rig::new(0, with_deferred);
@@ -2622,16 +2776,15 @@ async fn a_resumed_run_reproduces_the_loaded_list() {
             let (requests, state) = rig.finish(run).await;
             let label = format!("after call {call}, applied before the loss: {after_apply}");
             assert_eq!(rig.store.injected(Method::CommitRun), 1, "{label}");
-            assert_eq!(state.loaded_servers, ["docs"], "{label}");
+            assert_eq!(state.loaded, baseline.1.loaded, "{label}");
             assert_eq!(state.tools_appended, [1], "{label}");
             assert_eq!(state.messages, baseline.1.messages, "{label}");
-            for request in &requests {
-                let once = request
-                    .tools
-                    .iter()
-                    .filter(|t| t.name == "docs__search")
-                    .count();
-                assert!(once <= 1, "{label}: the tool appears at most once");
+            for (got, want) in requests.iter().zip(&baseline.0) {
+                assert_eq!(
+                    serde_json::to_string(got).unwrap(),
+                    serde_json::to_string(want).unwrap(),
+                    "{label}: the resumed request is the baseline's bytes"
+                );
             }
             let last = requests.last().unwrap();
             assert!(
@@ -2647,10 +2800,130 @@ async fn a_resumed_run_reproduces_the_loaded_list() {
     }
 }
 
+/// The loader's schema is a constant: the same bytes at every turn of a run, before and after a
+/// load, and in a continuation, so the tool list never moves with the group's contents.
+#[tokio::test]
+async fn the_loader_schemas_are_the_same_bytes_at_every_turn() {
+    let rig = Rig::new(0, with_deferred);
+    rig.mock
+        .push_tool_calls(vec![call("c1", "load__group__docs", json!({}))])
+        .push_text("done")
+        .push_text("again");
+    // The test is about the loader's spec, which the request carries; the rig's model records it.
+    let run = rig.start().await;
+    let (requests, _) = rig.finish(run).await;
+    let spec = |request: &ModelRequest| {
+        request
+            .tools
+            .iter()
+            .find(|tool| tool.name == "load__group__docs")
+            .map(|tool| serde_json::to_string(tool).unwrap())
+            .expect("the loader is offered")
+    };
+    let first = spec(&requests[0]);
+    for request in &requests[1..] {
+        assert_eq!(spec(request), first, "the loader's bytes moved");
+    }
+}
+
+/// Two loads in one reply: the tools array grows once, at the next request, by both groups in the
+/// order the calls ran, and the state records that one turn once.
+#[tokio::test]
+async fn two_loads_in_one_reply_apply_in_order() {
+    let rig = Rig::new(0, |builder| {
+        with_groups(
+            builder,
+            &[
+                ("docs", &["docs__search"], "the docs words", &[]),
+                ("linear", &["linear__list"], "the linear words", &[]),
+            ],
+        )
+    });
+    rig.mock
+        .push_tool_calls(vec![
+            call("c1", "load__group__docs", json!({})),
+            call("c2", "load__group__linear", json!({})),
+        ])
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(
+        tool_names(&requests[1]),
+        [
+            "big",
+            "handle",
+            "load__group__docs",
+            "load__group__linear",
+            "docs__search",
+            "linear__list"
+        ],
+        "both groups' tools, in the order the calls ran"
+    );
+    assert_eq!(
+        state
+            .loaded
+            .iter()
+            .map(|one| one.loader.as_str())
+            .collect::<Vec<_>>(),
+        ["load__group__docs", "load__group__linear"]
+    );
+    assert_eq!(
+        state.tools_appended,
+        [1],
+        "the array grew once, at one request"
+    );
+    assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
+}
+
+/// Two loaders in **parallel** (no `after_previous`, `max_parallel` above one): each reads the
+/// turn-start state, so each result carries only its own entry; the loop merges them by name in
+/// call order.
+#[tokio::test]
+async fn two_loads_in_parallel_apply_in_order() {
+    let rig = Rig::new(0, |builder| {
+        with_groups(
+            builder,
+            &[
+                ("docs", &["docs__search"], "the docs words", &[]),
+                ("linear", &["linear__list"], "the linear words", &[]),
+            ],
+        )
+        .max_parallel(4)
+    });
+    rig.mock
+        .push_tool_calls(vec![
+            call("c1", "load__group__docs", json!({})),
+            call("c2", "load__group__linear", json!({})),
+        ])
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(
+        state
+            .loaded
+            .iter()
+            .map(|one| one.loader.as_str())
+            .collect::<Vec<_>>(),
+        ["load__group__docs", "load__group__linear"],
+        "the merge follows the model's call order, whatever finished first"
+    );
+    assert_eq!(
+        tool_names(&requests[1]),
+        [
+            "big",
+            "handle",
+            "load__group__docs",
+            "load__group__linear",
+            "docs__search",
+            "linear__list"
+        ],
+        "both groups' tools are appended"
+    );
+}
+
 /// A load appends to the prompt even when a source **after** the one that grows contributes words
-/// of its own (the assembly puts the MCP selector before the sources a host adds: the agents a
-/// person mentioned, the access tier, references). The loaded server's section must follow
-/// everything the request before carried, never sit between two parts of it.
+/// of its own: the loaded source's section must follow everything the request before carried,
+/// never sit between two parts of it.
 #[tokio::test]
 async fn a_load_appends_to_a_prompt_another_source_already_grew() {
     struct Always;
@@ -2677,7 +2950,7 @@ async fn a_load_appends_to_a_prompt_another_source_already_grew() {
 
     let rig = Rig::new(0, |builder| with_deferred(builder).tool_source(Always));
     rig.mock
-        .push_tool_calls(vec![call("c1", "use_server", json!({"name": "docs"}))])
+        .push_tool_calls(vec![call("c1", "load__group__docs", json!({}))])
         .push_text("done");
     let run = rig.start().await;
     let (requests, state) = rig.finish(run).await;
@@ -2693,8 +2966,104 @@ async fn a_load_appends_to_a_prompt_another_source_already_grew() {
     );
     assert!(
         after.ends_with("> docs words"),
-        "the loaded server's words follow everything: {after:?}"
+        "the loaded group's words follow everything: {after:?}"
     );
     assert_eq!(state.tools_appended, [1]);
     assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
+}
+
+/// A seeded resume at turn 4: the restored tools are offered, the requests are a prefix, and no
+/// turn records a growth (the seed's carried set already names them).
+#[tokio::test]
+async fn a_seeded_resume_records_no_growth() {
+    let rig = Rig::new(0, with_deferred);
+    rig.mock
+        .push_tool_calls(vec![call("c1", "docs__search", json!({}))])
+        .push_text("done");
+    let run = rig.start().await;
+    rig.seed_stored_state(run, 4, &["docs"], 0).await;
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_names(&requests[0]),
+        [
+            "big",
+            "handle",
+            "load__group__docs",
+            "docs__search",
+            "docs__read"
+        ],
+        "the seeded group's tools are offered"
+    );
+    assert_eq!(
+        &requests[1].tools[..requests[0].tools.len()],
+        &requests[0].tools[..],
+        "the requests are a prefix"
+    );
+    assert!(
+        state.tools_appended.is_empty(),
+        "the seed is not a growth: {:?}",
+        state.tools_appended
+    );
+    assert_eq!(state.loaded[0].loader, "load__group__docs");
+    assert_eq!(state.loaded[0].tools, ["docs__search", "docs__read"]);
+    assert_eq!(state.loaded[0].note, "the docs words");
+    assert!(state.loaded[0].note_is_server);
+}
+
+/// A seeded group filled from a `Loader` keeps its note: the loader carries it, so the recap can
+/// label the server's words.
+#[tokio::test]
+async fn a_seeded_group_filled_from_a_loader_keeps_its_note() {
+    let rig = Rig::summarising(1000, with_deferred);
+    rig.mock.push_text("SUMMARY: seeded").push_text("done");
+    let run = rig.start_task("go").await;
+    rig.seed_stored_state(run, 4, &["docs"], 8).await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.loaded[0].note, "the docs words");
+    assert!(state.loaded[0].note_is_server);
+    let marker = state.messages[0].text();
+    assert!(
+        marker.contains("(the server's words: the docs words)"),
+        "{marker}"
+    );
+}
+
+/// A resume whose first transition compacts seeds and fills before the marker is written: the
+/// marker names the seeded group through the real transition.
+#[tokio::test]
+async fn a_resume_that_compacts_first_names_the_seeded_group() {
+    let rig = Rig::summarising(1000, with_deferred);
+    rig.mock.push_text("SUMMARY: seeded").push_text("done");
+    let run = rig.start_task("go").await;
+    rig.seed_stored_state(run, 4, &["docs"], 8).await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "the resume compacted first");
+    let marker = state.messages[0].text();
+    assert!(marker.contains("load__group__docs"), "{marker}");
+    assert!(marker.contains("docs__search"), "{marker}");
+}
+
+/// A seeded resume whose task also loads a **different** group journals that group too: the
+/// recap names every group the run's task matches, not only the seeded one.
+#[tokio::test]
+async fn a_seeded_resume_names_a_different_task_loaded_group() {
+    let rig = Rig::summarising(1000, |builder| {
+        with_groups(
+            builder,
+            &[
+                ("docs", &["docs__search"], "the docs words", &[]),
+                ("linear", &["linear__list"], "the linear words", &["linear"]),
+            ],
+        )
+    });
+    rig.mock.push_text("SUMMARY: seeded").push_text("done");
+    let run = rig.start_task("go linear").await;
+    rig.seed_stored_state(run, 4, &["docs"], 8).await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1);
+    let marker = state.messages[0].text();
+    assert!(marker.contains("load__group__docs"), "{marker}");
+    assert!(marker.contains("load__group__linear"), "{marker}");
+    assert!(marker.contains("linear__list"), "{marker}");
 }

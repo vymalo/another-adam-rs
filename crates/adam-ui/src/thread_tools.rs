@@ -463,6 +463,7 @@ fn fits(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && !name.starts_with('_')
+        && !name.starts_with(adam_llm_agent::RESERVED_LOADER_PREFIX)
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
@@ -798,7 +799,16 @@ mod tests {
         ] {
             assert!(fits(ok), "{ok}");
         }
-        for bad in ["", "_hidden", "a.b", "a b", "é", "x".repeat(65).as_str()] {
+        for bad in [
+            "",
+            "_hidden",
+            "a.b",
+            "a b",
+            "é",
+            "x".repeat(65).as_str(),
+            "load__group__bash",
+            "load__group__heavy",
+        ] {
             assert!(!fits(bad), "{bad}");
         }
     }

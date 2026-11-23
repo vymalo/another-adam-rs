@@ -57,7 +57,7 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 
 | Item | What |
 |---|---|
-| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `run_skills(Arc<dyn RunSkills>)` (the root finds skills during its run: [Skills a run finds](#skills-a-run-finds-runskills)), `var(name, value)`, `agent_var(agent, name, value)`, `env(name, value)` (a value for the environment variable `auth: bearer:VAR` reads), `secrets(DynSecretSource)` (where a variable that `env` does not give is asked, for remote subagents and MCP servers alike: `adam_core::ProcessEnv` by default, `adam_core::NoSecrets` in an embedded engine, ADR 0047), `allow_insecure_remotes(bool)`, `remote_timeout(Duration)`, `mcp_tools(agent, ToolSet)` (the MCP tools of an agent, from a client of your own), `connect_mcp(&McpPolicy)` (feature `mcp`: connect to the servers of every agent's `mcp.json`; what each agent's servers said about themselves is appended to **that agent's** instructions at `bind`, once, after the instructions and before the skills — the **eager** servers' only: a server with a `when` contributes its section when a run loads it: [adam-mcp](../adam-mcp/README.md#server-instructions)), `with_extra_mcp(McpConfig, &Path)` and `with_extra_mcp_file(&Path)` (add the servers of another file to the root's own `mcp.json`; a name both have is an error, see [Extra MCP servers](#extra-mcp-servers-adam_extra_mcp_file)), `mcp_env_references()` (the `${VAR}` names every local agent's servers refer to), `reasoning_effort(Option<ReasoningEffort>)` (the root's reasoning level when its file sets none; the file's own `reasoning_effort` wins, and a subagent's file always has its own; resolved against the root model's profile at `BoundDef::model`, not at `bind` (which does not know the model), ADR 0063 decision 8), `name()`, `manifest()`, `bind(ToolSet)`, `child_sessions()` (feature `sessions`, which `a2a` turns on: the helpers and limits the root's A2A front serves `child-sessions/v1` for, from the same roster as the session tools, `None` without a subagent; pure, no binding), `session_starters(RuntimeBuilder)` (the start-only agents of the root's helpers, local and remote, for a process that serves the front and does not step: [Child sessions on the A2A front](#child-sessions-on-the-a2a-front)) |
+| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `run_skills(Arc<dyn RunSkills>)` (the root finds skills during its run: [Skills a run finds](#skills-a-run-finds-runskills)), `var(name, value)`, `agent_var(agent, name, value)`, `env(name, value)` (a value for the environment variable `auth: bearer:VAR` reads), `secrets(DynSecretSource)` (where a variable that `env` does not give is asked, for remote subagents and MCP servers alike: `adam_core::ProcessEnv` by default, `adam_core::NoSecrets` in an embedded engine, ADR 0047), `allow_insecure_remotes(bool)`, `remote_timeout(Duration)`, `mcp_tools(agent, ToolSet)` (the MCP tools of an agent, from a client of your own), `connect_mcp(&McpPolicy)` (feature `mcp`: connect to the servers of every agent's `mcp.json`; what each agent's servers said about themselves is appended to **that agent's** instructions at `bind`, once, after the instructions and before the skills — the **eager** servers' only: a server with a `when` contributes its section to the first prompt when the task loads it, and to the load's result when the run loads it: [adam-mcp](../adam-mcp/README.md#server-instructions)), `with_extra_mcp(McpConfig, &Path)` and `with_extra_mcp_file(&Path)` (add the servers of another file to the root's own `mcp.json`; a name both have is an error, see [Extra MCP servers](#extra-mcp-servers-adam_extra_mcp_file)), `mcp_env_references()` (the `${VAR}` names every local agent's servers refer to), `reasoning_effort(Option<ReasoningEffort>)` (the root's reasoning level when its file sets none; the file's own `reasoning_effort` wins, and a subagent's file always has its own; resolved against the root model's profile at `BoundDef::model`, not at `bind` (which does not know the model), ADR 0063 decision 8), `name()`, `manifest()`, `bind(ToolSet)`, `child_sessions()` (feature `sessions`, which `a2a` turns on: the helpers and limits the root's A2A front serves `child-sessions/v1` for, from the same roster as the session tools, `None` without a subagent; pure, no binding), `session_starters(RuntimeBuilder)` (the start-only agents of the root's helpers, local and remote, for a process that serves the front and does not step: [Child sessions on the A2A front](#child-sessions-on-the-a2a-front)) |
 | `IntoManifest` | `AgentManifest`, `&AgentManifest`, `EmbeddedAgent` and `&EmbeddedAgent` (what `include_agent!` gives; these bring the bytes of the skills' files) |
 | `SkillFiles` | the bytes of the files skills bundle (opaque: made by `IntoManifest` and `resources_from`) |
 | `LOAD_SKILL`, `READ_SKILL_FILE` | the names of the two skill tools |
@@ -70,7 +70,8 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 | `RemoteRoundAgent` (feature `remote`) | the `Agent` (and `AgentStarter`) that works the rounds of a session on a remote subagent of the root, registered as `<root>/<subagent>`; `with_wait_poll(Duration)` (`BoundDef::wait_poll` sets it). See [Remote sessions](#remote-sessions) |
 | `RemoteRoundStarter` (feature `remote`) | its start-only twin, `new(name)`: makes the same round state (`init`, `init_continuing`) with no endpoint and no credential; `AgentDef::session_starters` registers it |
 | `Assembly::prompt_commands()` (feature `mcp`) | the prompts of the **root's** MCP servers as commands (`adam_mcp::PromptCommand`), read once when the servers were connected; a subagent's give none. `adam-service` adds them to the backend and the card ([adam-mcp](../adam-mcp/README.md#prompts-as-commands)) |
-| `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `reasoning_effort` (the default the folder, its `model_preset` or the profile resolves to, or `None`), `prompt` (rendered, with the skills catalog and the instructions of its MCP servers), `tools` (own, `use_server` when one of its servers has a `when`, skill tools, then one per subagent, local or remote, then the five session tools of the root when it has a subagent, local or remote: what the model is offered), `skills`, `preloaded`, `when`, `limits` (the loop's limits, with `max_output_tokens` resolved for the agent's model and clamped, ADR 0064): what an `LlmAgent` was made from, comparable. **Breaking:** `reasoning_effort` is a new public field, so a hand-built literal needs it |
+| `Group`, `Groups` | a named set of tools that load together (ADR 0066): `Group::new(name, note, members)`, `for_server` (a `when` server's group: its name is the server's, its note the server's words, and a bad name's error names the server), `with_keywords`, `searchable` (refused until S2), `loader()`, `server`; `Groups::bind(&Origin, defs, &[(String, DynTool)])` drops every member the agent was not given (an empty group has no loader), refuses a bad name, two groups of one name, a searchable group, a tool in two groups, and a loader name a tool already has; the reserved `load__` catalogue check is `def.rs`'s. `declared_loaders()` is the catalogue (S2/S3 and tests); the run-time path is the trait's `loaders(ctx)`, and `loader_tools()` gives one `load__group__<name>` per group. `Groups` is a `ToolSource`: it withholds a group's members until the task's keywords or the run's load, appends a loaded group after every other tool, and journals the task-loaded groups and the loaders. Constants: `GROUP_LOADER_PREFIX`, `MAX_GROUP_NAME_CHARS`, `MAX_KEYWORDS`, `MAX_KEYWORD_CHARS`, `name_fits`, `keywords_fit`; the reserved prefix is `adam_llm_agent::RESERVED_LOADER_PREFIX` |
+| `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `reasoning_effort` (the default the folder, its `model_preset` or the profile resolves to, or `None`), `prompt` (rendered, with the skills catalog and the instructions of its eager MCP servers), `tools` (own, one `load__group__<server>` per server with a `when`, skill tools, then one per subagent, local or remote, then the five session tools of the root when it has a subagent, local or remote: what the model is offered), `skills`, `preloaded`, `when`, `limits` (the loop's limits, with `max_output_tokens` resolved for the agent's model and clamped, ADR 0064): what an `LlmAgent` was made from, comparable. **Breaking:** `reasoning_effort` is a new public field, so a hand-built literal needs it |
 | `RemoteInfo` | a remote (`a2a:`) subagent, as data (its tool is in `AgentInfo::tools` like a local subagent's) |
 | `LiveAssembly`, `LiveBuilder`, `Watch` (feature `dev`) | dev reload: `LiveAssembly::builder(dir, model, alias)` then `tools`, `configure`, `configure_bound`, `strictness`, `default_name`, `debounce`, `connect_mcp(&McpPolicy)` (feature `mcp`), `load()`; on the handle `register(RuntimeBuilder)`, `reload()`, `watch()`, `generation()`, `schedules()`, `last_error()`, `info()`, `retired()`, `runs_on_previous_tools()`, `dir()` |
 | `Reloaded`, `ToolChange`, `ReloadError`, `WatchError` (feature `dev`) | what a reload did (`generation`, `changed`, `tool_changes`, `retired`), why it changed nothing (`Load(Error)` with `diagnostics()`, `NeedsRestart { added }`), why a watcher did not start |
@@ -285,6 +286,10 @@ same tool results.
 | a selected skill's files were not supplied | `SkillFilesUnavailable` |
 | a skill bundles more than 1 MiB | `SkillTooLarge` (also from `resources_from`) |
 | a registered tool called `load_skill` or `read_skill_file` on an agent with skills | `ReservedToolName` |
+| a registered tool, selected tool or subagent whose name starts with `load__` | `ReservedLoaderName` |
+| a group's name or keywords do not fit, or two groups have one name | `GroupName` |
+| a searchable group (S2 is not built yet) | `SearchableGroup` |
+| one tool in two groups | `GroupOverlap` |
 
 `tools:` does not filter the skill tools; `skills: []` turns them off. Both are ordinary tools, so their
 results are journaled with the step that ran them.
@@ -715,28 +720,34 @@ let assembly = AgentDef::from_manifest(AGENT)?
 
 ### A server loaded only when the task asks (`when`)
 
-A server entry may say `"when": { "keywords": ["linear", "ticket"] }`. Its tools are then **withheld** from every
-run whose task does not mention one of its keywords, and its instructions are not in the agent's prompt; a call to
-one of its tools is refused with a result that names the server and its keywords. A server with no `when` is eager,
-as before the key existed. The task is the words of the run's first message (`Conversation::task`), the same text
-at every turn, so a run that continues another selects the same servers. `when.paths` is not supported (the coder
-has no checkout before its first model call) and is ignored with a warning. The format is
+A server entry may say `"when": { "keywords": ["linear", "ticket"] }`. It becomes one **group**, named after
+the server, and the agent gets one generated tool per group, `load__group__<server>`
+([ADR 0066](../../docs/decisions/0066-a-first-request-is-lean-and-tools-load-in-groups.md)). A server with no
+`when` is eager, as before the key existed. The task is the words of the run's first message
+(`Conversation::task`), the same text at every turn, so a run that continues another selects the same groups.
+`when.paths` is not supported (the coder has no checkout before its first model call) and is ignored with a
+warning. The format is
 [`agent-files.md`](../../docs/reference/agent-files.md#a-server-loaded-only-when-the-task-asks-when).
 
-**The fallback: `use_server`.** An agent with at least one triggered server has one more fixed tool, `use_server
-{ name }`, from its first request whatever the task (so the tool list is the same bytes until something is loaded;
-a folder whose own tools already have that name is refused at bind). Its result says whether the server's tools are
-now available and names them, and the loop makes the run's list from it (`Conversation::loaded_servers`): from the
-**next** model call on the server stops being withheld, its instructions follow every other source's words, and its tools are
-**appended after every other tool** of the request, in the order the run loaded them
-([`ToolSource::appended`](../adam-llm-agent/README.md#context-and-tool-sources)). That is the whole point: the
-request before stays a byte prefix of the one after it, and the loop records the turn where the head grew
-(`Conversation::tools_appended`), so the prefix test knows the one recorded exception. The append costs **one full
-history re-prefill** — the result says so in words, and the tool invents no number: what it cost is the next call's
-`Usage::cached_input_tokens`, which only the provider reports. A refused load changes nothing: an unknown name, an
-eager server (its tools are already there), a server the task or the run already loaded, and a server that offered
-no tool at bind (an `optional` server that was not reachable, or an allow-list that selects nothing) are each a
-result the model can act on.
+**A group and its loader.** The group's tools are the agent's own tools, **withheld** until the task holds one
+of the group's keywords or the run calls its loader. A group the **task** loads keeps the `when` behaviour: its
+tools stand where the agent's list puts them and its note (the server's instructions section) is in the first
+request's prompt. A group the run loads during itself says its note in the loader's result, and the loop makes
+the run's list from it (`Conversation::loaded`): from the
+**next** model call on the group stops being withheld and its tools are **appended after every other tool** of
+the request, in the order the run loaded them ([`ToolSource::appended`](../adam-llm-agent/README.md#context-and-tool-sources)).
+That is the whole point: the request before stays a byte prefix of the one after it, and the loop records the
+turn where the head grew (`Conversation::tools_appended`), so the prefix test knows the one recorded exception.
+The append costs **one full history re-prefill** — the result says so in words, and the tool invents no number:
+what it cost is the next call's `Usage::cached_input_tokens`, which only the provider reports. A refused load
+changes nothing: a loader called twice, and one whose group the task already loaded. A group with no member the
+agent was given (its `tools:` narrowed the server's list, or an `optional` server was not reachable) has **no
+loader**: lazy never widens access, and its existence is not revealed. `Groups::bind` refuses a group name that
+does not fit `^[a-z0-9]+(_[a-z0-9]+)*$` (at most 40 characters), two groups of one name, a tool in two groups, a
+reserved `load__` name, and a searchable group until S2. A `when` server's name becomes its group's name, so
+`adam-agent-fs` refuses a `when` server whose name is not one at load, naming the server and saying to rename it;
+nothing is renamed, because a rename would change its tools' `<server>__<tool>` names. The loaders reserve the word `load`: a server named `load` is refused at start, and a registered tool
+whose name starts with `load__` is refused at bind.
 
 ### Extra MCP servers (`ADAM_EXTRA_MCP_FILE`)
 

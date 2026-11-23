@@ -205,11 +205,11 @@ async fn a_secret_in_what_a_question_shows_reaches_neither_the_surface_nor_the_q
         // The shown content is there, with the secret taken out: the scrub reached it.
         let shown = format!("{question}{ui}");
         assert!(
-            shown.contains("token = [redacted]"),
+            shown.contains("token = [redacted: secret removed, do not reuse]"),
             "version {version}: {shown}"
         );
         assert!(
-            shown.contains("The key is [redacted]"),
+            shown.contains("The key is [redacted: secret removed, do not reuse]"),
             "version {version}: {shown}"
         );
         for attempt in 1..=3 {
@@ -234,7 +234,7 @@ async fn a_secret_in_what_a_question_shows_reaches_neither_the_surface_nor_the_q
             );
             let again = format!("{}{}", refusal.question, refusal.ui.as_ref().unwrap());
             assert!(
-                again.contains("token = [redacted]"),
+                again.contains("token = [redacted: secret removed, do not reuse]"),
                 "version {version}, attempt {attempt}: the same things are shown again: {again}"
             );
             ui = refusal.ui.unwrap();

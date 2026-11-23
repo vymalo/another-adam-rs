@@ -151,8 +151,8 @@ mod def;
 mod dev;
 mod error;
 mod folder;
+mod groups;
 mod mcp;
-mod mcp_select;
 #[cfg(feature = "remote")]
 mod remote;
 #[cfg(feature = "remote")]
@@ -162,7 +162,6 @@ mod skills;
 mod subagent;
 mod suggest;
 mod template;
-mod use_server;
 
 pub use assembly::{AgentInfo, Assembly, BoundDef, RemoteInfo};
 pub use def::{AgentDef, IntoManifest};
@@ -178,6 +177,10 @@ pub use error::{
 pub use folder::{
     AGENT_DIR_ENV, AgentFolder, EXTRA_MCP_FILE_ENV, agent_dir, agent_dir_from_env,
     extra_mcp_file_from_env,
+};
+pub use groups::{
+    GROUP_LOADER_PREFIX, Group, Groups, MAX_GROUP_NAME_CHARS, MAX_KEYWORD_CHARS, MAX_KEYWORDS,
+    keywords_fit, name_fits,
 };
 #[cfg(feature = "remote")]
 pub use remote_session::{RemoteRoundAgent, RemoteRoundStarter};

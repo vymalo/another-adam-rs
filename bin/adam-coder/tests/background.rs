@@ -657,8 +657,14 @@ async fn output_is_scrubbed_before_it_is_written() {
     })
     .await;
     let on_disk = std::fs::read_to_string(rig.file_of(&id)).unwrap();
-    assert!(on_disk.contains("[redacted]"), "{on_disk}");
-    assert!(on_disk.contains("key=[redacted]"), "{on_disk}");
+    assert!(
+        on_disk.contains("[redacted: secret removed, do not reuse]"),
+        "{on_disk}"
+    );
+    assert!(
+        on_disk.contains("key=[redacted: secret removed, do not reuse]"),
+        "{on_disk}"
+    );
     for needle in ["BEGIN KEY", "AAAA1234BBBB5678", "END KEY", MODEL_KEY] {
         assert!(
             !volume_holds(&rig.fx.root, needle),

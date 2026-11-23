@@ -156,6 +156,16 @@ pub enum Error {
         /// The tool, when it is the tool's name that does not fit.
         tool: Option<String>,
     },
+    /// A server named `load`: the word is reserved for the group loaders (`load__group__<name>`),
+    /// and its tools would be named `load__<tool>`, which a loader's name would collide with.
+    #[error(
+        "MCP server `load` is refused: `load` is reserved for the tool loaders \
+         (`load__group__<name>`); rename the server"
+    )]
+    ReservedServerName {
+        /// The server.
+        server: String,
+    },
     /// The process of a stdio server could not be started.
     #[error("MCP server `{server}`: cannot start `{command}`: {message}")]
     Spawn {
@@ -235,6 +245,7 @@ impl Classify for Error {
             | Self::UrlSecret { .. }
             | Self::Header { .. }
             | Self::Name { .. }
+            | Self::ReservedServerName { .. }
             | Self::BearerBinding { .. }
             | Self::UnknownTool { .. } => ErrorClass::Invalid,
         }

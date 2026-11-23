@@ -17,13 +17,23 @@ use serde_json::{Map, Value};
 
 use crate::access::ToolAccess;
 use crate::conversation::{
-    MODEL_RUN_KEY, PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message,
+    Loaded, MODEL_RUN_KEY, PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message,
 };
 use crate::images::{ImageGate, ImageOutcome, ImagePolicy, ImageStore, KeptImage};
 use crate::kept::KeptOutput;
 use crate::plan::Plan;
 use crate::source::ToolNote;
 use crate::state::{Extensions, State, StateKey};
+
+/// The prefix of a group loader's tool name: `load__group__<name>`.
+pub const GROUP_LOADER_PREFIX: &str = "load__group__";
+
+/// The prefix the group loaders reserve: `load__group__<name>` (ADR 0066, decision 2). A tool of an
+/// MCP server or of a conversation
+/// whose full name starts with it is left out with a warning, and a registered tool whose name
+/// starts with it is refused at bind, because an MCP tool is `<server>__<tool>` and the names would
+/// collide.
+pub const RESERVED_LOADER_PREFIX: &str = "load__";
 
 /// The longest a call of a tool that declares no [`Tool::time_limit`] may run: 300 s.
 pub const DEFAULT_TOOL_TIME_LIMIT: Duration = Duration::from_secs(300);
@@ -487,20 +497,18 @@ pub struct ToolOutput {
     /// Absent from a journal written before it existed, and not written while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageRef>,
-    /// The MCP servers the run has loaded, as this result says: the list the call saw, in the
-    /// order they were loaded, with the server it loaded. The loop adds each name the run does not
-    /// have yet, in the order the results are applied, and makes the union the run's list
-    /// ([`Conversation::loaded_servers`](crate::Conversation::loaded_servers)) when the result is
-    /// not an error, in the same commit as the result, and records the turn of the next request in
+    /// The groups and tools the run has loaded, as this result says: the whole list the call saw,
+    /// with the one it loaded, in the order they were loaded. The loop applies it to the run's
+    /// state ([`Conversation::loaded`](crate::Conversation::loaded)) when the result is not an
+    /// error, in the same commit as the result, and records the turn of the next request in
     /// [`Conversation::tools_appended`](crate::Conversation::tools_appended); a replay takes the
-    /// list from the journal. A server named here stops being withheld
-    /// from the next model call on, and its tools are **appended** to the tools array, never
-    /// inserted ([ADR 0044](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md),
-    /// decision 1). Only `use_server` (`adam-assembly`) sets it. Never read from an error result.
+    /// list from the journal. A load appends its tools to the tools array, never inserts them (ADR
+    /// 0044, decision 1). Only a group loader (`load__group__…`) sets it. Never read from
+    /// an error result.
     ///
     /// Absent from a journal written before it existed, and not written while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub loaded_servers: Vec<String>,
+    pub loaded: Vec<Loaded>,
     /// The bytes of [`images`](Self::images), for the run to keep **in its own state**: only when
     /// the agent has no [`ImageStore`](crate::ImageStore) ([`keep_image`](crate::keep_image) says
     /// which). Journaled with the result, like [`kept`](Self::kept), so a replay keeps the same
@@ -555,8 +563,12 @@ impl ToolOutput {
                 }
             }
         }
-        for server in &mut self.loaded_servers {
-            clean_text(server);
+        for one in &mut self.loaded {
+            clean_text(&mut one.loader);
+            clean_text(&mut one.note);
+            for tool in &mut one.tools {
+                clean_text(tool);
+            }
         }
         for artifact in &mut self.artifacts {
             clean_text(&mut artifact.name);
@@ -586,7 +598,7 @@ impl ToolOutput {
             reported: Vec::new(),
             pinned: false,
             images: Vec::new(),
-            loaded_servers: Vec::new(),
+            loaded: Vec::new(),
             kept_images: Box::default(),
         }
     }
@@ -607,7 +619,7 @@ impl ToolOutput {
             reported: Vec::new(),
             pinned: false,
             images: Vec::new(),
-            loaded_servers: Vec::new(),
+            loaded: Vec::new(),
             kept_images: Box::default(),
         }
     }
@@ -625,16 +637,12 @@ impl ToolOutput {
         self
     }
 
-    /// Say which MCP servers the run has loaded ([`loaded_servers`](Self::loaded_servers)): the
-    /// list this call saw, with the one it loaded, in the order they were loaded. The loop adds
-    /// each name the run does not have, and the next
-    /// model call is the first whose tools array has the loaded servers' tools appended.
+    /// Say what the run has loaded ([`loaded`](Self::loaded)): the whole list this call saw, with
+    /// its own entry added, in the order they were loaded. The next model call is the first whose
+    /// tools array has the loaded groups' tools appended.
     #[must_use]
-    pub fn with_loaded_servers(
-        mut self,
-        servers: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.loaded_servers = servers.into_iter().map(Into::into).collect();
+    pub fn with_loaded(mut self, loaded: impl IntoIterator<Item = Loaded>) -> Self {
+        self.loaded = loaded.into_iter().collect();
         self
     }
 
@@ -945,9 +953,13 @@ pub struct ToolCtx {
     kept: Arc<BTreeMap<String, String>>,
     /// The conversation's plan as the call starts ([`plan`](Self::plan)).
     plan: Option<Arc<Plan>>,
-    /// The MCP servers the run has loaded as the call starts
-    /// ([`loaded_servers`](Self::loaded_servers)).
-    loaded_servers: Arc<[String]>,
+    /// What the run has loaded as the call starts ([`loaded`](Self::loaded)).
+    loaded: Arc<[Loaded]>,
+    /// The loaded tools the run no longer holds
+    /// ([`Conversation::removed_tools`](crate::Conversation::removed_tools)): a member its group
+    /// shrank out of, or a task-loaded member the tier hid. An explicit load's tier-hidden member
+    /// is not one. A loader refuses to offer one again, and a call to one is refused.
+    removed_tools: Arc<[String]>,
     /// The words the run was started with ([`task`](Self::task)).
     task: Option<Arc<str>>,
     /// What scrubs secrets out of a text ([`scrub`](Self::scrub)); `None` scrubs nothing.
@@ -1006,7 +1018,8 @@ impl ToolCtx {
             files_left: Arc::new(std::sync::atomic::AtomicU64::new(MAX_RUN_FILE_BYTES as u64)),
             sandbox: Arc::default(),
             plan: None,
-            loaded_servers: Arc::default(),
+            loaded: Arc::default(),
+            removed_tools: Arc::default(),
             task: None,
             scrub: None,
             kept_left: Arc::default(),
@@ -1135,11 +1148,20 @@ impl ToolCtx {
         self
     }
 
-    /// Say which MCP servers the run has loaded as this call starts
-    /// ([`loaded_servers`](Self::loaded_servers)); the agent loop does it for every call.
+    /// Say what the run has loaded as this call starts ([`loaded`](Self::loaded)); the agent loop
+    /// does it for every call.
     #[must_use]
-    pub fn with_loaded_servers(mut self, servers: impl Into<Arc<[String]>>) -> Self {
-        self.loaded_servers = servers.into();
+    pub fn with_loaded(mut self, loaded: impl Into<Arc<[Loaded]>>) -> Self {
+        self.loaded = loaded.into();
+        self
+    }
+
+    /// Say which loaded tools a request did not carry
+    /// ([`Conversation::removed_tools`](crate::Conversation::removed_tools)); the agent loop does
+    /// it for every call.
+    #[must_use]
+    pub fn with_removed_tools(mut self, removed: impl Into<Arc<[String]>>) -> Self {
+        self.removed_tools = removed.into();
         self
     }
 
@@ -1159,13 +1181,20 @@ impl ToolCtx {
         self.plan.as_deref()
     }
 
-    /// The MCP servers the run has loaded as this call starts, in the order it loaded them
-    /// ([`Conversation::loaded_servers`](crate::Conversation::loaded_servers)): the whole list,
-    /// not a change. A tool that loads one (`use_server`) reads it to refuse a second load, and a
-    /// source that withholds a server's tools reads
-    /// [`SourceCtx::loaded_servers`](crate::SourceCtx::loaded_servers) instead.
-    pub fn loaded_servers(&self) -> &[String] {
-        &self.loaded_servers
+    /// What the run has loaded as this call starts, in the order it loaded it
+    /// ([`Conversation::loaded`](crate::Conversation::loaded)): the whole list, not a change. A
+    /// loader reads it to refuse a second load, and a source that withholds a group's tools reads
+    /// [`SourceCtx::loaded`](crate::SourceCtx::loaded) instead.
+    pub fn loaded(&self) -> &[Loaded] {
+        &self.loaded
+    }
+
+    /// The loaded tools the run no longer holds
+    /// ([`Conversation::removed_tools`](crate::Conversation::removed_tools)): a member its group
+    /// shrank out of, or a task-loaded member the tier hid. A call to one is refused, and a loader
+    /// does not offer it again.
+    pub fn removed_tools(&self) -> &[String] {
+        &self.removed_tools
     }
 
     /// The words the run was started with ([`Conversation::task`](crate::Conversation::task)):
