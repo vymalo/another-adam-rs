@@ -261,7 +261,7 @@ mod tests {
             "es-419",
             "en-US-x-twain",
             "en-a-bbb",
-            "FR-FR",
+            "FR-fr",
         ] {
             let locale = Locale::parse(tag).unwrap_or_else(|e| panic!("{tag}: {e}"));
             assert_eq!(locale.as_str(), tag, "kept as it came");
