@@ -844,7 +844,10 @@ mod tests {
                 .join(format!("{id}.txt")),
         )
         .unwrap();
-        assert!(!on_disk.contains(secret) && on_disk.contains("key=[redacted]"));
+        assert!(
+            !on_disk.contains(secret)
+                && on_disk.contains("key=[redacted: secret removed, do not reuse]")
+        );
         for offset in [1, 1999, 2000, 2001] {
             let page = store.page(RUN, &id, offset, 2000).await.unwrap();
             assert!(!page.contains(secret), "{page}");
@@ -1067,9 +1070,11 @@ mod tests {
     async fn assert_clean(store: &FileKept, root: &Path, id: &str, what: &str) {
         let kept = std::fs::read_to_string(file_of(root, id)).unwrap();
         assert_no_part(&kept, what);
-        // Something is kept (the secrets that are whole are replaced, and the filler is there).
+        // Something is kept (the secrets that are whole are replaced, and the filler is there). A
+        // fold puts a line break wherever the mark falls, so the breaks are not part of the mark.
         assert!(
-            kept.contains("[redacted]"),
+            kept.replace('\n', "")
+                .contains("[redacted: secret removed, do not reuse]"),
             "{what}: the secret is not replaced"
         );
         let mut offset = 1;
@@ -1090,7 +1095,8 @@ mod tests {
         let kept = std::fs::read_to_string(file_of(root, id)).unwrap();
         assert_no_part(&kept, what);
         assert!(
-            kept.contains("[redacted]") && kept.len() > 8 * 1024 * 1024,
+            kept.contains("[redacted: secret removed, do not reuse]")
+                && kept.len() > 8 * 1024 * 1024,
             "{what}: little is kept"
         );
         for offset in [1, -30] {
@@ -1378,7 +1384,7 @@ mod tests {
             "the start of the secret is kept"
         );
         assert!(
-            kept.starts_with("early [redacted] done\nxyxz"),
+            kept.starts_with("early [redacted: secret removed, do not reuse] done\nxyxz"),
             "{}",
             &kept[..60]
         );

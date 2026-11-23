@@ -98,7 +98,7 @@ mod tests {
         assert_eq!(protected.registered, 1);
         assert_eq!(
             redactor.scrub("key value-of-MODEL_API_KEY-0123456789 here"),
-            "key [redacted] here"
+            "key [redacted: secret removed, do not reuse] here"
         );
     }
 }

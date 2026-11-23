@@ -132,11 +132,15 @@ mod tests {
             "tok-one-1",
             "tok-two-2",
         ] {
-            assert_eq!(r.scrub(&format!("<{leaked}>")), "<[redacted]>", "{leaked}");
+            assert_eq!(
+                r.scrub(&format!("<{leaked}>")),
+                "<[redacted: secret removed, do not reuse]>",
+                "{leaked}"
+            );
         }
         assert_eq!(
-            r.scrub("postgres://u:[redacted]@db/adam"),
-            "postgres://u:[redacted]@db/adam"
+            r.scrub("postgres://u:[redacted: secret removed, do not reuse]@db/adam"),
+            "postgres://u:[redacted: secret removed, do not reuse]@db/adam"
         );
     }
 
@@ -152,7 +156,11 @@ mod tests {
         assert!(config.worker.is_none());
         let r = Redactor::from_config(&config);
         for leaked in ["db-password-1", "tok-one-1"] {
-            assert_eq!(r.scrub(&format!("<{leaked}>")), "<[redacted]>", "{leaked}");
+            assert_eq!(
+                r.scrub(&format!("<{leaked}>")),
+                "<[redacted: secret removed, do not reuse]>",
+                "{leaked}"
+            );
         }
     }
 
@@ -187,7 +195,7 @@ mod tests {
         );
         assert_eq!(
             tools_copy.scrub("push ghs_installation_token"),
-            "push [redacted]"
+            "push [redacted: secret removed, do not reuse]"
         );
         assert_eq!(format!("{creds:?}"), "RedactingCredentials(..)");
     }
@@ -217,13 +225,16 @@ mod tests {
         // The whole PEM and its body are found. A slice of the body is not: this is exact-value
         // replacement, not a detector.
         for leaked in [key.pkcs8_pem.trim(), body.as_str()] {
-            assert_eq!(r.scrub(&format!("<{leaked}>")), "<[redacted]>");
+            assert_eq!(
+                r.scrub(&format!("<{leaked}>")),
+                "<[redacted: secret removed, do not reuse]>"
+            );
         }
         let slice = &body[10..200];
         assert_eq!(r.scrub(&format!("<{slice}>")), format!("<{slice}>"));
         assert_eq!(
             r.scrub(&format!("key={body} and {}", key.pkcs8_pem.trim())),
-            "key=[redacted] and [redacted]"
+            "key=[redacted: secret removed, do not reuse] and [redacted: secret removed, do not reuse]"
         );
     }
 

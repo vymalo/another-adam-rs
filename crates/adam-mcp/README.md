@@ -227,7 +227,7 @@ by `McpPolicy::thread_tools_max_call` (`THREAD_TOOLS_MAX_CALL_SECS`, 3600 s). A 
   `McpPolicy::allow_insecure(true)`; a user name or password in it is always refused; **a `${VAR}` anywhere in it
   (a key in the query, a token in the path, the whole URL from a variable, even one with a default) is refused
   with `Error::UrlSecret` unless `McpPolicy::allow_url_secrets(true)`**, before any request; errors show it
-  without userinfo, query and fragment, and with every value a variable put into it replaced by `[REDACTED]`
+  without userinfo, query and fragment, and with every value a variable put into it replaced by `[redacted: secret removed, do not reuse]`
   (so, with the opt-in, a secret in the path or the host is not shown either). The rules are those of remote subagents (`a2a:`), whose helpers were copied (with a
   comment saying where from) rather than shared, because the two crates do not depend on each other.
 * **Headers** are sent on every request, values marked sensitive (on a server the deployment bound to a bearer per call,
@@ -461,7 +461,7 @@ stateDiagram-v2
   included: <uri> (<type>)]`, a resource link as `[resource link: <uri>]`; anything the SDK adds later as
   `[unsupported content not included]`. On a server with `files: true`, an image, an audio clip and a blob are
   shared instead, each a line `Shared <file> (<size>, <type>).`, which says how to show an image inline ([Files](#files-files-true)). No content falls back to `structuredContent` as JSON, then to `(the tool
-  returned no content)`. It is **scrubbed of every value a `${VAR}` put into the server's text** (`[REDACTED]`;
+  returned no content)`. It is **scrubbed of every value a `${VAR}` put into the server's text** (`[redacted: secret removed, do not reuse]`;
   success text and `isError` text alike). `isError: true` is an error
   *result* (the model reads it and the run goes on).
 * **A text over 64 KiB is kept and paged, never cut silently** ([ADR 0044](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), the owner's answer). After the scrub, a successful text over `MAX_RESULT_BYTES` is kept by `adam_llm_agent::keep_long` and the model is shown `[kept as o-...: N lines; read_output {"id":"o-..."} reads it]`, the first page (at most 2,000 lines or 50 KiB) and the page's last line, `[more: N lines left; next page: offset=K]`; it reads the rest with `read_output` (the tool [`adam-assembly`](../adam-assembly/README.md) adds to every agent whose tools include an MCP tool, and the coder has). Where it is kept: **in a `KeptStore` of the agent's state when there is one (the coder: files on its workspace volume, scrubbed with its own secrets too), otherwise in the run's durable state, 4 MiB for the run** (what an agent that is only a folder gets); a result that would go over that room is **not kept**: the first page and `[not kept: a run keeps at most 4 MiB of long results here, ...; the rest is lost]`. At most 16 MiB of a text is kept (the first page says `only the first N of M bytes are kept` and the last line of the kept text says the same); the text is scrubbed whole, and a text over 16 MiB and 64 KiB is given to the keeper as that first part with the count of what is left out (`keep_long_cut`): the keeper, which scrubs with secrets of its own that the server's redactor does not know, cuts the end of such a part back at a place no secret straddles (`scrub_open_end`), so no first half of a secret is kept at the cut. A caller with no keeper (`Endpoint`, the one-shot calls) still gets the text cut there with the `[cut here: ...]` note. **Structured content** (no text blocks) over 64 KiB is serialised pretty-printed, so that it pages by lines; under 64 KiB it stays compact. **An `isError` result is not kept**: it is cut at 64 KiB with the `[cut here: ...]` note, as before. **Images, audio and blobs** are not paged and nothing changed for them: described (`[image not included: ...]`), or shared as files with `files: true`.
@@ -493,13 +493,13 @@ stateDiagram-v2
   JSON prints** (percent-encoded as a path or a query, form-encoded, JSON-escaped): every message that comes from
   the server, the transport or the SDK, every tool result (text and `isError` text: a server that echoes a
   credential it was given does not hand it to the model or the journal) and every line of a child's stderr goes
-  through it (`[REDACTED]`) before it is shown, logged or returned. A default written in the file
+  through it (`[redacted: secret removed, do not reuse]`) before it is shown, logged or returned. A default written in the file
   (`${LEVEL:-info}`) is not registered: it is in the file already. A child's stderr is logged at `debug` under
   the target `adam_mcp::stderr`, a line at a time; a line over 4 KiB is dropped whole (a cut line could end in the
   first half of a secret the redactor no longer recognises).
 * **A short secret is redacted too, and garbles what it matches.** A value of one or two characters is still
   registered (a short secret is still a secret), so every occurrence of those characters in a message or a tool
-  result becomes `[REDACTED]`, and a result can read strangely (`a t[REDACTED]le`). The remedy is a real secret,
+  result becomes `[redacted: secret removed, do not reuse]`, and a result can read strangely (`a t[redacted: secret removed, do not reuse]le`). The remedy is a real secret,
   not a weaker redactor.
 * **Secrets go in headers, never in the URL.** *The SDK logs the URL it dials* (*verified 2026-09-29, found by
   running the tests*: `rmcp::transport::streamable_http_client` logs "fail to delete session ... for url (...)" at
@@ -648,7 +648,7 @@ per test): none relies on another test's runtime to reap a process or to install
   `http` to another machine refused before anything is sent. Unit tests in `src/once.rs`: the URL policy, `Debug`, the
   listed tool's defaults, the wordings of a 401 and a 403, and a URL holding `401` that is not one.
 * `tests/stdio.rs` (testkit): list and call over stdio; declared `env` expanded into the child (what the child
-  reports comes back as `[REDACTED]`, which also proves it holds the value); the child does not
+  reports comes back as `[redacted: secret removed, do not reuse]`, which also proves it holds the value); the child does not
   inherit the environment (`CARGO`) unless asked; stdio refused without the opt-in; a missing command; a child
   that exits mid-call (error result, then a new process); dropping the servers kills the child, also outside a
   runtime and after it; a later server failing kills the children already started; the child's stderr is logged

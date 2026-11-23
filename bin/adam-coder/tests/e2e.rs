@@ -4028,14 +4028,14 @@ async fn secrets_in_check_output_never_reach_the_client(store: DynStore) {
         .find(|m| m.contains("checks are failing and no pull request was opened"))
         .unwrap_or_else(|| panic!("no verdict in {:#?}", seen.messages));
     assert!(
-        error.contains("GITHUB_TOKEN=[redacted]")
-            && error.contains("db=postgres://u:[redacted]@h/db"),
+        error.contains("GITHUB_TOKEN=[redacted: secret removed, do not reuse]")
+            && error.contains("db=postgres://u:[redacted: secret removed, do not reuse]@h/db"),
         "the findings are kept, the secrets are not: {error}"
     );
     let results = tool_results(&mock.requests().last().unwrap().messages);
     let (_, seen_by_model, _) = results.iter().find(|(c, _, _)| c == "c3").unwrap();
     assert!(
-        seen_by_model.contains("GITHUB_TOKEN=[redacted]"),
+        seen_by_model.contains("GITHUB_TOKEN=[redacted: secret removed, do not reuse]"),
         "{seen_by_model}"
     );
     assert_no_secret(seen_by_model, "the model's tool result");
@@ -5269,15 +5269,23 @@ async fn a_steps_input_and_output_carry_the_call_and_never_a_secret_the_process_
     // The arguments are there, with the token replaced.
     let wrote = of("tool:s2", false).input.as_ref().expect("an input");
     assert_eq!(wrote["path"], "t.txt");
-    assert_eq!(wrote["content"], "token=[redacted]\n");
+    assert_eq!(
+        wrote["content"],
+        "token=[redacted: secret removed, do not reuse]\n"
+    );
     let checked = of("tool:s3", false).input.as_ref().expect("an input");
-    assert_eq!(checked["command"], "echo checked [redacted]");
+    assert_eq!(
+        checked["command"],
+        "echo checked [redacted: secret removed, do not reuse]"
+    );
     // The answer of a check is its output, and it is ended as completed with it.
     let done = of("tool:s3", true);
     assert_eq!(done.state, StepState::Completed);
     let output = done.output.as_ref().expect("an output");
     assert!(
-        output.text.contains("checked [redacted]"),
+        output
+            .text
+            .contains("checked [redacted: secret removed, do not reuse]"),
         "{}",
         output.text
     );

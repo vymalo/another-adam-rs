@@ -551,21 +551,21 @@ async fn both_tools_scrub_a_secret_from_the_command_the_output_and_the_progress(
     assert!(!looked.is_error);
     assert_eq!(
         looked.content,
-        "$ echo [redacted]\nexit code 0\n--- output ---\n[redacted]\n"
+        "$ echo [redacted: secret removed, do not reuse]\nexit code 0\n--- output ---\n[redacted: secret removed, do not reuse]\n"
     );
     let made = rig.make(json!({ "command": command })).await;
     assert!(!made.is_error);
     assert_eq!(
         made.content,
-        "$ echo [redacted]\nexit code 0\n--- output ---\n[redacted]\n(git sees no change in the \
+        "$ echo [redacted: secret removed, do not reuse]\nexit code 0\n--- output ---\n[redacted: secret removed, do not reuse]\n(git sees no change in the \
          worktree; files the project ignores are kept too, and are not listed)\n"
     );
     assert_eq!(
         rig.progress(),
         [
-            "running: echo [redacted]",
-            "running: echo [redacted]",
-            "ran: echo [redacted]",
+            "running: echo [redacted: secret removed, do not reuse]",
+            "running: echo [redacted: secret removed, do not reuse]",
+            "ran: echo [redacted: secret removed, do not reuse]",
         ]
     );
 }

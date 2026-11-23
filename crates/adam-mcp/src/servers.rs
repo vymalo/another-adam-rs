@@ -1107,7 +1107,10 @@ mod tests {
         for leaked in ["tok-4c1e9d7a", "key-88b2f0e3"] {
             assert!(!scrubbed.contains(leaked), "{scrubbed}");
         }
-        assert!(scrubbed.contains("[REDACTED]"), "{scrubbed}");
+        assert!(
+            scrubbed.contains("[redacted: secret removed, do not reuse]"),
+            "{scrubbed}"
+        );
         assert!(scrubbed.contains("error sending request"), "{scrubbed}");
     }
 
@@ -1185,7 +1188,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("`{url}` was accepted"));
             assert!(matches!(error, Error::Url { .. }), "{url}: {error}");
             let shown = format!("{error} / {error:?}");
-            assert!(shown.contains("[REDACTED]"), "{shown}");
+            assert!(
+                shown.contains("[redacted: secret removed, do not reuse]"),
+                "{shown}"
+            );
             for leaked in ["key-88b2f0e3", "a%20b", "a b", "%C3%BC", "ü"] {
                 assert!(!shown.contains(leaked), "{leaked} in {shown}");
             }

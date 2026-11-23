@@ -149,7 +149,10 @@ async fn instructions_bounded_and_scrubbed() {
     );
     assert!(text.contains("> Use `search` for facts."), "{text}");
     assert!(!text.contains(SECRET), "the secret is scrubbed: {text}");
-    assert!(text.contains("[REDACTED]"), "{text}");
+    assert!(
+        text.contains("[redacted: secret removed, do not reuse]"),
+        "{text}"
+    );
     assert!(
         !text.contains('\u{202e}') && !text.contains('\u{200b}'),
         "{text}"
@@ -419,7 +422,10 @@ async fn a_server_that_says_nothing_about_a_secret_with_a_zero_width_character_i
         "{text}"
     );
     assert!(!text.contains('\u{200b}'), "{text}");
-    assert!(text.contains("[REDACTED]"), "{text}");
+    assert!(
+        text.contains("[redacted: secret removed, do not reuse]"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -639,7 +645,7 @@ async fn an_expansion_names_its_prompt_and_server_and_is_stripped_then_scrubbed(
     assert_eq!(
         text,
         "(the prompt note of the MCP server docs, with the person's arguments)\n\n\
-         line one\n\tline two [REDACTED]"
+         line one\n\tline two [redacted: secret removed, do not reuse]"
     );
 }
 

@@ -292,7 +292,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(token.expose_secret(), "ghs_appInstallationToken0123456789");
-        assert_eq!(redactor.scrub(token.expose_secret()), "[redacted]");
+        assert_eq!(
+            redactor.scrub(token.expose_secret()),
+            "[redacted: secret removed, do not reuse]"
+        );
         // A second call is the cached token: the mock expects one request only.
         creds
             .token_for(&RepoRef::new("https://github.com/o/r.git", "main"))
@@ -411,7 +414,11 @@ mod tests {
             "ghs_tokenOfTheAcmeInstallation01",
             "ghs_tokenOfOctocatInstallation02",
         ] {
-            assert_eq!(redactor.scrub(token), "[redacted]", "{token} is registered");
+            assert_eq!(
+                redactor.scrub(token),
+                "[redacted: secret removed, do not reuse]",
+                "{token} is registered"
+            );
         }
         // The mocks' `expect(1)` are checked when the server is dropped.
     }
