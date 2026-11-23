@@ -572,7 +572,7 @@ async fn the_interface_language_of_an_activated_message_is_the_runs_context_and_
         .backend
         .submit(
             activated(),
-            naming(Some("fr-CM")),
+            naming(Some("fr-FR")),
             None,
             Some("ctx-l".into()),
         )
@@ -580,7 +580,7 @@ async fn the_interface_language_of_an_activated_message_is_the_runs_context_and_
         .unwrap();
     assert_eq!(
         rig.state(&one).await.context[CONTEXT_LOCALE],
-        json!("fr-CM")
+        json!("fr-FR")
     );
     wait_task(&rig, &one.id, TaskState::Completed).await;
 
@@ -594,7 +594,7 @@ async fn the_interface_language_of_an_activated_message_is_the_runs_context_and_
         .unwrap();
     assert_eq!(
         rig.state(&two).await.context[CONTEXT_LOCALE],
-        json!("fr-CM"),
+        json!("fr-FR"),
         "a request that did not activate the extension changes nothing"
     );
     wait_task(&rig, &two.id, TaskState::Completed).await;

@@ -716,7 +716,7 @@ mod tests {
     }
 
     fn default_language() -> crate::Locale {
-        crate::Locale::parse("en-CM").expect("a well-formed tag")
+        crate::Locale::parse("en-GB").expect("a well-formed tag")
     }
 
     #[test]
@@ -737,13 +737,13 @@ mod tests {
         );
         assert_eq!(
             serde_json::Value::Object(e.params),
-            json!({"locale": "en-CM"})
+            json!({"locale": "en-GB"})
         );
         // One tag, and it is the deployment's: another deployment says another.
-        let fr = crate::Locale::parse("fr-CM").expect("a well-formed tag");
+        let fr = crate::Locale::parse("fr-FR").expect("a well-formed tag");
         assert_eq!(
             serde_json::Value::Object(ExtensionConfig::locale(&fr).params),
-            json!({"locale": "fr-CM"})
+            json!({"locale": "fr-FR"})
         );
     }
 
