@@ -414,6 +414,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Two checkouts get two project names
+        run: sh tools/check-compose-project.sh
       - name: Compose files are valid
         run: |
           docker compose config -q
