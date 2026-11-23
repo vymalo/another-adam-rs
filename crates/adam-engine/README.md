@@ -217,6 +217,12 @@ It also depends on `a2a-lf` (the A2A types, data only: ADR 0047's confirmed deci
 withheld file says), `thiserror`, `uuid` and `tracing` (a firing whose state cannot be read is left out of
 `firings` with a warning, as `list` leaves out a task).
 
+## The phone targets
+
+CI job `phone-targets` runs `cargo check -p adam-engine --locked --target aarch64-linux-android` and
+`--target aarch64-apple-ios` on every pull request, on a Linux runner. The targets are type-checked, not linked
+(no NDK, no Xcode, no device): a dependency that does not compile for a phone fails the job.
+
 ## The dependency check
 
 `tools/embedded-deps/check.sh` (CI job `embedded`, part of the required `lint`):
