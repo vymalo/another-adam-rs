@@ -26,7 +26,7 @@ base64.workspace = true
 jiff = { workspace = true, optional = true }
 jsonc-parser.workspace = true
 libc.workspace = true
-reqwest = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, features = ["rustls"] }
 # `openat2` and the `*at` calls, as safe functions: a slot is opened once and used by descriptor
 # (`safe_fs::SlotDir`). Already in the tree through `tempfile`.
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
