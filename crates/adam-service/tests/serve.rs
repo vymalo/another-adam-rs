@@ -994,7 +994,7 @@ async fn the_card_lists_locale_exactly_when_the_deployment_names_a_default_langu
 
     let Some(url) = database() else { return };
 
-    for tag in [Some("fr-CM"), None] {
+    for tag in [Some("fr-FR"), None] {
         let name = unique("serve-locale");
         let (listener, port) = listen().await;
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
