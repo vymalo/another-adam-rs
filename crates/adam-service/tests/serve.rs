@@ -984,3 +984,51 @@ async fn a_helper_that_is_not_registered_stops_serve_with_78() {
     assert_eq!(exit_code(&error), 78);
     assert!(!error.to_string().contains("postgres://"));
 }
+
+/// `DEFAULT_LOCALE` reaches the card through `serve`: the card lists `locale/v1` with the tag
+/// when the deployment sets one, and lists nothing when it does not.
+#[tokio::test]
+async fn the_card_lists_locale_exactly_when_the_deployment_names_a_default_language() {
+    use a2a_client::agent_card::AgentCardResolver;
+    use adam_a2a::LOCALE_EXTENSION;
+
+    let Some(url) = database() else { return };
+
+    for tag in [Some("fr-CM"), None] {
+        let name = unique("serve-locale");
+        let (listener, port) = listen().await;
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let more: Vec<(&str, String)> = tag
+            .map(|t| ("DEFAULT_LOCALE", t.to_owned()))
+            .into_iter()
+            .collect();
+        let cfg = config_with(&url, "all", port, &more);
+        let card = AgentCardConfig::new(
+            &name,
+            "A test agent.",
+            format!("http://{addr}/").parse().unwrap(),
+            "0.0.1",
+        );
+        let agents = agents(&name, &cfg);
+        let running = Running::start(listener, cfg, agents.card(card));
+        until_ok(addr, "/healthz", &running.handle).await;
+
+        let public = AgentCardResolver::new(None)
+            .resolve(&format!("http://{addr}"))
+            .await
+            .unwrap();
+        let entry = public
+            .capabilities
+            .extensions
+            .as_ref()
+            .and_then(|all| all.iter().find(|e| e.uri == LOCALE_EXTENSION));
+        match tag {
+            Some(t) => {
+                let params = entry.and_then(|e| e.params.as_ref()).expect("params");
+                assert_eq!(params["locale"], t);
+            }
+            None => assert!(entry.is_none(), "no tag, no entry"),
+        }
+        running.finish().await;
+    }
+}
