@@ -363,7 +363,8 @@ fn lost_view(why: &KeptError) -> String {
 }
 
 /// The most bytes a replacement of a secret can share with the secret's own bytes where the two
-/// scrubs of an open edge diverge: the mark is [`REDACTED_MARKER`], and a secret that starts with it
+/// scrubs of an open edge diverge: the mark is [`REDACTED_MARKER`](crate::REDACTED_MARKER), and a secret that
+/// starts with it
 /// shares all of it. A cut that is not at the end of the agreement is backed off by this.
 const REPLACEMENT_SLACK: usize = crate::REDACTED_MARKER.len();
 

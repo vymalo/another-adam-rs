@@ -79,7 +79,8 @@ impl StepIo {
 
     /// Scrub every string of a call's arguments (and every key) and of its result with `redact`
     /// before they are sent. It sees one string at a time and must return it with what is secret
-    /// replaced (by [`REDACTED_MARKER`], say); it is called on every call of every tool, so it should be
+    /// replaced (by [`REDACTED_MARKER`](crate::REDACTED_MARKER), say); it is called on every call of every
+    /// tool, so it should be
     /// cheap, and it must not fail.
     #[must_use]
     pub fn redact(mut self, redact: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
