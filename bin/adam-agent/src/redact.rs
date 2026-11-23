@@ -99,7 +99,9 @@ pub fn secret_values_named(
 
 /// `text` with every value of `secrets` (longest first) replaced by [`REDACTED`] where it stands
 /// as a value ([`adam_llm_agent::is_value_position`]): a held secret that is also an ordinary word
-/// is kept where it is an identifier. `step_io` holds a whole value at once, so the rule applies.
+/// is kept where it is an identifier, and one that is not
+/// ([`adam_llm_agent::is_ordinary_word`]: a digit, a capital, `_`, `-`, a Base64 form) is replaced
+/// wherever it stands. `step_io` holds a whole value at once, so the rule applies.
 pub fn scrub(secrets: &[String], text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
@@ -108,7 +110,8 @@ pub fn scrub(secrets: &[String], text: &str) -> String {
             // An empty needle would match here and advance nothing: the loop would never end.
             !secret.is_empty()
                 && text[at..].starts_with(secret.as_str())
-                && adam_llm_agent::is_value_position(text, at, secret.len())
+                && (!adam_llm_agent::is_ordinary_word(secret)
+                    || adam_llm_agent::is_value_position(text, at, secret.len()))
         });
         if let Some(secret) = matched {
             out.push_str(REDACTED);
@@ -313,6 +316,22 @@ mod tests {
             "x [redacted: secret removed, do not reuse] y [redacted: secret removed, do not reuse] z"
         );
         assert_eq!(scrub(&secrets, "nothing"), "nothing");
+        // A value that is not an ordinary word is never an identifier, so it goes wherever it stands:
+        // a token with a digit glued into other text is replaced (`step_io` is what the journal keeps
+        // and the UI shows).
+        assert_eq!(
+            scrub(&["abc123".to_owned()], "prefixabc123suffix"),
+            "prefix[redacted: secret removed, do not reuse]suffix"
+        );
+        // An ordinary word still keeps its identifier.
+        assert_eq!(
+            scrub(&["postgres".to_owned()], "fn postgres_handler() {}"),
+            "fn postgres_handler() {}"
+        );
+        assert_eq!(
+            scrub(&["postgres".to_owned()], "password=postgres"),
+            "password=[redacted: secret removed, do not reuse]"
+        );
         // An empty needle matches everywhere and advances nothing: it is skipped, not looped on.
         assert_eq!(scrub(&["".to_owned()], "nothing"), "nothing");
         assert_eq!(

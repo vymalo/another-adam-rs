@@ -328,7 +328,7 @@ impl Redactor {
             let word = known
                 .needles
                 .get(found.pattern().as_usize())
-                .is_some_and(|needle| is_ordinary_word(needle));
+                .is_some_and(|needle| adam_llm_agent::is_ordinary_word(needle));
             if inside_the_mark(text, found.start())
                 || (values_only
                     && word
@@ -398,7 +398,7 @@ fn sequential_scrub_values<'a>(
         if !out.contains(needle.as_str()) {
             continue;
         }
-        let rule = values_only && is_ordinary_word(needle);
+        let rule = values_only && adam_llm_agent::is_ordinary_word(needle);
         let mut next = String::with_capacity(out.len());
         let mut at = 0;
         while let Some(found) = out[at..].find(needle.as_str()) {
@@ -420,19 +420,14 @@ fn sequential_scrub_values<'a>(
     out
 }
 
-/// Whether `needle` is an ordinary word: lowercase ASCII letters only, so that it can be an
-/// identifier in code (`postgres`, `password`). A token with a digit, a capital, `_`, `-` or a
-/// Base64 form cannot be one, and is replaced wherever it stands.
-fn is_ordinary_word(needle: &str) -> bool {
-    !needle.is_empty() && needle.bytes().all(|b| b.is_ascii_lowercase())
-}
-
-/// Whether `at` falls inside a [`REDACTED`] mark already in `text`: the mark starts at most
-/// `REDACTED.len() - 1` bytes before `at`, so the text before it ends with one of the mark's proper
-/// prefixes. (The mark is ASCII, so every prefix is a string slice.)
+/// Whether `at` falls inside a [`REDACTED`] mark already in `text`: a mark that spans `at` starts at
+/// one of the `REDACTED.len() - 1` bytes before it, and the whole of it must be there — a text that
+/// merely ends like the mark's front (`x[redact`) is not one.
 fn inside_the_mark(text: &str, at: usize) -> bool {
     let head = &text[..at];
-    (1..REDACTED.len()).any(|k| head.len() >= k && head.ends_with(&REDACTED[..k]))
+    (1..REDACTED.len()).any(|k| {
+        head.len() >= k && head.ends_with(&REDACTED[..k]) && text[at - k..].starts_with(REDACTED)
+    })
 }
 
 /// The sequential replacement [`Redactor::scrub`] made before it had an automaton: kept for a
@@ -670,6 +665,23 @@ mod tests {
             r.scrub_values("fn postgres_handler() {}".into()),
             "fn postgres_handler() {}"
         );
+    }
+
+    /// A text that merely ends like the mark's front is not a mark: a value there is still a value.
+    #[test]
+    fn a_prefix_of_the_mark_is_not_a_mark() {
+        let r = Redactor::new(["secret"]);
+        assert_eq!(
+            r.scrub_string("x[redactsecret".into()),
+            "x[redact[redacted: secret removed, do not reuse]"
+        );
+        // A value is replaced, and the mark itself is not rewritten.
+        assert_eq!(
+            r.scrub_string("password=secret".into()),
+            format!("password={REDACTED}")
+        );
+        let marked = "a [redacted: secret removed, do not reuse] b".to_owned();
+        assert_eq!(r.scrub_string(marked.clone()), marked);
     }
 
     /// A scrub that runs twice (the coder settles an output, then the redacting layer scrubs the
