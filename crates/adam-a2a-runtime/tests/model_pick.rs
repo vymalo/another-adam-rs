@@ -221,6 +221,34 @@ async fn a_card_without_the_extension_leaves_the_pick_unread() {
 }
 
 #[tokio::test]
+async fn an_empty_choice_list_leaves_the_pick_unread() {
+    // A card that lists no models offers none, even when the backend was handed the empty set.
+    let rig = Rig::new(Some(ModelChoices::new()));
+    rig.mock.push_text("done");
+    let who = uniq("erin");
+    let (stop, handle) = rig.worker();
+    let task = rig
+        .backend
+        .submit(
+            picking(&who),
+            naming("go", "m-0", json!({"model": A})),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        rig.state_of(&task).await["context"]
+            .get(CONTEXT_MODEL)
+            .is_none()
+    );
+    wait_state(&rig, &picking(&who), &task.id, TaskState::Completed).await;
+    assert_eq!(rig.mock.last_request().expect("a model request").model, OWN);
+    stop.send(()).ok();
+    handle.await.ok();
+}
+
+#[tokio::test]
 async fn a_message_that_did_not_activate_the_extension_carries_no_pick() {
     let rig = Rig::new(Some(all_choices()));
     rig.mock.push_text("done");
