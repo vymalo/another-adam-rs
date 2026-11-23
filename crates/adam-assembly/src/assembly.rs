@@ -297,9 +297,13 @@ impl BoundDef {
             };
             self.check_alias(&origin, &alias)?;
             let effort = self.default_effort(node, &origin, &alias)?;
-            let cap = self.output_cap(node, &origin, &alias, &model)?;
+            let cap = self.output_cap(node, &origin, &alias, &model, false)?;
             let fallback = self.fallback_of(node, &origin, &alias, &model)?;
             let choices = self.choices_of(node, &origin, &alias, &model);
+            let (model_fallback, model_choices) = (
+                fallback.as_ref().map(|b| b.alias.clone()),
+                choices.iter().map(|b| b.alias.clone()).collect(),
+            );
             agents.push(self.build(
                 node,
                 &origin,
@@ -317,6 +321,8 @@ impl BoundDef {
                 description: node.description.clone(),
                 file: node.file.clone(),
                 model_alias: alias.clone(),
+                model_fallback,
+                model_choices,
                 reasoning_effort: effort,
                 prompt: node.prompt.clone(),
                 tools: node.tools.iter().map(|(name, _)| name.clone()).collect(),
@@ -364,10 +370,37 @@ impl BoundDef {
         })
     }
 
-    /// The model `node`'s run continues on when its own is locked: its `model_fallback`, with the
-    /// output cap and the reasoning level its **own** profile resolves (the folder's reasoning
-    /// level is for the agent's model, which the fallback may not take). Refused when the alias is
-    /// not one the deployment serves, is the agent's own, or has a cap that cannot be resolved.
+    /// The alias `node`'s run continues on when its own model is locked (ADR 0064, amended
+    /// 2026-11-23): the folder's `model_fallback`, else the one of the preset its `model_preset`
+    /// names, else the one of its model's profile, else of that profile's base preset.
+    fn fallback_name<'a>(
+        &'a self,
+        node: &'a Node,
+        origin: &Origin,
+        alias: &str,
+    ) -> Result<Option<&'a str>, Error> {
+        if let Some(name) = node.model_fallback.as_deref() {
+            return Ok(Some(name));
+        }
+        Ok(self
+            .named_preset(node, origin)?
+            .and_then(|p| p.fallback.as_deref())
+            .or_else(|| {
+                self.profiles
+                    .profile(alias)
+                    .and_then(|p| p.fallback.as_deref())
+            })
+            .or_else(|| {
+                self.profiles
+                    .preset_of(alias)
+                    .and_then(|p| p.fallback.as_deref())
+            }))
+    }
+
+    /// The model `node`'s run continues on when its own is locked, with the output cap and the
+    /// reasoning level its **own** profile resolves (what the folder and its preset set is for the
+    /// agent's model, which the fallback may not take). Refused when the alias is not one the
+    /// deployment serves, is the agent's own, or has a cap or a level that cannot be resolved.
     fn fallback_of(
         &self,
         node: &Node,
@@ -375,7 +408,7 @@ impl BoundDef {
         alias: &str,
         model: &DynModel,
     ) -> Result<Option<ModelBinding>, Error> {
-        let Some(name) = node.model_fallback.as_deref() else {
+        let Some(name) = self.fallback_name(node, origin, alias)? else {
             return Ok(None);
         };
         self.check_alias(origin, name)?;
@@ -386,9 +419,9 @@ impl BoundDef {
                 problem: AliasProblem::SameAsModel,
             });
         }
-        let cap = self.output_cap(node, origin, name, model)?;
+        let cap = self.output_cap(node, origin, name, model, true)?;
         Ok(Some(
-            ModelBinding::new(name, cap).reasoning_effort(self.own_effort(name)),
+            ModelBinding::new(name, cap).reasoning_effort(self.own_effort(origin, name)?),
         ))
     }
 
@@ -415,22 +448,39 @@ impl BoundDef {
                     .is_none_or(|allowed| allowed.contains(name))
             })
             .filter_map(|name| {
-                let cap = self.output_cap(node, origin, name, model).ok()?;
-                Some(ModelBinding::new(name, cap).reasoning_effort(self.own_effort(name)))
+                let cap = self.output_cap(node, origin, name, model, true).ok()?;
+                let effort = self.own_effort(origin, name).ok()?;
+                Some(ModelBinding::new(name, cap).reasoning_effort(effort))
             })
             .collect()
     }
 
-    /// The level a model's own profile asks for: its `reasoningEffort`, else its base preset's.
-    fn own_effort(&self, alias: &str) -> Option<ReasoningEffort> {
-        self.profiles
-            .profile(alias)
+    /// The level a model's own profile asks for: its `reasoningEffort`, else its base preset's,
+    /// which must be one of the model's levels.
+    fn own_effort(&self, origin: &Origin, alias: &str) -> Result<Option<ReasoningEffort>, Error> {
+        let profile = self.profiles.profile(alias);
+        let Some(effort) = profile
             .and_then(|p| p.reasoning_effort)
-            .or_else(|| {
-                self.profiles
-                    .preset_of(alias)
-                    .and_then(|p| p.reasoning_effort)
-            })
+            .or_else(|| self.profiles.preset_of(alias).and_then(|p| p.reasoning_effort))
+        else {
+            return Ok(None);
+        };
+        let allowed: Vec<ReasoningEffort> = profile
+            .and_then(|p| p.reasoning_efforts.clone())
+            .unwrap_or_default();
+        if !allowed.contains(&effort) {
+            let allowed: Vec<String> = allowed.iter().map(|e| e.as_str().to_owned()).collect();
+            return Err(Error::ReasoningEffort {
+                origin: origin.clone(),
+                effort: effort.as_str().to_owned(),
+                set_by: EffortSource::Profile,
+                model: alias.to_owned(),
+                suggestion: closest(effort.as_str(), allowed.iter().map(String::as_str))
+                    .map(str::to_owned),
+                allowed,
+            });
+        }
+        Ok(Some(effort))
     }
 
     fn check_alias(&self, origin: &Origin, alias: &str) -> Result<(), Error> {
@@ -548,15 +598,25 @@ impl BoundDef {
     /// promise about the model, where the folder's value is the agent's own choice. The folder's
     /// value is clamped, and so is the profile's, so a model that documents less than the value
     /// never receives more than it allows.
+    ///
+    /// With `own`, the cap of a model the agent does not run on itself (its fallback, a model a
+    /// message picks): the folder's value and its preset's are for the agent's model and are left
+    /// out, the model's own profile decides, and the history the window leaves room for is at
+    /// most half of that model's window.
     fn output_cap(
         &self,
         node: &Node,
         origin: &Origin,
         alias: &str,
         model: &DynModel,
+        own: bool,
     ) -> Result<u32, Error> {
         let profile = self.profiles.profile(alias);
-        let agent_preset = self.named_preset(node, origin)?;
+        let agent_preset = if own {
+            None
+        } else {
+            self.named_preset(node, origin)?
+        };
         let base_preset = self.profiles.preset_of(alias);
         let limit = profile.and_then(|p| p.max_output_tokens_limit);
         if let Some(limit) = limit {
@@ -589,7 +649,7 @@ impl BoundDef {
         // every source is filtered and the result is at least 1.
         let chosen = node
             .max_output_tokens
-            .filter(|cap| *cap > 0)
+            .filter(|cap| !own && *cap > 0)
             .or(agent_preset
                 .and_then(|p| p.max_output_tokens)
                 .filter(|cap| *cap > 0))
@@ -607,7 +667,8 @@ impl BoundDef {
         let window = model.context_window(alias);
         let history = window.map(|window| {
             if node.limits.max_history_tokens > 0 {
-                u64::from(node.limits.max_history_tokens)
+                let own_half = if own { window / 2 } else { u64::MAX };
+                u64::from(node.limits.max_history_tokens).min(own_half)
             } else {
                 window / 2
             }
@@ -732,6 +793,12 @@ pub struct AgentInfo {
     pub file: PathBuf,
     /// The gateway alias its model calls use.
     pub model_alias: String,
+    /// The alias its run continues on when its model is locked, resolved from its folder, its
+    /// preset and its model's profile (ADR 0064, amended 2026-11-23).
+    pub model_fallback: Option<String>,
+    /// The aliases a message may pick for its run ([`BoundDef::allow_model_choice`]): the models
+    /// with a profile that this agent can be bound to, its own left out. Empty unless allowed.
+    pub model_choices: Vec<String>,
     /// The reasoning effort its model calls ask for by default, resolved from its folder, its
     /// `model_preset`, the model profile and the profile's preset (ADR 0063 decision 4), or `None`
     /// when none of them sets one.

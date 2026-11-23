@@ -10,10 +10,12 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    Conversation, FnTool, LlmAgent, LlmAgentBuilder, MODEL_CONTEXT_KEY, ModelBinding, ToolError,
-    user_message,
+    COMPACTION_TURN, CompactionReason, Conversation, FnTool, Limits, LlmAgent, LlmAgentBuilder,
+    MODEL_CONTEXT_KEY, ModelBinding, ToolError, user_message,
 };
-use adam_model::{DynModel, MockModel, ModelError, ModelRequest, ReasoningEffort};
+use adam_model::{
+    DynModel, MockModel, ModelError, ModelRequest, ReasoningEffort, ToolCall, ToolChoice,
+};
 use adam_runtime::{
     CollectingSink, Inbound, ManualClock, RetryPolicy, RunEvent, RunView, Runtime, StepState,
 };
@@ -38,7 +40,15 @@ impl Rig {
     }
 
     fn over(store: DynStore, configure: impl FnOnce(LlmAgentBuilder) -> LlmAgentBuilder) -> Self {
-        let mock = Arc::new(MockModel::new());
+        Self::with(MockModel::new(), store, configure)
+    }
+
+    fn with(
+        mock: MockModel,
+        store: DynStore,
+        configure: impl FnOnce(LlmAgentBuilder) -> LlmAgentBuilder,
+    ) -> Self {
+        let mock = Arc::new(mock);
         let model: DynModel = mock.clone();
         let agent: LlmAgent = configure(LlmAgent::builder("llm", model, BASE)).build();
         let sink = CollectingSink::new();
@@ -324,5 +334,163 @@ async fn a_switch_replayed_after_a_lost_commit_gives_the_same_requests() {
         rig.state(run).await.model_switch.map(|s| s.to),
         Some(LITE.to_owned())
     );
+    rig.stop().await;
+}
+
+/// A tool whose answer is `n` letters: results of a size the test chooses.
+fn big_tool(b: LlmAgentBuilder) -> LlmAgentBuilder {
+    b.tool(FnTool::raw(
+        "big",
+        "answers a text of the size asked",
+        json!({"type": "object"}),
+        |_ctx, args| async move {
+            let n = args["n"].as_u64().unwrap_or(10) as usize;
+            let tag = args["tag"].as_str().unwrap_or("t");
+            Ok::<_, ToolError>(format!("{tag}:{}", "x".repeat(n)))
+        },
+    ))
+}
+
+fn big(id: &str, n: u64) -> ToolCall {
+    ToolCall::new(id, "big", json!({"n": n, "tag": id}))
+}
+
+fn is_summary(request: &ModelRequest) -> bool {
+    request.tool_choice == ToolChoice::None
+        && request
+            .messages
+            .last()
+            .is_some_and(|m| m.text().ends_with(COMPACTION_TURN))
+}
+
+/// The tokens a request holds, estimated as the agent does (characters / 4).
+fn tokens(request: &ModelRequest) -> usize {
+    request.messages.iter().map(|m| m.text().len()).sum::<usize>() / 4
+}
+
+/// After the switch the compaction budget, and so what the fallback is sent, are the fallback's own
+/// window's, not the agent's: a 70,000-token history fits the agent's 200,000-token window, not the
+/// fallback's 64,000, so it is summarised before the fallback is asked.
+#[tokio::test]
+async fn a_smaller_fallback_is_sent_a_history_that_fits_its_own_window() {
+    let mock = MockModel::new()
+        .with_context_window(BASE, 200_000)
+        .with_context_window(LITE, 64_000);
+    let rig = Rig::with(mock, Arc::new(MemoryStore::new()), |b| {
+        big_tool(b)
+            .limits(Limits {
+                max_output_tokens: 1024,
+                ..Limits::default()
+            })
+            .model_fallback(ModelBinding::new(LITE, 1024))
+    });
+    for n in 0..20 {
+        rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 14_000)]);
+    }
+    rig.mock
+        .push_error(locked(BASE))
+        .push_text("SUMMARY")
+        .push_text("answered");
+    let run = rig.start().await;
+    let view = rig.until(run, RunStatus::Done).await;
+    assert_eq!(text_of(&view).as_deref(), Some("answered"));
+    let requests = rig.mock.requests();
+    let on_lite: Vec<&ModelRequest> = requests.iter().filter(|r| r.model == LITE).collect();
+    assert!(
+        on_lite.first().is_some_and(|r| is_summary(r)),
+        "the history is summarised on the fallback first: {:?}",
+        models(&requests)
+    );
+    let answered = on_lite.last().unwrap();
+    assert!(
+        tokens(answered) + 1024 < 64_000,
+        "the request to the fallback holds {} tokens",
+        tokens(answered)
+    );
+    rig.stop().await;
+}
+
+/// A summary call the endpoint refuses as locked switches the run too, and is asked again of the
+/// fallback: a budget compaction.
+#[tokio::test]
+async fn a_lock_on_a_budget_summary_switches_and_the_summary_is_made_on_the_fallback() {
+    let rig = Rig::with(MockModel::new(), Arc::new(MemoryStore::new()), |b| {
+        big_tool(b)
+            .limits(Limits {
+                max_history_tokens: 1200,
+                ..Limits::default()
+            })
+            .model_fallback(lite())
+    });
+    for n in 0..4 {
+        rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 1200)]);
+    }
+    rig.mock
+        .push_error(locked(BASE))
+        .push_text("SUMMARY")
+        .push_text("answered");
+    let run = rig.start().await;
+    let view = rig.until(run, RunStatus::Done).await;
+    let requests = rig.mock.requests();
+    assert_eq!(text_of(&view).as_deref(), Some("answered"));
+    let summaries: Vec<&str> = requests
+        .iter()
+        .filter(|r| is_summary(r))
+        .map(|r| r.model.as_str())
+        .collect();
+    assert_eq!(summaries, [BASE, LITE], "{:?}", models(&requests));
+    let state = rig.state(run).await;
+    assert_eq!(state.compactions.len(), 1);
+    assert_eq!(state.compactions[0].reason, CompactionReason::Budget);
+    assert!(state.model_switch.is_some());
+    rig.stop().await;
+}
+
+/// The same, for the summary that follows a prompt the provider rejected as too long: the run does
+/// not fail while a fallback exists.
+#[tokio::test]
+async fn a_lock_on_an_overflow_summary_switches_instead_of_failing_the_run() {
+    let rig = Rig::with(MockModel::new(), Arc::new(MemoryStore::new()), |b| {
+        big_tool(b)
+            .limits(Limits {
+                max_history_tokens: 0,
+                ..Limits::default()
+            })
+            .model_fallback(lite())
+    });
+    for n in 0..4 {
+        rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 3000)]);
+    }
+    rig.mock
+        .push_error(ModelError::ContextLength("prompt is too long".into()))
+        .push_error(locked(BASE))
+        .push_text("SUMMARY")
+        .push_text("answered");
+    let run = rig.start().await;
+    let view = rig.until(run, RunStatus::Done).await;
+    assert_eq!(text_of(&view).as_deref(), Some("answered"));
+    let state = rig.state(run).await;
+    assert_eq!(state.compactions.len(), 1);
+    assert_eq!(state.compactions[0].reason, CompactionReason::Overflow);
+    assert_eq!(
+        rig.mock.requests().last().map(|r| r.model.as_str()),
+        Some(LITE)
+    );
+    rig.stop().await;
+}
+
+/// A message that picks the fallback itself, and is refused as locked there, fails at once: there
+/// is no other model to continue on, and no second call is made to the locked one.
+#[tokio::test]
+async fn a_lock_on_the_model_that_is_also_the_fallback_fails_without_a_second_call() {
+    let rig = Rig::new(|b| b.model_fallback(lite()).model_choices(vec![lite()]));
+    rig.mock.push_error(locked(LITE)).push_text("never asked");
+    let run = rig
+        .start_with(json!({"text": "go", "context": {MODEL_CONTEXT_KEY: {"model": LITE}}}))
+        .await;
+    let error = rig.until(run, RunStatus::Failed).await.error.unwrap();
+    assert!(error.contains(&format!("`{LITE}`")), "{error}");
+    assert_eq!(models(&rig.mock.requests()), [LITE], "no second call");
+    assert!(rig.state(run).await.model_switch.is_none());
     rig.stop().await;
 }

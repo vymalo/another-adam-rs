@@ -258,7 +258,6 @@ impl EngineBuilder {
             reasoning_effort,
             tools,
         } = self;
-        let models: Vec<String> = profiles.profiles.keys().cloned().collect();
         if limits.lease_ttl.is_zero() {
             return Err(EngineError::Invalid(
                 "the lease of a run must last longer than zero".to_owned(),
@@ -298,6 +297,18 @@ impl EngineBuilder {
             .model(model, alias)
             .map_err(|e| EngineError::Agent(Box::new(e)))?;
         let sessions = assembly.child_sessions().cloned();
+        // The models a message may name: what the root agent can be bound to (its own, and each
+        // model with a profile that its caps and the deployment's aliases allow).
+        let models: Vec<String> = assembly
+            .info()
+            .iter()
+            .find(|info| info.parent.is_none())
+            .map(|root| {
+                let mut models = root.model_choices.clone();
+                models.push(root.model_alias.clone());
+                models
+            })
+            .unwrap_or_default();
         store.migrate().await.map_err(EngineError::Store)?;
         // Held until the worker task has ended, so a second engine of this process with the same id
         // on this store is refused before its release could take this one's leases.
@@ -496,7 +507,8 @@ impl Drop for AbortOnDrop {
 
 pub(crate) struct Shared {
     backend: RuntimeTaskBackend,
-    /// The aliases a [`Say::model`] may name: the models that have a profile.
+    /// The aliases a [`Say::model`] may name: the root agent's own and the models it can be bound
+    /// to (they have a profile).
     models: Vec<String>,
     /// What [`Engine::file`] reads a file's bytes from, once the backend has said the run is this
     /// engine's caller's.
@@ -527,22 +539,39 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    /// Refuse a message that names a model for a run that has already switched to its fallback: the
+    /// run continues on the fallback for good, so the pick would change nothing, and is told so
+    /// instead of being ignored. A message that names none reaches the run as always.
+    async fn refuse_pick_after_switch(&self, run: RunId, say: &Say) -> Result<(), EngineError> {
+        if say.model.is_none() {
+            return Ok(());
+        }
+        let Ok(Some(state)) = self.runtime.state(run).await else {
+            return Ok(());
+        };
+        let Ok(state) = serde_json::from_value::<adam_llm_agent::Conversation>(state) else {
+            return Ok(());
+        };
+        match state.model_switch {
+            Some(switch) => Err(EngineError::Refused(format!(
+                "run {run} was switched from `{}` to its fallback `{}` and continues on it, so a \
+                 message cannot pick another model; the next run of the conversation starts on \
+                 the agent's own model again",
+                switch.from, switch.to
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Refuse a message that names a model with no profile.
     fn allows(&self, say: &Say) -> Result<(), EngineError> {
         match say.model.as_deref() {
             Some(alias) if !self.models.iter().any(|m| m == alias) => {
-                Err(EngineError::Invalid(if self.models.is_empty() {
-                    format!(
-                        "the message names the model `{alias}`, but this engine was given no model \
-                         profiles (`EngineBuilder::models`)"
-                    )
-                } else {
-                    format!(
-                        "the message names the model `{alias}`, which has no model profile; \
-                         profiled: {}",
-                        self.models.join(", ")
-                    )
-                }))
+                Err(EngineError::Invalid(format!(
+                    "the message names the model `{alias}`, which the agent cannot be bound to (it \
+                     needs a model profile it can resolve, `EngineBuilder::models`); allowed: {}",
+                    self.models.join(", ")
+                )))
             }
             _ => Ok(()),
         }
@@ -655,6 +684,9 @@ impl Engine {
                 let latest = self.latest_run(conversation).await?;
                 // Continued once it has ended; while it is open, the backend delivers to it.
                 message.reference_task_ids = Some(vec![latest.run.to_string()]);
+                if matches!(latest.state, RunState::Working | RunState::Waiting) {
+                    shared.refuse_pick_after_switch(latest.run, &say).await?;
+                }
                 Some(latest)
             }
             None => None,
@@ -700,6 +732,7 @@ impl Engine {
         let _writing = self.writable().await?;
         say.check()?;
         self.shared.allows(&say)?;
+        self.shared.refuse_pick_after_switch(run, &say).await?;
         let shared = &self.shared;
         let steered = shared
             .backend
@@ -727,6 +760,7 @@ impl Engine {
         let _writing = self.writable().await?;
         say.check()?;
         self.shared.allows(&say)?;
+        self.shared.refuse_pick_after_switch(run, &say).await?;
         let shared = &self.shared;
         let answered = shared
             .backend

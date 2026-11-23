@@ -50,6 +50,7 @@ fn portable(path: &Path) -> String {
 
 /// Why a model alias was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AliasProblem {
     /// The alias is empty (or only blanks).
     Empty,

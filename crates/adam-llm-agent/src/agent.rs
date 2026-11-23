@@ -2114,7 +2114,10 @@ impl LlmAgent {
     /// What the run admits as images from now on: the gate for this model, and what the history
     /// holds, so that a call admits the images the run has room for and no more.
     fn image_gate(&self, state: &Conversation) -> ImageGate {
-        let limits = self.model.input_modalities(&self.model_alias).images;
+        let limits = self
+            .model
+            .input_modalities(self.live_model(state).alias)
+            .images;
         let keeps_in_state = self.extensions.get::<ImageStore>().is_none();
         let room = keeps_in_state.then(|| MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()));
         let journal_left = keeps_in_state
@@ -2252,20 +2255,6 @@ impl LlmAgent {
         Ok(now + every)
     }
 
-    /// What a model call that failed with `failure` does when it parks the run ([ADR 0067]
-    /// decisions 4, 6 and 8): `None` for a failure that does not park, which the caller handles as
-    /// it always has.
-    ///
-    /// A refusal whose provider parks ([`ModelError::Refused`]) parks on a timer or until woken, as
-    /// the provider said; an endpoint that could not be reached parks on a timer, when this agent
-    /// parks on one ([`ModelParking::when_unreachable`]) and the step's retries are spent. The
-    /// conversation is left as it was before the call, with [`Conversation::model_wait`] set, so the
-    /// same call is made again when the run wakes. A park on a timer waits with a backoff, and parks
-    /// on a timer in a row past [`ModelParking::limit`] fail the run; a run nobody can wake (a
-    /// schedule's firing) fails on a park until woken. What is recorded is the reason, the status
-    /// and the slug, never anything else of the answer.
-    ///
-    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
     /// The model a model call of this run is made to now: after a switch, the fallback; else the
     /// one the run's context names when the agent was given a binding for it; else the agent's own.
     fn live_model(&self, state: &Conversation) -> LiveModel<'_> {
@@ -2311,6 +2300,12 @@ impl LlmAgent {
         }
         let from = self.live_model(state).alias.to_owned();
         let to = fallback.alias.clone();
+        if from == to {
+            return Flow::Fail(format!(
+                "model call failed: {message}: `{locked}` is also the fallback of this agent, so \
+                 there is no other model to continue on"
+            ));
+        }
         tracing::info!(run = %ctx.run_id(), %from, %to, "the endpoint does not allow the model: the run continues on its fallback");
         ctx.emit(RunEvent::Step(
             StepEvent::new(
@@ -2333,6 +2328,20 @@ impl LlmAgent {
         Flow::Next
     }
 
+    /// What a model call that failed with `failure` does when it parks the run ([ADR 0067]
+    /// decisions 4, 6 and 8): `None` for a failure that does not park, which the caller handles as
+    /// it always has.
+    ///
+    /// A refusal whose provider parks ([`ModelError::Refused`]) parks on a timer or until woken, as
+    /// the provider said; an endpoint that could not be reached parks on a timer, when this agent
+    /// parks on one ([`ModelParking::when_unreachable`]) and the step's retries are spent. The
+    /// conversation is left as it was before the call, with [`Conversation::model_wait`] set, so the
+    /// same call is made again when the run wakes. A park on a timer waits with a backoff, and parks
+    /// on a timer in a row past [`ModelParking::limit`] fail the run; a run nobody can wake (a
+    /// schedule's firing) fails on a park until woken. What is recorded is the reason, the status
+    /// and the slug, never anything else of the answer.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
     async fn parked_on_model(
         &self,
         ctx: &mut Ctx,
@@ -3093,10 +3102,11 @@ impl LlmAgent {
     }
 
     /// The budget of the history, in tokens (see [`compaction::budget`]).
-    fn history_budget(&self) -> Option<usize> {
+    fn history_budget(&self, state: &Conversation) -> Option<usize> {
+        let live = self.live_model(state);
         compaction::budget(
-            self.model.context_window(&self.model_alias),
-            self.limits.max_output_tokens,
+            self.model.context_window(live.alias),
+            live.max_output_tokens,
             self.limits.max_history_tokens,
         )
     }
@@ -3130,7 +3140,7 @@ impl LlmAgent {
             return None;
         }
         let estimate = self.estimated_tokens(state);
-        let limit = match (reason, self.history_budget()) {
+        let limit = match (reason, self.history_budget(state)) {
             (CompactionReason::Budget, budget) => budget.unwrap_or(estimate),
             (CompactionReason::Overflow, budget) => budget.unwrap_or(estimate).min(estimate),
         };
@@ -3140,7 +3150,7 @@ impl LlmAgent {
     /// Whether the committed state is due for a compaction: the estimate has reached the budget, and
     /// nothing says otherwise (a compaction at this very turn, a summary that failed a few turns ago).
     fn compaction_due(&self, state: &Conversation) -> bool {
-        let Some(budget) = self.history_budget() else {
+        let Some(budget) = self.history_budget(state) else {
             return false;
         };
         state
@@ -3332,6 +3342,21 @@ impl LlmAgent {
                 ctx.emit(RunEvent::Step(step(StepState::Waiting).with_detail(reason)))
                     .await;
             }
+            return Ok(Compacted::Parked(flow));
+        }
+        // A summary the endpoint refuses as locked switches the run as a turn does: the summary is
+        // asked for again of the fallback in the next transition, from the history as it is.
+        if let Err(f) = &recorded
+            && let Some(locked) = &f.locked
+        {
+            let flow = self.switched_on_lock(ctx, state, locked, &f.message).await;
+            if matches!(flow, Flow::Next) {
+                state.compact_next = asked;
+            }
+            ctx.emit(RunEvent::Step(step(StepState::Failed).with_detail(format!(
+                "the model `{locked}` is not allowed"
+            ))))
+            .await;
             return Ok(Compacted::Parked(flow));
         }
         if !matches!(&recorded, Err(f) if f.retryable) {
@@ -6207,6 +6232,8 @@ impl Agent for LlmAgent {
                     self.absorb_while_parked(ctx, &mut state, inbox).await?;
                 }
                 return Ok(match flow {
+                    // A switch to the fallback: the summary is asked of it in the next transition.
+                    Flow::Next => Transition::Continue(state),
                     Flow::Sleep(wake_at) => Transition::Park {
                         state,
                         wake_at: Some(wake_at),

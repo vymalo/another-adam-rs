@@ -250,6 +250,7 @@ fn a_hand_built_base_preset_above_the_limit_names_the_profiles_file() {
             Preset {
                 reasoning_effort: None,
                 max_output_tokens: Some(200_000),
+                ..Preset::default()
             },
         )]),
     };

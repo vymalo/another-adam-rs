@@ -84,10 +84,13 @@ impl Say {
     }
 
     /// Ask for the run to go on with the model `alias`, with its profile's output cap and reasoning
-    /// level (ADR 0064, amended 2026-11-23). The alias must have a profile in
-    /// [`EngineBuilder::models`](crate::EngineBuilder::models): the engine refuses any other with
-    /// [`EngineError::Invalid`], and every alias when it was given no profiles. The choice holds for
-    /// the run until a later message names another.
+    /// level (ADR 0064, amended 2026-11-23). The alias must be the root agent's own or a model it
+    /// can be bound to (a profile in [`EngineBuilder::models`](crate::EngineBuilder::models) that
+    /// resolves for it): the engine refuses any other with [`EngineError::Invalid`], and writes
+    /// nothing. The choice holds for the run until a later message names another. A run that
+    /// switched to its fallback because the endpoint locked its model stays on the fallback: a
+    /// later message that names a model is refused with [`EngineError::Refused`] (never ignored),
+    /// and the conversation's next run starts on the agent's own model again.
     #[must_use]
     pub fn with_model(mut self, alias: impl Into<String>) -> Self {
         self.model = Some(alias.into());
