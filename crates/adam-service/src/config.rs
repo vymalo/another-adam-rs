@@ -233,6 +233,9 @@ pub struct ServiceConfig {
     /// `SESSION_*`: the limits on the sessions of one conversation and how long an idle one stays
     /// open. Read by every role.
     pub sessions: SessionSettings,
+    /// `DEFAULT_LOCALE`: the agent's default language, a BCP 47 tag; the card lists `locale/v1`
+    /// with it when set (ADR 0069). `None`: the card lists nothing.
+    pub default_locale: Option<adam_a2a::Locale>,
 }
 
 impl std::fmt::Debug for ServiceConfig {
@@ -342,6 +345,11 @@ impl ServiceConfig {
             A2aSettings::default()
         };
 
+        let default_locale = get("DEFAULT_LOCALE").and_then(|raw| {
+            adam_a2a::Locale::parse(raw.trim())
+                .map_err(|e| problems.push(format!("DEFAULT_LOCALE is invalid: {e}")))
+                .ok()
+        });
         Self {
             role,
             database_url: SecretString::from(database_url),
@@ -352,6 +360,7 @@ impl ServiceConfig {
             worker,
             a2a,
             sessions: SessionSettings::parse(lookup, problems),
+            default_locale,
         }
     }
 }
@@ -1507,6 +1516,22 @@ mod tests {
                 max_parallel_tool_calls: 10,
             })
         );
+    }
+
+    /// `DEFAULT_LOCALE` names the agent's default language: unset is none, a well-formed tag is
+    /// kept, a malformed one is a startup problem (exit 78), never a guessed language.
+    #[test]
+    fn default_locale_is_a_well_formed_tag_or_a_startup_problem() {
+        assert!(parse(&full()).expect("valid").default_locale.is_none());
+        let mut vars = full();
+        vars.insert("DEFAULT_LOCALE", "fr-CM");
+        let c = parse(&vars).expect("valid");
+        assert_eq!(c.default_locale.expect("a tag").as_str(), "fr-CM");
+        for bad in ["fr_CM", "not a tag", "x-private", "toolongsubtagxx"] {
+            let mut vars = full();
+            vars.insert("DEFAULT_LOCALE", bad);
+            assert!(mentions(&problems_of(&vars), "DEFAULT_LOCALE"), "{bad:?}");
+        }
     }
 
     /// `NOTIFY_LOCAL_ONLY` is a startup variable of every role (every role runs
