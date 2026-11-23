@@ -89,3 +89,6 @@ mod tests {
         assert_eq!(format!("{secrets:?}"), "SecretSource(none)");
     }
 }
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+compile_error!("planted: phone-hostile code (ANR-119 failure proof, to be reverted)");
