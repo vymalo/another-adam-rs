@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # A host that installs its own TLS provider builds adam-model-openai and adam-model-oauth with
-# `--no-default-features`: neither may then link aws-lc-rs. `self-test` plants the feature and expects a failure.
+# `--no-default-features`: neither may then link aws-lc-rs. adam-engine is checked over its normal
+# dependencies (the embedded set); its example's dev-dependency on adam-model-openai is the host's own choice. `self-test` plants the feature and expects a failure.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-PACKAGES='adam-model-openai adam-model-oauth'
+PACKAGES='adam-model-openai adam-model-oauth adam-engine'
 
 check() {
   local found=0 out
   for p in $PACKAGES; do
     cargo build -p "$p" --locked --no-default-features >/dev/null
-    out=$(cargo tree -p "$p" --locked --no-default-features -e features -i aws-lc-rs 2>&1 || true)
-    if [[ "$out" == *"did not match any packages"* ]]; then
+    local edges=features
+    [[ "$p" == adam-engine ]] && edges=features,normal
+    out=$(cargo tree -p "$p" --locked --no-default-features -e "$edges" -i aws-lc-rs 2>&1 || true)
+    if [[ "$out" == *"did not match any packages"* || "$out" == *"nothing to print"* ]]; then
       echo "tls-provider: $p holds no aws-lc-rs without its defaults"
     else
       echo "tls-provider: $p links aws-lc-rs without its defaults:" >&2
