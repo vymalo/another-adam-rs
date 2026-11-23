@@ -34,10 +34,9 @@ use crate::compaction::{
 };
 use crate::conversation::{
     ArtifactRef, Conversation, LOCALE_CONTEXT_KEY, LimitHit, LimitKind, Loaded, Loader,
-    MODEL_CONTEXT_KEY, ModelSwitch,
-    PendingQuestion, PendingRemote, PendingRun, PendingSession, PendingWait,
-    REASONING_EFFORT_CONTEXT_KEY, Repeats, asks_to_close, parse_context, parse_model_run,
-    parse_root_run, parse_root_step, parse_session, parse_user_text,
+    MODEL_CONTEXT_KEY, ModelSwitch, PendingQuestion, PendingRemote, PendingRun, PendingSession,
+    PendingWait, REASONING_EFFORT_CONTEXT_KEY, Repeats, asks_to_close, parse_context,
+    parse_model_run, parse_root_run, parse_root_step, parse_session, parse_user_text,
 };
 use crate::history::{RunChars, record_shortenings};
 use crate::images::{
@@ -716,9 +715,7 @@ pub fn interface_language(context: &Map<String, Value>) -> Option<&str> {
         .filter(|tag| {
             !tag.is_empty()
                 && tag.len() <= MAX_INTERFACE_LANGUAGE_BYTES
-                && tag
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
 }
 

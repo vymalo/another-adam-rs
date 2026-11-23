@@ -11,9 +11,9 @@ use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
     ACCESS_TIER_CONTEXT_KEY, CALLER_CONTEXT_KEY, Conversation, LOCALE_CONTEXT_KEY, LlmAgent,
     LlmAgentBuilder, MAX_CONTEXT_BYTES, MAX_INTERFACE_LANGUAGE_BYTES, MAX_PROTECTED_VALUE_BYTES,
-    MAX_SOURCE_TOOLS, interface_language, interface_language_turn,
-    PendingQuestion, PendingWait, REASONING_EFFORT_CONTEXT_KEY, SourceCtx, Tool, ToolAccess,
-    ToolCtx, ToolError, ToolOutput, ToolSource, user_message,
+    MAX_SOURCE_TOOLS, PendingQuestion, PendingWait, REASONING_EFFORT_CONTEXT_KEY, SourceCtx, Tool,
+    ToolAccess, ToolCtx, ToolError, ToolOutput, ToolSource, interface_language,
+    interface_language_turn, user_message,
 };
 use adam_model::{DynModel, Message, MockModel, ReasoningEffort, ToolCall, ToolSpec};
 use adam_runtime::{Inbound, ManualClock, RetryPolicy, RunView, Runtime};
@@ -1381,7 +1381,11 @@ async fn the_interface_language_is_sent_as_a_per_turn_turn_and_never_in_the_syst
         "the language is the last turn of the request"
     );
     assert!(
-        !first.system.as_deref().unwrap_or_default().contains("fr-CM"),
+        !first
+            .system
+            .as_deref()
+            .unwrap_or_default()
+            .contains("fr-CM"),
         "the tag is not in the stable prefix: {:?}",
         first.system
     );
@@ -1412,7 +1416,11 @@ async fn a_value_that_is_not_a_language_tag_is_never_sent() {
         h.mock.push_text("done");
         let rt = h.runtime(&agent);
         let run = rt
-            .start("llm", message_with("hi", json!({LOCALE_CONTEXT_KEY: value})), None)
+            .start(
+                "llm",
+                message_with("hi", json!({LOCALE_CONTEXT_KEY: value})),
+                None,
+            )
             .await
             .expect("start");
         let worker = spawn_worker(&rt);
@@ -1449,7 +1457,10 @@ fn a_language_tag_is_ascii_letters_digits_and_hyphens_of_a_bounded_length() {
     assert_eq!(of(json!("fr-CM; rm -rf /")), None);
     assert_eq!(of(json!(42)), None);
     assert_eq!(of(json!({"locale": "fr-CM"})), None);
-    assert_eq!(of(json!("x".repeat(MAX_INTERFACE_LANGUAGE_BYTES + 1))), None);
+    assert_eq!(
+        of(json!("x".repeat(MAX_INTERFACE_LANGUAGE_BYTES + 1))),
+        None
+    );
     assert_eq!(
         of(json!("x".repeat(MAX_INTERFACE_LANGUAGE_BYTES))),
         Some("x".repeat(MAX_INTERFACE_LANGUAGE_BYTES))
