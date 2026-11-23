@@ -7,7 +7,8 @@ use std::time::Duration;
 use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent};
 use adam_llm_agent::{
     DEFAULT_MAX_PARALLEL, DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder,
-    MAX_PARALLEL_LIMIT, ModelParking, SESSION_TOOLS, StepIo, ToolSource, WINDOW_MARGIN_TOKENS,
+    MAX_PARALLEL_LIMIT, ModelBinding, ModelParking, SESSION_TOOLS, StepIo, ToolSource,
+    WINDOW_MARGIN_TOKENS,
 };
 use adam_model::{DEFAULT_MAX_OUTPUT_TOKENS, DynModel, ModelProfiles, Preset, ReasoningEffort};
 use adam_runtime::{RuntimeBuilder, SessionLimits};
@@ -36,6 +37,7 @@ pub struct BoundDef {
     sources: Vec<DynToolSource>,
     aliases: Option<Vec<String>>,
     profiles: ModelProfiles,
+    model_choices: bool,
     wait_poll: Option<Duration>,
     max_parallel: Option<usize>,
     model_parking: Option<ModelParking>,
@@ -82,6 +84,7 @@ impl BoundDef {
             sources: Vec::new(),
             aliases: None,
             profiles: ModelProfiles::default(),
+            model_choices: false,
             wait_poll: None,
             max_parallel: None,
             model_parking: None,
@@ -157,6 +160,17 @@ impl BoundDef {
     #[must_use]
     pub fn model_profiles(mut self, profiles: ModelProfiles) -> Self {
         self.profiles = profiles;
+        self
+    }
+
+    /// Let a message pick the model of its run among the deployment's profiles
+    /// ([`MODEL_CONTEXT_KEY`](adam_llm_agent::MODEL_CONTEXT_KEY), ADR 0064 amended 2026-11-23):
+    /// every agent is given a binding, with its cap and reasoning level, for each model that has a
+    /// profile ([`model_profiles`](Self::model_profiles)). Off by default: a served agent's callers
+    /// may not choose what a run costs, so the key is ignored there. The engine turns it on.
+    #[must_use]
+    pub fn allow_model_choice(mut self) -> Self {
+        self.model_choices = true;
         self
     }
 
@@ -284,7 +298,16 @@ impl BoundDef {
             self.check_alias(&origin, &alias)?;
             let effort = self.default_effort(node, &origin, &alias)?;
             let cap = self.output_cap(node, &origin, &alias, &model)?;
-            agents.push(self.build(node, &origin, &model, &alias, effort, cap)?);
+            let fallback = self.fallback_of(node, &origin, &alias, &model)?;
+            let choices = self.choices_of(node, &origin, &alias, &model);
+            agents.push(self.build(
+                node,
+                &origin,
+                &model,
+                (&alias, effort, cap),
+                fallback,
+                choices,
+            )?);
             info.push(AgentInfo {
                 name: node.name.clone(),
                 parent: node
@@ -339,6 +362,75 @@ impl BoundDef {
             #[cfg(feature = "mcp")]
             prompt_commands: self.prompt_commands,
         })
+    }
+
+    /// The model `node`'s run continues on when its own is locked: its `model_fallback`, with the
+    /// output cap and the reasoning level its **own** profile resolves (the folder's reasoning
+    /// level is for the agent's model, which the fallback may not take). Refused when the alias is
+    /// not one the deployment serves, is the agent's own, or has a cap that cannot be resolved.
+    fn fallback_of(
+        &self,
+        node: &Node,
+        origin: &Origin,
+        alias: &str,
+        model: &DynModel,
+    ) -> Result<Option<ModelBinding>, Error> {
+        let Some(name) = node.model_fallback.as_deref() else {
+            return Ok(None);
+        };
+        self.check_alias(origin, name)?;
+        if name == alias {
+            return Err(Error::ModelAlias {
+                origin: origin.clone(),
+                alias: name.to_owned(),
+                problem: AliasProblem::SameAsModel,
+            });
+        }
+        let cap = self.output_cap(node, origin, name, model)?;
+        Ok(Some(
+            ModelBinding::new(name, cap).reasoning_effort(self.own_effort(name)),
+        ))
+    }
+
+    /// The models a message may pick for `node`'s run, when the deployment allows it: one binding
+    /// for each model with a profile, but the agent's own. A model whose cap cannot be resolved for
+    /// this agent is not offered.
+    fn choices_of(
+        &self,
+        node: &Node,
+        origin: &Origin,
+        alias: &str,
+        model: &DynModel,
+    ) -> Vec<ModelBinding> {
+        if !self.model_choices {
+            return Vec::new();
+        }
+        self.profiles
+            .profiles
+            .keys()
+            .filter(|name| name.as_str() != alias)
+            .filter(|name| {
+                self.aliases
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(name))
+            })
+            .filter_map(|name| {
+                let cap = self.output_cap(node, origin, name, model).ok()?;
+                Some(ModelBinding::new(name, cap).reasoning_effort(self.own_effort(name)))
+            })
+            .collect()
+    }
+
+    /// The level a model's own profile asks for: its `reasoningEffort`, else its base preset's.
+    fn own_effort(&self, alias: &str) -> Option<ReasoningEffort> {
+        self.profiles
+            .profile(alias)
+            .and_then(|p| p.reasoning_effort)
+            .or_else(|| {
+                self.profiles
+                    .preset_of(alias)
+                    .and_then(|p| p.reasoning_effort)
+            })
     }
 
     fn check_alias(&self, origin: &Origin, alias: &str) -> Result<(), Error> {
@@ -573,9 +665,9 @@ impl BoundDef {
         node: &Node,
         origin: &Origin,
         model: &DynModel,
-        alias: &str,
-        effort: Option<ReasoningEffort>,
-        cap: u32,
+        (alias, effort, cap): (&str, Option<ReasoningEffort>, u32),
+        fallback: Option<ModelBinding>,
+        choices: Vec<ModelBinding>,
     ) -> Result<LlmAgent, Error> {
         let mut builder = LlmAgent::builder(node.name.clone(), Arc::clone(model), alias)
             .instructions(node.prompt.clone())
@@ -584,7 +676,11 @@ impl BoundDef {
                 ..node.limits
             })
             .max_parallel(self.parallel_of(node))
-            .reasoning_effort(effort);
+            .reasoning_effort(effort)
+            .model_choices(choices);
+        if let Some(fallback) = fallback {
+            builder = builder.model_fallback(fallback);
+        }
         if let Some(every) = self.wait_poll {
             builder = builder.wait_poll(every);
         }

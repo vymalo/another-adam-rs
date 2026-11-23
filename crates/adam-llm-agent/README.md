@@ -19,7 +19,7 @@ instructions + a model + a toolset. It is served over A2A by
 | Item | What |
 |---|---|
 | `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
-| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.reasoning_effort(Option<ReasoningEffort>)` (the level every turn asks for unless the run's context names one: see *Reasoning effort*), `.model_parking(ModelParking)` (how a run waits on a model that refused it: see *A run parked on the model*), `.build()` |
+| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.reasoning_effort(Option<ReasoningEffort>)` (the level every turn asks for unless the run's context names one: see *Reasoning effort*), `.model_parking(ModelParking)` (how a run waits on a model that refused it: see *A run parked on the model*), `.model_fallback(ModelBinding)` (the model a run continues on, once, when its own is locked: see *A locked model*), `.model_choices(Vec<ModelBinding>)` (the models a message may name through `MODEL_CONTEXT_KEY`), `.build()` |
 | `ModelParking`, `ModelWait`, `ModelPark`, `MODEL_RESUME_KIND`, `DEFAULT_MODEL_PARK_LIMIT`, `MAX_MODEL_BACKOFF` | a run parked on the model (ADR 0067): `ModelParking::new(limit).when_unreachable(bool)`, the default a limit of 24 h and an unreachable endpoint that fails as before; `Conversation::model_wait` is the `ModelWait` of a parked run (`reason`, `status`, `slug`, `park`, `parked_since`, `parks`, `wake_at`); see *A run parked on the model* |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*); it also splits and joins the conversation exactly like `LlmAgent` (`AgentStarter::split`/`join`), so a run it starts is written with a head and a body, not left in the v4 format |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens` (the cap a call asks for; `0` leaves it to the model, and `Limits::default()` is 4,096 for a hand-built agent: the 128,000 fallback and the model's profile are resolved and clamped by the assembly, ADR 0064), `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
@@ -740,12 +740,24 @@ the summary: a parked run never keeps an inbox, which the runtime's looks at a c
 kind `MODEL_RESUME_KIND` (`adam.resume`, the runtime's wake-only `RESUME_KIND`) wakes the run and adds nothing; one that
 lands while the run works is no message that arrived and reopens nothing. The first call
 that is answered clears the wait. A cancel ends the park. `ModelError::ModelLocked` is no park: the run fails naming the
-model. A provider that does not park (`StaticBearer`) fails as before. The journal holds the reason's status and slug
+model, or switches once to its fallback (*A locked model*). A provider that does not park (`StaticBearer`) fails as before. The journal holds the reason's status and slug
 (`park` in the failure's record), never a header, a body or a credential.
 
 **Breaking:** `Conversation::model_wait` is a new public field of a struct that is not `#[non_exhaustive]`: a literal
 outside the workspace needs it. `PendingRun::model_wait` is the same for a wait on a child. A wait this build cannot read
 loads as none (`ModelPark` gains a kind in a later build).
+
+**A locked model** (ADR 0064, amended 2026-11-23). An agent built with `.model_fallback(ModelBinding::new(alias, cap)
+.reasoning_effort(..))` (the assembly builds it from the folder's `model_fallback:`) answers a `ModelError::ModelLocked`
+by recording `Conversation::model_switch` (`ModelSwitch { from, to, turn }`), emitting the step `Switched model`, and asking
+the same turn again of the fallback, with its cap and level, in the next transition. Every later call of the run (the
+compaction summary too) names the fallback, `usage/v1` names it, and the run never goes back. A `ModelLocked` on the
+fallback fails the run naming both models; an agent with no fallback fails as before. `ModelFailure` journals the locked
+alias, so a replay finds the same refusal and makes no call. `.model_choices(..)` gives the models a message may pick with
+the context key `MODEL_CONTEXT_KEY` (`vymalo.model`, `{"model": alias}`); an alias without a binding, or an agent without
+choices, is ignored. **Breaking:** `Conversation::model_switch` is a new public field of a struct that is not
+`#[non_exhaustive]`. Tests: `tests/model_fallback.rs` (the switch, no switch back, a second lock, no fallback, a message's
+pick, a replay after a lost commit).
 
 Tests: `tests/model_park.rs` (each kind, the backoff by the journaled times, the limit and a wake clamped to it, a message,
 one refused again, a resume, a resume during the woken call adding no turn, a row that changes kind, a replay after a lost

@@ -2369,3 +2369,107 @@ async fn the_builders_level_never_reaches_a_subagent() {
     );
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 }
+
+// ------------------------------- ADR 0064 amended 2026-11-23: a model per Say, and a fallback
+
+/// Two profiled models: `m` (the engine's own) and `lite`, with its own cap and level.
+fn two_models() -> ModelProfiles {
+    ModelProfiles::parse_json(
+        r#"{ "profiles": {
+            "m": { "reasoningEfforts": ["low", "high"], "reasoningWire": "reasoning_effort" },
+            "lite": { "reasoningEfforts": ["low"], "reasoningWire": "reasoning_effort",
+                      "reasoningEffort": "low", "maxOutputTokens": 4096 }
+        } }"#,
+    )
+    .expect("the profiles parse")
+}
+
+/// A `Say` that names a model with a profile is answered by it, with that profile's cap and level;
+/// one that names a model without a profile is refused before anything is written, and so is any
+/// alias when the engine was given no profiles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_say_names_a_model_and_the_engine_refuses_one_with_no_profile() {
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .models(two_models())
+        .start()
+        .await
+        .expect("starts");
+
+    let refused = engine
+        .send(None, Say::new("hi").with_model("unknown"))
+        .await
+        .expect_err("a model with no profile is refused");
+    let EngineError::Invalid(why) = &refused else {
+        panic!("expected Invalid, got {refused:?}");
+    };
+    assert!(why.contains("`unknown`") && why.contains("lite"), "{why}");
+    assert!(mock.requests().is_empty(), "nothing reached the model");
+
+    let turn = engine
+        .send(None, Say::new("hi").with_model("lite"))
+        .await
+        .expect("a profiled model is accepted");
+    let mut events = engine.events(turn.run).await.unwrap();
+    while timeout(WAIT, events.next())
+        .await
+        .expect("an event")
+        .is_some()
+    {}
+    let requests = mock.requests();
+    assert_eq!(requests[0].model, "lite");
+    assert_eq!(requests[0].max_output_tokens, Some(4096));
+    assert_eq!(requests[0].reasoning_effort, Some(ReasoningEffort::Low));
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+
+    // No profiles at all: every alias is refused.
+    let model: DynModel = Arc::new(MockModel::new());
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .start()
+        .await
+        .expect("starts");
+    let refused = engine
+        .send(None, Say::new("hi").with_model("m"))
+        .await
+        .expect_err("no profiles, no choice");
+    assert!(matches!(refused, EngineError::Invalid(_)), "{refused:?}");
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// A folder's `model_fallback` reaches the engine's agent: the locked model's call is made again
+/// to the fallback. A fallback that is the agent's own model stops `start`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folders_model_fallback_switches_once_in_an_engine() {
+    let with = |fallback: &str| {
+        agent(&[(
+            "agent/instructions.md",
+            &format!(
+                "---\nname: chat\ndescription: Talks with the person.\nmodel_fallback: {fallback}\n---\nYou chat.\n"
+            ),
+        )])
+    };
+    let mock = Arc::new(MockModel::new());
+    mock.push_error(adam_model::ModelError::ModelLocked { model: "m".into() })
+        .push_text("done");
+    let model: DynModel = mock.clone();
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), with("lite"), model, "m")
+        .models(two_models())
+        .start()
+        .await
+        .expect("starts");
+    let done = say_to_the_end(&engine, "hi").await;
+    assert_eq!(done.state, RunState::Done);
+    let models: Vec<String> = mock.requests().iter().map(|r| r.model.clone()).collect();
+    assert_eq!(models, ["m", "lite"]);
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+
+    let model: DynModel = Arc::new(MockModel::new());
+    let refused = Engine::builder(Arc::new(MemoryStore::new()), with("m"), model, "m")
+        .models(two_models())
+        .start()
+        .await
+        .expect_err("a fallback that is the agent's own model");
+    assert!(matches!(refused, EngineError::Agent(_)), "{refused:?}");
+}

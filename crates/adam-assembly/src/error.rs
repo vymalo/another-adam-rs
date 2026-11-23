@@ -55,6 +55,8 @@ pub enum AliasProblem {
     Empty,
     /// The alias has whitespace or a control character: a gateway alias is one token.
     NotAToken,
+    /// A `model_fallback` that is the agent's own model: the switch would change nothing.
+    SameAsModel,
     /// [`BoundDef::model_aliases`](crate::BoundDef::model_aliases) lists the aliases the
     /// deployment serves, and this is not one of them.
     NotAllowed {
@@ -72,6 +74,9 @@ impl fmt::Display for AliasProblem {
             Self::NotAToken => {
                 f.write_str("a gateway alias is one token: no whitespace or control characters")
             }
+            Self::SameAsModel => f.write_str(
+                "the fallback is the agent's own model, so a switch would change nothing",
+            ),
             Self::NotAllowed {
                 suggestion,
                 allowed,

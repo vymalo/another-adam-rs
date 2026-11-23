@@ -62,6 +62,10 @@ pub struct Say {
     pub id: String,
     /// The text.
     pub text: String,
+    /// The model alias this message asks its run to be answered by, when it is not the agent's own
+    /// ([`with_model`](Self::with_model)). `None`: the agent's own model, or the one an earlier
+    /// message of the run named.
+    pub model: Option<String>,
 }
 
 impl Say {
@@ -75,7 +79,19 @@ impl Say {
         Self {
             id: id.into(),
             text: text.into(),
+            model: None,
         }
+    }
+
+    /// Ask for the run to go on with the model `alias`, with its profile's output cap and reasoning
+    /// level (ADR 0064, amended 2026-11-23). The alias must have a profile in
+    /// [`EngineBuilder::models`](crate::EngineBuilder::models): the engine refuses any other with
+    /// [`EngineError::Invalid`], and every alias when it was given no profiles. The choice holds for
+    /// the run until a later message names another.
+    #[must_use]
+    pub fn with_model(mut self, alias: impl Into<String>) -> Self {
+        self.model = Some(alias.into());
+        self
     }
 
     pub(crate) fn check(&self) -> Result<(), EngineError> {
@@ -84,6 +100,15 @@ impl Say {
         }
         if self.text.trim().is_empty() {
             return Err(EngineError::Invalid("the message has no text".to_owned()));
+        }
+        if self
+            .model
+            .as_deref()
+            .is_some_and(|alias| alias.trim().is_empty())
+        {
+            return Err(EngineError::Invalid(
+                "the message names an empty model alias".to_owned(),
+            ));
         }
         Ok(())
     }

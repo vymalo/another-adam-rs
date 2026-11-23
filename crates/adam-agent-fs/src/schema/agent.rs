@@ -419,6 +419,12 @@ pub struct AgentFrontmatter {
     /// profile; an undeclared name is a bind error naming the agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_preset: Option<String>,
+    /// The model alias this agent's run continues on, once, when the endpoint refuses its model as
+    /// locked (ADR 0064, amended 2026-11-23). It must differ from the agent's own alias and be one
+    /// the deployment serves; its output cap and reasoning level come from its own profile. A
+    /// subagent follows its own file's value; none is inherited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_fallback: Option<String>,
     /// The skills the catalog offers: `all` or a list. Default: every skill of the agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills: Option<SkillSelection>,

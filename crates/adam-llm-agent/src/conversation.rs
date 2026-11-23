@@ -107,6 +107,18 @@ pub(crate) fn parse_user_text(payload: &Value) -> Result<String, String> {
 /// context is dropped, with a warning.
 pub const MAX_CONTEXT_BYTES: usize = 256 * 1024;
 
+/// A run's switch to its agent's fallback model: the model the endpoint refused, the one the run
+/// continues on, and the turn the refusal came at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSwitch {
+    /// The alias the endpoint refused as locked.
+    pub from: String,
+    /// The alias the run continues on, for the rest of the run.
+    pub to: String,
+    /// The turn the refused call belonged to ([`Conversation::turns`]).
+    pub turn: u32,
+}
+
 /// The context key under which a message carries the access tier the person picked for it
 /// (`access-tier/v1`): `{"tier": "plan" | "edits" | "auto" | "bypass"}`.
 pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
@@ -117,6 +129,14 @@ pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
 /// a continuing task and a child run inherit it. A value that is not that shape is ignored here:
 /// the front refuses it before anything is written.
 pub const REASONING_EFFORT_CONTEXT_KEY: &str = "vymalo.reasoningEffort";
+
+/// The context key under which a message names the model its run is asked of: `{"model":
+/// "<alias>"}`, an alias the agent was given a profile for ([`LlmAgentBuilder::model_choices`]); the
+/// engine's `Say::model` sets it. It holds for the run until a later message names another. Not a
+/// protected key, and ignored by an agent given no choices (ADR 0064, amended 2026-11-23).
+///
+/// [`LlmAgentBuilder::model_choices`]: crate::LlmAgentBuilder::model_choices
+pub const MODEL_CONTEXT_KEY: &str = "vymalo.model";
 
 /// The context key under which a message says **who it was sent for** (`thread-tools/v1`): the
 /// thread's addressed agent, `{"caller": "main"}`, or an agent another agent asked, `{"caller":
@@ -804,6 +824,12 @@ pub struct Conversation {
     /// while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compactions: Vec<Compaction>,
+    /// The one switch the run made from its model to the agent's fallback, after the endpoint refused
+    /// the model as locked ([`ModelSwitch`]). Once set, every call of the run names the fallback and
+    /// a second `ModelLocked` fails the run. Absent from state written before it existed, and not
+    /// written while `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_switch: Option<ModelSwitch>,
     /// The turn whose prompt the provider rejected as too long, once: a second rejection of the same
     /// turn fails the run. Absent from state written before it existed, and not written while `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

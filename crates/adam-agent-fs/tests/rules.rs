@@ -1489,6 +1489,24 @@ fn the_reasoning_keys_are_read_and_the_effort_key_stays_ignored() {
 }
 
 #[test]
+fn model_fallback_is_a_known_key() {
+    let dir = write(&[(
+        "agent/instructions.md",
+        "---\nname: root\nmodel_fallback: lite\n---\nHi.\n",
+    )]);
+    let report = load(dir.path());
+    assert!(report.is_ok(), "{:?}", report.diagnostics);
+    assert_eq!(report.warnings().count(), 0, "{:?}", report.diagnostics);
+    assert_eq!(
+        report.package.agents[0]
+            .frontmatter
+            .model_fallback
+            .as_deref(),
+        Some("lite")
+    );
+}
+
+#[test]
 fn diagnostics_carry_the_file_and_the_line() {
     let dir = write(&[(
         "agent/instructions.md",

@@ -177,6 +177,12 @@ A folder that sets an effort on a model whose profile takes none is that same er
 value is `AgentInfo::reasoning_effort` and goes to `LlmAgentBuilder::reasoning_effort`; the run's
 `vymalo.reasoningEffort` context still wins per message.
 
+**Fallback and choices.** A folder's `model_fallback:` is resolved per agent: checked like `model:` (and refused as
+`AliasProblem::SameAsModel` when it is the agent's own alias), with the cap resolved for the fallback model and the
+level its own profile gives (`reasoningEffort`, else its base preset; the folder's level is for the agent's model) and
+handed to `LlmAgentBuilder::model_fallback`. `BoundDef::allow_model_choice()` (the engine calls it; off by default) gives
+every agent a `ModelBinding` for each other profiled model, for `Say::with_model` (ADR 0064, amended 2026-11-23).
+
 **Output cap.** With `model_profiles(profiles)`, each agent's cap is, narrowest first: its folder's
 `limits.max_output_tokens`, the preset its `model_preset` names, the profile's `maxOutputTokens`, the profile's base
 preset, then `adam_model::DEFAULT_MAX_OUTPUT_TOKENS` (128,000). It is then the smallest of that, the model's

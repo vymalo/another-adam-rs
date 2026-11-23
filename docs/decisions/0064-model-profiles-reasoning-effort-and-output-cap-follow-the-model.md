@@ -278,7 +278,7 @@ Each is one pull request, in order. The reasoning slices (effort per call, `reas
 4. **Presets.** `presets:` with `maxOutputTokens`, a profile's `preset:`, `model_preset:` in the frontmatter, the order of
    decision 3 (with 0063's effort). Accepted when an agent naming `quick` sends `low` and its preset's cap, and an
    undeclared preset is exit 78.
-5. **A model chosen at run time.** When ADR 0054 slice 11 or the relay lands: the session's alias or the relay's pick is
+5. **A model chosen at run time.** (The engine's per-message pick and the fallback switch, slice 6, are in the 2026-11-23 amendment below.) When ADR 0054 slice 11 or the relay lands: the session's alias or the relay's pick is
    the key. Accepted when a session moved to another alias sends that alias's cap on its next call.
 
 Follow-ups in the other repositories, theirs to decide: the system maps its endpoints and relay models to profiles and
@@ -308,3 +308,49 @@ derived from that resolved cap. Slice 5 (a model chosen at run time) is where th
 names that asks above the model's `maxOutputTokensLimit` is refused at bind (exit 78), while the folder's own value is
 clamped. It follows the coordinator's 18:42Z ruling accepting decision 4; the board post asks the owner for a veto,
 and if he takes it we amend again.
+
+## Amended 2026-11-23: a locked model switches once to a fallback, and a message may name a model
+
+*Amended 2026-11-23:* **slice 6, the switch on a typed refusal.** [ADR 0067](0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+decision 7 leaves the switch to "the profile's fallback model" and fails the run naming the model until it is built.
+This ADR's "fallback" is the 128,000 output cap, so no slice owned the switch. It is this one. It is an amendment, not a
+new ADR: it changes what a profiled model's calls resolve to, which is this ADR's subject, and claims no number.
+
+1. **The fallback is declared in the agent's file.** `model_fallback: <alias>` in the frontmatter of a root or a subagent
+   (a local-only key, warned on a remote subagent). A subagent follows its **own** file's value; none is inherited from
+   its parent. The seat is the folder because the agent knows what a lesser model may still do for it; a deployment-wide
+   default in a profile (`fallback`) is not built and would be a later slice.
+2. **Validation at start.** The alias goes through the same check as `model:` (not empty, one token, one of
+   `model_aliases` when the deployment lists them) and must differ from the agent's own alias
+   (`AliasProblem::SameAsModel`). A refusal is the assembly's `Error::ModelAlias` naming the agent and its file, which
+   every host turns into exit 78 (the engine's `start` returns `EngineError::Agent`).
+3. **What the fallback resolves to.** Its output cap, resolved as decision 3 does for the fallback model (the folder's
+   `limits.max_output_tokens`, the agent's preset, the fallback's profile, then 128,000, clamped to the fallback's own
+   limit and window). Its reasoning level is the fallback's **own** profile's (`reasoningEffort`, else its base
+   preset's), never the folder's: the folder's level was chosen for the agent's model, which the fallback may not take.
+4. **The switch.** When a model call is refused with `ModelError::ModelLocked`
+   ([ADR 0067](0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md) decision 7), a run
+   with a fallback records the switch in its state (`Conversation::model_switch`: `from`, `to`, the turn), says it as
+   a step, and asks the same turn again of the fallback, in the next transition. The refusal is in the journal as the
+   failure of `model:<turn>`; the second call is that turn's step in the next transition, so a replay finds the same
+   refusal, makes no call to the locked model, and builds the same requests. A run with no fallback fails as before,
+   naming the model.
+5. **Once, and never back.** After the switch every call of the run, the summary call of a compaction included, names the
+   fallback with its cap and level; the run does not try the first model again. A second `ModelLocked`, on the fallback,
+   fails the run: `model call failed: <the refusal>: `<fallback>` is the fallback of `<first>`, which the endpoint did
+   not allow either, and a run switches once`. A subagent's run switches on its own.
+6. **The step.** Label `Switched model`, state `Completed`, detail ``The model `<from>` is not allowed; this run continues
+   on `<to>` ``, id `model-switch:<turn>`.
+7. **Usage.** A `usage/v1` event names the model the call was made to, so the calls after the switch name the fallback; the
+   refused call reports none (no tokens were taken). `UsageTotals` count under the same alias.
+8. **A message may name a model (decision 5's slice, narrowed).** `Say::with_model(alias)` in the engine asks that the
+   run be answered by `alias`, with that profile's cap and level. The engine refuses an alias that has no profile in
+   `EngineBuilder::models` (`EngineError::Invalid`, nothing written), and every alias when it was given none. It travels
+   as the context key `vymalo.model` (`{"model": alias}`), which only an agent **given choices** honours: the assembly
+   gives them when the host calls `BoundDef::allow_model_choice` (the engine does, a served agent's front does not), so a
+   remote caller cannot choose what a run costs. The choice holds for the run until a later message names another; the
+   fallback switch overrides it. Not built: the compaction's budget still derives from the agent's own window and cap.
+
+Slice 6 is accepted when a scripted run whose model answers `model_locked` continues on the fallback with its cap and
+level, the step and the usage say so, and a replay after a lost commit asks the locked model nothing more; a second lock
+fails the run naming both models; and the engine refuses a `Say` that names a model with no profile.
