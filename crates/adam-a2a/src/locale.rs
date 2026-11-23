@@ -261,6 +261,7 @@ mod tests {
             "es-419",
             "en-US-x-twain",
             "en-a-bbb",
+            "FR-fr",
             "FR-FR",
         ] {
             let locale = Locale::parse(tag).unwrap_or_else(|e| panic!("{tag}: {e}"));
