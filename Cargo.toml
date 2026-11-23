@@ -34,8 +34,8 @@ adam-macros = { path = "crates/adam-macros", version = "0.1.0" }
 adam-mcp = { path = "crates/adam-mcp", version = "0.1.0" }
 adam-mcp-testkit = { path = "crates/adam-mcp-testkit", version = "0.1.0" }
 adam-model = { path = "crates/adam-model", version = "0.1.0" }
-adam-model-oauth = { path = "crates/adam-model-oauth", version = "0.1.0" }
-adam-model-openai = { path = "crates/adam-model-openai", version = "0.1.0" }
+adam-model-oauth = { path = "crates/adam-model-oauth", version = "0.1.0", default-features = false }
+adam-model-openai = { path = "crates/adam-model-openai", version = "0.1.0", default-features = false }
 adam-notify-postgres = { path = "crates/adam-notify-postgres", version = "0.1.0" }
 adam-notify-testkit = { path = "crates/adam-notify-testkit", version = "0.1.0" }
 adam-postgres = { path = "crates/adam-postgres", version = "0.1.0" }
@@ -99,13 +99,13 @@ quote = "1"
 rmcp = { version = "3.9", default-features = false }
 # `search_files` (adam-coder): a linear-time engine, with no backtracking and a size limit.
 regex = "1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream", "json", "query"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream", "json", "query"] }
 # The SQLite store (adam-store-sqlite): bundled SQLite, on the minor cratestack-rusqlite uses
 # (0.41.1), so an application that links both has one libsqlite3-sys (ADR 0053 decision 2).
 rusqlite = { version = "0.41.1", default-features = false, features = ["bundled"] }
 # The process-wide TLS provider (adam-env-kubernetes): kube builds its TLS configuration with it, and a binary whose tree enables both providers
 # (the coder's does) has to name one. Already in the tree under rustls.
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 # Reads the PEM of a GitHub App's private key (adam-workspace): already in the tree under rustls.
 rustls-pki-types = "1"
 # ECMAScript number formatting for the JSON Canonicalization Scheme (RFC 8785) that signs an agent card (adam-a2a).

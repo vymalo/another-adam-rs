@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# See adam-model-openai: on by default, off for a host that installs its own TLS provider.
+default = ["aws-lc"]
+aws-lc = ["reqwest/rustls", "adam-model-openai/aws-lc"]
+
 [dependencies]
 adam-model.workspace = true
 async-trait.workspace = true

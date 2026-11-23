@@ -15,7 +15,7 @@ deadpool-postgres = "0.14"
 percent-encoding = "2"
 # `aws-lc-rs` is the process's provider (ADR 0019): the tree compiles both it and ring (mongodb),
 # so the builder names the provider instead of asking for the process default.
-rustls.workspace = true
+rustls = { workspace = true, features = ["aws_lc_rs"] }
 rustls-pki-types = { workspace = true, features = ["std"] }
 tokio.workspace = true
 tokio-postgres = { version = "0.7", features = [

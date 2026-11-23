@@ -40,7 +40,7 @@ rustls-pki-types = { workspace = true, optional = true }
 ryu-js = { workspace = true, optional = true }
 # Push-notification delivery: one client that never follows a redirect and only connects to the
 # addresses the guarded resolver allows.
-reqwest = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, features = ["rustls"] }
 uuid = { workspace = true, optional = true }
 a2a-server-lf = { workspace = true, optional = true }
 async-trait.workspace = true
