@@ -85,6 +85,7 @@ reasoning_effort: low          # the level the model calls ask for by default; o
 model_preset: quick            # a named preset of MODEL_ALIASES_FILE the calls start from (ADR 0064)
 model_fallback: coder-lite     # overrides the preset's and the profile's `fallback`: the alias the run continues on, once, if the endpoint refuses `model` as locked (ADR 0064)
 tools: [prepare_workspace, run_checks, ask_user]     # or "a, b, c"; "*" = all; MCP: "linear__*"
+tools_loading: eager           # `eager`: every tool in every request, as before the key existed; `lazy` (default): a run loads them in groups (ADR 0066)
 skills: all                    # or a list; default: every skill in this agent's skills/
 limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as limits.max_turns
   max_turns: 200               # model calls that may be followed by tools, plus one closing turn in which it may call none (0: one call with no tools)
@@ -151,6 +152,10 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   any other, so **a folder with `tools:` must list `plan_*` (or `"*"`) to keep the plan**. A subagent has none of them
   unless it lists them, and even then `plan_*` answers that a subagent keeps no plan: the plan belongs to the
   conversation's root run.
+* **`tools_loading:` chooses how a run sees the tools** ([ADR 0066](../decisions/0066-a-first-request-is-lean-and-tools-load-in-groups.md)):
+  `lazy` (the default) starts lean, and a run loads tools in groups; `eager` puts every tool in every request, as
+  before the key existed, and **a server whose `mcp.json` entry has a `when` is offered too** (nothing is withheld).
+  `searchable` is accepted and behaves as `lazy` until searchable groups land.
 * **`retry:` is a retry policy per tool** ([ADR 0061](../decisions/0061-a-step-names-its-retry-policy.md)): a map from
   one of the agent's tool names (its own, an MCP server's `<server>__<tool>`, a skill or subagent tool) to `attempts`
   (required, 1 to 20, the tries in all), `backoff` and `max_backoff` (`500ms`, `1s`, `30m`, `1h`; at most `1h`, and

@@ -9,6 +9,7 @@ use std::time::Duration;
 use adam_agent_fs::{
     AgentManifest, Diagnostic, EmbeddedAgent, InstructionPart, Instructions, Limits as FileLimits,
     ManifestSource, McpConfig, ModelRef, SkillSelection, Strictness, Subagent, ToolList,
+    ToolsLoading,
 };
 use adam_core::{DynSecretSource, ProcessEnv};
 use adam_llm_agent::{
@@ -763,6 +764,10 @@ pub(crate) struct Node {
     /// and its keywords, in name order. [`AgentInfo::when`](crate::AgentInfo::when) carries them, so
     /// a definition that differs only in a `when` compares unequal to one that does not.
     pub(crate) when: Vec<(String, Vec<String>)>,
+    /// `tools_loading` of the agent's file (ADR 0066, decision 1): `eager` offers every tool in
+    /// every request, `lazy` (the default) lets a run load them in groups. Part of the info because
+    /// an eager agent with a `when` server behaves differently: nothing is withheld.
+    pub(crate) tools_loading: ToolsLoading,
     /// Sources this agent alone has, added at [`BoundDef::build`](crate::BoundDef): the
     /// `mcp.json` servers whose `when` loads them only when a run's task matches.
     pub(crate) sources: Vec<DynToolSource>,
@@ -855,15 +860,24 @@ impl Walk<'_> {
         // The servers whose `when` makes them groups: their tools are withheld by the source below
         // until the task holds a keyword or the run loads the group, and their instructions are the
         // group's note.
-        let triggers: Vec<(String, Vec<String>)> = mcp::declared(manifest)
-            .into_iter()
-            .flat_map(|config| config.servers.iter())
-            .filter_map(|(server, entry)| {
-                entry
-                    .when()
-                    .map(|when| (server.clone(), when.keywords.clone()))
-            })
-            .collect();
+        //
+        // An `eager` folder keeps every tool in every request (ADR 0066, decision 1): a `when`
+        // withholds nothing, so its server's section stays in the prompt as it did before lazy
+        // loading existed.
+        let eager = manifest.frontmatter.tools_loading == ToolsLoading::Eager;
+        let triggers: Vec<(String, Vec<String>)> = if eager {
+            Vec::new()
+        } else {
+            mcp::declared(manifest)
+                .into_iter()
+                .flat_map(|config| config.servers.iter())
+                .filter_map(|(server, entry)| {
+                    entry
+                        .when()
+                        .map(|when| (server.clone(), when.keywords.clone()))
+                })
+                .collect()
+        };
         // What the agent's MCP servers said about themselves, once, here: the prompt is the same
         // for every model call of the process, so the cached prefix holds. A triggered server's
         // section is its group's note: `Groups` gives it to the first prompt when the task loads
@@ -1011,6 +1025,7 @@ impl Walk<'_> {
             session_agents,
             round_agents,
             when: triggers,
+            tools_loading: manifest.frontmatter.tools_loading,
             sources,
         });
         for sub in &manifest.subagents {

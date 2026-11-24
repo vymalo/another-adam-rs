@@ -387,6 +387,28 @@ pub struct Card {
     pub extra: BTreeMap<String, Value>,
 }
 
+/// How a folder's own tools are offered (ADR 0066, decision 1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolsLoading {
+    /// Every tool is in every request, as before the key existed.
+    Eager,
+    /// The agent starts lean and loads its tools in groups: the default.
+    #[default]
+    Lazy,
+    /// Lazy, with a group whose loader searches it. Accepted for a deployment that writes it; it
+    /// behaves as [`Lazy`](Self::Lazy) until searchable groups land (S2).
+    Searchable,
+}
+
+impl ToolsLoading {
+    /// Whether this is the default (`lazy`), so the key is left out of the JSON and the digest.
+    #[must_use]
+    pub fn is_lazy(&self) -> bool {
+        matches!(self, Self::Lazy)
+    }
+}
+
 /// The YAML frontmatter of an agent or subagent file.
 ///
 /// Everything is optional at this level; which keys are required depends on the role of the
@@ -405,6 +427,10 @@ pub struct AgentFrontmatter {
     /// The tools the agent gets, by name: a list or a comma-separated string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolList>,
+    /// How the agent's own tools are offered (ADR 0066): `eager` puts every one in every request,
+    /// as before the key existed; `lazy` (the default) lets a run load them in groups.
+    #[serde(skip_serializing_if = "ToolsLoading::is_lazy")]
+    pub tools_loading: ToolsLoading,
     /// The model alias, or `inherit`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
@@ -608,6 +634,55 @@ mod tests {
         for model in [ModelRef::Inherit, ModelRef::Alias("coder-large".into())] {
             assert_eq!(round_trip(&model), model);
         }
+        for loading in [
+            ToolsLoading::Eager,
+            ToolsLoading::Lazy,
+            ToolsLoading::Searchable,
+        ] {
+            assert_eq!(round_trip(&loading), loading);
+        }
+    }
+
+    #[test]
+    fn tools_loading_reads_its_three_values_and_defaults_to_lazy() {
+        for (text, want) in [
+            ("eager", ToolsLoading::Eager),
+            ("lazy", ToolsLoading::Lazy),
+            ("searchable", ToolsLoading::Searchable),
+        ] {
+            let front: AgentFrontmatter =
+                serde_json::from_value(serde_json::json!({ "tools_loading": text })).unwrap();
+            assert_eq!(front.tools_loading, want, "{text}");
+        }
+        // The key is optional, and its absence is `lazy`.
+        assert_eq!(
+            AgentFrontmatter::default().tools_loading,
+            ToolsLoading::Lazy
+        );
+        let front: AgentFrontmatter = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(front.tools_loading, ToolsLoading::Lazy);
+        // `lazy` is left out of the JSON, so a folder that does not set the key keeps its digest.
+        assert_eq!(
+            serde_json::to_string(&AgentFrontmatter::default()).unwrap(),
+            "{}"
+        );
+        let eager: AgentFrontmatter =
+            serde_json::from_value(serde_json::json!({ "tools_loading": "eager" })).unwrap();
+        assert_eq!(
+            serde_json::to_string(&eager).unwrap(),
+            r#"{"tools_loading":"eager"}"#
+        );
+        // Anything else is refused, naming the three values it may be.
+        let error = serde_json::from_value::<AgentFrontmatter>(
+            serde_json::json!({ "tools_loading": "sometimes" }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown variant `sometimes`"), "{error}");
+        assert!(
+            error.contains("`eager`") && error.contains("`lazy`") && error.contains("`searchable`"),
+            "{error}"
+        );
     }
 
     #[test]
