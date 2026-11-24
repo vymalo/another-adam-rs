@@ -25,9 +25,10 @@ use adam_llm_agent::{KeptOutputs, ToolCtx, ToolError};
 use adam_workspace::{EnvError, EnvSession, ExecSpec};
 use async_trait::async_trait;
 
+use crate::governor::Governor;
 use crate::redact::Redactor;
 use crate::sandbox::Meter;
-use crate::shell::{self, MissingTool, RunError, ShellOutcome};
+use crate::shell::{self, Governed, MissingTool, RunError, ShellOutcome};
 use crate::workspace::{CodeWorkspace, Place};
 
 /// The bounds of one command.
@@ -53,6 +54,13 @@ pub trait CommandWorkspace: CodeWorkspace {
 
     /// The bounds of a command.
     fn limits(&self) -> CommandLimits;
+
+    /// The process pool and the OS limits the commands of this workspace run under (ADR 0065):
+    /// `None` (the default) is a workspace whose commands take no seat and are not confined. A new
+    /// method with a default, so no implementation breaks.
+    fn governor(&self) -> Option<&Governor> {
+        None
+    }
 
     /// Where a long output is kept, for `read_output`.
     ///
@@ -202,10 +210,16 @@ pub async fn run(
 ) -> Result<ShellOutcome, RunError> {
     let cancel = ctx.cancel_token();
     let margin = ws.redactor().margin();
+    let root = ctx.root_run_id().to_string();
+    let governed = ws.governor().map(|governor| Governed {
+        governor,
+        conversation: &root,
+    });
     let (outcome, ran) = if keep {
-        shell::run_captured(session, spec, timeout, tail_cap, margin, &cancel).await
+        shell::run_captured_governed(session, spec, timeout, tail_cap, margin, &cancel, governed)
+            .await
     } else {
-        shell::run_timed(session, spec, timeout, tail_cap, margin, &cancel).await
+        shell::run_timed_governed(session, spec, timeout, tail_cap, margin, &cancel, governed).await
     };
     // A call that keeps nothing shows the tail of a long output: scrubbed here, with the bytes
     // before it, so that a secret cut by the tail's start leaves no part of itself.
@@ -273,5 +287,7 @@ pub fn run_error(redactor: &Redactor, e: &RunError) -> ToolError {
         RunError::Prepare(e) => environment_error(redactor, e),
         RunError::Spawn(e) => ToolError::Transient(format!("cannot start the shell: {e}")),
         RunError::Cancelled => cancelled("the command was stopped"),
+        RunError::Busy(refused) => ToolError::from_classified(refused),
+        RunError::Confine(e) => ToolError::from_classified(e),
     }
 }

@@ -48,6 +48,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// [ADR 0065]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md
 pub const RETRY_AFTER: Duration = Duration::from_millis(250);
 
+/// What is left of `wait` since `started`. A wait that was zero stays zero.
+fn remaining(wait: Duration, started: Instant) -> Duration {
+    if wait.is_zero() {
+        return wait;
+    }
+    wait.saturating_sub(started.elapsed())
+        .max(Duration::from_millis(1))
+}
+
 /// The number of millionths that count as one token in the bucket's arithmetic.
 const MICRO: u128 = 1_000_000;
 
@@ -228,6 +237,7 @@ impl LocalAdmission {
 #[async_trait]
 impl Admission for LocalAdmission {
     async fn admit(&self, ask: Ask) -> Result<Permit, Refused> {
+        let started = Instant::now();
         let pool = ask.pool;
         let units = u64::from(ask.units.max(1));
         let slot = self.slot(pool);
@@ -246,11 +256,15 @@ impl Admission for LocalAdmission {
         }
         // The conversation's seat first, so that a conversation waiting for its own share never
         // holds a pool permit another conversation needs.
-        let seat = self.acquire_seat(slot, &ask, units, ask.wait).await?;
+        let seat = self
+            .acquire_seat(slot, &ask, units, remaining(ask.wait, started))
+            .await?;
         // Counting it as a waiter for as long as this future lives, so a cancelled ask stops
         // counting too (a `fetch_sub` after the await would never run for it).
         let waiting = Waiting::of(slot);
-        let permit = self.acquire_pool(slot, units, ask.wait).await;
+        let permit = self
+            .acquire_pool(slot, units, remaining(ask.wait, started))
+            .await;
         drop(waiting);
         match permit {
             Some(permit) => Ok(Permit::new(
@@ -358,6 +372,7 @@ impl std::fmt::Debug for LocalAdmission {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use adam_budget::Ratio;
@@ -398,5 +413,37 @@ mod tests {
             60_000 * MICRO,
             "never over the minute"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_busy_ask_never_waits_longer_than_its_wait() {
+        let budget = Budget::builder()
+            .processes(2)
+            .per_conversation_share(Ratio::HALF)
+            .build();
+        let admission = Arc::new(LocalAdmission::new(budget));
+        let ask = |who: &str, wait: Duration| {
+            Ask::new(Pool::Processes, ConversationId::new(who)).wait(wait)
+        };
+        let first = admission.admit(ask("a", Duration::ZERO)).await.unwrap();
+        let _other = admission.admit(ask("b", Duration::ZERO)).await.unwrap();
+        // `c` queues for the pool before `a`'s seat frees, so the pool permit `a` frees goes to it.
+        let c = {
+            let admission = admission.clone();
+            tokio::spawn(async move { admission.admit(ask("c", Duration::from_secs(5))).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let wait = Duration::from_millis(400);
+        let started = Instant::now();
+        let releasing = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            drop(first);
+        });
+        let refused = admission.admit(ask("a", wait)).await;
+        let took = started.elapsed();
+        releasing.await.unwrap();
+        assert!(matches!(refused, Err(Refused::Busy { .. })), "{refused:?}");
+        assert!(took < wait + Duration::from_millis(120), "waited {took:?}");
+        drop(c);
     }
 }

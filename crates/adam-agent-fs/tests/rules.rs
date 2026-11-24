@@ -429,6 +429,51 @@ fn cases() -> Vec<Case> {
             "`limits.max_parallel` is from 1 to 32",
         ),
         (
+            "max_processes of 0",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_processes: 0 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_processes` is from 1 to 256",
+        ),
+        (
+            "command_memory that is not a size",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { command_memory: lots }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.command_memory` is \"lots\"",
+        ),
+        (
+            "command_memory under 64 MiB",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { command_memory: 1MB }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.command_memory` is at least 64 MiB",
+        ),
+        (
+            "command_cpu that is not a share",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { command_cpu: fast }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.command_cpu` is \"fast\"",
+        ),
+        (
+            "command_cpu under a tenth of a core",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { command_cpu: 50m }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.command_cpu` is at least `100m`",
+        ),
+        (
             "max_output_tokens of 0",
             vec![(
                 "agent/instructions.md",
@@ -1913,6 +1958,23 @@ fn max_parallel_from_1_to_32_is_read_and_is_no_diagnostic() {
         let package = report.into_package(Strictness::Strict).unwrap();
         let limits = package.agents[0].frontmatter.limits.as_ref().unwrap();
         assert_eq!(limits.max_parallel, Some(n));
+    }
+}
+
+#[test]
+fn the_process_limits_are_read_in_both_spellings_and_are_no_diagnostic() {
+    for text in [
+        "---\nname: root\nlimits: { max_processes: 2, command_memory: 2GB, command_cpu: 1.5 }\n---\nHi.\n",
+        "---\nname: root\nlimits: { maxProcesses: 2, commandMemory: 2GB, commandCpu: 1.5 }\n---\nHi.\n",
+    ] {
+        let dir = write(&[("agent/instructions.md", text)]);
+        let report = load(dir.path());
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        let package = report.into_package(Strictness::Strict).unwrap();
+        let limits = package.agents[0].frontmatter.limits.as_ref().unwrap();
+        assert_eq!(limits.max_processes, Some(2));
+        assert_eq!(limits.command_memory.as_deref(), Some("2GB"));
+        assert_eq!(limits.command_cpu.as_deref(), Some("1.5"));
     }
 }
 

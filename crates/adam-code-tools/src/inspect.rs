@@ -157,6 +157,8 @@ fn changed_the_worktree(command: &str, outcome: &ShellOutcome, restored: bool) -
 pub fn render(command: &str, outcome: &ShellOutcome) -> String {
     let how = if outcome.timed_out {
         "timed out (the command was killed)".to_owned()
+    } else if let Some(stopped) = outcome.stopped {
+        format!("stopped: {stopped} (the command was killed)")
     } else {
         match outcome.exit_code {
             Some(code) => format!("exit code {code}"),

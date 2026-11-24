@@ -8,9 +8,10 @@ use crate::frontmatter::{Split, clean_body, key_line};
 use crate::manifest::RemoteAuth;
 use crate::schema::{
     AgentFrontmatter, DEFAULT_RETRY_BACKOFF, MAX_MINUTES_LIMIT, MAX_OPEN_SESSIONS_LIMIT,
-    MAX_PARALLEL_LIMIT, MAX_RETRY_ATTEMPTS, MAX_RETRY_BACKOFF, MAX_SESSION_ROUNDS_LIMIT,
-    MAX_WORKING_SESSIONS_LIMIT, ModelRef, RETRY_CLASS_NAMES, ToolList, ToolsLoading,
-    check_references, is_agent_name, is_env_name, is_retry_tool_name, is_tool_name, retry_duration,
+    MAX_PARALLEL_LIMIT, MAX_PROCESSES_LIMIT, MAX_RETRY_ATTEMPTS, MAX_RETRY_BACKOFF,
+    MAX_SESSION_ROUNDS_LIMIT, MAX_WORKING_SESSIONS_LIMIT, ModelRef, RETRY_CLASS_NAMES, ToolList,
+    ToolsLoading, check_references, is_agent_name, is_env_name, is_retry_tool_name, is_tool_name,
+    retry_duration,
 };
 
 /// The most characters GitHub Copilot accepts in an agent prompt. Verified 2026-09-29,
@@ -536,6 +537,52 @@ fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter, k
                 "`limits.max_parallel` is from 1 to {MAX_PARALLEL_LIMIT} (the tool calls of a turn that run at once); it is {n}"
             ),
         );
+    }
+    if let Some(n) = fm.limits.as_ref().and_then(|limits| limits.max_processes)
+        && !(1..=MAX_PROCESSES_LIMIT).contains(&n)
+    {
+        sink.error(
+            key_line(split, "limits"),
+            format!(
+                "`limits.max_processes` is from 1 to {MAX_PROCESSES_LIMIT} (the processes of the worker at once); it is {n}"
+            ),
+        );
+    }
+    if let Some(text) = fm
+        .limits
+        .as_ref()
+        .and_then(|limits| limits.command_memory.as_deref())
+    {
+        match adam_budget::parse_bytes(text) {
+            Ok(bytes) if bytes >= 64 * 1024 * 1024 => {}
+            Ok(_) => sink.error(
+                key_line(split, "limits"),
+                format!("`limits.command_memory` is at least 64 MiB; it is {text:?}"),
+            ),
+            Err(e) => sink.error(
+                key_line(split, "limits"),
+                format!("`limits.command_memory` is {text:?}: {e}"),
+            ),
+        }
+    }
+    if let Some(text) = fm
+        .limits
+        .as_ref()
+        .and_then(|limits| limits.command_cpu.as_deref())
+    {
+        match adam_budget::parse_millicores(text) {
+            Ok(milli) if milli >= 100 => {}
+            Ok(_) => sink.error(
+                key_line(split, "limits"),
+                format!(
+                    "`limits.command_cpu` is at least `100m` (a tenth of a core); it is {text:?}"
+                ),
+            ),
+            Err(e) => sink.error(
+                key_line(split, "limits"),
+                format!("`limits.command_cpu` is {text:?}: {e}"),
+            ),
+        }
     }
     if let Some(0) = fm
         .limits

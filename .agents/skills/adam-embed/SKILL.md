@@ -68,6 +68,18 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      it the level is dropped silently (ADR 0063 decision 6; `.models(..)` on the engine does not reach the client).
      Details and the tool rules:
      `crates/adam/README.md` ("`#[tool]`", "Agent directories"), `docs/reference/agent-files.md`.
+   * **Limiting commands in your own tools** (ADR 0065): `adam_code_tools::Governor` pairs an
+     `adam_budget::Admission` (`adam-admission-local`'s `LocalAdmission` over a `Budget`) with a
+     `adam_workspace::Confine`. Build the confine with `adam_confine::best_effort()` (a systemd
+     scope where the user manager delegates memory, cpu and pids, else `Rlimits`; Unix only, and
+     `describe()` says what is not enforced) and run commands through
+     `adam_code_tools::shell::run_timed_governed(.., Some(Governed { governor, conversation }))`:
+     a command takes a seat of `Pool::Processes` (a full pool is `RunError::Busy`, retryable) and
+     its group is ended when it ends, so nothing it started outlives its seat. Read
+     `ShellOutcome::stopped` for the limit that ended it. A confine you write passes
+     `adam_confine_testkit::confine_conformance!`. Not governed yet: background commands, language
+     servers, git. Sources: `crates/adam-code-tools/src/governor.rs`, `crates/adam-confine/`
+     at https://github.com/vymalo/another-adam-rs/tree/main/crates/adam-confine.
    * **A wrapper agent must delegate the split.** `adam_runtime::Agent` has provided `split`/`join`
      methods (and so does `AgentStarter`) that let a run keep its transcript in an append-only body
      beside a small head; the default keeps the whole state in the head, the v4 format. An agent of

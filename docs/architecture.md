@@ -201,6 +201,10 @@ classDiagram
     Tool <|.. FnTool
     class Admission { <<interface>> }
     Admission <|.. LocalAdmission
+    class Confine { <<interface>> }
+    Confine <|.. NoConfine
+    Confine <|.. Rlimits
+    Confine <|.. SystemdScope
 ```
 
 | Port | Defined in | Real implementations | Doubles |
@@ -220,6 +224,7 @@ classDiagram
 | `Environment` | `adam-workspace` | `Local`, `KubeEnvironment` (`adam-env-kubernetes`) | a fake API server and exec seam in the tests |
 | `CallBearer` | `adam-mcp` | `GitHubReadBearer` (`adam-coder`) | test bearers |
 | `Admission` | `adam-budget` | `LocalAdmission` (`adam-admission-local`): semaphores per pool and per conversation, one token bucket | the conformance suite `admission_conformance!` is the reference |
+| `Confine` | `adam-workspace` | `Rlimits`, `SystemdScope` (`adam-confine`, Unix); `best_effort()` picks | `NoConfine`; the suite `confine_conformance!` (`adam-confine-testkit`) is the reference |
 | `DeviceState` | `adam-device-state` | none yet: the host pushes its readings ([ADR 0065](decisions/0065-resource-governance-admission-pools-and-os-limits.md) decision 8) | `FakeDevice`, the reference of `device_state_conformance!` |
 | `PermissionPrompt` | `adam-acp` | none (the default policy needs no prompt) | `StaticPrompt` |
 
@@ -261,11 +266,46 @@ stateDiagram-v2
 |---|---|---|
 | `gate::Admitted`, wrapping the agent's model client | one seat of `Pool::ModelCalls` per `complete`/`stream`, held until the answer or the stream ends; the tokens it estimates when the budget meters them | a full pool is a `RateLimited` model failure with the refusal's `retry_after`, so the run waits and then parks (ADR 0061, ADR 0067) |
 | The tool loop (`LlmAgent::drive_one`) | one seat of `Pool::ToolCalls` per call, held until its work ends | the call waits up to a minute and then runs anyway with a warning: **a run never fails because a slot was busy** |
+| `commands::run` (`adam-code-tools`) | one seat of `Pool::Processes` per command of this container, held until the process is gone, and the command runs confined (below) | the command waits up to a minute; past it the tool call fails as retryable (`RateLimited`) and the run tries again |
 
 The ceiling comes from the deployment or the device; a folder's or a person's budget is combined with
 `Budget::lower`, which takes the smaller value field by field, so nothing built from it can raise what
 the deployment allows. `LocalAdmission` is one process: it persists nothing, and two replicas each
 admit up to the whole budget (counting them in the store is `StoreAdmission`, undecided).
+
+### Confine: the OS limits on a command
+
+Admission says whether a command may start; the operating system holds it to what it was given. A
+command of this container takes a seat, then `Confine::confine` limits it before it starts, and
+`Confined::finish` says afterwards whether the OS stopped it ([ADR 0065](decisions/0065-resource-governance-admission-pools-and-os-limits.md)
+decision 6). **A command stopped for a limit is not an error**: the tool result says `stopped: memory limit 2 GB` and the
+run goes on, so the model can change approach. adam itself is never stopped.
+
+```mermaid
+sequenceDiagram
+  participant T as commands::run
+  participant A as Admission
+  participant C as Confine
+  participant P as the command
+  T->>A: admit(Processes, root run), waits up to a minute
+  A-->>T: Permit
+  T->>C: confine(cmd, limits)
+  C-->>T: Confined (a scope, or rlimits set in the child)
+  T->>P: spawn
+  P-->>T: ends, or is stopped by the OS
+  T->>C: finish(how it ended)
+  C-->>T: Stopped (memory, cpu, file size) or none
+  T-->>A: the Permit is dropped
+```
+
+| Backend | Enforces | `describe()` |
+|---|---|---|
+| `SystemdScope` | a transient scope per command: `MemoryMax`, `CPUQuota`, `TasksMax`, plus the rlimits below except the address space | `Full`, or `Partial` naming each controller the user manager does not delegate |
+| `Rlimits` | `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, `RLIMIT_CPU`, `RLIMIT_AS` (Linux), `nice` 10, a process group; never `RLIMIT_NPROC` | `Partial`: no CPU share, no process count, address space instead of resident memory |
+| `NoConfine` | nothing (an environment that runs the command elsewhere) | `None` |
+
+`adam-coder` probes at start (`adam_confine::best_effort`) and logs what is enforced. macOS and Windows backends are
+not built yet.
 
 ## Processes and roles
 

@@ -21,6 +21,7 @@ pub mod confine;
 pub mod files;
 pub mod find;
 pub mod git;
+pub mod governor;
 pub mod inspect;
 pub mod make;
 pub mod output;

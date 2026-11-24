@@ -26,6 +26,14 @@ slice 2.
 | `Limit` | A pool's ceiling in a report: `Unlimited`, or `AtMost(u64)`. **An absent limit is not a limit of zero**: `AtMost(0)` is a pool a deployment closed on purpose. `at_most()`, `is_unlimited()`, `Display` (`unlimited`). |
 | `Usage`, `PoolUsage`, `TokenUsage` | What is held now, pool by pool: each `PoolUsage` has its `Limit`, what is held, and how many asks wait. It names no person, conversation or run. |
 
+## Sizes and shares
+
+`parse_bytes("2GB")` (binary units), `parse_millicores("1.5")` or `("500m")`, `default_command_memory(ram)` (a quarter
+of the RAM, at most 8 GB; 2 GB when the RAM is unknown) and `default_command_cpu(cores)` (half the cores, at least
+one): how `COMMAND_MEMORY_MAX` and `COMMAND_CPU_MAX` are read and defaulted. The machine's RAM and core count are
+arguments, so the crate stays free of I/O. `Budget::command_memory` and `command_cpu` are what **one command** may
+use; the commands' pool is `Pool::Processes`, and `Pool::CommandMemory` is not asked by the process pool.
+
 ## The two rules a caller relies on
 
 1. **A ceiling is lowered, never raised.** Build it once at the deployment; a folder's or a

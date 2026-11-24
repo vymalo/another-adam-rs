@@ -64,6 +64,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 
+# The OS limits on a command (ADR 0065 slice 3): rlimits, and a systemd scope where there is one.
+[target.'cfg(unix)'.dependencies]
+adam-confine.workspace = true
+
 [build-dependencies]
 adam-agent-fs = { workspace = true, features = ["build"] }
 
