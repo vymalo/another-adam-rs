@@ -2359,7 +2359,10 @@ async fn a_served_agent_lists_its_models_reasoning_levels_and_takes_one() {
         r#"{"profiles": {"test-model": {"reasoningEfforts": ["low", "high"], "reasoningWire": "reasoning_effort"}}}"#,
     )
     .expect("valid profiles");
-    let agents = build(def_of(&folder), None, Some(parts)).await.unwrap();
+    let base = card_of(&def_of(&folder), &url()).unwrap();
+    let agents = build(def_of(&folder), Some(base), Some(parts))
+        .await
+        .unwrap();
     // The levels the backend reads, and the card the process serves, are the model's and the
     // folder's resolved default.
     let efforts = agents
@@ -2371,7 +2374,9 @@ async fn a_served_agent_lists_its_models_reasoning_levels_and_takes_one() {
         [ReasoningEffort::Low, ReasoningEffort::High]
     );
     assert_eq!(efforts.default_of("chat"), Some(ReasoningEffort::High));
-    let card = agents.card.as_ref().expect("a card");
+    // `serve` composes the card it answers with, so this is the same call it makes.
+    let card =
+        adam_service::card_with_reasoning(agents.card.clone().expect("a card"), efforts, "chat");
     let entry = card
         .extensions
         .iter()
