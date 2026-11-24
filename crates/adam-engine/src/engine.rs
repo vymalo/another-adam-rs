@@ -13,9 +13,9 @@ use adam_a2a::{
 use adam_a2a_runtime::{Commands, RuntimeTaskBackend, default_inbound, task_id_for};
 use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
-use adam_budget::DynAdmission;
+use adam_budget::{DeviceRules, DynAdmission, Throttled};
 use adam_core::{ConversationScope, DynSecretSource, DynStore, RunId, RunQuery, RunStatus};
-use adam_device_state::DynDeviceState;
+use adam_device_state::{DeviceReadings, DeviceState, DynDeviceState};
 use adam_llm_agent::{DEFAULT_MAX_PARALLEL, ToolSet};
 use adam_model::{DynModel, ModelProfiles, ReasoningEffort};
 use adam_runtime::{
@@ -156,6 +156,7 @@ pub struct EngineBuilder {
     tools: ToolSet,
     admission: Option<DynAdmission>,
     device: Option<DynDeviceState>,
+    device_rules: DeviceRules,
 }
 
 impl std::fmt::Debug for EngineBuilder {
@@ -188,13 +189,22 @@ impl EngineBuilder {
     }
 
     /// The host's own device ([`adam_device_state::DeviceState`], [ADR 0065] decision 8): the
-    /// four readings the resource report carries. The rule table that would lower the live budget
-    /// by them is not built yet, so the readings reach the report and nothing else. Without one,
-    /// the report says the host pushed no device. [`Engine::set_device_state`] replaces it later.
+    /// four readings the resource report carries, and the ones the engine lowers its admission by
+    /// under the [`DeviceRules`] (a battery below 20 % or in low-power mode: one run; a hot
+    /// device: new steps held). Without one, the report says the host pushed no device and nothing
+    /// is lowered. [`Engine::set_device_state`] replaces it later.
     ///
     /// [ADR 0065]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md
     pub fn device_state(mut self, device: DynDeviceState) -> Self {
         self.device = Some(device);
+        self
+    }
+
+    /// Which device rules apply (every one on by default): the person's switches.
+    /// [`Engine::set_device_rules`] changes them later. They act on the
+    /// [`admission`](Self::admission) only.
+    pub fn device_rules(mut self, rules: DeviceRules) -> Self {
+        self.device_rules = rules;
         self
     }
 
@@ -283,6 +293,7 @@ impl EngineBuilder {
             tools,
             admission,
             device,
+            device_rules,
         } = self;
         if limits.lease_ttl.is_zero() {
             return Err(EngineError::Invalid(
@@ -322,6 +333,13 @@ impl EngineBuilder {
             .allow_model_choice();
         // The same admission is kept for the resource report (`Engine::resources`): the agent
         // asks it for its seats, the report asks it what is held.
+        let device = Arc::new(DeviceSlot::new(device));
+        let throttle = admission.map(|inner| {
+            let readings: DynDeviceState = device.clone();
+            Arc::new(Throttled::new(inner, device_rules, readings))
+        });
+        let admission: Option<DynAdmission> =
+            throttle.clone().map(|throttle| throttle as DynAdmission);
         let bound = match admission.clone() {
             Some(admission) => bound.admission(admission),
             None => bound,
@@ -450,7 +468,8 @@ impl EngineBuilder {
                 agent: name,
                 commands,
                 admission,
-                device: Mutex::new(device),
+                device,
+                throttle,
                 writes: RwLock::new(()),
                 stopping: AtomicBool::new(false),
                 worker: Worker {
@@ -540,6 +559,35 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// The device the host pushed, swapped live: the admission reads it at every ask, the report reads
+/// it on request. A host that pushed none reads as [`DeviceReadings::NOMINAL`] here, so nothing is
+/// held back on a machine that cannot say.
+struct DeviceSlot(Mutex<Option<DynDeviceState>>);
+
+impl DeviceSlot {
+    fn new(device: Option<DynDeviceState>) -> Self {
+        Self(Mutex::new(device))
+    }
+
+    fn set(&self, device: DynDeviceState) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(device);
+    }
+
+    fn current(&self) -> Option<DynDeviceState> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl DeviceState for DeviceSlot {
+    fn readings(&self) -> DeviceReadings {
+        self.current()
+            .map_or(DeviceReadings::NOMINAL, |device| device.readings())
+    }
+}
+
 pub(crate) struct Shared {
     backend: RuntimeTaskBackend,
     /// The aliases a [`Say::model`] may name: the root agent's own and the models it can be bound
@@ -562,8 +610,12 @@ pub(crate) struct Shared {
     commands: Vec<Command>,
     /// The process's pools, when the host built some: what [`Engine::resources`] reports.
     admission: Option<DynAdmission>,
-    /// The device the host pushed, when it pushed one: the readings the report carries.
-    device: Mutex<Option<DynDeviceState>>,
+    /// The device the host pushed, when it pushed one: the readings the report carries and the
+    /// admission is lowered by.
+    device: Arc<DeviceSlot>,
+    /// `admission` with the device rules on it, when there is one: what
+    /// [`Engine::set_device_rules`] switches.
+    throttle: Option<Arc<Throttled<DynAdmission>>>,
     /// The helpers a person may start a session with: what [`Engine::helpers`] lists.
     helpers: Vec<SessionHelper>,
     /// Their names as registered on the runtime (`<root>/<helper>`), in the same order: what a
@@ -665,6 +717,7 @@ impl Engine {
             tools: ToolSet::new(),
             admission: None,
             device: None,
+            device_rules: DeviceRules::default(),
         }
     }
 
@@ -924,26 +977,39 @@ impl Engine {
             Some(admission) => admission.snapshot(),
             None => crate::ResourceReport::unlimited(),
         };
-        let device = shared
-            .device
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .map(|device| device.readings());
+        let device = shared.device.current().map(|device| device.readings());
         crate::ResourceReport::new(usage, device)
     }
 
     /// The host's device, pushed now ([ADR 0065] decision 8): the readings the resource report
-    /// carries from here on. The rule table that would lower the live budget by them is not built
-    /// yet, so this changes the report and nothing else.
+    /// carries from here on, and the ones the rule table lowers the admission by from the next
+    /// ask on, never below one run: a battery below 20 % or in low-power mode admits one run at a
+    /// time, a hot device holds new model and tool calls. A run already admitted counts, and a
+    /// call in flight is not stopped. The person's switches are [`Engine::set_device_rules`].
+    ///
+    /// What the table cannot say to the admission is not enforced: no new background command on a
+    /// low battery, and no clone or large fetch without asking on a metered network.
     ///
     /// [ADR 0065]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md
     pub fn set_device_state(&self, device: DynDeviceState) {
-        *self
-            .shared
-            .device
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(device);
+        self.shared.device.set(device);
+    }
+
+    /// Which device rules apply, from the next ask on: every one is on until the person turns it
+    /// off. Without an [`EngineBuilder::admission`] there is nothing to lower, and this does
+    /// nothing.
+    pub fn set_device_rules(&self, rules: DeviceRules) {
+        if let Some(throttle) = &self.shared.throttle {
+            throttle.set_rules(rules);
+        }
+    }
+
+    /// The process's admission as the engine asks it, device rules included: what a host asks
+    /// for a seat of its own (a run it starts itself) so that the rules count it. `None` without
+    /// an [`EngineBuilder::admission`].
+    #[must_use]
+    pub fn admission(&self) -> Option<DynAdmission> {
+        self.shared.admission.clone()
     }
 
     /// The runs that match `query`, the most recently updated first.

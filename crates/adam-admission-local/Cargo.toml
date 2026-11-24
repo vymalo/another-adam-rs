@@ -15,6 +15,7 @@ tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 adam-admission-testkit = { path = "../adam-admission-testkit" }
+adam-device-state.workspace = true
 adam-error.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 

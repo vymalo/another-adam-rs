@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+adam-device-state.workspace = true
 adam-error.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true

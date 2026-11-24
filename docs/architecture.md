@@ -225,7 +225,7 @@ classDiagram
 | `CallBearer` | `adam-mcp` | `GitHubReadBearer` (`adam-coder`) | test bearers |
 | `Admission` | `adam-budget` | `LocalAdmission` (`adam-admission-local`): semaphores per pool and per conversation, one token bucket | the conformance suite `admission_conformance!` is the reference |
 | `Confine` | `adam-workspace` | `Rlimits`, `SystemdScope` (`adam-confine`, Unix); `best_effort()` picks | `NoConfine`; the suite `confine_conformance!` (`adam-confine-testkit`) is the reference |
-| `DeviceState` | `adam-device-state` | none yet: the host pushes its readings ([ADR 0065](decisions/0065-resource-governance-admission-pools-and-os-limits.md) decision 8) | `FakeDevice`, the reference of `device_state_conformance!` |
+| `DeviceState` | `adam-device-state` | none yet: the host pushes its readings, and `adam_budget::Throttled` lowers the admission by them ([ADR 0065](decisions/0065-resource-governance-admission-pools-and-os-limits.md) decision 8) | `FakeDevice`, the reference of `device_state_conformance!` |
 | `PermissionPrompt` | `adam-acp` | none (the default policy needs no prompt) | `StaticPrompt` |
 
 `AgentStarter` is the start-only half of `Agent` (`name`, `init`, `init_continuing`): a process that
@@ -270,7 +270,11 @@ stateDiagram-v2
 
 The ceiling comes from the deployment or the device; a folder's or a person's budget is combined with
 `Budget::lower`, which takes the smaller value field by field, so nothing built from it can raise what
-the deployment allows. `LocalAdmission` is one process: it persists nothing, and two replicas each
+the deployment allows. In an embedded engine the host's device lowers the admission further, at each ask
+and never below one run: `Engine::set_device_state` pushes the readings and `adam_budget::Throttled` applies the
+`DeviceRules` table (a battery below 20 % or in low-power mode admits one `Pool::Runs` at a time; a `Serious` or
+hotter device holds new `Pool::ModelCalls` and `Pool::ToolCalls` asks, which the tool loop's wait above then lets
+through after a minute). `LocalAdmission` is one process: it persists nothing, and two replicas each
 admit up to the whole budget (counting them in the store is `StoreAdmission`, undecided).
 
 ### Confine: the OS limits on a command

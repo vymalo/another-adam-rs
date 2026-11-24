@@ -2,11 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use adam_device_state::{DeviceReadings, DynDeviceState};
 use adam_error::{Classify, ErrorClass};
 use async_trait::async_trait;
+use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use crate::budget::Limit;
 
@@ -489,6 +492,326 @@ impl fmt::Debug for dyn Admission {
     }
 }
 
+/// The battery charge, in percent, below which the default rule table lowers the budget.
+pub const LOW_BATTERY_PERCENT: u8 = 20;
+
+/// What the device's readings ask the budget to give up now (ADR 0065 decision 8).
+///
+/// It is the output of [`DeviceRules::constraint`]: a value, with no state, that
+/// [`Throttled`] reads at every ask. [`Constraint::NONE`] holds nothing back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct Constraint {
+    max_runs: Option<u32>,
+    hold_new_steps: bool,
+    no_background_commands: bool,
+    ask_before_large_fetch: bool,
+}
+
+impl Constraint {
+    /// Nothing is held back.
+    pub const NONE: Self = Self {
+        max_runs: None,
+        hold_new_steps: false,
+        no_background_commands: false,
+        ask_before_large_fetch: false,
+    };
+
+    /// At most `runs` runs at once, never below one.
+    #[must_use]
+    pub const fn with_max_runs(mut self, runs: u32) -> Self {
+        self.max_runs = Some(if runs == 0 { 1 } else { runs });
+        self
+    }
+
+    /// New model calls and tool calls wait.
+    #[must_use]
+    pub const fn with_hold_new_steps(mut self) -> Self {
+        self.hold_new_steps = true;
+        self
+    }
+
+    /// No new background command starts.
+    #[must_use]
+    pub const fn with_no_background_commands(mut self) -> Self {
+        self.no_background_commands = true;
+        self
+    }
+
+    /// A clone or a large fetch needs the person's say first.
+    #[must_use]
+    pub const fn with_ask_before_large_fetch(mut self) -> Self {
+        self.ask_before_large_fetch = true;
+        self
+    }
+
+    /// The most runs at once, when the device caps them; always at least one.
+    #[must_use]
+    pub const fn max_runs(&self) -> Option<u32> {
+        self.max_runs
+    }
+
+    /// Whether new model calls and tool calls wait ([`Throttled`] enforces it).
+    #[must_use]
+    pub const fn hold_new_steps(&self) -> bool {
+        self.hold_new_steps
+    }
+
+    /// Whether no new background command may start. Not enforced by [`Throttled`]: an
+    /// [`Ask`] does not say whether a process is a background command.
+    #[must_use]
+    pub const fn no_background_commands(&self) -> bool {
+        self.no_background_commands
+    }
+
+    /// Whether a clone or a large fetch needs the person's say first. Not enforced by
+    /// [`Throttled`]: an [`Ask`] does not say what a process fetches.
+    #[must_use]
+    pub const fn ask_before_large_fetch(&self) -> bool {
+        self.ask_before_large_fetch
+    }
+}
+
+/// The fixed rule table of ADR 0065 decision 8, one switch per rule, every one on by default.
+///
+/// | Rule | Reading | [`Constraint`] |
+/// |---|---|---|
+/// | low battery | on battery below [`LOW_BATTERY_PERCENT`] or in low-power mode | one run, no new background commands |
+/// | hot | thermal `Serious` or `Critical` | new steps held |
+/// | metered | the network is metered | a clone or a large fetch is asked first |
+///
+/// A rule only ever lowers the budget, and a switch turned off removes its row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceRules {
+    low_battery: bool,
+    hot: bool,
+    metered: bool,
+}
+
+impl Default for DeviceRules {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+impl DeviceRules {
+    /// Every rule on: the default.
+    pub const ALL: Self = Self {
+        low_battery: true,
+        hot: true,
+        metered: true,
+    };
+
+    /// Every rule off: the device never lowers the budget.
+    pub const OFF: Self = Self {
+        low_battery: false,
+        hot: false,
+        metered: false,
+    };
+
+    /// Turn the low-battery rule on or off.
+    #[must_use]
+    pub const fn low_battery(mut self, on: bool) -> Self {
+        self.low_battery = on;
+        self
+    }
+
+    /// Turn the hot-device rule on or off.
+    #[must_use]
+    pub const fn hot(mut self, on: bool) -> Self {
+        self.hot = on;
+        self
+    }
+
+    /// Turn the metered-network rule on or off.
+    #[must_use]
+    pub const fn metered(mut self, on: bool) -> Self {
+        self.metered = on;
+        self
+    }
+
+    /// What `readings` ask the budget to give up under these rules.
+    #[must_use]
+    pub fn constraint(&self, readings: &DeviceReadings) -> Constraint {
+        let mut constraint = Constraint::NONE;
+        if self.low_battery && readings.power.is_low(LOW_BATTERY_PERCENT) {
+            constraint = constraint.with_max_runs(1).with_no_background_commands();
+        }
+        if self.hot && readings.thermal.is_hot() {
+            constraint = constraint.with_hold_new_steps();
+        }
+        if self.metered && readings.network.is_metered() {
+            constraint = constraint.with_ask_before_large_fetch();
+        }
+        constraint
+    }
+}
+
+/// How often a waiting ask looks again at the device, which may have changed without a release.
+const POLL: Duration = Duration::from_millis(50);
+
+/// What [`Refused::Busy`] says to wait when a device rule held an ask for its whole wait.
+const BUSY_RETRY: Duration = Duration::from_millis(250);
+
+fn busy(pool: Pool) -> Refused {
+    Refused::Busy {
+        pool,
+        retry_after: Some(BUSY_RETRY),
+    }
+}
+
+#[derive(Default)]
+struct RunGate {
+    held: Mutex<u32>,
+    changed: Notify,
+}
+
+impl RunGate {
+    fn try_take(&self, units: u32, cap: Option<u32>) -> bool {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let fits = match cap {
+            None => true,
+            Some(cap) => *held == 0 || held.saturating_add(units) <= cap,
+        };
+        if fits {
+            *held = held.saturating_add(units);
+        }
+        fits
+    }
+}
+
+struct RunSeat {
+    gate: Arc<RunGate>,
+    units: u32,
+}
+
+impl Drop for RunSeat {
+    fn drop(&mut self) {
+        {
+            let mut held = self
+                .gate
+                .held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *held = held.saturating_sub(self.units);
+        }
+        self.gate.changed.notify_waiters();
+    }
+}
+
+/// An [`Admission`] that lowers another by the device's readings (ADR 0065 decision 8).
+///
+/// At every [`admit`](Admission::admit) it reads the live readings, maps them through its
+/// [`DeviceRules`] and enforces the [`Constraint`]:
+///
+/// * **One run.** While the constraint caps runs, a [`Pool::Runs`] ask waits for the runs it
+///   already admitted, whatever the device said when they started, and is [`Refused::Busy`] after
+///   its wait. The cap is never below one: a run on its own is always admitted.
+/// * **New steps held.** While the device is hot, a [`Pool::ModelCalls`] or [`Pool::ToolCalls`]
+///   ask waits for it to cool and is [`Refused::Busy`] after its wait. A call already in flight
+///   is not touched, and a run already admitted is held at its next step, not stopped.
+///
+/// What an [`Ask`] cannot say is not enforced: see [`Constraint::no_background_commands`] and
+/// [`Constraint::ask_before_large_fetch`]. Every other ask passes to the inner admission, with the
+/// time left of its wait.
+pub struct Throttled<A> {
+    inner: A,
+    rules: Mutex<DeviceRules>,
+    device: DynDeviceState,
+    runs: Arc<RunGate>,
+}
+
+impl<A: Admission> Throttled<A> {
+    /// `inner`, lowered by `device`'s readings under `rules`.
+    pub fn new(inner: A, rules: DeviceRules, device: DynDeviceState) -> Self {
+        Self {
+            inner,
+            rules: Mutex::new(rules),
+            device,
+            runs: Arc::new(RunGate::default()),
+        }
+    }
+
+    /// Replace the rules from the next ask on.
+    pub fn set_rules(&self, rules: DeviceRules) {
+        *self.rules.lock().unwrap_or_else(PoisonError::into_inner) = rules;
+    }
+
+    /// The rules now.
+    #[must_use]
+    pub fn rules(&self) -> DeviceRules {
+        *self.rules.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What the device asks of the budget now.
+    #[must_use]
+    pub fn constraint(&self) -> Constraint {
+        self.rules().constraint(&self.device.readings())
+    }
+
+    async fn hold_steps(&self, ask: &Ask, started: Instant) -> Result<(), Refused> {
+        while self.constraint().hold_new_steps() {
+            let left = ask.wait.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Err(busy(ask.pool));
+            }
+            tokio::time::sleep(left.min(POLL)).await;
+        }
+        Ok(())
+    }
+
+    async fn take_run(&self, ask: &Ask, started: Instant) -> Result<RunSeat, Refused> {
+        let units = ask.units.max(1);
+        loop {
+            let mut notified = std::pin::pin!(self.runs.changed.notified());
+            notified.as_mut().enable();
+            if self.runs.try_take(units, self.constraint().max_runs()) {
+                return Ok(RunSeat {
+                    gate: Arc::clone(&self.runs),
+                    units,
+                });
+            }
+            let left = ask.wait.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Err(busy(ask.pool));
+            }
+            let _ = tokio::time::timeout(left.min(POLL), notified).await;
+        }
+    }
+}
+
+#[async_trait]
+impl<A: Admission> Admission for Throttled<A> {
+    async fn admit(&self, mut ask: Ask) -> Result<Permit, Refused> {
+        let started = Instant::now();
+        let wait = ask.wait;
+        let mut seat = None;
+        match ask.pool {
+            Pool::ModelCalls | Pool::ToolCalls => self.hold_steps(&ask, started).await?,
+            Pool::Runs => seat = Some(self.take_run(&ask, started).await?),
+            _ => {}
+        }
+        ask.wait = wait.saturating_sub(started.elapsed());
+        let permit = self.inner.admit(ask).await?;
+        match seat {
+            None => Ok(permit),
+            Some(seat) => Ok(Permit::new(
+                permit.pool(),
+                permit.conversation().clone(),
+                permit.units(),
+                move || {
+                    drop(permit);
+                    drop(seat);
+                },
+            )),
+        }
+    }
+
+    fn snapshot(&self) -> Usage {
+        self.inner.snapshot()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +879,55 @@ mod tests {
         );
         assert_eq!(usage.tokens().map(TokenUsage::available), Some(100));
         assert_eq!(usage.pool(Pool::Git), None);
+    }
+
+    #[test]
+    fn the_rule_table_lowers_by_each_reading_and_never_below_one_run() {
+        use adam_device_state::{MemoryPressure, Network, Power, Thermal};
+
+        let on = DeviceRules::default();
+        assert_eq!(on.constraint(&DeviceReadings::NOMINAL), Constraint::NONE);
+        let low = |power| DeviceReadings {
+            power,
+            ..DeviceReadings::NOMINAL
+        };
+        for power in [Power::on_battery(19, false), Power::on_battery(90, true)] {
+            let constraint = on.constraint(&low(power));
+            assert_eq!(constraint.max_runs(), Some(1), "{power}");
+            assert!(constraint.no_background_commands(), "{power}");
+        }
+        assert_eq!(
+            on.constraint(&low(Power::on_battery(20, false))),
+            Constraint::NONE
+        );
+        assert_eq!(Constraint::NONE.with_max_runs(0).max_runs(), Some(1));
+        let hot = DeviceReadings {
+            thermal: Thermal::Serious,
+            ..DeviceReadings::NOMINAL
+        };
+        assert!(on.constraint(&hot).hold_new_steps());
+        assert_eq!(on.constraint(&hot).max_runs(), None);
+        let metered = DeviceReadings {
+            network: Network::Metered,
+            memory_pressure: MemoryPressure::Normal,
+            ..DeviceReadings::NOMINAL
+        };
+        assert!(on.constraint(&metered).ask_before_large_fetch());
+        let all = DeviceReadings::new(
+            Power::on_battery(5, true),
+            Thermal::Critical,
+            Network::Metered,
+            MemoryPressure::Critical,
+        );
+        assert_ne!(on.constraint(&all), Constraint::NONE);
+        assert_eq!(DeviceRules::OFF.constraint(&all), Constraint::NONE);
+        assert_eq!(
+            on.low_battery(false)
+                .constraint(&low(Power::on_battery(1, true))),
+            Constraint::NONE
+        );
+        assert_eq!(on.hot(false).constraint(&hot), Constraint::NONE);
+        assert_eq!(on.metered(false).constraint(&metered), Constraint::NONE);
     }
 
     #[test]

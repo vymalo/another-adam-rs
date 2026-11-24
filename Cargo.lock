@@ -206,6 +206,7 @@ version = "0.1.0"
 dependencies = [
  "adam-admission-testkit",
  "adam-budget",
+ "adam-device-state",
  "adam-error",
  "async-trait",
  "tokio",
@@ -328,6 +329,7 @@ dependencies = [
 name = "adam-budget"
 version = "0.1.0"
 dependencies = [
+ "adam-device-state",
  "adam-error",
  "async-trait",
  "thiserror",

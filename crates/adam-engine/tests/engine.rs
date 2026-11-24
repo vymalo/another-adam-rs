@@ -2715,3 +2715,69 @@ async fn a_working_run_hears_the_resource_report() {
     rig.wait(turn.run, RunState::Done).await;
     rig.stop().await;
 }
+
+/// ADR 0065 decision 8: `set_device_state` lowers the admission from the next ask on. On a low
+/// battery a second run waits for the first, plugged in again it does not, and the floor of one
+/// run holds: a run on its own is always admitted. The person's switch turns the rule off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_device_state_on_a_low_battery_admits_one_run_at_a_time() {
+    use adam_admission_local::LocalAdmission;
+    use adam_budget::{Ask, Budget, DeviceRules, DynAdmission, Pool, Refused};
+    use adam_device_state::{DeviceReadings, FakeDevice, Power};
+
+    let admission: DynAdmission = Arc::new(LocalAdmission::new(
+        Budget::builder()
+            .runs(3)
+            .tool_calls(4)
+            .model_calls(2)
+            .build(),
+    ));
+    let model: DynModel = Arc::new(MockModel::new());
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .admission(admission)
+        .start()
+        .await
+        .unwrap();
+    let asked = engine
+        .admission()
+        .expect("the engine was given an admission");
+
+    let first = asked.admit(Ask::new(Pool::Runs, "one")).await.unwrap();
+    let second = asked.admit(Ask::new(Pool::Runs, "two")).await.unwrap();
+    drop((first, second));
+
+    let device = Arc::new(FakeDevice::new(DeviceReadings::NOMINAL));
+    engine.set_device_state(device.clone());
+    device.set_power(Power::on_battery(12, false));
+    let first = asked.admit(Ask::new(Pool::Runs, "one")).await.unwrap();
+    let second = asked.admit(Ask::new(Pool::Runs, "two")).await;
+    assert!(
+        matches!(
+            second,
+            Err(Refused::Busy {
+                pool: Pool::Runs,
+                ..
+            })
+        ),
+        "{second:?}"
+    );
+    assert_eq!(
+        engine
+            .resources()
+            .pool(Pool::Runs)
+            .expect("listed")
+            .in_use(),
+        1
+    );
+
+    engine.set_device_rules(DeviceRules::default().low_battery(false));
+    let second = asked.admit(Ask::new(Pool::Runs, "two")).await.unwrap();
+    drop((first, second));
+
+    engine.set_device_rules(DeviceRules::default());
+    device.set_power(Power::OnMains);
+    let first = asked.admit(Ask::new(Pool::Runs, "one")).await.unwrap();
+    let second = asked.admit(Ask::new(Pool::Runs, "two")).await.unwrap();
+    drop((first, second));
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}

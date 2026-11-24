@@ -242,8 +242,8 @@ Each is one pull request, in order.
 5. **The device-state port.** Accepted when a fake device on battery runs one run at a time and a hot device holds new
    steps. **Partly built:** `adam-device-state` holds `DeviceState`, the four readings and `FakeDevice`, and
    `adam-device-state-testkit` the suite `device_state_conformance!`. `Engine::set_device_state` and
-   `EngineBuilder::device_state` are built with slice 6 for the report (amended 2026-11-24); the rule table that lowers
-   the live budget by these readings is not.
+   `EngineBuilder::device_state` are built with slice 6 for the report (amended 2026-11-24); the rule table is built
+   too (amended 2026-11-24, below).
 6. **The resource report and the parity rows.** Accepted when a snapshot names each pool's use and the parity page has
    the section. **Built** (2026-11-24): `adam-budget`'s `PoolUsage` carries a `Limit` (`Unlimited`, or `AtMost(n)`), so
    an absent limit is never a zero; `Engine::resources()` returns a `ResourceReport` of every pool's ceiling and use,
@@ -273,3 +273,18 @@ worker runs in its own container takes a seat of `Pool::Git` (`govern_git`), so 
 `LANGUAGE_SERVERS_MAX` now count inside `MAX_PROCESSES` and `MAX_GIT_PROCESSES` is used. The chart sets the four
 variables (`config.maxProcesses`, `config.maxGitProcesses`, `config.commandMemoryMax`, `config.commandCpuMax`). What
 slice 3 still lacks is the macOS and Windows backends and the three-system matrix.
+
+*Amended 2026-11-24 (device rules):* **decision 8's rule table is built in part.** `adam_budget::DeviceRules` (one switch per
+rule, all on by default) maps `DeviceReadings` to a `Constraint`, and `adam_budget::Throttled` is an `Admission` decorator
+that reads the live readings at every ask. The engine wraps the admission it was given with it, so `set_device_state` takes
+effect on the next ask; `EngineBuilder::device_rules` and `Engine::set_device_rules` are the person's switches.
+**Built:** on battery below 20 % or in low-power mode a `Pool::Runs` ask waits for the runs already admitted (one run, never
+below one, and a run that began on mains counts); a hot device (`Serious` or `Critical`) holds new `Pool::ModelCalls` and
+`Pool::ToolCalls` asks, by *steps* meaning those two pools; a held ask is `Refused::Busy`, class `RateLimited`, after its
+wait. Proof: `a_device_on_low_battery_admits_one_run_at_a_time`, `its_twin_on_mains_admits_as_many_as_the_budget_allows`,
+`a_hot_device_holds_new_steps`, `the_person_turns_the_battery_rule_off`,
+`set_device_state_on_a_low_battery_admits_one_run_at_a_time`. **Not built:** *no new background commands* on a low battery
+(`Constraint::no_background_commands` is computed, but an `Ask` does not say a process is a background command, so the
+decorator cannot hold it) and *no clone or large fetch without asking* on a metered network (`Constraint::ask_before_large_fetch`
+is computed; an `Ask` carries no size or kind, and asking the person is a `tool.before` question, not an admission). Each
+needs the call site to read the constraint.

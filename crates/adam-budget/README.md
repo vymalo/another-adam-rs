@@ -24,6 +24,8 @@ slice 2.
 | `Refused` | Why an ask got no permit, with the class a caller reacts to through `Classify`: `Busy`/`TokensPerMinute` are `RateLimited` (park the run and ask again at `retry_after`), `DiskFull` is `Rejected` (ask the person), `TooLarge` is `Invalid` (the same ask never fits). No new `ErrorClass`. |
 | `Budget::ceiling(Pool)` | The pool's ceiling as a report reads it: `Limit::Unlimited` for a field the budget leaves at `Budget::UNLIMITED`'s value, `Limit::AtMost(n)` otherwise. `Budget::limit(Pool)` stays the numeric ceiling a semaphore needs. |
 | `Limit` | A pool's ceiling in a report: `Unlimited`, or `AtMost(u64)`. **An absent limit is not a limit of zero**: `AtMost(0)` is a pool a deployment closed on purpose. `at_most()`, `is_unlimited()`, `Display` (`unlimited`). |
+| `DeviceRules`, `Constraint`, `LOW_BATTERY_PERCENT` | The fixed rule table of ADR 0065 decision 8, pure: `DeviceRules::constraint(&DeviceReadings)` maps the host's readings to a `Constraint` (`max_runs`, never below one; `hold_new_steps`; `no_background_commands`; `ask_before_large_fetch`). One switch per rule (`low_battery`, `hot`, `metered`), all on by default; `DeviceRules::OFF` turns every one off. This crate depends on `adam-device-state` for the readings, which has no dependency of its own. |
+| `Throttled<A: Admission>` | An `Admission` that lowers `A` by the live readings of a `DynDeviceState` at every ask: on a low battery a `Pool::Runs` ask waits for the runs already admitted (one at a time); on a hot device `Pool::ModelCalls` and `Pool::ToolCalls` asks wait, then `Busy`. `no_background_commands` and `ask_before_large_fetch` are computed but **not enforced**, because an `Ask` does not say what a process is or fetches. `set_rules` swaps the switches live. |
 | `Usage`, `PoolUsage`, `TokenUsage` | What is held now, pool by pool: each `PoolUsage` has its `Limit`, what is held, and how many asks wait. It names no person, conversation or run. |
 
 ## Sizes and shares
@@ -65,4 +67,6 @@ Every implementation passes [`admission_conformance!`](../adam-admission-testkit
 `a_permit_releases_once_and_frees_its_share_on_drop`, `a_usage_adds_up_by_pool` and
 `a_pool_names_itself_for_a_metric`, `no_limit_is_not_a_zero_limit` (ADR 0065 decision 9: a
 budget that sets nothing reports `Unlimited` for every pool, a pool set to zero stays `AtMost(0)`)
-and `a_limit_names_itself`.
+and `a_limit_names_itself`, plus `the_rule_table_lowers_by_each_reading_and_never_below_one_run`
+(the pure table, each switch, the floor of one). The behaviour of `Throttled` over a real admission
+is in [`adam-admission-local`](../adam-admission-local/README.md)'s `tests/device.rs`.
