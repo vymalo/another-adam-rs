@@ -809,9 +809,13 @@ impl Workspaces {
         }
 
         // After the early return above, so a run that has its worktree keeps it; before anything is
-        // made, so a refusal leaves the disk as it was.
+        // made, so a refusal leaves the disk as it was — and the lock taken above has already made
+        // the mirror's parent directory and its lock file, so a refusal undoes exactly that.
         if let Some(disk) = &self.inner.disk {
-            disk.admit(&self.inner.root).await?;
+            if let Err(refusal) = disk.admit(&self.inner.root).await {
+                self.inner.drop_lock_files(&mirror).await;
+                return Err(refusal);
+            }
         }
         self.inner.ensure_mirror(repo, &loc, &mirror).await?;
         let auth = self.inner.authorize(repo, &loc).await?;
@@ -1528,6 +1532,26 @@ impl Inner {
     /// root. See the *Concurrency* section of [`Workspaces`].
     pub(crate) async fn lock_mirror(&self, mirror: &Path) -> WorkspaceResult<MirrorGuard> {
         self.lock_path(mirror).await
+    }
+
+    /// Undo what taking the lock of `mirror` made: its lock file, and the directories above it that
+    /// are now empty, up to (not including) the root. A budget that refuses a clone must leave the
+    /// disk as it was (ADR 0065 decision 7), and the lock is taken before the budget is asked.
+    ///
+    /// Anything another run put there stops the walk: only empty directories are removed, so a
+    /// mirror, a worktree or an unrelated file is never touched.
+    pub(crate) async fn drop_lock_files(&self, mirror: &Path) {
+        let _ = tokio::fs::remove_file(lock_file_of(mirror)).await;
+        let mut at = mirror.parent().map(Path::to_path_buf);
+        while let Some(dir) = at {
+            if !dir.starts_with(&self.root) || dir == self.root {
+                return;
+            }
+            if tokio::fs::remove_dir(&dir).await.is_err() {
+                return;
+            }
+            at = dir.parent().map(Path::to_path_buf);
+        }
     }
 
     /// The lock of `target`, a directory (a mirror, a run's workspace): the in-process lock, then
