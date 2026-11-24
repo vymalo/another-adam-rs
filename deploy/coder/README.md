@@ -316,8 +316,22 @@ rollout):
 | Value | Default | |
 |---|---|---|
 | `database.enabled` | `true` | The chart creates a CloudNativePG `Cluster` named `<release>-db` (`database.name`, `owner`, `instances`, `storage`) and every pod reads `DATABASE_URL` from the `uri` key of the Secret CNPG creates, `<release>-db-app`. The render is the one this chart always had (`tests/golden/combined.yaml`). |
+| `database.instances` | `1` | Instances of the `Cluster`. With `database.enabled: true` only. |
+| `database.resources` | `{}` | CPU and memory requests and limits of each instance. Empty renders nothing, so the default render is unchanged. |
 | `database.existingSecret.name` | `""` | With `database.enabled: false`: a Secret in the release namespace that holds the connection string. Required then, refused with `enabled: true`. |
 | `database.existingSecret.key` | `uri` | The key of that Secret; empty means `uri`. |
+
+Starting points for three instances (not measurements; size them from your own load):
+
+```yaml
+database:
+  instances: 3
+  resources:
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {memory: 2Gi}
+```
+
+Backups and a transaction-mode pooler are not part of this chart.
 
 ```sh
 helm template coder deploy/coder \

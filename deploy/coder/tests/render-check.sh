@@ -1122,6 +1122,13 @@ extdb='--set database.enabled=false --set database.existingSecret.name=coder-db-
 helm_db > "$out"
 check "database default: the CNPG Cluster and its app Secret, key uri" dburl_is 1 coder-db-app uri
 check "database default: no existing Secret is named" lacks 'coder-db-uri'
+check "database default: no instances override and no resources in the Cluster" lacks '^  resources:'
+# shellcheck disable=SC2086
+helm_db --set database.instances=3 --set database.resources.requests.cpu=500m --set database.resources.requests.memory=1Gi --set database.resources.limits.memory=2Gi > "$out"
+check "database.instances 3 renders on the Cluster" has '^  instances: 3$'
+check "database.resources renders on the Cluster" has '^    limits:'
+check "database.resources renders the requests" has '^      cpu: 500m$'
+check "database.resources renders the memory limit" has '^      memory: 2Gi$'
 # shellcheck disable=SC2086
 helm_db $extdb > "$out"
 check "existing database: no CNPG Cluster is rendered" lacks '^kind: Cluster$'
