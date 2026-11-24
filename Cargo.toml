@@ -38,6 +38,8 @@ adam-model-oauth = { path = "crates/adam-model-oauth", version = "0.1.0", defaul
 adam-model-openai = { path = "crates/adam-model-openai", version = "0.1.0", default-features = false }
 adam-notify-postgres = { path = "crates/adam-notify-postgres", version = "0.1.0" }
 adam-notify-testkit = { path = "crates/adam-notify-testkit", version = "0.1.0" }
+adam-plugin = { path = "crates/adam-plugin", version = "0.1.0" }
+adam-plugin-testkit = { path = "crates/adam-plugin-testkit", version = "0.1.0" }
 adam-postgres = { path = "crates/adam-postgres", version = "0.1.0" }
 adam-runtime = { path = "crates/adam-runtime", version = "0.1.0" }
 adam-service = { path = "crates/adam-service", version = "0.1.0" }
