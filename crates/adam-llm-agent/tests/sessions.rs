@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
     CHILD_SESSIONS_CONTEXT_KEY, Conversation, DynTool, LlmAgent, LlmAgentBuilder, PendingSession,
-    PendingWait, SessionAgent, SessionTools, Tool, ToolCtx, ToolError, ToolOutput, user_message,
+    PendingWait, Plugin, SessionAgent, SessionTools, Tool, ToolCtx, ToolError, ToolOutput,
+    user_message,
 };
 use adam_model::{
     DynModel, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
@@ -760,6 +761,23 @@ fn tick(clock: &ManualClock) -> tokio::task::JoinHandle<()> {
             clock.advance(Duration::from_millis(200));
         }
     })
+}
+
+/// An observer that keeps every event it is offered.
+#[derive(Default)]
+struct Watches(std::sync::Mutex<Vec<adam_llm_agent::HookEvent>>);
+
+struct SharedWatches(Arc<Watches>);
+
+impl Plugin for SharedWatches {
+    fn name(&self) -> &str {
+        "watches"
+    }
+
+    fn observe(&self, event: &adam_llm_agent::HookEvent) -> Result<(), adam_llm_agent::HookError> {
+        self.0.0.lock().unwrap().push(event.clone());
+        Ok(())
+    }
 }
 
 fn conv_id() -> String {
@@ -3206,6 +3224,149 @@ mod cases {
         assert_eq!(again.parent_mock.requests().len(), 0, "no model was asked");
     }
 
+    /// Observers see a one-shot child and a kept-open session in one golden order (ADR 0050, slice
+    /// H7).
+    pub async fn observers_see_a_child_and_a_session_in_order(store: DynStore) {
+        observed_script(store, true).await;
+    }
+
+    /// A replay of a session's journal gives the observers the same events in the same order. (A
+    /// one-shot child's id comes from its parent's run id, so a copy of the journal under another
+    /// run cannot replay it: its events are held by the test above.)
+    pub async fn observers_see_a_sessions_events_again_on_a_replay(store: DynStore) {
+        observed_script(store, false).await;
+    }
+
+    async fn observed_script(store: DynStore, with_child: bool) {
+        let order = |watches: &Watches, run: RunId| -> Vec<(String, String)> {
+            watches
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    let name = e.kind.name();
+                    name.starts_with("child.") || name.starts_with("session.")
+                })
+                .map(|e| {
+                    (
+                        e.kind.name().to_owned(),
+                        e.header.key.replace(&run.to_string(), "RUN"),
+                    )
+                })
+                .collect()
+        };
+        let build = |watches: &Arc<Watches>| {
+            let rig = Rig::new();
+            let leaf_name = uniq("leaf");
+            let leaf_mock = Arc::new(MockModel::new());
+            leaf_mock.push_text("leaf done");
+            rig.child_mock
+                .push_text("round one")
+                .push_text("round two")
+                .push_text("closed");
+            let model: DynModel = rig.parent_mock.clone();
+            let mut builder = LlmAgent::builder(&rig.parent_name, model, "m")
+                .session_agents([rig.child_name.clone()])
+                .tool(Spawn {
+                    target: leaf_name.clone(),
+                })
+                .plugin(SharedWatches(watches.clone()));
+            for tool in rig.roster().tools() {
+                builder = builder.dyn_tool(tool);
+            }
+            let leaf_model: DynModel = leaf_mock.clone();
+            let leaf = LlmAgent::builder(&leaf_name, leaf_model, "m").build();
+            (rig, builder.build(), leaf)
+        };
+
+        let watches = Arc::new(Watches::default());
+        let (rig, parent_agent, leaf) = build(&watches);
+        let child_agent = rig.child();
+        let rt = rig
+            .builder(&store, "w")
+            .agent(parent_agent)
+            .agent(child_agent)
+            .agent(leaf)
+            .build();
+        let parent = rig.start(&rt, &conv_id()).await;
+        let session = child_run_id(parent, "c1");
+        if with_child {
+            rig.parent_mock
+                .push_tool_calls(vec![call("c0", "spawn", json!({}))]);
+        }
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_tool_calls(vec![read_call("r1", session, true)])
+            .push_tool_calls(vec![send_call("s1", session, "again")])
+            .push_tool_calls(vec![read_call("r2", session, true)])
+            .push_tool_calls(vec![close_call("x1", session, false)])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+
+        let got = order(&watches, parent);
+        let key = |name: &str, call: &str| (name.to_owned(), format!("RUN/tool:{call}/{name}/0"));
+        let mut golden = vec![
+            key("session.started", "c1"),
+            key("session.round.ended", "r1"),
+            key("session.round.started", "s1"),
+            key("session.round.ended", "r2"),
+            key("session.closed", "x1"),
+        ];
+        let seen = watches.0.lock().unwrap().clone();
+        if with_child {
+            golden.insert(0, key("child.ended", "c0"));
+            golden.insert(0, key("child.started", "c0"));
+            let ended = seen
+                .iter()
+                .find(|e| e.kind.name() == "child.ended")
+                .unwrap();
+            assert_eq!(ended.fields["status"], json!("done"));
+        }
+        assert_eq!(got, golden);
+        let started = seen
+            .iter()
+            .find(|e| e.kind.name() == "session.started")
+            .unwrap();
+        assert_eq!(started.fields["session"], json!(session.to_string()));
+        assert_eq!(started.fields["keep_open"], json!(true));
+
+        if with_child {
+            return;
+        }
+        // The same journal, run again by a worker that asks no model: the same events.
+        let again = Arc::new(Watches::default());
+        let (rig2, parent_agent, leaf) = build(&again);
+        let child_agent = rig2.child();
+        let rt2 = rig2
+            .builder(&store, "w2")
+            .agent(parent_agent)
+            .agent(child_agent)
+            .agent(leaf)
+            .build();
+        let copy = rig2.start(&rt2, &conv_id()).await;
+        let mut seq = 0;
+        while let Some(entry) = store.journal_get(parent, seq).await.unwrap() {
+            store.journal_put(copy, entry).await.unwrap();
+            seq += 1;
+        }
+        let worker = spawn_worker(&rt2);
+        let clock = rig2.clock.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                clock.advance(Duration::from_secs(61));
+            }
+        });
+        wait_done(&rt2, copy).await;
+        ticker.abort();
+        worker.stop().await;
+        assert_eq!(rig2.parent_mock.requests().len(), 0, "no model was asked");
+        assert_eq!(order(&again, copy), got, "the replay's events and order");
+    }
+
     /// A report is counted when the model reads it, not only when the run ends: the totals of a run
     /// that is parked on a later round already hold the round it read.
     pub async fn a_report_is_counted_when_it_is_read(store: DynStore) {
@@ -4959,6 +5120,8 @@ macro_rules! session_suite {
                 cancelling_the_parent_leaves_a_kept_open_session_idle,
                 polling_is_refused_and_waiting_is_not,
                 the_specs_are_byte_stable,
+                observers_see_a_child_and_a_session_in_order,
+                observers_see_a_sessions_events_again_on_a_replay,
                 a_report_is_counted_when_it_is_read,
                 cancelling_the_parent_closes_a_session_that_was_not_kept_open,
                 a_blipped_start_of_the_last_session_still_answers_started,

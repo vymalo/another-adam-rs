@@ -56,6 +56,18 @@ pub enum EventKind {
     CompactionEnded,
     /// The agent saw its cancel during a step.
     RunCancelled,
+    /// A tool started a one-shot child run and will wait for it.
+    ChildStarted,
+    /// The child run a tool waited for ended, done or failed.
+    ChildEnded,
+    /// A session was started: `subagent_start` returned, and its first round works.
+    SessionStarted,
+    /// A message started another round of a session: `subagent_send` returned.
+    SessionRoundStarted,
+    /// A session's round was read as a report: `subagent_read` returned one.
+    SessionRoundEnded,
+    /// A session was closed: `subagent_close` returned.
+    SessionClosed,
 }
 
 impl EventKind {
@@ -75,6 +87,12 @@ impl EventKind {
             EventKind::TurnEnded => "turn.ended",
             EventKind::CompactionEnded => "compaction.ended",
             EventKind::RunCancelled => "run.cancelled",
+            EventKind::ChildStarted => "child.started",
+            EventKind::ChildEnded => "child.ended",
+            EventKind::SessionStarted => "session.started",
+            EventKind::SessionRoundStarted => "session.round.started",
+            EventKind::SessionRoundEnded => "session.round.ended",
+            EventKind::SessionClosed => "session.closed",
         }
     }
 }
