@@ -28,7 +28,12 @@ pub struct GitAt {
 #[derive(Debug, Clone)]
 enum Pin {
     /// Discover the repository from the directory.
-    #[cfg(any(test, feature = "test-util"))]
+    ///
+    /// For a slot this is behind `test-util` on purpose — a run's directory must not discover a
+    /// repository of its own — and it is always available through [`GitAt::directory`], which is the
+    /// person's own directory ([ADR 0047], slice 7): no pin of a run exists there to honour.
+    ///
+    /// [ADR 0047]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md
     Plain,
     Pinned(GitPin),
     Refused,
@@ -47,6 +52,24 @@ impl GitAt {
             root: Arc::new(SlotDir::open(dir).expect("a plain directory")),
             pin: Pin::Plain,
         }
+    }
+
+    /// A directory the person owns, whose repository `git` finds by itself: the person's own
+    /// directory as a workspace ([ADR 0047], slice 7).
+    ///
+    /// Unlike a slot, nothing pins which repository this is: nobody's metadata describes a person's
+    /// directory, and a run never owns it, so `git` is asked there as it would be in a terminal.
+    ///
+    /// # Errors
+    ///
+    /// The directory cannot be opened: it does not exist, is not a directory, or is not readable.
+    ///
+    /// [ADR 0047]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md
+    pub fn directory(dir: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            root: Arc::new(SlotDir::open(dir)?),
+            pin: Pin::Plain,
+        })
     }
 
     /// A directory whose repository is not known: every question is "unknown", as for a repository
