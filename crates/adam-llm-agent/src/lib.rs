@@ -165,10 +165,10 @@ mod toolset;
 mod typed;
 
 pub use access::{ToolAccess, Use, UseMode, path_scope};
-/// The hooks around a tool call ([ADR 0050](../../docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md),
-/// slice H1): what a plugin implements and what the loop installs
-/// ([`LlmAgentBuilder::plugin`](agent::LlmAgentBuilder::plugin),
-/// [`LlmAgentBuilder::hooks`](agent::LlmAgentBuilder::hooks)).
+/// The hooks around a tool call (ADR 0050, slice H1): what a plugin implements and what the loop
+/// installs with [`LlmAgentBuilder::plugin`] or [`LlmAgentBuilder::hooks`].
+///
+/// [ADR 0050]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
 pub use adam_plugin::{HookError, HookLimits, HookSet, HookedCall, HookedText, Plugin, Verdict};
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{
