@@ -152,7 +152,7 @@ fn short_lease(b: RuntimeBuilder) -> RuntimeBuilder {
 }
 
 /// The result message of the call `id`.
-fn tool_of(messages: &[Message], id: &str) -> &Message {
+fn tool_of<'a>(messages: &'a [Message], id: &str) -> &'a Message {
     messages
         .iter()
         .find(|message| matches!(message, Message::Tool { call_id, .. } if call_id == id))
