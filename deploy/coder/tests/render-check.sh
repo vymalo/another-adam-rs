@@ -1550,6 +1550,10 @@ check "policy: fails closed" rhas ValidatingAdmissionPolicy "$pn" 'failurePolicy
 check "policy: only CREATE of pods" rhas ValidatingAdmissionPolicy "$pn" 'operations: \["CREATE"\]'
 check "policy: refuses a pod without the run label and the managed-by label" policy_has "$pn" "'adam.vymalo.com/run' in object.metadata.labels"
 check "policy: ... or without the priority class" policy_has "$pn" "object.spec.priorityClassName == 'coder-run'"
+policy_refuses_secrets() { policy_has "$pn" "!has(e.valueFrom.secretKeyRef)" && policy_has "$pn" "!has(f.secretRef)"; }
+check "policy: refuses a secretKeyRef and an envFrom secretRef (ADR 0038)" policy_refuses_secrets
+check "policy: ... and says no Secret volume, secretKeyRef or envFrom in its message" \
+  policy_has "$pn" "no Secret volume, no secretKeyRef, no envFrom"
 check "policy: ... or with another image (the run image by digest and the coder's)" \
   policy_has "$pn" "c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-8c297d3@sha256:b465808bfb8a1baae5e59a429bf292726b021e3b37322f759dbda3ee2c57ed67', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234']"
 check "policy: ... or a hostPath: only emptyDir and the work claim" \

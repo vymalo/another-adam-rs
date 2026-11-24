@@ -170,3 +170,5 @@ using).
    wiremock test of `adam-model-openai`. Every `dev/*-e2e.sh` passes without OpenCode.
 5. **Docs and skills.** The pages in the table, `adam-coder-deploy`, `adam-a2a-extensions`, `adam-acp`'s README note, and the
    neutral labels in the shared crates' examples. `node tools/docs-check/check-docs.mjs` passes.
+
+*Amended 2026-11-24:* built in `cb7bb8f` ([#145](https://github.com/vymalo/another-adam-rs/pull/145)); a run pod holds no Secret reference (proved by `deploy/coder/tests/render-check.sh` and `kind-run-pods.sh`, see ADR 0041 decision 5).
