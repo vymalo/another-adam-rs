@@ -8,6 +8,12 @@ workspace per conversation"). Builds on [ADR 0003](0003-a-new-task-continues-the
 
 *Amended 2026-11-14 ([ADR 0045](0045-a-subagent-can-run-in-the-background-as-a-session.md)):* a turn that asks nothing does not complete while a session round it started still works, and a kept-open session lives for the thread, as scratch does.
 
+*Amended 2026-11-24 ([ADR 0065](0065-resource-governance-admission-pools-and-os-limits.md), decision 7):* the janitor no
+longer removes a scratch project. A project has no remote, so all of its work is unpushed, and the sweep never removes a
+workspace that holds unpushed work (`RunWorkspace::remove_if_pushed`, `Sweep::kept_unpushed`). The projects of a finished
+run therefore stay until a later task of the conversation takes them over. `SCRATCH_IDLE_DAYS` is unchanged as a setting and
+now times the conversation's **images** only (`Janitor::with_scratch_idle`).
+
 ## Context
 
 The owner tested Adam in production on a thread of seven jobs (2026-10-11). Two things cost him time:
@@ -45,25 +51,29 @@ The owner tested Adam in production on a thread of seven jobs (2026-10-11). Two 
    * the janitor still releases a finished run's environment and removes its worktrees, but **keeps its scratch projects**
      until the conversation has had no task for `SCRATCH_IDLE_DAYS` (default **7**; `0` restores the old rule: deleted with
      the run). It measures from the newest run of the conversation in the store, so a thread with an open or recent task is
-     never swept, and a run the store does not know (a purged one) is removed whole, as before;
+     never swept, and a run the store does not know (a purged one) is removed whole, as before. *Amended 2026-11-24 (see the
+     note at the top):* the sweep never removes a scratch project, and `SCRATCH_IDLE_DAYS` times the conversation's images;
    * `start_scratch` of a name that is already there returns the project, with a note of what it holds.
 
 ## Consequences
 
 * A "yes, publish it to acme/site" a day later finds the files. A scratch project is still not an artifact of record: it is
-  deleted after the idle time, and what the person wants kept goes to a repository they name.
+  deleted after the idle time, and what the person wants kept goes to a repository they name. *Amended 2026-11-24:* it is
+  never deleted by the sweep; the disk it holds is what a person publishing or a later task taking it over frees.
 * A task that only reports ("did the checks pass?", "Merged") is `completed`, not `blocked`. A reply that is a request with
   no question mark ("Tell me the repository") is not read as a question; the instructions say to ask with `ask_user` or end
   with the question.
 * `Janitor::new` is unchanged; `Janitor::with_scratch_idle` and `Sweep::kept_scratch` are new (`Sweep` has a public field
   more), and `adam-workspace` gains `RunWorkspace::adopt_scratch`, `RunWorkspace::remove_keeping_scratch`,
   `RunWorkspace::add_scratch_for` and `Scratch::conversation`. No required trait method is added. Metadata written before has
-  no conversation: such a project is not adopted and is swept with its run.
+  no conversation: such a project is not adopted and is swept with its run. *Amended 2026-11-24:* `Sweep::kept_scratch` is
+  `Sweep::kept_unpushed`, and a project with no conversation is kept too (ADR 0065 decision 7).
 * The projects move between the workspaces of one volume. With the `affinity` and `isolated` placements the next task of a
   conversation may be claimed by another worker, whose volume does not have the project: it makes a new one, as it did before
   (as for any file of a run). The `shared` placement and a single worker find it.
 * The retained scratch of a finished run holds disk for up to the idle time. The volume must be sized for it; the knob is
-  `SCRATCH_IDLE_DAYS`.
+  `SCRATCH_IDLE_DAYS`. *Amended 2026-11-24:* it holds disk until a later task of the conversation takes it over; no sweep
+  removes it.
 * What Adam may do is unchanged: no tool is added, and a repository is still only used on the person's word.
 
 ## Alternatives rejected

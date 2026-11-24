@@ -119,6 +119,10 @@ impl CommandWorkspace for ToolEnv {
         }
     }
 
+    fn governor(&self) -> Option<&adam_code_tools::governor::Governor> {
+        self.settings.governor.as_ref()
+    }
+
     fn kept(&self) -> &dyn KeptOutputs {
         &*self.kept
     }

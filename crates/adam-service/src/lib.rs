@@ -6,6 +6,7 @@ pub mod config;
 pub mod exit;
 pub mod harden;
 pub mod logging;
+pub mod metrics;
 #[cfg(feature = "mcp")]
 mod prompt_commands;
 mod serve;

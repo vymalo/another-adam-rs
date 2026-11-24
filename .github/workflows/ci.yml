@@ -227,6 +227,32 @@ jobs:
       - run: cargo check --workspace --all-targets --locked
       - run: cargo check --workspace --all-targets --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
 
+  # ADR 0065 slice 3: the OS limits on a command, proven on a machine with a systemd user manager. The
+  # memory hog, the process flood and the file over the size limit run here, and the test binary itself
+  # runs inside a scope with its own cap, so that a limit that does not hold cannot take the runner. The
+  # `scope` conformance cases skip without a user manager; ADAM_TEST_REQUIRE_SYSTEMD=1 makes that a
+  # failure, and `ci_has_the_full_scope` requires memory, cpu and pids to be delegated.
+  confine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start the user's systemd manager
+        run: |
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - run: cargo test -p adam-confine --locked --no-run
+      - name: The limits hold (inside a capped scope)
+        env:
+          ADAM_TEST_REQUIRE_SYSTEMD: "1"
+        run: |
+          systemd-run --user --scope --quiet -p MemoryMax=4G -p TasksMax=4096 \
+            cargo test -p adam-confine --locked -- --test-threads 1
+
   # The compile tests of `#[tool]` (crates/adam/tests/ui), on the toolchain their
   # rustc-produced snapshots were written with. The errors the macro produces
   # itself run everywhere (nextest, stable); the ones rustc words itself change

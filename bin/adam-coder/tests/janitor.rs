@@ -57,15 +57,18 @@ fn workspace_dir(fx: &Fixture, run: &str) -> std::path::PathBuf {
     fx.root.join("workspaces").join(run)
 }
 
-/// A scratch project made without a conversation belongs to its run (nothing could take it over): a
-/// cancelled (failed) run's project is deleted, a parked run's is kept with its files, and what was
-/// published stays on the remote. (A project of a conversation lives for the thread: see below.)
+/// A finished run whose workspace holds unpushed work keeps it: a scratch project has no remote, so
+/// every commit in it is unpushed, and the sweep never removes it ([ADR 0065](../../docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md)
+/// decision 7, "it never removes a workspace that holds unpushed work"). The repository beside the
+/// project stays too: the workspace is kept whole. A finished run with nothing unpushed still goes,
+/// so this test cannot pass by the sweep doing nothing.
 #[tokio::test]
-async fn a_scratch_project_goes_with_its_run_unless_the_run_is_waiting() {
+async fn a_scratch_project_with_unpushed_work_is_kept_with_its_run() {
     let fx = Fixture::new().await;
     let store: DynStore = Arc::new(MemoryStore::new());
     let cancelled = run_in(&store, RunStatus::Failed).await.to_string();
     let parked = run_in(&store, RunStatus::Parked).await.to_string();
+    let clean = run_in(&store, RunStatus::Done).await.to_string();
     for run in [&cancelled, &parked] {
         let workspace = fx.env.workspaces.run(run).unwrap();
         let slot = workspace
@@ -76,6 +79,8 @@ async fn a_scratch_project_goes_with_its_run_unless_the_run_is_waiting() {
     }
     // The cancelled run also has a repository in its workspace, beside the project.
     workspace_of(&fx, &cancelled).await;
+    // A finished run whose workspace holds a repository and nothing else unpushed.
+    workspace_of(&fx, &clean).await;
 
     let janitor = Janitor::new(fx.env.workspaces.clone(), Some(Duration::from_secs(300)));
     let report = janitor
@@ -83,24 +88,58 @@ async fn a_scratch_project_goes_with_its_run_unless_the_run_is_waiting() {
         .await;
     assert_eq!(
         report.removed,
+        std::slice::from_ref(&clean),
+        "a workspace with no unpushed work still goes: {report:?}"
+    );
+    assert_eq!(
+        report.kept_unpushed,
         std::slice::from_ref(&cancelled),
-        "{report:?}"
+        "the cancelled run's project is kept, and said so: {report:?}"
     );
     assert!(report.failed.is_empty(), "{report:?}");
-    assert!(!workspace_dir(&fx, &cancelled).exists());
     assert!(
-        !fx.root.join("meta").join(&cancelled).exists(),
-        "the metadata of its slots is gone too"
+        workspace_dir(&fx, &cancelled).join("fib/fib.sh").is_file(),
+        "a project holds work no remote has: the sweep keeps it"
+    );
+    assert!(
+        workspace_dir(&fx, &cancelled).join("fib/.git").is_dir(),
+        "with its repository"
+    );
+    assert!(
+        workspace_dir(&fx, &cancelled)
+            .join("remote/README.md")
+            .is_file(),
+        "and the workspace is kept whole, worktree beside it"
+    );
+    assert!(
+        fx.root.join("meta").join(&cancelled).is_dir(),
+        "the metadata of a kept workspace stays"
     );
     assert!(
         workspace_dir(&fx, &parked).join("fib/fib.sh").is_file(),
         "a run that waits for the person keeps its project"
     );
-    assert!(workspace_dir(&fx, &parked).join("fib/.git").is_dir());
+    assert!(!workspace_dir(&fx, &clean).exists());
+    assert!(
+        !fx.root.join("meta").join(&clean).exists(),
+        "the metadata of a removed workspace is gone too"
+    );
+
+    // The workspace is decided again at every sweep: the project is still there, so it stays.
+    let again = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert_eq!(
+        again.kept_unpushed,
+        std::slice::from_ref(&cancelled),
+        "{again:?}"
+    );
+    assert!(again.removed.is_empty(), "{again:?}");
 }
 
-/// A scratch project lives for the thread: when its run is over, its worktrees go and the project
-/// stays for as long as the conversation has a task within the idle time, whatever sweeps happen.
+/// A scratch project lives for the thread: while it is in a finished run's workspace, that workspace
+/// is kept whole (it holds unpushed work, ADR 0065 decision 7), and it goes once the next task of the
+/// conversation has taken the project over and nothing unpushed is left.
 #[tokio::test]
 async fn a_scratch_project_outlives_its_run_while_the_conversation_is_alive() {
     let fx = Fixture::new().await;
@@ -128,13 +167,13 @@ async fn a_scratch_project_outlives_its_run_while_the_conversation_is_alive() {
         "{report:?}"
     );
     assert_eq!(
-        report.kept_scratch,
+        report.kept_unpushed,
         std::slice::from_ref(&done),
         "{report:?}"
     );
     assert!(
-        !workspace_dir(&fx, &done).join("remote").exists(),
-        "the repository's worktree went with the run"
+        workspace_dir(&fx, &done).join("remote/README.md").is_file(),
+        "the repository's worktree stays: the workspace is kept whole"
     );
     assert!(
         workspace_dir(&fx, &done).join("site/index.html").is_file(),
@@ -151,7 +190,11 @@ async fn a_scratch_project_outlives_its_run_while_the_conversation_is_alive() {
         let again = janitor
             .sweep(store.as_ref(), &CancellationToken::new())
             .await;
-        assert_eq!(again.kept_scratch, std::slice::from_ref(&done), "{again:?}");
+        assert_eq!(
+            again.kept_unpushed,
+            std::slice::from_ref(&done),
+            "{again:?}"
+        );
         assert!(again.removed.is_empty(), "{again:?}");
     }
     assert_eq!(environment.released.lock().unwrap().len(), 1);
@@ -180,10 +223,12 @@ async fn a_scratch_project_outlives_its_run_while_the_conversation_is_alive() {
     );
 }
 
-/// The project goes once the conversation has had no task for the idle time, measured from its
-/// newest task, and an open task keeps it however old the finished one is.
+/// The idle time of a conversation never removes a scratch project: a project has no remote, so its
+/// work is unpushed and its workspace is kept (`SCRATCH_IDLE_DAYS` included: `0`, none, or a time
+/// that has passed). An open task of the conversation makes no difference to that, and the images of
+/// the conversation still follow the idle time (`images_go_with_an_idle_conversation`).
 #[tokio::test]
-async fn a_scratch_project_goes_when_its_conversation_has_been_idle() {
+async fn an_idle_time_never_removes_a_scratch_project() {
     let fx = Fixture::new().await;
     let store: DynStore = Arc::new(MemoryStore::new());
     let idle = run_of(&store, RunStatus::Done, Some("caller:idle"))
@@ -205,43 +250,52 @@ async fn a_scratch_project_goes_when_its_conversation_has_been_idle() {
     run_of(&store, RunStatus::Parked, Some("caller:busy")).await;
     tokio::time::sleep(Duration::from_millis(60)).await;
 
-    let janitor = Janitor::new(fx.env.workspaces.clone(), None)
-        .with_scratch_idle(Some(Duration::from_millis(30)));
-    let report = janitor
-        .sweep(store.as_ref(), &CancellationToken::new())
-        .await;
-    assert_eq!(report.removed, std::slice::from_ref(&idle), "{report:?}");
-    assert_eq!(
-        report.kept_scratch,
-        std::slice::from_ref(&busy),
-        "{report:?}"
-    );
-    assert!(!workspace_dir(&fx, &idle).exists());
-    assert!(workspace_dir(&fx, &busy).join("site/.git").is_dir());
+    for scratch_idle in [None, Some(Duration::ZERO), Some(Duration::from_millis(30))] {
+        let report = Janitor::new(fx.env.workspaces.clone(), None)
+            .with_scratch_idle(scratch_idle)
+            .sweep(store.as_ref(), &CancellationToken::new())
+            .await;
+        assert!(
+            report.removed.is_empty(),
+            "nothing goes whatever the idle time is ({scratch_idle:?}): {report:?}"
+        );
+        assert!(report.failed.is_empty(), "{report:?}");
+        let mut kept = report.kept_unpushed.clone();
+        kept.sort();
+        let mut want = vec![idle.clone(), busy.clone()];
+        want.sort();
+        assert_eq!(kept, want, "{scratch_idle:?} {report:?}");
+        assert!(workspace_dir(&fx, &idle).join("site/.git").is_dir());
+        assert!(workspace_dir(&fx, &busy).join("site/.git").is_dir());
+    }
 }
 
-/// `SCRATCH_IDLE_DAYS=0` is the old rule: the project goes with its run, conversation or not.
+/// A run with a repository and no scratch project is decided by its git state alone: a worktree with
+/// an uncommitted change is unpushed work and its workspace stays.
 #[tokio::test]
-async fn without_an_idle_time_a_scratch_project_goes_with_its_run() {
+async fn an_uncommitted_change_keeps_the_workspace_of_its_run() {
     let fx = Fixture::new().await;
     let store: DynStore = Arc::new(MemoryStore::new());
-    let done = run_of(&store, RunStatus::Done, Some("caller:thread-1"))
-        .await
-        .to_string();
-    fx.env
-        .workspaces
-        .run(&done)
-        .unwrap()
-        .add_scratch_for("site", &fx.env.settings.identity, Some("caller:thread-1"))
-        .await
-        .unwrap();
+    let dirty = run_in(&store, RunStatus::Failed).await.to_string();
+    let clean = run_in(&store, RunStatus::Done).await.to_string();
+    for run in [&dirty, &clean] {
+        workspace_of(&fx, run).await;
+    }
+    let file = workspace_dir(&fx, &dirty).join("remote/fib.sh");
+    std::fs::write(&file, "echo 0\n").unwrap();
+
     let report = Janitor::new(fx.env.workspaces.clone(), None)
-        .with_scratch_idle(None)
         .sweep(store.as_ref(), &CancellationToken::new())
         .await;
-    assert_eq!(report.removed, std::slice::from_ref(&done), "{report:?}");
-    assert!(report.kept_scratch.is_empty());
-    assert!(!workspace_dir(&fx, &done).exists());
+    assert_eq!(report.removed, std::slice::from_ref(&clean), "{report:?}");
+    assert_eq!(
+        report.kept_unpushed,
+        std::slice::from_ref(&dirty),
+        "{report:?}"
+    );
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert!(file.is_file(), "the uncommitted file is still there");
+    assert!(!workspace_dir(&fx, &clean).exists());
 }
 
 #[tokio::test]

@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Weak;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adam_core::RunId;
 use adam_runtime::{BroadcastSink, EventSink, Received, RunEvent, RunSubscription, blob_id};
@@ -21,6 +21,10 @@ use crate::{Engine, EngineError, RunInfo};
 /// How long a stream waits for an event before it reads the run from the store anyway: the events
 /// are a latency aid, and the store decides when a run has ended.
 const POLL: Duration = Duration::from_secs(2);
+
+/// How often a stream carries a [`EngineEvent::Resources`] while its run works: ADR 0065 decision
+/// 9 says at most every two seconds.
+const REPORT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// What a [`RunEvents`] stream says about its run. Every event is a prompt; the store is the
 /// truth, and [`Snapshot`](Self::Snapshot) and [`Ended`](Self::Ended) are read from it.
@@ -47,11 +51,18 @@ pub enum EngineEvent {
     /// The run has ended (`Done`, `Failed` or `Cancelled`), as the store has it: the last item of
     /// the stream.
     Ended(RunInfo),
+    /// What the process's pools hold and what the host's device says
+    /// ([ADR 0065](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md)
+    /// decision 9), while the run works: at most every two seconds. A host that shows the report
+    /// on request reads [`Engine::resources`](crate::Engine::resources) instead.
+    Resources(crate::ResourceReport),
 }
 
 /// The events of one run, from [`Engine::events`]: a [`Stream`] of
 /// `Result<`[`EngineEvent`]`, `[`EngineError`]`>`.
 ///
+/// * While the run works it carries an [`EngineEvent::Resources`] at most every two seconds
+///   (ADR 0065 decision 9).
 /// * It ends after [`EngineEvent::Ended`], or after an error: [`EngineError::Stopped`] once the
 ///   worker has stopped with the run unfinished ([`Engine::shutdown`], the last [`Engine`]
 ///   dropped, or the worker failed: nothing would step the run), or the store's error when a read
@@ -93,6 +104,7 @@ impl RunEvents {
             worker,
             queue: VecDeque::with_capacity(2),
             ended: false,
+            report_at: Instant::now() + REPORT_INTERVAL,
         };
         if info.state.is_terminal() {
             follow.end(EngineEvent::Ended(info));
@@ -131,6 +143,9 @@ struct Follow {
     queue: VecDeque<Result<EngineEvent, EngineError>>,
     /// Nothing more is received once the queue is empty.
     ended: bool,
+    /// When the next [`EngineEvent::Resources`] may be handed out: a report is sent at most every
+    /// [`REPORT_INTERVAL`], not on every live event of a busy run.
+    report_at: Instant,
 }
 
 impl Follow {
@@ -141,6 +156,17 @@ impl Follow {
             }
             if self.ended {
                 return None;
+            }
+            let now = Instant::now();
+            if now >= self.report_at {
+                self.report_at = now + REPORT_INTERVAL;
+                match Engine::from_weak(&self.engine) {
+                    Some(engine) => return Some(Ok(EngineEvent::Resources(engine.resources()))),
+                    None => {
+                        self.fail(EngineError::Stopped);
+                        continue;
+                    }
+                }
             }
             // The events the ring holds first: the last of them may be the run's end.
             let heard = tokio::select! {

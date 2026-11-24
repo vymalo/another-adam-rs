@@ -983,6 +983,13 @@ impl GitCmd {
         let sub = self.subcommand();
         let invocation = self.invocation();
         let sandbox = self.route();
+        // Held until the process is gone; one that runs in the sandbox is not this process's.
+        let _seat = match sandbox {
+            Some(_) => None,
+            None => crate::git_gate::seat(invocation.cwd.as_deref())
+                .await
+                .map_err(busy)?,
+        };
         let run = async {
             match sandbox {
                 Some(sandbox) => invocation
@@ -1013,6 +1020,14 @@ impl GitCmd {
             },
             stderr,
         ))
+    }
+}
+
+/// A git that found no seat of the pool: nothing ran, and asking again later is right.
+fn busy(refused: adam_budget::Refused) -> WorkspaceError {
+    use adam_error::Classify as _;
+    WorkspaceError::RateLimited {
+        retry_after: refused.retry_after(),
     }
 }
 
@@ -1165,6 +1180,9 @@ impl LocalGit {
                 if self.invocation.carries_credentials() {
                     return Err(io::Error::other(SandboxFailure::Credential));
                 }
+                let _seat = crate::git_gate::seat(self.invocation.cwd.as_deref())
+                    .await
+                    .map_err(io::Error::other)?;
                 self.invocation.run_here().await?
             }
         };
@@ -1208,6 +1226,9 @@ impl LocalGit {
                 if self.invocation.carries_credentials() {
                     return Err(io::Error::other(SandboxFailure::Credential));
                 }
+                let _seat = crate::git_gate::seat(self.invocation.cwd.as_deref())
+                    .await
+                    .map_err(io::Error::other)?;
                 self.invocation.run_here_capped(max_stdout).await?
             }
         };

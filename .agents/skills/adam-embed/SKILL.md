@@ -77,6 +77,18 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      `Ctx` and adds no step. `EngineBuilder` takes no `HookSet` yet, and an agent file's `plugins:`
      is a later slice, so a served folder agent installs none.
      https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
+   * **Limiting commands in your own tools** (ADR 0065): `adam_code_tools::Governor` pairs an
+     `adam_budget::Admission` (`adam-admission-local`'s `LocalAdmission` over a `Budget`) with a
+     `adam_workspace::Confine`. Build the confine with `adam_confine::best_effort()` (a systemd
+     scope where the user manager delegates memory, cpu and pids, else `Rlimits`; Unix only, and
+     `describe()` says what is not enforced) and run commands through
+     `adam_code_tools::shell::run_timed_governed(.., Some(Governed { governor, conversation }))`:
+     a command takes a seat of `Pool::Processes` (a full pool is `RunError::Busy`, retryable) and
+     its group is ended when it ends, so nothing it started outlives its seat. Read
+     `ShellOutcome::stopped` for the limit that ended it. A confine you write passes
+     `adam_confine_testkit::confine_conformance!`. Not governed yet: background commands, language
+     servers, git. Sources: `crates/adam-code-tools/src/governor.rs`, `crates/adam-confine/`
+     at https://github.com/vymalo/another-adam-rs/tree/main/crates/adam-confine.
    * **A wrapper agent must delegate the split.** `adam_runtime::Agent` has provided `split`/`join`
      methods (and so does `AgentStarter`) that let a run keep its transcript in an append-only body
      beside a small head; the default keeps the whole state in the head, the v4 format. An agent of

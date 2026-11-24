@@ -10,6 +10,9 @@ which are.
 "it is deleted with the workspace" and the alternative "a workspace per conversation" change in one respect: a scratch project
 records its conversation, the next task of the conversation takes it over (it moves into that run's workspace), and the janitor
 keeps it until the conversation has been idle for `SCRATCH_IDLE_DAYS` (7 by default). The workspace is still per run.
+*Amended 2026-11-24 ([ADR 0065](0065-resource-governance-admission-pools-and-os-limits.md), decision 7):* a scratch project is
+never removed, because a project has no remote and the sweep never removes a workspace that holds unpushed work; the next task
+of the conversation is what takes it over. `SCRATCH_IDLE_DAYS` times a conversation's images.
 
 ## Context
 

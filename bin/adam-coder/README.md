@@ -428,8 +428,8 @@ make them hold:
   delivered (max_turns = N): <the answer>` (or the `max_tool_calls` form), redacted; with neither (a question, research) it completes.
   A pull request already delivered is a success whatever the limit (the verdict runs first).
 * **A scratch project lives for the thread, and what is published is what was checked.** It stays for the conversation:
-  the next task takes it over, and the janitor removes it once the conversation has had no task for `SCRATCH_IDLE_DAYS`
-  (7 by default; the instructions and the tool's result tell the model to say so; [Scratch projects](#scratch-projects)),
+  the next task takes it over, and the janitor never removes it (a project has no remote, so everything in it is unpushed
+  work: ADR 0065 decision 7; the instructions and the tool's result tell the model to say so; [Scratch projects](#scratch-projects)),
   `commit_and_push` there is a local commit and `open_pull_request` is refused, so nothing leaves the process until
   `publish_scratch` copies the files into a repository the person named. The gate does not change: the checks that ran
   on the project are bound to the pushed commit only when its tree is the same ([below](#scratch-projects)).
@@ -803,10 +803,11 @@ slot, and may be joined by others.
   and then every `WORKSPACE_SWEEP_SECS` (300; `0` turns it off): for each run that has a workspace on this worker's volume
   (`Workspaces::runs`), a run the store reports `done` or `failed` (a cancel is `failed`), or does not know, has what its
   environment holds released (`Environment::release`; nothing for `Local`; a release that fails leaves the workspace for
-  the next sweep) and **then** loses its
-  workspace (`RunWorkspace::remove`: every slot, the legacy worktree, the metadata, **except the scratch projects of a
-  conversation that is still alive**, which stay with `RunWorkspace::remove_keeping_scratch`; `Sweep::kept_scratch`
-  lists those runs, [Scratch projects](#scratch-projects)); the sweep then asks the environment what
+  the next sweep) and **then** has its workspace removed only when it holds no unpushed work
+  (`RunWorkspace::remove_if_pushed`, ADR 0065 decision 7, "it never removes a workspace that holds unpushed work"):
+  a worktree with uncommitted changes or commits no `origin` ref has, and **every scratch project** (no remote), keeps
+  the workspace whole, which the sweep logs and lists in `Sweep::kept_unpushed`; [Scratch projects](#scratch-projects).
+  The sweep then asks the environment what
   it still holds (`held_runs`) and releases what belongs to runs that are over or unknown even though they have no workspace
   here (`Sweep::orphans`); a **`runnable` or `parked` run is
   never swept**, so a run waiting a week for an answer keeps its files; a directory that is not a run id is left alone.
@@ -930,12 +931,16 @@ conversation of the run in the project's metadata (`add_scratch_for`), and:
   for the same conversation into its own workspace (`RunWorkspace::adopt_scratch`: the directory is renamed, the
   metadata rewritten, under both runs' locks, once per run: `RunNotes::scratch_adopted`). The model asks `start_scratch`
   for its name and gets the project back, with the files it holds listed. A name the run already has is left where it is.
-* **The janitor keeps it.** A finished run's worktrees and environment are released as before, but its projects stay
-  while the conversation is alive: a task of it is open, or the newest one was touched within `SCRATCH_IDLE_DAYS`
-  (default **7**, measured from the store, so the thread's activity decides, not the run's). After that the next sweep removes
-  the rest. `SCRATCH_IDLE_DAYS=0` is the old rule: the project goes with its run. A project made without a conversation
-  (before this) and a run the store does not know go with their run.
-* **The disk holds them.** A retained project is files on the worker's volume (`WORKSPACE_ROOT`) for up to the idle time.
+* **The janitor keeps it, always.** A project has no remote, so everything in it is unpushed work, and the sweep never
+  removes the workspace that holds it ([ADR 0065](../../docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md)
+  decision 7, "it never removes a workspace that holds unpushed work"): a finished run's environment is still released,
+  and its workspace stays whole, logged as kept and listed in `Sweep::kept_unpushed`. That is true for a project made
+  without a conversation and for a run the store does not know. The workspace goes once nothing unpushed is left in it:
+  the next task of the conversation takes the project over (`adopt_scratch`), or the project was published and the run
+  ended with nothing else in its workspace. `SCRATCH_IDLE_DAYS` no longer removes a project; it is the idle time of a
+  conversation whose **images** the sweep removes.
+* **The disk holds them.** A retained project is files on the worker's volume (`WORKSPACE_ROOT`) for as long as its
+  conversation's workspace is kept, and the janitor never removes it.
 
 The project is left as it is and remembers where it went (`published_to`); the tools that change it afterwards
 (`write_file`, `apply_patch`, `commit_and_push`, `start_scratch` again) say that the change does not reach the repository,
@@ -979,7 +984,7 @@ stateDiagram-v2
   Delivered --> Kept: the run is done, with no pull request (the janitor keeps the project)
   Scratch --> Kept: the run ends, nothing published (the janitor keeps the project)
   Kept --> Scratch: the next task of the conversation takes it over
-  Kept --> Deleted: the conversation was idle for SCRATCH_IDLE_DAYS
+  Kept --> Deleted: removed by hand, never by the janitor
   Published --> Released: the run ends (the janitor), the pushed branch stays
   Deleted --> [*]
   Pushed --> Released
@@ -2170,13 +2175,17 @@ way; every problem is reported at once at startup):
 | `WORKSPACE_ROOT` | mirrors, the workspaces of runs, run notes | `/work` |
 | `GIT_SANDBOX_SOCKET` | the Unix socket of an [`adam-git-sandbox`](../../crates/adam-git-sandbox/README.md) server, an absolute path (a relative one is exit 78). Set: the `git` commands that carry **no credential** (`status`, `add`, `diff`, `commit` and its plumbing, `worktree`, `config`, the `apply` of a patch, the questions the tools ask) run **there**, in a container with no secret, because git runs what a repository's configuration names and a run controls some repositories (a scratch project, an embedded repository); `fetch`, `push` and `ls-remote` stay here, on the bare mirror, after its configuration has been checked ([`adam-workspace`](../../crates/adam-workspace/README.md#where-git-runs-the-git-sandbox)). The sandbox's container mounts `WORKSPACE_ROOT` at the same path and runs as the same user. A sandbox that cannot be reached makes those commands fail as transient; **they are not run here instead**. Unset (the default; local mode and run pods off): every `git` runs in this container, **unprotected** from the repositories a run controls. The chart sets it, to the socket of its `git-sandbox` container, whenever `runPods.enabled` is on. Read by the roles that run workers | unset |
 | `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs ([below](#the-workspace-of-a-run)); `0` turns it off | `300` |
-| `SCRATCH_IDLE_DAYS` | how many days a scratch project outlives the last task of its conversation before the janitor removes it ([Scratch projects](#scratch-projects)); `0`: it goes with its run | `7` |
+| `SCRATCH_IDLE_DAYS` | the idle time of a conversation: how many days after its last task the janitor removes its images ([Scratch projects](#scratch-projects)). A scratch project is never removed: it has no remote, so its workspace is kept | `7` |
 | `WORKSPACE_PLACEMENT` | where the files of a run live: `shared`, `affinity` or `isolated` (`a2a-only` is refused; see [Workspace placement](#workspace-placement)) | `shared` |
 | `WORKER_ID` | stable identity of this worker (lease identity, and run owner when pinned): 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; **required** by `affinity` and `isolated` |
 | `WORKERS` | runs advanced concurrently | `4` |
 | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (else exit 78): the agent's `LlmAgentBuilder::max_parallel`. Which calls may overlap is each tool's declaration (ADR 0049) | `10` |
 | `MAX_TOOL_CALLS_IN_FLIGHT` | the most tool calls of the whole process that run at the same time, 1 to 256 (else exit 78): the process's `Pool::ToolCalls`, inside which `MAX_PARALLEL_TOOL_CALLS` bounds one turn (ADR 0065). A call waits up to a minute for a seat and then runs anyway, with a warning: a run never fails because a slot was busy | `4` |
 | `MAX_MODEL_CALLS` | the most model calls in flight in the process, 1 to 64 (else exit 78): the process's `Pool::ModelCalls` (ADR 0065). A call that waits five seconds parks the run at the refusal's `retry_after` | `2` |
+| `MAX_PROCESSES` | the most processes of the whole worker at once, 1 to 256 (else exit 78): the process's `Pool::Processes` (ADR 0065 slice 3). `run`, `run_command` and the checks take a seat and wait up to a minute; past it the call fails as retryable (`RateLimited`) and the run tries again. `start_command` and a language server take a seat too and hold it until the process and its descendants are gone (a server that is idle counts), so `BACKGROUND_COMMANDS_MAX` and `LANGUAGE_SERVERS_MAX` count inside this pool; a language server that finds no seat in time says to try again | `4` |
+| `MAX_GIT_PROCESSES` | the most git processes at once, 1 to 64 (else exit 78): every git that runs in this container (`GitCmd` of a workspace, `LocalGit` of a tool; one run in the git sandbox is not counted) takes a seat of `Pool::Git`, waits up to a minute, then fails as retryable (`RateLimited`); `adam_workspace::govern_git` is called once by `serve` | `2` |
+| `COMMAND_MEMORY_MAX` | the memory one command may use: bytes, or `512MiB`, `2GB`; at least 64 MiB (else exit 78). The OS stops a command over it (a systemd scope's `MemoryMax`, else `RLIMIT_AS`) and the result says `stopped: memory limit 2 GB`: not an error, the run goes on. Start logs what the host enforces (`enforcement=`) | a quarter of the RAM, at most 8 GB |
+| `COMMAND_CPU_MAX` | the CPU one command may use: cores (`2`, `1.5`) or millicores (`500m`), at least `100m` (else exit 78); a scope's `CPUQuota`, **not enforced** without a systemd user manager that delegates `cpu` | half the cores, at least 1 |
 | `MODEL_TOKENS_PER_MINUTE` | the model's tokens per minute, 1 to 100000000 (else exit 78), charged to one bucket the whole process shares (ADR 0065) | unset (no rate) |
 | `MODEL_PARK_LIMIT` | how long a run may wait on the model on a timer, from the first park in a row, before it fails with the last reason: a model call the gateway refused under `MODEL_AUTH=injector` parks the run and is made again, and so does a gateway that cannot be reached once the retries are spent (ADR 0067; `CoderSettings::model_parking`, the agent's `LlmAgentBuilder::model_parking`); whole seconds or a number with `s`, `m`, `h` or `d`, 60 s to 30 d (else exit 78). A park until woken stops the background commands as a question does, the run's own or a child's it waits on (the root shows the child's reason and wakes it through a message or a resume, ADR 0067 decision 5). **Breaking:** `CoderSettings::model_parking` is a new public field: a `CoderSettings` literal needs it (or `..CoderSettings::new()`) | `24h` |
 | `MAX_CHECK_CYCLES` | failed `run_checks` in a repository before the agent must stop | `3` |
@@ -2950,7 +2959,8 @@ database of its own, so the role needs `CREATEDB`):
   several; `a_cancelled_run_publishes_nothing`; `the_history_of_the_project_is_not_carried_into_the_repository`),
   `tests/e2e.rs`' `a_scratch_project_is_published_to_the_repository_the_person_names` (per store: build and check, the run parks
   on the question with nothing pushed, the answer names an empty repository, publish, push, pull request),
-  `tests/janitor.rs`' `a_scratch_project_goes_with_its_run_unless_the_run_is_waiting` (a project without a conversation), `a_scratch_project_outlives_its_run_while_the_conversation_is_alive`, `a_scratch_project_goes_when_its_conversation_has_been_idle` and `without_an_idle_time_a_scratch_project_goes_with_its_run`, `tests/e2e.rs`' `a_scratch_project_is_found_again_by_the_next_task_of_the_conversation`, and the compose scenario
+  `tests/janitor.rs`' `a_scratch_project_with_unpushed_work_is_kept_with_its_run` (a project without a conversation, beside a
+  repository, and the workspace of a run with nothing unpushed that still goes), `a_scratch_project_outlives_its_run_while_the_conversation_is_alive`, `an_idle_time_never_removes_a_scratch_project` and `an_uncommitted_change_keeps_the_workspace_of_its_run`, `tests/e2e.rs`' `a_scratch_project_is_found_again_by_the_next_task_of_the_conversation`, and the compose scenario
   `SCENARIO=scratch sh dev/coder-e2e.sh` (the `[mock:scratch]` script, which `wiremock_compose` of `adam-model-openai` plays
   against a real WireMock).
 * `tests/tools.rs`: each tool against real worktrees, including the hostile

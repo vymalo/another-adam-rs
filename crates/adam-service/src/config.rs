@@ -20,6 +20,10 @@
 //! | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (`1` is one at a time); an agent file's `limits.max_parallel` may lower it for that agent; read by the roles that run workers ([`WorkerSettings::max_parallel_tool_calls`]) | `10` |
 //! | `MAX_TOOL_CALLS_IN_FLIGHT` | the most tool calls of the whole process that run at the same time, 1 to 256: the process's pool, inside which `MAX_PARALLEL_TOOL_CALLS` still bounds one turn (ADR 0065) | `4` |
 //! | `MAX_MODEL_CALLS` | the most model calls in flight in the process, 1 to 64 (ADR 0065) | `2` |
+//! | `MAX_PROCESSES` | the most commands (`run`, `run_command`, checks, background commands, language servers) of the whole process at once, 1 to 256; a command waits for a seat, then the tool says so and the run retries (ADR 0065) | `4` |
+//! | `MAX_GIT_PROCESSES` | the most git processes at once, 1 to 64 (ADR 0065) | `2` |
+//! | `COMMAND_MEMORY_MAX` | the memory one command may use: bytes, or `512MiB`, `2GB` (binary units), at least 64 MiB; over it the OS stops the command and the tool says "stopped: memory limit" | a quarter of the RAM, at most 8 GB |
+//! | `COMMAND_CPU_MAX` | the CPU one command may use: cores (`2`, `1.5`) or millicores (`500m`), at least `100m`; needs a systemd user manager that delegates the `cpu` controller | half the cores, at least 1 |
 //! | `MODEL_TOKENS_PER_MINUTE` | the model's tokens per minute, charged to a bucket the whole process shares (1 to 100000000); unset meters none | unset |
 //! | `SESSION_MAX_OPEN` | the most sessions (a subagent that runs in the background) of one conversation open at once, 1 to 100; read by **every role**; the root agent's `limits.max_open_sessions` may lower it ([`SessionSettings::limits`]) | `16` |
 //! | `SESSION_MAX_WORKING` | the most rounds of one conversation working at once, 1 to 32 and at most `SESSION_MAX_OPEN`; `limits.max_working_sessions` may lower it | `4` |
@@ -651,6 +655,24 @@ pub const DEFAULT_MAX_MODEL_CALLS: usize = 2;
 /// The most `MAX_MODEL_CALLS` may say.
 pub const MAX_MODEL_CALLS_LIMIT: usize = 64;
 
+/// The default of `MAX_PROCESSES`: the desktop's four (ADR 0065 decision 11).
+pub const DEFAULT_MAX_PROCESSES: usize = 4;
+
+/// The most `MAX_PROCESSES` may say.
+pub const MAX_PROCESSES_LIMIT: usize = 256;
+
+/// The default of `MAX_GIT_PROCESSES`.
+pub const DEFAULT_MAX_GIT_PROCESSES: usize = 2;
+
+/// The most `MAX_GIT_PROCESSES` may say.
+pub const MAX_GIT_PROCESSES_LIMIT: usize = 64;
+
+/// The least `COMMAND_MEMORY_MAX` may say: 64 MiB, under which no shell starts.
+pub const COMMAND_MEMORY_MIN: u64 = 64 * 1024 * 1024;
+
+/// The least `COMMAND_CPU_MAX` may say, in millicores: a tenth of a core.
+pub const COMMAND_CPU_MIN: u32 = 100;
+
 /// The most `MODEL_TOKENS_PER_MINUTE` may say.
 pub const MODEL_TOKENS_PER_MINUTE_LIMIT: u32 = 100_000_000;
 
@@ -692,6 +714,62 @@ fn parse_tokens_per_minute(
     None
 }
 
+/// The RAM of this machine, in bytes, where the system says (`MemTotal` of `/proc/meminfo`).
+fn total_ram() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kib.checked_mul(1024)
+}
+
+/// `COMMAND_MEMORY_MAX`: a size (`2GB`, `512MiB`, bytes) of at least [`COMMAND_MEMORY_MIN`]; unset or
+/// blank is a quarter of the RAM, at most 8 GB. Anything else is a problem and the default.
+fn parse_command_memory(get: &impl Fn(&str) -> Option<String>, problems: &mut Vec<String>) -> u64 {
+    const NAME: &str = "COMMAND_MEMORY_MAX";
+    let default = adam_budget::default_command_memory(total_ram());
+    let Some(raw) = get(NAME) else {
+        return default;
+    };
+    match adam_budget::parse_bytes(&raw) {
+        Ok(bytes) if bytes >= COMMAND_MEMORY_MIN => bytes,
+        Ok(bytes) => {
+            problems.push(format!(
+                "{NAME} must be at least {COMMAND_MEMORY_MIN} bytes (64 MiB), got {bytes}"
+            ));
+            default
+        }
+        Err(e) => {
+            problems.push(format!("{NAME} is invalid ({raw:?}): {e}"));
+            default
+        }
+    }
+}
+
+/// `COMMAND_CPU_MAX`: cores (`2`, `1.5`) or millicores (`500m`) of at least [`COMMAND_CPU_MIN`];
+/// unset or blank is half the cores, at least one. Anything else is a problem and the default.
+fn parse_command_cpu(get: &impl Fn(&str) -> Option<String>, problems: &mut Vec<String>) -> u32 {
+    const NAME: &str = "COMMAND_CPU_MAX";
+    let cores =
+        std::thread::available_parallelism().map_or(1, |n| u32::try_from(n.get()).unwrap_or(1));
+    let default = adam_budget::default_command_cpu(cores);
+    let Some(raw) = get(NAME) else {
+        return default;
+    };
+    match adam_budget::parse_millicores(&raw) {
+        Ok(milli) if milli >= COMMAND_CPU_MIN => milli,
+        Ok(milli) => {
+            problems.push(format!(
+                "{NAME} must be at least {COMMAND_CPU_MIN} millicores (0.1 core), got {milli}"
+            ));
+            default
+        }
+        Err(e) => {
+            problems.push(format!("{NAME} is invalid ({raw:?}): {e}"));
+            default
+        }
+    }
+}
+
 /// `WORKERS`, `WORKER_ID` and `MAX_PARALLEL_TOOL_CALLS`: how a worker process takes runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerSettings {
@@ -711,6 +789,15 @@ pub struct WorkerSettings {
     pub max_model_calls: usize,
     /// `MODEL_TOKENS_PER_MINUTE`: the model's tokens per minute, or `None` to meter none.
     pub model_tokens_per_minute: Option<u32>,
+    /// `MAX_PROCESSES`: the most commands (`run`, `run_command`, checks, background commands and
+    /// language servers) at once, 1 to [`MAX_PROCESSES_LIMIT`] (ADR 0065).
+    pub max_processes: usize,
+    /// `MAX_GIT_PROCESSES`: the most git processes at once, 1 to [`MAX_GIT_PROCESSES_LIMIT`].
+    pub max_git_processes: usize,
+    /// `COMMAND_MEMORY_MAX`: the memory one command may use, in bytes.
+    pub command_memory_max: u64,
+    /// `COMMAND_CPU_MAX`: the CPU one command may use, in millicores.
+    pub command_cpu_max: u32,
 }
 
 impl WorkerSettings {
@@ -746,6 +833,22 @@ impl WorkerSettings {
             problems,
         );
         let model_tokens_per_minute = parse_tokens_per_minute(&get, problems);
+        let max_processes = bounded_count(
+            &get,
+            "MAX_PROCESSES",
+            DEFAULT_MAX_PROCESSES,
+            MAX_PROCESSES_LIMIT,
+            problems,
+        );
+        let max_git_processes = bounded_count(
+            &get,
+            "MAX_GIT_PROCESSES",
+            DEFAULT_MAX_GIT_PROCESSES,
+            MAX_GIT_PROCESSES_LIMIT,
+            problems,
+        );
+        let command_memory_max = parse_command_memory(&get, problems);
+        let command_cpu_max = parse_command_cpu(&get, problems);
         Self {
             workers,
             worker_id,
@@ -753,19 +856,28 @@ impl WorkerSettings {
             max_tool_calls_in_flight,
             max_model_calls,
             model_tokens_per_minute,
+            max_processes,
+            max_git_processes,
+            command_memory_max,
+            command_cpu_max,
         }
     }
 
     /// The process's budget: this many runs ([`WORKERS`](Self::workers)), the two pools of
     /// [ADR 0065](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md)
-    /// slice 2 and, when the deployment meters them, the tokens per minute. Every other ceiling is
-    /// `Budget::UNLIMITED`: the slices that build them lower it.
+    /// slice 2, the process pools and the memory and CPU of one command (slice 3) and, when the
+    /// deployment meters them, the tokens per minute. Every other ceiling is `Budget::UNLIMITED`:
+    /// the slices that build them lower it.
     #[must_use]
     pub fn budget(&self) -> adam_budget::Budget {
         let budget = adam_budget::Budget::builder()
             .runs(u32::try_from(self.workers).unwrap_or(u32::MAX))
             .tool_calls(u32::try_from(self.max_tool_calls_in_flight).unwrap_or(u32::MAX))
             .model_calls(u32::try_from(self.max_model_calls).unwrap_or(u32::MAX))
+            .processes(u32::try_from(self.max_processes).unwrap_or(u32::MAX))
+            .git(u32::try_from(self.max_git_processes).unwrap_or(u32::MAX))
+            .command_memory(self.command_memory_max)
+            .command_cpu(self.command_cpu_max)
             // The share ADR 0065 decision 11 gives one conversation: half of each pool.
             .per_conversation_share(adam_budget::Ratio::HALF);
         match self.model_tokens_per_minute {
@@ -1617,8 +1729,50 @@ mod tests {
                 max_tool_calls_in_flight: 4,
                 max_model_calls: 2,
                 model_tokens_per_minute: None,
+                max_processes: 4,
+                max_git_processes: 2,
+                command_memory_max: adam_budget::default_command_memory(total_ram()),
+                command_cpu_max: parse_command_cpu(&|_: &str| None, &mut Vec::new()),
             })
         );
+    }
+
+    /// The process pool and a command's limits (ADR 0065 slice 3): read like the other pools, and a
+    /// bad value is a problem naming the variable (exit 78), never a silent default.
+    #[test]
+    fn the_process_pool_and_command_limits_are_read_and_bounded() {
+        let mut vars = full();
+        vars.insert("MAX_PROCESSES", "8");
+        vars.insert("MAX_GIT_PROCESSES", "3");
+        vars.insert("COMMAND_MEMORY_MAX", "2GB");
+        vars.insert("COMMAND_CPU_MAX", "1.5");
+        let worker = parse(&vars).expect("valid").worker.expect("workers");
+        assert_eq!(worker.max_processes, 8);
+        assert_eq!(worker.max_git_processes, 3);
+        assert_eq!(worker.command_memory_max, 2 * 1024 * 1024 * 1024);
+        assert_eq!(worker.command_cpu_max, 1500);
+        let budget = worker.budget();
+        assert_eq!(budget.processes, 8);
+        assert_eq!(budget.git, 3);
+        assert_eq!(budget.command_memory, 2 * 1024 * 1024 * 1024);
+        assert_eq!(budget.command_cpu, 1500);
+
+        for (name, bad) in [
+            ("MAX_PROCESSES", "0"),
+            ("MAX_PROCESSES", "257"),
+            ("MAX_PROCESSES", "many"),
+            ("MAX_GIT_PROCESSES", "0"),
+            ("MAX_GIT_PROCESSES", "65"),
+            ("COMMAND_MEMORY_MAX", "1MB"),
+            ("COMMAND_MEMORY_MAX", "lots"),
+            ("COMMAND_CPU_MAX", "0"),
+            ("COMMAND_CPU_MAX", "50m"),
+            ("COMMAND_CPU_MAX", "fast"),
+        ] {
+            let mut vars = full();
+            vars.insert(name, bad);
+            assert!(mentions(&problems_of(&vars), name), "{name}={bad}");
+        }
     }
 
     /// `DEFAULT_LOCALE` names the agent's default language: unset is none, a well-formed tag is

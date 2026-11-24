@@ -230,11 +230,46 @@ Each is one pull request, in order.
    file over the size limit are each stopped while the engine keeps answering, `describe()` says `Partial` without
    systemd, on Linux, macOS and Windows runners (ADR 0047 slice 8's matrix).
 4. **The disk budget.** Accepted when a clone past the budget asks the person, the reserve is kept free, and a
-   workspace with unpushed work is never removed.
+   workspace with unpushed work is never removed. **Partly built:** `adam-workspace` measures its root, checks the
+   budget and the reserve before a mirror or worktree (`WorkspaceError::DiskFull`, class `Rejected`) and sweeps finished
+   runs without touching unpushed work (`a_clone_past_the_disk_budget_asks_the_person`, `the_reserve_is_kept_free`,
+   `unpushed_work_is_never_removed`), and **the coder's janitor uses the same decision** (`RunWorkspace::remove_if_pushed`):
+   a finished run's workspace is kept, and logged as kept, when it holds uncommitted changes, commits no `origin` ref has,
+   or any scratch project (`a_scratch_project_with_unpushed_work_is_kept_with_its_run`,
+   `an_uncommitted_change_keeps_the_workspace_of_its_run`). A scratch project has no remote, so it is never swept; ADR 0034
+   is amended for that. Not built yet: `WORKSPACE_DISK_MAX` and `WORKSPACE_DISK_RESERVE`, the
+   `tool.before` question to the person, `TooLarge`, cache writes, and `adam_disk_bytes{kind}`.
 5. **The device-state port.** Accepted when a fake device on battery runs one run at a time and a hot device holds new
-   steps.
+   steps. **Partly built:** `adam-device-state` holds `DeviceState`, the four readings and `FakeDevice`, and
+   `adam-device-state-testkit` the suite `device_state_conformance!`. `Engine::set_device_state` and
+   `EngineBuilder::device_state` are built with slice 6 for the report (amended 2026-11-24); the rule table that lowers
+   the live budget by these readings is not.
 6. **The resource report and the parity rows.** Accepted when a snapshot names each pool's use and the parity page has
-   the section.
+   the section. **Built** (2026-11-24): `adam-budget`'s `PoolUsage` carries a `Limit` (`Unlimited`, or `AtMost(n)`), so
+   an absent limit is never a zero; `Engine::resources()` returns a `ResourceReport` of every pool's ceiling and use,
+   the token bucket and the host's device readings, and a working run's stream carries `EngineEvent::Resources` at most
+   every 2 seconds with no person, run or conversation in it; `adam-service::metrics::render` writes the pools in the
+   Prometheus text format, with `+Inf` for an unlimited pool; `docs/reference/parity.md` has the **Resources** section.
+   Proof: `no_limit_is_not_a_zero_limit`, `a_deployment_with_no_limits_reports_unlimited_not_zero`,
+   `the_report_carries_the_pools_held_and_the_devices_readings`, `a_working_run_hears_the_resource_report`,
+   `every_pool_is_one_series_and_an_unlimited_pool_is_infinite`. Not built: a metrics listener, the counters, and
+   `adam_disk_bytes`.
 
 Per-person limits before a run starts, in a server or an orchestrator, are decided where that component lives and may
 count through a `StoreAdmission` later.
+
+## Amended 2026-11-24
+
+*Amended 2026-11-24:* **slice 3 is delivered on Linux only.** The `Confine` port with its two Linux backends (`Rlimits`,
+`SystemdScope`) and the process pool for commands (`run`, `run_command`, the checks) are built, with
+`MAX_PROCESSES`, `MAX_GIT_PROCESSES`, `COMMAND_MEMORY_MAX` and `COMMAND_CPU_MAX`. Still open, as a follow-up card: the
+macOS and Windows backends and the three-system matrix the slice's acceptance names. Background commands, language
+servers and git do not take a seat yet. The *unverified until slice 3 has run a build under it* note in the
+Consequences stands: no build has been run under a CPU limit.
+
+*Amended 2026-11-24 (later):* **background commands, language servers and git take a seat.** `start_command` and a
+language server take a seat of `Pool::Processes` and hold it until the process group is gone (`Hold`), and every git a
+worker runs in its own container takes a seat of `Pool::Git` (`govern_git`), so `BACKGROUND_COMMANDS_MAX` and
+`LANGUAGE_SERVERS_MAX` now count inside `MAX_PROCESSES` and `MAX_GIT_PROCESSES` is used. The chart sets the four
+variables (`config.maxProcesses`, `config.maxGitProcesses`, `config.commandMemoryMax`, `config.commandCpuMax`). What
+slice 3 still lacks is the macOS and Windows backends and the three-system matrix.

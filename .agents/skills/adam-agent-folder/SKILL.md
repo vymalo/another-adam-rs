@@ -33,9 +33,9 @@ before you rely on a detail here.
    * `name`: the registered name, which is the key of the agent's stored runs. Renaming it
      strands the runs of the old name. Two folders with the same `name` share their runs.
    * `description` (or `card.description`): the A2A card needs one.
-   * `card:` (`name`, `skills` with `id`, `name`, `description`, `tags`, `examples`), `limits:`     (`max_turns`, `max_tool_calls`, `max_output_tokens` — the cap this agent asks for, at least 1;
+   * `card:` (`name`, `skills` with `id`, `name`, `description`, `tags`, `examples`), `limits:` (`max_turns`, `max_tool_calls`, `max_output_tokens` — the cap this agent asks for, at least 1;
      absent, its preset's, the model's profile's, then 128,000, clamped to the model's limit and
-     window, ADR 0064; a `0` stops the load, naming the key — and `max_history_tokens`), `model:` (an alias,
+     window, ADR 0064; a `0` stops the load, naming the key — `max_history_tokens`, and for commands `max_processes`, `command_memory` and `command_cpu`, which only lower the deployment's `MAX_PROCESSES`, `COMMAND_MEMORY_MAX` and `COMMAND_CPU_MAX` and are read by `adam-coder`; see `docs/reference/agent-files.md` at https://github.com/vymalo/another-adam-rs/blob/main/docs/reference/agent-files.md), `model:` (an alias,
      only when it should not be `MODEL`), `model_fallback:` (overrides the `fallback` of the agent's `model_preset` and of
      its model's profile in `MODEL_ALIASES_FILE`: the alias the run continues on, once, when the endpoint refuses
      `model` as locked; not the agent's own alias, else exit 78; a subagent resolves its own, so an `inherit` subagent

@@ -8,6 +8,8 @@ use std::time::Duration;
 use adam_error::{Classify, ErrorClass};
 use async_trait::async_trait;
 
+use crate::budget::Limit;
+
 /// One kind of work: a pool of its own, so that one kind never starves another (ADR 0065
 /// decision 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -324,7 +326,7 @@ impl Classify for Refused {
 #[non_exhaustive]
 pub struct PoolUsage {
     pool: Pool,
-    limit: u64,
+    limit: Limit,
     in_use: u64,
     waiting: u32,
 }
@@ -332,11 +334,11 @@ pub struct PoolUsage {
 impl PoolUsage {
     /// One pool's line of a report.
     #[must_use]
-    pub fn new(pool: Pool, limit: u64, in_use: u64, waiting: u32) -> Self {
+    pub fn new(pool: Pool, limit: Limit, in_use: u64, waiting: u32) -> Self {
         Self {
             pool,
             limit,
-            in_use: in_use.min(limit),
+            in_use: in_use.min(limit.at_most().unwrap_or(u64::MAX)),
             waiting,
         }
     }
@@ -347,9 +349,9 @@ impl PoolUsage {
         self.pool
     }
 
-    /// The ceiling of the pool, in its unit.
+    /// The ceiling of the pool, in its unit, or [`Limit::Unlimited`] when it has none.
     #[must_use]
-    pub fn limit(&self) -> u64 {
+    pub fn limit(&self) -> Limit {
         self.limit
     }
 
@@ -536,13 +538,16 @@ mod tests {
     fn a_usage_adds_up_by_pool() {
         let usage = Usage::new(
             [
-                PoolUsage::new(Pool::ToolCalls, 4, 3, 1),
-                PoolUsage::new(Pool::ModelCalls, 2, 9, 0),
+                PoolUsage::new(Pool::ToolCalls, Limit::AtMost(4), 3, 1),
+                PoolUsage::new(Pool::ModelCalls, Limit::AtMost(2), 9, 0),
             ],
             Some(TokenUsage::new(100, 250)),
         );
         let calls = usage.pool(Pool::ToolCalls).expect("listed");
-        assert_eq!((calls.in_use(), calls.limit(), calls.waiting()), (3, 4, 1));
+        assert_eq!(
+            (calls.in_use(), calls.limit(), calls.waiting()),
+            (3, Limit::AtMost(4), 1)
+        );
         let models = usage.pool(Pool::ModelCalls).expect("listed");
         assert_eq!(
             models.in_use(),

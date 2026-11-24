@@ -312,6 +312,35 @@ impl Worktree {
         Ok(parse_porcelain(&out.stdout))
     }
 
+    /// Whether removing this worktree would lose work: it has changes that are not committed, or
+    /// the run's branch has commits that no `origin` ref has (it was never pushed, or was moved
+    /// on after the push). A reference never does: it is read and never written.
+    ///
+    /// The remote-tracking refs are the ones [`push`](Self::push) records, so "pushed" means "the
+    /// remote took it", not "a branch of this name exists".
+    ///
+    /// # Errors
+    ///
+    /// A git failure. The caller must read it as "unknown", never as "nothing to lose".
+    #[tracing::instrument(skip(self), fields(run = %self.run))]
+    pub async fn has_unpushed_work(&self) -> WorkspaceResult<bool> {
+        if self.reference {
+            return Ok(false);
+        }
+        if !self.status().await?.is_empty() {
+            return Ok(true);
+        }
+        let ahead = self
+            .git()
+            .args(["rev-list", "-n", "1"])
+            .arg(format!("refs/heads/{}", self.local))
+            .args(["--not", "--remotes=origin"])
+            .run()
+            .await?
+            .stdout_text();
+        Ok(!ahead.is_empty())
+    }
+
     /// `git diff --stat` from the merge-base with `origin/<base_branch>` to the
     /// working tree: committed, staged, unstaged and untracked changes alike.
     ///

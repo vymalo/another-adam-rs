@@ -790,6 +790,7 @@ async fn a_server_that_does_not_answer_initialize_does_not_start_and_nothing_is_
         hide: Vec::new(),
         init_timeout: Duration::from_secs(1),
         redactor: adam_coder::Redactor::default(),
+        governor: None,
     };
     let failed = env
         .commands
@@ -1808,6 +1809,7 @@ fn want<'a>(
         hide: Vec::new(),
         init_timeout,
         redactor: adam_coder::Redactor::default(),
+        governor: None,
     }
 }
 
@@ -2609,4 +2611,44 @@ async fn a_definition_asked_while_indexing_keeps_the_server() {
     assert!(out.content.contains("still indexing"), "{}", out.content);
     assert_eq!(lsp.servers().len(), 1, "the server is kept");
     assert!(alive(lsp.pid()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_server_counts_inside_the_process_pool() {
+    let lsp = Lsp::new(json!({})).await;
+    rust_project(&lsp);
+    let budget = adam_budget::Budget::builder().processes(1).build();
+    let governor = adam_code_tools::governor::Governor::new(
+        Arc::new(adam_admission_local::LocalAdmission::new(budget)),
+        Arc::new(adam_confine::Rlimits::new()),
+        adam_workspace::ProcessLimits::new(),
+    )
+    .with_wait(Duration::from_millis(100));
+    // The only seat is somebody else's: a server has to wait for one, and is told to try again.
+    let _taken = governor
+        .seat(adam_budget::ConversationId::new("another-run"))
+        .await
+        .expect("the pool is free");
+    let mut asked = want(
+        &lsp,
+        adam_workspace::LocalSession::shared(),
+        lsp.worktree(),
+        4,
+        Duration::from_secs(5),
+    );
+    asked.governor = Some(governor);
+    let failed = match lsp
+        .fx
+        .env
+        .commands
+        .language_servers()
+        .get_or_start(asked)
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("no seat is free"),
+    };
+    assert!(matches!(failed, StartError::Seat(_)), "{failed:?}");
+    assert!(lsp.servers().is_empty());
 }

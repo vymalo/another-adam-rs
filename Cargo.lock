@@ -272,6 +272,7 @@ dependencies = [
 name = "adam-agent-fs"
 version = "0.1.0"
 dependencies = [
+ "adam-budget",
  "adam-error",
  "jiff",
  "proptest",
@@ -337,6 +338,9 @@ dependencies = [
 name = "adam-code-tools"
 version = "0.1.0"
 dependencies = [
+ "adam-admission-local",
+ "adam-budget",
+ "adam-confine",
  "adam-error",
  "adam-llm-agent",
  "adam-model",
@@ -382,6 +386,7 @@ dependencies = [
  "adam-budget",
  "adam-code-tools",
  "adam-code-tools-testkit",
+ "adam-confine",
  "adam-core",
  "adam-env-kubernetes",
  "adam-error",
@@ -426,6 +431,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-confine"
+version = "0.1.0"
+dependencies = [
+ "adam-confine-testkit",
+ "adam-workspace",
+ "async-trait",
+ "libc",
+ "rustix",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "adam-confine-testkit"
+version = "0.1.0"
+dependencies = [
+ "adam-workspace",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "adam-core"
 version = "0.1.0"
 dependencies = [
@@ -438,6 +466,20 @@ dependencies = [
  "thiserror",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "adam-device-state"
+version = "0.1.0"
+dependencies = [
+ "adam-device-state-testkit",
+]
+
+[[package]]
+name = "adam-device-state-testkit"
+version = "0.1.0"
+dependencies = [
+ "adam-device-state",
 ]
 
 [[package]]
@@ -463,10 +505,12 @@ dependencies = [
  "a2a-lf",
  "adam-a2a",
  "adam-a2a-runtime",
+ "adam-admission-local",
  "adam-agent-fs",
  "adam-assembly",
  "adam-budget",
  "adam-core",
+ "adam-device-state",
  "adam-error",
  "adam-llm-agent",
  "adam-model",
@@ -937,6 +981,8 @@ dependencies = [
 name = "adam-workspace"
 version = "0.1.0"
 dependencies = [
+ "adam-admission-local",
+ "adam-budget",
  "adam-error",
  "adam-git-sandbox",
  "adam-workspace",

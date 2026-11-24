@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::credentials::DynGitCredentials;
+use crate::disk::{DiskBudget, Sweep};
 use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::git::{Auth, GitCmd, GitOutput, GitSandbox};
 use crate::mirror_config;
@@ -119,6 +120,8 @@ pub(crate) struct Inner {
     policy: Policy,
     /// Where the commands that carry no credential run, when the deployment has a git sandbox.
     sandbox: Option<GitSandbox>,
+    /// What the root may hold, checked before anything new is made on disk.
+    disk: Option<DiskBudget>,
     locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     /// The slots of each run as this process last listed them (see [`SlotCache`]).
     slots: Mutex<SlotCache>,
@@ -466,6 +469,7 @@ impl Workspaces {
                 creds,
                 policy: Policy::default(),
                 sandbox: None,
+                disk: None,
                 locks: Mutex::new(HashMap::new()),
                 slots: Mutex::default(),
                 #[cfg(test)]
@@ -533,6 +537,7 @@ impl Workspaces {
                 creds: self.inner.creds.clone(),
                 policy,
                 sandbox: self.inner.sandbox.clone(),
+                disk: self.inner.disk.clone(),
                 locks: Mutex::new(HashMap::new()),
                 slots: Mutex::default(),
                 #[cfg(test)]
@@ -568,12 +573,59 @@ impl Workspaces {
                 creds: self.inner.creds.clone(),
                 policy: self.inner.policy.clone(),
                 sandbox: Some(sandbox),
+                disk: self.inner.disk.clone(),
                 locks: Mutex::new(HashMap::new()),
                 slots: Mutex::default(),
                 #[cfg(test)]
                 slot_reads: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Refuse to make a new mirror or worktree when the root is over `disk`, or when the disk has
+    /// less than the budget's reserve free: [`WorkspaceError::DiskFull`], class `Rejected`, before
+    /// any process is spawned or any credential is requested. A worktree that already exists is
+    /// found again whatever the budget says, so a run that has its workspace is never cut off from it.
+    ///
+    /// Configure the value right after [`Workspaces::new`], like
+    /// [`Workspaces::allow_hosts`].
+    #[must_use]
+    pub fn with_disk_budget(self, disk: DiskBudget) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                root: self.inner.root.clone(),
+                creds: self.inner.creds.clone(),
+                policy: self.inner.policy.clone(),
+                sandbox: self.inner.sandbox.clone(),
+                disk: Some(disk),
+                locks: Mutex::new(HashMap::new()),
+                slots: Mutex::default(),
+                #[cfg(test)]
+                slot_reads: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// Remove the workspaces of the finished `runs` that hold no unpushed work, and keep the others
+    /// ([`RunWorkspace::remove_if_pushed`]): what frees disk when the budget is full. A run that
+    /// cannot be checked (a git failure, unreadable metadata) is kept: when in doubt the work stays.
+    pub async fn sweep_finished(&self, runs: &[String]) -> Sweep {
+        let mut sweep = Sweep::default();
+        for run in runs {
+            let removed = match self.run(run) {
+                Ok(workspace) => workspace.remove_if_pushed().await,
+                Err(e) => Err(e),
+            };
+            match removed {
+                Ok(true) => sweep.removed.push(run.clone()),
+                Ok(false) => sweep.kept.push(run.clone()),
+                Err(e) => {
+                    tracing::warn!(run = %run, error = %e, "kept a workspace that could not be checked");
+                    sweep.kept.push(run.clone());
+                }
+            }
+        }
+        sweep
     }
 
     /// The git sandbox the commands that carry no credential run in, if the deployment has one
@@ -713,10 +765,21 @@ impl Workspaces {
                 .await?;
         }
         let mirror = self.inner.root.join(loc.mirror_relative());
+        let path = &target.path;
+
+        // **Before the lock**, because taking it makes the mirror's directories (`<root>/git/...`):
+        // a refusal must leave the disk as it was, and those are what a refused clone used to leave
+        // behind (ADR 0065 decision 7). A run that already has its worktree is not new work and is
+        // found again below whatever the budget says, so it is not measured here; this is a look
+        // without the lock, and the worktree is only made if the locked read below finds none.
+        if let Some(disk) = &self.inner.disk
+            && !(exists(&target.meta_path).await? && exists(path).await?)
+        {
+            disk.admit(&self.inner.root).await?;
+        }
 
         let _guard = self.inner.lock_mirror(&mirror).await?;
 
-        let path = &target.path;
         let meta = self
             .inner
             .read_meta_at(&target.meta_path, run, target.meta_version())
@@ -756,6 +819,8 @@ impl Workspaces {
             )));
         }
 
+        // The budget was spent above: nothing has been made yet, and the run's own worktree was
+        // never measured.
         self.inner.ensure_mirror(repo, &loc, &mirror).await?;
         let auth = self.inner.authorize(repo, &loc).await?;
         // The URL and the refspec are named, not read from the remote called `origin`: what

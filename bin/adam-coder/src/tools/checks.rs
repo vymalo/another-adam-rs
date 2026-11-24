@@ -360,6 +360,8 @@ fn cut_head(text: &str, max: usize) -> &str {
 fn verdict(outcome: &ShellOutcome, timeout: std::time::Duration) -> String {
     if outcome.timed_out {
         format!("timed out after {}", human(timeout))
+    } else if let Some(stopped) = outcome.stopped {
+        format!("stopped: {stopped}")
     } else {
         match outcome.exit_code {
             Some(0) => "exit code 0".to_owned(),
@@ -514,6 +516,8 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
             "TIMED OUT after {} (the command was killed): FAILED",
             human(timeout)
         )
+    } else if let Some(stopped) = outcome.stopped {
+        format!("stopped: {stopped} (the command was killed): FAILED")
     } else {
         match outcome.exit_code {
             Some(0) => "exit code 0: passed".to_owned(),

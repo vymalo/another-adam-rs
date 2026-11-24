@@ -319,6 +319,7 @@ The three tools of [the coder's language servers](coder-agent.md#language-server
 | a writable slot was written to by a server of a run at tier `plan` | `The language server changed files of `repo`, and this run is at the `plan` tier, where nothing is changed. The files are as they were. ...` | stopped |
 | the run's servers were stopped while this one started | `The language servers of this run were stopped while this one was starting (the run parked, or its environment was made again): call again.` | stopped |
 | `LANGUAGE_SERVERS_MAX` servers are held and all are working | `This worker holds 4 language servers (LANGUAGE_SERVERS_MAX) and every one is working for a call: try again shortly.` | a call waits |
+| no seat of `MAX_PROCESSES` frees for a language server within a minute | `The language server `rust-analyzer` was not started: the processes pool is full (MAX_PROCESSES): try again shortly.` | a call waits |
 | the call is past its budget (`wait` + 120 s) | `The language server call did not finish within N s. A server that was started is kept: call again, or use run_checks or run_command.` | kept |
 
 ### An image the model is not sent
@@ -372,6 +373,12 @@ A model call whose seat is refused is a `ModelError::RateLimited` with the refus
 the loop's existing park handles it; a request over the whole token rate is `ModelError::InvalidRequest`.
 A tool call is never refused: it waits up to a minute and then runs anyway with a warning, because a run
 never fails because a slot was busy (ADR 0065 decision 4).
+
+A command's seat of `Pool::Processes` is refused as `Busy` after a minute: `commands::run_error` makes it a
+retryable `RateLimited` tool error, which the step's retry policy handles. A command the operating system stops
+for its memory, CPU time or file size is **not an error**: `ShellOutcome::stopped` is set and the result says
+`stopped: memory limit 2 GB`. `adam_workspace::ConfineError` (`Unsupported`, `Invalid`) is a command that could not be
+limited and was not started.
 
 ## Exit codes
 

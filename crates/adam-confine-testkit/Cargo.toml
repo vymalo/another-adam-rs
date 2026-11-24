@@ -1,0 +1,18 @@
+[package]
+name = "adam-confine-testkit"
+description = "The conformance suite of adam-workspace's Confine port: a confine_conformance! macro that proves a backend keeps a command running, stops a file over its limit and a memory hog, and says honestly what it enforces"
+readme = "README.md"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-workspace = { path = "../adam-workspace", version = "0.1.0", default-features = false }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "io-util", "time"] }
+
+[lints]
+workspace = true
