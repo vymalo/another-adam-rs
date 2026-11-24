@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn the_set_of_an_assembly_is_each_models_own_levels() {
         let profiles = adam_model::ModelProfiles::parse_json(
-            r#"{"profiles": {"wide": {"reasoningEfforts": ["max", "low"], "reasoningWire": "reasoning_effort"}, "bare": {}, "off": {"reasoningEfforts": [], "reasoningWire": "reasoning_effort"}}}"#,
+            r#"{"profiles": {"wide": {"reasoningEfforts": ["max", "low"], "reasoningWire": "reasoning_effort"}, "bare": {}, "off": {"reasoningEfforts": []}}}"#,
         )
         .expect("valid profiles");
         let set = ReasoningEfforts::from_models(
