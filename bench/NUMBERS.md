@@ -58,6 +58,23 @@ A value written here must name the runs it came from: the command's table is per
 finished run in the ledger it was given, so the same command on another ledger gives another number,
 and neither is wrong.
 
+### Where those files are
+
+The ledgers are **not in this repository** and never will be (they hold a run's costs and its
+prompts' fingerprints): they live in **`$BENCH_HOME` on the machine that ran the bench** — today a
+bench VM, one `$BENCH_HOME` per series — as **`ledger.jsonl`** and **`reviews.jsonl`**. To fill the
+table above:
+
+1. copy those two files (or run `bench numbers --ledger <path>` there) for the series whose figures
+   are wanted;
+2. name the series from its plan of record, which holds the pins and the spend: the pilot
+   (`plans/2026-11-21-bench-pilot-8-cells.agent.md`, coder `sha-e46c8f4`, harness `ba93c9d`) or the
+   night series and the rerun (`plans/2026-11-22-bench-adam-vs-opencode.agent.md`, coder
+   `sha-35af9f4` and `sha-9a9e6c5`);
+3. the blind second reading of all 95 runs is attached to ANR-424 as `bench-deep-analysis.html`
+   (with the plan pages as its other attachments) — it is prose over the same runs, not a ledger,
+   so a figure that has to be *recomputed* comes from step 1, never from it.
+
 ## Where the epics' own figures are
 
 `docs/reference/parity.md` compares surfaces, not speed. The speed claims live in the epic (sys#345)
