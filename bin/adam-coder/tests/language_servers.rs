@@ -2638,15 +2638,17 @@ async fn a_server_counts_inside_the_process_pool() {
         Duration::from_secs(5),
     );
     asked.governor = Some(governor);
-    let failed = lsp
+    let failed = match lsp
         .fx
         .env
         .commands
         .language_servers()
         .get_or_start(asked)
         .await
-        .err()
-        .expect("no seat is free");
+    {
+        Err(error) => error,
+        Ok(_) => panic!("no seat is free"),
+    };
     assert!(matches!(failed, StartError::Seat(_)), "{failed:?}");
     assert!(lsp.servers().is_empty());
 }

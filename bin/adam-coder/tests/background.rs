@@ -2424,14 +2424,16 @@ async fn a_command_that_keeps_running_holds_a_seat_of_the_process_pool() {
 
     // The one seat is the command's: the next one waits, then is told to try again (a retryable
     // error, as `run` gives), and nothing of it was started.
-    let err = StartCommand
+    let err = match StartCommand
         .call(
             &rig.call_ctx("b"),
             json!({"command": "sleep 623", "wait": 1}),
         )
         .await
-        .err()
-        .expect("no seat is free");
+    {
+        Err(error) => error,
+        Ok(_) => panic!("no seat is free"),
+    };
     assert!(
         matches!(err, adam_llm_agent::ToolError::Retryable { .. }),
         "{err:?}"
