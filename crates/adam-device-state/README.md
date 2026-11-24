@@ -37,8 +37,8 @@ assert!(state.readings().power.is_low(20));
 
 The crate is pure: no platform API, no I/O, no clock of the wall. Reading the real battery, thermal
 state, link cost or memory pressure needs the host's own platform calls and is a later slice;
-`FakeDevice` is the device a test, and a host with no reader, uses. `Engine::set_device_state` and
-the rule table that lowers the live budget by these readings are not built here either.
+`FakeDevice` is the device a test, and a host with no reader, uses. The rule table that lowers the
+live budget by these readings is `adam_budget::DeviceRules`, and `Engine::set_device_state` applies it.
 
 A server has no device state: it sets its own ceiling (ADR 0065 decision 1). A host that pushes
 nothing reads as `DeviceReadings::NOMINAL`, so nothing is held back on a machine that cannot say.
@@ -54,7 +54,7 @@ None.
 
 * `a_push_changes_one_reading_and_leaves_the_others`;
 * `a_fake_on_battery_says_the_charge_is_low` and `a_hot_fake_says_the_device_is_hot`, the
-  predicates the engine's rule table will read;
+  predicates `adam_budget::DeviceRules` reads;
 * `a_push_on_one_thread_is_read_on_another`.
 
 The unit tests cover the charge's clamp, `is_low` on mains and in low-power mode, the labels, and

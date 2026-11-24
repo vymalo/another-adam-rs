@@ -63,5 +63,11 @@ also adds:
 * `one_conversation_takes_half_of_a_pool_of_twenty`;
 * `the_token_bucket_meters_a_model_call` and `a_budget_without_a_token_rate_reports_no_bucket`.
 
+`tests/device.rs` runs `adam_budget::Throttled` over a `LocalAdmission` with a `FakeDevice`
+(ADR 0065 decision 8): `a_device_on_low_battery_admits_one_run_at_a_time` and its twin
+`its_twin_on_mains_admits_as_many_as_the_budget_allows`,
+`a_run_already_in_flight_counts_when_the_battery_runs_low`, `a_hot_device_holds_new_steps` and
+`the_person_turns_the_battery_rule_off`.
+
 The unit tests cover the share's floor of one, the budget it counts against, and the bucket's
 continuous refill.

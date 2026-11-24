@@ -39,8 +39,8 @@ mod budget;
 mod units;
 
 pub use admission::{
-    Admission, Ask, ConversationId, DynAdmission, Permit, Pool, PoolUsage, Refused, TokenUsage,
-    Usage,
+    Admission, Ask, Constraint, ConversationId, DeviceRules, DynAdmission, LOW_BATTERY_PERCENT,
+    Permit, Pool, PoolUsage, Refused, Throttled, TokenUsage, Usage,
 };
 pub use budget::{Budget, BudgetBuilder, DiskReserve, Limit, Ratio};
 pub use units::{default_command_cpu, default_command_memory, parse_bytes, parse_millicores};
