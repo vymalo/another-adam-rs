@@ -651,6 +651,15 @@ fn cases() -> Vec<Case> {
             Warning,
             "`tools` is ignored on a remote subagent",
         ),
+        with_root(
+            "model_fallback on a remote subagent",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\na2a: https://example.com/card\nmodel_fallback: lite\n---\n",
+            )],
+            Warning,
+            "`model_fallback` is ignored on a remote subagent",
+        ),
         // --- skills
         with_root(
             "skill name differs from its directory",
@@ -1486,6 +1495,64 @@ fn the_reasoning_keys_are_read_and_the_effort_key_stays_ignored() {
     let front = &report.package.agents[0].frontmatter;
     assert_eq!(front.reasoning_effort.as_deref(), Some("high"));
     assert_eq!(front.model_preset.as_deref(), Some("quick"));
+}
+
+#[test]
+fn tools_loading_reads_eager_and_defaults_to_lazy() {
+    let eager = write(&[(
+        "agent/instructions.md",
+        "---\nname: root\ntools_loading: eager\n---\nHi.\n",
+    )]);
+    let report = load(eager.path());
+    assert!(report.is_ok(), "{:?}", report.diagnostics);
+    assert_eq!(
+        report.package.agents[0].frontmatter.tools_loading,
+        adam_agent_fs::ToolsLoading::Eager
+    );
+
+    let plain = write(&[("agent/instructions.md", "---\nname: root\n---\nHi.\n")]);
+    let report = load(plain.path());
+    assert!(report.is_ok(), "{:?}", report.diagnostics);
+    assert_eq!(
+        report.package.agents[0].frontmatter.tools_loading,
+        adam_agent_fs::ToolsLoading::Lazy,
+        "a folder that says nothing is lean"
+    );
+}
+
+#[test]
+fn an_unknown_tools_loading_value_is_refused_by_name() {
+    let dir = write(&[(
+        "agent/instructions.md",
+        "---\nname: root\ntools_loading: sometimes\n---\nHi.\n",
+    )]);
+    let report = load(dir.path());
+    assert!(!report.is_ok(), "an unknown value stops the folder");
+    let text: Vec<String> = report.diagnostics.iter().map(ToString::to_string).collect();
+    let text = text.join("\n");
+    assert!(text.contains("invalid frontmatter"), "{text}");
+    assert!(text.contains("unknown variant `sometimes`"), "{text}");
+    for allowed in ["eager", "lazy", "searchable"] {
+        assert!(text.contains(allowed), "{allowed} not named: {text}");
+    }
+}
+
+#[test]
+fn model_fallback_is_a_known_key() {
+    let dir = write(&[(
+        "agent/instructions.md",
+        "---\nname: root\nmodel_fallback: lite\n---\nHi.\n",
+    )]);
+    let report = load(dir.path());
+    assert!(report.is_ok(), "{:?}", report.diagnostics);
+    assert_eq!(report.warnings().count(), 0, "{:?}", report.diagnostics);
+    assert_eq!(
+        report.package.agents[0]
+            .frontmatter
+            .model_fallback
+            .as_deref(),
+        Some("lite")
+    );
 }
 
 #[test]

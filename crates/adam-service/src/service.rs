@@ -179,6 +179,16 @@ impl Service {
         self
     }
 
+    /// Serve `model-pick/v1` for an agent whose card offers `choices`
+    /// ([`RuntimeTaskBackend::with_model_choices`]); `None` changes nothing.
+    #[must_use]
+    pub fn with_model_choices(mut self, choices: Option<adam_a2a::ModelChoices>) -> Self {
+        if let Some(choices) = choices {
+            self.backend = self.backend.with_model_choices(choices);
+        }
+        self
+    }
+
     /// Serve `commands/v1` for an agent whose card lists `commands`
     /// ([`RuntimeTaskBackend::with_commands`]); `None` changes nothing.
     #[must_use]
@@ -207,6 +217,11 @@ impl Service {
     /// The sessions the backend serves `child-sessions/v1` for, if it does.
     pub fn child_sessions(&self) -> Option<&adam_a2a_runtime::ChildSessions> {
         self.backend.child_sessions()
+    }
+
+    /// The models the backend serves `model-pick/v1` for, if it does.
+    pub fn model_choices(&self) -> Option<&adam_a2a::ModelChoices> {
+        self.backend.model_choices()
     }
 
     /// Advance runs until `shutdown` resolves; in-flight steps finish first.

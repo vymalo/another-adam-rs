@@ -50,7 +50,7 @@ const MAX_CATALOG_ID_BYTES: usize = 256;
 pub const CONTEXT_THREAD_TOOLS: &str = "vymalo.threadTools";
 
 /// The context key of the person's **interface language** (`locale/v1`, ADR 0069): the BCP 47 tag
-/// the client sent with this message, as a string (`"fr-CM"`). It is the language the agent's own
+/// the client sent with this message, as a string (`"fr-FR"`). It is the language the agent's own
 /// words are written in, unless the person writes in another one. Set from an activated message,
 /// cleared by an activated message that names none, and one of
 /// `adam_llm_agent::PROTECTED_CONTEXT_KEYS` (a test keeps the two equal): a message whose context
@@ -91,7 +91,7 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// Put the interface language `message` names into the context `inbound` carries to the run, when
 /// the request **activated** [`LOCALE_EXTENSION`] (`locale/v1`, ADR 0069).
 ///
-/// The tag becomes the context key [`CONTEXT_LOCALE`], a bare string (`"fr-CM"`). A message that
+/// The tag becomes the context key [`CONTEXT_LOCALE`], a bare string (`"fr-FR"`). A message that
 /// activated the extension and names none — or names a tag that is not well formed — **clears** the
 /// language an earlier message set (a `null`, which deletes the key): a run never answers in a
 /// language the newest message did not ask for, and a malformed tag is refused rather than passed
@@ -750,16 +750,16 @@ mod tests {
     #[test]
     fn an_activated_message_puts_its_interface_language_in_the_context() {
         assert_eq!(
-            context_after(&activated(), json!({LOCALE_EXTENSION: {"locale": "fr-CM"}})),
-            Some(json!("fr-CM"))
+            context_after(&activated(), json!({LOCALE_EXTENSION: {"locale": "fr-FR"}})),
+            Some(json!("fr-FR"))
         );
         // Unknown members of the entry are ignored.
         assert_eq!(
             context_after(
                 &activated(),
-                json!({LOCALE_EXTENSION: {"locale": "ybb-CM", "why": "the person's"}})
+                json!({LOCALE_EXTENSION: {"locale": "fur-IT", "why": "the person's"}})
             ),
-            Some(json!("ybb-CM"))
+            Some(json!("fur-IT"))
         );
     }
 
@@ -772,7 +772,7 @@ mod tests {
             json!({LOCALE_EXTENSION: {"locale": ""}}),
             json!({LOCALE_EXTENSION: {"locale": "fr CM"}}),
             json!({LOCALE_EXTENSION: {"locale": 3}}),
-            json!({LOCALE_EXTENSION: "fr-CM"}),
+            json!({LOCALE_EXTENSION: "fr-FR"}),
         ] {
             assert_eq!(
                 context_after(&activated(), entry.clone()),
@@ -785,7 +785,7 @@ mod tests {
     #[test]
     fn a_message_that_did_not_activate_the_extension_is_read_as_it_always_was() {
         let plain = Caller::new("token-0");
-        for entry in [json!({LOCALE_EXTENSION: {"locale": "fr-CM"}}), json!({})] {
+        for entry in [json!({LOCALE_EXTENSION: {"locale": "fr-FR"}}), json!({})] {
             let message = with_metadata(text_message("bonjour"), entry.clone());
             let mut inbound = Inbound::new("message", json!({ "text": "bonjour" }));
             locale_into(&plain, &message, &mut inbound);
@@ -801,16 +801,39 @@ mod tests {
         // A bare string payload becomes an object, as the tier's does.
         let message = with_metadata(
             text_message("bonjour"),
-            json!({LOCALE_EXTENSION: {"locale": "wes-CM"}}),
+            json!({LOCALE_EXTENSION: {"locale": "gsw-CH"}}),
         );
         let mut inbound = Inbound::new("message", json!("bonjour"));
         locale_into(&activated(), &message, &mut inbound);
         assert_eq!(inbound.payload["text"], "bonjour");
-        assert_eq!(inbound.payload["context"][CONTEXT_LOCALE], "wes-CM");
+        assert_eq!(inbound.payload["context"][CONTEXT_LOCALE], "gsw-CH");
         // A payload that cannot carry a context is left as it is, never refused.
         let mut inbound = Inbound::new("message", json!(3));
         locale_into(&activated(), &message, &mut inbound);
         assert_eq!(inbound.payload, json!(3));
+    }
+
+    /// The inbound function never reads the model a message names: `vymalo.model` reaches a run
+    /// through `model-pick/v1` only, which the backend writes from an activated message and only
+    /// for an alias the card offers (ADR 0064, amended 2026-11-23). A message's metadata alone
+    /// therefore cannot choose what a run costs.
+    #[test]
+    fn a_served_front_ignores_the_model_a_message_names() {
+        let message = with_metadata(
+            text_message("hi"),
+            json!({adam_llm_agent::MODEL_CONTEXT_KEY: {"model": "lite"}}),
+        );
+        for inbound in [
+            vymalo_inbound(&message).unwrap(),
+            crate::default_inbound(&message).unwrap(),
+        ] {
+            let context = inbound.payload.get("context");
+            assert!(
+                context.is_none_or(|c| c.get(adam_llm_agent::MODEL_CONTEXT_KEY).is_none()),
+                "{:?}",
+                inbound.payload
+            );
+        }
     }
 
     #[test]

@@ -82,6 +82,13 @@ Behaviour (details in the crate docs, `src/lib.rs`):
   chunk that is not JSON, and a complete non-streamed body whose choice has no `finish_reason` (absent or
   `null`), stay `Protocol`: a server that never sends it fails fast, not after every retry.
 
+## TLS provider
+
+The feature `aws-lc` (default) links reqwest and rustls on aws-lc-rs, as the coder does. A host with its own
+provider (ring, the platform's) depends on the crate with `default-features = false` and installs it before
+the first request: `rustls::crypto::ring::default_provider().install_default()`. `adam-model-oauth` has the
+same feature. `tools/tls-provider/check.sh` (CI job `tls-provider`) fails when aws-lc-rs is in that tree.
+
 ## Images
 
 `OpenAiCompatible::with_input_modalities(alias, modalities)` is what `ModelClient::input_modalities` answers for that alias, and text only for any other (a subagent on another alias fails closed); `adam-service` sets it from `MODEL_INPUT_MODALITIES` for the alias `MODEL`. On the wire (*unverified* on every provider: the OpenAI API reference answered 403 on 2026-11-15, so the shapes are from memory):

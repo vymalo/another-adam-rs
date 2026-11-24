@@ -278,7 +278,7 @@ Each is one pull request, in order. The reasoning slices (effort per call, `reas
 4. **Presets.** `presets:` with `maxOutputTokens`, a profile's `preset:`, `model_preset:` in the frontmatter, the order of
    decision 3 (with 0063's effort). Accepted when an agent naming `quick` sends `low` and its preset's cap, and an
    undeclared preset is exit 78.
-5. **A model chosen at run time.** When ADR 0054 slice 11 or the relay lands: the session's alias or the relay's pick is
+5. **A model chosen at run time.** (The engine's per-message pick and the fallback switch, slice 6, are in the 2026-11-23 amendment below.) When ADR 0054 slice 11 or the relay lands: the session's alias or the relay's pick is
    the key. Accepted when a session moved to another alias sends that alias's cap on its next call.
 
 Follow-ups in the other repositories, theirs to decide: the system maps its endpoints and relay models to profiles and
@@ -308,3 +308,112 @@ derived from that resolved cap. Slice 5 (a model chosen at run time) is where th
 names that asks above the model's `maxOutputTokensLimit` is refused at bind (exit 78), while the folder's own value is
 clamped. It follows the coordinator's 18:42Z ruling accepting decision 4; the board post asks the owner for a veto,
 and if he takes it we amend again.
+
+## Amended 2026-11-23: a locked model switches once to a fallback, and a message may name a model
+
+*Amended 2026-11-23:* **slice 6, the switch on a typed refusal.** [ADR 0067](0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)
+decision 7 leaves the switch to "the profile's fallback model" and fails the run naming the model until it is built.
+This ADR's "fallback" is the 128,000 output cap, so no slice owned the switch. It is this one. It is an amendment, not a
+new ADR: it changes what a profiled model's calls resolve to, which is this ADR's subject, and claims no number.
+
+1. **The fallback's seat is the profile, with the folder as an override** (the order effort resolves in). The alias is, in
+   order: the agent's `model_fallback:` (a local-only key, warned on a remote subagent), then the `fallback` of the preset
+   its `model_preset` names, then the `fallback` of its model's profile in `MODEL_ALIASES_FILE`, then of that profile's
+   base preset. A profile's `fallback` names another profile of the same document (a file that names itself or a model
+   with no profile is exit 78). The profile is the seat because a shared folder that named one deployment's alias would
+   stop every other deployment at start; the folder overrides it for an agent that knows what a lesser model may still
+   do. A subagent resolves its **own** chain: nothing is inherited from its parent, so an `inherit` subagent takes its
+   (inherited) model's profile fallback and needs no key of its own.
+2. **Validation at start.** The resolved alias goes through the same check as `model:` (not empty, one token, one of
+   `model_aliases` when the deployment lists them) and must differ from the agent's own alias
+   (`AliasProblem::SameAsModel`). A refusal is the assembly's `Error::ModelAlias` naming the agent and its file, which
+   every host turns into exit 78 (the engine's `start` returns `EngineError::Agent`).
+3. **What the fallback resolves to.** Its output cap and its reasoning level are the fallback's **own**: its profile's
+   `maxOutputTokens`, else its base preset's, else 128,000, clamped to its own `maxOutputTokensLimit` and window (the
+   history it leaves room for is at most half of that window); and its profile's `reasoningEffort`, else its base preset's,
+   which must be one of the fallback's levels. The folder's `limits.max_output_tokens`, its `reasoning_effort` and its
+   `model_preset` are for the agent's own model and are not carried over. After the switch the compaction budget, the
+   window the history is cut to and the image limits are the **live** model's, not the agent's.
+4. **The switch.** When a model call is refused with `ModelError::ModelLocked`
+   ([ADR 0067](0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md) decision 7), a run
+   with a fallback records the switch in its state (`Conversation::model_switch`: `from`, `to`, the turn), says it as
+   a step, and asks the same turn again of the fallback, in the next transition. The refusal is in the journal as the
+   failure of `model:<turn>`; the second call is that turn's step in the next transition, so a replay finds the same
+   refusal, makes no call to the locked model, and builds the same requests. A run with no fallback fails as before,
+   naming the model.
+5. **Once, and never back.** After the switch every call of the run, the summary call of a compaction included, names the
+   fallback with its cap and level; the run does not try the first model again. A lock on a **compaction summary** call
+   switches the run the same way, and the summary is asked of the fallback in the next transition. A fallback that is
+   the model the run is on already (a message picked it) fails the run at once, with no second call. A second `ModelLocked`, on the fallback,
+   fails the run: `model call failed: <the refusal>: `<fallback>` is the fallback of `<first>`, which the endpoint did
+   not allow either, and a run switches once`. A subagent's run switches on its own.
+6. **The step.** Label `Switched model`, state `Completed`, detail ``The model `<from>` is not allowed; this run continues
+   on `<to>` ``, id `model-switch:<turn>`.
+7. **Usage.** A `usage/v1` event names the model the call was made to, so the calls after the switch name the fallback; the
+   refused call reports none (no tokens were taken). `UsageTotals` count under the same alias.
+8. **A message may name a model (decision 5's slice, narrowed).** `Say::with_model(alias)` in the engine asks that the
+   run be answered by `alias`, with that profile's cap and level. The engine refuses at `Say` time any alias the root
+   agent cannot be bound to: not its own, and not a profiled model whose cap and level resolve for it
+   (`EngineError::Invalid`, nothing written). After the run switched, a message that names a model is refused with
+   `EngineError::Refused` (never silently ignored); the pick does not carry into the conversation's next run, which
+   starts on the agent's own model again. It travels
+   as the context key `vymalo.model` (`{"model": alias}`), which only an agent **given choices** honours: the assembly
+   gives them when the host calls `BoundDef::allow_model_choice` (the engine does, a served agent's front does not), so a
+   remote caller cannot choose what a run costs. The choice holds for the run until a later message names another; the
+   fallback switch overrides it.
+
+Slice 6 is accepted when a scripted run whose model answers `model_locked` continues on the fallback with its cap and
+level, the step and the usage say so, and a replay after a lost commit asks the locked model nothing more; a second lock
+fails the run naming both models; and the engine refuses a `Say` that names a model the agent cannot bind.
+
+*Amended 2026-11-23 (review of the slice):* decision 1 moved the seat from the folder to the profile (the folder and the
+preset override it); decision 3 takes the fallback's cap and level from its own profile and makes the compaction budget
+follow the live model; the lock on a summary call, the fallback equal to the live model and the engine's per-agent check
+and post-switch refusal are in decisions 5 and 8. **Mixed workers:** a worker that does not know `model_switch` reads a
+run that switched as one that did not, and asks the locked model again, so roll forward only.
+
+## Amended 2026-11-23: a served agent takes a per-message model pick (`model-pick/v1`)
+
+*Amended 2026-11-23:* **slice 7, the served half of decision 5's slice.** Decision 8 above gives a model per message to
+the **engine** (`Say::with_model`) and states that "a served agent's front does not" allow a choice, and review R7 on
+[adam#338](https://github.com/vymalo/another-adam-rs/pull/338) pinned that: the coder and a folder agent deliberately
+took no per-message pick. **This amendment narrows R7**: from now on they take one, through the `model-pick/v1` A2A
+extension only. The context key, its shape and the run binding are decision 8's, unchanged; what is new is the served
+front's reading and the card entry that lets a client offer the choices. It is an amendment, not a new ADR: it changes
+what a served run is answered by, which is this ADR's subject, and claims no number.
+
+1. **The extension and its card entry.** URI `https://agents.vymalo.com/a2a/extensions/model-pick/v1`, aligned with the
+   system's ADR 0086 (`docs/api/model-pick-v1.md`): the card's `params` are `{"choices": ["<alias>", ..]}` — the
+   aliases the deployment offers this agent, each once, in the order the assembly lists them — and a message names one
+   as `metadata[URI] = {"model": "<alias>"}`. The reading is `adam_a2a::ModelChoices`; `ExtensionConfig::model_pick` builds
+   the entry. **Only aliases the deployment lists:** the list is the profiles of `MODEL_ALIASES_FILE` minus the
+   agent's own model (and minus whatever `BoundDef::model_aliases` hides), filtered by what this agent can actually be
+   bound to — the same `Assembly` choices the loop takes. A deployment with one model offers none, and an agent with no
+   choice lists no extension (`model_pick` returns `None`), so no client sees a pick it cannot make.
+2. **Refused outside the list.** A message whose request activated the extension must name one of the choices, or it is
+   `InvalidParams` before anything is written. The refusal is typed: its sentence begins with the code
+   `model_not_offered` and names the choices. A missing entry, a non-object, a missing, blank or non-string `model` are
+   the same refusal. A message that did not activate the extension carries no pick, whatever its metadata says.
+3. **It is the run binding, not a second one.** The alias becomes the run's context key `vymalo.model` (`{"model":
+   alias}`), the one decision 8 already defines, and the loop applies it exactly as `Say::with_model` does: that
+   model's cap and level, from its profile. The choice holds for the thread's runs until a later message names another;
+   a run that switched to its fallback does not pick again. Absent an activated message the key is untouched.
+4. **The gateway keeps enforcing tiers.** A pick chooses a model, it does not allow it. The call goes through the
+   deployment's gateway as every other, so `model_locked` ([ADR 0067](0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md))
+   still refuses it there and the slice-6 amendment's decision 4 (the switch) still applies; a pick never bypasses that check.
+5. **Caller identity is unchanged.** The pick is read from an authenticated message like every other extension
+   (`Caller::has_extension`), the backend refuses what the card does not offer, and nothing new is trusted. The card is
+   the bound on what a caller may ask for.
+6. **Where it is served.** `adam-agent` and `adam-coder` call `BoundDef::allow_model_choice` on the served assembly
+   and pass the root's choices to `adam_service::Agents::model_choices`, which hands them to the backend and lists the
+   extension on the card **only when the backend serves a non-empty list**. A `control-plane` process of the split
+   topology assembles no agent and reads no profiles file, so it lists nothing yet; a deployment that wants a pick runs
+   `ROLE=all`. That limitation is a follow-up, not a silent default.
+7. **Companions.** The parity row for a picked model changes (the coder and folder-agent columns no longer say "no
+   per-message pick"), gap 15 of [parity](../reference/parity.md) is rewritten, and `docs/reference/a2a-server.md`,
+   `crates/adam-a2a/README.md`, `crates/adam-a2a-runtime/README.md`, `crates/adam-service/README.md` and the
+   `adam-a2a-extensions`, `adam-agent-folder` and `adam-embed` skills carry the extension.
+
+Slice 7 is accepted when an offered pick is the model a served run's request names (against a mock model client, never a
+live provider), an alias outside the card's choices is `model_not_offered` with no run written, and a request that did
+not activate the extension, or a card that lists none, leaves the pick unread.

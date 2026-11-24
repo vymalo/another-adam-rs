@@ -1,6 +1,7 @@
 ---
 name: painter
 description: "A painter: it makes one picture from a short description with an image server and shares it as a file."
+tools_loading: eager
 limits:
   max_turns: 10
   max_output_tokens: 1024

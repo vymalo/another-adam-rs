@@ -10,7 +10,7 @@ use a2a::{Message, Part, Role, Task};
 use adam_a2a::{
     BackendError, CHILD_SESSIONS_EXTENSION, Caller, STEER_EXTENSION, TaskBackend, TaskQuery,
 };
-use adam_a2a_runtime::{Commands, RuntimeTaskBackend, task_id_for};
+use adam_a2a_runtime::{Commands, RuntimeTaskBackend, default_inbound, task_id_for};
 use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
 use adam_core::{ConversationScope, DynSecretSource, DynStore, RunId, RunQuery, RunStatus};
@@ -293,9 +293,22 @@ impl EngineBuilder {
             .tool_source(ui.screen())
             .max_parallel(limits.max_parallel_tools)
             .model_profiles(profiles)
+            .allow_model_choice()
             .model(model, alias)
             .map_err(|e| EngineError::Agent(Box::new(e)))?;
         let sessions = assembly.child_sessions().cloned();
+        // The models a message may name: what the root agent can be bound to (its own, and each
+        // model with a profile that its caps and the deployment's aliases allow).
+        let models: Vec<String> = assembly
+            .info()
+            .iter()
+            .find(|info| info.parent.is_none())
+            .map(|root| {
+                let mut models = root.model_choices.clone();
+                models.push(root.model_alias.clone());
+                models
+            })
+            .unwrap_or_default();
         store.migrate().await.map_err(EngineError::Store)?;
         // Held until the worker task has ended, so a second engine of this process with the same id
         // on this store is refused before its release could take this one's leases.
@@ -334,7 +347,8 @@ impl EngineBuilder {
         // The folder's commands (`commands/v1`): a message whose text is `/name args` is expanded
         // from `commands/<name>.md` before it is stored, as on the server surfaces.
         let backend = RuntimeTaskBackend::new(runtime.clone(), events.clone(), name.clone())
-            .with_commands(Commands::from_manifest(&commands));
+            .with_commands(Commands::from_manifest(&commands))
+            .with_inbound(inbound);
         // The helpers a person may start a session with (`child-sessions/v1`), as `adam-agent`
         // serves them: every local subagent of the root, under the effective limits.
         let backend = match &sessions {
@@ -391,6 +405,7 @@ impl EngineBuilder {
             .collect();
         Ok(Engine {
             shared: Arc::new(Shared {
+                models,
                 steering,
                 helpers,
                 helper_agents,
@@ -492,6 +507,9 @@ impl Drop for AbortOnDrop {
 
 pub(crate) struct Shared {
     backend: RuntimeTaskBackend,
+    /// The aliases a [`Say::model`] may name: the root agent's own and the models it can be bound
+    /// to (they have a profile).
+    models: Vec<String>,
     /// What [`Engine::file`] reads a file's bytes from, once the backend has said the run is this
     /// engine's caller's.
     runtime: Runtime,
@@ -518,6 +536,46 @@ pub(crate) struct Shared {
     writes: RwLock<()>,
     stopping: AtomicBool,
     worker: Worker,
+}
+
+impl Shared {
+    /// Refuse a message that names a model for a run that has already switched to its fallback: the
+    /// run continues on the fallback for good, so the pick would change nothing, and is told so
+    /// instead of being ignored. A message that names none reaches the run as always.
+    async fn refuse_pick_after_switch(&self, run: RunId, say: &Say) -> Result<(), EngineError> {
+        if say.model.is_none() {
+            return Ok(());
+        }
+        let Ok(Some(state)) = self.runtime.state(run).await else {
+            return Ok(());
+        };
+        let Ok(state) = serde_json::from_value::<adam_llm_agent::Conversation>(state) else {
+            return Ok(());
+        };
+        match state.model_switch {
+            Some(switch) => Err(EngineError::Refused(format!(
+                "run {run} was switched from `{}` to its fallback `{}` and continues on it, so a \
+                 message cannot pick another model; the next run of the conversation starts on \
+                 the agent's own model again",
+                switch.from, switch.to
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Refuse a message that names a model with no profile.
+    fn allows(&self, say: &Say) -> Result<(), EngineError> {
+        match say.model.as_deref() {
+            Some(alias) if !self.models.iter().any(|m| m == alias) => {
+                Err(EngineError::Invalid(format!(
+                    "the message names the model `{alias}`, which the agent cannot be bound to (it \
+                     needs a model profile it can resolve, `EngineBuilder::models`); allowed: {}",
+                    self.models.join(", ")
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 impl Drop for Shared {
@@ -590,6 +648,7 @@ impl Engine {
     ) -> Result<Turn, EngineError> {
         let _writing = self.writable().await?;
         say.check()?;
+        self.shared.allows(&say)?;
         let shared = &self.shared;
         let context = conversation.map(|c| c.as_str().to_owned());
         let session = conversation.filter(|c| is_session(c));
@@ -625,6 +684,9 @@ impl Engine {
                 let latest = self.latest_run(conversation).await?;
                 // Continued once it has ended; while it is open, the backend delivers to it.
                 message.reference_task_ids = Some(vec![latest.run.to_string()]);
+                if matches!(latest.state, RunState::Working | RunState::Waiting) {
+                    shared.refuse_pick_after_switch(latest.run, &say).await?;
+                }
                 Some(latest)
             }
             None => None,
@@ -669,6 +731,8 @@ impl Engine {
     pub async fn steer(&self, run: RunId, say: Say) -> Result<RunInfo, EngineError> {
         let _writing = self.writable().await?;
         say.check()?;
+        self.shared.allows(&say)?;
+        self.shared.refuse_pick_after_switch(run, &say).await?;
         let shared = &self.shared;
         let steered = shared
             .backend
@@ -695,6 +759,8 @@ impl Engine {
     pub async fn answer(&self, run: RunId, say: Say) -> Result<RunInfo, EngineError> {
         let _writing = self.writable().await?;
         say.check()?;
+        self.shared.allows(&say)?;
+        self.shared.refuse_pick_after_switch(run, &say).await?;
         let shared = &self.shared;
         let answered = shared
             .backend
@@ -930,6 +996,7 @@ impl Engine {
     ) -> Result<Turn, EngineError> {
         let _writing = self.writable().await?;
         say.check()?;
+        self.shared.allows(&say)?;
         let shared = &self.shared;
         if shared.helpers.is_empty() {
             return Err(EngineError::Invalid(
@@ -962,14 +1029,14 @@ impl Engine {
             }
         }
         let mut message = message(&say);
-        message.metadata = Some(std::collections::HashMap::from([(
+        message.metadata.get_or_insert_default().insert(
             CHILD_SESSIONS_EXTENSION.to_owned(),
             serde_json::json!({ "start": {
                 "agent": start.helper,
                 "description": start.description,
                 "keepOpen": start.keep_open,
             }}),
-        )]));
+        );
         let task = shared
             .backend
             .submit(
@@ -1347,10 +1414,40 @@ pub(crate) enum Expected {
     Open,
 }
 
-/// `say` as the message the backend reads: its text, under its id.
+/// The metadata key a [`Say::model`] travels under, and the context key the agent reads
+/// ([`adam_llm_agent::MODEL_CONTEXT_KEY`]).
+const MODEL_KEY: &str = adam_llm_agent::MODEL_CONTEXT_KEY;
+
+/// How the engine's backend reads a message: as [`default_inbound`] does, and the model the message
+/// names (its metadata under [`MODEL_KEY`]) goes into the run's context. Only this engine reads it
+/// there: a served agent's front does not, so a remote caller cannot pick a run's model.
+fn inbound(message: &Message) -> Result<adam_runtime::Inbound, String> {
+    let mut inbound = default_inbound(message)?;
+    let alias = message
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(MODEL_KEY))
+        .and_then(|entry| entry.get("model"))
+        .and_then(serde_json::Value::as_str);
+    if let (Some(alias), Some(payload)) = (alias, inbound.payload.as_object_mut()) {
+        payload.insert(
+            "context".to_owned(),
+            serde_json::json!({ MODEL_KEY: { "model": alias } }),
+        );
+    }
+    Ok(inbound)
+}
+
+/// `say` as the message the backend reads: its text, under its id, and the model it names.
 fn message(say: &Say) -> Message {
     let mut message = Message::new(Role::User, vec![Part::text(say.text.clone())]);
     message.message_id = say.id.clone();
+    if let Some(alias) = &say.model {
+        message.metadata = Some(std::collections::HashMap::from([(
+            MODEL_KEY.to_owned(),
+            serde_json::json!({ "model": alias }),
+        )]));
+    }
     message
 }
 

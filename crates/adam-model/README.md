@@ -140,7 +140,7 @@ in this crate touches the file system.
 |---|---|
 | `ReasoningEffort` | `None`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max`, spelled `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Closed on purpose, `ALL` lowest first, exhaustive `as_str`/`FromStr`, serde lower case, `Ord` in that order. `none` is a real level (some models reason unless it is sent); **absent** sends nothing |
 | `ReasoningWire` | `ReasoningEffort` (`{"reasoning_effort": ...}`, the only one verified on the deployment's gateway), `ReasoningObject` (`{"reasoning": {"effort": ...}}`), `ThinkingBudget` (`{"thinking": {"type": "enabled", "budget_tokens": n}}`); serde snake case |
-| `ModelProfile` | serde camelCase, `Default`, unknown members ignored: `reasoning_efforts`, `reasoning_wire`, `reasoning_budgets`, `reasoning_effort`, `max_output_tokens`, `max_output_tokens_limit`, `extra_body`, `preset`. A profile with only a cap or only an extra body is valid |
+| `ModelProfile` | serde camelCase, `Default`, unknown members ignored: `reasoning_efforts`, `reasoning_wire`, `reasoning_budgets`, `reasoning_effort`, `max_output_tokens`, `max_output_tokens_limit`, `extra_body`, `preset`, `fallback` (the model a run continues on, once, when this one is locked: another profile of the document). A profile with only a cap or only an extra body is valid. **Breaking:** `ModelProfile::fallback` and `Preset::fallback` are new public fields of structs that are not `#[non_exhaustive]`: a literal needs them (or `..Default::default()`) |
 | `Preset`, `ModelProfiles` | a named bundle (`reasoning_effort`, `max_output_tokens`) and the document (`profiles` by model id, `presets` by name). `profile(id)`, `preset(name)`, `preset_of(id)` |
 | `ModelProfiles::parse_json(text)` | parse and validate, **JSON only for now** (the workspace has no YAML parser). `Err(Vec<String>)` lists every problem, each naming the profile (or preset) and the key, but not the file: the caller adds the path. A file with any problem is refused whole |
 | `DEFAULT_MAX_OUTPUT_TOKENS` | 128,000: the cap a call asks for when its folder, its preset and its model's profile set none (ADR 0064). The assembly resolves it per model and clamps it to the model's limit and window; the loop's `Limits` default is the same value |
@@ -151,7 +151,7 @@ list is sorted lowest first); a budget for an undeclared level, a declared level
 reason" would send `thinking: {type: enabled, ...}`: leave `none` out or use another wire); an effort outside the
 model's levels (a profile's own, or a preset's); an unknown preset; efforts without a
 wire, a wire with no efforts, or budgets without `thinking_budget`; a cap of `0`, or above
-`maxOutputTokensLimit` (a preset's too); an `extra_body` member the runtime owns (`RESERVED_EXTRA_BODY_KEYS`:
+`maxOutputTokensLimit` (a preset's too); a `fallback` that names itself or a model with no profile; an `extra_body` member the runtime owns (`RESERVED_EXTRA_BODY_KEYS`:
 `model`, `messages`, `tools`, `tool_choice`, `stream`, `reasoning_effort`, `max_tokens`,
 `max_completion_tokens`). `reasoningEfforts: []` says the model takes no reasoning setting.
 

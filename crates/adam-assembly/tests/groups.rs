@@ -69,6 +69,26 @@ fn assembly(mock: &Arc<MockModel>, mcp: &str) -> Assembly {
     .unwrap()
 }
 
+/// The same agent with a `tools_loading` key in its file.
+fn assembly_loading(mock: &Arc<MockModel>, mcp: &str, loading: &str) -> Assembly {
+    let front = format!("name: root\n{TOOLS}\ntools_loading: {loading}");
+    common::def(&[
+        (
+            "agent/instructions.md",
+            &common::instructions(&front, "You are root."),
+        ),
+        ("agent/mcp.json", mcp),
+    ])
+    .mcp_tools(
+        "root",
+        common::tools(&["github__search", "linear__list_issues", "docs__search"]),
+    )
+    .bind(ToolSet::new())
+    .unwrap()
+    .model(mock.clone(), "default")
+    .unwrap()
+}
+
 /// The tools the model was shown on request `n`, by name, sorted.
 fn names(request: &ModelRequest) -> Vec<String> {
     let mut names: Vec<String> = request.tools.iter().map(|t| t.name.clone()).collect();
@@ -181,6 +201,42 @@ async fn a_server_with_no_when_is_eager() {
         !has(&requests[0], "docs__search"),
         "a triggered server's tool is withheld: {:?}",
         names(&requests[0])
+    );
+}
+
+#[tokio::test]
+async fn an_eager_folder_keeps_a_when_servers_tools_in_every_request() {
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let assembly = assembly_loading(&mock, MCP, "eager");
+    assert_eq!(
+        assembly.info()[0].tools_loading,
+        adam_agent_fs::ToolsLoading::Eager,
+        "the setting is observable in the assembly"
+    );
+    assert!(
+        assembly.info()[0].when.is_empty(),
+        "an eager folder withholds nothing, so no server is a keyword-triggered group: {:?}",
+        assembly.info()[0].when
+    );
+    let (requests, view) = run_task(&mock, &assembly, "fix a typo").await;
+    assert_eq!(requests.len(), 1, "the answer alone");
+    assert_eq!(
+        names(&requests[0]),
+        [
+            "docs__search",
+            "github__search",
+            "linear__list_issues",
+            "read_output"
+        ],
+        "an eager folder withholds nothing: no loader, and both `when` servers' tools are offered"
+    );
+    let state = state_of(&view);
+    assert!(
+        state.tools_appended.is_empty() && state.loaded.is_empty(),
+        "nothing was withheld, so nothing was loaded: {:?} {:?}",
+        state.tools_appended,
+        state.loaded
     );
 }
 

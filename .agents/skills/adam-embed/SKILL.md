@@ -52,7 +52,10 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      `adam_service::serve(&ServiceConfig, agents, shutdown)`, or for a composition of your own.
      `adam_agent::folder::load(path)`, `card_of`, `assemble` are the pieces
      (`bin/adam-agent/README.md`, "Library"). `bin/adam-agent` is `publish = false`: depend on it
-     by git rev too.
+     by git rev too. Served that way it also takes a per-message model pick (`model-pick/v1`) when
+     the deployment profiles more than one model; a hand-built `LlmAgent` honours `vymalo.model`
+     only if you give it `LlmAgentBuilder::model_choices(..)` and your front writes the key, as
+     `RuntimeTaskBackend::with_model_choices` does (ADR 0064, amended 2026-11-23).
    * **Your own agent with Rust tools**: depend on the `adam` facade
      (`crates/adam/README.md`): `use adam::prelude::*` gives `#[tool]`, `tools!`, `Tool`, `State`,
      `LlmAgent`; features `macros` (default), `a2a` (the card), `mcp` (`mcp.json` tools), `dev`
@@ -101,7 +104,10 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.
   them an agent whose file sets `reasoning_effort` or `model_preset` is refused at `start`, fail closed) and with
   `.reasoning_effort(..)` the root's level when its file sets none — the folder's own key wins, the builder's level
   wins over the agent's `model_preset` and the profile, and it is validated when it applies (a file's own level is
-  validated instead). The engine reads no environment variable.
+  validated instead). `Say::with_model(alias)` asks that a message's run be answered by a model that has a
+  profile there (anything else is `EngineError::Invalid`, nothing written; the choice holds for the run until
+  a later message names another), and a folder's `model_fallback:` is the alias a run continues on, once, when
+  the endpoint refuses its model as locked (ADR 0064, amended 2026-11-23). The engine reads no environment variable.
 * **Then** `start().await?`, `send`, `steer`, `answer`, `cancel`, `list`, `get`, `events`, `commands` (the folder's
   `/name` commands, which a message expands), `files` and `file` (what a tool handed over, by SHA-256), `firings` (the runs
   `schedules/` fired, which `get`, `events` and `cancel` reach too), `helpers`, `start_session`, `sessions` and

@@ -1,7 +1,6 @@
 # 0069. The interface language is a hint, and a hint is all it is
 
-Status: **Accepted** (2026-11-22). The owner decided on 2026-11-22, in the plan `2026-11-22-languages.md` of
-`another-context` (decisions 14 to 17), that an agent answers in the interface language by default and in the person's
+Status: **Accepted** (2026-11-22). The owner decided on 2026-11-22 that an agent answers in the interface language by default and in the person's
 own language when they write in another, and that the languages a deployment offers are its configuration. This ADR
 is the adam-rs side; the client half is the orchestration layer's.
 
@@ -124,6 +123,26 @@ hint never fills that text (decision 3).
    cleared by a message that names none, beside `access-tier/v1`'s handling, and among the protected keys so a
    dropped context keeps it. **Built.**
 3. `adam-coder` and `adam-agent`: the card entry from the deployment's own tag and that tag's variable in
-   `deploy/coder`.
+   `deploy/coder`. **Built.** The variable is `DEFAULT_LOCALE`, read by `adam-service` for every binary and
+   role (a malformed tag exits 78); the chart carries it through `config.extraEnv`, with no value of its own.
 4. The client half: the orchestrator sends the person's interface locale with each message, activated per message,
    and keeps it with the message (`vymalo/another-agentic-system`).
+
+### Status note, 2026-11-23: the tag reaches the model as one more turn, after the history
+
+Slices 1 to 3 put the tag in the run's context (`vymalo.locale`) and on the card, and nothing rendered that key into a
+model request: `Conversation::context` was read by tools (`ToolCtx::context`) and by the process-level checks
+(`is_unattended`, `context_effort`), never by the request builder, so the agent's rule ("answer in the language the
+interface names") had nothing to read. Found while wiring the orchestration layer's half (another-agentic-system's
+ANR-114).
+
+- **Built:** `adam-llm-agent` appends `interface_language_turn(tag)` as one user message **after the history** on every
+  model turn of a run whose context names a printable tag, never in `system` (the stable prefix of ADR 0044 keeps its
+  bytes) and never in the history (like `CLOSING_TURN`). `interface_language(context)` accepts only a string of at most
+  `MAX_INTERFACE_LANGUAGE_BYTES` (64) bytes of ASCII letters, digits or `-`; anything else sends nothing, so no value a
+  tool wrote can become a line of the prompt.
+- **Verified 2026-11-23:** `cargo test -p adam-llm-agent --test context_and_sources` (31 tests, three of them new: the
+  line is the last message and not in `system`; a value that is not a tag sends nothing and the request is the one it
+  always was; the accepted characters and the length bound).
+- **Unverified:** what a model does with the line — that is the orchestration layer's real-agent e2e (its ANR-114
+  item 3), on a scripted model first.

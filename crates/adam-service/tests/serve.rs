@@ -965,6 +965,51 @@ async fn serve_lists_child_sessions_on_the_card_exactly_when_it_serves_them() {
     }
 }
 
+/// The card lists `model-pick/v1` with the choices the backend serves, and lists nothing when the
+/// backend serves none (a deployment that offers one model has nothing to pick).
+#[tokio::test]
+async fn the_card_lists_model_pick_exactly_when_the_backend_serves_it() {
+    use a2a_client::agent_card::AgentCardResolver;
+    use adam_a2a::{MODEL_PICK_EXTENSION, ModelChoices};
+
+    let Some(url) = database() else { return };
+
+    for served in [true, false] {
+        let name = unique("serve-model-pick");
+        let (listener, port) = listen().await;
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let cfg = config(&url, "all", port);
+        let mut agents = agents(&name, &cfg).card(AgentCardConfig::new(
+            &name,
+            "A test agent.",
+            format!("http://{addr}/").parse().unwrap(),
+            "0.0.1",
+        ));
+        if served {
+            agents = agents.model_choices(ModelChoices::from_aliases(["alias-a", "alias-b"]));
+        }
+        let running = Running::start(listener, cfg, agents);
+        until_ok(addr, "/healthz", &running.handle).await;
+
+        let public = AgentCardResolver::new(None)
+            .resolve(&format!("http://{addr}"))
+            .await
+            .unwrap();
+        let entry = public
+            .capabilities
+            .extensions
+            .iter()
+            .flatten()
+            .find(|e| e.uri == MODEL_PICK_EXTENSION);
+        assert_eq!(entry.is_some(), served);
+        if let Some(entry) = entry {
+            let params = entry.params.as_ref().unwrap();
+            assert_eq!(params["choices"], json!(["alias-a", "alias-b"]));
+        }
+        running.finish().await;
+    }
+}
+
 /// A helper the process did not register is a fault of the binary, found at start: exit 78 and
 /// nothing served.
 #[tokio::test]
@@ -983,4 +1028,52 @@ async fn a_helper_that_is_not_registered_stops_serve_with_78() {
     );
     assert_eq!(exit_code(&error), 78);
     assert!(!error.to_string().contains("postgres://"));
+}
+
+/// `DEFAULT_LOCALE` reaches the card through `serve`: the card lists `locale/v1` with the tag
+/// when the deployment sets one, and lists nothing when it does not.
+#[tokio::test]
+async fn the_card_lists_locale_exactly_when_the_deployment_names_a_default_language() {
+    use a2a_client::agent_card::AgentCardResolver;
+    use adam_a2a::LOCALE_EXTENSION;
+
+    let Some(url) = database() else { return };
+
+    for tag in [Some("fr-FR"), None] {
+        let name = unique("serve-locale");
+        let (listener, port) = listen().await;
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let more: Vec<(&str, String)> = tag
+            .map(|t| ("DEFAULT_LOCALE", t.to_owned()))
+            .into_iter()
+            .collect();
+        let cfg = config_with(&url, "all", port, &more);
+        let card = AgentCardConfig::new(
+            &name,
+            "A test agent.",
+            format!("http://{addr}/").parse().unwrap(),
+            "0.0.1",
+        );
+        let agents = agents(&name, &cfg);
+        let running = Running::start(listener, cfg, agents.card(card));
+        until_ok(addr, "/healthz", &running.handle).await;
+
+        let public = AgentCardResolver::new(None)
+            .resolve(&format!("http://{addr}"))
+            .await
+            .unwrap();
+        let entry = public
+            .capabilities
+            .extensions
+            .as_ref()
+            .and_then(|all| all.iter().find(|e| e.uri == LOCALE_EXTENSION));
+        match tag {
+            Some(t) => {
+                let params = entry.and_then(|e| e.params.as_ref()).expect("params");
+                assert_eq!(params["locale"], t);
+            }
+            None => assert!(entry.is_none(), "no tag, no entry"),
+        }
+        running.finish().await;
+    }
 }

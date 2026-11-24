@@ -83,7 +83,9 @@ description: Turns a coding task into a verified pull request.   # required on s
 model: coder-large             # a gateway alias; `inherit` = the parent's (default for subagents)
 reasoning_effort: low          # the level the model calls ask for by default; one the model's profile declares (ADR 0063)
 model_preset: quick            # a named preset of MODEL_ALIASES_FILE the calls start from (ADR 0064)
+model_fallback: coder-lite     # overrides the preset's and the profile's `fallback`: the alias the run continues on, once, if the endpoint refuses `model` as locked (ADR 0064)
 tools: [prepare_workspace, run_checks, ask_user]     # or "a, b, c"; "*" = all; MCP: "linear__*"
+tools_loading: eager           # `eager`: every tool in every request, as before the key existed; `lazy` (default): a run loads them in groups (ADR 0066)
 skills: all                    # or a list; default: every skill in this agent's skills/
 limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as limits.max_turns
   max_turns: 200               # model calls that may be followed by tools, plus one closing turn in which it may call none (0: one call with no tools)
@@ -130,6 +132,13 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   declares no wire sends nothing. An embedded engine's host
   gives the root's level (`EngineBuilder::reasoning_effort`) when the file sets none: the file's key
   wins. Claude Code's `effort` is still ignored with a warning.
+* **A locked model switches once.** `model_fallback` names the alias a run continues on when the endpoint refuses
+  its model as not allowed (`model_locked`, ADR 0067). The run says it as a step (`Switched model`), reports
+  its later calls under the fallback, takes the fallback's cap and its profile's own reasoning level, and never goes back;
+  a second refusal fails it naming both models. The alias is the file's `model_fallback`, else the `fallback` of its
+  `model_preset`, else of its model's profile in `MODEL_ALIASES_FILE`; it is checked like `model:` and may not be the
+  agent's own (exit 78). A subagent resolves its own: an `inherit` subagent takes its model's profile fallback, and
+  nothing is inherited from the parent's file (ADR 0064, amended 2026-11-23).
 * **The output cap is per model.** `limits.max_output_tokens` is what this agent's calls ask for;
   without it the cap is its `model_preset`'s, else the model profile's `maxOutputTokens`, else the
   profile's base preset, else 128,000 (ADR 0064). The result is clamped to the model's
@@ -143,6 +152,10 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   any other, so **a folder with `tools:` must list `plan_*` (or `"*"`) to keep the plan**. A subagent has none of them
   unless it lists them, and even then `plan_*` answers that a subagent keeps no plan: the plan belongs to the
   conversation's root run.
+* **`tools_loading:` chooses how a run sees the tools** ([ADR 0066](../decisions/0066-a-first-request-is-lean-and-tools-load-in-groups.md)):
+  `lazy` (the default) starts lean, and a run loads tools in groups; `eager` puts every tool in every request, as
+  before the key existed, and **a server whose `mcp.json` entry has a `when` is offered too** (nothing is withheld).
+  `searchable` is accepted and behaves as `lazy` until searchable groups land.
 * **`retry:` is a retry policy per tool** ([ADR 0061](../decisions/0061-a-step-names-its-retry-policy.md)): a map from
   one of the agent's tool names (its own, an MCP server's `<server>__<tool>`, a skill or subagent tool) to `attempts`
   (required, 1 to 20, the tries in all), `backoff` and `max_backoff` (`500ms`, `1s`, `30m`, `1h`; at most `1h`, and

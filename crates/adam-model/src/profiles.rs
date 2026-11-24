@@ -213,6 +213,10 @@ pub struct ModelProfile {
     pub extra_body: Option<serde_json::Map<String, Value>>,
     /// The name of the preset this profile starts from; the profile's own keys win.
     pub preset: Option<String>,
+    /// The model a run of this model continues on, once, when the endpoint refuses this one as
+    /// locked (ADR 0064, amended 2026-11-23): another profile of the document. An agent's
+    /// `model_fallback`, then its preset's, win over it.
+    pub fallback: Option<String>,
 }
 
 /// A named bundle a profile (or an agent's `model_preset`) starts from.
@@ -223,6 +227,9 @@ pub struct Preset {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The output cap the preset sets.
     pub max_output_tokens: Option<u32>,
+    /// The model alias a run continues on when its model is locked, for an agent that names this
+    /// preset and no `model_fallback` of its own.
+    pub fallback: Option<String>,
 }
 
 /// The whole document: the profiles by model id, and the presets by name.
@@ -333,6 +340,19 @@ impl ModelProfiles {
         let mut problems = Vec::new();
         for (alias, profile) in &self.profiles {
             let at = |key: &str| format!("profiles.{alias:?}.{key}");
+            if let Some(fallback) = &profile.fallback {
+                if fallback == alias {
+                    problems.push(format!(
+                        "{}: a model cannot be its own fallback",
+                        at("fallback")
+                    ));
+                } else if !self.profiles.contains_key(fallback) {
+                    problems.push(format!(
+                        "{}: {fallback:?} has no profile; a fallback is another model of this document",
+                        at("fallback")
+                    ));
+                }
+            }
             let efforts = profile.reasoning_efforts.as_deref().unwrap_or(&[]);
             match (profile.reasoning_wire, efforts.is_empty()) {
                 (None, false) => problems.push(format!(
@@ -478,6 +498,7 @@ struct RawProfile {
     max_output_tokens_limit: Option<u32>,
     extra_body: Option<serde_json::Map<String, Value>>,
     preset: Option<String>,
+    fallback: Option<String>,
 }
 
 /// A preset as written.
@@ -486,6 +507,7 @@ struct RawProfile {
 struct RawPreset {
     reasoning_effort: Option<String>,
     max_output_tokens: Option<u32>,
+    fallback: Option<String>,
 }
 
 /// A cap of `0` is no cap a model can honour: a problem, not a value.
@@ -523,6 +545,7 @@ fn convert_preset(name: &str, raw: RawPreset, problems: &mut Vec<String>) -> Opt
     ok.then_some(Preset {
         reasoning_effort,
         max_output_tokens,
+        fallback: raw.fallback,
     })
 }
 
@@ -627,6 +650,7 @@ fn convert_profile(
         max_output_tokens_limit,
         extra_body: raw.extra_body,
         preset: raw.preset,
+        fallback: raw.fallback,
     })
 }
 
@@ -748,6 +772,7 @@ mod tests {
                 json!(false),
             )])),
             preset: Some("quick".into()),
+            fallback: Some("other".into()),
         };
         roundtrip(profile.clone());
         assert_eq!(

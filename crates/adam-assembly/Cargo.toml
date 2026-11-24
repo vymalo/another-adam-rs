@@ -49,7 +49,7 @@ adam-runtime.workspace = true
 async-trait.workspace = true
 jiff.workspace = true
 notify = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, features = ["rustls"] }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

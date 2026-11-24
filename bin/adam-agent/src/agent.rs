@@ -237,6 +237,9 @@ async fn assemble_parked(
         .step_io(step_io);
     bound
         .model_profiles(profiles)
+        // A served agent takes the model a message picks (`model-pick/v1`): the card lists the
+        // choices and the backend refuses anything outside them (ADR 0064, amended 2026-11-23).
+        .allow_model_choice()
         .model(model, alias)
         .map_err(|e| AgentError::Assembly(Box::new(e)))
 }
@@ -269,7 +272,7 @@ pub async fn agents(
     // with the effective limits, so every role that serves A2A lists and serves the same.
     let sessions = def.child_sessions();
     let schedules = def.manifest().schedules.clone();
-    let (agents, commands, card) = match workers {
+    let (agents, commands, card, choices) = match workers {
         Some(parts) => {
             let assembly = assemble_parked(
                 def,
@@ -282,6 +285,13 @@ pub async fn agents(
                 parts.parking,
             )
             .await?;
+            // The models a message may pick (`model-pick/v1`): the root's choices, the same list
+            // its card advertises.
+            let choices = assembly
+                .info()
+                .first()
+                .map(|root| adam_a2a::ModelChoices::from_aliases(root.model_choices.clone()))
+                .filter(|choices| !choices.is_empty());
             // The prompts of the root's MCP servers are commands too, known only now that the
             // servers are connected: a role without workers connects none, so it serves none.
             let (commands, listed) =
@@ -304,6 +314,7 @@ pub async fn agents(
                 }),
                 commands,
                 card,
+                choices,
             )
         }
         None => {
@@ -322,6 +333,8 @@ pub async fn agents(
                 }),
                 commands,
                 card,
+                // A control plane assembles no agent, so it knows no choices: its card lists none.
+                None,
             )
         }
     };
@@ -331,6 +344,10 @@ pub async fn agents(
         .card_if(card)
         .inbound(adam_a2a_runtime::vymalo_inbound)
         .commands(commands);
+    let agents = match choices {
+        Some(choices) => agents.model_choices(choices),
+        None => agents,
+    };
     Ok(match sessions {
         Some(sessions) => agents.child_sessions(sessions),
         None => agents,
