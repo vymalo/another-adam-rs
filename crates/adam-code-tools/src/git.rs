@@ -171,7 +171,8 @@ impl GitAt {
     pub fn pinned_common_dir(&self) -> Option<&Path> {
         match &self.pin {
             Pin::Pinned(pin) => Some(pin.common_dir()),
-            #[cfg(any(test, feature = "test-util"))]
+            // A directory `git` finds by itself (a test's, or a person's through
+            // [`GitAt::directory`]) has to be asked.
             Pin::Plain => None,
             Pin::Refused => None,
         }
@@ -182,7 +183,6 @@ impl GitAt {
     /// says. `None` for a refused repository.
     pub async fn index_path(&self) -> Option<PathBuf> {
         match &self.pin {
-            #[cfg(any(test, feature = "test-util"))]
             Pin::Plain => {
                 let path = git_stdout(self, &["rev-parse", "--git-path", "index"]).await?;
                 Some(self.path().join(path))
@@ -199,7 +199,6 @@ impl GitAt {
     /// trusted (see [`GitPin::check`]).
     pub async fn command(&self) -> Option<LocalGit> {
         let cmd = match &self.pin {
-            #[cfg(any(test, feature = "test-util"))]
             Pin::Plain => LocalGit::new(self.path(), None),
             Pin::Pinned(pin) => {
                 if let Err(why) = pin.check().await {
