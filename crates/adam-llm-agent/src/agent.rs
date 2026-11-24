@@ -1414,7 +1414,7 @@ impl LlmAgentBuilder {
     ///
     /// * A model call waits five seconds for its seat, then parks the run on the refusal's
     ///   `retry_after`, as it parks on a provider's `429` (ADR 0061, ADR 0067).
-    /// * A tool call waits up to [`TOOL_ADMISSION_WAIT`] and then runs anyway, with a warning: a
+    /// * A tool call waits up to `TOOL_ADMISSION_WAIT` and then runs anyway, with a warning: a
     ///   run never fails because a slot was busy (ADR 0065 decision 4).
     ///
     /// [ADR 0061]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0061-a-step-names-its-retry-policy.md
@@ -4455,7 +4455,7 @@ impl LlmAgent {
     /// A seat of the process's tool pool for `conversation` ([`Pool::ToolCalls`], ADR 0065).
     ///
     /// `None` when the deployment built no admission, when the pool can never admit the call, or
-    /// when waiting once more would pass [`TOOL_ADMISSION_WAIT`]: the call then runs ungated. A run
+    /// when waiting once more would pass `TOOL_ADMISSION_WAIT`: the call then runs ungated. A run
     /// never fails because a slot was busy, so the ceiling is a bulkhead and not a barrier.
     async fn seat_tool(&self, conversation: ConversationId) -> Option<Permit> {
         let admission = self.admission.as_ref()?;
