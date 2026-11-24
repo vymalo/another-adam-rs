@@ -811,11 +811,11 @@ impl Workspaces {
         // After the early return above, so a run that has its worktree keeps it; before anything is
         // made, so a refusal leaves the disk as it was — and the lock taken above has already made
         // the mirror's parent directory and its lock file, so a refusal undoes exactly that.
-        if let Some(disk) = &self.inner.disk {
-            if let Err(refusal) = disk.admit(&self.inner.root).await {
-                self.inner.drop_lock_files(&mirror).await;
-                return Err(refusal);
-            }
+        if let Some(disk) = &self.inner.disk
+            && let Err(refusal) = disk.admit(&self.inner.root).await
+        {
+            self.inner.drop_lock_files(&mirror).await;
+            return Err(refusal);
         }
         self.inner.ensure_mirror(repo, &loc, &mirror).await?;
         let auth = self.inner.authorize(repo, &loc).await?;
