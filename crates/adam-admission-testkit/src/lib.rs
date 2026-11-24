@@ -31,7 +31,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_budget::{Admission, Ask, Budget, DynAdmission, Permit, Pool, Ratio, Refused, Usage};
+use adam_budget::{Admission, Ask, Budget, Permit, Pool, Ratio, Refused, Usage};
 use adam_error::Classify;
 
 /// How many asks the concurrency case launches at once.
@@ -108,8 +108,8 @@ impl Plan {
     }
 }
 
-// `Pool` is re-exported for the macro's expansions, which name it in the implementing crate.
-pub use adam_budget::ConversationId;
+// Re-exported for the macro's expansion, which names them from the implementing crate.
+pub use adam_budget::{ConversationId, DynAdmission};
 
 /// Fill the pool, holding every permit: `plan.limit` asks of one unit at once, each from its own
 /// conversation so that the share does not bind.
@@ -197,7 +197,7 @@ pub async fn a_dropped_holder_frees_its_share(admission: DynAdmission, plan: Pla
         admission.admit(plan.ask()).await.is_err(),
         "a full pool refuses without waiting"
     );
-    held.pop().expect("a permit to drop");
+    drop(held.pop().expect("a permit to drop"));
     let permit = admission
         .admit(plan.ask())
         .await
@@ -216,7 +216,7 @@ pub async fn a_dropped_holder_frees_its_share(admission: DynAdmission, plan: Pla
 /// When the share of a cancelled holder stays held.
 pub async fn a_cancelled_holder_frees_its_share(admission: DynAdmission, plan: Plan) {
     let mut held = fill(&admission, &plan).await;
-    held.pop().expect("a seat for the cancelled holder");
+    drop(held.pop().expect("a seat for the cancelled holder"));
     let (said, heard) = tokio::sync::oneshot::channel();
     let holder = {
         let admission = Arc::clone(&admission);

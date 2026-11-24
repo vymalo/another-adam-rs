@@ -153,7 +153,6 @@ impl Budget {
     };
 
     /// A builder that starts from [`UNLIMITED`](Self::UNLIMITED): set what the ceiling is.
-    #[must_use]
     pub fn builder() -> BudgetBuilder {
         BudgetBuilder {
             budget: Self::UNLIMITED,
