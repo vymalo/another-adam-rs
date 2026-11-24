@@ -180,7 +180,6 @@ impl EngineBuilder {
     /// call of every run of this engine asks it for a seat. Without one, nothing is admitted.
     ///
     /// [ADR 0065]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md
-    #[must_use]
     pub fn admission(mut self, admission: DynAdmission) -> Self {
         self.admission = Some(admission);
         self

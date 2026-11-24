@@ -420,7 +420,8 @@ mod tests {
         assert_eq!(budget.limit(Pool::CommandMemory), 2_048);
         assert_eq!(
             Budget::UNLIMITED.limit(Pool::CommandMemory),
-            (u64::MAX / (1024 * 1024)) + 1
+            u64::MAX / (1024 * 1024),
+            "a saturated addition rounds the same way"
         );
         assert_eq!(
             Budget::builder()

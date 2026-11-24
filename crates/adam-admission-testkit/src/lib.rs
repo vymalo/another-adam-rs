@@ -27,6 +27,7 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![allow(clippy::unwrap_used, clippy::expect_used)] // a test kit asserts by unwrapping
 
 use std::sync::Arc;
 use std::time::Duration;
