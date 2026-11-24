@@ -220,6 +220,7 @@ classDiagram
 | `Environment` | `adam-workspace` | `Local`, `KubeEnvironment` (`adam-env-kubernetes`) | a fake API server and exec seam in the tests |
 | `CallBearer` | `adam-mcp` | `GitHubReadBearer` (`adam-coder`) | test bearers |
 | `Admission` | `adam-budget` | `LocalAdmission` (`adam-admission-local`): semaphores per pool and per conversation, one token bucket | the conformance suite `admission_conformance!` is the reference |
+| `DeviceState` | `adam-device-state` | none yet: the host pushes its readings ([ADR 0065](decisions/0065-resource-governance-admission-pools-and-os-limits.md) decision 8) | `FakeDevice`, the reference of `device_state_conformance!` |
 | `PermissionPrompt` | `adam-acp` | none (the default policy needs no prompt) | `StaticPrompt` |
 
 `AgentStarter` is the start-only half of `Agent` (`name`, `init`, `init_continuing`): a process that

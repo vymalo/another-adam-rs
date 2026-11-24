@@ -236,7 +236,9 @@ Each is one pull request, in order.
    `unpushed_work_is_never_removed`). Not built yet: `WORKSPACE_DISK_MAX` and `WORKSPACE_DISK_RESERVE`, the
    `tool.before` question to the person, `TooLarge`, cache writes, and `adam_disk_bytes{kind}`.
 5. **The device-state port.** Accepted when a fake device on battery runs one run at a time and a hot device holds new
-   steps.
+   steps. **Partly built:** `adam-device-state` holds `DeviceState`, the four readings and `FakeDevice`, and
+   `adam-device-state-testkit` the suite `device_state_conformance!`. Not built yet: `Engine::set_device_state` and
+   the rule table that lowers the live budget by these readings.
 6. **The resource report and the parity rows.** Accepted when a snapshot names each pool's use and the parity page has
    the section.
 
