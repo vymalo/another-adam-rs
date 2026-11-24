@@ -3715,7 +3715,6 @@ impl LlmAgent {
             .await;
         }
         state.messages.extend(messages);
-        self.observe_reported(ctx, state.root_run, reports);
         let rounds: Vec<RunId> = reports.iter().map(|r| r.round).collect();
         state.note_reported(&rounds);
         Ok(added)
@@ -4106,15 +4105,6 @@ impl LlmAgent {
                         run,
                         model_wait: None,
                     };
-                    self.observe_child(
-                        ctx,
-                        state.root_run,
-                        adam_plugin::EventKind::ChildStarted,
-                        &call.name,
-                        &call.id,
-                        run,
-                        None,
-                    );
                     let Some((_, child)) = notices.iter().find(|(r, _)| *r == run) else {
                         ctx.emit(RunEvent::Custom {
                             kind: "awaiting_run".into(),
@@ -4136,15 +4126,6 @@ impl LlmAgent {
                         return Ok(Flow::Wait);
                     };
                     let outcome = Self::answer_run(state, &wait, child);
-                    self.observe_child(
-                        ctx,
-                        state.root_run,
-                        adam_plugin::EventKind::ChildEnded,
-                        &wait.tool,
-                        &wait.call_id,
-                        run,
-                        Some(outcome),
-                    );
                     Self::count_child(ctx, state, run).await?;
                     say(
                         ctx,
@@ -5412,83 +5393,7 @@ impl LlmAgent {
             .text("tool", tool, &scrub)
             .text("call_id", call_id, &scrub)
             .text(field, &text, &scrub);
-        let mut events = vec![event];
-        // A session tool that answered also says what it did to the session (ADR 0050, H7).
-        if kind == EventKind::ToolCompleted {
-            let session_kind = match tool {
-                SUBAGENT_START => Some(EventKind::SessionOpened),
-                SUBAGENT_SEND => Some(EventKind::SessionRound),
-                SUBAGENT_CLOSE => Some(EventKind::SessionClosed),
-                _ => None,
-            };
-            if let Some(session_kind) = session_kind {
-                let header = self.event_header(ctx, root, &format!("tool:{call_id}"), session_kind);
-                let mut event = adam_plugin::HookEvent::new(session_kind, header)
-                    .text("tool", tool, &scrub)
-                    .text("call_id", call_id, &scrub);
-                if let Ok(answer) = serde_json::from_str::<Value>(&text)
-                    && let Some(session) = answer.get("session").and_then(Value::as_str)
-                {
-                    event = event.text("session", session, &scrub);
-                }
-                events.push(event);
-            }
-        }
-        self.flush_events(events);
-    }
-
-    /// `child.started` and `child.ended`: a one-shot child run a call waits for. The end carries
-    /// the state of the call's step; both are keyed by the call, so a replay says them again with
-    /// the same key.
-    #[allow(clippy::too_many_arguments)] // the call and its child, handed over once
-    fn observe_child(
-        &self,
-        ctx: &Ctx,
-        root: Option<RunId>,
-        kind: adam_plugin::EventKind,
-        tool: &str,
-        call_id: &str,
-        child: RunId,
-        outcome: Option<StepState>,
-    ) {
-        if self.hooks.is_empty() {
-            return;
-        }
-        let scrub = |s: &str| self.step_io.scrub(s);
-        let header = self.event_header(ctx, root, &format!("tool:{call_id}"), kind);
-        let mut event = adam_plugin::HookEvent::new(kind, header)
-            .text("tool", tool, &scrub)
-            .text("call_id", call_id, &scrub)
-            .text("child", &child.to_string(), &scrub);
-        if let Some(outcome) = outcome {
-            let word = if outcome == StepState::Completed {
-                "completed"
-            } else {
-                "failed"
-            };
-            event = event.text("outcome", word, &scrub);
-        }
         self.flush_events(vec![event]);
-    }
-
-    /// `session.reported`: a round's report was put in front of the model.
-    fn observe_reported(&self, ctx: &Ctx, root: Option<RunId>, reports: &[RoundReport]) {
-        if self.hooks.is_empty() {
-            return;
-        }
-        let scrub = |s: &str| self.step_io.scrub(s);
-        let kind = adam_plugin::EventKind::SessionReported;
-        let events = reports
-            .iter()
-            .map(|report| {
-                let id = report_call_id(report.round);
-                let header = self.event_header(ctx, root, &id, kind);
-                adam_plugin::HookEvent::new(kind, header)
-                    .text("call_id", &id, &scrub)
-                    .text("round", &report.round.to_string(), &scrub)
-            })
-            .collect();
-        self.flush_events(events);
     }
 
     /// The note the listing that offered tool `name` made about it, if the tool is a source's (the
@@ -6999,15 +6904,6 @@ impl Agent for LlmAgent {
             match finished {
                 Some(child) => {
                     let outcome = Self::answer_run(&mut state, &wait, &child);
-                    self.observe_child(
-                        ctx,
-                        state.root_run,
-                        adam_plugin::EventKind::ChildEnded,
-                        &wait.tool,
-                        &wait.call_id,
-                        wait.run,
-                        Some(outcome),
-                    );
                     Self::count_child(ctx, &mut state, wait.run).await?;
                     ctx.emit(self.step_end_with_result(&state, &wait.tool, &wait.call_id, outcome))
                         .await;

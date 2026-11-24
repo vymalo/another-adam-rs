@@ -118,7 +118,7 @@ repository holds is run, a program's environment is empty, and every decision is
    | `compaction.before` | before the summary call | **decide**: add context (at most 4 KiB), veto | inside `compact:<n>:<turn>` |
    | `compaction.ended` | a compaction was recorded | observe | after the step, from its record |
    | `child.started`, `child.ended` | a one-shot subagent call starts its child or reads its outcome | observe | after the step that did it |
-   | `session.opened`, `session.round`, `session.reported`, `session.closed` | the session tools of ADR 0045 act (`subagent_start`, `_send`, `_close` answered), or a round's report is told to the model | observe | after the step that did it |
+   | `session.started`, `session.round.started`, `session.round.ended`, `session.closed` | the session tools of ADR 0045 act, or a report is read | observe | after the step that did it |
    | `run.ending` | the run would end with an answer (the model's, or a tool's final answer) | **decide**: end, or continue with a reason | inside `end:<turn>` (decision 10) |
    | `run.cancelled` | the agent sees its cancel during a step | observe | before the transition returns |
    | `run.parked`, `run.ended`, `run.error`, `artifact.kept` | the runtime committed a park, an end, a failed try or a file | observe | after the commit, best effort |
