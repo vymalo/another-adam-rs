@@ -97,7 +97,10 @@ fn a_scripted_run_gives_the_golden_event_list() {
         std::fs::write(path, &got).unwrap();
     }
     let want = std::fs::read_to_string(path).expect("run once with UPDATE_GOLDEN=1");
-    assert_eq!(got, want);
+    // Compare as values: key order depends on whether `preserve_order` is unified in.
+    let want: Value = serde_json::from_str(&want).unwrap();
+    let got_value: Value = serde_json::from_str(&got).unwrap();
+    assert_eq!(got_value, want);
     assert!(!got.contains("sk-secret-token"), "no secret in an event");
 }
 
