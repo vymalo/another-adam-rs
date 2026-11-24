@@ -867,9 +867,9 @@ impl Tool for Read {
                 "Read the report of a session's latest round: its state, its round number and, \
                  once the round has ended, the subagent's answer (paged: `offset` and `limit` are \
                  lines). While the round works the result says so. To wait for it, call again with \
-                 which returns when the round has ended: never poll by calling again and again, \
-                 which gets the same answer and is refused after two. A wait returns the first \
-                 page. Closing is {SUBAGENT_CLOSE}."
+                 wait: true, which returns when the round has ended: never poll by calling again \
+                 and again, which gets the same answer and is refused after two. A wait returns \
+                 the first page. Closing is {SUBAGENT_CLOSE}."
             ),
             parameters: json!({
                 "type": "object",
