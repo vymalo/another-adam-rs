@@ -293,6 +293,7 @@ dependencies = [
  "adam-a2a-runtime",
  "adam-agent-fixture",
  "adam-agent-fs",
+ "adam-budget",
  "adam-core",
  "adam-error",
  "adam-llm-agent",
@@ -374,7 +375,9 @@ dependencies = [
  "adam",
  "adam-a2a",
  "adam-a2a-runtime",
+ "adam-admission-local",
  "adam-agent-fs",
+ "adam-budget",
  "adam-code-tools",
  "adam-code-tools-testkit",
  "adam-core",
@@ -460,6 +463,7 @@ dependencies = [
  "adam-a2a-runtime",
  "adam-agent-fs",
  "adam-assembly",
+ "adam-budget",
  "adam-core",
  "adam-error",
  "adam-llm-agent",
@@ -548,6 +552,7 @@ dependencies = [
 name = "adam-llm-agent"
 version = "0.1.0"
 dependencies = [
+ "adam-budget",
  "adam-core",
  "adam-error",
  "adam-model",
@@ -786,6 +791,7 @@ dependencies = [
  "adam-a2a",
  "adam-a2a-runtime",
  "adam-agent-fs",
+ "adam-budget",
  "adam-core",
  "adam-error",
  "adam-host",

@@ -385,6 +385,11 @@ impl CoderAgent {
                 let redactor = env.redactor.clone();
                 move || redactor.longest()
             });
+        // The process's pools (ADR 0065): the tool calls and model calls in flight of every run.
+        let bound = match &env.settings.admission {
+            Some(admission) => bound.admission(Arc::clone(admission)),
+            None => bound,
+        };
         // Where `prepare_workspace` finds it: absent, nothing of a repository's skills is listed.
         let bound = match repo_skills {
             Some(found) => bound.state(found),

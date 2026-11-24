@@ -411,7 +411,7 @@ refuses a non-empty `config.role`. See the crate README (`bin/adam-coder/README.
 
 A control plane needs no model, GitHub or workspace configuration, so with
 `config.role=control-plane` the chart leaves out `MODEL_BASE_URL` (the literal, or the Secret key of `config.modelBaseUrlFromSecret`), `MODEL`,
-`WORKERS`, `MAX_PARALLEL_TOOL_CALLS`, `MAX_CHECK_CYCLES`, `CHECK_TIMEOUT_SECS`, `WORKSPACE_SWEEP_SECS`, `ALLOWED_REPO_HOSTS`, `GITHUB_API_URL`,
+`WORKERS`, `MAX_PARALLEL_TOOL_CALLS`, `MAX_TOOL_CALLS_IN_FLIGHT`, `MAX_MODEL_CALLS`, `MODEL_TOKENS_PER_MINUTE` (the last three have no chart value yet: set them with `config.extraEnv`; ADR 0065), `MAX_CHECK_CYCLES`, `CHECK_TIMEOUT_SECS`, `WORKSPACE_SWEEP_SECS`, `ALLOWED_REPO_HOSTS`, `GITHUB_API_URL`,
 `PR_DRAFT`, `GIT_AUTHOR_*`, `WORKSPACE_ROOT`, `GITHUB_MCP_URL` and the GitHub MCP server sidecar, the GitHub App settings and key volume (`github.auth: app`) and the two secrets above (the helper
 `coder.runsWorkers` in `templates/_helpers.tpl`). The render of `all` and `worker` is unchanged.
 A `combined` control plane still mounts the `work` volume, because a StatefulSet's

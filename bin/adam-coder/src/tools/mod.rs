@@ -232,6 +232,9 @@ pub struct CoderSettings {
     /// How a run waits on a model that refused it (ADR 0067): `MODEL_PARK_LIMIT`, and whether an
     /// unreachable gateway parks (`MODEL_AUTH=injector`).
     pub model_parking: adam_llm_agent::ModelParking,
+    /// The process's pools (ADR 0065): the tool calls and model calls in flight the worker admits.
+    /// `None` in a test that builds the settings by hand, which admits everything.
+    pub admission: Option<adam_budget::DynAdmission>,
 }
 
 impl Default for CoderSettings {
@@ -283,6 +286,7 @@ impl CoderSettings {
             language_servers_max: 4,
             max_parallel_tool_calls: adam_llm_agent::DEFAULT_MAX_PARALLEL,
             model_parking: adam_llm_agent::ModelParking::default(),
+            admission: None,
         }
     }
 }

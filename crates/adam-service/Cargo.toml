@@ -22,6 +22,7 @@ mcp = ["dep:adam-mcp", "dep:adam-agent-fs"]
 [dependencies]
 a2a-lf.workspace = true
 adam-a2a.workspace = true
+adam-budget.workspace = true
 adam-a2a-runtime.workspace = true
 adam-agent-fs = { workspace = true, optional = true }
 adam-core.workspace = true

@@ -16,6 +16,7 @@ default = []
 schema = ["dep:schemars", "schemars/derive"]
 
 [dependencies]
+adam-budget.workspace = true
 adam-error.workspace = true
 adam-core.workspace = true
 adam-model.workspace = true

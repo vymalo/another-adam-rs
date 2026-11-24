@@ -23,6 +23,7 @@ The calls, their refusals and their defaults: the [crate README](../../crates/ad
 | its own tools | `ToolSet` (`EngineBuilder::tools`): an `FnTool`, or `#[tool]` functions with `adam = { default-features = false, features = ["macros"] }` | none: the catalog is the screen's tools (`ask_user`, `show`, `ui_catalog`, the plan tools); the files' `tools:` selects from it; a file a tool returns is read with `Engine::files` and `Engine::file` |
 | secrets the agent's files name | `SecretSource` (`EngineBuilder::secrets`) | none: `default_secrets()` refuses every name |
 | a tokio runtime | the current one at `start` | the worker runs on it |
+| the process's pools | `DynAdmission` (`EngineBuilder::admission`) | none: nothing is admitted, so every model call and tool call runs. With one ([`adam-admission-local`](../crates/adam-admission-local/README.md), or your own), every model call takes a seat of `Pool::ModelCalls` and every tool call one of `Pool::ToolCalls` ([ADR 0065](../decisions/0065-resource-governance-admission-pools-and-os-limits.md)): a model call waits five seconds and then parks the run at the refusal's `retry_after`, a tool call waits a minute and then runs anyway with a warning |
 | limits | `Limits` (`EngineBuilder::limits`) | `Limits::default()`; among them `retry`, the runtime's retry policy (5 attempts, 1 s to 60 s), and `sessions`, the child sessions' limits (16 open, 4 working, 20 rounds) |
 
 The engine reads no environment variable and no file it was not given.
