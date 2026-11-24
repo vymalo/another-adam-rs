@@ -13,6 +13,7 @@ use adam_model::{
     Classify, DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse,
     ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
+use adam_plugin::{HookSet, HookedCall, HookedText, Plugin, Verdict};
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
     CancelToken, ChildLook, ChildStarter, ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES,
@@ -248,8 +249,8 @@ use crate::state::Extensions;
 use crate::step_io::StepIo;
 use crate::text_stream;
 use crate::tool::{
-    AnswerCheck, DEFAULT_TOOL_TIME_LIMIT, DynTool, Refusal, RemotePoll, StepStyle, TOOL_STOP_GRACE,
-    Tool, ToolCtx, ToolError, ToolOutput,
+    AnswerCheck, DEFAULT_TOOL_TIME_LIMIT, DynTool, HookDecision, HookedOutput, Refusal, RemotePoll,
+    StepStyle, TOOL_STOP_GRACE, Tool, ToolCtx, ToolError, ToolOutput,
 };
 use crate::toolset::ToolSet;
 
@@ -340,7 +341,7 @@ enum Finished {
     Said(String),
     /// The recorded outcome of the call's step.
     Ran {
-        outcome: Box<Result<ToolOutput, ToolError>>,
+        outcome: Box<Result<HookedOutput, ToolError>>,
         unjournaled: Arc<Mutex<SandboxUsage>>,
         live: Live,
     },
@@ -1229,6 +1230,7 @@ pub struct LlmAgentBuilder {
     fallback: Option<ModelBinding>,
     choices: Vec<ModelBinding>,
     admission: Option<DynAdmission>,
+    hooks: HookSet,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -1433,6 +1435,37 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// Install a compiled hook set around every tool call ([ADR 0050], slice H1): `before_tool` runs
+    /// inside the call's journaled step, after a source's `withhold` and before the tool, and
+    /// `after_tool` runs there once the tool answered.
+    ///
+    /// A hook may rewrite the arguments or the text the model reads, deny the call, ask a person
+    /// (until approval is built the call is not run, and its result says it awaits approval), or stop
+    /// the run: the call's result is the reason and the run fails `stopped by a plugin: <reason>`.
+    /// A hook that fails never lets a call through. The verdict is recorded in the step's record
+    /// ([`HookedOutput`](crate::HookedOutput)), so a replay that finds the step recorded asks no hook
+    /// again, and adding or removing a plugin never changes a step's name or seq.
+    ///
+    /// A `before_tool` rewrite that would change what the call touches (`Tool::access` of the new
+    /// arguments differs from the one the schedule used, ADR 0049) is refused and the call denied. A
+    /// call that takes no step (arguments that are not JSON, a tool nobody has) runs no hook: a
+    /// decision is recorded in the step it would have changed, and there is none.
+    ///
+    /// [ADR 0050]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
+    #[must_use]
+    pub fn hooks(mut self, hooks: HookSet) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    /// Append one plugin to the hook set ([`LlmAgentBuilder::hooks`]); the order plugins are added in
+    /// is the order their hooks run in.
+    #[must_use]
+    pub fn plugin(mut self, plugin: impl Plugin + 'static) -> Self {
+        self.hooks = std::mem::take(&mut self.hooks).with(Arc::new(plugin));
+        self
+    }
+
     /// The reasoning effort every model call of this agent asks for unless the run's context names
     /// one ([`REASONING_EFFORT_CONTEXT_KEY`], ADR 0063): what an agent folder, its `model_preset`
     /// or its model profile resolves to. `None` (the default) sends nothing, which is the model's
@@ -1613,6 +1646,7 @@ impl LlmAgentBuilder {
             images_cache: Arc::new(Mutex::new(ImageCache::new())),
             run_chars: Arc::new(Mutex::new(RunChars::default())),
             admission: self.admission,
+            hooks: Arc::new(self.hooks),
         }
     }
 }
@@ -1841,6 +1875,9 @@ pub struct LlmAgent {
     /// The process's pools, when the deployment built some: every model call takes a seat of
     /// [`Pool::ModelCalls`] and every tool call one of [`Pool::ToolCalls`] (ADR 0065).
     admission: Option<DynAdmission>,
+    /// The compiled hooks around every tool call (ADR 0050, slice H1). Shared, because a run's calls
+    /// of one segment read the same set from several futures, and a hook's plugin is written once.
+    hooks: Arc<HookSet>,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -1950,6 +1987,7 @@ impl LlmAgent {
             fallback: None,
             choices: Vec::new(),
             admission: None,
+            hooks: HookSet::new(),
         }
     }
 
@@ -4172,25 +4210,7 @@ impl LlmAgent {
     /// tool that does not declare. A call that takes no step (bad arguments, a tool nobody has) shares
     /// nothing.
     fn access_of(&self, call: &ToolCall) -> ToolAccess {
-        if call.invalid_arguments.is_some() {
-            return ToolAccess::Independent;
-        }
-        match self.tool(&call.name) {
-            Some(tool) => {
-                if tool.asks_user() || is_session_tool(&call.name) {
-                    ToolAccess::Alone
-                } else {
-                    tool.access(&call.arguments)
-                }
-            }
-            None if self.sources.is_empty() => ToolAccess::Independent,
-            None => self
-                .sources
-                .iter()
-                .map(|source| source.access(&call.name, &call.arguments))
-                .find(|access| !access.is_alone())
-                .unwrap_or(ToolAccess::Alone),
-        }
+        access_of(self.tool(&call.name), &self.sources, call)
     }
 
     /// How many of the owed calls, from the first, run together as one segment: `1` when the first
@@ -4561,7 +4581,7 @@ impl LlmAgent {
                     )),
                 );
             };
-            let journaled: Result<ToolOutput, ToolError> =
+            let journaled: Result<HookedOutput, ToolError> =
                 match step.run(move || async move { *outcome }).await {
                     Ok(outcome) => outcome,
                     Err(error) => return (i, Err(error)),
@@ -4623,7 +4643,7 @@ impl LlmAgent {
         let _seat = self.seat_tool(conversation).await;
         let unjournaled = prepared.unjournaled.clone();
         let work = self.step_work(call, self.source_note(notes, &call.name), prepared);
-        let outcome: Result<ToolOutput, ToolError> = step.run(move || work).await?;
+        let outcome: Result<HookedOutput, ToolError> = step.run(move || work).await?;
         // How it ended, said now; `conclude` says it again only if applying the result changes it.
         let live = self.say_outcome(call, notes, emitter, &outcome).await;
         if let Some(error) = transient_failure(call, &outcome, self.tool_retry_policy(&call.name)) {
@@ -4644,7 +4664,7 @@ impl LlmAgent {
         call: &ToolCall,
         notes: &[ToolNote],
         emitter: &Emitter,
-        outcome: &Result<ToolOutput, ToolError>,
+        outcome: &Result<HookedOutput, ToolError>,
     ) -> Live {
         let silent = self
             .source_note(notes, &call.name)
@@ -4652,7 +4672,7 @@ impl LlmAgent {
         match outcome {
             // Rounds are reported only by a call that runs alone (the loop reads them in a step of
             // its own, which a segment cannot place between the calls).
-            Ok(output) if reports_rounds(output) => {
+            Ok(hooked) if reports_rounds(&hooked.output) => {
                 say_with(
                     emitter,
                     silent,
@@ -4667,7 +4687,8 @@ impl LlmAgent {
                 .await;
                 Live { said: None }
             }
-            Ok(output) => {
+            Ok(hooked) => {
+                let output = &hooked.output;
                 let state = if output.is_error {
                     StepState::Failed
                 } else {
@@ -4869,20 +4890,26 @@ impl LlmAgent {
 
     /// The work of the journaled step `tool:<call id>`, which runs only if nothing is recorded: the
     /// call to the agent's own tool or to a source's, within its time limit, after the check of what a
-    /// source holds back.
+    /// source holds back and around the hooks (ADR 0050, slice H1).
+    ///
+    /// The hooks run **here**, inside the step: a `before_tool` rewrite changes the arguments the tool
+    /// runs with, a `tool.after` rewrite changes the text the model reads, and the decisions are
+    /// returned beside the output ([`HookedOutput`]) so the one journal write records both. A replay
+    /// that finds the step recorded runs none of this, so no hook is asked twice.
     fn step_work(
         &self,
         call: &ToolCall,
         note: Option<&ToolNote>,
         prepared: Prepared,
-    ) -> BoxFuture<'static, Result<ToolOutput, ToolError>> {
+    ) -> BoxFuture<'static, Result<HookedOutput, ToolError>> {
         let Prepared {
             tool_ctx,
             holding,
             unjournaled,
         } = prepared;
-        let args = call.arguments.clone();
+        let call = call.clone();
         let name = call.name.clone();
+        let hooks = Arc::clone(&self.hooks);
         let own = self.tool(&call.name).cloned();
         let sources = self.sources.clone();
         let unknown = self.unknown_tool(&call.name);
@@ -4898,13 +4925,33 @@ impl LlmAgent {
                     .into_iter()
                     .next()
             {
-                return Ok(ToolOutput::error(held.reason).sanitized());
+                return Ok(HookedOutput::plain(
+                    ToolOutput::error(held.reason).sanitized(),
+                ));
             }
+            let mut args = call.arguments.clone();
+            let mut hooks_run: Vec<HookDecision> = Vec::new();
+            // `tool.before`: the arguments a rewrite made, or a verdict that ends the call here.
+            let refusal = decide_before(
+                &hooks,
+                &call,
+                &mut args,
+                own.as_ref(),
+                &sources,
+                &mut hooks_run,
+            )?;
+            if let Some(refusal) = refusal {
+                return Ok(refusal);
+            }
+            let rewritten = args != call.arguments;
+            // The arguments the tool ran with, for the two `within` closures: each would otherwise
+            // take `args` from this scope, and the after hook reads them again below.
+            let ran = args.clone();
             let called = match own {
                 Some(tool) => {
                     let limit = tool.time_limit().unwrap_or(DEFAULT_TOOL_TIME_LIMIT);
                     within(&tool_ctx, &name, limit, |ctx| async move {
-                        tool.call(&ctx, args).await
+                        tool.call(&ctx, ran).await
                     })
                     .await
                 }
@@ -4912,8 +4959,7 @@ impl LlmAgent {
                     let tool_name = name.clone();
                     within(&tool_ctx, &name, source_limit, |ctx| async move {
                         for source in &sources {
-                            if let Some(answer) = source.call(&ctx, &tool_name, args.clone()).await
-                            {
+                            if let Some(answer) = source.call(&ctx, &tool_name, ran.clone()).await {
                                 return answer;
                             }
                         }
@@ -4924,7 +4970,14 @@ impl LlmAgent {
             };
             // The one place a call's output becomes its journaled step and its model message: a NUL
             // a tool printed is stored and shown as U+FFFD, before either (ADR 0051).
-            with_reported_sandbox(&tool_ctx, &unjournaled, called).map(ToolOutput::sanitized)
+            let answered =
+                with_reported_sandbox(&tool_ctx, &unjournaled, called).map(ToolOutput::sanitized);
+            let output = decide_after(&hooks, &name, &args, answered, &mut hooks_run);
+            output.map(|output| HookedOutput {
+                output,
+                hooks: hooks_run,
+                args: rewritten.then_some(args),
+            })
         }
         .boxed()
     }
@@ -4956,7 +5009,7 @@ impl LlmAgent {
                     "a call that started early has no outcome".to_owned(),
                 ));
             };
-            let outcome: Result<ToolOutput, ToolError> = ctx
+            let outcome: Result<HookedOutput, ToolError> = ctx
                 .step(
                     &format!("tool:{}", call.id),
                     move || async move { *outcome },
@@ -5002,7 +5055,7 @@ impl LlmAgent {
         let prepared = self.prepare(&CtxFacts::of(ctx), context, root, notes, call, facts);
         let unjournaled = prepared.unjournaled.clone();
         let work = self.step_work(call, self.source_note(notes, &call.name), prepared);
-        let outcome: Result<ToolOutput, ToolError> =
+        let outcome: Result<HookedOutput, ToolError> =
             ctx.step(&format!("tool:{}", call.id), move || work).await?;
         let unattended = is_unattended(ctx.conversation_id(), context.map(|c| c.as_ref()));
         self.conclude(
@@ -5029,7 +5082,7 @@ impl LlmAgent {
         ctx: &Ctx,
         notes: &[ToolNote],
         call: &ToolCall,
-        outcome: Result<ToolOutput, ToolError>,
+        outcome: Result<HookedOutput, ToolError>,
         unjournaled: &Mutex<SandboxUsage>,
         files_used: u64,
         live: Option<Live>,
@@ -5047,8 +5100,32 @@ impl LlmAgent {
             None => false,
         };
         let end = |state: StepState| self.step_event(&call.name, &call.id, state, notes);
+        // A hook that stopped the run (ADR 0050, decision 8): the call's result is its reason, and the
+        // run fails after the step that recorded it.
+        if let Ok(hooked) = &outcome
+            && let Some(reason) = hooked.stopped()
+        {
+            let reason = reason.to_owned();
+            if !said_live(StepState::Failed, Some(&reason)) {
+                say(
+                    ctx,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        StepState::Failed,
+                        Some((&reason, true)),
+                        notes,
+                    ),
+                )
+                .await;
+            }
+            return Err(AgentError::permanent(format!(
+                "stopped by a plugin: {reason}"
+            )));
+        }
         let reported = match &outcome {
-            Ok(output) => output.sandbox.clone(),
+            Ok(hooked) => hooked.output.sandbox.clone(),
             // Tried again: only the try that is kept counts.
             Err(ToolError::Transient(_) | ToolError::Retryable { .. }) => SandboxUsage::new(),
             Err(_) => unjournaled
@@ -5057,10 +5134,11 @@ impl LlmAgent {
                 .clone(),
         };
         let answered = match outcome {
-            Ok(output) if live.is_some() && reports_rounds(&output) => {
+            Ok(hooked) if live.is_some() && reports_rounds(&hooked.output) => {
                 ToolResult::error(&call.id, NOT_ALONGSIDE.to_owned())
             }
-            Ok(mut output) => {
+            Ok(hooked) => {
+                let mut output = hooked.output;
                 let repeat_key = output.repeat_key.as_deref().cloned();
                 let reported = if output.is_error {
                     Vec::new()
@@ -5788,6 +5866,178 @@ impl Conversation {
     }
 }
 
+/// What a call with the arguments in `call` shares with the other calls of its turn, from the agent's
+/// own tool and its sources: [`LlmAgent::access_of`] is this, for a call the loop is scheduling.
+///
+/// The loop asks it twice for a call a hook rewrote — the schedule was made from the model's
+/// arguments, and the rewrite runs only if it changes nothing (ADR 0049, ADR 0050 decision 7).
+fn access_of(own: Option<&DynTool>, sources: &[DynToolSource], call: &ToolCall) -> ToolAccess {
+    if call.invalid_arguments.is_some() {
+        return ToolAccess::Independent;
+    }
+    match own {
+        Some(tool) => {
+            if tool.asks_user() || is_session_tool(&call.name) {
+                ToolAccess::Alone
+            } else {
+                tool.access(&call.arguments)
+            }
+        }
+        None if sources.is_empty() => ToolAccess::Independent,
+        None => sources
+            .iter()
+            .map(|source| source.access(&call.name, &call.arguments))
+            .find(|access| !access.is_alone())
+            .unwrap_or(ToolAccess::Alone),
+    }
+}
+
+/// The hooks' `before_tool` for one call (ADR 0050, slice H1): they may rewrite the arguments in
+/// `args`, and the first verdict other than `Continue` decides. `Some(output)` is the refusal the
+/// call ends with — its result, and what the step records; `None` means the call runs.
+///
+/// A hook that fails never lets the call through: a retryable failure is the step's own
+/// ([`ToolError::Transient`], so the transition is tried again and the call runs afresh), and any
+/// other failure denies the call. A rewrite that would change what the call touches
+/// ([`ToolAccess`]) is refused the same way, because the schedule of the turn was made from the
+/// model's arguments (ADR 0049).
+fn decide_before(
+    hooks: &HookSet,
+    call: &ToolCall,
+    args: &mut Value,
+    own: Option<&DynTool>,
+    sources: &[DynToolSource],
+    recorded: &mut Vec<HookDecision>,
+) -> Result<Option<HookedOutput>, ToolError> {
+    if hooks.is_empty() {
+        return Ok(None);
+    }
+    let tool = call.name.as_str();
+    let verdict = hooks.before_tool(&mut HookedCall {
+        tool,
+        arguments: &mut *args,
+    });
+    let mut refuse = |verdict: &str, reason: String, plugin: Option<&str>| {
+        let decision = match plugin {
+            Some(plugin) => {
+                HookDecision::new(HookDecision::TOOL_BEFORE, verdict, Some(&reason)).by(plugin)
+            }
+            None => HookDecision::new(HookDecision::TOOL_BEFORE, verdict, Some(&reason)),
+        };
+        recorded.push(decision);
+        HookedOutput {
+            output: ToolOutput::error(reason).sanitized(),
+            hooks: recorded.clone(),
+            args: None,
+        }
+    };
+    match verdict {
+        Ok(Verdict::Continue) => {
+            if *args == call.arguments {
+                return Ok(None);
+            }
+            let mut rewritten = call.clone();
+            rewritten.arguments = args.clone();
+            // The schedule of the turn was made from the model's arguments (ADR 0049): a rewrite that
+            // would change what the call touches is refused, because two calls the loop started
+            // together were ordered from the arguments it has.
+            if access_of(own, sources, &rewritten) == access_of(own, sources, call) {
+                return Ok(None);
+            }
+            Ok(Some(refuse(
+                HookDecision::FAILED,
+                format!(
+                    "a hook rewrote the arguments of `{tool}` so that the call would touch what the \
+                     schedule of the turn was not made from: the call is not run"
+                ),
+                None,
+            )))
+        }
+        Ok(Verdict::Deny(reason)) => Ok(Some(refuse(HookDecision::DENY, reason, None))),
+        // Approval (ADR 0050, slice H8) is not built yet: an ask parks nothing, and the call is not
+        // run, exactly as a denial.
+        Ok(Verdict::Ask(question)) => Ok(Some(refuse(
+            HookDecision::ASK,
+            format!("awaiting approval: {question}"),
+            None,
+        ))),
+        Ok(Verdict::Stop(reason)) => Ok(Some(refuse(HookDecision::STOP, reason, None))),
+        Err(error) if error.is_retryable() => Err(ToolError::Transient(error.to_string())),
+        Err(error) => Ok(Some(refuse(
+            HookDecision::FAILED,
+            format!("the hook `{}` failed: {}", error.plugin, error.reason),
+            Some(&error.plugin),
+        ))),
+    }
+}
+
+/// The hooks' `after_tool` for one call (ADR 0050, slice H1): they may rewrite the text the model
+/// will read, and the first verdict other than `Continue` decides. The result is the output the step
+/// records.
+///
+/// At this point ask and refuse are not verdicts the point allows (the call already ran): both are
+/// recorded as a failure and the result becomes an error, so nothing a hook was meant to hold back
+/// reaches the model. A hook that fails does the same, except that a retryable failure is the step's
+/// own, and the call runs again (at-least-once, as for any step that is not yet recorded).
+fn decide_after(
+    hooks: &HookSet,
+    tool: &str,
+    args: &Value,
+    answered: Result<ToolOutput, ToolError>,
+    recorded: &mut Vec<HookDecision>,
+) -> Result<ToolOutput, ToolError> {
+    let mut output = answered?;
+    if hooks.is_empty() {
+        return Ok(output);
+    }
+    let mut text = std::mem::take(&mut output.content);
+    // The arguments the call ran with, as a hook reads them. A rewrite here changes nothing: the call
+    // already ran, and only the text it answered is still open to a plugin.
+    let mut ran = args.clone();
+    let verdict = hooks.after_tool(
+        &HookedCall {
+            tool,
+            arguments: &mut ran,
+        },
+        &mut HookedText { text: &mut text },
+    );
+    // What a refusal leaves: the reason as an error result, and the time the call already ran still
+    // counted, nothing else kept.
+    let mut refuse = |output: ToolOutput, verdict: &str, reason: String, plugin: Option<&str>| {
+        let decision = match plugin {
+            Some(plugin) => {
+                HookDecision::new(HookDecision::TOOL_AFTER, verdict, Some(&reason)).by(plugin)
+            }
+            None => HookDecision::new(HookDecision::TOOL_AFTER, verdict, Some(&reason)),
+        };
+        recorded.push(decision);
+        let mut refused = ToolOutput::error(reason);
+        refused.sandbox = output.sandbox;
+        refused.sanitized()
+    };
+    match verdict {
+        Ok(Verdict::Continue) => {
+            output.content = text;
+            Ok(output.sanitized())
+        }
+        Ok(Verdict::Deny(reason)) => Ok(refuse(output, HookDecision::DENY, reason, None)),
+        Ok(Verdict::Ask(question)) => Ok(refuse(
+            output,
+            HookDecision::FAILED,
+            format!("a hook may not ask after the call ran: {question}"),
+            None,
+        )),
+        Ok(Verdict::Stop(reason)) => Ok(refuse(output, HookDecision::STOP, reason, None)),
+        Err(error) if error.is_retryable() => Err(ToolError::Transient(error.to_string())),
+        Err(error) => Ok(refuse(
+            output,
+            HookDecision::FAILED,
+            format!("the hook `{}` failed: {}", error.plugin, error.reason),
+            Some(&error.plugin),
+        )),
+    }
+}
+
 /// The result of a call with what the call reported as sandbox usage: in the result of a call that
 /// returned one, which the step journals, and else in `unjournaled`.
 fn with_reported_sandbox(
@@ -6025,7 +6275,7 @@ pub(crate) fn call_key(call: &ToolCall) -> String {
 /// happened, by [`LlmAgent::say_outcome`].
 fn transient_failure(
     call: &ToolCall,
-    outcome: &Result<ToolOutput, ToolError>,
+    outcome: &Result<HookedOutput, ToolError>,
     policy: Option<RetryPolicy>,
 ) -> Option<AgentError> {
     let (reason, class) = outcome.as_ref().err()?.retry_parts()?;
