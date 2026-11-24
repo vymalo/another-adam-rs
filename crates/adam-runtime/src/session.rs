@@ -2125,14 +2125,15 @@ mod tests {
 
     #[test]
     fn admit_takes_a_lower_value_for_every_option_and_fills_nothing_in() {
-        let mut requested = SessionConfig::default();
-        requested.max_turns = Some(10);
-        requested.max_tool_calls = Some(20);
-        requested.max_output_tokens = Some(512);
-        requested.context_window = Some(40_000);
-        requested.max_parallel_tool_calls = Some(2);
-        requested.time_limit = Some(3);
-        requested.max_rounds = Some(4);
+        let requested = SessionConfig {
+            max_turns: Some(10),
+            max_tool_calls: Some(20),
+            max_output_tokens: Some(512),
+            context_window: Some(40_000),
+            max_parallel_tool_calls: Some(2),
+            time_limit: Some(3),
+            max_rounds: Some(4),
+        };
         let admitted = bounds().admit(requested.clone()).expect("all lowered");
         assert_eq!(
             admitted, requested,
@@ -2140,8 +2141,10 @@ mod tests {
         );
 
         // Nothing is filled in: an absent option stays absent and means the folder's.
-        let mut one = SessionConfig::default();
-        one.max_turns = Some(5);
+        let one = SessionConfig {
+            max_turns: Some(5),
+            ..SessionConfig::default()
+        };
         let admitted = bounds().admit(one.clone()).expect("one option");
         assert_eq!(admitted, one);
         assert_eq!(admitted.max_tool_calls, None, "the rest is the folder's");
@@ -2239,9 +2242,11 @@ mod tests {
             max_output_tokens: 200_000,
             ..bounds()
         };
-        let mut request = SessionConfig::default();
-        request.max_output_tokens = Some(100_000);
-        request.context_window = Some(floor);
+        let request = SessionConfig {
+            max_output_tokens: Some(100_000),
+            context_window: Some(floor),
+            ..SessionConfig::default()
+        };
         let why = wide
             .admit(request)
             .expect_err("the window is below the new floor");
