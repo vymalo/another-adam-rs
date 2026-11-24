@@ -19,6 +19,7 @@
 //! | `child-sessions/v1` | [`CHILD_SESSIONS_EXTENSION`] | the card lists the helpers a person may start a session with; a client that activates it sees the agent's sessions, follows their rounds as tasks, and starts, talks to and closes one |
 //! | `locale/v1` | [`LOCALE_EXTENSION`] | a message names the person's interface language (a BCP 47 tag) and the agent answers in it, unless the person writes in another; a hint for the agent's own words, never a translation layer (ADR 0069) |
 //! | `reasoning/v1` | [`REASONING_EXTENSION`] | the card lists the root model's reasoning levels and the resolved default, and an activated message names one (`effort`); a level the model does not take is refused (ADR 0063, decision 5) |
+//! | `uploads/v1` | [`UPLOADS_EXTENSION`] | the card lists the largest file the agent asks a presigned `PUT` for (`params.maxBytes`); a message that activates it carries the orchestrator's limits |
 //! | `model-pick/v1` | [`MODEL_PICK_EXTENSION`] | the card lists the model aliases the deployment offers, and an activated message names one (`model`) for its run; an alias outside the list is refused as `model_not_offered` (ADR 0064, amended 2026-11-23) |
 //!
 //! The contracts are the orchestration layer's (`docs/api/ui-catalog-v2.md`,
@@ -135,6 +136,20 @@ pub const REASONING_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/
 /// 2026-11-24 in the orchestration layer). The reading is [`crate::ModelChoices`] (ADR 0064,
 /// amended 2026-11-23).
 pub const MODEL_PICK_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/model-pick/v1";
+
+/// The URI of the `uploads/v1` extension: a message that activates it carries the orchestrator's
+/// limits (`{"maxBytes", "ttlSecs"}`) and the agent may ask the thread tools for a presigned `PUT`
+/// (`request_upload`) for a file too large for a message. The contract is the orchestration
+/// layer's (`docs/api/uploads-v1.md` of `vymalo/another-agentic-system`); it gives the card entry
+/// no `params`, and this repository adds one, `maxBytes`, the largest file the agent asks a slot
+/// for, which the orchestrator's own limit lowers further and which a reader may ignore.
+pub const UPLOADS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/uploads/v1";
+
+/// The most `maxBytes` of `uploads/v1` may be: the orchestrator's own ceiling, 4 GiB.
+pub const UPLOADS_MAX_BYTES_CEILING: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The largest upload the card says when no folder, variable or chart value names one: 1 GiB.
+pub const DEFAULT_UPLOADS_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// One helper of the card's `child-sessions/v1` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +444,18 @@ impl ExtensionConfig {
         let mut extension = Self::new(MENTIONS_EXTENSION);
         extension.description =
             Some("Reads the agents a person mentioned in a message, and asks them.".into());
+        extension
+    }
+
+    /// The `uploads/v1` extension: the agent can ask the thread tools for a presigned `PUT` for a
+    /// file larger than a message carries. `params.maxBytes` is the largest file it asks a slot for
+    /// (a setting of the agent, never above [`UPLOADS_MAX_BYTES_CEILING`]). Optional.
+    pub fn uploads(max_bytes: u64) -> Self {
+        let mut extension = Self::new(UPLOADS_EXTENSION);
+        extension.description = Some(
+            "Uploads large files to the bucket by a presigned URL the thread tools give.".into(),
+        );
+        extension.params.insert("maxBytes".into(), json!(max_bytes));
         extension
     }
 
@@ -828,6 +855,19 @@ mod tests {
             ),
             json!({"efforts": ["low", "max"]})
         );
+    }
+
+    #[test]
+    fn the_uploads_entry_lists_the_limit_and_nothing_else() {
+        let e = ExtensionConfig::uploads(5_000);
+        assert_eq!(e.uri, UPLOADS_EXTENSION);
+        assert_eq!(
+            UPLOADS_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/uploads/v1"
+        );
+        assert_eq!(e.params.len(), 1);
+        assert_eq!(e.params["maxBytes"], json!(5_000));
+        assert!(!e.required);
     }
 
     #[test]

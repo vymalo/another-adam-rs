@@ -515,6 +515,13 @@ which anyone may add): list the owners here. The coder asks the person before ev
 tier below), makes the repository private and empty unless asked otherwise, and refuses an owner that is not allowed. A GitHub
 App creates for organisations only; a token needs the `repo` scope.
 
+### Uploads
+
+`uploads.maxBytes` (env `UPLOADS_MAX_BYTES`, every role that serves A2A; empty renders nothing and the card says 1 GiB) is the largest
+file the agent asks the orchestrator for a presigned upload slot for: the card lists `uploads/v1` with it as `params.maxBytes`, from 1 byte to
+4 GiB, and the orchestrator's own limits lower it further. The agent folder's `limits.max_upload_bytes` wins over it. Do not also set
+`config.extraEnv.UPLOADS_MAX_BYTES`: the chart refuses the render.
+
 ### The access tiers
 
 The person picks an access tier for each message (`plan`, `edits`, `auto`, `bypass`; the default is `auto`;

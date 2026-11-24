@@ -68,6 +68,16 @@ means the coder's own default, auto, and nothing is rendered.
 {{- end -}}
 
 {{/*
+uploads.maxBytes (the largest file the agent asks the orchestrator for an upload slot for), as the digits
+of a whole number. A YAML number is read as a float by Helm, so it is formatted, not printed. Empty
+means the binary's own default (1 GiB) and nothing is rendered.
+*/}}
+{{- define "coder.uploadsMaxBytes" -}}
+{{- $v := .Values.uploads.maxBytes -}}
+{{- if kindIs "float64" $v -}}{{- printf "%d" (int64 $v) -}}{{- else -}}{{- default "" $v | toString | trim -}}{{- end -}}
+{{- end -}}
+
+{{/*
 Whether this pod runs workers: every role but `control-plane` (an empty role is
 `all`). The role is trimmed and lower-cased first, as the binary parses it, so
 " Control-Plane " is a control plane here too. Renders "true" or nothing, so
