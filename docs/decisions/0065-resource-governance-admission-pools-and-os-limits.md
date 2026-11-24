@@ -233,7 +233,11 @@ Each is one pull request, in order.
    workspace with unpushed work is never removed. **Partly built:** `adam-workspace` measures its root, checks the
    budget and the reserve before a mirror or worktree (`WorkspaceError::DiskFull`, class `Rejected`) and sweeps finished
    runs without touching unpushed work (`a_clone_past_the_disk_budget_asks_the_person`, `the_reserve_is_kept_free`,
-   `unpushed_work_is_never_removed`). Not built yet: `WORKSPACE_DISK_MAX` and `WORKSPACE_DISK_RESERVE`, the
+   `unpushed_work_is_never_removed`), and **the coder's janitor uses the same decision** (`RunWorkspace::remove_if_pushed`):
+   a finished run's workspace is kept, and logged as kept, when it holds uncommitted changes, commits no `origin` ref has,
+   or any scratch project (`a_scratch_project_with_unpushed_work_is_kept_with_its_run`,
+   `an_uncommitted_change_keeps_the_workspace_of_its_run`). A scratch project has no remote, so it is never swept; ADR 0034
+   is amended for that. Not built yet: `WORKSPACE_DISK_MAX` and `WORKSPACE_DISK_RESERVE`, the
    `tool.before` question to the person, `TooLarge`, cache writes, and `adam_disk_bytes{kind}`.
 5. **The device-state port.** Accepted when a fake device on battery runs one run at a time and a hot device holds new
    steps.

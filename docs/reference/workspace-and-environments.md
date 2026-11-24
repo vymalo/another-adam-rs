@@ -69,11 +69,14 @@ repository to read beside the one the run works on, checked out detached with no
 written. A run has at most one slot per repository it works on (and may also hold a reference of it: the address
 reaches the working copy, the reference's own name reaches the reference); slots keep the order they joined.
 
-* The workspace lives as long as the run and is deleted when it ends (the janitor), **except its scratch projects**:
-  a scratch project lives for the conversation. The next task of the same A2A context takes it over (its first step
-  moves the project into its own workspace), and the janitor keeps a finished run's projects until the conversation has
-  had no task for `SCRATCH_IDLE_DAYS` (7 by default, `0` for the old rule). The run's notes and the
-  `agent/*` branches in the mirrors stay: they are the only copy of an unpushed commit.
+* The workspace lives as long as the run and is deleted when it ends (the janitor), **except when it holds unpushed
+  work**: a worktree with uncommitted changes or commits no `origin` ref has, and every scratch project (a project has
+  no remote, so all of its work is unpushed), keeps the workspace whole ([ADR 0065](../decisions/0065-resource-governance-admission-pools-and-os-limits.md)
+  decision 7). A scratch project lives for the conversation: the next task of the same A2A context takes it over (its
+  first step moves the project into its own workspace), after which the finished run's workspace holds nothing unpushed
+  and goes. `SCRATCH_IDLE_DAYS` is the idle time of a conversation, and it decides when the conversation's **images**
+  go; it never removes a project. The run's notes and the `agent/*` branches in the mirrors stay: they are the only copy
+  of an unpushed commit.
 * `copy_into` is the only way a scratch project's files reach a repository, all or nothing.
   `initialize_empty` gives an empty repository its first commit, the only push outside `agent/*`.
 * A workspace made before slots existed (`<root>/worktrees/<run>`) is read as a slot and removed with the rest.
@@ -88,7 +91,7 @@ stateDiagram-v2
     Scratch --> RepoBacked: add_repository, copy_into
     RepoBacked --> RepoBacked: add_repository (another repository, a new slot)
     Scratch --> Scratch: the run ends, the conversation is alive, the next task takes it over
-    Scratch --> Removed: remove, nothing was published, or the conversation was idle for SCRATCH_IDLE_DAYS
+    Scratch --> Removed: remove, nothing unpushed is left: published, or taken over by the next task
     RepoBacked --> Removed: remove, pushed branches remain
     Empty --> Reading: add_reference (first read of a reference)
     Scratch --> Scratch: add_reference (a read-only slot beside it)
@@ -197,8 +200,9 @@ The janitor (`bin/adam-coder/src/janitor.rs`, a worker component) sweeps at star
 `WORKSPACE_SWEEP_SECS` (default 300; `0` is off): it removes the workspace of a run that is `done`,
 `failed` (a cancel included) or unknown to the store, after releasing what the run's environment holds. A
 run that is `runnable` or `parked` keeps its workspace however long the person takes to answer. A store
-that does not answer leaves it alone. For a finished run whose conversation is alive (a task open, or the newest one
-within `SCRATCH_IDLE_DAYS`) it removes everything but the scratch projects.
+that does not answer leaves it alone. A finished run's workspace is removed only when it holds no unpushed work
+(`RunWorkspace::remove_if_pushed`, ADR 0065 decision 7): a worktree with an uncommitted change or a commit no `origin`
+ref has, and every scratch project, keep it whole, which the sweep logs and reports in `Sweep::kept_unpushed`.
 
 The janitor also stops the commands that keep running of a run that is over, **before** it releases the environment
 ([Commands that keep running](coder-agent.md#commands-that-keep-running)).
