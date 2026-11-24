@@ -871,9 +871,8 @@ impl RunWorkspace {
 
     /// [`add_scratch`](Self::add_scratch) for a run of `conversation`: the project remembers it, so
     /// that a later run of the same conversation takes the project over
-    /// ([`adopt_scratch`](Self::adopt_scratch)) instead of finding nothing, and the janitor of the
-    /// coder keeps it while the conversation has tasks. A project that is already there without a
-    /// conversation is given this one.
+    /// ([`adopt_scratch`](Self::adopt_scratch)) instead of finding nothing. A project that is
+    /// already there without a conversation is given this one.
     ///
     /// # Errors
     ///
@@ -1069,8 +1068,10 @@ impl RunWorkspace {
     /// `remove`. Metadata that cannot be read is no reason to keep anything: the workspace is
     /// removed whole, as `remove` does. **Idempotent.**
     ///
-    /// What the coder's janitor calls for a finished run whose conversation may go on
-    /// ([`adopt_scratch`](Self::adopt_scratch)).
+    /// What a caller uses for a finished run whose scratch projects a later run of the same
+    /// conversation should take over ([`adopt_scratch`](Self::adopt_scratch)). The coder's janitor
+    /// does not: it keeps a workspace that holds unpushed work whole
+    /// ([`remove_if_pushed`](Self::remove_if_pushed), ADR 0065 decision 7).
     ///
     /// # Errors
     ///
