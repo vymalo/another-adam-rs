@@ -130,6 +130,23 @@ wiring into `adam-assembly`, `adam-service` and `adam-coder` (part c).
 * Mixed versions: roll the workers before the control plane (a round for a helper an older worker does not know stays `working`).
 * adam stays as built where the contract differs (`UnsupportedOperation` past `max_working` and `max_rounds`, a required `start.description`); the system's contract is to be amended. Not built here: the system's own run against a real `adam-agent`.
 
+*Amended 2026-11-24* (slice 7, part 1: the workspace a round reads). The bullet above ("a person's round has no workspace") is
+superseded: `SessionHeader` gains a **`workspace: Option<RunId>`**, the run whose workspace the session's rounds read, distinct from
+`root` (the run a round's model calls name, which for a person's round is its own task, ADR 0067). Consequences:
+* The front fills it when a person starts a session: the **latest task of the context it was opened in**, which is the repository the
+  person is looking at, read with one listing of the front's agent's runs in that conversation (`context_workspace` in
+  `crates/adam-a2a-runtime/src/child_sessions.rs`). No port was widened: a task is a run of the root agent in that conversation, and a
+  round, a subagent's child run and another agent's run are registered under other agent names or in other conversations.
+* Every later round keeps it (the header is carried, as it was), so round 2 of a session reads the repository round 1 read.
+* A session a **task** opens names `Some(ctx.workspace_run_id())`, which for a task is its root run: a helper a model starts keeps
+  working in the worktree of the task that started it, as before.
+* The coder reads it through one accessor, `ToolCtx::workspace_run_id()` (`SourceCtx::workspace_run_id()` for a source), which falls
+  back to `root_run_id()`: the workspace, the environment session, `prepare_workspace`, `start_scratch`, `use_repository_environment`
+  and the language servers key by it. The **notes** (checks, budgets, gates, agreed repositories) stay on `root_run_id()`, so a helper
+  writes none of the task's.
+* `None` — a parent context with no task yet — is not an error: the rounds answer in words, as they did before this slice.
+* Not built here: part 2 of the slice (whatever binds a round to a parent task beyond its workspace).
+
 *Amended 2026-11-19* (slice 6 part b, the listing cadence): the tracker is evaluated only when the
 subscription polls — its fallback (`RuntimeTaskBackend::with_poll_interval`, 2 s by default) or a
 `Status` event of the task it streams — so the bound on a session change is

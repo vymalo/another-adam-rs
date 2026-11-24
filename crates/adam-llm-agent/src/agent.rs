@@ -388,13 +388,35 @@ struct CallFacts {
     removed_tools: Arc<[String]>,
 }
 
+/// The runs a call reads, owned: the root run, the step of it a child works under, the plan, the run
+/// the call's model names ([`model_run_of`]) and the run whose workspace it reads
+/// ([`workspace_run_of`]). What [`EarlyFacts`] takes while the model is still writing.
+type OwnedRootFacts = (
+    Option<RunId>,
+    Option<String>,
+    Option<Plan>,
+    Option<RunId>,
+    Option<RunId>,
+);
+
+/// [`OwnedRootFacts`], borrowed from it for one call.
+type RootFacts<'a> = (
+    Option<RunId>,
+    Option<&'a str>,
+    Option<&'a Plan>,
+    Option<RunId>,
+    Option<RunId>,
+);
+
 /// What the calls of a turn that starts while the model writes need from the run, owned: taken
 /// from the state and the `Ctx` before [`Ctx::step`], which is where they start.
 struct EarlyFacts {
     ctx: CtxFacts,
     /// The step's one shared copy of the run's context: every call of the turn reads the same map.
     context: Option<Arc<Map<String, Value>>>,
-    root: (Option<RunId>, Option<String>, Option<Plan>, Option<RunId>),
+    /// The runs the calls read: the root, the step under it, the plan, the run the model calls
+    /// name, and the run whose workspace they read ([`workspace_run_of`]).
+    root: OwnedRootFacts,
     kept: Arc<BTreeMap<String, String>>,
     kept_left: usize,
     files_used: u64,
@@ -475,12 +497,13 @@ impl<'a> Early<'a> {
     }
 
     /// The root, root step and plan of the run, as [`prepare`](LlmAgent::prepare) takes them.
-    fn root(&self) -> (Option<RunId>, Option<&str>, Option<&Plan>, Option<RunId>) {
+    fn root(&self) -> RootFacts<'_> {
         (
             self.facts.root.0,
             self.facts.root.1.as_deref(),
             self.facts.root.2.as_ref(),
             self.facts.root.3,
+            self.facts.root.4,
         )
     }
 
@@ -2680,6 +2703,10 @@ impl LlmAgent {
                 context.cloned().unwrap_or_default(),
             )
             .with_task(state.task())
+            .with_workspace_run(
+                workspace_run_of(state)
+                    .unwrap_or_else(|| state.root_run.unwrap_or_else(|| ctx.run_id())),
+            )
             .with_loaded(Arc::from(state.loaded.clone()))
             .with_removed_tools(Arc::from(state.removed_tools.clone()))
         });
@@ -2733,6 +2760,7 @@ impl LlmAgent {
                 state.root_step.clone(),
                 state.plan.clone(),
                 model_run_of(state),
+                workspace_run_of(state),
             ),
             kept: Arc::clone(&state.kept_outputs),
             kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
@@ -3402,6 +3430,10 @@ impl LlmAgent {
                 Arc::new(state.context.clone()),
             )
             .with_task(state.task())
+            .with_workspace_run(
+                workspace_run_of(state)
+                    .unwrap_or_else(|| state.root_run.unwrap_or_else(|| ctx.run_id())),
+            )
             .with_loaded(Arc::from(state.loaded.clone()))
             .with_removed_tools(Arc::from(state.removed_tools.clone()))
         });
@@ -3644,6 +3676,7 @@ impl LlmAgent {
                     state.root_step.as_deref(),
                     state.plan.as_ref(),
                     model_run_of(state),
+                    workspace_run_of(state),
                 ),
                 &state.source_notes,
                 "report",
@@ -4027,6 +4060,7 @@ impl LlmAgent {
                         state.root_step.as_deref(),
                         state.plan.as_ref(),
                         model_run_of(state),
+                        workspace_run_of(state),
                     ),
                     &state.source_notes,
                     &call,
@@ -4292,6 +4326,7 @@ impl LlmAgent {
             state.root_step.as_deref(),
             state.plan.as_ref(),
             model_run_of(state),
+            workspace_run_of(state),
         );
         let facts_of_ctx = CtxFacts::of(ctx);
         let mut slots: Vec<Option<Slot>> = Vec::with_capacity(n);
@@ -4838,7 +4873,7 @@ impl LlmAgent {
         &self,
         ctx: &CtxFacts,
         context: Option<&Arc<Map<String, Value>>>,
-        root: (Option<RunId>, Option<&str>, Option<&Plan>, Option<RunId>),
+        root: RootFacts<'_>,
         notes: &[ToolNote],
         call: &ToolCall,
         facts: CallFacts,
@@ -4880,6 +4915,7 @@ impl LlmAgent {
                     context.cloned().unwrap_or_default(),
                 )
                 .with_task(task.as_deref())
+                .with_workspace_run(root.4.unwrap_or_else(|| root.0.unwrap_or(ctx.run)))
                 .with_loaded(loaded)
                 .with_removed_tools(removed_tools),
             )
@@ -4993,7 +5029,7 @@ impl LlmAgent {
         &self,
         ctx: &mut Ctx,
         context: Option<&Arc<Map<String, Value>>>,
-        root: (Option<RunId>, Option<&str>, Option<&Plan>, Option<RunId>),
+        root: RootFacts<'_>,
         notes: &[ToolNote],
         call: &ToolCall,
         facts: CallFacts,
@@ -5411,12 +5447,7 @@ impl LlmAgent {
         &self,
         ctx: &CtxFacts,
         context: Option<&Arc<Map<String, Value>>>,
-        (root_run, root_step, plan, model_run): (
-            Option<RunId>,
-            Option<&str>,
-            Option<&Plan>,
-            Option<RunId>,
-        ),
+        (root_run, root_step, plan, model_run, workspace_run): RootFacts<'_>,
         notes: &[ToolNote],
         call_id: &str,
         tool: &str,
@@ -5437,6 +5468,7 @@ impl LlmAgent {
                 .event(tool, call_id, StepState::Running),
         )
         .with_model_run(model_run.or(root_run).unwrap_or(ctx.run))
+        .with_workspace_run(workspace_run.or(root_run).unwrap_or(ctx.run))
         .with_plan(plan.cloned())
     }
 
@@ -5596,6 +5628,7 @@ impl LlmAgent {
                     state.root_step.as_deref(),
                     state.plan.as_ref(),
                     model_run_of(state),
+                    workspace_run_of(state),
                 ),
                 &state.source_notes,
                 &wait.call_id,
@@ -5841,6 +5874,14 @@ fn model_run_of(state: &Conversation) -> Option<RunId> {
         .model_run
         .or_else(|| state.session.as_ref().and_then(|header| header.root))
         .or(state.root_run)
+}
+
+/// The run whose workspace this run's calls read, when its session's header names one (ADR 0045
+/// slice 7): the task a person's session was opened in, so its rounds read that repository. `None`
+/// when the run is no round of a session, or its session names none; the calls then read the
+/// workspace of [`ToolCtx::root_run_id`](crate::ToolCtx::root_run_id), as they always did.
+fn workspace_run_of(state: &Conversation) -> Option<RunId> {
+    state.session.as_ref().and_then(|header| header.workspace)
 }
 
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
@@ -6977,7 +7018,11 @@ impl Agent for LlmAgent {
                 ctx.conversation_id().map(str::to_owned),
                 Arc::new(state.context.clone()),
             )
-            .with_task(state.task());
+            .with_task(state.task())
+            .with_workspace_run(
+                workspace_run_of(&state)
+                    .unwrap_or_else(|| state.root_run.unwrap_or_else(|| ctx.run_id())),
+            );
             let loaders = crate::source::loaders_offered(&self.sources, &source_ctx).await;
             let task_loaded = crate::source::loaded_by_task(&self.sources, &source_ctx).await;
             state.fill_seeded(&loaders, &task_loaded);

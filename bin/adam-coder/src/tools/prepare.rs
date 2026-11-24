@@ -59,7 +59,11 @@ pub async fn prepare_workspace(
     let Some(url) = non_empty(&repo_url) else {
         return Ok(ToolOutput::error("repo_url is required"));
     };
+    // The notes of the task (the repositories it may work on, the branch it continues) are the
+    // root's; the worktree is the one the run reads, which a round inherits from its session
+    // (ADR 0045 slice 7).
     let run = ctx.root_run_id().to_string();
+    let workspace_run = ctx.workspace_run_id().to_string();
     let continuing = branch.as_deref().and_then(non_empty);
     // An argument the workspace cannot read (not a URL or an absolute path) is its error to
     // report, below; every other one must be a repository of the person's. This comes **before**
@@ -121,7 +125,7 @@ pub async fn prepare_workspace(
         }
     }
     let repo = RepoRef::new(url, base);
-    let workspace = match env.workspaces.run(&run) {
+    let workspace = match env.workspaces.run(&workspace_run) {
         Ok(workspace) => workspace,
         Err(e) => return Err(workspace_error(&e)),
     };
@@ -230,7 +234,7 @@ pub async fn prepare_workspace(
 /// The branch to start from when the model gave none: the one this run's workspace already uses
 /// for `url` (a repeated call needs no network), else the remote's default branch.
 async fn default_base(env: &ToolEnv, ctx: &ToolCtx, url: &str) -> Result<String, Outcome> {
-    if let Ok(workspace) = env.workspaces.run(&ctx.root_run_id().to_string())
+    if let Ok(workspace) = env.workspaces.run(&ctx.workspace_run_id().to_string())
         && let Ok(Some(slot)) = workspace.slot_for(&RepoRef::new(url, "HEAD")).await
         && let Some(existing) = slot.worktree()
     {

@@ -1062,6 +1062,10 @@ pub struct ToolCtx {
     children: Option<ChildStarter>,
     context: Arc<Map<String, Value>>,
     root_run: RunId,
+    /// The run whose workspace this run's rounds read (ADR 0045 slice 7): what
+    /// [`workspace_run_id`](Self::workspace_run_id) answers. Its own root unless its session's
+    /// header names another.
+    workspace_run: RunId,
     /// The run this run's model calls name (ADR 0067), handed to its children and its sessions.
     model_run: RunId,
     /// The step of the root run this run works under, when it is a child (see
@@ -1143,6 +1147,7 @@ impl ToolCtx {
             children,
             context,
             root_run: root_run.unwrap_or(run_id),
+            workspace_run: root_run.unwrap_or(run_id),
             model_run: root_run.unwrap_or(run_id),
             root_step,
             step,
@@ -1512,11 +1517,24 @@ impl ToolCtx {
     }
 
     /// Make the context the one of a child run that works for `root`, as a run started with
-    /// [`start_child`](Self::start_child) is.
+    /// [`start_child`](Self::start_child) is. The workspace it reads is the root's too, unless
+    /// [`with_workspace_run`](Self::with_workspace_run) says otherwise (a session's header does).
     #[must_use]
     pub fn with_root_run(mut self, root: RunId) -> Self {
         self.root_run = root;
+        self.workspace_run = root;
         self.model_run = root;
+        self
+    }
+
+    /// Say which run's workspace this run reads, when it is not
+    /// [`root_run_id`](Self::root_run_id): the run a session's header names (ADR 0045 slice 7), so
+    /// that a round a person started works in the worktree of the task it was opened in. The agent
+    /// does it for the calls of a round whose header says one; a test may set it on a detached
+    /// context.
+    #[must_use]
+    pub fn with_workspace_run(mut self, run: RunId) -> Self {
+        self.workspace_run = run;
         self
     }
 
@@ -1576,6 +1594,18 @@ impl ToolCtx {
     /// restart and costs no store read.
     pub fn root_run_id(&self) -> RunId {
         self.root_run
+    }
+
+    /// The run whose workspace this run works in: what a tool that keeps a worktree, an environment
+    /// session or a scratch project keys by. It is [`root_run_id`](Self::root_run_id) unless the
+    /// run's session names another ([`SessionHeader::workspace`](adam_runtime::SessionHeader)),
+    /// which is how a round a person started reads the repository of the task it was opened in
+    /// (ADR 0045 slice 7).
+    ///
+    /// The **notes** of the task — the checks, the budgets, the gates, the repositories a person
+    /// agreed to — stay on [`root_run_id`](Self::root_run_id): a helper writes none of them.
+    pub fn workspace_run_id(&self) -> RunId {
+        self.workspace_run
     }
 
     /// The conversation the run belongs to, if any.

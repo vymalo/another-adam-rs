@@ -465,7 +465,10 @@ impl Call<'_> {
 
     async fn run(&self) -> Outcome {
         let env = self.env;
-        let run = self.ctx.root_run_id().to_string();
+        // The servers and what was probed of them belong to the workspace the run reads (ADR 0045
+        // slice 7); the tier is the one of the notes of the task, which stay on the root run.
+        let run = self.ctx.workspace_run_id().to_string();
+        let root_run = self.ctx.root_run_id().to_string();
         let slot_dir = self.slot.dir().to_owned();
         let spec = env.language_table.get(self.language);
         let root = project_root(self.slot.path(), self.rel, self.language);
@@ -481,7 +484,7 @@ impl Call<'_> {
         // runs no project code beyond what looking needs) and the slot is held to what it was. A
         // run that may write, in a slot it may write, gets the server `run_checks` there would run.
         let reference = !self.slot.writable();
-        let tier = self.tier(&run).await?;
+        let tier = self.tier(&root_run).await?;
         let mode = if reference || tier == AccessTier::Plan {
             Mode::Safe
         } else {
@@ -1216,7 +1219,7 @@ enum Place {
 
 impl Mapper {
     async fn new(env: &ToolEnv, ctx: &ToolCtx, current: &Slot) -> Self {
-        let slots = match env.workspaces.run(&ctx.root_run_id().to_string()) {
+        let slots = match env.workspaces.run(&ctx.workspace_run_id().to_string()) {
             Ok(workspace) => workspace.slots().await.unwrap_or_default(),
             Err(_) => Vec::new(),
         };

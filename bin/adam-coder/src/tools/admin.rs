@@ -124,7 +124,7 @@ async fn target(
     let host = &env.settings.default_repo_host;
     let mut address = None;
     if using == Use::Merge
-        && let Ok(workspace) = env.workspaces.run(&ctx.root_run_id().to_string())
+        && let Ok(workspace) = env.workspaces.run(&ctx.workspace_run_id().to_string())
         && let Ok(slots) = workspace.slots().await
         && let Ok(slot) = resolve_slot(slots, non_empty(repo), host)
         && let Some(wt) = slot.checkout()
@@ -147,7 +147,7 @@ async fn target(
     };
     // A reference is read and never changed: not merged into, renamed or deleted. A repository the
     // person named is theirs to change, whatever else reads it.
-    let slots = match env.workspaces.run(&ctx.root_run_id().to_string()) {
+    let slots = match env.workspaces.run(&ctx.workspace_run_id().to_string()) {
         Ok(workspace) => workspace.slots().await.unwrap_or_default(),
         Err(_) => Vec::new(),
     };

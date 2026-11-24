@@ -86,7 +86,9 @@ pub async fn use_repository_environment(
     if ctx.is_cancelled() {
         return Err(cancelled("the run's environment was not changed"));
     }
-    let run = ctx.root_run_id().to_string();
+    // The environment session and the image belong to the workspace the run reads (ADR 0045
+    // slice 7), which a helper inherits from the task it serves.
+    let run = ctx.workspace_run_id().to_string();
     if off {
         // The pod is made again on the deployment's image: what runs in it ends with it.
         let stale = super::background::stale_after(env.settings.background_sweep);
@@ -198,7 +200,7 @@ impl RepositoryEnvironmentSource {
 
     /// Whether a writable slot of the root run holds a devcontainer configuration.
     async fn has_configuration(&self, ctx: &SourceCtx) -> bool {
-        let run = ctx.root_run_id().to_string();
+        let run = ctx.workspace_run_id().to_string();
         let Ok(workspace) = self.env.workspaces.run(&run) else {
             return false;
         };

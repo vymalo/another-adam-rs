@@ -25,7 +25,7 @@ use adam_model::{
     DynModel, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse, ToolCall,
 };
 use adam_runtime::{
-    BroadcastSink, ManualClock, Runtime, SessionBounds, SessionLimits,
+    BroadcastSink, ManualClock, Runtime, SessionBounds, SessionHeader, SessionLimits,
     parse_session_conversation_id,
 };
 use async_trait::async_trait;
@@ -436,6 +436,100 @@ async fn a_person_starts_a_session_and_it_is_the_round_of_a_new_child_context() 
         let second = rig.submit(&alice(), again, None).await.unwrap();
         assert_eq!(first.id, second.id);
         rig.stop().await;
+    }
+}
+
+/// ADR 0045 slice 7: a session a person starts reads the workspace of the **latest task of the
+/// context it was opened in** — the repository the person is looking at — and every later round of
+/// it reads the same one, though the round itself has no task of its own. A context nobody has sent
+/// a task to has none: the session answers in words, and that is not an error.
+#[tokio::test]
+async fn a_persons_session_reads_the_workspace_of_the_latest_task_of_its_context() {
+    for store in stores().await {
+        let rig = Rig::new(&store);
+        rig.helper_mock
+            .push_text("lonely")
+            .push_text("one")
+            .push_text("two");
+
+        // A context nobody has sent a task to: no workspace, and the round still runs.
+        let lonely = rig.start(&alice(), Some("ctx-empty"), "look", true).await;
+        let (_, session) = parse_session_conversation_id(&lonely.context_id).unwrap();
+        assert_eq!(
+            rig.round_header(session).await.workspace,
+            None,
+            "no task in the context, so no workspace"
+        );
+        rig.until(&alice(), &lonely.id, TaskState::Completed).await;
+
+        // Two tasks in one context: the later one is the task the person is looking at.
+        rig.parent_mock.push_text("first").push_text("second");
+        let first = rig
+            .submit(&alice(), said("start", Some("ctx-ws")), None)
+            .await
+            .unwrap();
+        rig.until(&alice(), &first.id, TaskState::Completed).await;
+        let latest = rig
+            .submit(&alice(), said("again", Some("ctx-ws")), None)
+            .await
+            .unwrap();
+        assert_ne!(first.id, latest.id);
+
+        // A person starts a session there: its round names the latest task as its workspace.
+        let start = rig
+            .start(&alice(), Some("ctx-ws"), "where is it?", true)
+            .await;
+        let (_, session) = parse_session_conversation_id(&start.context_id).unwrap();
+        let header = rig.round_header(session).await;
+        assert_eq!(
+            header.workspace.map(|run| run.to_string()).as_deref(),
+            Some(latest.id.as_str()),
+            "the workspace of the latest task of the context"
+        );
+        assert_eq!(
+            header.root, None,
+            "a person's round names its own task, not the parent's"
+        );
+        rig.until(&alice(), &start.id, TaskState::Completed).await;
+
+        // Round 2 keeps it: the same repository, though the round is another run.
+        let mut more = said("and there?", Some(&start.context_id));
+        more.message_id = "m-second".into();
+        let round = rig.submit(&alice(), more, None).await.unwrap();
+        assert_ne!(round.id, start.id, "a new round");
+        let header = rig.round_header(session).await;
+        assert_eq!(
+            header.workspace.map(|run| run.to_string()).as_deref(),
+            Some(latest.id.as_str()),
+            "round 2 reads the workspace round 1 read"
+        );
+        assert_eq!(header.round, 2);
+        rig.stop().await;
+    }
+}
+
+/// The header the session `session` reads now, as the front does: from its latest round's state.
+impl Rig {
+    async fn round_header(&self, session: RunId) -> SessionHeader {
+        let rec = self
+            .store
+            .load_run(session)
+            .await
+            .expect("store")
+            .expect("the round");
+        let (parent, _) = parse_session_conversation_id(
+            rec.conversation_id
+                .as_deref()
+                .expect("a session conversation"),
+        )
+        .expect("a child context");
+        self.runtime
+            .session_view(&parent, session)
+            .await
+            .expect("session view")
+            .expect("the session exists")
+            .header
+            .expect("the round carries the session")
     }
 }
 
