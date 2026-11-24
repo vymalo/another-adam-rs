@@ -110,8 +110,8 @@ impl DiskBudget {
         })
         .await
         .map_err(|e| WorkspaceError::io("the disk count was interrupted", io::Error::other(e)))?;
-        let space = space
-            .map_err(|e| WorkspaceError::io("cannot read the free space of the disk", e))?;
+        let space =
+            space.map_err(|e| WorkspaceError::io("cannot read the free space of the disk", e))?;
         let reserve = self.reserve.of_disk(space.total);
         if used >= self.limit || space.free < reserve {
             return Err(WorkspaceError::DiskFull {

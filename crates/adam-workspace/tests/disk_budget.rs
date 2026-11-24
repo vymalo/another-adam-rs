@@ -90,9 +90,8 @@ async fn a_clone_past_the_disk_budget_asks_the_person() {
     std::fs::create_dir_all(&root).expect("root");
     std::fs::write(root.join("earlier-work.bin"), vec![1u8; 64 * 1024]).expect("filler");
 
-    let over = workspaces(dir.path()).with_disk_budget(
-        DiskBudget::new(1024, DiskReserve::NONE).with_free_space(plenty()),
-    );
+    let over = workspaces(dir.path())
+        .with_disk_budget(DiskBudget::new(1024, DiskReserve::NONE).with_free_space(plenty()));
     let err = over.prepare(&repo, "run-over").await.expect_err("refused");
 
     assert!(
@@ -107,9 +106,8 @@ async fn a_clone_past_the_disk_budget_asks_the_person() {
     );
 
     // The same request with room succeeds: the refusal was the budget, not the repository.
-    let roomy = workspaces(dir.path()).with_disk_budget(
-        DiskBudget::new(1 << 30, DiskReserve::NONE).with_free_space(plenty()),
-    );
+    let roomy = workspaces(dir.path())
+        .with_disk_budget(DiskBudget::new(1 << 30, DiskReserve::NONE).with_free_space(plenty()));
     roomy.prepare(&repo, "run-roomy").await.expect("room");
 }
 
@@ -120,7 +118,8 @@ async fn the_reserve_is_kept_free() {
     let root = dir.path().join("root");
     let ws = |disk: &Arc<FakeDisk>, reserve| {
         workspaces(dir.path()).with_disk_budget(
-            DiskBudget::new(1 << 30, reserve).with_free_space(Arc::clone(disk) as Arc<dyn FreeSpace>),
+            DiskBudget::new(1 << 30, reserve)
+                .with_free_space(Arc::clone(disk) as Arc<dyn FreeSpace>),
         )
     };
 
@@ -131,7 +130,14 @@ async fn the_reserve_is_kept_free() {
         .await
         .expect_err("under the reserve");
     assert!(
-        matches!(err, WorkspaceError::DiskFull { free: 4096, reserve: 8192, .. }),
+        matches!(
+            err,
+            WorkspaceError::DiskFull {
+                free: 4096,
+                reserve: 8192,
+                ..
+            }
+        ),
         "{err:?}"
     );
     assert_eq!(err.class(), ErrorClass::Rejected);
@@ -145,13 +151,22 @@ async fn the_reserve_is_kept_free() {
         .await
         .expect_err("one byte under");
     assert!(
-        matches!(err, WorkspaceError::DiskFull { reserve: 10_000, .. }),
+        matches!(
+            err,
+            WorkspaceError::DiskFull {
+                reserve: 10_000,
+                ..
+            }
+        ),
         "{err:?}"
     );
 
     // Exactly the reserve is enough: "at least this much stays free".
     disk.free.store(10_000, Ordering::SeqCst);
-    ws(&disk, tenth).prepare(&repo, "run-b").await.expect("at the reserve");
+    ws(&disk, tenth)
+        .prepare(&repo, "run-b")
+        .await
+        .expect("at the reserve");
 }
 
 #[tokio::test]
@@ -171,10 +186,18 @@ async fn unpushed_work_is_never_removed() {
     assert_eq!(swept.removed, ["run-clean"]);
     assert_eq!(swept.kept, ["run-work"]);
     assert!(!clean.path().exists(), "the clean workspace was freed");
-    assert!(work.path().join("new.txt").exists(), "the edit is still there");
+    assert!(
+        work.path().join("new.txt").exists(),
+        "the edit is still there"
+    );
 
     // Committed but never pushed: still kept.
-    assert!(work.commit_all("add new.txt", &me).await.expect("commit").is_some());
+    assert!(
+        work.commit_all("add new.txt", &me)
+            .await
+            .expect("commit")
+            .is_some()
+    );
     let swept = ws.sweep_finished(&runs(&["run-work"])).await;
     assert_eq!(swept.kept, ["run-work"], "a local commit is the only copy");
     assert!(work.path().exists());
