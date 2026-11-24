@@ -738,6 +738,8 @@ impl HookDecision {
     pub const TOOL_BEFORE: &str = "tool.before";
     /// The point after the tool answered.
     pub const TOOL_AFTER: &str = "tool.after";
+    /// The point where a person's message is about to reach a model (ADR 0050, decision 9).
+    pub const MESSAGE_RECEIVED: &str = adam_plugin::MESSAGE_RECEIVED;
     /// The call is refused, and the reason is its result.
     pub const DENY: &str = "deny";
     /// A person is asked first. Until approval exists (ADR 0050, slice H8) the call is not run.
@@ -806,6 +808,35 @@ impl HookedOutput {
             .iter()
             .find(|decision| decision.verdict == HookDecision::STOP)
             .map(|decision| decision.reason.as_deref().unwrap_or_default())
+    }
+}
+
+/// What the step that takes a person's message in records (`message.received`, ADR 0050 decision 9).
+///
+/// A rewrite is recorded as the text the message takes; a refusal as the decision that carried it.
+/// Both absent: the hook allowed the message as it was. The record is what a replay applies, so no
+/// hook is asked again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageDecision {
+    /// The text the hook rewrote the message to. Absent when the text is the one the person sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// The refusal, when the message does not reach a model. It is a `deny`, a `stop`, or a
+    /// `failed` hook (a hook that cannot decide never lets a message through).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook: Option<HookDecision>,
+}
+
+impl MessageDecision {
+    /// Whether the message is refused, and the decision that refused it.
+    #[must_use]
+    pub fn refusal(&self) -> Option<&HookDecision> {
+        self.hook.as_ref().filter(|hook| {
+            matches!(
+                hook.verdict.as_str(),
+                HookDecision::DENY | HookDecision::STOP | HookDecision::FAILED
+            )
+        })
     }
 }
 

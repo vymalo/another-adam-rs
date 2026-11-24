@@ -165,13 +165,15 @@ mod toolset;
 mod typed;
 
 pub use access::{ToolAccess, Use, UseMode, path_scope};
-/// The hooks around a tool call (ADR 0050, slice H1): what a plugin implements and what the loop
-/// installs with [`LlmAgentBuilder::plugin`] or [`LlmAgentBuilder::hooks`].
+/// The hooks around a tool call and around a person's message (ADR 0050, slices H1 and H1b): what a
+/// plugin implements and what the loop installs with [`LlmAgentBuilder::plugin`] or
+/// [`LlmAgentBuilder::hooks`].
 ///
 /// [ADR 0050]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
 pub use adam_plugin::{
     EventHeader, EventKind, EventQueue, FlushReport, HookError, HookEvent, HookLimits, HookResult,
-    HookSet, HookedCall, HookedText, ObserveLimits, Plugin, Verdict,
+    HookSet, HookedCall, HookedMessage, HookedText, MESSAGE_RECEIVED, MessageFile, ObserveLimits,
+    Plugin, Verdict,
 };
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{
@@ -233,8 +235,8 @@ pub use state::{Extensions, State, StateKey};
 pub use step_io::StepIo;
 pub use tool::{
     AnswerCheck, DEFAULT_TOOL_TIME_LIMIT, DynTool, GROUP_LOADER_PREFIX, HookDecision, HookedOutput,
-    RESERVED_LOADER_PREFIX, Refusal, RemotePoll, StepStyle, TOOL_STOP_GRACE, Tool, ToolCtx,
-    ToolError, ToolOutput,
+    MessageDecision, RESERVED_LOADER_PREFIX, Refusal, RemotePoll, StepStyle, TOOL_STOP_GRACE, Tool,
+    ToolCtx, ToolError, ToolOutput,
 };
 pub use toolset::ToolSet;
 pub use typed::{IntoToolOutput, IntoToolResult, Json, parse_args};
