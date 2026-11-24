@@ -438,7 +438,7 @@ impl Usage {
 
 /// The admission port: is there room in the budget?
 ///
-/// Every implementation passes [`admission_conformance!`]: never over a limit under many
+/// Every implementation passes `admission_conformance!` (in `adam-admission-testkit`): never over a limit under many
 /// concurrent asks, a dropped or cancelled holder gives its share back, one conversation never
 /// holds more than its share of a pool, `snapshot` adds up, and a refusal that may pass says when
 /// to ask again.
