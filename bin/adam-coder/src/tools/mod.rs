@@ -235,6 +235,9 @@ pub struct CoderSettings {
     /// The process's pools (ADR 0065): the tool calls and model calls in flight the worker admits.
     /// `None` in a test that builds the settings by hand, which admits everything.
     pub admission: Option<adam_budget::DynAdmission>,
+    /// The process pool and the OS limits of the commands (ADR 0065 slice 3): `None` in a test that
+    /// builds the settings by hand, whose commands take no seat and are not confined.
+    pub governor: Option<adam_code_tools::governor::Governor>,
 }
 
 impl Default for CoderSettings {
@@ -287,6 +290,7 @@ impl CoderSettings {
             max_parallel_tool_calls: adam_llm_agent::DEFAULT_MAX_PARALLEL,
             model_parking: adam_llm_agent::ModelParking::default(),
             admission: None,
+            governor: None,
         }
     }
 }

@@ -93,6 +93,9 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_output_tokens: 64000     # the output cap this agent asks for, at least 1; absent: its preset's, the model profile's, then 128,000, clamped to the model's limit and window (ADR 0064)
   max_minutes: 30              # subagent only: the longest one run may take; 0 = no limit, at most 1440
   max_parallel: 4              # tool calls of one turn that run at once, 1 to 32: lowers MAX_PARALLEL_TOOL_CALLS for this agent, never raises it
+  max_processes: 2             # processes (commands) of the worker at once, 1 to 256: lowers MAX_PROCESSES, never raises it (read by adam-coder; ADR 0065)
+  command_memory: 1GB          # the memory one command may use (`2GB`, `512MiB`, bytes), at least 64 MiB: lowers COMMAND_MEMORY_MAX, never raises it
+  command_cpu: 500m            # the CPU one command may use (`2`, `1.5` cores or `500m`), at least 100m: lowers COMMAND_CPU_MAX, never raises it
   max_open_sessions: 8         # root only: most sessions open at once, 1 to 100; lowers SESSION_MAX_OPEN, never raises it (a larger value is lowered with a warning)
   max_working_sessions: 2      # root only: most rounds working at once, 1 to 32 and at most max_open_sessions; lowers SESSION_MAX_WORKING
   max_session_rounds: 10       # root only: most rounds one session may have, 2 to 200; lowers SESSION_MAX_ROUNDS (a subagent's value is ignored, with a warning)

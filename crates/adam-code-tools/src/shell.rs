@@ -11,10 +11,15 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use adam_budget::{ConversationId, Refused};
 use adam_runtime::CancelToken;
-use adam_workspace::{EnvError, EnvSession, ExecSpec, safe_fs};
+use adam_workspace::{
+    ConfineError, Confined, Ended, EnvError, EnvKind, EnvSession, ExecSpec, Stopped, safe_fs,
+};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+
+use crate::governor::Governor;
 
 pub use adam_workspace::login_shell;
 
@@ -89,6 +94,9 @@ pub struct ShellOutcome {
     pub tail_raw: Vec<u8>,
     /// Where the whole output is kept, once it was settled.
     pub kept: Option<KeptNote>,
+    /// The operating system stopped the command for passing a limit (ADR 0065): not an error, the
+    /// model is told and the run goes on.
+    pub stopped: Option<Stopped>,
 }
 
 impl std::fmt::Debug for ShellOutcome {
@@ -104,6 +112,7 @@ impl std::fmt::Debug for ShellOutcome {
             .field("captured_len", &self.captured.len())
             .field("tail_raw_len", &self.tail_raw.len())
             .field("kept", &self.kept)
+            .field("stopped", &self.stopped)
             .finish()
     }
 }
@@ -111,7 +120,7 @@ impl std::fmt::Debug for ShellOutcome {
 impl ShellOutcome {
     /// Exit code 0 and no timeout.
     pub fn passed(&self) -> bool {
-        !self.timed_out && self.exit_code == Some(0)
+        !self.timed_out && self.stopped.is_none() && self.exit_code == Some(0)
     }
 
     /// What makes this failure the same as another of the same command for the repeated-call rule
@@ -120,6 +129,9 @@ impl ShellOutcome {
     pub fn repeat_key(&self) -> Option<String> {
         if self.timed_out {
             return Some("timeout".to_owned());
+        }
+        if let Some(stopped) = self.stopped {
+            return Some(format!("stopped:{}", stopped.reason()));
         }
         match self.exit_code {
             Some(0) => None,
@@ -416,6 +428,23 @@ pub enum RunError {
     /// The run was cancelled: the process group was killed, or never started.
     #[error("the run was cancelled")]
     Cancelled,
+    /// No seat of the process pool freed in time (ADR 0065): nothing ran, and asking again later
+    /// is right (`RateLimited`).
+    #[error("no process seat is free")]
+    Busy(#[source] Refused),
+    /// The limits could not be applied: nothing ran.
+    #[error("cannot limit the process")]
+    Confine(#[source] ConfineError),
+}
+
+/// A command's pool and limits: the process's [`Governor`] and the conversation the seat counts
+/// against (the root run, so every command of one conversation counts together).
+#[derive(Clone, Copy)]
+pub struct Governed<'a> {
+    /// The pool and the limits.
+    pub governor: &'a Governor,
+    /// Whose share the seat counts against.
+    pub conversation: &'a str,
 }
 
 /// Run `spec` in the environment of `session` (a login shell for a [`Program::Shell`](adam_workspace::Program),
@@ -458,7 +487,45 @@ pub async fn run_timed(
     margin: usize,
     cancel: &CancelToken,
 ) -> (Result<ShellOutcome, RunError>, Option<Duration>) {
-    run_with(session, spec, timeout, tail_cap, margin, cancel, false).await
+    run_with(
+        session, spec, timeout, tail_cap, margin, cancel, false, None,
+    )
+    .await
+}
+
+/// [`run_timed`] under the process pool and the OS limits of `governed` (ADR 0065): the command
+/// takes a seat of the pool (waiting for it, up to the governor's wait) and runs confined. An
+/// environment that runs the command somewhere else (a pod has its own limits) is not confined.
+pub async fn run_timed_governed(
+    session: &dyn EnvSession,
+    spec: ExecSpec,
+    timeout: Duration,
+    tail_cap: usize,
+    margin: usize,
+    cancel: &CancelToken,
+    governed: Option<Governed<'_>>,
+) -> (Result<ShellOutcome, RunError>, Option<Duration>) {
+    run_with(
+        session, spec, timeout, tail_cap, margin, cancel, false, governed,
+    )
+    .await
+}
+
+/// [`run_captured`] under the process pool and the OS limits of `governed`; see
+/// [`run_timed_governed`].
+pub async fn run_captured_governed(
+    session: &dyn EnvSession,
+    spec: ExecSpec,
+    timeout: Duration,
+    tail_cap: usize,
+    margin: usize,
+    cancel: &CancelToken,
+    governed: Option<Governed<'_>>,
+) -> (Result<ShellOutcome, RunError>, Option<Duration>) {
+    run_with(
+        session, spec, timeout, tail_cap, margin, cancel, true, governed,
+    )
+    .await
 }
 
 /// [`run_timed`] that also captures the output for keeping ([`ShellOutcome::captured`]): for a tool
@@ -471,10 +538,11 @@ pub async fn run_captured(
     margin: usize,
     cancel: &CancelToken,
 ) -> (Result<ShellOutcome, RunError>, Option<Duration>) {
-    run_with(session, spec, timeout, tail_cap, margin, cancel, true).await
+    run_with(session, spec, timeout, tail_cap, margin, cancel, true, None).await
 }
 
-#[tracing::instrument(skip(session, spec), fields(dir = %spec.cwd.display()))]
+#[tracing::instrument(skip(session, spec, governed), fields(dir = %spec.cwd.display()))]
+#[allow(clippy::too_many_arguments)]
 async fn run_with(
     session: &dyn EnvSession,
     spec: ExecSpec,
@@ -483,6 +551,7 @@ async fn run_with(
     margin: usize,
     cancel: &CancelToken,
     capture: bool,
+    governed: Option<Governed<'_>>,
 ) -> (Result<ShellOutcome, RunError>, Option<Duration>) {
     if cancel.is_cancelled() {
         return (Err(RunError::Cancelled), None);
@@ -491,9 +560,35 @@ async fn run_with(
         Ok(prepared) => prepared,
         Err(e) => return (Err(RunError::Prepare(e)), None),
     };
-    let mut child = match spawn_prepared(&prepared) {
-        Ok(child) => child,
-        Err(e) => return (Err(RunError::Spawn(e)), None),
+    // Only what runs in this container is governed: a pod has its own limits, and the process that
+    // is spawned here for it only carries the command there.
+    let governed = governed.filter(|_| matches!(session.describe().kind, EnvKind::Local));
+    // Held until the command is gone, however this function returns.
+    let _seat = match governed {
+        Some(g) => {
+            let seat = g.governor.seat(ConversationId::new(g.conversation));
+            let seat = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return (Err(RunError::Cancelled), None),
+                seat = seat => seat,
+            };
+            match seat {
+                Ok(seat) => Some(seat),
+                Err(refused) => return (Err(RunError::Busy(refused)), None),
+            }
+        }
+        None => None,
+    };
+    let spawned = match governed {
+        Some(g) => spawn_confined(&prepared, g.governor),
+        None => spawn_prepared(&prepared)
+            .map(|child| (child, Confined::unconfined()))
+            .map_err(SpawnError::Io),
+    };
+    let (mut child, confined) = match spawned {
+        Ok(spawned) => spawned,
+        Err(SpawnError::Io(e)) => return (Err(RunError::Spawn(e)), None),
+        Err(SpawnError::Confine(e)) => return (Err(RunError::Confine(e)), None),
     };
     let started = Instant::now();
     let pid = child.id();
@@ -519,19 +614,41 @@ async fn run_with(
         () = cancel.cancelled() => None,
         waited = tokio::time::timeout(timeout, child.wait()) => Some(waited),
     };
+    let mut stopped = None;
     let (exit_code, timed_out) = match waited {
-        Some(Ok(Ok(status))) => (status.code(), false),
-        Some(Ok(Err(e))) => return (Err(RunError::Spawn(e)), Some(started.elapsed())),
+        Some(Ok(Ok(status))) => {
+            stopped = confined.finish(Ended::from(status)).await;
+            (status.code(), false)
+        }
+        Some(Ok(Err(e))) => {
+            confined.stop().await;
+            return (Err(RunError::Spawn(e)), Some(started.elapsed()));
+        }
         Some(Err(_)) => {
             kill_group(pid).await;
+            confined.stop().await;
             let _ = child.kill().await;
             session.kill(&prepared.exec).await;
+            // Only to clean up: why a command a timeout stopped ended is known.
+            let _ = confined
+                .finish(Ended {
+                    code: None,
+                    signal: Some(9),
+                })
+                .await;
             (None, true)
         }
         None => {
             kill_group(pid).await;
+            confined.stop().await;
             let _ = child.kill().await;
             session.kill(&prepared.exec).await;
+            let _ = confined
+                .finish(Ended {
+                    code: None,
+                    signal: Some(9),
+                })
+                .await;
             for reader in &readers {
                 reader.abort();
             }
@@ -579,10 +696,39 @@ async fn run_with(
             total,
             captured,
             tail_raw,
+            stopped,
             ..ShellOutcome::default()
         }),
         Some(ran),
     )
+}
+
+/// Why [`spawn_confined`] did not start the command.
+#[derive(Debug)]
+enum SpawnError {
+    Io(io::Error),
+    Confine(ConfineError),
+}
+
+/// [`spawn_prepared`], confined to the limits of `governor`: the command is made, confined, and
+/// then given its streams.
+fn spawn_confined(
+    prepared: &adam_workspace::PreparedCommand,
+    governor: &Governor,
+) -> Result<(tokio::process::Child, Confined), SpawnError> {
+    let mut cmd = prepared.command();
+    let confined = governor
+        .confine()
+        .confine(&mut cmd, governor.limits())
+        .map_err(SpawnError::Confine)?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd.spawn().map_err(SpawnError::Io)?;
+    Ok((child, confined))
 }
 
 /// Spawn what an environment prepared: in a process group of its own, with stdin closed, stdout and

@@ -373,6 +373,12 @@ the loop's existing park handles it; a request over the whole token rate is `Mod
 A tool call is never refused: it waits up to a minute and then runs anyway with a warning, because a run
 never fails because a slot was busy (ADR 0065 decision 4).
 
+A command's seat of `Pool::Processes` is refused as `Busy` after a minute: `commands::run_error` makes it a
+retryable `RateLimited` tool error, which the step's retry policy handles. A command the operating system stops
+for its memory, CPU time or file size is **not an error**: `ShellOutcome::stopped` is set and the result says
+`stopped: memory limit 2 GB`. `adam_workspace::ConfineError` (`Unsupported`, `Invalid`) is a command that could not be
+limited and was not started.
+
 ## Exit codes
 
 Values are BSD `sysexits.h` numbers (*unverified*: from memory). The code is found by walking the

@@ -272,6 +272,7 @@ dependencies = [
 name = "adam-agent-fs"
 version = "0.1.0"
 dependencies = [
+ "adam-budget",
  "adam-error",
  "jiff",
  "proptest",
@@ -337,6 +338,7 @@ dependencies = [
 name = "adam-code-tools"
 version = "0.1.0"
 dependencies = [
+ "adam-budget",
  "adam-error",
  "adam-llm-agent",
  "adam-model",
@@ -382,6 +384,7 @@ dependencies = [
  "adam-budget",
  "adam-code-tools",
  "adam-code-tools-testkit",
+ "adam-confine",
  "adam-core",
  "adam-env-kubernetes",
  "adam-error",
@@ -423,6 +426,29 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "adam-confine"
+version = "0.1.0"
+dependencies = [
+ "adam-confine-testkit",
+ "adam-workspace",
+ "async-trait",
+ "libc",
+ "rustix",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "adam-confine-testkit"
+version = "0.1.0"
+dependencies = [
+ "adam-workspace",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

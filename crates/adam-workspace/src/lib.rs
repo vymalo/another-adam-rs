@@ -57,6 +57,7 @@
 #![warn(missing_docs)]
 
 mod code_host;
+mod confine;
 mod credentials;
 pub mod devcontainer;
 mod environment;
@@ -85,6 +86,10 @@ pub use code_host::MemoryCodeHost;
 pub use code_host::{
     Checks, CodeHost, CreatedRepository, DynCodeHost, MergeMethod, MergePullRequest,
     MergedPullRequest, NewPullRequest, NewRepository, OwnerKind, PullRequest, PullRequestStatus,
+};
+pub use confine::{
+    Confine, ConfineError, Confined, Confinement, DynConfine, Ended, Enforcement, NoConfine,
+    ProcessLimits, Stopped, human_bytes,
 };
 pub use credentials::{DynGitCredentials, GitCredentials, HostScoped, ScopedToken, StaticToken};
 pub use environment::{

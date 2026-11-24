@@ -112,11 +112,6 @@ async fn build_agent(
     settings.language_server_idle = worker.language_server_idle;
     settings.language_servers_max = worker.language_servers_max;
     settings.max_parallel_tool_calls = worker.max_parallel_tool_calls;
-    // The process's pools (ADR 0065): the tool calls and model calls in flight of every run. One
-    // admission per process, shared by the agent and its subagents.
-    settings.admission = Some(Arc::new(adam_admission_local::LocalAdmission::new(
-        worker.budget.clone(),
-    )));
     // A refused model call parks the run (ADR 0067); behind the injector, so does a gateway that
     // cannot be reached.
     settings.model_parking = adam_llm_agent::ModelParking::new(worker.model.park_limit)
@@ -171,6 +166,35 @@ async fn build_agent(
     );
     let environment =
         crate::mcp_secrets::hiding(environment_for(worker, &root).await?, &protected.hidden);
+    // The process's pools (ADR 0065): the tool calls, model calls and processes in flight of every
+    // run, one admission per process shared by the agent and its subagents. The folder's `limits:`
+    // may only lower the deployment's ceiling (`Budget::lower`).
+    let folder = def.manifest().frontmatter.limits.as_ref();
+    let budget = worker.budget.lower(&folder_budget(
+        folder.and_then(|l| l.max_processes),
+        folder.and_then(|l| l.command_memory.as_deref()),
+        folder.and_then(|l| l.command_cpu.as_deref()),
+    ));
+    let admission: adam_budget::DynAdmission =
+        Arc::new(adam_admission_local::LocalAdmission::new(budget.clone()));
+    settings.admission = Some(Arc::clone(&admission));
+    // The commands' OS limits. The probe starts a transient scope, so it runs off the async threads,
+    // once.
+    #[cfg(unix)]
+    {
+        let confine = tokio::task::spawn_blocking(adam_confine::best_effort)
+            .await
+            .context("probing for the OS limits of commands")?;
+        tracing::info!(
+            enforcement = %confine.describe(),
+            "OS limits on commands (memory {} per command, cpu {} millicores)",
+            adam_workspace::human_bytes(budget.command_memory),
+            budget.command_cpu
+        );
+        settings.governor = Some(adam_code_tools::governor::Governor::from_budget(
+            admission, confine, &budget,
+        ));
+    }
     let mut tool_env = ToolEnv::new(workspaces, code_host, settings).with_environment(environment);
     // A run pod the cluster cannot give now (the quota is used up) is waited for, not failed at once
     // and not replaced by this container (ADR 0019, decision 6).
@@ -481,4 +505,52 @@ pub async fn serve(
 
     adam_service::serve(&config.service, agents.card_if(card), shutdown).await?;
     Ok(())
+}
+
+/// The ceiling a folder's `limits:` sets for processes and commands (ADR 0065 decision 1): a field
+/// the file leaves out, or that does not read (the loader already refused those), lowers nothing.
+fn folder_budget(
+    max_processes: Option<u32>,
+    command_memory: Option<&str>,
+    command_cpu: Option<&str>,
+) -> adam_budget::Budget {
+    let mut budget = adam_budget::Budget::builder();
+    if let Some(n) = max_processes {
+        budget = budget.processes(n);
+    }
+    if let Some(bytes) = command_memory.and_then(|m| adam_budget::parse_bytes(m).ok()) {
+        budget = budget.command_memory(bytes);
+    }
+    if let Some(millicores) = command_cpu.and_then(|c| adam_budget::parse_millicores(c).ok()) {
+        budget = budget.command_cpu(millicores);
+    }
+    budget.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A folder lowers the deployment's ceiling and never raises it (ADR 0065 decision 1).
+    #[test]
+    fn a_folder_lowers_the_processes_and_never_raises_them() {
+        let deployment = adam_budget::Budget::builder()
+            .processes(4)
+            .command_memory(4 << 30)
+            .command_cpu(2000)
+            .build();
+        let lower = deployment.lower(&folder_budget(Some(2), Some("1GB"), Some("500m")));
+        assert_eq!(
+            (lower.processes, lower.command_memory, lower.command_cpu),
+            (2, 1 << 30, 500)
+        );
+        let raised = deployment.lower(&folder_budget(Some(64), Some("64GB"), Some("32")));
+        assert_eq!(
+            (raised.processes, raised.command_memory, raised.command_cpu),
+            (4, 4 << 30, 2000),
+            "a larger value in a file is the deployment's"
+        );
+        let none = deployment.lower(&folder_budget(None, None, None));
+        assert_eq!(none, deployment);
+    }
 }
