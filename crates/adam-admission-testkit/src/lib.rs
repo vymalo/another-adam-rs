@@ -12,18 +12,14 @@
 //!
 //! Each case is a function here, so the suite is compiled once and the macro only names it.
 //!
-//! ```no_run
-//! # use std::sync::Arc;
-//! # use adam_budget::{Budget, DynAdmission};
-//! # use adam_admission_testkit::Plan;
-//! # struct LocalAdmission;
-//! # impl LocalAdmission { fn new(_: Budget) -> Self { Self } }
-//! # impl adam_budget::Admission for LocalAdmission {
-//! #     async fn admit(&self, _: adam_budget::Ask) -> Result<adam_budget::Permit, adam_budget::Refused> { unimplemented!() }
-//! #     fn snapshot(&self) -> adam_budget::Usage { unimplemented!() }
-//! # }
+//! ```text
+//! use std::sync::Arc;
+//!
+//! use adam_admission_testkit::Plan;
+//! use adam_budget::DynAdmission;
+//!
 //! fn make(plan: &Plan) -> DynAdmission {
-//!     Arc::new(LocalAdmission::new(plan.budget()))
+//!     Arc::new(LocalAdmission::new(plan.budget())) // LocalAdmission from adam-admission-local
 //! }
 //!
 //! adam_admission_testkit::admission_conformance!(crate::make);

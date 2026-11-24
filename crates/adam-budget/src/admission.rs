@@ -8,8 +8,6 @@ use std::time::Duration;
 use adam_error::{Classify, ErrorClass};
 use async_trait::async_trait;
 
-use crate::budget::Budget;
-
 /// One kind of work: a pool of its own, so that one kind never starves another (ADR 0065
 /// decision 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
