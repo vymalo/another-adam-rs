@@ -230,7 +230,11 @@ Each is one pull request, in order.
    file over the size limit are each stopped while the engine keeps answering, `describe()` says `Partial` without
    systemd, on Linux, macOS and Windows runners (ADR 0047 slice 8's matrix).
 4. **The disk budget.** Accepted when a clone past the budget asks the person, the reserve is kept free, and a
-   workspace with unpushed work is never removed.
+   workspace with unpushed work is never removed. **Partly built:** `adam-workspace` measures its root, checks the
+   budget and the reserve before a mirror or worktree (`WorkspaceError::DiskFull`, class `Rejected`) and sweeps finished
+   runs without touching unpushed work (`a_clone_past_the_disk_budget_asks_the_person`, `the_reserve_is_kept_free`,
+   `unpushed_work_is_never_removed`). Not built yet: `WORKSPACE_DISK_MAX` and `WORKSPACE_DISK_RESERVE`, the
+   `tool.before` question to the person, `TooLarge`, cache writes, and `adam_disk_bytes{kind}`.
 5. **The device-state port.** Accepted when a fake device on battery runs one run at a time and a hot device holds new
    steps.
 6. **The resource report and the parity rows.** Accepted when a snapshot names each pool's use and the parity page has
