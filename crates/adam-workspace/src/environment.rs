@@ -563,6 +563,12 @@ impl Environment for Local {
     }
 }
 
+/// What [`LocalSession::describe`] says: this container, and plainly what is not protected yet. A
+/// command can do what the person can; only its process group is killed as one, so a process that
+/// leaves the group outlives it. OS limits are a `Confine`'s, not the environment's.
+const LOCAL_SUMMARY: &str = "this container: no sandbox, a command can do what the person can; \
+its process group is killed as a whole, but a process that leaves the group is not";
+
 /// The session of [`Local`]: stateless, so a value is a session.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LocalSession;
@@ -579,7 +585,7 @@ impl EnvSession for LocalSession {
     fn describe(&self) -> EnvDescription {
         EnvDescription {
             kind: EnvKind::Local,
-            summary: "this container".to_owned(),
+            summary: LOCAL_SUMMARY.to_owned(),
         }
     }
 
@@ -739,6 +745,25 @@ impl EnvSession for HidingSession {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_local_description_names_what_is_not_protected() {
+        let described = LocalSession.describe();
+        assert_eq!(described.kind, EnvKind::Local);
+        for part in [
+            "this container",
+            "no sandbox",
+            "can do what the person can",
+            "process group is killed as a whole",
+            "leaves the group",
+        ] {
+            assert!(
+                described.summary.contains(part),
+                "{part:?} in {described:?}"
+            );
+        }
+        assert!(!described.summary.contains('\n'), "one line");
+    }
+
     use super::*;
 
     #[test]
