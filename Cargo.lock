@@ -685,6 +685,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-plugin"
+version = "0.1.0"
+dependencies = [
+ "adam-error",
+ "adam-plugin-testkit",
+ "serde_json",
+]
+
+[[package]]
+name = "adam-plugin-testkit"
+version = "0.1.0"
+dependencies = [
+ "adam-error",
+ "adam-plugin",
+ "serde_json",
+]
+
+[[package]]
 name = "adam-postgres"
 version = "0.1.0"
 dependencies = [

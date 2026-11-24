@@ -1,0 +1,18 @@
+[package]
+name = "adam-plugin"
+description = "Plugins around the agent loop (ADR 0050, slice H1): the Plugin trait, the ordered HookSet with deadlines and catch_unwind, the verdicts and the errors. The wiring into the loop is part 2."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+adam-error.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+adam-plugin-testkit.workspace = true
+
+[lints]
+workspace = true
