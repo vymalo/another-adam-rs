@@ -221,7 +221,7 @@ activation the message is refused as before ([`adam-a2a-runtime`](../../crates/a
 
 The person's screen (the orchestration layer's chat) can draw a form. The coder announces that on its card
 (`adam_ui::with_card_extensions`: A2UI v1.0 with `acceptsInlineCatalogs: true`, `ui-catalog/v2`,
-`thread-tools/v1`, `mentions/v1`, `steer/v1`; `agent_card_from` adds them, with `steps/v1`, `text-stream/v1`, `usage/v1`, `access-tier/v1` ([above](#access-tiers-what-the-person-lets-it-do-alone)), `child-sessions/v1` (added by `adam_service::serve`, not by `agent_card_from`, and only when the backend serves it: [Sessions a person opens](#sessions-a-person-opens)), `commands/v1` (the three commands of `agent/commands/`: `review`, `fix-checks` and `explain`; templates the agent expands, never part of the prompt) and `build/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
+`thread-tools/v1`, `mentions/v1`, `steer/v1`; `agent_card_from` adds them, with `steps/v1`, `text-stream/v1`, `usage/v1`, `access-tier/v1` ([above](#access-tiers-what-the-person-lets-it-do-alone)), `child-sessions/v1` (added by `adam_service::serve`, not by `agent_card_from`, and only when the backend serves it: [Sessions a person opens](#sessions-a-person-opens)), `commands/v1` (the three commands of `agent/commands/`: `review`, `fix-checks` and `explain`; templates the agent expands, never part of the prompt) and `build/v1` below, and `tests/fixtures/agent/card.json` pins them all; `reasoning/v1` is **not** one of them: the levels are the deployment's `MODEL_ALIASES_FILE` profile of `MODEL`, so `Coder::router` and `serve` add the entry to the card they serve, from `Coder::reasoning_efforts()` ([Reasoning effort](#reasoning-effort))), reads A2A messages as one from
 a screen (`vymalo_inbound`, set by `Coder::new_with` and `serve`), and gives the model `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`:
 three questions at once (a database, a login, where it runs) become **one Choices surface** beside the question, with a title
 and a description of why, and the person's answers come back as the tool result, `- db: pg` per question, which the model quotes in its next words.
@@ -1006,6 +1006,17 @@ deleted with the completed run; decision 5 of [ADR 0008](../../docs/decisions/00
 is amended by [ADR 0034](../../docs/decisions/0034-a-turn-that-asks-nothing-completes-and-scratch-lives-for-the-thread.md)),
 so a person who takes the offer starts a follow-up task that continues the conversation, finds the project with
 `start_scratch` and `publish_scratch`es it.
+
+### Reasoning effort
+
+The model reasons at the effort its deployment profile lets it, and a message may name one for its run
+(`reasoning/v1`, [ADR 0063](../../docs/decisions/0063-a-reasoning-effort-is-one-setting.md)): the card lists the
+levels of `MODEL`'s profile (`MODEL_ALIASES_FILE`) and the level the folder's `reasoning_effort` or its
+`model_preset` resolved; a message that names a level the model does not take is refused (`invalid params`,
+naming the agent and its levels) before anything is written, and one it takes rides the run's context to every
+model call (`vymalo.reasoningEffort`). A model with no profile, or `reasoningEfforts: []`, lists nothing and
+reads nothing. A control plane assembles no model, so it lists no levels (as it lists no `model-pick/v1`
+choice).
 
 ### Access tiers: what the person lets it do alone
 

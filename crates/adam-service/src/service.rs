@@ -189,6 +189,16 @@ impl Service {
         self
     }
 
+    /// Serve `reasoning/v1` for an agent whose card lists `efforts`
+    /// ([`RuntimeTaskBackend::with_reasoning_efforts`]); `None` changes nothing.
+    #[must_use]
+    pub fn with_reasoning_efforts(mut self, efforts: Option<adam_a2a::ReasoningEfforts>) -> Self {
+        if let Some(efforts) = efforts {
+            self.backend = self.backend.with_reasoning_efforts(efforts);
+        }
+        self
+    }
+
     /// Serve `commands/v1` for an agent whose card lists `commands`
     /// ([`RuntimeTaskBackend::with_commands`]); `None` changes nothing.
     #[must_use]
@@ -222,6 +232,11 @@ impl Service {
     /// The models the backend serves `model-pick/v1` for, if it does.
     pub fn model_choices(&self) -> Option<&adam_a2a::ModelChoices> {
         self.backend.model_choices()
+    }
+
+    /// The levels the backend serves `reasoning/v1` for, if it does.
+    pub fn reasoning_efforts(&self) -> Option<&adam_a2a::ReasoningEfforts> {
+        self.backend.reasoning_efforts()
     }
 
     /// Advance runs until `shutdown` resolves; in-flight steps finish first.

@@ -160,6 +160,7 @@ dependencies = [
  "adam-error",
  "adam-llm-agent",
  "adam-model",
+ "adam-model-openai",
  "adam-runtime",
  "adam-store-postgres",
  "adam-store-testkit",
@@ -179,6 +180,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

@@ -399,7 +399,7 @@ or `reasoningEfforts: []`) lists no extension: `adam_a2a::ExtensionConfig::reaso
 A request that **activates** the extension **must** carry `metadata[URI] = {"effort": "<one of the model's
 levels>"}` on the message. `adam_a2a::ReasoningEfforts::requested` reads it and returns the refusal sentence
 for every other shape; the runtime turns that into `InvalidParams` (`-32602`) before anything is written
-(PR B):
+(`crates/adam-a2a-runtime/src/backend.rs`, `with_reasoning_efforts`):
 
 * a missing entry;
 * an entry that is not an object;
@@ -409,25 +409,24 @@ for every other shape; the runtime turns that into `InvalidParams` (`-32602`) be
 
 The sentence names the agent and its levels, so a client can offer what the card lists. Other members of the
 entry are ignored. A message that does not activate the extension carries no effort, whatever its metadata
-says: activation is the caller's check (`Caller::has_extension`), as for every extension, and the runtime
-wires it in PR B.
+says: activation is the caller's check (`Caller::has_extension`), as for every extension, and a backend given
+no levels (a card that lists none) never reads one.
 
-**In the run.** The key is built: `vymalo.reasoningEffort` (`{"effort": ..}`) is
-`adam_llm_agent::REASONING_EFFORT_CONTEXT_KEY`, one of `PROTECTED_CONTEXT_KEYS`, read on every model turn
+**In the run.** An accepted level becomes `vymalo.reasoningEffort` (`{"effort": ..}`,
+`adam_a2a_runtime::CONTEXT_REASONING_EFFORT`; it is `adam_llm_agent::REASONING_EFFORT_CONTEXT_KEY`, one of
+`PROTECTED_CONTEXT_KEYS`), which the loop reads on every model turn
 (`crates/adam-llm-agent/src/agent.rs`), so a message whose context is too large and dropped keeps it; it
 carries into a continuing task of the same thread and into a child run, and a new thread starts at the
-resolved default. **PR B writes it from an activated message** (the newest wins), calls `requested` against
-the model of the run it reaches (the root's for the root context, the child's for a child context; the card
-always describes the root's), and adds the echo: a caller that activated the extension is echoed the effort in
-the task's `metadata[URI]` on the answer of `SendMessage`, on `GetTask`, on the first frame of a stream, and in
-a status update when it changes — the access tier's echo shape. The extension can only set: no member clears
-an effort. A subagent's `subagent_start` value is checked against the subagent's profile (PR B); a helper's
-`child-sessions/v1` `config` bounds and the platform's forms are later slices.
+resolved default. The newest message wins, from the agent's next call. The extension can only set: no member
+clears an effort. A subagent's `subagent_start` value and a helper's `child-sessions/v1` `config` bounds are
+later slices, as is the echo of the effort on the task (the access tier's shape).
 
-**No card lists it yet.** `ExtensionConfig::reasoning` and the reading are built; the cards of `adam-coder` and
-`adam-agent` and the runtime's write are PR B (ADR 0063, decision 5). Until a card lists it, no request can
-activate it, so no agent reads an effort and every run keeps the folder, preset or profile value it always
-had.
+**The cards.** `adam-coder` and `adam-agent` list the entry when the deployment profiles their model with at
+least one level (`MODEL_ALIASES_FILE`, `config.modelProfiles`): `agents()` and `Coder::new` build the set from
+each agent's `model_alias` and its resolved level (`adam_a2a::ReasoningEfforts::from_models`), the backend
+refuses an effort the model does not take, and `serve` adds the entry to the card it serves
+(`adam_service::card_with_reasoning`). A model with no profile, or with `reasoningEfforts: []`, lists nothing.
+A split control plane knows no model, so it lists no entry (as it lists no `model-pick/v1` choice).
 
 ## The model a message picks (`model-pick/v1`)
 

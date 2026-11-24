@@ -44,6 +44,7 @@ mod model_pick;
 mod person;
 #[cfg(feature = "push")]
 mod push;
+mod reasoning;
 mod session_events;
 mod steps;
 mod subscribe;
@@ -73,6 +74,7 @@ pub use model_pick::CONTEXT_MODEL;
 pub use person::{CONTEXT_PERSON, person_said};
 #[cfg(feature = "push")]
 pub use push::StorePushStore;
+pub use reasoning::CONTEXT_REASONING_EFFORT;
 pub use tier::CONTEXT_ACCESS_TIER;
 pub use usage::MAX_TOKEN_COUNT;
 pub use vymalo::{

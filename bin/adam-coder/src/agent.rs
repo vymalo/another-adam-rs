@@ -155,6 +155,10 @@ const REPOSITORY_CREATION_OFF: &str = "Creating a repository is switched off in 
 /// no other.
 pub struct CoderAgent {
     assembly: Assembly,
+    /// The deployment's per-model profiles the agent was assembled with: what each model of the
+    /// assembly takes as a reasoning effort, which [`reasoning_efforts`](Self::reasoning_efforts)
+    /// reads for the card and the backend.
+    profiles: adam_model::ModelProfiles,
     env: Arc<ToolEnv>,
 }
 
@@ -390,13 +394,18 @@ impl CoderAgent {
             Some(found) => bound.state(found),
             None => bound,
         };
+        let profiles_of = profiles.clone();
         let assembly = bound
             .model_profiles(profiles)
             // A served coder takes the model a message picks (`model-pick/v1`): its card lists the
             // choices and the backend refuses anything outside them (ADR 0064, amended 2026-11-23).
             .allow_model_choice()
             .model(model, model_alias)?;
-        Ok(Self { assembly, env })
+        Ok(Self {
+            assembly,
+            profiles: profiles_of,
+            env,
+        })
     }
 
     /// The models a message may pick for its run (`model-pick/v1`): the root's choices, the same
@@ -407,6 +416,24 @@ impl CoderAgent {
             .first()
             .map(|root| root.model_choices.clone())
             .unwrap_or_default()
+    }
+
+    /// The reasoning levels of each agent's model (`reasoning/v1`): the root's and its subagents',
+    /// from its model's profile in `MODEL_ALIASES_FILE` and the level the folder, its
+    /// `model_preset` or the profile resolved for it. The card lists the root's, and the backend
+    /// refuses a message that names one its model does not take. Empty when the deployment profiles
+    /// no model of the assembly: no card lists the extension.
+    pub fn reasoning_efforts(&self) -> adam_a2a::ReasoningEfforts {
+        adam_a2a::ReasoningEfforts::from_models(
+            self.assembly.info().iter().map(|info| {
+                (
+                    info.name.as_str(),
+                    info.model_alias.as_str(),
+                    info.reasoning_effort,
+                )
+            }),
+            &self.profiles,
+        )
     }
 
     /// The highest access tier the agent's tools allow (`MAX_ACCESS_TIER`): what the A2A backend

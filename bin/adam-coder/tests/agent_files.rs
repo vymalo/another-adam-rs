@@ -1675,3 +1675,89 @@ async fn the_coders_skills_parse_and_are_in_the_catalog() {
         format!("{}\n\n{}", expected_body(3), SKILLS.trim_end())
     );
 }
+
+/// The deployment's model profile gives the coder's model reasoning levels (`MODEL_ALIASES_FILE`,
+/// `reasoning/v1`): the card the router serves lists them and the level the folder or the profile
+/// resolved, and the backend refuses an effort the model does not take before anything is written
+/// (ADR 0063, decision 5).
+#[tokio::test]
+async fn the_coder_takes_the_reasoning_levels_of_its_models_profile() {
+    use a2a::{Message as A2aMessage, Part, Role};
+    use adam_a2a::{Caller, REASONING_EXTENSION, TaskBackend as _};
+    use adam_llm_agent::ToolSet;
+    use adam_model::ModelProfiles;
+
+    let fx = Fixture::new().await;
+    let profiles = ModelProfiles::parse_json(
+        r#"{"profiles": {"test-model": {"reasoningEfforts": ["low", "high"], "reasoningWire": "reasoning_effort"}}}"#,
+    )
+    .expect("valid profiles");
+    let model: DynModel = Arc::new(MockModel::new());
+    let def = AgentFiles::Embedded
+        .def()
+        .unwrap()
+        .mcp_tools(AGENT_NAME, ToolSet::new());
+    let agent = CoderAgent::try_from_def_with_profiles(
+        def,
+        model,
+        "test-model",
+        profiles,
+        fx.env.clone(),
+        coder_tools(&fx.env),
+    )
+    .expect("the coder assembles against the model's profile");
+    let coder = Coder::new(
+        Arc::new(MemoryStore::new()),
+        agent,
+        &RuntimeOptions::default(),
+    );
+
+    // The card of the process: the root model's levels, each once, lowest first. The embedded folder
+    // sets no `reasoning_effort`, so there is no `default` member.
+    let url: url::Url = "https://agents.example.com/coder/".parse().unwrap();
+    let efforts = coder
+        .backend
+        .reasoning_efforts()
+        .expect("the model takes a level");
+    assert_eq!(
+        efforts.levels(AGENT_NAME),
+        [
+            adam_model::ReasoningEffort::Low,
+            adam_model::ReasoningEffort::High
+        ]
+    );
+    let card = adam_service::card_with_reasoning(agent_card(&url), efforts, coder.backend.agent());
+    let entry = card
+        .extensions
+        .iter()
+        .find(|e| e.uri == REASONING_EXTENSION)
+        .expect("the card lists reasoning/v1");
+    assert!(!entry.required);
+    assert_eq!(
+        serde_json::Value::Object(entry.params.clone()),
+        json!({"efforts": ["low", "high"]})
+    );
+
+    // A level the model does not take is refused, naming the levels, before anything is written.
+    let mut message = A2aMessage::new(Role::User, vec![Part::text("hi")]);
+    message.message_id = "m-effort".into();
+    message.metadata = Some(std::collections::HashMap::from([(
+        REASONING_EXTENSION.to_owned(),
+        json!({"effort": "medium"}),
+    )]));
+    let error = coder
+        .backend
+        .submit(
+            Caller::new("token-0").with_extensions([REASONING_EXTENSION]),
+            message,
+            None,
+            None,
+        )
+        .await
+        .expect_err("medium is not one of the model's levels");
+    assert!(
+        matches!(&error, adam_a2a::BackendError::InvalidParams(m)
+            if m.contains("does not take") && m.contains("low, high")),
+        "{error:?}"
+    );
+}

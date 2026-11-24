@@ -215,6 +215,11 @@ pub struct Agents {
     /// outside the choices. `None`: the extension is never read. Only the roles that serve A2A use
     /// it.
     pub model_choices: Option<adam_a2a::ModelChoices>,
+    /// The reasoning levels the agent's card lists (`reasoning/v1`), when it lists any: the
+    /// backend then reads the effort of a message that activated the extension and refuses one the
+    /// agent's model does not take. `None`: the extension is never read. Only the roles that serve
+    /// A2A use it.
+    pub reasoning_efforts: Option<adam_a2a::ReasoningEfforts>,
     /// The commands the agent's card lists (`commands/v1`), when it lists any: the backend then
     /// expands a message that names one. `None`: the extension is never read. Only the roles that
     /// serve A2A use it.
@@ -244,6 +249,7 @@ impl Agents {
             inbound: None,
             access_tiers: None,
             model_choices: None,
+            reasoning_efforts: None,
             commands: None,
             child_sessions: None,
             components: Vec::new(),
@@ -330,6 +336,18 @@ impl Agents {
 }
 
 impl Agents {
+    /// The agent takes `efforts` of `reasoning/v1`: list them on the card
+    /// ([`ExtensionConfig::reasoning`](adam_a2a::ExtensionConfig::reasoning)) and the backend reads
+    /// the effort of a message that activated it. See
+    /// [`Agents::reasoning_efforts`](struct@Agents#structfield.reasoning_efforts).
+    #[must_use]
+    pub fn reasoning_efforts(mut self, efforts: adam_a2a::ReasoningEfforts) -> Self {
+        self.reasoning_efforts = Some(efforts);
+        self
+    }
+}
+
+impl Agents {
     /// The agent serves `commands` (`commands/v1`): list them on the card
     /// ([`ExtensionConfig::commands`](adam_a2a::ExtensionConfig::commands)) and the backend
     /// expands a message that names one. See [`Agents::commands`](struct@Agents#structfield.commands).
@@ -359,6 +377,7 @@ impl std::fmt::Debug for Agents {
             .field("inbound", &self.inbound.is_some())
             .field("access_tiers", &self.access_tiers)
             .field("model_choices", &self.model_choices)
+            .field("reasoning_efforts", &self.reasoning_efforts)
             .field("commands", &self.commands.as_ref().map(|c| !c.is_empty()))
             .field("child_sessions", &self.child_sessions.is_some())
             .field(
@@ -371,6 +390,28 @@ impl std::fmt::Debug for Agents {
             )
             .finish_non_exhaustive()
     }
+}
+
+/// `card` with the `reasoning/v1` entry of `efforts` for `agent`, when the card lists none yet: the
+/// card of a process says the levels its backend reads, and a card that already lists the entry (a
+/// composition of its own) is kept as it is. An agent whose model takes no level gets no entry.
+#[must_use]
+pub fn card_with_reasoning(
+    mut card: AgentCardConfig,
+    efforts: &adam_a2a::ReasoningEfforts,
+    agent: &str,
+) -> AgentCardConfig {
+    if card
+        .extensions
+        .iter()
+        .any(|extension| extension.uri == adam_a2a::REASONING_EXTENSION)
+    {
+        return card;
+    }
+    if let Some(extension) = adam_a2a::ExtensionConfig::reasoning(efforts, agent) {
+        card.extensions.push(extension);
+    }
+    card
 }
 
 /// Why [`serve`] ended with an error. Each message says which step failed and never contains a
@@ -715,6 +756,7 @@ async fn run(
         inbound,
         access_tiers,
         model_choices,
+        reasoning_efforts,
         commands,
         child_sessions,
         components,
@@ -741,6 +783,7 @@ async fn run(
     .with_inbound(inbound)
     .with_access_tiers(access_tiers)
     .with_model_choices(model_choices)
+    .with_reasoning_efforts(reasoning_efforts)
     .with_commands(commands)
     .with_child_sessions(child_sessions.clone());
     // The card lists the extension if and only if this process serves it.
@@ -753,6 +796,17 @@ async fn run(
         && let Some(extension) = adam_a2a::ExtensionConfig::model_pick(choices)
     {
         card.extensions.push(extension);
+    }
+    // The levels of `reasoning/v1`, the root agent's model's: `None` when it takes none, and the
+    // card keeps whatever it already says (a composition of its own listed the entry).
+    if let Some(efforts) = service.reasoning_efforts()
+        && let Some(listed) = card.take()
+    {
+        card = Some(card_with_reasoning(
+            listed,
+            efforts,
+            service.backend.agent(),
+        ));
     }
     if role.runs_control_plane()
         && let Some(sessions) = &child_sessions

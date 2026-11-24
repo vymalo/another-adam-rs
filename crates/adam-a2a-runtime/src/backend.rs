@@ -6,8 +6,8 @@ use std::time::Duration;
 use a2a::{Message, Task, TaskState};
 use adam_a2a::{
     ACCESS_TIER_EXTENSION, AccessTiers, BackendError, COMMANDS_EXTENSION, Caller,
-    MODEL_PICK_EXTENSION, ModelChoices, STEER_EXTENSION, TaskBackend, TaskEvent, TaskPage,
-    TaskQuery,
+    MODEL_PICK_EXTENSION, ModelChoices, REASONING_EXTENSION, ReasoningEfforts, STEER_EXTENSION,
+    TaskBackend, TaskEvent, TaskPage, TaskQuery,
 };
 use adam_core::{RunId, StoreError};
 use adam_error::ErrorClass;
@@ -24,6 +24,7 @@ use crate::convert::{
 };
 use crate::ids::task_id_for;
 use crate::model_pick;
+use crate::reasoning;
 use crate::subscribe;
 use crate::tier;
 use crate::vymalo;
@@ -190,6 +191,17 @@ pub const MAX_REFERENCES: usize = 8;
 /// pick is a request, not an authorisation: the model call goes through the deployment's gateway,
 /// which still refuses a locked model (`model_locked`, ADR 0067).
 ///
+/// # The reasoning effort (`reasoning/v1`)
+///
+/// With [`with_reasoning_efforts`](Self::with_reasoning_efforts), a message whose request
+/// **activated** [`REASONING_EXTENSION`] must name in its metadata under that URI an effort the model
+/// of the run takes, or it is refused (`InvalidParams`, before anything is written) with a sentence
+/// naming the agent and its levels. The level reaches the run as the context key
+/// [`CONTEXT_REASONING_EFFORT`](crate::CONTEXT_REASONING_EFFORT), which the agent loop reads on every
+/// model turn and sends through the model's wire; a message that does not activate the extension
+/// carries no level, whatever its metadata says. The extension can only set: no member clears an
+/// effort, and a backend given no levels (a card that lists none) never reads one.
+///
 /// # Commands (`commands/v1`)
 ///
 /// With [`with_commands`](Self::with_commands), a message that names a command the agent serves is
@@ -250,6 +262,9 @@ pub struct RuntimeTaskBackend {
     /// The models of `model-pick/v1` this agent offers a message to pick, when its card lists
     /// them.
     pub(crate) model_choices: Option<ModelChoices>,
+    /// The levels of `reasoning/v1` the model of each agent takes, when the root's card lists
+    /// them.
+    pub(crate) reasoning_efforts: Option<ReasoningEfforts>,
     /// The commands of `commands/v1` this agent serves, when its card lists them.
     pub(crate) commands: Option<crate::Commands>,
     /// The helpers of `child-sessions/v1` this agent serves, when its card lists them.
@@ -277,6 +292,7 @@ impl RuntimeTaskBackend {
             inbound: Arc::new(default_inbound),
             access_tiers: None,
             model_choices: None,
+            reasoning_efforts: None,
             commands: None,
             child_sessions: None,
         }
@@ -349,6 +365,28 @@ impl RuntimeTaskBackend {
     /// The models this backend offers a message to pick, when it serves `model-pick/v1`.
     pub fn model_choices(&self) -> Option<&ModelChoices> {
         self.model_choices.as_ref()
+    }
+
+    /// Serve `reasoning/v1` for an agent whose card lists `efforts`
+    /// ([`ExtensionConfig::reasoning`](adam_a2a::ExtensionConfig::reasoning)): see "The reasoning
+    /// effort" in the type's documentation. A message that activated the extension is refused
+    /// unless it names a level the agent's model takes, and an accepted one rides the run's
+    /// context. Without it the extension is never read, whatever a request names.
+    #[must_use]
+    pub fn with_reasoning_efforts(mut self, efforts: ReasoningEfforts) -> Self {
+        self.reasoning_efforts = Some(efforts).filter(|efforts| !efforts.is_empty());
+        self
+    }
+
+    /// The levels this backend serves `reasoning/v1` for, when it does.
+    pub fn reasoning_efforts(&self) -> Option<&ReasoningEfforts> {
+        self.reasoning_efforts.as_ref()
+    }
+
+    /// The name of the agent this backend serves: the key its `reasoning/v1` levels are held
+    /// under, and the agent a refusal names.
+    pub fn agent(&self) -> &str {
+        &self.agent
     }
 
     /// Serve `commands/v1` for an agent whose card lists `commands`
@@ -865,6 +903,17 @@ impl RuntimeTaskBackend {
                 .requested(&message)
                 .map_err(BackendError::InvalidParams)?;
             model_pick::put(&mut inbound, &alias).map_err(BackendError::InvalidParams)?;
+        }
+        // A message that activated `reasoning/v1` names an effort the model of this run takes, or
+        // nothing is written; the level rides the context to the loop, which asks for it from its
+        // next model call. One that did not is read as it always was.
+        if let Some(efforts) = &self.reasoning_efforts
+            && caller.has_extension(REASONING_EXTENSION)
+        {
+            let level = efforts
+                .requested(&self.agent, &message)
+                .map_err(BackendError::InvalidParams)?;
+            reasoning::put(&mut inbound, level).map_err(BackendError::InvalidParams)?;
         }
 
         let Some(task_id) = task_id else {

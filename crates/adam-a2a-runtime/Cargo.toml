@@ -37,6 +37,8 @@ uuid.workspace = true
 proptest.workspace = true
 adam-llm-agent.workspace = true
 adam-model.workspace = true
+# The client the `reasoning/v1` test drives the whole chain through (`tests/reasoning.rs`).
+adam-model-openai = { workspace = true, features = ["aws-lc"] }
 adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }
 adam-store-testkit.workspace = true
 a2a-client-lf.workspace = true
@@ -46,6 +48,7 @@ secrecy.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
 tracing-subscriber.workspace = true
+wiremock.workspace = true
 
 # These tests need the server parts: an embedded build (no default features) leaves them out.
 [[test]]

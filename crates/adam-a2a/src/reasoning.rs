@@ -56,6 +56,12 @@ impl ReasoningEfforts {
         Self::default()
     }
 
+    /// Whether no agent has an entry: an empty set lists no extension and refuses every request,
+    /// so a backend given one reads nothing, as a card that lists no `reasoning/v1`.
+    pub fn is_empty(&self) -> bool {
+        self.agents.is_empty()
+    }
+
     /// The set from `(agent, levels, default)` triples, each agent once (a later triple replaces an
     /// earlier one), every level re-ordered by [`ReasoningEffort::ALL`] and kept once.
     pub fn from_agents<I, A, L>(agents: I) -> Self
@@ -92,6 +98,26 @@ impl ReasoningEfforts {
         self.agents
             .insert(agent.into(), AgentEfforts { levels, default });
         self
+    }
+
+    /// The set of an assembly's agents, from `(agent, model alias, default)` triples and the
+    /// deployment's `MODEL_ALIASES_FILE` profiles ([ADR 0063](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0063-a-reasoning-effort-is-one-setting.md),
+    /// decision 5): `agent`'s levels are the `reasoningEfforts` of the profile of the model `alias`
+    /// names, lowest first, and `default` is the level the folder, its `model_preset` or the profile
+    /// resolved for it ([`Self::with_agent`] drops one the model does not take). An alias with no
+    /// profile, or a profile with `reasoningEfforts: []`, takes no level: its card lists no
+    /// extension.
+    pub fn from_models<'a, I>(agents: I, profiles: &adam_model::ModelProfiles) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a str, Option<ReasoningEffort>)>,
+    {
+        Self::from_agents(agents.into_iter().map(|(agent, alias, default)| {
+            let levels = profiles
+                .profile(alias)
+                .and_then(|profile| profile.reasoning_efforts.clone())
+                .unwrap_or_default();
+            (agent.to_owned(), levels, default)
+        }))
     }
 
     /// The levels `agent`'s model takes, lowest first; empty for an agent with no entry.
@@ -279,6 +305,35 @@ mod tests {
             serde_json::Value::Object(e.params),
             json!({"efforts": ["low"]})
         );
+    }
+
+    #[test]
+    fn the_set_of_an_assembly_is_each_models_own_levels() {
+        let profiles = adam_model::ModelProfiles::parse_json(
+            r#"{"profiles": {"wide": {"reasoningEfforts": ["max", "low"], "reasoningWire": "reasoning_effort"}, "bare": {}, "off": {"reasoningEfforts": []}}}"#,
+        )
+        .expect("valid profiles");
+        let set = ReasoningEfforts::from_models(
+            [
+                ("coder", "wide", Some(ReasoningEffort::Low)),
+                ("chat", "bare", None),
+                ("tutor", "off", None),
+                ("nobody", "unknown", None),
+            ],
+            &profiles,
+        );
+        assert_eq!(
+            set.levels("coder"),
+            [ReasoningEffort::Low, ReasoningEffort::Max],
+            "the model's levels, lowest first"
+        );
+        assert_eq!(set.default_of("coder"), Some(ReasoningEffort::Low));
+        for agent in ["chat", "tutor", "nobody"] {
+            assert!(set.levels(agent).is_empty(), "{agent}");
+            assert_eq!(set.default_of(agent), None, "{agent}");
+        }
+        assert!(!set.is_empty());
+        assert!(ReasoningEfforts::new().is_empty());
     }
 
     #[test]
