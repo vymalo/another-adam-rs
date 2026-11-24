@@ -635,6 +635,7 @@ impl Tool for Start {
             // A session is one the person sees when their client shows child sessions: only then
             // may a round of it ask them (ADR 0045 decision 9).
             visible: ctx.context(crate::CHILD_SESSIONS_CONTEXT_KEY) == Some(&Value::Bool(true)),
+            config: None,
         };
         let input = round_message(ctx, prompt, &header);
         starter
@@ -786,6 +787,7 @@ impl Tool for Send {
                 round: 0,
                 root: None,
                 visible: false,
+                config: None,
             });
             header.round = view.round + 1;
             // The round before may have been one that only cleaned up after a cancel.
@@ -1073,6 +1075,7 @@ impl Tool for Close {
                 round: 0,
                 root: None,
                 visible: false,
+                config: None,
             });
             header.round = view.round + 1;
             header.closed = true;

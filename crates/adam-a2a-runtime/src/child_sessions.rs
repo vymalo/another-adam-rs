@@ -982,6 +982,7 @@ impl RuntimeTaskBackend {
             // Only a request that activated the extension gets here, so the person sees the
             // session and can answer a round of it (ADR 0045 decision 9).
             visible: true,
+            config: None,
         };
         put_header(&mut inbound, &header).map_err(BackendError::InvalidParams)?;
         self.runtime
@@ -1300,6 +1301,7 @@ fn next_header(view: &SessionView, session: RunId) -> SessionHeader {
         round: 0,
         root: None,
         visible: false,
+        config: None,
     });
     header.round = view.round + 1;
     // The round before may have been one that only cleaned up after a cancel.
@@ -1590,6 +1592,7 @@ mod tests {
             round: 1,
             root: None,
             visible: false,
+            config: None,
         };
         let mut text = Inbound::new("message", json!("hi"));
         put_header(&mut text, &header).unwrap();
