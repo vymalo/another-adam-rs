@@ -1,6 +1,7 @@
 //! The disk budget (ADR 0065 decision 7): a clone past it asks the person, the reserve stays
 //! free, and cleanup never removes unpushed work. Needs `git` on the PATH.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
