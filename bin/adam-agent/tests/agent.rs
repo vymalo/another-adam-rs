@@ -2185,10 +2185,10 @@ async fn a_control_plane_refuses_a_prompt_it_cannot_expand_and_warns_at_start() 
 }
 
 /// `MAX_PARALLEL_TOOL_CALLS` reaches the folder's agents, and the folder's own `limits.max_parallel`
-/// can only lower it (ADR 0049).
+/// can only lower it: a larger value is refused (ADR 0049, ADR 0054).
 #[tokio::test]
 async fn the_deployments_parallel_limit_reaches_the_agent_and_the_file_only_lowers_it() {
-    let limit = |folder: &tempfile::TempDir, setting: usize| {
+    let assemble = |folder: &tempfile::TempDir, setting: usize| {
         let def = def_of(folder);
         let model: DynModel = Arc::new(MockModel::new());
         async move {
@@ -2201,9 +2201,16 @@ async fn the_deployments_parallel_limit_reaches_the_agent_and_the_file_only_lowe
                 setting,
             )
             .await
-            .expect("the folder assembles")
-            .root()
-            .max_parallel()
+        }
+    };
+    let limit = |folder: &tempfile::TempDir, setting: usize| {
+        let assembled = assemble(folder, setting);
+        async move {
+            assembled
+                .await
+                .expect("the folder assembles")
+                .root()
+                .max_parallel()
         }
     };
     let folder = chat();
@@ -2213,7 +2220,13 @@ async fn the_deployments_parallel_limit_reaches_the_agent_and_the_file_only_lowe
         t.replacen("limits:", "limits:\n  max_parallel: 2", 1)
     });
     assert_eq!(limit(&folder, 6).await, 2, "the file lowers it");
-    assert_eq!(limit(&folder, 1).await, 1, "and never raises it");
+    let refused = assemble(&folder, 1).await.err().map(|e| format!("{e:?}"));
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|e| e.contains("ParallelAboveDeployment")),
+        "a file above the deployment is refused, never clamped (ADR 0054): {refused:?}"
+    );
 }
 
 /// `MODEL_ALIASES_FILE`'s profiles reach the agent through `WorkerParts`: the folder's
