@@ -986,7 +986,16 @@ async fn the_card_lists_model_pick_exactly_when_the_backend_serves_it() {
             "0.0.1",
         ));
         if served {
-            agents = agents.model_choices(ModelChoices::from_aliases(["alias-a", "alias-b"]));
+            // One choice names its endpoint label, the other does not (ANR-623): the card carries
+            // each as it is, and invents nothing.
+            let profiles = adam_model::ModelProfiles::parse_json(
+                r#"{"profiles": {"alias-a": {"endpoint": "gateway-a"}, "alias-b": {}}}"#,
+            )
+            .expect("valid profiles");
+            agents = agents.model_choices(ModelChoices::from_profiles(
+                ["alias-a", "alias-b"],
+                &profiles,
+            ));
         }
         let running = Running::start(listener, cfg, agents);
         until_ok(addr, "/healthz", &running.handle).await;
@@ -1004,7 +1013,10 @@ async fn the_card_lists_model_pick_exactly_when_the_backend_serves_it() {
         assert_eq!(entry.is_some(), served);
         if let Some(entry) = entry {
             let params = entry.params.as_ref().unwrap();
-            assert_eq!(params["choices"], json!(["alias-a", "alias-b"]));
+            assert_eq!(
+                params["choices"],
+                json!([{"id": "alias-a", "endpoint": "gateway-a"}, {"id": "alias-b"}])
+            );
         }
         running.finish().await;
     }

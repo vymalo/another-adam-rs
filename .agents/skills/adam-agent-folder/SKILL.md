@@ -52,9 +52,12 @@ before you rely on a detail here.
      server's `when` included; `lazy`, the default, starts lean and loads tools in groups; `searchable` behaves as `lazy` until
      searchable groups land; ADR 0066).
    * **A model per message is the deployment's offer, not a folder key.** When `MODEL_ALIASES_FILE` profiles more than one
-     model, a served `ROLE=all` agent lists `model-pick/v1` with the aliases it may be bound to, other than its own, and
-     a message that activates it names one (`metadata[URI] = {"model": ..}`); an alias outside the list is refused as
-     `model_not_offered` before anything runs (ADR 0064, amended 2026-11-23; the client side is `adam-a2a-extensions`).
+     model, a served `ROLE=all` agent lists `model-pick/v1` with the aliases it may be bound to, other than its own, each
+     as `{"id": "<alias>", "endpoint"?: "<label>"}` — the endpoint label coming from that alias's profile's `endpoint`,
+     a label only, absent when the deployment names none — and a message that activates it names one
+     (`metadata[URI] = {"model": ..}`); an alias outside the list is refused as
+     `model_not_offered` before anything runs (ADR 0064, amended 2026-11-23; the card field is ANR-623; the client side is
+     `adam-a2a-extensions`).
    * `vars:` are the `{{placeholders}}` of the body. Every var needs a value in the file. A var
      declared without a value, a var the body does not use, or a placeholder not declared, stops
      the process at startup.
