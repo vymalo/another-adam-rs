@@ -270,6 +270,13 @@ const NOT_ALONGSIDE: &str = "this tool cannot run alongside others: call it alon
 pub const UNATTENDED: &str = "nobody answers this run: a schedule started it, not a person, so nothing \
 can be asked. Do what you can without asking, and say in your final answer what is still needed";
 
+/// The result a tool that asks the person gets in a child run that may not ask (ADR 0045 decision
+/// 9): only a round of a kept-open session that a client shows (`child-sessions/v1`) has somebody
+/// to answer it, so the model is told to go on and say what it needs in its report.
+pub const NOT_ASKABLE: &str = "nobody can answer this run: only a kept-open subagent session whose \
+client shows child sessions may ask the person. Do what you can without asking, and say in your \
+final answer what is still needed";
+
 /// Whether nobody answers a run: a firing of a schedule (its conversation is under
 /// `adam.schedule:`), or a child of one (its context carries `adam_runtime::UNATTENDED_CONTEXT_KEY`,
 /// which the scheduler sets and children inherit).
@@ -3971,6 +3978,7 @@ impl LlmAgent {
                 Some(early) => early.take_one(&call).await,
                 None => None,
             };
+            let may_ask = state.may_ask_person(ctx.conversation_id());
             let (result, reported) = self
                 .run_tool(
                     ctx,
@@ -3994,6 +4002,7 @@ impl LlmAgent {
                         removed_tools: Arc::from(state.removed_tools.clone()),
                     },
                     started,
+                    may_ask,
                 )
                 .await?;
             state.sandbox_usage.merge(&reported);
@@ -4411,6 +4420,7 @@ impl LlmAgent {
                         files_kept(&state.artifacts),
                         Some(live),
                         is_unattended(ctx.conversation_id(), Some(&state.context)),
+                        state.may_ask_person(ctx.conversation_id()),
                     )
                     .await?
                 }
@@ -4930,6 +4940,7 @@ impl LlmAgent {
         call: &ToolCall,
         facts: CallFacts,
         started: Option<Finished>,
+        may_ask: bool,
     ) -> Result<(ToolResult, SandboxUsage), AgentError> {
         let files_used = facts.files_used;
         // A call that started while the model wrote: its work is done, so the step records what it
@@ -4961,6 +4972,7 @@ impl LlmAgent {
                     files_used,
                     Some(live),
                     is_unattended(ctx.conversation_id(), context.map(|c| c.as_ref())),
+                    may_ask,
                 )
                 .await;
         }
@@ -5002,6 +5014,7 @@ impl LlmAgent {
             files_used,
             None,
             unattended,
+            may_ask,
         )
         .await
     }
@@ -5021,6 +5034,7 @@ impl LlmAgent {
         files_used: u64,
         live: Option<Live>,
         unattended: bool,
+        may_ask: bool,
     ) -> Result<(ToolResult, SandboxUsage), AgentError> {
         let silent = self
             .source_note(notes, &call.name)
@@ -5145,6 +5159,24 @@ impl LlmAgent {
             // Nobody answers a firing of a schedule: the question is refused, and the model goes on.
             Err(ToolError::NeedsInput { question, .. }) if unattended => {
                 let reason = format!("{UNATTENDED}. The question was: {question}");
+                say(
+                    ctx,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        StepState::Failed,
+                        Some((&reason, true)),
+                        notes,
+                    ),
+                )
+                .await;
+                ToolResult::error(&call.id, backstop(&reason, &call.name, false).into_owned())
+            }
+            // Only a round of a kept-open session a client shows may ask the person (ADR 0045
+            // decision 9): a child that cannot would wait for an answer nobody can give.
+            Err(ToolError::NeedsInput { question, .. }) if !may_ask => {
+                let reason = format!("{NOT_ASKABLE}. The question was: {question}");
                 say(
                     ctx,
                     silent,

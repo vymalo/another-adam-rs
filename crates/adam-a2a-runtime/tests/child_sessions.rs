@@ -20,7 +20,7 @@ use adam_a2a::{
 };
 use adam_a2a_runtime::{ChildSessionAgent, ChildSessions, RuntimeTaskBackend};
 use adam_core::{DynStore, MemoryStore, RunId};
-use adam_llm_agent::{LlmAgent, SessionAgent, SessionTools};
+use adam_llm_agent::{LlmAgent, SessionAgent, SessionTools, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::{
     DynModel, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse, ToolCall,
 };
@@ -94,6 +94,34 @@ impl ModelClient for GateModel {
     }
 }
 
+/// A tool of the helper's that asks the person: the round parks on it (ADR 0045 decision 9).
+struct Ask;
+
+#[async_trait]
+impl Tool for Ask {
+    fn spec(&self) -> adam_model::ToolSpec {
+        adam_model::ToolSpec {
+            name: "ask".into(),
+            description: "asks the person".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"question": {"type": "string"}},
+                "required": ["question"],
+            }),
+        }
+    }
+
+    fn asks_user(&self) -> bool {
+        true
+    }
+
+    async fn call(&self, _ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::needs_input(
+            args["question"].as_str().unwrap_or("which one?"),
+        ))
+    }
+}
+
 struct Rig {
     store: DynStore,
     runtime: Runtime,
@@ -124,6 +152,8 @@ struct Options {
     /// How often a subscription re-reads the durable run: the pump's fallback poll, and therefore
     /// the interval on which a session change is noticed. 10 ms unless a test pins the real bound.
     view_poll: Duration,
+    /// The helper has a tool that asks the person.
+    asks: bool,
 }
 
 impl Options {
@@ -139,6 +169,7 @@ impl Options {
             limits: None,
             idle: None,
             view_poll: Duration::from_millis(10),
+            asks: false,
         }
     }
 }
@@ -198,9 +229,13 @@ impl Rig {
         if let Some((ttl, clock)) = &options.idle {
             builder = builder.session_idle_ttl(*ttl).clock(clock.clone());
         }
+        let mut helper_agent = LlmAgent::builder(&helper, helper_model, "m");
+        if options.asks {
+            helper_agent = helper_agent.tool(Ask);
+        }
         let runtime = builder
             .agent(parent_agent.build())
-            .agent(LlmAgent::builder(&helper, helper_model, "m").build())
+            .agent(helper_agent.build())
             .agent(LlmAgent::builder(&hidden, hidden_mock.clone() as DynModel, "m").build())
             .event_sink(events.clone())
             .poll_interval(Duration::from_millis(10))
@@ -397,6 +432,88 @@ async fn a_person_starts_a_session_and_it_is_the_round_of_a_new_child_context() 
         let first = rig.submit(&alice(), again.clone(), None).await.unwrap();
         let second = rig.submit(&alice(), again, None).await.unwrap();
         assert_eq!(first.id, second.id);
+        rig.stop().await;
+    }
+}
+
+/// ADR 0045 decision 9, slice 8: a round of a kept-open session a person started **asks** them.
+/// Its task is `input-required` with the question, the session's round says `blocked`, and the
+/// person's answer sent to the child context resumes the round, which ends with it. A caller that
+/// did not activate the extension cannot reach the round at all.
+#[tokio::test]
+async fn a_shown_round_asks_the_person_who_answers_it_in_the_child_context() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                asks: true,
+                ..Options::new()
+            },
+        );
+        rig.helper_mock
+            .push_tool_calls(vec![ToolCall::new(
+                "q1",
+                "ask",
+                json!({"question": "which branch?"}),
+            )])
+            .push_text("pushed to main");
+        let start = rig
+            .start(&alice(), Some("ctx-ask"), "do the work", true)
+            .await;
+
+        // It parks `input-required`, with the question as the status message.
+        let waiting = rig
+            .until(&alice(), &start.id, TaskState::InputRequired)
+            .await;
+        let asked = waiting
+            .status
+            .message
+            .as_ref()
+            .and_then(|m| m.parts.first())
+            .and_then(a2a::Part::as_text)
+            .unwrap_or_default();
+        assert_eq!(asked, "which branch?");
+
+        // The session says it waits for the person, and its header says the person sees it.
+        let (session, rec) = {
+            let (_, session) = parse_session_conversation_id(&start.context_id).unwrap();
+            let rec = store.load_run(session).await.unwrap().unwrap();
+            (session, rec)
+        };
+        let (parent, _) =
+            parse_session_conversation_id(rec.conversation_id.as_deref().unwrap()).unwrap();
+        let view = rig
+            .runtime
+            .session_view(&parent, session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(view.waiting, "the round waits, it is not done");
+        assert_eq!(view.waiting_reason.as_deref(), Some("which branch?"));
+        assert!(view.header.as_ref().is_some_and(|h| h.visible));
+        assert_eq!(object(&waiting)["state"], "working");
+
+        // A caller that did not activate the extension cannot even reach the round.
+        assert!(invalid(
+            rig.submit(&plain("alice"), said("main", Some(&start.context_id)), None)
+                .await
+        ));
+
+        // The person answers in the child context: the same round resumes and ends with it.
+        let answered = rig
+            .submit(&alice(), said("main", Some(&start.context_id)), None)
+            .await
+            .unwrap();
+        assert_eq!(answered.id, start.id);
+        let done = rig.until(&alice(), &start.id, TaskState::Completed).await;
+        let said = done
+            .status
+            .message
+            .as_ref()
+            .and_then(|m| m.parts.first())
+            .and_then(a2a::Part::as_text)
+            .unwrap_or_default();
+        assert_eq!(said, "pushed to main");
         rig.stop().await;
     }
 }

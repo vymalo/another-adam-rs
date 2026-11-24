@@ -67,6 +67,40 @@ pub const MAX_SESSION_ROUNDS: u32 = 20;
 /// most recently updated first.
 const CLOSED_LISTED: usize = 16;
 
+/// The context key under which a request says its client **shows child sessions**: `true` when it
+/// activated [`CHILD_SESSIONS_EXTENSION`], and `null` (which clears an earlier value) when it did
+/// not. The loop keeps it as `adam_llm_agent::CHILD_SESSIONS_CONTEXT_KEY`, and a session it starts
+/// is then one the person sees: a round of that kept-open session may ask them (ADR 0045
+/// decision 9). A request to a child context writes no key: the round it starts is shown already.
+pub const CONTEXT_CHILD_SESSIONS: &str = "vymalo.childSessions";
+
+/// Put into `inbound` whether this request activated `child-sessions/v1`
+/// ([`CONTEXT_CHILD_SESSIONS`]): `true` or `null`, so that a message that did not activate the
+/// extension takes an earlier yes away.
+pub(crate) fn shown_into(activated: bool, inbound: &mut Inbound) {
+    if let Value::String(text) = &inbound.payload {
+        inbound.payload = json!({ "text": text });
+    }
+    let Some(payload) = inbound.payload.as_object_mut() else {
+        return;
+    };
+    let Some(context) = payload
+        .entry("context")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+    else {
+        return;
+    };
+    context.insert(
+        CONTEXT_CHILD_SESSIONS.to_owned(),
+        if activated {
+            Value::Bool(true)
+        } else {
+            Value::Null
+        },
+    );
+}
+
 /// How many times a request that finds its session changing under it looks again.
 const ATTEMPTS: usize = 3;
 
@@ -945,6 +979,9 @@ impl RuntimeTaskBackend {
             // name the round's own task, which the orchestrator binds as any task it creates
             // (ADR 0067).
             root: None,
+            // Only a request that activated the extension gets here, so the person sees the
+            // session and can answer a round of it (ADR 0045 decision 9).
+            visible: true,
         };
         put_header(&mut inbound, &header).map_err(BackendError::InvalidParams)?;
         self.runtime
@@ -1064,8 +1101,12 @@ impl RuntimeTaskBackend {
                     max_working,
                 )));
             }
-            put_header(&mut inbound, &next_header(&view, session))
-                .map_err(BackendError::InvalidParams)?;
+            let mut header = next_header(&view, session);
+            // A person's message only reaches here through a request that activated the
+            // extension: the person sees the session, so a round of it may ask them (ADR 0045
+            // decision 9).
+            header.visible = true;
+            put_header(&mut inbound, &header).map_err(BackendError::InvalidParams)?;
             match self.next_round(&view, next, inbound, within).await? {
                 Next::Started => return self.answer_round(caller, &next).await,
                 Next::Busy => {}
@@ -1258,6 +1299,7 @@ fn next_header(view: &SessionView, session: RunId) -> SessionHeader {
         closing: false,
         round: 0,
         root: None,
+        visible: false,
     });
     header.round = view.round + 1;
     // The round before may have been one that only cleaned up after a cancel.
@@ -1529,6 +1571,14 @@ mod tests {
     }
 
     #[test]
+    fn the_child_sessions_context_key_is_the_loops() {
+        assert_eq!(
+            CONTEXT_CHILD_SESSIONS,
+            adam_llm_agent::CHILD_SESSIONS_CONTEXT_KEY
+        );
+    }
+
+    #[test]
     fn the_header_goes_into_the_payload_whatever_it_is() {
         let header = SessionHeader {
             id: RunId::new(),
@@ -1539,6 +1589,7 @@ mod tests {
             closing: false,
             round: 1,
             root: None,
+            visible: false,
         };
         let mut text = Inbound::new("message", json!("hi"));
         put_header(&mut text, &header).unwrap();

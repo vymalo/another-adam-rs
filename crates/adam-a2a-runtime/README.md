@@ -129,6 +129,12 @@ The contract is `docs/api/child-sessions-v1.md` of
 the decision is [ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) (decision 11, slice 6 parts a, b and c). The front is wired by `adam-service` (`Agents::child_sessions`, which lists the card entry only when `RuntimeTaskBackend::child_sessions()` says the backend serves it) from `AgentDef::child_sessions` of `adam-assembly`; `ChildSessions::agents()` lists the helpers.
 A session is a chain of runs of a helper agent that share one conversation (`adam_runtime::session_conversation_id`); to a client
 that **activated** the extension each round is a task of a **child context**, and the parent task lists its sessions.
+**A round may ask the person** (ADR 0045 decision 9): its task is `input-required` with the question, the session's round
+event says `blocked`, and the person's answer is a plain message in the child context (or a follow-up to the round's task),
+which the parked round reads as the asking tool's result. Only a round of a kept-open session is askable, and the front
+writes `visible` into the header of a round it starts; a message to a root context carries, in the run's context,
+`child_sessions::CONTEXT_CHILD_SESSIONS` (`vymalo.childSessions`), `true` when the request activated the extension and `null`
+when it did not, so a session the model starts for a client that shows none is one whose rounds are told `NOT_ASKABLE`.
 
 **Context ids.** The client says `C` for a parent context and `K = session_conversation_id(C, S)` (`<C escaped>/s/<S>`) for
 the child context of session `S`. The store keeps `encode_conversation(subject, C)` and

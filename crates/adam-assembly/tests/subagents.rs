@@ -870,7 +870,7 @@ fn a_clash_is_found_below_the_root_too() {
     assert_eq!(origin.agent, "coder/researcher/summarizer");
 }
 
-// --- a subagent cannot ask -----------------------------------------------------------------
+// --- a subagent may have an asking tool, and cannot use it at run time -----------------------
 
 fn asking(name: &str) -> FnTool {
     FnTool::raw(
@@ -883,45 +883,32 @@ fn asking(name: &str) -> FnTool {
 }
 
 #[test]
-fn a_subagent_with_a_tool_that_asks_the_user_is_refused() {
-    let files = with_helper("coder", "tools: [ask_user]", "tools: [ask_user]");
-    let registered = || ToolSet::new().tool(asking("ask_user")).tool(stub("fetch"));
-    let error = bind_error(&files, registered());
-    let Error::SubagentAsksUser { origin, tool } = &error else {
-        panic!("wrong variant: {error}");
-    };
-    assert_eq!(origin.agent, "coder/helper");
-    assert_eq!(origin.file.to_string_lossy(), "agent/subagents/helper.md");
-    assert_eq!(tool, "ask_user");
-    assert_eq!(
-        error.to_string(),
-        "agent `coder/helper` (agent/subagents/helper.md): a subagent cannot have `ask_user`: it \
-         asks the user a question, and a subagent runs as a child of another run, so nobody could \
-         answer it. List its `tools` by name, without `ask_user`, or let the parent ask instead"
+fn a_subagent_with_a_tool_that_asks_the_user_is_offered_it() {
+    // ADR 0045 decision 9: whether a child may ask is decided per run, not at bind time. A tool
+    // that asks is offered to a subagent here; the loop refuses the question in a run nobody can
+    // answer (`adam_llm_agent::NOT_ASKABLE`) and lets a round of a kept-open session a client
+    // shows ask.
+    let files = with_helper("coder", "tools: [fetch]", "tools: [ask_user]");
+    let assembly = assemble(
+        &files,
+        ToolSet::new().tool(asking("ask_user")).tool(stub("fetch")),
+        &Arc::new(MockModel::new()),
     );
-
-    // Also when it gets the tool by `all` or by a pattern, not by name.
+    assert_eq!(assembly.info()[1].tools, ["ask_user"]);
+    // Also through `all` or a pattern, not only by name.
     for listed in ["tools: '*'", "tools: [fetch, 'ask*']"] {
-        let files = with_helper("coder", "tools: [ask_user]", listed);
+        let files = with_helper("coder", "tools: [fetch]", listed);
+        let assembly = assemble(
+            &files,
+            ToolSet::new().tool(asking("ask_user")).tool(stub("fetch")),
+            &Arc::new(MockModel::new()),
+        );
         assert!(
-            matches!(
-                bind_error(&files, registered()),
-                Error::SubagentAsksUser { .. }
-            ),
-            "{listed}"
+            assembly.info()[1].tools.iter().any(|t| t == "ask_user"),
+            "{listed}: {:?}",
+            assembly.info()[1].tools
         );
     }
-    // And below the root.
-    let mut files = nested("coder");
-    files[2].1 = instructions(
-        "description: Summarises.\ntools: [ask_user]",
-        "You summarise.",
-    );
-    let error = bind_error(&files, registered().tool(stub("parent_only")));
-    assert!(
-        matches!(&error, Error::SubagentAsksUser { origin, .. } if origin.agent == "coder/researcher/summarizer"),
-        "{error}"
-    );
 }
 
 #[test]
