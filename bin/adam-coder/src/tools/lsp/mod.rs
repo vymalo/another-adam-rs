@@ -522,6 +522,7 @@ impl Call<'_> {
             hide: Vec::new(),
             init_timeout: INITIALIZE_TIMEOUT,
             redactor: env.redactor.clone(),
+            governor: env.settings.governor.clone(),
         };
         let server = match env.commands.language_servers().get_or_start(want).await {
             Ok(server) => server,
@@ -718,6 +719,11 @@ impl Call<'_> {
             StartError::Busy(max) => format!(
                 "This worker holds {max} language servers (LANGUAGE_SERVERS_MAX) and every one is \
                  working for a call: try again shortly."
+            ),
+            StartError::Seat(refused) => format!(
+                "The language server `{}` was not started: {} (MAX_PROCESSES): try again shortly.",
+                shown(&spec.program),
+                adam_error::report(refused)
             ),
             StartError::Stopped => "The language servers of this run were stopped while this one \
                  was starting (the run parked, or its environment was made again): call again."

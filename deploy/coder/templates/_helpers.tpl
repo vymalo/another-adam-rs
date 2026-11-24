@@ -137,6 +137,20 @@ refuse. Null or empty is nothing at all.
 {{- end -}}
 
 {{/*
+A setting's value as the text its variable holds (config.maxProcesses, config.maxGitProcesses,
+config.commandMemoryMax, config.commandCpuMax): Helm reads the numbers of a values file as floats, so a
+whole one is written in full; anything else is written as it is, for _validate.tpl or the binary to
+refuse. Null or empty is nothing at all.
+*/}}
+{{- define "coder.settingText" -}}
+{{- if and (kindIs "float64" .) (eq . (floor .)) -}}
+{{- printf "%.0f" . -}}
+{{- else if not (kindIs "invalid" .) -}}
+{{- toString . | trim -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Whether config.modelBaseUrl holds a URL somebody chose: not empty and not the placeholder above.
 Renders "true" or nothing.
 */}}

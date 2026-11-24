@@ -43,7 +43,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use adam_workspace::{EnvError, EnvSession, ExecId, SlotDir};
+use adam_code_tools::governor::Governor;
+use adam_workspace::{EnvError, EnvKind, EnvSession, ExecId, SlotDir};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt as _;
 use tokio::process::Child;
@@ -54,6 +55,7 @@ use super::rpc::{Client, Peer, RpcError};
 use super::table::{Language, Mode, ServerSpec, Settings};
 use crate::redact::Redactor;
 use crate::tools::inspect::Snapshot;
+use crate::tools::shell::{Hold, RunError, seat_of, spawn_seated};
 
 /// How long `initialize` may take.
 pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -434,6 +436,8 @@ pub enum StartError {
     Failed(String),
     /// `LANGUAGE_SERVERS_MAX` servers are held and every one is working.
     Busy(usize),
+    /// No seat of the process pool (`MAX_PROCESSES`) freed in time: the call is told to try again.
+    Seat(adam_budget::Refused),
     /// The run's servers were stopped (it parked, ended or remade its environment) while this one
     /// was starting: it was stopped too.
     Stopped,
@@ -1252,6 +1256,9 @@ pub struct Want<'a> {
     /// What the server's stderr is scrubbed with; its [`margin`](Redactor::margin) is how much of
     /// it is held beyond [`STDERR_KEPT`].
     pub redactor: Redactor,
+    /// The process pool a server takes a seat of for as long as it lives (ADR 0065): `None` takes
+    /// none. A server that runs in a pod is never counted, whatever this says.
+    pub governor: Option<Governor>,
 }
 
 impl Servers {
@@ -1606,13 +1613,19 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
     }
     spec = spec.hide(want.hide.iter().cloned());
     let prepared = want.session.prepare(&spec).map_err(StartError::Prepare)?;
-    let mut cmd = prepared.command();
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
-    let mut child = cmd.spawn().map_err(StartError::Spawn)?;
+    let governor = want
+        .governor
+        .as_ref()
+        .filter(|_| matches!(want.session.describe().kind, EnvKind::Local));
+    let seat = seat_of(governor, &key.run).await.map_err(|e| match e {
+        RunError::Busy(refused) => StartError::Seat(refused),
+        other => StartError::Failed(adam_error::report(&other)),
+    })?;
+    let (mut child, hold) =
+        spawn_seated(&prepared, governor, seat, Stdio::piped()).map_err(|e| match e {
+            RunError::Spawn(e) => StartError::Spawn(e),
+            other => StartError::Failed(adam_error::report(&other)),
+        })?;
     let pid = child.id();
     let mut guard = StartGuard {
         pid,
@@ -1767,7 +1780,13 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
         kill_wait: want.kill_wait,
         extensions: language.extensions(),
     });
-    tokio::spawn(supervise(server.clone(), child, stderr_task, stderr_failed));
+    tokio::spawn(supervise(
+        server.clone(),
+        child,
+        stderr_task,
+        stderr_failed,
+        hold,
+    ));
     guard.disarm();
     Ok(server)
 }
@@ -1866,6 +1885,7 @@ async fn supervise(
     mut child: Child,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     stderr_failed: Arc<Notify>,
+    _hold: Option<Hold>,
 ) {
     let pid = child.id();
     let ended = loop {
@@ -2084,6 +2104,7 @@ mod tests {
                 hide: Vec::new(),
                 init_timeout: Duration::from_secs(10),
                 redactor: Redactor::default(),
+                governor: None,
             };
             assert!(servers.get_or_start(want).await.is_err());
         }

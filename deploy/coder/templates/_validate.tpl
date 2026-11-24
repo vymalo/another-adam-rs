@@ -196,6 +196,23 @@ from service.yaml, which every render contains, so they always run.
 {{- fail "config.maxParallelToolCalls is set and config.extraEnv sets MAX_PARALLEL_TOOL_CALLS: set one" -}}
 {{- end -}}
 {{- end -}}
+{{- /* config.maxProcesses (1 to 256) and config.maxGitProcesses (1 to 64): whole numbers, which the binary would otherwise refuse with exit 78. */ -}}
+{{- with include "coder.settingText" .Values.config.maxProcesses -}}
+{{- if or (not (regexMatch "^[1-9][0-9]{0,2}$" .)) (gt (int64 .) 256) -}}
+{{- fail (printf "config.maxProcesses must be a whole number from 1 to 256 (the processes of a worker at once), got %q" .) -}}
+{{- end -}}
+{{- end -}}
+{{- with include "coder.settingText" .Values.config.maxGitProcesses -}}
+{{- if or (not (regexMatch "^[1-9][0-9]?$" .)) (gt (int64 .) 64) -}}
+{{- fail (printf "config.maxGitProcesses must be a whole number from 1 to 64 (the git processes of a worker at once), got %q" .) -}}
+{{- end -}}
+{{- end -}}
+{{- /* A setting and the same variable in config.extraEnv: set one. */ -}}
+{{- range $key, $name := dict "maxProcesses" "MAX_PROCESSES" "maxGitProcesses" "MAX_GIT_PROCESSES" "commandMemoryMax" "COMMAND_MEMORY_MAX" "commandCpuMax" "COMMAND_CPU_MAX" -}}
+{{- if and (include "coder.settingText" (index $.Values.config $key)) (hasKey $.Values.config.extraEnv $name) -}}
+{{- fail (printf "config.%s is set and config.extraEnv sets %s: set one" $key $name) -}}
+{{- end -}}
+{{- end -}}
 {{- /* config.modelBaseUrlFromSecret: MODEL_BASE_URL from the ExternalSecret, not from config.modelBaseUrl. */ -}}
 {{- if not (kindIs "bool" .Values.config.modelBaseUrlFromSecret) -}}
 {{- fail (printf "config.modelBaseUrlFromSecret must be true or false, got %q" (toString .Values.config.modelBaseUrlFromSecret)) -}}

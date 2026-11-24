@@ -244,6 +244,23 @@ spec:
             - name: MAX_PARALLEL_TOOL_CALLS
               value: {{ . | quote }}
             {{- end }}
+            {{- /* The process pools and the limits of one command (ADR 0065). Unset: nothing is rendered and the binary's own defaults apply. */}}
+            {{- with include "coder.settingText" .Values.config.maxProcesses }}
+            - name: MAX_PROCESSES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with include "coder.settingText" .Values.config.maxGitProcesses }}
+            - name: MAX_GIT_PROCESSES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with include "coder.settingText" .Values.config.commandMemoryMax }}
+            - name: COMMAND_MEMORY_MAX
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with include "coder.settingText" .Values.config.commandCpuMax }}
+            - name: COMMAND_CPU_MAX
+              value: {{ . | quote }}
+            {{- end }}
             - name: MAX_CHECK_CYCLES
               value: {{ .Values.config.maxCheckCycles | quote }}
             - name: CHECK_TIMEOUT_SECS

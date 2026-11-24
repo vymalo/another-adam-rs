@@ -92,7 +92,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::inspect::Snapshot;
 use super::sandbox::Meter;
-use super::shell::{KeptNote, ShellOutcome, kill_group, resolve_cwd, shell_spec, spawn_prepared};
+use super::shell::{
+    Hold, KeptNote, ShellOutcome, kill_group, resolve_cwd, seat_of, shell_spec, spawn_seated,
+};
 use super::{Outcome, ToolEnv, cancelled, non_empty, output, run_error};
 use crate::kept::{FileKept, size_text};
 use crate::redact::Redactor;
@@ -1278,6 +1280,7 @@ async fn supervise(
     mut child: tokio::process::Child,
     readers: Vec<tokio::task::JoinHandle<()>>,
     lifetime: Duration,
+    _hold: Option<Hold>,
 ) {
     let pid = child.id();
     let ending = tokio::select! {
@@ -1643,6 +1646,18 @@ pub async fn start_command(
     let shown = cut_text(&redactor.scrub(command), MAX_COMMAND_BYTES);
     // Nothing is reserved yet: a call that is dropped here (its time limit, a cancel) leaves nothing.
     ctx.emit_progress(format!("starting: {shown}")).await;
+    // A seat of the process pool, held until the command and its descendants are gone: taken before
+    // anything is reserved, because the wait is an await. A pod runs its commands under its own
+    // limits, so only a command of this container counts.
+    let governor = env
+        .settings
+        .governor
+        .as_ref()
+        .filter(|_| matches!(environment.describe().kind, EnvKind::Local));
+    let seat = match seat_of(governor, &run).await {
+        Ok(seat) => seat,
+        Err(e) => return Err(run_error(redactor, &e)),
+    };
     let room = MIN_ROOM.min(env.kept.run_max() / 4);
     let file = match env.kept.open_live(&run, &id, room) {
         Ok(file) => file,
@@ -1730,8 +1745,8 @@ pub async fn start_command(
 
     // Written before the process exists: a worker that dies in between leaves the exec id to kill.
     entry.write_record_over();
-    let mut child = match spawn_prepared(&prepared) {
-        Ok(child) => child,
+    let (mut child, hold) = match spawn_seated(&prepared, governor, seat, Stdio::null()) {
+        Ok(spawned) => spawned,
         Err(e) => {
             *lock(&entry.ended) = Some(Ended {
                 state: CommandState::Stopped {
@@ -1742,7 +1757,7 @@ pub async fn start_command(
             entry.write_record();
             env.commands.remove(&run, &id);
             env.kept.end_live(&run, &id);
-            return Err(run_error(redactor, &super::shell::RunError::Spawn(e)));
+            return Err(run_error(redactor, &e));
         }
     };
     let pid = child.id();
@@ -1761,6 +1776,7 @@ pub async fn start_command(
         child,
         readers,
         env.settings.background_command_max,
+        hold,
     ));
     view_after(&env, ctx, &entry, wait).await
 }

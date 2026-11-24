@@ -144,6 +144,31 @@ for bad in 0 -1 33 2.5 lots true; do
 done
 check "maxParallelToolCalls and extraEnv MAX_PARALLEL_TOOL_CALLS together are refused" \
   fails helm_reasoning --set config.maxParallelToolCalls=6 --set-string config.extraEnv.MAX_PARALLEL_TOOL_CALLS=6
+# The process pools and the limits of one command (ADR 0065): nothing by default, so the golden does not move.
+helm_reasoning > "$out"
+check "by default no process pool or command limit is rendered" lacks 'name: (MAX_PROCESSES|MAX_GIT_PROCESSES|COMMAND_MEMORY_MAX|COMMAND_CPU_MAX)$'
+helm_reasoning --set config.maxProcesses=8 --set config.maxGitProcesses=3 \
+  --set config.commandMemoryMax=2GB --set config.commandCpuMax=500m > "$out"
+check "maxProcesses is MAX_PROCESSES" envval MAX_PROCESSES 8
+check "maxGitProcesses is MAX_GIT_PROCESSES" envval MAX_GIT_PROCESSES 3
+check "commandMemoryMax is COMMAND_MEMORY_MAX" envval COMMAND_MEMORY_MAX 2GB
+check "commandCpuMax is COMMAND_CPU_MAX" envval COMMAND_CPU_MAX 500m
+check "... each once" count 'name: (MAX_PROCESSES|MAX_GIT_PROCESSES|COMMAND_MEMORY_MAX|COMMAND_CPU_MAX)$' 4
+helm_reasoning --set config.maxProcesses=8 --set config.role=control-plane > "$out"
+check "a control plane runs no commands: no MAX_PROCESSES" lacks 'MAX_PROCESSES'
+helm_reasoning --set config.maxProcesses=8 --set topology=split > "$out"
+check "split: the worker StatefulSet has MAX_PROCESSES" envval MAX_PROCESSES 8
+check "split: the front has not" dlacks Deployment 'MAX_PROCESSES'
+for bad in 0 257 2.5 lots true; do
+  check "maxProcesses $bad is refused" fails helm_reasoning --set-string config.maxProcesses=$bad
+done
+for bad in 0 65 2.5 lots; do
+  check "maxGitProcesses $bad is refused" fails helm_reasoning --set-string config.maxGitProcesses=$bad
+done
+check "maxProcesses and extraEnv MAX_PROCESSES together are refused" \
+  fails helm_reasoning --set config.maxProcesses=8 --set-string config.extraEnv.MAX_PROCESSES=8
+check "commandCpuMax and extraEnv COMMAND_CPU_MAX together are refused" \
+  fails helm_reasoning --set config.commandCpuMax=1 --set-string config.extraEnv.COMMAND_CPU_MAX=1
 # MODEL_AUTH (ADR 0067): how the workers authenticate to the model. Empty by default (nothing is rendered and
 # the binary's own default, `key`, applies), so the golden above does not move; `key`, `device` or `injector`
 # render the word on the roles that run workers. `injector` sends X-Run-Id and no Authorization, for an

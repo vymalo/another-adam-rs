@@ -178,6 +178,8 @@ async fn build_agent(
     let admission: adam_budget::DynAdmission =
         Arc::new(adam_admission_local::LocalAdmission::new(budget.clone()));
     settings.admission = Some(Arc::clone(&admission));
+    // Every git of this process takes a seat of `MAX_GIT_PROCESSES` (ADR 0065 decision 5).
+    adam_workspace::govern_git(Arc::clone(&admission), adam_code_tools::governor::WAIT);
     // The commands' OS limits. The probe starts a transient scope, so it runs off the async threads,
     // once.
     #[cfg(unix)]

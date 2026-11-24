@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use adam_budget::{ConversationId, Refused};
+use adam_budget::{ConversationId, Permit, Refused};
 use adam_runtime::CancelToken;
 use adam_workspace::{
     ConfineError, Confined, Ended, EnvError, EnvKind, EnvSession, ExecSpec, Stopped, safe_fs,
@@ -580,7 +580,7 @@ async fn run_with(
         None => None,
     };
     let spawned = match governed {
-        Some(g) => spawn_confined(&prepared, g.governor),
+        Some(g) => spawn_confined(&prepared, g.governor, Stdio::null()),
         None => spawn_prepared(&prepared)
             .map(|child| (child, Confined::unconfined()))
             .map_err(SpawnError::Io),
@@ -753,13 +753,14 @@ enum SpawnError {
 fn spawn_confined(
     prepared: &adam_workspace::PreparedCommand,
     governor: &Governor,
+    stdin: Stdio,
 ) -> Result<(tokio::process::Child, Confined), SpawnError> {
     let mut cmd = prepared.command();
     let confined = governor
         .confine()
         .confine(&mut cmd, governor.limits())
         .map_err(SpawnError::Confine)?;
-    cmd.stdin(Stdio::null())
+    cmd.stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -767,6 +768,89 @@ fn spawn_confined(
     cmd.process_group(0);
     let child = cmd.spawn().map_err(SpawnError::Io)?;
     Ok((child, confined))
+}
+
+/// What a process that outlives a call holds: a seat of the process pool and, for a command that
+/// runs in this container, its confinement. Dropping it kills the process group, stops the scope and
+/// only then gives the seat back (ADR 0065), so a seat is free only once the process and its
+/// descendants are gone.
+#[must_use = "the seat is given back as soon as this is dropped, and the process group is killed"]
+pub struct Hold {
+    _group: GroupGuard,
+    _seat: Permit,
+}
+
+impl std::fmt::Debug for Hold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hold").finish_non_exhaustive()
+    }
+}
+
+/// A seat of the process pool for a process that is started with [`spawn_seated`]: `None` when
+/// `governor` is `None` (nothing is governed).
+///
+/// # Errors
+///
+/// [`RunError::Busy`] when no seat frees within the governor's wait: nothing is started, and
+/// asking again later is right.
+pub async fn seat_of(
+    governor: Option<&Governor>,
+    conversation: &str,
+) -> Result<Option<Permit>, RunError> {
+    match governor {
+        Some(governor) => governor
+            .seat(ConversationId::new(conversation))
+            .await
+            .map(Some)
+            .map_err(RunError::Busy),
+        None => Ok(None),
+    }
+}
+
+/// Spawn what an environment prepared with the streams a long-lived process needs: `stdin` as
+/// given, stdout and stderr piped, a process group of its own and `kill_on_drop`. With a `governor`
+/// and a `seat` ([`seat_of`]) it runs confined and the returned [`Hold`] keeps the seat until the
+/// process group is gone; without, it is [`spawn_prepared`] with `stdin` and no hold.
+///
+/// Not async, so that a caller that must not await between two steps can use it.
+///
+/// # Errors
+///
+/// [`RunError::Spawn`] when the process cannot be started, [`RunError::Confine`] when its limits
+/// cannot be applied.
+pub fn spawn_seated(
+    prepared: &adam_workspace::PreparedCommand,
+    governor: Option<&Governor>,
+    seat: Option<Permit>,
+    stdin: Stdio,
+) -> Result<(tokio::process::Child, Option<Hold>), RunError> {
+    match (governor, seat) {
+        (Some(governor), Some(seat)) => {
+            let (child, confined) =
+                spawn_confined(prepared, governor, stdin).map_err(|e| match e {
+                    SpawnError::Io(e) => RunError::Spawn(e),
+                    SpawnError::Confine(e) => RunError::Confine(e),
+                })?;
+            let hold = Hold {
+                _group: GroupGuard {
+                    pid: child.id(),
+                    confined: Arc::new(confined),
+                },
+                _seat: seat,
+            };
+            Ok((child, Some(hold)))
+        }
+        _ => {
+            let mut cmd = prepared.command();
+            cmd.stdin(stdin)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            cmd.process_group(0);
+            Ok((cmd.spawn().map_err(RunError::Spawn)?, None))
+        }
+    }
 }
 
 /// Spawn what an environment prepared: in a process group of its own, with stdin closed, stdout and
@@ -1227,6 +1311,75 @@ mod tests {
             gone_within("300.222", Duration::from_secs(2)).await,
             "a dropped run left its processes behind"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_process_that_keeps_running_holds_its_seat_until_it_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let governor = governor(1);
+        let seat = seat_of(Some(&governor), "c").await.unwrap();
+        let prepared = LocalSession
+            .prepare(&shell_spec(dir.path(), "sleep 300.333 & wait"))
+            .unwrap();
+        let (child, hold) = spawn_seated(&prepared, Some(&governor), seat, Stdio::null()).unwrap();
+        assert!(hold.is_some());
+
+        // The pool has one seat and a background process has it: a command waits, then is busy.
+        let busy = run_timed_governed(
+            &LocalSession,
+            shell_spec(dir.path(), "echo hi"),
+            LONG,
+            1024,
+            0,
+            &CancelToken::new(),
+            Some(Governed {
+                governor: &governor,
+                conversation: "c",
+            }),
+        )
+        .await
+        .0;
+        assert!(matches!(busy, Err(RunError::Busy(_))), "{busy:?}");
+        assert!(matches!(
+            seat_of(Some(&governor), "c").await,
+            Err(RunError::Busy(_))
+        ));
+
+        drop(child);
+        drop(hold);
+        assert!(
+            gone_within("300.333", Duration::from_secs(2)).await,
+            "the process outlived its hold"
+        );
+        let out = run_timed_governed(
+            &LocalSession,
+            shell_spec(dir.path(), "echo hi"),
+            LONG,
+            1024,
+            0,
+            &CancelToken::new(),
+            Some(Governed {
+                governor: &governor,
+                conversation: "c",
+            }),
+        )
+        .await
+        .0
+        .unwrap();
+        assert!(out.tail.contains("hi"), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn nothing_is_held_without_a_governor() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(seat_of(None, "c").await.unwrap().is_none());
+        let prepared = LocalSession
+            .prepare(&shell_spec(dir.path(), "true"))
+            .unwrap();
+        let (mut child, hold) = spawn_seated(&prepared, None, None, Stdio::null()).unwrap();
+        assert!(hold.is_none());
+        assert!(child.wait().await.unwrap().success());
     }
 
     #[tokio::test]
