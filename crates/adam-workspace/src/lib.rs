@@ -60,6 +60,7 @@ mod code_host;
 mod confine;
 mod credentials;
 pub mod devcontainer;
+mod disk;
 mod environment;
 mod error;
 mod git;
@@ -92,6 +93,7 @@ pub use confine::{
     ProcessLimits, Stopped, human_bytes,
 };
 pub use credentials::{DynGitCredentials, GitCredentials, HostScoped, ScopedToken, StaticToken};
+pub use disk::{DiskBudget, DiskSpace, FreeSpace, HostDisk, Sweep};
 pub use environment::{
     BACKGROUND_PREFIX, DynEnvironment, EnvDescription, EnvError, EnvKind, EnvProgress, EnvSession,
     EnvStep, EnvStepState, Environment, ExecId, ExecSpec, HidingEnvironment, Local, LocalSession,

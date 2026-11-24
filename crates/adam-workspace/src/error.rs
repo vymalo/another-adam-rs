@@ -17,7 +17,7 @@ pub type WorkspaceResult<T> = Result<T, WorkspaceError>;
 /// Decide from [`Classify::class`], not from the variant: `Auth` is
 /// `Unauthenticated`, `NotFound` and `NoDefaultBranch` are `NotFound`, `Invalid` is `Invalid`,
 /// `Transient` is `Transient`, `RateLimited` is `RateLimited`, `Conflict` is
-/// `Rejected`, `Corrupt` is `Corrupt`, and `Git`, `Http` and `Io` are `Internal`.
+/// `Rejected` (so is `DiskFull`), `Corrupt` is `Corrupt`, and `Git`, `Http` and `Io` are `Internal`.
 /// A message describes this layer only; [`adam_error::report`] prints the chain.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -72,6 +72,25 @@ pub enum WorkspaceError {
     #[error("corrupt workspace: {0}")]
     Corrupt(String),
 
+    /// The disk budget is exhausted, or the write would eat into the free space kept in reserve
+    /// ([`DiskBudget`](crate::DiskBudget)). Nothing was cloned. Class `Rejected`, like
+    /// `adam_budget::Refused::DiskFull`: the same input succeeds once the person frees space or
+    /// raises the budget, so the caller puts the question to them and never retries on its own.
+    #[error(
+        "the disk budget is exhausted: {used} of {limit} bytes used, {free} bytes free of the \
+         {reserve} kept in reserve. Free some space or raise the disk budget, then ask again"
+    )]
+    DiskFull {
+        /// Bytes adam's workspaces and cache take now.
+        used: u64,
+        /// The budget, in bytes.
+        limit: u64,
+        /// Bytes free on the disk now.
+        free: u64,
+        /// Bytes the budget always keeps free.
+        reserve: u64,
+    },
+
     /// `git` exited unsuccessfully and the failure fits no other category.
     #[error("git {command} failed ({status}): {message}")]
     Git {
@@ -111,7 +130,7 @@ impl Classify for WorkspaceError {
             Self::Invalid(_) => ErrorClass::Invalid,
             Self::Transient { .. } => ErrorClass::Transient,
             Self::RateLimited { .. } => ErrorClass::RateLimited,
-            Self::Conflict(_) => ErrorClass::Rejected,
+            Self::Conflict(_) | Self::DiskFull { .. } => ErrorClass::Rejected,
             Self::Corrupt(_) => ErrorClass::Corrupt,
             Self::Git { .. } | Self::Http { .. } | Self::Io { .. } => ErrorClass::Internal,
         }
@@ -167,6 +186,7 @@ mod tests {
             WorkspaceError::Transient { .. } => ErrorClass::Transient,
             WorkspaceError::RateLimited { .. } => ErrorClass::RateLimited,
             WorkspaceError::Conflict(_) => ErrorClass::Rejected,
+            WorkspaceError::DiskFull { .. } => ErrorClass::Rejected,
             WorkspaceError::Corrupt(_) => ErrorClass::Corrupt,
             WorkspaceError::Git { .. } => ErrorClass::Internal,
             WorkspaceError::Http { .. } => ErrorClass::Internal,
@@ -196,6 +216,12 @@ mod tests {
             },
             WorkspaceError::io("cannot do it", io::Error::other("disk on fire")),
             WorkspaceError::NoDefaultBranch("x".into()),
+            WorkspaceError::DiskFull {
+                used: 2,
+                limit: 1,
+                free: 0,
+                reserve: 0,
+            },
         ]
     }
 

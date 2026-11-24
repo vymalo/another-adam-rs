@@ -18,6 +18,7 @@ github = ["dep:reqwest", "dep:aws-lc-rs", "dep:jiff", "dep:rustls-pki-types"]
 test-util = []
 
 [dependencies]
+adam-budget.workspace = true
 adam-error.workspace = true
 adam-git-sandbox.workspace = true
 async-trait.workspace = true

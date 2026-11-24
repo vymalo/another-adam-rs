@@ -248,8 +248,9 @@ async fn build_agent(
     // either is a startup error, not a panic. The error is unboxed so its class (exit 78 for a
     // mistake in the files) reaches `exit_code`.
     let tools = coder_tools(&env);
-    // The workspaces of finished runs are swept from this worker's volume; their scratch projects
-    // stay until their conversation has been idle for `SCRATCH_IDLE_DAYS`.
+    // The workspaces of finished runs are swept from this worker's volume, never removing one that
+    // holds unpushed work (ADR 0065 decision 7: a worktree with a change no `origin` has, or any
+    // scratch project). The images of a conversation follow `SCRATCH_IDLE_DAYS`.
     let janitor = Janitor::new(env.workspaces.clone(), worker.workspace_sweep)
         .with_environment(env.environment.clone())
         .with_scratch_idle(worker.scratch_idle);

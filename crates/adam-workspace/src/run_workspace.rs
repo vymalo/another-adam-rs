@@ -500,6 +500,44 @@ impl RunWorkspace {
         }))
     }
 
+    /// Whether removing the workspace would lose work: a repository slot with uncommitted changes
+    /// or commits that were never pushed ([`Worktree::has_unpushed_work`]), or a scratch project,
+    /// which no remote has and which is kept whatever it holds.
+    ///
+    /// # Errors
+    ///
+    /// As [`slots`](Self::slots) and [`Worktree::has_unpushed_work`]; read an error as "unknown".
+    pub async fn holds_unpushed_work(&self) -> WorkspaceResult<bool> {
+        for slot in self.slots().await? {
+            let held = match slot.kind() {
+                SlotKind::Repository(wt) => wt.has_unpushed_work().await?,
+                SlotKind::Reference(_) => false,
+                SlotKind::Scratch(_) => true,
+            };
+            if held {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// [`remove`](Self::remove) unless the workspace holds unpushed work
+    /// ([`holds_unpushed_work`](Self::holds_unpushed_work)): `true` when it was removed, `false`
+    /// when it was kept. The cleanup the disk budget uses, which never trades a person's work for
+    /// space. The check and the removal are two steps: call it for a finished run, not one that
+    /// is still writing.
+    ///
+    /// # Errors
+    ///
+    /// When the check fails nothing is removed.
+    pub async fn remove_if_pushed(&self) -> WorkspaceResult<bool> {
+        if self.holds_unpushed_work().await? {
+            return Ok(false);
+        }
+        self.remove().await?;
+        Ok(true)
+    }
+
     /// The slots of the workspace that are there: the run's legacy worktree first (it is named
     /// after its repository), then the others sorted by directory name. A slot whose directory is
     /// gone is not listed.
@@ -833,9 +871,8 @@ impl RunWorkspace {
 
     /// [`add_scratch`](Self::add_scratch) for a run of `conversation`: the project remembers it, so
     /// that a later run of the same conversation takes the project over
-    /// ([`adopt_scratch`](Self::adopt_scratch)) instead of finding nothing, and the janitor of the
-    /// coder keeps it while the conversation has tasks. A project that is already there without a
-    /// conversation is given this one.
+    /// ([`adopt_scratch`](Self::adopt_scratch)) instead of finding nothing. A project that is
+    /// already there without a conversation is given this one.
     ///
     /// # Errors
     ///
@@ -1031,8 +1068,10 @@ impl RunWorkspace {
     /// `remove`. Metadata that cannot be read is no reason to keep anything: the workspace is
     /// removed whole, as `remove` does. **Idempotent.**
     ///
-    /// What the coder's janitor calls for a finished run whose conversation may go on
-    /// ([`adopt_scratch`](Self::adopt_scratch)).
+    /// What a caller uses for a finished run whose scratch projects a later run of the same
+    /// conversation should take over ([`adopt_scratch`](Self::adopt_scratch)). The coder's janitor
+    /// does not: it keeps a workspace that holds unpushed work whole
+    /// ([`remove_if_pushed`](Self::remove_if_pushed), ADR 0065 decision 7).
     ///
     /// # Errors
     ///

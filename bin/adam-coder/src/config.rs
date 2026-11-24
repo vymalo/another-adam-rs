@@ -35,7 +35,7 @@
 //! | `MAX_CHECK_CYCLES` | failed `run_checks` in a repository before the agent must stop | `3` |
 //! | `SCRATCH_CHECK_CYCLES` | the same for a scratch project, counted apart | `5` |
 //! | `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs; `0` turns it off | `300` |
-//! | `SCRATCH_IDLE_DAYS` | how many days a scratch project is kept after the last task of its conversation: a project lives for the thread, and the janitor removes it once the conversation has had no task for this long; `0` removes it with its run, as it was before | `7` |
+//! | `SCRATCH_IDLE_DAYS` | the idle time of a conversation: how many days after the last task of it the janitor removes its **images**. A scratch project is never removed: it has no remote, so it holds unpushed work, and the workspace that holds it is kept ([ADR 0065](../../../docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md) decision 7) | `7` |
 //! | `CHECK_TIMEOUT_SECS` | time limit of one `run_checks` command | `900` |
 //! | `BACKGROUND_COMMANDS_MAX` | commands of one run that keep running (`start_command`) at once, 1 to 16; `0` is refused (exit 78) | `4` |
 //! | `BACKGROUND_COMMAND_MAX_SECS` | how long a command that keeps running may run before it is stopped, 60 to 86400; `0` is refused (exit 78) | `3600` |
@@ -231,8 +231,9 @@ pub struct WorkerConfig {
     /// `WORKSPACE_SWEEP_SECS`: how often the janitor sweeps the workspaces of finished runs;
     /// `None` (the variable is `0`) turns it off.
     pub workspace_sweep: Option<Duration>,
-    /// `SCRATCH_IDLE_DAYS`: how long a scratch project outlives the last task of its conversation
-    /// before the janitor removes it; `None` (the variable is `0`) removes it with its run.
+    /// `SCRATCH_IDLE_DAYS`: the idle time of a conversation, how long after its last task the
+    /// janitor removes its images; `None` (the variable is `0`) means as soon as it has no open run.
+    /// A scratch project itself is never removed (ADR 0065 decision 7).
     pub scratch_idle: Option<Duration>,
     /// `CHECK_TIMEOUT_SECS`.
     pub check_timeout: Duration,
