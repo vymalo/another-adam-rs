@@ -248,3 +248,12 @@ Each is one pull request, in order.
 
 Per-person limits before a run starts, in a server or an orchestrator, are decided where that component lives and may
 count through a `StoreAdmission` later.
+
+## Amended 2026-11-24
+
+*Amended 2026-11-24:* **slice 3 is delivered on Linux only.** The `Confine` port with its two Linux backends (`Rlimits`,
+`SystemdScope`) and the process pool for commands (`run`, `run_command`, the checks) are built, with
+`MAX_PROCESSES`, `MAX_GIT_PROCESSES`, `COMMAND_MEMORY_MAX` and `COMMAND_CPU_MAX`. Still open, as a follow-up card: the
+macOS and Windows backends and the three-system matrix the slice's acceptance names. Background commands, language
+servers and git do not take a seat yet. The *unverified until slice 3 has run a build under it* note in the
+Consequences stands: no build has been run under a CPU limit.

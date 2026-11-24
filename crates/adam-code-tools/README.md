@@ -51,8 +51,25 @@ restores are still the coder's. `adam_coder::tools::{shell, sandbox, access}`, `
   repository's only ones, have them). One that watches nothing returns `Ok(Box::new(Unwatched))` and `Ok(String::new())`.
   `refusal_note` and `missing_tool_answer` are provided.
 
+* `ShellOutcome` has a new field `stopped: Option<Stopped>` and `RunError` two new variants, `Busy(Refused)` and
+  `Confine(ConfineError)` (ADR 0065 slice 3): a literal `ShellOutcome` needs `..Default::default()`, and a `match` over
+  `RunError` needs the two arms (`commands::run_error` maps them: `Busy` is a retryable `RateLimited` tool error, so a
+  busy pool never fails a run). `CommandWorkspace::governor` is **provided** (default `None`), so no implementation breaks.
+
 **Not a break:** `CommandWorkspace` itself (step 5b) was additive: an implementation of `CodeWorkspace` alone is
 unchanged; only a workspace that serves commands implements it.
+
+## The process pool and the OS limits
+
+`governor::Governor` pairs an `Admission` with a `Confine`. A workspace that returns one from
+`CommandWorkspace::governor` has every command of `commands::run` take one seat of `Pool::Processes` (waiting up to
+`governor::WAIT`, a minute, then `RunError::Busy`), run **confined** to `limits_of(&budget)` (the budget's memory and CPU
+for one command, and `FILE_SIZE_MAX`, 4 GiB, for one file), and have its seat held until the process is gone. The
+conversation the seat counts under is the root run. A command the operating system stopped for a limit is **not an
+error**: `ShellOutcome::stopped` is set, `render` says `stopped: memory limit 2 GB (the command was killed)`, and the run
+goes on. Only commands that run in this container are governed (`EnvKind::Local`): a run pod has its own limits.
+`shell::run_in` itself is unchanged and ungoverned; `shell::run_timed_governed` and `run_captured_governed` take the
+`Governed` the tools pass. Background commands and language servers do not take a seat yet.
 
 ## Features
 

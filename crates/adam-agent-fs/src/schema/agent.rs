@@ -123,6 +123,9 @@ pub const MAX_MINUTES_LIMIT: u32 = 1_440;
 /// The most `limits.max_parallel` may say: the bound of `MAX_PARALLEL_TOOL_CALLS`.
 pub const MAX_PARALLEL_LIMIT: u32 = 32;
 
+/// The most `limits.max_processes` may say: the bound of `MAX_PROCESSES`.
+pub const MAX_PROCESSES_LIMIT: u32 = 256;
+
 /// The largest `limits.max_open_sessions`: the page of one session listing.
 pub const MAX_OPEN_SESSIONS_LIMIT: u32 = 100;
 
@@ -306,6 +309,19 @@ pub struct Limits {
     /// deployment's value. Not a field of `adam_llm_agent::Limits` (ADR 0049).
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxParallel")]
     pub max_parallel: Option<u32>,
+    /// The most processes (commands) of the whole process at once, 1 to [`MAX_PROCESSES_LIMIT`]. It
+    /// only **lowers** the deployment's `MAX_PROCESSES` (a larger value is the deployment's). Read by
+    /// the coder; ADR 0065.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "maxProcesses")]
+    pub max_processes: Option<u32>,
+    /// The memory one command may use, as a size (`2GB`, `512MiB`, or bytes), at least 64 MiB. Only
+    /// **lowers** `COMMAND_MEMORY_MAX`.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "commandMemory")]
+    pub command_memory: Option<String>,
+    /// The CPU one command may use: cores (`2`, `1.5`) or millicores (`500m`), at least `100m`. Only
+    /// **lowers** `COMMAND_CPU_MAX`.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "commandCpu")]
+    pub command_cpu: Option<String>,
     /// The most sessions of a conversation open at once (ADR 0045), 1 to
     /// [`MAX_OPEN_SESSIONS_LIMIT`]. **Root agent only**, and it only lowers the deployment's
     /// `SESSION_MAX_OPEN` (a larger value is lowered with a warning at startup); ignored on a
