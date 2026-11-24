@@ -69,6 +69,7 @@ The file is `$BENCH_CONFIG` (default `~/.config/adam-bench/config.json`); result
 ```sh
 BENCH_MODEL_API_KEY=... node bench/bin/bench.mjs config    # what may be shown of the configuration
 node bench/bin/bench.mjs report                            # report.md from the ledger
+node bench/bin/bench.mjs numbers                           # the three faster-coder figures, from the ledger
 ```
 
 ## How a run goes
@@ -148,6 +149,7 @@ for on every restart. The report lists such a run among those left out, with its
 | `bench/lib/scripted-model.mjs` | an OpenAI-compatible server for the tests |
 | `bench/lib/stats.mjs` | Wilson intervals, the exact McNemar test, a seeded bootstrap |
 | `bench/lib/report.mjs` | the report |
+| `bench/lib/numbers.mjs` | the three figures the faster-coder epic rests on, from the ledger (`bench numbers`), and what the ledger cannot answer ([NUMBERS.md](NUMBERS.md)) |
 | `bench/lib/toml.mjs` | the TOML subset of `task.toml` |
 | `bench/lib/task.mjs` | the task format and its validator |
 | `bench/lib/upstream.mjs` | the pinned clone of the public tasks and `SHA256SUMS` |
