@@ -265,7 +265,6 @@ stateDiagram-v2
 |---|---|---|
 | `gate::Admitted`, wrapping the agent's model client | one seat of `Pool::ModelCalls` per `complete`/`stream`, held until the answer or the stream ends; the tokens it estimates when the budget meters them | a full pool is a `RateLimited` model failure with the refusal's `retry_after`, so the run waits and then parks (ADR 0061, ADR 0067) |
 | The tool loop (`LlmAgent::drive_one`) | one seat of `Pool::ToolCalls` per call, held until its work ends | the call waits up to a minute and then runs anyway with a warning: **a run never fails because a slot was busy** |
-
 | `commands::run` (`adam-code-tools`) | one seat of `Pool::Processes` per command of this container, held until the process is gone, and the command runs confined (below) | the command waits up to a minute; past it the tool call fails as retryable (`RateLimited`) and the run tries again |
 
 The ceiling comes from the deployment or the device; a folder's or a person's budget is combined with

@@ -12,13 +12,16 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use crate::child;
-use crate::rlimits::{plan, stopped_by_rlimit};
+use crate::rlimits::{is_shell, plan, stopped_by_rlimit};
 
 /// How long the probe at start may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a `systemctl` call of a command's end may take.
 const CTL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the end of a scope is awaited: systemd settles its result after the process is gone.
+const SETTLE: Duration = Duration::from_secs(2);
 
 /// The slice every scope of adam's commands is made under.
 const SLICE: &str = "adam-commands";
@@ -122,6 +125,7 @@ impl SystemdScope {
 
 struct Held {
     unit: String,
+    via_shell: bool,
 }
 
 impl Held {
@@ -137,6 +141,31 @@ impl Held {
     }
 }
 
+impl Held {
+    /// The `Result` of the scope once it is no longer active, which systemd sets a moment after the
+    /// process ends (`oom-kill` among them); whatever it says at the cap.
+    async fn settled_result(&self, unit: &str) -> Option<String> {
+        let deadline = Instant::now() + SETTLE;
+        loop {
+            let shown = self
+                .ctl(&["show", unit, "-p", "ActiveState", "-p", "Result"])
+                .await;
+            let field = |name: &str| {
+                shown.as_deref().and_then(|text| {
+                    text.lines()
+                        .find_map(|l| l.strip_prefix(name)?.strip_prefix('='))
+                        .map(str::to_owned)
+                })
+            };
+            let settled = matches!(field("ActiveState").as_deref(), Some("inactive" | "failed"));
+            if settled || shown.is_none() || Instant::now() >= deadline {
+                return field("Result");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
 #[async_trait]
 impl Confinement for Held {
     async fn stop(&self) {
@@ -147,7 +176,7 @@ impl Confinement for Held {
 
     async fn finish(&self, limits: &ProcessLimits, ended: Ended) -> Option<Stopped> {
         let unit = format!("{}.scope", self.unit);
-        let result = self.ctl(&["show", &unit, "-p", "Result", "--value"]).await;
+        let result = self.settled_result(&unit).await;
         // A scope that failed stays loaded until it is reset: it must not pile up.
         self.ctl(&["reset-failed", &unit]).await;
         if result.as_deref() == Some("oom-kill")
@@ -155,7 +184,7 @@ impl Confinement for Held {
         {
             return Some(Stopped::Memory { limit });
         }
-        stopped_by_rlimit(limits, ended)
+        stopped_by_rlimit(limits, ended, self.via_shell)
     }
 }
 
@@ -166,7 +195,9 @@ impl Confine for SystemdScope {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
-        let std = cmd.as_std();
+        let std: &StdCommand = cmd.as_std();
+        let via_shell = is_shell(std.get_program());
+        let cleared = env_cleared(std);
         let program = std.get_program().to_owned();
         let args: Vec<_> = std.get_args().map(ToOwned::to_owned).collect();
         let cwd = std.get_current_dir().map(ToOwned::to_owned);
@@ -176,6 +207,16 @@ impl Confine for SystemdScope {
             .collect();
 
         let mut wrapped = Command::new("systemd-run");
+        if cleared {
+            // A scope runs in the environment of `systemd-run`; it needs these two to reach the
+            // person's manager.
+            wrapped.env_clear();
+            for name in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+                if let Some(value) = std::env::var_os(name) {
+                    wrapped.env(name, value);
+                }
+            }
+        }
         wrapped.args([
             "--user", "--scope", "--quiet", "--unit", &unit, "--slice", SLICE,
         ]);
@@ -203,7 +244,7 @@ impl Confine for SystemdScope {
         }
         child::install(&mut wrapped, plan(limits, false));
         *cmd = wrapped;
-        Ok(Confined::held(*limits, Arc::new(Held { unit })))
+        Ok(Confined::held(*limits, Arc::new(Held { unit, via_shell })))
     }
 
     fn describe(&self) -> Enforcement {
@@ -223,4 +264,18 @@ impl Confine for SystemdScope {
             Enforcement::Partial(missing)
         }
     }
+}
+
+/// Whether `env_clear` was called on `cmd`: `std` has no getter, but its `Debug` output starts with
+/// `env -i` (after the directory) for a cleared environment. The conformance case
+/// `env_clear_is_kept` fails if that ever changes.
+fn env_cleared(cmd: &StdCommand) -> bool {
+    let debug = format!("{cmd:?}");
+    let rest = match cmd.get_current_dir() {
+        Some(dir) => debug
+            .strip_prefix(&format!("cd {dir:?} && "))
+            .unwrap_or(&debug),
+        None => &debug,
+    };
+    rest.starts_with("env -i ")
 }

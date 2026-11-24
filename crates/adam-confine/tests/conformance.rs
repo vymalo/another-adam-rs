@@ -1,6 +1,8 @@
 //! The two backends against the conformance suite, and the memory-hog proof the card needs: the same
 //! hog that a confined command cannot finish runs to its end under `NoConfine`.
 
+#![cfg(unix)]
+
 use std::sync::Arc;
 
 use adam_confine::{Rlimits, SystemdScope};

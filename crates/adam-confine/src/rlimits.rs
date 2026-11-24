@@ -49,11 +49,29 @@ pub(crate) fn plan(limits: &ProcessLimits, address_space: bool) -> Plan {
     }
 }
 
-/// A limit that ended the command by a signal, or by a shell that reports one as `128 + signal`.
-pub(crate) fn stopped_by_rlimit(limits: &ProcessLimits, ended: Ended) -> Option<Stopped> {
-    let signal = ended
-        .signal
-        .or_else(|| ended.code.and_then(|c| c.checked_sub(128)));
+/// Whether `program` is a shell, which reports a child that a signal ended as `128 + signal`. Any
+/// other program's exit code is its own.
+pub(crate) fn is_shell(program: &std::ffi::OsStr) -> bool {
+    let name = std::path::Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    matches!(name, "sh" | "bash" | "dash" | "zsh" | "ash" | "ksh")
+}
+
+/// A limit that ended the command by a signal, or, when `via_shell`, by a shell that reports one
+/// as `128 + signal`.
+pub(crate) fn stopped_by_rlimit(
+    limits: &ProcessLimits,
+    ended: Ended,
+    via_shell: bool,
+) -> Option<Stopped> {
+    let signal = ended.signal.or_else(|| {
+        ended
+            .code
+            .filter(|_| via_shell)
+            .and_then(|c| c.checked_sub(128))
+    });
     match signal? {
         SIGXFSZ => limits.file_size.map(|limit| Stopped::FileSize { limit }),
         SIGXCPU => limits.cpu_seconds.map(|seconds| Stopped::Cpu { seconds }),
@@ -61,21 +79,24 @@ pub(crate) fn stopped_by_rlimit(limits: &ProcessLimits, ended: Ended) -> Option<
     }
 }
 
-struct Held;
+struct Held {
+    via_shell: bool,
+}
 
 #[async_trait]
 impl Confinement for Held {
     async fn stop(&self) {}
 
     async fn finish(&self, limits: &ProcessLimits, ended: Ended) -> Option<Stopped> {
-        stopped_by_rlimit(limits, ended)
+        stopped_by_rlimit(limits, ended, self.via_shell)
     }
 }
 
 impl Confine for Rlimits {
     fn confine(&self, cmd: &mut Command, limits: &ProcessLimits) -> Result<Confined, ConfineError> {
+        let via_shell = is_shell(cmd.as_std().get_program());
         child::install(cmd, plan(limits, true));
-        Ok(Confined::held(*limits, Arc::new(Held)))
+        Ok(Confined::held(*limits, Arc::new(Held { via_shell })))
     }
 
     fn describe(&self) -> Enforcement {

@@ -16,8 +16,7 @@
 //! Setting a limit in the child, before its program runs, takes `Command::pre_exec`, which is
 //! `unsafe`. That call is the only `unsafe` here, in `child::install`; the closure it installs makes
 //! nothing but system calls (`getrlimit`, `setrlimit`, `setpriority`, `ioprio_set`), with no
-//! allocation and no lock, as `pre_exec` requires. Every other crate of adam keeps
-//! `forbid(unsafe_code)`.
+//! allocation and no lock, as `pre_exec` requires. No other crate of adam contains `unsafe`.
 
 #![cfg(unix)]
 #![warn(missing_docs)]

@@ -26,24 +26,34 @@ pub(crate) struct Plan {
 
 /// Lower `resource` to at most `wanted`, never raising a ceiling the child already has.
 fn lower(resource: Resource, wanted: u64) -> io::Result<()> {
+    set(resource, wanted, wanted)
+}
+
+/// Set the soft ceiling to at most `soft` and the hard one to at most `hard`, never raising a
+/// ceiling the child already has.
+fn set(resource: Resource, soft: u64, hard: u64) -> io::Result<()> {
     let have = getrlimit(resource);
-    let cap = have.maximum.map_or(wanted, |max| max.min(wanted));
+    let hard = have.maximum.map_or(hard, |max| max.min(hard));
     setrlimit(
         resource,
         Rlimit {
-            current: Some(cap),
-            maximum: Some(cap),
+            current: Some(soft.min(hard)),
+            maximum: Some(hard),
         },
     )
     .map_err(io::Error::from)
 }
+
+/// Seconds between the soft `RLIMIT_CPU` (`SIGXCPU`, which a command can be told by) and the hard
+/// one (`SIGKILL`, when it ignores the first).
+const CPU_GRACE: u64 = 5;
 
 fn apply(plan: &Plan) -> io::Result<()> {
     if let Some(n) = plan.file_size {
         lower(Resource::Fsize, n)?;
     }
     if let Some(n) = plan.cpu_seconds {
-        lower(Resource::Cpu, n)?;
+        set(Resource::Cpu, n, n.saturating_add(CPU_GRACE))?;
     }
     #[cfg(target_os = "linux")]
     if let Some(n) = plan.address_space {

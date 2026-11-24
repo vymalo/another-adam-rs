@@ -68,7 +68,7 @@ an agent does.
 | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32; anything else is a problem naming the variable (exit 78); an agent file's `limits.max_parallel` may lower it for its agent | `10` (roles that run workers) |
 | `MAX_TOOL_CALLS_IN_FLIGHT` | the most tool calls of the whole process that run at the same time, 1 to 256: the pool `MAX_PARALLEL_TOOL_CALLS` sits inside (ADR 0065); anything else is a problem naming the variable (exit 78) | `4` (roles that run workers) |
 | `MAX_MODEL_CALLS` | the most model calls in flight in the process, 1 to 64 (ADR 0065); anything else is a problem naming the variable | `2` |
-| `MAX_PROCESSES` | the most processes (commands) of the whole process at once, 1 to 256 (ADR 0065 slice 3); anything else is a problem naming the variable | `4` |
+| `MAX_PROCESSES` | the most commands (`run`, `run_command`, checks; not background commands or language servers) of the whole process at once, 1 to 256 (ADR 0065 slice 3); anything else is a problem naming the variable | `4` |
 | `MAX_GIT_PROCESSES` | the most git processes at once, 1 to 64; read and in the budget, **git is not admitted yet** | `2` |
 | `COMMAND_MEMORY_MAX` | the memory one command may use: bytes, or `512MiB`, `2GB`; at least 64 MiB | a quarter of the RAM, at most 8 GB |
 | `COMMAND_CPU_MAX` | the CPU one command may use: cores (`2`, `1.5`) or millicores (`500m`); at least `100m` | half the cores, at least 1 |

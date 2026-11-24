@@ -592,6 +592,13 @@ async fn run_with(
     };
     let started = Instant::now();
     let pid = child.id();
+    let confined = Arc::new(confined);
+    // A governed command's seat is held until its descendants are gone: this ends them however the
+    // function ends, a dropped future included (`kill_on_drop` reaches only the leader).
+    let _group = governed.map(|_| GroupGuard {
+        pid,
+        confined: Arc::clone(&confined),
+    });
 
     let tail = Arc::new(Mutex::new(Tail {
         buf: Vec::new(),
@@ -617,6 +624,11 @@ async fn run_with(
     let mut stopped = None;
     let (exit_code, timed_out) = match waited {
         Some(Ok(Ok(status))) => {
+            if governed.is_some() {
+                // What the command left running is not its own to keep, nor outside its limits.
+                kill_group(pid).await;
+                confined.stop().await;
+            }
             stopped = confined.finish(Ended::from(status)).await;
             (status.code(), false)
         }
@@ -701,6 +713,32 @@ async fn run_with(
         }),
         Some(ran),
     )
+}
+
+/// Ends the process group and the confinement of a governed command when it goes out of scope.
+struct GroupGuard {
+    pid: Option<u32>,
+    confined: Arc<Confined>,
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            // Synchronous: a drop cannot await, and the group must be gone before the seat is.
+            let _ = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("kill -s KILL -- -{pid}"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let confined = Arc::clone(&self.confined);
+            runtime.spawn(async move { confined.stop().await });
+        }
+    }
 }
 
 /// Why [`spawn_confined`] did not start the command.
@@ -1101,6 +1139,94 @@ mod tests {
             "{err:?}"
         );
         assert!(!marker.exists());
+    }
+
+    fn governor(processes: u32) -> Governor {
+        use adam_budget::Budget;
+        let budget = Budget::builder().processes(processes).build();
+        Governor::new(
+            Arc::new(adam_admission_local::LocalAdmission::new(budget)),
+            Arc::new(adam_confine::Rlimits::new()),
+            adam_workspace::ProcessLimits::new(),
+        )
+        .with_wait(Duration::from_millis(100))
+    }
+
+    /// Whether a process with `needle` among its arguments is alive.
+    fn alive(needle: &str) -> bool {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+            .any(|cmdline| String::from_utf8_lossy(&cmdline).contains(needle))
+    }
+
+    async fn gone_within(needle: &str, limit: Duration) -> bool {
+        let started = Instant::now();
+        while alive(needle) {
+            if started.elapsed() > limit {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_governed_command_leaves_nothing_of_its_own_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let governor = governor(1);
+        let out = run_timed_governed(
+            &LocalSession,
+            shell_spec(dir.path(), "sleep 300.111 & echo done"),
+            LONG,
+            1024,
+            0,
+            &CancelToken::new(),
+            Some(Governed {
+                governor: &governor,
+                conversation: "c",
+            }),
+        )
+        .await
+        .0
+        .unwrap();
+        assert!(out.tail.contains("done"), "{out:?}");
+        assert!(
+            gone_within("300.111", Duration::from_secs(2)).await,
+            "a background process outlived its command's seat"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_dropped_governed_run_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let governor = governor(1);
+        let cancel = CancelToken::new();
+        let run = run_timed_governed(
+            &LocalSession,
+            shell_spec(dir.path(), "sleep 300.222 & wait"),
+            LONG,
+            1024,
+            0,
+            &cancel,
+            Some(Governed {
+                governor: &governor,
+                conversation: "c",
+            }),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), run)
+                .await
+                .is_err(),
+            "the command was meant to still be running"
+        );
+        assert!(
+            gone_within("300.222", Duration::from_secs(2)).await,
+            "a dropped run left its processes behind"
+        );
     }
 
     #[tokio::test]
