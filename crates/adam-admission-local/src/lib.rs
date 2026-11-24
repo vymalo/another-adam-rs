@@ -74,7 +74,8 @@ struct PoolSlot {
     /// The most one conversation holds, in the pool's unit.
     share: u64,
     sem: Arc<Semaphore>,
-    /// One semaphore per conversation that has ever asked, so a conversation's share is enforced.
+    /// One semaphore per conversation that holds or awaits a seat, so a conversation's share is
+    /// enforced; an idle conversation's entry is dropped by the next ask.
     conversations: Mutex<HashMap<ConversationId, ConversationSlot>>,
     /// The asks waiting for room in this pool.
     waiting: AtomicU32,
@@ -169,6 +170,11 @@ impl LocalAdmission {
                 .conversations
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            // A seat nobody holds or waits on is the map's alone, so its conversation can be
+            // forgotten: a new ask makes a fresh one with the same capacity. A held or awaited
+            // seat has a second owner (the permit, the waiter), so a share stays enforced.
+            conversations
+                .retain(|who, seat| *who == ask.conversation || Arc::strong_count(&seat.sem) > 1);
             let entry = conversations
                 .entry(ask.conversation.clone())
                 .or_insert_with(|| ConversationSlot {
@@ -412,6 +418,57 @@ mod tests {
             bucket.available_micro,
             60_000 * MICRO,
             "never over the minute"
+        );
+    }
+
+    fn conversations_known(admission: &LocalAdmission, pool: Pool) -> usize {
+        admission
+            .slot(pool)
+            .conversations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    #[tokio::test]
+    async fn an_idle_conversation_is_forgotten() {
+        let admission = LocalAdmission::new(Budget::builder().tool_calls(4).build());
+        for n in 0..50 {
+            let who = format!("conversation-{n}");
+            let permit = admission
+                .admit(
+                    Ask::new(Pool::ToolCalls, ConversationId::new(who.as_str()))
+                        .wait(Duration::ZERO),
+                )
+                .await
+                .unwrap();
+            drop(permit);
+        }
+        assert_eq!(
+            conversations_known(&admission, Pool::ToolCalls),
+            1,
+            "only the last conversation's entry is left, the others were idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_that_holds_a_seat_keeps_its_share() {
+        let budget = Budget::builder()
+            .tool_calls(4)
+            .per_conversation_share(Ratio::HALF)
+            .build();
+        let admission = LocalAdmission::new(budget);
+        let ask =
+            |who: &str| Ask::new(Pool::ToolCalls, ConversationId::new(who)).wait(Duration::ZERO);
+        let _one = admission.admit(ask("a")).await.unwrap();
+        let _two = admission.admit(ask("a")).await.unwrap();
+        for other in ["b", "c"] {
+            let _ = admission.admit(ask(other)).await;
+        }
+        let third = admission.admit(ask("a")).await;
+        assert!(
+            matches!(third, Err(Refused::Busy { .. })),
+            "a held seat was not forgotten, so `a` is still at its share of two: {third:?}"
         );
     }
 
