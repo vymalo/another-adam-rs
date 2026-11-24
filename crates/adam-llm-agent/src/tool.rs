@@ -735,17 +735,17 @@ pub struct HookDecision {
 
 impl HookDecision {
     /// The point before the call runs.
-    pub const TOOL_BEFORE: &'static str = "tool.before";
+    pub const TOOL_BEFORE: &str = "tool.before";
     /// The point after the tool answered.
-    pub const TOOL_AFTER: &'static str = "tool.after";
+    pub const TOOL_AFTER: &str = "tool.after";
     /// The call is refused, and the reason is its result.
-    pub const DENY: &'static str = "deny";
+    pub const DENY: &str = "deny";
     /// A person is asked first. Until approval exists (ADR 0050, slice H8) the call is not run.
-    pub const ASK: &'static str = "ask";
+    pub const ASK: &str = "ask";
     /// The run ends after this call, with the reason.
-    pub const STOP: &'static str = "stop";
+    pub const STOP: &str = "stop";
     /// The hook could not decide: the call is denied, or the result becomes an error. Never a pass.
-    pub const FAILED: &'static str = "failed";
+    pub const FAILED: &str = "failed";
 
     /// A decision at `point` that said `verdict`.
     #[must_use]
