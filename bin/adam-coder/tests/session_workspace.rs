@@ -155,11 +155,9 @@ async fn a_round_a_person_started_cannot_write_even_with_a_write_tool() {
 
 fn options() -> RuntimeOptions {
     RuntimeOptions {
-        worker_id: None,
-        claim_scope: adam_core::ClaimScope::Any,
         concurrency: 2,
-        lease_ttl: Duration::from_secs(30),
         poll_interval: Duration::from_millis(20),
+        ..RuntimeOptions::default()
     }
 }
 
@@ -217,15 +215,16 @@ fn coder_with_sessions(fx: &Fixture, mock: &Arc<MockModel>, store: DynStore) -> 
         4,
     )
     .unwrap();
+    let backend = RuntimeTaskBackend::new(
+        coder.runtime.clone(),
+        adam_runtime::BroadcastSink::default(),
+        AGENT_NAME,
+    )
+    .with_poll_interval(Duration::from_millis(20))
+    .with_child_sessions(sessions);
     Coder {
         runtime: coder.runtime,
-        backend: RuntimeTaskBackend::new(
-            coder.runtime.clone(),
-            adam_runtime::BroadcastSink::default(),
-            AGENT_NAME,
-        )
-        .with_poll_interval(Duration::from_millis(20))
-        .with_child_sessions(sessions),
+        backend,
     }
 }
 
@@ -252,6 +251,7 @@ fn status_text(task: &a2a::Task) -> String {
         .and_then(|m| m.parts.first())
         .and_then(Part::as_text)
         .unwrap_or_default()
+        .to_owned()
 }
 
 /// What the model read as the result of the call `id`, from every request it was sent.
@@ -329,7 +329,7 @@ async fn a_persons_explorer_reads_the_parents_repository_in_every_round() {
     );
 
     // Round 2 of the same session: a message to the child context, and the same repository again.
-    let child = round.context_id.clone().expect("a child context");
+    let child = round.context_id.clone();
     let mut more = said("and again?", Some(&child));
     more.message_id = "m-second".into();
     let second = coder

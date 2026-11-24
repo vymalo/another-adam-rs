@@ -1486,10 +1486,12 @@ impl ToolCtx {
     }
 
     /// Make the context the one of a child run that works for `root`, as a run started with
-    /// [`start_child`](Self::start_child) is.
+    /// [`start_child`](Self::start_child) is. The workspace it reads is the root's too, unless
+    /// [`with_workspace_run`](Self::with_workspace_run) says otherwise (a session's header does).
     #[must_use]
     pub fn with_root_run(mut self, root: RunId) -> Self {
         self.root_run = root;
+        self.workspace_run = root;
         self.model_run = root;
         self
     }

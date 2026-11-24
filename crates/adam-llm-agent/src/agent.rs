@@ -388,6 +388,26 @@ struct CallFacts {
     removed_tools: Arc<[String]>,
 }
 
+/// The runs a call reads, owned: the root run, the step of it a child works under, the plan, the run
+/// the call's model names ([`model_run_of`]) and the run whose workspace it reads
+/// ([`workspace_run_of`]). What [`EarlyFacts`] takes while the model is still writing.
+type OwnedRootFacts = (
+    Option<RunId>,
+    Option<String>,
+    Option<Plan>,
+    Option<RunId>,
+    Option<RunId>,
+);
+
+/// [`OwnedRootFacts`], borrowed from it for one call.
+type RootFacts<'a> = (
+    Option<RunId>,
+    Option<&'a str>,
+    Option<&'a Plan>,
+    Option<RunId>,
+    Option<RunId>,
+);
+
 /// What the calls of a turn that starts while the model writes need from the run, owned: taken
 /// from the state and the `Ctx` before [`Ctx::step`], which is where they start.
 struct EarlyFacts {
@@ -396,13 +416,7 @@ struct EarlyFacts {
     context: Option<Arc<Map<String, Value>>>,
     /// The runs the calls read: the root, the step under it, the plan, the run the model calls
     /// name, and the run whose workspace they read ([`workspace_run_of`]).
-    root: (
-        Option<RunId>,
-        Option<String>,
-        Option<Plan>,
-        Option<RunId>,
-        Option<RunId>,
-    ),
+    root: OwnedRootFacts,
     kept: Arc<BTreeMap<String, String>>,
     kept_left: usize,
     files_used: u64,
@@ -483,15 +497,7 @@ impl<'a> Early<'a> {
     }
 
     /// The root, root step and plan of the run, as [`prepare`](LlmAgent::prepare) takes them.
-    fn root(
-        &self,
-    ) -> (
-        Option<RunId>,
-        Option<&str>,
-        Option<&Plan>,
-        Option<RunId>,
-        Option<RunId>,
-    ) {
+    fn root(&self) -> RootFacts<'_> {
         (
             self.facts.root.0,
             self.facts.root.1.as_deref(),
@@ -4862,13 +4868,7 @@ impl LlmAgent {
         &self,
         ctx: &CtxFacts,
         context: Option<&Arc<Map<String, Value>>>,
-        root: (
-            Option<RunId>,
-            Option<&str>,
-            Option<&Plan>,
-            Option<RunId>,
-            Option<RunId>,
-        ),
+        root: RootFacts<'_>,
         notes: &[ToolNote],
         call: &ToolCall,
         facts: CallFacts,
@@ -5024,13 +5024,7 @@ impl LlmAgent {
         &self,
         ctx: &mut Ctx,
         context: Option<&Arc<Map<String, Value>>>,
-        root: (
-            Option<RunId>,
-            Option<&str>,
-            Option<&Plan>,
-            Option<RunId>,
-            Option<RunId>,
-        ),
+        root: RootFacts<'_>,
         notes: &[ToolNote],
         call: &ToolCall,
         facts: CallFacts,
@@ -5341,13 +5335,7 @@ impl LlmAgent {
         &self,
         ctx: &CtxFacts,
         context: Option<&Arc<Map<String, Value>>>,
-        (root_run, root_step, plan, model_run, workspace_run): (
-            Option<RunId>,
-            Option<&str>,
-            Option<&Plan>,
-            Option<RunId>,
-            Option<RunId>,
-        ),
+        (root_run, root_step, plan, model_run, workspace_run): RootFacts<'_>,
         notes: &[ToolNote],
         call_id: &str,
         tool: &str,
@@ -6666,7 +6654,7 @@ impl Agent for LlmAgent {
             )
             .with_task(state.task())
             .with_workspace_run(
-                workspace_run_of(state)
+                workspace_run_of(&state)
                     .unwrap_or_else(|| state.root_run.unwrap_or_else(|| ctx.run_id())),
             );
             let loaders = crate::source::loaders_offered(&self.sources, &source_ctx).await;

@@ -447,6 +447,10 @@ async fn a_person_starts_a_session_and_it_is_the_round_of_a_new_child_context() 
 async fn a_persons_session_reads_the_workspace_of_the_latest_task_of_its_context() {
     for store in stores().await {
         let rig = Rig::new(&store);
+        rig.helper_mock
+            .push_text("lonely")
+            .push_text("one")
+            .push_text("two");
 
         // A context nobody has sent a task to: no workspace, and the round still runs.
         let lonely = rig.start(&alice(), Some("ctx-empty"), "look", true).await;
@@ -472,7 +476,6 @@ async fn a_persons_session_reads_the_workspace_of_the_latest_task_of_its_context
         assert_ne!(first.id, latest.id);
 
         // A person starts a session there: its round names the latest task as its workspace.
-        rig.helper_mock.push_text("one").push_text("two");
         let start = rig
             .start(&alice(), Some("ctx-ws"), "where is it?", true)
             .await;
