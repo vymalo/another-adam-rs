@@ -765,10 +765,21 @@ impl Workspaces {
                 .await?;
         }
         let mirror = self.inner.root.join(loc.mirror_relative());
+        let path = &target.path;
+
+        // **Before the lock**, because taking it makes the mirror's directories (`<root>/git/...`):
+        // a refusal must leave the disk as it was, and those are what a refused clone used to leave
+        // behind (ADR 0065 decision 7). A run that already has its worktree is not new work and is
+        // found again below whatever the budget says, so it is not measured here; this is a look
+        // without the lock, and the worktree is only made if the locked read below finds none.
+        if let Some(disk) = &self.inner.disk
+            && !(exists(&target.meta_path).await? && exists(path).await?)
+        {
+            disk.admit(&self.inner.root).await?;
+        }
 
         let _guard = self.inner.lock_mirror(&mirror).await?;
 
-        let path = &target.path;
         let meta = self
             .inner
             .read_meta_at(&target.meta_path, run, target.meta_version())
@@ -808,11 +819,8 @@ impl Workspaces {
             )));
         }
 
-        // After the early return above, so a run that has its worktree keeps it; before anything is
-        // made, so a refusal leaves the disk as it was.
-        if let Some(disk) = &self.inner.disk {
-            disk.admit(&self.inner.root).await?;
-        }
+        // The budget was spent above: nothing has been made yet, and the run's own worktree was
+        // never measured.
         self.inner.ensure_mirror(repo, &loc, &mirror).await?;
         let auth = self.inner.authorize(repo, &loc).await?;
         // The URL and the refspec are named, not read from the remote called `origin`: what

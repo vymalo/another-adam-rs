@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use adam_budget::{DiskReserve, Ratio};
 use adam_error::{Classify, ErrorClass};
 use adam_workspace::{
-    DiskBudget, DiskSpace, FreeSpace, GitIdentity, RepoRef, StaticToken, WorkspaceError, Workspaces,
+    DiskBudget, DiskSpace, FreeSpace, GitIdentity, RepoRef, RunWorkspace, StaticToken,
+    WorkspaceError, Workspaces,
 };
 
 /// A disk whose free space the test sets.
@@ -110,6 +111,69 @@ async fn a_clone_past_the_disk_budget_asks_the_person() {
     let roomy = workspaces(dir.path())
         .with_disk_budget(DiskBudget::new(1 << 30, DiskReserve::NONE).with_free_space(plenty()));
     roomy.prepare(&repo, "run-roomy").await.expect("room");
+}
+
+/// The companion of the two refusals above, on the other side of the same line: a run that already
+/// has its worktree finds it again **whatever the budget says** (checked before the mirror's lock
+/// creates `<root>/git`, so that a refusal creates nothing; an existing worktree is not new work).
+#[tokio::test]
+async fn a_run_that_has_its_worktree_finds_it_again_under_a_full_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = remote(dir.path());
+    let root = dir.path().join("root");
+
+    let roomy = workspaces(dir.path())
+        .with_disk_budget(DiskBudget::new(1 << 30, DiskReserve::NONE).with_free_space(plenty()));
+    let made = roomy.prepare(&repo, "run-kept").await.expect("with room");
+
+    // The same run, with a budget nothing can pass: it is not refused, and its worktree is the one
+    // it has.
+    let full = workspaces(dir.path())
+        .with_disk_budget(DiskBudget::new(1, DiskReserve::NONE).with_free_space(plenty()));
+    let again = full
+        .prepare(&repo, "run-kept")
+        .await
+        .expect("finds its own");
+    assert_eq!(again.path(), made.path());
+
+    // A run that has nothing yet is refused, and that refusal still creates nothing.
+    let err = full
+        .prepare(&repo, "run-new")
+        .await
+        .expect_err("a new clone is measured");
+    assert!(matches!(err, WorkspaceError::DiskFull { .. }), "{err:?}");
+    assert!(
+        !root.join("worktrees").join("run-new").exists(),
+        "the refused run has no worktree"
+    );
+}
+
+/// The same refusal through a [`RunWorkspace`], the layout of several repositories: the run's own
+/// lock sits in `<root>/workspaces/`, so a refusal must not leave that run's directory behind, nor
+/// the mirror or the worktrees of the legacy layout.
+#[tokio::test]
+async fn a_refused_slot_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = remote(dir.path());
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).expect("root");
+    std::fs::write(root.join("earlier-work.bin"), vec![1u8; 64 * 1024]).expect("filler");
+
+    let over = workspaces(dir.path())
+        .with_disk_budget(DiskBudget::new(1024, DiskReserve::NONE).with_free_space(plenty()));
+    let run: RunWorkspace = over.run("run-slot").expect("run");
+    let err = run.add_repository(&repo).await.expect_err("refused");
+    assert!(
+        matches!(&err, WorkspaceError::DiskFull { used, limit: 1024, .. } if *used >= 64 * 1024),
+        "{err:?}"
+    );
+    assert!(
+        !root.join("git").exists()
+            && !root.join("worktrees").exists()
+            && !root.join("workspaces").join("run-slot").exists()
+            && !root.join("meta").join("run-slot").exists(),
+        "a refused slot leaves nothing behind"
+    );
 }
 
 #[tokio::test]
