@@ -418,3 +418,43 @@ async fn a_call_made_again_after_a_transient_failure_is_another_call() {
         Some(Message::Assistant { .. })
     ));
 }
+
+/// The level a call names is reported with it (ADR 0063 decision 7): the agent's own effort when the
+/// run's context names none, and no member at all when nothing asked for a level.
+#[tokio::test]
+async fn the_report_carries_the_reasoning_level_the_call_named() {
+    use adam_model::ReasoningEffort;
+
+    async fn first_report(effort: Option<ReasoningEffort>) -> UsageEvent {
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let sink = CollectingSink::new();
+        let mock = Arc::new(MockModel::new());
+        mock.push_response(text_with("done", Usage::new(10, 2)));
+        let model: DynModel = mock;
+        let agent = LlmAgent::builder("llm", model, "big")
+            .reasoning_effort(effort)
+            .build();
+        let rt = Runtime::builder(store)
+            .poll_interval(Duration::from_millis(20))
+            .event_sink(sink.clone())
+            .agent(agent)
+            .build();
+        let run = rt.start("llm", user_message("go"), None).await.unwrap();
+        let view = run_to_end(&rt, run).await;
+        assert_eq!(view.status, RunStatus::Done);
+        let reports = reports(&sink, run);
+        assert_eq!(reports.len(), 1, "{reports:#?}");
+        reports.into_iter().next().expect("a report")
+    }
+
+    assert_eq!(
+        first_report(Some(ReasoningEffort::High)).await.effort,
+        Some(ReasoningEffort::High),
+        "a call that asked for a level reports it"
+    );
+    assert_eq!(
+        first_report(None).await.effort,
+        None,
+        "a call that asked for none reports no level"
+    );
+}

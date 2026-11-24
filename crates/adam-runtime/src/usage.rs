@@ -55,6 +55,11 @@ pub struct UsageEvent {
     /// The model's context window as the deployment configured it, when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// The reasoning level the call named (ADR 0063 decision 7), when it named one: what the
+    /// request asked for, from the folder, the profile or the run's context. Absent when the call
+    /// asked for none, which is not the same as `none` (a level of its own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<adam_model::ReasoningEffort>,
 }
 
 impl UsageEvent {
@@ -67,6 +72,7 @@ impl UsageEvent {
             model: cut(model.as_ref(), MAX_USAGE_LABEL_BYTES),
             usage,
             context_window: None,
+            effort: None,
         }
     }
 
@@ -88,6 +94,13 @@ impl UsageEvent {
     #[must_use]
     pub fn with_context_window(mut self, window: u64) -> Self {
         self.context_window = Some(window);
+        self
+    }
+
+    /// With the reasoning level the call named (`low`, `high`, …).
+    #[must_use]
+    pub fn with_effort(mut self, effort: adam_model::ReasoningEffort) -> Self {
+        self.effort = Some(effort);
         self
     }
 }
@@ -340,7 +353,21 @@ mod tests {
         let full = event
             .under("tool:c2")
             .with_provider("openai")
-            .with_context_window(131_072);
+            .with_context_window(131_072)
+            .with_effort(adam_model::ReasoningEffort::Low);
+        // The level the call named is reported (ADR 0063 decision 7); no level, no member.
+        assert_eq!(
+            serde_json::to_value(&full).unwrap()["effort"],
+            json!("low"),
+            "a call that named a level reports it"
+        );
+        assert!(
+            serde_json::to_value(UsageEvent::new("c", "m", Usage::default()))
+                .unwrap()
+                .get("effort")
+                .is_none(),
+            "a call that named none reports no member"
+        );
         let back: UsageEvent =
             serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
         assert_eq!(back, full);

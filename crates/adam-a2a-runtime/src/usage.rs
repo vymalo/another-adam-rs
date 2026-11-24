@@ -87,6 +87,9 @@ pub(crate) fn report(call: &UsageEvent) -> Value {
     if let Some(window) = call.context_window {
         report.insert("contextWindow".into(), window.min(MAX_TOKEN_COUNT).into());
     }
+    if let Some(effort) = call.effort {
+        report.insert("effort".into(), effort.as_str().into());
+    }
     Value::Object(report)
 }
 
@@ -232,12 +235,14 @@ mod tests {
         )
         .under("tool:call_2")
         .with_provider("openai")
-        .with_context_window(131_072);
+        .with_context_window(131_072)
+        .with_effort(adam_model::ReasoningEffort::High);
         assert_eq!(
             report(&call),
             json!({"call": "c7", "stepId": "tool:call_2", "provider": "openai", "model": "glm-5.3",
                    "inputTokens": 41250, "outputTokens": 812, "totalTokens": 42062,
-                   "reasoningTokens": 300, "cachedInputTokens": 38000, "contextWindow": 131072})
+                   "reasoningTokens": 300, "cachedInputTokens": 38000, "contextWindow": 131072,
+                   "effort": "high"})
         );
         // The agent's own call, a provider that says nothing, no window: none of those members.
         assert_eq!(
