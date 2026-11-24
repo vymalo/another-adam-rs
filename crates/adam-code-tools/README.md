@@ -69,7 +69,13 @@ conversation the seat counts under is the root run. A command the operating syst
 error**: `ShellOutcome::stopped` is set, `render` says `stopped: memory limit 2 GB (the command was killed)`, and the run
 goes on. Only commands that run in this container are governed (`EnvKind::Local`): a run pod has its own limits.
 `shell::run_in` itself is unchanged and ungoverned; `shell::run_timed_governed` and `run_captured_governed` take the
-`Governed` the tools pass. Background commands and language servers do not take a seat yet.
+`Governed` the tools pass.
+
+A process that outlives its call (a background command, a language server) takes its seat with `shell::seat_of`
+(`RunError::Busy` when none frees) and starts with `shell::spawn_seated(prepared, governor, seat, stdin)`, which
+returns the child and a `Hold`. Dropping the `Hold` kills the process group, stops the scope and only then gives the seat
+back; a caller keeps it until the process and its descendants are gone. **New public items, nothing breaks:** `Hold`,
+`seat_of`, `spawn_seated`.
 
 ## Features
 

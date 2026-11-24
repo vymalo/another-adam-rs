@@ -257,3 +257,10 @@ count through a `StoreAdmission` later.
 macOS and Windows backends and the three-system matrix the slice's acceptance names. Background commands, language
 servers and git do not take a seat yet. The *unverified until slice 3 has run a build under it* note in the
 Consequences stands: no build has been run under a CPU limit.
+
+*Amended 2026-11-24 (later):* **background commands, language servers and git take a seat.** `start_command` and a
+language server take a seat of `Pool::Processes` and hold it until the process group is gone (`Hold`), and every git a
+worker runs in its own container takes a seat of `Pool::Git` (`govern_git`), so `BACKGROUND_COMMANDS_MAX` and
+`LANGUAGE_SERVERS_MAX` now count inside `MAX_PROCESSES` and `MAX_GIT_PROCESSES` is used. The chart sets the four
+variables (`config.maxProcesses`, `config.maxGitProcesses`, `config.commandMemoryMax`, `config.commandCpuMax`). What
+slice 3 still lacks is the macOS and Windows backends and the three-system matrix.

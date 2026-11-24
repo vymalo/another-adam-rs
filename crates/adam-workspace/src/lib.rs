@@ -65,6 +65,7 @@ mod environment;
 mod error;
 mod git;
 mod git_env;
+mod git_gate;
 #[cfg(feature = "github")]
 mod github;
 #[cfg(feature = "github")]
@@ -104,6 +105,7 @@ pub use git::{
     CappedOutput, GitPin, GitSandbox, LOCAL_TIMEOUT, LocalGit, LocalOutput, NETWORK_TIMEOUT,
 };
 pub use git_env::{GIT_INHERITED_ENV, confine_git_env};
+pub use git_gate::govern_git;
 #[cfg(feature = "github")]
 pub use github::GitHub;
 #[cfg(feature = "github")]

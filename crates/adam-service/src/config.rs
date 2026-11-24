@@ -20,7 +20,7 @@
 //! | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (`1` is one at a time); an agent file's `limits.max_parallel` may lower it for that agent; read by the roles that run workers ([`WorkerSettings::max_parallel_tool_calls`]) | `10` |
 //! | `MAX_TOOL_CALLS_IN_FLIGHT` | the most tool calls of the whole process that run at the same time, 1 to 256: the process's pool, inside which `MAX_PARALLEL_TOOL_CALLS` still bounds one turn (ADR 0065) | `4` |
 //! | `MAX_MODEL_CALLS` | the most model calls in flight in the process, 1 to 64 (ADR 0065) | `2` |
-//! | `MAX_PROCESSES` | the most commands (`run`, `run_command`, checks) of the whole process at once, 1 to 256; background commands and language servers take no seat yet; a command waits for a seat, then the tool says so and the run retries (ADR 0065) | `4` |
+//! | `MAX_PROCESSES` | the most commands (`run`, `run_command`, checks, background commands, language servers) of the whole process at once, 1 to 256; a command waits for a seat, then the tool says so and the run retries (ADR 0065) | `4` |
 //! | `MAX_GIT_PROCESSES` | the most git processes at once, 1 to 64 (ADR 0065) | `2` |
 //! | `COMMAND_MEMORY_MAX` | the memory one command may use: bytes, or `512MiB`, `2GB` (binary units), at least 64 MiB; over it the OS stops the command and the tool says "stopped: memory limit" | a quarter of the RAM, at most 8 GB |
 //! | `COMMAND_CPU_MAX` | the CPU one command may use: cores (`2`, `1.5`) or millicores (`500m`), at least `100m`; needs a systemd user manager that delegates the `cpu` controller | half the cores, at least 1 |
@@ -789,8 +789,8 @@ pub struct WorkerSettings {
     pub max_model_calls: usize,
     /// `MODEL_TOKENS_PER_MINUTE`: the model's tokens per minute, or `None` to meter none.
     pub model_tokens_per_minute: Option<u32>,
-    /// `MAX_PROCESSES`: the most commands (`run`, `run_command`, checks) at once (background
-    /// commands and language servers take no seat yet), 1 to [`MAX_PROCESSES_LIMIT`] (ADR 0065).
+    /// `MAX_PROCESSES`: the most commands (`run`, `run_command`, checks, background commands and
+    /// language servers) at once, 1 to [`MAX_PROCESSES_LIMIT`] (ADR 0065).
     pub max_processes: usize,
     /// `MAX_GIT_PROCESSES`: the most git processes at once, 1 to [`MAX_GIT_PROCESSES_LIMIT`].
     pub max_git_processes: usize,

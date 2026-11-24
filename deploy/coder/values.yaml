@@ -121,6 +121,20 @@ config:
   # runs 10. An agent file's `limits.max_parallel` may lower it for that agent, never raise it. Roles
   # that run workers only.
   maxParallelToolCalls: null
+  # The process pools and the limits of one command (ADR 0065). null (default): nothing is rendered
+  # and the binary's own defaults apply. Roles that run workers only; the chart refuses the same
+  # variable in extraEnv beside the value.
+  # MAX_PROCESSES: the most commands, background commands and language servers of a worker at once,
+  # a whole number from 1 to 256 (the binary runs 4).
+  maxProcesses: null
+  # MAX_GIT_PROCESSES: the most git processes of a worker at once, 1 to 64 (the binary runs 2).
+  maxGitProcesses: null
+  # COMMAND_MEMORY_MAX: the memory one command may use: bytes, or a size such as 2GB or 512MiB, at
+  # least 64 MiB (the binary takes a quarter of the RAM, at most 8 GB). The binary refuses a bad one.
+  commandMemoryMax: null
+  # COMMAND_CPU_MAX: the CPU one command may use: cores (2, 1.5) or millicores (500m), at least 100m
+  # (the binary takes half the cores). The binary refuses a bad one.
+  commandCpuMax: null
   # Failed run_checks after which the agent must stop and report.
   maxCheckCycles: 3
   # Time limit of one run_checks command, in seconds.

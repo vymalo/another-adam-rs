@@ -2399,3 +2399,63 @@ async fn a_pid_is_only_killed_on_the_machine_that_the_record_names() {
     elsewhere.wait().unwrap();
     nowhere.wait().unwrap();
 }
+
+#[cfg(unix)]
+fn pool_of_one() -> adam_code_tools::governor::Governor {
+    let budget = adam_budget::Budget::builder().processes(1).build();
+    adam_code_tools::governor::Governor::new(
+        Arc::new(adam_admission_local::LocalAdmission::new(budget)),
+        Arc::new(adam_confine::Rlimits::new()),
+        adam_workspace::ProcessLimits::new(),
+    )
+    .with_wait(Duration::from_millis(200))
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_that_keeps_running_holds_a_seat_of_the_process_pool() {
+    let rig = Rig::with(|s| s.governor = Some(pool_of_one())).await;
+    let started = rig
+        .start("a", json!({"command": "sleep 622", "wait": 1}))
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("a");
+    let pid = rig.pid_of(&id);
+
+    // The one seat is the command's: the next one waits, then is told to try again (a retryable
+    // error, as `run` gives), and nothing of it was started.
+    let err = StartCommand
+        .call(
+            &rig.call_ctx("b"),
+            json!({"command": "sleep 623", "wait": 1}),
+        )
+        .await
+        .err()
+        .expect("no seat is free");
+    assert!(
+        matches!(err, adam_llm_agent::ToolError::Retryable { .. }),
+        "{err:?}"
+    );
+    assert_eq!(rig.fx.env.commands.running_count(&rig.run()), 1);
+
+    // Stopping it gives the seat back once its process is gone.
+    rig.stop(&id).await;
+    until("the process to be gone", || !alive(pid)).await;
+    let mut next = None;
+    for _ in 0..50 {
+        let out = StartCommand
+            .call(
+                &rig.call_ctx("c"),
+                json!({"command": "sleep 624", "wait": 1}),
+            )
+            .await;
+        if let Ok(out) = out {
+            next = Some(out);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let next = next.expect("the seat was given back");
+    assert!(!next.is_error, "{}", next.content);
+    rig.stop(&rig.id_of("c")).await;
+}

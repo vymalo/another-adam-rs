@@ -319,6 +319,7 @@ The three tools of [the coder's language servers](coder-agent.md#language-server
 | a writable slot was written to by a server of a run at tier `plan` | `The language server changed files of `repo`, and this run is at the `plan` tier, where nothing is changed. The files are as they were. ...` | stopped |
 | the run's servers were stopped while this one started | `The language servers of this run were stopped while this one was starting (the run parked, or its environment was made again): call again.` | stopped |
 | `LANGUAGE_SERVERS_MAX` servers are held and all are working | `This worker holds 4 language servers (LANGUAGE_SERVERS_MAX) and every one is working for a call: try again shortly.` | a call waits |
+| no seat of `MAX_PROCESSES` frees for a language server within a minute | `The language server `rust-analyzer` was not started: the processes pool is full (MAX_PROCESSES): try again shortly.` | a call waits |
 | the call is past its budget (`wait` + 120 s) | `The language server call did not finish within N s. A server that was started is kept: call again, or use run_checks or run_command.` | kept |
 
 ### An image the model is not sent
