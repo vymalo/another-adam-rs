@@ -21,6 +21,13 @@
 
 #![warn(missing_docs)]
 
+mod events;
+
+pub use events::{
+    EVENT_MAX, EventHeader, EventKind, EventQueue, FIELD_MAX, FlushReport, HookEvent, JSON_MAX,
+    ObserveLimits,
+};
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -130,6 +137,13 @@ pub trait Plugin: Send + Sync {
     fn after_tool(&self, _call: &HookedCall<'_>, _output: &mut HookedText<'_>) -> HookResult {
         Ok(Verdict::Continue)
     }
+
+    /// An event of the catalogue happened (ADR 0050, slice H2). An observer only reads: it runs
+    /// outside the journal, its failure is counted and dropped, and it cannot change the run. The
+    /// event's `key` is stable across replays: a plugin that writes elsewhere dedupes on it.
+    fn observe(&self, _event: &HookEvent) -> Result<(), HookError> {
+        Ok(())
+    }
 }
 
 /// How long one hook may take, and how many times a transient failure is tried again.
@@ -154,8 +168,9 @@ impl Default for HookLimits {
 /// An ordered set of plugins, with their limits.
 #[derive(Default)]
 pub struct HookSet {
-    plugins: Vec<Arc<dyn Plugin>>,
+    pub(crate) plugins: Vec<Arc<dyn Plugin>>,
     limits: HookLimits,
+    pub(crate) observe_limits: ObserveLimits,
 }
 
 impl std::fmt::Debug for HookSet {
