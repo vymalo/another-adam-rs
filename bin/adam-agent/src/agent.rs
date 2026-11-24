@@ -299,11 +299,13 @@ pub async fn agents(
                 &profiles,
             );
             // The models a message may pick (`model-pick/v1`): the root's choices, the same list
-            // its card advertises.
+            // its card advertises, each with its endpoint label when the deployment names one.
             let choices = assembly
                 .info()
                 .first()
-                .map(|root| adam_a2a::ModelChoices::from_aliases(root.model_choices.clone()))
+                .map(|root| {
+                    adam_a2a::ModelChoices::from_profiles(root.model_choices.clone(), &profiles)
+                })
                 .filter(|choices| !choices.is_empty());
             // The prompts of the root's MCP servers are commands too, known only now that the
             // servers are connected: a role without workers connects none, so it serves none.

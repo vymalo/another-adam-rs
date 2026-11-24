@@ -432,11 +432,19 @@ A split control plane knows no model, so it lists no entry (as it lists no `mode
 
 An agent whose card lists `https://agents.vymalo.com/a2a/extensions/model-pick/v1` takes a model
 **for each message** ([ADR 0064](../decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md),
-amended 2026-11-23). The card's `params` are `{"choices": ["<alias>", ..]}`, the aliases the
-deployment offers this agent — the profiles of `MODEL_ALIASES_FILE` minus the agent's own model —
-each once. An agent the deployment gives one model offers
-nothing and lists no extension: `adam_a2a::ExtensionConfig::model_pick` returns `None`, and
-`adam_service::serve` adds the entry only when the backend serves a non-empty list.
+amended 2026-11-23). The card's `params` are
+`{"choices": [{"id": "<alias>", "endpoint"?: "<label>"}, ..]}`, the aliases the deployment offers
+this agent — the profiles of `MODEL_ALIASES_FILE` minus the agent's own model — each once. An agent
+the deployment gives one model offers nothing and lists no extension:
+`adam_a2a::ExtensionConfig::model_pick` returns `None`, and `adam_service::serve` adds the entry
+only when the backend serves a non-empty list.
+
+`endpoint` is the deployment's own **name for the model's endpoint**, a label only — never a
+provider, a host, a URL or a key. It comes from the alias's profile in `MODEL_ALIASES_FILE`
+(`endpoint`, ANR-623): a choice whose profile names one lists it, a choice whose profile names none
+lists no `endpoint`, and a malformed label (blank, not a string, or longer than 128 bytes) is
+omitted from that choice, never guessed and never a reason to refuse the file. `label` is left out:
+the alias is the name a person reads, and a client falls back to the `id`.
 
 A request that **activates** the extension **must** carry `metadata[URI] = {"model": "<alias>"}`
 on the message. `adam_a2a::ModelChoices::requested` reads it and returns the refusal sentence for

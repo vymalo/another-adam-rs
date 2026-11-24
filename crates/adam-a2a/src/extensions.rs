@@ -129,8 +129,11 @@ pub const REASONING_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/
 
 /// The URI of the `model-pick/v1` extension: a message that activates it names the model alias its
 /// run is answered by, in its metadata under this URI, as `{"model": "<alias>"}`. The card's
-/// `params` are `{"choices": [<the aliases the deployment offers>]}`, each once; an agent with one
-/// alias lists no extension. The reading is [`crate::ModelChoices`] (ADR 0064, amended 2026-11-23).
+/// `params` are `{"choices": [{"id": "<alias>", "endpoint"?: "<label>"}, ..]}`, each alias once; an
+/// agent with one alias lists no extension. `endpoint` is the deployment's own name for the model
+/// endpoint, a label only, and absent when the deployment names none (ANR-623, ADR 0084's note of
+/// 2026-11-24 in the orchestration layer). The reading is [`crate::ModelChoices`] (ADR 0064,
+/// amended 2026-11-23).
 pub const MODEL_PICK_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/model-pick/v1";
 
 /// One helper of the card's `child-sessions/v1` entry.
@@ -430,8 +433,10 @@ impl ExtensionConfig {
     }
 
     /// The `model-pick/v1` extension: the card lists the model aliases the deployment offers for a
-    /// message's run, `params.choices`, each once. `None` when the
-    /// agent offers none (a deployment with one alias): such an agent does not list the extension.
+    /// message's run, `params.choices`, each once, with the deployment's endpoint label beside the
+    /// alias when it names one (`{"id": "<alias>", "endpoint"?: "<label>"}`, ANR-623). `None` when
+    /// the agent offers none (a deployment with one alias): such an agent does not list the
+    /// extension.
     /// Optional; the description is this repository's until the orchestration layer publishes the
     /// contract.
     pub fn model_pick(choices: &crate::ModelChoices) -> Option<Self> {
@@ -442,7 +447,7 @@ impl ExtensionConfig {
         extension.description = Some("Answers with the model the message names.".into());
         extension
             .params
-            .insert("choices".into(), json!(choices.aliases()));
+            .insert("choices".into(), json!(choices.entries()));
         Some(extension)
     }
 }
@@ -838,12 +843,31 @@ mod tests {
             e.description.as_deref(),
             Some("Answers with the model the message names.")
         );
+        // A choice is an object with its alias as `id`; a deployment that names no endpoint lists
+        // none, so this card is the one card a pick could always be read from.
         assert_eq!(
             serde_json::Value::Object(e.params),
-            json!({"choices": ["alias-b", "alias-a"]})
+            json!({"choices": [{"id": "alias-b"}, {"id": "alias-a"}]})
         );
         // An agent that offers no model lists nothing: a deployment with one alias has no choice.
         assert!(ExtensionConfig::model_pick(&crate::ModelChoices::new()).is_none());
+    }
+
+    #[test]
+    fn a_model_pick_choice_carries_its_endpoint_label_when_the_profile_names_one() {
+        let profiles = adam_model::ModelProfiles::parse_json(
+            r#"{"profiles": {"alias-a": {"endpoint": "gateway-a"}, "alias-b": {}}}"#,
+        )
+        .expect("valid profiles");
+        let choices = crate::ModelChoices::from_profiles(["alias-b", "alias-a"], &profiles);
+        let e = ExtensionConfig::model_pick(&choices).expect("listed");
+        assert_eq!(
+            serde_json::Value::Object(e.params),
+            json!({"choices": [
+                {"id": "alias-b"},
+                {"id": "alias-a", "endpoint": "gateway-a"}
+            ]})
+        );
     }
 
     /// The extension is activatable only on a card that lists it: the URIs a card offers are the

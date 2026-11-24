@@ -1,7 +1,7 @@
 //! The per-model profiles of `MODEL_ALIASES_FILE` ([ADR 0063](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0063-a-reasoning-effort-is-one-setting.md),
 //! [ADR 0064](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md)):
 //! which reasoning levels a model takes and how they are sent, its output cap, the members merged into
-//! its requests, and the named presets.
+//! its requests, the deployment's endpoint label for it, and the named presets.
 //!
 //! The types are pure data: no file is read here. [`ModelProfiles::parse_json`] parses and validates a
 //! document and reports every problem it finds, naming the profile (or preset) and the key; the binary
@@ -18,7 +18,8 @@
 //!       "preset": "quick",
 //!       "reasoningEfforts": ["low", "medium", "high", "max"],
 //!       "reasoningWire": "reasoning_effort",
-//!       "maxOutputTokensLimit": 131072
+//!       "maxOutputTokensLimit": 131072,
+//!       "endpoint": "gateway-a"
 //!     },
 //!     "small-chat": {
 //!       "reasoningEfforts": [],
@@ -37,7 +38,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// How much a model reasons for one call, from the least to the most: the gateway's observed levels,
@@ -176,6 +177,35 @@ impl FromStr for ReasoningWire {
 /// host that builds an agent by hand.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 128_000;
 
+/// The longest endpoint label a profile may name, in bytes: a label, not a paragraph. A longer one
+/// is malformed and omitted, never truncated into a different endpoint's name.
+pub const MAX_ENDPOINT_LABEL_LEN: usize = 128;
+
+/// The endpoint label a profile's `endpoint` names, when it is one.
+///
+/// The member is a **label only**: the deployment's own name for a model endpoint, never a
+/// provider, a host, a URL or a key. A value that is not a short, non-blank string is *omitted*,
+/// never guessed and never a reason to refuse the document: a card that lists no endpoint is the
+/// card of a deployment that names none.
+fn endpoint_label(value: &Value) -> Option<String> {
+    let text = value.as_str()?.trim();
+    if text.is_empty() || text.len() > MAX_ENDPOINT_LABEL_LEN {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
+/// Deserialize `endpoint` leniently: a malformed value is `None`, not a parse error, so one bad
+/// label never stops a process that could serve every other profile.
+fn deserialize_endpoint<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?
+        .as_ref()
+        .and_then(endpoint_label))
+}
+
 /// The members of a request body the runtime owns: a profile's `extraBody` may not set one.
 pub const RESERVED_EXTRA_BODY_KEYS: [&str; 8] = [
     "model",
@@ -217,6 +247,16 @@ pub struct ModelProfile {
     /// locked (ADR 0064, amended 2026-11-23): another profile of the document. An agent's
     /// `model_fallback`, then its preset's, win over it.
     pub fallback: Option<String>,
+    /// The deployment's own name for this model's endpoint, a **label only**: what a
+    /// `model-pick/v1` choice carries beside its alias, so a client can name the endpoint the
+    /// person picked. Never a provider, a host, a URL or a key. Absent when the deployment names
+    /// none; a malformed value is absent too, never a refusal of the document (ANR-623).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_endpoint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub endpoint: Option<String>,
 }
 
 /// A named bundle a profile (or an agent's `model_preset`) starts from.
@@ -251,6 +291,12 @@ impl ModelProfiles {
     /// The profile of `model`, when the deployment declared one.
     pub fn profile(&self, model: &str) -> Option<&ModelProfile> {
         self.profiles.get(model)
+    }
+
+    /// The endpoint label the profile of `model` names, when it names one. This is the label a
+    /// `model-pick/v1` choice carries beside its alias; an absent or malformed member is `None`.
+    pub fn endpoint_of(&self, model: &str) -> Option<&str> {
+        self.profile(model)?.endpoint.as_deref()
     }
 
     /// The preset named `name`, when it is declared.
@@ -499,6 +545,7 @@ struct RawProfile {
     extra_body: Option<serde_json::Map<String, Value>>,
     preset: Option<String>,
     fallback: Option<String>,
+    endpoint: Option<Value>,
 }
 
 /// A preset as written.
@@ -651,6 +698,7 @@ fn convert_profile(
         extra_body: raw.extra_body,
         preset: raw.preset,
         fallback: raw.fallback,
+        endpoint: raw.endpoint.as_ref().and_then(endpoint_label),
     })
 }
 
@@ -773,6 +821,7 @@ mod tests {
             )])),
             preset: Some("quick".into()),
             fallback: Some("other".into()),
+            endpoint: Some("gateway-a".into()),
         };
         roundtrip(profile.clone());
         assert_eq!(
@@ -1127,6 +1176,47 @@ mod tests {
         let profiles = ModelProfiles::parse_json(&good.to_string()).unwrap();
         assert_eq!(profiles.profiles.len(), 3);
         assert_eq!(profiles.profile("bare"), Some(&ModelProfile::default()));
+    }
+
+    /// The endpoint label (ANR-623): `endpoint` on a profile is a label only, and it reaches the
+    /// `model-pick/v1` choice beside the alias — present, absent, or malformed (each omitted).
+    #[test]
+    fn a_profiles_endpoint_label_is_a_short_string_or_nothing() {
+        // Present: the deployment's own name, trimmed, kept as it is.
+        let named = json!({
+            "profiles": {
+                "alias-a": { "endpoint": " gateway-a " },
+                "alias-b": {}
+            }
+        });
+        let profiles = ModelProfiles::parse_json(&named.to_string()).expect("valid");
+        assert_eq!(profiles.endpoint_of("alias-a"), Some("gateway-a"));
+        // Absent stays absent: a profile that names none, and one the document does not hold.
+        assert_eq!(profiles.endpoint_of("alias-b"), None);
+        assert_eq!(profiles.endpoint_of("alias-c"), None);
+        assert_eq!(ModelProfiles::default().endpoint_of("alias-a"), None);
+
+        // Malformed: each is omitted (never guessed), and the document still loads whole.
+        for bad in [
+            json!(""),
+            json!("   "),
+            json!("x".repeat(MAX_ENDPOINT_LABEL_LEN + 1)),
+            json!({ "name": "gateway-a" }),
+            json!(3),
+            json!(null),
+            json!(["gateway-a"]),
+        ] {
+            let document = json!({ "profiles": { "alias-a": { "endpoint": bad.clone() } } });
+            let profiles = ModelProfiles::parse_json(&document.to_string())
+                .unwrap_or_else(|problems| panic!("{bad}: {problems:?}"));
+            assert_eq!(profiles.endpoint_of("alias-a"), None, "{bad}");
+        }
+        // The longest accepted label is exactly the bound, and it round-trips.
+        let longest = "x".repeat(MAX_ENDPOINT_LABEL_LEN);
+        let at_bound = json!({ "profiles": { "alias-a": { "endpoint": longest } } });
+        let profiles = ModelProfiles::parse_json(&at_bound.to_string()).expect("valid");
+        assert_eq!(profiles.endpoint_of("alias-a"), Some(longest.as_str()));
+        roundtrip(profiles.profile("alias-a").unwrap().clone());
     }
 
     #[test]

@@ -417,3 +417,37 @@ what a served run is answered by, which is this ADR's subject, and claims no num
 Slice 7 is accepted when an offered pick is the model a served run's request names (against a mock model client, never a
 live provider), an alias outside the card's choices is `model_not_offered` with no run written, and a request that did
 not activate the extension, or a card that lists none, leaves the pick unread.
+
+### Status note, 2026-11-24: each `model-pick/v1` choice carries its endpoint label (ANR-623)
+
+The system's ADR 0084 answers question 4 (ANR-Q53, 2026-11-24): adam's card lists, for each model
+choice, the **endpoint label** its alias maps to, so a client can bind a run's model credential to
+the endpoint the person picked. This note records adam's side; the contract is the system's.
+
+1. **The card's shape.** The slice-7 amendment's `{"choices": ["<alias>", ..]}` is superseded by the
+   contract's objects: `params.choices` is `[{"id": "<alias>", "endpoint"?: "<label>"}, ..]`, in the
+   order the assembly lists the aliases, each once. `label` is not sent: the alias is the name a
+   person reads, and a client falls back to the `id`. This is a wire change of the card (a client
+   written against the bare-string list reads no choices); the merged system contract already
+   reads the objects, and this is the shape it names.
+2. **Where the label comes from.** `MODEL_ALIASES_FILE`: a profile gains an optional `endpoint`,
+   the deployment's own name for that model's endpoint — a **label only**, never a provider, a
+   host, a URL or a key. `ModelProfiles::endpoint_of` reads it, and
+   `ModelChoices::from_profiles(aliases, &profiles)` puts it on each offered alias's choice. Both
+   served binaries use it: `adam-coder` (`CoderAgent::model_choices`) and the folder agents
+   (`adam-agent`, through `adam-service`).
+3. **Absent stays absent.** A profile that names no endpoint lists no `endpoint` on its choice, and
+   no member of the card becomes required. An agent that offers no model still lists no extension.
+4. **Malformed fails closed.** A label that is blank, not a string, or longer than
+   `MAX_ENDPOINT_LABEL_LEN` (128 bytes) is **omitted** from that choice: never guessed, never a
+   different endpoint's name, and never a refusal of the whole profiles file (a process keeps
+   serving every other profile).
+5. **Companions.** `docs/reference/a2a-server.md`, `docs/reference/parity.md`,
+   `crates/adam-model/README.md`, `crates/adam-a2a/README.md`, `crates/adam-a2a-runtime/README.md`,
+   `crates/adam-service/README.md`, `docs/architecture.md` and the `adam-a2a-extensions` and
+   `adam-agent-folder` skills carry the member.
+
+Accepted when a served card lists `endpoint` on a choice whose profile names one, omits it when the
+profile names none, and omits it (rather than failing) when the label is malformed — unit-tested in
+`crates/adam-model/src/profiles.rs` and `crates/adam-a2a/src/{model_pick,extensions}.rs`, and on a
+served card in `crates/adam-service/tests/serve.rs`.

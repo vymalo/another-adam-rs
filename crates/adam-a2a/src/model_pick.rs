@@ -16,13 +16,19 @@
 //! * **The gateway still decides.** A pick is a request, never an authorisation: the model call
 //!   goes through the deployment's gateway as any other, and a locked model is refused there
 //!   (`model_locked`, ADR 0067).
+//!
+//! Each choice also carries the deployment's **endpoint label** for its alias, when
+//! `MODEL_ALIASES_FILE` names one ([`ModelProfiles::endpoint_of`](adam_model::ModelProfiles::endpoint_of),
+//! ANR-623): a label only, never a provider, a host, a URL or a key. A deployment that names none
+//! lists no `endpoint`, and a malformed label is omitted rather than guessed.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use a2a::Message;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::extensions::MODEL_PICK_EXTENSION;
+use adam_model::ModelProfiles;
 
 /// The member of the entry under [`MODEL_PICK_EXTENSION`] that carries the alias:
 /// `{"model": "alias-a"}`. It is part of the wire: clients and agents read it by name.
@@ -37,10 +43,14 @@ pub const MODEL_NOT_OFFERED: &str = "model_not_offered";
 ///
 /// The deployment's list is the models of `MODEL_ALIASES_FILE` that this agent can be bound to, its
 /// own model left out; an agent the deployment gives one alias offers none, so its card lists no
-/// extension.
+/// extension. Each choice may also carry the deployment's endpoint label for that alias
+/// ([`Self::endpoint_of`], ANR-623).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelChoices {
     aliases: Vec<String>,
+    /// The endpoint label of each offered alias that names one, and only those: the label is a
+    /// property of the choice, so it never outlives the alias.
+    endpoints: BTreeMap<String, String>,
 }
 
 impl ModelChoices {
@@ -63,12 +73,55 @@ impl ModelChoices {
                 .filter(|alias| !alias.trim().is_empty())
                 .filter(|alias| seen.insert(alias.clone()))
                 .collect(),
+            endpoints: BTreeMap::new(),
         }
+    }
+
+    /// The choices `aliases` with the endpoint label each one's profile names in `profiles`
+    /// (ANR-623): the same list [`Self::from_aliases`] builds, each offered alias carrying its
+    /// profile's `endpoint` when the deployment names a well-formed one.
+    ///
+    /// A profile that names no endpoint, and a malformed one, leave the choice without a label.
+    pub fn from_profiles<I, S>(aliases: I, profiles: &ModelProfiles) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut choices = Self::from_aliases(aliases);
+        choices.endpoints = choices
+            .aliases
+            .iter()
+            .filter_map(|alias| {
+                profiles
+                    .endpoint_of(alias)
+                    .map(|endpoint| (alias.clone(), endpoint.to_owned()))
+            })
+            .collect();
+        choices
     }
 
     /// The aliases offered, in the order the deployment lists them.
     pub fn aliases(&self) -> &[String] {
         &self.aliases
+    }
+
+    /// The endpoint label the deployment names for `alias`, when it names one: its own name for the
+    /// model's endpoint, never a provider, a host, a URL or a key.
+    pub fn endpoint_of(&self, alias: &str) -> Option<&str> {
+        self.endpoints.get(alias).map(String::as_str)
+    }
+
+    /// The choices as the card's `params.choices` lists them: each `{"id": "<alias>"}`, and
+    /// `"endpoint": "<label>"` beside the `id` when the deployment names one. `label` is left out:
+    /// the alias is the name a person reads, and a client falls back to the `id`.
+    pub fn entries(&self) -> Vec<Value> {
+        self.aliases
+            .iter()
+            .map(|alias| match self.endpoint_of(alias) {
+                Some(endpoint) => json!({ "id": alias, "endpoint": endpoint }),
+                None => json!({ "id": alias }),
+            })
+            .collect()
     }
 
     /// Whether the agent offers no model at all.
@@ -169,6 +222,44 @@ mod tests {
         assert!(!set.offers("alias-c"));
         assert!(ModelChoices::new().is_empty());
         assert!(!ModelChoices::new().offers("alias-a"));
+        // No endpoint label is invented for a list built from aliases alone.
+        assert_eq!(
+            set.entries(),
+            [
+                serde_json::json!({"id": "alias-b"}),
+                serde_json::json!({"id": "alias-a"})
+            ]
+        );
+        assert_eq!(set.endpoint_of("alias-a"), None);
+    }
+
+    #[test]
+    fn a_choice_carries_the_endpoint_label_its_profile_names() {
+        use adam_model::ModelProfiles;
+
+        let profiles = ModelProfiles::parse_json(
+            r#"{"profiles": {
+                "alias-a": {"endpoint": "gateway-a"},
+                "alias-b": {"endpoint": "   "}
+            }}"#,
+        )
+        .expect("valid profiles");
+        let set = ModelChoices::from_profiles(["alias-a", "alias-b", "unprofiled"], &profiles);
+        assert_eq!(set.aliases(), ["alias-a", "alias-b", "unprofiled"]);
+        assert_eq!(set.endpoint_of("alias-a"), Some("gateway-a"));
+        // A malformed label and a model with no profile are both absent, never guessed.
+        assert_eq!(set.endpoint_of("alias-b"), None);
+        assert_eq!(set.endpoint_of("unprofiled"), None);
+        assert_eq!(
+            set.entries(),
+            [
+                serde_json::json!({"id": "alias-a", "endpoint": "gateway-a"}),
+                serde_json::json!({"id": "alias-b"}),
+                serde_json::json!({"id": "unprofiled"}),
+            ]
+        );
+        // A choice the deployment does not offer never carries a label.
+        assert_eq!(set.endpoint_of("not-offered"), None);
     }
 
     #[test]
