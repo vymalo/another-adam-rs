@@ -407,6 +407,8 @@ replay: the decision must be readable after a crash without asking a hook again,
 model call that follows it. The consequence decision 3 warns about stands for a run already in flight when a deployment
 adds its first plugin: its next transition takes a new step at a seq the journal holds, so roll every worker before the
 build is used. Decision 9's payload, refusal semantics and `Rejected` class are as written.
+**The owner accepted this reading** (ANR-Q86, 2026-11-24): *"Accept the conditional step (keep the Amended note, roll
+workers before a deployment's first plugin)"*.
 
 *Amended 2026-11-18 (ADR 0045 slice 3, which reports to the model a session round that ended, is built; no hook is):* the reports a model call is given are
 appended **inside the step `model:<turn>`** and recorded in its record, so `model:<turn>` holds what decision 9 puts there for `message.received` and the
