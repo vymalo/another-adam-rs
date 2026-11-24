@@ -1,0 +1,22 @@
+[package]
+name = "adam-admission-local"
+description = "The in-process Admission of adam-rs: tokio semaphores per pool, a weighted one for command memory, and a token bucket for a model's tokens per minute"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-budget.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+adam-admission-testkit = { path = "../adam-admission-testkit" }
+adam-error.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

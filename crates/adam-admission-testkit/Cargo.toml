@@ -1,0 +1,21 @@
+[package]
+name = "adam-admission-testkit"
+description = "The conformance suite of adam-budget's Admission port: an admission_conformance! macro that proves an implementation never over-admits, frees what is dropped or cancelled, and keeps one conversation within its share"
+readme = "README.md"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-budget.workspace = true
+adam-error.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

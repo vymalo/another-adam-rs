@@ -1,0 +1,18 @@
+[package]
+name = "adam-budget"
+description = "The resource budget and the admission port of adam-rs: what a process may use at once, and the permit that gives it back"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-error.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[lints]
+workspace = true

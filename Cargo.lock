@@ -199,6 +199,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-admission-local"
+version = "0.1.0"
+dependencies = [
+ "adam-admission-testkit",
+ "adam-budget",
+ "adam-error",
+ "async-trait",
+ "tokio",
+]
+
+[[package]]
+name = "adam-admission-testkit"
+version = "0.1.0"
+dependencies = [
+ "adam-budget",
+ "adam-error",
+ "tokio",
+]
+
+[[package]]
 name = "adam-agent"
 version = "0.1.0"
 dependencies = [
@@ -298,6 +318,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "adam-budget"
+version = "0.1.0"
+dependencies = [
+ "adam-error",
+ "async-trait",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
