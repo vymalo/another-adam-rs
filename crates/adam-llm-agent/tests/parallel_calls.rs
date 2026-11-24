@@ -2049,6 +2049,7 @@ fn read_output_is_independent_and_the_session_list_runs_alone() {
         description: "Does a piece of work.".into(),
         within: None,
         remote: false,
+        bounds: adam_runtime::SessionBounds::default(),
     }]);
     for tool in roster.tools() {
         assert_eq!(
