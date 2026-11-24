@@ -7,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use adam_code_tools::person::{MAX_LISTED, PLACE};
+use adam_code_tools::person::PLACE;
 use adam_code_tools::{CodeWorkspace, CommandWorkspace, Guarding, PersonDir};
 use adam_code_tools_testkit::{
     CommandHarness, Harness, code_workspace_conformance, command_workspace_conformance,
@@ -148,11 +148,4 @@ async fn the_repository_bookkeeping_is_not_a_change() {
     fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     assert_eq!(guard.settle().await, adam_code_tools::Settled::Unchanged);
     assert_eq!(workspace.after_run(&ctx, &place).await.unwrap(), "");
-}
-
-/// The listing is bounded: a place past its limit still answers, and says the report is a lower
-/// bound rather than pretending it saw everything.
-#[test]
-fn the_listing_keeps_at_most_its_limit() {
-    assert!(MAX_LISTED > 0);
 }

@@ -10,7 +10,7 @@
 //! reads — the files a command added, changed and removed.
 //!
 //! The report travels through the workspace, not through the guard, because
-//! [`CommandGuard::settle`](crate::CommandGuard::settle) consumes the guard and
+//! [`CommandGuard::settle`] consumes the guard and
 //! `after_run` is given no guard: the guard writes what it saw into a map keyed by the place, and
 //! `after_run` reads that entry once and **clears** it, so a command that never reaches its report
 //! cannot leak into the next one. One command is taken per place at a time (the tools run one per
