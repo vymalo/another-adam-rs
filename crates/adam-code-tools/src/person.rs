@@ -286,21 +286,6 @@ impl CommandGuard for Recorded {
                 None => false,
             }
         };
-        // MUTATION, NOT FOR MERGING: undoing what the command added, which is exactly what a
-        // person's directory must never do. It is here for one CI run, to see the case that says
-        // "nothing is restored" go red, and it is reverted in the next commit.
-        {
-            let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entry) = seen.get(&self.key) {
-                if let Some(after) = &entry.after {
-                    for path in after.keys() {
-                        if !entry.before.contains_key(path) {
-                            let _ = std::fs::remove_file(self.key.join(path));
-                        }
-                    }
-                }
-            }
-        }
         if changed {
             Settled::FilesChanged
         } else {
