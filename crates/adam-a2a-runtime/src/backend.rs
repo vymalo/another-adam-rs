@@ -893,6 +893,10 @@ impl RuntimeTaskBackend {
         // A message that activated `locale/v1` names the interface language of this message, or
         // names none and takes an earlier one away; one that did not is read as it always was.
         vymalo::locale_into(caller, &message, &mut inbound);
+        // A client that activated `child-sessions/v1` shows the sessions of this run: the fact
+        // rides the run's context so a session the model starts is one the person can answer
+        // (ADR 0045 decision 9).
+        crate::child_sessions::shown_into(self.sessions_activated(caller), &mut inbound);
         // A message that activated `model-pick/v1` names the model of its run, one the card
         // offers; anything else is refused before anything is written, and the pick rides the
         // run's context to the loop.

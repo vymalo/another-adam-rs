@@ -8,6 +8,9 @@
 //! The file and search tools are here ([`files`], [`find`]); the commands have their port, with the
 //! guard of a command, and the plumbing `run_command` and `run` share ([`commands`], [`output`]).
 //! `run_command` is here ([`inspect`]), and so is `run` ([`make`]).
+//!
+//! The host's side of the port has its first implementation: [`PersonDir`] is a person's own
+//! directory, which a run never owns, cleans or restores ([ADR 0047], slice 7, decision 8).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -22,6 +25,7 @@ pub mod governor;
 pub mod inspect;
 pub mod make;
 pub mod output;
+pub mod person;
 pub mod redact;
 pub mod sandbox;
 pub mod shell;
@@ -31,6 +35,7 @@ pub use commands::{
     CommandGuard, CommandLimits, CommandWorkspace, DynCommandWorkspace, Guarding, Settled,
     Unwatched,
 };
+pub use person::PersonDir;
 pub use redact::Redactor;
 pub use workspace::{
     CodeWorkspace, DynCodeWorkspace, Intent, MAX_INSTRUCTIONS_BLOCK, Outcome, Place, Target,

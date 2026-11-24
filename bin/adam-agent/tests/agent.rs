@@ -2286,19 +2286,18 @@ async fn a_served_agent_offers_the_deployments_other_models_and_takes_a_pick() {
     let model: DynModel = mock.clone();
     let mut parts = worker(model, McpPolicy::default());
     parts.profiles = ModelProfiles::parse_json(
-        r#"{"profiles": {"test-model": {}, "alias-a": {"maxOutputTokens": 2048}}}"#,
+        r#"{"profiles": {"test-model": {}, "alias-a": {"maxOutputTokens": 2048, "endpoint": "gateway-a"}}}"#,
     )
     .expect("valid profiles");
     let agents = build(def_of(&folder), None, Some(parts)).await.unwrap();
-    // The root's choices are what the card advertises: its own model is not one of them.
-    assert_eq!(
-        agents
-            .model_choices
-            .as_ref()
-            .expect("the deployment offers a model")
-            .aliases(),
-        ["alias-a"]
-    );
+    // The root's choices are what the card advertises: its own model is not one of them, and the
+    // choice carries the endpoint label the deployment's profile names (ANR-623).
+    let choices = agents
+        .model_choices
+        .as_ref()
+        .expect("the deployment offers a model");
+    assert_eq!(choices.aliases(), ["alias-a"]);
+    assert_eq!(choices.endpoint_of("alias-a"), Some("gateway-a"));
     let service = service_over(agents, &store());
     let started = Worker::start(&service);
 

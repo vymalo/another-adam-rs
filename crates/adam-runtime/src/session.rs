@@ -196,6 +196,14 @@ pub struct SessionHeader {
     /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<RunId>,
+    /// A client that activated `child-sessions/v1` started or sent this session, so the person
+    /// sees it and can answer a round of it: a round of a kept-open session may ask the person
+    /// only then (ADR 0045 decision 9, [`SessionHeader::keep_open`]). The A2A front writes it for
+    /// a round it starts, and the session tools write it for a session they start from a run whose
+    /// client shows child sessions; a later round keeps it. Absent when `false`, which is what a
+    /// header written before it existed reads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub visible: bool,
 }
 
 /// The header a round's agent state holds, if it holds one.
@@ -215,6 +223,11 @@ struct RoundFacts {
     status: RunStatus,
     /// Why it failed, when it did.
     error: Option<String>,
+    /// The wake the runtime set for the round itself (it watches a run it started), and that
+    /// `agent_wake` is the agent's own when it did, exactly as [`RunView`](crate::RunView) reads
+    /// them: with `rec.wake_at` they decide whether a parked round waits for a person.
+    hb: bool,
+    agent_wake: Option<Timestamp>,
 }
 
 /// The members of a round's state a listing reads by name. Every other member — `agent` above all —
@@ -225,6 +238,10 @@ struct ListedState {
     inbox: Vec<ListedInbound>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    hb: bool,
+    #[serde(default)]
+    agent_wake: Option<Timestamp>,
 }
 
 /// The one member of an inbox message a listing reads. Required, as it is in [`Inbound`]: a message
@@ -249,6 +266,8 @@ impl RoundFacts {
                 RunStatus::Failed
             },
             error: None,
+            hb: false,
+            agent_wake: None,
         })
     }
 
@@ -278,7 +297,25 @@ impl RoundFacts {
             close_asked: state.inbox.iter().any(|i| i.kind == SESSION_CLOSE_KIND),
             status: rec.status,
             error: state.error,
+            hb: state.hb,
+            agent_wake: state.agent_wake,
         })
+    }
+
+    /// Whether the round waits for the person: it is parked with no timer, as
+    /// [`RunView::waiting`](crate::RunView::waiting) says of a run. The runtime's own wake on a
+    /// run it watches is not the agent's, so a round that waits for a child on a timer does not
+    /// read as waiting (`RunView::new`).
+    fn waits(&self, rec: &RunRecord) -> bool {
+        if rec.status != RunStatus::Parked {
+            return false;
+        }
+        let wake = if self.hb {
+            self.agent_wake
+        } else {
+            rec.wake_at
+        };
+        wake.is_none()
     }
 }
 
@@ -567,6 +604,26 @@ pub(crate) struct Latest {
     pub closed: bool,
     pub idle_expired: bool,
     pub status: ChildStatus,
+    /// The round is parked with no timer: it waits for the person (ADR 0045 decision 9).
+    pub waiting: bool,
+    /// What it waits for: the question a tool asked, or the reason a park on the model gave.
+    pub waiting_reason: Option<String>,
+}
+
+/// What a run parked with no timer waits for, from the agent head of its state: the question a
+/// tool asked, or the reason of a model park ([ADR 0067]). The same order the A2A front reads
+/// (`adam_a2a_runtime::convert::default_prompt`).
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+fn waiting_reason(state: &Value) -> Option<String> {
+    let agent = state.get("agent")?;
+    agent
+        .pointer("/pending_wait/question")
+        .or_else(|| agent.pointer("/pending_question/question"))
+        .or_else(|| agent.get("question"))
+        .or_else(|| agent.pointer("/model_wait/reason"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 /// Read `latest`, the newest round of a session, at `now`, from the facts a listing already read of
@@ -604,6 +661,12 @@ fn read_latest(
         };
         (state, Some(outcome))
     };
+    let waiting = open && facts.waits(latest);
+    let waiting_reason = if waiting {
+        waiting_reason(&latest.state)
+    } else {
+        None
+    };
     Latest {
         state,
         outcome,
@@ -611,6 +674,8 @@ fn read_latest(
         closed,
         idle_expired,
         status,
+        waiting,
+        waiting_reason,
     }
 }
 
@@ -723,6 +788,16 @@ pub struct SessionView {
     /// The report: the last round **that did work** (a round that only closed the session has none),
     /// as a parent reads a child: its status and output.
     pub latest: ChildStatus,
+    /// Whether the latest round is parked with no timer: it waits for the person, on a question it
+    /// asked (ADR 0045 decision 9) or on a model that refused it until woken (ADR 0067). Its
+    /// [`state`](Self::state) is still [`Working`](SessionState::Working): the round's work is not
+    /// done, and the person's answer is its next step.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    pub waiting: bool,
+    /// What the latest round waits for, when it does: the question it asked, or the reason of a
+    /// model park. `None` for a round that does not wait, and for one whose state names no reason.
+    pub waiting_reason: Option<String>,
     /// The run of the round the report is of.
     pub report_run: RunId,
     /// The run that started the latest round.
@@ -776,6 +851,8 @@ impl SessionView {
             closed: read.closed,
             idle_expired: read.idle_expired,
             latest: read.status,
+            waiting: read.waiting,
+            waiting_reason: read.waiting_reason,
             report_run: runs[worked].0.id,
             started_by: latest.parent_id,
             cleanup_rounds: u32::try_from(
@@ -887,6 +964,7 @@ mod tests {
             closing: true,
             round: 3,
             root: None,
+            visible: false,
         };
         let payload = closing_round_payload(&header);
         assert_eq!(payload[SESSION_CLOSE_ROUND_KEY], Value::Bool(true));
@@ -1062,6 +1140,7 @@ mod tests {
             closing: false,
             round: 1,
             root: None,
+            visible: false,
         }
     }
 

@@ -414,13 +414,16 @@ impl CoderAgent {
     }
 
     /// The models a message may pick for its run (`model-pick/v1`): the root's choices, the same
-    /// list its card advertises. Empty when the deployment offers no other model.
-    pub fn model_choices(&self) -> Vec<String> {
-        self.assembly
+    /// list its card advertises, each with its endpoint label from `MODEL_ALIASES_FILE` when the
+    /// deployment names one (ANR-623). Empty when the deployment offers no other model.
+    pub fn model_choices(&self) -> adam_a2a::ModelChoices {
+        let aliases = self
+            .assembly
             .info()
             .first()
             .map(|root| root.model_choices.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        adam_a2a::ModelChoices::from_profiles(aliases, &self.profiles)
     }
 
     /// The reasoning levels of each agent's model (`reasoning/v1`): the root's and its subagents',

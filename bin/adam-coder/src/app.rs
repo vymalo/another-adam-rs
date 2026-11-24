@@ -60,7 +60,7 @@ impl Coder {
         live: LiveSignals,
     ) -> Self {
         let tiers = crate::tier::honoured_up_to(agent.max_access_tier());
-        let choices = adam_a2a::ModelChoices::from_aliases(agent.model_choices());
+        let choices = agent.model_choices();
         let efforts = agent.reasoning_efforts();
         let builder = agent.register(Runtime::builder(store));
         Self::from_service(

@@ -83,12 +83,12 @@ pub trait Tool: Send + Sync + 'static {
     /// Whether this tool can end a call with [`ToolError::NeedsInput`]: it asks the person who
     /// started the run a question, and the run parks until someone answers.
     ///
-    /// Declare it (`true`) on every tool that can. A run nobody can answer would wait forever, and
-    /// the composition layer uses the declaration to keep such a tool away from those runs:
-    /// `adam-assembly` refuses to bind a subagent, which runs as a child of another run and has no
-    /// user to ask, with a tool that says `true`. The default is `false`, which is what a tool
-    /// written before this method existed declares. `#[tool(asks_user)]` and
-    /// [`FnTool::asking_user`](crate::FnTool::asking_user) set it.
+    /// Declare it (`true`) on every tool that can: the loop reads it to run such a call alone.
+    /// Whether the person can be asked is decided **per run** (ADR 0045 decision 9): a root run
+    /// asks, a round of a kept-open session a client shows asks, and any other child run is
+    /// answered that nobody can answer it (`NOT_ASKABLE`) instead of parking for ever. The default
+    /// is `false`, which is what a tool written before this method existed declares.
+    /// `#[tool(asks_user)]` and [`FnTool::asking_user`](crate::FnTool::asking_user) set it.
     ///
     /// It is a declaration, not a guard: nothing stops a tool that says `false` from returning
     /// `NeedsInput` anyway, and the run would park. A tool that wraps another (see

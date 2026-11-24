@@ -182,7 +182,8 @@ inbound function reads a screen's action as JSON text.
   drawn: a page may drop it on the way back, and the words that came back would no longer be the default's. When the
   screen cannot draw it (no catalog, none with `Choices`, one that cannot be read now) the form is listed in the question's
   text (description, help, options with their descriptions and marks, typed questions, the free box) and the answer is free
-  text. It parks the run, so `asks_user()` is `true` and `adam-assembly` keeps it out of subagents. The constraints are stated
+  text. It parks the run, so `asks_user()` is `true`; a subagent may have it, and the loop refuses the
+  question in a child run nobody can answer (`docs/reference/child-runs.md`). The constraints are stated
   where the model reads them, so the first call is right: the description says `question` is required **even with `choices`**
   (the line that opens the form), to give the form a title and a description of why, to describe every option, the types and
   their limits, and that ids and values are `^[A-Za-z0-9_.:-]{1,64}$`, with an example; the schema has `required`, `enum`,

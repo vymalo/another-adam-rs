@@ -560,14 +560,12 @@ tools and its skills' tools, in the order of the manifest (`AgentInfo::tools` li
 | Mistake | Error, at `bind` |
 |---|---|
 | a subagent named like a tool its parent has (registered and selected, or `load_skill` / `read_skill_file` when the parent has skills), or like another subagent of the parent | `SubagentToolClash { origin, parent, tool, clash: ToolClash }` (origin is the subagent) |
-| a subagent with a tool that asks the user (`Tool::asks_user()`), by name, by `*` or by a pattern | `SubagentAsksUser { origin, tool }` |
-
-A registered tool the parent does not select is not a clash. **Why a subagent may not have an asking
-tool:** a subagent runs as a child of another run with nobody to answer, and a run that asks parks until
-someone does, so the parent would wait for ever. The tool declares it (`#[tool(asks_user)]`,
-`FnTool::asking_user()`, or `fn asks_user(&self) -> bool` on a hand-written `Tool`) and `bind` refuses it
-(a deadline on the child would only make "waits for ever" into "fails late"). It is a declaration: a tool
-that returns `NeedsInput` without saying so would still park its child.
+A registered tool the parent does not select is not a clash. **A subagent may have a tool that asks the
+person** (`Tool::asks_user()`), by name, by `*` or by a pattern: whether the person can be asked is decided
+per **run** (ADR 0045 decision 9, `docs/reference/child-runs.md`), not at `bind`. A round of a kept-open
+session whose client shows child sessions asks and parks `input-required`; any other child run is told that
+nobody can answer it (`adam_llm_agent::NOT_ASKABLE`) and goes on, so no child parks for an answer nobody can
+give. It is a declaration: a tool that returns `NeedsInput` without saying so would still park its child.
 
 ## Remote subagents
 

@@ -58,7 +58,8 @@ pub use adam_a2a::RESUME_METADATA_KEY;
 pub use backend::{DEFAULT_POLL_INTERVAL, MAX_REFERENCES, RuntimeTaskBackend};
 pub use caller::{CONTEXT_CALLER, UNREADABLE_CALLER, asked_by_an_agent};
 pub use child_sessions::{
-    ChildSessionAgent, ChildSessions, MAX_DESCRIPTION_CHARS, MAX_SESSION_ROUNDS,
+    CONTEXT_CHILD_SESSIONS, ChildSessionAgent, ChildSessions, MAX_DESCRIPTION_CHARS,
+    MAX_SESSION_ROUNDS,
 };
 pub use commands::{
     CommandRefusal, Commands, MAX_COMMAND_ARGUMENTS, MAX_COMMAND_EXPANSION, RemoteCommand,

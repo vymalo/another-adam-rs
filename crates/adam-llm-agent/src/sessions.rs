@@ -271,6 +271,7 @@ fn closed_words(session: RunId, idle_expired: bool) -> String {
 fn state_word(view: &SessionView) -> &'static str {
     match (view.state, view.closed) {
         (SessionState::Working, true) => "working (closes when its round ends)",
+        (SessionState::Working, false) if view.waiting => "blocked on the person",
         (SessionState::Working, false) => "working",
         (SessionState::Idle, _) => "idle",
         (SessionState::Closed, _) => "closed",
@@ -394,19 +395,33 @@ fn read_output(
         view.round,
         state_word(view)
     );
-    if view.state == SessionState::Working {
+    // A round parked with no timer is **blocked** on the person (ADR 0045 decision 9): it asked a
+    // question, or a model refused it until woken (ADR 0067), and only an answer moves it. The
+    // parent is told why; nothing is a report yet, so nothing is counted as read.
+    let blocked = view.state == SessionState::Working && view.waiting;
+    if view.state == SessionState::Working && !blocked {
         return ToolOutput::text(format!(
             "{head}\nreport: none yet; the round is still working. Call {SUBAGENT_READ} with \
              wait: true to wait for it; do not poll.\n{}",
             end_line(0, "lines", &[])
         ));
     }
-    let (status, body) = match (&view.latest.status, &view.latest.error) {
-        (adam_core::RunStatus::Done, _) => ("done", render_output(view.latest.output.as_ref())),
-        (_, error) => (
-            "failed",
-            error.as_deref().unwrap_or("no reason given").to_owned(),
-        ),
+    let (status, body) = if blocked {
+        (
+            "blocked",
+            view.waiting_reason
+                .as_deref()
+                .unwrap_or("the round waits for the person's answer")
+                .to_owned(),
+        )
+    } else {
+        match (&view.latest.status, &view.latest.error) {
+            (adam_core::RunStatus::Done, _) => ("done", render_output(view.latest.output.as_ref())),
+            (_, error) => (
+                "failed",
+                error.as_deref().unwrap_or("no reason given").to_owned(),
+            ),
+        }
     };
     // A report ends in a newline, so the page does not say the text has none.
     let body = if body.ends_with('\n') {
@@ -425,7 +440,9 @@ fn read_output(
     };
     let mut out = ToolOutput::text(format!("{head}\nreport: {status}\n{}", page.render()));
     out.is_error = false;
-    out.reported = vec![view.report_run];
+    if !blocked {
+        out.reported = vec![view.report_run];
+    }
     out
 }
 
@@ -615,6 +632,9 @@ impl Tool for Start {
             // The run this call's model calls name, which the orchestrator bound: the round's
             // calls name it too (ADR 0067).
             root: Some(ctx.model_run_id()),
+            // A session is one the person sees when their client shows child sessions: only then
+            // may a round of it ask them (ADR 0045 decision 9).
+            visible: ctx.context(crate::CHILD_SESSIONS_CONTEXT_KEY) == Some(&Value::Bool(true)),
         };
         let input = round_message(ctx, prompt, &header);
         starter
@@ -765,6 +785,7 @@ impl Tool for Send {
                 closing: false,
                 round: 0,
                 root: None,
+                visible: false,
             });
             header.round = view.round + 1;
             // The round before may have been one that only cleaned up after a cancel.
@@ -772,6 +793,11 @@ impl Tool for Send {
             // A round names the task that sent it, the one the orchestrator bound for it, not the
             // one that opened the session, whose lease may be over (ADR 0067, amended).
             header.root = Some(ctx.model_run_id());
+            // A client that shows child sessions sees this session too, so a round of it may ask
+            // the person (ADR 0045 decision 9). Once shown, a session stays shown: the header the
+            // round before left says so.
+            header.visible = header.visible
+                || ctx.context(crate::CHILD_SESSIONS_CONTEXT_KEY) == Some(&Value::Bool(true));
             let within = self
                 .roster
                 .by_registered(&view.agent)
@@ -1046,6 +1072,7 @@ impl Tool for Close {
                 closing: false,
                 round: 0,
                 root: None,
+                visible: false,
             });
             header.round = view.round + 1;
             header.closed = true;

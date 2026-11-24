@@ -432,11 +432,19 @@ A split control plane knows no model, so it lists no entry (as it lists no `mode
 
 An agent whose card lists `https://agents.vymalo.com/a2a/extensions/model-pick/v1` takes a model
 **for each message** ([ADR 0064](../decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md),
-amended 2026-11-23). The card's `params` are `{"choices": ["<alias>", ..]}`, the aliases the
-deployment offers this agent — the profiles of `MODEL_ALIASES_FILE` minus the agent's own model —
-each once. An agent the deployment gives one model offers
-nothing and lists no extension: `adam_a2a::ExtensionConfig::model_pick` returns `None`, and
-`adam_service::serve` adds the entry only when the backend serves a non-empty list.
+amended 2026-11-23). The card's `params` are
+`{"choices": [{"id": "<alias>", "endpoint"?: "<label>"}, ..]}`, the aliases the deployment offers
+this agent — the profiles of `MODEL_ALIASES_FILE` minus the agent's own model — each once. An agent
+the deployment gives one model offers nothing and lists no extension:
+`adam_a2a::ExtensionConfig::model_pick` returns `None`, and `adam_service::serve` adds the entry
+only when the backend serves a non-empty list.
+
+`endpoint` is the deployment's own **name for the model's endpoint**, a label only — never a
+provider, a host, a URL or a key. It comes from the alias's profile in `MODEL_ALIASES_FILE`
+(`endpoint`, ANR-623): a choice whose profile names one lists it, a choice whose profile names none
+lists no `endpoint`, and a malformed label (blank, not a string, or longer than 128 bytes) is
+omitted from that choice, never guessed and never a reason to refuse the file. `label` is left out:
+the alias is the name a person reads, and a client falls back to the `id`.
 
 A request that **activates** the extension **must** carry `metadata[URI] = {"model": "<alias>"}`
 on the message. `adam_a2a::ModelChoices::requested` reads it and returns the refusal sentence for
@@ -476,6 +484,8 @@ contract is the orchestration layer's `docs/api/child-sessions-v1.md`) sees the 
 follows each round as an ordinary task of a **child context**, and starts, talks to, stops and closes a session.
 `RuntimeTaskBackend::with_child_sessions` is the backend side (`crates/adam-a2a-runtime/src/child_sessions.rs`); the card entry is
 `ExtensionConfig::child_sessions`. The parent stream's events are `crates/adam-a2a-runtime/src/session_events.rs`. **Who lists it.** An agent whose root has a subagent, local or remote (the rule that gives the root the five session tools): `adam-agent` and `adam-coder`. `AgentDef::child_sessions` of `adam-assembly` computes the helpers and the limits from the files alone, so the same on every role; `adam_service::serve` hands them to the backend and adds the card entry **only when the backend accepted them** (a helper nobody registered is exit 78). The `worker` role serves no A2A and lists nothing. A root with no subagent lists nothing and refuses every request of the extension. There is no deployment switch.
+
+**A round may ask the person** (ADR 0045 decision 9): the round's task is `input-required` with the question, the session's round event reports `blocked`, and the person answers with a plain message in the child context (or a follow-up to the round's task), which the parked round reads as the asking tool's result. Only a round of a **kept-open** session a client shows may ask: the front writes `visible` into the header of a round it starts, and a request that did not activate the extension clears the run's `vymalo.childSessions` context key, so a session the model starts for a client that does not show sessions is one whose rounds are told `NOT_ASKABLE`. `docs/reference/child-runs.md` has the sequence.
 
 ```mermaid
 sequenceDiagram

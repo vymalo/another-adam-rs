@@ -426,7 +426,7 @@ pub async fn serve(
             let prompts = agent.assembly().prompt_commands().to_vec();
             // The models a message may pick (`model-pick/v1`): the root's choices, the same list
             // its card advertises.
-            let choices = adam_a2a::ModelChoices::from_aliases(agent.model_choices());
+            let choices = agent.model_choices();
             // The reasoning levels of the root's model (`reasoning/v1`), which its card lists and
             // the backend checks a message's effort against.
             let efforts = agent.reasoning_efforts();

@@ -140,8 +140,8 @@ in this crate touches the file system.
 |---|---|
 | `ReasoningEffort` | `None`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max`, spelled `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Closed on purpose, `ALL` lowest first, exhaustive `as_str`/`FromStr`, serde lower case, `Ord` in that order. `none` is a real level (some models reason unless it is sent); **absent** sends nothing |
 | `ReasoningWire` | `ReasoningEffort` (`{"reasoning_effort": ...}`, the only one verified on the deployment's gateway), `ReasoningObject` (`{"reasoning": {"effort": ...}}`), `ThinkingBudget` (`{"thinking": {"type": "enabled", "budget_tokens": n}}`); serde snake case |
-| `ModelProfile` | serde camelCase, `Default`, unknown members ignored: `reasoning_efforts`, `reasoning_wire`, `reasoning_budgets`, `reasoning_effort`, `max_output_tokens`, `max_output_tokens_limit`, `extra_body`, `preset`, `fallback` (the model a run continues on, once, when this one is locked: another profile of the document). A profile with only a cap or only an extra body is valid. **Breaking:** `ModelProfile::fallback` and `Preset::fallback` are new public fields of structs that are not `#[non_exhaustive]`: a literal needs them (or `..Default::default()`) |
-| `Preset`, `ModelProfiles` | a named bundle (`reasoning_effort`, `max_output_tokens`) and the document (`profiles` by model id, `presets` by name). `profile(id)`, `preset(name)`, `preset_of(id)` |
+| `ModelProfile` | serde camelCase, `Default`, unknown members ignored: `reasoning_efforts`, `reasoning_wire`, `reasoning_budgets`, `reasoning_effort`, `max_output_tokens`, `max_output_tokens_limit`, `extra_body`, `preset`, `fallback` (the model a run continues on, once, when this one is locked: another profile of the document), `endpoint` (the deployment's own **endpoint label** for the model: a label only, never a provider, a host, a URL or a key; what a `model-pick/v1` choice carries beside its alias, ANR-623, read by `endpoint_of`). A profile with only a cap or only an extra body is valid. **Breaking:** `ModelProfile::fallback`, `Preset::fallback` and `ModelProfile::endpoint` are new public fields of structs that are not `#[non_exhaustive]`: a literal needs them (or `..Default::default()`) |
+| `Preset`, `ModelProfiles` | a named bundle (`reasoning_effort`, `max_output_tokens`) and the document (`profiles` by model id, `presets` by name). `profile(id)`, `preset(name)`, `preset_of(id)`, `endpoint_of(id)` |
 | `ModelProfiles::parse_json(text)` | parse and validate, **JSON only for now** (the workspace has no YAML parser). `Err(Vec<String>)` lists every problem, each naming the profile (or preset) and the key, but not the file: the caller adds the path. A file with any problem is refused whole |
 | `DEFAULT_MAX_OUTPUT_TOKENS` | 128,000: the cap a call asks for when its folder, its preset and its model's profile set none (ADR 0064). The assembly resolves it per model and clamps it to the model's limit and window; the loop's `Limits` default is the same value |
 
@@ -154,6 +154,9 @@ wire, a wire with no efforts, or budgets without `thinking_budget`; a cap of `0`
 `maxOutputTokensLimit` (a preset's too); a `fallback` that names itself or a model with no profile; an `extra_body` member the runtime owns (`RESERVED_EXTRA_BODY_KEYS`:
 `model`, `messages`, `tools`, `tool_choice`, `stream`, `reasoning_effort`, `max_tokens`,
 `max_completion_tokens`). `reasoningEfforts: []` says the model takes no reasoning setting.
+`endpoint` is the one member that never refuses the document: a blank, non-string or over-long label
+(over `MAX_ENDPOINT_LABEL_LEN`, 128 bytes) is *omitted*, so a card lists no endpoint rather than a
+guessed one (ANR-623).
 
 `ModelRequest::reasoning_effort` carries the level a call asks for (ADR 0063); the agent loop sets it
 from the run's protected context key `vymalo.reasoningEffort`, else the agent's default. The
