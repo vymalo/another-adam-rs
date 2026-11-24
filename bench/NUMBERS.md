@@ -32,27 +32,29 @@ usage and the model call's `startedAt`/`endedAt` — a model call's span, not a 
 tool time" has no denominator in a ledger, and `bench numbers` reports what the ledger does have
 instead: **the `run_checks` share of the named tool calls**, beside the basis that says so.
 
-**The epic's 61 % is therefore marked wrong as stated** — not contradicted (it may come from a
-measurement nobody wrote down), but it cannot be reproduced from a ledger, and a figure that cannot
-be reproduced is not evidence. Two ways to make it one, both cheap:
+**The epic's 61 % is therefore published as *not measurable yet*** (the wording the coordinator
+chose on ANR-Q67): not contradicted — it may come from a measurement nobody wrote down — but a
+ledger cannot reproduce it, and the end-of-month rerun (ANR-424) will only change that if it records
+tool durations. Two ways to make it a number, both cheap:
 
 - **Count calls, not time**: state the `run_checks` share of named tool calls, which `bench numbers`
   prints, and drop the time claim.
 - **Record tool time**: have the coder's tools write their duration into the ledger (a new field of
-  a tool's record), and then the share is computable. That is a change to the harness, not to this
-  command.
+  a tool's record), which is what the rerun has been asked to do; then the share is computable. That
+  is a change to the harness, not to this command.
 
 ## The other two
 
 Both are computable today and neither is published here, because the numbers must come from a run,
-and the bench keeps its ledger outside the repository (`$BENCH_HOME/ledger.jsonl`, refused inside a
+and the **owner's answer to ANR-Q67 (option b) is that they come from the end-of-month bench rerun
+(ANR-424)**, whose ledger lives outside the repository (`$BENCH_HOME/ledger.jsonl`, refused inside a
 work tree). A figure is published by running the command above on that ledger and writing down, in
 this table, the value with the ledger's runs and the date:
 
 | Figure | Value | Run(s) | Date |
 |---|---|---|---|
-| Calls per task, and the ratio | _to be filled from the ledger_ | | |
-| Cache share of the fixed prompt | _to be filled from the ledger_ | | |
+| Calls per task, and the ratio | _to be filled from the rerun's ledger (ANR-424)_ | | |
+| Cache share of the fixed prompt | _to be filled from the rerun's ledger (ANR-424)_ | | |
 
 A value written here must name the runs it came from: the command's table is per agent over every
 finished run in the ledger it was given, so the same command on another ledger gives another number,
