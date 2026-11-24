@@ -807,6 +807,7 @@ async fn start_persons_round(rt: &Runtime, rig: &Rig, conversation: &str, text: 
         closing: false,
         round: 1,
         root: None,
+        workspace: None,
         // The A2A front sets it: only a request that activated `child-sessions/v1` starts a
         // person's round, so the person sees the session (ADR 0045 decision 9).
         visible: true,
@@ -2769,6 +2770,7 @@ mod cases {
             closing: false,
             round: 1,
             root: None,
+            workspace: None,
             visible: false,
             config: None,
         };
@@ -4149,6 +4151,7 @@ mod cases {
             closing: true,
             round: 2,
             root: None,
+            workspace: None,
             visible: false,
             config: None,
         };

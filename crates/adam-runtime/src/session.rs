@@ -196,6 +196,19 @@ pub struct SessionHeader {
     /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<RunId>,
+    /// The run whose workspace this session's rounds work in: the task a session a **task** opened
+    /// reads (its root run), and for a session a **person** opened, the latest task of the parent
+    /// context it was opened in, which the A2A front resolves from the store. A round a task sends
+    /// keeps it, so every round of one session reads the same repository. `None` when the parent
+    /// context holds no task with a workspace, which is a round that works in words only — not an
+    /// error — and what a header written before it existed reads. Absent when `None`.
+    ///
+    /// It is **not** [`root`](Self::root): that is the run a round's model calls name, which is the
+    /// round's own task for a person's round. A tool that keys a workspace, an environment session
+    /// or a scratch project reads this; a tool that keys the notes, the budgets and the gates of a
+    /// task reads [`root`](Self::root) (ADR 0045 slice 7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<RunId>,
     /// A client that activated `child-sessions/v1` started or sent this session, so the person
     /// sees it and can answer a round of it: a round of a kept-open session may ask the person
     /// only then (ADR 0045 decision 9, [`SessionHeader::keep_open`]). The A2A front writes it for
@@ -1242,13 +1255,13 @@ mod tests {
         });
         let decoded: SessionHeader = serde_json::from_value(old).unwrap();
         assert_eq!(decoded.root, None, "a header stored before `root`");
-        assert!(
-            serde_json::to_value(&decoded)
-                .unwrap()
-                .get("root")
-                .is_none(),
-            "absent when None"
+        assert_eq!(
+            decoded.workspace, None,
+            "a header stored before `workspace`"
         );
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert!(encoded.get("root").is_none(), "absent when None");
+        assert!(encoded.get("workspace").is_none(), "absent when None");
         let root = RunId::new();
         let header = SessionHeader {
             root: Some(root),
@@ -1257,6 +1270,47 @@ mod tests {
         let back: SessionHeader =
             serde_json::from_value(serde_json::to_value(&header).unwrap()).unwrap();
         assert_eq!(back.root, Some(root));
+    }
+
+    /// The workspace a session's rounds read (ADR 0045 slice 7) is its own field, not `root`: it
+    /// round-trips, it is absent when `None`, and a header without it decodes as one without.
+    #[test]
+    fn a_header_names_the_workspace_its_rounds_read() {
+        let workspace = RunId::new();
+        let root = RunId::new();
+        let header = SessionHeader {
+            id: RunId::new(),
+            agent: "helper".into(),
+            description: "d".into(),
+            keep_open: true,
+            closed: false,
+            closing: false,
+            round: 1,
+            root: Some(root),
+            workspace: Some(workspace),
+            visible: false,
+            config: None,
+        };
+        let encoded = serde_json::to_value(&header).unwrap();
+        assert_eq!(
+            encoded["workspace"],
+            serde_json::to_value(workspace).unwrap()
+        );
+        assert_eq!(encoded["root"], serde_json::to_value(root).unwrap());
+        let back: SessionHeader = serde_json::from_value(encoded).unwrap();
+        assert_eq!(back, header);
+        let none = SessionHeader {
+            workspace: None,
+            ..header
+        };
+        assert!(
+            serde_json::to_value(&none)
+                .unwrap()
+                .get("workspace")
+                .is_none(),
+            "absent when None"
+        );
+        assert_eq!(none.workspace, None);
     }
 
     #[test]
@@ -1270,6 +1324,7 @@ mod tests {
             closing: true,
             round: 3,
             root: None,
+            workspace: None,
             visible: false,
             config: None,
         };
@@ -1447,6 +1502,7 @@ mod tests {
             closing: false,
             round: 1,
             root: None,
+            workspace: None,
             visible: false,
             config: None,
         }

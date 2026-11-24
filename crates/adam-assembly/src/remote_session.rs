@@ -1126,6 +1126,7 @@ mod tests {
             closing: true,
             round: 2,
             root: None,
+            workspace: None,
             visible: false,
             config: None,
         });
@@ -1402,6 +1403,7 @@ mod tests {
             closing: false,
             round: 1,
             root: None,
+            workspace: None,
             visible: false,
             config: None,
         };
@@ -1457,6 +1459,7 @@ mod tests {
             closing: true,
             round: 2,
             root: None,
+            workspace: None,
             visible: false,
             config: None,
         };
@@ -1497,6 +1500,7 @@ mod tests {
             closing: true,
             round: 2,
             root: None,
+            workspace: None,
             visible: false,
             config: None,
         };

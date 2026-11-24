@@ -653,6 +653,9 @@ impl Tool for Start {
             // The run this call's model calls name, which the orchestrator bound: the round's
             // calls name it too (ADR 0067).
             root: Some(ctx.model_run_id()),
+            // The workspace the round works in: the one of the run that opens the session, so a
+            // helper a task starts reads the repository of that task (ADR 0045 slice 7).
+            workspace: Some(ctx.workspace_run_id()),
             // A session is one the person sees when their client shows child sessions: only then
             // may a round of it ask them (ADR 0045 decision 9).
             visible: ctx.context(crate::CHILD_SESSIONS_CONTEXT_KEY) == Some(&Value::Bool(true)),
@@ -807,6 +810,7 @@ impl Tool for Send {
                 closing: false,
                 round: 0,
                 root: None,
+                workspace: None,
                 visible: false,
                 config: None,
             });
@@ -1095,6 +1099,7 @@ impl Tool for Close {
                 closing: false,
                 round: 0,
                 root: None,
+                workspace: None,
                 visible: false,
                 config: None,
             });

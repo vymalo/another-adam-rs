@@ -566,7 +566,7 @@ creation** in addition to **Administration**. A token needs the `repo` scope for
 
 ## Agent files
 
-The served card lists `child-sessions/v1` (`explorer` and `reviewer` as sessions a person opens; `maxOpen` is `SESSION_MAX_OPEN`, 16 by default, which `config.extraEnv` sets; no chart value and no template changed). A person's round has no workspace yet ([`bin/adam-coder/README.md`](../../bin/adam-coder/README.md#sessions-a-person-opens)). Roll the workers before the control plane (`topology: split`): a round for a helper an older worker does not know stays `working`.
+The served card lists `child-sessions/v1` (`explorer` and `reviewer` as sessions a person opens; `maxOpen` is `SESSION_MAX_OPEN`, 16 by default, which `config.extraEnv` sets; no chart value and no template changed). A person's round reads the workspace of the latest task of the context it was opened in, and every later round of the session reads the same one (ADR 0045 slice 7; [`bin/adam-coder/README.md`](../../bin/adam-coder/README.md#sessions-a-person-opens)). Roll the workers before the control plane (`topology: split`): a round for a helper an older worker does not know stays `working`.
 
 The binary reads its prompt, card and skills from the folder `ADAM_AGENT_DIR` names, once, at startup
 (`bin/adam-coder/README.md`, "Where the prompt and the card live"); unset, it runs the copy embedded in the

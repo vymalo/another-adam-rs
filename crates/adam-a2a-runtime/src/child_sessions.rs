@@ -36,13 +36,18 @@
 //! A round a person starts has no run of an agent behind it, so its parent is the round itself
 //! ([`SessionView::started_outside_a_run`](adam_runtime::SessionView::started_outside_a_run)): no
 //! run's end cancels it and no run waits for it. `by` is `person` for exactly those rounds.
+//!
+//! Such a round has no task of its own to find a worktree by, so the session's header names the run
+//! whose workspace its rounds read ([`SessionHeader::workspace`], ADR 0045 slice 7): the latest task
+//! of the parent context, which the start resolves (`context_workspace` in this module).
+//! Every later round keeps it, so a session's rounds read one repository.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use a2a::{Message, Task, TaskState};
 use adam_a2a::{BackendError, CHILD_SESSIONS_EXTENSION, Caller, ChildSessionInfo, ExtensionConfig};
-use adam_core::{RunId, RunRecord};
+use adam_core::{ConversationScope, RunId, RunQuery, RunRecord};
 use adam_runtime::{
     Inbound, MAX_SESSION_PAGE, RoundOutcome, RunView, RuntimeError, SESSION_CLOSE_KIND,
     SESSION_STATE_KEY, SessionHeader, SessionLimits, SessionState, SessionSummary, SessionView,
@@ -55,7 +60,6 @@ use crate::backend::{RuntimeTaskBackend, map_err};
 use crate::convert::{decode_conversation, encode_conversation};
 use crate::ids::task_id_for;
 use crate::task_state;
-
 /// The most characters of a session's description (the contract's bound).
 pub const MAX_DESCRIPTION_CHARS: usize = 80;
 
@@ -528,6 +532,34 @@ impl RuntimeTaskBackend {
         }))
     }
 
+    /// The run whose workspace a session started in the stored parent conversation `parent` reads
+    /// (ADR 0045 slice 7): the latest task of that context — the most recently updated run of this
+    /// agent in it, which is the worktree the person is looking at. `None` when the context holds no
+    /// task of this agent yet (a start from a context nobody sent a task to), which is a session
+    /// whose rounds answer in words.
+    ///
+    /// One listing, of the agent's runs in one conversation: a round of a session, a subagent's
+    /// child run and another agent's run are all registered under other agent names or in other
+    /// conversations, so the page holds tasks. A child run that arrives anyway (an agent registered
+    /// under its root's name) is skipped, since a child has no workspace of its own.
+    async fn context_workspace(&self, parent: &str) -> Result<Option<RunId>, BackendError> {
+        let query = RunQuery::new(
+            self.agent.clone(),
+            ConversationScope::Exact(parent.to_owned()),
+            4,
+        );
+        let runs = self
+            .runtime
+            .store()
+            .list_runs(&query)
+            .await
+            .map_err(|e| map_err(e.into()))?;
+        Ok(runs
+            .iter()
+            .find(|run| run.parent_id.is_none())
+            .map(|run| run.id))
+    }
+
     /// The session `session` of parent context `context`, if it is the caller's and a helper's.
     pub(crate) async fn session_of(
         &self,
@@ -967,6 +999,9 @@ impl RuntimeTaskBackend {
                 max_working,
             )));
         }
+        // The workspace of the latest task of the context the person is talking to (ADR 0045
+        // slice 7), read before the round is written: a failure to read it is a failure to start.
+        let workspace = self.context_workspace(&parent).await?;
         let header = SessionHeader {
             id: session,
             agent: helper.agent.clone(),
@@ -979,6 +1014,10 @@ impl RuntimeTaskBackend {
             // name the round's own task, which the orchestrator binds as any task it creates
             // (ADR 0067).
             root: None,
+            // A person's session reads the workspace of the latest task of the context it was
+            // opened in: the repository they are looking at (ADR 0045 slice 7). A context with no
+            // task yet has none, and its rounds answer in words.
+            workspace,
             // Only a request that activated the extension gets here, so the person sees the
             // session and can answer a round of it (ADR 0045 decision 9).
             visible: true,
@@ -1300,6 +1339,7 @@ fn next_header(view: &SessionView, session: RunId) -> SessionHeader {
         closing: false,
         round: 0,
         root: None,
+        workspace: None,
         visible: false,
         config: None,
     });
@@ -1591,6 +1631,7 @@ mod tests {
             closing: false,
             round: 1,
             root: None,
+            workspace: None,
             visible: false,
             config: None,
         };

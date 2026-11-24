@@ -777,6 +777,7 @@ mod tests {
             closing: false,
             round: 1,
             root: None,
+            workspace: None,
             visible: false,
             config: None,
         };
