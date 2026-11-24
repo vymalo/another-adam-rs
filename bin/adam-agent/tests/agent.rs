@@ -2185,10 +2185,11 @@ async fn a_control_plane_refuses_a_prompt_it_cannot_expand_and_warns_at_start() 
 }
 
 /// `MAX_PARALLEL_TOOL_CALLS` reaches the folder's agents, and the folder's own `limits.max_parallel`
-/// can only lower it: a larger value is refused (ADR 0049, ADR 0054).
+/// can only lower it: a larger value is **clamped** to the deployment's (ADR 0049, ADR 0054
+/// decision 3 — the bounds are clamped to the bounds of that time, and nothing is raised back).
 #[tokio::test]
 async fn the_deployments_parallel_limit_reaches_the_agent_and_the_file_only_lowers_it() {
-    let assemble = |folder: &tempfile::TempDir, setting: usize| {
+    let limit = |folder: &tempfile::TempDir, setting: usize| {
         let def = def_of(folder);
         let model: DynModel = Arc::new(MockModel::new());
         async move {
@@ -2201,16 +2202,9 @@ async fn the_deployments_parallel_limit_reaches_the_agent_and_the_file_only_lowe
                 setting,
             )
             .await
-        }
-    };
-    let limit = |folder: &tempfile::TempDir, setting: usize| {
-        let assembled = assemble(folder, setting);
-        async move {
-            assembled
-                .await
-                .expect("the folder assembles")
-                .root()
-                .max_parallel()
+            .expect("the folder assembles")
+            .root()
+            .max_parallel()
         }
     };
     let folder = chat();
@@ -2220,13 +2214,7 @@ async fn the_deployments_parallel_limit_reaches_the_agent_and_the_file_only_lowe
         t.replacen("limits:", "limits:\n  max_parallel: 2", 1)
     });
     assert_eq!(limit(&folder, 6).await, 2, "the file lowers it");
-    let refused = assemble(&folder, 1).await.err().map(|e| format!("{e:?}"));
-    assert!(
-        refused
-            .as_deref()
-            .is_some_and(|e| e.contains("ParallelAboveDeployment")),
-        "a file above the deployment is refused, never clamped (ADR 0054): {refused:?}"
-    );
+    assert_eq!(limit(&folder, 1).await, 1, "and never raises it");
 }
 
 /// `MODEL_ALIASES_FILE`'s profiles reach the agent through `WorkerParts`: the folder's
