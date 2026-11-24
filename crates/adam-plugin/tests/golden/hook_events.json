@@ -1,0 +1,68 @@
+[
+  {
+    "agent": "scripted",
+    "fields": {
+      "turn": 0
+    },
+    "key": "run-1/model:0/turn.started/0",
+    "name": "turn.started",
+    "root_run": "run-1",
+    "run": "run-1"
+  },
+  {
+    "agent": "scripted",
+    "fields": {
+      "arguments": {
+        "path": "a.txt",
+        "token": "[redacted]"
+      },
+      "tool": "read"
+    },
+    "key": "run-1/tool:c1/tool.started/0",
+    "name": "tool.started",
+    "root_run": "run-1",
+    "run": "run-1"
+  },
+  {
+    "agent": "scripted",
+    "fields": {
+      "output": "hello [redacted]",
+      "tool": "read"
+    },
+    "key": "run-1/tool:c1/tool.completed/0",
+    "name": "tool.completed",
+    "root_run": "run-1",
+    "run": "run-1"
+  },
+  {
+    "agent": "scripted",
+    "fields": {
+      "tool": "rm"
+    },
+    "key": "run-1/tool:c2/tool.started/0",
+    "name": "tool.started",
+    "root_run": "run-1",
+    "run": "run-1"
+  },
+  {
+    "agent": "scripted",
+    "fields": {
+      "reason": "not allowed",
+      "tool": "rm"
+    },
+    "key": "run-1/tool:c2/tool.denied/0",
+    "name": "tool.denied",
+    "root_run": "run-1",
+    "run": "run-1"
+  },
+  {
+    "agent": "scripted",
+    "fields": {
+      "calls": 2
+    },
+    "key": "run-1/model:0/turn.ended/0",
+    "name": "turn.ended",
+    "root_run": "run-1",
+    "run": "run-1"
+  }
+]

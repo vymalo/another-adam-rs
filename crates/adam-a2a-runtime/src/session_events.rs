@@ -778,6 +778,7 @@ mod tests {
             round: 1,
             root: None,
             visible: false,
+            config: None,
         };
         a_session_with(
             store,

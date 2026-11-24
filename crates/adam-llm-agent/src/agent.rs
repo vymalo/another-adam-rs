@@ -4017,6 +4017,7 @@ impl LlmAgent {
                 None => None,
             };
             let may_ask = state.may_ask_person(ctx.conversation_id());
+            self.observe_tool_started(ctx, state.root_run, &call);
             let (result, reported) = self
                 .run_tool(
                     ctx,
@@ -4431,8 +4432,12 @@ impl LlmAgent {
                     unjournaled,
                     live,
                 } => {
+                    // The calls of a segment ran together; their events are told in the order of the
+                    // calls, whatever order they finished in (ADR 0050, decision 4).
+                    self.observe_tool_started(ctx, state.root_run, call);
                     self.conclude(
                         ctx,
+                        state.root_run,
                         &notes,
                         call,
                         *outcome,
@@ -5018,6 +5023,7 @@ impl LlmAgent {
             return self
                 .conclude(
                     ctx,
+                    root.0,
                     notes,
                     call,
                     outcome,
@@ -5060,6 +5066,7 @@ impl LlmAgent {
         let unattended = is_unattended(ctx.conversation_id(), context.map(|c| c.as_ref()));
         self.conclude(
             ctx,
+            root.0,
             notes,
             call,
             outcome,
@@ -5080,6 +5087,7 @@ impl LlmAgent {
     async fn conclude(
         &self,
         ctx: &Ctx,
+        root: Option<RunId>,
         notes: &[ToolNote],
         call: &ToolCall,
         outcome: Result<HookedOutput, ToolError>,
@@ -5100,6 +5108,7 @@ impl LlmAgent {
             None => false,
         };
         let end = |state: StepState| self.step_event(&call.name, &call.id, state, notes);
+        self.observe_tool_ended(ctx, root, &call.name, &call.id, &outcome);
         // A hook that stopped the run (ADR 0050, decision 8): the call's result is its reason, and the
         // run fails after the step that recorded it.
         if let Ok(hooked) = &outcome
@@ -5282,6 +5291,109 @@ impl LlmAgent {
             }
         };
         Ok((answered, reported))
+    }
+
+    /// The observers' flush for events of `call`'s step (ADR 0050, slice H2): the events are queued
+    /// in the order they happened and offered to every plugin before the loop goes on, so they reach
+    /// observers before the transition commits. An observer's failure is counted and dropped.
+    fn flush_events(&self, events: Vec<adam_plugin::HookEvent>) {
+        if self.hooks.is_empty() {
+            return;
+        }
+        let mut queue = adam_plugin::EventQueue::new();
+        for event in events {
+            queue.push(event);
+        }
+        let report = queue.flush(&self.hooks);
+        if report.failed > 0 || report.dropped > 0 {
+            tracing::warn!(
+                failed = report.failed,
+                dropped = report.dropped,
+                "observers did not take every event"
+            );
+        }
+    }
+
+    fn event_header(
+        &self,
+        ctx: &Ctx,
+        root: Option<RunId>,
+        step: &str,
+        kind: adam_plugin::EventKind,
+    ) -> adam_plugin::EventHeader {
+        let run = ctx.run_id().to_string();
+        adam_plugin::EventHeader {
+            key: format!("{run}/{step}/{}/0", kind.name()),
+            root_run: root.map_or_else(|| run.clone(), |r| r.to_string()),
+            run,
+            agent: self.name.clone(),
+            at: jiff::Timestamp::now().to_string(),
+        }
+    }
+
+    /// `tool.started`: a call's step is about to run. It is emitted before the step, so a replay
+    /// emits it again with the same key.
+    fn observe_tool_started(&self, ctx: &Ctx, root: Option<RunId>, call: &ToolCall) {
+        if self.hooks.is_empty() {
+            return;
+        }
+        let scrub = |s: &str| self.step_io.scrub(s);
+        let kind = adam_plugin::EventKind::ToolStarted;
+        let header = self.event_header(ctx, root, &format!("tool:{}", call.id), kind);
+        let event = adam_plugin::HookEvent::new(kind, header)
+            .text("tool", &call.name, &scrub)
+            .text("call_id", &call.id, &scrub)
+            .json("arguments", &call.arguments, &scrub);
+        self.flush_events(vec![event]);
+    }
+
+    /// `tool.completed`, `tool.failed` or `tool.denied`, from the step's record. A call that is
+    /// tried again, or parks on a question or a wait, has no end yet and says nothing.
+    fn observe_tool_ended(
+        &self,
+        ctx: &Ctx,
+        root: Option<RunId>,
+        tool: &str,
+        call_id: &str,
+        outcome: &Result<HookedOutput, ToolError>,
+    ) {
+        use adam_plugin::EventKind;
+        if self.hooks.is_empty() {
+            return;
+        }
+        let scrub = |s: &str| self.step_io.scrub(s);
+        let (kind, field, text): (EventKind, &str, String) = match outcome {
+            Ok(hooked) => {
+                if let Some(refusal) = hooked.hooks.iter().find(|d| d.verdict != "continue") {
+                    (
+                        EventKind::ToolDenied,
+                        "reason",
+                        refusal.reason.clone().unwrap_or_default(),
+                    )
+                } else if hooked.output.is_error {
+                    (
+                        EventKind::ToolFailed,
+                        "output",
+                        hooked.output.content.clone(),
+                    )
+                } else {
+                    (
+                        EventKind::ToolCompleted,
+                        "output",
+                        hooked.output.content.clone(),
+                    )
+                }
+            }
+            Err(ToolError::Permanent(reason)) => (EventKind::ToolFailed, "reason", reason.clone()),
+            Err(_) => return,
+        };
+        // Whether a hook rewrote anything is part of the record, not of this event.
+        let header = self.event_header(ctx, root, &format!("tool:{call_id}"), kind);
+        let event = adam_plugin::HookEvent::new(kind, header)
+            .text("tool", tool, &scrub)
+            .text("call_id", call_id, &scrub)
+            .text(field, &text, &scrub);
+        self.flush_events(vec![event]);
     }
 
     /// The note the listing that offered tool `name` made about it, if the tool is a source's (the

@@ -806,3 +806,158 @@ async fn a_panicking_hook_denies_the_call() {
     assert_eq!(record.hooks[0].verdict, HookDecision::FAILED);
     assert_eq!(record.hooks[0].plugin.as_deref(), Some("panics"));
 }
+
+// ---------------------------------------------------------------------------
+// Observers (ADR 0050, slice H2)
+// ---------------------------------------------------------------------------
+
+/// An observer that records what it is offered, as `(name, key)` and the whole event.
+#[derive(Default)]
+struct Watches(Mutex<Vec<adam_llm_agent::HookEvent>>);
+
+impl Plugin for Watches {
+    fn name(&self) -> &str {
+        "watches"
+    }
+
+    fn observe(&self, event: &adam_llm_agent::HookEvent) -> Result<(), adam_llm_agent::HookError> {
+        self.0.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
+
+struct SharedWatches(Arc<Watches>);
+
+impl Plugin for SharedWatches {
+    fn name(&self) -> &str {
+        "watches"
+    }
+
+    fn observe(&self, event: &adam_llm_agent::HookEvent) -> Result<(), adam_llm_agent::HookError> {
+        self.0.observe(event)
+    }
+}
+
+/// An observer that panics at every event.
+struct PanicsWhenWatching;
+
+impl Plugin for PanicsWhenWatching {
+    fn name(&self) -> &str {
+        "panics-when-watching"
+    }
+
+    fn observe(&self, _event: &adam_llm_agent::HookEvent) -> Result<(), adam_llm_agent::HookError> {
+        panic!("on purpose")
+    }
+}
+
+/// Runs one call of `e` that answers `e-out` under `agent`, and returns the model-visible messages.
+async fn run_one_call(h: &Harness, agent: &LlmAgent, args: Value) -> (RunId, Vec<Message>) {
+    h.mock
+        .push_tool_calls(vec![call("c1", "e", args)])
+        .push_text("done");
+    let rt = h.runtime(agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    (run, conversation(&rt, &view).await.messages)
+}
+
+#[tokio::test]
+async fn an_observer_sees_a_calls_events_in_order_with_stable_keys() {
+    let h = Harness::new();
+    let (echo, _) = Echo::new("e");
+    let watches = Arc::new(Watches::default());
+    let agent = h
+        .agent()
+        .tool(echo)
+        .plugin(SharedWatches(watches.clone()))
+        .build();
+    let (run, _) = run_one_call(&h, &agent, json!({"q": 1})).await;
+
+    let seen = watches.0.lock().unwrap().clone();
+    let got: Vec<(String, String)> = seen
+        .iter()
+        .map(|e| (e.kind.name().to_owned(), e.header.key.clone()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                "tool.started".into(),
+                format!("{run}/tool:c1/tool.started/0")
+            ),
+            (
+                "tool.completed".into(),
+                format!("{run}/tool:c1/tool.completed/0")
+            ),
+        ]
+    );
+    assert_eq!(seen[1].fields["output"], json!("e-out"));
+}
+
+#[tokio::test]
+async fn a_panicking_observer_leaves_the_run_unchanged() {
+    let plain = {
+        let h = Harness::new();
+        let (echo, _) = Echo::new("e");
+        let agent = h.agent().tool(echo).build();
+        run_one_call(&h, &agent, json!({})).await.1
+    };
+    let h = Harness::new();
+    let (echo, _) = Echo::new("e");
+    let agent = h.agent().tool(echo).plugin(PanicsWhenWatching).build();
+    let (_, watched) = run_one_call(&h, &agent, json!({})).await;
+    let texts = |m: &[Message]| m.iter().map(Message::text).collect::<Vec<_>>();
+    assert_eq!(texts(&plain), texts(&watched));
+}
+
+#[tokio::test]
+async fn no_secret_reaches_an_observer() {
+    let h = Harness::new();
+    let (echo, _) = Echo::new("e");
+    let watches = Arc::new(Watches::default());
+    let agent = h
+        .agent()
+        .tool(echo)
+        .step_io(
+            adam_llm_agent::StepIo::default()
+                .redact(|s| s.replace("sk-secret-token", "[redacted]")),
+        )
+        .plugin(SharedWatches(watches.clone()))
+        .build();
+    run_one_call(&h, &agent, json!({"auth": "sk-secret-token"})).await;
+    let seen = watches.0.lock().unwrap().clone();
+    let all = seen
+        .iter()
+        .map(|e| e.to_value().to_string())
+        .collect::<String>();
+    assert!(all.contains("[redacted]"), "{all}");
+    assert!(!all.contains("sk-secret-token"), "{all}");
+}
+
+#[tokio::test]
+async fn a_denied_call_is_a_denied_event_with_its_reason() {
+    let h = Harness::new();
+    let (echo, calls) = Echo::new("e");
+    let watches = Arc::new(Watches::default());
+    let agent = h
+        .agent()
+        .tool(echo)
+        .plugin(Refuses {
+            verdict: Verdict::Deny,
+            reason: "not from here",
+        })
+        .plugin(SharedWatches(watches.clone()))
+        .build();
+    run_one_call(&h, &agent, json!({})).await;
+    assert_eq!(calls.load(SeqCst), 0);
+    let seen = watches.0.lock().unwrap().clone();
+    let names: Vec<_> = seen.iter().map(|e| e.kind.name()).collect();
+    assert_eq!(names, ["tool.started", "tool.denied"]);
+    assert_eq!(seen[1].fields["reason"], json!("not from here"));
+}

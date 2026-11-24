@@ -356,6 +356,7 @@ impl Rig {
                 description: "Does a piece of work.".into(),
                 within: self.within,
                 remote: false,
+                bounds: adam_runtime::SessionBounds::default(),
             },
             SessionAgent {
                 name: "far".into(),
@@ -363,6 +364,7 @@ impl Rig {
                 description: "Lives on another system.".into(),
                 within: None,
                 remote: true,
+                bounds: adam_runtime::SessionBounds::default(),
             },
         ]);
         match self.limits {
@@ -808,6 +810,7 @@ async fn start_persons_round(rt: &Runtime, rig: &Rig, conversation: &str, text: 
         // The A2A front sets it: only a request that activated `child-sessions/v1` starts a
         // person's round, so the person sees the session (ADR 0045 decision 9).
         visible: true,
+        config: None,
     };
     let mut first = user_message(text);
     first.payload["session"] = serde_json::to_value(&header).unwrap();
@@ -2495,6 +2498,7 @@ mod cases {
                 description: "Does a piece of work.".into(),
                 within: Some(Duration::from_secs(5)),
                 remote: false,
+                bounds: adam_runtime::SessionBounds::default(),
             },
             SessionAgent {
                 name: "far".into(),
@@ -2502,6 +2506,7 @@ mod cases {
                 description: "Lives on another system.".into(),
                 within: None,
                 remote: true,
+                bounds: adam_runtime::SessionBounds::default(),
             },
         ]);
         let again: Vec<adam_model::ToolSpec> = again.tools().iter().map(|t| t.spec()).collect();
@@ -2765,6 +2770,7 @@ mod cases {
             round: 1,
             root: None,
             visible: false,
+            config: None,
         };
         let mut first = user_message("old work");
         first.payload["session"] = serde_json::to_value(&header).unwrap();
@@ -4144,6 +4150,7 @@ mod cases {
             round: 2,
             root: None,
             visible: false,
+            config: None,
         };
         rt.start_child_continuing(
             cleanup,
@@ -4860,6 +4867,7 @@ fn limits_do_not_change_the_specs() {
             description: "Does a piece of work.".into(),
             within: None,
             remote: false,
+            bounds: adam_runtime::SessionBounds::default(),
         }]
     };
     let specs = |tools: SessionTools| {
@@ -4884,6 +4892,7 @@ fn the_five_specs_are_pinned() {
             description: "Reviews a diff.".into(),
             within: None,
             remote: false,
+            bounds: adam_runtime::SessionBounds::default(),
         },
         SessionAgent {
             name: "explorer".into(),
@@ -4891,6 +4900,7 @@ fn the_five_specs_are_pinned() {
             description: "Reads the repository and answers where and how.".into(),
             within: None,
             remote: false,
+            bounds: adam_runtime::SessionBounds::default(),
         },
     ]);
     let specs: Vec<adam_model::ToolSpec> = roster.tools().iter().map(|t| t.spec()).collect();

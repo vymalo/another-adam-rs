@@ -1127,6 +1127,7 @@ mod tests {
             round: 2,
             root: None,
             visible: false,
+            config: None,
         });
         assert_eq!(state.next(), Action::Close, "a closing round calls nothing");
         // But it cancels what the round before left working first.
@@ -1402,6 +1403,7 @@ mod tests {
             round: 1,
             root: None,
             visible: false,
+            config: None,
         };
         let close = Inbound::new(
             SESSION_CLOSE_KIND,
@@ -1456,6 +1458,7 @@ mod tests {
             round: 2,
             root: None,
             visible: false,
+            config: None,
         };
         let close = Inbound::new(
             SESSION_CLOSE_KIND,
@@ -1495,6 +1498,7 @@ mod tests {
             round: 2,
             root: None,
             visible: false,
+            config: None,
         };
         let close = Inbound::new(
             SESSION_CLOSE_KIND,
