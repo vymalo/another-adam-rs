@@ -59,7 +59,7 @@ async fn a_device_on_low_battery_admits_one_run_at_a_time() {
         assert_eq!(second.class(), ErrorClass::RateLimited);
         assert!(second.retry_after().is_some());
         drop(first);
-        admission
+        let _ = admission
             .admit(Ask::new(Pool::Runs, "two"))
             .await
             .expect("the first run gave its seat back");
@@ -92,7 +92,7 @@ async fn a_second_run_waits_and_goes_in_when_the_first_ends() {
         tokio::time::sleep(Duration::from_millis(60)).await;
         drop(first);
     });
-    admission
+    let _ = admission
         .admit(Ask::new(Pool::Runs, "two").wait(Duration::from_secs(5)))
         .await
         .expect("admitted once the first run is over");
@@ -109,7 +109,7 @@ async fn a_run_already_in_flight_counts_when_the_battery_runs_low() {
         .await
         .expect_err("the run that started on mains is one run");
     device.set_power(Power::OnMains);
-    admission
+    let _ = admission
         .admit(Ask::new(Pool::Runs, "two"))
         .await
         .expect("plugged in again, the budget is whole");
@@ -151,7 +151,7 @@ async fn a_hot_device_holds_new_steps() {
         assert!(matches!(held, Refused::Busy { .. }), "{held:?}");
         assert_eq!(held.class(), ErrorClass::RateLimited);
     }
-    admission
+    let _ = admission
         .admit(Ask::new(Pool::Git, "c"))
         .await
         .expect("only steps are held, not every pool");
@@ -162,7 +162,7 @@ async fn a_hot_device_holds_new_steps() {
         device.set_thermal(Thermal::Fair);
     };
     let (permit, ()) = tokio::join!(waiting, cool);
-    permit.expect("the step goes in when the device cools");
+    let _ = permit.expect("the step goes in when the device cools");
 
     device.set_thermal(Thermal::Critical);
     admission
@@ -170,7 +170,7 @@ async fn a_hot_device_holds_new_steps() {
         .await
         .expect_err("critical holds too");
     admission.set_rules(DeviceRules::default().hot(false));
-    admission
+    let _ = admission
         .admit(Ask::new(Pool::ModelCalls, "c"))
         .await
         .expect("the person turned the rule off");
