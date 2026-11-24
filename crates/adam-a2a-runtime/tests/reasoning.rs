@@ -195,7 +195,7 @@ async fn a_level_the_agent_does_not_take_is_refused_and_writes_nothing() {
             .unwrap_err();
         assert!(
             matches!(&err, BackendError::InvalidParams(m)
-                if m.contains(&wanted) && m.contains("low, high")),
+                if m.contains(wanted) && m.contains("low, high")),
             "{id}: {err:?}"
         );
         // Nothing was written: the task the message would have been is not there.
