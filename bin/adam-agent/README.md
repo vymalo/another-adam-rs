@@ -52,7 +52,8 @@ The built-in tools are the person's screen ([`adam-ui`](../../crates/adam-ui/REA
   buttons, checkboxes, a searchable list, a deck of pictures or a typed answer, options with a label and a
   description) and a screen that can draw a form, the question carries one Choices surface with its title and its
   description of why, and the answers come back as the result (`- db: pg`); otherwise the form is listed in the
-  question's text. `asks_user` is `true`, so a subagent never has it.
+  question's text. `asks_user` is `true`; a subagent may have it, and the loop refuses the question in a child
+  run nobody can answer (a kept-open session a client shows is the one that may ask).
 * `show { blocks, title? }` and `ui_catalog {}`: draw blocks of the components the person's screen has (cards, a
   diagram), and list them. They answer "answer in text" when the screen sent no catalog. A folder that does not want
   them lists the tools it does want in `tools:`.

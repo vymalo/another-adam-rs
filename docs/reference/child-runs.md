@@ -203,15 +203,16 @@ What the design refuses to do, and why:
   sessions ([ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)) are the way to children
   side by side. Starting all the
   children first and waiting for all of them needs `pending_wait` to hold several runs.
-* **No asking tools in a subagent.** A child that parks with no timer, for instance because one of its tools asked the
-  user something, waits for an answer nobody is placed to give; a park with no timer clears its deadline, so nothing
-  ends it but a cancel (the parent's own cancel cascades to it). The subagent binding
-  (`adam-assembly`) closes this at startup instead of at run time: a tool that can ask says so
-  (`Tool::asks_user()`), and `bind` refuses a subagent that has one, so the situation cannot arise from an
-  agent directory. A tool that returns `NeedsInput` without declaring it still parks its child, and a child
-  can still be cancelled by id: the parent then gets the error result. A **model** park until woken is the
-  exception: the parent shows it and wakes the child through a message or a resume ([a park on the
-  model](#a-park-on-the-model)), so it is not stranded, and its deadline is paused while it waits.
+* **A child asks the person only in a shown kept-open session.** A park with no timer clears the child's deadline,
+  so nothing but a cancel ends it: a question nobody can answer would strand the child. Since ADR 0045 slice 8 the
+  rule is decided **per run**, not at bind: a round of a kept-open session whose client shows it
+  (`child-sessions/v1` activated) asks and parks `input-required`; any other child run is told that nobody can
+  answer (`adam_llm_agent::NOT_ASKABLE`) and goes on. `adam-assembly` no longer refuses an asking tool on a
+  subagent. A tool that returns `NeedsInput` without declaring `Tool::asks_user()` is not refused either: it parks
+  its child, and a child can still be cancelled by id (the parent then gets the error result). A **model** park
+  until woken is the other exception: the parent shows it and wakes the child through a message or a resume ([a
+  park on the model](#a-park-on-the-model)), so it is not stranded, and its deadline is paused while it waits.
+  See [a child that asks the person](#a-child-that-asks-the-person).
 * **The output travels whole.** The child's output is the payload of the message, then the text of the tool
   result in the parent's history. Long histories are shortened by `max_history_tokens` as for any tool output,
   in the stored conversation too (the journal keeps the whole output), and a history that reaches its budget is
@@ -416,6 +417,7 @@ is read from the store, the notice is only a wake-up).
 | S15 | The model read the report itself, or the run has no session | A report the model read is not appended again; a run that never opens a session lists once, at its first call | `a_report_read_by_the_model_is_not_appended_again`, `a_run_without_sessions_lists_only_at_its_first_model_call` |
 | S16 | A journal from before slice 3, or one with reports, is replayed, with a message that arrived since | The same history, no model asked, no child run, no disagreement; the rounds are counted once even when the answer is dropped as stale | `a_journal_from_before_reports_replays_to_the_same_history`, `a_replay_appends_the_same_reports`, `a_replay_of_a_stale_answer_counts_each_round_once` |
 | S17 | A session has sat idle for `idle_ttl` | It reads closed, frees its place, refuses a send in words; a working round never expires; its unreported report is told once | `each_limit_refuses_in_words`, `an_idle_expired_session_refuses_a_send_as_closed`, `an_expired_sessions_report_is_still_told_once` |
+| S18 | A round asks the person, and one that may not asks anyway | A shown kept-open round parks `input-required` and the parent's read says `blocked`; an answer in the child context resumes it; a child that may not ask is told `NOT_ASKABLE` and goes on | `a_persons_round_that_asks_the_person_is_blocked_and_the_answer_resumes_it`, `a_child_run_that_is_no_shown_session_cannot_ask`, `a_shown_round_asks_the_person_who_answers_it_in_the_child_context` |
 
 **Tokens.** Each round a run started or sent to is counted once in the run's `usage_totals`: a journaled step `usage:<call id>` reads it when a report is given to the model and, at the latest, when the run ends (`sessions_end`), whether or not the report was read; a store error on the read is retried. **Known limit:** the checks scan every round of the conversation, and past 5,000 rounds of one subagent a start **and a send** are refused.
 
@@ -453,7 +455,7 @@ round makes the session read as the round before it, or not at all.
 `CancelTask`). A cancelled or failed parent frees its working slots for the next task (`a_cancel_frees_the_working_slots_for_the_next_task`,
 `a_parent_that_fails_stops_its_rounds`). A person's round is its own parent and is not stopped by a parent's cancel.
 
-**Not built yet** (slices 5 to 8): the coder's kept-open helpers, a child that asks the person.
+**Not built yet** (slice 7): the coder's kept-open helpers.
 
 **A person's round.** The A2A front (`adam-a2a-runtime`, *Child sessions*) lets a person start a session and send rounds with no run
 of an agent behind them. Such a round is **its own parent** (`start_child_continuing(id, id, ..)`): `parent_id` is its own id, so
@@ -462,6 +464,66 @@ the worker's check of the parent (`parent_has_ended`) reads a run that has not e
 and `SessionSummary::started_outside_a_run` say it. Its end notice goes to the round itself, which is finished by then, and is dropped (`notify_parent`, "nobody to tell"); its park notice is not sent at all (a run that is its own parent is no child, and one delivered to itself would wake it for ever). A parent
 learns the round by reading the session, as for any round it did not start (slice 3: the parent's next listing reports it, marked as the person's). `closing_round_payload` builds the first message of a
 round that only closes a session, for the tools and for the A2A front.
+
+## A child that asks the person
+
+A **round of a kept-open session** may ask the person (ADR 0045 decision 9), and only that: the person sees the
+session because their client activated `child-sessions/v1`, and answers in the round's own thread. Anything else in
+a child run is told that nobody can answer and goes on: a one-shot child, a round of a session that is not kept
+open, and a round of a session whose client does not show it (`adam_llm_agent::NOT_ASKABLE`).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as client (child-sessions/v1)
+    participant F as A2A front
+    participant R as round run<br/>LlmAgent
+    participant P as parent run<br/>LlmAgent
+    C->>F: start a kept-open session (the extension activated)
+    F->>R: round 1, header {keep_open, visible}
+    R->>R: a tool asks, and the round parks with no timer
+    F-->>C: the round's task is input-required, with the question
+    P->>F: subagent_read(session)
+    F-->>P: report: blocked, with the question
+    C->>F: a message in the child context
+    F->>R: deliver it, and it becomes the asking tool's result
+    R->>R: the model goes on and the round ends
+    F-->>C: the round's task is completed
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Working: the round starts
+    Working --> Blocked: a tool asks, and the run may ask
+    Working --> Working: a tool asks, and the run may not (an error result)
+    Blocked --> Working: the person's answer is the tool's result
+    Working --> Done: the round ends
+    Done --> [*]
+```
+
+**Where the permission lives.** The session's header carries `visible` (`adam_runtime::SessionHeader::visible`, ADR 0045 decision
+9): the A2A front writes it for a round it starts (a request that activated the extension is the only way to a child
+context), and the session tools write it for a session they start when the run's context says the client shows child
+sessions (`vymalo.childSessions`, written by the front from `Caller::extensions`, cleared by a request that did not
+activate). The loop reads it at the call that asks: a round with `keep_open` and `visible` parks; anything else is told that
+nobody can answer.
+
+**What the person sees.** The round's task is `input-required` with the question (the A2A mapping of a run parked
+with no timer), the session's round event says `reported: blocked`, and the parent's `subagent_read` on the session
+says `report: blocked` with the question, from `SessionView::waiting` and `SessionView::waiting_reason`. A read with
+`wait: true` still waits, because the answer ends the round; a parent that waits on such a round waits until the
+person answers, as the turn-end rule says for any working round.
+
+**The answer.** A plain message in the child context, or a follow-up to the round's task, is delivered into the
+parked round and becomes the asking tool's result: the round resumes where it stopped. A request that did not
+activate the extension is `InvalidParams`, as for any request about a child context.
+
+Proof: `crates/adam-a2a-runtime/tests/child_sessions.rs`
+(`a_shown_round_asks_the_person_who_answers_it_in_the_child_context`) and `crates/adam-llm-agent/tests/sessions.rs`
+(`a_persons_round_that_asks_the_person_is_blocked_and_the_answer_resumes_it`,
+`a_child_run_that_is_no_shown_session_cannot_ask`,
+`a_model_started_session_asks_only_when_the_client_shows_child_sessions`), on memory, PostgreSQL and MongoDB where the
+variables are set.
 
 ## Remote sessions
 

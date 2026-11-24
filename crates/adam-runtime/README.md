@@ -309,10 +309,12 @@ its parent.
 **Child sessions, slice 2 (ADR 0045).** A session is read from its rounds and nothing else:
 `Runtime::session_view(conversation, session)` answers `None` for an id that is not the first round of a session of that
 conversation, and otherwise the latest round (`SessionView`: its status and output as a parent reads a child, its number,
-`SessionState`, whether the session takes more messages, which run started it). Whether a session is **closed** is read from
+`SessionState`, whether the session takes more messages, which run started it, and `waiting` with `waiting_reason` when the
+round is parked with no timer: it asks the person, or the model refused it until woken, and only an answer moves it). Whether a session is **closed** is read from
 the latest round: its `SessionHeader` (`session` in the round's agent state: id, agent, description, `keep_open`, `closed`,
-`closing`, `round`, and `root`: the run the round's model calls name, the opener's root when the session opens and the
-sending task's for a round a task sends,
+`closing`, `round`, `visible` (a client that activated `child-sessions/v1` sees the session, so a round of it may ask the
+person, ADR 0045 decision 9; a `SessionHeader` literal needs it too), and `root`: the run the round's model calls name, the
+opener's root when the session opens and the sending task's for a round a task sends,
 [ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md); `None`
 for a session a person opened, and in a header stored before it, which still decodes; **a new public field: a
 `SessionHeader` literal needs `root`**), a `SESSION_CLOSE_KIND` request waiting in its inbox, or a round that has ended in a session that is not kept open

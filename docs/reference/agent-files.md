@@ -513,7 +513,8 @@ of `adam-llm-agent`.
   durations are `500ms`, `1s`, `30m`, `1h`; `on` lists `transient`, `rate-limited`, `conflict`; what is left out
   is `RetryPolicy`'s default, 1 s, 60 s, 2.0 and all three classes;
   [ADR 0061](../decisions/0061-a-step-names-its-retry-policy.md)), `asks_user` (the tool can end a call with `ToolError::NeedsInput`: the
-  generated `Tool::asks_user` says `true`, and `bind` refuses it on a subagent), `step`, `label` and
+  generated `Tool::asks_user` says `true`, so the loop runs such a call alone; whether the person can be asked is decided per
+  run ([ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)), `step`, `label` and
   `icon` (how a call is drawn as a step, `Tool::step_style`: the kind, a label instead of the tool's name (give one: it is what the person reads), and an
   icon from the closed vocabulary of the orchestration layer's `steps/v1` (`opencode` is OpenCode's own); [ADR 0007](../decisions/0007-progress-as-steps-and-streamed-text.md)) and
   `parallel = "independent" | "read" | "write" | "exclusive"` with `path = "<argument>"`, or `access = path::to::fn`
@@ -766,9 +767,12 @@ bind. A root whose subagents are all remote gets the five tools as well.
   [errors](errors.md#what-the-model-is-told).
 * **Name clashes are build errors** (`Error::SubagentToolClash`): a subagent named like a tool of its parent, a
   skill tool, or another subagent.
-* **No asking tools in a subagent.** Nobody could answer, and the parent would wait for ever. A tool declares
-  it can ask with `#[tool(asks_user)]` or `FnTool::asking_user()`; `bind` refuses a subagent whose resolved
-  tools include one (`Error::SubagentAsksUser`), also through `*` or a pattern.
+* **A subagent cannot ask outside a shown child session.** A tool declares that it can ask with
+  `#[tool(asks_user)]` or `FnTool::asking_user()`, and a subagent may have it: `bind` no longer refuses it, because
+  whether the person can be asked is decided per **run** (ADR 0045 decision 9). A round of a kept-open session whose
+  client shows child sessions (`child-sessions/v1` activated) asks the person and parks `input-required`; any other
+  child run is answered that nobody can answer it (`adam_llm_agent::NOT_ASKABLE`) and goes on. A question from a run
+  nobody answers would otherwise park for ever.
 * **Limits of the design.** The calls of one model turn run one after another. Only the child's text travels
   back (artifacts stay on the child's run). The child starts empty and cannot be continued. Cancelling the
   parent cancels the child (the task of a remote A2A subagent called through its tool is not cancelled; a round of a
@@ -790,8 +794,9 @@ embeds adam, refuses the file at `bind` with `Error::RemoteNotEnabled`, before a
   `AgentDef::remote_timeout` (default **one hour**); the remote task keeps running.
 * **Terminal states.** `completed`: the artifacts' text (cut at 64 KiB), else the status message; when the artifacts
   hold files only (an adam agent's screenshots), the status message and then their lines. `failed`,
-  `canceled`, `rejected`, and also `input-required` and `auth-required`: an error result (a subagent cannot ask
-  the user). `submitted`, `working` are "still going".
+  `canceled`, `rejected`, and also `input-required` and `auth-required`: an error result (a one-shot child cannot
+  ask the person; a round of a remote **session** turns `input-required` into its report instead,
+  [Child runs](child-runs.md#remote-sessions)). `submitted`, `working` are "still going".
 * **Failures.** A transport or JSON-RPC internal error is `Transient` (retried with backoff); anything the
   remote answered on purpose (401, task not found) is an error result and the parent goes on.
 * **Auth: `auth: bearer:VAR`.** `bind` reads the variable (`AgentDef::env(name, value)` wins), trims it and

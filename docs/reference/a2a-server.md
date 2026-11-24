@@ -485,6 +485,8 @@ follows each round as an ordinary task of a **child context**, and starts, talks
 `RuntimeTaskBackend::with_child_sessions` is the backend side (`crates/adam-a2a-runtime/src/child_sessions.rs`); the card entry is
 `ExtensionConfig::child_sessions`. The parent stream's events are `crates/adam-a2a-runtime/src/session_events.rs`. **Who lists it.** An agent whose root has a subagent, local or remote (the rule that gives the root the five session tools): `adam-agent` and `adam-coder`. `AgentDef::child_sessions` of `adam-assembly` computes the helpers and the limits from the files alone, so the same on every role; `adam_service::serve` hands them to the backend and adds the card entry **only when the backend accepted them** (a helper nobody registered is exit 78). The `worker` role serves no A2A and lists nothing. A root with no subagent lists nothing and refuses every request of the extension. There is no deployment switch.
 
+**A round may ask the person** (ADR 0045 decision 9): the round's task is `input-required` with the question, the session's round event reports `blocked`, and the person answers with a plain message in the child context (or a follow-up to the round's task), which the parked round reads as the asking tool's result. Only a round of a **kept-open** session a client shows may ask: the front writes `visible` into the header of a round it starts, and a request that did not activate the extension clears the run's `vymalo.childSessions` context key, so a session the model starts for a client that does not show sessions is one whose rounds are told `NOT_ASKABLE`. `docs/reference/child-runs.md` has the sequence.
+
 ```mermaid
 sequenceDiagram
   participant C as Client (activates the extension)

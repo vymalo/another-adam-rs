@@ -51,7 +51,8 @@ mod expand;
 /// multiplier = 2.0, on = ["rate-limited"])` (the tool's retry policy, `Tool::retry_policy`:
 /// `attempts` is required, durations are `500ms`, `1s`, `30m` or `1h`, `on` lists `transient`,
 /// `rate-limited` and `conflict`, and what is left out is `RetryPolicy`'s default), `asks_user` (the tool can end a call with
-/// `ToolError::NeedsInput`: `Tool::asks_user` says `true`, and a subagent may not have it) and
+/// `ToolError::NeedsInput`: `Tool::asks_user` says `true`; a subagent may have it, and the loop decides per run whether
+/// the person can be asked) and
 /// `step = "subagent"`, `label = "Helper"` and `icon = "agent"` (how a call is drawn as a step,
 /// `Tool::step_style`: the kind, a label instead of the tool's name, and an icon; each from the closed
 /// vocabulary of the `steps/v1` extension, and any other word is an error that lists them),

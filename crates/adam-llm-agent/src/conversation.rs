@@ -151,6 +151,15 @@ pub const CALLER_CONTEXT_KEY: &str = "vymalo.caller";
 /// a message that is no longer the newest.
 pub const LOCALE_CONTEXT_KEY: &str = "vymalo.locale";
 
+/// The context key under which a message says its client **shows child sessions**
+/// (`child-sessions/v1` activated): `true`, written by the A2A front, and cleared by a message that
+/// did not activate the extension. It is what lets a session the model starts be one the person
+/// sees: a round of a kept-open session asks the person only when the header says they see it
+/// ([`SessionHeader::visible`](adam_runtime::SessionHeader::visible), ADR 0045 decision 9). Not one
+/// of [`PROTECTED_CONTEXT_KEYS`]: a context too large to keep it makes a child unable to ask, which
+/// is the safe way to lose it.
+pub const CHILD_SESSIONS_CONTEXT_KEY: &str = "vymalo.childSessions";
+
 /// The context keys that must survive a context the run drops: the **limits on the agent** (the
 /// access tier the person picked, who the message was sent for, the reasoning effort it activated,
 /// and that nobody answers the run, `adam_runtime::UNATTENDED_CONTEXT_KEY`) and the **interface
@@ -1311,6 +1320,37 @@ impl Conversation {
         let before = self.context.len();
         self.context.retain(|_, value| !has_expired(value, now));
         before - self.context.len()
+    }
+
+    /// Whether the client that started or last wrote to this run **shows child sessions**
+    /// ([`CHILD_SESSIONS_CONTEXT_KEY`]): `true` when its request activated `child-sessions/v1`. A
+    /// session this run starts is then one the person sees, so a round of it may ask them (ADR 0045
+    /// decision 9); the session tools write it into the session's header.
+    #[must_use]
+    pub fn shows_child_sessions(&self) -> bool {
+        self.context.get(CHILD_SESSIONS_CONTEXT_KEY) == Some(&Value::Bool(true))
+    }
+
+    /// Whether a tool of this run may **ask the person** ([`ToolError::NeedsInput`], ADR 0045
+    /// decision 9): a root run always; a round of a session only when the session is kept open and
+    /// a client shows it ([`SessionHeader::visible`](adam_runtime::SessionHeader::visible)); and no
+    /// other child run at all, because nobody would answer it and it would wait for ever. A round
+    /// of a session that carries no header (one an embedder made with
+    /// `Runtime::start_child_continuing`) is no root either: nobody sees it.
+    ///
+    /// The agent refuses the question in words instead of parking when this is `false`.
+    ///
+    /// [`ToolError::NeedsInput`]: crate::ToolError::NeedsInput
+    #[must_use]
+    pub fn may_ask_person(&self, conversation_id: Option<&str>) -> bool {
+        match &self.session {
+            Some(header) => header.keep_open && header.visible,
+            None => {
+                self.root_run.is_none()
+                    && conversation_id
+                        .is_none_or(|c| adam_runtime::parse_session_conversation_id(c).is_none())
+            }
+        }
     }
 
     /// Whether text part `part` of message `message` is the marker that says turns were left out

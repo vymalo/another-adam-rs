@@ -66,8 +66,10 @@ Rules worth knowing:
 
 * **Secrets and endpoints never go in files.** `api_key`, `token`, `secret`, `password`, `base_url` are errors;
   `model` is an alias. `${VAR}` exists only in `mcp.json`.
-* **A subagent inherits nothing**, and without `tools:` it has none. It cannot use a tool that asks the person.
-  A file copied from `.claude/agents/` parses unchanged, but its `tools` must name adam's tools.
+* **A subagent inherits nothing**, and without `tools:` it has none. A tool that asks the person may be in its
+  `tools:`, but the question only reaches the person in a kept-open session whose client shows child sessions
+  (ADR 0045 decision 9); in any other child run the model is told that nobody can answer and goes on. A file
+  copied from `.claude/agents/` parses unchanged, but its `tools` must name adam's tools.
 * **A remote subagent** is a file with `a2a: <agent-card URL>`: another A2A agent, called like a subagent. Its token
   is the environment's (`auth: bearer:VAR`), plain `http` to a service of the cluster needs
   `A2A_ALLOW_INSECURE_REMOTES=true`, and one declared in a subagent's directory (`subagents/researcher/subagents/`)

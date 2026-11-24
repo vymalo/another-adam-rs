@@ -616,8 +616,6 @@ impl AgentDef {
     ///
     /// * a subagent tool whose name is already a tool of the parent, or another subagent's
     ///   ([`Error::SubagentToolClash`]);
-    /// * a subagent with a tool that asks the user ([`Error::SubagentAsksUser`]): nobody would
-    ///   answer it.
     ///
     /// A remote subagent (`a2a:`) gets a tool of the same shape and the same name checks, and is
     /// checked here too: its URL must be https (or local, unless
@@ -853,9 +851,6 @@ impl Walk<'_> {
             parent.is_none(),
             &catalog,
         )?;
-        if parent.is_some() {
-            refuse_asking_tools(&origin, &tools)?;
-        }
         let mut prompt = render_prompt(&origin, manifest, self.values.get(&name))?;
         // The servers whose `when` makes them groups: their tools are withheld by the source below
         // until the task holds a keyword or the run loads the group, and their instructions are the
@@ -1147,18 +1142,6 @@ fn add_skills(
     prompt.push_str("\n\n");
     prompt.push_str(&section);
     Ok((set.names(), set.preloaded()))
-}
-
-/// A subagent runs as a child of another run: there is nobody to answer a question, and a run
-/// that asks parks until someone does. Refuse the tools that say they ask.
-fn refuse_asking_tools(origin: &Origin, tools: &[(String, DynTool)]) -> Result<(), Error> {
-    match tools.iter().find(|(_, tool)| tool.asks_user()) {
-        Some((name, _)) => Err(Error::SubagentAsksUser {
-            origin: origin.clone(),
-            tool: name.clone(),
-        }),
-        None => Ok(()),
-    }
 }
 
 /// Where some of an agent's tools came from, so that a name clash can say whose tool it hit.

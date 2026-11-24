@@ -613,21 +613,6 @@ pub enum Error {
         /// The name in conflict.
         tool: String,
     },
-    /// A subagent has a tool that asks the user a question ([`Tool::asks_user`]). A subagent runs as
-    /// a child of another run, so nobody could answer, and the child would wait for ever.
-    ///
-    /// [`Tool::asks_user`]: adam_llm_agent::Tool::asks_user
-    #[error(
-        "{origin}: a subagent cannot have `{tool}`: it asks the user a question, and a subagent runs \
-         as a child of another run, so nobody could answer it. List its `tools` by name, without \
-         `{tool}`, or let the parent ask instead"
-    )]
-    SubagentAsksUser {
-        /// The subagent and its file.
-        origin: Origin,
-        /// The tool that asks.
-        tool: String,
-    },
     /// A remote subagent's `auth: bearer:VAR` names an environment variable that cannot give a
     /// token. The token is read at [`AgentDef::bind`](crate::AgentDef::bind), and a remote
     /// subagent with no usable credential is refused (fail closed) rather than called without.
@@ -1026,10 +1011,6 @@ mod tests {
                 clash: ToolClash::Subagent {
                     file: "agent/subagents/reviewer.md".into(),
                 },
-            },
-            Error::SubagentAsksUser {
-                origin: o.clone(),
-                tool: "ask_user".into(),
             },
             Error::RemoteAuth {
                 origin: o.clone(),

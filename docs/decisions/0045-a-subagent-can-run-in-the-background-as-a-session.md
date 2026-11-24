@@ -192,6 +192,26 @@ round agents' starters on the A2A front; a reload of `LiveAssembly` keeps the ro
 * **Not built here:** the live usage of a model round stays on the parent until the loop is free to change; push configs on round
   tasks are unsupported.
 
+*Built 2026-11-24:* slice 8 (asking from a visible child), decision 9's "now per run instead of at bind time", built as:
+
+* **The permission is the round's header.** `SessionHeader` gains `visible`: the A2A front writes it for a round it
+  starts (only a request that activated `child-sessions/v1` reaches a child context), and the session tools write it for
+  a session they start when the run's context says its client shows child sessions (`vymalo.childSessions`, written by
+  the A2A backend from `Caller::extensions` and cleared by a request that did not activate it); a later round keeps it.
+  A round with `keep_open` and `visible` may ask the person; every other child run — a one-shot child, a session that is
+  not kept open, a session no client shows, a round of a session with no header — is answered
+  `adam_llm_agent::NOT_ASKABLE` and goes on. `Error::SubagentAsksUser` and the bind-time refusal are gone: a subagent
+  may have an asking tool, and `Tool::asks_user` stays what makes such a call run alone.
+* **What the person sees needed no front change.** A round parked with no timer is already `input-required` with the
+  question, and the session's event already reports `blocked` (slice 6 part b). The parent's `subagent_read` now says
+  `report: blocked` with the question, from the new `SessionView::waiting` / `waiting_reason` (read from the parked
+  round's state, as the front reads its question). A read with `wait: true` still waits, because the answer ends the
+  round; the parent's turn-end wait is unchanged.
+* **The answer** is the existing follow-up: a plain message in the child context, or a follow-up to the round's task,
+  is delivered into the parked round and becomes the asking tool's result.
+* Proof: `docs/reference/child-runs.md` § "A child that asks the person" names the four cases. Not built: the coder's
+  kept-open helpers (slice 7), so no shipped agent has a helper that asks.
+
 ## Context
 
 *Verified 2026-11-14 by reading adam-rs at `103965f`:*

@@ -94,10 +94,11 @@
 //!
 //! Each local subagent is an agent of its own, `<parent>/<name>`, that inherits nothing, and its
 //! parent gets a [`SubagentTool`] named after it: a call runs the subagent as a durable child run
-//! of the parent's run and the child's final text is the result. A subagent cannot have a tool that
-//! asks the user ([`Tool::asks_user`](adam_llm_agent::Tool::asks_user)), and its name may not clash
-//! with a tool of its parent: both are errors at [`AgentDef::bind`]. The tool needs no runtime
-//! handle: [`Assembly::register`] registers every agent, and that is all it needs.
+//! of the parent's run and the child's final text is the result. A subagent may have a tool that
+//! asks the person ([`Tool::asks_user`](adam_llm_agent::Tool::asks_user)): whether it may ask is
+//! decided per run by the loop (ADR 0045 decision 9), not here. Its name may not clash with a tool
+//! of its parent, which is an error at [`AgentDef::bind`]. The tool needs no runtime handle:
+//! [`Assembly::register`] registers every agent, and that is all it needs.
 //!
 //! # Remote subagents
 //!

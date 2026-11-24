@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    Conversation, DynTool, LlmAgent, LlmAgentBuilder, PendingSession, PendingWait, SessionAgent,
-    SessionTools, Tool, ToolCtx, ToolError, ToolOutput, user_message,
+    CHILD_SESSIONS_CONTEXT_KEY, Conversation, DynTool, LlmAgent, LlmAgentBuilder, PendingSession,
+    PendingWait, SessionAgent, SessionTools, Tool, ToolCtx, ToolError, ToolOutput, user_message,
 };
 use adam_model::{
     DynModel, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
@@ -231,6 +231,39 @@ impl Tool for Flaky {
     }
 }
 
+/// A tool of the model's that asks the person: the run parks on it when it may ask, and is told
+/// that nobody can answer when it may not (ADR 0045 decision 9).
+struct Ask;
+
+#[async_trait]
+impl Tool for Ask {
+    fn spec(&self) -> adam_model::ToolSpec {
+        adam_model::ToolSpec {
+            name: "ask".into(),
+            description: "asks the person".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"question": {"type": "string"}},
+                "required": ["question"],
+            }),
+        }
+    }
+
+    fn asks_user(&self) -> bool {
+        true
+    }
+
+    async fn call(&self, _ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::needs_input(
+            args["question"].as_str().unwrap_or("which one?"),
+        ))
+    }
+}
+
+fn ask_call(id: &str, question: &str) -> ToolCall {
+    call(id, "ask", json!({"question": question}))
+}
+
 struct Rig {
     parent_name: String,
     child_name: String,
@@ -253,6 +286,8 @@ struct Rig {
     reports_off: bool,
     /// The limits the session tools hold (`None`: the defaults).
     limits: Option<SessionLimits>,
+    /// The child agent has a tool that asks the person ([`Ask`]).
+    asks: bool,
     /// How long a kept-open session may sit idle (`None`: the runtime's default).
     idle_ttl: Option<Duration>,
     sink: CollectingSink,
@@ -276,6 +311,7 @@ impl Rig {
             hold_parent_on: None,
             reports_off: false,
             limits: None,
+            asks: false,
             idle_ttl: None,
             sink: CollectingSink::new(),
             clock: ManualClock::new(),
@@ -284,6 +320,12 @@ impl Rig {
 
     fn holding(mut self, n: usize) -> Self {
         self.hold_child_on = Some(n);
+        self
+    }
+
+    /// Give the child agent a tool that asks the person.
+    fn asking(mut self) -> Self {
+        self.asks = true;
         self
     }
 
@@ -380,7 +422,11 @@ impl Rig {
             }),
             None => self.child_mock.clone(),
         };
-        LlmAgent::builder(&self.child_name, model, "m").build()
+        let mut builder = LlmAgent::builder(&self.child_name, model, "m");
+        if self.asks {
+            builder = builder.tool(Ask);
+        }
+        builder.build()
     }
 
     fn builder(&self, store: &DynStore, worker: &str) -> RuntimeBuilder {
@@ -759,6 +805,9 @@ async fn start_persons_round(rt: &Runtime, rig: &Rig, conversation: &str, text: 
         closing: false,
         round: 1,
         root: None,
+        // The A2A front sets it: only a request that activated `child-sessions/v1` starts a
+        // person's round, so the person sees the session (ADR 0045 decision 9).
+        visible: true,
     };
     let mut first = user_message(text);
     first.payload["session"] = serde_json::to_value(&header).unwrap();
@@ -2715,6 +2764,7 @@ mod cases {
             closing: false,
             round: 1,
             root: None,
+            visible: false,
         };
         let mut first = user_message("old work");
         first.payload["session"] = serde_json::to_value(&header).unwrap();
@@ -4093,6 +4143,7 @@ mod cases {
             closing: true,
             round: 2,
             root: None,
+            visible: false,
         };
         rt.start_child_continuing(
             cleanup,
@@ -4676,6 +4727,128 @@ mod cases {
         assert_eq!(again.parent_mock.requests().len(), 0, "no model was asked");
         assert_eq!(again.child_mock.requests().len(), 0, "no child ran");
     }
+
+    /// ADR 0045 decision 9, row 8, tests 1 and 2: a round of a kept-open session a person sees
+    /// asks them and parks `input-required`; the parent's report on it says `blocked` and what it
+    /// asked; and the person's answer in the round's own thread resumes it.
+    pub async fn a_persons_round_that_asks_the_person_is_blocked_and_the_answer_resumes_it(
+        store: DynStore,
+    ) {
+        let rig = Rig::new().asking();
+        rig.child_mock
+            .push_tool_calls(vec![ask_call("q1", "which branch?")])
+            .push_text("pushed to main");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let session = start_persons_round(&rt, &rig, &conv, "do the work").await;
+        let worker = spawn_worker(&rt);
+
+        let waiting = wait_for(&rt, session, "parked on the question", |v| v.waiting).await;
+        assert_eq!(
+            waiting.status,
+            RunStatus::Parked,
+            "it waits, it does not end"
+        );
+        let view = session_until(&rt, &conv, session, |v| v.waiting).await;
+        assert_eq!(view.waiting_reason.as_deref(), Some("which branch?"));
+
+        // A parent task reads the session without waiting: the report says blocked, and why.
+        rig.parent_mock
+            .push_tool_calls(vec![read_call("r1", session, false)])
+            .push_text("told");
+        let reader = rig.start(&rt, &conv).await;
+        wait_done(&rt, reader).await;
+        let said = tool_results(&state_of(&rt, reader).await);
+        let (_, blocked, is_error) = result_of(&said, "r1");
+        assert!(!is_error, "{blocked}");
+        assert!(blocked.contains("report: blocked"), "{blocked}");
+        assert!(blocked.contains("which branch?"), "{blocked}");
+
+        // The person answers in the round's own thread: the round resumes and ends with it.
+        rt.deliver(session, user_message("main")).await.unwrap();
+        let done = wait_done(&rt, session).await;
+        assert_eq!(
+            done.output
+                .as_ref()
+                .and_then(|o| o.get("text"))
+                .and_then(Value::as_str),
+            Some("pushed to main")
+        );
+        worker.stop().await;
+    }
+
+    /// ADR 0045 decision 9, row 8, test 3: a child run that is no round of a shown kept-open
+    /// session cannot ask. It is told so instead of parking for an answer nobody can give.
+    pub async fn a_child_run_that_is_no_shown_session_cannot_ask(store: DynStore) {
+        let rig = Rig::new().asking();
+        rig.child_mock
+            .push_tool_calls(vec![ask_call("q1", "which branch?")])
+            .push_text("did it without asking");
+        let parent: DynModel = rig.parent_mock.clone();
+        let parent_agent = LlmAgent::builder(&rig.parent_name, parent, "m")
+            .tool(Spawn {
+                target: rig.child_name.clone(),
+            })
+            .build();
+        let rt = rig
+            .builder(&store, "w")
+            .agent(parent_agent)
+            .agent(rig.child())
+            .build();
+        let conv = conv_id();
+        rig.parent_mock
+            .push_tool_calls(vec![call("s1", "spawn", json!({}))])
+            .push_text("done");
+        let parent_run = rig.start(&rt, &conv).await;
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent_run).await;
+
+        let child = child_run_id(parent_run, "s1");
+        let child_view = wait_done(&rt, child).await;
+        let state = conversation(&rt, &child_view).await;
+        let said = tool_results(&state);
+        let (_, refusal, is_error) = result_of(&said, "q1");
+        assert!(is_error, "{refusal}");
+        assert!(refusal.contains("nobody can answer this run"), "{refusal}");
+        assert!(refusal.contains("which branch?"), "{refusal}");
+        worker.stop().await;
+    }
+
+    /// ADR 0045 decision 9, row 8, test 3 for a session the model starts: its round may ask only
+    /// when the client that started the run shows child sessions (`vymalo.childSessions`).
+    pub async fn a_model_started_session_asks_only_when_the_client_shows_child_sessions(
+        store: DynStore,
+    ) {
+        for shown in [false, true] {
+            let rig = Rig::new().asking();
+            rig.child_mock
+                .push_tool_calls(vec![ask_call("q1", "which branch?")])
+                .push_text("asked and told");
+            let (parent_agent, child_agent) = (rig.parent(), rig.child());
+            let rt = rig.together(&store, &parent_agent, &child_agent);
+            let conv = conv_id();
+            let mut first = user_message("go");
+            if shown {
+                first.payload["context"] = json!({ CHILD_SESSIONS_CONTEXT_KEY: true });
+            }
+            let parent = rt
+                .start(&rig.parent_name, first, Some(&conv))
+                .await
+                .unwrap();
+            rig.parent_mock
+                .push_tool_calls(vec![start_call("c1", true)])
+                .push_text("started");
+            let worker = spawn_worker(&rt);
+            let session = child_run_id(parent, "c1");
+            let view = session_until(&rt, &conv, session, |v| {
+                v.waiting || v.state == SessionState::Idle
+            })
+            .await;
+            assert_eq!(view.waiting, shown, "shown = {shown}");
+            worker.stop().await;
+        }
+    }
 }
 
 #[test]
@@ -4821,6 +4994,9 @@ macro_rules! session_suite {
                 a_parent_that_fails_stops_its_rounds,
                 a_cancel_frees_the_working_slots_for_the_next_task,
                 a_cleanup_round_is_not_counted_and_the_next_send_is_an_ordinary_round,
+                a_persons_round_that_asks_the_person_is_blocked_and_the_answer_resumes_it,
+                a_child_run_that_is_no_shown_session_cannot_ask,
+                a_model_started_session_asks_only_when_the_client_shows_child_sessions,
             );
         }
     };
