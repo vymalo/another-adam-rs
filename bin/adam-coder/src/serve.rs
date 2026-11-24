@@ -398,6 +398,9 @@ pub async fn serve(
             // The models a message may pick (`model-pick/v1`): the root's choices, the same list
             // its card advertises.
             let choices = adam_a2a::ModelChoices::from_aliases(agent.model_choices());
+            // The reasoning levels of the root's model (`reasoning/v1`), which its card lists and
+            // the backend checks a message's effort against.
+            let efforts = agent.reasoning_efforts();
             (
                 Agents::new(AGENT_NAME, move |builder| {
                     agent
@@ -406,6 +409,7 @@ pub async fn serve(
                 })
                 .options(options_of(worker))
                 .model_choices(choices)
+                .reasoning_efforts(efforts)
                 // Beside the runtime's worker: the sweep of the workspaces of finished runs.
                 .worker_component("janitor", move |store, stop| janitor.run(store, stop))
                 // The commands that keep running: stopped with their run, whatever ended it.

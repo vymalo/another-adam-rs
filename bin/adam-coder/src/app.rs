@@ -61,12 +61,14 @@ impl Coder {
     ) -> Self {
         let tiers = crate::tier::honoured_up_to(agent.max_access_tier());
         let choices = adam_a2a::ModelChoices::from_aliases(agent.model_choices());
+        let efforts = agent.reasoning_efforts();
         let builder = agent.register(Runtime::builder(store));
         Self::from_service(
             Service::new_with(builder, AGENT_NAME, options, live)
                 .with_inbound(screen_inbound())
                 .with_access_tiers(Some(tiers))
                 .with_model_choices(Some(choices))
+                .with_reasoning_efforts(Some(efforts))
                 .with_commands(Some(crate::files::embedded_commands())),
         )
     }
@@ -144,6 +146,12 @@ impl Coder {
         {
             card.extensions.push(extension);
         }
+        // The backend is what reads an effort, so its card is what lists the levels; a card that
+        // already lists `reasoning/v1` keeps its own entry.
+        let card = match self.backend.reasoning_efforts() {
+            Some(efforts) => adam_service::card_with_reasoning(card, efforts, self.backend.agent()),
+            None => card,
+        };
         adam_service::router(&self.backend, card, auth)
     }
 }

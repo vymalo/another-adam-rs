@@ -84,6 +84,7 @@ fn service_over(agents: Agents, store: &DynStore) -> Service {
         inbound,
         access_tiers,
         model_choices,
+        reasoning_efforts,
         commands,
         ..
     } = agents;
@@ -91,6 +92,7 @@ fn service_over(agents: Agents, store: &DynStore) -> Service {
         .with_inbound(inbound)
         .with_access_tiers(access_tiers)
         .with_model_choices(model_choices)
+        .with_reasoning_efforts(reasoning_efforts)
         .with_commands(commands)
 }
 
@@ -2331,6 +2333,91 @@ async fn a_served_agent_offers_the_deployments_other_models_and_takes_a_pick() {
         matches!(&error, adam_a2a::BackendError::InvalidParams(m)
             if m.starts_with(MODEL_NOT_OFFERED) && m.contains("alias-a")),
         "{error:?}"
+    );
+    started.stop().await;
+}
+
+/// The root's model takes reasoning levels (`MODEL_ALIASES_FILE`): the card lists them
+/// (`reasoning/v1`: the model's levels, lowest first, and the level the folder resolved), the backend
+/// refuses an effort the model does not take before anything is written, and one it takes reaches the
+/// request (ADR 0063, decision 5).
+#[tokio::test]
+async fn a_served_agent_lists_its_models_reasoning_levels_and_takes_one() {
+    use adam_a2a::{REASONING_EFFORT_MEMBER, REASONING_EXTENSION};
+    use adam_model::ModelProfiles;
+    use std::collections::HashMap;
+
+    let folder = chat();
+    edit_instructions(&folder, |t| {
+        t.replacen("limits:", "reasoning_effort: high\nlimits:", 1)
+    });
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Hi.");
+    let model: DynModel = mock.clone();
+    let mut parts = worker(model, McpPolicy::default());
+    parts.profiles = ModelProfiles::parse_json(
+        r#"{"profiles": {"test-model": {"reasoningEfforts": ["low", "high"], "reasoningWire": "reasoning_effort"}}}"#,
+    )
+    .expect("valid profiles");
+    let agents = build(def_of(&folder), None, Some(parts)).await.unwrap();
+    // The levels the backend reads, and the card the process serves, are the model's and the
+    // folder's resolved default.
+    let efforts = agents
+        .reasoning_efforts
+        .as_ref()
+        .expect("the model takes a level");
+    assert_eq!(
+        efforts.levels("chat"),
+        [ReasoningEffort::Low, ReasoningEffort::High]
+    );
+    assert_eq!(efforts.default_of("chat"), Some(ReasoningEffort::High));
+    let card = agents.card.as_ref().expect("a card");
+    let entry = card
+        .extensions
+        .iter()
+        .find(|e| e.uri == REASONING_EXTENSION)
+        .expect("the card lists reasoning/v1");
+    assert!(
+        !entry.required,
+        "a client that does not know it must still talk to the agent"
+    );
+    assert_eq!(
+        serde_json::Value::Object(entry.params.clone()),
+        json!({"efforts": ["low", "high"], "default": "high"})
+    );
+
+    let service = service_over(agents, &store());
+    let started = Worker::start(&service);
+    let asking = || Caller::new("token-0").with_extensions([REASONING_EXTENSION]);
+    let naming = |text: &str, effort: &str| {
+        let mut message = user(text);
+        message.metadata = Some(HashMap::from([(
+            REASONING_EXTENSION.to_owned(),
+            json!({ REASONING_EFFORT_MEMBER: effort }),
+        )]));
+        message
+    };
+    // A level the model does not take is refused, naming the levels, before anything is written.
+    let error = service
+        .backend
+        .submit(asking(), naming("hi", "max"), None, None)
+        .await
+        .expect_err("max is not one of the model's levels");
+    assert!(
+        matches!(&error, adam_a2a::BackendError::InvalidParams(m)
+            if m.contains("does not take") && m.contains("low, high")),
+        "{error:?}"
+    );
+    // One it takes is the run's, and the request asks for it.
+    let task = service
+        .backend
+        .submit(asking(), naming("hi", "low"), None, None)
+        .await
+        .expect("a level the model takes");
+    wait_for(&service, &task.id, TaskState::Completed).await;
+    assert_eq!(
+        mock.requests()[0].reasoning_effort,
+        Some(ReasoningEffort::Low)
     );
     started.stop().await;
 }

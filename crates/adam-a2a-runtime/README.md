@@ -28,6 +28,7 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 | `MAX_TOKEN_COUNT` | the largest count a `usage/v1` report or total carries (2^53 - 1); see *Usage* |
 | `RuntimeTaskBackend::with_access_tiers(AccessTiers)`, `CONTEXT_ACCESS_TIER` | `access-tier/v1`: the backend reads the tier of a message that activated the extension, refuses a bad one, and says the tier a task works under; the tier is the run's context key `vymalo.accessTier` = `{"tier": ..}`; see *The access tier* |
 | `RuntimeTaskBackend::with_model_choices(ModelChoices)`, `RuntimeTaskBackend::model_choices()`, `CONTEXT_MODEL` | `model-pick/v1`: the backend reads the model alias of a message that activated the extension, refuses one the card does not offer as `model_not_offered`, and the alias is the run's context key `vymalo.model` = `{"model": ..}`; see *The model a message picks* |
+| `RuntimeTaskBackend::with_reasoning_efforts(ReasoningEfforts)`, `RuntimeTaskBackend::reasoning_efforts()`, `RuntimeTaskBackend::agent()`, `CONTEXT_REASONING_EFFORT` | `reasoning/v1`: the backend reads the effort of a message that activated the extension, refuses one the agent's model does not take (`InvalidParams`, naming the agent and its levels) before anything is written, and the level is the run's context key `vymalo.reasoningEffort` = `{"effort": ..}`; see *The reasoning effort* |
 | `CONTEXT_LOCALE` | `locale/v1`: the person's interface language of the **latest message that activated the extension**, the run's context key `vymalo.locale` = `"fr-FR"` (a bare BCP 47 tag), set from `metadata[URI] = {"locale": "<tag>"}` and **cleared** by an activated message that names none (or names a malformed tag, which is refused rather than passed on); one of `adam_llm_agent::PROTECTED_CONTEXT_KEYS`, so a dropped context does not take it; a request that did not activate the extension changes nothing; see *The interface language* |
 | `RemoteCommand`, `CommandRefusal`, `Commands::add_remote(name, Arc<dyn RemoteCommand>)`, `Commands::expand_any`, `Commands::served()`, `Commands::refuse_prefix(prefix, why)` | a command whose text is **asked** when a message names it (an MCP server's prompt): the source gets the argument text as typed, trimmed (`expand(&str)`, and maps it itself), the source answers, and the answer is held to the same limits and `(typed)` marking and stored like a template's expansion. `CommandRefusal::Invalid` is `invalid params`, `Unavailable` the A2A `unavailable` error; a name the agent already has is not replaced (`add_remote` returns `false`). `refuse_prefix` makes a process that cannot serve a family of commands (a control plane has no MCP server) answer `invalid params` with a sentence of its own to `/<prefix>...` (typed or in the metadata) instead of letting it reach the model as text; `is_empty()` counts the refusals. `is_format_or_control` now lives in `adam-agent-fs` and is re-exported here. **Breaking:** the crate-private `apply` is async, and `Commands`' `PartialEq` compares a remote command by pointer |
 | `RuntimeTaskBackend::with_commands(Commands)`, `Commands`, `Commands::from_manifest(&[adam_agent_fs::Command])` (the one place a manifest becomes the backend's commands, used by `adam-agent` and `adam-coder`; this crate gained the `adam-agent-fs` dependency for it), `MAX_COMMAND_ARGUMENTS`, `MAX_COMMAND_EXPANSION` | `commands/v1`: the backend expands a message that names a command the agent serves, in this request, and stores the expansion; see *Commands*. An empty `Commands` is the same as none |
@@ -526,6 +527,27 @@ Unit tests in `src/model_pick.rs` (the context, any payload shape, the key's ide
 and `tests/model_pick.rs` (a real `Runtime` and `LlmAgent` with a `MockModel`: an offered pick is the model request's alias and cap, an
 alias outside the choices is `InvalidParams` and writes no run, a backend that serves no choices leaves the pick unread, and a message
 that did not activate the extension carries no pick).
+
+## The reasoning effort
+
+`reasoning/v1` ([ADR 0063](../../docs/decisions/0063-a-reasoning-effort-is-one-setting.md), decision 5). With
+`with_reasoning_efforts(efforts)`, for an agent whose card lists the extension
+(`ExtensionConfig::reasoning`), `submit` reads every message right after the inbound function and beside the
+tier and the pick:
+
+| | |
+|---|---|
+| A message whose request **activated** the extension (`Caller::extensions`) | must carry `metadata[URI] = {"effort": "<level>"}`, a level the agent's model takes (`adam_a2a::ReasoningEfforts`, keyed by the agent's registration name). Anything else — no entry, an entry that is not an object, a missing or non-string `effort`, a word outside the seven, or a level the model does not take — is **`InvalidParams`** (A2A `-32602`) whose sentence names the agent and its levels, **before anything is written**: no task, no run |
+| the effort of an accepted message | the run's inbound context key `vymalo.reasoningEffort` = `{"effort": ..}` (`CONTEXT_REASONING_EFFORT`, `adam_llm_agent::REASONING_EFFORT_CONTEXT_KEY` and one of its `PROTECTED_CONTEXT_KEYS`), merged like any key: the **newest message that names one wins** from the agent's next model call, a message that names none leaves it, and a dropped context keeps it. The loop asks for it on every model turn and the client sends it through the model's `reasoningWire` |
+| a message that did **not** activate it | no effort is read, whatever its metadata says; the context is untouched |
+| a backend with no `with_reasoning_efforts`, or one given the empty set | never reads one: a model that takes no level lists no extension |
+| only setting | no member clears an effort; the extension cannot take one away (a new thread starts at the resolved default) |
+
+Unit tests in `src/reasoning.rs` (the key's identity and protection, any payload shape) and
+`tests/reasoning.rs` (a real `Runtime` and `LlmAgent` with a `MockModel`: an accepted level reaches the run and
+its model request, every refusal shape is `InvalidParams` and writes no run, a backend that serves no level
+leaves the effort unread, and the whole chain through `adam-model-openai` against a mock server: the body of
+the call asks for `"reasoning_effort": "high"`).
 
 ## The interface language
 

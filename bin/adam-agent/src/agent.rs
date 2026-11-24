@@ -272,8 +272,9 @@ pub async fn agents(
     // with the effective limits, so every role that serves A2A lists and serves the same.
     let sessions = def.child_sessions();
     let schedules = def.manifest().schedules.clone();
-    let (agents, commands, card, choices) = match workers {
+    let (agents, commands, card, choices, efforts) = match workers {
         Some(parts) => {
+            let profiles = parts.profiles;
             let assembly = assemble_parked(
                 def,
                 parts.model,
@@ -281,10 +282,22 @@ pub async fn agents(
                 &parts.mcp,
                 parts.step_io,
                 parts.max_parallel,
-                parts.profiles,
+                profiles.clone(),
                 parts.parking,
             )
             .await?;
+            // The reasoning levels of each agent's model (`reasoning/v1`): what the backend checks
+            // a message's effort against, and the root's the card lists.
+            let efforts = adam_a2a::ReasoningEfforts::from_models(
+                assembly.info().iter().map(|info| {
+                    (
+                        info.name.as_str(),
+                        info.model_alias.as_str(),
+                        info.reasoning_effort,
+                    )
+                }),
+                &profiles,
+            );
             // The models a message may pick (`model-pick/v1`): the root's choices, the same list
             // its card advertises.
             let choices = assembly
@@ -296,7 +309,11 @@ pub async fn agents(
             // servers are connected: a role without workers connects none, so it serves none.
             let (commands, listed) =
                 adam_service::with_prompt_commands(commands, assembly.prompt_commands());
-            let card = card.map(|card| adam_service::card_with_commands(card, &listed));
+            let card = card
+                .map(|card| adam_service::card_with_commands(card, &listed))
+                // The card says the levels the backend reads; a card that already lists
+                // `reasoning/v1` keeps its own entry.
+                .map(|card| adam_service::card_with_reasoning(card, &efforts, &name));
             let root = name.clone();
             let scheduler = adam_schedule::SchedulerAgent::new(&name);
             (
@@ -315,6 +332,7 @@ pub async fn agents(
                 commands,
                 card,
                 choices,
+                Some(efforts),
             )
         }
         None => {
@@ -333,7 +351,9 @@ pub async fn agents(
                 }),
                 commands,
                 card,
-                // A control plane assembles no agent, so it knows no choices: its card lists none.
+                // A control plane assembles no agent, so it knows no choices and no levels: its
+                // card lists neither.
+                None,
                 None,
             )
         }
@@ -346,6 +366,10 @@ pub async fn agents(
         .commands(commands);
     let agents = match choices {
         Some(choices) => agents.model_choices(choices),
+        None => agents,
+    };
+    let agents = match efforts {
+        Some(efforts) => agents.reasoning_efforts(efforts),
         None => agents,
     };
     Ok(match sessions {

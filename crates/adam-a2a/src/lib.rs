@@ -151,6 +151,9 @@ pub use locale::{LOCALE_MEMBER, Locale, MAX_LOCALE_BYTES, NotALocale};
 pub use memory::{InMemoryBackend, InMemoryConfig};
 pub use model_pick::{MODEL_NOT_OFFERED, MODEL_PICK_MEMBER, ModelChoices};
 pub use page::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, PageToken, TaskPage, TaskQuery};
+// The closed vocabulary `reasoning/v1` reads and advertises, re-exported so a caller of
+// `ReasoningEfforts` names the type from this crate.
+pub use adam_model::ReasoningEffort;
 pub use reasoning::{REASONING_EFFORT_MEMBER, ReasoningEfforts};
 #[cfg(feature = "server")]
 pub use server::{A2aServer, SDK_KEEPALIVE_INTERVAL, ServerOptions};
