@@ -815,7 +815,9 @@ impl BoundDef {
             max_tool_calls,
             max_output_tokens,
             context_window: None,
-            // A hand-made `parallel_of` value is clamped to the loop's own limit, 32.
+            // `parallel_of` never gives more than the loop's own limit (32), so nothing is lost
+            // here. If a hand-made value ever could not be carried, the bound is that limit — the
+            // most the loop runs at once — and never "no bound", which would widen.
             max_parallel_tool_calls: u32::try_from(parallel).unwrap_or(MAX_PARALLEL_LIMIT as u32),
             // A round with no limit (`None`) is `0` here, which means the same: no limit.
             time_limit: target.within.map_or(0, |within| {

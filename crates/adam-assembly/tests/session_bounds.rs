@@ -187,6 +187,39 @@ fn a_folder_above_the_deployment_is_refused_naming_the_option() {
     assert_eq!(bound_of(&assembly).max_parallel_tool_calls, 16);
 }
 
+/// A folder at the loop's own limit is admitted and is the bound: `MAX_PARALLEL_TOOL_CALLS` is
+/// clamped to 32 (`MAX_PARALLEL_LIMIT`), so a deployment that asks for more still runs at most 32
+/// calls at once, and so is what a session may ask for.
+#[test]
+fn a_folder_at_the_loops_own_limit_is_the_bound() {
+    let assembly = assemble(
+        family("  max_parallel: 32"),
+        SessionLimits::default(),
+        Some(64),
+    )
+    .unwrap();
+    let bound = bound_of(&assembly);
+    assert_eq!(
+        bound.max_parallel_tool_calls, 32,
+        "the deployment's setting is clamped to the loop's 32 (MAX_PARALLEL_LIMIT)"
+    );
+    assert!(
+        bound
+            .admit(
+                SessionConfig::from_value(json!({ "maxParallelToolCalls": 32 })).expect("a config")
+            )
+            .is_ok()
+    );
+    assert!(
+        bound
+            .admit(
+                SessionConfig::from_value(json!({ "maxParallelToolCalls": 33 })).expect("a config")
+            )
+            .is_err(),
+        "33 is over the loop's own limit"
+    );
+}
+
 /// The bounds of every subagent of a real definition, in the order of its folder, from the same
 /// one list the root's session tools are made with: a local helper's time limit is its
 /// `max_minutes`, and a helper that says nothing gets the loop's defaults for the values of its
