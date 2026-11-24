@@ -399,6 +399,15 @@ step that part changes. Hooks are tested with concurrent tool calls from H1 on.
 `permission.ask`, a deciding point on the `ask` of ADR 0039's rules, comes with those rules (ADR 0039 slice 5) and is
 added here by a dated note when they are built.
 
+*Amended 2026-11-24 (slice **H1b** built):* decision 9's "no step is added" is not what shipped. A message is
+decided in a step of its own — `message:start`, then `message:<inbound id>` — which is taken **only when a hook set is
+installed** (an empty set writes no step, so a journal written without hooks replays unchanged), and the record is
+`MessageDecision` (`text` when a hook rewrote the message, `hook` when it was refused). The reason a step was needed is
+replay: the decision must be readable after a crash without asking a hook again, and `model:<turn>` is recorded by the
+model call that follows it. The consequence decision 3 warns about stands for a run already in flight when a deployment
+adds its first plugin: its next transition takes a new step at a seq the journal holds, so roll every worker before the
+build is used. Decision 9's payload, refusal semantics and `Rejected` class are as written.
+
 *Amended 2026-11-18 (ADR 0045 slice 3, which reports to the model a session round that ended, is built; no hook is):* the reports a model call is given are
 appended **inside the step `model:<turn>`** and recorded in its record, so `model:<turn>` holds what decision 9 puts there for `message.received` and the
 reports of ADR 0045. When both exist, the message verdict is applied first, then the reports. A report is not a message, so `message.received` is not asked

@@ -770,13 +770,16 @@ sequenceDiagram
   (`doom_loop`, `limit: "repeated_call"`). A call that runs past its tool's time limit (300 s unless it says otherwise)
   is stopped inside its step and answered with an error, which the journal keeps.
 * **A hook sits inside the call's step** ([ADR 0050](decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md),
-  slice H1). `LlmAgentBuilder::hooks`/`.plugin` install a compiled `HookSet`; its `before_tool` runs after a source's
-  `withhold` and before the tool, and its `after_tool` once the tool answered, both **inside** `tool:<call id>` and with no
-  `Ctx` of their own. The step records `HookedOutput`: the output flattened, the decisions that were not `Continue`
+  slices H1 and H1b). `LlmAgentBuilder::hooks`/`.plugin` install a compiled `HookSet`; its `message_received` runs in the step
+  that takes a person's message in (`message:start`, `message:<inbound id>`: taken only when a set is installed, and recorded
+  as a `MessageDecision` — the rewritten text, or the refusal), its `before_tool` after a source's `withhold` and before the
+  tool, and its `after_tool` once the tool answered, the last two **inside** `tool:<call id>` and all with no `Ctx` of their
+  own. The call's step records `HookedOutput`: the output flattened, the decisions that were not `Continue`
   (`point`, `verdict`, `reason`, the failing `plugin`) and the arguments that ran when a hook rewrote them. A replay that
-  finds the step recorded asks no hook. A hook may rewrite the arguments or the text, deny the call, ask a person (not
-  built: the call is not run) or stop the run; one that fails never lets the call through. A rewrite that would change
-  `Tool::access` is refused, because the schedule above was made from the model's arguments.
+  finds the step recorded asks no hook. A hook may refuse a message (a start then fails `Rejected` with the reason; one that
+  arrives while the run works is left out and the task goes on), rewrite the arguments or the text, deny the call, ask a
+  person (not built: the call is not run) or stop the run; one that fails never lets the call or the message through. A
+  rewrite that would change `Tool::access` is refused, because the schedule above was made from the model's arguments.
 * **The calls of a turn run at the same time** ([ADR 0049](decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)),
   up to `max_parallel` (10 by default). A tool says what a call shares (`Tool::access`); calls that conflict keep the
   model's order, and a call that is `Alone`, repeats the call before it, or follows a limit of 1 runs by itself, after

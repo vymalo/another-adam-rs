@@ -14,11 +14,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use adam_error::ErrorClass;
-use adam_plugin::{HookError, HookResult, HookedCall, HookedText, Plugin, Verdict};
+use adam_plugin::{HookError, HookResult, HookedCall, HookedMessage, HookedText, Plugin, Verdict};
 
 /// A plugin that lets every call through, counting how often it was asked.
 #[derive(Default)]
 pub struct Allows {
+    /// How often `message_received` ran.
+    pub messages: AtomicUsize,
     /// How often `before_tool` ran.
     pub before: AtomicUsize,
     /// How often `after_tool` ran.
@@ -28,6 +30,11 @@ pub struct Allows {
 impl Plugin for Allows {
     fn name(&self) -> &str {
         "allows"
+    }
+
+    fn message_received(&self, _message: &mut HookedMessage<'_>) -> HookResult {
+        self.messages.fetch_add(1, Ordering::SeqCst);
+        Ok(Verdict::Continue)
     }
 
     fn before_tool(&self, _call: &mut HookedCall<'_>) -> HookResult {
@@ -50,6 +57,19 @@ impl Plugin for Answers {
     }
 
     fn before_tool(&self, _call: &mut HookedCall<'_>) -> HookResult {
+        Ok(self.0.clone())
+    }
+}
+
+/// A plugin that answers `verdict` at `message_received`, again and again.
+pub struct AnswersMessage(pub Verdict);
+
+impl Plugin for AnswersMessage {
+    fn name(&self) -> &str {
+        "answers-message"
+    }
+
+    fn message_received(&self, _message: &mut HookedMessage<'_>) -> HookResult {
         Ok(self.0.clone())
     }
 }
@@ -295,6 +315,35 @@ macro_rules! plugin_conformance {
                 adam_plugin::Verdict::Continue
             );
             assert_eq!(plugin.after.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn a_message_runs_its_plugins_and_a_refusal_decides() {
+            let plugin = std::sync::Arc::new($crate::Allows::default());
+            let set = ($make)().with(plugin.clone());
+            let mut text = String::from("hello");
+            assert!(
+                set.message_received(&mut adam_plugin::HookedMessage {
+                    text: &mut text,
+                    files: &[],
+                })
+                .expect("allows")
+                .is_none(),
+                "every plugin continued"
+            );
+            assert_eq!(plugin.messages.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+            let set = ($make)().with(std::sync::Arc::new($crate::AnswersMessage(adam_plugin::Verdict::Deny("no".into()))));
+            let mut text = String::from("hello");
+            let decided = set
+                .message_received(&mut adam_plugin::HookedMessage {
+                    text: &mut text,
+                    files: &[],
+                })
+                .expect("a verdict")
+                .expect("a refusal");
+            assert_eq!(decided.verdict, adam_plugin::Verdict::Deny("no".into()));
+            assert_eq!(decided.plugin, "answers-message");
         }
     };
 }

@@ -815,6 +815,13 @@ pub struct Conversation {
     /// a run that continues another starts with none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_ids: Vec<String>,
+    /// Whether the message the run started with has been decided by the `message.received` hooks
+    /// (ADR 0050, slice H1b). It is set in the state the decision is taken in, so the decision is
+    /// made once even when the transition that made it fails or parks before a model call. Absent
+    /// from state written before it existed (a run in flight reads `false`), and not written while
+    /// `false`: a run with no hook set never writes it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub start_decided: bool,
     /// How big the last model call's prompt was, as the provider reported it, and how many messages
     /// the history held then: the estimate that says when the run is compacted starts from it. `None`
     /// until a call reported its prompt, and again after a compaction or a shortening changed the
