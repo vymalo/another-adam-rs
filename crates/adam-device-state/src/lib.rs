@@ -81,6 +81,6 @@ mod tests {
         let readings = device.readings();
         assert_eq!(readings.thermal, Thermal::Serious);
         assert!(readings.power.is_low(20));
-        assert!(format!("{device:?}").contains("serious"));
+        assert!(format!("{device:?}").contains("Serious"));
     }
 }
