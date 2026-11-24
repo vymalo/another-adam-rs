@@ -25,7 +25,8 @@ use adam_model::{
     DynModel, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse, ToolCall,
 };
 use adam_runtime::{
-    BroadcastSink, ManualClock, Runtime, SessionLimits, parse_session_conversation_id,
+    BroadcastSink, ManualClock, Runtime, SessionBounds, SessionLimits,
+    parse_session_conversation_id,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -209,6 +210,7 @@ impl Rig {
                 description: "Does a piece of work.".into(),
                 within: None,
                 remote: false,
+                bounds: SessionBounds::default(),
             },
             // A helper the model may start but the card does not list.
             SessionAgent {
@@ -217,6 +219,7 @@ impl Rig {
                 description: "Not on the card.".into(),
                 within: None,
                 remote: false,
+                bounds: SessionBounds::default(),
             },
         ]);
         let mut parent_agent = LlmAgent::builder(&parent, parent_model, "m")

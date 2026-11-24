@@ -73,13 +73,28 @@ fn a_file_may_lower_the_setting_for_its_agent_only() {
 }
 
 #[test]
-fn a_file_never_raises_the_setting() {
-    // 8 asks for more than the deployment allows: the deployment's 4 stands.
-    let got = assemble(family("max_parallel: 8", "max_parallel: 32"), Some(4));
-    assert_eq!(parallel_of(&got), (4, 4));
-    // And at the deployment's 1 nothing can be raised.
-    let got = assemble(family("max_parallel: 5", ""), Some(1));
-    assert_eq!(parallel_of(&got), (1, 1));
+fn a_file_above_the_setting_is_refused() {
+    // 8 asks for more than the deployment allows: refused, not clamped (ADR 0054 decision 2). The
+    // message names the option, the value asked and the value the deployment allows.
+    for (limits, deployment, asked) in [
+        ("max_parallel: 8", 4, 8),
+        ("max_parallel: 32", 4, 32),
+        ("max_parallel: 5", 1, 5),
+    ] {
+        let why = family(limits, "")
+            .bind(tools(&[]))
+            .unwrap()
+            .max_parallel(deployment)
+            .model(Arc::new(MockModel::new()), "m")
+            .expect_err("a file may only lower what the deployment allows");
+        let text = why.to_string();
+        assert!(text.contains("limits.max_parallel"), "{text}");
+        assert!(text.contains(&asked.to_string()), "the value asked: {text}");
+        assert!(
+            text.contains(&format!("at most {deployment}")),
+            "the value the deployment allows: {text}"
+        );
+    }
 }
 
 #[test]

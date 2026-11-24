@@ -2033,6 +2033,7 @@ impl Family {
             description: "Does a piece of work.".into(),
             within: None,
             remote: false,
+            bounds: adam_runtime::SessionBounds::default(),
         }]);
         let parent_model: DynModel = parent_mock.clone();
         let mut parent = LlmAgent::builder(&parent_name, parent_model, "m")

@@ -356,6 +356,7 @@ impl Rig {
                 description: "Does a piece of work.".into(),
                 within: self.within,
                 remote: false,
+                bounds: adam_runtime::SessionBounds::default(),
             },
             SessionAgent {
                 name: "far".into(),
@@ -363,6 +364,7 @@ impl Rig {
                 description: "Lives on another system.".into(),
                 within: None,
                 remote: true,
+                bounds: adam_runtime::SessionBounds::default(),
             },
         ]);
         match self.limits {
@@ -2496,6 +2498,7 @@ mod cases {
                 description: "Does a piece of work.".into(),
                 within: Some(Duration::from_secs(5)),
                 remote: false,
+                bounds: adam_runtime::SessionBounds::default(),
             },
             SessionAgent {
                 name: "far".into(),
@@ -2503,6 +2506,7 @@ mod cases {
                 description: "Lives on another system.".into(),
                 within: None,
                 remote: true,
+                bounds: adam_runtime::SessionBounds::default(),
             },
         ]);
         let again: Vec<adam_model::ToolSpec> = again.tools().iter().map(|t| t.spec()).collect();
@@ -4863,6 +4867,7 @@ fn limits_do_not_change_the_specs() {
             description: "Does a piece of work.".into(),
             within: None,
             remote: false,
+            bounds: adam_runtime::SessionBounds::default(),
         }]
     };
     let specs = |tools: SessionTools| {
@@ -4887,6 +4892,7 @@ fn the_five_specs_are_pinned() {
             description: "Reviews a diff.".into(),
             within: None,
             remote: false,
+            bounds: adam_runtime::SessionBounds::default(),
         },
         SessionAgent {
             name: "explorer".into(),
@@ -4894,6 +4900,7 @@ fn the_five_specs_are_pinned() {
             description: "Reads the repository and answers where and how.".into(),
             within: None,
             remote: false,
+            bounds: adam_runtime::SessionBounds::default(),
         },
     ]);
     let specs: Vec<adam_model::ToolSpec> = roster.tools().iter().map(|t| t.spec()).collect();
