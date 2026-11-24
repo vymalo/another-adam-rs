@@ -1,4 +1,5 @@
-//! Plugins around the agent loop (ADR 0050, slice **H1**): the types, and no wiring into the loop yet.
+//! Plugins around the agent loop (ADR 0050, slice **H1**): the vocabulary, and the shapes the loop
+//! records when it uses them.
 //!
 //! A **plugin** is a compiled hook set: it may rewrite a tool call before it runs, refuse it, ask a
 //! person, stop the run, or rewrite what the tool answered. Three rules make it safe:
@@ -12,8 +13,11 @@
 //! 3. **Order is the declaration order**, and the first verdict other than [`Verdict::Continue`] is
 //!    the set's: a later plugin is not asked once one has decided.
 //!
-//! Deciding *where* these run (inside a journaled step, with the verdict recorded so a replay asks no
-//! hook again) is part 2; this crate is only the vocabulary.
+//! The loop runs a set **inside** the journaled step `tool:<call id>`, with
+//! `LlmAgentBuilder::hooks` of `adam-llm-agent`: after a source's `withhold` and before the tool for
+//! `before_tool`, and once the tool answered for `after_tool`. The verdict is recorded beside the
+//! call's output, so a replay that finds the step recorded asks no hook again. A hook gets no `Ctx`
+//! and cannot add a step.
 
 #![warn(missing_docs)]
 

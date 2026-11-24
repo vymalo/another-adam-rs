@@ -1,10 +1,16 @@
 # adam-plugin
 
 The vocabulary of the hooks around the agent loop ([ADR 0050](../../docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md),
-slice **H1**, first half): a compiled plugin may rewrite a tool call before it runs, refuse it, ask a
-person, stop the run, or rewrite what the tool answered. **Nothing is wired into the loop yet**: this
-crate is the types, and part 2 (the deciding points inside the journaled steps, the verdicts recorded
-so a replay asks no hook again) follows.
+slice **H1**): a compiled plugin may rewrite a tool call before it runs, refuse it, ask a person, stop
+the run, or rewrite what the tool answered.
+
+`adam-llm-agent` wires a set into the loop: `LlmAgentBuilder::hooks(HookSet)` (or `.plugin(one)`) runs
+`before_tool` and `after_tool` **inside** the call's journaled step `tool:<call id>` and records the
+verdict in that step, so a replay that finds the step recorded asks no hook again. A hook gets no
+`Ctx` and adds no step. What the step records is `adam_llm_agent::HookedOutput`
+(`output`, flattened, plus `hooks` and the rewritten `args`); a record written before hooks existed
+is a bare `ToolOutput` and still decodes. This crate is only the vocabulary: it depends on neither the
+loop nor the runtime.
 
 ## The API
 

@@ -708,6 +708,107 @@ impl ToolOutput {
     }
 }
 
+/// One decision a hook set made about a call, as the call's step records it
+/// ([ADR 0050](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md),
+/// decision 2).
+///
+/// The point and the verdict are words, not closed enums, because the journal is read by whatever
+/// build finds it: a later build that adds a verdict or a point writes a record this one reads as
+/// "some hook decided", instead of failing the replay that reads it. Only a verdict other than
+/// `Continue` is recorded; a rewrite is recorded as the arguments the call ran with
+/// ([`HookedOutput::args`]) or as the output it produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookDecision {
+    /// The point the hook ran at: [`TOOL_BEFORE`](Self::TOOL_BEFORE) or [`TOOL_AFTER`](Self::TOOL_AFTER).
+    pub point: String,
+    /// What it said: [`DENY`](Self::DENY), [`ASK`](Self::ASK), [`STOP`](Self::STOP), or
+    /// [`FAILED`](Self::FAILED) when it could not decide.
+    pub verdict: String,
+    /// Why, as a person reads it. Absent when the verdict carries no words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The plugin that could not decide, for a `failed` decision. Absent otherwise:
+    /// [`HookSet`](adam_plugin::HookSet) answers a verdict without saying which plugin gave it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+}
+
+impl HookDecision {
+    /// The point before the call runs.
+    pub const TOOL_BEFORE: &str = "tool.before";
+    /// The point after the tool answered.
+    pub const TOOL_AFTER: &str = "tool.after";
+    /// The call is refused, and the reason is its result.
+    pub const DENY: &str = "deny";
+    /// A person is asked first. Until approval exists (ADR 0050, slice H8) the call is not run.
+    pub const ASK: &str = "ask";
+    /// The run ends after this call, with the reason.
+    pub const STOP: &str = "stop";
+    /// The hook could not decide: the call is denied, or the result becomes an error. Never a pass.
+    pub const FAILED: &str = "failed";
+
+    /// A decision at `point` that said `verdict`.
+    #[must_use]
+    pub fn new(point: &str, verdict: &str, reason: Option<&str>) -> Self {
+        HookDecision {
+            point: point.to_owned(),
+            verdict: verdict.to_owned(),
+            reason: reason.map(str::to_owned),
+            plugin: None,
+        }
+    }
+
+    /// The same decision, naming the plugin that could not decide.
+    #[must_use]
+    pub fn by(mut self, plugin: &str) -> Self {
+        self.plugin = Some(plugin.to_owned());
+        self
+    }
+}
+
+/// What the journaled step `tool:<call id>` records: what the call answered, beside what the hooks
+/// decided about it (ADR 0050, decision 2).
+///
+/// The output is **flattened**, so a record written before hooks existed is exactly a
+/// [`ToolOutput`] and reads here as one with no decision and no rewritten arguments. An older build
+/// reads a record written now as the output, ignoring the members it does not know. The verdict is
+/// in the record, so a replay that finds the step recorded calls no hook again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookedOutput {
+    /// What the call answered.
+    #[serde(flatten)]
+    pub output: ToolOutput,
+    /// What the hooks decided, in the order they decided. Empty when none did, and absent from a
+    /// record written before hooks existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<HookDecision>,
+    /// The arguments the call ran with, when a `before_tool` hook rewrote them. Absent when the model's
+    /// arguments are the ones that ran, and from a record written before hooks existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
+}
+
+impl HookedOutput {
+    /// A call no hook touched.
+    #[must_use]
+    pub fn plain(output: ToolOutput) -> Self {
+        HookedOutput {
+            output,
+            hooks: Vec::new(),
+            args: None,
+        }
+    }
+
+    /// The reason a hook stopped the run, when one did; `None` otherwise.
+    #[must_use]
+    pub fn stopped(&self) -> Option<&str> {
+        self.hooks
+            .iter()
+            .find(|decision| decision.verdict == HookDecision::STOP)
+            .map(|decision| decision.reason.as_deref().unwrap_or_default())
+    }
+}
+
 /// Why a tool call did not produce an output.
 ///
 /// Journaled, hence serializable: the strings are the record and the serde shape is frozen, so
