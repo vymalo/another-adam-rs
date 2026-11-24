@@ -2586,6 +2586,9 @@ impl LlmAgent {
         request.max_output_tokens = (live.max_output_tokens > 0).then_some(live.max_output_tokens);
         // What the newest message activated wins over the agent's resolved default (ADR 0063).
         request.reasoning_effort = context_effort(context).or(live.reasoning_effort);
+        // Kept for the report: a call names the level it asked for, and the request is moved into
+        // the model call before the call is reported (ADR 0063 decision 7).
+        let call_effort = request.reasoning_effort;
 
         let model = self.model.clone();
         let sources = self.sources.clone();
@@ -2807,7 +2810,7 @@ impl LlmAgent {
             Ok(r) => {
                 let usage = r.response.usage.accounted();
                 let call = r.call.clone().unwrap_or_else(|| old_call_id(run, turn));
-                self.report_usage(ctx, state, call, &live_alias, usage)
+                self.report_usage(ctx, state, call, &live_alias, usage, call_effort)
                     .await;
                 usage
             }
@@ -3403,7 +3406,7 @@ impl LlmAgent {
         let (summary, cut_at, rejected) = match recorded {
             Ok(done) => {
                 // The call was made and counts, whatever its summary is worth.
-                self.report_usage(ctx, state, done.call.clone(), &live_alias, done.usage)
+                self.report_usage(ctx, state, done.call.clone(), &live_alias, done.usage, None)
                     .await;
                 state.usage = state.usage.saturating_add(done.usage);
                 state
@@ -3495,8 +3498,12 @@ impl LlmAgent {
         call: String,
         alias: &str,
         usage: adam_model::Usage,
+        effort: Option<ReasoningEffort>,
     ) {
         let mut event = UsageEvent::new(call, alias, usage);
+        if let Some(level) = effort {
+            event = event.with_effort(level);
+        }
         if let Some(provider) = self.model.provider() {
             event = event.with_provider(provider);
         }
