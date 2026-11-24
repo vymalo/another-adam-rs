@@ -18,16 +18,19 @@
 //! * the run is **finished** (`done`, `failed`, which a cancel is) or the store **does not know it**
 //!   (another database, a purged run): what its environment holds is released
 //!   ([`Environment::release`](adam_workspace::Environment::release); nothing, for the coder's own
-//!   container), **then** its workspace is removed, every slot of it. A release that fails leaves the
-//!   workspace for the next sweep: an environment that still holds the files is not left without
-//!   them. The run's notes stay (`<root>/coder/<run>.json`) and so do its `agent/*` branches in the
-//!   mirrors, the only copy of any unpushed commit. **Its scratch projects stay**, though, while
-//!   its conversation is alive (`SCRATCH_IDLE_DAYS`, [`Janitor::with_scratch_idle`]): a scratch
-//!   project lives for the thread, the next task of the conversation takes it over
-//!   ([`RunWorkspace::adopt_scratch`](adam_workspace::RunWorkspace::adopt_scratch)), and it is
-//!   removed once the conversation has had no task for the idle time (an open task, or one that
-//!   finished recently, keeps it). A run the store does not know has no conversation to ask about,
-//!   and a project made without one belongs to its run: both go with it;
+//!   container), **then** its workspace is removed, every slot of it, unless it holds unpushed work
+//!   ([`RunWorkspace::remove_if_pushed`](adam_workspace::RunWorkspace::remove_if_pushed)):
+//!   [ADR 0065](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md)
+//!   decision 7, "it never removes a workspace that holds unpushed work", whatever the budget says.
+//!   A workspace with uncommitted changes, with commits no `origin` ref has, or with **any scratch
+//!   project** (a project has no remote, so all of its work is unpushed) is kept whole, and the
+//!   sweep says so in its log and in [`Sweep::kept_unpushed`]; it is looked at again at every
+//!   sweep, so it goes once its work has reached a remote, or once a later task of its conversation
+//!   has taken its scratch projects over
+//!   ([`RunWorkspace::adopt_scratch`](adam_workspace::RunWorkspace::adopt_scratch)). A release that
+//!   fails leaves the workspace for the next sweep: an environment that still holds the files is
+//!   not left without them. The run's notes stay (`<root>/coder/<run>.json`) and so do its
+//!   `agent/*` branches in the mirrors, the only copy of any unpushed commit;
 //! * a directory whose name is not a run id is not the janitor's and is left alone.
 //!
 //! The kept output of a finished run (`<root>/outputs/<run>`, [`crate::kept`]) is removed with its
@@ -78,15 +81,17 @@ type Verdicts = HashMap<String, Option<bool>>;
 /// What one sweep did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sweep {
-    /// The runs whose workspace was removed.
+    /// The finished runs whose workspace was removed.
     pub removed: Vec<String>,
     /// How many were left: runs that are open, and directories that are not runs.
     pub kept: usize,
     /// The runs the sweep could not decide, release or remove (the error is in the log).
     pub failed: Vec<String>,
-    /// The finished runs whose worktrees were removed and whose scratch projects stay, because their
-    /// conversation is still alive. (Not in `kept`, which counts runs the sweep left whole.)
-    pub kept_scratch: Vec<String>,
+    /// The finished runs whose workspace was **kept because it holds unpushed work** (ADR 0065
+    /// decision 7): a worktree with uncommitted changes or unpushed commits, or a scratch project,
+    /// which has no remote. (Not in `kept`, which counts runs the sweep left whole because they are
+    /// open or are not runs.)
+    pub kept_unpushed: Vec<String>,
     /// The runs whose environment was released although the run has no workspace on this volume
     /// (what a crash left behind).
     pub orphans: Vec<String>,
@@ -137,9 +142,13 @@ impl Janitor {
         }
     }
 
-    /// Keep the scratch projects of a finished run while its conversation has had a task within
-    /// `idle` (`SCRATCH_IDLE_DAYS`), and remove them when it has not. `None`, the default, removes a
-    /// scratch project with its run.
+    /// The idle time of a conversation (`SCRATCH_IDLE_DAYS`): the images of a conversation that has
+    /// had no task for this long go. `None` (the default) and `0` both mean "as soon as it has no
+    /// open run".
+    ///
+    /// A scratch project does **not** go with it: a project has no remote, so it holds unpushed work
+    /// and the sweep keeps its workspace ([`Sweep::kept_unpushed`], ADR 0065 decision 7). The idle
+    /// time names the conversation whose images follow it.
     #[must_use]
     pub fn with_scratch_idle(mut self, idle: Option<Duration>) -> Self {
         self.scratch_idle = idle;
@@ -226,16 +235,14 @@ impl Janitor {
                     }
                     released.insert(run.clone());
                     self.commands.forget_run(&run);
-                    let keep_scratch = match &record {
-                        Some(record) => self.conversation_is_alive(store, record).await,
-                        None => false,
-                    };
+                    // What the workspace holds decides: a worktree with uncommitted changes or
+                    // unpushed commits, or a scratch project (no remote), is never removed
+                    // (ADR 0065 decision 7).
                     let removed = match self.workspaces.run(&run) {
-                        Ok(workspace) if keep_scratch => workspace.remove_keeping_scratch().await,
-                        Ok(workspace) => workspace.remove().await.map(|()| 0),
+                        Ok(workspace) => workspace.remove_if_pushed().await,
                         Err(e) => Err(e),
                     };
-                    // Its kept command output goes with it, whether or not scratch projects stay.
+                    // Its kept command output goes with it, whether or not the workspace stays.
                     if removed.is_ok()
                         && let Err(e) = self.kept.remove_run(&run).await
                     {
@@ -259,15 +266,18 @@ impl Janitor {
                         }
                     }
                     match removed {
-                        Ok(0) => {
+                        Ok(true) => {
                             tracing::info!(%run, "removed the workspace of a finished run");
                             self.forget_released(&run);
                             report.removed.push(run);
                         }
-                        Ok(scratch) => {
-                            tracing::debug!(%run, scratch, "kept the scratch projects of a finished run");
+                        Ok(false) => {
+                            tracing::info!(
+                                %run,
+                                "kept the workspace of a finished run: it holds work no remote has"
+                            );
                             self.remember_released(&run);
-                            report.kept_scratch.push(run);
+                            report.kept_unpushed.push(run);
                         }
                         Err(e) => {
                             tracing::warn!(%run, error = %adam_error::report(&e), "cannot remove the workspace of a finished run");
@@ -395,20 +405,6 @@ impl Janitor {
                 }
             }
         }
-    }
-
-    /// Whether the conversation of the finished run `record` may go on, so that its scratch projects
-    /// stay: a task of it is open, or the newest one was last touched within the idle time. When the
-    /// store cannot say, the projects stay (they are removed at a later sweep, never by a guess).
-    async fn conversation_is_alive(&self, store: &dyn Store, record: &RunRecord) -> bool {
-        let Some(idle) = self.scratch_idle else {
-            return false;
-        };
-        let Some(conversation) = record.conversation_id.as_deref() else {
-            return false;
-        };
-        self.conversation_has_task_within(store, record, conversation, idle)
-            .await
     }
 
     /// Whether `conversation` has a task open, or had one touched within `idle`. A store that
@@ -560,10 +556,14 @@ impl Janitor {
         };
         loop {
             let report = self.sweep(store.as_ref(), &stop).await;
-            if !report.removed.is_empty() || !report.failed.is_empty() {
+            if !report.removed.is_empty()
+                || !report.kept_unpushed.is_empty()
+                || !report.failed.is_empty()
+            {
                 tracing::info!(
                     removed = report.removed.len(),
                     kept = report.kept,
+                    kept_unpushed = report.kept_unpushed.len(),
                     failed = report.failed.len(),
                     "swept the workspaces of finished runs"
                 );

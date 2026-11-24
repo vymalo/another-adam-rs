@@ -418,7 +418,8 @@ A run's files are `Workspaces::run(run)`: a directory of **slots** ([ADR 0008](.
   metadata and the directory, idempotently, under the run's lock and each mirror's; the `agent/*` branches stay. A workspace
   with unreadable metadata is removed anyway. **`remove_keeping_scratch()`** is the same except for the scratch projects that
   have a conversation (they, their metadata and the directory stay for a later `adopt_scratch`); it returns how many stay,
-  and with none it is `remove`. **`Workspaces::runs()`** lists the runs that have anything on disk, in either
+  and with none it is `remove`. It has no caller in `adam-coder`: the janitor keeps a workspace that holds unpushed work
+  whole (`remove_if_pushed`). **`Workspaces::runs()`** lists the runs that have anything on disk, in either
   layout, a partly removed one too, so a sweep of finished runs can finish the job.
 
 ```mermaid
