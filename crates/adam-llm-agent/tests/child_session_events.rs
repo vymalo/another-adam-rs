@@ -195,13 +195,11 @@ async fn child_and_session_events_come_in_a_golden_order_and_again_on_a_replay()
             .collect()
     };
     let all = scripted_run().await;
-    // Whether a round's report is told before the script ends depends on timing too: when one is,
-    // its key is the round's own.
-    for (name, key) in &all {
-        if name == "session.reported" {
-            assert!(key.starts_with("<run>/report_<round>/"), "{key}");
-        }
-    }
+    assert!(
+        all.iter()
+            .any(|(n, k)| n == "session.reported" && k.contains("report_<round>")),
+        "a round's report is told: {all:#?}"
+    );
     let first = without_reports(all);
     let names: Vec<&str> = first.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
