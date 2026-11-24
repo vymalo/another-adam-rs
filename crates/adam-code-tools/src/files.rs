@@ -1966,8 +1966,13 @@ mod tests {
         );
     }
 
+    /// 200k candidates: the scan **finishes** and **respects its caps**. The wall-clock bound is a hang
+    /// detector, not a performance guarantee — a loaded CI runner took the old 10 s bound over the line
+    /// (ANR-599), which said nothing about the algorithm: what bounds the work is `CLOSEST_WANTED_CHARS`,
+    /// `CLOSEST_CANDIDATE_CHARS` and the `stop` check every `CLOSEST_CHECK_EVERY` candidates, and those are
+    /// asserted below on their own.
     #[test]
-    fn closest_paths_over_a_big_tree_is_quick_and_bounded() {
+    fn closest_paths_over_a_big_tree_finishes_and_respects_its_caps() {
         let all: Vec<Vec<u8>> = (0..200_000)
             .map(|i| format!("crates/module-{:03}/src/part-{i:06}/mod.rs", i % 500).into_bytes())
             .collect();
@@ -1977,9 +1982,11 @@ mod tests {
             &all,
             &AtomicBool::new(false),
         );
+        // A hang detector, generous on purpose (see the doc comment): the assertions after it are the
+        // properties this test exists for.
         assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "{:?}",
+            started.elapsed() < Duration::from_secs(60),
+            "the scan took {:?}: a hang, not a slow machine",
             started.elapsed()
         );
         assert_eq!(near.len(), CLOSEST_PATHS, "{near:?}");
