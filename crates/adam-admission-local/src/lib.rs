@@ -212,8 +212,7 @@ impl LocalAdmission {
                 }
                 let missing = need - bucket.available_micro;
                 // Microseconds until `missing` tokens refill, at the bucket's rate.
-                let micros =
-                    missing * 60_000_000 / (u128::from(bucket.capacity).max(1) * MICRO).max(1);
+                let micros = missing * 60 / u128::from(bucket.capacity).max(1);
                 Duration::from_micros(u64::try_from(micros).unwrap_or(u64::MAX))
             };
             if started.elapsed() + shortfall > wait {
@@ -248,9 +247,11 @@ impl Admission for LocalAdmission {
         // The conversation's seat first, so that a conversation waiting for its own share never
         // holds a pool permit another conversation needs.
         let seat = self.acquire_seat(slot, &ask, units, ask.wait).await?;
-        slot.waiting.fetch_add(1, Ordering::SeqCst);
+        // Counting it as a waiter for as long as this future lives, so a cancelled ask stops
+        // counting too (a `fetch_sub` after the await would never run for it).
+        let waiting = Waiting::of(slot);
         let permit = self.acquire_pool(slot, units, ask.wait).await;
-        slot.waiting.fetch_sub(1, Ordering::SeqCst);
+        drop(waiting);
         match permit {
             Some(permit) => Ok(Permit::new(
                 pool,
@@ -292,6 +293,22 @@ impl Admission for LocalAdmission {
     }
 }
 
+/// One ask, counted as waiting until it is dropped.
+struct Waiting<'a>(&'a AtomicU32);
+
+impl<'a> Waiting<'a> {
+    fn of(slot: &'a PoolSlot) -> Self {
+        slot.waiting.fetch_add(1, Ordering::SeqCst);
+        Self(&slot.waiting)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// One bucket: `capacity` tokens per minute, refilled continuously, spent by model calls.
 struct Bucket {
     capacity: u32,
@@ -307,12 +324,13 @@ impl Bucket {
         if elapsed == 0 {
             return;
         }
-        let added = elapsed * u128::from(self.capacity) / 60_000_000;
+        // `capacity` tokens per minute is `capacity / 60` millionths of a token per microsecond.
+        let added = elapsed * u128::from(self.capacity) / 60;
         let capacity = u128::from(self.capacity) * MICRO;
         let gained = (self.available_micro + added).min(capacity);
         if gained > self.available_micro {
             // Advance by exactly the time those tokens took, so the fraction is not lost.
-            let took = (gained - self.available_micro) * 60_000_000 / u128::from(self.capacity);
+            let took = (gained - self.available_micro) * 60 / u128::from(self.capacity);
             self.at += Duration::from_micros(u64::try_from(took).unwrap_or(u64::MAX));
             self.available_micro = gained;
         }

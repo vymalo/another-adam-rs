@@ -298,7 +298,7 @@ impl EngineBuilder {
             Some(effort) => agent.reasoning_effort(Some(effort)),
             None => agent,
         };
-        let mut assembly = agent
+        let bound = agent
             .secrets(secrets)
             .session_limits(limits.sessions)
             .bind(ui.tools().extend(tools))
@@ -306,12 +306,14 @@ impl EngineBuilder {
             .tool_source(ui.screen())
             .max_parallel(limits.max_parallel_tools)
             .model_profiles(profiles)
-            .allow_model_choice()
+            .allow_model_choice();
+        let bound = match admission {
+            Some(admission) => bound.admission(admission),
+            None => bound,
+        };
+        let assembly = bound
             .model(model, alias)
             .map_err(|e| EngineError::Agent(Box::new(e)))?;
-        if let Some(admission) = admission {
-            assembly = assembly.admission(admission);
-        }
         let sessions = assembly.child_sessions().cloned();
         // The models a message may name: what the root agent can be bound to (its own, and each
         // model with a profile that its caps and the deployment's aliases allow).
