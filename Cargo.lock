@@ -201,6 +201,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-admission-local"
+version = "0.1.0"
+dependencies = [
+ "adam-admission-testkit",
+ "adam-budget",
+ "adam-error",
+ "async-trait",
+ "tokio",
+]
+
+[[package]]
+name = "adam-admission-testkit"
+version = "0.1.0"
+dependencies = [
+ "adam-budget",
+ "adam-error",
+ "tokio",
+]
+
+[[package]]
 name = "adam-agent"
 version = "0.1.0"
 dependencies = [
@@ -275,6 +295,7 @@ dependencies = [
  "adam-a2a-runtime",
  "adam-agent-fixture",
  "adam-agent-fs",
+ "adam-budget",
  "adam-core",
  "adam-error",
  "adam-llm-agent",
@@ -300,6 +321,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "adam-budget"
+version = "0.1.0"
+dependencies = [
+ "adam-error",
+ "async-trait",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -346,7 +377,9 @@ dependencies = [
  "adam",
  "adam-a2a",
  "adam-a2a-runtime",
+ "adam-admission-local",
  "adam-agent-fs",
+ "adam-budget",
  "adam-code-tools",
  "adam-code-tools-testkit",
  "adam-core",
@@ -432,6 +465,7 @@ dependencies = [
  "adam-a2a-runtime",
  "adam-agent-fs",
  "adam-assembly",
+ "adam-budget",
  "adam-core",
  "adam-error",
  "adam-llm-agent",
@@ -520,6 +554,7 @@ dependencies = [
 name = "adam-llm-agent"
 version = "0.1.0"
 dependencies = [
+ "adam-budget",
  "adam-core",
  "adam-error",
  "adam-model",
@@ -776,6 +811,7 @@ dependencies = [
  "adam-a2a",
  "adam-a2a-runtime",
  "adam-agent-fs",
+ "adam-budget",
  "adam-core",
  "adam-error",
  "adam-host",

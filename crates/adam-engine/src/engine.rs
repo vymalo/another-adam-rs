@@ -13,6 +13,7 @@ use adam_a2a::{
 use adam_a2a_runtime::{Commands, RuntimeTaskBackend, default_inbound, task_id_for};
 use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
+use adam_budget::DynAdmission;
 use adam_core::{ConversationScope, DynSecretSource, DynStore, RunId, RunQuery, RunStatus};
 use adam_llm_agent::{DEFAULT_MAX_PARALLEL, ToolSet};
 use adam_model::{DynModel, ModelProfiles, ReasoningEffort};
@@ -152,6 +153,7 @@ pub struct EngineBuilder {
     profiles: ModelProfiles,
     reasoning_effort: Option<ReasoningEffort>,
     tools: ToolSet,
+    admission: Option<DynAdmission>,
 }
 
 impl std::fmt::Debug for EngineBuilder {
@@ -171,6 +173,15 @@ impl EngineBuilder {
     /// refuses every name. It replaces whatever source `agent` was given.
     pub fn secrets(mut self, secrets: DynSecretSource) -> Self {
         self.secrets = secrets;
+        self
+    }
+
+    /// The process's pools ([`adam_budget::Admission`], [ADR 0065]): every model call and every tool
+    /// call of every run of this engine asks it for a seat. Without one, nothing is admitted.
+    ///
+    /// [ADR 0065]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md
+    pub fn admission(mut self, admission: DynAdmission) -> Self {
+        self.admission = Some(admission);
         self
     }
 
@@ -257,6 +268,7 @@ impl EngineBuilder {
             profiles,
             reasoning_effort,
             tools,
+            admission,
         } = self;
         if limits.lease_ttl.is_zero() {
             return Err(EngineError::Invalid(
@@ -285,7 +297,7 @@ impl EngineBuilder {
             Some(effort) => agent.reasoning_effort(Some(effort)),
             None => agent,
         };
-        let assembly = agent
+        let bound = agent
             .secrets(secrets)
             .session_limits(limits.sessions)
             .bind(ui.tools().extend(tools))
@@ -293,7 +305,12 @@ impl EngineBuilder {
             .tool_source(ui.screen())
             .max_parallel(limits.max_parallel_tools)
             .model_profiles(profiles)
-            .allow_model_choice()
+            .allow_model_choice();
+        let bound = match admission {
+            Some(admission) => bound.admission(admission),
+            None => bound,
+        };
+        let assembly = bound
             .model(model, alias)
             .map_err(|e| EngineError::Agent(Box::new(e)))?;
         let sessions = assembly.child_sessions().cloned();
@@ -624,6 +641,7 @@ impl Engine {
             profiles: ModelProfiles::default(),
             reasoning_effort: None,
             tools: ToolSet::new(),
+            admission: None,
         }
     }
 

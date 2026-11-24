@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use adam_budget::{Admission, Ask, ConversationId, DynAdmission, Permit, Pool, Refused};
 use adam_core::time::Timestamp;
 use adam_core::{RunId, RunStatus};
 use adam_error::report;
@@ -1220,11 +1221,16 @@ pub struct LlmAgentBuilder {
     model_parking: ModelParking,
     fallback: Option<ModelBinding>,
     choices: Vec<ModelBinding>,
+    admission: Option<DynAdmission>,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
 /// [`LlmAgentBuilder::wait_poll`] says otherwise.
 pub const DEFAULT_WAIT_POLL: Duration = Duration::from_secs(60);
+
+/// How long a tool call waits for the process's tool pool ([`LlmAgentBuilder::admission`]) before it
+/// runs anyway, with a warning: a run never fails because a slot was busy (ADR 0065 decision 4).
+pub const TOOL_ADMISSION_WAIT: Duration = Duration::from_secs(60);
 
 /// Why [`LlmAgentBuilder::try_build`] refused to build an agent.
 ///
@@ -1401,6 +1407,25 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// The process's pools ([`Admission`], [ADR 0065]): every model call takes a seat of
+    /// [`Pool::ModelCalls`] and every tool call one of [`Pool::ToolCalls`], so four runs at once
+    /// never start more calls than the deployment allows. `None` (the default) admits everything:
+    /// a host that sets no ceiling is the ceiling.
+    ///
+    /// * A model call waits five seconds for its seat, then parks the run on the refusal's
+    ///   `retry_after`, as it parks on a provider's `429` (ADR 0061, ADR 0067).
+    /// * A tool call waits up to `TOOL_ADMISSION_WAIT` and then runs anyway, with a warning: a
+    ///   run never fails because a slot was busy (ADR 0065 decision 4).
+    ///
+    /// [ADR 0061]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0061-a-step-names-its-retry-policy.md
+    /// [ADR 0065]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[must_use]
+    pub fn admission(mut self, admission: DynAdmission) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+
     /// The reasoning effort every model call of this agent asks for unless the run's context names
     /// one ([`REASONING_EFFORT_CONTEXT_KEY`], ADR 0063): what an agent folder, its `model_preset`
     /// or its model profile resolves to. `None` (the default) sends nothing, which is the model's
@@ -1554,9 +1579,10 @@ impl LlmAgentBuilder {
         order::prepare(&mut shown, self.max_parallel > 1);
         let fixed_chars = instructions.as_deref().map_or(0, |s| s.chars().count())
             + serde_json::to_string(&shown).map_or(0, |s| s.chars().count());
+        let model = crate::gate::admitted(self.model, self.admission.as_ref(), &self.name);
         LlmAgent {
             name: self.name,
-            model: self.model,
+            model,
             model_alias: self.model_alias,
             instructions,
             tools,
@@ -1579,6 +1605,7 @@ impl LlmAgentBuilder {
             choices: self.choices.into(),
             images_cache: Arc::new(Mutex::new(ImageCache::new())),
             run_chars: Arc::new(Mutex::new(RunChars::default())),
+            admission: self.admission,
         }
     }
 }
@@ -1804,6 +1831,9 @@ pub struct LlmAgent {
     /// The characters of each run's history as this worker last counted it: a turn counts only the
     /// messages appended since, not the whole transcript again.
     run_chars: Arc<Mutex<RunChars>>,
+    /// The process's pools, when the deployment built some: every model call takes a seat of
+    /// [`Pool::ModelCalls`] and every tool call one of [`Pool::ToolCalls`] (ADR 0065).
+    admission: Option<DynAdmission>,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -1912,6 +1942,7 @@ impl LlmAgent {
             model_parking: ModelParking::default(),
             fallback: None,
             choices: Vec::new(),
+            admission: None,
         }
     }
 
@@ -4428,6 +4459,51 @@ impl LlmAgent {
         Ok(None)
     }
 
+    /// A seat of the process's tool pool for `conversation` ([`Pool::ToolCalls`], ADR 0065).
+    ///
+    /// `None` when the deployment built no admission, when the pool can never admit the call, or
+    /// when waiting once more would pass `TOOL_ADMISSION_WAIT`: the call then runs ungated. A run
+    /// never fails because a slot was busy, so the ceiling is a bulkhead and not a barrier.
+    async fn seat_tool(&self, conversation: ConversationId) -> Option<Permit> {
+        let admission = self.admission.as_ref()?;
+        let deadline = std::time::Instant::now() + TOOL_ADMISSION_WAIT;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match admission
+                .admit(Ask::new(Pool::ToolCalls, conversation.clone()).wait(left))
+                .await
+            {
+                Ok(permit) => return Some(permit),
+                Err(Refused::Busy { retry_after, .. }) => {
+                    let pause = retry_after.unwrap_or(Duration::from_millis(50));
+                    if std::time::Instant::now() + pause >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(pause).await;
+                }
+                Err(refused) => {
+                    tracing::warn!(
+                        pool = Pool::ToolCalls.as_str(),
+                        %refused,
+                        "the tool pool cannot admit this call: it runs nevertheless"
+                    );
+                    return None;
+                }
+            }
+        }
+        let limit = admission
+            .snapshot()
+            .pool(Pool::ToolCalls)
+            .map_or(0, adam_budget::PoolUsage::limit);
+        tracing::warn!(
+            pool = Pool::ToolCalls.as_str(),
+            limit,
+            waited_millis = u64::try_from(TOOL_ADMISSION_WAIT.as_millis()).unwrap_or(u64::MAX),
+            "the tool pool stayed full: the call runs nevertheless, over its share"
+        );
+        None
+    }
+
     /// One call of a segment, from its start to its finish: say that it runs, run its step, and say
     /// how it ended, **as it happens**; applying the result to the run is left to the caller, in call
     /// order. An `Err` is a failure of the transition (a transient tool error, the journal).
@@ -4528,6 +4604,13 @@ impl LlmAgent {
                 "a call of a segment has no step to run".to_owned(),
             ));
         };
+        let conversation = prepared
+            .tool_ctx
+            .conversation_id()
+            .map(ConversationId::from)
+            .unwrap_or_else(|| ConversationId::new(emitter.run_id().to_string()));
+        // Held until the call's work is done: the process's tool pool, one share per call.
+        let _seat = self.seat_tool(conversation).await;
         let unjournaled = prepared.unjournaled.clone();
         let work = self.step_work(call, self.source_note(notes, &call.name), prepared);
         let outcome: Result<ToolOutput, ToolError> = step.run(move || work).await?;
@@ -7029,6 +7112,101 @@ mod failure_tests {
         let back: ModelFailure =
             serde_json::from_value(serde_json::to_value(&new).unwrap()).unwrap();
         assert_eq!(back.class, new.class);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use adam_model::MockModel;
+
+    /// An admission that admits everything and records each ask, so a test can see what the loop
+    /// asked for and under which conversation.
+    #[derive(Default)]
+    struct Recorder {
+        asks: Mutex<Vec<(Pool, String, u32)>>,
+    }
+
+    impl Recorder {
+        fn asks(&self) -> Vec<(Pool, String, u32)> {
+            self.asks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl Admission for Recorder {
+        async fn admit(&self, ask: Ask) -> Result<Permit, Refused> {
+            let conversation = ask.conversation.as_str().to_owned();
+            self.asks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((ask.pool, conversation, ask.units));
+            Ok(Permit::new(ask.pool, ask.conversation, ask.units, || {}))
+        }
+
+        fn snapshot(&self) -> adam_budget::Usage {
+            adam_budget::Usage::default()
+        }
+    }
+
+    fn agent(admission: Option<DynAdmission>) -> LlmAgent {
+        let model: DynModel = Arc::new(MockModel::new());
+        match admission {
+            Some(admission) => LlmAgent::builder("t", model, "m")
+                .admission(admission)
+                .build(),
+            None => LlmAgent::builder("t", model, "m").build(),
+        }
+    }
+
+    /// A tool call asks the process's tool pool for one seat, under the run's conversation.
+    #[tokio::test]
+    async fn a_tool_call_takes_a_seat_of_the_tool_pool() {
+        let recorder = Arc::new(Recorder::default());
+        let admission: DynAdmission = Arc::clone(&recorder) as DynAdmission;
+        let agent = agent(Some(admission));
+        let seat = agent.seat_tool(ConversationId::new("talk")).await;
+        assert!(seat.is_some(), "a pool with room admits the call");
+        drop(seat);
+        assert_eq!(
+            recorder.asks(),
+            [(Pool::ToolCalls, "talk".to_owned(), 1)].to_vec()
+        );
+    }
+
+    /// An agent with no admission asks nobody: the host that sets no ceiling is the ceiling.
+    #[tokio::test]
+    async fn a_call_without_an_admission_takes_no_seat() {
+        let agent = agent(None);
+        assert!(
+            agent.seat_tool(ConversationId::new("talk")).await.is_none(),
+            "nothing is asked"
+        );
+    }
+
+    /// Every model call asks the model pool first, under the root run the request names, so every
+    /// turn and every child call of one conversation counts together.
+    #[tokio::test]
+    async fn a_model_call_takes_a_seat_of_the_model_pool() {
+        let recorder = Arc::new(Recorder::default());
+        let admission: DynAdmission = Arc::clone(&recorder) as DynAdmission;
+        let model: DynModel = Arc::new(MockModel::new());
+        let gate = crate::gate::admitted(model, Some(&admission), "t");
+        let mut req = ModelRequest::new("m");
+        req.run = Some("root-run".to_owned());
+        // The mock's answer is the mock's business; the seat is what this proves.
+        let _ = gate.complete(req).await;
+        let asks = recorder.asks();
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        assert_eq!(asks[0].0, Pool::ModelCalls);
+        assert_eq!(asks[0].1, "root-run");
+        assert_eq!(asks[0].2, 1);
+        // A request that names no run is counted under the agent's name.
+        let _ = gate.complete(ModelRequest::new("m")).await;
+        assert_eq!(recorder.asks()[1].1, "t");
     }
 }
 

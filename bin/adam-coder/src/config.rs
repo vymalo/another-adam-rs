@@ -221,6 +221,9 @@ pub struct WorkerConfig {
     pub workers: usize,
     /// `MAX_PARALLEL_TOOL_CALLS`: the most tool calls of one model turn that run at once.
     pub max_parallel_tool_calls: usize,
+    /// The process's ceiling (ADR 0065): `WORKERS`, `MAX_TOOL_CALLS_IN_FLIGHT`, `MAX_MODEL_CALLS`
+    /// and `MODEL_TOKENS_PER_MINUTE`, as `adam-service` read them.
+    pub budget: adam_budget::Budget,
     /// `MAX_CHECK_CYCLES`.
     pub max_check_cycles: u32,
     /// `SCRATCH_CHECK_CYCLES`.
@@ -1141,6 +1144,7 @@ impl WorkerConfig {
             worker_id: settings.worker_id.clone(),
             workers: settings.workers,
             max_parallel_tool_calls: settings.max_parallel_tool_calls,
+            budget: settings.budget(),
             max_check_cycles,
             scratch_check_cycles,
             workspace_sweep: workspace_sweep.map(Duration::from_secs),

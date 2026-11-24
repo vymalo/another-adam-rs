@@ -18,6 +18,9 @@
 //! | `LISTEN_ADDR` | bind address: the A2A server, or for `worker` its `/healthz` listener | `0.0.0.0:8080` |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
 //! | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (`1` is one at a time); an agent file's `limits.max_parallel` may lower it for that agent; read by the roles that run workers ([`WorkerSettings::max_parallel_tool_calls`]) | `10` |
+//! | `MAX_TOOL_CALLS_IN_FLIGHT` | the most tool calls of the whole process that run at the same time, 1 to 256: the process's pool, inside which `MAX_PARALLEL_TOOL_CALLS` still bounds one turn (ADR 0065) | `4` |
+//! | `MAX_MODEL_CALLS` | the most model calls in flight in the process, 1 to 64 (ADR 0065) | `2` |
+//! | `MODEL_TOKENS_PER_MINUTE` | the model's tokens per minute, charged to a bucket the whole process shares (1 to 100000000); unset meters none | unset |
 //! | `SESSION_MAX_OPEN` | the most sessions (a subagent that runs in the background) of one conversation open at once, 1 to 100; read by **every role**; the root agent's `limits.max_open_sessions` may lower it ([`SessionSettings::limits`]) | `16` |
 //! | `SESSION_MAX_WORKING` | the most rounds of one conversation working at once, 1 to 32 and at most `SESSION_MAX_OPEN`; `limits.max_working_sessions` may lower it | `4` |
 //! | `SESSION_MAX_ROUNDS` | the most rounds one session may have, 2 to 200; `limits.max_session_rounds` may lower it | `20` |
@@ -636,6 +639,59 @@ fn parse_max_parallel(get: &impl Fn(&str) -> Option<String>, problems: &mut Vec<
     DEFAULT_MAX_PARALLEL_TOOL_CALLS
 }
 
+/// The default of `MAX_TOOL_CALLS_IN_FLIGHT`: the desktop's four (ADR 0065 decision 11).
+pub const DEFAULT_MAX_TOOL_CALLS_IN_FLIGHT: usize = 4;
+
+/// The most `MAX_TOOL_CALLS_IN_FLIGHT` may say.
+pub const MAX_TOOL_CALLS_IN_FLIGHT_LIMIT: usize = 256;
+
+/// The default of `MAX_MODEL_CALLS`: the desktop's two.
+pub const DEFAULT_MAX_MODEL_CALLS: usize = 2;
+
+/// The most `MAX_MODEL_CALLS` may say.
+pub const MAX_MODEL_CALLS_LIMIT: usize = 64;
+
+/// The most `MODEL_TOKENS_PER_MINUTE` may say.
+pub const MODEL_TOKENS_PER_MINUTE_LIMIT: u32 = 100_000_000;
+
+/// A count variable in `low..=high`, the default when unset or blank, a problem and the default
+/// when it is not.
+fn bounded_count(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    default: usize,
+    high: usize,
+    problems: &mut Vec<String>,
+) -> usize {
+    let n = parse_or(get, name, default, problems);
+    if (1..=high).contains(&n) {
+        return n;
+    }
+    problems.push(format!("{name} must be between 1 and {high}, got {n}"));
+    default
+}
+
+/// `MODEL_TOKENS_PER_MINUTE`: unset or blank meters no tokens; otherwise 1 to
+/// [`MODEL_TOKENS_PER_MINUTE_LIMIT`], and anything else is a problem and no rate.
+fn parse_tokens_per_minute(
+    get: &impl Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+) -> Option<u32> {
+    const NAME: &str = "MODEL_TOKENS_PER_MINUTE";
+    let raw = get(NAME)?;
+    let Ok(n) = raw.trim().parse::<u32>() else {
+        problems.push(format!("{NAME} is invalid ({raw:?}): not a whole number"));
+        return None;
+    };
+    if (1..=MODEL_TOKENS_PER_MINUTE_LIMIT).contains(&n) {
+        return Some(n);
+    }
+    problems.push(format!(
+        "{NAME} must be between 1 and {MODEL_TOKENS_PER_MINUTE_LIMIT}, got {n}"
+    ));
+    None
+}
+
 /// `WORKERS`, `WORKER_ID` and `MAX_PARALLEL_TOOL_CALLS`: how a worker process takes runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerSettings {
@@ -647,6 +703,14 @@ pub struct WorkerSettings {
     /// 1 to [`MAX_PARALLEL_TOOL_CALLS_LIMIT`] (`1` is one at a time). An agent file's
     /// `limits.max_parallel` may lower it for that agent, never raise it.
     pub max_parallel_tool_calls: usize,
+    /// `MAX_TOOL_CALLS_IN_FLIGHT`: the most tool calls of the whole process that run at once, 1 to
+    /// [`MAX_TOOL_CALLS_IN_FLIGHT_LIMIT`]. The per-turn bound sits inside it (ADR 0065).
+    pub max_tool_calls_in_flight: usize,
+    /// `MAX_MODEL_CALLS`: the most model calls in flight in the process, 1 to
+    /// [`MAX_MODEL_CALLS_LIMIT`].
+    pub max_model_calls: usize,
+    /// `MODEL_TOKENS_PER_MINUTE`: the model's tokens per minute, or `None` to meter none.
+    pub model_tokens_per_minute: Option<u32>,
 }
 
 impl WorkerSettings {
@@ -667,10 +731,46 @@ impl WorkerSettings {
             ));
         }
         let max_parallel_tool_calls = parse_max_parallel(&get, problems);
+        let max_tool_calls_in_flight = bounded_count(
+            &get,
+            "MAX_TOOL_CALLS_IN_FLIGHT",
+            DEFAULT_MAX_TOOL_CALLS_IN_FLIGHT,
+            MAX_TOOL_CALLS_IN_FLIGHT_LIMIT,
+            problems,
+        );
+        let max_model_calls = bounded_count(
+            &get,
+            "MAX_MODEL_CALLS",
+            DEFAULT_MAX_MODEL_CALLS,
+            MAX_MODEL_CALLS_LIMIT,
+            problems,
+        );
+        let model_tokens_per_minute = parse_tokens_per_minute(&get, problems);
         Self {
             workers,
             worker_id,
             max_parallel_tool_calls,
+            max_tool_calls_in_flight,
+            max_model_calls,
+            model_tokens_per_minute,
+        }
+    }
+
+    /// The process's budget: this many runs ([`WORKERS`](Self::workers)), the two pools of
+    /// [ADR 0065](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md)
+    /// slice 2 and, when the deployment meters them, the tokens per minute. Every other ceiling is
+    /// `Budget::UNLIMITED`: the slices that build them lower it.
+    #[must_use]
+    pub fn budget(&self) -> adam_budget::Budget {
+        let budget = adam_budget::Budget::builder()
+            .runs(u32::try_from(self.workers).unwrap_or(u32::MAX))
+            .tool_calls(u32::try_from(self.max_tool_calls_in_flight).unwrap_or(u32::MAX))
+            .model_calls(u32::try_from(self.max_model_calls).unwrap_or(u32::MAX))
+            // The share ADR 0065 decision 11 gives one conversation: half of each pool.
+            .per_conversation_share(adam_budget::Ratio::HALF);
+        match self.model_tokens_per_minute {
+            Some(tokens) => budget.tokens_per_minute(tokens).build(),
+            None => budget.build(),
         }
     }
 
@@ -1514,12 +1614,67 @@ mod tests {
                 workers: 4,
                 worker_id: None,
                 max_parallel_tool_calls: 10,
+                max_tool_calls_in_flight: 4,
+                max_model_calls: 2,
+                model_tokens_per_minute: None,
             })
         );
     }
 
     /// `DEFAULT_LOCALE` names the agent's default language: unset is none, a well-formed tag is
     /// kept, a malformed one is a startup problem (exit 78), never a guessed language.
+    /// The pools of ADR 0065 slice 2: read from their variables, with a problem naming each one
+    /// that is out of range, never silently clamped.
+    #[test]
+    fn the_pool_variables_are_read_and_bounded() {
+        let c = parse(&full()).expect("valid");
+        let worker = c.worker.expect("the role runs workers");
+        assert_eq!(worker.max_tool_calls_in_flight, 4);
+        assert_eq!(worker.max_model_calls, 2);
+        assert_eq!(worker.model_tokens_per_minute, None, "unset meters none");
+        let budget = worker.budget();
+        assert_eq!(budget.runs, 4, "WORKERS is the run ceiling");
+        assert_eq!(budget.tool_calls, 4);
+        assert_eq!(budget.model_calls, 2);
+        assert_eq!(budget.tokens_per_minute, None);
+
+        let mut vars = full();
+        vars.insert("MAX_TOOL_CALLS_IN_FLIGHT", "16");
+        vars.insert("MAX_MODEL_CALLS", "8");
+        vars.insert("MODEL_TOKENS_PER_MINUTE", "20000");
+        let worker = parse(&vars).expect("valid").worker.expect("workers");
+        assert_eq!(worker.max_tool_calls_in_flight, 16);
+        assert_eq!(worker.max_model_calls, 8);
+        assert_eq!(worker.model_tokens_per_minute, Some(20_000));
+        assert_eq!(worker.budget().tokens_per_minute, Some(20_000));
+
+        for (name, bad) in [
+            ("MAX_TOOL_CALLS_IN_FLIGHT", "0"),
+            ("MAX_TOOL_CALLS_IN_FLIGHT", "257"),
+            ("MAX_TOOL_CALLS_IN_FLIGHT", "many"),
+            ("MAX_MODEL_CALLS", "0"),
+            ("MAX_MODEL_CALLS", "65"),
+            ("MODEL_TOKENS_PER_MINUTE", "0"),
+            ("MODEL_TOKENS_PER_MINUTE", "100000001"),
+            ("MODEL_TOKENS_PER_MINUTE", "lots"),
+        ] {
+            let mut vars = full();
+            vars.insert(name, bad);
+            assert!(mentions(&problems_of(&vars), name), "{name}={bad}");
+        }
+        // A blank rate meters none, as an unset one does.
+        let mut vars = full();
+        vars.insert("MODEL_TOKENS_PER_MINUTE", "  ");
+        assert_eq!(
+            parse(&vars)
+                .expect("valid")
+                .worker
+                .expect("workers")
+                .model_tokens_per_minute,
+            None
+        );
+    }
+
     #[test]
     fn default_locale_is_a_well_formed_tag_or_a_startup_problem() {
         assert!(parse(&full()).expect("valid").default_locale.is_none());

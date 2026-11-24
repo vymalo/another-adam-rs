@@ -19,6 +19,7 @@ adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.1.0", default-fe
 adam-agent-fs.workspace = true
 # `sessions`: `child-sessions/v1` for local subagents, without the A2A client (`remote`).
 adam-assembly = { path = "../adam-assembly", version = "0.1.0", default-features = false, features = ["sessions"] }
+adam-budget.workspace = true
 adam-core.workspace = true
 adam-error.workspace = true
 adam-llm-agent.workspace = true

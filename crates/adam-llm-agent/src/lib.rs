@@ -143,6 +143,7 @@ mod compaction;
 mod conversation;
 mod early;
 mod fn_tool;
+mod gate;
 mod history;
 mod images;
 mod kept;

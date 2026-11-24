@@ -38,6 +38,7 @@ a2a-lf = { workspace = true, optional = true }
 # Without their defaults (the A2A server, push), so `sessions` alone brings no server or TLS; `a2a`
 # turns the defaults back on, and a server build is unchanged.
 adam-a2a = { path = "../adam-a2a", version = "0.1.0", default-features = false, optional = true }
+adam-budget.workspace = true
 adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.1.0", default-features = false, optional = true }
 adam-agent-fs.workspace = true
 adam-core.workspace = true

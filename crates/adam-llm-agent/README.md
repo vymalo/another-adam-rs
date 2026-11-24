@@ -19,7 +19,7 @@ instructions + a model + a toolset. It is served over A2A by
 | Item | What |
 |---|---|
 | `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
-| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.reasoning_effort(Option<ReasoningEffort>)` (the level every turn asks for unless the run's context names one: see *Reasoning effort*), `.model_parking(ModelParking)` (how a run waits on a model that refused it: see *A run parked on the model*), `.model_fallback(ModelBinding)` (the model a run continues on, once, when its own is locked: see *A locked model*), `.model_choices(Vec<ModelBinding>)` (the models a message may name through `MODEL_CONTEXT_KEY`), `.build()` |
+| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.reasoning_effort(Option<ReasoningEffort>)` (the level every turn asks for unless the run's context names one: see *Reasoning effort*), `.model_parking(ModelParking)` (how a run waits on a model that refused it: see *A run parked on the model*), `.model_fallback(ModelBinding)` (the model a run continues on, once, when its own is locked: see *A locked model*), `.model_choices(Vec<ModelBinding>)` (the models a message may name through `MODEL_CONTEXT_KEY`), `.admission(DynAdmission)` (the process's pools, ADR 0065: every model call takes a seat of `Pool::ModelCalls` and every tool call one of `Pool::ToolCalls`; see *The process's pools*), `.build()` |
 | `ModelParking`, `ModelWait`, `ModelPark`, `MODEL_RESUME_KIND`, `DEFAULT_MODEL_PARK_LIMIT`, `MAX_MODEL_BACKOFF` | a run parked on the model (ADR 0067): `ModelParking::new(limit).when_unreachable(bool)`, the default a limit of 24 h and an unreachable endpoint that fails as before; `Conversation::model_wait` is the `ModelWait` of a parked run (`reason`, `status`, `slug`, `park`, `parked_since`, `parks`, `wake_at`); see *A run parked on the model* |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*); it also splits and joins the conversation exactly like `LlmAgent` (`AgentStarter::split`/`join`), so a run it starts is written with a head and a body, not left in the v4 format |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens` (the cap a call asks for; `0` leaves it to the model, and `Limits::default()` is 4,096 for a hand-built agent: the 128,000 fallback and the model's profile are resolved and clamped by the assembly, ADR 0064), `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
@@ -829,6 +829,27 @@ ADR 0037 says of its state: a worker that has not been rolled runs a tool whose 
   otherwise** (`adam-runtime`, `adam-assembly`).
 
 ## Parallel tool calls
+
+## The process's pools
+
+`LlmAgentBuilder::admission(DynAdmission)` ([ADR 0065](../../docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md))
+hands the agent the process's admission, and then two pools bound it:
+
+* **Model calls.** The model client is wrapped in `gate::Admitted`, so every `complete` and every
+  `stream` asks for one seat of `Pool::ModelCalls` first and holds it until the answer or the
+  stream ends (a cancelled stream gives it back). The conversation it counts under is the root run
+  the request names (`ModelRequest::run`, which the loop always sets), so every turn, summary and
+  child call of one conversation counts together; a request that names no run counts under the
+  agent's name. The call waits `gate::WAIT` (5 s) for a seat and then parks the run on the
+  refusal's `retry_after`: a full pool is a `RateLimited` model failure, which the loop already
+  waits and retries on (ADR 0061, ADR 0067). When the budget meters tokens, the call also charges
+  its estimate: the request's text at four characters a token plus `max_output_tokens`.
+* **Tool calls.** Each call takes one seat of `Pool::ToolCalls` for the duration of its work. It
+  waits up to `TOOL_ADMISSION_WAIT` (60 s) and then runs anyway with a `WARN` that names the pool
+  and its limit: **a run never fails because a slot was busy** (ADR 0065 decision 4). A ceiling of
+  zero, or another refusal that can never pass, is the same: the call runs, and the warning says so.
+
+Without `.admission(..)` nothing is admitted: a host that sets no ceiling is the ceiling.
 
 The calls of one model turn run at the same time, up to `LlmAgentBuilder::max_parallel(n)` (10 by default, clamped to
 1..=32; `1` is one after another). [ADR 0049](../../docs/decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)

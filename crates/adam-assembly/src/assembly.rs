@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent, ToolsLoading};
+use adam_budget::DynAdmission;
 use adam_llm_agent::{
     DEFAULT_MAX_PARALLEL, DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder,
     MAX_PARALLEL_LIMIT, ModelBinding, ModelParking, SESSION_TOOLS, StepIo, ToolSource,
@@ -41,6 +42,7 @@ pub struct BoundDef {
     wait_poll: Option<Duration>,
     max_parallel: Option<usize>,
     model_parking: Option<ModelParking>,
+    admission: Option<DynAdmission>,
     session_limits: SessionLimits,
     #[cfg(feature = "sessions")]
     child_sessions: Option<adam_a2a_runtime::ChildSessions>,
@@ -88,6 +90,7 @@ impl BoundDef {
             wait_poll: None,
             max_parallel: None,
             model_parking: None,
+            admission: None,
             session_limits,
             #[cfg(feature = "sessions")]
             child_sessions: None,
@@ -205,6 +208,16 @@ impl BoundDef {
     #[must_use]
     pub fn model_parking(mut self, parking: ModelParking) -> Self {
         self.model_parking = Some(parking);
+        self
+    }
+
+    /// The process's pools ([`adam_budget::Admission`], [ADR 0065]): every agent built here asks it
+    /// for every model call and every tool call. Without one, nothing is admitted.
+    ///
+    /// [ADR 0065]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md
+    #[must_use]
+    pub fn admission(mut self, admission: DynAdmission) -> Self {
+        self.admission = Some(admission);
         self
     }
 
@@ -749,6 +762,9 @@ impl BoundDef {
         }
         if let Some(parking) = self.model_parking {
             builder = builder.model_parking(parking);
+        }
+        if let Some(admission) = &self.admission {
+            builder = builder.admission(Arc::clone(admission));
         }
         for (tool, _, policy) in &node.retry {
             builder = builder.tool_retry(tool.clone(), *policy);

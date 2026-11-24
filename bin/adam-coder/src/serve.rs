@@ -112,6 +112,11 @@ async fn build_agent(
     settings.language_server_idle = worker.language_server_idle;
     settings.language_servers_max = worker.language_servers_max;
     settings.max_parallel_tool_calls = worker.max_parallel_tool_calls;
+    // The process's pools (ADR 0065): the tool calls and model calls in flight of every run. One
+    // admission per process, shared by the agent and its subagents.
+    settings.admission = Some(Arc::new(adam_admission_local::LocalAdmission::new(
+        worker.budget.clone(),
+    )));
     // A refused model call parks the run (ADR 0067); behind the injector, so does a gateway that
     // cannot be reached.
     settings.model_parking = adam_llm_agent::ModelParking::new(worker.model.park_limit)

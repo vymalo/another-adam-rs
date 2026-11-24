@@ -357,6 +357,22 @@ the messages name the key (``gave up after 3 attempts of `fetch` ``); see the
 [adam-runtime README](../../crates/adam-runtime/README.md#retries-per-step). Any other class fails the run. A store error while stepping is decided by class: `Corrupt` and
 `Invalid` fail the run; everything else leaves the run to its lease and is logged with its class.
 
+## Admission refusals
+
+A resource budget ([ADR 0065](../decisions/0065-resource-governance-admission-pools-and-os-limits.md))
+refuses an ask with `adam_budget::Refused`, which implements `Classify` and adds **no class**:
+
+| Refusal | Class | What happens |
+|---|---|---|
+| `Busy { pool, retry_after }`, `TokensPerMinute { retry_after }` | `RateLimited` | the run waits a short queue and then parks until `retry_after`, as it does at `max(backoff, retry_after)` (ADR 0061); never a failed run |
+| `DiskFull { used, limit }` | `Rejected` | the person is asked to free space or raise the limit |
+| `TooLarge { what, asked, limit }` | `Invalid` | refused, naming the limit and its value: the same ask never fits |
+
+A model call whose seat is refused is a `ModelError::RateLimited` with the refusal's `retry_after`, so
+the loop's existing park handles it; a request over the whole token rate is `ModelError::InvalidRequest`.
+A tool call is never refused: it waits up to a minute and then runs anyway with a warning, because a run
+never fails because a slot was busy (ADR 0065 decision 4).
+
 ## Exit codes
 
 Values are BSD `sysexits.h` numbers (*unverified*: from memory). The code is found by walking the
