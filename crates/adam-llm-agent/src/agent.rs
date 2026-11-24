@@ -5917,7 +5917,7 @@ fn decide_before(
         tool,
         arguments: &mut *args,
     });
-    let refuse = |verdict: &str, reason: String, plugin: Option<&str>| {
+    let mut refuse = |verdict: &str, reason: String, plugin: Option<&str>| {
         let decision = match plugin {
             Some(plugin) => {
                 HookDecision::new(HookDecision::TOOL_BEFORE, verdict, Some(&reason)).by(plugin)
@@ -6003,7 +6003,7 @@ fn decide_after(
     );
     // What a refusal leaves: the reason as an error result, and the time the call already ran still
     // counted, nothing else kept.
-    let refuse = |output: ToolOutput, verdict: &str, reason: String, plugin: Option<&str>| {
+    let mut refuse = |output: ToolOutput, verdict: &str, reason: String, plugin: Option<&str>| {
         let decision = match plugin {
             Some(plugin) => {
                 HookDecision::new(HookDecision::TOOL_AFTER, verdict, Some(&reason)).by(plugin)
