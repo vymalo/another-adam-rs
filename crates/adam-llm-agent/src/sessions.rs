@@ -866,8 +866,7 @@ impl Tool for Read {
             description: format!(
                 "Read the report of a session's latest round: its state, its round number and, \
                  once the round has ended, the subagent's answer (paged: `offset` and `limit` are \
-                 lines). While the round works the result says so; one that waits for the person \
-                 says `blocked` and what it asked. To wait for it, call again with wait: true, \
+                 lines). While the round works the result says so. To wait for it, call again with \
                  which returns when the round has ended: never poll by calling again and again, \
                  which gets the same answer and is refused after two. A wait returns the first \
                  page. Closing is {SUBAGENT_CLOSE}."
