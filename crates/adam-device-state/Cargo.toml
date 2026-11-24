@@ -1,0 +1,15 @@
+[package]
+name = "adam-device-state"
+description = "The device-state port of adam-rs: the battery, thermal, network and memory-pressure readings a host pushes, and the in-process fake they are tested with"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dev-dependencies]
+adam-device-state-testkit = { path = "../adam-device-state-testkit" }
+
+[lints]
+workspace = true

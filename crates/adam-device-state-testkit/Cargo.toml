@@ -1,0 +1,16 @@
+[package]
+name = "adam-device-state-testkit"
+description = "The conformance suite of adam-device-state's DeviceState port: a device_state_conformance! macro that proves an implementation reports each reading the host pushes"
+readme = "README.md"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-device-state.workspace = true
+
+[lints]
+workspace = true

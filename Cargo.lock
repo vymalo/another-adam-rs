@@ -441,6 +441,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-device-state"
+version = "0.1.0"
+dependencies = [
+ "adam-device-state-testkit",
+]
+
+[[package]]
+name = "adam-device-state-testkit"
+version = "0.1.0"
+dependencies = [
+ "adam-device-state",
+]
+
+[[package]]
 name = "adam-egress"
 version = "0.1.0"
 dependencies = [
