@@ -4210,25 +4210,7 @@ impl LlmAgent {
     /// tool that does not declare. A call that takes no step (bad arguments, a tool nobody has) shares
     /// nothing.
     fn access_of(&self, call: &ToolCall) -> ToolAccess {
-        if call.invalid_arguments.is_some() {
-            return ToolAccess::Independent;
-        }
-        match self.tool(&call.name) {
-            Some(tool) => {
-                if tool.asks_user() || is_session_tool(&call.name) {
-                    ToolAccess::Alone
-                } else {
-                    tool.access(&call.arguments)
-                }
-            }
-            None if self.sources.is_empty() => ToolAccess::Independent,
-            None => self
-                .sources
-                .iter()
-                .map(|source| source.access(&call.name, &call.arguments))
-                .find(|access| !access.is_alone())
-                .unwrap_or(ToolAccess::Alone),
-        }
+        access_of(self.tool(&call.name), &self.sources, call)
     }
 
     /// How many of the owed calls, from the first, run together as one segment: `1` when the first
@@ -4927,10 +4909,6 @@ impl LlmAgent {
         } = prepared;
         let call = call.clone();
         let name = call.name.clone();
-        // The access the schedule was made from (ADR 0049): a rewrite may not change what the call
-        // touches, or two calls that the loop ran at once would have been run in the wrong order.
-        let scheduled = self.access_of(&call);
-        let agent = self.clone();
         let hooks = Arc::clone(&self.hooks);
         let own = self.tool(&call.name).cloned();
         let sources = self.sources.clone();
@@ -4956,12 +4934,11 @@ impl LlmAgent {
             // `tool.before`: the arguments a rewrite made, or a verdict that ends the call here.
             let refusal = decide_before(
                 &hooks,
-                &name,
-                &mut args,
-                &mut hooks_run,
-                &agent,
                 &call,
-                &scheduled,
+                &mut args,
+                own.as_ref(),
+                &sources,
+                &mut hooks_run,
             )?;
             if let Some(refusal) = refusal {
                 return Ok(refusal);
@@ -5889,6 +5866,32 @@ impl Conversation {
     }
 }
 
+/// What a call with the arguments in `call` shares with the other calls of its turn, from the agent's
+/// own tool and its sources: [`LlmAgent::access_of`] is this, for a call the loop is scheduling.
+///
+/// The loop asks it twice for a call a hook rewrote — the schedule was made from the model's
+/// arguments, and the rewrite runs only if it changes nothing (ADR 0049, ADR 0050 decision 7).
+fn access_of(own: Option<&DynTool>, sources: &[DynToolSource], call: &ToolCall) -> ToolAccess {
+    if call.invalid_arguments.is_some() {
+        return ToolAccess::Independent;
+    }
+    match own {
+        Some(tool) => {
+            if tool.asks_user() || is_session_tool(&call.name) {
+                ToolAccess::Alone
+            } else {
+                tool.access(&call.arguments)
+            }
+        }
+        None if sources.is_empty() => ToolAccess::Independent,
+        None => sources
+            .iter()
+            .map(|source| source.access(&call.name, &call.arguments))
+            .find(|access| !access.is_alone())
+            .unwrap_or(ToolAccess::Alone),
+    }
+}
+
 /// The hooks' `before_tool` for one call (ADR 0050, slice H1): they may rewrite the arguments in
 /// `args`, and the first verdict other than `Continue` decides. `Some(output)` is the refusal the
 /// call ends with — its result, and what the step records; `None` means the call runs.
@@ -5900,16 +5903,16 @@ impl Conversation {
 /// model's arguments (ADR 0049).
 fn decide_before(
     hooks: &HookSet,
-    tool: &str,
-    args: &mut Value,
-    recorded: &mut Vec<HookDecision>,
-    agent: &LlmAgent,
     call: &ToolCall,
-    scheduled: &ToolAccess,
+    args: &mut Value,
+    own: Option<&DynTool>,
+    sources: &[DynToolSource],
+    recorded: &mut Vec<HookDecision>,
 ) -> Result<Option<HookedOutput>, ToolError> {
     if hooks.is_empty() {
         return Ok(None);
     }
+    let tool = call.name.as_str();
     let verdict = hooks.before_tool(&mut HookedCall {
         tool,
         arguments: &mut *args,
@@ -5935,7 +5938,10 @@ fn decide_before(
             }
             let mut rewritten = call.clone();
             rewritten.arguments = args.clone();
-            if &agent.access_of(&rewritten) == scheduled {
+            // The schedule of the turn was made from the model's arguments (ADR 0049): a rewrite that
+            // would change what the call touches is refused, because two calls the loop started
+            // together were ordered from the arguments it has.
+            if access_of(own, sources, &rewritten) == access_of(own, sources, call) {
                 return Ok(None);
             }
             Ok(Some(refuse(

@@ -866,6 +866,9 @@ they are added in is the order their hooks run in. `adam-plugin` holds the vocab
 * **What takes no hook.** A call that takes no step (arguments that are not JSON, a tool nobody has,
   the `after_previous` refusal) runs no hook: a decision is recorded in the step it would have
   changed, and there is none. A call a source holds back runs none either.
+* **A call that starts while the model writes** (ADR 0049) runs its hooks when it starts, and its
+  step is written once the stream ends: a stream that fails runs its hooks again with the call, and
+  the recorded step is the one no later replay asks about.
 
 Tests: `tests/hooks.rs` — a replay past the step's journal write asks no hook again (a counter that
 stays at 1 while the unrecorded call's reaches 2), a rewrite that changes `Tool::access` is denied (the
