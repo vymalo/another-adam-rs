@@ -13,7 +13,7 @@ use adam_model::{
     Classify, DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse,
     ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
-use adam_plugin::{HookSet, HookedCall, HookedText, Plugin, Verdict};
+use adam_plugin::{HookSet, HookedCall, HookedMessage, HookedText, MessageFile, Plugin, Verdict};
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
     CancelToken, ChildLook, ChildStarter, ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES,
@@ -249,8 +249,8 @@ use crate::state::Extensions;
 use crate::step_io::StepIo;
 use crate::text_stream;
 use crate::tool::{
-    AnswerCheck, DEFAULT_TOOL_TIME_LIMIT, DynTool, HookDecision, HookedOutput, Refusal, RemotePoll,
-    StepStyle, TOOL_STOP_GRACE, Tool, ToolCtx, ToolError, ToolOutput,
+    AnswerCheck, DEFAULT_TOOL_TIME_LIMIT, DynTool, HookDecision, HookedOutput, MessageDecision,
+    Refusal, RemotePoll, StepStyle, TOOL_STOP_GRACE, Tool, ToolCtx, ToolError, ToolOutput,
 };
 use crate::toolset::ToolSet;
 
@@ -388,13 +388,35 @@ struct CallFacts {
     removed_tools: Arc<[String]>,
 }
 
+/// The runs a call reads, owned: the root run, the step of it a child works under, the plan, the run
+/// the call's model names ([`model_run_of`]) and the run whose workspace it reads
+/// ([`workspace_run_of`]). What [`EarlyFacts`] takes while the model is still writing.
+type OwnedRootFacts = (
+    Option<RunId>,
+    Option<String>,
+    Option<Plan>,
+    Option<RunId>,
+    Option<RunId>,
+);
+
+/// [`OwnedRootFacts`], borrowed from it for one call.
+type RootFacts<'a> = (
+    Option<RunId>,
+    Option<&'a str>,
+    Option<&'a Plan>,
+    Option<RunId>,
+    Option<RunId>,
+);
+
 /// What the calls of a turn that starts while the model writes need from the run, owned: taken
 /// from the state and the `Ctx` before [`Ctx::step`], which is where they start.
 struct EarlyFacts {
     ctx: CtxFacts,
     /// The step's one shared copy of the run's context: every call of the turn reads the same map.
     context: Option<Arc<Map<String, Value>>>,
-    root: (Option<RunId>, Option<String>, Option<Plan>, Option<RunId>),
+    /// The runs the calls read: the root, the step under it, the plan, the run the model calls
+    /// name, and the run whose workspace they read ([`workspace_run_of`]).
+    root: OwnedRootFacts,
     kept: Arc<BTreeMap<String, String>>,
     kept_left: usize,
     files_used: u64,
@@ -475,12 +497,13 @@ impl<'a> Early<'a> {
     }
 
     /// The root, root step and plan of the run, as [`prepare`](LlmAgent::prepare) takes them.
-    fn root(&self) -> (Option<RunId>, Option<&str>, Option<&Plan>, Option<RunId>) {
+    fn root(&self) -> RootFacts<'_> {
         (
             self.facts.root.0,
             self.facts.root.1.as_deref(),
             self.facts.root.2.as_ref(),
             self.facts.root.3,
+            self.facts.root.4,
         )
     }
 
@@ -2680,6 +2703,10 @@ impl LlmAgent {
                 context.cloned().unwrap_or_default(),
             )
             .with_task(state.task())
+            .with_workspace_run(
+                workspace_run_of(state)
+                    .unwrap_or_else(|| state.root_run.unwrap_or_else(|| ctx.run_id())),
+            )
             .with_loaded(Arc::from(state.loaded.clone()))
             .with_removed_tools(Arc::from(state.removed_tools.clone()))
         });
@@ -2733,6 +2760,7 @@ impl LlmAgent {
                 state.root_step.clone(),
                 state.plan.clone(),
                 model_run_of(state),
+                workspace_run_of(state),
             ),
             kept: Arc::clone(&state.kept_outputs),
             kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
@@ -3402,6 +3430,10 @@ impl LlmAgent {
                 Arc::new(state.context.clone()),
             )
             .with_task(state.task())
+            .with_workspace_run(
+                workspace_run_of(state)
+                    .unwrap_or_else(|| state.root_run.unwrap_or_else(|| ctx.run_id())),
+            )
             .with_loaded(Arc::from(state.loaded.clone()))
             .with_removed_tools(Arc::from(state.removed_tools.clone()))
         });
@@ -3644,6 +3676,7 @@ impl LlmAgent {
                     state.root_step.as_deref(),
                     state.plan.as_ref(),
                     model_run_of(state),
+                    workspace_run_of(state),
                 ),
                 &state.source_notes,
                 "report",
@@ -4027,6 +4060,7 @@ impl LlmAgent {
                         state.root_step.as_deref(),
                         state.plan.as_ref(),
                         model_run_of(state),
+                        workspace_run_of(state),
                     ),
                     &state.source_notes,
                     &call,
@@ -4292,6 +4326,7 @@ impl LlmAgent {
             state.root_step.as_deref(),
             state.plan.as_ref(),
             model_run_of(state),
+            workspace_run_of(state),
         );
         let facts_of_ctx = CtxFacts::of(ctx);
         let mut slots: Vec<Option<Slot>> = Vec::with_capacity(n);
@@ -4838,7 +4873,7 @@ impl LlmAgent {
         &self,
         ctx: &CtxFacts,
         context: Option<&Arc<Map<String, Value>>>,
-        root: (Option<RunId>, Option<&str>, Option<&Plan>, Option<RunId>),
+        root: RootFacts<'_>,
         notes: &[ToolNote],
         call: &ToolCall,
         facts: CallFacts,
@@ -4880,6 +4915,7 @@ impl LlmAgent {
                     context.cloned().unwrap_or_default(),
                 )
                 .with_task(task.as_deref())
+                .with_workspace_run(root.4.unwrap_or_else(|| root.0.unwrap_or(ctx.run)))
                 .with_loaded(loaded)
                 .with_removed_tools(removed_tools),
             )
@@ -4993,7 +5029,7 @@ impl LlmAgent {
         &self,
         ctx: &mut Ctx,
         context: Option<&Arc<Map<String, Value>>>,
-        root: (Option<RunId>, Option<&str>, Option<&Plan>, Option<RunId>),
+        root: RootFacts<'_>,
         notes: &[ToolNote],
         call: &ToolCall,
         facts: CallFacts,
@@ -5411,12 +5447,7 @@ impl LlmAgent {
         &self,
         ctx: &CtxFacts,
         context: Option<&Arc<Map<String, Value>>>,
-        (root_run, root_step, plan, model_run): (
-            Option<RunId>,
-            Option<&str>,
-            Option<&Plan>,
-            Option<RunId>,
-        ),
+        (root_run, root_step, plan, model_run, workspace_run): RootFacts<'_>,
         notes: &[ToolNote],
         call_id: &str,
         tool: &str,
@@ -5437,6 +5468,7 @@ impl LlmAgent {
                 .event(tool, call_id, StepState::Running),
         )
         .with_model_run(model_run.or(root_run).unwrap_or(ctx.run))
+        .with_workspace_run(workspace_run.or(root_run).unwrap_or(ctx.run))
         .with_plan(plan.cloned())
     }
 
@@ -5596,6 +5628,7 @@ impl LlmAgent {
                     state.root_step.as_deref(),
                     state.plan.as_ref(),
                     model_run_of(state),
+                    workspace_run_of(state),
                 ),
                 &state.source_notes,
                 &wait.call_id,
@@ -5843,6 +5876,14 @@ fn model_run_of(state: &Conversation) -> Option<RunId> {
         .or(state.root_run)
 }
 
+/// The run whose workspace this run's calls read, when its session's header names one (ADR 0045
+/// slice 7): the task a person's session was opened in, so its rounds read that repository. `None`
+/// when the run is no round of a session, or its session names none; the calls then read the
+/// workspace of [`ToolCtx::root_run_id`](crate::ToolCtx::root_run_id), as they always did.
+fn workspace_run_of(state: &Conversation) -> Option<RunId> {
+    state.session.as_ref().and_then(|header| header.workspace)
+}
+
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
 /// [`LlmAgent::init`] and [`LlmStarter::init`], so they cannot drift apart.
 fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
@@ -5864,6 +5905,240 @@ fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
 fn start_text(input: &Inbound) -> Result<String, AgentError> {
     parse_user_text(&input.payload)
         .map_err(|reason| AgentError::permanent(format!("unusable start message: {reason}")))
+}
+/// The name of the step that decides the message a run starts with (`message.received`, ADR 0050
+/// slice H1b). It is taken only when a hook set is installed.
+const START_MESSAGE_STEP: &str = "message:start";
+
+/// The step that decides one message delivered to a running run: `message:<inbound id>`.
+fn message_step(inbound: &Inbound) -> String {
+    format!("message:{}", inbound.id)
+}
+
+/// Why a `message.received` hook could not decide: the step records it so a retryable failure
+/// fails the transition, which the runtime tries again (ADR 0050, decision 8).
+#[derive(Debug, Serialize, Deserialize)]
+struct MessageStepError {
+    plugin: String,
+    reason: String,
+}
+
+/// Asks the `message.received` hooks about one message, inside the journaled step `name` (ADR 0050,
+/// slice H1b). A recorded step is what a replay applies, so no hook is asked again. A plan that
+/// cannot read the record is the runtime's `NonDeterminism`, as for any step.
+async fn decide_message(
+    agent_hooks: &Arc<HookSet>,
+    ctx: &mut Ctx,
+    name: &str,
+    text: &str,
+    files: Vec<MessageFile>,
+) -> Result<MessageDecision, AgentError> {
+    let hooks = Arc::clone(agent_hooks);
+    let original = text.to_owned();
+    let decided = ctx
+        .step(
+            name,
+            move || async move { ask_message(&hooks, original, files) },
+        )
+        .await?;
+    match decided {
+        Ok(decision) => Ok(decision),
+        Err(error) => Err(AgentError::transient(format!(
+            "the hook {} could not decide a message: {}",
+            error.plugin, error.reason
+        ))),
+    }
+}
+
+/// What the hooks say about one message: allowed as it was, rewritten, or refused. A hook that
+/// cannot say `Continue` never lets the message through.
+fn ask_message(
+    hooks: &HookSet,
+    mut text: String,
+    files: Vec<MessageFile>,
+) -> Result<MessageDecision, MessageStepError> {
+    let original = text.clone();
+    let decided = {
+        let mut message = HookedMessage {
+            text: &mut text,
+            files: &files,
+        };
+        hooks.message_received(&mut message)
+    };
+    Ok(match decided {
+        Ok(None) => MessageDecision {
+            text: (text != original).then_some(text),
+            hook: None,
+        },
+        Ok(Some(decided)) => {
+            let plugin = decided.plugin;
+            match decided.verdict {
+                Verdict::Continue => MessageDecision {
+                    text: (text != original).then_some(text),
+                    hook: None,
+                },
+                Verdict::Deny(reason) => MessageDecision {
+                    text: None,
+                    hook: Some(
+                        HookDecision::new(
+                            HookDecision::MESSAGE_RECEIVED,
+                            HookDecision::DENY,
+                            Some(&reason),
+                        )
+                        .by(plugin),
+                    ),
+                },
+                Verdict::Stop(reason) => MessageDecision {
+                    text: None,
+                    hook: Some(
+                        HookDecision::new(
+                            HookDecision::MESSAGE_RECEIVED,
+                            HookDecision::STOP,
+                            Some(&reason),
+                        )
+                        .by(plugin),
+                    ),
+                },
+                // The point allows, rewrites or refuses: an ask is a verdict this point does not
+                // have, so it is a failure of the hook and the message does not go through.
+                Verdict::Ask(reason) => refuse_at_message(
+                    plugin,
+                    &format!(
+                        "the hook asked at message.received, which only allows or refuses: {reason}"
+                    ),
+                ),
+            }
+        }
+        Err(error) if error.is_retryable() => {
+            return Err(MessageStepError {
+                plugin: error.plugin,
+                reason: error.reason,
+            });
+        }
+        Err(error) => refuse_at_message(&error.plugin, &error.reason),
+    })
+}
+
+/// A message refused because the hook could not decide a verdict of this point.
+fn refuse_at_message(plugin: &str, reason: &str) -> MessageDecision {
+    MessageDecision {
+        text: None,
+        hook: Some(
+            HookDecision::new(
+                HookDecision::MESSAGE_RECEIVED,
+                HookDecision::FAILED,
+                Some(reason),
+            )
+            .by(plugin),
+        ),
+    }
+}
+
+/// Decide the messages that arrived (`message.received`, ADR 0050 slice H1b) and return the ones the
+/// run keeps: each in a journaled step of its own, so a replay asks no hook again. A refused message
+/// is left out and its plugin and reason are said as progress; the task goes on. A message the run
+/// already read, or one that is not a person's words, is returned as it is.
+async fn decide_inbox(
+    hooks: &Arc<HookSet>,
+    ctx: &mut Ctx,
+    state: &mut Conversation,
+    inbox: Vec<Inbound>,
+) -> Result<Vec<Inbound>, AgentError> {
+    if hooks.is_empty() {
+        return Ok(inbox);
+    }
+    let mut kept = Vec::with_capacity(inbox.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for mut inbound in inbox {
+        if state.has_read(&inbound.id) || !seen.insert(inbound.id.clone()) {
+            kept.push(inbound);
+            continue;
+        }
+        let Ok(text) = parse_user_text(&inbound.payload) else {
+            // Not a person's message (an unreadable payload): the loop says so when it reads it.
+            kept.push(inbound);
+            continue;
+        };
+        let files = crate::images::message_files(&parse_inbound_images(&inbound.payload));
+        let step = message_step(&inbound);
+        let decision = decide_message(hooks, ctx, &step, &text, files).await?;
+        if let Some(refusal) = decision.refusal() {
+            state.note_read(&inbound.id);
+            let reason = refusal.reason.as_deref().unwrap_or("no reason was given");
+            let plugin = refusal.plugin.as_deref().unwrap_or("a plugin");
+            ctx.emit(RunEvent::Progress {
+                message: format!(
+                    "the message was refused by {plugin}: {reason}; the task goes on without it"
+                ),
+            })
+            .await;
+            continue;
+        }
+        if let Some(rewritten) = decision.text {
+            rewrite_payload(&mut inbound.payload, &rewritten);
+        }
+        kept.push(inbound);
+    }
+    Ok(kept)
+}
+
+/// Put a rewritten text in a message's payload, keeping everything else it carries (its images, its
+/// context, a session header).
+fn rewrite_payload(payload: &mut Value, text: &str) {
+    match payload {
+        Value::String(_) => *payload = Value::String(text.to_owned()),
+        Value::Object(object) => {
+            object.insert("text".into(), Value::String(text.to_owned()));
+        }
+        other => *other = json!({ "text": text }),
+    }
+}
+
+/// The failure a refused message that started the task leaves: `Rejected`, with the reason a person
+/// reads (ADR 0050, decision 9).
+fn refused_message(decision: &HookDecision) -> AgentError {
+    let reason = decision.reason.as_deref().unwrap_or("no reason was given");
+    match decision.plugin.as_deref() {
+        Some(plugin) => {
+            AgentError::rejected(format!("the message was refused by {plugin}: {reason}"))
+        }
+        None => AgentError::rejected(format!("the message was refused: {reason}")),
+    }
+}
+
+/// The text of the last user message of the state, when there is one.
+fn last_user_text(state: &Conversation) -> Option<String> {
+    state
+        .messages
+        .iter()
+        .rev()
+        .find(|message| matches!(message, Message::User { .. }))
+        .map(Message::text)
+}
+
+/// Replace the text of the last user message, keeping its images: what a rewritten start message
+/// becomes in the history.
+fn rewrite_last_user(state: &mut Conversation, text: &str) {
+    if let Some(message) = state
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|message| matches!(message, Message::User { .. }))
+    {
+        match message {
+            Message::User { content } => {
+                let images: Vec<adam_model::ContentPart> = content
+                    .iter()
+                    .filter(|part| !matches!(part, adam_model::ContentPart::Text { .. }))
+                    .cloned()
+                    .collect();
+                let mut parts = parts_of(text, &[]);
+                parts.extend(images);
+                *content = parts;
+            }
+            other => *other = Message::user_text(text),
+        }
+    }
 }
 
 /// The conversation of a run that continues `prior_run` (whose last state is `prior`) with the
@@ -6650,6 +6925,26 @@ impl Agent for LlmAgent {
             self.forget_chars(ctx.run_id());
             return Ok(Transition::Done { state, output });
         }
+        // A person's message is decided before anything sends it to a model (ADR 0050, slice H1b):
+        // here for the message the run starts with, and below for the ones that arrived, in steps
+        // of their own. The steps are taken only when a hook set is installed, so a run whose
+        // journal was written without hooks replays unchanged.
+        if !self.hooks.is_empty() && !state.start_decided {
+            if let Some(text) = last_user_text(&state) {
+                let files = crate::images::message_files(&state.pending_images);
+                let decision =
+                    decide_message(&self.hooks, ctx, START_MESSAGE_STEP, &text, files).await?;
+                if let Some(refusal) = decision.refusal() {
+                    let error = refused_message(refusal);
+                    self.forget_chars(ctx.run_id());
+                    return Err(error);
+                }
+                if let Some(rewritten) = decision.text {
+                    rewrite_last_user(&mut state, &rewritten);
+                }
+            }
+            state.start_decided = true;
+        }
         // The inbox is taken once, here, before the summary: a resume that wakes a run parked on its
         // summary is read (and its id recorded) before `compact_if_due` asks the summary again, so
         // `absorb_while_parked` cannot consume it unrecorded and a replayed forward cannot wake the
@@ -6723,7 +7018,11 @@ impl Agent for LlmAgent {
                 ctx.conversation_id().map(str::to_owned),
                 Arc::new(state.context.clone()),
             )
-            .with_task(state.task());
+            .with_task(state.task())
+            .with_workspace_run(
+                workspace_run_of(&state)
+                    .unwrap_or_else(|| state.root_run.unwrap_or_else(|| ctx.run_id())),
+            );
             let loaders = crate::source::loaders_offered(&self.sources, &source_ctx).await;
             let task_loaded = crate::source::loaded_by_task(&self.sources, &source_ctx).await;
             state.fill_seeded(&loaders, &task_loaded);
@@ -6840,6 +7139,10 @@ impl Agent for LlmAgent {
             Some(PendingWait::Question(q)) => Some((q.tool.clone(), q.call_id.clone())),
             _ => None,
         };
+        // A message that arrived is decided before its images are admitted (ADR 0050, slice H1b):
+        // a refused one is left out, its files are not kept, and the task goes on. Each decision is
+        // a journaled step of its own; a replay reads it and asks no hook again.
+        let inbox = decide_inbox(&self.hooks, ctx, &mut state, inbox).await?;
         // The images that came with a message are admitted and kept in journaled steps of their
         // own, before the message is read: it is read from the references those steps recorded.
         let admitted = self.admit_images(ctx, &mut state, &inbox).await?;

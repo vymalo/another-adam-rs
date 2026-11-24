@@ -104,6 +104,7 @@ flowchart LR
     AgentError -->|"Transient of class Transient with retry_after, or kept from from_classified"| RateLimited
     AgentError -->|"Transient of class Conflict, kept from from_classified"| Conflict
     AgentError -->|Permanent| Invalid
+    AgentError -->|Rejected| Rejected
     AgentError -->|NonDeterminism| Corrupt
     StoreError -.->|"Store(e)"| AgentError
 

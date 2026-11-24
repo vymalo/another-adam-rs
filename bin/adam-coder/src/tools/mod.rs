@@ -500,11 +500,13 @@ impl ToolEnv {
     /// the run waits for a slot. Without it the first such error is the tool's result, as it always
     /// was (the local environment's behaviour is unchanged).
     pub(crate) async fn session(&self, ctx: &ToolCtx) -> Result<Arc<dyn EnvSession>, ToolError> {
-        // The workspace is the root run's, so a subagent works in its parent's environment; the
-        // steps it shows are the call's own, under the id of the run that makes them.
+        // The workspace is the one the run reads ([`ToolCtx::workspace_run_id`]), which is the root
+        // run's unless its session names another (ADR 0045 slice 7), so a helper works in the
+        // worktree and environment of the task it serves; the steps it shows are the call's own,
+        // under the id of the run that makes them.
         let workspace = self
             .workspaces
-            .run(&ctx.root_run_id().to_string())
+            .run(&ctx.workspace_run_id().to_string())
             .map_err(|e| workspace_error(&e))?;
         let run = ctx.run_id().to_string();
         let started = std::time::Instant::now();
@@ -665,7 +667,7 @@ impl ToolEnv {
     /// `None`: a bare name then needs the person's word, as ever.
     async fn sole_owner(&self, ctx: &ToolCtx, notes: &RunNotes) -> Option<String> {
         let mut owners = std::collections::BTreeSet::new();
-        if let Ok(workspace) = self.workspaces.run(&ctx.root_run_id().to_string())
+        if let Ok(workspace) = self.workspaces.run(&ctx.workspace_run_id().to_string())
             && let Ok(slots) = workspace.slots().await
         {
             for slot in &slots {
@@ -790,10 +792,9 @@ impl ToolEnv {
         repo: Option<&str>,
         to_write: bool,
     ) -> Result<Slot, Outcome> {
-        let run = ctx.root_run_id().to_string();
         let workspace = self
             .workspaces
-            .run(&run)
+            .run(&ctx.workspace_run_id().to_string())
             .map_err(|e| Err(workspace_error(&e)))?;
         let slots = workspace
             .slots()
@@ -1104,7 +1105,8 @@ impl Tool for Gated {
         // the files it holds open, and of the others by the walk of its next call, which such a
         // write must not leave to the walk interval.
         if writes_the_worktree(&self.name) {
-            let run = ctx.root_run_id().to_string();
+            // The servers of the run are the ones of the workspace it reads.
+            let run = ctx.workspace_run_id().to_string();
             self.env.commands.language_servers().wrote(&run);
         }
         // Taken whatever the result, so nothing outlives the call.

@@ -780,6 +780,26 @@ pub(crate) fn removed_line(image: &ImageRef) -> String {
     )
 }
 
+/// The files of an inbound message, as a `message.received` hook sees them (ADR 0050, decision 9):
+/// **by reference**, never their bytes. The reference is the SHA-256 the image step records, so a
+/// hook sees the same one the journal holds; when the bytes cannot be read there is none.
+pub(crate) fn message_files(images: &[InboundImage]) -> Vec<adam_plugin::MessageFile> {
+    images
+        .iter()
+        .map(|image| {
+            let bytes = STANDARD.decode(image.data.as_bytes()).ok();
+            adam_plugin::MessageFile {
+                name: image.name.clone(),
+                media_type: image.media_type.clone(),
+                size: bytes
+                    .as_ref()
+                    .map_or((image.data.len() / 4 * 3) as u64, |b| b.len() as u64),
+                reference: bytes.as_deref().map(sha256_hex),
+            }
+        })
+        .collect()
+}
+
 /// What became of one image of an inbound message: recorded in the journal, so a replay reads the
 /// same decision and the same references.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

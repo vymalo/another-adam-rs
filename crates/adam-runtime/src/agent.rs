@@ -88,6 +88,7 @@ pub enum Transition<S> {
 /// | `Transient` of class `Transient` with `retry_after` | `RateLimited` | retried after `max(backoff, retry_after)`, when the policy retries rate limits |
 /// | `Transient` of class `RateLimited` or `Conflict` with `retry_after` | its `class` | retried after `max(backoff, retry_after)` |
 /// | `Permanent` | `Invalid` | `Failed` |
+/// | `Rejected` | `Rejected` | `Failed`, with the policy's reason |
 /// | `NonDeterminism` | `Corrupt` | `Failed` |
 /// | `Store(e)` | `e.class()` | `Failed` for `Corrupt` and `Invalid`, otherwise left to its lease |
 ///
@@ -134,6 +135,14 @@ pub enum AgentError {
         #[source]
         source: Option<BoxError>,
     },
+    /// Valid input that a policy refuses: the run becomes `Failed`, and the message is the reason a
+    /// person reads ([`ErrorClass::Rejected`]). The deciding hooks of a message use it (ADR 0050,
+    /// slice H1b); a front that reports the failure shows the reason as it is.
+    #[error("refused: {message}")]
+    Rejected {
+        /// Why the input was refused, as a person reads it.
+        message: String,
+    },
     /// Replay asked for a different step than the journal recorded (or the
     /// recorded result no longer decodes). The run becomes `Failed`.
     #[error("non-deterministic replay: {message}")]
@@ -173,6 +182,14 @@ impl AgentError {
         Self::Permanent {
             message: msg.to_string(),
             source: None,
+        }
+    }
+
+    /// A valid input a policy refuses: the run fails and the reason is what a person reads
+    /// ([`Rejected`](Self::Rejected), [`ErrorClass::Rejected`]).
+    pub fn rejected(msg: impl std::fmt::Display) -> Self {
+        Self::Rejected {
+            message: msg.to_string(),
         }
     }
 
@@ -257,6 +274,7 @@ impl Classify for AgentError {
             } => ErrorClass::RateLimited,
             Self::Transient { class, .. } => *class,
             Self::Permanent { .. } => ErrorClass::Invalid,
+            Self::Rejected { .. } => ErrorClass::Rejected,
             Self::NonDeterminism { .. } => ErrorClass::Corrupt,
             Self::Store(e) => e.class(),
         }
@@ -505,6 +523,7 @@ mod tests {
             } => ErrorClass::RateLimited,
             AgentError::Transient { class, .. } => *class,
             AgentError::Permanent { .. } => ErrorClass::Invalid,
+            AgentError::Rejected { .. } => ErrorClass::Rejected,
             AgentError::NonDeterminism { .. } => ErrorClass::Corrupt,
             AgentError::Store(e) => e.class(),
         }
@@ -521,6 +540,7 @@ mod tests {
             AgentError::Store(StoreError::unavailable(Lower)),
             AgentError::Store(StoreError::corrupt_source(Lower)),
             AgentError::Store(StoreError::InvalidInput("x".into())),
+            AgentError::rejected("x"),
         ];
         for e in &samples {
             assert_eq!(e.class(), expected(e), "{e}");
@@ -528,10 +548,25 @@ mod tests {
         let retryable: Vec<bool> = samples.iter().map(Classify::is_retryable).collect();
         assert_eq!(
             retryable,
-            [true, true, false, false, false, true, false, false]
+            [true, true, false, false, false, true, false, false, false]
         );
         assert_eq!(samples[1].retry_after(), Some(Duration::from_secs(5)));
         assert_eq!(samples[0].retry_after(), None);
+    }
+
+    /// A refusal is its own class: a person's message a policy refused is not a bug (`Invalid`) and
+    /// not something a retry fixes, so a caller can tell the two apart with `Classify` alone.
+    #[test]
+    fn a_refusal_is_classified_rejected_and_a_permanent_failure_is_not() {
+        let refusal = AgentError::rejected("not this task's to do");
+        assert_eq!(refusal.class(), ErrorClass::Rejected);
+        assert!(!refusal.is_retryable());
+        assert_ne!(refusal.class(), AgentError::permanent("x").class());
+        assert_eq!(
+            adam_error::report(&refusal),
+            "refused: not this task's to do",
+            "the reason a person reads is the error's own text"
+        );
     }
 
     #[test]
