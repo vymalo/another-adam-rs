@@ -27,7 +27,7 @@ dependency.
   unwritten id), empty bytes are a blob, a run's reference keeps a blob alive (including
 after a commit that names a different one), a shared
   digest survives until the last referencing run is purged, `purge_blobs` respects its cutoff, and
-  `purge_finished` removes the run's references and the unreferenced blob). Every case asserts `keeps_blobs()`: a store that keeps none is not
+  `purge_finished` removes the run's references and the unreferenced blob). The cases that assert a purge deletes a digest write bytes unique to the run (a UUID in the content), so the suite passes twice in a row against the same database. Every case asserts `keeps_blobs()`: a store that keeps none is not
   given this suite. Blobs are global, so the cases take turns inside one test binary (the
   `BLOB_SUITE` lock, which the cases that purge take too); under nextest, where each test is its own
   process, `.config/nextest.toml` puts the same cases in one single-thread group. Runs are still
