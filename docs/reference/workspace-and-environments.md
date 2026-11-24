@@ -91,7 +91,7 @@ stateDiagram-v2
     Scratch --> RepoBacked: add_repository, copy_into
     RepoBacked --> RepoBacked: add_repository (another repository, a new slot)
     Scratch --> Scratch: the run ends, the conversation is alive, the next task takes it over
-    Scratch --> Removed: remove, nothing unpushed is left: published, or taken over by the next task
+    Scratch --> Removed: remove, nothing unpushed is left, published or taken over by the next task
     RepoBacked --> Removed: remove, pushed branches remain
     Empty --> Reading: add_reference (first read of a reference)
     Scratch --> Scratch: add_reference (a read-only slot beside it)
