@@ -4504,10 +4504,10 @@ impl LlmAgent {
         let limit = admission
             .snapshot()
             .pool(Pool::ToolCalls)
-            .map_or(0, adam_budget::PoolUsage::limit);
+            .map_or(adam_budget::Limit::Unlimited, adam_budget::PoolUsage::limit);
         tracing::warn!(
             pool = Pool::ToolCalls.as_str(),
-            limit,
+            %limit,
             waited_millis = u64::try_from(TOOL_ADMISSION_WAIT.as_millis()).unwrap_or(u64::MAX),
             "the tool pool stayed full: the call runs nevertheless, over its share"
         );

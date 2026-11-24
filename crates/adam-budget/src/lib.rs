@@ -41,4 +41,4 @@ pub use admission::{
     Admission, Ask, ConversationId, DynAdmission, Permit, Pool, PoolUsage, Refused, TokenUsage,
     Usage,
 };
-pub use budget::{Budget, BudgetBuilder, DiskReserve, Ratio};
+pub use budget::{Budget, BudgetBuilder, DiskReserve, Limit, Ratio};

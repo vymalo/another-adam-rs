@@ -311,6 +311,8 @@ impl<W: Write> Chat<W> {
                     .line(&format!("[behind: {skipped} events skipped]"))?;
             }
             Ok(EngineEvent::Snapshot(info)) => self.waits(&info)?,
+            // The resource report (ADR 0065): this chat shows nothing of it.
+            Ok(EngineEvent::Resources(_)) => {}
             Ok(EngineEvent::Ended(info)) => {
                 let whole = followed.lost || !followed.shown;
                 self.followed = None;

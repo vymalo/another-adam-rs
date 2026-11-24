@@ -38,6 +38,8 @@ engine.shutdown().await?;
 | `files(run)` | the files the agent handed over in the run (`RunFile`: `name`, `mime_type`, `filename`, `len`, `sha256`), in the order they were emitted, without their bytes | `NotFound` for a run this engine has not (as for `get`: a firing is one it has); `Unavailable` (`Transient`) or `Internal` when the store cannot be read |
 | `file(run, sha256)` | the bytes (`Arc<[u8]>`) of the run's file with that SHA-256, as `files` or the event's `WithheldFile` says it; `None` for no such file, or bytes gone from the store | as for `files`, and `Store` (the store's class) when the bytes cannot be read |
 | `events(run)` | `RunEvents`, a `futures::Stream` of `Result<EngineEvent, EngineError>`: the run's recent events, then the live ones, then `Ended` once the store says the run has ended; a run that has already ended gives `Ended` at once. See [A run's events](#a-runs-events) | `NotFound` for a run the engine does not have, refused at the call (the stream would have nothing to say) |
+| `resources()` | `ResourceReport`: what the process's pools hold now, the ceiling of each (`adam_budget::Limit`, `Unlimited` when the deployment set none, never a zero), the token bucket when the budget meters one, and the host's device readings when it pushed a device — the report of ADR 0065 decision 9, which names no person, run or conversation. A stream of a working run also carries it at most every 2 s (`EngineEvent::Resources`); see [A run's events](#a-runs-events) | |
+| `set_device_state(device)`, `EngineBuilder::device_state(device)` | the host's `DynDeviceState` (`adam_device_state::DeviceState`): the four readings the report carries. The rule table that would lower the live budget by them is not built yet, so the readings reach the report and nothing else; without one, the report carries no readings, which is not a device on mains and cool (ADR 0065 decision 8) | |
 | `shutdown()` | waits for the messages being written, then nothing new is claimed and the steps in flight finish and commit; it returns once the worker has stopped, and so does every concurrent or later call; every clone stops; reads and `cancel` still work. Dropping a `shutdown` before it is done (a timeout around it) aborts the worker, and so does dropping the last engine, as a killed process would: the next engine started with the same fixed worker id claims its runs at once, any other once their leases run out | what the worker ended with |
 
 The types are the engine's own: `Say { id, text, model }` (the id makes a send idempotent: the same `Say` again reaches
@@ -139,6 +141,7 @@ while let Some(event) = events.next().await {
         EngineEvent::Live(event) => show(event),           // adam_runtime::RunEvent: a step, a text piece, ...
         EngineEvent::Behind { skipped } => {}             // the reader lost live events; a fresh read follows
         EngineEvent::Snapshot(info) => redraw(info),       // the run as the store has it now
+        EngineEvent::Resources(report) => {}               // what the pools hold, at most every 2 s (ADR 0065)
         EngineEvent::Ended(info) => done(info),            // the last item: Done, Failed or Cancelled
         _ => {}                                            // EngineEvent is #[non_exhaustive]
     }
@@ -163,6 +166,12 @@ while let Some(event) = events.next().await {
   [`adam-runtime`](../adam-runtime/README.md#a-late-subscriber)) and at most two items. So a reader that reads only
   after its run is over gets at most `REPLAY_EVENTS_PER_RUN + event_capacity` live events (80 with a ring of 16), then
   `Behind`, then `Ended` with the whole output.
+* **The resource report.** While the run works, at most every 2 s the stream carries one
+  `EngineEvent::Resources(ResourceReport)`: each pool's ceiling (`adam_budget::Limit::Unlimited` when the deployment set
+  none, never zero) and what it holds, the token bucket when the budget meters tokens, and the host's device readings
+  when it pushed a device. It is sent when the run is not over and the 2 s since the last one have passed, so a busy run
+  hears it even when its own events never stop. `Engine::resources()` is the same report on request, for a host that
+  shows it. It names no person, run or conversation (ADR 0065 decision 9).
 * **What an event weighs.** A text piece is at most 1 KiB (`MAX_TEXT_DELTA_BYTES`), a step's end about 12 KiB of input and
   output. **A file artifact's bytes are taken out** before the event enters the ring (the engine's sink; a file can be
   4 MiB): its `name`, `mime_type` and `filename` are kept, `bytes` is empty, and `data` (`null` for a file in the
@@ -211,7 +220,7 @@ re-exports them:
 | [`adam-a2a-runtime`](../adam-a2a-runtime/README.md), [`adam-a2a`](../adam-a2a/README.md) | `push`, and `server`: the backend port and the A2A types are data here |
 | [`adam-ui`](../adam-ui/README.md) | `thread-tools`: `Ui::embedded` and `Ui::screen` |
 | [`adam-assembly`](../adam-assembly/README.md) | `remote`: no remote (`a2a:`) subagents, so no A2A client, HTTP client or TLS; `bind` refuses one with `Error::RemoteNotEnabled` ([Without remote subagents](../adam-assembly/README.md#without-remote-subagents-feature-remote)) |
-| [`adam-runtime`](../adam-runtime/README.md), [`adam-llm-agent`](../adam-llm-agent/README.md), [`adam-core`](../adam-core/README.md), [`adam-agent-fs`](../adam-agent-fs/README.md), [`adam-model`](../adam-model/README.md), [`adam-error`](../adam-error/README.md) | nothing: they have no server parts |
+| [`adam-runtime`](../adam-runtime/README.md), [`adam-llm-agent`](../adam-llm-agent/README.md), [`adam-core`](../adam-core/README.md), [`adam-agent-fs`](../adam-agent-fs/README.md), [`adam-model`](../adam-model/README.md), [`adam-error`](../adam-error/README.md), [`adam-budget`](../adam-budget/README.md), [`adam-device-state`](../adam-device-state/README.md) | nothing: they have no server parts |
 
 It also depends on `a2a-lf` (the A2A types, data only: ADR 0047's confirmed decision 1), `tokio` (`rt`, `sync`,
 `time`), `futures` (the `Stream` of a run's events), `async-trait` (the engine's event sink), `serde_json` (what a
@@ -267,6 +276,13 @@ every wait is bounded by `tokio::time::timeout`:
 * `shutdown_refuses_new_work_and_reads_go_on` (a send, a steer and an answer are `Stopped`);
 * `a_dropped_shutdown_stops_the_worker`: a timed-out `shutdown` aborts the worker, so the run's lease runs out;
   `concurrent_shutdowns_both_wait_for_the_worker`;
+* `a_deployment_with_no_limits_reports_unlimited_not_zero`: an engine with no admission reports every pool as
+  `Limit::Unlimited` and holds nothing — an absent limit is not a limit of zero — and reports no device;
+* `the_report_carries_the_pools_held_and_the_devices_readings`: with a `LocalAdmission` and a `FakeDevice`, the report
+  carries a pool's `AtMost` ceiling, what a held permit holds (back to zero once dropped), the `Unlimited` pool beside
+  them, and the four readings;
+* `a_working_run_hears_the_resource_report`: a run held in its first model call has a `Resources` event after 2 s, with
+  the report's fields, and finishes once released;
 * `events_follow_a_run_to_its_end`: a reader that keeps up hears the tool's step and the text live, then `Ended(Done)`
   with the output, once, and nothing after it;
 * `a_slow_reader_stays_bounded`: a ring of 16 and a reply of 256 KiB (256 pieces); the reader reads only after the run

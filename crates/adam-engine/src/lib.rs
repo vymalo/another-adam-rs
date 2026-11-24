@@ -43,6 +43,7 @@ pub use adam_a2a_runtime;
 pub use adam_agent_fs;
 pub use adam_assembly;
 pub use adam_core;
+pub use adam_device_state;
 pub use adam_error;
 pub use adam_llm_agent;
 pub use adam_model;
@@ -53,11 +54,13 @@ pub use adam_ui;
 mod engine;
 mod error;
 mod events;
+mod resources;
 mod types;
 
 pub use engine::{Engine, EngineBuilder, Limits};
 pub use error::EngineError;
 pub use events::{EngineEvent, RunEvents, WithheldFile};
+pub use resources::ResourceReport;
 pub use types::{
     ConversationId, DEFAULT_PAGE_SIZE, Delivered, Firing, FiringQuery, ListQuery, MAX_PAGE_SIZE,
     Page, RunFile, RunInfo, RunState, Say, SessionHelper, SessionInfo, SessionState, StartSession,

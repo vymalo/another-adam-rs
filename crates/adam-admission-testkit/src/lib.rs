@@ -32,7 +32,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_budget::{Admission, Ask, Budget, Permit, Pool, Ratio, Refused, Usage};
+use adam_budget::{Admission, Ask, Budget, Limit, Permit, Pool, Ratio, Refused, Usage};
 use adam_error::Classify;
 
 /// How many asks the concurrency case launches at once.
@@ -304,7 +304,7 @@ pub async fn a_snapshot_adds_up(admission: DynAdmission, plan: Plan) {
         .pool(plan.pool)
         .unwrap_or_else(|| panic!("the report lists {}", plan.pool));
     assert_eq!(line.in_use(), u64::from(plan.limit));
-    assert_eq!(line.limit(), u64::from(plan.limit));
+    assert_eq!(line.limit(), Limit::AtMost(u64::from(plan.limit)));
     // A second ask of the same conversation waits: the report counts it while it waits.
     let waiter = {
         let admission = Arc::clone(&admission);

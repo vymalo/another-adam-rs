@@ -35,7 +35,8 @@ and the profile's `contextWindow` cell added in
 (ADR 0064, amended 2026-11-23), whose citations are at the row: `crates/adam-a2a/src/model_pick.rs`,
 `crates/adam-a2a-runtime/src/backend.rs`, `bin/adam-agent/src/agent.rs`; the pin is not moved),
 `sys:` another-agentic-system at `ebcee350`,
-`plat:` another-agentic-platform at `dd8bba3`, read on 2026-11-21 and 2026-11-22.
+`plat:` another-agentic-platform at `dd8bba3`, read on 2026-11-21 and 2026-11-22; the
+[Resources](#resources) rows were checked at `adam:0d216394` (2026-11-24).
 
 ## Legend
 
@@ -119,6 +120,33 @@ sees, so they have no row.
 | Leases and resume | `env` `WORKER_ID` (`adam:crates/adam-service/src/config.rs:646`), the store's leases | **same** | `crate` `Limits::lease_ttl`, `Limits::worker_id` (`adam:crates/adam-engine/src/engine.rs:84`, `:114`); on SQLite no fixed id is needed: `start` clears every lease the file holds, so one engine per file (`adam:crates/adam-store-sqlite/src/lib.rs:510`) | n/a: inside the agent | the operator sets `WORKER_ID` (`plat:crates/domain/src/contract.rs:53`) |
 | The store: PostgreSQL, MongoDB, SQLite, memory | `env` `DATABASE_URL` chooses one of `postgres://`/`postgresql://`, `mongodb://`/`mongodb+srv://` or `sqlite://<path>` (`adam:crates/adam-service/src/config.rs:280`), each migrated at start; SQLite holds one process per file ([ADR 0053](../decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)) | **same** | `crate` any `DynStore` (`adam:crates/adam-engine/src/engine.rs:510`): `SqliteStore::open(path)`, a file a killed process's next start resumes (`adam:crates/adam-engine/tests/resume_process.rs`), or `MemoryStore` | n/a: inside the agent | `crd` `store.postgres`: a Secret or CloudNativePG (`plat:crates/api/src/service.rs:186`) |
 
+## Resources
+
+[ADR 0065](../decisions/0065-resource-governance-admission-pools-and-os-limits.md) decides three layers: **admission**
+(is there room in the budget?), **bulkheads** (a pool per kind of work) and the **operating system's limits** on every
+process adam starts. One rule holds every row: the ceiling comes from the deployment or the device, and an agent folder
+or a person may only lower it. The rows are checked at `adam:0d216394` (2026-11-24), the revision that built the report
+and the metrics; the cells that cite another `adam:` line were read at that revision.
+
+| Feature | coder | agent | engine | system | platform |
+|---|---|---|---|---|---|
+| Runs at once | `env` `WORKERS` (`adam:crates/adam-service/src/config.rs:721`); `chart` `config.workers` (`adam:deploy/coder/values.yaml:118`) | **same** `env` (the shared parser) | `crate` `Limits::concurrency` (`adam:crates/adam-engine/src/engine.rs:81`) | n/a: it starts tasks, it does not step a run | `crd extraEnv` only, **gap** |
+| Tool calls in flight, whole process | `env` `MAX_TOOL_CALLS_IN_FLIGHT` (`adam:crates/adam-service/src/config.rs:736`), default 4, 1 to 256; `chart` `config.extraEnv` only, **gap** | **same** `env` | `crate` the host's `DynAdmission` (`EngineBuilder::admission`, `adam:crates/adam-engine/src/engine.rs:185`): the pool is whatever budget the host built, and `Limits::max_parallel_tools` still bounds one turn | n/a: inside the agent | `crd extraEnv` only, **gap** |
+| Model calls in flight | `env` `MAX_MODEL_CALLS` (`adam:crates/adam-service/src/config.rs:743`), default 2, 1 to 64; `chart` `config.extraEnv` only, **gap** | **same** `env` | **same** `crate`, the host's `DynAdmission`; the engine's `Limits` has no count of its own | n/a: inside the agent | `crd extraEnv` only, **gap** |
+| Tokens per minute | `env` `MODEL_TOKENS_PER_MINUTE` (`adam:crates/adam-service/src/config.rs:680`), unset meters none; `chart` `config.extraEnv` only, **gap** | **same** `env` | **same** `crate` (`Budget::tokens_per_minute` on the host's admission) | n/a: inside the agent | `crd extraEnv` only, **gap** |
+| Processes at once (commands, git, servers) `MAX_PROCESSES` | **planned**: ADR 0065 slice 3; `Budget.processes` exists (`adam:crates/adam-budget/src/budget.rs:164`), no variable reads it | **planned**, **same** | **planned**: the builder takes a whole `Admission`, so a host may set it today; the engine sets none itself | n/a: inside the agent | **planned** |
+| git processes `MAX_GIT_PROCESSES` | **planned**: ADR 0065 slice 3; `Budget.git` exists (`adam:crates/adam-budget/src/budget.rs:166`) | **planned**, **same** | **planned**, as above | n/a: inside the agent | **planned** |
+| MCP servers alive `MAX_MCP_SERVERS` | **planned**: ADR 0065 slice 3; `Budget.mcp_servers` exists (`adam:crates/adam-budget/src/budget.rs:168`) | **planned**, **same** | **planned**, as above | n/a: inside the agent | **planned** |
+| A command's memory and CPU `COMMAND_MEMORY_MAX`, `COMMAND_CPU_MAX` | **planned**: ADR 0065 slice 3; `Budget.command_memory` and `command_cpu` exist (`adam:crates/adam-budget/src/budget.rs:174`) | **planned**, **same** | **planned**: no `Confine` port yet, so a command is not stopped over its memory or CPU | n/a: inside the agent | **planned** |
+| The disk budget and its reserve `WORKSPACE_DISK_MAX`, `WORKSPACE_DISK_RESERVE` | **planned**: `adam-workspace` checks a `DiskBudget` and keeps a reserve free (`adam:crates/adam-workspace/src/disk.rs:58`, `:83`), but neither the coder nor the chart sets one (ADR 0065 slice 4, part) | **planned**, **same** | n/a: the engine holds no workspace | n/a: inside the agent | **planned** |
+| Device state: power, thermal, network, memory pressure (ADR 0065 decision 8) | **planned**: no platform reader, and no rule table lowering the live budget | **planned**, **same** | `crate` `EngineBuilder::device_state` and `Engine::set_device_state` (`adam:crates/adam-engine/src/engine.rs:196`, `:941`): the readings reach the resource report; the rule table that would lower the live budget is **planned** | n/a: a server has no device | **planned** |
+| The resource report (ADR 0065 decision 9) | **gap**: no A2A extension carries it, so a served agent shows nothing; the engine's own report is below | **gap**, **same** | `crate` `Engine::resources()` returns a `ResourceReport` — each pool's `adam_budget::Limit` (`Unlimited` when the deployment set none, never zero), what it holds, the token bucket and the device readings (`adam:crates/adam-engine/src/engine.rs:921`); a working run's stream carries `EngineEvent::Resources` at most every 2 s (`adam:crates/adam-engine/src/events.rs:58`), with no person, run or conversation in it | **planned**: no API reads it | n/a: it holds no run |
+| The server's metrics | `adam-service` renders the pools as Prometheus text (`adam:crates/adam-service/src/metrics.rs:28`: `adam_admission_in_use`, `adam_admission_limit`, `adam_admission_waiting`, and `adam_admission_tokens_available`/`_limit`), with `+Inf` for a pool with no ceiling; **gap**: no listener serves it, and the ADR's `adam_admission_waits_total`, `adam_admission_refusals_total`, `adam_process_stopped_total` and `adam_disk_bytes` are not built (no counters) | **same** `adam-service` | n/a: no server, no metrics | **planned**: it would scrape one | **planned** |
+| The OS's own limits (`Confine`: systemd scope, rlimits, job object) | **planned**: ADR 0065 slice 3 | **planned**, **same** | **planned**: an embedded host asks its platform, not adam | n/a: it starts no process | **planned** |
+
+No person, run or conversation is a metric label or a field of the report; a conversation's share of a pool is
+enforced, never reported.
+
 ## Coder only
 
 `adam-agent` and the engine run no commands and hold no repository, so every row here is **n/a** for them, and for the
@@ -189,3 +217,5 @@ One line per gap, with the repository that should fill it and the issue that tra
 | 21 | another-agentic-platform | no field gives the coder `ADAM_REFERENCES_FILE` | [vymalo/another-agentic-platform#76](https://github.com/vymalo/another-agentic-platform/issues/76) |
 | 22 | another-adam-rs | ~~`adam-engine`: a host cannot see or cancel a schedule's firing (`list`, `get`, `events`, `cancel`)~~ closed: `Engine::firings`, and `get`, `events`, `cancel` reach one (see *Schedules* above) | [vymalo/another-adam-rs#289](https://github.com/vymalo/another-adam-rs/issues/289) |
 | 23 | another-agentic-platform | no field for the locked-model fallback: a profile's and a preset's `fallback` (`MODEL_ALIASES_FILE`) and the folder's `model_fallback` reach the agent only through the profiles file and the folder's files, not through `ModelEndpoint` or `AgentConfig` (the orchestrator's `model_locked` handling is its own) | [vymalo/another-adam-rs#338](https://github.com/vymalo/another-adam-rs/pull/338) (the change; the platform issue is not filed yet) |
+| 24 | another-agentic-platform | no typed field for any resource setting of ADR 0065 (`WORKERS`, `MAX_TOOL_CALLS_IN_FLIGHT`, `MAX_MODEL_CALLS`, `MODEL_TOKENS_PER_MINUTE`, and the process and disk limits when they exist): `extraEnv` only, which is YAML only | not filed yet |
+| 25 | another-adam-rs | no listener serves the pools' metrics, and the resource report reaches no A2A surface: only a process embedding `adam-engine` reads it (`Engine::resources`); `Confine` and the process, command-memory and disk limits are ADR 0065 slice 3 and the rest of slice 4 | not filed yet |

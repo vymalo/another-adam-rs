@@ -21,6 +21,7 @@ adam-agent-fs.workspace = true
 adam-assembly = { path = "../adam-assembly", version = "0.1.0", default-features = false, features = ["sessions"] }
 adam-budget.workspace = true
 adam-core.workspace = true
+adam-device-state.workspace = true
 adam-error.workspace = true
 adam-llm-agent.workspace = true
 adam-model.workspace = true
@@ -39,6 +40,7 @@ uuid.workspace = true
 # The example's model client and stdin are the host's (`examples/chat`): dev-dependencies only, so the
 # embedded check (normal dependencies) never sees them.
 [dev-dependencies]
+adam-admission-local.workspace = true
 adam-model-openai = { workspace = true, features = ["aws-lc"] }
 secrecy.workspace = true
 tempfile.workspace = true
