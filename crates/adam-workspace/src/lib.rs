@@ -59,6 +59,7 @@
 mod code_host;
 mod credentials;
 pub mod devcontainer;
+mod disk;
 mod environment;
 mod error;
 mod git;
@@ -87,6 +88,7 @@ pub use code_host::{
     MergedPullRequest, NewPullRequest, NewRepository, OwnerKind, PullRequest, PullRequestStatus,
 };
 pub use credentials::{DynGitCredentials, GitCredentials, HostScoped, ScopedToken, StaticToken};
+pub use disk::{DiskBudget, DiskSpace, FreeSpace, HostDisk, Sweep};
 pub use environment::{
     BACKGROUND_PREFIX, DynEnvironment, EnvDescription, EnvError, EnvKind, EnvProgress, EnvSession,
     EnvStep, EnvStepState, Environment, ExecId, ExecSpec, HidingEnvironment, Local, LocalSession,

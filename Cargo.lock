@@ -936,6 +936,7 @@ dependencies = [
 name = "adam-workspace"
 version = "0.1.0"
 dependencies = [
+ "adam-budget",
  "adam-error",
  "adam-git-sandbox",
  "adam-workspace",
