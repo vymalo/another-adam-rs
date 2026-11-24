@@ -47,7 +47,7 @@ pub struct SystemdScope {
 impl SystemdScope {
     /// Probe the system: make a scope with the three limits and read them back from the cgroup the
     /// scope made. `None` when no scope can be made (no systemd, no user manager, no cgroup v2).
-    /// Blocks for up to [`PROBE_TIMEOUT`]; call it once, at start.
+    /// Blocks for up to `PROBE_TIMEOUT`; call it once, at start.
     #[must_use]
     pub fn detect() -> Option<Self> {
         let script = "d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); \

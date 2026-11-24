@@ -2,8 +2,8 @@
 //! of [ADR 0065](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md)
 //! (decisions 5 and 6).
 //!
-//! A [`Governor`] pairs the process's [`Admission`] with a [`Confine`]. A command asks for one seat of
-//! [`Pool::Processes`], waits for it up to [`Governor::wait`], and runs confined to the limits the
+//! A [`Governor`] pairs the process's [`Admission`] with a `Confine`. A command asks for one seat of
+//! [`Pool::Processes`], waits for it up to `Governor::wait`, and runs confined to the limits the
 //! budget gives one command. A command that cannot get a seat in time is refused as `Busy`
 //! (`RateLimited`), which the tool reports as a retryable error: a busy pool never fails a run.
 
