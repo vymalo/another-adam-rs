@@ -22,7 +22,9 @@ slice 2.
 | `Ask` | One question: the pool, the conversation, how many units, the tokens a model call is estimated to use, and how long it may wait (zero refuses at once). |
 | `Permit` | A share of a pool, **released when it is dropped**, so a cancelled, failed or panicking holder frees it. A permit is never released twice. |
 | `Refused` | Why an ask got no permit, with the class a caller reacts to through `Classify`: `Busy`/`TokensPerMinute` are `RateLimited` (park the run and ask again at `retry_after`), `DiskFull` is `Rejected` (ask the person), `TooLarge` is `Invalid` (the same ask never fits). No new `ErrorClass`. |
-| `Usage`, `PoolUsage`, `TokenUsage` | What is held now, pool by pool. It names no person, conversation or run. |
+| `Budget::ceiling(Pool)` | The pool's ceiling as a report reads it: `Limit::Unlimited` for a field the budget leaves at `Budget::UNLIMITED`'s value, `Limit::AtMost(n)` otherwise. `Budget::limit(Pool)` stays the numeric ceiling a semaphore needs. |
+| `Limit` | A pool's ceiling in a report: `Unlimited`, or `AtMost(u64)`. **An absent limit is not a limit of zero**: `AtMost(0)` is a pool a deployment closed on purpose. `at_most()`, `is_unlimited()`, `Display` (`unlimited`). |
+| `Usage`, `PoolUsage`, `TokenUsage` | What is held now, pool by pool: each `PoolUsage` has its `Limit`, what is held, and how many asks wait. It names no person, conversation or run. |
 
 ## Sizes and shares
 
@@ -61,4 +63,6 @@ Every implementation passes [`admission_conformance!`](../adam-admission-testkit
 `a_ratio_applies_without_overflow`, `a_pool_limit_is_its_field_in_its_unit`,
 `every_pool_has_a_setter`, `every_refusal_has_a_class_and_no_new_one`,
 `a_permit_releases_once_and_frees_its_share_on_drop`, `a_usage_adds_up_by_pool` and
-`a_pool_names_itself_for_a_metric`.
+`a_pool_names_itself_for_a_metric`, `no_limit_is_not_a_zero_limit` (ADR 0065 decision 9: a
+budget that sets nothing reports `Unlimited` for every pool, a pool set to zero stays `AtMost(0)`)
+and `a_limit_names_itself`.

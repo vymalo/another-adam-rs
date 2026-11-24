@@ -15,6 +15,7 @@ use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
 use adam_budget::DynAdmission;
 use adam_core::{ConversationScope, DynSecretSource, DynStore, RunId, RunQuery, RunStatus};
+use adam_device_state::DynDeviceState;
 use adam_llm_agent::{DEFAULT_MAX_PARALLEL, ToolSet};
 use adam_model::{DynModel, ModelProfiles, ReasoningEffort};
 use adam_runtime::{
@@ -154,6 +155,7 @@ pub struct EngineBuilder {
     reasoning_effort: Option<ReasoningEffort>,
     tools: ToolSet,
     admission: Option<DynAdmission>,
+    device: Option<DynDeviceState>,
 }
 
 impl std::fmt::Debug for EngineBuilder {
@@ -182,6 +184,17 @@ impl EngineBuilder {
     /// [ADR 0065]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md
     pub fn admission(mut self, admission: DynAdmission) -> Self {
         self.admission = Some(admission);
+        self
+    }
+
+    /// The host's own device ([`adam_device_state::DeviceState`], [ADR 0065] decision 8): the
+    /// four readings the resource report carries. The rule table that would lower the live budget
+    /// by them is not built yet, so the readings reach the report and nothing else. Without one,
+    /// the report says the host pushed no device. [`Engine::set_device_state`] replaces it later.
+    ///
+    /// [ADR 0065]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md
+    pub fn device_state(mut self, device: DynDeviceState) -> Self {
+        self.device = Some(device);
         self
     }
 
@@ -269,6 +282,7 @@ impl EngineBuilder {
             reasoning_effort,
             tools,
             admission,
+            device,
         } = self;
         if limits.lease_ttl.is_zero() {
             return Err(EngineError::Invalid(
@@ -306,7 +320,9 @@ impl EngineBuilder {
             .max_parallel(limits.max_parallel_tools)
             .model_profiles(profiles)
             .allow_model_choice();
-        let bound = match admission {
+        // The same admission is kept for the resource report (`Engine::resources`): the agent
+        // asks it for its seats, the report asks it what is held.
+        let bound = match admission.clone() {
             Some(admission) => bound.admission(admission),
             None => bound,
         };
@@ -433,6 +449,8 @@ impl EngineBuilder {
                 events,
                 agent: name,
                 commands,
+                admission,
+                device: Mutex::new(device),
                 writes: RwLock::new(()),
                 stopping: AtomicBool::new(false),
                 worker: Worker {
@@ -542,6 +560,10 @@ pub(crate) struct Shared {
     agent: String,
     /// The agent's commands, from its `commands/`: what [`Engine::commands`] lists.
     commands: Vec<Command>,
+    /// The process's pools, when the host built some: what [`Engine::resources`] reports.
+    admission: Option<DynAdmission>,
+    /// The device the host pushed, when it pushed one: the readings the report carries.
+    device: Mutex<Option<DynDeviceState>>,
     /// The helpers a person may start a session with: what [`Engine::helpers`] lists.
     helpers: Vec<SessionHelper>,
     /// Their names as registered on the runtime (`<root>/<helper>`), in the same order: what a
@@ -642,6 +664,7 @@ impl Engine {
             reasoning_effort: None,
             tools: ToolSet::new(),
             admission: None,
+            device: None,
         }
     }
 
@@ -881,6 +904,46 @@ impl Engine {
     /// The engine `shared` is, while any [`Engine`] is left.
     pub(crate) fn from_weak(shared: &Weak<Shared>) -> Option<Self> {
         shared.upgrade().map(|shared| Self { shared })
+    }
+
+    /// What the process's pools hold and what the host's device says, now: the resource report a
+    /// host shows on request ([ADR 0065] decision 9). A stream of a working run also carries it at
+    /// most every two seconds ([`EngineEvent::Resources`](crate::EngineEvent::Resources)).
+    ///
+    /// Without an [`EngineBuilder::admission`], every pool is
+    /// [`Limit::Unlimited`](adam_budget::Limit::Unlimited) and nothing is held: a deployment that
+    /// set no limit did not set a limit of zero. Without a
+    /// [`device_state`](EngineBuilder::device_state), the report carries no readings, which is not
+    /// the same as a device on mains and cool.
+    ///
+    /// [ADR 0065]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md
+    #[must_use]
+    pub fn resources(&self) -> crate::ResourceReport {
+        let shared = &self.shared;
+        let usage = match &shared.admission {
+            Some(admission) => admission.snapshot(),
+            None => crate::ResourceReport::unlimited(),
+        };
+        let device = shared
+            .device
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|device| device.readings());
+        crate::ResourceReport::new(usage, device)
+    }
+
+    /// The host's device, pushed now ([ADR 0065] decision 8): the readings the resource report
+    /// carries from here on. The rule table that would lower the live budget by them is not built
+    /// yet, so this changes the report and nothing else.
+    ///
+    /// [ADR 0065]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md
+    pub fn set_device_state(&self, device: DynDeviceState) {
+        *self
+            .shared
+            .device
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(device);
     }
 
     /// The runs that match `query`, the most recently updated first.

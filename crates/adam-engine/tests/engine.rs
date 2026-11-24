@@ -2597,3 +2597,121 @@ async fn a_model_picked_after_the_switch_is_refused_and_the_next_run_starts_on_t
     );
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 }
+
+/// ADR 0065 slice 6: an engine with no pools reports every pool as unlimited, not as zero: an
+/// absent limit is not a limit of zero. Nothing is held and no device was pushed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deployment_with_no_limits_reports_unlimited_not_zero() {
+    let rig = Rig::new(None).await;
+    let report = rig.engine.resources();
+    for pool in adam_budget::Pool::ALL {
+        let line = report
+            .pool(pool)
+            .unwrap_or_else(|| panic!("{pool} is in the report"));
+        assert_eq!(line.limit(), adam_budget::Limit::Unlimited, "{pool}");
+        assert_ne!(line.limit(), adam_budget::Limit::AtMost(0), "{pool}");
+        assert_eq!(line.in_use(), 0, "{pool}");
+    }
+    assert!(report.device().is_none(), "the host pushed no device");
+    rig.stop().await;
+}
+
+/// ADR 0065 decision 9: the report carries what the pools hold, the ceiling each counts against,
+/// and the four readings of the host's device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_report_carries_the_pools_held_and_the_devices_readings() {
+    use adam_admission_local::LocalAdmission;
+    use adam_budget::{Ask, Budget, DynAdmission, Limit, Pool};
+    use adam_device_state::{DeviceReadings, FakeDevice, MemoryPressure, Network, Power, Thermal};
+
+    let admission: DynAdmission = Arc::new(LocalAdmission::new(
+        Budget::builder()
+            .runs(2)
+            .tool_calls(4)
+            .model_calls(2)
+            .build(),
+    ));
+    let readings = DeviceReadings::new(
+        Power::on_battery(15, false),
+        Thermal::Serious,
+        Network::Metered,
+        MemoryPressure::Warn,
+    );
+    let device = Arc::new(FakeDevice::new(readings));
+    let model: DynModel = Arc::new(MockModel::new());
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .admission(Arc::clone(&admission))
+        .device_state(device)
+        .start()
+        .await
+        .unwrap();
+
+    let held = admission
+        .admit(Ask::new(Pool::ToolCalls, "one conversation"))
+        .await
+        .unwrap();
+    let report = engine.resources();
+    let calls = report.pool(Pool::ToolCalls).expect("tool calls are listed");
+    assert_eq!(calls.limit(), Limit::AtMost(4));
+    assert_eq!(calls.in_use(), 1);
+    assert_eq!(
+        report.pool(Pool::Runs).expect("runs are listed").limit(),
+        Limit::AtMost(2)
+    );
+    assert_eq!(
+        report
+            .pool(Pool::Processes)
+            .expect("processes are listed")
+            .limit(),
+        Limit::Unlimited,
+        "a pool the budget leaves alone is unlimited"
+    );
+    assert_eq!(report.device().copied(), Some(readings));
+    drop(held);
+    assert_eq!(
+        engine
+            .resources()
+            .pool(Pool::ToolCalls)
+            .expect("listed")
+            .in_use(),
+        0,
+        "a dropped permit gives its share back"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
+/// ADR 0065 decision 9: while a run works, its stream carries the report, at most every two
+/// seconds. The run is held in its first model call, so it is working and quiet throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_working_run_hears_the_resource_report() {
+    let rig = Rig::new(Some(0)).await;
+    rig.mock.push_text("hello back");
+    let started = std::time::Instant::now();
+    let turn = rig.engine.send(None, Say::new("hello")).await.unwrap();
+    rig.gate.wait_reached().await;
+    let mut events = rig.engine.events(turn.run).await.unwrap();
+    let report = timeout(WAIT, async {
+        while let Some(event) = events.next().await {
+            if let EngineEvent::Resources(report) = event.unwrap() {
+                return report;
+            }
+        }
+        panic!("the stream ended without a report");
+    })
+    .await
+    .expect("a report arrives while the run works");
+    assert!(
+        started.elapsed() >= Duration::from_millis(1_900),
+        "a report is not sent more often than every two seconds, {:?} after the start",
+        started.elapsed()
+    );
+    for pool in adam_budget::Pool::ALL {
+        let line = report
+            .pool(pool)
+            .unwrap_or_else(|| panic!("{pool} is in the report"));
+        assert_eq!(line.limit(), adam_budget::Limit::Unlimited, "{pool}");
+    }
+    rig.gate.release.notify_one();
+    rig.wait(turn.run, RunState::Done).await;
+    rig.stop().await;
+}

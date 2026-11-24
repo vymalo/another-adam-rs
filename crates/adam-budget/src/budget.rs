@@ -98,6 +98,57 @@ impl fmt::Display for DiskReserve {
     }
 }
 
+/// A pool's ceiling in a report: a number of its unit, or no ceiling at all.
+///
+/// An absent limit is not a limit of zero: a deployment that sets nothing leaves every pool
+/// unlimited, and a report says so (ADR 0065 decision 9). [`Limit::AtMost(0)`](Self::AtMost) is
+/// the other thing: a ceiling a deployment closes on purpose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Limit {
+    /// No ceiling: [`Budget::UNLIMITED`]'s value for the pool, which [`Budget::lower`] cannot make
+    /// smaller.
+    Unlimited,
+    /// At most this many, in the pool's unit.
+    AtMost(u64),
+}
+
+impl Limit {
+    /// The number, when there is one; `None` when the pool is unlimited.
+    #[must_use]
+    pub const fn at_most(self) -> Option<u64> {
+        match self {
+            Self::Unlimited => None,
+            Self::AtMost(limit) => Some(limit),
+        }
+    }
+
+    /// Whether no ceiling was set.
+    #[must_use]
+    pub const fn is_unlimited(self) -> bool {
+        matches!(self, Self::Unlimited)
+    }
+
+    /// One count field of a [`Budget`]: its type's maximum is the identity of
+    /// [`Budget::lower`], and reads as unlimited.
+    const fn of_count(count: u32) -> Self {
+        if count == u32::MAX {
+            Self::Unlimited
+        } else {
+            Self::AtMost(count as u64)
+        }
+    }
+}
+
+impl fmt::Display for Limit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unlimited => f.write_str("unlimited"),
+            Self::AtMost(limit) => write!(f, "{limit}"),
+        }
+    }
+}
+
 /// One ceiling for one process: what may run at once, and how much of the machine.
 ///
 /// It is [`non_exhaustive`](https://doc.rust-lang.org/reference/attributes/type_system.html) and
@@ -208,6 +259,32 @@ impl Budget {
             Pool::CommandMemory => {
                 const MIB: u64 = 1024 * 1024;
                 self.command_memory.saturating_add(MIB - 1) / MIB
+            }
+        }
+    }
+
+    /// The ceiling of `pool` as a report reads it: [`Limit::Unlimited`] when this budget leaves
+    /// the pool at [`Budget::UNLIMITED`]'s value, its number otherwise.
+    ///
+    /// The distinction is not cosmetic: [`Budget::limit`] gives the identity a number
+    /// (`u32::MAX`, or `u64::MAX` bytes rounded up to MiB), which a host would print as a ceiling
+    /// of four billion runs rather than as none.
+    #[must_use]
+    pub const fn ceiling(&self, pool: Pool) -> Limit {
+        match pool {
+            Pool::Runs => Limit::of_count(self.runs),
+            Pool::ModelCalls => Limit::of_count(self.model_calls),
+            Pool::ToolCalls => Limit::of_count(self.tool_calls),
+            Pool::Processes => Limit::of_count(self.processes),
+            Pool::Git => Limit::of_count(self.git),
+            Pool::McpServers => Limit::of_count(self.mcp_servers),
+            Pool::CommandMemory => {
+                if self.command_memory == u64::MAX {
+                    Limit::Unlimited
+                } else {
+                    const MIB: u64 = 1024 * 1024;
+                    Limit::AtMost(self.command_memory.saturating_add(MIB - 1) / MIB)
+                }
             }
         }
     }
@@ -438,5 +515,52 @@ mod tests {
             let budget = Budget::builder().pool_limit(pool, 7).build();
             assert_eq!(budget.limit(pool), 7, "{pool}");
         }
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    /// ADR 0065 decision 9: an absent limit is not a zero limit. A budget that sets nothing
+    /// reports every pool as unlimited, a pool it sets reports its number, and a pool set to zero
+    /// stays a zero limit.
+    #[test]
+    fn no_limit_is_not_a_zero_limit() {
+        for pool in Pool::ALL {
+            assert_eq!(
+                Budget::UNLIMITED.ceiling(pool),
+                Limit::Unlimited,
+                "{pool} with no limit"
+            );
+            assert_eq!(
+                Budget::builder().build().ceiling(pool),
+                Limit::Unlimited,
+                "{pool} of an empty budget"
+            );
+        }
+        let budget = Budget::builder()
+            .runs(2)
+            .command_memory(2 * 1024 * 1024 * 1024)
+            .build();
+        assert_eq!(budget.ceiling(Pool::Runs), Limit::AtMost(2));
+        assert_eq!(budget.ceiling(Pool::ToolCalls), Limit::Unlimited);
+        assert_eq!(budget.ceiling(Pool::CommandMemory), Limit::AtMost(2_048));
+        assert_eq!(
+            Budget::builder().runs(0).build().ceiling(Pool::Runs),
+            Limit::AtMost(0),
+            "a pool a deployment closes is a limit of zero"
+        );
+    }
+
+    /// The limit says itself: `unlimited`, never a number a reader could take for a ceiling.
+    #[test]
+    fn a_limit_names_itself() {
+        assert_eq!(Limit::Unlimited.to_string(), "unlimited");
+        assert_eq!(Limit::AtMost(4).to_string(), "4");
+        assert_eq!(Limit::Unlimited.at_most(), None);
+        assert_eq!(Limit::AtMost(4).at_most(), Some(4));
+        assert!(Limit::Unlimited.is_unlimited());
+        assert!(!Limit::AtMost(0).is_unlimited());
     }
 }

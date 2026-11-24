@@ -296,7 +296,7 @@ impl Admission for LocalAdmission {
                 .saturating_sub(slot.sem.available_permits() as u64);
             PoolUsage::new(
                 slot.pool,
-                slot.limit,
+                self.budget.ceiling(slot.pool),
                 held,
                 slot.waiting.load(Ordering::SeqCst),
             )

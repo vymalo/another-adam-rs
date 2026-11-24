@@ -46,6 +46,7 @@ an agent does.
 | `serve(&config, agents, shutdown)` | the whole process, until `shutdown` resolves; `ServeError` on failure |
 | `serve_on(&config, agents, listener, shutdown)` | the same on a `tokio::net::TcpListener` the caller bound (`LISTEN_ADDR` is not read, so never `Bind`): a host that must know its port first binds it and hands it over, with no moment in which another process can take it; the checks run in the same order |
 | `ServeError` | `Connect` (the message names the backend, `connecting to Postgres`), `Migrate`, `NoCard`, `ChildSessions` (a helper of `child-sessions/v1` is not registered on the runtime: exit 78), `UnsupportedScheme`, `StoreNotBuilt`, `SqliteWithoutPath`, `SplitRoleOnSqlite` (the store `DATABASE_URL` names cannot be served: exit 78), `Bind`, `LocalAddr`, `Host`, `Push` (push notifications are on and cannot be set up: exit 78). The message names the step; the cause is the `source`, so a chain printed whole says it once |
+| `metrics::render(&adam_budget::Usage)` | The process's pools in the Prometheus text exposition format (`adam_admission_in_use`, `adam_admission_limit`, `adam_admission_waiting{pool}`, and `adam_admission_tokens_available`/`_limit` when the budget meters tokens), with `+Inf` for a pool that has no ceiling (ADR 0065 decision 9). It is a rendering, not a listener: `adam-service` runs no `/metrics` endpoint, and the counters `adam_admission_waits_total`, `adam_admission_refusals_total`, `adam_process_stopped_total` and the size `adam_disk_bytes` are not built, because the admission keeps no such totals. No person, run or conversation is a label |
 | `claim_scope_for(placement)` | `Pinned` for a placement that pins runs, `Any` otherwise |
 | `exit_code(&err)`, `exit_code_with(&err, classify)`, `EX_*` | the exit code of an error chain (below); `classify` is how a binary adds its own error types |
 
@@ -193,6 +194,9 @@ from a worker not a 69.
   `adam-model-openai`) is refused without the variable, nothing reaching it, and answers with it.
 * `src/exit.rs`: the exit-code table, a `HostError` deciding over its source, a binary's own classifier.
 * `src/service.rs`: `LiveSignals::local`, the defaults.
+* `tests/metrics.rs`: `every_pool_is_one_series_and_an_unlimited_pool_is_infinite` (the whole text,
+  one series per pool per metric, `+Inf` for a pool with no ceiling) and
+  `a_process_that_meters_no_tokens_reports_no_bucket`.
 * `tests/service.rs`: a `Service` over the in-memory store with a scripted agent: the card is served, `/healthz`
   answers, a bearer token is required, a task completes, a control plane and a worker over one store meet in it,
   and two services of different names share a store without stealing each other's runs.
