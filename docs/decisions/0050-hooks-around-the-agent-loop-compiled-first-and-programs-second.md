@@ -404,3 +404,5 @@ appended **inside the step `model:<turn>`** and recorded in its record, so `mode
 reports of ADR 0045. When both exist, the message verdict is applied first, then the reports. A report is not a message, so `message.received` is not asked
 about it. A report that keeps a turn going is a read of `wait_<turn>` made after `sessions:<turn>`, so `end:<turn>` comes after `sessions:<turn>` and is not
 taken when a report keeps the turn going: a hook never sees an end that is taken back. No step name changes.
+
+*Amended 2026-11-24 (slice H4 built):* `RuntimeBuilder::observers(HookSet)` gives the runtime plugins whose `observe` receives `run.parked`, `run.ended` (done or failed), `run.error` (a failed try that will be retried) and one `artifact.kept` per artifact a transition kept, after the commit and best effort (a crash between the commit and its events loses them). Keys are `<run>/commit:<version>/<event>/<index>`. `RunEvent::Status` did not gain an error class: the event carries the text and the attempt. Proof: `observers_get_one_event_per_park_end_failed_try_and_artifact` in `crates/adam-runtime/tests/runtime.rs`, on the memory, PostgreSQL and MongoDB stores.
