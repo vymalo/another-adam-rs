@@ -740,12 +740,13 @@ impl Refusal {
 /// `max_output_tokens: 0` and `time_limit: 0` mean what they mean in a folder: the model's cap and
 /// no limit. A request is still held to the ADR's rule for them.
 ///
-/// The type is `#[non_exhaustive]`: a slice that adds an option adds its bound, and that must not
-/// break a consumer's literal.
+/// The fields are public and the type is exhaustive: the assembly builds one per subagent with a
+/// literal, once, where the folder and the deployment meet. A slice that adds an option adds its
+/// bound and a default in [`Default`], so code that builds one says what it wants and the break is
+/// the literal's (the ADR's consequences say so).
 ///
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct SessionBounds {
     /// The folder's `limits.max_turns`.
     pub max_turns: u32,
