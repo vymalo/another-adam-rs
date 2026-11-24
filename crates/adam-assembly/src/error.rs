@@ -392,21 +392,6 @@ pub enum Error {
         /// Why it was refused.
         problem: AliasProblem,
     },
-    /// `limits.max_parallel` asks for more tool calls at once than the deployment allows
-    /// (`MAX_PARALLEL_TOOL_CALLS`, ADR 0049). A bound only narrows (ADR 0054 decision 2), so a
-    /// value above it is refused rather than silently clamped.
-    #[error(
-        "{origin}: `limits.max_parallel` is {asked}; the deployment allows at most {allowed} \
-         (MAX_PARALLEL_TOOL_CALLS), and a bound only narrows"
-    )]
-    ParallelAboveDeployment {
-        /// The agent and file that ask.
-        origin: Origin,
-        /// The value the file asks for.
-        asked: usize,
-        /// The value the deployment allows.
-        allowed: usize,
-    },
     /// The agent's `reasoning_effort` is not one of the seven levels (ADR 0063).
     #[error("{origin}: `reasoning_effort`: {source}")]
     InvalidReasoningEffort {
