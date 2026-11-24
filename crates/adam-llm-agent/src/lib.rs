@@ -170,7 +170,8 @@ pub use access::{ToolAccess, Use, UseMode, path_scope};
 ///
 /// [ADR 0050]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
 pub use adam_plugin::{
-    HookError, HookLimits, HookResult, HookSet, HookedCall, HookedText, Plugin, Verdict,
+    EventHeader, EventKind, EventQueue, FlushReport, HookError, HookEvent, HookLimits, HookResult,
+    HookSet, HookedCall, HookedText, ObserveLimits, Plugin, Verdict,
 };
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{

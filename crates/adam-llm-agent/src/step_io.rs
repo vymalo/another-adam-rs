@@ -103,6 +103,14 @@ impl StepIo {
         self
     }
 
+    /// `text` scrubbed with the agent's scrubber, if it has one (ADR 0050: what an observer reads).
+    pub(crate) fn scrub(&self, text: &str) -> String {
+        match &self.redact {
+            Some(redact) => redact(text),
+            None => text.to_owned(),
+        }
+    }
+
     /// The arguments of a call, scrubbed, for the report that starts its step; `None` when the step
     /// is not to carry them (the switch is off, or the model gave none: nothing, an empty object or
     /// something that is not an object). The cut is [`StepEvent::with_input_within`](adam_runtime::StepEvent::with_input_within)'s.
