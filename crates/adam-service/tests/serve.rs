@@ -1089,3 +1089,57 @@ async fn the_card_lists_locale_exactly_when_the_deployment_names_a_default_langu
         running.finish().await;
     }
 }
+
+/// The card lists `uploads/v1` with the largest upload: the folder's value wins over
+/// `UPLOADS_MAX_BYTES`, which wins over the default.
+#[tokio::test]
+async fn the_card_lists_uploads_with_the_folder_then_the_environment_then_the_default() {
+    use a2a_client::agent_card::AgentCardResolver;
+    use adam_a2a::{DEFAULT_UPLOADS_MAX_BYTES, UPLOADS_EXTENSION};
+
+    let Some(url) = database() else { return };
+
+    let cases: [(Option<&str>, Option<u64>, u64); 4] = [
+        (None, None, DEFAULT_UPLOADS_MAX_BYTES),
+        (Some("2048"), None, 2048),
+        (None, Some(4096), 4096),
+        (Some("2048"), Some(4096), 4096),
+    ];
+    for (env, folder, expected) in cases {
+        let name = unique("serve-uploads");
+        let (listener, port) = listen().await;
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let more: Vec<(&str, String)> = env
+            .map(|t| ("UPLOADS_MAX_BYTES", t.to_owned()))
+            .into_iter()
+            .collect();
+        let cfg = config_with(&url, "all", port, &more);
+        let card = AgentCardConfig::new(
+            &name,
+            "A test agent.",
+            format!("http://{addr}/").parse().unwrap(),
+            "0.0.1",
+        );
+        let agents = agents(&name, &cfg).card(card);
+        let agents = match folder {
+            Some(bytes) => agents.uploads_max_bytes(bytes),
+            None => agents,
+        };
+        let running = Running::start(listener, cfg, agents);
+        until_ok(addr, "/healthz", &running.handle).await;
+
+        let public = AgentCardResolver::new(None)
+            .resolve(&format!("http://{addr}"))
+            .await
+            .unwrap();
+        let entry = public
+            .capabilities
+            .extensions
+            .as_ref()
+            .and_then(|all| all.iter().find(|e| e.uri == UPLOADS_EXTENSION))
+            .expect("listed");
+        let params = entry.params.as_ref().expect("params");
+        assert_eq!(params["maxBytes"], expected, "{env:?} {folder:?}");
+        running.finish().await;
+    }
+}

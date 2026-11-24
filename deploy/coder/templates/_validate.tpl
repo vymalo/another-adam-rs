@@ -29,6 +29,13 @@ from service.yaml, which every render contains, so they always run.
 {{- if and (include "coder.maxAccessTier" .) (hasKey .Values.config.extraEnv "MAX_ACCESS_TIER") -}}
 {{- fail "accessTiers.max is set and config.extraEnv sets MAX_ACCESS_TIER: set one (extraEnv would override the cap the chart renders)" -}}
 {{- end -}}
+{{- $uploads := include "coder.uploadsMaxBytes" . -}}
+{{- if and $uploads (not (and (regexMatch "^[0-9]{1,10}$" $uploads) (ge (int64 $uploads) 1) (le (int64 $uploads) 4294967296))) -}}
+{{- fail (printf "uploads.maxBytes must be a whole number of bytes from 1 to 4294967296 (4 GiB), or empty for the default, got %q" $uploads) -}}
+{{- end -}}
+{{- if and $uploads (hasKey .Values.config.extraEnv "UPLOADS_MAX_BYTES") -}}
+{{- fail "uploads.maxBytes is set and config.extraEnv sets UPLOADS_MAX_BYTES: set one (extraEnv would override the limit the chart renders)" -}}
+{{- end -}}
 {{- if not (has (toString .Values.github.auth) (list "token" "app")) -}}
 {{- fail (printf "github.auth must be token or app, got %q" (toString .Values.github.auth)) -}}
 {{- end -}}
