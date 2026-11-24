@@ -199,6 +199,8 @@ classDiagram
     Agent <|.. CoderAgent
     class Tool { <<interface>> }
     Tool <|.. FnTool
+    class Admission { <<interface>> }
+    Admission <|.. LocalAdmission
 ```
 
 | Port | Defined in | Real implementations | Doubles |
@@ -217,6 +219,7 @@ classDiagram
 | `GitCredentials` | `adam-workspace` | `ScopedToken`, `GitHubApp` (inside `HostScoped`), `StaticToken` | none needed |
 | `Environment` | `adam-workspace` | `Local`, `KubeEnvironment` (`adam-env-kubernetes`) | a fake API server and exec seam in the tests |
 | `CallBearer` | `adam-mcp` | `GitHubReadBearer` (`adam-coder`) | test bearers |
+| `Admission` | `adam-budget` | `LocalAdmission` (`adam-admission-local`): semaphores per pool and per conversation, one token bucket | the conformance suite `admission_conformance!` is the reference |
 | `PermissionPrompt` | `adam-acp` | none (the default policy needs no prompt) | `StaticPrompt` |
 
 `AgentStarter` is the start-only half of `Agent` (`name`, `init`, `init_continuing`): a process that
@@ -229,6 +232,39 @@ Rules the code follows:
 * A store passes the conformance suite `store_conformance!`; to add a backend, implement `Store` and add
   one line ([testing](guides/testing.md#adding-a-backend)).
 * The guarantee is the version compare-and-swap in `Store::commit_run`, not the lease.
+
+### Admission: the budget, the pools and the permit
+
+Before a unit of work starts, it asks the process's `Admission` for a seat of its
+[`Pool`](../crates/adam-budget/README.md) ([ADR 0065](decisions/0065-resource-governance-admission-pools-and-os-limits.md)):
+`Pool::ModelCalls` around a model call, `Pool::ToolCalls` around a tool call, and the pools the later
+slices add for processes, git, MCP servers and command memory. The **`Permit` is released by dropping
+it**, so a cancelled, failed or panicking holder frees its share and nothing releases a permit twice.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Asked
+  Asked --> Admitted: room in the budget
+  Asked --> Waiting: no room now
+  Waiting --> Admitted: room frees within the wait
+  Waiting --> Parked: the wait ran out
+  Parked --> Asked: retry_after passes or a slot frees
+  Asked --> NeedsPerson: disk budget full
+  NeedsPerson --> Asked: space freed or limit raised
+  Asked --> Refused: can never fit
+  Admitted --> [*]
+  Refused --> [*]
+```
+
+| Where | What it asks | A refusal does what |
+|---|---|---|
+| `gate::Admitted`, wrapping the agent's model client | one seat of `Pool::ModelCalls` per `complete`/`stream`, held until the answer or the stream ends; the tokens it estimates when the budget meters them | a full pool is a `RateLimited` model failure with the refusal's `retry_after`, so the run waits and then parks (ADR 0061, ADR 0067) |
+| The tool loop (`LlmAgent::drive_one`) | one seat of `Pool::ToolCalls` per call, held until its work ends | the call waits up to a minute and then runs anyway with a warning: **a run never fails because a slot was busy** |
+
+The ceiling comes from the deployment or the device; a folder's or a person's budget is combined with
+`Budget::lower`, which takes the smaller value field by field, so nothing built from it can raise what
+the deployment allows. `LocalAdmission` is one process: it persists nothing, and two replicas each
+admit up to the whole budget (counting them in the store is `StoreAdmission`, undecided).
 
 ## Processes and roles
 

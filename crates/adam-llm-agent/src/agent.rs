@@ -1412,7 +1412,7 @@ impl LlmAgentBuilder {
     /// never start more calls than the deployment allows. `None` (the default) admits everything:
     /// a host that sets no ceiling is the ceiling.
     ///
-    /// * A model call waits [`gate::WAIT`] for its seat, then parks the run on the refusal's
+    /// * A model call waits five seconds for its seat, then parks the run on the refusal's
     ///   `retry_after`, as it parks on a provider's `429` (ADR 0061, ADR 0067).
     /// * A tool call waits up to [`TOOL_ADMISSION_WAIT`] and then runs anyway, with a warning: a
     ///   run never fails because a slot was busy (ADR 0065 decision 4).
@@ -4487,11 +4487,11 @@ impl LlmAgent {
         let limit = admission
             .snapshot()
             .pool(Pool::ToolCalls)
-            .map(adam_budget::PoolUsage::limit);
+            .map_or(0, adam_budget::PoolUsage::limit);
         tracing::warn!(
             pool = Pool::ToolCalls.as_str(),
             limit,
-            waited_millis = TOOL_ADMISSION_WAIT.as_millis(),
+            waited_millis = u64::try_from(TOOL_ADMISSION_WAIT.as_millis()).unwrap_or(u64::MAX),
             "the tool pool stayed full: the call runs nevertheless, over its share"
         );
         None
@@ -7121,7 +7121,7 @@ mod admission_tests {
     }
 
     impl Recorder {
-        fn asks(self: &Arc<Self>) -> Vec<(Pool, String, u32)> {
+        fn asks(&self) -> Vec<(Pool, String, u32)> {
             self.asks
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

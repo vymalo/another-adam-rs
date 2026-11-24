@@ -82,6 +82,12 @@ fn refusal_as_model_error(refused: &Refused) -> ModelError {
             message: format!("the disk budget is full: {used} of {limit} bytes used"),
             source: None,
         },
+        // `Refused` is non-exhaustive: a refusal a later slice adds is a request that cannot be
+        // made as it is, never a failed run.
+        other => ModelError::InvalidRequest {
+            message: other.to_string(),
+            source: None,
+        },
     }
 }
 

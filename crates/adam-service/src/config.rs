@@ -679,10 +679,10 @@ fn parse_tokens_per_minute(
 ) -> Option<u32> {
     const NAME: &str = "MODEL_TOKENS_PER_MINUTE";
     let raw = get(NAME)?;
-    let n: u32 = raw.trim().parse().unwrap_or_else(|e| {
-        problems.push(format!("{NAME} is invalid ({raw:?}): {e}"));
-        0
-    });
+    let Ok(n) = raw.trim().parse::<u32>() else {
+        problems.push(format!("{NAME} is invalid ({raw:?}): not a whole number"));
+        return None;
+    };
     if (1..=MODEL_TOKENS_PER_MINUTE_LIMIT).contains(&n) {
         return Some(n);
     }
@@ -765,7 +765,9 @@ impl WorkerSettings {
         let budget = adam_budget::Budget::builder()
             .runs(u32::try_from(self.workers).unwrap_or(u32::MAX))
             .tool_calls(u32::try_from(self.max_tool_calls_in_flight).unwrap_or(u32::MAX))
-            .model_calls(u32::try_from(self.max_model_calls).unwrap_or(u32::MAX));
+            .model_calls(u32::try_from(self.max_model_calls).unwrap_or(u32::MAX))
+            // The share ADR 0065 decision 11 gives one conversation: half of each pool.
+            .per_conversation_share(adam_budget::Ratio::HALF);
         match self.model_tokens_per_minute {
             Some(tokens) => budget.tokens_per_minute(tokens).build(),
             None => budget.build(),

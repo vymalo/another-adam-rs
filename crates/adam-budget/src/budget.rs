@@ -388,8 +388,17 @@ mod tests {
             DiskReserve::Ratio(Ratio::new(1_000).expect("10%"))
         );
         assert_eq!(
-            DiskReserve::Bytes(5).lower(&DiskReserve::Bytes(9)),
-            DiskReserve::Bytes(9)
+            stricter_reserve(DiskReserve::Bytes(5), DiskReserve::Bytes(9)),
+            DiskReserve::Bytes(9),
+            "a fixed reserve is the larger of the two"
+        );
+        assert_eq!(
+            stricter_reserve(
+                DiskReserve::Ratio(Ratio::HALF),
+                DiskReserve::Ratio(Ratio::new(1_000).expect("10%"))
+            ),
+            DiskReserve::Ratio(Ratio::HALF),
+            "a ratio is the larger of the two"
         );
     }
 

@@ -319,8 +319,12 @@ impl Bucket {
     }
 }
 
+/// `limit` as semaphore permits. `Semaphore::new` panics over [`Semaphore::MAX_PERMITS`], and a
+/// budget's identity is very large, so the ceiling is clamped there rather than panicking.
 fn permits(limit: u64) -> usize {
-    usize::try_from(limit).unwrap_or(usize::MAX)
+    usize::try_from(limit)
+        .unwrap_or(usize::MAX)
+        .min(Semaphore::MAX_PERMITS)
 }
 
 fn saturating_u32(limit: u64) -> u32 {
