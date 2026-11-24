@@ -19,10 +19,12 @@ instructions + a model + a toolset. It is served over A2A by
 | Item | What |
 |---|---|
 | `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
-| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.reasoning_effort(Option<ReasoningEffort>)` (the level every turn asks for unless the run's context names one: see *Reasoning effort*), `.model_parking(ModelParking)` (how a run waits on a model that refused it: see *A run parked on the model*), `.model_fallback(ModelBinding)` (the model a run continues on, once, when its own is locked: see *A locked model*), `.model_choices(Vec<ModelBinding>)` (the models a message may name through `MODEL_CONTEXT_KEY`), `.admission(DynAdmission)` (the process's pools, ADR 0065: every model call takes a seat of `Pool::ModelCalls` and every tool call one of `Pool::ToolCalls`; see *The process's pools*), `.build()` |
+| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.reasoning_effort(Option<ReasoningEffort>)` (the level every turn asks for unless the run's context names one: see *Reasoning effort*), `.model_parking(ModelParking)` (how a run waits on a model that refused it: see *A run parked on the model*), `.model_fallback(ModelBinding)` (the model a run continues on, once, when its own is locked: see *A locked model*), `.model_choices(Vec<ModelBinding>)` (the models a message may name through `MODEL_CONTEXT_KEY`), `.admission(DynAdmission)` (the process's pools, ADR 0065: every model call takes a seat of `Pool::ModelCalls` and every tool call one of `Pool::ToolCalls`; see *The process's pools*), `.hooks(HookSet)` / `.plugin(one)` (compiled hooks inside each tool call's step, ADR 0050 slice H1; see *Hooks around a tool call*), `.build()` |
 | `ModelParking`, `ModelWait`, `ModelPark`, `MODEL_RESUME_KIND`, `DEFAULT_MODEL_PARK_LIMIT`, `MAX_MODEL_BACKOFF` | a run parked on the model (ADR 0067): `ModelParking::new(limit).when_unreachable(bool)`, the default a limit of 24 h and an unreachable endpoint that fails as before; `Conversation::model_wait` is the `ModelWait` of a parked run (`reason`, `status`, `slug`, `park`, `parked_since`, `parks`, `wake_at`); see *A run parked on the model* |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*); it also splits and joins the conversation exactly like `LlmAgent` (`AgentStarter::split`/`join`), so a run it starts is written with a head and a body, not left in the v4 format |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens` (the cap a call asks for; `0` leaves it to the model, and `Limits::default()` is 4,096 for a hand-built agent: the 128,000 fallback and the model's profile are resolved and clamped by the assembly, ADR 0064), `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
+| `HookSet`, `Plugin`, `Verdict`, `HookError`, `HookLimits`, `HookedCall`, `HookedText` | ADR 0050 slice H1, re-exported from `adam-plugin`: `HookSet::new().with(Arc::new(plugin)).with_limits(HookLimits { deadline, retries })`, and `Plugin` with `name`, `before_tool(&mut HookedCall { tool, arguments })` and `after_tool(&HookedCall, &mut HookedText { text })`. Installed with `LlmAgentBuilder::hooks`/`.plugin`; see *Hooks around a tool call* |
+| `HookedOutput`, `HookDecision` | what the journaled `tool:<call id>` step records: `output` (a flattened `ToolOutput`), `hooks` (the decisions that were not `Continue`, each with `point`, `verdict`, `reason` and the failing `plugin`) and `args` (the arguments that ran, when a rewrite changed them). A record written before hooks existed is a bare `ToolOutput` and decodes; an older build reads a new one as its output |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so the loop runs such a call alone; whether the person can be asked is decided per run, see *Child sessions*; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to the helper", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) and `read_answer(call_id, args, ui, payload) -> AnswerCheck` (`Accept`, `Read(text)`, `Refuse(Refusal)` or `End(Refusal)`; the default accepts: reads the answer to the tool's own question before the model does; see *The answer is read by the tool that asked*) |
 | `ToolOutput` | `text`, `error`, `with_artifact`, `pinned()` (a compaction that drops the result copies it into its marker, see *Compaction*), `with_loaded` (a loader's whole list, journaled with the result, see `Loaded` below). A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. That check comes after the result is journaled, so a tool that may return several files it did not choose keeps its result within `ToolCtx::files_left()` (`adam_runtime::ReceivedFiles` does). `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed. `announcing(text)` (the member `answer`) makes `text` **the run's answer**, see *Announced answers*. `sandbox: SandboxUsage` is what the call reported with `ToolCtx::report_sandbox`, put there by the loop and journaled with the result (absent from a journal from before, not written while empty), see *Sandbox time* |
 | `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
@@ -834,6 +836,42 @@ ADR 0037 says of its state: a worker that has not been rolled runs a tool whose 
   `Conversation` gains `repeats` and `ToolOutput` gains `repeat_key` (struct literals), **a tool that declares no bound of its own is stopped after 300 s**,
   and **cancelling a parent cancels its children** and **a subagent run stops after 30 minutes unless its file says
   otherwise** (`adam-runtime`, `adam-assembly`).
+
+## Hooks around a tool call (ADR 0050, slice H1)
+
+`LlmAgentBuilder::hooks(HookSet)` installs compiled plugins, and `.plugin(one)` appends one; the order
+they are added in is the order their hooks run in. `adam-plugin` holds the vocabulary: `Plugin`
+(`name`, `before_tool`, `after_tool`, each with a do-nothing default), `Verdict` (`Continue`, `Deny`,
+`Ask`, `Stop`), `HookError` and `HookLimits`; all are re-exported here.
+
+* **Where.** Both points run **inside** the call's journaled step `tool:<call id>`, after a source's
+  `withhold` and before the tool for `before_tool`, and once the tool answered for `after_tool`. No
+  step is added and no step name or seq changes, whatever a plugin decides, so adding or removing one
+  leaves every journal replayable.
+* **What a hook may do.** Rewrite the arguments (before) or the text the model reads (after); `Deny`
+  answers the call with the reason and the run goes on; `Ask` answers `awaiting approval: <question>`
+  and the call does not run — approval is ADR 0050's slice H8; `Stop` answers the call with the
+  reason and fails the run `stopped by a plugin: <reason>`.
+* **Fail closed.** A hook that errors, panics or misses its deadline never lets the call through. A
+  `Transient`/`RateLimited` failure is the step's own: the transition is retried and the call runs
+  afresh. Anything else denies the call (before) or turns the result into an error (after).
+* **A rewrite may not change what the call touches.** A `before_tool` rewrite whose `Tool::access`
+  differs from the one the schedule of the turn was made from (ADR 0049) is refused and the call is
+  denied: two calls the loop started together would otherwise have been ordered from other arguments.
+* **Recorded, never asked twice.** The step's record is `HookedOutput`: the `ToolOutput` flattened,
+  plus `hooks` (each decision: `point`, `verdict`, `reason`, and `plugin` when a plugin failed) and
+  `args` (the arguments that ran, when a hook rewrote them). A record written before hooks existed is
+  a bare `ToolOutput` and decodes as one with no decision; an older build reads a new record as its
+  output and ignores the rest. A replay that finds the step recorded runs no hook.
+* **What takes no hook.** A call that takes no step (arguments that are not JSON, a tool nobody has,
+  the `after_previous` refusal) runs no hook: a decision is recorded in the step it would have
+  changed, and there is none. A call a source holds back runs none either.
+
+Tests: `tests/hooks.rs` — a replay past the step's journal write asks no hook again (a counter that
+stays at 1 while the unrecorded call's reaches 2), a rewrite that changes `Tool::access` is denied (the
+tool never runs, the record says `failed`), old and new records decode both ways, each of four calls of
+one turn runs its own hooks, a rewrite at each point is what runs and what the model reads, and deny,
+ask, stop and a panicking plugin.
 
 ## Parallel tool calls
 

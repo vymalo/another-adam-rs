@@ -1,6 +1,6 @@
 [package]
 name = "adam-plugin"
-description = "Plugins around the agent loop (ADR 0050, slice H1): the Plugin trait, the ordered HookSet with deadlines and catch_unwind, the verdicts and the errors. The wiring into the loop is part 2."
+description = "Plugins around the agent loop (ADR 0050, slice H1): the Plugin trait, the ordered HookSet with deadlines and catch_unwind, the verdicts and the errors. adam-llm-agent runs a set inside the tool call's journaled step."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

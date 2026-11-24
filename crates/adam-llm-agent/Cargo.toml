@@ -20,6 +20,9 @@ adam-budget.workspace = true
 adam-error.workspace = true
 adam-core.workspace = true
 adam-model.workspace = true
+# The compiled hook set around a tool call (ADR 0050, slice H1): the loop runs it inside the
+# call's journaled step.
+adam-plugin.workspace = true
 adam-runtime.workspace = true
 async-trait.workspace = true
 futures.workspace = true

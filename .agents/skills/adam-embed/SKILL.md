@@ -68,6 +68,15 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      it the level is dropped silently (ADR 0063 decision 6; `.models(..)` on the engine does not reach the client).
      Details and the tool rules:
      `crates/adam/README.md` ("`#[tool]`", "Agent directories"), `docs/reference/agent-files.md`.
+   * **A host may put compiled hooks around every tool call** (ADR 0050, slice H1):
+     `LlmAgentBuilder::hooks(HookSet)` or `.plugin(one)` (`adam-plugin`, re-exported by
+     `adam-llm-agent`) runs `before_tool` and `after_tool` **inside** the call's journaled step
+     `tool:<call id>`, so a hook may rewrite the arguments or the text the model reads, deny the
+     call, ask (not built: the call is not run) or stop the run, and a replay that finds the step
+     recorded asks no hook. The verdict is recorded with the call, in `HookedOutput`. A hook gets no
+     `Ctx` and adds no step. `EngineBuilder` takes no `HookSet` yet, and an agent file's `plugins:`
+     is a later slice, so a served folder agent installs none.
+     https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
    * **A wrapper agent must delegate the split.** `adam_runtime::Agent` has provided `split`/`join`
      methods (and so does `AgentStarter`) that let a run keep its transcript in an append-only body
      beside a small head; the default keeps the whole state in the head, the v4 format. An agent of
