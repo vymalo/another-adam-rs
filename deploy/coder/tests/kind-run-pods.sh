@@ -327,7 +327,13 @@ import sys
 t = open(sys.argv[1]).read().replace("name: egress-check", "name: secret-check", 1)
 kind = sys.argv[3]
 if kind == "env":
-    add = "      env:\n        - name: CANARY\n          valueFrom:\n            secretKeyRef: {name: coder, key: MODEL_API_KEY}\n"
+    # The container already has an `env:` list; a second `env:` key would be overridden by the later one.
+    marker = "      env:\n"
+    if t.count(marker) != 1:
+        sys.exit("the template's run container has no single `env:` at six spaces")
+    t = t.replace(marker, marker + "        - name: CANARY\n          valueFrom:\n            secretKeyRef: {name: coder, key: MODEL_API_KEY}\n", 1)
+    add = None
+    kind = "done"
 elif kind == "envfrom":
     add = "      envFrom:\n        - secretRef: {name: coder}\n"
 else:
@@ -337,7 +343,7 @@ if add is not None:
     if t.count(marker) != 1:
         sys.exit("the template's first container is not `run` at two spaces: " + t[:300])
     t = t.replace(marker, marker + add, 1)
-else:
+elif kind == "volume":
     marker = "  volumes:\n"
     if t.count(marker) != 1:
         sys.exit("the template has no single `volumes:` list")
