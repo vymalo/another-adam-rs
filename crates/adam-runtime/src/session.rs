@@ -204,6 +204,14 @@ pub struct SessionHeader {
     /// header written before it existed reads.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub visible: bool,
+    /// The configuration the session runs with ([ADR 0054], decision 3): what its starter asked,
+    /// as [`SessionBounds::admit`] accepted it, so a replay reads it and never recomputes it. An
+    /// absent option means the folder's. Absent when `None`, which is what a header written before
+    /// it existed reads.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<SessionConfig>,
 }
 
 /// The header a round's agent state holds, if it holds one.
@@ -596,6 +604,303 @@ impl SessionLimits {
     }
 }
 
+/// The least `max_output_tokens` a session may ask for ([ADR 0054], decision 4): below it an answer
+/// is not worth the request, and `0` would leave the cap to the model, which widens.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MIN_SESSION_MAX_OUTPUT_TOKENS: u32 = 256;
+
+/// The most `max_output_tokens` a session may ask for when its folder leaves the cap to the model
+/// (`limits.max_output_tokens: 0`, [ADR 0054] decision 4): the model's own ceiling is not known
+/// here, so the decision gives one.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_SESSION_MAX_OUTPUT_TOKENS: u32 = 1_048_576;
+
+/// What a session's `context_window` must leave for the prompt before compaction can start:
+/// 20,000 tokens ([ADR 0054], decision 4).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const CONTEXT_WINDOW_PROMPT_TOKENS: u32 = 20_000;
+
+/// What a session's `context_window` must leave beside the prompt and the answer: 8,000 tokens
+/// ([ADR 0054], decision 4). A smaller window would make the compaction budget zero or less, which
+/// turns compaction **off**.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const CONTEXT_WINDOW_HEADROOM_TOKENS: u32 = 8_000;
+
+/// The configuration a session runs with ([ADR 0054]): every option optional, and each one only
+/// ever **narrows** what the subagent's folder and the deployment allow ([`SessionBounds::admit`]).
+///
+/// An absent option stays absent and means "the folder's": nothing is filled in. The type is
+/// `#[non_exhaustive]` because the decision adds options slice by slice (`tools`, `token_budget`,
+/// `model`, …), and an option added must not break a builder. It serialises camelCase, which is how
+/// it crosses the wire in `start.config` and how it is journaled in a [`SessionHeader`].
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SessionConfig {
+    /// The most model turns of a round, 1 to the folder's `limits.max_turns`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    /// The most tool calls of a round, 1 to the folder's `limits.max_tool_calls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u32>,
+    /// The cap of one model call, [`MIN_SESSION_MAX_OUTPUT_TOKENS`] to the folder's
+    /// `limits.max_output_tokens` (to [`MAX_SESSION_MAX_OUTPUT_TOKENS`] when the folder leaves it to
+    /// the model). Never `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// The window compaction starts from, at most the model's own window when known, and no smaller
+    /// than [`CONTEXT_WINDOW_PROMPT_TOKENS`] + the effective `max_output_tokens` +
+    /// [`CONTEXT_WINDOW_HEADROOM_TOKENS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    /// The most tool calls of one model turn that run at the same time ([ADR 0049]), 1 to the
+    /// agent's `max_parallel`.
+    ///
+    /// [ADR 0049]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_tool_calls: Option<u32>,
+    /// The minutes one round may take, 1 to the folder's `limits.max_minutes` (any when the folder
+    /// says `0`, none). Never `0`, which would mean no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_limit: Option<u32>,
+    /// The most rounds the session may have, 1 to the root's effective `max_session_rounds`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
+}
+
+impl SessionConfig {
+    /// Whether no option is asked for: the folder's own settings, exactly as no `config` at all.
+    pub fn is_empty(&self) -> bool {
+        self.max_turns.is_none()
+            && self.max_tool_calls.is_none()
+            && self.max_output_tokens.is_none()
+            && self.context_window.is_none()
+            && self.max_parallel_tool_calls.is_none()
+            && self.time_limit.is_none()
+            && self.max_rounds.is_none()
+    }
+
+    /// Read a `config` object ([ADR 0054], decision 1). **An unknown member is refused**, unlike the
+    /// members of `start` itself: an ignored narrowing fails open.
+    ///
+    /// # Errors
+    ///
+    /// A [`Refusal`] naming the member that is not an option, or the one whose value is not a
+    /// number.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub fn from_value(value: Value) -> Result<Self, Refusal> {
+        serde_json::from_value(value).map_err(|e| Refusal::new(None, e.to_string()))
+    }
+}
+
+/// Why a [`SessionConfig`] was not admitted ([ADR 0054], decision 2).
+///
+/// The sentence names the option, the value asked and what is allowed, so a caller can say what to
+/// ask instead: `config.max_turns is 500; at most 200`.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct Refusal {
+    option: Option<String>,
+    message: String,
+}
+
+impl Refusal {
+    fn new(option: Option<&str>, message: String) -> Self {
+        Self {
+            option: option.map(str::to_owned),
+            message,
+        }
+    }
+
+    /// The name of the option the refusal is about, when it is about one: `max_turns` for
+    /// `config.max_turns is 500; at most 200`.
+    pub fn option(&self) -> Option<&str> {
+        self.option.as_deref()
+    }
+
+    /// The whole sentence.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// The most a session of one subagent may ask of each option ([ADR 0054], decision 2): computed
+/// once at startup by the assembly from the subagent's file and the deployment, and never raised by
+/// a request. The starter's own grant (its tier) is added at the call.
+///
+/// `max_output_tokens: 0` and `time_limit: 0` mean what they mean in a folder: the model's cap and
+/// no limit. A request is still held to the ADR's rule for them.
+///
+/// The type is `#[non_exhaustive]`: a slice that adds an option adds its bound, and that must not
+/// break a consumer's literal.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionBounds {
+    /// The folder's `limits.max_turns`.
+    pub max_turns: u32,
+    /// The folder's `limits.max_tool_calls`.
+    pub max_tool_calls: u32,
+    /// The folder's `limits.max_output_tokens`, `0` when it leaves the cap to the model.
+    pub max_output_tokens: u32,
+    /// The model's context window, when the deployment knows it.
+    pub context_window: Option<u32>,
+    /// The agent's `max_parallel`, the deployment's `MAX_PARALLEL_TOOL_CALLS` lowered by the file.
+    pub max_parallel_tool_calls: u32,
+    /// The folder's `limits.max_minutes`, `0` when it sets no limit.
+    pub time_limit: u32,
+    /// The root's effective `max_session_rounds`.
+    pub max_rounds: u32,
+}
+
+impl Default for SessionBounds {
+    /// The loop's own defaults: 50 turns, 200 tool calls, 4,096 output tokens, 10 calls at once,
+    /// 30 minutes, 20 rounds, and no known window.
+    fn default() -> Self {
+        Self {
+            max_turns: 50,
+            max_tool_calls: 200,
+            max_output_tokens: 4_096,
+            context_window: None,
+            max_parallel_tool_calls: 10,
+            time_limit: 30,
+            max_rounds: 20,
+        }
+    }
+}
+
+impl SessionBounds {
+    /// Admit `requested` against these bounds ([ADR 0054], decision 2): the same config when every
+    /// option is within them, a [`Refusal`] otherwise. **It never raises a bound and it fills
+    /// nothing in**: an option the request leaves out stays out and means the folder's.
+    ///
+    /// # Errors
+    ///
+    /// The sentence naming the first option outside its bound.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub fn admit(&self, requested: SessionConfig) -> Result<SessionConfig, Refusal> {
+        if let Some(v) = requested.max_turns {
+            within("max_turns", v, 1, self.max_turns)?;
+        }
+        if let Some(v) = requested.max_tool_calls {
+            within("max_tool_calls", v, 1, self.max_tool_calls)?;
+        }
+        if let Some(v) = requested.max_output_tokens {
+            // `0` would leave the cap to the model, which is wider than any folder that set one:
+            // the ADR refuses it whatever the folder says.
+            if v == 0 {
+                return Err(Refusal::new(
+                    Some("max_output_tokens"),
+                    format!(
+                        "config.max_output_tokens is 0; a session may not leave it to the model: \
+                         at least {MIN_SESSION_MAX_OUTPUT_TOKENS}"
+                    ),
+                ));
+            }
+            let ceiling = if self.max_output_tokens == 0 {
+                MAX_SESSION_MAX_OUTPUT_TOKENS
+            } else {
+                self.max_output_tokens
+            };
+            within(
+                "max_output_tokens",
+                v,
+                MIN_SESSION_MAX_OUTPUT_TOKENS,
+                ceiling,
+            )?;
+        }
+        if let Some(window) = requested.context_window {
+            // The cap the round will really send: the request's, or the folder's, which is what
+            // compaction's budget subtracts. The request's was checked above; the folder's is a
+            // deployment value, so the sum saturates rather than panicking on a hand-made one.
+            let output = requested
+                .max_output_tokens
+                .unwrap_or(self.max_output_tokens);
+            let floor = CONTEXT_WINDOW_PROMPT_TOKENS
+                .saturating_add(output)
+                .saturating_add(CONTEXT_WINDOW_HEADROOM_TOKENS);
+            if window < floor {
+                return Err(Refusal::new(
+                    Some("context_window"),
+                    format!(
+                        "config.context_window is {window}; at least {floor}, to leave \
+                         {CONTEXT_WINDOW_PROMPT_TOKENS} for the prompt, {output} for the answer and \
+                         {CONTEXT_WINDOW_HEADROOM_TOKENS} of room (a smaller one turns compaction \
+                         off)"
+                    ),
+                ));
+            }
+            if let Some(model) = self.context_window.filter(|model| window > *model) {
+                return Err(Refusal::new(
+                    Some("context_window"),
+                    format!(
+                        "config.context_window is {window}; at most {model}, the model's window"
+                    ),
+                ));
+            }
+        }
+        if let Some(v) = requested.max_parallel_tool_calls {
+            within(
+                "max_parallel_tool_calls",
+                v,
+                1,
+                self.max_parallel_tool_calls,
+            )?;
+        }
+        if let Some(v) = requested.time_limit {
+            if v == 0 {
+                return Err(Refusal::new(
+                    Some("time_limit"),
+                    "config.time_limit is 0; a session may not ask for no limit: at least 1 minute"
+                        .to_owned(),
+                ));
+            }
+            // A folder that says `0` sets no limit, so nothing is above it.
+            if self.time_limit != 0 && v > self.time_limit {
+                return Err(Refusal::new(
+                    Some("time_limit"),
+                    format!(
+                        "config.time_limit is {v}; at most {} minutes",
+                        self.time_limit
+                    ),
+                ));
+            }
+        }
+        if let Some(v) = requested.max_rounds {
+            within("max_rounds", v, 1, self.max_rounds)?;
+        }
+        Ok(requested)
+    }
+}
+
+/// `value` between `min` and `max`, or the sentence that says the option and the range.
+fn within(option: &str, value: u32, min: u32, max: u32) -> Result<(), Refusal> {
+    if value < min {
+        return Err(Refusal::new(
+            Some(option),
+            format!("config.{option} is {value}; at least {min}"),
+        ));
+    }
+    if value > max {
+        return Err(Refusal::new(
+            Some(option),
+            format!("config.{option} is {value}; at most {max}"),
+        ));
+    }
+    Ok(())
+}
+
 /// The newest round of a session, read: what both a listing and a single session's view say.
 pub(crate) struct Latest {
     pub state: SessionState,
@@ -965,6 +1270,7 @@ mod tests {
             round: 3,
             root: None,
             visible: false,
+            config: None,
         };
         let payload = closing_round_payload(&header);
         assert_eq!(payload[SESSION_CLOSE_ROUND_KEY], Value::Bool(true));
@@ -1141,6 +1447,7 @@ mod tests {
             round: 1,
             root: None,
             visible: false,
+            config: None,
         }
     }
 
@@ -1623,5 +1930,412 @@ mod tests {
         // Working never exceeds open, even when the file lowers open alone.
         let narrow = d.lowered_by(Some(2), None, None);
         assert_eq!((narrow.max_open(), narrow.max_working()), (2, 2));
+    }
+
+    // ── ADR 0054: the session configuration and its admission ────────────────────────────────
+
+    /// Bounds as the assembly computes them for a `reviewer` whose folder allows more than any
+    /// test asks for: 200 turns, 500 tool calls, 4,096 output tokens, a 200,000-token window, 10
+    /// calls at once, 30 minutes and 12 rounds.
+    fn bounds() -> SessionBounds {
+        SessionBounds {
+            max_turns: 200,
+            max_tool_calls: 500,
+            max_output_tokens: 4_096,
+            context_window: Some(200_000),
+            max_parallel_tool_calls: 10,
+            time_limit: 30,
+            max_rounds: 12,
+        }
+    }
+
+    /// A config that asks `option` for `value`, and nothing else.
+    fn asking(option: &str, value: u32) -> SessionConfig {
+        let mut config = SessionConfig::default();
+        let slot = match option {
+            "max_turns" => &mut config.max_turns,
+            "max_tool_calls" => &mut config.max_tool_calls,
+            "max_output_tokens" => &mut config.max_output_tokens,
+            "context_window" => &mut config.context_window,
+            "max_parallel_tool_calls" => &mut config.max_parallel_tool_calls,
+            "time_limit" => &mut config.time_limit,
+            "max_rounds" => &mut config.max_rounds,
+            other => panic!("not an option of ADR 0054 slice 1: {other}"),
+        };
+        *slot = Some(value);
+        config
+    }
+
+    #[test]
+    fn max_turns_above_its_bound_is_refused_by_name() {
+        let why = bounds()
+            .admit(asking("max_turns", 500))
+            .expect_err("above the bound");
+        assert_eq!(why.option(), Some("max_turns"));
+        assert!(
+            why.message()
+                .contains("config.max_turns is 500; at most 200"),
+            "{why}"
+        );
+        // The positive control: the bound itself is admitted, so the refusal is the value.
+        assert_eq!(
+            bounds()
+                .admit(asking("max_turns", 200))
+                .expect("at the bound")
+                .max_turns,
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn max_tool_calls_above_its_bound_is_refused_by_name() {
+        let why = bounds()
+            .admit(asking("max_tool_calls", 501))
+            .expect_err("above the bound");
+        assert_eq!(why.option(), Some("max_tool_calls"));
+        assert!(
+            why.message()
+                .contains("config.max_tool_calls is 501; at most 500"),
+            "{why}"
+        );
+        assert_eq!(
+            bounds()
+                .admit(asking("max_tool_calls", 500))
+                .expect("at the bound")
+                .max_tool_calls,
+            Some(500)
+        );
+        // Never zero: a round with no turn would do nothing.
+        let zero = bounds()
+            .admit(asking("max_tool_calls", 0))
+            .expect_err("zero");
+        assert!(zero.message().contains("at least 1"), "{zero}");
+    }
+
+    #[test]
+    fn max_output_tokens_above_its_bound_is_refused_by_name() {
+        let why = bounds()
+            .admit(asking("max_output_tokens", 4_097))
+            .expect_err("above the bound");
+        assert_eq!(why.option(), Some("max_output_tokens"));
+        assert!(
+            why.message()
+                .contains("config.max_output_tokens is 4097; at most 4096"),
+            "{why}"
+        );
+        assert_eq!(
+            bounds()
+                .admit(asking("max_output_tokens", 4_096))
+                .expect("at the bound")
+                .max_output_tokens,
+            Some(4_096)
+        );
+    }
+
+    #[test]
+    fn context_window_above_the_models_window_is_refused_by_name() {
+        let why = bounds()
+            .admit(asking("context_window", 200_001))
+            .expect_err("above the model's window");
+        assert_eq!(why.option(), Some("context_window"));
+        assert!(
+            why.message()
+                .contains("config.context_window is 200001; at most 200000"),
+            "{why}"
+        );
+        // A deployment that does not know the model's window has no ceiling, only the floor.
+        let unknown = SessionBounds {
+            context_window: None,
+            ..bounds()
+        };
+        assert!(
+            unknown.admit(asking("context_window", 1_000_000)).is_ok(),
+            "no window is known, so none is raised"
+        );
+    }
+
+    #[test]
+    fn max_parallel_tool_calls_above_its_bound_is_refused_by_name() {
+        let why = bounds()
+            .admit(asking("max_parallel_tool_calls", 11))
+            .expect_err("above the bound");
+        assert_eq!(why.option(), Some("max_parallel_tool_calls"));
+        assert!(
+            why.message()
+                .contains("config.max_parallel_tool_calls is 11; at most 10"),
+            "{why}"
+        );
+        assert_eq!(
+            bounds()
+                .admit(asking("max_parallel_tool_calls", 10))
+                .expect("at the bound")
+                .max_parallel_tool_calls,
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn time_limit_above_its_bound_is_refused_by_name() {
+        let why = bounds()
+            .admit(asking("time_limit", 31))
+            .expect_err("above the bound");
+        assert_eq!(why.option(), Some("time_limit"));
+        assert!(
+            why.message()
+                .contains("config.time_limit is 31; at most 30 minutes"),
+            "{why}"
+        );
+        assert_eq!(
+            bounds()
+                .admit(asking("time_limit", 30))
+                .expect("at the bound")
+                .time_limit,
+            Some(30)
+        );
+        // A folder that sets no limit (`max_minutes: 0`) is above every value a session may ask.
+        let none = SessionBounds {
+            time_limit: 0,
+            ..bounds()
+        };
+        assert!(none.admit(asking("time_limit", 1_440)).is_ok());
+        // But no session may ask for *no* limit: that widens.
+        let zero = bounds().admit(asking("time_limit", 0)).expect_err("zero");
+        assert!(zero.message().contains("at least 1 minute"), "{zero}");
+    }
+
+    #[test]
+    fn max_rounds_above_its_bound_is_refused_by_name() {
+        let why = bounds()
+            .admit(asking("max_rounds", 13))
+            .expect_err("above the bound");
+        assert_eq!(why.option(), Some("max_rounds"));
+        assert!(
+            why.message()
+                .contains("config.max_rounds is 13; at most 12"),
+            "{why}"
+        );
+        assert_eq!(
+            bounds()
+                .admit(asking("max_rounds", 12))
+                .expect("at the bound")
+                .max_rounds,
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn admit_takes_a_lower_value_for_every_option_and_fills_nothing_in() {
+        let requested = SessionConfig {
+            max_turns: Some(10),
+            max_tool_calls: Some(20),
+            max_output_tokens: Some(512),
+            context_window: Some(40_000),
+            max_parallel_tool_calls: Some(2),
+            time_limit: Some(3),
+            max_rounds: Some(4),
+        };
+        let admitted = bounds().admit(requested.clone()).expect("all lowered");
+        assert_eq!(
+            admitted, requested,
+            "each option as asked, none raised to its bound"
+        );
+
+        // Nothing is filled in: an absent option stays absent and means the folder's.
+        let one = SessionConfig {
+            max_turns: Some(5),
+            ..SessionConfig::default()
+        };
+        let admitted = bounds().admit(one.clone()).expect("one option");
+        assert_eq!(admitted, one);
+        assert_eq!(admitted.max_tool_calls, None, "the rest is the folder's");
+        assert!(bounds().admit(SessionConfig::default()).is_ok());
+        assert!(SessionConfig::default().is_empty() && !admitted.is_empty());
+    }
+
+    #[test]
+    fn admit_refuses_a_raised_value_for_every_option_and_never_clamps_it() {
+        // A clamp would answer the bound; the ADR refuses, so nothing runs with a setting the
+        // starter did not ask for.
+        for (option, over, bound) in [
+            ("max_turns", 201, 200),
+            ("max_tool_calls", 501, 500),
+            ("max_output_tokens", 4_097, 4_096),
+            ("context_window", 200_001, 200_000),
+            ("max_parallel_tool_calls", 11, 10),
+            ("time_limit", 31, 30),
+            ("max_rounds", 13, 12),
+        ] {
+            let why = bounds()
+                .admit(asking(option, over))
+                .expect_err("above its bound");
+            assert_eq!(why.option(), Some(option), "{option}: {why}");
+            assert!(
+                why.message().contains(&format!("at most {bound}")),
+                "{option}: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_output_cap_is_refused_whatever_the_folder_leaves_it_to_the_model() {
+        for (bounds, what) in [
+            (bounds(), "a folder with a cap"),
+            (
+                SessionBounds {
+                    max_output_tokens: 0,
+                    ..bounds()
+                },
+                "a folder that leaves it to the model",
+            ),
+        ] {
+            let why = bounds
+                .admit(asking("max_output_tokens", 0))
+                .expect_err("zero widens");
+            assert_eq!(why.option(), Some("max_output_tokens"), "{what}");
+            assert!(why.message().contains("at least 256"), "{what}: {why}");
+        }
+        // When the folder leaves the cap to the model, the ADR's ceiling is the bound.
+        let model = SessionBounds {
+            max_output_tokens: 0,
+            ..bounds()
+        };
+        assert_eq!(
+            model
+                .admit(asking("max_output_tokens", MAX_SESSION_MAX_OUTPUT_TOKENS))
+                .expect("the ceiling itself")
+                .max_output_tokens,
+            Some(MAX_SESSION_MAX_OUTPUT_TOKENS)
+        );
+        assert!(
+            model
+                .admit(asking(
+                    "max_output_tokens",
+                    MAX_SESSION_MAX_OUTPUT_TOKENS + 1
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_window_that_leaves_no_budget_is_refused() {
+        let floor = CONTEXT_WINDOW_PROMPT_TOKENS + 4_096 + CONTEXT_WINDOW_HEADROOM_TOKENS;
+        let why = bounds()
+            .admit(asking("context_window", floor - 1))
+            .expect_err("no budget left");
+        assert_eq!(why.option(), Some("context_window"));
+        assert!(
+            why.message().contains(&format!("at least {floor}")),
+            "{why}"
+        );
+        assert!(
+            why.message().contains("compaction off"),
+            "the refusal says why: {why}"
+        );
+        assert!(
+            bounds().admit(asking("context_window", floor)).is_ok(),
+            "the floor leaves a budget"
+        );
+
+        // The floor follows the cap the round will really send: a session that asks for a larger
+        // answer needs a larger window.
+        let wide = SessionBounds {
+            max_output_tokens: 200_000,
+            ..bounds()
+        };
+        let request = SessionConfig {
+            max_output_tokens: Some(100_000),
+            context_window: Some(floor),
+            ..SessionConfig::default()
+        };
+        let why = wide
+            .admit(request)
+            .expect_err("the window is below the new floor");
+        let raised = CONTEXT_WINDOW_PROMPT_TOKENS + 100_000 + CONTEXT_WINDOW_HEADROOM_TOKENS;
+        assert!(
+            why.message().contains(&format!("at least {raised}")),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_option_is_refused_and_named() {
+        let why = SessionConfig::from_value(serde_json::json!({
+            "maxTurns": 4,
+            "maxParallelTools": 2,
+        }))
+        .expect_err("an unknown member fails open if ignored");
+        assert!(
+            why.message().contains("unknown field"),
+            "serde says what kind: {why}"
+        );
+        assert!(
+            why.message().contains("maxParallelTools"),
+            "the member is named: {why}"
+        );
+
+        // The known members read, camelCase as `start.config` writes them.
+        let config = SessionConfig::from_value(serde_json::json!({
+            "maxTurns": 4,
+            "contextWindow": 40_000,
+            "timeLimit": 2,
+        }))
+        .expect("every member is an option");
+        assert_eq!(config.max_turns, Some(4));
+        assert_eq!(config.context_window, Some(40_000));
+        assert_eq!(config.time_limit, Some(2));
+        assert_eq!(config.max_rounds, None, "an absent member stays absent");
+    }
+
+    #[test]
+    fn a_header_carries_the_config_and_round_trips_with_its_version() {
+        let id = RunId::new();
+        let mut h = header(id, true, false);
+        h.config = Some(asking("max_turns", 7));
+
+        // The wire form is camelCase, and an absent option is absent.
+        let encoded = serde_json::to_value(&h).expect("a header");
+        assert_eq!(encoded["config"]["maxTurns"], serde_json::json!(7));
+        assert!(
+            encoded["config"].get("maxRounds").is_none(),
+            "an absent option is not written"
+        );
+        let back: SessionHeader = serde_json::from_value(encoded).expect("a header");
+        assert_eq!(back, h);
+
+        // A header journaled before `config` existed reads as the folder's settings.
+        let old = serde_json::json!({
+            "id": id, "agent": "a", "description": "d", "keep_open": true,
+        });
+        let decoded: SessionHeader = serde_json::from_value(old).expect("an old header");
+        assert_eq!(decoded.config, None);
+
+        // Through the state the runtime keeps, at either version its gate accepts: the header and
+        // its config come back as they went in.
+        for v in [crate::envelope::VERSION, crate::head::VERSION] {
+            let state = serde_json::json!({
+                "v": v,
+                "agent": { SESSION_STATE_KEY: serde_json::to_value(&h).expect("a header") },
+            });
+            let mut rec = record(
+                id,
+                &session_conversation_id("p", id),
+                Some(RunId::new()),
+                RunStatus::Done,
+                None,
+                1,
+            );
+            rec.state = state;
+            let read = RoundFacts::of(&rec);
+            assert_eq!(
+                read.header.as_ref().map(|h| h.config.clone()),
+                Some(h.config.clone()),
+                "version {v}"
+            );
+            assert_eq!(
+                read.header.as_ref().map(|h| h.round),
+                Some(1),
+                "version {v}"
+            );
+        }
     }
 }
