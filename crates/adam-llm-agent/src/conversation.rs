@@ -703,6 +703,10 @@ pub struct Conversation {
     /// with it. Absent from state written before it existed, and not written while `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub announced_final: bool,
+    /// How many times a `run.ending` hook has kept this run going (ADR 0050, decision 10), against
+    /// the deployment's cap. Absent from state written before it existed, and not written at `0`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub end_continuations: u32,
     /// The plan of the conversation ([`Plan`]): written by a tool with
     /// [`ToolOutput::with_plan`](crate::ToolOutput::with_plan), applied only from a result that is not
     /// an error, and carried into a run that continues this one. It is never put in the system

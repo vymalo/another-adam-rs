@@ -14,8 +14,8 @@ use adam_model::{
     PromptStatement, ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_plugin::{
-    HookSet, HookedCall, HookedMessage, HookedModelRequest, HookedText, MessageFile, Plugin,
-    Verdict,
+    HookSet, HookedCall, HookedEnd, HookedMessage, HookedModelRequest, HookedText, MessageFile,
+    Plugin, Verdict,
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
@@ -769,6 +769,63 @@ thinking, before you wrote anything. Think briefly this time, then call a tool o
 /// A turn with words or a tool call starts the count again.
 pub const MAX_THINKING_CUTS: u32 = 2;
 
+/// How many times `run.ending` hooks may keep one run going, unless the deployment says otherwise.
+pub const DEFAULT_RUN_CONTINUATIONS: u32 = 3;
+/// The most a deployment may allow ([`LlmAgentBuilder::max_run_continuations`]).
+pub const MAX_RUN_CONTINUATIONS: u32 = 20;
+
+/// What the journaled step `end:<turn>` records: whether the run ended or a hook kept it going.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EndDecision {
+    /// `allow`, `continue`, `capped` (a hook asked to go on past the cap), `stop` or `failed`.
+    verdict: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plugin: Option<String>,
+}
+
+/// Asks the `run.ending` hooks about the answer; a retryable failure fails the try.
+fn ask_end(
+    hooks: &HookSet,
+    text: &str,
+    continuations: u32,
+    cap: u32,
+) -> Result<EndDecision, String> {
+    let end = HookedEnd {
+        text,
+        continuations,
+    };
+    let one = |verdict: &str, reason: Option<String>, plugin: &str| EndDecision {
+        verdict: verdict.into(),
+        reason,
+        plugin: Some(plugin.into()),
+    };
+    match hooks.run_ending(&end) {
+        Ok(None)
+        | Ok(Some(adam_plugin::Decided {
+            verdict: Verdict::Continue,
+            ..
+        })) => Ok(EndDecision {
+            verdict: "allow".into(),
+            reason: None,
+            plugin: None,
+        }),
+        Ok(Some(d)) => Ok(match d.verdict {
+            Verdict::Deny(reason) if continuations >= cap => one("capped", Some(reason), d.plugin),
+            Verdict::Deny(reason) => one("continue", Some(reason), d.plugin),
+            Verdict::Stop(reason) => one("stop", Some(reason), d.plugin),
+            _ => one(
+                "failed",
+                Some("the hook gave a verdict run.ending does not have".into()),
+                d.plugin,
+            ),
+        }),
+        Err(error) if error.is_retryable() => Err(format!("{}: {}", error.plugin, error.reason)),
+        Err(error) => Ok(one("failed", Some(error.reason), &error.plugin)),
+    }
+}
+
 /// Bounds on one run. A run that reaches `max_turns` or `max_tool_calls` gets one closing model
 /// call in which it may call no tool, and ends with that answer marked `limited` (the output's
 /// `limited` and `limit`); if the closing call says nothing the run fails with a message naming the
@@ -1277,6 +1334,7 @@ pub struct LlmAgentBuilder {
     choices: Vec<ModelBinding>,
     admission: Option<DynAdmission>,
     hooks: HookSet,
+    max_run_continuations: u32,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -1504,6 +1562,15 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// The most times the `run.ending` hooks may keep one run going (ADR 0050, decision 10; default
+    /// `DEFAULT_RUN_CONTINUATIONS`, at most `MAX_RUN_CONTINUATIONS`). Past it the run ends and
+    /// the step `end:<turn>` records `capped`; `0` never lets a hook keep a run going.
+    #[must_use]
+    pub fn max_run_continuations(mut self, max: u32) -> Self {
+        self.max_run_continuations = max;
+        self
+    }
+
     /// Append one plugin to the hook set ([`LlmAgentBuilder::hooks`]); the order plugins are added in
     /// is the order their hooks run in.
     #[must_use]
@@ -1695,6 +1762,7 @@ impl LlmAgentBuilder {
             run_chars: Arc::new(Mutex::new(RunChars::default())),
             admission: self.admission,
             hooks: Arc::new(self.hooks),
+            max_run_continuations: self.max_run_continuations.min(MAX_RUN_CONTINUATIONS),
         }
     }
 }
@@ -1928,6 +1996,8 @@ pub struct LlmAgent {
     /// The compiled hooks around every tool call (ADR 0050, slice H1). Shared, because a run's calls
     /// of one segment read the same set from several futures, and a hook's plugin is written once.
     hooks: Arc<HookSet>,
+    /// The most times `run.ending` hooks may keep one run going (ADR 0050, decision 10).
+    max_run_continuations: u32,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -2038,6 +2108,7 @@ impl LlmAgent {
             choices: Vec::new(),
             admission: None,
             hooks: HookSet::new(),
+            max_run_continuations: DEFAULT_RUN_CONTINUATIONS,
         }
     }
 
@@ -3272,6 +3343,9 @@ impl LlmAgent {
             // What a tool announced as the answer is the run's answer (the last announcement wins);
             // without one, the words that end the turn are.
             if let Some(announced) = state.announced.clone() {
+                if self.run_ending(ctx, state, &announced).await? {
+                    return Ok((Flow::Next, early));
+                }
                 return Ok((
                     Flow::Done(json!({
                         "text": announced,
@@ -3310,6 +3384,9 @@ impl LlmAgent {
                 if state.turns < self.limits.max_turns {
                     state.messages.push(Message::user_text(THINKING_CUT_TURN));
                 }
+                return Ok((Flow::Next, early));
+            }
+            if self.run_ending(ctx, state, &text).await? {
                 return Ok((Flow::Next, early));
             }
             let mut output = json!({
@@ -3943,6 +4020,44 @@ impl LlmAgent {
                 "listing the sessions failed: {why}"
             ))),
         }
+    }
+
+    /// The `run.ending` point (ADR 0050, decision 10): the run would end with `text`. The hooks are
+    /// asked in the journaled step `end:<turn>`, so a replay asks none. Returns whether a hook kept
+    /// the run going: the reason is then in the history as a message of the plugin's, and the loop
+    /// asks the model again. No hook set takes no step.
+    async fn run_ending(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        text: &str,
+    ) -> Result<bool, AgentError> {
+        if self.hooks.is_empty() {
+            return Ok(false);
+        }
+        let hooks = Arc::clone(&self.hooks);
+        let owned = text.to_owned();
+        let (continuations, cap) = (state.end_continuations, self.max_run_continuations);
+        let decided: Result<EndDecision, String> = ctx
+            .step(&format!("end:{}", state.turns), move || async move {
+                ask_end(&hooks, &owned, continuations, cap)
+            })
+            .await?;
+        let decision = decided.map_err(|why| {
+            AgentError::transient(format!("a run.ending hook could not decide: {why}"))
+        })?;
+        if decision.verdict != "continue" {
+            return Ok(false);
+        }
+        let plugin = decision.plugin.as_deref().unwrap_or("plugin");
+        let reason = decision.reason.as_deref().unwrap_or("");
+        state.end_continuations += 1;
+        state.announced = None;
+        state.announced_final = false;
+        state.messages.push(Message::user_text(format!(
+            "[A plugin ({plugin}) asked the run to go on instead of ending, not the person: {reason}]"
+        )));
+        Ok(true)
     }
 
     /// The run is about to end: a round it started or sent to that still works is cancelled (the
@@ -7594,6 +7709,9 @@ impl Agent for LlmAgent {
                         && state.deferred.is_empty()
                         && ctx.arrived().await? == 0
                     {
+                        if self.run_ending(ctx, &mut state, &text).await? {
+                            return Ok(Transition::Continue(state));
+                        }
                         let mut output = json!({ "text": text, "artifacts": state.artifacts });
                         self.end_sessions(ctx, &mut state, &mut output).await?;
                         self.forget_chars(ctx.run_id());
