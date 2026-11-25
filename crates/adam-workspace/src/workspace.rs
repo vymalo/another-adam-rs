@@ -89,8 +89,11 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// by one at a time: adding a slot (which picks its directory and its place in the order slots
 /// joined), and removing the workspace. The run's lock is taken before the mirror's, never the
 /// other way round, and never while holding another run's, except by
-/// [`RunWorkspace::adopt_scratch`], which holds two runs' locks in the order of their paths (and
-/// no mirror's) while a scratch project moves from one to the other.
+/// [`RunWorkspace::adopt_scratch`] and the repository half of adoption
+/// ([`RunWorkspace::add_repository`]), which hold two runs' locks in the order of their paths while
+/// a slot moves from one run to the other. The repository half then takes the mirror's, still
+/// after every run's lock: it is the same run-then-mirror order as everywhere else, so the pair of
+/// runs cannot wait on a mirror that waits on a run.
 ///
 /// A root used by one process pays for one uncontended `flock` per operation.
 /// The volume must honour file locks. *Unverified* for NFS and for Longhorn RWX:
@@ -261,6 +264,12 @@ pub(crate) struct Meta {
     pub(crate) base_branch: String,
     /// The local branch the worktree has checked out (`agent/<run-short-id>`).
     pub(crate) branch: String,
+    /// The conversation of the run that made the slot, as the caller named it: what lets a later
+    /// run of the same conversation take the slot over, with its branch and its files, instead of
+    /// making another worktree ([`RunWorkspace::add_repository`]). Absent for a slot made without
+    /// one (and in metadata written before it existed): such a slot stays with its run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) conversation: Option<String>,
     /// The pushed branch this run continues, if it does: the name its commits are published
     /// under. Absent for a run on a branch of its own (and in metadata written before it existed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -409,6 +418,7 @@ impl SlotFile {
                 .base_branch
                 .ok_or("a repository slot has no base branch")?,
             branch: self.branch.ok_or("a repository slot has no branch")?,
+            conversation: self.conversation,
             remote_branch: self.remote_branch,
             dir: self.dir,
             seq: self.seq,
@@ -739,7 +749,7 @@ impl Workspaces {
         validate_run(run)?;
         let loc = repo.locate()?;
         let target = self.inner.legacy_target(run, &loc);
-        self.prepare_at(repo, run, existing, &target).await
+        self.prepare_at(repo, run, existing, None, &target).await
     }
 
     /// Make (or find again) the worktree of `repo` for `run` at `target`: what [`prepare`] does
@@ -751,6 +761,7 @@ impl Workspaces {
         repo: &RepoRef,
         run: &str,
         existing: Option<&str>,
+        conversation: Option<&str>,
         target: &Target,
     ) -> WorkspaceResult<Worktree> {
         validate_run(run)?;
@@ -780,7 +791,7 @@ impl Workspaces {
 
         let _guard = self.inner.lock_mirror(&mirror).await?;
 
-        let meta = self
+        let mut meta = self
             .inner
             .read_meta_at(&target.meta_path, run, target.meta_version())
             .await?;
@@ -804,12 +815,26 @@ impl Workspaces {
                     ),
                 }));
             }
-            if let Some(root) = self.inner.valid_worktree(path, &mirror).await {
-                return Ok(self
-                    .inner
-                    .open_worktree(m, &target.dir, root, mirror, &target.meta_path)
-                    .await);
-            }
+        }
+        // A slot records the conversation of the run that prepares it: it is what lets a later
+        // task of the same conversation adopt it ([`RunWorkspace::add_repository`]) instead of
+        // making another worktree and branch. A slot found again is recorded too -- metadata
+        // written before the field existed, and a slot a caller prepared without naming one.
+        if let Some(m) = meta.as_mut()
+            && !target.reference
+            && m.conversation.is_none()
+            && let Some(conversation) = conversation
+        {
+            m.conversation = Some(conversation.to_owned());
+            self.inner.write_meta_at(&target.meta_path, m).await?;
+        }
+        if let Some(m) = &meta
+            && let Some(root) = self.inner.valid_worktree(path, &mirror).await
+        {
+            return Ok(self
+                .inner
+                .open_worktree(m, &target.dir, root, mirror, &target.meta_path)
+                .await);
         }
         if exists(path).await? {
             return Err(WorkspaceError::Corrupt(format!(
@@ -887,6 +912,7 @@ impl Workspaces {
                         url: repo.url.clone(),
                         base_branch: repo.base_branch.clone(),
                         branch,
+                        conversation: conversation.map(str::to_owned),
                         remote_branch: existing.map(str::to_owned),
                         dir: target.seq.map(|_| target.dir.clone()),
                         seq: target.seq,
@@ -1260,7 +1286,7 @@ async fn list_admin_dirs(mirror: &Path) -> WorkspaceResult<BTreeSet<String>> {
 /// Whether `<mirror>/worktrees/<name>/gitdir`, which git writes, names the `.git` file of the slot
 /// at `slot` (as written, or as the same file by another path). The file is in a directory a run's
 /// commands write: it is read as a regular file and not through a link ([`safe_fs`]).
-async fn names_worktree(mirror: &Path, name: &str, slot: &Path) -> bool {
+pub(crate) async fn names_worktree(mirror: &Path, name: &str, slot: &Path) -> bool {
     let Ok(text) = safe_fs::read_regular_text(
         &mirror.join("worktrees").join(name).join("gitdir"),
         safe_fs::MAX_SMALL_FILE,
@@ -1908,7 +1934,7 @@ impl Inner {
     }
 
     /// First free `agent/<short>` name for `run` (see [`Workspaces::prepare`]).
-    async fn pick_branch(&self, mirror: &Path, run: &str) -> WorkspaceResult<String> {
+    pub(crate) async fn pick_branch(&self, mirror: &Path, run: &str) -> WorkspaceResult<String> {
         let filtered: String = run
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
