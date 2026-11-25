@@ -316,6 +316,52 @@ until [ "$(kubectl get resourcequota coder-run-pods -n "$namespace" -o jsonpath=
 done
 kubectl --kubeconfig "$work/kubeconfig" create -n "$namespace" -f "$work/run-pod.yaml" \
   || die "the admission policy or the quota refused the run pod made from the chart's template"
+# The admission policy refuses each way a run pod could read a Secret (ADR 0038, ADR 0041): the chart's own pod plus one
+# Secret reference, asked of the API server with a server-side dry run as the coder's ServiceAccount. The control above is
+# the same pod without it, which was admitted.
+say "refused: a run pod that references a Secret (secretKeyRef, envFrom secretRef, a Secret volume)"
+secret_refused() {
+  sr_what=$1; sr_kind=$2
+  python3 - "$work/run-pod.yaml" "$work/secret-pod.yaml" "$sr_kind" <<'PY2'
+import sys
+t = open(sys.argv[1]).read().replace("name: egress-check", "name: secret-check", 1)
+kind = sys.argv[3]
+if kind == "env":
+    # The container already has an `env:` list; a second `env:` key would be overridden by the later one.
+    marker = "      env:\n"
+    if t.count(marker) != 1:
+        sys.exit("the template's run container has no single `env:` at six spaces")
+    t = t.replace(marker, marker + "        - name: CANARY\n          valueFrom:\n            secretKeyRef: {name: coder, key: MODEL_API_KEY}\n", 1)
+    add = None
+    kind = "done"
+elif kind == "envfrom":
+    add = "      envFrom:\n        - secretRef: {name: coder}\n"
+else:
+    add = None
+if add is not None:
+    marker = "  containers:\n    - name: run\n"
+    if t.count(marker) != 1:
+        sys.exit("the template's first container is not `run` at two spaces: " + t[:300])
+    t = t.replace(marker, marker + add, 1)
+elif kind == "volume":
+    marker = "  volumes:\n"
+    if t.count(marker) != 1:
+        sys.exit("the template has no single `volumes:` list")
+    t = t.replace(marker, marker + "    - name: canary\n      secret: {secretName: coder}\n", 1)
+open(sys.argv[2], "w").write(t)
+PY2
+  if sr_out=$(kubectl --kubeconfig "$work/kubeconfig" create --dry-run=server -n "$namespace" -f "$work/secret-pod.yaml" 2>&1); then
+    die "$sr_what: the pod was ADMITTED"
+  fi
+  case $sr_out in
+    *"references no Secret"*|*"no Secret"*) printf 'ok: %s is refused by the policy\n' "$sr_what" ;;
+    *) die "$sr_what: refused, but not by the admission policy: $(printf '%s' "$sr_out" | tail -c 300)" ;;
+  esac
+}
+secret_refused "a secretKeyRef in an env variable" env
+secret_refused "an envFrom of a Secret" envfrom
+secret_refused "a Secret volume" volume
+
 # A listener that no policy selects, and a client that no policy selects: the control that the pod network works. The
 # listener is adam-egress itself on 8080 (GET /healthz answers 200 ok), which is a real server on a port nothing allows.
 kubectl apply -n "$namespace" -f - <<YAML

@@ -157,34 +157,36 @@ fn a_folder_lower_than_the_deployment_is_what_admit_enforces() {
     assert!(why.message().contains("at most 2"), "{why}");
 }
 
-/// A folder above the deployment's bound is **refused** at startup, naming the option and what
-/// the deployment allows: a bound only narrows, so nothing is silently clamped to it.
+/// A folder above the deployment's bound is **clamped** to it at startup — a folder is portable
+/// across deployments, so a lower setting narrows the agent instead of refusing it to start (ADR
+/// 0049, ADR 0054 decision 3) — and the clamped value is what `admit` then enforces: a request
+/// above it is refused, naming the option (ADR 0054 decision 2).
 #[test]
-fn a_folder_above_the_deployment_is_refused_naming_the_option() {
-    let why = assemble(
+fn a_folder_above_the_deployment_is_clamped_and_admit_enforces_it() {
+    let assembly = assemble(
         family("  max_parallel: 24"),
         SessionLimits::default(),
         Some(16),
     )
-    .expect_err("the folder asks for more tool calls at once than the deployment allows");
-    let text = why.to_string();
-    assert!(text.contains("limits.max_parallel"), "{text}");
-    assert!(text.contains("24"), "the value the folder asked: {text}");
-    assert!(
-        text.contains("16"),
-        "the value the deployment allows: {text}"
-    );
-    assert!(text.contains("MAX_PARALLEL_TOOL_CALLS"), "{text}");
-
-    // The positive control: the same file at the deployment's own value is admitted, so the
-    // refusal is the value that is above it and not the file.
-    let assembly = assemble(
-        family("  max_parallel: 16"),
-        SessionLimits::default(),
-        Some(16),
-    )
     .unwrap();
-    assert_eq!(bound_of(&assembly).max_parallel_tool_calls, 16);
+    let bound = bound_of(&assembly);
+    assert_eq!(
+        bound.max_parallel_tool_calls, 16,
+        "the folder's 24 is clamped to the deployment's MAX_PARALLEL_TOOL_CALLS"
+    );
+
+    let asked = |parallel: u32| {
+        SessionConfig::from_value(json!({ "maxParallelToolCalls": parallel })).expect("a config")
+    };
+    assert!(
+        bound.admit(asked(16)).is_ok(),
+        "the bound itself is admitted"
+    );
+    let why = bound
+        .admit(asked(17))
+        .expect_err("one call more than the clamped bound");
+    assert_eq!(why.option(), Some("max_parallel_tool_calls"));
+    assert!(why.message().contains("at most 16"), "{why}");
 }
 
 /// A folder at the loop's own limit is admitted and is the bound: `MAX_PARALLEL_TOOL_CALLS` is

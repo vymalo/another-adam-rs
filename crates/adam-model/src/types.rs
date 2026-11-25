@@ -48,6 +48,12 @@ pub struct ModelRequest {
     /// context), which an injector in front of the model reads to find the run's credential (ADR 0067).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
+    /// The prompt statement of the run and the person's envelope (`prompt-statement/v1`, ADR 0077),
+    /// from the run's state, for a provider that sends them ([`InjectedRun`](crate::InjectedRun)).
+    /// Not serialized, like [`image_data`](Self::image_data): no journal holds it, and the body of
+    /// a call never carries it.
+    #[serde(skip)]
+    pub prompt_statement: Option<crate::PromptStatement>,
     /// The bytes of the images that `messages` name ([`ImageRef::sha256`]), for a client that can
     /// send them. The agent loop fills it inside the step that calls the model and never journals
     /// it: it is not serialized, so neither a journal nor a stored history ever holds a byte of an

@@ -272,6 +272,14 @@ pub async fn agents(
     // with the effective limits, so every role that serves A2A lists and serves the same.
     let sessions = def.child_sessions();
     let schedules = def.manifest().schedules.clone();
+    // The largest upload the card lists (`uploads/v1`): the folder's `limits.max_inline_upload_bytes`;
+    // without it the environment's and then the default are used by `serve`.
+    let uploads_inline_max_bytes = def
+        .manifest()
+        .frontmatter
+        .limits
+        .as_ref()
+        .and_then(|limits| limits.max_inline_upload_bytes);
     let (agents, commands, card, choices, efforts) = match workers {
         Some(parts) => {
             let profiles = parts.profiles;
@@ -366,6 +374,10 @@ pub async fn agents(
         .card_if(card)
         .inbound(adam_a2a_runtime::vymalo_inbound)
         .commands(commands);
+    let agents = match uploads_inline_max_bytes {
+        Some(bytes) => agents.uploads_inline_max_bytes(bytes),
+        None => agents,
+    };
     let agents = match choices {
         Some(choices) => agents.model_choices(choices),
         None => agents,

@@ -7,11 +7,11 @@ use crate::diagnostic::Sink;
 use crate::frontmatter::{Split, clean_body, key_line};
 use crate::manifest::RemoteAuth;
 use crate::schema::{
-    AgentFrontmatter, DEFAULT_RETRY_BACKOFF, MAX_MINUTES_LIMIT, MAX_OPEN_SESSIONS_LIMIT,
-    MAX_PARALLEL_LIMIT, MAX_PROCESSES_LIMIT, MAX_RETRY_ATTEMPTS, MAX_RETRY_BACKOFF,
-    MAX_SESSION_ROUNDS_LIMIT, MAX_WORKING_SESSIONS_LIMIT, ModelRef, RETRY_CLASS_NAMES, ToolList,
-    ToolsLoading, check_references, is_agent_name, is_env_name, is_retry_tool_name, is_tool_name,
-    retry_duration,
+    AgentFrontmatter, DEFAULT_RETRY_BACKOFF, MAX_INLINE_UPLOAD_BYTES_LIMIT, MAX_MINUTES_LIMIT,
+    MAX_OPEN_SESSIONS_LIMIT, MAX_PARALLEL_LIMIT, MAX_PROCESSES_LIMIT, MAX_RETRY_ATTEMPTS,
+    MAX_RETRY_BACKOFF, MAX_SESSION_ROUNDS_LIMIT, MAX_WORKING_SESSIONS_LIMIT, ModelRef,
+    RETRY_CLASS_NAMES, ToolList, ToolsLoading, check_references, is_agent_name, is_env_name,
+    is_retry_tool_name, is_tool_name, retry_duration,
 };
 
 /// The most characters GitHub Copilot accepts in an agent prompt. Verified 2026-09-29,
@@ -131,6 +131,17 @@ pub(crate) fn parse_agent_file(
                 ),
             );
         }
+    }
+    if kind == FileKind::Sub
+        && fm
+            .limits
+            .as_ref()
+            .is_some_and(|limits| limits.max_inline_upload_bytes.is_some())
+    {
+        sink.warn(
+            key_line(&split, "limits"),
+            "`limits.max_inline_upload_bytes` is the root agent's (`uploads/v1`): ignored on a subagent",
+        );
     }
     if kind != FileKind::Sub {
         if fm.a2a.is_some() || fm.auth.is_some() {
@@ -623,6 +634,16 @@ fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter, k
                     format!("`limits.{key}` is from {low} to {high}; it is {n}"),
                 );
             }
+        }
+        if let Some(bytes) = limits.max_inline_upload_bytes
+            && !(1..=MAX_INLINE_UPLOAD_BYTES_LIMIT).contains(&bytes)
+        {
+            sink.error(
+                key_line(split, "limits"),
+                format!(
+                    "`limits.max_inline_upload_bytes` is from 1 to {MAX_INLINE_UPLOAD_BYTES_LIMIT} (256 MiB); it is {bytes}"
+                ),
+            );
         }
         if let (Some(open), Some(working)) = (limits.max_open_sessions, limits.max_working_sessions)
             && working > open

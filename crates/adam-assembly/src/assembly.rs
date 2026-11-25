@@ -201,8 +201,9 @@ impl BoundDef {
     /// The most tool calls of one model turn that run at the same time, for every agent: the
     /// deployment's `MAX_PARALLEL_TOOL_CALLS` ([`LlmAgentBuilder::max_parallel`], 1 to 32; the
     /// loop's default is 10). An agent's file may **lower** it for that agent with
-    /// `limits.max_parallel`, never raise it: a larger value in a file is the deployment's, with a
-    /// warning.
+    /// `limits.max_parallel`; a larger value in a file is clamped to the deployment's, with a
+    /// warning (ADR 0049, ADR 0054 decision 3), so a folder stays usable under a deployment that
+    /// allows less.
     #[must_use]
     pub fn max_parallel(mut self, n: usize) -> Self {
         self.max_parallel = Some(n);
@@ -231,22 +232,33 @@ impl BoundDef {
         self
     }
 
-    /// The limit of the agent `node`: the deployment's (or the loop's default) lowered by the
-    /// agent's own file. A file that asks for **more** is refused, not clamped: a bound only
-    /// narrows (ADR 0049, ADR 0054 decision 2), so the process stops with the option named rather
-    /// than run an agent with a setting its file did not ask for.
-    fn parallel_of(&self, node: &Node) -> Result<usize, Error> {
+    /// The limit of the agent `node`: the deployment's (or the loop's default) **lowered by the
+    /// agent's own file**. A file above the deployment's is **clamped** to it, 1 to
+    /// [`MAX_PARALLEL_LIMIT`], with a warning naming both values: a folder is portable across
+    /// deployments, so a deployment that lowered the limit narrows the agent rather than refusing
+    /// it to start, and the effective setting says what the agent runs at (ADR 0049, ADR 0054
+    /// decision 3 — "clamped to the bounds of that time").
+    ///
+    /// This is the startup relationship between a folder and its deployment. A *round's requested*
+    /// `config` above a bound is the runtime question, and stays a refusal by
+    /// [`SessionBounds::admit`], naming the option (ADR 0054 decision 2); see `bounds_of`.
+    fn parallel_of(&self, node: &Node) -> usize {
         let allowed = self
             .max_parallel
             .map_or(DEFAULT_MAX_PARALLEL, |n| n.clamp(1, MAX_PARALLEL_LIMIT));
         match node.max_parallel {
-            Some(asked) if asked > allowed => Err(Error::ParallelAboveDeployment {
-                origin: Origin::new(node.name.clone(), node.file.clone()),
-                asked,
-                allowed,
-            }),
-            Some(asked) => Ok(asked.max(1)),
-            None => Ok(allowed),
+            Some(asked) if asked > allowed => {
+                tracing::warn!(
+                    agent = %node.name,
+                    asked,
+                    allowed,
+                    "`limits.max_parallel` is more than the deployment allows (MAX_PARALLEL_TOOL_CALLS): \
+                     the agent runs {allowed} tool calls at once (ADR 0049, ADR 0054 decision 3)"
+                );
+                allowed
+            }
+            Some(asked) => asked.clamp(1, MAX_PARALLEL_LIMIT),
+            None => allowed,
         }
     }
 
@@ -306,7 +318,7 @@ impl BoundDef {
         // not know: the deployment's `MAX_PARALLEL_TOOL_CALLS` (ADR 0054 slice 1 part 2). The root
         // is the only agent that has them, and the root is built first.
         let session_tools = match self.nodes.first() {
-            Some(root) => self.session_tools(root)?,
+            Some(root) => self.session_tools(root),
             None => None,
         };
         let session_bounds = session_tools
@@ -754,9 +766,9 @@ impl BoundDef {
     /// part 2): each subagent's [`SessionBounds`], made here because the deployment's
     /// `MAX_PARALLEL_TOOL_CALLS` is known and `bind` did not know it. The names and order are the
     /// ones `bind` fixed.
-    fn session_tools(&self, node: &Node) -> Result<Option<SessionTools>, Error> {
+    fn session_tools(&self, node: &Node) -> Option<SessionTools> {
         if node.session_targets.is_empty() {
-            return Ok(None);
+            return None;
         }
         let mut agents = Vec::with_capacity(node.session_targets.len());
         for target in &node.session_targets {
@@ -766,12 +778,10 @@ impl BoundDef {
                 description: target.description.clone(),
                 within: target.within,
                 remote: target.remote,
-                bounds: self.bounds_of(target)?,
+                bounds: self.bounds_of(target),
             });
         }
-        Ok(Some(
-            SessionTools::new(agents).with_limits(self.session_limits),
-        ))
+        Some(SessionTools::new(agents).with_limits(self.session_limits))
     }
 
     /// The bounds of one subagent a session may be started on (ADR 0054 decision 2): each option
@@ -782,16 +792,14 @@ impl BoundDef {
     /// * `context_window` is `None`: the window is a fact of the model alias (ADR 0054 decision
     ///   11), which the assembly does not have here, and `admit` applies only its floor.
     /// * `max_parallel_tool_calls` is the deployment's `MAX_PARALLEL_TOOL_CALLS` lowered by the
-    ///   folder's [`limits.max_parallel`](adam_agent_fs::Limits), which may never raise it.
+    ///   folder's [`limits.max_parallel`](adam_agent_fs::Limits), which may never raise it: a folder
+    ///   above the deployment's is clamped to it ([`Self::parallel_of`], ADR 0049, ADR 0054
+    ///   decision 3). What a *round asks for* above this bound is what `SessionBounds::admit`
+    ///   refuses, naming the option (decision 2).
     /// * `time_limit` is the round's own limit (`limits.max_minutes`, or the remote's wait), and
     ///   `max_rounds` the root's effective `max_session_rounds`: the deployment's, lowered by the
     ///   root's file.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::ParallelAboveDeployment`] when the folder asks for more tool calls at once than
-    /// the deployment allows: a bound only narrows, so the value is refused rather than clamped.
-    fn bounds_of(&self, target: &SessionTarget) -> Result<SessionBounds, Error> {
+    fn bounds_of(&self, target: &SessionTarget) -> SessionBounds {
         // A remote subagent's rounds are runs of an agent of its own, and the ADR refuses every
         // option but `time_limit`, `max_rounds` and `instructions` on one: the loop's defaults
         // stand for the rest.
@@ -801,7 +809,7 @@ impl BoundDef {
                 node.limits.max_turns,
                 node.limits.max_tool_calls,
                 node.max_output_tokens.unwrap_or(0),
-                self.parallel_of(node)?,
+                self.parallel_of(node),
             ),
             None => (
                 Limits::default().max_turns,
@@ -810,7 +818,7 @@ impl BoundDef {
                 DEFAULT_MAX_PARALLEL,
             ),
         };
-        Ok(SessionBounds {
+        SessionBounds {
             max_turns,
             max_tool_calls,
             max_output_tokens,
@@ -824,7 +832,7 @@ impl BoundDef {
                 u32::try_from(within.as_secs() / 60).unwrap_or(u32::MAX)
             }),
             max_rounds: self.session_limits.max_rounds(),
-        })
+        }
     }
 
     /// The tool as the agent gets it: a session tool is scrubbed when the deployment gave a scrub.
@@ -871,7 +879,7 @@ impl BoundDef {
                 max_output_tokens: cap,
                 ..node.limits
             })
-            .max_parallel(self.parallel_of(node)?)
+            .max_parallel(self.parallel_of(node))
             .reasoning_effort(effort)
             .model_choices(choices);
         if let Some(fallback) = fallback {

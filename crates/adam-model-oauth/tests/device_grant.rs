@@ -34,6 +34,7 @@ fn call() -> CredentialRequest<'static> {
         url: "https://models.example.test/v1/chat/completions",
         attempt: 0,
         run: None,
+        prompt_statement: None,
     }
 }
 

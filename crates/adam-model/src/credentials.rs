@@ -16,7 +16,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::ModelError;
+use crate::{ModelError, PROMPT_STATEMENT_HEADER, PROMPT_USER_SIGNATURE_HEADER, PromptStatement};
 
 /// The call a provider is asked to authorise.
 #[derive(Debug, Clone, Copy)]
@@ -32,6 +32,12 @@ pub struct CredentialRequest<'a> {
     ///
     /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
     pub run: Option<&'a str>,
+    /// The prompt statement and the person's envelope of the call's run
+    /// ([`ModelRequest::prompt_statement`](crate::ModelRequest::prompt_statement)), when it has
+    /// them: what [`InjectedRun`] sends beside the run ([ADR 0077]). Its `Debug` holds no value.
+    ///
+    /// [ADR 0077]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md
+    pub prompt_statement: Option<&'a PromptStatement>,
 }
 
 /// Why the endpoint refused a call: what a provider needs to decide whether a new credential would help.
@@ -298,9 +304,15 @@ impl ModelCredentials for StaticBearer {
 pub const RUN_HEADER: &str = "X-Run-Id";
 
 /// No key, the run's id instead: what `MODEL_AUTH=injector` gives ([ADR 0067]). Every call carries
-/// exactly one header, `X-Run-Id: <root run id>`, and no `Authorization`; an injector in front of
-/// the model finds the credential the run was leased and adds it upstream. The run id is an opaque
-/// capability, not a secret.
+/// `X-Run-Id: <root run id>` and no `Authorization`; an injector in front of the model finds the
+/// credential the run was leased and adds it upstream. The run id is an opaque capability, not a
+/// secret.
+///
+/// A call whose run has a prompt statement ([`CredentialRequest::prompt_statement`], ADR 0077) also
+/// carries [`PROMPT_STATEMENT_HEADER`] and, when the person's envelope is there,
+/// [`PROMPT_USER_SIGNATURE_HEADER`], each byte for byte; a run without one sends neither. Only this
+/// provider sends them: a key or a device grant talks to the model's own endpoint, which has no use
+/// for the person's signature.
 ///
 /// A call that names no run is refused with [`ModelError::InvalidRequest`] before anything is sent:
 /// there is no fallback to a key.
@@ -335,7 +347,21 @@ impl ModelCredentials for InjectedRun {
     async fn headers(&self, call: CredentialRequest<'_>) -> Result<CredentialHeaders, ModelError> {
         match call.run {
             Some(run) if !run.is_empty() => {
-                Ok(CredentialHeaders::none().with(RUN_HEADER, SecretString::from(run.to_owned())))
+                let mut headers =
+                    CredentialHeaders::none().with(RUN_HEADER, SecretString::from(run.to_owned()));
+                if let Some(prompt) = call.prompt_statement {
+                    headers = headers.with(
+                        PROMPT_STATEMENT_HEADER,
+                        SecretString::from(prompt.statement().to_owned()),
+                    );
+                    if let Some(user) = prompt.user() {
+                        headers = headers.with(
+                            PROMPT_USER_SIGNATURE_HEADER,
+                            SecretString::from(user.to_owned()),
+                        );
+                    }
+                }
+                Ok(headers)
             }
             _ => Err(ModelError::invalid_request(
                 "a model call through the injector names no run",
@@ -439,6 +465,7 @@ mod tests {
             url: "https://models.example.test/v1/chat/completions",
             attempt: 0,
             run: None,
+            prompt_statement: None,
         }
     }
 
@@ -467,6 +494,59 @@ mod tests {
             );
         }
         assert_eq!(RUN_HEADER, "X-Run-Id");
+    }
+
+    #[tokio::test]
+    async fn the_injector_sends_the_prompt_statement_and_the_envelope_when_the_run_has_them() {
+        let (statement, user) = ("aGVhZA.cGF5.c2ln", "dXNlcg.ZW52.c2ln");
+        let both = PromptStatement::new(statement, Some(user.to_owned())).unwrap();
+        let headers = InjectedRun::new()
+            .headers(CredentialRequest {
+                run: Some("run-root-1"),
+                prompt_statement: Some(&both),
+                ..call()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            header_pairs(&headers),
+            vec![
+                ("X-Run-Id".to_owned(), "run-root-1".to_owned()),
+                ("Prompt-Statement".to_owned(), statement.to_owned()),
+                ("Prompt-User-Signature".to_owned(), user.to_owned()),
+            ]
+        );
+        // No envelope: the statement alone. Neither value shows in a `Debug` of the headers.
+        let only = PromptStatement::new(statement, None).unwrap();
+        let headers = InjectedRun::new()
+            .headers(CredentialRequest {
+                run: Some("run-root-1"),
+                prompt_statement: Some(&only),
+                ..call()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            header_pairs(&headers),
+            vec![
+                ("X-Run-Id".to_owned(), "run-root-1".to_owned()),
+                ("Prompt-Statement".to_owned(), statement.to_owned()),
+            ]
+        );
+        assert!(!format!("{headers:?}").contains(statement));
+        // A key never sends them.
+        let headers = StaticBearer::new(SecretString::from("k"))
+            .headers(CredentialRequest {
+                run: Some("run-root-1"),
+                prompt_statement: Some(&both),
+                ..call()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            header_pairs(&headers),
+            vec![("authorization".to_owned(), "Bearer k".to_owned())]
+        );
     }
 
     #[tokio::test]

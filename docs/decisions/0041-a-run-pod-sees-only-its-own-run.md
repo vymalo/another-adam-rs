@@ -316,6 +316,7 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   `git` there says it is not a repository. The commands that do not use git run as before.
 * **A repository's devcontainer on Podman (ADR 0010) binds the mirror read-write.** Not touched here.
 * The model key is in every run pod's environment until ADR 0038 is built.
+  *Amended 2026-11-24:* ADR 0038 is built ([#145](https://github.com/vymalo/another-adam-rs/pull/145), `cb7bb8f`): no model key is in a run pod. This limit is closed.
 
 ## Alternatives rejected
 
@@ -386,6 +387,7 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
    the person's identity in the coder.
 4. **A new repository waits for a running command** (or makes the pod again when none runs) instead of ending the command.
 5. **Exactly one Secret key in a run pod, `MODEL_API_KEY`**, until ADR 0038 removes it.
+   *Amended 2026-11-24:* ADR 0038 was built in `cb7bb8f` (#145): a run pod holds no Secret reference at all. The admission policy refuses a `secretKeyRef`, an `envFrom` `secretRef` and a Secret volume; `render-check.sh` asserts the template has none and the policy says so, and `kind-run-pods.sh` submits each form to a real API server and requires the refusal.
 7. **Moving `HEAD` in a run pod fails** (`git switch --detach`, `git checkout <commit>`), because `logs` is read-only; the coder's
    `run_command` and `run` undo such a change anyway. The alternative is a writable `logs`, which leaves a link at `logs/HEAD` able to
    make the coder's git append to any file it can write; the coder could instead never write the worktree's reflog (its own
@@ -506,3 +508,9 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
     * The sandbox is a container of the coder's pod, not a user or a machine: a flaw in the container runtime's isolation or a capability the
       deployment adds back would reach the coder's. It is the same boundary the run pods rely on.
     * The sandbox's output is untrusted by design and the coder treats it as data; nothing here makes `git`'s answers true.
+
+* **2026-11-24, open decision 2 closed (the owner, ANR-Q52).** *"(c) Read-only in run pods, filled by a pull-through proxy to the public
+  registries (a proxy to build and run)."* The shared package cache ([ADR 0040](0040-a-shared-package-cache-at-cache.md)) is mounted
+  read-only in run pods and only the pull-through proxy writes it; the admission policy will refuse a run pod that mounts the cache
+  claim read-write. A cache for each person is not chosen. The risk named under decision 2 above (one run writing what another
+  person's build reads) stays open until the admission slice and the proxy slice are built; this note records the choice and builds nothing.

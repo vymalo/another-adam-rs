@@ -224,6 +224,27 @@ async fn the_card_is_the_one_the_folder_declares() {
     assert_eq!(card.name, "Chat");
 }
 
+/// The contract reads a card that lists `uploads/v1` alone as listing neither extension, so the
+/// card a process serves carries `thread-tools/v1` beside it. The binaries build the card with the
+/// screen's extensions (`card_of`); `adam_service::serve` adds `uploads/v1` to it when the
+/// process serves the extension, so this is that card.
+#[test]
+fn the_card_that_lists_uploads_lists_thread_tools_beside_it() {
+    let card = card_of(&def_of(&assistant()), &url())
+        .unwrap()
+        .with_extension(adam_a2a::ExtensionConfig::uploads());
+    let uris = card.extension_uris();
+    assert!(
+        uris.iter()
+            .any(|uri| uri == adam_a2a::THREAD_TOOLS_EXTENSION),
+        "uploads/v1 alone is read as neither: {uris:?}"
+    );
+    assert!(
+        uris.iter().any(|uri| uri == adam_a2a::UPLOADS_EXTENSION),
+        "{uris:?}"
+    );
+}
+
 /// A folder with `commands/` lists them on the card (`commands/v1`, sorted) and the agent expands
 /// a message that names one, as `/name arguments`, before it is stored.
 #[tokio::test]
@@ -2185,10 +2206,11 @@ async fn a_control_plane_refuses_a_prompt_it_cannot_expand_and_warns_at_start() 
 }
 
 /// `MAX_PARALLEL_TOOL_CALLS` reaches the folder's agents, and the folder's own `limits.max_parallel`
-/// can only lower it: a larger value is refused (ADR 0049, ADR 0054).
+/// can only lower it: a larger value is **clamped** to the deployment's (ADR 0049, ADR 0054
+/// decision 3 — the bounds are clamped to the bounds of that time, and nothing is raised back).
 #[tokio::test]
 async fn the_deployments_parallel_limit_reaches_the_agent_and_the_file_only_lowers_it() {
-    let assemble = |folder: &tempfile::TempDir, setting: usize| {
+    let limit = |folder: &tempfile::TempDir, setting: usize| {
         let def = def_of(folder);
         let model: DynModel = Arc::new(MockModel::new());
         async move {
@@ -2201,16 +2223,9 @@ async fn the_deployments_parallel_limit_reaches_the_agent_and_the_file_only_lowe
                 setting,
             )
             .await
-        }
-    };
-    let limit = |folder: &tempfile::TempDir, setting: usize| {
-        let assembled = assemble(folder, setting);
-        async move {
-            assembled
-                .await
-                .expect("the folder assembles")
-                .root()
-                .max_parallel()
+            .expect("the folder assembles")
+            .root()
+            .max_parallel()
         }
     };
     let folder = chat();
@@ -2220,13 +2235,7 @@ async fn the_deployments_parallel_limit_reaches_the_agent_and_the_file_only_lowe
         t.replacen("limits:", "limits:\n  max_parallel: 2", 1)
     });
     assert_eq!(limit(&folder, 6).await, 2, "the file lowers it");
-    let refused = assemble(&folder, 1).await.err().map(|e| format!("{e:?}"));
-    assert!(
-        refused
-            .as_deref()
-            .is_some_and(|e| e.contains("ParallelAboveDeployment")),
-        "a file above the deployment is refused, never clamped (ADR 0054): {refused:?}"
-    );
+    assert_eq!(limit(&folder, 1).await, 1, "and never raises it");
 }
 
 /// `MODEL_ALIASES_FILE`'s profiles reach the agent through `WorkerParts`: the folder's
@@ -2523,7 +2532,7 @@ fn check_tool_golden(generated: &str) {
 /// not counted: it is the same "hi" in every measurement.
 #[tokio::test]
 async fn a_folder_agents_first_request_stays_under_the_lean_budget() {
-    const BASELINE_BYTES: usize = 17437; // measured 2026-11-21, `origin/main` at e62e00b
+    const BASELINE_BYTES: usize = 16806; // re-recorded 2026-11-25 after the assistant folder trim (ANR-596); was 17437 on 2026-11-21
     const GROWTH_ALLOWED: usize = 1024;
     const LEAN_BUDGET_TOKENS: usize = 5000;
 

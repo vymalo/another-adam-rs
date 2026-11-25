@@ -30,6 +30,7 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 | `RuntimeTaskBackend::with_model_choices(ModelChoices)`, `RuntimeTaskBackend::model_choices()`, `CONTEXT_MODEL` | `model-pick/v1`: the backend reads the model alias of a message that activated the extension, refuses one the card does not offer as `model_not_offered`, and the alias is the run's context key `vymalo.model` = `{"model": ..}`; see *The model a message picks* |
 | `RuntimeTaskBackend::with_reasoning_efforts(ReasoningEfforts)`, `RuntimeTaskBackend::reasoning_efforts()`, `RuntimeTaskBackend::agent()`, `CONTEXT_REASONING_EFFORT` | `reasoning/v1`: the backend reads the effort of a message that activated the extension, refuses one the agent's model does not take (`InvalidParams`, naming the agent and its levels) before anything is written, and the level is the run's context key `vymalo.reasoningEffort` = `{"effort": ..}`; see *The reasoning effort* |
 | `CONTEXT_LOCALE` | `locale/v1`: the person's interface language of the **latest message that activated the extension**, the run's context key `vymalo.locale` = `"fr-FR"` (a bare BCP 47 tag), set from `metadata[URI] = {"locale": "<tag>"}` and **cleared** by an activated message that names none (or names a malformed tag, which is refused rather than passed on); one of `adam_llm_agent::PROTECTED_CONTEXT_KEYS`, so a dropped context does not take it; a request that did not activate the extension changes nothing; see *The interface language* |
+| `PAYLOAD_PROMPT_STATEMENT` | `prompt-statement/v1` (ADR 0077): the inbound payload key `prompt_statement` = `{"statement", "user"?}` (equal to `adam_llm_agent::PROMPT_STATEMENT_KEY`, a test keeps them so), written by `submit` and by a person's message to a session from a request that activated the extension, and **removed** from any other payload; a malformed entry is `InvalidParams` and writes nothing; see *The prompt statement* |
 | `RemoteCommand`, `CommandRefusal`, `Commands::add_remote(name, Arc<dyn RemoteCommand>)`, `Commands::expand_any`, `Commands::served()`, `Commands::refuse_prefix(prefix, why)` | a command whose text is **asked** when a message names it (an MCP server's prompt): the source gets the argument text as typed, trimmed (`expand(&str)`, and maps it itself), the source answers, and the answer is held to the same limits and `(typed)` marking and stored like a template's expansion. `CommandRefusal::Invalid` is `invalid params`, `Unavailable` the A2A `unavailable` error; a name the agent already has is not replaced (`add_remote` returns `false`). `refuse_prefix` makes a process that cannot serve a family of commands (a control plane has no MCP server) answer `invalid params` with a sentence of its own to `/<prefix>...` (typed or in the metadata) instead of letting it reach the model as text; `is_empty()` counts the refusals. `is_format_or_control` now lives in `adam-agent-fs` and is re-exported here. **Breaking:** the crate-private `apply` is async, and `Commands`' `PartialEq` compares a remote command by pointer |
 | `RuntimeTaskBackend::with_commands(Commands)`, `Commands`, `Commands::from_manifest(&[adam_agent_fs::Command])` (the one place a manifest becomes the backend's commands, used by `adam-agent` and `adam-coder`; this crate gained the `adam-agent-fs` dependency for it), `MAX_COMMAND_ARGUMENTS`, `MAX_COMMAND_EXPANSION` | `commands/v1`: the backend expands a message that names a command the agent serves, in this request, and stores the expansion; see *Commands*. An empty `Commands` is the same as none |
 | `RuntimeTaskBackend::with_child_sessions(ChildSessions)`, `ChildSessions::new(agents, max_open)`, `.with_max_rounds(n)`, `.card_extension()`, `.agents()`, `RuntimeTaskBackend::child_sessions()` (what the backend serves, `None` when never given or refused), `ChildSessionAgent::new(name, agent, description)` + `.within(duration)` + `.remote()` (a helper whose rounds work on another agent's task: a cancel of its round, or an idle expiry, is followed by a closing round that a worker steps and that sends the remote `CancelTask`; a kept-open session stays open) (and `adam_a2a::ChildSessionInfo::new(name, description)`; all three types are `#[non_exhaustive]`), `MAX_DESCRIPTION_CHARS`, `MAX_SESSION_ROUNDS` (a close is always allowed, even at the limit) | `child-sessions/v1`: a client that activates it sees the agent's sessions on the parent task, follows each round as a task of a child context, and starts, talks to, stops and closes a session; see *Child sessions*. A helper whose `agent` is not registered on the runtime is logged (`error!`) and the extension is not served. `card_extension()` is what the card lists (`None` when the contract's bounds are not met). Wired by `adam-assembly` (`AgentDef::child_sessions`), `adam-service` (`Agents::child_sessions`) and the shipped agents |
@@ -207,6 +208,20 @@ its own parent (`start_child_continuing_within(S, S, ..)`): no run's end cancels
 **The access tier.** A message that activated `access-tier/v1` names a tier as for any message; a round a person starts that did
 not still gets the agent's default written, so it never runs under a tier nobody chose. A close names none. Commands are not
 expanded in a child context (they are the parent agent's).
+
+**The workspace a person's round reads** (ADR 0045 slice 7). A round a person starts has no task of its own, so the front
+writes `SessionHeader::workspace` at the start: the **most recently created** task of the parent context — the repository the
+person is looking at — and every later round keeps it. Created, not updated: the store lists a context's runs by
+`(updated_at, id)` descending, and `updated_at` moves whenever a run progresses, so a task still running, or one somebody wrote
+to, is not "the task the person is in". The start reads **the whole context, a page of 64 runs at a time**, and keeps the best
+`(created_at, id)` **root** of every page: it stops when a page comes back short, which is the store's own statement that the
+context ended. A child run registered under the root's own agent name is skipped, since a child has no workspace. No number of
+runs turns this into "no workspace": `workspace` is `None` for exactly one case, a context with no root run of the agent at
+all (a person who has not started a task there), and then the session's rounds answer in words. `WORKSPACE_MAX_PAGES` is a
+loop-safety guard only (a store that never ends a page), and it is logged when it trips. Tests:
+`a_persons_session_reads_the_workspace_of_the_most_recently_created_task_of_its_context`,
+`a_context_whose_newest_runs_are_children_still_names_its_root_task`, and the unit test
+`the_workspace_scan_stops_on_a_page_that_never_ends`.
 
 ## A run parked on the model
 
@@ -555,6 +570,17 @@ its model request, every refusal shape is `InvalidParams` and writes no run, a b
 leaves the effort unread, and the whole chain through `adam-model-openai` against a mock server: the body of
 the call asks for `"reasoning_effort": "high"`).
 
+## The prompt statement
+
+`prompt-statement/v1` ([ADR 0077](../../docs/decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md)). The
+backend reads it in `submit`, after the locale, and in the three places a person's message reaches a session
+(`src/child_sessions.rs`), with `adam_a2a::statement_of_request`: a request that activated the extension and carries
+an entry puts `PAYLOAD_PROMPT_STATEMENT` in the inbound payload; any other leaves none (a key an inbound function
+wrote is removed). The loop keeps the values in `Conversation::prompt_statement` (a later message that brings new ones
+replaces them, one that brings none keeps them) and the injector sends them on every model call of the run. A
+malformed entry refuses the message before anything is written, with a sentence that quotes no value.
+`tests/prompt_statement.rs` drives it through the real client to a `wiremock` endpoint (below).
+
 ## The interface language
 
 `locale/v1` ([ADR 0069](../../docs/decisions/0069-the-interface-language-is-a-hint-and-a-hint-is-all-it-is.md)). The backend reads it in`submit`, right after the inbound function and beside the tier, for an agent whose card lists the extension
@@ -655,6 +681,13 @@ No environment variables at runtime.
 `tests/model_run.rs`: a message whose metadata or data part says `root_run`, `model_run` or `session` does not change the
 run its task's model calls name ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)),
 with the default inbound and with `vymalo_inbound`: the call names the task, and the state holds none of the three.
+
+`tests/prompt_statement.rs`: `prompt-statement/v1` from the A2A message to the wire (ADR 0077), a real `LlmAgent` whose
+model calls go through `adam-model-openai` with `InjectedRun` to a `wiremock` server: every call of the root, of a local
+subagent and of a session's round carries `Prompt-Statement` and `Prompt-User-Signature` beside `X-Run-Id`; a steer
+that brings new values replaces them for every later call, one that brings none keeps them, a malformed entry is
+`InvalidParams` quoting no value; a request that did not activate the extension (or a data part that spells the payload
+key) sends neither; and no value is in any log line, at any level (one global subscriber for the binary). Always runs.
 
 `tests/backend.rs` drives the backend with a real A2A client over HTTP and a
 scripted agent (its `listing` module: the caller's tasks newest first and each state told from the others, including
