@@ -759,6 +759,17 @@ enum Listen {
     Bound(TcpListener),
 }
 
+/// The threshold one process serves for `uploads/v1`: the agent folder's
+/// `limits.max_inline_upload_bytes`, else `UPLOADS_INLINE_MAX_BYTES`
+/// ([`ServiceConfig::uploads_inline_max_bytes`]), else
+/// [`DEFAULT_UPLOADS_INLINE_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES). Both are
+/// already inside the ceiling the deployment's configuration enforced.
+fn inline_upload_threshold(folder: Option<u64>, env: Option<u64>) -> u64 {
+    folder
+        .or(env)
+        .unwrap_or(adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES)
+}
+
 async fn run(
     config: &ServiceConfig,
     agents: Agents,
@@ -813,9 +824,8 @@ async fn run(
     }
     // The card entry has no params (the contract's). The inline threshold is the folder's, else
     // the environment's, else the default (10 MiB); the upload tool of the next card reads it.
-    let _uploads_inline_max_bytes = uploads_inline_max_bytes
-        .or(config.uploads_inline_max_bytes)
-        .unwrap_or(adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES);
+    let _inline_upload_threshold =
+        inline_upload_threshold(uploads_inline_max_bytes, config.uploads_inline_max_bytes);
     if let Some(card) = card.as_mut()
         && !card
             .extensions
@@ -957,6 +967,22 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The folder's value wins over the environment's, which wins over the default. What consumes
+    /// the threshold (the upload tool of the next card) does not exist yet, so the rule is the
+    /// helper's and is asserted here.
+    #[test]
+    fn the_inline_upload_threshold_is_the_folders_then_the_environments_then_the_default() {
+        let default = adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES;
+        assert_eq!(inline_upload_threshold(None, None), default);
+        assert_eq!(inline_upload_threshold(None, Some(4096)), 4096);
+        assert_eq!(inline_upload_threshold(Some(2048), None), 2048);
+        assert_eq!(
+            inline_upload_threshold(Some(2048), Some(4096)),
+            2048,
+            "the folder wins over the environment"
+        );
+    }
 
     /// The connection the helper accepts writes at once: `TCP_NODELAY` is on it.
     ///

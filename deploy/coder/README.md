@@ -519,7 +519,7 @@ App creates for organisations only; a token needs the `repo` scope.
 
 `uploads.inlineMaxBytes` (env `UPLOADS_INLINE_MAX_BYTES`, every role that serves A2A; empty renders nothing and the agent uses 10 MiB, the orchestrator's `artifacts.maxFileBytes`) is the largest
 file the agent sends inline: a larger one asks the orchestrator for a presigned upload slot. From 1 byte to
-4 GiB; set it to the orchestrator's `artifacts.maxFileBytes`. The card lists `uploads/v1` with no `params`, as the contract says. The agent folder's `limits.max_inline_upload_bytes` wins over it. Do not also set
+268435456 (256 MiB); set it to the orchestrator's `artifacts.maxFileBytes`. The card lists `uploads/v1` with no `params`, as the contract says. The agent folder's `limits.max_inline_upload_bytes` wins over it. Do not also set
 `config.extraEnv.UPLOADS_INLINE_MAX_BYTES`: the chart refuses the render.
 
 ### The access tiers
