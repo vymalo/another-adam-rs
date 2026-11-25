@@ -19,12 +19,13 @@ neither the loop nor the runtime.
 
 | Item | What it is |
 |---|---|
-| `Plugin` | `name`, `message_received`, `before_tool` and `after_tool`, each with a do-nothing default, so a plugin that cares about one point implements one method |
+| `Plugin` | `name`, `message_received`, `run_ending`, `before_tool` and `after_tool`, each with a do-nothing default, so a plugin that cares about one point implements one method |
 | `Verdict` | `Continue`, `Deny(reason)`, `Ask(reason)`, `Stop(reason)`: the first verdict other than `Continue` is the set's, and a later plugin is not asked |
 | `HookError` | the plugin's name, an `adam-error` class and a reason (never an argument or a tool's answer); `is_retryable` follows the class |
 | `HookLimits` | the deadline of one hook (1 s by default) and how many times a retryable failure is tried again (1) |
 | `HookSet` | the ordered plugins and their limits; `message_received`, `before_tool` and `after_tool` run them, `catch_unwind` each call, and stop at the first decision |
 | `HookedCall`, `HookedText` | what a hook sees: the tool's name and its arguments (rewritable), and the text the model will read (rewritable) |
+| `HookedEnding` | what a `run.ending` hook sees (slice H1c): the answer the run would end with and how many times a hook has already kept it going. `Verdict::Deny(reason)` keeps the run going with the reason as what the model is asked again with; `Continue` and `Stop` let it end; an error never keeps a run going |
 | `HookedMessage`, `MessageFile` | what a `message.received` hook sees: the text (rewritable) and the files **by reference** (name, media type, size, the SHA-256 the image step records), never their bytes |
 
 ## The rules

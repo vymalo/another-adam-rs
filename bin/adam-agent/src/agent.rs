@@ -105,6 +105,8 @@ pub struct WorkerParts<'a> {
     /// The most tool calls of one model turn that run at the same time (`MAX_PARALLEL_TOOL_CALLS`,
     /// 1 to 32): an agent file's `limits.max_parallel` may lower it for its agent.
     pub max_parallel: usize,
+    /// The most times `run.ending` hooks may keep one run going (`HOOK_END_CONTINUATIONS`).
+    pub end_continuations: u32,
     /// How every agent waits on a model that refused it (ADR 0067): `MODEL_PARK_LIMIT`, and whether
     /// an unreachable endpoint parks (`MODEL_AUTH=injector`).
     pub parking: ModelParking,
@@ -198,6 +200,7 @@ pub async fn assemble_limited_with_profiles(
         mcp,
         step_io,
         max_parallel,
+        adam_llm_agent::DEFAULT_END_CONTINUATIONS,
         profiles,
         ModelParking::default(),
     )
@@ -214,6 +217,7 @@ async fn assemble_parked(
     mcp: &McpPolicy,
     step_io: StepIo,
     max_parallel: usize,
+    end_continuations: u32,
     profiles: ModelProfiles,
     parking: ModelParking,
 ) -> Result<Assembly, AgentError> {
@@ -233,6 +237,7 @@ async fn assemble_parked(
         .map_err(|e| AgentError::Assembly(Box::new(e)))?
         .tool_source(ui.source())
         .max_parallel(max_parallel)
+        .end_continuations(end_continuations)
         .model_parking(parking)
         .step_io(step_io);
     bound
@@ -290,6 +295,7 @@ pub async fn agents(
                 &parts.mcp,
                 parts.step_io,
                 parts.max_parallel,
+                parts.end_continuations,
                 profiles.clone(),
                 parts.parking,
             )

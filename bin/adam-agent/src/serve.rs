@@ -93,6 +93,7 @@ pub async fn serve(
             // process (the configuration's and the environment's) are scrubbed from both.
             step_io: redact::step_io_named(&config, redact::process_vars(), &named_vars),
             max_parallel: settings.max_parallel_tool_calls,
+            end_continuations: settings.hook_end_continuations,
             // A refused model call parks the run (ADR 0067); behind the injector, so does a gateway
             // that cannot be reached.
             parking: ModelParking::new(worker.model.park_limit)

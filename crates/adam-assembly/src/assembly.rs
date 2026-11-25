@@ -41,6 +41,7 @@ pub struct BoundDef {
     model_choices: bool,
     wait_poll: Option<Duration>,
     max_parallel: Option<usize>,
+    end_continuations: Option<u32>,
     model_parking: Option<ModelParking>,
     admission: Option<DynAdmission>,
     session_limits: SessionLimits,
@@ -99,6 +100,7 @@ impl BoundDef {
             model_choices: false,
             wait_poll: None,
             max_parallel: None,
+            end_continuations: None,
             model_parking: None,
             admission: None,
             session_limits,
@@ -195,6 +197,15 @@ impl BoundDef {
     #[must_use]
     pub fn wait_poll(mut self, every: Duration) -> Self {
         self.wait_poll = Some(every);
+        self
+    }
+
+    /// The most times `run.ending` hooks may keep one run going, for every agent: the deployment's
+    /// `HOOK_END_CONTINUATIONS` ([`LlmAgentBuilder::end_continuations`]). Without it the loop's
+    /// default stands.
+    #[must_use]
+    pub fn end_continuations(mut self, n: u32) -> Self {
+        self.end_continuations = Some(n);
         self
     }
 
@@ -906,6 +917,9 @@ impl BoundDef {
                     hooks.with(Arc::clone(plugin))
                 });
             builder = builder.hooks(hooks);
+            if let Some(cap) = self.end_continuations {
+                builder = builder.end_continuations(cap);
+            }
         }
         if let Some(step_io) = &self.step_io {
             builder = builder.step_io(step_io.clone());

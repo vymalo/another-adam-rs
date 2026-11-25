@@ -70,6 +70,7 @@ fn worker(model: DynModel, mcp: McpPolicy) -> WorkerParts<'static> {
         options: options(),
         step_io: adam_llm_agent::StepIo::default(),
         max_parallel: 10,
+        end_continuations: 2,
         parking: adam_llm_agent::ModelParking::default(),
     }
 }

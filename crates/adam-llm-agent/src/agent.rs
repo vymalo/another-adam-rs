@@ -13,7 +13,9 @@ use adam_model::{
     Classify, DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse,
     PromptStatement, ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
-use adam_plugin::{HookSet, HookedCall, HookedMessage, HookedText, MessageFile, Plugin, Verdict};
+use adam_plugin::{
+    HookSet, HookedCall, HookedEnding, HookedMessage, HookedText, MessageFile, Plugin, Verdict,
+};
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
     CancelToken, ChildLook, ChildStarter, ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES,
@@ -736,6 +738,9 @@ write in another language. Never translate code, paths or command output."
     )
 }
 
+/// How many times `run.ending` hooks may keep one run going unless the deployment says otherwise.
+pub const DEFAULT_END_CONTINUATIONS: u32 = 2;
+
 /// The most bytes of a tag this module prints: `adam_a2a::Locale`'s bound, restated here because
 /// this crate does not depend on the A2A layer.
 pub const MAX_INTERFACE_LANGUAGE_BYTES: usize = 64;
@@ -1258,6 +1263,7 @@ pub struct LlmAgentBuilder {
     choices: Vec<ModelBinding>,
     admission: Option<DynAdmission>,
     hooks: HookSet,
+    end_continuations: u32,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -1485,6 +1491,15 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// The most times `run.ending` hooks may keep one run going (ADR 0050, slice H1c); past it the
+    /// run ends `capped`. Default [`DEFAULT_END_CONTINUATIONS`]; `0` means no hook may keep a run
+    /// going.
+    #[must_use]
+    pub fn end_continuations(mut self, cap: u32) -> Self {
+        self.end_continuations = cap;
+        self
+    }
+
     /// Append one plugin to the hook set ([`LlmAgentBuilder::hooks`]); the order plugins are added in
     /// is the order their hooks run in.
     #[must_use]
@@ -1676,6 +1691,7 @@ impl LlmAgentBuilder {
             run_chars: Arc::new(Mutex::new(RunChars::default())),
             admission: self.admission,
             hooks: Arc::new(self.hooks),
+            end_continuations: self.end_continuations,
         }
     }
 }
@@ -1909,6 +1925,8 @@ pub struct LlmAgent {
     /// The compiled hooks around every tool call (ADR 0050, slice H1). Shared, because a run's calls
     /// of one segment read the same set from several futures, and a hook's plugin is written once.
     hooks: Arc<HookSet>,
+    /// The most times a `run.ending` hook may keep a run going (slice H1c).
+    end_continuations: u32,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -2019,6 +2037,7 @@ impl LlmAgent {
             choices: Vec::new(),
             admission: None,
             hooks: HookSet::new(),
+            end_continuations: DEFAULT_END_CONTINUATIONS,
         }
     }
 
@@ -3255,10 +3274,36 @@ impl LlmAgent {
                 }
                 return Ok((Flow::Next, early));
             }
+            // The model's answer ends the run unless a `run.ending` hook keeps it going (slice H1c).
+            let mut capped = None;
+            if !self.hooks.is_empty() && state.limit.is_none() && finish != FinishReason::Length {
+                let ended = decide_ending(
+                    &self.hooks,
+                    ctx,
+                    &end_step(turn),
+                    &text,
+                    state.end_continuations,
+                    self.end_continuations,
+                )
+                .await?;
+                match ended {
+                    EndDecision::Keep { reason } => {
+                        state.end_continuations += 1;
+                        state.messages.push(Message::user_text(reason));
+                        return Ok((Flow::Next, early));
+                    }
+                    EndDecision::Capped { reason } => capped = Some(reason),
+                    EndDecision::End => {}
+                }
+            }
             let mut output = json!({
                 "text": text,
                 "artifacts": state.artifacts,
             });
+            if let Some(reason) = capped {
+                output["capped"] = json!(true);
+                output["capped_reason"] = json!(reason);
+            }
             if finish == FinishReason::Length {
                 output["truncated"] = json!(true);
             }
@@ -6200,6 +6245,60 @@ fn ask_message(
         }
         Err(error) => refuse_at_message(&error.plugin, &error.reason),
     })
+}
+
+/// The journaled step `run.ending` asks its hooks in, one per turn.
+fn end_step(turn: u32) -> String {
+    format!("end:{turn}")
+}
+
+/// What the step `end:<turn>` records: whether the run ends or goes on, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+enum EndDecision {
+    /// No hook kept the run going: it ends.
+    End,
+    /// A hook kept the run going; the reason is what the model is asked again with.
+    Keep { reason: String },
+    /// A hook would have kept the run going but the cap of continuations was reached: it ends.
+    Capped { reason: String },
+}
+
+/// Asks the `run.ending` hooks whether the run may end, inside the journaled step `name`. A
+/// recorded step is what a replay applies, so no hook is asked again. A hook that cannot decide
+/// never keeps a run going.
+async fn decide_ending(
+    hooks: &Arc<HookSet>,
+    ctx: &mut Ctx,
+    name: &str,
+    text: &str,
+    continuations: u32,
+    cap: u32,
+) -> Result<EndDecision, AgentError> {
+    let hooks = Arc::clone(hooks);
+    let text = text.to_owned();
+    let decided: Result<EndDecision, MessageStepError> = ctx
+        .step(name, move || async move {
+            Ok(ask_ending(&hooks, &text, continuations, cap))
+        })
+        .await?;
+    // The closure never fails, so the inner result is always `Ok`.
+    decided.map_err(|error| AgentError::transient(error.reason))
+}
+
+fn ask_ending(hooks: &HookSet, text: &str, continuations: u32, cap: u32) -> EndDecision {
+    let decided = hooks.run_ending(&HookedEnding {
+        text,
+        continuations,
+    });
+    match decided {
+        Ok(Some(decided)) => match decided.verdict {
+            Verdict::Deny(reason) if continuations >= cap => EndDecision::Capped { reason },
+            Verdict::Deny(reason) => EndDecision::Keep { reason },
+            Verdict::Continue | Verdict::Stop(_) | Verdict::Ask(_) => EndDecision::End,
+        },
+        Ok(None) | Err(_) => EndDecision::End,
+    }
 }
 
 /// A message refused because the hook could not decide a verdict of this point.

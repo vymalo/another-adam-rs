@@ -883,6 +883,10 @@ they are added in is the order their hooks run in. `adam-plugin` holds the vocab
   step is written once the stream ends: a stream that fails runs its hooks again with the call, and
   the recorded step is the one no later replay asks about.
 
+## A hook may keep a run going (ADR 0050, slice H1c)
+
+When the model answers with no tool call and a hook set is installed, `Plugin::run_ending(&HookedEnding { text, continuations })` is asked in the journaled step `end:<turn>`. `Verdict::Deny(reason)` keeps the run going: `reason` is added to the history as a user message and the model is asked again. `LlmAgentBuilder::end_continuations(n)` (default `DEFAULT_END_CONTINUATIONS`, 2; the deployment's `HOOK_END_CONTINUATIONS`) caps the continuations per run: past it the run ends with `capped: true` and `capped_reason` in its output, and the step records `capped`. A replay of the step asks no hook again; with no hook set no step is taken. Tests: `tests/run_ending_hooks.rs`.
+
 ## A hook may refuse a person's message (ADR 0050, slice H1b)
 
 `Plugin::message_received(&mut HookedMessage { text, files })` is asked about every message before a

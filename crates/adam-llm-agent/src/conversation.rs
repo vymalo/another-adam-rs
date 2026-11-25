@@ -715,6 +715,13 @@ pub struct Conversation {
     /// Absent from state written before it existed, and not written while `0`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub thinking_cuts: u32,
+    /// How many times a `run.ending` hook kept the run going ([ADR 0050], slice H1c); the loop stops
+    /// asking past the deployment's cap. Absent from state written before it existed, and not
+    /// written while `0`.
+    ///
+    /// [ADR 0050]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub end_continuations: u32,
     /// The latest model turn stopped at the output limit (`FinishReason::Length`): a call of it whose
     /// arguments are not JSON is most likely cut off, and its error says so. Absent from state
     /// written before it existed, and not written while `false`.

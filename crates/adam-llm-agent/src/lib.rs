@@ -172,15 +172,15 @@ pub use access::{ToolAccess, Use, UseMode, path_scope};
 /// [ADR 0050]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
 pub use adam_plugin::{
     EventHeader, EventKind, EventQueue, FlushReport, HookError, HookEvent, HookLimits, HookResult,
-    HookSet, HookedCall, HookedMessage, HookedText, MESSAGE_RECEIVED, MessageFile, ObserveLimits,
-    Plugin, Verdict,
+    HookSet, HookedCall, HookedEnding, HookedMessage, HookedText, MESSAGE_RECEIVED, MessageFile,
+    ObserveLimits, Plugin, RUN_ENDING, Verdict,
 };
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{
-    BuildError, CLOSING_TURN, DEFAULT_MAX_PARALLEL, DEFAULT_WAIT_POLL, Limits, LlmAgent,
-    LlmAgentBuilder, LlmStarter, MAX_INTERFACE_LANGUAGE_BYTES, MAX_PARALLEL_LIMIT,
-    MAX_THINKING_CUTS, ModelBinding, NOT_ASKABLE, THINKING_CUT_TURN, UNATTENDED,
-    interface_language, interface_language_turn, is_unattended, tool_retry_key,
+    BuildError, CLOSING_TURN, DEFAULT_END_CONTINUATIONS, DEFAULT_MAX_PARALLEL, DEFAULT_WAIT_POLL,
+    Limits, LlmAgent, LlmAgentBuilder, LlmStarter, MAX_INTERFACE_LANGUAGE_BYTES,
+    MAX_PARALLEL_LIMIT, MAX_THINKING_CUTS, ModelBinding, NOT_ASKABLE, THINKING_CUT_TURN,
+    UNATTENDED, interface_language, interface_language_turn, is_unattended, tool_retry_key,
 };
 pub use compaction::{
     COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize,

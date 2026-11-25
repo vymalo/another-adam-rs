@@ -17,6 +17,7 @@
 //! | `A2A_DOCS` | Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, both public (the calls still need a token); `false` turns them off ([`A2aSettings::docs`]) | `true` |
 //! | `LISTEN_ADDR` | bind address: the A2A server, or for `worker` its `/healthz` listener | `0.0.0.0:8080` |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
+//! | `HOOK_END_CONTINUATIONS` | the most times `run.ending` hooks may keep one run going, 0 to 16 (`0`: no hook may); past it the run ends `capped` (ADR 0050, slice H1c); read by the roles that run workers ([`WorkerSettings::hook_end_continuations`]) | `2` |
 //! | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (`1` is one at a time); an agent file's `limits.max_parallel` may lower it for that agent; read by the roles that run workers ([`WorkerSettings::max_parallel_tool_calls`]) | `10` |
 //! | `MAX_TOOL_CALLS_IN_FLIGHT` | the most tool calls of the whole process that run at the same time, 1 to 256: the process's pool, inside which `MAX_PARALLEL_TOOL_CALLS` still bounds one turn (ADR 0065) | `4` |
 //! | `MAX_MODEL_CALLS` | the most model calls in flight in the process, 1 to 64 (ADR 0065) | `2` |
@@ -677,6 +678,12 @@ fn parse_max_parallel(get: &impl Fn(&str) -> Option<String>, problems: &mut Vec<
     DEFAULT_MAX_PARALLEL_TOOL_CALLS
 }
 
+/// The default of `HOOK_END_CONTINUATIONS`: a hook that keeps a run going may do it twice.
+pub const DEFAULT_HOOK_END_CONTINUATIONS: u32 = 2;
+
+/// The most `HOOK_END_CONTINUATIONS` may say.
+pub const HOOK_END_CONTINUATIONS_LIMIT: u32 = 16;
+
 /// The default of `MAX_TOOL_CALLS_IN_FLIGHT`: the desktop's four (ADR 0065 decision 11).
 pub const DEFAULT_MAX_TOOL_CALLS_IN_FLIGHT: usize = 4;
 
@@ -818,6 +825,9 @@ pub struct WorkerSettings {
     /// `MAX_TOOL_CALLS_IN_FLIGHT`: the most tool calls of the whole process that run at once, 1 to
     /// [`MAX_TOOL_CALLS_IN_FLIGHT_LIMIT`]. The per-turn bound sits inside it (ADR 0065).
     pub max_tool_calls_in_flight: usize,
+    /// `HOOK_END_CONTINUATIONS`: the most times `run.ending` hooks may keep one run going, 0 to
+    /// [`HOOK_END_CONTINUATIONS_LIMIT`]; past it the run ends `capped`.
+    pub hook_end_continuations: u32,
     /// `MAX_MODEL_CALLS`: the most model calls in flight in the process, 1 to
     /// [`MAX_MODEL_CALLS_LIMIT`].
     pub max_model_calls: usize,
@@ -859,6 +869,20 @@ impl WorkerSettings {
             MAX_TOOL_CALLS_IN_FLIGHT_LIMIT,
             problems,
         );
+        let hook_end_continuations = parse_or(
+            &get,
+            "HOOK_END_CONTINUATIONS",
+            DEFAULT_HOOK_END_CONTINUATIONS,
+            problems,
+        );
+        let hook_end_continuations = if hook_end_continuations > HOOK_END_CONTINUATIONS_LIMIT {
+            problems.push(format!(
+                "HOOK_END_CONTINUATIONS must be between 0 and {HOOK_END_CONTINUATIONS_LIMIT}, got {hook_end_continuations}"
+            ));
+            DEFAULT_HOOK_END_CONTINUATIONS
+        } else {
+            hook_end_continuations
+        };
         let max_model_calls = bounded_count(
             &get,
             "MAX_MODEL_CALLS",
@@ -888,6 +912,7 @@ impl WorkerSettings {
             worker_id,
             max_parallel_tool_calls,
             max_tool_calls_in_flight,
+            hook_end_continuations,
             max_model_calls,
             model_tokens_per_minute,
             max_processes,
@@ -1820,6 +1845,7 @@ mod tests {
                 worker_id: None,
                 max_parallel_tool_calls: 10,
                 max_tool_calls_in_flight: 4,
+                hook_end_continuations: 2,
                 max_model_calls: 2,
                 model_tokens_per_minute: None,
                 max_processes: 4,
@@ -1865,6 +1891,28 @@ mod tests {
             let mut vars = full();
             vars.insert(name, bad);
             assert!(mentions(&problems_of(&vars), name), "{name}={bad}");
+        }
+    }
+
+    /// `HOOK_END_CONTINUATIONS` is 0 to 16: more is a startup problem (exit 78), never clamped.
+    #[test]
+    fn the_hook_end_continuations_are_bounded() {
+        let worker = parse(&full()).expect("valid").worker.expect("worker");
+        assert_eq!(worker.hook_end_continuations, 2);
+        let mut vars = full();
+        vars.insert("HOOK_END_CONTINUATIONS", "0");
+        assert_eq!(
+            parse(&vars)
+                .expect("valid")
+                .worker
+                .expect("worker")
+                .hook_end_continuations,
+            0
+        );
+        for bad in ["17", "-1", "many"] {
+            let mut vars = full();
+            vars.insert("HOOK_END_CONTINUATIONS", bad);
+            assert!(parse(&vars).is_err(), "{bad}");
         }
     }
 

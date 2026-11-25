@@ -58,6 +58,20 @@ pub struct HookedText<'a> {
 /// allow the message, rewrite [`HookedMessage::text`] in place, or refuse it with [`Verdict::Deny`].
 pub const MESSAGE_RECEIVED: &str = "message.received";
 
+/// The point where the model has answered with no tool call and the run is about to end (ADR 0050,
+/// slice H1c). A hook may keep the run going: [`Verdict::Deny`] is "not yet", and its reason is what
+/// the model is asked again with. `Continue` and `Stop` let the run end.
+pub const RUN_ENDING: &str = "run.ending";
+
+/// What a run's end is, as a `run.ending` hook sees it: the answer the model gave, which a hook
+/// reads and never rewrites.
+pub struct HookedEnding<'a> {
+    /// The words the run would end with.
+    pub text: &'a str,
+    /// How many times a hook has already kept this run going.
+    pub continuations: u32,
+}
+
 /// A file a person sent with a message, as a `message.received` hook sees it: **by reference**,
 /// never its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +180,14 @@ pub trait Plugin: Send + Sync {
     /// [`Verdict::Deny`] and the reason the person reads. `Ask` and `Stop` are not verdicts of this
     /// point, and the loop treats them as a hook failure (a refusal).
     fn message_received(&self, _message: &mut HookedMessage<'_>) -> HookResult {
+        Ok(Verdict::Continue)
+    }
+
+    /// The model answered with no tool call and the run is about to end: [`Verdict::Deny`] keeps it
+    /// going, with the reason as what the model is asked again with. `Continue` and `Stop` let it
+    /// end; `Ask` is not a verdict of this point and counts as a failure of the hook, which lets
+    /// the run end.
+    fn run_ending(&self, _ending: &HookedEnding<'_>) -> HookResult {
         Ok(Verdict::Continue)
     }
 
@@ -279,6 +301,20 @@ impl HookSet {
         self.run_decided(MESSAGE_RECEIVED, |plugin| {
             guard(plugin.name(), self.limits.deadline, || {
                 plugin.message_received(message)
+            })
+        })
+    }
+
+    /// Runs every plugin's `run_ending` in order, until one decides. `None` when every plugin said
+    /// [`Verdict::Continue`].
+    ///
+    /// # Errors
+    /// As [`HookSet::before_tool`]. The caller lets the run end on an error: a hook that cannot
+    /// decide never keeps a run going.
+    pub fn run_ending(&self, ending: &HookedEnding<'_>) -> Result<Option<Decided<'_>>, HookError> {
+        self.run_decided(RUN_ENDING, |plugin| {
+            guard(plugin.name(), self.limits.deadline, || {
+                plugin.run_ending(ending)
             })
         })
     }
