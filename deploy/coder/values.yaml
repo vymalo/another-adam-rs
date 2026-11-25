@@ -7,7 +7,7 @@ image:
   # Bumped on every green build of main by .github/workflows/coder.yml
   # (`sha-<first 7 of the commit>`). A plain key so the workflow can edit it.
   # sha-0000000 is the placeholder that exists before the first build.
-  tag: sha-34eba70
+  tag: sha-1486ff3
   pullPolicy: IfNotPresent
 
 # The image package may be private; name a pull secret here if so.
@@ -135,6 +135,37 @@ config:
   # COMMAND_CPU_MAX: the CPU one command may use: cores (2, 1.5) or millicores (500m), at least 100m
   # (the binary takes half the cores). The binary refuses a bad one.
   commandCpuMax: null
+  # MODEL_PROMPT_CACHE_KEY: `off` or `conversation`. With `conversation` every request carries a
+  # prompt_cache_key derived from the conversation id, so a gateway with a prompt cache routes one
+  # conversation together. Empty (default): nothing is rendered and the binary's `off` applies. The
+  # binary refuses anything else (exit 78); the chart refuses it first. Roles that run workers only.
+  modelPromptCacheKey: ""
+  # MODEL_INPUT_MODALITIES: `text` or `text,image`, what the model `model` names can read. Empty
+  # (default): nothing is rendered and the binary's `text` applies. Roles that run workers only.
+  modelInputModalities: ""
+  # LANGUAGE_SERVERS: `on` or `off`, the language-server tools of the coder (file_diagnostics,
+  # find_definition, find_references). Empty (default): nothing is rendered and the binary's `on`
+  # applies. Roles that run workers only.
+  languageServers: ""
+  # The limits of the sessions of one conversation (child-sessions/v1). null (default): nothing is
+  # rendered and the binary's defaults apply (16, 4, 20, 7). EVERY role reads them, so the chart
+  # writes them to the control plane and to the workers alike (set them the same on every role).
+  # The chart refuses a value outside the binary's bounds, and the same variable in extraEnv.
+  sessions:
+    # SESSION_MAX_OPEN: sessions of a conversation open at once, 1 to 100.
+    maxOpen: null
+    # SESSION_MAX_WORKING: rounds working at once, 1 to 32 and at most maxOpen.
+    maxWorking: null
+    # SESSION_MAX_ROUNDS: rounds one session may have, 2 to 200.
+    maxRounds: null
+    # SESSION_IDLE_DAYS: days a kept-open session may sit idle before it reads closed, 1 to 365.
+    idleDays: null
+  # ADAM_REFERENCES_FILE: the repositories the coder may READ beside the one it works on and never
+  # write, added to the `references:` of the agent's files. A list of {name, url, description, branch?}.
+  # The chart renders it as JSON in a ConfigMap mounted at /etc/adam/references.json. Empty (default):
+  # no file, no variable. A name the agent already declares, or an address its workspace policy
+  # refuses, stops the coder at startup (exit 78). Roles that run workers only.
+  references: []
   # Failed run_checks after which the agent must stop and report.
   maxCheckCycles: 3
   # Time limit of one run_checks command, in seconds.

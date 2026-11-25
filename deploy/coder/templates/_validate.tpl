@@ -220,6 +220,46 @@ from service.yaml, which every render contains, so they always run.
 {{- fail (printf "config.%s is set and config.extraEnv sets %s: set one" $key $name) -}}
 {{- end -}}
 {{- end -}}
+{{- /* The enumerated settings: the binary refuses anything else with exit 78. */ -}}
+{{- range $key, $spec := dict "modelPromptCacheKey" (list "MODEL_PROMPT_CACHE_KEY" "off" "conversation") "modelInputModalities" (list "MODEL_INPUT_MODALITIES" "text" "text,image") "languageServers" (list "LANGUAGE_SERVERS" "on" "off") -}}
+{{- $value := toString (default "" (get $.Values.config $key)) -}}
+{{- if and $value (not (has $value (rest $spec))) -}}
+{{- fail (printf "config.%s must be one of %s or empty, got %q" $key (join ", " (rest $spec)) $value) -}}
+{{- end -}}
+{{- if and $value (hasKey $.Values.config.extraEnv (first $spec)) -}}
+{{- fail (printf "config.%s is set and config.extraEnv sets %s: set one" $key (first $spec)) -}}
+{{- end -}}
+{{- end -}}
+{{- /* config.sessions: whole numbers inside the binary's bounds. */ -}}
+{{- range $key, $spec := dict "maxOpen" (list "SESSION_MAX_OPEN" 1 100) "maxWorking" (list "SESSION_MAX_WORKING" 1 32) "maxRounds" (list "SESSION_MAX_ROUNDS" 2 200) "idleDays" (list "SESSION_IDLE_DAYS" 1 365) -}}
+{{- with include "coder.settingText" (get $.Values.config.sessions $key) -}}
+{{- if or (not (regexMatch "^[1-9][0-9]{0,2}$" .)) (lt (int64 .) (int64 (index $spec 1))) (gt (int64 .) (int64 (index $spec 2))) -}}
+{{- fail (printf "config.sessions.%s must be a whole number from %d to %d, got %q" $key (int64 (index $spec 1)) (int64 (index $spec 2)) .) -}}
+{{- end -}}
+{{- if hasKey $.Values.config.extraEnv (first $spec) -}}
+{{- fail (printf "config.sessions.%s is set and config.extraEnv sets %s: set one" $key (first $spec)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- with include "coder.settingText" .Values.config.sessions.maxWorking -}}
+{{- with include "coder.settingText" $.Values.config.sessions.maxOpen -}}
+{{- if gt (int64 (include "coder.settingText" $.Values.config.sessions.maxWorking)) (int64 .) -}}
+{{- fail "config.sessions.maxWorking must be at most config.sessions.maxOpen" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- /* config.references: a list of repositories with a name, a url and a description. */ -}}
+{{- if and .Values.config.references (not (kindIs "slice" .Values.config.references)) -}}
+{{- fail "config.references must be a list of {name, url, description, branch?}" -}}
+{{- end -}}
+{{- range $i, $r := .Values.config.references -}}
+{{- if or (not (kindIs "map" $r)) (not $r.name) (not $r.url) (not $r.description) -}}
+{{- fail (printf "config.references[%d] must be a map with name, url and description" $i) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.config.references (hasKey .Values.config.extraEnv "ADAM_REFERENCES_FILE") -}}
+{{- fail "config.references is set and config.extraEnv sets ADAM_REFERENCES_FILE: the chart sets it itself, to the file it mounts" -}}
+{{- end -}}
 {{- /* config.modelBaseUrlFromSecret: MODEL_BASE_URL from the ExternalSecret, not from config.modelBaseUrl. */ -}}
 {{- if not (kindIs "bool" .Values.config.modelBaseUrlFromSecret) -}}
 {{- fail (printf "config.modelBaseUrlFromSecret must be true or false, got %q" (toString .Values.config.modelBaseUrlFromSecret)) -}}
