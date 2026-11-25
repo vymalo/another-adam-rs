@@ -491,3 +491,32 @@ are unchanged. JSON only for now: the binary refuses a file that does not parse.
 {{- define "coder.modelProfilesJson" -}}
 {{- toPrettyJson .Values.config.modelProfiles -}}
 {{- end -}}
+
+{{/*
+The sessions' limits (values config.sessions): every role reads them, so the control plane and the workers get the
+same lines. Nothing for a value that is not set.
+*/}}
+{{- define "coder.sessionEnv" -}}
+{{- range $key, $name := dict "maxOpen" "SESSION_MAX_OPEN" "maxWorking" "SESSION_MAX_WORKING" "maxRounds" "SESSION_MAX_ROUNDS" "idleDays" "SESSION_IDLE_DAYS" }}
+{{- with include "coder.settingText" (get $.Values.config.sessions $key) }}
+- name: {{ $name }}
+  value: {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+The coder's read-only references (values config.references): a JSON file of repositories, read at startup
+(ADAM_REFERENCES_FILE). Workers only. Renders "true" or nothing.
+*/}}
+{{- define "coder.references" -}}
+{{- if and .Values.config.references (include "coder.runsWorkers" .) -}}true{{- end -}}
+{{- end -}}
+
+{{- define "coder.referencesConfigMapName" -}}{{ include "coder.fullname" . }}-references{{- end -}}
+
+{{- define "coder.referencesFile" -}}/etc/adam/references.json{{- end -}}
+
+{{- define "coder.referencesJson" -}}
+{{- toPrettyJson (dict "references" .Values.config.references) -}}
+{{- end -}}

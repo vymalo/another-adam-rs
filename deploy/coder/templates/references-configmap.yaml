@@ -1,0 +1,13 @@
+{{- if include "coder.references" . }}
+# The coder's read-only references (values `config.references`): repositories it may read beside the one it works on
+# and never write (ADAM_REFERENCES_FILE). Addresses and names only; no secret is in it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "coder.referencesConfigMapName" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+data:
+  references.json: |
+    {{- include "coder.referencesJson" . | nindent 4 }}
+{{- end }}
