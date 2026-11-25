@@ -209,6 +209,20 @@ its own parent (`start_child_continuing_within(S, S, ..)`): no run's end cancels
 not still gets the agent's default written, so it never runs under a tier nobody chose. A close names none. Commands are not
 expanded in a child context (they are the parent agent's).
 
+**The workspace a person's round reads** (ADR 0045 slice 7). A round a person starts has no task of its own, so the front
+writes `SessionHeader::workspace` at the start: the **most recently created** task of the parent context — the repository the
+person is looking at — and every later round keeps it. Created, not updated: the store lists a context's runs by
+`(updated_at, id)` descending, and `updated_at` moves whenever a run progresses, so a task still running, or one somebody wrote
+to, is not "the task the person is in". The start reads **the whole context, a page of 64 runs at a time**, and keeps the best
+`(created_at, id)` **root** of every page: it stops when a page comes back short, which is the store's own statement that the
+context ended. A child run registered under the root's own agent name is skipped, since a child has no workspace. No number of
+runs turns this into "no workspace": `workspace` is `None` for exactly one case, a context with no root run of the agent at
+all (a person who has not started a task there), and then the session's rounds answer in words. `WORKSPACE_MAX_PAGES` is a
+loop-safety guard only (a store that never ends a page), and it is logged when it trips. Tests:
+`a_persons_session_reads_the_workspace_of_the_most_recently_created_task_of_its_context`,
+`a_context_whose_newest_runs_are_children_still_names_its_root_task`, and the unit test
+`the_workspace_scan_stops_on_a_page_that_never_ends`.
+
 ## A run parked on the model
 
 A run whose model call was refused under a provider that parks ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md))
