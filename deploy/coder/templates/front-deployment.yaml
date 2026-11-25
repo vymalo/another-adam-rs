@@ -60,6 +60,9 @@ spec:
             - name: UPLOADS_INLINE_MAX_BYTES
               value: {{ . | quote }}
             {{- end }}
+            {{- with (include "coder.sessionEnv" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- range $name, $value := .Values.config.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}

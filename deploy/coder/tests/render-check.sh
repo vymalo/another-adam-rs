@@ -2198,4 +2198,28 @@ notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=
 check "modelAuth=injector without the ExternalSecret: no empty-key note" fails says "$notes" 'must be EMPTY'
 rm -rf "$notes_chart"
 
+# Worker settings with a typed value: session limits, prompt cache key, input modalities, language servers, references.
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 > "$out"
+check "by default none of the worker settings is rendered" \
+  lacks 'SESSION_MAX|SESSION_IDLE|MODEL_PROMPT_CACHE_KEY|MODEL_INPUT_MODALITIES|LANGUAGE_SERVERS|ADAM_REFERENCES_FILE|coder-references'
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 \
+  --set config.sessions.maxOpen=8 --set config.sessions.maxWorking=2 --set config.sessions.maxRounds=30 --set config.sessions.idleDays=3 \
+  --set config.languageServers=off --set config.modelPromptCacheKey=conversation --set 'config.modelInputModalities=text\,image' \
+  --set 'config.references[0].name=docs' --set 'config.references[0].url=https://github.com/o/r' --set 'config.references[0].description=d' > "$out"
+check "the StatefulSet gets SESSION_MAX_OPEN" dhas StatefulSet 'name: SESSION_MAX_OPEN'
+check "... SESSION_MAX_WORKING, SESSION_MAX_ROUNDS and SESSION_IDLE_DAYS" \
+  dhas StatefulSet 'name: SESSION_IDLE_DAYS'
+check "... LANGUAGE_SERVERS, MODEL_PROMPT_CACHE_KEY and MODEL_INPUT_MODALITIES" \
+  dhas StatefulSet 'name: MODEL_INPUT_MODALITIES'
+check "... ADAM_REFERENCES_FILE, mounted from a ConfigMap" dhas StatefulSet 'name: ADAM_REFERENCES_FILE'
+check "the references ConfigMap holds the file as JSON" dhas ConfigMap '"references": \['
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 --set topology=split --set config.sessions.maxOpen=8 > "$out"
+check "a split render gives the control plane the session limits too" dcount Deployment 'name: SESSION_MAX_OPEN' 1
+check "... and the workers" dcount StatefulSet 'name: SESSION_MAX_OPEN' 1
+check "a session limit out of bounds is refused" fails helm template coder "$chart" --set image.tag=sha-abc1234 --set config.sessions.maxOpen=500
+check "maxWorking above maxOpen is refused" fails helm template coder "$chart" --set image.tag=sha-abc1234 --set config.sessions.maxOpen=2 --set config.sessions.maxWorking=5
+check "a language_servers value that is not on or off is refused" fails helm template coder "$chart" --set image.tag=sha-abc1234 --set config.languageServers=maybe
+check "a setting beside its extraEnv variable is refused" fails helm template coder "$chart" --set image.tag=sha-abc1234 --set config.languageServers=on --set config.extraEnv.LANGUAGE_SERVERS=on
+check "a reference with no description is refused" fails helm template coder "$chart" --set image.tag=sha-abc1234 --set 'config.references[0].name=x' --set 'config.references[0].url=u'
+
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi
