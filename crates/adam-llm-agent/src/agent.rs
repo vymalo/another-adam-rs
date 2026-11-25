@@ -4202,6 +4202,13 @@ impl LlmAgent {
                         run,
                         model_wait: None,
                     };
+                    self.observe_child(
+                        ctx,
+                        state.root_run,
+                        adam_plugin::EventKind::ChildStarted,
+                        (&call.name, &call.id),
+                        (run, None),
+                    );
                     let Some((_, child)) = notices.iter().find(|(r, _)| *r == run) else {
                         ctx.emit(RunEvent::Custom {
                             kind: "awaiting_run".into(),
@@ -4223,6 +4230,13 @@ impl LlmAgent {
                         return Ok(Flow::Wait);
                     };
                     let outcome = Self::answer_run(state, &wait, child);
+                    self.observe_child(
+                        ctx,
+                        state.root_run,
+                        adam_plugin::EventKind::ChildEnded,
+                        (&call.name, &call.id),
+                        (run, Some(outcome)),
+                    );
                     Self::count_child(ctx, state, run).await?;
                     say(
                         ctx,
@@ -5493,6 +5507,96 @@ impl LlmAgent {
             .text("tool", tool, &scrub)
             .text("call_id", call_id, &scrub)
             .text(field, &text, &scrub);
+        let mut events = vec![event];
+        if kind == EventKind::ToolCompleted
+            && let Ok(hooked) = outcome
+        {
+            events.extend(self.session_event(
+                ctx,
+                root,
+                tool,
+                call_id,
+                &hooked.output.content,
+                &hooked.output.reported,
+            ));
+        }
+        self.flush_events(events);
+    }
+
+    /// The session event of a session tool's answer (ADR 0050 decision 5, slice H7): what the tool
+    /// told the model, read back, so an observer sees what the model saw. A refused call (an error
+    /// answer) is a `tool.failed` and no session event.
+    fn session_event(
+        &self,
+        ctx: &Ctx,
+        root: Option<RunId>,
+        tool: &str,
+        call_id: &str,
+        content: &str,
+        reported: &[RunId],
+    ) -> Option<adam_plugin::HookEvent> {
+        use adam_plugin::EventKind;
+        let kind = match tool {
+            SUBAGENT_START => EventKind::SessionStarted,
+            SUBAGENT_SEND => EventKind::SessionRoundStarted,
+            SUBAGENT_READ if !reported.is_empty() => EventKind::SessionRoundEnded,
+            SUBAGENT_CLOSE => EventKind::SessionClosed,
+            _ => return None,
+        };
+        let scrub = |s: &str| self.step_io.scrub(s);
+        let header = self.event_header(ctx, root, &format!("tool:{call_id}"), kind);
+        let mut event = adam_plugin::HookEvent::new(kind, header).text("call_id", call_id, &scrub);
+        match kind {
+            EventKind::SessionRoundEnded => {
+                for run in reported {
+                    event = event.text("round_run", &run.to_string(), &scrub);
+                }
+            }
+            _ => {
+                let body: Value = serde_json::from_str(content).ok()?;
+                if let Some(session) = body.get("session").and_then(Value::as_str) {
+                    event = event.text("session", session, &scrub);
+                }
+                if let Some(agent) = body.get("agent").and_then(Value::as_str) {
+                    event = event.text("agent", agent, &scrub);
+                }
+                if let Some(keep) = body.get("keep_open").and_then(Value::as_bool) {
+                    event = event.plain("keep_open", keep);
+                }
+                if let Some(round) = body.get("round").and_then(Value::as_u64) {
+                    event = event.plain("round", round);
+                }
+            }
+        }
+        Some(event)
+    }
+
+    /// `child.started` or `child.ended`, for the one-shot child run a tool waits for.
+    fn observe_child(
+        &self,
+        ctx: &Ctx,
+        root: Option<RunId>,
+        kind: adam_plugin::EventKind,
+        (tool, call_id): (&str, &str),
+        (child, status): (RunId, Option<StepState>),
+    ) {
+        if self.hooks.is_empty() {
+            return;
+        }
+        let scrub = |s: &str| self.step_io.scrub(s);
+        let header = self.event_header(ctx, root, &format!("tool:{call_id}"), kind);
+        let mut event = adam_plugin::HookEvent::new(kind, header)
+            .text("tool", tool, &scrub)
+            .text("call_id", call_id, &scrub)
+            .text("child_run", &child.to_string(), &scrub);
+        if let Some(status) = status {
+            let word = if status == StepState::Completed {
+                "done"
+            } else {
+                "failed"
+            };
+            event = event.text("status", word, &scrub);
+        }
         self.flush_events(vec![event]);
     }
 
@@ -5728,6 +5832,18 @@ impl LlmAgent {
                     state.pinned_calls.push(wait.call_id.clone());
                 }
                 if !reported.is_empty() {
+                    // A wait that settles here is the same read as one answered at once: the same
+                    // event, under the same key.
+                    let root = state.root_run;
+                    let event = self.session_event(
+                        ctx,
+                        root,
+                        &wait.tool,
+                        &wait.call_id,
+                        &output.content,
+                        &reported,
+                    );
+                    self.flush_events(event.into_iter().collect());
                     state.note_reported(&reported);
                     Self::count_rounds(ctx, state, false).await?;
                 }
@@ -7276,6 +7392,13 @@ impl Agent for LlmAgent {
             match finished {
                 Some(child) => {
                     let outcome = Self::answer_run(&mut state, &wait, &child);
+                    self.observe_child(
+                        ctx,
+                        state.root_run,
+                        adam_plugin::EventKind::ChildEnded,
+                        (&wait.tool, &wait.call_id),
+                        (wait.run, Some(outcome)),
+                    );
                     Self::count_child(ctx, &mut state, wait.run).await?;
                     ctx.emit(self.step_end_with_result(&state, &wait.tool, &wait.call_id, outcome))
                         .await;

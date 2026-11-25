@@ -418,6 +418,24 @@ reports of ADR 0045. When both exist, the message verdict is applied first, then
 about it. A report that keeps a turn going is a read of `wait_<turn>` made after `sessions:<turn>`, so `end:<turn>` comes after `sessions:<turn>` and is not
 taken when a report keeps the turn going: a hook never sees an end that is taken back. No step name changes.
 
+*Amended 2026-11-24 (slice H7, built):* `child.started`, `child.ended`, `session.started`, `session.round.started`,
+`session.round.ended` and `session.closed` are observed events of the agent loop, in `EventKind`. The key of each is
+`<run>/tool:<call id>/<name>/0`, the call being the one that did it, so a replay gives the same key.
+
+| Event | When | Fields |
+| --- | --- | --- |
+| `child.started` | a tool returned `AwaitRun` for a one-shot child | `tool`, `call_id`, `child_run` |
+| `child.ended` | the child's outcome is read, whichever transition reads it | the same, and `status` (`done` or `failed`) |
+| `session.started` | `subagent_start` answered | `call_id`, `session`, `agent`, `keep_open` |
+| `session.round.started` | `subagent_send` answered | `call_id`, `session`, `round` |
+| `session.round.ended` | `subagent_read` returned a report, at once or after a wait | `call_id`, `round_run` |
+| `session.closed` | `subagent_close` answered | `call_id`, `session` |
+
+The events come from the tool's answer, not from the runtime's store, so a refused call (an error answer) is
+`tool.failed` and no session event. A one-shot child is a run a tool starts and waits for (`AwaitRun`); a
+`subagent_start` with `keep_open: false` is a session with one round. The test replays the session events from a copied
+journal; a one-shot child's run id derives from its parent's run id, so a copy under another run cannot replay it, and
+its events are held by the golden order alone.
 *Amended 2026-11-24 (slice H4 built):* `RuntimeBuilder::observers(HookSet)` gives the runtime plugins whose `observe` receives `run.parked`, `run.ended` (done or failed), `run.error` (a failed try that will be retried) and one `artifact.kept` per artifact a transition kept, after the commit and best effort (a crash between the commit and its events loses them). Keys are `<run>/commit:<version>/<event>/<index>`. `RunEvent::Status` did not gain an error class: the event carries the text and the attempt. Proof: `observers_get_one_event_per_park_end_failed_try_and_artifact` in `crates/adam-runtime/tests/runtime.rs`, on the memory, PostgreSQL and MongoDB stores.
 
 ## Amended (2026-11-25): the wake and the move
