@@ -170,9 +170,41 @@ impl Runtime {
             }
         }
 
-        // Graceful: let in-flight transitions finish, commit and release.
-        while let Some(joined) = tasks.join_next().await {
-            log_join(joined);
+        // Graceful: let in-flight transitions finish, commit and release, for at most the
+        // drain grace when one is set.
+        let drain = async {
+            while let Some(joined) = tasks.join_next().await {
+                log_join(joined);
+            }
+        };
+        let finished = match inner.cfg.drain_grace {
+            Some(grace) => tokio::time::timeout(grace, drain).await.is_ok(),
+            None => {
+                drain.await;
+                true
+            }
+        };
+        if !finished {
+            // Out of time: abort what is left. A step that was aborted committed nothing, so the
+            // run is as the last commit left it; hand the lease back so another worker takes it
+            // now.
+            let left: Vec<RunId> = in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .copied()
+                .collect();
+            tracing::warn!(
+                runs = left.len(),
+                "drain grace over, aborting the steps in flight"
+            );
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            for run in left {
+                if let Err(e) = inner.store.release_lease(run, &inner.cfg.worker_id).await {
+                    tracing::warn!(%run, error = %e, "releasing the lease failed; it will expire");
+                }
+            }
         }
         Ok(())
     }
