@@ -840,7 +840,7 @@ pub struct WorkerSettings {
     /// `COMMAND_CPU_MAX`: the CPU one command may use, in millicores.
     pub command_cpu_max: u32,
     /// `MAX_RUN_CONTINUATIONS`: the most times `run.ending` hooks may keep one run going, 0 to
-    /// [`MAX_RUN_CONTINUATIONS_LIMIT`]; hand it to `LlmAgentBuilder::max_run_continuations`.
+    /// `MAX_RUN_CONTINUATIONS_LIMIT`; hand it to `LlmAgentBuilder::max_run_continuations`.
     pub max_run_continuations: u32,
 }
 
