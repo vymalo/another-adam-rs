@@ -96,6 +96,20 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 | `A2A_CARD_SIGNING_JKU` | the `jku` in the signature's header (where clients fetch the key set; the server serves it at `/.well-known/jwks.json`); needs the key file | unset |
 | `A2A_DOCS` | Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, both public (the calls still need a token); `false` (or `0`) turns them off | `true` |
 
+### Turn signing (planned: slice T2 reads these)
+
+adam will sign the turns it commits and verify every history that comes back
+([ADR 0068](../decisions/0068-adam-signs-its-own-history.md)). **No binary reads these variables yet**, and nothing signs:
+slice T1 built the port and the reader of the two files (`adam_core::turn::Ed25519TurnKeys::from_files`), and slice T2
+adds the variables, every role, and exit 78 when the key is missing, unreadable or not Ed25519. The turn key is not the
+card's key.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `TURN_SIGNING_KEY_FILE` | a PKCS#8 PEM Ed25519 private key (`-----BEGIN PRIVATE KEY-----`, `openssl genpkey -algorithm ed25519`), mounted from a Secret | **required** (T2) |
+| `TURN_SIGNING_KEY_ID` | the `kid` of its signatures: the vault reference `vault:<name>#v<n>` (printable ASCII, at most 256 bytes) | the key's RFC 7638 thumbprint |
+| `TURN_VERIFY_KEYS_FILE` | a JWKS of the public keys of earlier versions, each with its `kid` (`kty` `OKP`, `crv` `Ed25519`; a private member `d` is refused), and `revoked`, a list of the ids no longer accepted; not secret (a ConfigMap) | the signing key's own public key only |
+
 ## Cross-process notifications (`adam-notify-postgres`)
 
 `adam-coder`, in every role (`all`, `control-plane`, `worker`): the `notify` component. Both binaries'

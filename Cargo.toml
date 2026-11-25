@@ -75,7 +75,13 @@ base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4", default-features = false, features = ["std", "derive"] }
+# The turn signature of ADR 0068 (adam-core): pure Rust, so the engine's tree, which may hold no C crypto
+# (`aws-lc-rs` and `ring` are forbidden there, tools/embedded-deps/check.sh), signs and verifies too.
+# `fast`: the precomputed tables; `zeroize`: the private key is wiped on drop.
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
 futures = "0.3"
+# The seed of an ephemeral turn key (adam-core, ADR 0068): already in the tree under uuid.
+getrandom = "0.4"
 # `find_files` (adam-coder): a glob compiled to the same linear-time regex engine.
 globset = "0.4"
 http = "1"
@@ -117,7 +123,8 @@ rusqlite = { version = "0.41.1", default-features = false, features = ["bundled"
 rustls = { version = "0.23", default-features = false, features = ["std"] }
 # Reads the PEM of a GitHub App's private key (adam-workspace): already in the tree under rustls.
 rustls-pki-types = "1"
-# ECMAScript number formatting for the JSON Canonicalization Scheme (RFC 8785) that signs an agent card (adam-a2a).
+# ECMAScript number formatting for the JSON Canonicalization Scheme (RFC 8785, adam-core): what signs an
+# agent card (adam-a2a) and a turn (ADR 0068).
 ryu-js = "1"
 schemars = { version = "1.2", default-features = false, features = ["std"] }
 secrecy = "0.10"

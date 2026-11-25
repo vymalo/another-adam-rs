@@ -11,13 +11,22 @@ rust-version.workspace = true
 [dependencies]
 adam-error.workspace = true
 async-trait.workspace = true
+# The turn signature (ADR 0068, `turn`): base64url, Ed25519, SHA-256 and RFC 8785's numbers.
+base64.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
 jiff.workspace = true
+ryu-js.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "fs"] }
 
 [lints]
 workspace = true

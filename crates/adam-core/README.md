@@ -1,7 +1,9 @@
 # adam-core
 
 The seam every durable-state backend implements: the `Store` trait, the run
-and journal types, and an in-memory reference store.
+and journal types, and an in-memory reference store. Also the turn key port
+`TurnKeys` and the turn signature of [ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md)
+(slice T1), and RFC 8785 canonical JSON (`jcs`).
 
 ## Where it sits
 
@@ -34,6 +36,15 @@ database driver.
 | `MemoryStore` | in-memory `Store`, the reference implementation of the suite |
 | `SecretSource` (trait), `DynSecretSource`, `SecretError` | where a secret that agent files name comes from ([ADR 0047](../../docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), decision 5): `secret(name)` gives a `SecretString` or `Missing`, `NotUnicode`, `Refused` (`#[non_exhaustive]`: a reader treats a reason it does not know as `Refused`); it is synchronous, so a source answers from memory (a host fetches a vault's secrets first); `kind()` names the source, and `Debug` of a `dyn SecretSource` shows only that, never a value, so a host's source needs no `Debug`; used by `adam-assembly`'s `AgentDef::secrets` and `adam-mcp`'s `Env::source` |
 | `ProcessEnv`, `NoSecrets` | the process environment (a server's default), and a source that refuses every name, set or not (an embedded engine's default) |
+| `jcs::canonicalize` (also `adam_core::canonicalize`) | RFC 8785 (JCS) of a JSON value: what a card signature (`adam-a2a`, which re-exports it) and a turn signature are made over. Moved here from `adam-a2a` so the engine has it |
+| `TurnKeys` (trait), `DynTurnKeys`, `<dyn TurnKeys>::ephemeral()` | the turn key port: `current` (the key that signs now, `CurrentKey`), `sign(kid, input)` (an Ed25519 `Signature`, never the private key), `key_set` (the `KeySet` it verifies with), `kind`; see *Turn keys and signatures* |
+| `CurrentKey`, `KeyIdentity`, `KeyStatus`, `CertificateChain`, `KeyId`, `Signature` | how the signing key is named (`Id`, or `Certificate`: a chain that rides as `x5c`), whether it is `Active` or `Renewing` (both enums closed), a key id (printable ASCII, at most 256 bytes) |
+| `Ed25519TurnKeys` | `TurnKeys` over one Ed25519 key: `from_pkcs8_pem`, `from_files` (the PEM and the verify JWKS a server mounts), `ephemeral` |
+| `KeySet`, `PublicKey` | the public keys by `kid` and the revoked ids, read from and written as a JWKS (`from_jwks`, `to_jwks`); a private member is refused |
+| `sign_detached`, `verify_detached`, `SignatureType`, `MAX_SIGNATURE_LEN` | the detached EdDSA JWS of a payload as `adam-turn/v1`, `adam-head/v1` or `adam-step/v1` |
+| `turn_payload`, `sign_turn`, `verify_turn`, `TurnPosition`, `ChainHash`, `ConversationHash`, `turn_signature`, `set_turn_signature` | a turn's payload `{typ, run, cnv, idx, prv, msg}`, the chain `prv`, and the member `extra_content.adam.turn_signature` |
+| `TurnKeyError`, `TurnKeyConfigError`, `KeySetError`, `TurnSignatureError` | see *Errors* |
+| `turn::testkit`, `turn_keys_conformance!` | the cases every `TurnKeys` passes |
 | `testing` (`#[doc(hidden)]`) | `test_env`, `skipped`, `require_db`: gate for database-backed tests, not part of the supported API |
 
 ```rust
@@ -187,6 +198,38 @@ keeps no bodies keeps today's bytes exactly. A store does not decide the format.
 
 `purge_finished` keeps its signature and extends its contract: a run's body rows go with it.
 
+## Turn keys and signatures
+
+[ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md) has adam sign the turns it
+produces and verify every history that comes back. Slice T1 is this crate's part: the port, its
+Ed25519 implementation and the form. **Nothing signs or verifies a run yet** (slice T3), and no
+variable is read (`TURN_SIGNING_KEY_FILE`, `TURN_SIGNING_KEY_ID`, `TURN_VERIFY_KEYS_FILE` are slice
+T2's; `Ed25519TurnKeys::from_files` reads the files they will name).
+
+* **The port.** A host gives a `TurnKeys`: adam asks it for the current key, then to sign bytes with
+  it, and for the key set. A private key never crosses the port, so a keychain, a KMS or an HSM can
+  sign. The key is named by an id (`vault:<name>#v<n>`, or its RFC 7638 thumbprint) or by a
+  certificate chain, and says whether it is `Renewing`: a key a PKI issues fits as it is, and
+  `tests/turn_signature.rs` has one (`WithChain`) that passes the conformance suite.
+* **The form.** `BASE64URL(header)..BASE64URL(signature)`, with the header the RFC 8785 form of
+  `{"alg":"EdDSA","kid":…,"typ":…}` (plus `x5c` for a chain). `verify_detached` accepts that form
+  only: one encoding of the header, exactly those members, 64 bytes of signature, at most
+  `MAX_SIGNATURE_LEN` (16 KiB) in all, refused before decoding when longer.
+* **A turn.** The payload is the RFC 8785 form of `{typ, run, cnv, idx, prv, msg}`: `cnv` the
+  SHA-256 of the conversation id (the run's id when it has none), `prv` the chain over every
+  message before it (`h(-1) = SHA-256(JCS({typ: "adam-chain/v1", run, cnv}))`,
+  `h(i) = SHA-256(h(i-1) ‖ SHA-256(JCS(message i)))`), `msg` the message without its
+  `extra_content.adam` member. The signature rides in that member, at the message's top level, not
+  in a provider's members (which a model switch drops).
+* **Revocation.** A `KeySet` refuses a revoked id whether its public key is listed or not; a signing
+  key the set revokes is refused at start.
+* **Ed25519 here is pure Rust** (`ed25519-dalek`, strict verification, weak keys refused), because
+  the engine's tree may hold neither `aws-lc-rs` nor `ring` (`tools/embedded-deps/check.sh`). It
+  gives the same bytes as `aws-lc-rs` (a test in `adam-a2a`).
+* **Cost** (`cargo run -p adam-core --release --example turn_signature_timing`, one core of a
+  2.1 GHz Xeon, 2026-11-25): a signature 20 µs, a verification 49 µs; a 2 KB turn signed with its
+  RFC 8785 form 45 µs, verified 67 µs; the chain over 1,000 such turns 7.3 ms.
+
 ## Push configurations
 
 A2A push notifications must survive a restart and a second replica, so the webhook a client
@@ -248,6 +291,16 @@ never from the variant (see [`adam-error`](../adam-error/README.md)).
 | `InvalidInput` | `Invalid` |
 | `Backend { class, source }` | the `class` the adapter chose |
 
+The turn errors carry no key, no signed content and no signature; they name a key by its id:
+
+| Error | Class |
+|---|---|
+| `TurnKeyError::NotSigning` (the port does not sign with that key: ask for the current one again) | `Conflict` |
+| `TurnKeyError::Unavailable`, `Refused` | `Transient`, `Unauthenticated` |
+| `TurnKeyConfigError` (a key file that cannot be read, is not an Ed25519 PKCS#8 private key, a public key, a revoked signing key, a bad verify set) | `Invalid`; `NoRandomness` is `Internal` |
+| `KeySetError`, `BadKeyId`, `BadCertificateChain` | `Invalid` |
+| `TurnSignatureError` (unsigned, too long, malformed, another type, an unknown or revoked key, does not verify) | `Corrupt` |
+
 `InvalidInput` is data the store cannot hold (an integer above `i64::MAX`, a
 bad table prefix); `Corrupt` is data read back that
 breaks an invariant (an unknown status, a negative version, a vanished journal
@@ -259,7 +312,7 @@ builds it with `StoreError::unavailable(e)` (`Transient`),
 
 ## Features and environment
 
-No Cargo features. The `testing` helpers read `ADAM_TEST_REQUIRE_DB`
+No Cargo features. Nothing reads a turn key variable yet (slice T2). The `testing` helpers read `ADAM_TEST_REQUIRE_DB`
 (`1` or `true`): a database-gated test whose variable is unset then fails
 instead of skipping.
 
@@ -276,7 +329,15 @@ pins the three transcript defaults on a store that overrides none of them, and
 `the_body_gc_keeps_the_current_generation_and_collects_an_old_one` pin `MemoryStore`'s head and its
 GC with an explicit cutoff. `src/secrets.rs` checks that `ProcessEnv` gives what the process has,
 that `NoSecrets` refuses a name the process has, that a held source's `Debug` shows its kind and not
-its values, and that no error says a value. Database gating is described in the
+its values, and that no error says a value. `src/jcs.rs` pins RFC 8785's ordering and numbers.
+`tests/turn_signature.rs` holds ADR 0068's decisive tests of slice T1: a golden vector (RFC 8032's
+own, RFC 8037's thumbprint, and a turn whose payload and signature were made outside the crate with
+Python and OpenSSL), each payload field changed, a `kid` outside the set, both keys of a rotation, a
+public-only key, a revoked key, no `Debug` or error holding a key, the size bound, the form, a
+certificate chain in the header, and the conformance suite run on the ephemeral, PEM and
+certificate keys; `src/turn/ed25519.rs` reads PKCS#8 v1 and both forms of v2. The round trip of a
+signed message through every store is `a_message_canonicalizes_as_it_was_written` and
+`body_a_row_canonicalizes_as_it_was_written` in `adam-store-testkit`. Database gating is described in the
 [testing guide](../../docs/guides/testing.md).
 
 ## See also

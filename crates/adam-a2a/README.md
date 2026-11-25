@@ -28,7 +28,7 @@ resubscribe only works inside one process, and mounts it behind both bindings.
 | `ServerOptions` | `with_keepalive_interval(..)` (the SDK sends an SSE comment every `SDK_KEEPALIVE_INTERVAL`, 15 s), `with_push(PushSupport)`, `with_card_signer(CardSigner)`, `with_docs(bool)` (Swagger UI and the OpenAPI document, **on by default**; the field `docs` is new and `Default` sets it `true`) |
 | `push` (module) | **push notifications**, off unless a policy allows a webhook: `PushPolicy` (the allow-list and the SSRF rules), `PushStore` (the port the configs and their delivery progress live behind; `InMemoryPushStore` with `test-util`), `PushSupport` (store and policy together), `PushDeliverer` and `PushDeliveryOptions` (the loop), `PushSender` (one request), `PushCursor` (what a webhook has heard), `GuardedResolver` |
 | `AgentCardConfig::with_extended_card(ExtendedCardConfig)` | what an authenticated caller sees on top of the public card (`GetExtendedAgentCard`) |
-| `CardSigner`, `VerifyingKey`, `canonical_payload`, `canonicalize`, `SigningError`, `VerifyError` | the card's JWS (ES256 or EdDSA over the RFC 8785 canonical card); `generate_signing_key_pem` with `test-util` |
+| `CardSigner`, `VerifyingKey`, `canonical_payload`, `canonicalize`, `SigningError`, `VerifyError` | the card's JWS (ES256 or EdDSA over the RFC 8785 canonical card); `generate_signing_key_pem` with `test-util`. `canonicalize` is `adam_core::jcs::canonicalize`, re-exported (it moved to `adam-core` for the turn signature of [ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md)) |
 | `AuthConfig` | `BearerTokens(Vec<SecretString>)` (constant-time comparison) or `AllowAnonymous` (logs a warning) |
 | `AgentCardConfig`, `SkillConfig`, `ExtensionConfig` | the public agent card |
 | `AccessTier`, `AccessTiers`, `AccessTiersError`, `NotATier`, `ACCESS_TIER_EXTENSION`, `ExtensionConfig::access_tier(&AccessTiers)` | **`access-tier/v1`** (ADR 0036): the person picks how much the agent may do alone for each message. `AccessTier` is the closed enum `Plan < Edits < Auto < Bypass` (`ALL`, `as_str`, `FromStr` exactly in lower case, `Ord`, serde as the word); `AccessTiers::new(honoured, default)` (non-empty, the default among them, each tier once in the order of the tiers) `AccessTiers::all(default)` or `AccessTiers::up_to(max, default)` (every tier up to a cap a deployment sets, the default never above it) is what an agent honours; `ExtensionConfig::access_tier` is its optional card entry, `params: {"tiers": [..], "default": ..}`, description `Works under the access tier the person picks for each message.` What a backend does with a message is [`adam-a2a-runtime`](../adam-a2a-runtime/README.md) (*The access tier*) |
@@ -226,7 +226,9 @@ another caller refused, disallowed URLs refused, each state change delivered in 
 a config in `SendMessage`, retry after 500s, **delivery resumes after a restart on the same store without loss**, give-up
 after the bound, a redirect never followed, a private address refused at delivery), `tests/list_tasks.rs` (order, pages by
 cursor, filters, isolation, bad and foreign tokens), `tests/card.rs` (the extended card needs authentication and shows the
-extra entries; the signature verifies with the key set and fails when the card is altered; the extended card is signed too)
+extra entries; the signature verifies with the key set and fails when the card is altered; the extended card is signed too),
+`src/signing.rs`'s `the_turn_keys_of_adam_core_sign_as_aws_lc_rs_does` (the turn signature of `adam-core`, pure Rust, gives
+the bytes `aws-lc-rs` gives for the same PKCS#8 key)
 and `tests/round_trip.rs`: a real A2A client (`a2a-client-lf`) against the router
 over TCP, using `InMemoryBackend` (card, send, streaming, get, cancel,
 resubscribe, `input-required` follow-ups, a message to a finished task as `-32004`, error mapping, malformed bodies

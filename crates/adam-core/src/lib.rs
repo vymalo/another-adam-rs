@@ -4,6 +4,7 @@
 //! [`store::Store`]) that every backend adapter implements, so a developer can
 //! pick Postgres, MongoDB, or their own storage without touching agent code.
 
+pub mod jcs;
 pub mod secrets;
 pub mod store;
 // Test support for this workspace's database-gated suites, not part of the
@@ -11,7 +12,9 @@ pub mod store;
 #[doc(hidden)]
 pub mod testing;
 pub mod time;
+pub mod turn;
 
+pub use jcs::canonicalize;
 pub use secrets::{DynSecretSource, NoSecrets, ProcessEnv, SecretError, SecretSource};
 pub use store::memory::MemoryStore;
 pub use store::{
@@ -21,3 +24,4 @@ pub use store::{
     set_head_body, storable, storable_owned, storable_text,
 };
 pub use time::Timestamp;
+pub use turn::{DynTurnKeys, KeySet, TurnKeys};
