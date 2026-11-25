@@ -41,6 +41,7 @@ fn options() -> RuntimeOptions {
         cancel_poll_interval: Duration::from_millis(20),
         view_poll_interval: Duration::from_millis(20),
         session_idle_ttl: adam_runtime::DEFAULT_SESSION_IDLE_TTL,
+        drain_grace: None,
     }
 }
 
