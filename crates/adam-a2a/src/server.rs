@@ -54,6 +54,10 @@ pub struct ServerOptions {
     /// Serve Swagger UI at `GET /docs` and the OpenAPI document at `GET /openapi.json`, both
     /// public. **On by default.**
     pub docs: bool,
+    /// Routes the host adds behind the same authentication as every other route (for example
+    /// `GET /internal/activity`). Merged under the authentication layer: a request without a valid
+    /// credential never reaches them.
+    pub protected_routes: Option<Router>,
 }
 
 impl Default for ServerOptions {
@@ -63,6 +67,7 @@ impl Default for ServerOptions {
             push: None,
             card_signer: None,
             docs: true,
+            protected_routes: None,
         }
     }
 }
@@ -89,6 +94,13 @@ impl ServerOptions {
     #[must_use]
     pub fn with_card_signer(mut self, signer: CardSigner) -> Self {
         self.card_signer = Some(signer);
+        self
+    }
+
+    /// Add `routes` behind the server's authentication (never public, whatever their path).
+    #[must_use]
+    pub fn with_protected_routes(mut self, routes: Router) -> Self {
+        self.protected_routes = Some(routes);
         self
     }
 
@@ -138,6 +150,16 @@ impl A2aServer {
     /// still answer probes, such as a worker that runs no front.
     pub fn health_router() -> Router {
         Router::new().route("/healthz", get(healthz))
+    }
+
+    /// [`health_router`](Self::health_router) plus `routes`, which need the bearer `auth` asks for.
+    /// `GET /healthz` stays public; `routes` are behind authentication, and any other path is a plain 404 (a worker has no A2A).
+    pub fn health_router_with_routes(auth: AuthConfig, routes: Router) -> Router {
+        let protected = routes.route_layer(middleware::from_fn_with_state(
+            Arc::new(Authenticator::new(auth)),
+            auth::authenticate,
+        ));
+        Self::health_router().merge(protected)
     }
 
     /// [`router`](Self::router) with [`ServerOptions`].
@@ -219,6 +241,9 @@ impl A2aServer {
                     async move { Json((*jwks).clone()) }
                 }),
             );
+        }
+        if let Some(routes) = options.protected_routes.clone() {
+            router = router.merge(routes);
         }
         if options.docs {
             let document = openapi::document(&card, flags, options.card_signer.is_some());

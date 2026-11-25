@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod activity;
 pub mod config;
 pub mod exit;
 pub mod harden;

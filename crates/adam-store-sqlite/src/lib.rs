@@ -52,7 +52,7 @@ use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig,
     NewRun, PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
-    RunUpdate, Store, StoreError, StoreResult,
+    RunUpdate, Store, StoreActivity, StoreError, StoreResult,
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
@@ -1159,6 +1159,40 @@ impl Store for SqliteStore {
             let limit = i64::try_from(query.limit).unwrap_or(i64::MAX);
             params.push(Value::Integer(limit));
             query_all(conn, &text, &params, run_from_row)
+        })
+        .await
+    }
+
+    async fn activity(&self, agents: &[String], now: Timestamp) -> StoreResult<StoreActivity> {
+        let at = to_ms(now);
+        if agents.is_empty() {
+            return Ok(StoreActivity::default());
+        }
+        let agents = agents.to_vec();
+        self.blocking(move |conn, sql| {
+            let placeholders = vec!["?"; agents.len()].join(", ");
+            let mut params = vec![Value::Integer(at), Value::Integer(at)];
+            params.extend(agents.iter().map(|a| Value::Text(a.clone())));
+            query_optional(
+                conn,
+                &format!(
+                    "SELECT coalesce(sum(lease_until > ?), 0) AS busy,
+                            min(CASE WHEN lease_until IS NULL OR lease_until <= ?
+                                     THEN sched_at END) AS next_due_at
+                       FROM {} WHERE sched_at IS NOT NULL AND agent IN ({placeholders})",
+                    sql.runs
+                ),
+                &params,
+                |row| {
+                    let busy: i64 = row.get("busy").map_err(classify)?;
+                    Ok(StoreActivity {
+                        busy: u64::try_from(busy)
+                            .map_err(|_| StoreError::Corrupt(format!("negative count {busy}")))?,
+                        next_due_at: opt_time_col(row, "next_due_at")?,
+                    })
+                },
+            )?
+            .ok_or_else(|| StoreError::Corrupt("activity returned no row".into()))
         })
         .await
     }

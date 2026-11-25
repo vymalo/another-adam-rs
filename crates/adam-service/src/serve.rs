@@ -561,7 +561,12 @@ fn a2a_features(
     config: &ServiceConfig,
     service: &Service,
 ) -> Result<(ServerOptions, Option<PushDeliverer>), ServeError> {
-    let mut options = ServerOptions::default().with_docs(config.a2a.docs);
+    let mut options = ServerOptions::default()
+        .with_docs(config.a2a.docs)
+        .with_protected_routes(crate::activity::router(
+            service.runtime.store().clone(),
+            service.runtime.agent_names(),
+        ));
     let mut deliverer = None;
     if let Some(push) = &config.a2a.push {
         let policy = push.policy().map_err(|e| ServeError::Push(Box::new(e)))?;
@@ -900,6 +905,11 @@ async fn run(
     let listener = no_delay(listener);
     tracing::info!(%addr, %role, workers, worker_id = worker_id.as_deref(), "listening");
 
+    let health_auth = AuthConfig::BearerTokens(config.a2a_bearer_tokens.clone());
+    let health_routes = crate::activity::router(
+        service.runtime.store().clone(),
+        service.runtime.agent_names(),
+    );
     let host = Host::new(role)
         .control_plane_drain(Some(SERVER_DRAIN))
         // Workers are never cut short here; the orchestrator's grace period bounds the wait.
@@ -923,10 +933,13 @@ async fn run(
         }
         // No A2A here, but probes still need an answer: the same `/healthz` the A2A router serves.
         _ => host.worker("health", |stop| async move {
-            axum::serve(listener, A2aServer::health_router())
-                .with_graceful_shutdown(stop.cancelled_owned())
-                .await
-                .map_err(Into::into)
+            axum::serve(
+                listener,
+                A2aServer::health_router_with_routes(health_auth, health_routes),
+            )
+            .with_graceful_shutdown(stop.cancelled_owned())
+            .await
+            .map_err(Into::into)
         }),
     };
     // With workers, `notify` is a worker component that stops when the `worker` component is done

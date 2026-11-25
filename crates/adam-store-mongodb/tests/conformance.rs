@@ -769,3 +769,4 @@ async fn an_append_sends_only_the_delta() {
             .await;
     }
 }
+adam_store_testkit::activity_conformance!(make_store);

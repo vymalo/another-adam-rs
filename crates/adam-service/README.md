@@ -132,7 +132,7 @@ stateDiagram-v2
 |---|---|---|
 | `all` (default) | `a2a-server`, `worker`, `notify` | |
 | `control-plane` | `a2a-server`, `notify` | the runtime knows the agent, and the helpers of `child-sessions/v1`, as starters only: no model, no tools |
-| `worker` | `worker`, `health`, `notify` | `/healthz` on `LISTEN_ADDR`, no A2A |
+| `worker` | `worker`, `health`, `notify` | `/healthz` on `LISTEN_ADDR` (and `GET /internal/activity`, bearer-protected), no A2A |
 
 `notify` exists only for a Postgres store: SQLite's signals are in-process (`LocalNotifier`) and
 MongoDB has none, so a worker polls.
@@ -223,3 +223,12 @@ New in slice 4 ([ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-b
 
 
 Retention: `retention::RetentionSettings` from `RUN_RETENTION_DAYS` (1-36500 or `off`, default 90) and `RUN_RETENTION_SWEEP_SECS` (60-86400, 3600), read by **every role** as `ServiceConfig::retention`; a bad value is exit 78. Roles that run workers start a `retention` component that calls `Store::purge_finished(agent, now - retention)` at start and every sweep, logs the count (no run or person label), and never touches an open run. **Destructive default:** unset deletes finished runs older than 90 days; set `RUN_RETENTION_DAYS=off` to keep everything. **Breaking:** `ServiceConfig` gained `retention`. Tests: `unset_keeps_ninety_days`, `a_value_overrides_and_off_keeps_everything`, `the_cutoff_separates_ninety_days_from_eighty_nine`, `off_deletes_nothing`; the store-side deletion and concurrent sweeps are the testkit case `purge_finished_runs`.
+
+## `GET /internal/activity`
+
+Served by every role on `LISTEN_ADDR`, behind `A2A_BEARER_TOKENS` like every route but `/healthz`. It answers
+`{"busy": N, "nextDueAt": "<RFC 3339>"}` from the run store, for this service's agents: `busy` counts the open
+runs a worker holds a live lease on, `nextDueAt` is the earliest due time of an open run nobody holds (a
+parked schedule's wake time included) and is omitted when there is none. No run content, no secret. A store
+that does not implement `Store::activity` answers 503. `tests/serve.rs` proves the 401s and the idle answer;
+`activity_conformance!` proves the store half.

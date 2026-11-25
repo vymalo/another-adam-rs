@@ -388,6 +388,15 @@ impl RunRecord {
     }
 }
 
+/// What a store says about its work (see [`Store::activity`]): no secret, no run content.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreActivity {
+    /// Open runs with a live lease: a worker is stepping them.
+    pub busy: u64,
+    /// The earliest due time of an open run no worker holds, if there is one.
+    pub next_due_at: Option<Timestamp>,
+}
+
 /// A run without its state: what a reader that only needs the run's own bookkeeping reads — its
 /// status, its version, its lease.
 ///
@@ -856,6 +865,20 @@ pub trait Store: Send + Sync + 'static {
     /// How many runs match `query`'s filters (its `after` and `limit` are ignored): the total
     /// before pagination.
     async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64>;
+
+    /// What the store says about the work of `agents`: how many open runs a worker holds a live lease on at `now`
+    /// (`busy`), and when the next open run that nobody holds is due (`next_due_at`: the earliest
+    /// `sched_at`, a parked schedule's wake time included). It reads no run content.
+    ///
+    /// **The default answers [`StoreError::InvalidInput`]**: the method is additive, so it breaks
+    /// no implementer, and a store that does not implement it cannot serve `/internal/activity`.
+    /// A store that implements it passes `activity_conformance!` in `adam-store-testkit`.
+    async fn activity(&self, agents: &[String], now: Timestamp) -> StoreResult<StoreActivity> {
+        let _ = (agents, now);
+        Err(StoreError::InvalidInput(
+            "this store does not report its activity".into(),
+        ))
+    }
 
     /// Create or replace the push configuration `(new.run, new.id)` and return it.
     ///

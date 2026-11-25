@@ -12,8 +12,9 @@ use uuid::Uuid;
 
 use super::{
     BlobId, BodyRow, BodyWrite, ClaimScope, JournalEntry, Lease, NewPushConfig, NewRun,
-    PushProgress, PushRecord, PushState, RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError,
-    StoreResult, add_ttl, head_body, now, set_head_body, storable_owned, truncate_ms,
+    PushProgress, PushRecord, PushState, RunId, RunQuery, RunRecord, RunUpdate, Store,
+    StoreActivity, StoreError, StoreResult, add_ttl, head_body, now, set_head_body, storable_owned,
+    truncate_ms,
 };
 
 #[derive(Default)]
@@ -459,6 +460,27 @@ impl Store for MemoryStore {
             .get(&id)
             .and_then(|slot| slot.lease.as_ref())
             .map(|(_, until)| *until))
+    }
+
+    async fn activity(&self, agents: &[String], now: Timestamp) -> StoreResult<StoreActivity> {
+        let now = truncate_ms(now);
+        let inner = self.inner.lock().await;
+        let mut activity = StoreActivity::default();
+        for slot in inner
+            .runs
+            .values()
+            .filter(|s| agents.contains(&s.run.agent))
+        {
+            let Some(due) = slot.run.sched_at() else {
+                continue;
+            };
+            if slot.lease.as_ref().is_some_and(|(_, until)| *until > now) {
+                activity.busy += 1;
+            } else if activity.next_due_at.is_none_or(|at| due < at) {
+                activity.next_due_at = Some(due);
+            }
+        }
+        Ok(activity)
     }
 
     async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {

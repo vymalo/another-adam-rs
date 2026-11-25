@@ -32,7 +32,8 @@ use std::time::Duration;
 use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
-    PushRecord, RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError, StoreResult,
+    PushRecord, RunId, RunQuery, RunRecord, RunUpdate, Store, StoreActivity, StoreError,
+    StoreResult,
 };
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -82,6 +83,8 @@ pub enum Method {
     ListRuns,
     /// [`Store::count_runs`].
     CountRuns,
+    /// [`Store::activity`].
+    Activity,
     /// [`Store::push_put`].
     PushPut,
     /// [`Store::push_list`].
@@ -479,6 +482,11 @@ impl Store for FaultyStore {
 
     async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
         self.run(Method::ListRuns, None, self.inner.list_runs(query))
+            .await
+    }
+
+    async fn activity(&self, agents: &[String], now: Timestamp) -> StoreResult<StoreActivity> {
+        self.run(Method::Activity, None, self.inner.activity(agents, now))
             .await
     }
 

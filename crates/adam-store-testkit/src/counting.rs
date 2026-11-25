@@ -45,7 +45,8 @@ use std::time::Duration;
 use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
-    PushRecord, RunHeader, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreResult,
+    PushRecord, RunHeader, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreActivity,
+    StoreResult,
 };
 use async_trait::async_trait;
 use jiff::SignedDuration;
@@ -692,6 +693,11 @@ impl Store for CountingStore {
         let runs = self.inner.list_runs(query).await?;
         self.reads(&runs);
         Ok(runs)
+    }
+
+    async fn activity(&self, agents: &[String], now: Timestamp) -> StoreResult<StoreActivity> {
+        self.call(Method::Activity);
+        self.inner.activity(agents, now).await
     }
 
     async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64> {
