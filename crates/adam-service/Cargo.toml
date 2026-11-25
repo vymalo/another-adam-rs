@@ -27,6 +27,7 @@ adam-a2a-runtime.workspace = true
 adam-agent-fs = { workspace = true, optional = true }
 adam-core.workspace = true
 adam-error.workspace = true
+jiff.workspace = true
 adam-host.workspace = true
 adam-mcp = { workspace = true, optional = true }
 adam-model.workspace = true

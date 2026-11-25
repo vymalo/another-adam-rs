@@ -9,6 +9,7 @@ pub mod logging;
 pub mod metrics;
 #[cfg(feature = "mcp")]
 mod prompt_commands;
+pub mod retention;
 mod serve;
 mod service;
 
