@@ -58,6 +58,9 @@ use uuid::Uuid;
 
 use crate::backend::{RuntimeTaskBackend, map_err};
 use crate::convert::{decode_conversation, encode_conversation};
+
+/// How many of a context's most recently updated runs `context_workspace` considers.
+const CONTEXT_WORKSPACE_PAGE: usize = 32;
 use crate::ids::task_id_for;
 use crate::task_state;
 /// The most characters of a session's description (the contract's bound).
@@ -546,7 +549,7 @@ impl RuntimeTaskBackend {
         let query = RunQuery::new(
             self.agent.clone(),
             ConversationScope::Exact(parent.to_owned()),
-            4,
+            CONTEXT_WORKSPACE_PAGE,
         );
         let runs = self
             .runtime
@@ -554,9 +557,13 @@ impl RuntimeTaskBackend {
             .list_runs(&query)
             .await
             .map_err(|e| map_err(e.into()))?;
+        // Task ids are derived from message ids (`ids::task_id_for`), so they do not sort by
+        // time: when two tasks share an `updated_at`, the listing's `id` tiebreak is arbitrary.
+        // The task created last is the one the person is looking at.
         Ok(runs
             .iter()
-            .find(|run| run.parent_id.is_none())
+            .filter(|run| run.parent_id.is_none())
+            .max_by_key(|run| (run.updated_at, run.created_at))
             .map(|run| run.id))
     }
 
