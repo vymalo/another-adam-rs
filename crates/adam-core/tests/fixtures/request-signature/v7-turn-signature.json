@@ -1,0 +1,51 @@
+{
+  "test_only": true,
+  "vector": "V7",
+  "description": "The turn signature: adam's signature of one model request, a compact JWS whose header is the RFC 8785 form of alg, kid, typ (and x5c for a certified key), with its RFC 8785 payload attached. V7a is cloud adam's, by x5c [adam leaf, intermediate] (kid is the leaf's x5t#S256); V7b is the device's adam, by a kid the registry holds. Ed25519 is deterministic: exact bytes.",
+  "turn_typ": "adam-request/v1",
+  "header": "Turn-Signature",
+  "keys": {
+    "V7a": {
+      "leaf": "adam (V1)",
+      "seed_hex": "95767d71d7cc86081e2b95534a549fcad76f8997ec9d73a22801104b09cff6a4",
+      "x5t_s256": "ysQZpNsh6gur_vRDEUVpOnsBrnNncKvPvZCrfeDNkEs"
+    },
+    "V7b": {
+      "kid": "dev-test-ed25519#turn-v1",
+      "owner": "test-person-alice",
+      "use": "turn",
+      "seed_hex": "a80a47f216f0fdb73fa76c6ec4be175218918d4e5d580f9d7f0fe51f328fcafa",
+      "jwk": {
+        "crv": "Ed25519",
+        "kty": "OKP",
+        "x": "Ug6VqcXZvrwAfxHjptOV_xyCYR0l3d37lXK9bGBudfM"
+      }
+    }
+  },
+  "vectors": {
+    "V7a": {
+      "call": "V2+V3a",
+      "carrier": "x5c",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"Summarise the open pull requests of the example repository.\"}],\"stream\":true}"
+      },
+      "protected_header_jcs": "{\"alg\":\"EdDSA\",\"kid\":\"ysQZpNsh6gur_vRDEUVpOnsBrnNncKvPvZCrfeDNkEs\",\"typ\":\"adam-request/v1\",\"x5c\":[\"MIIB5zCCAZmgAwIBAgICIAEwBQYDK2VwMFAxHDAaBgNVBAoME0Fub3RoZXIgKFRFU1QgT05MWSkxMDAuBgNVBAMMJ0Fub3RoZXIgcHJvbXB0IGludGVybWVkaWF0ZSAoVEVTVCBPTkxZKTAeFw0yNjExMTgxMDA2NDBaFw0yNjExMjExMDA2NDBaMDkxHDAaBgNVBAoME0Fub3RoZXIgKFRFU1QgT05MWSkxGTAXBgNVBAMMEGFkYW0gKFRFU1QgT05MWSkwKjAFBgMrZXADIQBLzKz1sz0nKc4nIoIHL1EdEBwwiEZ/9zTOGgCvo12Mg6OBrTCBqjAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDAzA1BgNVHREELjAshipzcGlmZmU6Ly9hbm90aGVyL25zL2Fub3RoZXItYWdlbnRzL3NhL2FkYW0wHQYDVR0OBBYEFDBGy1eP6JPAMig2UCKvPYaI5jU0MB8GA1UdIwQYMBaAFMy6NhunkATd4GgSjvapMqRt2Pn+MAUGAytlcANBAIeG9JGnlkDMm0UUchAWLKh7lk0L6dRzcpAJdCqDitwNmCim9fJV7XhrYOGYWcDQ2IUXyL/D2qWm5QrRJJtJ6g8=\",\"MIIBrTCCAV+gAwIBAgIBAjAFBgMrZXAwSDEcMBoGA1UECgwTQW5vdGhlciAoVEVTVCBPTkxZKTEoMCYGA1UEAwwfQW5vdGhlciBwcm9tcHQgcm9vdCAoVEVTVCBPTkxZKTAeFw0yNjAxMDEwMDAwMDBaFw0yODAxMDEwMDAwMDBaMFAxHDAaBgNVBAoME0Fub3RoZXIgKFRFU1QgT05MWSkxMDAuBgNVBAMMJ0Fub3RoZXIgcHJvbXB0IGludGVybWVkaWF0ZSAoVEVTVCBPTkxZKTAqMAUGAytlcAMhAGDh98t5/s9jxf23Ezqh7H/HHixOY9H9Dy9ey8Z36xZHo2YwZDASBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUzLo2G6eQBN3gaBKO9qkypG3Y+f4wHwYDVR0jBBgwFoAU/Rujh3Nln4HuduDRB5n/x2fBRdUwBQYDK2VwA0EAirLtrtSiRDoG/lcfGl5TvwOIz1/w5oYdpAWONQ7DIn0RTnxWdrv4fZ+v/nadO3mMHauj3L8UVH9GzDIya6RsAw==\"]}",
+      "payload_jcs": "{\"body_sha256\":\"l96mUuHYBDdzvt4Vt0Fn0OCVnF3N620ZBQaJJTdp-XI\",\"iat\":1795000599,\"method\":\"POST\",\"nonce\":\"iMBVjR5Gp7XDmjSHZv1AMQ\",\"path\":\"/v1/chat/completions\",\"prompt_jti\":\"AQEBAQEBAQEBAQEBAQEBAQ\",\"run\":\"run-test-0001\",\"typ\":\"adam-request/v1\"}",
+      "turn_signature": "eyJhbGciOiJFZERTQSIsImtpZCI6InlzUVpwTnNoNmd1cl92UkRFVVZwT25zQnJuTm5jS3ZQdlpDcmZlRE5rRXMiLCJ0eXAiOiJhZGFtLXJlcXVlc3QvdjEiLCJ4NWMiOlsiTUlJQjV6Q0NBWm1nQXdJQkFnSUNJQUV3QlFZREsyVndNRkF4SERBYUJnTlZCQW9NRTBGdWIzUm9aWElnS0ZSRlUxUWdUMDVNV1NreE1EQXVCZ05WQkFNTUowRnViM1JvWlhJZ2NISnZiWEIwSUdsdWRHVnliV1ZrYVdGMFpTQW9WRVZUVkNCUFRreFpLVEFlRncweU5qRXhNVGd4TURBMk5EQmFGdzB5TmpFeE1qRXhNREEyTkRCYU1Ea3hIREFhQmdOVkJBb01FMEZ1YjNSb1pYSWdLRlJGVTFRZ1QwNU1XU2t4R1RBWEJnTlZCQU1NRUdGa1lXMGdLRlJGVTFRZ1QwNU1XU2t3S2pBRkJnTXJaWEFESVFCTHpLejFzejBuS2M0bklvSUhMMUVkRUJ3d2lFWi85elRPR2dDdm8xMk1nNk9CclRDQnFqQU1CZ05WSFJNQkFmOEVBakFBTUE0R0ExVWREd0VCL3dRRUF3SUhnREFUQmdOVkhTVUVEREFLQmdnckJnRUZCUWNEQXpBMUJnTlZIUkVFTGpBc2hpcHpjR2xtWm1VNkx5OWhibTkwYUdWeUwyNXpMMkZ1YjNSb1pYSXRZV2RsYm5SekwzTmhMMkZrWVcwd0hRWURWUjBPQkJZRUZEQkd5MWVQNkpQQU1pZzJVQ0t2UFlhSTVqVTBNQjhHQTFVZEl3UVlNQmFBRk15Nk5odW5rQVRkNEdnU2p2YXBNcVJ0MlBuK01BVUdBeXRsY0FOQkFJZUc5SkdubGtETW0wVVVjaEFXTEtoN2xrMEw2ZFJ6Y3BBSmRDcURpdHdObUNpbTlmSlY3WGhyWU9HWVdjRFEySVVYeUwvRDJxV201UXJSSkp0SjZnOD0iLCJNSUlCclRDQ0FWK2dBd0lCQWdJQkFqQUZCZ01yWlhBd1NERWNNQm9HQTFVRUNnd1RRVzV2ZEdobGNpQW9WRVZUVkNCUFRreFpLVEVvTUNZR0ExVUVBd3dmUVc1dmRHaGxjaUJ3Y205dGNIUWdjbTl2ZENBb1ZFVlRWQ0JQVGt4WktUQWVGdzB5TmpBeE1ERXdNREF3TURCYUZ3MHlPREF4TURFd01EQXdNREJhTUZBeEhEQWFCZ05WQkFvTUUwRnViM1JvWlhJZ0tGUkZVMVFnVDA1TVdTa3hNREF1QmdOVkJBTU1KMEZ1YjNSb1pYSWdjSEp2YlhCMElHbHVkR1Z5YldWa2FXRjBaU0FvVkVWVFZDQlBUa3haS1RBcU1BVUdBeXRsY0FNaEFHRGg5OHQ1L3M5anhmMjNFenFoN0gvSEhpeE9ZOUg5RHk5ZXk4WjM2eFpIbzJZd1pEQVNCZ05WSFJNQkFmOEVDREFHQVFIL0FnRUFNQTRHQTFVZER3RUIvd1FFQXdJQkJqQWRCZ05WSFE0RUZnUVV6TG8yRzZlUUJOM2dhQktPOXFreXBHM1krZjR3SHdZRFZSMGpCQmd3Rm9BVS9SdWpoM05sbjRIdWR1RFJCNW4veDJmQlJkVXdCUVlESzJWd0EwRUFpckx0cnRTaVJEb0cvbGNmR2w1VHZ3T0l6MS93NW9ZZHBBV09OUTdESW4wUlRueFdkcnY0Zlordi9uYWRPM21NSGF1ajNMOFVWSDlHekRJeWE2UnNBdz09Il19.eyJib2R5X3NoYTI1NiI6Imw5Nm1VdUhZQkRkenZ0NFZ0MEZuME9DVm5GM042MjBaQlFhSkpUZHAtWEkiLCJpYXQiOjE3OTUwMDA1OTksIm1ldGhvZCI6IlBPU1QiLCJub25jZSI6ImlNQlZqUjVHcDdYRG1qU0hadjFBTVEiLCJwYXRoIjoiL3YxL2NoYXQvY29tcGxldGlvbnMiLCJwcm9tcHRfanRpIjoiQVFFQkFRRUJBUUVCQVFFQkFRRUJBUSIsInJ1biI6InJ1bi10ZXN0LTAwMDEiLCJ0eXAiOiJhZGFtLXJlcXVlc3QvdjEifQ.0JHePoRraheI_0__mYEuHi-D-EHuLTm1SecARkdhP4ZRCKwU1aaEhwRpsnShCugzZEYcVCvLSTP_BhpiHWckAQ"
+    },
+    "V7b": {
+      "call": "D1",
+      "carrier": "kid",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"Summarise the open pull requests of the example repository.\"}],\"stream\":true}"
+      },
+      "protected_header_jcs": "{\"alg\":\"EdDSA\",\"kid\":\"dev-test-ed25519#turn-v1\",\"typ\":\"adam-request/v1\"}",
+      "payload_jcs": "{\"body_sha256\":\"l96mUuHYBDdzvt4Vt0Fn0OCVnF3N620ZBQaJJTdp-XI\",\"iat\":1795000599,\"method\":\"POST\",\"nonce\":\"b83du4fJzo6pbk7iiO4vmQ\",\"path\":\"/v1/chat/completions\",\"prompt_jti\":\"YGFiY2RlZmdoaWprbG1ubw\",\"run\":\"run-test-0001\",\"typ\":\"adam-request/v1\"}",
+      "turn_signature": "eyJhbGciOiJFZERTQSIsImtpZCI6ImRldi10ZXN0LWVkMjU1MTkjdHVybi12MSIsInR5cCI6ImFkYW0tcmVxdWVzdC92MSJ9.eyJib2R5X3NoYTI1NiI6Imw5Nm1VdUhZQkRkenZ0NFZ0MEZuME9DVm5GM042MjBaQlFhSkpUZHAtWEkiLCJpYXQiOjE3OTUwMDA1OTksIm1ldGhvZCI6IlBPU1QiLCJub25jZSI6ImI4M2R1NGZKem82cGJrN2lpTzR2bVEiLCJwYXRoIjoiL3YxL2NoYXQvY29tcGxldGlvbnMiLCJwcm9tcHRfanRpIjoiWUdGaVkyUmxabWRvYVdwcmJHMXVidyIsInJ1biI6InJ1bi10ZXN0LTAwMDEiLCJ0eXAiOiJhZGFtLXJlcXVlc3QvdjEifQ.Ct5-56jp0yogRuxUpCgr6bLTtTeuVMrfpOLUbZ-ezdXSnw3eSEX7_o73Eqq0_S-tXCXlci7-I2-0EnDWJD16Cg"
+    }
+  }
+}

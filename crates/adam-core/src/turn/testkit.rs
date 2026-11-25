@@ -9,14 +9,79 @@
 //! ```
 //!
 //! A case panics on a failure: it is test code.
+//!
+//! [`Certified`] is a key named by a certificate chain (`KeyIdentity::Certificate`), over an
+//! [`Ed25519TurnKeys`]: what a PKI adapter looks like to a signer, for the tests of code that
+//! writes `x5c`.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use serde_json::json;
 
 use super::{
-    ChainHash, ConversationHash, KeyId, SignatureType, TurnKeyError, TurnKeys, TurnPosition,
+    CertificateChain, ChainHash, ConversationHash, CurrentKey, Ed25519TurnKeys, KeyId, KeyIdentity,
+    KeySet, KeyStatus, Signature, SignatureType, TurnKeyError, TurnKeys, TurnPosition,
     TurnSignatureError, set_turn_signature, sign_detached, sign_turn, verify_detached, verify_turn,
 };
 use crate::RunId;
+
+/// A key named by a certificate chain: [`current`](TurnKeys::current) answers
+/// `KeyIdentity::Certificate(chain)`, so every signature's header carries `x5c`, and the key set
+/// names the key by the chain's `kid` (the leaf's `x5t#S256` unless the chain names another). The
+/// chain is carried, not checked: it is test material.
+#[derive(Debug)]
+pub struct Certified {
+    inner: Ed25519TurnKeys,
+    chain: CertificateChain,
+    status: KeyStatus,
+}
+
+impl Certified {
+    /// `inner`'s key, named by `chain`, [`KeyStatus::Active`].
+    pub fn new(inner: Ed25519TurnKeys, chain: CertificateChain) -> Self {
+        Self {
+            inner,
+            chain,
+            status: KeyStatus::Active,
+        }
+    }
+
+    /// The same, [`KeyStatus::Renewing`].
+    #[must_use]
+    pub fn renewing(mut self) -> Self {
+        self.status = KeyStatus::Renewing;
+        self
+    }
+}
+
+#[async_trait]
+impl TurnKeys for Certified {
+    async fn current(&self) -> Result<CurrentKey, TurnKeyError> {
+        Ok(CurrentKey {
+            identity: KeyIdentity::Certificate(self.chain.clone()),
+            status: self.status,
+        })
+    }
+
+    async fn sign(&self, kid: &KeyId, input: &[u8]) -> Result<Signature, TurnKeyError> {
+        if kid != self.chain.kid() {
+            return Err(TurnKeyError::NotSigning { kid: kid.clone() });
+        }
+        self.inner.sign(self.inner.kid(), input).await
+    }
+
+    async fn key_set(&self) -> Result<Arc<KeySet>, TurnKeyError> {
+        let mut set = KeySet::new();
+        set.insert(self.chain.kid().clone(), self.inner.public_key())
+            .map_err(|e| TurnKeyError::Unavailable(Box::new(e)))?;
+        Ok(Arc::new(set))
+    }
+
+    fn kind(&self) -> &'static str {
+        "certificate"
+    }
+}
 
 /// The names of the cases, in the order [`turn_keys_conformance!`](crate::turn_keys_conformance)
 /// generates them.

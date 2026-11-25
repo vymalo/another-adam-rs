@@ -2,9 +2,10 @@
 //! two signed values a client sends with a message, which every model call of the run carries to
 //! the injector in front of the model as headers ([`InjectedRun`](crate::InjectedRun)).
 //!
-//! adam does not read them: it checks that each is a compact JWS of a bounded size, keeps them
-//! with the run, and sends them byte for byte. Whoever verifies a signature is in front of the
-//! model, not here. Neither value is ever printed: `Debug` says only whether a value is there, and
+//! adam checks that each is a compact JWS of a bounded size, keeps them with the run, and sends
+//! them byte for byte. Whoever verifies a signature is in front of the model, not here. The one
+//! thing adam reads is the prompt's id, for its request signature ([`PromptStatement::prompt_jti`]):
+//! the statement's `jti`, or, on a device with no statement, the envelope's `nonce`. Neither value is ever printed: `Debug` says only whether a value is there, and
 //! no error quotes one.
 //!
 //! [ADR 0077]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md
@@ -26,14 +27,17 @@ pub const PROMPT_USER_SIGNATURE_HEADER: &str = "Prompt-User-Signature";
 pub const MAX_PROMPT_JWS_BYTES: usize = 8 * 1024;
 
 /// The prompt statement of a run and, when the message carried one, the person's envelope: each a
-/// compact JWS (RFC 7515 §7.1) of at most [`MAX_PROMPT_JWS_BYTES`] bytes.
+/// compact JWS (RFC 7515 §7.1) of at most [`MAX_PROMPT_JWS_BYTES`] bytes. A device, which has no
+/// orchestrator to state the prompt, sends the envelope alone ([`envelope`](Self::envelope)); at
+/// least one of the two is always there.
 ///
 /// Built only through [`new`](Self::new) (deserializing checks the same), so a value of this type
 /// is always safe to put in a header: three base64url segments and two dots. Its `Debug` holds no
 /// value.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct PromptStatement {
-    statement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    statement: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     user: Option<String>,
 }
@@ -49,19 +53,67 @@ impl PromptStatement {
         statement: impl Into<String>,
         user: Option<String>,
     ) -> Result<Self, NotAPromptStatement> {
-        let statement = statement.into();
-        if !is_compact_jws(&statement) {
+        Self::from_parts(Some(statement.into()), user)
+    }
+
+    /// The person's envelope `user` alone, with no statement: a device's (the shared
+    /// prompt-signature contract's device path), when it is a compact JWS of at most
+    /// [`MAX_PROMPT_JWS_BYTES`] bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`NotAPromptStatement::User`]. It does not quote the value.
+    pub fn envelope(user: impl Into<String>) -> Result<Self, NotAPromptStatement> {
+        Self::from_parts(None, Some(user.into()))
+    }
+
+    /// The statement and the envelope, each optional, and not both absent.
+    ///
+    /// # Errors
+    ///
+    /// [`NotAPromptStatement`] naming which is not a compact JWS, or
+    /// [`NotAPromptStatement::Neither`].
+    pub fn from_parts(
+        statement: Option<String>,
+        user: Option<String>,
+    ) -> Result<Self, NotAPromptStatement> {
+        if statement.as_deref().is_some_and(|s| !is_compact_jws(s)) {
             return Err(NotAPromptStatement::Statement);
         }
         if user.as_deref().is_some_and(|user| !is_compact_jws(user)) {
             return Err(NotAPromptStatement::User);
         }
+        if statement.is_none() && user.is_none() {
+            return Err(NotAPromptStatement::Neither);
+        }
         Ok(Self { statement, user })
     }
 
-    /// The statement, byte for byte as it came.
-    pub fn statement(&self) -> &str {
-        &self.statement
+    /// The statement, byte for byte as it came; `None` for a device's envelope alone.
+    pub fn statement(&self) -> Option<&str> {
+        self.statement.as_deref()
+    }
+
+    /// The id of the prompt a request signature binds (`prompt_jti`): the statement's `jti`
+    /// (a member of its attached payload) when there is a statement, else the envelope's `nonce`
+    /// (a member of its protected header, which is its `jti` on a device).
+    ///
+    /// # Errors
+    ///
+    /// [`NoPromptId`] when that member cannot be read as a non-empty string. It quotes nothing.
+    pub fn prompt_jti(&self) -> Result<String, NoPromptId> {
+        let (jws, segment, member) = match (&self.statement, &self.user) {
+            (Some(statement), _) => (statement, 1, "jti"),
+            (None, Some(user)) => (user, 0, "nonce"),
+            (None, None) => return Err(NoPromptId),
+        };
+        jws.split('.')
+            .nth(segment)
+            .and_then(base64url_decode)
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value.get(member)?.as_str().map(str::to_owned))
+            .filter(|id| !id.is_empty())
+            .ok_or(NoPromptId)
     }
 
     /// The person's envelope, byte for byte as it came; `None` when the message carried none.
@@ -73,7 +125,7 @@ impl PromptStatement {
 impl fmt::Debug for PromptStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PromptStatement")
-            .field("statement", &"[REDACTED]")
+            .field("statement", &self.statement.as_ref().map(|_| "[REDACTED]"))
             .field("user", &self.user.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
@@ -83,12 +135,13 @@ impl<'de> Deserialize<'de> for PromptStatement {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Raw {
-            statement: String,
+            #[serde(default)]
+            statement: Option<String>,
             #[serde(default)]
             user: Option<String>,
         }
         let raw = Raw::deserialize(deserializer)?;
-        Self::new(raw.statement, raw.user).map_err(serde::de::Error::custom)
+        Self::from_parts(raw.statement, raw.user).map_err(serde::de::Error::custom)
     }
 }
 
@@ -109,6 +162,26 @@ pub enum NotAPromptStatement {
          most {MAX_PROMPT_JWS_BYTES} bytes"
     )]
     User,
+    /// Neither a statement nor an envelope.
+    #[error("a prompt statement holds a statement, the person's envelope, or both")]
+    Neither,
+}
+
+/// A prompt statement whose id cannot be read ([`PromptStatement::prompt_jti`]): the statement's
+/// payload has no string `jti`, or the device envelope's header no string `nonce`. It quotes
+/// nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the prompt statement names no prompt id (the statement's `jti`, or the envelope's `nonce`)"
+)]
+pub struct NoPromptId;
+
+/// RFC 4648 §5 without padding, the alphabet [`is_compact_jws`] admits.
+fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(text)
+        .ok()
 }
 
 /// Whether `jws` is the compact serialization of a JWS: `header.payload.signature`, each segment
@@ -144,7 +217,7 @@ mod tests {
     #[test]
     fn a_compact_jws_is_kept_as_it_came() {
         let both = PromptStatement::new(JWS, Some(format!("{JWS}x"))).unwrap();
-        assert_eq!(both.statement(), JWS);
+        assert_eq!(both.statement(), Some(JWS));
         assert_eq!(both.user(), Some(format!("{JWS}x").as_str()));
         assert_eq!(PromptStatement::new(JWS, None).unwrap().user(), None);
         // A detached payload is a compact JWS too.

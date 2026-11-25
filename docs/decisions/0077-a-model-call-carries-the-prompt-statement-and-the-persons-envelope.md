@@ -93,3 +93,14 @@ holds names only, and every refusal names the member that is wrong and never its
   not list the extension; that is a gap in `docs/reference/parity.md`.
 - **The engine** (`adam-engine`) has no card; a host that builds its client with `InjectedRun` sets nothing that fills
   the values, which is a gap listed beside it.
+
+## Amended 2026-11-25 (the device's envelope alone, and the request signature)
+
+The shared prompt-signature contract's device path has no orchestrator: a device sends the person's envelope alone. So
+an activated entry may now be `{"user": "<JWS>"}` with no `statement` (`PromptStatement::envelope`,
+`PromptStatement::statement` is an `Option`); an entry with neither, or a member that is not a string, is still
+refused. Such a run sends `Prompt-User-Signature` and no `Prompt-Statement`. An engine's host gives the values with
+`Say::with_prompt_statement`, which closes this ADR's engine gap. adam now reads one thing of the values: the prompt's
+id, for its request signature ([ADR 0068](0068-adam-signs-its-own-history.md), *Amended 2026-11-25 (the request
+signature)*): the statement's `jti`, or the envelope's `nonce`. With `SignedRequests` the values are sent whatever the
+inner credentials (not only by `InjectedRun`), because the signature binds them.

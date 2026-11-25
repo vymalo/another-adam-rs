@@ -35,6 +35,9 @@
 //! | `MODEL_AUTH` | `key` (the token of `MODEL_API_KEY`), `device`: the process signs in to an OAuth 2.0 issuer with the device grant and renews its token (ADR 0058, [`ModelConfig::device_grant`]); the code and the link are a `WARN` log line at startup; or `injector`: no key, every model call carries `X-Run-Id: <root run id>` and no `Authorization`, for an injector in front of the model that adds the run's credential (ADR 0067, [`ModelConfig::injected_run`]). With `device` or `injector`, `MODEL_API_KEY` must be unset or empty | `key` |
 //! | `MODEL_PARK_LIMIT` | how long parks on a timer in a row may last, from the first, before the run fails with the last reason: a model call the gateway refused (or could not be reached, with `MODEL_AUTH=injector`) parks the run and is made again (ADR 0067, [`ModelConfig::park_limit`]). Whole seconds, or a number with `s`, `m`, `h` or `d` (`24h`), from 60 s to 30 d; anything else is a startup error | `24h` |
 //! | `MODEL_CA_FILE` | a PEM file of certificates trusted for the model endpoint, beside the default roots (ADR 0067, [`ModelConfig::ca_roots`]); not for the device grant's issuer. A file that cannot be read or holds no certificate is a startup error | unset (the default roots) |
+//! | `TURN_SIGNING_KEY_FILE` | a PKCS#8 PEM Ed25519 private key: every model call carries `Turn-Signature`, adam's signature of that request, and `X-Run-Id` (ADR 0068 amended 2026-11-25, [`ModelConfig::turn_keys`]). A file that cannot be read or is not an Ed25519 private key is a startup error | unset (no model call is signed) |
+//! | `TURN_SIGNING_KEY_ID` | the `kid` of those signatures (printable ASCII, at most 256 bytes); needs the key file | the key's RFC 7638 thumbprint |
+//! | `TURN_VERIFY_KEYS_FILE` | a JWKS of earlier public keys and `revoked` ids, read and checked with the key; needs the key file | the key's own public key |
 //! | `MODEL_OAUTH_ISSUER` | with `MODEL_AUTH=device`: the issuer, whose `/.well-known/openid-configuration` names the device and token endpoints (on its own origin); `https`, or `http` on a loopback address | required with `device` |
 //! | `MODEL_OAUTH_CLIENT_ID` | with `MODEL_AUTH=device`: the public client the issuer knows the process as | required with `device` |
 //! | `MODEL_OAUTH_SCOPE` | with `MODEL_AUTH=device`: the scope asked for | `offline_access` |
@@ -251,10 +254,11 @@ pub struct ServiceConfig {
     /// [`DEFAULT_UPLOADS_INLINE_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES). The agent folder's
     /// `limits.max_inline_upload_bytes` wins over it ([`Agents::uploads_inline_max_bytes`](crate::Agents)).
     pub uploads_inline_max_bytes: Option<u64>,
-    /// `MODEL_AUTH=injector`, read by every role (the word only): the process's model calls carry a
-    /// message's prompt statement and the person's envelope, so the card lists
-    /// `prompt-statement/v1` (ADR 0077). `false` with a key or a device grant: such a card does not
-    /// list it, and no message is read for it.
+    /// `MODEL_AUTH=injector` or `TURN_SIGNING_KEY_FILE` set, read by every role (the word only): the
+    /// process's model calls carry a message's prompt statement and the person's envelope, so the
+    /// card lists `prompt-statement/v1` (ADR 0077; with a turn key the calls are signed and the
+    /// signature binds the values, ADR 0068 amended 2026-11-25). `false` with a key or a device
+    /// grant and no turn key: such a card does not list it, and no message is read for it.
     pub prompt_statement: bool,
 }
 
@@ -396,7 +400,8 @@ impl ServiceConfig {
             retention: crate::retention::RetentionSettings::parse(lookup, problems),
             default_locale,
             uploads_inline_max_bytes,
-            prompt_statement: is_injector(lookup),
+            prompt_statement: is_injector(lookup)
+                || not_blank(lookup, "TURN_SIGNING_KEY_FILE").is_some(),
         }
     }
 }
@@ -945,6 +950,10 @@ pub struct ModelConfig {
     /// `MODEL_CA_FILE`: certificates trusted for the model endpoint beside the default roots, read
     /// and checked at startup. `None` when unset.
     pub ca_roots: Option<ExtraRoots>,
+    /// `TURN_SIGNING_KEY_FILE` (with `TURN_SIGNING_KEY_ID` and `TURN_VERIFY_KEYS_FILE`): the keys
+    /// every model call is signed with ([`adam_model::SignedRequests`], ADR 0068 amended
+    /// 2026-11-25), read and checked at startup. `None` when unset: no call is signed.
+    pub turn_keys: Option<adam_core::turn::DynTurnKeys>,
     /// `MODEL_PARK_LIMIT`: how long parks on a timer in a row may last, from the first, before the
     /// run fails with the last reason (ADR 0067; `adam_llm_agent::ModelParking::limit`). 24 hours
     /// by default. A binary gives it to its agents with whether an unreachable endpoint parks,
@@ -1021,6 +1030,7 @@ impl std::fmt::Debug for ModelConfig {
             .field("device_grant", &self.device_grant)
             .field("injected_run", &self.injected_run)
             .field("ca_roots", &self.ca_roots)
+            .field("turn_keys", &self.turn_keys)
             .field("park_limit", &self.park_limit)
             // The members, not their values.
             .field(
@@ -1119,6 +1129,7 @@ impl ModelConfig {
             device_grant,
             injected_run,
             ca_roots: parse_ca_file(&get, problems),
+            turn_keys: parse_turn_keys(&get, problems),
             park_limit: parse_park_limit(&get("MODEL_PARK_LIMIT"), problems),
             alias,
             model_aliases_file,
@@ -1142,13 +1153,26 @@ impl ModelConfig {
             self.base_url.clone(),
             self.api_key.clone(),
         ))?;
+        let mut credentials: Option<adam_model::DynCredentials> = None;
         if let Some(grant) = &self.device_grant {
             // The code is asked for now, so the person can sign in before the first run.
             grant.start();
-            client = client.with_credentials(std::sync::Arc::new(grant.clone()));
+            credentials = Some(std::sync::Arc::new(grant.clone()));
         }
         if self.injected_run {
-            client = client.with_credentials(std::sync::Arc::new(adam_model::InjectedRun::new()));
+            credentials = Some(std::sync::Arc::new(adam_model::InjectedRun::new()));
+        }
+        if let Some(keys) = &self.turn_keys {
+            let inner = credentials.unwrap_or_else(|| {
+                std::sync::Arc::new(adam_model::StaticBearer::new(self.api_key.clone()))
+            });
+            credentials = Some(std::sync::Arc::new(adam_model::SignedRequests::new(
+                inner,
+                keys.clone(),
+            )));
+        }
+        if let Some(credentials) = credentials {
+            client = client.with_credentials(credentials);
         }
         if let Some(roots) = &self.ca_roots {
             client = client.with_extra_roots(roots)?;
@@ -1227,6 +1251,46 @@ fn parse_device_grant(
 /// Whether `MODEL_AUTH` is `injector` (ADR 0067).
 fn is_injector(lookup: &impl Fn(&str) -> Option<String>) -> bool {
     not_blank(lookup, "MODEL_AUTH").is_some_and(|auth| auth.eq_ignore_ascii_case("injector"))
+}
+
+/// `TURN_SIGNING_KEY_FILE`, `TURN_SIGNING_KEY_ID`, `TURN_VERIFY_KEYS_FILE`: the turn keys, `None`
+/// when the key file is unset. A key file that cannot be read or is not an Ed25519 private key, a
+/// bad id, a bad verify set, or an id or a set without a key file, is a problem naming the
+/// variable, never a key.
+fn parse_turn_keys(
+    get: &impl Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+) -> Option<adam_core::turn::DynTurnKeys> {
+    use adam_core::turn::{Ed25519TurnKeys, KeyId};
+    let kid = get("TURN_SIGNING_KEY_ID");
+    let verify = get("TURN_VERIFY_KEYS_FILE");
+    let Some(key) = get("TURN_SIGNING_KEY_FILE") else {
+        for (name, value) in [
+            ("TURN_SIGNING_KEY_ID", &kid),
+            ("TURN_VERIFY_KEYS_FILE", &verify),
+        ] {
+            if value.is_some() {
+                problems.push(format!("{name} needs TURN_SIGNING_KEY_FILE"));
+            }
+        }
+        return None;
+    };
+    let kid = match kid.map(|kid| KeyId::new(kid.trim())) {
+        None => None,
+        Some(Ok(kid)) => Some(kid),
+        Some(Err(e)) => {
+            problems.push(format!("TURN_SIGNING_KEY_ID: {e}"));
+            return None;
+        }
+    };
+    let verify = verify.map(|path| std::path::PathBuf::from(path.trim()));
+    match Ed25519TurnKeys::from_files(std::path::Path::new(key.trim()), kid, verify.as_deref()) {
+        Ok(keys) => Some(std::sync::Arc::new(keys)),
+        Err(e) => {
+            problems.push(format!("TURN_SIGNING_KEY_FILE: {e}"));
+            None
+        }
+    }
 }
 
 /// `MODEL_CA_FILE`: the certificates of the PEM file it names, `None` when unset. A file that
@@ -1902,8 +1966,8 @@ mod tests {
         }
     }
 
-    /// `prompt-statement/v1` is listed exactly when the model calls go through the injector, which
-    /// is the only provider that sends the headers (ADR 0077).
+    /// `prompt-statement/v1` is listed exactly when the model calls send the headers: through the
+    /// injector (ADR 0077), or signed with a turn key (ADR 0068 amended 2026-11-25).
     #[test]
     fn the_prompt_statement_follows_model_auth_injector() {
         assert!(!parse(&full()).expect("valid").prompt_statement);
@@ -1916,6 +1980,20 @@ mod tests {
                 "{auth}"
             );
         }
+        let dir =
+            std::env::temp_dir().join(format!("adam-service-card-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("turn.pem");
+        std::fs::write(
+            &key,
+            "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let key: &'static str = Box::leak(key.to_str().unwrap().to_owned().into_boxed_str());
+        let mut vars = full();
+        vars.insert("TURN_SIGNING_KEY_FILE", key);
+        assert!(parse(&vars).expect("valid").prompt_statement, "a turn key");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `NOTIFY_LOCAL_ONLY` is a startup variable of every role (every role runs
@@ -3008,6 +3086,62 @@ mod tests {
                 "{bad} is refused"
             );
         }
+    }
+
+    /// `TURN_SIGNING_KEY_FILE`: a readable Ed25519 key turns request signing on, with its id;
+    /// anything else is a problem naming the variable and never the key. Unset: nothing is signed.
+    #[test]
+    fn the_turn_signing_key_turns_on_request_signing() {
+        // RFC 8032 §7.1 test 1's seed, as `openssl genpkey -algorithm ed25519` writes it.
+        const PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g\n-----END PRIVATE KEY-----\n";
+        let dir =
+            std::env::temp_dir().join(format!("adam-service-turn-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("turn.pem");
+        std::fs::write(&key, PEM).unwrap();
+        let not_a_key = dir.join("not.pem");
+        std::fs::write(&not_a_key, "hello").unwrap();
+        // The variables are `&'static str`: a test may leak two paths.
+        let key: &'static str = Box::leak(key.to_str().unwrap().to_owned().into_boxed_str());
+        let not_a_key: &'static str =
+            Box::leak(not_a_key.to_str().unwrap().to_owned().into_boxed_str());
+
+        let (model, problems) = model_problems(&model_vars());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(model.turn_keys.is_none());
+
+        let mut vars = model_vars();
+        vars.insert("TURN_SIGNING_KEY_FILE", key);
+        vars.insert("TURN_SIGNING_KEY_ID", "vault:turn-key#v1");
+        let (model, problems) = model_problems(&vars);
+        assert!(problems.is_empty(), "{problems:?}");
+        let keys = model.turn_keys.clone().expect("signing is on");
+        let current = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(keys.current())
+            .unwrap();
+        assert_eq!(current.kid().as_str(), "vault:turn-key#v1");
+        assert!(!format!("{model:?}").contains("MC4C"));
+        model.client().expect("a usable client");
+
+        for (name, value, problem) in [
+            ("TURN_SIGNING_KEY_FILE", not_a_key, "TURN_SIGNING_KEY_FILE"),
+            ("TURN_SIGNING_KEY_ID", "has space", "TURN_SIGNING_KEY_ID"),
+        ] {
+            let mut bad = vars.clone();
+            bad.insert(name, value);
+            let problems = model_problems(&bad).1;
+            assert!(mentions(&problems, problem), "{name}: {problems:?}");
+            assert!(!problems.iter().any(|p| p.contains("MC4C")));
+        }
+        let mut orphan = model_vars();
+        orphan.insert("TURN_SIGNING_KEY_ID", "k");
+        assert!(mentions(
+            &model_problems(&orphan).1,
+            "TURN_SIGNING_KEY_ID needs TURN_SIGNING_KEY_FILE"
+        ));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

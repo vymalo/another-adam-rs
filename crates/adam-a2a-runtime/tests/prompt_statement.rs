@@ -9,6 +9,10 @@
 //!   it included); one that brings none keeps them; a malformed entry is refused and writes nothing.
 //! * A message whose request did not activate it, or that forges the payload key, sends neither.
 //! * Neither value is in any log line of the run, at any level, nor in an error's text.
+//! * With `SignedRequests` (ADR 0068, amended 2026-11-25) every call of the run, the root's, a local
+//!   subagent's and a session round's, carries a `Turn-Signature` that verifies over the request
+//!   the mock received and binds the statement's `jti` (or a device envelope's `nonce`); no
+//!   signature is in any log line.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::collections::{HashMap, VecDeque};
@@ -20,14 +24,17 @@ use adam_a2a::{
     BackendError, Caller, PROMPT_STATEMENT_EXTENSION, STEER_EXTENSION, TaskBackend as _,
 };
 use adam_a2a_runtime::{RuntimeTaskBackend, task_id_for};
+use adam_core::turn::{DynTurnKeys, KeySet, ModelCall, TurnKeys, verify_request};
 use adam_core::{DynStore, MemoryStore, RunId};
 use adam_llm_agent::{
     Conversation, LlmAgent, SessionAgent, SessionTools, Tool, ToolCtx, ToolError, ToolOutput,
 };
-use adam_model::{DynModel, InjectedRun, ToolSpec};
+use adam_model::{DynModel, InjectedRun, SignedRequests, ToolSpec};
 use adam_model_openai::{OpenAiCompatible, OpenAiConfig};
 use adam_runtime::{BroadcastSink, Runtime, child_run_id};
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::sync::{Notify, oneshot};
@@ -129,16 +136,23 @@ async fn script(server: &MockServer, prefix: &str, answers: Vec<Value>) {
         .await;
 }
 
-fn model(server: &MockServer, prefix: &str) -> DynModel {
+fn model(server: &MockServer, prefix: &str, keys: Option<&DynTurnKeys>) -> DynModel {
     let mut config = OpenAiConfig::new(
         format!("{}/{prefix}/v1", server.uri()),
         SecretString::from(""),
     );
     config.timeout = Duration::from_secs(20);
+    let credentials: adam_model::DynCredentials = match keys {
+        None => Arc::new(InjectedRun::new()),
+        Some(keys) => Arc::new(SignedRequests::new(
+            Arc::new(InjectedRun::new()),
+            keys.clone(),
+        )),
+    };
     Arc::new(
         OpenAiCompatible::new(config)
             .expect("client")
-            .with_credentials(Arc::new(InjectedRun::new())),
+            .with_credentials(credentials),
     )
 }
 
@@ -224,6 +238,11 @@ struct Rig {
 
 impl Rig {
     async fn new() -> Self {
+        Self::with_keys(None).await
+    }
+
+    async fn with_keys(keys: Option<DynTurnKeys>) -> Self {
+        let keys = keys.as_ref();
         let _ = logs();
         let server = MockServer::start().await;
         let root = format!("root-{}", RunId::new());
@@ -238,7 +257,7 @@ impl Rig {
             remote: false,
             bounds: adam_runtime::SessionBounds::default(),
         }]);
-        let mut builder = LlmAgent::builder(&root, model(&server, "root"), "m")
+        let mut builder = LlmAgent::builder(&root, model(&server, "root", keys), "m")
             .stream_text(false)
             .session_agents([helper.clone()])
             .tool(Spawn {
@@ -249,7 +268,7 @@ impl Rig {
             builder = builder.dyn_tool(tool);
         }
         let agent = |name: &str, prefix: &str| {
-            LlmAgent::builder(name, model(&server, prefix), "m")
+            LlmAgent::builder(name, model(&server, prefix, keys), "m")
                 .stream_text(false)
                 .build()
         };
@@ -420,7 +439,7 @@ async fn every_model_call_of_the_run_carries_the_values_and_a_steer_replaces_the
     // The run keeps the values in its state, never in its context.
     let state = rig.state(root_run).await;
     let kept = state.prompt_statement.expect("kept");
-    assert_eq!((kept.statement(), kept.user()), (STATEMENT_B, None));
+    assert_eq!((kept.statement(), kept.user()), (Some(STATEMENT_B), None));
     let context = serde_json::to_string(&state.context).unwrap();
     assert!(!context.contains(STATEMENT_B), "{context}");
     // No body carries them.
@@ -458,7 +477,7 @@ async fn a_steer_without_values_keeps_them_and_a_malformed_one_is_refused() {
     for entry in [
         json!({"statement": forged}),
         json!({"statement": STATEMENT_B, "user": "not a jws"}),
-        json!({"user": USER_A}),
+        json!({"statement": null}),
     ] {
         let err = rig
             .backend
@@ -555,4 +574,165 @@ async fn without_the_activation_no_call_carries_either_header() {
         None
     );
     assert_no_value_logged();
+}
+
+// ---------------------------------------------------------------------------
+// The request signature
+// ---------------------------------------------------------------------------
+
+/// A statement whose attached payload names the prompt's `jti`; a device envelope whose header
+/// names its `nonce`. Shapes only.
+fn statement_with_jti(jti: &str) -> String {
+    format!(
+        "{}.{}.c3RhdGVtZW50LWo",
+        URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA"}"#),
+        URL_SAFE_NO_PAD.encode(format!(r#"{{"jti":"{jti}"}}"#))
+    )
+}
+
+fn device_envelope(nonce: &str) -> String {
+    format!(
+        "{}.{}.ZW52ZWxvcGUtZA",
+        URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"EdDSA","nonce":"{nonce}"}}"#)),
+        URL_SAFE_NO_PAD.encode(r#"{"typ":"prompt/v1"}"#)
+    )
+}
+
+/// The `Turn-Signature` of each call to `prefix`, verified over the request the mock received:
+/// its `X-Run-Id`, method, target and exact body, and `prompt_jti`. The signatures, in order.
+async fn signed_calls(
+    server: &MockServer,
+    prefix: &str,
+    set: &KeySet,
+    run: &str,
+    prompt_jti: &str,
+) -> Vec<String> {
+    let now = jiff::Timestamp::now().as_second();
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().starts_with(&format!("/{prefix}/")))
+        .map(|r| {
+            let text = |n: &str| r.headers.get(n).map(|v| v.to_str().unwrap().to_owned());
+            assert_eq!(text("x-run-id").as_deref(), Some(run), "{prefix}");
+            let jws = text("turn-signature").expect("every call is signed");
+            verify_request(
+                set,
+                &jws,
+                &ModelCall {
+                    run,
+                    method: r.method.as_str(),
+                    path: r.url.path(),
+                    body: &r.body,
+                    prompt_jti: Some(prompt_jti),
+                },
+                now,
+            )
+            .unwrap_or_else(|e| panic!("{prefix}: {e}"));
+            jws
+        })
+        .collect()
+}
+
+fn assert_no_signature_logged(signatures: &[String]) {
+    let text = String::from_utf8_lossy(&logs().lock().unwrap()).into_owned();
+    for jws in signatures {
+        let tail = jws.rsplit('.').next().unwrap();
+        assert!(!text.contains(tail), "a turn signature is in the logs");
+    }
+    assert!(!text.contains("PRIVATE KEY"));
+}
+
+/// The root's calls, the local subagent's and the session round's each carry a signature of that
+/// request, bound to the run and to the statement's `jti`.
+#[tokio::test]
+async fn every_model_call_of_the_run_is_signed() {
+    let keys = <dyn TurnKeys>::ephemeral().unwrap();
+    let set = keys.key_set().await.unwrap();
+    let rig = Rig::with_keys(Some(keys)).await;
+    let token = format!("token-{}", RunId::new());
+    let root_run = task_id_for(&rig.root, &token, None, "m-1");
+    let session = child_run_id(root_run, "c1");
+    script(
+        &rig.server,
+        "root",
+        vec![
+            calls("p1", "spawn", json!({})),
+            calls(
+                "c1",
+                "subagent_start",
+                json!({"agent": "helper", "description": "look", "prompt": "do the work",
+                       "keep_open": true}),
+            ),
+            calls(
+                "r1",
+                "subagent_read",
+                json!({"session": session.to_string(), "wait": true}),
+            ),
+            text("root done"),
+        ],
+    )
+    .await;
+    script(&rig.server, "child", vec![text("child done")]).await;
+    script(&rig.server, "helper", vec![text("helper done")]).await;
+
+    let who = signing(&token);
+    let entry = json!({"statement": statement_with_jti("jti-root-1"), "user": USER_A});
+    let task = rig
+        .backend
+        .submit(who.clone(), message("go", "m-1", Some(entry)), None, None)
+        .await
+        .unwrap();
+    let (stop, worker) = rig.worker();
+    rig.wait(&who, &task.id, TaskState::Completed).await;
+    stop.send(()).ok();
+    worker.await.ok();
+
+    let run = root_run.to_string();
+    let root = signed_calls(&rig.server, "root", &set, &run, "jti-root-1").await;
+    let child = signed_calls(&rig.server, "child", &set, &run, "jti-root-1").await;
+    let helper = signed_calls(&rig.server, "helper", &set, &run, "jti-root-1").await;
+    assert_eq!((root.len(), child.len(), helper.len()), (4, 1, 1));
+    let mut all: Vec<String> = root.into_iter().chain(child).chain(helper).collect();
+    assert_no_signature_logged(&all);
+    all.sort();
+    all.dedup();
+    assert_eq!(all.len(), 6, "each call has its own signature");
+}
+
+/// A device's envelope alone: every call carries it, no statement, and the signature binds the
+/// envelope's `nonce`.
+#[tokio::test]
+async fn a_device_envelope_alone_is_sent_and_its_nonce_is_signed() {
+    let keys = <dyn TurnKeys>::ephemeral().unwrap();
+    let set = keys.key_set().await.unwrap();
+    let rig = Rig::with_keys(Some(keys)).await;
+    script(&rig.server, "root", vec![text("done")]).await;
+    let token = format!("token-{}", RunId::new());
+    let who = signing(&token);
+    let envelope = device_envelope("bm9uY2UtZGV2aWNl");
+    let task = rig
+        .backend
+        .submit(
+            who.clone(),
+            message("go", "m-1", Some(json!({"user": envelope}))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let (stop, worker) = rig.worker();
+    rig.wait(&who, &task.id, TaskState::Completed).await;
+    stop.send(()).ok();
+    worker.await.ok();
+
+    assert_eq!(
+        heads(&rig.server, "root").await,
+        vec![(None, Some(envelope), Some(task.id.clone()))]
+    );
+    let signatures = signed_calls(&rig.server, "root", &set, &task.id, "bm9uY2UtZGV2aWNl").await;
+    assert_eq!(signatures.len(), 1);
+    assert_no_signature_logged(&signatures);
 }
