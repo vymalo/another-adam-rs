@@ -68,7 +68,7 @@ pub use schema::{
     MAX_MINUTES_LIMIT, MAX_OPEN_SESSIONS_LIMIT, MAX_PARALLEL_LIMIT, MAX_PROCESSES_LIMIT,
     MAX_REFERENCES, MAX_RETRY_ATTEMPTS, MAX_RETRY_BACKOFF, MAX_SESSION_ROUNDS_LIMIT,
     MAX_UPLOAD_BYTES_LIMIT, MAX_WORKING_SESSIONS_LIMIT, McpConfig, McpServer, McpSettings, McpWhen,
-    ModelRef, REFERENCE_BRANCH_MAX, REFERENCE_DESCRIPTION_MAX, REFERENCE_URL_MAX,
+    ModelRef, PluginRef, REFERENCE_BRANCH_MAX, REFERENCE_DESCRIPTION_MAX, REFERENCE_URL_MAX,
     REFERENCES_FILE_MAX, RETRY_CLASS_NAMES, ReferenceDef, ReferencesRead, RemoteKind, RetryDef,
     ScheduleFrontmatter, Segment, SkillFrontmatter, SkillSelection, ToolList, ToolsLoading,
     check_references, group_name_fits, is_agent_name, is_env_name, is_reference_name,

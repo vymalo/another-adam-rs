@@ -392,6 +392,7 @@ impl BoundDef {
                 preloaded: node.preloaded.clone(),
                 when: node.when.clone(),
                 tools_loading: node.tools_loading,
+                plugins: node.plugins.iter().map(|(name, _)| name.clone()).collect(),
                 retry: node
                     .retry
                     .iter()
@@ -897,6 +898,15 @@ impl BoundDef {
         for (tool, _, policy) in &node.retry {
             builder = builder.tool_retry(tool.clone(), *policy);
         }
+        if !node.plugins.is_empty() {
+            let hooks = node
+                .plugins
+                .iter()
+                .fold(adam_plugin::HookSet::new(), |hooks, (_, plugin)| {
+                    hooks.with(Arc::clone(plugin))
+                });
+            builder = builder.hooks(hooks);
+        }
         if let Some(step_io) = &self.step_io {
             builder = builder.step_io(step_io.clone());
         }
@@ -984,6 +994,9 @@ pub struct AgentInfo {
     /// Each is one of [`tools`](Self::tools). Part of the info because an agent that retries a
     /// tool differently behaves differently.
     pub retry: Vec<(String, adam_agent_fs::RetryDef)>,
+    /// The plugins the agent runs, by registered name, in order: its parent's first (ADR 0050,
+    /// slice H6).
+    pub plugins: Vec<String>,
     /// The loop's limits, with [`max_output_tokens`](Limits::max_output_tokens) resolved for the
     /// agent's model (ADR 0064): the folder's value, its preset's, the profile's, the fallback,
     /// then clamped to the model's limit and window.

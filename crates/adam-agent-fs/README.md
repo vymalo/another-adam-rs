@@ -225,3 +225,5 @@ and `factor`, `retry_duration`, `MAX_RETRY_ATTEMPTS` (20), `MAX_RETRY_BACKOFF` (
   frontmatter.
 
 New in slice 4 ([ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)): `limits.max_open_sessions` (1 to `MAX_OPEN_SESSIONS_LIMIT` = 100), `max_working_sessions` (1 to `MAX_WORKING_SESSIONS_LIMIT` = 32, at most the open one when both are given) and `max_session_rounds` (`MAX_SESSION_ROUNDS_LIMIT` = 2 to 200), with camelCase aliases: errors outside the range, a warning on a subagent (the keys are the root's). They only lower the deployment's `SESSION_*`. **Breaking:** three new fields of `Limits`, so struct literals stop compiling.
+
+`plugins:` (ADR 0050, slice H6a): `AgentFrontmatter::plugins`, a list of `PluginRef` (a bare name, or `{name, options}` of scalars). The loader checks the shape: a name that is not an agent name, a name twice and an option that looks like a secret (a secret-sounding key with a literal value, or a `Bearer`/`sk-`/`ghp_` value) are errors; `${VAR}` is not a secret. Left out of the JSON and the digest when empty. Test: `plugins_are_read_bare_or_with_options_and_a_secret_option_is_refused`.

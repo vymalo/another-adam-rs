@@ -304,6 +304,8 @@ dependencies = [
  "adam-mcp",
  "adam-mcp-testkit",
  "adam-model",
+ "adam-plugin",
+ "adam-plugin-testkit",
  "adam-runtime",
  "adam-store-mongodb",
  "adam-store-postgres",

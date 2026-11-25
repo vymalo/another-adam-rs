@@ -99,6 +99,7 @@ pub(crate) fn parse_agent_file(
     check_keys(sink, &split, &fm);
     check_values(sink, &split, &fm, kind);
     check_retry(sink, &split, &fm);
+    check_plugins(sink, &split, &fm);
 
     if kind != FileKind::Sub
         && fm
@@ -301,6 +302,76 @@ fn invalid_name_message(name: &str, using: &str) -> String {
         "`name: {name}` is not a valid agent name (`a-z`, `0-9`, `-`, `_`; at most 64 characters, \
          starting with a letter or digit){tail}"
     )
+}
+
+/// `plugins:` (ADR 0050, slice H6): each entry names a compiled plugin and may carry scalar
+/// options. Only the shape is checked here; whether the deployment registered the name is for
+/// binding. An option that looks like a secret is refused: secrets are the deployment's.
+fn check_plugins(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
+    if fm.plugins.is_empty() {
+        return;
+    }
+    let line = key_line(split, "plugins");
+    if fm.a2a.is_some() {
+        sink.warn(
+            line,
+            "`plugins` is ignored on a remote subagent: its loop is the remote agent's",
+        );
+        return;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for plugin in &fm.plugins {
+        let name = plugin.name();
+        if !is_agent_name(name) {
+            sink.error(
+                line,
+                format!(
+                    "`plugins` entry `{name}` is not a plugin name (`a-z`, `0-9`, `-`, `_`; at most 64 characters)"
+                ),
+            );
+        }
+        if !seen.insert(name.to_owned()) {
+            sink.error(line, format!("`plugins` names `{name}` twice"));
+        }
+        for (key, value) in plugin.options() {
+            if looks_secret(&key, &value) {
+                sink.error(
+                    line,
+                    format!(
+                        "`plugins` entry `{name}`: option `{key}` looks like a secret; \
+                         secrets are not written in an agent file"
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// Whether an option value is a literal credential: a secret-sounding key with a value that is
+/// not a `${VAR}` reference, or a value that carries a credential scheme or a well-known prefix.
+fn looks_secret(key: &str, value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() || v.contains("${") {
+        return false;
+    }
+    let k = key.to_ascii_lowercase();
+    let secretish = [
+        "authorization",
+        "token",
+        "secret",
+        "password",
+        "api-key",
+        "api_key",
+        "apikey",
+        "credential",
+    ]
+    .iter()
+    .any(|s| k.contains(s));
+    let lower = v.to_ascii_lowercase();
+    secretish
+        || ["bearer ", "basic ", "sk-", "ghp_", "github_pat_", "xox"]
+            .iter()
+            .any(|p| lower.starts_with(p))
 }
 
 /// `retry:`, the retry policy per tool (ADR 0061, decision 6): the shape and the bounds. Whether a
