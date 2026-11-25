@@ -71,20 +71,19 @@ pub const MAX_SESSION_ROUNDS: u32 = 20;
 /// most recently updated first.
 const CLOSED_LISTED: usize = 16;
 
-/// The most runs [`RuntimeTaskBackend::context_workspace`] reads while it looks for the latest task
-/// of a parent context, and the number of runs a context can hold before that search gives up.
+/// The most runs a person's session start reads of its parent context while it looks for the latest
+/// task of it, and the number of runs a context can hold before that search gives up.
 ///
 /// A context holds one run per task and per subagent child run registered under the root's own agent
-/// name, and it only grows, so a bound is needed: the scan reads [`WORKSPACE_PAGE`] runs at a time
-/// and stops here. A context with **more than this many runs of the agent, none of them a task in
-/// the first `256` by `updated_at`**, finds none: the session's rounds answer in words, as they do
-/// in a context nobody sent a task to, and nothing is an error. That is the documented limit, not a
-/// silent `None` — a person's context that long is one whose newest run of a task is older than 256
-/// later updates of the same context.
+/// name, and it only grows, so a bound is needed: the scan reads pages of 64 runs and stops here. A
+/// context with **more than this many runs of the agent, none of them a task among the newest ones**,
+/// finds none: the session's rounds answer in words, as they do in a context nobody sent a task to,
+/// and nothing is an error. That is the documented limit, not a silent `None` — a person's context
+/// that long is one whose newest run of a task is older than this many later updates of it.
 pub const MAX_WORKSPACE_SCAN: usize = 256;
 
 /// How many runs one page of that scan reads. Smaller than the bound, so the scan pages rather than
-/// reads a context's whole history in one query.
+/// reading a context's whole history in one query.
 const WORKSPACE_PAGE: usize = 64;
 
 /// The context key under which a request says its client **shows child sessions**: `true` when it

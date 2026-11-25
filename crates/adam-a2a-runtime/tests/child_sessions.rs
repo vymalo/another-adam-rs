@@ -19,7 +19,7 @@ use adam_a2a::{
     STEER_EXTENSION, TaskBackend, TaskQuery,
 };
 use adam_a2a_runtime::{ChildSessionAgent, ChildSessions, MAX_WORKSPACE_SCAN, RuntimeTaskBackend};
-use adam_core::{DynStore, MemoryStore, NewRun, RunId, RunStatus, Timestamp};
+use adam_core::{DynStore, MemoryStore, NewRun, RunId, RunStatus, RunUpdate, Timestamp};
 use adam_llm_agent::{LlmAgent, SessionAgent, SessionTools, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::{
     DynModel, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse, ToolCall,
@@ -533,10 +533,7 @@ async fn a_persons_session_reads_the_workspace_of_the_most_recently_created_task
         );
 
         // Two tasks in one context: the second by `created_at` is the task the person is in.
-        rig.parent_mock
-            .push_text("first")
-            .push_text("second")
-            .push_text("carry on");
+        rig.parent_mock.push_text("first").push_text("second");
         let first = rig
             .submit(&alice(), said("start", Some("ctx-ws")), None)
             .await
@@ -553,16 +550,28 @@ async fn a_persons_session_reads_the_workspace_of_the_most_recently_created_task
         let newer_run = RunId::from(Uuid::parse_str(&newer.id).expect("a task id is a run id"));
         rig.until(&alice(), &newer.id, TaskState::Completed).await;
 
-        // The older task is written again **after** the newer one was created — a follow-up, as a
-        // person sending a message to it — so it is now the most recently *updated* task of the
-        // context, and the newer task is still the one the person opened the session in.
-        let mut again = said("carry on", Some("ctx-ws"));
-        again.message_id = "m-first-again".into();
-        let carried = rig.submit(&alice(), again, Some(&first.id)).await.unwrap();
-        assert_eq!(carried.id, first.id, "a follow-up continues the task");
+        // The older task is written again **after** the newer one was created. A run is committed on
+        // every progress and does not stop being committed when it finishes (a subagent's report, a
+        // session event, the usage of a round), so the store can hold a context whose most recently
+        // *updated* run is not the task the person is in — which is exactly the order a listing by
+        // `updated_at` answers, and exactly what must not decide this.
+        clock_past(updated_at(&store, newer_run).await).await;
+        let older = store
+            .load_run(first_run)
+            .await
+            .expect("store")
+            .expect("the older task");
+        store
+            .commit_run(
+                first_run,
+                older.version,
+                RunUpdate::new(older.status, older.state),
+            )
+            .await
+            .expect("write the older task again");
         assert!(
-            updated_at(&store, first_run).await > created_at(&store, newer_run).await,
-            "the older task was updated after the newer one was created"
+            updated_at(&store, first_run).await > updated_at(&store, newer_run).await,
+            "the older task is the most recently updated run of the context"
         );
 
         // A person starts a session there: its round names the most recently created task.
