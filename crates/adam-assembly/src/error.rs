@@ -261,6 +261,23 @@ pub enum Error {
         /// Every registered tool, in registration order.
         available: Vec<String>,
     },
+    /// `plugins:` names a plugin the deployment did not register (ADR 0050, slice H6): the agent
+    /// does not start.
+    #[error(
+        "{origin}: `plugins` names `{plugin}`, which the deployment did not register{}; registered: {}",
+        hint(.suggestion.as_deref()),
+        list(.available)
+    )]
+    UnknownPlugin {
+        /// The agent and file that name it.
+        origin: Origin,
+        /// The name as written.
+        plugin: String,
+        /// The closest registered name, when one is close.
+        suggestion: Option<String>,
+        /// Every registered plugin.
+        available: Vec<String>,
+    },
     /// `retry:` names a tool the agent does not have (ADR 0061).
     #[error(
         "{origin}: `retry` names `{tool}`, which is not one of the agent's tools{}; its tools: {}",
@@ -905,6 +922,12 @@ mod tests {
                 origin: o.clone(),
                 tool: "web_search".into(),
                 reason: "it has no `attempts`".into(),
+            },
+            Error::UnknownPlugin {
+                origin: o.clone(),
+                plugin: "audt".into(),
+                suggestion: Some("audit".into()),
+                available: vec!["audit".into()],
             },
             Error::Template {
                 origin: o.clone(),

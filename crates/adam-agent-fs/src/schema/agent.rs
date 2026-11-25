@@ -438,6 +438,46 @@ impl ToolsLoading {
     }
 }
 
+/// One entry of `plugins:` (ADR 0050, slice H6): the name of a compiled plugin the deployment
+/// registered, bare or with `options`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum PluginRef {
+    /// `- audit`
+    Name(String),
+    /// `- name: audit` with `options:` of scalars, read as text.
+    With {
+        /// The plugin's registered name.
+        name: String,
+        /// Its options. A value that looks like a secret is refused by the loader.
+        #[serde(
+            default,
+            deserialize_with = "scalar_map",
+            skip_serializing_if = "BTreeMap::is_empty"
+        )]
+        options: BTreeMap<String, String>,
+    },
+}
+
+impl PluginRef {
+    /// The plugin's registered name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Name(name) | Self::With { name, .. } => name,
+        }
+    }
+
+    /// The plugin's options; none for a bare name.
+    #[must_use]
+    pub fn options(&self) -> BTreeMap<String, String> {
+        match self {
+            Self::Name(_) => BTreeMap::new(),
+            Self::With { options, .. } => options.clone(),
+        }
+    }
+}
+
 /// The YAML frontmatter of an agent or subagent file.
 ///
 /// Everything is optional at this level; which keys are required depends on the role of the
@@ -503,6 +543,11 @@ pub struct AgentFrontmatter {
     /// of the digest) when there is none.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub retry: BTreeMap<String, RetryDef>,
+    /// The compiled plugins the agent runs, by the name the deployment registered them under; its
+    /// subagents inherit them (ADR 0050, slice H6). Left out of the JSON (and so of the digest)
+    /// when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<PluginRef>,
     /// The A2A card (root agent only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub card: Option<Card>,
