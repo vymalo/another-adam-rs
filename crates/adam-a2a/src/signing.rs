@@ -37,12 +37,14 @@
 //! ([`canonical_payload`]); *unverified:* byte-for-byte agreement with other SDKs' canonical
 //! payloads, which no published test vector in the specification confirms.
 //!
-//! The canonicalization is RFC 8785: object members sorted by their UTF-16 code units, no
-//! insignificant whitespace, strings escaped minimally, numbers as ECMAScript prints them.
+//! The canonicalization is RFC 8785, [`adam_core::jcs::canonicalize`] (re-exported here as
+//! [`canonicalize`]): object members sorted by their UTF-16 code units, no insignificant
+//! whitespace, strings escaped minimally, numbers as ECMAScript prints them.
 
 use std::sync::Arc;
 
 use a2a::{AgentCard, AgentCardSignature};
+pub use adam_core::jcs::canonicalize;
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{
     ECDSA_P256_SHA256_FIXED, ECDSA_P256_SHA256_FIXED_SIGNING, ED25519, EcdsaKeyPair,
@@ -501,89 +503,6 @@ fn normalize(value: Value, context: &str) -> Value {
     }
 }
 
-/// RFC 8785 (JCS) of `value`.
-pub fn canonicalize(value: &Value) -> Vec<u8> {
-    let mut out = String::new();
-    write_value(value, &mut out);
-    out.into_bytes()
-}
-
-fn write_value(value: &Value, out: &mut String) {
-    match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => write_number(n, out),
-        Value::String(s) => write_string(s, out),
-        Value::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_value(item, out);
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            let mut members: Vec<(&String, &Value)> = map.iter().collect();
-            // RFC 8785 §3.2.3: sorted by the UTF-16 code units of the names.
-            members.sort_by(|(a, _), (b, _)| a.encode_utf16().cmp(b.encode_utf16()));
-            out.push('{');
-            for (i, (k, v)) in members.into_iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_string(k, out);
-                out.push(':');
-                write_value(v, out);
-            }
-            out.push('}');
-        }
-    }
-}
-
-/// RFC 8785 §3.2.2.2: only `"` and `\` and the control characters are escaped, the control
-/// characters with the short forms where JSON has them and `\u00xx` (lowercase) otherwise.
-fn write_string(s: &str, out: &mut String) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{9}' => out.push_str("\\t"),
-            '\u{a}' => out.push_str("\\n"),
-            '\u{c}' => out.push_str("\\f"),
-            '\u{d}' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
-
-/// RFC 8785 §3.2.2.3: numbers as ECMAScript's `Number::toString` prints them (via `ryu-js`).
-fn write_number(n: &serde_json::Number, out: &mut String) {
-    const EXACT: u64 = 1 << 53;
-    if let Some(i) = n.as_i64()
-        && i.unsigned_abs() <= EXACT
-    {
-        out.push_str(&i.to_string());
-    } else if let Some(u) = n.as_u64()
-        && u <= EXACT
-    {
-        out.push_str(&u.to_string());
-    } else if let Some(f) = n.as_f64() {
-        if f == 0.0 {
-            out.push('0'); // -0 prints as 0
-        } else {
-            out.push_str(ryu_js::Buffer::new().format_finite(f));
-        }
-    } else {
-        out.push_str(&n.to_string());
-    }
-}
-
 /// A fresh private key as a PKCS#8 PEM, for tests and examples: Ed25519 when `ed25519`, else
 /// ECDSA P-256. Nothing is protected by it.
 ///
@@ -655,40 +574,6 @@ mod tests {
             security_requirements: None,
             signatures: None,
         }
-    }
-
-    fn canon(v: &Value) -> String {
-        String::from_utf8(canonicalize(v)).unwrap()
-    }
-
-    /// The ordering rule of RFC 8785 §3.2.3 and number formatting of §3.2.2.3 (the expected
-    /// strings are what ECMAScript prints for these numbers).
-    #[test]
-    fn jcs_orders_members_by_utf16_and_prints_numbers_as_ecmascript_does() {
-        // §3.2.3: names sort by UTF-16 code units, so the emoji (a surrogate pair, 0xD83D first)
-        // sorts before U+FF5E, where a sort by code point would put it after.
-        let v: Value =
-            serde_json::from_str("{\"\u{ff5e}\":1,\"😀\":2,\"a\":3,\"\\r\":4,\"1\":5}").unwrap();
-        assert_eq!(
-            canon(&v),
-            "{\"\\r\":4,\"1\":5,\"a\":3,\"😀\":2,\"\u{ff5e}\":1}"
-        );
-        let v: Value = serde_json::from_str(
-            "[1e30, 4.5, 2e-3, 0.000001, 1e-7, 100, -0.0, 1.5e300, 9007199254740993]",
-        )
-        .unwrap();
-        assert_eq!(
-            canon(&v),
-            "[1e+30,4.5,0.002,0.000001,1e-7,100,0,1.5e+300,9007199254740992]"
-        );
-        assert_eq!(
-            canon(&json!("a\u{7f}\u{1}\"\\/\u{8}")),
-            "\"a\u{7f}\\u0001\\\"\\\\/\\b\""
-        );
-        assert_eq!(
-            canon(&json!({"b": [true, null, {"y": 1, "x": 2}], "a": "é"})),
-            "{\"a\":\"é\",\"b\":[true,null,{\"x\":2,\"y\":1}]}"
-        );
     }
 
     #[test]
@@ -907,5 +792,30 @@ mod tests {
             !debug.contains("PRIVATE") && debug.contains("ES256"),
             "{debug}"
         );
+    }
+
+    /// The turn signature of adam-core (ADR 0068, pure-Rust Ed25519) and aws-lc-rs, which signs the
+    /// card, agree: the same PKCS#8 key (v2, as aws-lc-rs writes it) gives the same public key and
+    /// the same signature bytes, and aws-lc-rs verifies adam-core's.
+    #[tokio::test]
+    async fn the_turn_keys_of_adam_core_sign_as_aws_lc_rs_does() {
+        use adam_core::turn::{Ed25519TurnKeys, TurnKeys as _};
+        use aws_lc_rs::signature::KeyPair as _;
+
+        let pem = generate_signing_key_pem(true);
+        let turn = Ed25519TurnKeys::from_pkcs8_pem(&pem.clone().into(), None, None).unwrap();
+
+        let der = match PrivateKeyDer::from_pem_slice(pem.as_bytes()).unwrap() {
+            PrivateKeyDer::Pkcs8(der) => der,
+            _ => unreachable!(),
+        };
+        let aws = Ed25519KeyPair::from_pkcs8(der.secret_pkcs8_der()).unwrap();
+        assert_eq!(aws.public_key().as_ref(), turn.public_key().to_bytes());
+        let input = b"header.payload";
+        let ours = turn.sign(turn.kid(), input).await.unwrap().to_bytes();
+        assert_eq!(aws.sign(input).as_ref(), ours.as_slice());
+        UnparsedPublicKey::new(&ED25519, turn.public_key().to_bytes())
+            .verify(input, &ours)
+            .unwrap();
     }
 }

@@ -33,7 +33,7 @@ use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, DynStore, JournalEntry,
     NewPushConfig, NewRun, PushProgress, PushState, RunId, RunQuery, RunRecord, RunStatus,
-    RunUpdate, StoreError,
+    RunUpdate, StoreError, canonicalize,
 };
 use futures::future::join_all;
 use jiff::SignedDuration;
@@ -50,6 +50,7 @@ macro_rules! store_conformance {
     ($make:path) => {
         $crate::store_conformance!(@cases $make;
             create_and_load, timestamps_keep_millisecond_precision, state_roundtrip,
+            a_message_canonicalizes_as_it_was_written,
             nul_characters_are_stored_as_the_replacement_character,
             a_write_does_not_echo_the_state,
             create_duplicate_id, load_missing,
@@ -206,6 +207,7 @@ macro_rules! body_conformance {
             body_a_non_contiguous_index_is_refused,
             body_an_unknown_generation_is_empty,
             body_a_nul_is_stored_as_the_replacement_character,
+            body_a_row_canonicalizes_as_it_was_written,
         );
     };
     (@cases $make:path; $($case:ident),* $(,)?) => {
@@ -1315,6 +1317,79 @@ pub mod cases {
         assert_eq!(head["agent"]["text"], json!("a\u{FFFD}b"));
         let rows = store.body_list(run.id, generation).await.unwrap();
         assert_eq!(rows[0].message, json!("x\u{FFFD}y"));
+    }
+
+    /// A message shaped to trip a store's number and key handling: integers on both sides of 2^53,
+    /// the extremes of `i64`, floats that print in exponent form, `-0`, an integer-valued float,
+    /// and names that sort differently by UTF-16 than by code point, that are not ASCII, that are
+    /// not in Unicode normal form, or that a document store treats specially. (A `u64` above
+    /// `i64::MAX` is not here: MongoDB refuses it at the write.)
+    fn signed_message() -> Value {
+        json!({
+            "role": "tool",
+            "content": [{"type": "text", "text": "Bonjour, ça va ? 你好 👋"}],
+            "numbers": [0, -1, 9007199254740991_i64, 9007199254740993_i64, i64::MIN, i64::MAX,
+                        0.1, 1e-7, 1e21, 1.5e300, 5e-324, -0.0, 1.0, 100.0, 12345.678, -2.5e-8],
+            "keys": {"\u{ff5e}": 1, "😀": 2, "é": 3, "e\u{301}": 4, "日本": 5, "": 6, "a": 7,
+                     "$ref": 8, "a.b": 9, "%24": 10},
+            "extra_content": {"adam": {"turn_signature": "header..signature"}},
+        })
+    }
+
+    /// What a turn signature covers is the RFC 8785 form of the message (ADR 0068): every store
+    /// gives back a state and a journal payload that canonicalize to the bytes that were written.
+    pub async fn a_message_canonicalizes_as_it_was_written(store: DynStore) {
+        let message = signed_message();
+        let want = canonicalize(&message);
+        let state = json!({"messages": [message.clone()]});
+        let run = store
+            .create_run(NewRun::new(agent(), state.clone()))
+            .await
+            .unwrap();
+        let loaded = store.load_run(run.id).await.unwrap().unwrap().state;
+        assert_eq!(canonicalize(&loaded["messages"][0]), want, "the state");
+        store
+            .commit_run(run.id, 1, RunUpdate::new(RunStatus::Runnable, state))
+            .await
+            .unwrap();
+        let loaded = store.load_run(run.id).await.unwrap().unwrap().state;
+        assert_eq!(canonicalize(&loaded["messages"][0]), want, "a commit");
+        store
+            .journal_put(run.id, JournalEntry::ok(0, "step-0", message))
+            .await
+            .unwrap();
+        let entry = store.journal_get(run.id, 0).await.unwrap().unwrap();
+        assert_eq!(canonicalize(&entry.payload), want, "a journal payload");
+    }
+
+    /// The same for a body row (ADR 0068: a turn's signature rides in its row).
+    pub async fn body_a_row_canonicalizes_as_it_was_written(store: DynStore) {
+        keeps_bodies(&store);
+        let message = signed_message();
+        let run = store
+            .create_run(NewRun::new(agent(), json!({})))
+            .await
+            .unwrap();
+        let generation = Uuid::new_v4();
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                    .head(head_doc(1))
+                    .body(BodyWrite {
+                        generation: Some(generation),
+                        writer: Uuid::new_v4(),
+                        rows: vec![BodyRow {
+                            idx: 0,
+                            message: message.clone(),
+                        }],
+                    }),
+            )
+            .await
+            .unwrap();
+        let rows = store.body_list(run.id, generation).await.unwrap();
+        assert_eq!(canonicalize(&rows[0].message), canonicalize(&message));
     }
 
     pub async fn create_and_load(store: DynStore) {
