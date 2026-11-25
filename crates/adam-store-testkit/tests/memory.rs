@@ -16,3 +16,4 @@ adam_store_testkit::worker_leases_conformance!(make_store);
 adam_store_testkit::transcript_measurement!(make_store);
 
 adam_store_testkit::headless_measurement!(make_store);
+adam_store_testkit::activity_conformance!(make_store);

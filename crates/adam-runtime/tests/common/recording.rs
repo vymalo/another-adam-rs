@@ -274,6 +274,14 @@ impl Store for RecordingStore {
         self.inner.count_runs(query).await
     }
 
+    async fn activity(
+        &self,
+        agents: &[String],
+        now: adam_core::Timestamp,
+    ) -> StoreResult<adam_core::StoreActivity> {
+        self.inner.activity(agents, now).await
+    }
+
     async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord> {
         self.inner.push_put(new).await
     }

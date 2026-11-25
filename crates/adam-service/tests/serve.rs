@@ -171,6 +171,29 @@ async fn status_of(addr: SocketAddr, path: &str) -> Option<u16> {
     response.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// One raw HTTP/1.1 request with an optional bearer: the status and the body.
+async fn get_with(addr: SocketAddr, path: &str, token: Option<&str>) -> Option<(u16, String)> {
+    let mut stream = TcpStream::connect(addr).await.ok()?;
+    let auth = token
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .ok()?;
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut response))
+        .await
+        .ok()?
+        .ok()?;
+    let status = response.split_whitespace().nth(1)?.parse().ok()?;
+    let body = response.split("\r\n\r\n").nth(1)?.to_owned();
+    Some((status, body))
+}
+
 /// Wait until `path` answers 200 at `addr`.
 async fn until_ok(
     addr: SocketAddr,
@@ -402,6 +425,40 @@ async fn serve_runs_the_whole_agent_on_a_sqlite_file() {
         Some(format!("{name} says: over sqlite").as_str()),
         "the worker over SQLite completed the run"
     );
+    running.finish().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `GET /internal/activity` needs the bearer, and on an idle store answers `busy: 0` with no
+/// `nextDueAt` and nothing of any run.
+#[tokio::test]
+async fn the_activity_route_needs_the_bearer_and_reports_an_idle_store() {
+    let name = unique("serve-activity");
+    let dir = std::env::temp_dir().join(format!("adam-serve-activity-{}", RunId::new().0.simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("sqlite://{}", dir.join("adam.sqlite").display());
+    let (listener, port) = listen().await;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let cfg = config(&url, "all", port);
+    let running = Running::start(listener, cfg.clone(), agents(&name, &cfg));
+    until_ok(addr, "/healthz", &running.handle).await;
+    assert_eq!(
+        get_with(addr, "/internal/activity", None)
+            .await
+            .map(|r| r.0),
+        Some(401)
+    );
+    assert_eq!(
+        get_with(addr, "/internal/activity", Some("wrong"))
+            .await
+            .map(|r| r.0),
+        Some(401)
+    );
+    let (status, body) = get_with(addr, "/internal/activity", Some("serve-test-token"))
+        .await
+        .expect("an answer");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body.trim(), r#"{"busy":0}"#);
     running.finish().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

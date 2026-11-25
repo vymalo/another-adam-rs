@@ -20,8 +20,8 @@ pub use store::memory::MemoryStore;
 pub use store::{
     BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, DynStore, JournalEntry, Lease,
     NewPushConfig, NewRun, PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery,
-    RunRecord, RunStatus, RunUpdate, Store, StoreError, StoreResult, claimed, head_body,
-    set_head_body, storable, storable_owned, storable_text,
+    RunRecord, RunStatus, RunUpdate, Store, StoreActivity, StoreError, StoreResult, claimed,
+    head_body, set_head_body, storable, storable_owned, storable_text,
 };
 pub use time::Timestamp;
 pub use turn::{DynTurnKeys, KeySet, TurnKeys};

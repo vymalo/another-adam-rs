@@ -32,3 +32,4 @@ adam_store_testkit::body_conformance!(make_store);
 adam_store_testkit::transcript_measurement!(make_store);
 
 adam_store_testkit::headless_measurement!(make_store);
+adam_store_testkit::activity_conformance!(make_store);

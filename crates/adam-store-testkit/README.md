@@ -52,6 +52,10 @@ after a commit that names a different one), a shared
   not given this suite. The purge and compaction cases take the `BLOB_SUITE` lock because
   `purge_finished` sweeps blobs in the same call. `make` is the same
   `async fn() -> Option<DynStore>` as above.
+* `activity_conformance!(make)` generates one `#[tokio::test]` per `Store::activity` case (2 cases: a claimed run
+  makes `busy` 1, a parked schedule due in an hour is `next_due_at`, an expired or released lease is not busy and
+  another agent's runs are not counted; with no open run the answer is zero and no time). Give it only to a store
+  that implements `activity`.
 * `worker_leases_conformance!(make)` generates one `#[tokio::test]` per worker-lease case (3 cases:
   every run lease a worker holds goes, so its runs are claimable at once — by another worker's unpinned
   claim too — and the owner is not cleared, so a pinned run still comes back only to the same

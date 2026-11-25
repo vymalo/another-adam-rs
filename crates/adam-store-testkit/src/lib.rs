@@ -265,6 +265,39 @@ macro_rules! worker_leases_conformance {
     };
 }
 
+/// Generate one `#[tokio::test]` per activity conformance case. `$make` is a path to an
+/// `async fn() -> Option<DynStore>`, like [`store_conformance!`].
+///
+/// The cases prove [`Store::activity`](adam_core::Store::activity): a run a worker holds a live
+/// lease on counts as busy, the earliest due time of a run nobody holds is reported (a parked
+/// schedule included), and a store with neither answers zero and no time. The method is defaulted
+/// to an error, so give this suite only to a store that implements it.
+#[macro_export]
+macro_rules! activity_conformance {
+    ($make:path) => {
+        $crate::activity_conformance!(@cases $make;
+            activity_counts_a_claimed_run_and_reports_the_next_schedule,
+            activity_is_empty_without_open_runs,
+        );
+    };
+    (@cases $make:path; $($case:ident),* $(,)?) => {
+        $(
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn $case() {
+                let Some(store) = $make().await else {
+                    $crate::skipped(&format!(
+                        "{}: store not configured",
+                        stringify!($case)
+                    ));
+                    return;
+                };
+                store.migrate().await.expect("migrate");
+                $crate::cases::$case(store).await;
+            }
+        )*
+    };
+}
+
 /// Generate the `measure_the_headless_transcript` test: run
 /// [`counting::measure_headless_transcript`] through `$make`, print its line, and assert that the
 /// workload ran.
@@ -2458,6 +2491,60 @@ pub mod cases {
         assert_eq!(
             store.lease_until(run.id).await.unwrap(),
             Some(t2 + jiff::SignedDuration::from_secs(10))
+        );
+    }
+
+    /// A run a worker has claimed makes `busy` 1; a parked schedule due in an hour is the next due
+    /// time; a finished run counts for nothing.
+    pub async fn activity_counts_a_claimed_run_and_reports_the_next_schedule(store: DynStore) {
+        let agent = agent();
+        let agents = vec![agent.clone()];
+        let t = now();
+        let hour = jiff::SignedDuration::from_secs(3600);
+        let mut parked = NewRun::new(&agent, json!({ "n": 0 }));
+        parked.status = RunStatus::Parked;
+        parked.wake_at = Some(truncate_ms(t + hour));
+        store.create_run(parked).await.unwrap();
+        let idle = store.activity(&agents, t).await.unwrap();
+        assert_eq!(idle.busy, 0, "a parked schedule is not work in progress");
+        assert_eq!(idle.next_due_at, Some(truncate_ms(t + hour)));
+
+        let run = store
+            .create_run(NewRun::new(&agent, json!({ "n": 1 })))
+            .await
+            .unwrap();
+        let ttl = Duration::from_secs(30);
+        let claim_at = t + jiff::SignedDuration::from_secs(1);
+        let claimed = claim_ids(&store, &agent, "w1", claim_at, ttl, 10).await;
+        assert_eq!(claimed, vec![run.id]);
+        let busy = store.activity(&agents, claim_at).await.unwrap();
+        assert_eq!(busy.busy, 1, "the claimed run is busy");
+        assert_eq!(busy.next_due_at, Some(truncate_ms(t + hour)));
+
+        let after = claim_at + jiff::SignedDuration::from_secs(31);
+        assert_eq!(
+            store.activity(&agents, after).await.unwrap().busy,
+            0,
+            "an expired lease is not busy"
+        );
+        store.release_lease(run.id, "w1").await.unwrap();
+        assert_eq!(store.activity(&agents, claim_at).await.unwrap().busy, 0);
+        assert_eq!(
+            store
+                .activity(&["another-agent".into()], claim_at)
+                .await
+                .unwrap(),
+            adam_core::StoreActivity::default(),
+            "another agent's runs are not counted"
+        );
+    }
+
+    /// With no open run, `busy` is 0 and there is no next due time.
+    pub async fn activity_is_empty_without_open_runs(store: DynStore) {
+        let agents = vec![agent()];
+        assert_eq!(
+            store.activity(&agents, now()).await.unwrap(),
+            adam_core::StoreActivity::default()
         );
     }
 

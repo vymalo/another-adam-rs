@@ -158,6 +158,14 @@ impl Store for LostRows {
         self.inner.count_runs(query).await
     }
 
+    async fn activity(
+        &self,
+        agents: &[String],
+        now: adam_core::Timestamp,
+    ) -> StoreResult<adam_core::StoreActivity> {
+        self.inner.activity(agents, now).await
+    }
+
     async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord> {
         self.inner.push_put(new).await
     }
@@ -361,6 +369,14 @@ impl Store for LostBlob {
 
     async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64> {
         self.inner.count_runs(query).await
+    }
+
+    async fn activity(
+        &self,
+        agents: &[String],
+        now: adam_core::Timestamp,
+    ) -> StoreResult<adam_core::StoreActivity> {
+        self.inner.activity(agents, now).await
     }
 
     async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord> {

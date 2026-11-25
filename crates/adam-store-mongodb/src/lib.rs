@@ -77,7 +77,7 @@ use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig,
     NewRun, PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
-    RunUpdate, Store, StoreError, StoreResult,
+    RunUpdate, Store, StoreActivity, StoreError, StoreResult,
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
@@ -1493,6 +1493,34 @@ impl Store for MongoStore {
             .await
             .map_err(classify)?;
         docs.iter().map(served_from_doc).collect()
+    }
+
+    async fn activity(&self, agents: &[String], now: Timestamp) -> StoreResult<StoreActivity> {
+        let at = date(now);
+        let busy = self
+            .runs
+            .count_documents(doc! {
+                "agent": { "$in": agents },
+                "sched_at": { "$ne": Bson::Null },
+                "lease_until": { "$gt": at.clone() },
+            })
+            .await
+            .map_err(classify)?;
+        let next = self
+            .runs
+            .find_one(doc! {
+                "agent": { "$in": agents },
+                "sched_at": { "$ne": Bson::Null },
+                "$or": [ { "lease_until": Bson::Null }, { "lease_until": { "$lte": at } } ],
+            })
+            .sort(doc! { "sched_at": 1 })
+            .projection(doc! { "sched_at": 1 })
+            .await
+            .map_err(classify)?;
+        Ok(StoreActivity {
+            busy,
+            next_due_at: next.map_or(Ok(None), |d| get_date(&d, "sched_at"))?,
+        })
     }
 
     async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64> {

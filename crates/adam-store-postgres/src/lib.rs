@@ -57,7 +57,7 @@ use adam_core::time::Timestamp;
 use adam_core::{
     BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig,
     NewRun, PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
-    RunUpdate, Store, StoreError, StoreResult,
+    RunUpdate, Store, StoreActivity, StoreError, StoreResult,
 };
 use adam_error::ErrorClass;
 use adam_postgres::{PgConfig, classify, classify_pool};
@@ -533,6 +533,7 @@ struct Sql {
     renew_lease: Arc<str>,
     release_lease: Arc<str>,
     lease_until: Arc<str>,
+    activity: Arc<str>,
     purge: Arc<str>,
     list_prefix: Arc<str>,
     list_exact: Arc<str>,
@@ -851,6 +852,12 @@ impl Sql {
                   WHERE id = $1 AND lease_owner = $2"
             )),
             lease_until: Arc::from(format!("SELECT lease_until FROM {runs} WHERE id = $1")),
+            activity: Arc::from(format!(
+                "SELECT count(*) FILTER (WHERE lease_until > $1) AS busy,
+                        min(sched_at) FILTER (WHERE lease_until IS NULL OR lease_until <= $1)
+                            AS next_due_at
+                   FROM {runs} WHERE sched_at IS NOT NULL AND agent = ANY($2)"
+            )),
             // Batched so a large backlog never becomes one huge transaction.
             // SKIP LOCKED lets concurrent sweepers share the work.
             purge: Arc::from(format!(
@@ -1590,6 +1597,25 @@ impl Store for PgStore {
             .map(|row| opt_time(row, "lease_until"))
             .transpose()
             .map(Option::flatten)
+    }
+
+    async fn activity(&self, agents: &[String], now: Timestamp) -> StoreResult<StoreActivity> {
+        let at = sql_time(truncate_ms(now));
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client
+            .prepare_cached(&self.sql.activity)
+            .await
+            .map_err(classify)?;
+        let row = client
+            .query_one(&stmt, &[&at, &agents])
+            .await
+            .map_err(classify)?;
+        let busy: i64 = decode_at(&row, 0)?;
+        Ok(StoreActivity {
+            busy: u64::try_from(busy)
+                .map_err(|_| StoreError::Corrupt(format!("negative count {busy}")))?,
+            next_due_at: opt_time(&row, "next_due_at")?,
+        })
     }
 
     async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
