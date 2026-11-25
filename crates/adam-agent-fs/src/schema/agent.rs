@@ -135,8 +135,11 @@ pub const MAX_WORKING_SESSIONS_LIMIT: u32 = 32;
 /// The smallest and largest `limits.max_session_rounds`.
 pub const MAX_SESSION_ROUNDS_LIMIT: (u32, u32) = (2, 200);
 
-/// The largest `limits.max_inline_upload_bytes`: 4 GiB, the orchestrator's own ceiling.
-pub const MAX_INLINE_UPLOAD_BYTES_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+/// The largest `limits.max_inline_upload_bytes`: 256 MiB, the orchestrator's ceiling for one file,
+/// `artifacts.maxFileBytes` (`sys:docs/api/config.md`, verified 2026-11-25). The same number as
+/// `adam_a2a::UPLOADS_INLINE_MAX_BYTES_CEILING`, which this crate does not depend on and so cannot
+/// name.
+pub const MAX_INLINE_UPLOAD_BYTES_LIMIT: u64 = 268_435_456;
 
 /// The most `retry.<tool>.attempts` may say (ADR 0061, decision 6).
 pub const MAX_RETRY_ATTEMPTS: u32 = 20;
@@ -341,7 +344,7 @@ pub struct Limits {
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxSessionRounds")]
     pub max_session_rounds: Option<u32>,
     /// The largest file the agent sends inline (`uploads/v1`; a larger one asks for a slot), in
-    /// bytes, 1 to 4 GiB. Root agent only; the card says nothing of it; it wins over `UPLOADS_INLINE_MAX_BYTES`.
+    /// bytes, 1 to 256 MiB. Root agent only; the card says nothing of it; it wins over `UPLOADS_INLINE_MAX_BYTES`.
     #[serde(
         skip_serializing_if = "Option::is_none",
         alias = "maxInlineUploadBytes"

@@ -1941,12 +1941,14 @@ check "refused: the cap in extraEnv beside the value" \
 # uploads.inlineMaxBytes (UPLOADS_INLINE_MAX_BYTES): nothing for the default, one variable per pod that serves A2A when set.
 helm template coder "$chart" --namespace coder-ns > "$out"
 check "the default renders no UPLOADS_INLINE_MAX_BYTES (the binary's own default is 10 MiB)" lacks 'name: UPLOADS_INLINE_MAX_BYTES'
-helm template coder "$chart" --namespace coder-ns --set uploads.inlineMaxBytes=1073741824 > "$out"
+helm template coder "$chart" --namespace coder-ns --set uploads.inlineMaxBytes=1048576 > "$out"
 check "uploads.inlineMaxBytes reaches the coder as UPLOADS_INLINE_MAX_BYTES" count 'name: UPLOADS_INLINE_MAX_BYTES' 1
-check "... as plain digits, not a float" has 'value: "1073741824"'
+check "... as plain digits, not a float" has 'value: "1048576"'
 helm template coder "$chart" --namespace coder-ns --set topology=split --set-string uploads.inlineMaxBytes=2048 > "$out"
 check "with topology=split the front and the worker both get it" count 'name: UPLOADS_INLINE_MAX_BYTES' 2
-for bad in 0 -5 ten 1.5 4294967297; do
+helm template coder "$chart" --namespace coder-ns --set uploads.inlineMaxBytes=268435456 > "$out"
+check "the ceiling itself (256 MiB) is accepted" has 'value: "268435456"'
+for bad in 0 -5 ten 1.5 268435457; do
   check "refused: uploads.inlineMaxBytes $bad" \
     fails helm template coder "$chart" --namespace coder-ns --set-string uploads.inlineMaxBytes=$bad
 done

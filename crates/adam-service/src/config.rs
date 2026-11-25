@@ -243,7 +243,7 @@ pub struct ServiceConfig {
     /// `DEFAULT_LOCALE`: the agent's default language, a BCP 47 tag; the card lists `locale/v1`
     /// with it when set (ADR 0069). `None`: the card lists nothing.
     pub default_locale: Option<adam_a2a::Locale>,
-    /// `UPLOADS_INLINE_MAX_BYTES`: the largest file the agent sends inline, 1 byte to 4 GiB; a larger
+    /// `UPLOADS_INLINE_MAX_BYTES`: the largest file the agent sends inline, 1 byte to 256 MiB; a larger
     /// one asks for an upload slot (`uploads/v1`; the card carries no params). `None`: the card says
     /// [`DEFAULT_UPLOADS_INLINE_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES). The agent folder's
     /// `limits.max_inline_upload_bytes` wins over it ([`Agents::uploads_inline_max_bytes`](crate::Agents)).
@@ -373,7 +373,7 @@ impl ServiceConfig {
                 Ok(n) if (1..=adam_a2a::UPLOADS_INLINE_MAX_BYTES_CEILING).contains(&n) => Some(n),
                 _ => {
                     problems.push(format!(
-                        "UPLOADS_INLINE_MAX_BYTES is invalid: a whole number of bytes from 1 to {} (4 GiB), got {raw:?}",
+                        "UPLOADS_INLINE_MAX_BYTES is invalid: a whole number of bytes from 1 to {} (256 MiB), got {raw:?}",
                         adam_a2a::UPLOADS_INLINE_MAX_BYTES_CEILING
                     ));
                     None
@@ -1868,7 +1868,13 @@ mod tests {
             parse(&vars).expect("valid").uploads_inline_max_bytes,
             Some(1_048_576)
         );
-        for bad in ["0", "-1", "ten", "1.5", "4294967297"] {
+        // The ceiling itself is a threshold; one byte past it is not.
+        vars.insert("UPLOADS_INLINE_MAX_BYTES", "268435456");
+        assert_eq!(
+            parse(&vars).expect("valid").uploads_inline_max_bytes,
+            Some(268_435_456)
+        );
+        for bad in ["0", "-1", "ten", "1.5", "268435457"] {
             let mut vars = full();
             vars.insert("UPLOADS_INLINE_MAX_BYTES", bad);
             assert!(

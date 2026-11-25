@@ -641,7 +641,7 @@ fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter, k
             sink.error(
                 key_line(split, "limits"),
                 format!(
-                    "`limits.max_inline_upload_bytes` is from 1 to {MAX_INLINE_UPLOAD_BYTES_LIMIT} (4 GiB); it is {bytes}"
+                    "`limits.max_inline_upload_bytes` is from 1 to {MAX_INLINE_UPLOAD_BYTES_LIMIT} (256 MiB); it is {bytes}"
                 ),
             );
         }

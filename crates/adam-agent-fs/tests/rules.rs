@@ -543,16 +543,16 @@ fn cases() -> Vec<Case> {
                 "---\nname: root\nlimits: { max_inline_upload_bytes: 0 }\n---\nHi.\n",
             )],
             Error,
-            "`limits.max_inline_upload_bytes` is from 1 to 4294967296",
+            "`limits.max_inline_upload_bytes` is from 1 to 268435456",
         ),
         (
-            "max_inline_upload_bytes of 5 GiB",
+            "max_inline_upload_bytes of 256 MiB + 1",
             vec![(
                 "agent/instructions.md",
-                "---\nname: root\nlimits: { max_inline_upload_bytes: 5368709120 }\n---\nHi.\n",
+                "---\nname: root\nlimits: { max_inline_upload_bytes: 268435457 }\n---\nHi.\n",
             )],
             Error,
-            "`limits.max_inline_upload_bytes` is from 1 to 4294967296",
+            "`limits.max_inline_upload_bytes` is from 1 to 268435456",
         ),
         (
             "more working sessions than open ones",

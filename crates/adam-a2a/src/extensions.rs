@@ -156,8 +156,11 @@ pub const PROMPT_STATEMENT_EXTENSION: &str =
 /// inline, is the agent's own and is never on the card.
 pub const UPLOADS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/uploads/v1";
 
-/// The most the inline threshold of `uploads/v1` may be: the orchestrator's own ceiling, 4 GiB.
-pub const UPLOADS_INLINE_MAX_BYTES_CEILING: u64 = 4 * 1024 * 1024 * 1024;
+/// The most the inline threshold of `uploads/v1` may be: the orchestrator's own ceiling for one
+/// file, `artifacts.maxFileBytes`, 256 MiB (`sys:docs/api/config.md`, verified 2026-11-25). Its
+/// 4 GiB `artifacts.maxPerJobBytes` is a job's total, not one file's; an inline threshold above
+/// 256 MiB would tell an agent to send inline a file the orchestrator can never keep.
+pub const UPLOADS_INLINE_MAX_BYTES_CEILING: u64 = 268_435_456;
 
 /// The largest file sent inline when no folder, variable or chart value names one: 10 MiB, the
 /// orchestrator's own `artifacts.maxFileBytes`, the size at which a file stops fitting a message.

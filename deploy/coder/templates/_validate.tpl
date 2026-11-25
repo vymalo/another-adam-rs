@@ -30,8 +30,8 @@ from service.yaml, which every render contains, so they always run.
 {{- fail "accessTiers.max is set and config.extraEnv sets MAX_ACCESS_TIER: set one (extraEnv would override the cap the chart renders)" -}}
 {{- end -}}
 {{- $uploads := include "coder.uploadsInlineMaxBytes" . -}}
-{{- if and $uploads (not (and (regexMatch "^[0-9]{1,10}$" $uploads) (ge (int64 $uploads) 1) (le (int64 $uploads) 4294967296))) -}}
-{{- fail (printf "uploads.inlineMaxBytes must be a whole number of bytes from 1 to 4294967296 (4 GiB), or empty for the default, got %q" $uploads) -}}
+{{- if and $uploads (not (and (regexMatch "^[0-9]{1,10}$" $uploads) (ge (int64 $uploads) 1) (le (int64 $uploads) 268435456))) -}}
+{{- fail (printf "uploads.inlineMaxBytes must be a whole number of bytes from 1 to 268435456 (256 MiB), or empty for the default, got %q" $uploads) -}}
 {{- end -}}
 {{- if and $uploads (hasKey .Values.config.extraEnv "UPLOADS_INLINE_MAX_BYTES") -}}
 {{- fail "uploads.inlineMaxBytes is set and config.extraEnv sets UPLOADS_INLINE_MAX_BYTES: set one (extraEnv would override the limit the chart renders)" -}}
