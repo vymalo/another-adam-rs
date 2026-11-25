@@ -112,7 +112,7 @@ in it that you would not give every holder of a token.
 
 With `A2A_CARD_SIGNING_KEY_FILE` the public and the extended card carry one JWS in `signatures` (RFC 7515 over the RFC 8785
 canonical card, *verified 2026-10-07*, specification §8.4): `alg` `ES256` (a P-256 key) or `EdDSA` (Ed25519), `typ: JOSE`,
-`kid` (the key's RFC 7638 thumbprint unless `A2A_CARD_SIGNING_KEY_ID`), `jku` only if `A2A_CARD_SIGNING_JKU`. The public key
+`kid` (the key's RFC 7638 thumbprint unless `A2A_CARD_SIGNING_KEY_ID`) (before this fix, binaries built with `serde_json/preserve_order` hashed the members in insertion order, so their default `kid` was not the RFC value and changes now; a client that pins the old default `kid` must pin the new one, or set `A2A_CARD_SIGNING_KEY_ID`; the signature itself is unaffected), `jku` only if `A2A_CARD_SIGNING_JKU`. The public key
 set is served at `GET /.well-known/jwks.json`. To verify: take the card as you received it (either JSON form parses to the
 same card), remove `signatures`, remove `null`s and empty arrays and objects except `capabilities`, `defaultInputModes`,
 `defaultOutputModes`, `skills`, `supportedInterfaces` and a skill's `tags`, remove an extension's `required: false`, leave
