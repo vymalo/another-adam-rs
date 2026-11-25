@@ -182,6 +182,13 @@ pub const MAX_PARK: Duration = Duration::from_secs(24 * 60 * 60);
 /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
 pub const MODEL_LOCKED_SLUG: &str = "model_locked";
 
+/// The slug a refusal of status `402` reads as, whatever the gateway's problem type called it: the
+/// person's usage limit is reached for the model the call named, so a run tries another model and
+/// parks until it is woken when none is left ([ADR 0067] decision 3, amended 2026-11-25).
+///
+/// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+pub const OVER_LIMIT_SLUG: &str = "over_limit";
+
 /// The headers of one call. Names are plain; values are secrets, never shown by `Debug`.
 #[derive(Default, Clone)]
 pub struct CredentialHeaders(Vec<(String, SecretString)>);
@@ -357,16 +364,17 @@ pub const RUN_HEADER: &str = "X-Run-Id";
 ///
 /// Its refusals park the run ([`parks`](ModelCredentials::parks)), by the problem type's slug:
 ///
-/// | Slug | Park |
+/// | Answer | Park |
 /// |---|---|
 /// | `unauthenticated`, `run_not_bound`, `lease_expired` | [`Park::OnTimer`]`(`[`FIRST_PARK`]`)` |
-/// | `over_limit` | [`Park::UntilWoken`] |
+/// | any `402` ([`OVER_LIMIT_SLUG`], `model_locked`, or no problem document) | [`Park::UntilWoken`] |
 /// | `rate_limited`, `unavailable` | [`Park::OnTimer`] of `Retry-After`, at least [`FIRST_PARK`] and at most [`MAX_PARK`] |
 /// | none ([`ProblemType::Absent`]), on a `401` or `403` | [`Park::OnTimer`]`(`[`FIRST_PARK`]`)`, as `unauthenticated` (an edge's own denial may carry no problem body, *unverified*) |
-/// | `model_locked`, any other slug, a `type` that cannot be read ([`ProblemType::Unreadable`]), none on any other status | [`Park::No`] |
+/// | `model_locked` on another status, any other slug, a `type` that cannot be read ([`ProblemType::Unreadable`]), none on any other status | [`Park::No`] |
 ///
-/// A known slug decides whatever the status; `model_locked` is [`ModelError::ModelLocked`], which
-/// the client gives for every provider.
+/// A known slug decides whatever the status, and a `402` says the person's usage limit is reached
+/// whatever the gateway named it ([ADR 0067] decision 3, amended 2026-11-25). `model_locked` is
+/// [`ModelError::ModelLocked`], which the client gives for every provider.
 ///
 /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
 #[derive(Debug, Clone, Copy, Default)]
@@ -407,6 +415,11 @@ impl ModelCredentials for InjectedRun {
             )
         };
         match &refusal.problem {
+            // A `402` is the person's usage limit reached whatever the gateway called it (`over_limit`,
+            // the injector's `model_locked`, or no problem document): waiting for the person is what
+            // cures it. A `type` adam cannot read is no refusal it acts on, as for every status.
+            ProblemType::Unreadable => Park::No,
+            _ if refusal.status == 402 => Park::UntilWoken,
             ProblemType::Slug(slug) => match slug.as_str() {
                 "unauthenticated" | "run_not_bound" | "lease_expired" => Park::OnTimer(FIRST_PARK),
                 "over_limit" => Park::UntilWoken,
@@ -415,9 +428,6 @@ impl ModelCredentials for InjectedRun {
                 // not know.
                 _ => Park::No,
             },
-            // The endpoint named the refusal and adam cannot read the name: it is not one of the
-            // table's, so it parks nothing.
-            ProblemType::Unreadable => Park::No,
             ProblemType::Absent if matches!(refusal.status, 401 | 403) => Park::OnTimer(FIRST_PARK),
             ProblemType::Absent => Park::No,
         }
@@ -636,6 +646,10 @@ mod tests {
                 refusal(402, Some("over_limit"), Some(600)),
                 Park::UntilWoken,
             ),
+            // A `402` is the person's limit reached whatever the gateway called it, and with no
+            // problem document at all.
+            (refusal(402, Some("model_locked"), None), Park::UntilWoken),
+            (refusal(402, None, None), Park::UntilWoken),
             (refusal(429, Some("rate_limited"), None), timer(30)),
             (refusal(429, Some("rate_limited"), Some(5)), timer(30)),
             (refusal(429, Some("rate_limited"), Some(30)), timer(30)),
@@ -664,7 +678,6 @@ mod tests {
             // Anything else is no park.
             (refusal(401, Some("invalid_token"), None), Park::No),
             (refusal(400, None, None), Park::No),
-            (refusal(402, None, None), Park::No),
             (refusal(404, None, None), Park::No),
             (refusal(429, None, Some(120)), Park::No),
             (refusal(500, None, None), Park::No),
@@ -676,6 +689,7 @@ mod tests {
         assert_eq!(FIRST_PARK, Duration::from_secs(30));
         assert_eq!(MAX_PARK, Duration::from_secs(24 * 60 * 60));
         assert_eq!(MODEL_LOCKED_SLUG, "model_locked");
+        assert_eq!(OVER_LIMIT_SLUG, "over_limit");
     }
 
     /// A problem type that is there but cannot be read is not "no problem type": it parks nothing,

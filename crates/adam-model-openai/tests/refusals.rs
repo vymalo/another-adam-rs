@@ -236,23 +236,43 @@ async fn model_locked_is_its_own_error_for_every_provider() {
     }
 }
 
+/// A 402 is the person's usage limit reached for the model asked, whatever the gateway's problem
+/// type calls it (`over_limit`, the injector's `model_locked`, or no problem document at all): the
+/// run is told `over_limit` and parks until it is woken when no other model is left, never
+/// `model_locked`, which would fail it.
+#[tokio::test]
+async fn a_402_is_the_over_limit_refusal_for_the_injector() {
+    let cases = [
+        ("over_limit", problem(402, "over_limit", None)),
+        ("model_locked", problem(402, "model_locked", None)),
+        ("no problem document", ResponseTemplate::new(402)),
+    ];
+    for (what, template) in cases {
+        let (err, sent) = refused_with(injected(), template, false).await;
+        match &err {
+            ModelError::Refused {
+                status: 402,
+                slug,
+                park: Park::UntilWoken,
+                ..
+            } => assert_eq!(slug.as_deref(), Some("over_limit"), "{what}"),
+            other => panic!("{what}: {other:?}"),
+        }
+        assert_eq!(sent, 1, "{what}");
+        assert_holds_no_body(&err);
+    }
+}
+
 #[tokio::test]
 async fn what_the_injector_does_not_park_is_todays_error() {
-    // An unknown slug, a slugless answer of another status, and a problem type in a body that is
-    // not a problem document.
+    // An unknown slug, an invalid-token slug and a slugless 500. (A 402 parks whatever its problem
+    // document says, so it is the over-limit refusal above.)
     let (err, _) = refused_with(injected(), problem(400, "something_else", None), false).await;
     assert!(matches!(err, ModelError::InvalidRequest { .. }), "{err:?}");
     let (err, _) = refused_with(injected(), problem(401, "invalid_token", None), false).await;
     assert!(matches!(err, ModelError::Auth(_)), "{err:?}");
     let (err, _) = refused_with(injected(), ResponseTemplate::new(500), false).await;
     assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
-    let (err, _) = refused_with(
-        injected(),
-        ResponseTemplate::new(402).set_body_raw(problem_body("over_limit"), "application/json"),
-        false,
-    )
-    .await;
-    assert!(matches!(err, ModelError::InvalidRequest { .. }), "{err:?}");
 }
 
 /// A deployment with its own key fails as before (ADR 0058 decision 3): every answer of the table

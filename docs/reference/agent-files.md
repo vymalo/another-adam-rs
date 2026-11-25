@@ -83,7 +83,7 @@ description: Turns a coding task into a verified pull request.   # required on s
 model: coder-large             # a gateway alias; `inherit` = the parent's (default for subagents)
 reasoning_effort: low          # the level the model calls ask for by default; one the model's profile declares (ADR 0063)
 model_preset: quick            # a named preset of MODEL_ALIASES_FILE the calls start from (ADR 0064)
-model_fallback: coder-lite     # overrides the preset's and the profile's `fallback`: the alias the run continues on, once, if the endpoint refuses `model` as locked (ADR 0064)
+model_fallback: coder-lite     # overrides the preset's and the profile's `fallback`: the alias the run continues on, once, if the endpoint refuses `model` as locked or over the person's limit (ADR 0064)
 tools: [prepare_workspace, run_checks, ask_user]     # or "a, b, c"; "*" = all; MCP: "linear__*"
 tools_loading: eager           # `eager`: every tool in every request, as before the key existed; `lazy` (default): a run loads them in groups (ADR 0066)
 skills: all                    # or a list; default: every skill in this agent's skills/
@@ -138,9 +138,10 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   gives the root's level (`EngineBuilder::reasoning_effort`) when the file sets none: the file's key
   wins. Claude Code's `effort` is still ignored with a warning.
 * **A locked model switches once.** `model_fallback` names the alias a run continues on when the endpoint refuses
-  its model as not allowed (`model_locked`, ADR 0067). The run says it as a step (`Switched model`), reports
-  its later calls under the fallback, takes the fallback's cap and its profile's own reasoning level, and never goes back;
-  a second refusal fails it naming both models. The alias is the file's `model_fallback`, else the `fallback` of its
+  its model as not allowed (`model_locked`) or over the person's limit (`over_limit`, a `402`; ADR 0067). The run says
+  it as a step (`Switched model`), reports its later calls under the fallback, takes the fallback's cap and its
+  profile's own reasoning level, and never goes back; a second refusal fails it naming both models, save for a `402`,
+  which parks the run as over limit instead. The alias is the file's `model_fallback`, else the `fallback` of its
   `model_preset`, else of its model's profile in `MODEL_ALIASES_FILE`; it is checked like `model:` and may not be the
   agent's own (exit 78). A subagent resolves its own: an `inherit` subagent takes its model's profile fallback, and
   nothing is inherited from the parent's file (ADR 0064, amended 2026-11-23).

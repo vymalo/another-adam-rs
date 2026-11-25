@@ -765,7 +765,10 @@ the summary: a parked run never keeps an inbox, which the runtime's looks at a c
 kind `MODEL_RESUME_KIND` (`adam.resume`, the runtime's wake-only `RESUME_KIND`) wakes the run and adds nothing; one that
 lands while the run works is no message that arrived and reopens nothing. The first call
 that is answered clears the wait. A cancel ends the park. `ModelError::ModelLocked` is no park: the run fails naming the
-model, or switches once to its fallback (*A locked model*). A provider that does not park (`StaticBearer`) fails as before. The journal holds the reason's status and slug
+model, or switches once to its fallback (*A locked model*). A refusal of status `402` (the person's usage limit reached)
+takes that one switch first, and parks as `over_limit` (`Park::UntilWoken`) when no model is left, so the person reads
+the limit reached rather than a failed run. A provider that does not park (`StaticBearer`) fails as before. The journal
+holds the reason's status and slug
 (`park` in the failure's record), never a header, a body or a credential.
 
 **Breaking:** `Conversation::model_wait` is a new public field of a struct that is not `#[non_exhaustive]`: a literal
@@ -776,17 +779,20 @@ loads as none (`ModelPark` gains a kind in a later build).
 .reasoning_effort(..))` (the assembly builds it from the folder's `model_fallback:`) answers a `ModelError::ModelLocked`
 by recording `Conversation::model_switch` (`ModelSwitch { from, to, turn }`), emitting the step `Switched model`, and asking
 the same turn again of the fallback, with its cap and level, in the next transition. Every later call of the run names the fallback, and so do the compaction budget (the live model's window and cap), the image limits and the summary call; a `ModelLocked` on a summary call switches the run too, and the summary is asked of the fallback in the next transition; `usage/v1` names it, and the run never goes back. A `ModelLocked` on the
-fallback fails the run naming both models; an agent with no fallback fails as before; a fallback that is the model the run is on already (a message picked it) fails the run at once, with no second call. `ModelFailure` journals the locked
+fallback fails the run naming both models; an agent with no fallback fails as before; a fallback that is the model the run is on already (a message picked it) fails the run at once, with no second call. A refusal of status `402` (the
+person's usage limit reached, `over_limit`, whatever the gateway's problem type called it) takes the same one switch, and
+when no model is left — none configured, the fallback already locked too, or the fallback is the live model — it parks
+the run as `over_limit` (`Park::UntilWoken`) instead of failing it, which is the event the app renders. `ModelFailure` journals the locked
 alias, so a replay finds the same refusal and makes no call. `.model_choices(..)` gives the models a message may pick with
 the context key `MODEL_CONTEXT_KEY` (`vymalo.model`, `{"model": alias}`); an alias without a binding, or an agent without
 choices, is ignored. **Breaking:** `Conversation::model_switch` is a new public field of a struct that is not
 `#[non_exhaustive]`. Tests: `tests/model_fallback.rs` (the switch, no switch back, a second lock, no fallback, a message's
-pick, a replay after a lost commit, a smaller fallback's window, a lock on a budget and on an overflow summary, a fallback equal to the live model).
+pick, a replay after a lost commit, a smaller fallback's window, a lock on a budget and on an overflow summary, a fallback equal to the live model, a 402 that switches once and a 402 on the fallback that parks).
 
 Tests: `tests/model_park.rs` (each kind, the backoff by the journaled times, the limit and a wake clamped to it, a message,
 one refused again, a resume, a resume during the woken call adding no turn, a row that changes kind, a replay after a lost
 commit, an unattended run, a parked summary with a message not stepped before its wake, an
-unreachable endpoint, `ModelLocked`, `StaticBearer`'s errors, a cancel, a parked child shown on its parent and woken
+unreachable endpoint, `ModelLocked`, a 402 with no model left parking as `over_limit`, `StaticBearer`'s errors, a cancel, a parked child shown on its parent and woken
 through a message or a resume (its words staying there, a copy of the waking message waking it once, a copy of a resume
 it read making no call, the copy cleared while it works, a timer child keeping the look), a grandchild reached one level
 at a time, and nothing of a problem document's body in the journal through `adam-model-openai` against a mock
