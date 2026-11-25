@@ -555,22 +555,33 @@ async fn a_persons_session_reads_the_workspace_of_the_most_recently_created_task
         // session event, the usage of a round), so the store can hold a context whose most recently
         // *updated* run is not the task the person is in — which is exactly the order a listing by
         // `updated_at` answers, and exactly what must not decide this.
-        clock_past(updated_at(&store, newer_run).await).await;
-        let older = store
-            .load_run(first_run)
-            .await
-            .expect("store")
-            .expect("the older task");
-        store
-            .commit_run(
-                first_run,
-                older.version,
-                RunUpdate::new(older.status, older.state),
-            )
-            .await
-            .expect("write the older task again");
+        // A bounded loop rather than one shot: the runtime commits a run on its own progress — a
+        // session event, the usage of a round, the repository slot a task adopts — so the newer
+        // task can be written again between reading its `updated_at` and writing the older one.
+        // The ordering this test needs is the one it establishes, not one it assumes.
+        let mut ordered = false;
+        for _ in 0..8 {
+            clock_past(updated_at(&store, newer_run).await).await;
+            let older = store
+                .load_run(first_run)
+                .await
+                .expect("store")
+                .expect("the older task");
+            store
+                .commit_run(
+                    first_run,
+                    older.version,
+                    RunUpdate::new(older.status, older.state),
+                )
+                .await
+                .expect("write the older task again");
+            if updated_at(&store, first_run).await > updated_at(&store, newer_run).await {
+                ordered = true;
+                break;
+            }
+        }
         assert!(
-            updated_at(&store, first_run).await > updated_at(&store, newer_run).await,
+            ordered,
             "the older task is the most recently updated run of the context"
         );
 
