@@ -18,6 +18,17 @@ ignore = [
     # (ADR 0053 decision 1, amended 2026-11-20). Review by 2027-02-17, or at once if an advisory
     # names a vulnerability in chrono.
     { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; advisory date 2026-09-14, accepted 2026-11-17, adam-rs's own code moved to jiff (ADR 0057); what remains is a2a-lf/a2a-server-lf/a2a-pb, review by 2027-02-17" },
+    # kube-client's `openssl-tls` connector trusts OpenSSL's default CA store beside the configured
+    # cluster CA (RUSTSEC-2026-0600, published 2026-11-25). **The feature is not enabled in this
+    # workspace and the crate it names is not in the tree**: the workspace declares
+    # `kube = { default-features = false, features = ["client", "rustls-tls", "aws-lc-rs", "ws"] }`,
+    # `cargo tree -e features -p kube-client | grep openssl-tls` is empty, and `cargo tree -i openssl`
+    # finds no package (verified 2026-11-25). The advisory fires only because `[graph] all-features`
+    # below resolves every feature of every dependency, including connectors no binary here builds.
+    # If a kube client ever enables `openssl-tls`, this ignore must go in the same change: the
+    # connector would then trust roots from the machine's store, which is a real boundary failure.
+    # Review by 2027-02-25, or at once if a kube release pins a patched connector.
+    { id = "RUSTSEC-2026-0600", reason = "kube-client's openssl-tls is not enabled (rustls-tls only, default-features = false) and openssl is not in the tree; all-features resolution is what trips the advisory; verified 2026-11-25, review by 2027-02-25" },
 ]
 
 [licenses]
