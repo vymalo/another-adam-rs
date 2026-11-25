@@ -147,6 +147,17 @@ superseded: `SessionHeader` gains a **`workspace: Option<RunId>`**, the run whos
 * `None` — a parent context with no task yet — is not an error: the rounds answer in words, as they did before this slice.
 * Not built here: part 2 of the slice (whatever binds a round to a parent task beyond its workspace).
 
+*Amended 2026-11-25* (slice 7, part 1: which task). The note above says "one listing", and the first build took the first root
+run of the four most recently **updated** ones, which was wrong twice. "The latest task" is the task most recently **created**:
+the store lists a context's runs by `(updated_at, id)` descending, and `updated_at` moves whenever a run progresses, so an older
+task that was still running, or that somebody wrote to, won over the task the person was in. And a fixed window of four assumed
+one of those runs is a root, which four child runs registered under the root agent's own name break: the session then answered
+`None` with the repository right there. `context_workspace` now keeps the best `(created_at, id)` root over pages of 64 runs,
+stopping early only when a page's `updated_at` order proves no later page can hold an older-created root, and it is bounded by
+`MAX_WORKSPACE_SCAN` (256 runs): past the bound the answer is `None`, which is a session that answers in words (the bullet
+above), documented rather than silent. Records of both defects and their tests: `crates/adam-a2a-runtime/README.md`, *Child
+sessions*.
+
 *Amended 2026-11-19* (slice 6 part b, the listing cadence): the tracker is evaluated only when the
 subscription polls — its fallback (`RuntimeTaskBackend::with_poll_interval`, 2 s by default) or a
 `Status` event of the task it streams — so the bound on a session change is
