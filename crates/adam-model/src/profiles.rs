@@ -78,6 +78,15 @@ impl ReasoningEffort {
         Self::Max,
     ];
 
+    /// The seven words, lowest first, as a list that ends in `or`: `none, minimal, ... or max`.
+    pub fn words_sentence() -> String {
+        let words: Vec<&str> = Self::ALL.iter().map(|e| e.as_str()).collect();
+        match words.split_last() {
+            Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+            None => String::new(),
+        }
+    }
+
     /// The word on the wire: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -99,9 +108,21 @@ impl fmt::Display for ReasoningEffort {
 }
 
 /// A word that is none of the seven levels.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{0:?} is not a reasoning effort: use none, minimal, low, medium, high, xhigh or max")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotAnEffort(pub String);
+
+impl fmt::Display for NotAnEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:?} is not a reasoning effort: use {}",
+            self.0,
+            ReasoningEffort::words_sentence()
+        )
+    }
+}
+
+impl std::error::Error for NotAnEffort {}
 
 impl FromStr for ReasoningEffort {
     type Err = NotAnEffort;
@@ -1235,5 +1256,13 @@ mod tests {
         );
         // An empty document is a valid, empty set.
         assert!(ModelProfiles::parse_json("{}").unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_refusal_lists_the_seven_words_in_order_with_or_before_the_last() {
+        assert_eq!(
+            NotAnEffort("hi".into()).to_string(),
+            "\"hi\" is not a reasoning effort: use none, minimal, low, medium, high, xhigh or max"
+        );
     }
 }
