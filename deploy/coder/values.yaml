@@ -625,6 +625,9 @@ database:
   name: adam
   owner: adam
   instances: 1
+  # CPU and memory requests and limits of each database instance, as on any container. Empty (the
+  # default) renders nothing. Starting points for three instances are in the chart README.
+  resources: {}
   storage:
     size: 5Gi
     storageClass: longhorn
