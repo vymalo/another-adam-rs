@@ -7,7 +7,7 @@ image:
   # Bumped on every green build of main by .github/workflows/coder.yml
   # (`sha-<first 7 of the commit>`). A plain key so the workflow can edit it.
   # sha-0000000 is the placeholder that exists before the first build.
-  tag: sha-d1e3e6a
+  tag: sha-b1bdf3d
   pullPolicy: IfNotPresent
 
 # The image package may be private; name a pull secret here if so.
