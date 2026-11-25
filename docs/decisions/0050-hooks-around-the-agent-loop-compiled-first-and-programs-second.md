@@ -467,3 +467,13 @@ Both events carry the **`seq` of the row transition they describe**, so a replay
 observer deduplicates by `(run, kind, seq)`. A store that lost a write and re-emits the transition re-emits the event with the same
 key; a second claim of the same lease is refused by the store, so a second `run.moved` for it cannot exist. Both are **observe**
 only: no hook may veto a wake or a move, because the transition has already happened in the store.
+
+*Amended 2026-11-25 (slice **H1c** built):* `run.ending` is `Plugin::run_ending(&HookedEnd { text, continuations })`.
+`Verdict::Continue` allows the end and `Verdict::Deny(reason)` keeps the run going with the reason; `Stop` ends the run
+as it was ending, and `Ask` or a hook failure is recorded `failed` and the run ends (a retryable failure fails the try).
+It is decided in the step `end:<turn>`, recorded as `{verdict: allow|continue|capped|stop|failed, reason, plugin}`, at
+the three places a run ends with an answer, before `end_sessions`. A continuation appends the reason as a user message
+that says a plugin asked, and clears an announced answer. The count is `Conversation::end_continuations`; the cap is
+`LlmAgentBuilder::max_run_continuations` (3 by default, at most 20) and the service setting `MAX_RUN_CONTINUATIONS`
+(exit 78 outside 0 to 20). Wiring the setting into the agents the assembly builds is not done: the service parses it,
+and a host that builds its agent by hand passes it to the builder.

@@ -19,6 +19,7 @@
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
 //! | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (`1` is one at a time); an agent file's `limits.max_parallel` may lower it for that agent; read by the roles that run workers ([`WorkerSettings::max_parallel_tool_calls`]) | `10` |
 //! | `MAX_TOOL_CALLS_IN_FLIGHT` | the most tool calls of the whole process that run at the same time, 1 to 256: the process's pool, inside which `MAX_PARALLEL_TOOL_CALLS` still bounds one turn (ADR 0065) | `4` |
+//! | `MAX_RUN_CONTINUATIONS` | the most times `run.ending` hooks may keep one run going, 0 to 20 (ADR 0050); anything else is exit 78 | `3` |
 //! | `MAX_MODEL_CALLS` | the most model calls in flight in the process, 1 to 64 (ADR 0065) | `2` |
 //! | `MAX_PROCESSES` | the most commands (`run`, `run_command`, checks, background commands, language servers) of the whole process at once, 1 to 256; a command waits for a seat, then the tool says so and the run retries (ADR 0065) | `4` |
 //! | `MAX_GIT_PROCESSES` | the most git processes at once, 1 to 64 (ADR 0065) | `2` |
@@ -804,6 +805,12 @@ fn parse_command_cpu(get: &impl Fn(&str) -> Option<String>, problems: &mut Vec<S
     }
 }
 
+/// `MAX_RUN_CONTINUATIONS`: the most times `run.ending` hooks may keep one run going (ADR 0050,
+/// decision 10), 0 to this.
+pub const MAX_RUN_CONTINUATIONS_LIMIT: u32 = 20;
+/// The default of `MAX_RUN_CONTINUATIONS`.
+pub const DEFAULT_MAX_RUN_CONTINUATIONS: u32 = 3;
+
 /// `WORKERS`, `WORKER_ID` and `MAX_PARALLEL_TOOL_CALLS`: how a worker process takes runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerSettings {
@@ -832,6 +839,9 @@ pub struct WorkerSettings {
     pub command_memory_max: u64,
     /// `COMMAND_CPU_MAX`: the CPU one command may use, in millicores.
     pub command_cpu_max: u32,
+    /// `MAX_RUN_CONTINUATIONS`: the most times `run.ending` hooks may keep one run going, 0 to
+    /// [`MAX_RUN_CONTINUATIONS_LIMIT`]; hand it to `LlmAgentBuilder::max_run_continuations`.
+    pub max_run_continuations: u32,
 }
 
 impl WorkerSettings {
@@ -883,6 +893,22 @@ impl WorkerSettings {
         );
         let command_memory_max = parse_command_memory(&get, problems);
         let command_cpu_max = parse_command_cpu(&get, problems);
+        let max_run_continuations = {
+            let n = parse_or(
+                &get,
+                "MAX_RUN_CONTINUATIONS",
+                DEFAULT_MAX_RUN_CONTINUATIONS,
+                problems,
+            );
+            if n > MAX_RUN_CONTINUATIONS_LIMIT {
+                problems.push(format!(
+                    "MAX_RUN_CONTINUATIONS must be between 0 and {MAX_RUN_CONTINUATIONS_LIMIT}, got {n}"
+                ));
+                DEFAULT_MAX_RUN_CONTINUATIONS
+            } else {
+                n
+            }
+        };
         Self {
             workers,
             worker_id,
@@ -894,6 +920,7 @@ impl WorkerSettings {
             max_git_processes,
             command_memory_max,
             command_cpu_max,
+            max_run_continuations,
         }
     }
 
@@ -1826,6 +1853,7 @@ mod tests {
                 max_git_processes: 2,
                 command_memory_max: adam_budget::default_command_memory(total_ram()),
                 command_cpu_max: parse_command_cpu(&|_: &str| None, &mut Vec::new()),
+                max_run_continuations: 3,
             })
         );
     }
@@ -1901,6 +1929,8 @@ mod tests {
             ("MAX_TOOL_CALLS_IN_FLIGHT", "many"),
             ("MAX_MODEL_CALLS", "0"),
             ("MAX_MODEL_CALLS", "65"),
+            ("MAX_RUN_CONTINUATIONS", "21"),
+            ("MAX_RUN_CONTINUATIONS", "-1"),
             ("MODEL_TOKENS_PER_MINUTE", "0"),
             ("MODEL_TOKENS_PER_MINUTE", "100000001"),
             ("MODEL_TOKENS_PER_MINUTE", "lots"),
@@ -1909,6 +1939,13 @@ mod tests {
             vars.insert(name, bad);
             assert!(mentions(&problems_of(&vars), name), "{name}={bad}");
         }
+        let mut vars = full();
+        vars.insert("MAX_RUN_CONTINUATIONS", "0");
+        let worker = parse(&vars).expect("valid").worker.expect("workers");
+        assert_eq!(
+            worker.max_run_continuations, 0,
+            "0 never lets a hook keep a run going"
+        );
         // A blank rate meters none, as an unset one does.
         let mut vars = full();
         vars.insert("MODEL_TOKENS_PER_MINUTE", "  ");
