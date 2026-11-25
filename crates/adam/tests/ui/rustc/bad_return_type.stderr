@@ -12,6 +12,7 @@ error[E0277]: `u8` cannot be returned from a tool
             &'static str
             Cow<'static, str>
             Json<T>
+            String
             ToolOutput
-            std::string::String
+            serde_json::value::Value
   = note: required for `u8` to implement `IntoToolResult`
