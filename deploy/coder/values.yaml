@@ -169,7 +169,7 @@ accessTiers:
 # The largest file the agent sends inline (uploads/v1): a larger one asks the orchestrator for an upload slot.
 # Set it to the orchestrator's artifacts.maxFileBytes. Every role that serves A2A. The card carries no params.
 uploads:
-  # UPLOADS_INLINE_MAX_BYTES: a whole number of bytes, 1 to 4294967296 (4 GiB). Empty (default): the binary's own
+  # UPLOADS_INLINE_MAX_BYTES: a whole number of bytes, 1 to 268435456 (256 MiB). Empty (default): the binary's own
   # 10 MiB, and nothing is rendered. The agent folder's `limits.max_inline_upload_bytes` wins over it.
   inlineMaxBytes: ""
 
