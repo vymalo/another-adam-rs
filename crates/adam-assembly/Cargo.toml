@@ -44,6 +44,7 @@ adam-agent-fs.workspace = true
 adam-core.workspace = true
 adam-error.workspace = true
 adam-llm-agent.workspace = true
+adam-plugin.workspace = true
 adam-mcp = { workspace = true, optional = true }
 adam-model.workspace = true
 adam-runtime.workspace = true
@@ -68,6 +69,7 @@ adam-a2a = { path = "../adam-a2a", version = "0.1.0", features = ["test-util"] }
 # The A2A front the child-sessions tests start a session through (the feature `a2a` of this crate).
 adam-a2a-runtime.workspace = true
 adam-error.workspace = true
+adam-plugin-testkit.workspace = true
 # The MCP server the tests talk to (over HTTP: another package's binary is not available here).
 adam-mcp-testkit = { path = "../adam-mcp-testkit" }
 adam-store-mongodb = { path = "../adam-store-mongodb", version = "0.1.0" }

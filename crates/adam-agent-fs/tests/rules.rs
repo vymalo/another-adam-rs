@@ -2051,3 +2051,36 @@ fn parallel_false_is_read_per_server_and_is_on_by_default() {
     assert!(config.servers["plain"].settings().is_default());
     assert!(config.servers["explicit"].settings().is_default());
 }
+
+#[test]
+fn plugins_are_read_bare_or_with_options_and_a_secret_option_is_refused() {
+    let dir = write(&[(
+        "agent/instructions.md",
+        "---\nname: root\nplugins:\n  - audit\n  - name: snapshot\n    options: { mode: fast }\n---\nHi.\n",
+    )]);
+    let report = load(dir.path());
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let plugins = &report.package.agents[0].frontmatter.plugins;
+    assert_eq!(plugins.len(), 2);
+    assert_eq!(plugins[0].name(), "audit");
+    assert_eq!(plugins[1].options()["mode"], "fast");
+
+    for bad in [
+        "{ token: abc123 }",
+        "{ mode: 'Bearer abc' }",
+        "{ mode: sk-live-1 }",
+    ] {
+        let dir = write(&[(
+            "agent/instructions.md",
+            &format!("---\nname: root\nplugins:\n  - name: audit\n    options: {bad}\n---\nHi.\n"),
+        )]);
+        let report = load(dir.path());
+        assert!(
+            report
+                .errors()
+                .any(|d| d.to_string().contains("looks like a secret")),
+            "{bad}: {:?}",
+            report.diagnostics
+        );
+    }
+}
