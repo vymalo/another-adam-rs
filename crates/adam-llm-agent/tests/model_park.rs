@@ -361,6 +361,40 @@ async fn a_park_until_woken_has_no_timer_and_a_resume_wakes_it_adding_nothing() 
     rig.stop().await;
 }
 
+/// A 402 with no fallback has no unlocked model left: the run parks until it is woken, and the
+/// wait the app reads names the over-limit reason, status and slug. This is the outcome the card
+/// keeps; a run with a fallback reaches it only after the switch (`tests/model_fallback.rs`).
+#[tokio::test]
+async fn a_402_with_no_unlocked_model_left_parks_the_run_as_over_limit() {
+    let rig = Rig::new(ModelParking::default());
+    rig.mock
+        .push_error(refused(402, Some("over_limit"), Park::UntilWoken));
+    let run = rig.start(None).await;
+    let (view, state) = rig
+        .parked(run, |s| {
+            s.model_wait
+                .as_ref()
+                .is_some_and(|w| w.park == ModelPark::UntilWoken)
+        })
+        .await;
+    assert!(view.waiting, "the task waits on the person");
+    assert_eq!(view.wake_at, None);
+    let wait = state.model_wait.unwrap();
+    assert_eq!(wait.reason, "the model gateway's limit is reached");
+    assert_eq!(
+        (wait.status, wait.slug.as_deref()),
+        (Some(402), Some("over_limit")),
+        "the app reads the over-limit event, not a failed run"
+    );
+    assert_eq!(wait.park, ModelPark::UntilWoken);
+    assert_eq!(
+        rig.mock.requests().len(),
+        1,
+        "there is no other model to ask"
+    );
+    rig.stop().await;
+}
+
 /// A message wakes a park on a timer before its time, and its text is the person's turn, added
 /// before the call.
 #[tokio::test]

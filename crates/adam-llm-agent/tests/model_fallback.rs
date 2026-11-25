@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
     COMPACTION_TURN, CompactionReason, Conversation, FnTool, Limits, LlmAgent, LlmAgentBuilder,
-    MODEL_CONTEXT_KEY, ModelBinding, ToolError, user_message,
+    MODEL_CONTEXT_KEY, ModelBinding, ModelPark, ToolError, user_message,
 };
 use adam_model::{
-    DynModel, MockModel, ModelError, ModelRequest, ReasoningEffort, ToolCall, ToolChoice,
+    DynModel, MockModel, ModelError, ModelRequest, Park, ReasoningEffort, ToolCall, ToolChoice,
 };
 use adam_runtime::{
     CollectingSink, Inbound, ManualClock, RetryPolicy, RunEvent, RunView, Runtime, StepState,
@@ -145,6 +145,15 @@ fn locked(model: &str) -> ModelError {
     }
 }
 
+fn over_limit() -> ModelError {
+    ModelError::Refused {
+        status: 402,
+        slug: Some("over_limit".into()),
+        retry_after: None,
+        park: Park::UntilWoken,
+    }
+}
+
 fn lite() -> ModelBinding {
     ModelBinding::new(LITE, 2048).reasoning_effort(Some(ReasoningEffort::Low))
 }
@@ -222,6 +231,63 @@ async fn a_locked_model_continues_once_on_the_fallback() {
     assert!(
         rig.journal(run).await.contains(BASE),
         "the refusal is in the journal"
+    );
+    rig.stop().await;
+}
+
+/// A 402 — the person's usage limit is reached for the model the call named — takes the switch a
+/// `model_locked` refusal takes (ADR 0064, amended 2026-11-25): the same turn is asked once of the
+/// fallback, the run says so as one step, and it completes instead of parking on the first call.
+#[tokio::test]
+async fn a_limit_reached_on_the_primary_continues_once_on_the_fallback() {
+    let rig = Rig::new(|b| b.model_fallback(lite()));
+    rig.mock.push_error(over_limit()).push_text("answered");
+    let run = rig.start().await;
+    let view = rig.until(run, RunStatus::Done).await;
+    assert_eq!(text_of(&view).as_deref(), Some("answered"));
+
+    assert_eq!(
+        models(&rig.mock.requests()),
+        [BASE, LITE],
+        "the fallback is asked after the refusal"
+    );
+    let events = rig.sink.events_for(run);
+    let switches = events
+        .iter()
+        .filter(|e| matches!(e, RunEvent::Step(s) if s.label == "Switched model"))
+        .count();
+    assert_eq!(switches, 1, "exactly one switch");
+    let state = rig.state(run).await;
+    let switch = state.model_switch.expect("the switch is kept");
+    assert_eq!((switch.from.as_str(), switch.to.as_str()), (BASE, LITE));
+    assert!(state.model_wait.is_none(), "the run did not park");
+    rig.stop().await;
+}
+
+/// A 402 on the fallback too: the run has no unlocked model left after its one switch, and parks
+/// as over limit instead of failing.
+#[tokio::test]
+async fn a_limit_reached_on_the_fallback_too_parks_the_run_as_over_limit() {
+    let rig = Rig::new(|b| b.model_fallback(lite()));
+    rig.mock.push_error(over_limit()).push_error(over_limit());
+    let run = rig.start().await;
+    rig.until(run, RunStatus::Parked).await;
+    assert_eq!(
+        models(&rig.mock.requests()),
+        [BASE, LITE],
+        "asked once each"
+    );
+    let state = rig.state(run).await;
+    let wait = state.model_wait.expect("the run waits on the person");
+    assert_eq!(wait.reason, "the model gateway's limit is reached");
+    assert_eq!(
+        (wait.status, wait.slug.as_deref()),
+        (Some(402), Some("over_limit"))
+    );
+    assert_eq!(wait.park, ModelPark::UntilWoken);
+    assert!(
+        state.model_switch.is_some(),
+        "the one switch is kept in the state"
     );
     rig.stop().await;
 }
