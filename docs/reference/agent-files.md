@@ -98,7 +98,7 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   command_cpu: 500m            # the CPU one command may use (`2`, `1.5` cores or `500m`), at least 100m: lowers COMMAND_CPU_MAX, never raises it
   max_open_sessions: 8         # root only: most sessions open at once, 1 to 100; lowers SESSION_MAX_OPEN, never raises it (a larger value is lowered with a warning)
   max_working_sessions: 2      # root only: most rounds working at once, 1 to 32 and at most max_open_sessions; lowers SESSION_MAX_WORKING
-  max_upload_bytes: 1073741824 # root only: the largest file the card lists for `uploads/v1`, 1 to 4294967296 (4 GiB); wins over UPLOADS_MAX_BYTES (a subagent's value is ignored, with a warning)
+  max_inline_upload_bytes: 10485760 # root only: the largest file sent inline (`uploads/v1`; a larger one asks for a slot; the card carries no params), 1 to 4294967296 (4 GiB); wins over UPLOADS_INLINE_MAX_BYTES (a subagent's value is ignored, with a warning)
   max_session_rounds: 10       # root only: most rounds one session may have, 2 to 200; lowers SESSION_MAX_ROUNDS (a subagent's value is ignored, with a warning)
 retry:                         # a retry policy per tool (below); this agent's own, none inherits
   web_search: { attempts: 5, backoff: 2s, max_backoff: 5m, on: [rate-limited] }

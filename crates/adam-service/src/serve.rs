@@ -231,12 +231,12 @@ pub struct Agents {
     /// full agent or its starter), or [`serve`] stops with [`ServeError::ChildSessions`]. `None`:
     /// the extension is never listed or read. Only the roles that serve A2A use it.
     pub child_sessions: Option<adam_a2a_runtime::ChildSessions>,
-    /// The largest upload the card says (`uploads/v1`'s `params.maxBytes`), from the agent
-    /// folder's `limits.max_upload_bytes`. It wins over `UPLOADS_MAX_BYTES`
-    /// ([`ServiceConfig::uploads_max_bytes`]), which wins over
-    /// [`DEFAULT_UPLOADS_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_MAX_BYTES). Only the roles that
+    /// The largest file sent inline (`uploads/v1`: above it, the agent asks a presigned slot; the
+    /// card says nothing of it), from the agent folder's `limits.max_inline_upload_bytes`. It wins over `UPLOADS_INLINE_MAX_BYTES`
+    /// ([`ServiceConfig::uploads_inline_max_bytes`]), which wins over
+    /// [`DEFAULT_UPLOADS_INLINE_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES). Only the roles that
     /// serve A2A use it.
-    pub uploads_max_bytes: Option<u64>,
+    pub uploads_inline_max_bytes: Option<u64>,
     /// The components the binary adds to the worker tier ([`Agents::worker_component`]).
     components: Vec<(String, StartComponent)>,
 }
@@ -258,7 +258,7 @@ impl Agents {
             reasoning_efforts: None,
             commands: None,
             child_sessions: None,
-            uploads_max_bytes: None,
+            uploads_inline_max_bytes: None,
             components: Vec::new(),
         }
     }
@@ -332,10 +332,10 @@ impl Agents {
 
 impl Agents {
     /// The agent's folder says the largest upload the card lists (`uploads/v1`). See
-    /// [`Agents::uploads_max_bytes`](struct@Agents#structfield.uploads_max_bytes).
+    /// [`Agents::uploads_inline_max_bytes`](struct@Agents#structfield.uploads_inline_max_bytes).
     #[must_use]
-    pub fn uploads_max_bytes(mut self, bytes: u64) -> Self {
-        self.uploads_max_bytes = Some(bytes);
+    pub fn uploads_inline_max_bytes(mut self, bytes: u64) -> Self {
+        self.uploads_inline_max_bytes = Some(bytes);
         self
     }
 }
@@ -397,7 +397,7 @@ impl std::fmt::Debug for Agents {
             .field("reasoning_efforts", &self.reasoning_efforts)
             .field("commands", &self.commands.as_ref().map(|c| !c.is_empty()))
             .field("child_sessions", &self.child_sessions.is_some())
-            .field("uploads_max_bytes", &self.uploads_max_bytes)
+            .field("uploads_inline_max_bytes", &self.uploads_inline_max_bytes)
             .field(
                 "components",
                 &self
@@ -777,7 +777,7 @@ async fn run(
         reasoning_efforts,
         commands,
         child_sessions,
-        uploads_max_bytes,
+        uploads_inline_max_bytes,
         components,
     } = agents;
     if role.runs_control_plane() && card.is_none() {
@@ -811,18 +811,18 @@ async fn run(
         card.extensions
             .push(adam_a2a::ExtensionConfig::locale(locale));
     }
-    // The largest upload the card says: the folder's, else the environment's, else the default.
+    // The card entry has no params (the contract's). The inline threshold is the folder's, else
+    // the environment's, else the default (10 MiB); the upload tool of the next card reads it.
+    let _uploads_inline_max_bytes = uploads_inline_max_bytes
+        .or(config.uploads_inline_max_bytes)
+        .unwrap_or(adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES);
     if let Some(card) = card.as_mut()
         && !card
             .extensions
             .iter()
             .any(|listed| listed.uri == adam_a2a::UPLOADS_EXTENSION)
     {
-        card.extensions.push(adam_a2a::ExtensionConfig::uploads(
-            uploads_max_bytes
-                .or(config.uploads_max_bytes)
-                .unwrap_or(adam_a2a::DEFAULT_UPLOADS_MAX_BYTES),
-        ));
+        card.extensions.push(adam_a2a::ExtensionConfig::uploads());
     }
     if let (Some(card), Some(choices)) = (card.as_mut(), service.model_choices())
         && let Some(extension) = adam_a2a::ExtensionConfig::model_pick(choices)

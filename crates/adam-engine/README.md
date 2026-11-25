@@ -136,9 +136,9 @@ answers it.
 The engine has no HTTP surface, so it lists no agent card and applies no `uploads/v1` itself: the extension (a presigned `PUT` the
 orchestrator's thread tools give for a file too large for a message) belongs to a process that serves A2A. A host that embeds the
 engine and serves A2A itself lists [`ExtensionConfig::uploads`](../adam-a2a/src/extensions.rs) (`adam-a2a`) on its card, reads the
-folder's `limits.max_upload_bytes` from the definition (`AgentDef::manifest().frontmatter.limits`), and makes the request to the
+folder's `limits.max_inline_upload_bytes` from the definition (`AgentDef::manifest().frontmatter.limits`), and makes the request to the
 bucket itself; the engine neither signs nor sends one. `adam-agent` and `adam-coder` do this through `adam-service`
-(`UPLOADS_MAX_BYTES`, the folder's limit wins).
+(`UPLOADS_INLINE_MAX_BYTES`, the folder's limit wins).
 
 ## A run's events
 

@@ -1090,17 +1090,17 @@ async fn the_card_lists_locale_exactly_when_the_deployment_names_a_default_langu
     }
 }
 
-/// The card lists `uploads/v1` with the largest upload: the folder's value wins over
-/// `UPLOADS_MAX_BYTES`, which wins over the default.
+/// The card lists `uploads/v1` with no `params`, whatever the folder or `UPLOADS_INLINE_MAX_BYTES`
+/// say about the inline threshold (the contract gives the entry none).
 #[tokio::test]
-async fn the_card_lists_uploads_with_the_folder_then_the_environment_then_the_default() {
+async fn the_card_lists_uploads_with_no_params() {
     use a2a_client::agent_card::AgentCardResolver;
-    use adam_a2a::{DEFAULT_UPLOADS_MAX_BYTES, UPLOADS_EXTENSION};
+    use adam_a2a::UPLOADS_EXTENSION;
 
     let Some(url) = database() else { return };
 
     let cases: [(Option<&str>, Option<u64>, u64); 4] = [
-        (None, None, DEFAULT_UPLOADS_MAX_BYTES),
+        (None, None, 0),
         (Some("2048"), None, 2048),
         (None, Some(4096), 4096),
         (Some("2048"), Some(4096), 4096),
@@ -1110,7 +1110,7 @@ async fn the_card_lists_uploads_with_the_folder_then_the_environment_then_the_de
         let (listener, port) = listen().await;
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
         let more: Vec<(&str, String)> = env
-            .map(|t| ("UPLOADS_MAX_BYTES", t.to_owned()))
+            .map(|t| ("UPLOADS_INLINE_MAX_BYTES", t.to_owned()))
             .into_iter()
             .collect();
         let cfg = config_with(&url, "all", port, &more);
@@ -1122,7 +1122,7 @@ async fn the_card_lists_uploads_with_the_folder_then_the_environment_then_the_de
         );
         let agents = agents(&name, &cfg).card(card);
         let agents = match folder {
-            Some(bytes) => agents.uploads_max_bytes(bytes),
+            Some(bytes) => agents.uploads_inline_max_bytes(bytes),
             None => agents,
         };
         let running = Running::start(listener, cfg, agents);
@@ -1138,8 +1138,10 @@ async fn the_card_lists_uploads_with_the_folder_then_the_environment_then_the_de
             .as_ref()
             .and_then(|all| all.iter().find(|e| e.uri == UPLOADS_EXTENSION))
             .expect("listed");
-        let params = entry.params.as_ref().expect("params");
-        assert_eq!(params["maxBytes"], expected, "{env:?} {folder:?}");
+        assert!(
+            entry.params.as_ref().is_none_or(|p| p.is_empty()),
+            "{env:?} {folder:?} {expected}"
+        );
         running.finish().await;
     }
 }

@@ -497,12 +497,14 @@ pub async fn serve(
         None => agents,
     };
     // The largest upload the card lists (`uploads/v1`): the folder's, else the environment's.
-    let agents = match files
-        .def()
-        .ok()
-        .and_then(|def| def.manifest().frontmatter.limits.as_ref()?.max_upload_bytes)
-    {
-        Some(bytes) => agents.uploads_max_bytes(bytes),
+    let agents = match files.def().ok().and_then(|def| {
+        def.manifest()
+            .frontmatter
+            .limits
+            .as_ref()?
+            .max_inline_upload_bytes
+    }) {
+        Some(bytes) => agents.uploads_inline_max_bytes(bytes),
         None => agents,
     };
     // The card of the files this process runs, like the workers' agent.
