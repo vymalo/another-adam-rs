@@ -2503,6 +2503,218 @@ async fn remove_keeping_scratch_keeps_only_the_projects_of_a_conversation() {
     assert!(!other.path().exists());
 }
 
+/// The metadata file of a slot, as it is written.
+fn slot_meta(root: &Path, run: &str, dir: &str) -> serde_json::Value {
+    let path = root.join("meta").join(run).join(format!("{dir}.json"));
+    serde_json::from_slice(&std::fs::read(&path).expect("the slot's metadata")).expect("valid JSON")
+}
+
+/// A repository slot belongs to the conversation of its run (ADR 0073 decision 3): the next task of
+/// that conversation adopts the slot — the same worktree and directory name, the line of work it
+/// was made on, and the files the first task did not commit — instead of making another worktree.
+/// The commits go to a branch of the new run's own, as a continued branch does, so the checks gate
+/// still decides what reaches the published branch.
+#[tokio::test]
+async fn a_second_task_of_a_conversation_adopts_the_firsts_slot() {
+    let env = Env::new();
+    let first = env
+        .ws
+        .run("run-first-0001")
+        .unwrap()
+        .with_conversation(Some("c1"));
+    let slot = first.add_repository(&env.repo).await.unwrap();
+    let dir = slot.dir().to_owned();
+    let branch = slot.worktree().unwrap().branch().to_owned();
+    assert_eq!(
+        branch,
+        slot.worktree().unwrap().local_branch(),
+        "a first task starts a branch of its own"
+    );
+    let generation = slot.generation().map(str::to_owned);
+    std::fs::write(slot.path().join("wip.txt"), "uncommitted\n").unwrap();
+
+    let second = env
+        .ws
+        .run("run-second-002")
+        .unwrap()
+        .with_conversation(Some("c1"));
+    let adopted = second.add_repository(&env.repo).await.unwrap();
+    let wt = adopted.worktree().unwrap();
+    assert_eq!(adopted.dir(), dir, "the slot keeps its directory name");
+    assert_eq!(
+        adopted.path(),
+        second.path().join(&dir),
+        "the worktree moved into the second run's workspace"
+    );
+    assert_eq!(wt.branch(), branch, "the branch it was made on is kept");
+    assert_eq!(wt.continues(), Some(branch.as_str()));
+    let local = wt.local_branch().to_owned();
+    assert_ne!(
+        local, branch,
+        "the commits go to a branch of this run's own"
+    );
+    assert_eq!(git(wt.path(), &["symbolic-ref", "--short", "HEAD"]), local);
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("wip.txt")).unwrap(),
+        "uncommitted\n",
+        "the files the first task did not commit come along"
+    );
+    assert_ne!(
+        adopted.generation(),
+        generation.as_deref(),
+        "a moved slot is a new generation"
+    );
+    assert_eq!(
+        slot_meta(&env.root, "run-second-002", &dir)["conversation"],
+        "c1"
+    );
+    assert!(
+        first.slot(&dir).await.unwrap().is_none(),
+        "it is the second run's now"
+    );
+    assert!(!first.path().join(&dir).exists());
+
+    // The adopted worktree is a real one of the mirror: commit, push to the run's own branch, and
+    // publish moves the line the first task made once the gate (here, nothing) has passed.
+    std::fs::write(wt.path().join("wip.txt"), "committed\n").unwrap();
+    wt.commit_all("carry on", &me())
+        .await
+        .unwrap()
+        .expect("a commit");
+    wt.push().await.unwrap();
+    assert_eq!(
+        git(&env.remote, &["rev-parse", &format!("refs/heads/{local}")]),
+        git(wt.path(), &["rev-parse", "HEAD"])
+    );
+    wt.publish().await.unwrap();
+    assert_eq!(
+        git(&env.remote, &["rev-parse", &format!("refs/heads/{branch}")]),
+        git(wt.path(), &["rev-parse", "HEAD"])
+    );
+
+    // A third task of the conversation adopts it from the second, still on the same line.
+    let third = env
+        .ws
+        .run("run-third-0003")
+        .unwrap()
+        .with_conversation(Some("c1"));
+    let again = third.add_repository(&env.repo).await.unwrap();
+    assert_eq!(again.dir(), dir);
+    assert_eq!(again.worktree().unwrap().branch(), branch);
+    assert!(second.slot(&dir).await.unwrap().is_none());
+}
+
+/// Another conversation never adopts the slot: it gets a worktree and a branch of its own, and the
+/// first conversation's slot stays where it is.
+#[tokio::test]
+async fn a_task_of_another_conversation_does_not_adopt_it() {
+    let env = Env::new();
+    let first = env
+        .ws
+        .run("run-first-0001")
+        .unwrap()
+        .with_conversation(Some("c1"));
+    let slot = first.add_repository(&env.repo).await.unwrap();
+    let dir = slot.dir().to_owned();
+    let branch = slot.worktree().unwrap().branch().to_owned();
+    std::fs::write(slot.path().join("wip.txt"), "c1\n").unwrap();
+
+    let other = env
+        .ws
+        .run("run-other-0002")
+        .unwrap()
+        .with_conversation(Some("c2"));
+    let made = other.add_repository(&env.repo).await.unwrap();
+    assert_eq!(made.dir(), dir, "the same repository, the same slot name");
+    assert_ne!(made.path(), slot.path(), "a worktree of its own");
+    assert_ne!(
+        made.worktree().unwrap().branch(),
+        branch,
+        "a branch of its own"
+    );
+    assert!(!made.path().join("wip.txt").exists());
+    assert!(
+        first.slot(&dir).await.unwrap().is_some(),
+        "the first conversation's slot stays with its run"
+    );
+    assert_eq!(
+        slot_meta(&env.root, "run-first-0001", &dir)["conversation"],
+        "c1"
+    );
+}
+
+/// Metadata written before a slot recorded its conversation still loads: the field's serde default
+/// is what does it. The round trip is asserted, not only the absence of an error: the slot reads
+/// back as it was, and the next prepare records the conversation the run knows.
+#[tokio::test]
+async fn slot_metadata_written_before_the_conversation_field_still_loads() {
+    let env = Env::new();
+    let run = env
+        .ws
+        .run("run-first-0001")
+        .unwrap()
+        .with_conversation(Some("c1"));
+    let slot = run.add_repository(&env.repo).await.unwrap();
+    let dir = slot.dir().to_owned();
+    let path = env
+        .root
+        .join("meta")
+        .join("run-first-0001")
+        .join(format!("{dir}.json"));
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(meta["conversation"], "c1");
+    meta.as_object_mut().unwrap().remove("conversation");
+    std::fs::write(&path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+    let again = run.slot(&dir).await.unwrap().expect("the slot loads");
+    assert_eq!(
+        again.worktree().unwrap().branch(),
+        slot.worktree().unwrap().branch()
+    );
+    let filled = run.add_repository(&env.repo).await.unwrap();
+    assert_eq!(filled.dir(), dir);
+    assert_eq!(
+        slot_meta(&env.root, "run-first-0001", &dir)["conversation"],
+        "c1",
+        "the next prepare records the conversation"
+    );
+}
+
+/// Adoption takes the slot of the repository asked for and leaves the conversation's other slots
+/// with the run that still holds them.
+#[tokio::test]
+async fn adoption_takes_one_slot_and_leaves_the_conversations_others() {
+    let env = Env::new();
+    let (_, other_repo) = remote_with(
+        env._tmp.path(),
+        "acme",
+        "other",
+        &[("other.txt", "other\n")],
+    );
+    let first = env
+        .ws
+        .run("run-first-0001")
+        .unwrap()
+        .with_conversation(Some("c1"));
+    let api = first.add_repository(&env.repo).await.unwrap();
+    let other = first.add_repository(&other_repo).await.unwrap();
+
+    let second = env
+        .ws
+        .run("run-second-002")
+        .unwrap()
+        .with_conversation(Some("c1"));
+    let adopted = second.add_repository(&env.repo).await.unwrap();
+    assert_eq!(adopted.dir(), api.dir());
+    assert!(first.slot(api.dir()).await.unwrap().is_none());
+    assert!(
+        first.slot(other.dir()).await.unwrap().is_some(),
+        "the slot of the repository nobody asked for stays with its run"
+    );
+    assert!(second.slot(other.dir()).await.unwrap().is_none());
+}
+
 /// A check can be run on the code the run started from: a detached checkout of `origin/<base>`
 /// next to the slot, with the installed (ignored) files of the slot linked in, and nothing of the
 /// run's changes. It is a worktree of the same repository, and removing it leaves the run alone.

@@ -23,14 +23,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::git::{GitCmd, GitPin};
-use crate::repo::RepoRef;
+use crate::repo::{RepoLocation, RepoRef};
 use crate::safe_fs::{self, Dir, SlotDir, WalkError};
 use crate::workspace::{
-    Inner, Meta, SLOT_META_VERSION, ScratchMeta, SlotMeta, Workspaces, exists, is_generation,
-    new_generation, open_scratch_root, open_worktree_root, remove_dir_if_exists,
-    remove_file_if_exists, slot_name,
+    Inner, Meta, SLOT_META_VERSION, ScratchMeta, SlotMeta, Workspaces, admin_name, exists,
+    is_generation, names_worktree, new_generation, open_scratch_root, open_worktree_root,
+    remove_dir_if_exists, remove_file_if_exists, slot_name,
 };
-use crate::worktree::{ChangedFile, GitIdentity, Worktree, commit_all_in, parse_porcelain};
+use crate::worktree::{
+    ChangedFile, GitIdentity, Worktree, commit_all_in, is_admin_name, parse_porcelain,
+};
 
 /// Longest directory name of a scratch slot.
 const MAX_SCRATCH_DIR: usize = 64;
@@ -47,6 +49,11 @@ pub struct RunWorkspace {
     ws: Workspaces,
     run: String,
     path: PathBuf,
+    /// The conversation of the run, as the caller named it: when it is `Some`, a repository slot
+    /// the run prepares records it, and the run adopts a slot an earlier task of the same
+    /// conversation left ([`RunWorkspace::add_repository`], ADR 0073). `None` for a caller that
+    /// names none: the slot stays with its run, as every slot did before.
+    conversation: Option<String>,
 }
 
 impl fmt::Debug for RunWorkspace {
@@ -381,7 +388,22 @@ impl RunWorkspace {
             ws,
             run: run.to_owned(),
             path,
+            conversation: None,
         }
+    }
+
+    /// The same workspace, with the conversation of its run named: what a repository slot the run
+    /// prepares records, and what lets it adopt a slot an earlier task of that conversation left
+    /// ([`RunWorkspace::add_repository`], ADR 0073). `None` clears it.
+    #[must_use]
+    pub fn with_conversation(mut self, conversation: Option<&str>) -> Self {
+        self.conversation = conversation.map(str::to_owned);
+        self
+    }
+
+    /// The conversation of the run, as the caller named it ([`with_conversation`](Self::with_conversation)).
+    pub fn conversation(&self) -> Option<&str> {
+        self.conversation.as_deref()
     }
 
     /// The run.
@@ -687,6 +709,14 @@ impl RunWorkspace {
         let inner = self.inner();
         // A refused repository costs no process, no lock and no credential.
         let loc = self.ws.check_repo(repo)?;
+        // Take over the slot an earlier task of the conversation left, before this run's lock: a
+        // move holds both runs' locks in the order of their paths, this run's being one of them
+        // (see [`take_repository_from`](Self::take_repository_from)). The store keeps one open run
+        // per conversation, and the locks -- not a second guard -- are what keeps two runs off one
+        // slot: whichever gets both first moves it, and the other then finds it gone or its own.
+        if let Some(conversation) = self.conversation.as_deref() {
+            self.adopt_repository(conversation, &loc).await?;
+        }
         let _run = inner.lock_path(&self.path).await?;
         let metas = inner.read_slot_metas(&self.run).await?;
         let legacy = inner.read_meta(&self.run).await?;
@@ -703,7 +733,13 @@ impl RunWorkspace {
             let target = inner.legacy_target(&self.run, &loc);
             let wt = self
                 .ws
-                .prepare_at(&known, &self.run, existing, &target)
+                .prepare_at(
+                    &known,
+                    &self.run,
+                    existing,
+                    self.conversation.as_deref(),
+                    &target,
+                )
                 .await?;
             return Ok(repository_slot(wt, 0));
         }
@@ -717,7 +753,13 @@ impl RunWorkspace {
             let target = inner.slot_target(&self.run, &dir, seq);
             let wt = self
                 .ws
-                .prepare_at(&known, &self.run, existing, &target)
+                .prepare_at(
+                    &known,
+                    &self.run,
+                    existing,
+                    self.conversation.as_deref(),
+                    &target,
+                )
                 .await?;
             return Ok(repository_slot(wt, seq));
         }
@@ -729,7 +771,13 @@ impl RunWorkspace {
         let target = inner.slot_target(&self.run, &dir, seq);
         let wt = self
             .ws
-            .prepare_at(repo, &self.run, existing, &target)
+            .prepare_at(
+                repo,
+                &self.run,
+                existing,
+                self.conversation.as_deref(),
+                &target,
+            )
             .await?;
         Ok(repository_slot(wt, seq))
     }
@@ -825,7 +873,7 @@ impl RunWorkspace {
         };
         let wt = self
             .ws
-            .prepare_at(&spelled, &self.run, None, &target)
+            .prepare_at(&spelled, &self.run, None, None, &target)
             .await?;
         Ok(Slot {
             dir: wt.dir().to_owned(),
@@ -1047,6 +1095,232 @@ impl RunWorkspace {
         Ok(moved)
     }
 
+    /// Take over the repository slot that another run of `conversation` holds for `loc`, if there
+    /// is one: the worktree (its branch and the files it did not commit) and its directory in the
+    /// mirror become this run's, at the slot name the earlier run gave it. Returns whether a slot
+    /// was moved.
+    ///
+    /// The look is without any lock; the move is made under both runs' locks, in the order of
+    /// their paths, and then the mirror's (the run-then-mirror order every other operation uses),
+    /// so two runs cannot both move one slot. The store keeps one open run per conversation; the
+    /// locks are what keeps a second off the slot, not another guard.
+    async fn adopt_repository(
+        &self,
+        conversation: &str,
+        loc: &RepoLocation,
+    ) -> WorkspaceResult<bool> {
+        let inner = self.inner();
+        let wanted = loc.mirror_relative();
+        for run in self.ws.runs().await? {
+            if run == self.run {
+                continue;
+            }
+            // A look without the lock: most runs hold nothing of this conversation.
+            let holds = match inner.read_slot_metas(&run).await {
+                Ok(metas) => metas.iter().any(|m| {
+                    matches!(m, SlotMeta::Repo(r)
+                        if r.conversation.as_deref() == Some(conversation)
+                            && same_repository(r, &wanted))
+                }),
+                Err(_) => false,
+            };
+            if holds
+                && self
+                    .take_repository_from(&run, conversation, &wanted)
+                    .await?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Move the slot of `conversation` for the repository mirrored at `wanted` from `from`'s
+    /// workspace into this one: the directory is moved with `git worktree move` (the worktree's
+    /// `.git` and the mirror's `gitdir` are repointed together), its directory in the mirror is
+    /// renamed to carry this run, and the metadata is rewritten for this run with a new
+    /// generation. An adopted slot keeps the line of work it had and gets a branch of this run's
+    /// own, as a `prepare_continuing` does: the commits go to the local branch and only `publish`
+    /// (after the checks gate) moves the published one. Returns whether a slot was moved; a slot
+    /// whose name this run already has, whose mirror directory cannot be told, or whose move fails
+    /// stays where it is.
+    async fn take_repository_from(
+        &self,
+        from: &str,
+        conversation: &str,
+        wanted: &Path,
+    ) -> WorkspaceResult<bool> {
+        let inner = self.inner();
+        let from_dir = inner.run_dir(from);
+        let (first, second) = if from_dir < self.path {
+            (&from_dir, &self.path)
+        } else {
+            (&self.path, &from_dir)
+        };
+        let _first = inner.lock_path(first).await?;
+        let _second = inner.lock_path(second).await?;
+        // Slots may move: neither run's list outlives this call, whatever it does.
+        inner.forget_slots(from);
+        self.forget_slots();
+        let theirs = inner.read_slot_metas(from).await?;
+        let Some(meta) = theirs.iter().find_map(|m| match m {
+            SlotMeta::Repo(r)
+                if r.conversation.as_deref() == Some(conversation)
+                    && same_repository(r, wanted) =>
+            {
+                Some(r)
+            }
+            _ => None,
+        }) else {
+            return Ok(false);
+        };
+        let dir = meta.dir.clone().unwrap_or_default();
+        // A slot this run already has stays where it is (the earlier run keeps its own).
+        let mine = inner.read_slot_metas(&self.run).await?;
+        let legacy = inner.read_meta(&self.run).await?;
+        let same = |m: &Meta| same_repository(m, wanted);
+        if mine.iter().any(|m| m.dir() == dir)
+            || legacy.as_ref().is_some_and(&same)
+            || mine.iter().any(|m| match m {
+                SlotMeta::Repo(r) | SlotMeta::Reference(r) => same(r),
+                SlotMeta::Scratch(_) => false,
+            })
+        {
+            return Ok(false);
+        }
+        let Some(admin) = meta.admin.as_deref().filter(|name| is_admin_name(name)) else {
+            // Metadata from before the mirror directory was recorded: it cannot be moved reliably.
+            return Ok(false);
+        };
+        let source = inner.slot_path(from, &dir);
+        let target = inner.slot_path(&self.run, &dir);
+        if !exists(&source.join(".git")).await? || exists(&target).await? {
+            return Ok(false);
+        }
+        let repo = RepoRef::new(&meta.url, &meta.base_branch);
+        let mirror = inner.root().join(repo.locate()?.mirror_relative());
+        if !exists(&mirror.join("HEAD")).await? || !names_worktree(&mirror, admin, &source).await {
+            return Ok(false);
+        }
+        let new_admin = admin_name(&self.run, &dir);
+        if exists(&mirror.join("worktrees").join(&new_admin)).await? {
+            return Ok(false);
+        }
+        let seq = mine.iter().map(SlotMeta::seq).max().unwrap_or(0) + 1;
+        // The line of work the slot carries on: what a pull request is from. The run gets a
+        // branch of its own for its commits, so a red-checked change never reaches that line
+        // before `publish` (the checks gate) — as `prepare_continuing` does for a pushed branch.
+        let published = meta
+            .remote_branch
+            .clone()
+            .unwrap_or_else(|| meta.branch.clone());
+        let local = inner.pick_branch(&mirror, &self.run).await?;
+        let new_meta = Meta {
+            run: self.run.clone(),
+            dir: Some(dir.clone()),
+            seq: Some(seq),
+            conversation: Some(conversation.to_owned()),
+            branch: local.clone(),
+            remote_branch: Some(published),
+            admin: Some(new_admin.clone()),
+            admin_gen: Some(new_generation()),
+            ..meta.clone()
+        };
+        {
+            let _mirror = inner.lock_mirror(&mirror).await?;
+            if let Some(parent) = target.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| WorkspaceError::io("cannot make the run's workspace", e))?;
+            }
+            let moved = inner
+                .mirror_git(&mirror)
+                .args(["worktree", "move"])
+                .arg(&source)
+                .arg(&target)
+                .run_status()
+                .await?;
+            if !moved.success {
+                // The worktree stays where it was; this run makes a slot of its own.
+                tracing::warn!(run = %self.run, from = %from, dir = %dir, "cannot move a repository slot into this run's workspace");
+                return Ok(false);
+            }
+            let admin_from = mirror.join("worktrees").join(admin);
+            let admin_to = mirror.join("worktrees").join(&new_admin);
+            let renamed = tokio::fs::rename(&admin_from, &admin_to).await;
+            if let Err(e) = renamed {
+                // Put the worktree back: a half-moved slot is worse than none.
+                let _ = inner
+                    .mirror_git(&mirror)
+                    .args(["worktree", "move"])
+                    .arg(&target)
+                    .arg(&source)
+                    .run_status()
+                    .await;
+                return Err(WorkspaceError::io(
+                    "cannot move a slot's git directory in the mirror",
+                    e,
+                ));
+            }
+            let pointer = format!("gitdir: {}\n", admin_to.display());
+            if let Err(e) = safe_fs::replace_file(&target.join(".git"), pointer.as_bytes()).await {
+                let _ = tokio::fs::rename(&admin_to, &admin_from).await;
+                let _ = inner
+                    .mirror_git(&mirror)
+                    .args(["worktree", "move"])
+                    .arg(&target)
+                    .arg(&source)
+                    .run_status()
+                    .await;
+                return Err(WorkspaceError::io(
+                    "cannot repoint a moved slot's .git file",
+                    e,
+                ));
+            }
+            // The run's own branch, from where the slot stands: a switch keeps the files the
+            // earlier task did not commit, and the published line is moved only by `publish`
+            // (after the checks gate), as for a continued branch.
+            let switched = inner
+                .git()
+                .cwd(&target)
+                .args(["switch", "--quiet", "-c", &local])
+                .run_status()
+                .await?;
+            if !switched.success {
+                let _ = tokio::fs::rename(&admin_to, &admin_from).await;
+                let _ = safe_fs::replace_file(
+                    &target.join(".git"),
+                    format!("gitdir: {}\n", admin_from.display()).as_bytes(),
+                )
+                .await;
+                let _ = inner
+                    .mirror_git(&mirror)
+                    .args(["worktree", "move"])
+                    .arg(&target)
+                    .arg(&source)
+                    .run_status()
+                    .await;
+                return Err(WorkspaceError::Corrupt(format!(
+                    "cannot check out branch {local} in the adopted slot: it stays with {from}"
+                )));
+            }
+            inner
+                .mirror_git(&mirror)
+                .args(["config", &format!("branch.{local}.adam-run"), &self.run])
+                .run()
+                .await?;
+        }
+        // This run's record goes first, the earlier one second: a crash in between leaves a slot
+        // this run lists, never an orphan that neither does.
+        inner
+            .write_meta_at(&inner.slot_meta_path(&self.run, &dir), &new_meta)
+            .await?;
+        remove_file_if_exists(&inner.slot_meta_path(from, &dir)).await?;
+        inner.forget_slots(from);
+        self.forget_slots();
+        Ok(true)
+    }
+
     /// Delete the whole workspace: every slot (a worktree with its uncommitted changes, a scratch
     /// project), the legacy worktree of the run, the metadata and the directory, under the
     /// mirrors' locks. **Idempotent.** The run's `agent/*` branches stay in their mirrors: they
@@ -1143,6 +1417,14 @@ impl RunWorkspace {
         self.forget_slots();
         Ok(0)
     }
+}
+
+/// Whether the repository a slot's metadata names is the one mirrored at `wanted` (a slot's url,
+/// whatever its spelling and base branch).
+fn same_repository(meta: &Meta, wanted: &Path) -> bool {
+    RepoRef::new(&meta.url, "HEAD")
+        .locate()
+        .is_ok_and(|loc| loc.mirror_relative().as_path() == wanted)
 }
 
 /// The slot of a worktree that was just made or found.

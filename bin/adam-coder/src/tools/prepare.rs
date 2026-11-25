@@ -126,7 +126,9 @@ pub async fn prepare_workspace(
     }
     let repo = RepoRef::new(url, base);
     let workspace = match env.workspaces.run(&workspace_run) {
-        Ok(workspace) => workspace,
+        // The conversation is the thread's: the slot records it, so the thread's next task adopts
+        // the worktree and its branch instead of making new ones (ADR 0073).
+        Ok(workspace) => workspace.with_conversation(ctx.conversation_id()),
         Err(e) => return Err(workspace_error(&e)),
     };
     let prepared = match continuing {

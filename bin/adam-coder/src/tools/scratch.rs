@@ -205,7 +205,10 @@ pub async fn publish_scratch(
     let workspace = env
         .workspaces
         .run(&workspace_run)
-        .map_err(|e| workspace_error(&e))?;
+        .map_err(|e| workspace_error(&e))?
+        // The conversation is the thread's: a repository slot this publishes into records it, so
+        // the thread's next task adopts the slot instead of making another worktree (ADR 0073).
+        .with_conversation(ctx.conversation_id());
     let slots = workspace.slots().await.map_err(|e| workspace_error(&e))?;
     // A reference is read and never published to, unless the person named the repository too.
     if let Some(key) = key_of_argument(url)
