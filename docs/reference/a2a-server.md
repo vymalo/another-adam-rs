@@ -390,10 +390,12 @@ says.
 An agent whose card lists `https://agents.vymalo.com/a2a/extensions/prompt-statement/v1` (no `params`) carries a
 message's prompt statement and the person's envelope to the gateway in front of the model
 ([ADR 0077](../decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md)). The card lists
-it only with `MODEL_AUTH=injector`, the one provider that sends them.
+it only when the model calls send them: with `MODEL_AUTH=injector`, or with a turn key (`TURN_SIGNING_KEY_FILE`, every
+call signed, [turn signing](environment.md#turn-signing)).
 
-A request that **activates** it may carry `metadata[URI] = {"statement": "<JWS>", "user": "<JWS>"}` (`user` may be
-absent). Each must be a compact JWS of at most 8 KiB; anything else refuses the message with `InvalidParams`, which
+A request that **activates** it may carry `metadata[URI] = {"statement": "<JWS>", "user": "<JWS>"}`: `user` may be
+absent, and on a device, which has no orchestrator, `statement` is absent and `user` alone is required. Each must be a
+compact JWS of at most 8 KiB; an entry with neither, or anything else, refuses the message with `InvalidParams`, which
 names the member and never its value. A request that did not activate it carries nothing.
 
 | Message | The run's values |
@@ -403,9 +405,11 @@ names the member and never its value. A request that did not activate it carries
 | a later one without values | kept |
 | a later task of the conversation | its own message's, none otherwise |
 
-Every model call of the run carries `Prompt-Statement` and, when there is an envelope, `Prompt-User-Signature`, byte
-for byte, beside `X-Run-Id`: the root's calls, a local subagent's (started with its parent's values) and a session
-round's. The values live in the run's state, not its context, and are in no log line.
+Every model call of the run carries `Prompt-Statement` when there is a statement and `Prompt-User-Signature` when
+there is an envelope, byte for byte, beside `X-Run-Id`: the root's calls, a local subagent's (started with its parent's
+values) and a session round's. With a turn key each call also carries `Turn-Signature`, whose `prompt_jti` is the
+statement's `jti`, or the envelope's `nonce` when there is no statement. The values live in the run's state, not its
+context, and are in no log line.
 
 ## The reasoning effort (`reasoning/v1`)
 

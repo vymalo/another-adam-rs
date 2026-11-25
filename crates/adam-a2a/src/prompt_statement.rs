@@ -1,7 +1,8 @@
 //! `prompt-statement/v1`: the prompt statement and the person's envelope a message carries.
 //!
 //! A client that signs what a person asked sends, in the message's metadata under
-//! [`PROMPT_STATEMENT_EXTENSION`], `{"statement": "<JWS>", "user": "<JWS>"}` (`user` may be absent).
+//! [`PROMPT_STATEMENT_EXTENSION`], `{"statement": "<JWS>", "user": "<JWS>"}` (`user` may be absent;
+//! on a device, which has no orchestrator, `statement` is absent and `user` is required).
 //! The agent keeps both with the run and every model call of the run carries them, byte for byte,
 //! as the headers `Prompt-Statement` and `Prompt-User-Signature` (adam ADR 0077). The agent checks
 //! the shape of each value and nothing more: whoever verifies a signature sits in front of the model.
@@ -38,8 +39,8 @@ pub const PROMPT_USER_MEMBER: &str = "user";
 /// # Errors
 ///
 /// A sentence naming what is wrong, for `InvalidParams`: an entry that is not an object, a
-/// [`PROMPT_STATEMENT_MEMBER`] that is missing or not a string, a [`PROMPT_USER_MEMBER`] that is
-/// neither absent, `null` nor a string, or a value that is not a compact JWS of at most
+/// [`PROMPT_STATEMENT_MEMBER`] or a [`PROMPT_USER_MEMBER`] that is neither absent, `null` nor a
+/// string, neither of the two, or a value that is not a compact JWS of at most
 /// [`adam_model::MAX_PROMPT_JWS_BYTES`] bytes. It never quotes a value.
 pub fn statement_of(metadata: &HashMap<String, Value>) -> Result<Option<PromptStatement>, String> {
     let Some(entry) = metadata.get(PROMPT_STATEMENT_EXTENSION) else {
@@ -48,17 +49,19 @@ pub fn statement_of(metadata: &HashMap<String, Value>) -> Result<Option<PromptSt
     let Some(entry) = entry.as_object() else {
         return Err("prompt-statement/v1: the entry is not an object".to_owned());
     };
-    let Some(statement) = entry.get(PROMPT_STATEMENT_MEMBER).and_then(Value::as_str) else {
-        return Err("prompt-statement/v1: the entry has no string `statement`".to_owned());
+    let text = |member: &str| match entry.get(member) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("prompt-statement/v1: `{member}` is not a string")),
     };
-    let user = match entry.get(PROMPT_USER_MEMBER) {
-        None | Some(Value::Null) => None,
-        Some(Value::String(user)) => Some(user.clone()),
-        Some(_) => {
-            return Err("prompt-statement/v1: `user` is not a string".to_owned());
-        }
-    };
-    PromptStatement::new(statement, user)
+    let (statement, user) = (text(PROMPT_STATEMENT_MEMBER)?, text(PROMPT_USER_MEMBER)?);
+    if statement.is_none() && user.is_none() {
+        return Err(
+            "prompt-statement/v1: the entry has neither a string `statement` nor a string `user`"
+                .to_owned(),
+        );
+    }
+    PromptStatement::from_parts(statement, user)
         .map(Some)
         .map_err(|why| format!("prompt-statement/v1: {why}"))
 }
@@ -110,7 +113,7 @@ mod tests {
         let read = statement_of_request(&activated(), &with(json!({"statement": S, "user": U})))
             .unwrap()
             .unwrap();
-        assert_eq!((read.statement(), read.user()), (S, Some(U)));
+        assert_eq!((read.statement(), read.user()), (Some(S), Some(U)));
         for absent in [
             json!({"statement": S}),
             json!({"statement": S, "user": null}),
@@ -118,8 +121,13 @@ mod tests {
             let read = statement_of_request(&activated(), &with(absent))
                 .unwrap()
                 .unwrap();
-            assert_eq!((read.statement(), read.user()), (S, None));
+            assert_eq!((read.statement(), read.user()), (Some(S), None));
         }
+        // A device's envelope alone.
+        let device = statement_of_request(&activated(), &with(json!({"user": U})))
+            .unwrap()
+            .unwrap();
+        assert_eq!((device.statement(), device.user()), (None, Some(U)));
         let bare = Message::new(Role::User, vec![Part::text("hi")]);
         assert_eq!(statement_of_request(&activated(), &bare), Ok(None));
     }
@@ -139,8 +147,13 @@ mod tests {
     fn a_malformed_entry_is_refused_without_its_value() {
         for (entry, wanted) in [
             (json!("x.y.z"), "not an object"),
-            (json!({}), "no string `statement`"),
-            (json!({"statement": 3}), "no string `statement`"),
+            (json!({}), "neither"),
+            (json!({"statement": null, "user": null}), "neither"),
+            (json!({"statement": 3}), "`statement` is not a string"),
+            (
+                json!({"statement": 3, "user": U}),
+                "`statement` is not a string",
+            ),
             (json!({"statement": "not-a-jws"}), "prompt statement"),
             (json!({"statement": S, "user": 4}), "`user` is not a string"),
             (json!({"statement": S, "user": "not-a-jws"}), "envelope"),

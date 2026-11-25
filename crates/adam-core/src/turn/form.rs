@@ -1,5 +1,7 @@
-//! The form of a signature: a compact JWS with a detached payload (RFC 7515 appendix F),
-//! `BASE64URL(header)..BASE64URL(signature)`.
+//! The form of a signature: a compact JWS, its payload detached (RFC 7515 appendix F,
+//! `BASE64URL(header)..BASE64URL(signature)`) for what adam keeps, or attached
+//! (`BASE64URL(header).BASE64URL(payload).BASE64URL(signature)`) for a model request, whose
+//! verifier cannot rebuild the payload ([`SignatureType::Request`]).
 
 use adam_error::{Classify, ErrorClass};
 use base64::Engine as _;
@@ -27,6 +29,10 @@ pub enum SignatureType {
     Head,
     /// A journal entry (`adam-step/v1`; its payload is slice T3's).
     Step,
+    /// One model request as adam sends it (`adam-request/v1`, [`request_payload`](super::request_payload)):
+    /// the payload is **attached** ([`sign_attached`]), never kept, and a history signature never
+    /// verifies as one ([ADR 0068], *Amended 2026-11-25 (the request signature)*).
+    Request,
 }
 
 impl SignatureType {
@@ -36,6 +42,7 @@ impl SignatureType {
             Self::Turn => "adam-turn/v1",
             Self::Head => "adam-head/v1",
             Self::Step => "adam-step/v1",
+            Self::Request => "adam-request/v1",
         }
     }
 }
@@ -73,15 +80,41 @@ pub async fn sign_detached(
     typ: SignatureType,
     payload: &[u8],
 ) -> Result<String, TurnKeyError> {
+    let (protected, signature) = sign_compact(keys, typ, payload).await?;
+    Ok(format!("{protected}..{signature}"))
+}
+
+/// Sign `payload` as `typ` with the current key of `keys`, the payload **attached**:
+/// `BASE64URL(header).BASE64URL(payload).BASE64URL(signature)`. The header and the signing input
+/// are byte for byte those of [`sign_detached`]; only the middle segment differs.
+///
+/// # Errors
+///
+/// [`TurnKeyError`] from the keys.
+pub async fn sign_attached(
+    keys: &(impl TurnKeys + ?Sized),
+    typ: SignatureType,
+    payload: &[u8],
+) -> Result<String, TurnKeyError> {
+    let (protected, signature) = sign_compact(keys, typ, payload).await?;
+    Ok(format!(
+        "{protected}.{}.{signature}",
+        URL_SAFE_NO_PAD.encode(payload)
+    ))
+}
+
+/// The protected header and the signature, each base64url, of `payload` signed as `typ`.
+async fn sign_compact(
+    keys: &(impl TurnKeys + ?Sized),
+    typ: SignatureType,
+    payload: &[u8],
+) -> Result<(String, String), TurnKeyError> {
     let current = keys.current().await?;
     let protected = URL_SAFE_NO_PAD.encode(header(&current.identity, typ));
     let signature = keys
         .sign(current.kid(), &signing_input(&protected, payload))
         .await?;
-    Ok(format!(
-        "{protected}..{}",
-        URL_SAFE_NO_PAD.encode(signature.to_bytes())
-    ))
+    Ok((protected, URL_SAFE_NO_PAD.encode(signature.to_bytes())))
 }
 
 /// Verify that `jws` is a signature of `payload` as `typ` by a key of `set`; the id of the key
@@ -109,6 +142,54 @@ pub fn verify_detached(
     else {
         return Err(TurnSignatureError::Malformed);
     };
+    verify_compact(set, typ, protected, payload, signature)
+}
+
+/// Verify that `jws` is an attached signature as `typ` by a key of `set` ([`sign_attached`]): the
+/// id of the key that made it and the payload it carries. What the payload says is the caller's to
+/// check ([`verify_request`](super::verify_request) for a request).
+///
+/// Fails closed as [`verify_detached`] does, and on an empty or detached payload.
+///
+/// # Errors
+///
+/// [`TurnSignatureError`], all of class `Corrupt`.
+pub fn verify_attached(
+    set: &KeySet,
+    typ: SignatureType,
+    jws: &str,
+) -> Result<(KeyId, Vec<u8>), TurnSignatureError> {
+    if jws.len() > MAX_SIGNATURE_LEN {
+        return Err(TurnSignatureError::TooLong);
+    }
+    let mut parts = jws.split('.');
+    let (Some(protected), Some(encoded), Some(signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(TurnSignatureError::Malformed);
+    };
+    if encoded.is_empty() {
+        return Err(TurnSignatureError::Malformed);
+    }
+    let payload = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| TurnSignatureError::Malformed)?;
+    // One encoding only: the segment must be the payload's own base64url, so the bytes signed
+    // (`header.segment`) are the bytes the payload re-encodes to.
+    if URL_SAFE_NO_PAD.encode(&payload) != encoded {
+        return Err(TurnSignatureError::Malformed);
+    }
+    let kid = verify_compact(set, typ, protected, &payload, signature)?;
+    Ok((kid, payload))
+}
+
+fn verify_compact(
+    set: &KeySet,
+    typ: SignatureType,
+    protected: &str,
+    payload: &[u8],
+    signature: &str,
+) -> Result<KeyId, TurnSignatureError> {
     let raw = URL_SAFE_NO_PAD
         .decode(protected)
         .map_err(|_| TurnSignatureError::Malformed)?;
@@ -210,6 +291,16 @@ pub enum TurnSignatureError {
         /// The key the signature names.
         kid: KeyId,
     },
+    /// A request signature verifies, and covers another request: the member named differs from
+    /// the request it came with (`run`, `method`, `path`, `body_sha256`, `prompt_jti`).
+    #[error("turn signature: its `{member}` is not the request's")]
+    Mismatch {
+        /// The payload member that differs. Never its value.
+        member: &'static str,
+    },
+    /// A request signature verifies, and its `iat` is outside the window.
+    #[error("turn signature: its `iat` is outside the window")]
+    Expired,
 }
 
 impl Classify for TurnSignatureError {

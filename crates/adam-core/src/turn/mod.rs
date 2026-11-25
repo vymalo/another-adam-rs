@@ -12,9 +12,14 @@
 //!   `{"alg":"EdDSA","kid":"…","typ":"adam-turn/v1"}` ([`sign_detached`], [`verify_detached`]); the
 //!   turn's payload `{typ, run, cnv, idx, prv, msg}` ([`turn_payload`]) and the chain `prv`
 //!   ([`ChainHash`]); every byte string signed is RFC 8785 ([`crate::jcs`]).
-//! * [`testkit`]: the cases every `TurnKeys` passes, [`turn_keys_conformance!`](crate::turn_keys_conformance).
+//! * The request signature: adam's signature of one model request as it sends it
+//!   (`adam-request/v1`, [`sign_request`], [`verify_request`]), its payload attached
+//!   ([`sign_attached`]) and carried in the header [`TURN_SIGNATURE_HEADER`].
+//! * [`testkit`]: the cases every `TurnKeys` passes, [`turn_keys_conformance!`](crate::turn_keys_conformance),
+//!   and [`testkit::Certified`], a key named by a certificate chain.
 //!
-//! Slice T1 of the ADR builds these; nothing signs or verifies a run's history yet (T3).
+//! Slice T1 of the ADR builds the history's form; nothing signs or verifies a run's history yet
+//! (T3). Every model request is signed when the host gives keys (`adam_model::SignedRequests`).
 //!
 //! [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
 
@@ -22,6 +27,7 @@ mod chain;
 mod ed25519;
 mod form;
 mod key_set;
+mod request;
 pub mod testkit;
 
 use std::fmt;
@@ -39,9 +45,15 @@ pub use chain::{
 };
 pub use ed25519::{Ed25519TurnKeys, TurnKeyConfigError};
 pub use form::{
-    MAX_SIGNATURE_LEN, SignatureType, TurnSignatureError, sign_detached, verify_detached,
+    MAX_SIGNATURE_LEN, SignatureType, TurnSignatureError, sign_attached, sign_detached,
+    verify_attached, verify_detached,
 };
 pub use key_set::{KeySet, KeySetError, PublicKey};
+pub use request::{
+    ModelCall, REQUEST_MAX_AGE_SECS, REQUEST_MAX_SKEW_SECS, REQUEST_NONCE_LEN,
+    TURN_SIGNATURE_HEADER, VerifiedRequest, body_sha256, request_payload, sign_request,
+    sign_request_at, verify_request,
+};
 
 /// Signs with the turn key and gives the keys a turn signature is verified with ([ADR 0068]
 /// decision 7). The host provides it, adam asks: as `ModelCredentials` does for a model call, and
