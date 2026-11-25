@@ -839,6 +839,8 @@ impl RuntimeTaskBackend {
                 }
                 let mut inbound = (self.inbound)(message).map_err(BackendError::InvalidParams)?;
                 self.named_tier(caller, message, &mut inbound, false)?;
+                crate::prompt_statement::put(caller, message, &mut inbound)
+                    .map_err(BackendError::InvalidParams)?;
                 let context = context_id.map(str::to_owned);
                 self.follow_up(caller, located, inbound, task, context)
                     .await?
@@ -862,6 +864,8 @@ impl RuntimeTaskBackend {
                         let mut inbound =
                             (self.inbound)(message).map_err(BackendError::InvalidParams)?;
                         self.named_tier(caller, message, &mut inbound, true)?;
+                        crate::prompt_statement::put(caller, message, &mut inbound)
+                            .map_err(BackendError::InvalidParams)?;
                         Some(inbound)
                     }
                 };
@@ -902,6 +906,8 @@ impl RuntimeTaskBackend {
                 }
                 let mut inbound = (self.inbound)(message).map_err(BackendError::InvalidParams)?;
                 self.named_tier(caller, message, &mut inbound, true)?;
+                crate::prompt_statement::put(caller, message, &mut inbound)
+                    .map_err(BackendError::InvalidParams)?;
                 let task = self
                     .start_session(
                         caller,

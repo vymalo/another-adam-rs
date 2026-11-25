@@ -822,6 +822,18 @@ async fn run(
         card.extensions
             .push(adam_a2a::ExtensionConfig::locale(locale));
     }
+    // Only a process whose model calls carry the statement lists the extension (ADR 0077): with a
+    // key or a device grant the headers are never sent, so no message is read for them.
+    if let Some(card) = card.as_mut()
+        && config.prompt_statement
+        && !card
+            .extensions
+            .iter()
+            .any(|listed| listed.uri == adam_a2a::PROMPT_STATEMENT_EXTENSION)
+    {
+        card.extensions
+            .push(adam_a2a::ExtensionConfig::prompt_statement());
+    }
     // The card entry has no params (the contract's). The inline threshold is the folder's, else
     // the environment's, else the default (10 MiB); the upload tool of the next card reads it.
     let _inline_upload_threshold =

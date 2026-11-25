@@ -89,6 +89,7 @@ mod credentials;
 mod error;
 mod mock;
 mod profiles;
+mod prompt;
 mod types;
 
 pub use adam_error::{Classify, ErrorClass};
@@ -103,6 +104,10 @@ pub use mock::{MockModel, RecordedCall};
 pub use profiles::{
     DEFAULT_MAX_OUTPUT_TOKENS, ModelProfile, ModelProfiles, NotAWire, NotAnEffort, Preset,
     RESERVED_EXTRA_BODY_KEYS, ReasoningEffort, ReasoningWire,
+};
+pub use prompt::{
+    MAX_PROMPT_JWS_BYTES, NotAPromptStatement, PROMPT_STATEMENT_HEADER,
+    PROMPT_USER_SIGNATURE_HEADER, PromptStatement,
 };
 pub use types::{
     ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, ImageData, ImageLimits, ImageOrigin,

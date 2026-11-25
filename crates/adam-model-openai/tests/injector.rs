@@ -220,3 +220,63 @@ async fn the_retry_after_a_401_names_the_run_too() {
         );
     }
 }
+
+/// A run with a prompt statement (ADR 0077): each call, streamed or not, carries both headers byte
+/// for byte beside `X-Run-Id`; one without the envelope carries the statement alone; a run with
+/// none carries neither. Never in the body.
+#[tokio::test]
+async fn a_run_with_a_prompt_statement_sends_it_on_every_call() {
+    use adam_model::PromptStatement;
+    const STATEMENT: &str = "eyJhbGciOiJFZERTQSJ9.eyJwIjoiMSJ9.c3RhdGVtZW50";
+    const USER: &str = "eyJhbGciOiJFUzI1NiJ9.eyJ1IjoiMSJ9.ZW52ZWxvcGU";
+    let headers_of = |r: &wiremock::Request| {
+        (
+            r.headers
+                .get("prompt-statement")
+                .map(|v| v.to_str().unwrap().to_owned()),
+            r.headers
+                .get("prompt-user-signature")
+                .map(|v| v.to_str().unwrap().to_owned()),
+        )
+    };
+    for streaming in [false, true] {
+        let server = MockServer::start().await;
+        serve(&server, if streaming { sse() } else { answer() }).await;
+        let client = client(&server);
+        let send = |prompt: Option<PromptStatement>| {
+            let mut req = request(Some(ROOT));
+            req.prompt_statement = prompt;
+            let client = client.clone();
+            async move {
+                if streaming {
+                    let _: Vec<_> = client.stream(req).await.unwrap().collect().await;
+                } else {
+                    client.complete(req).await.unwrap();
+                }
+            }
+        };
+        send(Some(
+            PromptStatement::new(STATEMENT, Some(USER.to_owned())).unwrap(),
+        ))
+        .await;
+        send(Some(PromptStatement::new(STATEMENT, None).unwrap())).await;
+        send(None).await;
+
+        let requests = server.received_requests().await.unwrap();
+        let seen: Vec<_> = requests.iter().map(headers_of).collect();
+        assert_eq!(
+            seen,
+            vec![
+                (Some(STATEMENT.to_owned()), Some(USER.to_owned())),
+                (Some(STATEMENT.to_owned()), None),
+                (None, None),
+            ],
+            "streaming: {streaming}"
+        );
+        for r in &requests {
+            assert_eq!(r.headers.get("x-run-id").unwrap(), ROOT);
+            let body = String::from_utf8_lossy(&r.body);
+            assert!(!body.contains(STATEMENT) && !body.contains(USER), "{body}");
+        }
+    }
+}
