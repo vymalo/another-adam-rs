@@ -737,6 +737,30 @@ mod tests {
     }
 
     #[test]
+    fn a_constructed_ed25519_signer_derives_rfc_8037s_kid() {
+        // RFC 8037 appendix A.1's Ed25519 key through the real constructor. The PKCS#8 PEM is built
+        // here from the RFC's private key `d`, because `from_pem` is the only constructor.
+        let d = URL_SAFE_NO_PAD
+            .decode("nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A")
+            .unwrap();
+        let mut der = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        der.extend_from_slice(&d);
+        let body = base64::engine::general_purpose::STANDARD.encode(der);
+        let pem = format!("-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\n");
+
+        let signer = CardSigner::from_pem(&pem, None).unwrap();
+        assert_eq!(
+            signer.jwks()["keys"][0]["x"],
+            "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+            "the key material is the RFC's"
+        );
+        assert_eq!(signer.kid(), "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k");
+    }
+
+    #[test]
     fn the_key_set_verifies_and_the_kid_is_the_thumbprint_unless_configured() {
         for ed25519 in [false, true] {
             let pem = generate_signing_key_pem(ed25519);
