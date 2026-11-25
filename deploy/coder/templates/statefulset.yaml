@@ -201,6 +201,11 @@ spec:
             - name: MAX_ACCESS_TIER
               value: {{ . | quote }}
             {{- end }}
+            {{- with include "coder.uploadsInlineMaxBytes" . }}
+            {{- /* uploads.inlineMaxBytes: the largest upload the card lists (uploads/v1). Nothing is rendered for the default. */}}
+            - name: UPLOADS_INLINE_MAX_BYTES
+              value: {{ . | quote }}
+            {{- end }}
             {{- if include "coder.runsWorkers" . }}
             - name: MODEL_BASE_URL
               {{- if include "coder.modelBaseUrlFromSecret" . }}
@@ -260,6 +265,26 @@ spec:
             {{- with include "coder.settingText" .Values.config.commandCpuMax }}
             - name: COMMAND_CPU_MAX
               value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.config.modelPromptCacheKey }}
+            - name: MODEL_PROMPT_CACHE_KEY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.config.modelInputModalities }}
+            - name: MODEL_INPUT_MODALITIES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.config.languageServers }}
+            - name: LANGUAGE_SERVERS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with (include "coder.sessionEnv" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- if include "coder.references" . }}
+            {{- /* config.references: the read-only repositories file. */}}
+            - name: ADAM_REFERENCES_FILE
+              value: {{ include "coder.referencesFile" . | quote }}
             {{- end }}
             - name: MAX_CHECK_CYCLES
               value: {{ .Values.config.maxCheckCycles | quote }}
@@ -443,6 +468,12 @@ spec:
               mountPath: {{ include "coder.extraMcpDir" . }}
               readOnly: true
             {{- end }}
+            {{- if include "coder.references" . }}
+            - name: references
+              mountPath: {{ include "coder.referencesFile" . }}
+              subPath: references.json
+              readOnly: true
+            {{- end }}
             {{- if include "coder.modelProfiles" . }}
             - name: model-profiles
               mountPath: {{ include "coder.modelProfilesFile" . }}
@@ -465,7 +496,7 @@ spec:
               mountPath: {{ include "coder.a2aCardSigningDir" . }}
               readOnly: true
             {{- end }}
-      {{- if or (include "coder.sharedWork" .) (include "coder.cache" .) $githubApp (include "coder.extraMcp" .) (include "coder.modelProfiles" .) (include "coder.runPods" .) $cardSigning }}
+      {{- if or (include "coder.sharedWork" .) (include "coder.cache" .) $githubApp (include "coder.extraMcp" .) (include "coder.modelProfiles" .) (include "coder.references" .) (include "coder.runPods" .) $cardSigning }}
       volumes:
         {{- if include "coder.sharedWork" . }}
         - name: work
@@ -499,6 +530,13 @@ spec:
           configMap:
             name: {{ include "coder.modelProfilesConfigMapName" . }}
             # The deployment's profiles file: no secret in it (a key never belongs in a model profile).
+            defaultMode: 0444
+        {{- end }}
+        {{- if include "coder.references" . }}
+        - name: references
+          configMap:
+            name: {{ include "coder.referencesConfigMapName" . }}
+            # The deployment's references: repository addresses, no secret.
             defaultMode: 0444
         {{- end }}
         {{- if include "coder.runPods" . }}

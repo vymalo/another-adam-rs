@@ -341,6 +341,11 @@ new ADR: it changes what a profiled model's calls resolve to, which is this ADR'
    failure of `model:<turn>`; the second call is that turn's step in the next transition, so a replay finds the same
    refusal, makes no call to the locked model, and builds the same requests. A run with no fallback fails as before,
    naming the model.
+
+   *Amended 2026-11-25 (ANR-669):* a refusal of status `402` (the person's usage limit reached, `over_limit`,
+   ADR 0067 decision 3 amended) takes the same one switch. When it cannot switch — no fallback, the fallback already
+   refused too, or the fallback is the live model — the run parks as `over_limit` (`Park::UntilWoken`) instead of
+   failing, and the app reads the limit reached; a `model_locked` at another status still fails.
 5. **Once, and never back.** After the switch every call of the run, the summary call of a compaction included, names the
    fallback with its cap and level; the run does not try the first model again. A lock on a **compaction summary** call
    switches the run the same way, and the summary is asked of the fallback in the next transition. A fallback that is

@@ -171,6 +171,23 @@ pub struct AgentDef {
     /// The root's reasoning level when its file sets none
     /// ([`reasoning_effort`](Self::reasoning_effort)).
     reasoning_effort: Option<ReasoningEffort>,
+    /// The compiled plugins `plugins:` may name ([`plugin`](Self::plugin)).
+    plugins: BTreeMap<String, PluginFactory>,
+}
+
+/// The plugins one agent runs, by registered name.
+pub(crate) type NodePlugins = Vec<(String, Arc<dyn adam_plugin::Plugin>)>;
+
+/// Makes a plugin from the options an agent file gives it.
+#[derive(Clone)]
+pub(crate) struct PluginFactory(Arc<MakePlugin>);
+
+type MakePlugin = dyn Fn(&BTreeMap<String, String>) -> Arc<dyn adam_plugin::Plugin> + Send + Sync;
+
+impl std::fmt::Debug for PluginFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PluginFactory")
+    }
 }
 
 impl AgentDef {
@@ -192,6 +209,7 @@ impl AgentDef {
             run_skills: None,
             session_limits: SessionLimits::default(),
             reasoning_effort: None,
+            plugins: BTreeMap::new(),
         })
     }
 
@@ -527,6 +545,32 @@ impl AgentDef {
         self
     }
 
+    /// Register a compiled plugin under `name`, so that an agent file may list it in `plugins:`
+    /// (ADR 0050, slice H6). A subagent runs the plugins of its parent. Registering a name again
+    /// replaces it. Only compiled plugins are named: an agent file never declares a program.
+    ///
+    /// The same plugin serves every agent that names it; use [`plugin_with`](Self::plugin_with)
+    /// when the options of the file matter.
+    ///
+    /// Checked at [`bind`](Self::bind): [`Error::UnknownPlugin`] for a name nobody registered.
+    #[must_use]
+    pub fn plugin(self, name: impl Into<String>, plugin: Arc<dyn adam_plugin::Plugin>) -> Self {
+        self.plugin_with(name, move |_| Arc::clone(&plugin))
+    }
+
+    /// Like [`plugin`](Self::plugin), made from the `options` the agent file gives (empty for a
+    /// bare name).
+    #[must_use]
+    pub fn plugin_with(
+        mut self,
+        name: impl Into<String>,
+        make: impl Fn(&BTreeMap<String, String>) -> Arc<dyn adam_plugin::Plugin> + Send + Sync + 'static,
+    ) -> Self {
+        self.plugins
+            .insert(name.into(), PluginFactory(Arc::new(make)));
+        self
+    }
+
     /// Connect to the MCP servers of the root agent's `mcp.json` and of each local subagent's, and
     /// keep their tools for [`bind`](Self::bind). Only with the feature `mcp`.
     ///
@@ -664,6 +708,7 @@ impl AgentDef {
             remote: &self.remote,
             secrets: &self.secrets,
             mcp: &self.mcp,
+            plugins: &self.plugins,
             run_skills: self.run_skills.as_ref(),
             session_limits: lowered_by_file(
                 self.session_limits,
@@ -741,11 +786,14 @@ pub(crate) struct Node {
     /// asks for, before the preset, the model's profile and the fallback. `None` when the file
     /// says nothing.
     pub(crate) max_output_tokens: Option<u32>,
-    /// `limits.max_parallel` of the agent's file: it lowers the deployment's setting for this agent.
+    /// `limits.max_parallel` of the agent's file: it lowers the deployment's setting for this
+    /// agent, and a larger value is clamped to it (ADR 0049, ADR 0054 decision 3).
     pub(crate) max_parallel: Option<usize>,
     /// `retry:` of the agent's file: the retry policy per tool, by name, each one of its tools
     /// (ADR 0061). The agent's own; a subagent's are its file's.
     pub(crate) retry: Vec<(String, adam_agent_fs::RetryDef, adam_runtime::RetryPolicy)>,
+    /// The plugins the agent runs, by name, in order: its parent's, then its own (ADR 0050, H6).
+    pub(crate) plugins: NodePlugins,
     /// The skills the agent may use, in order.
     pub(crate) skills: Vec<String>,
     /// The skills whose body is in the prompt.
@@ -846,6 +894,7 @@ struct Walk<'a> {
     remote: &'a RemoteSettings,
     secrets: &'a Secrets,
     mcp: &'a McpBinding,
+    plugins: &'a BTreeMap<String, PluginFactory>,
     /// What the root's run finds ([`AgentDef::run_skills`]); a subagent has none.
     run_skills: Option<&'a RunSkillsHandle>,
     /// What the root's sessions run under: the deployment's, lowered by the root's file.
@@ -858,6 +907,36 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
+    /// The plugins of one agent: its parent's first, then its own that the parent does not have.
+    /// A name nobody registered is [`Error::UnknownPlugin`].
+    fn plugins_of(
+        &self,
+        origin: &Origin,
+        manifest: &AgentManifest,
+        parent: Option<usize>,
+    ) -> Result<NodePlugins, Error> {
+        let mut out: NodePlugins = parent
+            .map(|index| self.nodes[index].plugins.clone())
+            .unwrap_or_default();
+        for entry in &manifest.frontmatter.plugins {
+            let name = entry.name();
+            let Some(factory) = self.plugins.get(name) else {
+                let available: Vec<String> = self.plugins.keys().cloned().collect();
+                return Err(Error::UnknownPlugin {
+                    origin: origin.clone(),
+                    plugin: name.to_owned(),
+                    suggestion: closest(name, available.iter().map(String::as_str))
+                        .map(str::to_owned),
+                    available,
+                });
+            };
+            if out.iter().all(|(have, _)| have != name) {
+                out.push((name.to_owned(), (factory.0)(&entry.options())));
+            }
+        }
+        Ok(out)
+    }
+
     fn agent(
         &mut self,
         manifest: &AgentManifest,
@@ -1006,6 +1085,7 @@ impl Walk<'_> {
             parent.is_none().then_some(self.session_limits),
         )?;
         let retry = retry_policies(&origin, manifest, &tools)?;
+        let plugins = self.plugins_of(&origin, manifest, parent)?;
         let index = self.nodes.len();
         self.nodes.push(Node {
             name: name.clone(),
@@ -1039,6 +1119,7 @@ impl Walk<'_> {
                 .and_then(|file| file.max_parallel)
                 .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
             retry,
+            plugins,
             skills,
             preloaded,
             session_agents,

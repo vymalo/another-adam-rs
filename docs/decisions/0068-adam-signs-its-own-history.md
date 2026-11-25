@@ -1,8 +1,10 @@
 # 0068. adam signs its own history
 
 Status: **Accepted** (2026-11-22). The owner decided on 2026-11-22 that adam uses, **by default** and for security, the same
-kind of signature the model providers use for their reasoning continuity. Nothing of it is built: the slices are at the
-end, after ADR 0067's S8b and S8c.
+kind of signature the model providers use for their reasoning continuity. Slice T1 (the port, its Ed25519 implementation and
+the form) is built: see *Amended 2026-11-25 (slice T1)*. Nothing signs or verifies a run yet; the other slices are at the
+end. Every model **request** is signed when the deployment gives a turn key: see *Amended 2026-11-25 (the request
+signature)*.
 
 It has two parts. **Part 1 is not decided here**: adam carries every opaque member a provider attaches (Gemini 3's
 `thought_signature` in a tool call's `extra_content`) byte for byte, sends it back only to the model that made it, and
@@ -296,3 +298,109 @@ After ADR 0067's S8b and S8c.
 * **What the orchestrator does with `signed-turns/v1`**: storing the rows in its log, sending them back on a fork, and
   checking them. That is another-agentic-system's decision.
 * **Signing a person's messages** on their way in (by the orchestrator, for the person): another key and another trust.
+
+## Amended 2026-11-25 (slice T1)
+
+Slice T1 is built in `adam-core`: `crates/adam-core/src/turn/` (the port `TurnKeys`, `Ed25519TurnKeys`, `KeySet`, the form,
+the payload and the chain, `turn::testkit`), `crates/adam-core/src/jcs.rs` (`canonicalize`, moved from `adam-a2a`, which
+re-exports it), and two cases of `adam-store-testkit`. Nothing signs or verifies a run, and no variable is read (T2, T3).
+What building it changed or settled:
+
+1. **Ed25519 is `ed25519-dalek` 3.0.0, not `aws-lc-rs`** (decision 10). The engine's tree may hold neither `aws-lc-rs`
+   nor `ring` (`tools/embedded-deps/check.sh`, [ADR 0047](0047-adam-rs-can-be-embedded-in-an-application.md)), and
+   decision 9 has the engine sign (`ephemeral`) and verify, so the implementation in `adam-core` is pure Rust. Six
+   packages are added to `Cargo.lock` (`ed25519-dalek`, `ed25519`, `signature`, `curve25519-dalek`,
+   `curve25519-dalek-derive`, `fiat-crypto`), against "no package is added": BSD-3-Clause, Apache-2.0 OR MIT and
+   MIT OR Apache-2.0 OR BSD-1-Clause, all in `deny.toml`'s list. Verification is strict (RFC 8032, a non-canonical
+   signature refused) and a weak public key is refused. A test in `adam-a2a` holds that it gives the bytes `aws-lc-rs`
+   gives for the same key. **Measured** (`crates/adam-core/examples/turn_signature_timing.rs`, release build, one core
+   of a 2.1 GHz Xeon, 2026-11-25): a signature 20 µs and a verification 49 µs over 64 bytes; a 2 KB turn signed with its
+   RFC 8785 form 45 µs, verified 67 µs; the chain over 1,000 such turns 7.3 ms.
+2. **The port answers a key id or a certificate chain, and whether it is renewing** (the owner, 2026-11-25: the cloud's
+   turn key will come from a PKI certificate). `current()` gives a `CurrentKey`: a `KeyIdentity`, `Id(kid)` or
+   `Certificate(chain)` (leaf first, named by its leaf's `x5t#S256` unless the adapter names it), and a `KeyStatus`,
+   `Active` or `Renewing` (both closed); `sign(kid, input)` signs with the key that id names, or answers `NotSigning`
+   (class `Conflict`: ask again); `key_set()`. A chain rides in the header as `x5c` (RFC 7515 §4.1.6, at most four
+   certificates of 2 KiB), so the header of decision 3 is `alg`, `kid`, `typ` and, for a chain, `x5c`. T1 verifies by
+   `kid` against the key set and carries the chain without trusting it: trusting a PKI is the certificate adapter's work.
+3. **The chain's first link** is `h(-1) = SHA-256(JCS({typ: "adam-chain/v1", run, cnv}))`: decision 3 named the members,
+   not the `typ`; a `typ` of its own keeps it apart from a turn's payload. `run` is the run's UUID as text, `cnv` and
+   `prv` are base64url without padding, `idx` is the body row's `u32`.
+4. **Where the member is.** `extra_content.adam` is a member of the message object itself, not of #322's
+   `provider.members` (a model switch drops those). `msg` is the message without `extra_content.adam`, and without
+   `extra_content` when that was its only member, so adding the signature never changes what it signs.
+5. **One encoding.** `verify_detached` accepts only the header adam writes: its RFC 8785 bytes, those members, `EdDSA`,
+   the expected `typ`, 64 bytes of signature, and at most `MAX_SIGNATURE_LEN` (16 KiB) in all, refused before it is
+   decoded. A key id is 1 to 256 bytes of printable ASCII. With a 19-character `kid` the member is 222 bytes
+   (`{"extra_content":{"adam":{"turn_signature":…}}}`), as the *Consequences* estimated.
+6. **`TurnKeys::ephemeral()`** is `<dyn TurnKeys>::ephemeral()` (and `Ed25519TurnKeys::ephemeral()`), and returns a
+   `Result`: a system with no random numbers is an error (`Internal`), not a panic.
+7. **The store round trip** (*Consequences*, *unverified* until now): `a_message_canonicalizes_as_it_was_written` and
+   `body_a_row_canonicalizes_as_it_was_written` write floats, integers either side of 2^53, `i64`'s extremes, `-0` and
+   names that sort differently by UTF-16 into a state, a commit, a journal payload and a body row. *Verified 2026-11-25*
+   on `MemoryStore`, SQLite and PostgreSQL 16.15; MongoDB is *unverified* (no server where this was built; CI runs it).
+   A `u64` above `i64::MAX` is not in it: MongoDB refuses it at the write, as before.
+
+## Amended 2026-11-25 (the request signature)
+
+The shared prompt-signature contract (its decisions 9 to 11, and its vector V7) asks adam for a second use of the turn
+key: a signature of **each model request** adam sends, so a verifier in front of the model can bind the request's run,
+body and prompt to adam. Decision 2 still holds for the history: a model call never carries a turn's signature. The
+request signature is another type, built with the same port and header writer. Built in `adam-core`
+(`crates/adam-core/src/turn/request.rs`, `form.rs`) and `adam-model` (`crates/adam-model/src/signed.rs`).
+
+1. **A new signature type.** `SignatureType::Request`, `typ` `adam-request/v1`. The enum stays closed: every `match` on
+   it names the new variant, and a history signature never verifies as a request one (the `typ` differs).
+2. **The form is attached**: `BASE64URL(header).BASE64URL(payload).BASE64URL(signature)` (`sign_attached`,
+   `verify_attached`), because the verifier cannot rebuild `iat` and `nonce` from the request. The header is the one
+   decision 3 and T1 write: the RFC 8785 form of `{"alg":"EdDSA","kid":…,"typ":"adam-request/v1"}`, plus `x5c` when
+   `TurnKeys::current` names the key by a certificate chain. The signing input is the detached form's, byte for byte.
+   The bound stays `MAX_SIGNATURE_LEN` (16 KiB).
+3. **The payload** is the RFC 8785 form of exactly eight members (`request_payload`):
+
+   | Member | Value |
+   |---|---|
+   | `typ` | `adam-request/v1` |
+   | `run` | the root run, the value of `X-Run-Id` beside it |
+   | `method` | the HTTP method, upper case |
+   | `path` | the request target as sent: path and query (`adam_model::request_target`; `adam-model-openai` keeps its URL in the form its parser writes, so the target signed is the target sent) |
+   | `body_sha256` | base64url SHA-256 of the body's exact bytes (`CredentialRequest::body`) |
+   | `prompt_jti` | the prompt statement's `jti` (a member of its attached payload), or, with no statement, the person's envelope's `nonce` (its protected header); `null` when the run has neither (item 5) |
+   | `iat` | seconds since the epoch, when adam signs |
+   | `nonce` | 16 random bytes, base64url |
+
+   Each call and each attempt is signed anew: the retry after a `401`, and every retry of the loop, get a new `iat`
+   and `nonce`.
+4. **Where.** `adam_model::SignedRequests` wraps any `ModelCredentials` (the injector on the cloud, the host's
+   credentials on a device) and adds, on every call: `X-Run-Id` (on the device path too, as the contract asks), the
+   run's `Prompt-Statement` and `Prompt-User-Signature` when it has them, and `Turn-Signature`. The client asks it for
+   every call, so the root's calls, a local subagent's and a session round's are all signed (the test
+   `crates/adam-a2a-runtime/tests/prompt_statement.rs`). `CredentialRequest` gained a public field, `body`; code that
+   builds one with a struct literal adds it (no trait changed). A server reads `TURN_SIGNING_KEY_FILE`,
+   `TURN_SIGNING_KEY_ID` and `TURN_VERIFY_KEYS_FILE` with the model's configuration
+   ([environment](../reference/environment.md#turn-signing)); an embedding host wraps the credentials of its own
+   client with its keys, and gives the person's envelope with `Say::with_prompt_statement`.
+5. **No prompt (the contract is silent).** A run with neither a statement nor an envelope is still signed, with
+   `prompt_jti` `null`: every call carries a signature, and it still binds the run, the method, the path and the body.
+   The contract's verifier refuses such a call before it reads the turn signature (no prompt header: `missing`), so
+   nothing is weakened; a deployment that checks only the request signature can use it.
+6. **No key, and a key that cannot sign (fail closed).** With no `TURN_SIGNING_KEY_FILE`, no call is signed, as before
+   (slice T2 makes the key required, with exit 78); a contract verifier then refuses each call (`missing`). Once a key
+   is given, **a call adam cannot sign is never sent unsigned**: no run, a URL with no target, or a statement whose
+   `jti` (an envelope whose `nonce`) cannot be read is `InvalidRequest`; keys that cannot be reached are a transient
+   error, retried as a model outage is; keys that refuse are `Auth`. A key renewed between `current` and `sign`
+   (`NotSigning`) is asked for once more. A key file that cannot be read, or is not an Ed25519 private key, is exit 78.
+7. **The carrier.** The key is named as the adapter names it: `KeyIdentity::Id` gives a header with `kid` only (the
+   device, and today's file key), `KeyIdentity::Certificate` adds `x5c` (the leaf first). The contract wants `x5c` on
+   every cloud call; the certificate adapter of the cloud's PKI is a later change, so until then a cloud call signed
+   with the file key carries `kid` only, which the contract's verifier refuses (`mismatch`). The `x5c` path is built
+   and tested with `turn::testkit::Certified`.
+8. **Verified against the contract's vector V7** (copied, test material only, into
+   `crates/adam-core/tests/fixtures/request-signature/`): adam's signer gives V7a (by `x5c`) and V7b (by `kid`) byte
+   for byte, both verify with `verify_request`, and a changed body, method, path, `prompt_jti` or run, a changed byte
+   of the signature, and an `iat` outside 300 s before or 60 s after the clock fail (`crates/adam-core/tests/request_signature.rs`).
+   `verify_request` checks in the contract's order (the form, the key and signature, then each member, then the
+   window); a replay store and trusting a chain are the verifier's, not adam's.
+9. **Never logged.** The headers are secret values (`SecretString`, a sensitive `HeaderValue`); the `Debug` of
+   `CredentialRequest` and of `ModelCall` shows the body's length, never the body; `SignedRequests`' shows the keys'
+   kind. The end-to-end test reads every log line of a run and finds no signature.

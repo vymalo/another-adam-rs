@@ -98,6 +98,12 @@ Three things are missing in adam today:
    worker's own decision (`retry::decide`, which both call) for an error of class `Transient` that names no policy,
    which is what the LLM agent returns for a model call.
 
+   *Amended 2026-11-25 (ANR-669):* a `402` is the person's usage limit reached whatever the gateway's problem document
+   calls it (`over_limit`, the injector's `model_locked`, or none). `InjectedRun` parks every `402` until woken, and
+   `adam-model-openai` gives it as `Refused` with the slug `over_limit`, so the person reads one event. The LLM agent
+   takes its one switch to the fallback on it, as on a `model_locked` refusal, and parks the run as `over_limit` when no
+   model is left (ADR 0064 decision 4, amended the same day).
+
    **A gateway that cannot be reached.** The client reports a failed connection (not a timeout, not a stream cut off)
    as the new `ModelError::Unreachable`, class `Transient`, so the runtime retries it as today and a short drop costs
    seconds. Under `injector` only, when the step's retries are spent, the LLM agent parks on a timer instead of failing:
@@ -209,6 +215,10 @@ Three things are missing in adam today:
    *Amended 2026-11-23:* the switch is built (ADR 0064, slice 6, amended). The fallback's seat is the profile's `fallback`
    in `MODEL_ALIASES_FILE`, as this decision says, with the preset's and the agent's `model_fallback:` overriding it.
    A run with no fallback still fails naming the model.
+
+   *Amended 2026-11-25 (ANR-669):* a `model_locked` answered at status `402` is the person's budget spent, not a model
+   forbidden for ever: it is `Refused` as `over_limit` (decision 3), so a run with a fallback switches once and a run
+   without one parks until it is woken. A `model_locked` at another status keeps this decision's rule.
 8. **What a park records.** The journal, the step's error and the task's message hold the reason, the status and the
    slug. Never a header, never the body, never a credential. A refusal's report is built from those three fields, not
    from the body the client read.

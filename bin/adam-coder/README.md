@@ -862,11 +862,14 @@ They run one at a time: the agent loop runs a turn's tool calls in order (`crate
 subagent calls never overlap, and no subagent edits. The prompt says so.
 
 A child run has an id of its own, so the tools key by the **root run** (`ToolCtx::root_run_id()`, carried down by
-`ToolCtx::start_child`: [ADR 0021](../../docs/decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md)). Per place:
+`ToolCtx::start_child`: [ADR 0021](../../docs/decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md)) and, for
+the worktree, by the **workspace run** (`ToolCtx::workspace_run_id()`): its session's header's `workspace`, else the root.
+The two are the same for every run of a task; they differ for a round a person started, whose header names the task it was
+opened on (see *Sessions a person opens*). Per place:
 
 | What | Keyed by | Why |
 |---|---|---|
-| the workspace's slots, the environment session, `prepare_workspace`, `start_scratch`, `use_repository_environment` | root | a subagent works in its parent's worktree and environment |
+| the workspace's slots, the environment session, `prepare_workspace`, `start_scratch`, `use_repository_environment` | the workspace run | a subagent works in its parent's worktree and environment; a person's round works in the worktree of the task it was opened on |
 | the run notes: check cycles and results, the repositories named and agreed to, created repositories, the credentials blocker | root | a budget or a gate that protects the pull request is counted once, on the root: a subagent has no fresh budget and passes no gate the root has not |
 | a call id in the notes (`record_missing_tool`) | the subagent's run plus the call id | model call ids are unique only within the run that made them |
 | the steps the environment shows (`env:<run>:...`) | the run that makes the call | a step belongs to the run that emits it |
@@ -896,11 +899,18 @@ to a person as sessions they open, talk to and close from their client, with `ma
 (`coder/explorer`, `coder/reviewer`) beside `CoderStarter` and a worker steps the rounds. `app.rs` (`Coder::new_with`, the control-plane
 constructors) is unchanged. The card entry is not in `tests/fixtures/agent/card.json`: that is `agent_card_for`'s card, which `serve` extends.
 
-**The limit: a person's round has no workspace.** A round a person starts is its own parent, so its `root_run_id()` is the round itself, and the
-tools find the workspace by the root run: there is no worktree for it until slice 7 of ADR 0045 binds a round to the parent task's workspace.
-Until then a person's `explorer` or `reviewer` can answer from the conversation and the tier's tools (`plan` tier and below; the tier a
-message names is read as for any task and capped by `MAX_ACCESS_TIER`), but cannot read a repository. The model's own `subagent_start` is
-unaffected: its rounds are children of the task that started them and work in its worktree.
+**A person's round reads the workspace of the task it was opened on.** A round a person starts is its own parent, so its
+`root_run_id()` is the round itself and a tool that keyed the worktree by the root run would find none. The session's header carries
+`workspace` instead: the run whose workspace its rounds read (`SessionHeader::workspace`,
+`crates/adam-runtime/src/session.rs`), which the A2A front fills at the start with the **latest task of the context the person opened
+the session in** (one listing of the front's own agent's runs in that conversation: `context_workspace` in
+`crates/adam-a2a-runtime/src/child_sessions.rs`). Every later round of that session keeps it, so round 2 reads the same repository as
+round 1. `ToolCtx::workspace_run_id()` is what the tools that key a workspace, the environment session, `prepare_workspace`,
+`start_scratch` and `use_repository_environment` read; the **notes** stay on `root_run_id()`, so a helper never writes the task's
+checks, budgets, gates or agreed repositories. A context nobody has sent a task to has no workspace, and its rounds answer in words:
+that is not an error. A person's `explorer` or `reviewer` therefore reads a repository and still cannot write: its folder gives it read
+tools, and a write tool it were handed would be refused, since a round works under `plan` unless its message names a tier (capped by
+`MAX_ACCESS_TIER`).
 
 ### Scratch projects
 

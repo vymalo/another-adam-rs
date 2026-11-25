@@ -316,6 +316,7 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   `git` there says it is not a repository. The commands that do not use git run as before.
 * **A repository's devcontainer on Podman (ADR 0010) binds the mirror read-write.** Not touched here.
 * The model key is in every run pod's environment until ADR 0038 is built.
+  *Amended 2026-11-24:* ADR 0038 is built ([#145](https://github.com/vymalo/another-adam-rs/pull/145), `cb7bb8f`): no model key is in a run pod. This limit is closed.
 
 ## Alternatives rejected
 
@@ -386,6 +387,7 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
    the person's identity in the coder.
 4. **A new repository waits for a running command** (or makes the pod again when none runs) instead of ending the command.
 5. **Exactly one Secret key in a run pod, `MODEL_API_KEY`**, until ADR 0038 removes it.
+   *Amended 2026-11-24:* ADR 0038 was built in `cb7bb8f` (#145): a run pod holds no Secret reference at all. The admission policy refuses a `secretKeyRef`, an `envFrom` `secretRef` and a Secret volume; `render-check.sh` asserts the template has none and the policy says so, and `kind-run-pods.sh` submits each form to a real API server and requires the refusal.
 7. **Moving `HEAD` in a run pod fails** (`git switch --detach`, `git checkout <commit>`), because `logs` is read-only; the coder's
    `run_command` and `run` undo such a change anyway. The alternative is a writable `logs`, which leaves a link at `logs/HEAD` able to
    make the coder's git append to any file it can write; the coder could instead never write the worktree's reflog (its own
@@ -506,3 +508,45 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
     * The sandbox is a container of the coder's pod, not a user or a machine: a flaw in the container runtime's isolation or a capability the
       deployment adds back would reach the coder's. It is the same boundary the run pods rely on.
     * The sandbox's output is untrusted by design and the coder treats it as data; nothing here makes `git`'s answers true.
+
+* **2026-11-24, open decision 2 closed (the owner, ANR-Q52).** *"(c) Read-only in run pods, filled by a pull-through proxy to the public
+  registries (a proxy to build and run)."* The shared package cache ([ADR 0040](0040-a-shared-package-cache-at-cache.md)) is mounted
+  read-only in run pods and only the pull-through proxy writes it; the admission policy will refuse a run pod that mounts the cache
+  claim read-write. A cache for each person is not chosen. The risk named under decision 2 above (one run writing what another
+  person's build reads) stays open until the admission slice and the proxy slice are built; this note records the choice and builds nothing.
+* **2026-11-24, a mirror for each person: the design (owner decision 3; issue [#122](https://github.com/vymalo/another-adam-rs/issues/122)). Nothing is built.**
+  Design only, to be confirmed by the owner before the build card is written. It closes the first Known limit (*a mirror is shared by
+  everyone who works on a repository*) and is the "later use of the identity" that sys ADR 0064 decision 15 names without deciding.
+  *Unverified until built:* every behaviour below is a plan, none is run.
+  1. **Naming.** The person is the pseudonym of the `identity/v1` assertion (sys ADR 0064 decision 2): 43 characters of base64url, the
+     same for one person, one agent and one deployment, and never the e-mail. The layout is
+     `git/<host>/<owner>/<repo>.git` becoming `git/p-<pseudonym>/<host>/<owner>/<repo>.git`. The `p-` prefix means a pseudonym that
+     starts with `-` is never read as an option; the coder checks the alphabet (`A-Za-z0-9_-`, 43 long) before it builds any path, and
+     refuses a run whose pseudonym does not match, instead of falling back.
+  2. **First fetch.** The first run of a person on a repository makes their mirror by a fresh bare clone from the host (as today's first
+     fetch), under the mirror lock of decision 6. It is not seeded from another person's mirror: copying one would copy their unpushed
+     `agent/*` refs and objects, which is the exposure this closes. The cost is one full clone per person and repository, paid once; a
+     deployment that finds it too slow sets a pull-through cache at the host (ADR 0040), which is shared and holds only what the host
+     already serves.
+  3. **Mounts.** Decision 1's table is unchanged except for the path: a run pod mounts `subPath` of its own person's mirror only, so
+     the sibling `worktrees/*` of other people's runs are not there to read. Nothing of `git/p-<other>/` is in the pod. Because a person
+     now owns their mirror, the run pod of that person's own run may see the person's other runs' worktree directories; that is the
+     same person, and is stated here as accepted.
+  4. **Storage.** One mirror per person and repository on the same work volume, so the volume grows with people times repositories.
+     The deployment sizes it; the chart gets a documented starting point and no default quota.
+  5. **Clean-up.** The sweeper that removes idle run directories also removes a person's mirror when no run of that person has used it
+     for a time the deployment sets (`mirror_idle_ttl`, off by default so nothing is removed unless asked), after the last worktree
+     directory in it is gone, under the mirror lock. Removing a mirror loses only objects that are on the host; a branch not yet pushed
+     is lost, so the sweeper refuses a mirror that still holds a ref the host does not have, and says so in the run's record.
+  6. **No pseudonym.** When the identity extension is off or the assertion carries no `sub`, the coder uses the layout of today, one
+     mirror per repository shared by everyone, and the Known limit stays open for that deployment. The sentence a test can check:
+     *a run with no pseudonym mounts `git/<host>/<owner>/<repo>.git`; a run with one mounts only `git/p-<pseudonym>/...`.* The coder
+     never mixes the two for one person within a deployment, because a pseudonym appearing later would orphan the shared mirror's refs.
+  7. **Workspaces that last (ANR-52).** A kept slot is a worktree of the person's mirror, so it follows the person: the slot's
+     `gitdir` points into `git/p-<pseudonym>/...`, and the sweeper must not remove the mirror while a kept slot exists.
+  8. **The kind test the build card adds.** Two people, one repository: each run pod lists only its own mirror and no
+     `worktrees/` entry of the other; a run with no pseudonym sees the shared path; the sweeper removes an idle mirror with no
+     unpushed ref and refuses one that has one. It runs in kind beside the existing mounts checks, and `render-check.sh` holds the
+     render's half.
+  *What this does not close:* a filter in the git sandbox still reads the whole work volume (Known limits above), so the volume's
+  other people's mirrors stay readable from the sandbox until git runs per run. The mount change reaches run pods only.

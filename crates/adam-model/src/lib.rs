@@ -89,14 +89,16 @@ mod credentials;
 mod error;
 mod mock;
 mod profiles;
+mod prompt;
+mod signed;
 mod types;
 
 pub use adam_error::{Classify, ErrorClass};
 pub use client::{DynModel, ModelClient};
 pub use credentials::{
     AfterRejection, CredentialHeaders, CredentialRequest, DynCredentials, FIRST_PARK, InjectedRun,
-    MAX_PARK, MODEL_LOCKED_SLUG, ModelCredentials, Park, ProblemType, RUN_HEADER, Refusal,
-    Rejection, RenewingCredentials, StaticBearer,
+    MAX_PARK, MODEL_LOCKED_SLUG, ModelCredentials, OVER_LIMIT_SLUG, Park, ProblemType, RUN_HEADER,
+    Refusal, Rejection, RenewingCredentials, StaticBearer,
 };
 pub use error::ModelError;
 pub use mock::{MockModel, RecordedCall};
@@ -104,6 +106,11 @@ pub use profiles::{
     DEFAULT_MAX_OUTPUT_TOKENS, ModelProfile, ModelProfiles, NotAWire, NotAnEffort, Preset,
     RESERVED_EXTRA_BODY_KEYS, ReasoningEffort, ReasoningWire,
 };
+pub use prompt::{
+    MAX_PROMPT_JWS_BYTES, NoPromptId, NotAPromptStatement, PROMPT_STATEMENT_HEADER,
+    PROMPT_USER_SIGNATURE_HEADER, PromptStatement,
+};
+pub use signed::{SignedRequests, TURN_SIGNATURE_HEADER, request_target};
 pub use types::{
     ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, ImageData, ImageLimits, ImageOrigin,
     ImageRef, InputModalities, Message, ModelDelta, ModelRequest, ModelResponse, ProviderTurn,

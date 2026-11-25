@@ -537,6 +537,24 @@ fn cases() -> Vec<Case> {
             "`limits.max_session_rounds` is from 2 to 200",
         ),
         (
+            "max_inline_upload_bytes of 0",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_inline_upload_bytes: 0 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_inline_upload_bytes` is from 1 to 268435456",
+        ),
+        (
+            "max_inline_upload_bytes of 256 MiB + 1",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_inline_upload_bytes: 268435457 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_inline_upload_bytes` is from 1 to 268435456",
+        ),
+        (
             "more working sessions than open ones",
             vec![(
                 "agent/instructions.md",
@@ -2032,4 +2050,37 @@ fn parallel_false_is_read_per_server_and_is_on_by_default() {
     assert!(config.servers["plain"].settings().parallel);
     assert!(config.servers["plain"].settings().is_default());
     assert!(config.servers["explicit"].settings().is_default());
+}
+
+#[test]
+fn plugins_are_read_bare_or_with_options_and_a_secret_option_is_refused() {
+    let dir = write(&[(
+        "agent/instructions.md",
+        "---\nname: root\nplugins:\n  - audit\n  - name: snapshot\n    options: { mode: fast }\n---\nHi.\n",
+    )]);
+    let report = load(dir.path());
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let plugins = &report.package.agents[0].frontmatter.plugins;
+    assert_eq!(plugins.len(), 2);
+    assert_eq!(plugins[0].name(), "audit");
+    assert_eq!(plugins[1].options()["mode"], "fast");
+
+    for bad in [
+        "{ token: abc123 }",
+        "{ mode: 'Bearer abc' }",
+        "{ mode: sk-live-1 }",
+    ] {
+        let dir = write(&[(
+            "agent/instructions.md",
+            &format!("---\nname: root\nplugins:\n  - name: audit\n    options: {bad}\n---\nHi.\n"),
+        )]);
+        let report = load(dir.path());
+        assert!(
+            report
+                .errors()
+                .any(|d| d.to_string().contains("looks like a secret")),
+            "{bad}: {:?}",
+            report.diagnostics
+        );
+    }
 }

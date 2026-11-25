@@ -121,6 +121,7 @@ mod model_pick;
 #[cfg(feature = "server")]
 mod openapi;
 mod page;
+mod prompt_statement;
 #[cfg(feature = "server")]
 pub mod push;
 mod reasoning;
@@ -141,15 +142,22 @@ pub use card::{AgentCardConfig, ExtendedCardConfig, ExtensionConfig, SkillConfig
 pub use extensions::{
     A2UI_BASIC_CATALOG_V1_0, A2UI_EXTENSION_V1_0, A2UI_MEDIA_TYPE, ACCESS_TIER_EXTENSION,
     BUILD_EXTENSION, CHILD_SESSIONS_EXTENSION, COMMANDS_EXTENSION, ChildSessionInfo, CommandInfo,
-    LOCALE_EXTENSION, MENTIONS_EXTENSION, MODEL_PICK_EXTENSION, REASONING_EXTENSION,
-    REPLACEABLE_ARTIFACT, STEER_EXTENSION, STEPS_EXTENSION, TEXT_STREAM_EXTENSION,
-    TEXT_STREAM_KIND_REASONING, THREAD_TOOLS_EXTENSION, UI_CATALOG_EXTENSION, UNKNOWN_REVISION,
+    DEFAULT_UPLOADS_INLINE_MAX_BYTES, LOCALE_EXTENSION, MENTIONS_EXTENSION, MODEL_PICK_EXTENSION,
+    PROMPT_STATEMENT_EXTENSION, REASONING_EXTENSION, REPLACEABLE_ARTIFACT, STEER_EXTENSION,
+    STEPS_EXTENSION, TEXT_STREAM_EXTENSION, TEXT_STREAM_KIND_REASONING, THREAD_TOOLS_EXTENSION,
+    UI_CATALOG_EXTENSION, UNKNOWN_REVISION, UPLOADS_EXTENSION, UPLOADS_INLINE_MAX_BYTES_CEILING,
     USAGE_EXTENSION, build_version, revision_of,
 };
 pub use locale::{LOCALE_MEMBER, Locale, MAX_LOCALE_BYTES, NotALocale};
 #[cfg(feature = "test-util")]
 pub use memory::{InMemoryBackend, InMemoryConfig};
 pub use model_pick::{MODEL_NOT_OFFERED, MODEL_PICK_MEMBER, ModelChoices};
+pub use prompt_statement::{
+    PROMPT_STATEMENT_MEMBER, PROMPT_USER_MEMBER, statement_of, statement_of_request,
+};
+// The values `prompt-statement/v1` reads, re-exported so a reader of the extension names the type
+// from this crate.
+pub use adam_model::PromptStatement;
 pub use page::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, PageToken, TaskPage, TaskQuery};
 // The closed vocabulary `reasoning/v1` reads and advertises, re-exported so a caller of
 // `ReasoningEfforts` names the type from this crate.

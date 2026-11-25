@@ -23,8 +23,8 @@ instructions + a model + a toolset. It is served over A2A by
 | `ModelParking`, `ModelWait`, `ModelPark`, `MODEL_RESUME_KIND`, `DEFAULT_MODEL_PARK_LIMIT`, `MAX_MODEL_BACKOFF` | a run parked on the model (ADR 0067): `ModelParking::new(limit).when_unreachable(bool)`, the default a limit of 24 h and an unreachable endpoint that fails as before; `Conversation::model_wait` is the `ModelWait` of a parked run (`reason`, `status`, `slug`, `park`, `parked_since`, `parks`, `wake_at`); see *A run parked on the model* |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*); it also splits and joins the conversation exactly like `LlmAgent` (`AgentStarter::split`/`join`), so a run it starts is written with a head and a body, not left in the v4 format |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens` (the cap a call asks for; `0` leaves it to the model, and `Limits::default()` is 4,096 for a hand-built agent: the 128,000 fallback and the model's profile are resolved and clamped by the assembly, ADR 0064), `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
-| `HookSet`, `Plugin`, `Verdict`, `HookError`, `HookLimits`, `HookedCall`, `HookedText` | ADR 0050 slice H1, re-exported from `adam-plugin`: `HookSet::new().with(Arc::new(plugin)).with_limits(HookLimits { deadline, retries })`, and `Plugin` with `name`, `before_tool(&mut HookedCall { tool, arguments })` and `after_tool(&HookedCall, &mut HookedText { text })`. Installed with `LlmAgentBuilder::hooks`/`.plugin`; see *Hooks around a tool call* |
-| `HookedOutput`, `HookDecision` | what the journaled `tool:<call id>` step records: `output` (a flattened `ToolOutput`), `hooks` (the decisions that were not `Continue`, each with `point`, `verdict`, `reason` and the failing `plugin`) and `args` (the arguments that ran, when a rewrite changed them). A record written before hooks existed is a bare `ToolOutput` and decodes; an older build reads a new one as its output |
+| `HookSet`, `Plugin`, `Verdict`, `HookError`, `HookLimits`, `HookedCall`, `HookedText`, `HookedMessage`, `MessageFile` | ADR 0050 slices H1 and H1b, re-exported from `adam-plugin`: `HookSet::new().with(Arc::new(plugin)).with_limits(HookLimits { deadline, retries })`, and `Plugin` with `name`, `message_received(&mut HookedMessage { text, files })`, `before_tool(&mut HookedCall { tool, arguments })` and `after_tool(&HookedCall, &mut HookedText { text })`. Installed with `LlmAgentBuilder::hooks`/`.plugin`; see *Hooks around a tool call* and *A hook may refuse a person's message* |
+| `HookedOutput`, `HookDecision`, `MessageDecision` | what the journaled `tool:<call id>` step records: `output` (a flattened `ToolOutput`), `hooks` (the decisions that were not `Continue`, each with `point`, `verdict`, `reason` and the failing `plugin`) and `args` (the arguments that ran, when a rewrite changed them); `MessageDecision` is what a message's step records: `text` (when a hook rewrote the message) and `hook` (the refusal). A record written before hooks existed is a bare `ToolOutput` and decodes; an older build reads a new one as its output |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so the loop runs such a call alone; whether the person can be asked is decided per run, see *Child sessions*; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to the helper", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) and `read_answer(call_id, args, ui, payload) -> AnswerCheck` (`Accept`, `Read(text)`, `Refuse(Refusal)` or `End(Refusal)`; the default accepts: reads the answer to the tool's own question before the model does; see *The answer is read by the tool that asked*) |
 | `ToolOutput` | `text`, `error`, `with_artifact`, `pinned()` (a compaction that drops the result copies it into its marker, see *Compaction*), `with_loaded` (a loader's whole list, journaled with the result, see `Loaded` below). A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. That check comes after the result is journaled, so a tool that may return several files it did not choose keeps its result within `ToolCtx::files_left()` (`adam_runtime::ReceivedFiles` does). `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed. `announcing(text)` (the member `answer`) makes `text` **the run's answer**, see *Announced answers*. `sandbox: SandboxUsage` is what the call reported with `ToolCtx::report_sandbox`, put there by the loop and journaled with the result (absent from a journal from before, not written while empty), see *Sandbox time* |
 | `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
@@ -649,6 +649,13 @@ sending task's, so a round names the task that sent it), else `Conversation::roo
 reads it as `ToolCtx::model_run_id()`, and every child it starts and every session it opens or sends to is handed it,
 so the whole tree under a task or a round names one run; `root_run` (whose task hears a subagent's steps) is unchanged.
 Never a message's context, which a person can set.
+**The prompt statement** ([ADR 0077](../../docs/decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md)):
+`Conversation::prompt_statement` holds the statement and the person's envelope of the run (`PROMPT_STATEMENT_KEY`,
+`prompt_statement`, of its first message, which the A2A front writes for a request that activated `prompt-statement/v1`);
+a later message of the task that brings new ones replaces them, one that brings none keeps them, and a later task
+starts with none of them. Every model call, the summary call included, carries them in `ModelRequest::prompt_statement`
+(`InjectedRun` sends the headers), and a child and a session's round start with the values of the run that started
+them (`child_message`). Not in the context, so no tool reads them; their `Debug` holds no value.
 (`tests/root_run.rs` is the chain of three runs, every model call of which names the top, and the limits it hands down, the tier and who the message was sent for; `tests/child_runs.rs` starts children with a `Runtime` it holds, which works too; `tests/compaction.rs` checks the summary call names the run, a child's included (`a_childs_summary_call_names_the_top_run`), and `tests/sessions.rs` `every_round_names_the_root_that_opened_its_session` the rounds of a session (round one, a person's later round, a round a later task sends, which names that task, and a person's round after it) and a session a person opened, whose round names itself; `everything_under_a_persons_round_names_what_the_round_names` a subagent under a person's round; `tests/prefix.rs` checks each request names a run of its rig; `adam-a2a-runtime`'s `tests/model_run.rs` that a message's metadata and data parts cannot name the run.)
 
 ## Remote tasks
@@ -758,7 +765,10 @@ the summary: a parked run never keeps an inbox, which the runtime's looks at a c
 kind `MODEL_RESUME_KIND` (`adam.resume`, the runtime's wake-only `RESUME_KIND`) wakes the run and adds nothing; one that
 lands while the run works is no message that arrived and reopens nothing. The first call
 that is answered clears the wait. A cancel ends the park. `ModelError::ModelLocked` is no park: the run fails naming the
-model, or switches once to its fallback (*A locked model*). A provider that does not park (`StaticBearer`) fails as before. The journal holds the reason's status and slug
+model, or switches once to its fallback (*A locked model*). A refusal of status `402` (the person's usage limit reached)
+takes that one switch first, and parks as `over_limit` (`Park::UntilWoken`) when no model is left, so the person reads
+the limit reached rather than a failed run. A provider that does not park (`StaticBearer`) fails as before. The journal
+holds the reason's status and slug
 (`park` in the failure's record), never a header, a body or a credential.
 
 **Breaking:** `Conversation::model_wait` is a new public field of a struct that is not `#[non_exhaustive]`: a literal
@@ -769,17 +779,20 @@ loads as none (`ModelPark` gains a kind in a later build).
 .reasoning_effort(..))` (the assembly builds it from the folder's `model_fallback:`) answers a `ModelError::ModelLocked`
 by recording `Conversation::model_switch` (`ModelSwitch { from, to, turn }`), emitting the step `Switched model`, and asking
 the same turn again of the fallback, with its cap and level, in the next transition. Every later call of the run names the fallback, and so do the compaction budget (the live model's window and cap), the image limits and the summary call; a `ModelLocked` on a summary call switches the run too, and the summary is asked of the fallback in the next transition; `usage/v1` names it, and the run never goes back. A `ModelLocked` on the
-fallback fails the run naming both models; an agent with no fallback fails as before; a fallback that is the model the run is on already (a message picked it) fails the run at once, with no second call. `ModelFailure` journals the locked
+fallback fails the run naming both models; an agent with no fallback fails as before; a fallback that is the model the run is on already (a message picked it) fails the run at once, with no second call. A refusal of status `402` (the
+person's usage limit reached, `over_limit`, whatever the gateway's problem type called it) takes the same one switch, and
+when no model is left — none configured, the fallback already locked too, or the fallback is the live model — it parks
+the run as `over_limit` (`Park::UntilWoken`) instead of failing it, which is the event the app renders. `ModelFailure` journals the locked
 alias, so a replay finds the same refusal and makes no call. `.model_choices(..)` gives the models a message may pick with
 the context key `MODEL_CONTEXT_KEY` (`vymalo.model`, `{"model": alias}`); an alias without a binding, or an agent without
 choices, is ignored. **Breaking:** `Conversation::model_switch` is a new public field of a struct that is not
 `#[non_exhaustive]`. Tests: `tests/model_fallback.rs` (the switch, no switch back, a second lock, no fallback, a message's
-pick, a replay after a lost commit, a smaller fallback's window, a lock on a budget and on an overflow summary, a fallback equal to the live model).
+pick, a replay after a lost commit, a smaller fallback's window, a lock on a budget and on an overflow summary, a fallback equal to the live model, a 402 that switches once and a 402 on the fallback that parks).
 
 Tests: `tests/model_park.rs` (each kind, the backoff by the journaled times, the limit and a wake clamped to it, a message,
 one refused again, a resume, a resume during the woken call adding no turn, a row that changes kind, a replay after a lost
 commit, an unattended run, a parked summary with a message not stepped before its wake, an
-unreachable endpoint, `ModelLocked`, `StaticBearer`'s errors, a cancel, a parked child shown on its parent and woken
+unreachable endpoint, `ModelLocked`, a 402 with no model left parking as `over_limit`, `StaticBearer`'s errors, a cancel, a parked child shown on its parent and woken
 through a message or a resume (its words staying there, a copy of the waking message waking it once, a copy of a resume
 it read making no call, the copy cleared while it works, a timer child keeping the look), a grandchild reached one level
 at a time, and nothing of a problem document's body in the journal through `adam-model-openai` against a mock
@@ -869,6 +882,28 @@ they are added in is the order their hooks run in. `adam-plugin` holds the vocab
 * **A call that starts while the model writes** (ADR 0049) runs its hooks when it starts, and its
   step is written once the stream ends: a stream that fails runs its hooks again with the call, and
   the recorded step is the one no later replay asks about.
+
+## A hook may refuse a person's message (ADR 0050, slice H1b)
+
+`Plugin::message_received(&mut HookedMessage { text, files })` is asked about every message before a
+model can see it: the start of the run, and each message delivered while it works. It may allow the
+message, rewrite `text` in place, or return `Verdict::Deny(reason)`; `files` holds the message's files
+**by reference** (name, media type, size, the SHA-256 the image step records), never their bytes.
+
+* **A step of its own, only when a set is installed.** The decision is recorded in `message:start` (or
+  `message:<inbound id>`) as a `MessageDecision` — the text a rewrite made, or the refusal — so a
+  replay applies it and asks no hook. With no `HookSet` the step is not taken at all: a journal written
+  without hooks replays unchanged. Installing one on a run already in flight is the same change as
+  adding any step, so roll the workers over first.
+* **A refused start fails the run**: `AgentError::Rejected` with `the message was refused by
+  <plugin>: <reason>`, class `Rejected` (`Classify`), and no model is called.
+* **A refused message that arrives while the task works** is left out — its files are not kept — and
+  the task goes on; a `RunEvent::Progress` line names the plugin and the reason, so a refusal is never
+  silent. A transient hook failure is the step's own: the transition is retried.
+
+Tests: `tests/message_hooks.rs` — a refused start fails `Rejected` with the reason and the record, a
+refused steer is dropped while the task finishes, a replay asks the hook once, a run with no hook
+takes no `message:` step, and a message's files reach the hook as the SHA-256 the image step recorded.
 
 Tests: `tests/hooks.rs` — a replay past the step's journal write asks no hook again (a counter that
 stays at 1 while the unrecorded call's reaches 2), a rewrite that changes `Tool::access` is denied (the

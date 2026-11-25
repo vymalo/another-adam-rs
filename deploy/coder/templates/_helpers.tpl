@@ -68,6 +68,16 @@ means the coder's own default, auto, and nothing is rendered.
 {{- end -}}
 
 {{/*
+uploads.inlineMaxBytes (the largest file the agent sends inline; a larger one asks for an upload slot), as the digits
+of a whole number. A YAML number is read as a float by Helm, so it is formatted, not printed. Empty
+means the binary's own default (10 MiB) and nothing is rendered.
+*/}}
+{{- define "coder.uploadsInlineMaxBytes" -}}
+{{- $v := .Values.uploads.inlineMaxBytes -}}
+{{- if kindIs "float64" $v -}}{{- printf "%d" (int64 $v) -}}{{- else -}}{{- default "" $v | toString | trim -}}{{- end -}}
+{{- end -}}
+
+{{/*
 Whether this pod runs workers: every role but `control-plane` (an empty role is
 `all`). The role is trimmed and lower-cased first, as the binary parses it, so
 " Control-Plane " is a control plane here too. Renders "true" or nothing, so
@@ -480,4 +490,33 @@ are unchanged. JSON only for now: the binary refuses a file that does not parse.
 {{/* The file: the value as pretty JSON. */}}
 {{- define "coder.modelProfilesJson" -}}
 {{- toPrettyJson .Values.config.modelProfiles -}}
+{{- end -}}
+
+{{/*
+The sessions' limits (values config.sessions): every role reads them, so the control plane and the workers get the
+same lines. Nothing for a value that is not set.
+*/}}
+{{- define "coder.sessionEnv" -}}
+{{- range $key, $name := dict "maxOpen" "SESSION_MAX_OPEN" "maxWorking" "SESSION_MAX_WORKING" "maxRounds" "SESSION_MAX_ROUNDS" "idleDays" "SESSION_IDLE_DAYS" }}
+{{- with include "coder.settingText" (get $.Values.config.sessions $key) }}
+- name: {{ $name }}
+  value: {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+The coder's read-only references (values config.references): a JSON file of repositories, read at startup
+(ADAM_REFERENCES_FILE). Workers only. Renders "true" or nothing.
+*/}}
+{{- define "coder.references" -}}
+{{- if and .Values.config.references (include "coder.runsWorkers" .) -}}true{{- end -}}
+{{- end -}}
+
+{{- define "coder.referencesConfigMapName" -}}{{ include "coder.fullname" . }}-references{{- end -}}
+
+{{- define "coder.referencesFile" -}}/etc/adam/references.json{{- end -}}
+
+{{- define "coder.referencesJson" -}}
+{{- toPrettyJson (dict "references" .Values.config.references) -}}
 {{- end -}}

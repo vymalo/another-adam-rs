@@ -135,6 +135,12 @@ pub const MAX_WORKING_SESSIONS_LIMIT: u32 = 32;
 /// The smallest and largest `limits.max_session_rounds`.
 pub const MAX_SESSION_ROUNDS_LIMIT: (u32, u32) = (2, 200);
 
+/// The largest `limits.max_inline_upload_bytes`: 256 MiB, the orchestrator's ceiling for one file,
+/// `artifacts.maxFileBytes` (`sys:docs/api/config.md`, verified 2026-11-25). The same number as
+/// `adam_a2a::UPLOADS_INLINE_MAX_BYTES_CEILING`, which this crate does not depend on and so cannot
+/// name.
+pub const MAX_INLINE_UPLOAD_BYTES_LIMIT: u64 = 268_435_456;
+
 /// The most `retry.<tool>.attempts` may say (ADR 0061, decision 6).
 pub const MAX_RETRY_ATTEMPTS: u32 = 20;
 
@@ -337,6 +343,13 @@ pub struct Limits {
     /// `SESSION_MAX_ROUNDS`.
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxSessionRounds")]
     pub max_session_rounds: Option<u32>,
+    /// The largest file the agent sends inline (`uploads/v1`; a larger one asks for a slot), in
+    /// bytes, 1 to 256 MiB. Root agent only; the card says nothing of it; it wins over `UPLOADS_INLINE_MAX_BYTES`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "maxInlineUploadBytes"
+    )]
+    pub max_inline_upload_bytes: Option<u64>,
     /// Keys this schema does not know.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -425,6 +438,46 @@ impl ToolsLoading {
     }
 }
 
+/// One entry of `plugins:` (ADR 0050, slice H6): the name of a compiled plugin the deployment
+/// registered, bare or with `options`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum PluginRef {
+    /// `- audit`
+    Name(String),
+    /// `- name: audit` with `options:` of scalars, read as text.
+    With {
+        /// The plugin's registered name.
+        name: String,
+        /// Its options. A value that looks like a secret is refused by the loader.
+        #[serde(
+            default,
+            deserialize_with = "scalar_map",
+            skip_serializing_if = "BTreeMap::is_empty"
+        )]
+        options: BTreeMap<String, String>,
+    },
+}
+
+impl PluginRef {
+    /// The plugin's registered name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Name(name) | Self::With { name, .. } => name,
+        }
+    }
+
+    /// The plugin's options; none for a bare name.
+    #[must_use]
+    pub fn options(&self) -> BTreeMap<String, String> {
+        match self {
+            Self::Name(_) => BTreeMap::new(),
+            Self::With { options, .. } => options.clone(),
+        }
+    }
+}
+
 /// The YAML frontmatter of an agent or subagent file.
 ///
 /// Everything is optional at this level; which keys are required depends on the role of the
@@ -490,6 +543,11 @@ pub struct AgentFrontmatter {
     /// of the digest) when there is none.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub retry: BTreeMap<String, RetryDef>,
+    /// The compiled plugins the agent runs, by the name the deployment registered them under; its
+    /// subagents inherit them (ADR 0050, slice H6). Left out of the JSON (and so of the digest)
+    /// when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<PluginRef>,
     /// The A2A card (root agent only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub card: Option<Card>,

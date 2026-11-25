@@ -17,7 +17,8 @@ use serde_json::{Map, Value};
 
 use crate::access::ToolAccess;
 use crate::conversation::{
-    Loaded, MODEL_RUN_KEY, PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message,
+    Loaded, MODEL_RUN_KEY, PROMPT_STATEMENT_KEY, PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY,
+    ROOT_STEP_KEY, user_message,
 };
 use crate::images::{ImageGate, ImageOutcome, ImagePolicy, ImageStore, KeptImage};
 use crate::kept::KeptOutput;
@@ -738,6 +739,8 @@ impl HookDecision {
     pub const TOOL_BEFORE: &str = "tool.before";
     /// The point after the tool answered.
     pub const TOOL_AFTER: &str = "tool.after";
+    /// The point where a person's message is about to reach a model (ADR 0050, decision 9).
+    pub const MESSAGE_RECEIVED: &str = adam_plugin::MESSAGE_RECEIVED;
     /// The call is refused, and the reason is its result.
     pub const DENY: &str = "deny";
     /// A person is asked first. Until approval exists (ADR 0050, slice H8) the call is not run.
@@ -806,6 +809,35 @@ impl HookedOutput {
             .iter()
             .find(|decision| decision.verdict == HookDecision::STOP)
             .map(|decision| decision.reason.as_deref().unwrap_or_default())
+    }
+}
+
+/// What the step that takes a person's message in records (`message.received`, ADR 0050 decision 9).
+///
+/// A rewrite is recorded as the text the message takes; a refusal as the decision that carried it.
+/// Both absent: the hook allowed the message as it was. The record is what a replay applies, so no
+/// hook is asked again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageDecision {
+    /// The text the hook rewrote the message to. Absent when the text is the one the person sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// The refusal, when the message does not reach a model. It is a `deny`, a `stop`, or a
+    /// `failed` hook (a hook that cannot decide never lets a message through).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook: Option<HookDecision>,
+}
+
+impl MessageDecision {
+    /// Whether the message is refused, and the decision that refused it.
+    #[must_use]
+    pub fn refusal(&self) -> Option<&HookDecision> {
+        self.hook.as_ref().filter(|hook| {
+            matches!(
+                hook.verdict.as_str(),
+                HookDecision::DENY | HookDecision::STOP | HookDecision::FAILED
+            )
+        })
     }
 }
 
@@ -1031,8 +1063,15 @@ pub struct ToolCtx {
     children: Option<ChildStarter>,
     context: Arc<Map<String, Value>>,
     root_run: RunId,
+    /// The run whose workspace this run's rounds read (ADR 0045 slice 7): what
+    /// [`workspace_run_id`](Self::workspace_run_id) answers. Its own root unless its session's
+    /// header names another.
+    workspace_run: RunId,
     /// The run this run's model calls name (ADR 0067), handed to its children and its sessions.
     model_run: RunId,
+    /// The run's prompt statement and the person's envelope (ADR 0077), handed to its children and
+    /// its sessions' rounds. Its `Debug` holds no value.
+    prompt_statement: Option<adam_model::PromptStatement>,
     /// The step of the root run this run works under, when it is a child (see
     /// `Conversation::root_step`); `None` for a run that is nobody's child.
     root_step: Option<String>,
@@ -1112,7 +1151,9 @@ impl ToolCtx {
             children,
             context,
             root_run: root_run.unwrap_or(run_id),
+            workspace_run: root_run.unwrap_or(run_id),
             model_run: root_run.unwrap_or(run_id),
+            prompt_statement: None,
             root_step,
             step,
             note: None,
@@ -1481,11 +1522,24 @@ impl ToolCtx {
     }
 
     /// Make the context the one of a child run that works for `root`, as a run started with
-    /// [`start_child`](Self::start_child) is.
+    /// [`start_child`](Self::start_child) is. The workspace it reads is the root's too, unless
+    /// [`with_workspace_run`](Self::with_workspace_run) says otherwise (a session's header does).
     #[must_use]
     pub fn with_root_run(mut self, root: RunId) -> Self {
         self.root_run = root;
+        self.workspace_run = root;
         self.model_run = root;
+        self
+    }
+
+    /// Say which run's workspace this run reads, when it is not
+    /// [`root_run_id`](Self::root_run_id): the run a session's header names (ADR 0045 slice 7), so
+    /// that a round a person started works in the worktree of the task it was opened in. The agent
+    /// does it for the calls of a round whose header says one; a test may set it on a detached
+    /// context.
+    #[must_use]
+    pub fn with_workspace_run(mut self, run: RunId) -> Self {
+        self.workspace_run = run;
         self
     }
 
@@ -1495,6 +1549,17 @@ impl ToolCtx {
     #[must_use]
     pub(crate) fn with_model_run(mut self, run: RunId) -> Self {
         self.model_run = run;
+        self
+    }
+
+    /// With the run's prompt statement and the person's envelope (ADR 0077), which a child this
+    /// call starts, and a round of a session it opens or sends to, start with.
+    #[must_use]
+    pub(crate) fn with_prompt_statement(
+        mut self,
+        prompt_statement: Option<adam_model::PromptStatement>,
+    ) -> Self {
+        self.prompt_statement = prompt_statement;
         self
     }
 
@@ -1545,6 +1610,18 @@ impl ToolCtx {
     /// restart and costs no store read.
     pub fn root_run_id(&self) -> RunId {
         self.root_run
+    }
+
+    /// The run whose workspace this run works in: what a tool that keeps a worktree, an environment
+    /// session or a scratch project keys by. It is [`root_run_id`](Self::root_run_id) unless the
+    /// run's session names another ([`SessionHeader::workspace`](adam_runtime::SessionHeader)),
+    /// which is how a round a person started reads the repository of the task it was opened in
+    /// (ADR 0045 slice 7).
+    ///
+    /// The **notes** of the task — the checks, the budgets, the gates, the repositories a person
+    /// agreed to — stay on [`root_run_id`](Self::root_run_id): a helper writes none of them.
+    pub fn workspace_run_id(&self) -> RunId {
+        self.workspace_run
     }
 
     /// The conversation the run belongs to, if any.
@@ -1642,6 +1719,13 @@ impl ToolCtx {
             );
             // The step of the root the child works under: this call's own when this run is the
             // root, the one this run works under when it is a child itself.
+            // The prompt statement of this run is the child's: its model calls carry the same
+            // headers (ADR 0077).
+            if let Some(prompt) = &self.prompt_statement
+                && let Ok(value) = serde_json::to_value(prompt)
+            {
+                payload.insert(PROMPT_STATEMENT_KEY.to_owned(), value);
+            }
             let root_step = self.root_step.as_deref().unwrap_or(&self.step.id);
             payload.insert(
                 ROOT_STEP_KEY.to_owned(),

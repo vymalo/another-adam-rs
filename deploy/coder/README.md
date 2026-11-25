@@ -195,6 +195,11 @@ Each model call's `usage/v1` report can say the model's window, so a screen show
 | Value | Variable | What |
 |---|---|---|
 | `config.maxParallelToolCalls` | `MAX_PARALLEL_TOOL_CALLS` | The most tool calls of one model turn that run at the same time: a whole number from 1 to 32 (`1` is one at a time). `null` (default) renders nothing and the binary runs 10, **so the render of a deployment that does not set it is unchanged**. An agent file's `limits.max_parallel` may lower it for that agent. The chart refuses a value outside 1 to 32 and one given beside `config.extraEnv.MAX_PARALLEL_TOOL_CALLS`; a control plane renders none |
+| `config.sessions.maxOpen`, `.maxWorking`, `.maxRounds`, `.idleDays` | `SESSION_MAX_OPEN` (1 to 100), `SESSION_MAX_WORKING` (1 to 32, at most `maxOpen`), `SESSION_MAX_ROUNDS` (2 to 200), `SESSION_IDLE_DAYS` (1 to 365) | The limits of a conversation's sessions. `null` (default) renders nothing and the binary's defaults (16, 4, 20, 7) apply. Every role reads them, so the control plane and the workers get the same lines. A value out of bounds, and one beside its `config.extraEnv` variable, is refused |
+| `config.modelPromptCacheKey` | `MODEL_PROMPT_CACHE_KEY` | `off` or `conversation`. Empty renders nothing (`off`). Workers only |
+| `config.modelInputModalities` | `MODEL_INPUT_MODALITIES` | `text` or `text,image`. Empty renders nothing (`text`). Workers only |
+| `config.languageServers` | `LANGUAGE_SERVERS` | `on` or `off`. Empty renders nothing (`on`). Workers only |
+| `config.references` | `ADAM_REFERENCES_FILE` | A list of `{name, url, description, branch?}`: repositories the coder may read and never write. Rendered as JSON in the ConfigMap `<release>-references`, mounted at `/etc/adam/references.json`. Empty renders neither. Workers only |
 | `config.maxProcesses` | `MAX_PROCESSES` | The most commands, background commands and language servers of a worker at once: a whole number from 1 to 256 ([ADR 0065](../../docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md)). `null` (default) renders nothing and the binary runs 4, **so the render of a deployment that does not set it is unchanged**. A folder's `limits.max_processes` may lower it. A value outside 1 to 256, and one given beside `config.extraEnv.MAX_PROCESSES`, is refused; a control plane renders none |
 | `config.maxGitProcesses` | `MAX_GIT_PROCESSES` | The most git processes of a worker at once: a whole number from 1 to 64. `null` (default) renders nothing and the binary runs 2. Refused outside 1 to 64 and beside `config.extraEnv.MAX_GIT_PROCESSES`; a control plane renders none |
 | `config.commandMemoryMax` | `COMMAND_MEMORY_MAX` | The memory one command may use: bytes, or a size such as `2GB` or `512MiB`, at least 64 MiB. `null` (default) renders nothing and the binary takes a quarter of the RAM, at most 8 GB. The chart passes the text as it is: a bad one is the binary's exit 78. Refused beside `config.extraEnv.COMMAND_MEMORY_MAX` |
@@ -316,8 +321,22 @@ rollout):
 | Value | Default | |
 |---|---|---|
 | `database.enabled` | `true` | The chart creates a CloudNativePG `Cluster` named `<release>-db` (`database.name`, `owner`, `instances`, `storage`) and every pod reads `DATABASE_URL` from the `uri` key of the Secret CNPG creates, `<release>-db-app`. The render is the one this chart always had (`tests/golden/combined.yaml`). |
+| `database.instances` | `1` | Instances of the `Cluster`. With `database.enabled: true` only. |
+| `database.resources` | `{}` | CPU and memory requests and limits of each instance. Empty renders nothing, so the default render is unchanged. |
 | `database.existingSecret.name` | `""` | With `database.enabled: false`: a Secret in the release namespace that holds the connection string. Required then, refused with `enabled: true`. |
 | `database.existingSecret.key` | `uri` | The key of that Secret; empty means `uri`. |
+
+Starting points for three instances (not measurements; size them from your own load):
+
+```yaml
+database:
+  instances: 3
+  resources:
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {memory: 2Gi}
+```
+
+Backups and a transaction-mode pooler are not part of this chart.
 
 ```sh
 helm template coder deploy/coder \
@@ -515,6 +534,13 @@ which anyone may add): list the owners here. The coder asks the person before ev
 tier below), makes the repository private and empty unless asked otherwise, and refuses an owner that is not allowed. A GitHub
 App creates for organisations only; a token needs the `repo` scope.
 
+### Uploads
+
+`uploads.inlineMaxBytes` (env `UPLOADS_INLINE_MAX_BYTES`, every role that serves A2A; empty renders nothing and the agent uses 10 MiB, the orchestrator's `artifacts.maxFileBytes`) is the largest
+file the agent sends inline: a larger one asks the orchestrator for a presigned upload slot. From 1 byte to
+268435456 (256 MiB); set it to the orchestrator's `artifacts.maxFileBytes`. The card lists `uploads/v1` with no `params`, as the contract says. The agent folder's `limits.max_inline_upload_bytes` wins over it. Do not also set
+`config.extraEnv.UPLOADS_INLINE_MAX_BYTES`: the chart refuses the render.
+
 ### The access tiers
 
 The person picks an access tier for each message (`plan`, `edits`, `auto`, `bypass`; the default is `auto`;
@@ -566,7 +592,7 @@ creation** in addition to **Administration**. A token needs the `repo` scope for
 
 ## Agent files
 
-The served card lists `child-sessions/v1` (`explorer` and `reviewer` as sessions a person opens; `maxOpen` is `SESSION_MAX_OPEN`, 16 by default, which `config.extraEnv` sets; no chart value and no template changed). A person's round has no workspace yet ([`bin/adam-coder/README.md`](../../bin/adam-coder/README.md#sessions-a-person-opens)). Roll the workers before the control plane (`topology: split`): a round for a helper an older worker does not know stays `working`.
+The served card lists `child-sessions/v1` (`explorer` and `reviewer` as sessions a person opens; `maxOpen` is `SESSION_MAX_OPEN`, 16 by default, which `config.sessions.maxOpen` sets). A person's round reads the workspace of the latest task of the context it was opened in, and every later round of the session reads the same one (ADR 0045 slice 7; [`bin/adam-coder/README.md`](../../bin/adam-coder/README.md#sessions-a-person-opens)). Roll the workers before the control plane (`topology: split`): a round for a helper an older worker does not know stays `working`.
 
 The binary reads its prompt, card and skills from the folder `ADAM_AGENT_DIR` names, once, at startup
 (`bin/adam-coder/README.md`, "Where the prompt and the card live"); unset, it runs the copy embedded in the

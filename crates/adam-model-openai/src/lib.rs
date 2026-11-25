@@ -42,9 +42,11 @@
 //!   [`Refusal`] (the status, the slug of an `application/problem+json`
 //!   body's `type`, the `Retry-After`) and asks the provider whether it parks
 //!   ([`ModelCredentials::parks`](adam_model::ModelCredentials::parks)). The slug `model_locked`
-//!   is [`ModelLocked`](adam_model::ModelError::ModelLocked) for every provider. A park is
-//!   [`Refused`](adam_model::ModelError::Refused), which holds no body and no header; no park is
-//!   the error the status always gave. An error object inside a stream is the model's and never parks.
+//!   on a status other than `402` is [`ModelLocked`](adam_model::ModelError::ModelLocked) for every
+//!   provider. A park is [`Refused`](adam_model::ModelError::Refused), which holds no body and no
+//!   header, and a `402` the provider parks is `over_limit` whatever the gateway named it: the
+//!   person's usage limit is reached. No park is the error the status always gave. An error object
+//!   inside a stream is the model's and never parks.
 //! * **Response size caps.** A body over 16 MiB, an SSE line over 1 MiB, one
 //!   event's `data:` over 4 MiB, or a stream over 64 MiB is a
 //!   [`Protocol`](adam_model::ModelError::Protocol) error (class `Corrupt`),
@@ -102,7 +104,7 @@ use adam_error::{BoxError, Classify, ErrorClass};
 use adam_model::{
     AfterRejection, CredentialHeaders, CredentialRequest, DynCredentials, InputModalities,
     MODEL_LOCKED_SLUG, Message, ModelClient, ModelDelta, ModelError, ModelProfile, ModelProfiles,
-    ModelRequest, ModelResponse, Park, Refusal, Rejection, StaticBearer,
+    ModelRequest, ModelResponse, OVER_LIMIT_SLUG, Park, Refusal, Rejection, StaticBearer,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -392,7 +394,14 @@ impl OpenAiCompatible {
         Ok(Self {
             http,
             default_headers: headers,
-            url: format!("{base}/chat/completions"),
+            // As the URL parser writes it, so the request target a signature names
+            // (`adam_model::request_target`) is the one sent.
+            url: reqwest::Url::parse(&format!("{base}/chat/completions"))
+                .map_err(|e| OpenAiConfigError::InvalidBaseUrl {
+                    reason: e.to_string(),
+                    source: Some(Box::new(e)),
+                })?
+                .to_string(),
             endpoint: endpoint_id(base),
             credentials: Arc::new(StaticBearer::new(config.api_key.clone())),
             timeout: config.timeout,
@@ -586,6 +595,7 @@ impl OpenAiCompatible {
         streaming: bool,
         model: &str,
         run: Option<&str>,
+        prompt_statement: Option<&adam_model::PromptStatement>,
     ) -> Result<reqwest::Response, ModelError> {
         let body = Bytes::from(body);
         let mut attempt = 0;
@@ -595,6 +605,8 @@ impl OpenAiCompatible {
                 url: &self.url,
                 attempt,
                 run,
+                prompt_statement,
+                body: &body,
             };
             let credentials = self.credentials.headers(call).await?;
             let mut request = self
@@ -654,12 +666,25 @@ impl OpenAiCompatible {
             let refusal = Refusal::new(status.as_u16())
                 .with_problem(errors::problem_type(content_type.as_deref(), &text))
                 .with_retry_after(retry_after);
+            let park = self.credentials.parks(&refusal);
+            // A `402` is the person's usage limit reached for the model the call named, whatever the
+            // gateway called it (`over_limit`, `model_locked`, or no problem document): a run with
+            // another model tries it, and parks until it is woken when none is left (ADR 0067
+            // decision 3, amended 2026-11-25).
+            if refusal.status == 402 && park != Park::No {
+                return Err(ModelError::Refused {
+                    status: 402,
+                    slug: Some(OVER_LIMIT_SLUG.to_owned()),
+                    retry_after: refusal.retry_after,
+                    park,
+                });
+            }
             if refusal.slug() == Some(MODEL_LOCKED_SLUG) {
                 return Err(ModelError::ModelLocked {
                     model: model.to_owned(),
                 });
             }
-            match self.credentials.parks(&refusal) {
+            match park {
                 Park::No => {}
                 // The status, the slug and the wait only: the body and the headers stay here.
                 park => {
@@ -937,7 +962,13 @@ impl ModelClient for OpenAiCompatible {
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
         let body = wire::build_request(&req, false, self.options())?;
         let response = self
-            .send(body, false, &req.model, req.run.as_deref())
+            .send(
+                body,
+                false,
+                &req.model,
+                req.run.as_deref(),
+                req.prompt_statement.as_ref(),
+            )
             .await?;
         let bytes = read_body(response).await?;
         let parsed = wire::parse_completion(&bytes).map(|r| self.echoed(r, &req.model));
@@ -960,7 +991,13 @@ impl ModelClient for OpenAiCompatible {
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
         let body = wire::build_request(&req, true, self.options())?;
         let response = self
-            .send(body, true, &req.model, req.run.as_deref())
+            .send(
+                body,
+                true,
+                &req.model,
+                req.run.as_deref(),
+                req.prompt_statement.as_ref(),
+            )
             .await?;
         let this = self.clone();
         let model = req.model.clone();

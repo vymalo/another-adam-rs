@@ -83,7 +83,7 @@ description: Turns a coding task into a verified pull request.   # required on s
 model: coder-large             # a gateway alias; `inherit` = the parent's (default for subagents)
 reasoning_effort: low          # the level the model calls ask for by default; one the model's profile declares (ADR 0063)
 model_preset: quick            # a named preset of MODEL_ALIASES_FILE the calls start from (ADR 0064)
-model_fallback: coder-lite     # overrides the preset's and the profile's `fallback`: the alias the run continues on, once, if the endpoint refuses `model` as locked (ADR 0064)
+model_fallback: coder-lite     # overrides the preset's and the profile's `fallback`: the alias the run continues on, once, if the endpoint refuses `model` as locked or over the person's limit (ADR 0064)
 tools: [prepare_workspace, run_checks, ask_user]     # or "a, b, c"; "*" = all; MCP: "linear__*"
 tools_loading: eager           # `eager`: every tool in every request, as before the key existed; `lazy` (default): a run loads them in groups (ADR 0066)
 skills: all                    # or a list; default: every skill in this agent's skills/
@@ -98,8 +98,10 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   command_cpu: 500m            # the CPU one command may use (`2`, `1.5` cores or `500m`), at least 100m: lowers COMMAND_CPU_MAX, never raises it
   max_open_sessions: 8         # root only: most sessions open at once, 1 to 100; lowers SESSION_MAX_OPEN, never raises it (a larger value is lowered with a warning)
   max_working_sessions: 2      # root only: most rounds working at once, 1 to 32 and at most max_open_sessions; lowers SESSION_MAX_WORKING
+  max_inline_upload_bytes: 10485760 # root only: the largest file sent inline (`uploads/v1`; a larger one asks for a slot; the card carries no params), 1 to 268435456 (256 MiB); wins over UPLOADS_INLINE_MAX_BYTES (a subagent's value is ignored, with a warning)
   max_session_rounds: 10       # root only: most rounds one session may have, 2 to 200; lowers SESSION_MAX_ROUNDS (a subagent's value is ignored, with a warning)
 retry:                         # a retry policy per tool (below); this agent's own, none inherits
+plugins: [audit]                # compiled plugins the deployment registered; subagents inherit them (ADR 0050); an unknown name exits 78
   web_search: { attempts: 5, backoff: 2s, max_backoff: 5m, on: [rate-limited] }
 vars: { max_check_cycles: 3 }  # defaults for {{placeholders}} in the body; code may override
 references:                    # root only: repositories the coder reads and never writes (below)
@@ -136,9 +138,10 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   gives the root's level (`EngineBuilder::reasoning_effort`) when the file sets none: the file's key
   wins. Claude Code's `effort` is still ignored with a warning.
 * **A locked model switches once.** `model_fallback` names the alias a run continues on when the endpoint refuses
-  its model as not allowed (`model_locked`, ADR 0067). The run says it as a step (`Switched model`), reports
-  its later calls under the fallback, takes the fallback's cap and its profile's own reasoning level, and never goes back;
-  a second refusal fails it naming both models. The alias is the file's `model_fallback`, else the `fallback` of its
+  its model as not allowed (`model_locked`) or over the person's limit (`over_limit`, a `402`; ADR 0067). The run says
+  it as a step (`Switched model`), reports its later calls under the fallback, takes the fallback's cap and its
+  profile's own reasoning level, and never goes back; a second refusal fails it naming both models, save for a `402`,
+  which parks the run as over limit instead. The alias is the file's `model_fallback`, else the `fallback` of its
   `model_preset`, else of its model's profile in `MODEL_ALIASES_FILE`; it is checked like `model:` and may not be the
   agent's own (exit 78). A subagent resolves its own: an `inherit` subagent takes its model's profile fallback, and
   nothing is inherited from the parent's file (ADR 0064, amended 2026-11-23).
@@ -159,6 +162,7 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   `lazy` (the default) starts lean, and a run loads tools in groups; `eager` puts every tool in every request, as
   before the key existed, and **a server whose `mcp.json` entry has a `when` is offered too** (nothing is withheld).
   `searchable` is accepted and behaves as `lazy` until searchable groups land.
+* **`plugins:` names compiled plugins** ([ADR 0050](../decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md), slice H6): each entry is a name or `{name, options}` of scalars. The deployment registers plugins by name (`AgentDef::plugin`); a name it did not register stops the agent (exit 78). A subagent runs its parent's plugins and then its own. An option that looks like a secret is refused. An agent file never declares a hook program.
 * **`retry:` is a retry policy per tool** ([ADR 0061](../decisions/0061-a-step-names-its-retry-policy.md)): a map from
   one of the agent's tool names (its own, an MCP server's `<server>__<tool>`, a skill or subagent tool) to `attempts`
   (required, 1 to 20, the tries in all), `backoff` and `max_backoff` (`500ms`, `1s`, `30m`, `1h`; at most `1h`, and

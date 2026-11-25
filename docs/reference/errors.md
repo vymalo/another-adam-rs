@@ -104,6 +104,7 @@ flowchart LR
     AgentError -->|"Transient of class Transient with retry_after, or kept from from_classified"| RateLimited
     AgentError -->|"Transient of class Conflict, kept from from_classified"| Conflict
     AgentError -->|Permanent| Invalid
+    AgentError -->|Rejected| Rejected
     AgentError -->|NonDeterminism| Corrupt
     StoreError -.->|"Store(e)"| AgentError
 
@@ -192,14 +193,26 @@ decision 3:
 
 | Variant | When | Class |
 |---|---|---|
-| `Refused { status, slug, retry_after, park }` | an answer of status 400 or above that the credential provider parks on (`ModelCredentials::parks`, today `InjectedRun` alone: the gateway's `unauthenticated`, `run_not_bound`, `lease_expired`, `over_limit`, `rate_limited`, `unavailable`, or a 401 or 403 with no problem type; never one whose `type` cannot be read) | by its status: `401`, `403` `Unauthenticated`; `402` `Rejected`; `429` `RateLimited` (`retry_after()` is its `Retry-After`); `503` `Transient`; any other `Rejected` |
-| `ModelLocked { model }` | the problem type `model_locked`, for every provider: the model is not allowed at all | `Rejected` |
+| `Refused { status, slug, retry_after, park }` | an answer of status 400 or above that the credential provider parks on (`ModelCredentials::parks`, today `InjectedRun` alone: the gateway's `unauthenticated`, `run_not_bound`, `lease_expired`, `over_limit`, `rate_limited`, `unavailable`, a `402` whatever its problem type (as `over_limit`), or a 401 or 403 with no problem type; never one whose `type` cannot be read) | by its status: `401`, `403` `Unauthenticated`; `402` `Rejected`; `429` `RateLimited` (`retry_after()` is its `Retry-After`); `503` `Transient`; any other `Rejected` |
+| `ModelLocked { model }` | the problem type `model_locked` on a status other than `402`, for every provider: the model is not allowed at all | `Rejected` |
 | `Unreachable` | a connection to the model endpoint could not be made (refused, no route, a name that does not resolve); a timeout, a cut stream and a failed TLS handshake stay `Transient` | `Transient` |
 
 `Refused` holds no body and no header: its message is `the model endpoint refused the call: HTTP <status>[ <slug>]`.
 A provider that does not park (a key of one's own, the device grant) keeps the errors above, so a wrong key fails as
-before. Nothing parks a run yet: the LLM agent treats these errors as any other of their class (the runtime retries a `429`,
-a `503` and `Unreachable`; the rest fail the run).
+before. A refusal the provider parks parks the run on the model (the LLM agent's `ModelParking`); a `402`
+first takes the agent's one switch to its fallback, and parks as `over_limit` (`Park::UntilWoken`) only when no model is
+left — the event a person reads as the limit reached, not a failed run (ADR 0067 decision 3, amended 2026-11-25).
+
+A model call that must be signed ([turn signing](environment.md#turn-signing), [ADR 0068](../decisions/0068-adam-signs-its-own-history.md)
+amended 2026-11-25) and cannot be is never sent:
+
+| Cause | Error | Class |
+|---|---|---|
+| the call names no run, its URL has no request target, or the run's prompt statement has no readable `jti` (an envelope alone, no `nonce`) | `InvalidRequest` | `Invalid` |
+| the turn keys cannot be reached (`TurnKeyError::Unavailable`), or name a key they no longer sign with, twice | `Transient` | `Transient` |
+| the turn keys refuse to sign (`TurnKeyError::Refused`) | `Auth` | `Unauthenticated` |
+
+None of the messages holds a key, a signature or the request.
 
 ## What each class decides
 

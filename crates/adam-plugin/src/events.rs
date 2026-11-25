@@ -68,6 +68,14 @@ pub enum EventKind {
     SessionRoundEnded,
     /// A session was closed: `subagent_close` returned.
     SessionClosed,
+    /// The runtime committed a park (H4).
+    RunParked,
+    /// The runtime committed the end of a run, done or failed (H4).
+    RunEnded,
+    /// The runtime committed a failed try that will be retried (H4).
+    RunError,
+    /// The runtime committed a transition that kept an artifact (H4).
+    ArtifactKept,
 }
 
 impl EventKind {
@@ -93,6 +101,10 @@ impl EventKind {
             EventKind::SessionRoundStarted => "session.round.started",
             EventKind::SessionRoundEnded => "session.round.ended",
             EventKind::SessionClosed => "session.closed",
+            EventKind::RunParked => "run.parked",
+            EventKind::RunEnded => "run.ended",
+            EventKind::RunError => "run.error",
+            EventKind::ArtifactKept => "artifact.kept",
         }
     }
 }
