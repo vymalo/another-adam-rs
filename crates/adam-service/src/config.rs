@@ -240,9 +240,22 @@ pub struct ServiceConfig {
     /// `SESSION_*`: the limits on the sessions of one conversation and how long an idle one stays
     /// open. Read by every role.
     pub sessions: SessionSettings,
+    /// `RUN_RETENTION_DAYS`, `RUN_RETENTION_SWEEP_SECS`: how long finished runs are kept (90 days
+    /// by default; `off` keeps all). Read by every role; swept by the roles that run workers.
+    pub retention: crate::retention::RetentionSettings,
     /// `DEFAULT_LOCALE`: the agent's default language, a BCP 47 tag; the card lists `locale/v1`
     /// with it when set (ADR 0069). `None`: the card lists nothing.
     pub default_locale: Option<adam_a2a::Locale>,
+    /// `UPLOADS_INLINE_MAX_BYTES`: the largest file the agent sends inline, 1 byte to 256 MiB; a larger
+    /// one asks for an upload slot (`uploads/v1`; the card carries no params). `None`: the card says
+    /// [`DEFAULT_UPLOADS_INLINE_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES). The agent folder's
+    /// `limits.max_inline_upload_bytes` wins over it ([`Agents::uploads_inline_max_bytes`](crate::Agents)).
+    pub uploads_inline_max_bytes: Option<u64>,
+    /// `MODEL_AUTH=injector`, read by every role (the word only): the process's model calls carry a
+    /// message's prompt statement and the person's envelope, so the card lists
+    /// `prompt-statement/v1` (ADR 0077). `false` with a key or a device grant: such a card does not
+    /// list it, and no message is read for it.
+    pub prompt_statement: bool,
 }
 
 impl std::fmt::Debug for ServiceConfig {
@@ -263,6 +276,7 @@ impl std::fmt::Debug for ServiceConfig {
             .field("worker", &self.worker)
             .field("a2a", &self.a2a)
             .field("sessions", &self.sessions)
+            .field("prompt_statement", &self.prompt_statement)
             .finish()
     }
 }
@@ -357,6 +371,18 @@ impl ServiceConfig {
                 .map_err(|e| problems.push(format!("DEFAULT_LOCALE is invalid: {e}")))
                 .ok()
         });
+        let uploads_inline_max_bytes = get("UPLOADS_INLINE_MAX_BYTES").and_then(|raw| {
+            match raw.trim().parse::<u64>() {
+                Ok(n) if (1..=adam_a2a::UPLOADS_INLINE_MAX_BYTES_CEILING).contains(&n) => Some(n),
+                _ => {
+                    problems.push(format!(
+                        "UPLOADS_INLINE_MAX_BYTES is invalid: a whole number of bytes from 1 to {} (256 MiB), got {raw:?}",
+                        adam_a2a::UPLOADS_INLINE_MAX_BYTES_CEILING
+                    ));
+                    None
+                }
+            }
+        });
         Self {
             role,
             database_url: SecretString::from(database_url),
@@ -367,7 +393,10 @@ impl ServiceConfig {
             worker,
             a2a,
             sessions: SessionSettings::parse(lookup, problems),
+            retention: crate::retention::RetentionSettings::parse(lookup, problems),
             default_locale,
+            uploads_inline_max_bytes,
+            prompt_statement: is_injector(lookup),
         }
     }
 }
@@ -1830,6 +1859,36 @@ mod tests {
     }
 
     #[test]
+    fn uploads_inline_max_bytes_is_a_size_in_range_or_a_startup_problem() {
+        assert!(
+            parse(&full())
+                .expect("valid")
+                .uploads_inline_max_bytes
+                .is_none()
+        );
+        let mut vars = full();
+        vars.insert("UPLOADS_INLINE_MAX_BYTES", "1048576");
+        assert_eq!(
+            parse(&vars).expect("valid").uploads_inline_max_bytes,
+            Some(1_048_576)
+        );
+        // The ceiling itself is a threshold; one byte past it is not.
+        vars.insert("UPLOADS_INLINE_MAX_BYTES", "268435456");
+        assert_eq!(
+            parse(&vars).expect("valid").uploads_inline_max_bytes,
+            Some(268_435_456)
+        );
+        for bad in ["0", "-1", "ten", "1.5", "268435457"] {
+            let mut vars = full();
+            vars.insert("UPLOADS_INLINE_MAX_BYTES", bad);
+            assert!(
+                mentions(&problems_of(&vars), "UPLOADS_INLINE_MAX_BYTES"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn default_locale_is_a_well_formed_tag_or_a_startup_problem() {
         assert!(parse(&full()).expect("valid").default_locale.is_none());
         let mut vars = full();
@@ -1840,6 +1899,22 @@ mod tests {
             let mut vars = full();
             vars.insert("DEFAULT_LOCALE", bad);
             assert!(mentions(&problems_of(&vars), "DEFAULT_LOCALE"), "{bad:?}");
+        }
+    }
+
+    /// `prompt-statement/v1` is listed exactly when the model calls go through the injector, which
+    /// is the only provider that sends the headers (ADR 0077).
+    #[test]
+    fn the_prompt_statement_follows_model_auth_injector() {
+        assert!(!parse(&full()).expect("valid").prompt_statement);
+        for (auth, listed) in [("injector", true), ("Injector", true), ("key", false)] {
+            let mut vars = full();
+            vars.insert("MODEL_AUTH", auth);
+            assert_eq!(
+                parse(&vars).expect("valid").prompt_statement,
+                listed,
+                "{auth}"
+            );
         }
     }
 

@@ -78,14 +78,17 @@ trait at your rev: its doc comments are the contract.
    adam_store_testkit::worker_leases_conformance!(make_store); // a store that implements release_worker_leases
    ```
 
-   `store_conformance!` generates one `#[tokio::test]` per case (49 at the time of writing) and
-   calls `migrate` first. `blob_conformance!` adds the **ten** blob cases (put/get, a 4 MiB round
+   `store_conformance!` generates one `#[tokio::test]` per case (50 at the time of writing) and
+   calls `migrate` first. One of them, `a_message_canonicalizes_as_it_was_written` (and the body
+   case `body_a_row_canonicalizes_as_it_was_written`), holds what a turn signature needs (adam ADR
+   0068): a state, a journal payload and a body row read back canonicalize (RFC 8785,
+   `adam_core::canonicalize`) to the bytes written, numbers and non-ASCII names included. `blob_conformance!` adds the **ten** blob cases (put/get, a 4 MiB round
    trip, an idempotent put, an unknown id, empty bytes, a run's reference keeping a blob alive
    (including after a commit that names a different one), a shared digest surviving until the last
    run is purged, the cutoff, `purge_finished`'s sweep, and `blob_stored` reporting what is
    stored); every
    case asserts `keeps_blobs()`, so do not give it to a store that keeps none. `body_conformance!`
-   adds the **fourteen** body cases: the append-only delta, the stable generation, the compaction
+   adds the **fifteen** body cases: the canonical round trip of a row, the append-only delta, the stable generation, the compaction
    and its GC, a stale version's conflict, the first split, **every read serving the current head**
    (`load_run`, `load_head`, `claim_due`, `open_run_for_conversation`, `list_runs`), a stale head
    serving the state, a tombstoned run serving its head (the repair), a JSON-null head not being a

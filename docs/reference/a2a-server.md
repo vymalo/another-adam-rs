@@ -385,6 +385,28 @@ the two rules (`bin/adam-coder/agent/instructions.md`, "Language" and "Never wri
 it, no request can activate it, so no agent reads a hint and each follows the person's language — which the same rule
 says.
 
+## The prompt statement (`prompt-statement/v1`)
+
+An agent whose card lists `https://agents.vymalo.com/a2a/extensions/prompt-statement/v1` (no `params`) carries a
+message's prompt statement and the person's envelope to the gateway in front of the model
+([ADR 0077](../decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md)). The card lists
+it only with `MODEL_AUTH=injector`, the one provider that sends them.
+
+A request that **activates** it may carry `metadata[URI] = {"statement": "<JWS>", "user": "<JWS>"}` (`user` may be
+absent). Each must be a compact JWS of at most 8 KiB; anything else refuses the message with `InvalidParams`, which
+names the member and never its value. A request that did not activate it carries nothing.
+
+| Message | The run's values |
+|---|---|
+| the first, with values | set |
+| a later one of the task (a steer, an answer), with values | replaced |
+| a later one without values | kept |
+| a later task of the conversation | its own message's, none otherwise |
+
+Every model call of the run carries `Prompt-Statement` and, when there is an envelope, `Prompt-User-Signature`, byte
+for byte, beside `X-Run-Id`: the root's calls, a local subagent's (started with its parent's values) and a session
+round's. The values live in the run's state, not its context, and are in no log line.
+
 ## The reasoning effort (`reasoning/v1`)
 
 An agent whose card lists `https://agents.vymalo.com/a2a/extensions/reasoning/v1` takes a reasoning effort

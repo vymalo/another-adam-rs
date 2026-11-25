@@ -165,12 +165,15 @@ mod toolset;
 mod typed;
 
 pub use access::{ToolAccess, Use, UseMode, path_scope};
-/// The hooks around a tool call (ADR 0050, slice H1): what a plugin implements and what the loop
-/// installs with [`LlmAgentBuilder::plugin`] or [`LlmAgentBuilder::hooks`].
+/// The hooks around a tool call and around a person's message (ADR 0050, slices H1 and H1b): what a
+/// plugin implements and what the loop installs with [`LlmAgentBuilder::plugin`] or
+/// [`LlmAgentBuilder::hooks`].
 ///
 /// [ADR 0050]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
 pub use adam_plugin::{
-    HookError, HookLimits, HookResult, HookSet, HookedCall, HookedText, Plugin, Verdict,
+    EventHeader, EventKind, EventQueue, FlushReport, HookError, HookEvent, HookLimits, HookResult,
+    HookSet, HookedCall, HookedMessage, HookedText, MESSAGE_RECEIVED, MessageFile, ObserveLimits,
+    Plugin, Verdict,
 };
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{
@@ -188,9 +191,9 @@ pub use conversation::{
     Conversation, LOCALE_CONTEXT_KEY, LimitHit, LimitKind, Loaded, Loader, MAX_CARRIED_BYTES,
     MAX_CONTEXT_BYTES, MAX_LOADED_NOTE_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS,
     MAX_REPORTED_ROUNDS, MESSAGE_KIND, MODEL_CONTEXT_KEY, ModelSwitch, OMITTED_MARKER_PREFIX,
-    PER_MESSAGE_CONTEXT_KEYS, PROTECTED_CONTEXT_KEYS, PendingQuestion, PendingRemote, PendingRun,
-    PendingSession, PendingWait, REASONING_EFFORT_CONTEXT_KEY, RENDERER_OFFER_CONTEXT_KEY, Repeats,
-    STOPPED_BY_THE_PERSON, loaded_note, user_message,
+    PER_MESSAGE_CONTEXT_KEYS, PROMPT_STATEMENT_KEY, PROTECTED_CONTEXT_KEYS, PendingQuestion,
+    PendingRemote, PendingRun, PendingSession, PendingWait, REASONING_EFFORT_CONTEXT_KEY,
+    RENDERER_OFFER_CONTEXT_KEY, Repeats, STOPPED_BY_THE_PERSON, loaded_note, user_message,
 };
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]
@@ -232,8 +235,8 @@ pub use state::{Extensions, State, StateKey};
 pub use step_io::StepIo;
 pub use tool::{
     AnswerCheck, DEFAULT_TOOL_TIME_LIMIT, DynTool, GROUP_LOADER_PREFIX, HookDecision, HookedOutput,
-    RESERVED_LOADER_PREFIX, Refusal, RemotePoll, StepStyle, TOOL_STOP_GRACE, Tool, ToolCtx,
-    ToolError, ToolOutput,
+    MessageDecision, RESERVED_LOADER_PREFIX, Refusal, RemotePoll, StepStyle, TOOL_STOP_GRACE, Tool,
+    ToolCtx, ToolError, ToolOutput,
 };
 pub use toolset::ToolSet;
 pub use typed::{IntoToolOutput, IntoToolResult, Json, parse_args};

@@ -23,8 +23,8 @@ use adam_core::time::Timestamp;
 use adam_core::RunId;
 use adam_model::ToolSpec;
 use adam_runtime::{
-    Inbound, MAX_SESSION_PAGE, RuntimeError, SESSION_CLOSE_KIND, SessionHeader, SessionLimits,
-    SessionState, SessionSummary, SessionView,
+    Inbound, MAX_SESSION_PAGE, RuntimeError, SESSION_CLOSE_KIND, SessionBounds, SessionHeader,
+    SessionLimits, SessionState, SessionSummary, SessionView,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -100,6 +100,13 @@ pub struct SessionAgent {
     /// agent says in its round state (`queues_messages`) whether the remote takes the message at
     /// once (`steered`) or only after its current task (`queued`).
     pub remote: bool,
+    /// The most a session on it may ask of each option ([ADR 0054] decision 2): what the
+    /// subagent's folder declares, narrowed by what the deployment allows, computed once by the
+    /// assembly at startup. [`SessionBounds::admit`] holds a `subagent_start`'s `config` to them;
+    /// a request above one is refused by name, never clamped.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub bounds: SessionBounds,
 }
 
 /// The five session tools, for the subagents of one agent.
@@ -189,6 +196,20 @@ impl SessionTools {
             .registered()
             .into_iter()
             .map(str::to_owned)
+            .collect()
+    }
+
+    /// The bounds of each subagent, by the name the model writes in `agent` ([ADR 0054] decision
+    /// 2), in the roster's order: what [`SessionBounds::admit`] holds a start's `config` to. The
+    /// assembly computes them once, at startup, from the subagent's folder and the deployment, and
+    /// hands them here; a reader of the card lists them beside each helper (decision 8).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub fn bounds(&self) -> Vec<(String, SessionBounds)> {
+        self.roster
+            .agents
+            .iter()
+            .map(|agent| (agent.name.clone(), agent.bounds.clone()))
             .collect()
     }
 }
@@ -632,6 +653,9 @@ impl Tool for Start {
             // The run this call's model calls name, which the orchestrator bound: the round's
             // calls name it too (ADR 0067).
             root: Some(ctx.model_run_id()),
+            // The workspace the round works in: the one of the run that opens the session, so a
+            // helper a task starts reads the repository of that task (ADR 0045 slice 7).
+            workspace: Some(ctx.workspace_run_id()),
             // A session is one the person sees when their client shows child sessions: only then
             // may a round of it ask them (ADR 0045 decision 9).
             visible: ctx.context(crate::CHILD_SESSIONS_CONTEXT_KEY) == Some(&Value::Bool(true)),
@@ -786,6 +810,7 @@ impl Tool for Send {
                 closing: false,
                 round: 0,
                 root: None,
+                workspace: None,
                 visible: false,
                 config: None,
             });
@@ -1074,6 +1099,7 @@ impl Tool for Close {
                 closing: false,
                 round: 0,
                 root: None,
+                workspace: None,
                 visible: false,
                 config: None,
             });

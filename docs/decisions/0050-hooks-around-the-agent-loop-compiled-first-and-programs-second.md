@@ -122,6 +122,7 @@ repository holds is run, a program's environment is empty, and every decision is
    | `run.ending` | the run would end with an answer (the model's, or a tool's final answer) | **decide**: end, or continue with a reason | inside `end:<turn>` (decision 10) |
    | `run.cancelled` | the agent sees its cancel during a step | observe | before the transition returns |
    | `run.parked`, `run.ended`, `run.error`, `artifact.kept` | the runtime committed a park, an end, a failed try or a file | observe | after the commit, best effort |
+   | `run.woke`, `run.moved` (amended 2026-11-25) | a parked run is resumed, or another worker takes over its lease | observe | after the commit, best effort, once per transition |
    | `exec.prepare` | a command's `ExecSpec` is prepared (the coder, `adam-workspace`) | **decide**: add non-secret variables, hide names, refuse | inside the step of the tool that runs the command |
 
    Not events, on purpose: streamed text and reasoning (many, not durable, and reasoning is never stored, ADR 0020); a
@@ -385,6 +386,7 @@ step that part changes. Hooks are tested with concurrent tool calls from H1 on.
 | H2 | Observers: `observe`, `HookEvent`, ordered queues, the flush before a commit, bounds and scrubbing | a golden event list for a scripted run; a replay repeats events with the same keys; a slow or panicking observer leaves the run unchanged | H1 |
 | H3 | `model.request` on `temperature`, `max_output_tokens`, `metadata`; H3b adds `top_p`, headers and an extra body (credential-like header names refused) | the model sees the rewrite; a replay asks no hook; a `Stop` fails the run | H1 |
 | H4 | Events after a commit (`run.parked`, `run.ended`, `run.error`, `artifact.kept`) | one event per park, end, failed try, on the three stores | H2 |
+| H4b | Wake and move events (`run.woke`, `run.moved`), after H4 | exactly one wake event per resume and one move event per lease taken over, on the three stores | H4 |
 | H5 | Custom events: `EventSpec`, namespaces, `Tool::events`, `ToolCtx::emit_event`, patterns, limits, `Clients` visibility | an undeclared or reserved name is refused; a replay delivers again with the same key; an A2A client sees a `Clients` event and not a `Hooks` one | H2 |
 | H6 | `plugins:` in agent files, `BoundDef::plugin`, inheritance by subagents, `audit` | a missing name exits 78; a secret-looking option is refused; audit lines match a golden | H2 |
 | H10 | `ExecHook`, `HookedEnvironment`, `HidingEnvironment` as one | the coder's hiding tests unchanged; hidden names always win | H1 |
@@ -399,8 +401,51 @@ step that part changes. Hooks are tested with concurrent tool calls from H1 on.
 `permission.ask`, a deciding point on the `ask` of ADR 0039's rules, comes with those rules (ADR 0039 slice 5) and is
 added here by a dated note when they are built.
 
+*Amended 2026-11-24 (slice **H1b** built):* decision 9's "no step is added" is not what shipped. A message is
+decided in a step of its own — `message:start`, then `message:<inbound id>` — which is taken **only when a hook set is
+installed** (an empty set writes no step, so a journal written without hooks replays unchanged), and the record is
+`MessageDecision` (`text` when a hook rewrote the message, `hook` when it was refused). The reason a step was needed is
+replay: the decision must be readable after a crash without asking a hook again, and `model:<turn>` is recorded by the
+model call that follows it. The consequence decision 3 warns about stands for a run already in flight when a deployment
+adds its first plugin: its next transition takes a new step at a seq the journal holds, so roll every worker before the
+build is used. Decision 9's payload, refusal semantics and `Rejected` class are as written.
+**The owner accepted this reading** (ANR-Q86, 2026-11-24): *"Accept the conditional step (keep the Amended note, roll
+workers before a deployment's first plugin)"*.
+
 *Amended 2026-11-18 (ADR 0045 slice 3, which reports to the model a session round that ended, is built; no hook is):* the reports a model call is given are
 appended **inside the step `model:<turn>`** and recorded in its record, so `model:<turn>` holds what decision 9 puts there for `message.received` and the
 reports of ADR 0045. When both exist, the message verdict is applied first, then the reports. A report is not a message, so `message.received` is not asked
 about it. A report that keeps a turn going is a read of `wait_<turn>` made after `sessions:<turn>`, so `end:<turn>` comes after `sessions:<turn>` and is not
 taken when a report keeps the turn going: a hook never sees an end that is taken back. No step name changes.
+
+*Amended 2026-11-24 (slice H4 built):* `RuntimeBuilder::observers(HookSet)` gives the runtime plugins whose `observe` receives `run.parked`, `run.ended` (done or failed), `run.error` (a failed try that will be retried) and one `artifact.kept` per artifact a transition kept, after the commit and best effort (a crash between the commit and its events loses them). Keys are `<run>/commit:<version>/<event>/<index>`. `RunEvent::Status` did not gain an error class: the event carries the text and the attempt. Proof: `observers_get_one_event_per_park_end_failed_try_and_artifact` in `crates/adam-runtime/tests/runtime.rs`, on the memory, PostgreSQL and MongoDB stores.
+
+## Amended (2026-11-25): the wake and the move
+
+ANR-9's second gap ([sys#403](https://github.com/vymalo/another-agentic-system/issues/403)) asks for lifecycle hooks when a run
+**parks, wakes or moves to another worker**. H4 (above) covers the park and the end; **verified at `main` before writing this**:
+the catalogue at *Events* lists `run.parked`, `run.ended`, `run.error` and `artifact.kept` and **no event for a wake or for a
+lease taken over**, so two events are added here and a slice row follows H4.
+
+### `run.woke`
+
+- **Fires** when a run that was **parked** is resumed: the transition from parked back to running, which is the store's own
+  claim of the run's lease after a park. **Exactly once per resume**, not once per step — a run resumed and then parked again
+  wakes twice, because it was resumed twice.
+- **Payload** `{ run, worker, cause }`, `cause` one of `lease`, `signal` or `schedule`. Never the run's text, never a secret.
+- **Why it is not folded into `run.parked`:** a park that is never resumed is a different story from one that is, and an observer
+  that watches for stalls needs the second half.
+
+### `run.moved`
+
+- **Fires** when the lease of a run is **taken over by another worker** — the previous worker's lease lapsed and a different one
+  claimed it. **Exactly once per takeover**, and *never* on a run's first claim: the first claim is a start, not a move.
+- **Payload** `{ run, from, to }`: the worker that lost the lease and the one that took it. Both are worker identities already in
+  the store; nothing new is stored for it.
+
+### Replay and duplicates
+
+Both events carry the **`seq` of the row transition they describe**, so a replay produces them again **with the same key** and an
+observer deduplicates by `(run, kind, seq)`. A store that lost a write and re-emits the transition re-emits the event with the same
+key; a second claim of the same lease is refused by the store, so a second `run.moved` for it cannot exist. Both are **observe**
+only: no hook may veto a wake or a move, because the transition has already happened in the store.

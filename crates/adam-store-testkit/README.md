@@ -14,9 +14,13 @@ dependency.
 
 ## API at a glance
 
-* `store_conformance!(make)` generates one `#[tokio::test]` per case (49
+* `store_conformance!(make)` generates one `#[tokio::test]` per case (50
   cases: create/load, the millisecond precision of every timestamp (`.120` survives, finer truncates),
-  `run_header` against `load_run` + `lease_until`, state round trip, CAS
+  `run_header` against `load_run` + `lease_until`, state round trip, a message whose state, commit and
+  journal payload canonicalize (RFC 8785) to the bytes written, with numbers either side of 2^53, `i64`'s extremes, floats in
+  exponent form, `-0` and names that sort differently by UTF-16 (what a turn signature of
+  [ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md) covers; a `u64` above `i64::MAX` is left out, MongoDB
+  refuses it), CAS
   conflicts, concurrent commits, journal ordering and first-writer-wins, claim rules and
   exclusivity, busy runs that a claim leaves alone, lease expiry/renew/release, what `lease_until` reports, pinned claims and the
   run owner, one open run per conversation, purge, the listing of a caller's runs (scoped, ordered, keyset pages, status and time filters, literal prefixes including ones that hold or end in `/`, `count_runs`; two creates with different ids in one conversation leave one open run), and the push-notification configs: put/replace, list, delete, claim rules, exclusive claims under concurrency, commit, stale versions, removal with the run).
@@ -27,12 +31,13 @@ dependency.
   unwritten id), empty bytes are a blob, a run's reference keeps a blob alive (including
 after a commit that names a different one), a shared
   digest survives until the last referencing run is purged, `purge_blobs` respects its cutoff, and
-  `purge_finished` removes the run's references and the unreferenced blob). Every case asserts `keeps_blobs()`: a store that keeps none is not
+  `purge_finished` removes the run's references and the unreferenced blob). The cases that assert a purge deletes a digest write bytes unique to the run (a UUID in the content), so the suite passes twice in a row against the same database. Every case asserts `keeps_blobs()`: a store that keeps none is not
   given this suite. Blobs are global, so the cases take turns inside one test binary (the
   `BLOB_SUITE` lock, which the cases that purge take too); under nextest, where each test is its own
   process, `.config/nextest.toml` puts the same cases in one single-thread group. Runs are still
   isolated by agent name. `make` is the same `async fn() -> Option<DynStore>` as above.
-* `body_conformance!(make)` generates one `#[tokio::test]` per body case (14 cases: an append writes
+* `body_conformance!(make)` generates one `#[tokio::test]` per body case (15 cases: a row that
+  canonicalizes as it was written (the same message as above); an append writes
   only the rows after the head's `len`, so a generation holds the transcript once; the generation
   is stable across appends; a compaction starts a new generation and `gc_body` collects the old one
   with an explicit cutoff; a stale version is a `Conflict` (a real insert-then-lose race is the

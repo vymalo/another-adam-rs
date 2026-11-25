@@ -12,9 +12,7 @@ use adam_agent_fs::{
     ToolsLoading,
 };
 use adam_core::{DynSecretSource, ProcessEnv};
-use adam_llm_agent::{
-    DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionAgent, SessionTools, ToolSet,
-};
+use adam_llm_agent::{DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, ToolSet};
 use adam_model::ReasoningEffort;
 use adam_runtime::{RuntimeBuilder, SessionLimits};
 use secrecy::SecretString;
@@ -434,7 +432,7 @@ impl AgentDef {
     pub fn child_sessions(&self) -> Option<adam_a2a_runtime::ChildSessions> {
         use adam_a2a_runtime::{ChildSessionAgent, ChildSessions};
         let limits = self.effective_session_limits();
-        let helpers = session_roster(&self.manifest, &self.manifest.name, &self.remote)
+        let helpers = session_targets(&self.manifest, &self.manifest.name, &self.remote)
             .into_iter()
             .map(|helper| {
                 let agent = ChildSessionAgent::new(helper.name, helper.agent, helper.description);
@@ -743,7 +741,8 @@ pub(crate) struct Node {
     /// asks for, before the preset, the model's profile and the fallback. `None` when the file
     /// says nothing.
     pub(crate) max_output_tokens: Option<u32>,
-    /// `limits.max_parallel` of the agent's file: it lowers the deployment's setting for this agent.
+    /// `limits.max_parallel` of the agent's file: it lowers the deployment's setting for this
+    /// agent, and a larger value is clamped to it (ADR 0049, ADR 0054 decision 3).
     pub(crate) max_parallel: Option<usize>,
     /// `retry:` of the agent's file: the retry policy per tool, by name, each one of its tools
     /// (ADR 0061). The agent's own; a subagent's are its file's.
@@ -755,6 +754,10 @@ pub(crate) struct Node {
     /// The registration names of the subagents a session can be started on, when the agent has the
     /// session tools; empty otherwise.
     pub(crate) session_agents: Vec<String>,
+    /// The subagents a session can be started on, as [`add_subagent_tools`] found them (ADR 0054
+    /// slice 1 part 2): the roster the session tools are made from, once the model — and with it
+    /// the deployment's `MAX_PARALLEL_TOOL_CALLS` — is known. Empty unless the agent has them.
+    pub(crate) session_targets: Vec<SessionTarget>,
     /// The agents that work the rounds of a session on a remote subagent, one per remote subagent
     /// of the root; empty for any other agent.
     pub(crate) round_agents: Rounds,
@@ -769,6 +772,28 @@ pub(crate) struct Node {
     /// Sources this agent alone has, added at [`BoundDef::build`](crate::BoundDef): the
     /// `mcp.json` servers whose `when` loads them only when a run's task matches.
     pub(crate) sources: Vec<DynToolSource>,
+}
+
+/// One subagent a session may be started on, as `bind` found it ([ADR 0054] slice 1 part 2). What
+/// [`BoundDef::build`](crate::BoundDef) still needs to make its [`SessionBounds`]: the values of
+/// the folder's own are on the subagent's [`Node`], and the rest is the deployment's, known only
+/// once the model is.
+///
+/// The same list makes the helpers of `child-sessions/v1` ([`AgentDef::child_sessions`]), so the
+/// card, the A2A front and the session tools cannot disagree about who a session may run on.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+/// [`SessionBounds`]: adam_runtime::SessionBounds
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionTarget {
+    /// The name the model writes in `agent`.
+    pub(crate) name: String,
+    /// The name it is registered under on the runtime (`coder/reviewer`).
+    pub(crate) agent: String,
+    pub(crate) description: String,
+    /// The time limit of each of its rounds (`None`: none).
+    pub(crate) within: Option<Duration>,
+    pub(crate) remote: bool,
 }
 
 /// A remote (A2A) subagent, found on the way: what [`Assembly::remotes`](crate::Assembly::remotes) lists.
@@ -969,7 +994,7 @@ impl Walk<'_> {
         let skill_tools: Vec<String> = tools[registered..].iter().map(|(n, _)| n.clone()).collect();
         let mcp_names: Vec<String> = own_mcp.iter().map(|(n, _)| n.clone()).collect();
         // The session tools (ADR 0045) go to the root only: sessions are one level deep.
-        let (session_agents, round_agents) = add_subagent_tools(
+        let (session_agents, session_targets, round_agents) = add_subagent_tools(
             &origin,
             manifest,
             &Taken {
@@ -1018,6 +1043,7 @@ impl Walk<'_> {
             skills,
             preloaded,
             session_agents,
+            session_targets,
             round_agents,
             when: triggers,
             tools_loading: manifest.frontmatter.tools_loading,
@@ -1163,7 +1189,7 @@ fn add_subagent_tools(
     secrets: &Secrets,
     tools: &mut Vec<(String, DynTool)>,
     session_limits: Option<SessionLimits>,
-) -> Result<(Vec<String>, Rounds), Error> {
+) -> Result<(Vec<String>, Vec<SessionTarget>, Rounds), Error> {
     let sessions = session_limits.is_some();
     // The subagent tools added so far, by name, with the file of the subagent that owns each.
     let mut subagents: Vec<(&str, &std::path::Path)> = Vec::new();
@@ -1241,12 +1267,11 @@ fn add_subagent_tools(
         tools.push((name.to_owned(), tool));
     }
     if !sessions || manifest.subagents.is_empty() {
-        return Ok((Vec::new(), Rounds::default()));
+        return Ok((Vec::new(), Vec::new(), Rounds::default()));
     }
     // The tools that run a subagent in the background: after the one tool per subagent, and named
     // so that a clash with a tool or a subagent is found now.
-    let roster = session_roster(manifest, &origin.agent, remote);
-    let session_tools = SessionTools::new(roster).with_limits(session_limits.unwrap_or_default());
+    let targets = session_targets(manifest, &origin.agent, remote);
     for name in SESSION_TOOLS {
         if tools.iter().any(|(n, _)| n == name) {
             let clash = manifest
@@ -1266,33 +1291,36 @@ fn add_subagent_tools(
             });
         }
     }
-    for tool in session_tools.tools() {
-        tools.push((tool.spec().name, tool));
-    }
-    Ok((session_tools.session_agents(), rounds))
+    // The five tools themselves are made at `BoundDef::build`, where the deployment's
+    // `MAX_PARALLEL_TOOL_CALLS` and the model are known: each subagent's bounds need both (ADR
+    // 0054 slice 1 part 2). Their names and order are fixed here, so a clash is still found
+    // before a model is needed, and `AgentInfo::tools` names them.
+    let mut names: Vec<String> = targets.iter().map(|t| t.agent.clone()).collect();
+    names.sort();
+    Ok((names, targets, rounds))
 }
 
 /// The subagents of the root a session can be started on, in the order of the manifest: the one
 /// list the session tools, the card and the A2A front are made from, so they cannot disagree. A
 /// local subagent's rounds are limited by its `limits.max_minutes`, a remote one's by the
 /// deployment's remote wait.
-fn session_roster(
+fn session_targets(
     manifest: &AgentManifest,
     root: &str,
     remote: &RemoteSettings,
-) -> Vec<SessionAgent> {
+) -> Vec<SessionTarget> {
     manifest
         .subagents
         .iter()
         .map(|sub| match sub {
-            Subagent::Local(child) => SessionAgent {
+            Subagent::Local(child) => SessionTarget {
                 name: child.name.clone(),
                 agent: format!("{root}/{}", child.name),
                 description: child.frontmatter.description.clone().unwrap_or_default(),
                 within: run_limit(child.frontmatter.limits.as_ref()),
                 remote: false,
             },
-            Subagent::Remote(agent) => SessionAgent {
+            Subagent::Remote(agent) => SessionTarget {
                 name: agent.name.clone(),
                 agent: format!("{root}/{}", agent.name),
                 description: agent.description.clone(),

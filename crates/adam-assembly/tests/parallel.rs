@@ -1,5 +1,6 @@
-//! `limits.max_parallel` of an agent file and the deployment's setting (ADR 0049): the file may only
-//! lower what the deployment allows, and a subagent has its own value.
+//! `limits.max_parallel` of an agent file and the deployment's setting (ADR 0049): the file may
+//! only lower what the deployment allows (a larger value is clamped to it), and a subagent has its
+//! own value.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
@@ -73,13 +74,22 @@ fn a_file_may_lower_the_setting_for_its_agent_only() {
 }
 
 #[test]
-fn a_file_never_raises_the_setting() {
-    // 8 asks for more than the deployment allows: the deployment's 4 stands.
-    let got = assemble(family("max_parallel: 8", "max_parallel: 32"), Some(4));
-    assert_eq!(parallel_of(&got), (4, 4));
-    // And at the deployment's 1 nothing can be raised.
-    let got = assemble(family("max_parallel: 5", ""), Some(1));
-    assert_eq!(parallel_of(&got), (1, 1));
+fn a_file_above_the_setting_is_clamped_to_it() {
+    // 8 asks for more than the deployment allows: clamped to it, not refused (ADR 0049, ADR 0054
+    // decision 3 — a folder is portable across deployments, and a lower setting narrows it). The
+    // root runs at the deployment's value; the child's file says nothing and gets the same.
+    for (limits, deployment, clamped) in [
+        ("max_parallel: 8", 4, 4),
+        ("max_parallel: 32", 4, 4),
+        ("max_parallel: 5", 1, 1),
+    ] {
+        let got = assemble(family(limits, ""), Some(deployment));
+        assert_eq!(
+            parallel_of(&got),
+            (clamped, deployment),
+            "{limits} under a deployment of {deployment}"
+        );
+    }
 }
 
 #[test]

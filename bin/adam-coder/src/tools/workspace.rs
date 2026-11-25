@@ -189,7 +189,7 @@ impl CommandWorkspace for ToolEnv {
     /// and what they write is not undone.
     fn refusal_note(&self, ctx: &ToolCtx, place: &Place) -> String {
         place.handle::<Slot>().map_or_else(String::new, |slot| {
-            background::slot_note(self, &ctx.root_run_id().to_string(), slot.dir())
+            background::slot_note(self, &ctx.workspace_run_id().to_string(), slot.dir())
         })
     }
 

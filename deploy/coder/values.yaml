@@ -7,7 +7,7 @@ image:
   # Bumped on every green build of main by .github/workflows/coder.yml
   # (`sha-<first 7 of the commit>`). A plain key so the workflow can edit it.
   # sha-0000000 is the placeholder that exists before the first build.
-  tag: sha-23c9642
+  tag: sha-b7b1209
   pullPolicy: IfNotPresent
 
 # The image package may be private; name a pull secret here if so.
@@ -165,6 +165,13 @@ accessTiers:
   # `bypass` (renaming and deleting repositories, no consent form for a repository) is opt-in: set
   # it only for a deployment whose GitHub credentials you are willing to see used that way.
   max: ""
+
+# The largest file the agent sends inline (uploads/v1): a larger one asks the orchestrator for an upload slot.
+# Set it to the orchestrator's artifacts.maxFileBytes. Every role that serves A2A. The card carries no params.
+uploads:
+  # UPLOADS_INLINE_MAX_BYTES: a whole number of bytes, 1 to 268435456 (256 MiB). Empty (default): the binary's own
+  # 10 MiB, and nothing is rendered. The agent folder's `limits.max_inline_upload_bytes` wins over it.
+  inlineMaxBytes: ""
 
 # How the coder authenticates to GitHub (ADR 0009). Roles that run workers only: a control
 # plane renders none of it.
@@ -618,6 +625,9 @@ database:
   name: adam
   owner: adam
   instances: 1
+  # CPU and memory requests and limits of each database instance, as on any container. Empty (the
+  # default) renders nothing. Starting points for three instances are in the chart README.
+  resources: {}
   storage:
     size: 5Gi
     storageClass: longhorn

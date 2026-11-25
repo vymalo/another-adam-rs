@@ -8,13 +8,13 @@ use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent, ToolsLoading};
 use adam_budget::DynAdmission;
 use adam_llm_agent::{
     DEFAULT_MAX_PARALLEL, DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder,
-    MAX_PARALLEL_LIMIT, ModelBinding, ModelParking, SESSION_TOOLS, StepIo, ToolSource,
-    WINDOW_MARGIN_TOKENS,
+    MAX_PARALLEL_LIMIT, ModelBinding, ModelParking, SESSION_TOOLS, SessionAgent, SessionTools,
+    StepIo, ToolSource, WINDOW_MARGIN_TOKENS,
 };
 use adam_model::{DEFAULT_MAX_OUTPUT_TOKENS, DynModel, ModelProfiles, Preset, ReasoningEffort};
-use adam_runtime::{RuntimeBuilder, SessionLimits};
+use adam_runtime::{RuntimeBuilder, SessionBounds, SessionLimits};
 
-use crate::def::{Node, Remote};
+use crate::def::{Node, Remote, SessionTarget};
 use crate::error::{AliasProblem, CapSource, EffortSource, Error, Origin};
 #[cfg(feature = "remote")]
 use crate::remote_session::RemoteRoundAgent;
@@ -69,6 +69,16 @@ impl std::fmt::Debug for BoundDef {
             .field("aliases", &self.aliases)
             .finish_non_exhaustive()
     }
+}
+
+/// What one agent is built with, beyond its node and its tools: its model alias, the reasoning
+/// effort and the output cap resolved for that alias, and — for the root — the session tools whose
+/// bounds are now known (ADR 0054 slice 1 part 2).
+struct Built<'a> {
+    alias: &'a str,
+    effort: Option<ReasoningEffort>,
+    cap: u32,
+    sessions: Option<&'a SessionTools>,
 }
 
 impl BoundDef {
@@ -191,8 +201,9 @@ impl BoundDef {
     /// The most tool calls of one model turn that run at the same time, for every agent: the
     /// deployment's `MAX_PARALLEL_TOOL_CALLS` ([`LlmAgentBuilder::max_parallel`], 1 to 32; the
     /// loop's default is 10). An agent's file may **lower** it for that agent with
-    /// `limits.max_parallel`, never raise it: a larger value in a file is the deployment's, with a
-    /// warning.
+    /// `limits.max_parallel`; a larger value in a file is clamped to the deployment's, with a
+    /// warning (ADR 0049, ADR 0054 decision 3), so a folder stays usable under a deployment that
+    /// allows less.
     #[must_use]
     pub fn max_parallel(mut self, n: usize) -> Self {
         self.max_parallel = Some(n);
@@ -221,8 +232,16 @@ impl BoundDef {
         self
     }
 
-    /// The limit of the agent `node`: the deployment's (or the loop's default) lowered by the
-    /// agent's own file.
+    /// The limit of the agent `node`: the deployment's (or the loop's default) **lowered by the
+    /// agent's own file**. A file above the deployment's is **clamped** to it, 1 to
+    /// [`MAX_PARALLEL_LIMIT`], with a warning naming both values: a folder is portable across
+    /// deployments, so a deployment that lowered the limit narrows the agent rather than refusing
+    /// it to start, and the effective setting says what the agent runs at (ADR 0049, ADR 0054
+    /// decision 3 — "clamped to the bounds of that time").
+    ///
+    /// This is the startup relationship between a folder and its deployment. A *round's requested*
+    /// `config` above a bound is the runtime question, and stays a refusal by
+    /// [`SessionBounds::admit`], naming the option (ADR 0054 decision 2); see `bounds_of`.
     fn parallel_of(&self, node: &Node) -> usize {
         let allowed = self
             .max_parallel
@@ -234,11 +253,11 @@ impl BoundDef {
                     asked,
                     allowed,
                     "`limits.max_parallel` is more than the deployment allows (MAX_PARALLEL_TOOL_CALLS): \
-                     the agent runs {allowed} tool calls at once"
+                     the agent runs {allowed} tool calls at once (ADR 0049, ADR 0054 decision 3)"
                 );
                 allowed
             }
-            Some(asked) => asked.max(1),
+            Some(asked) => asked.clamp(1, MAX_PARALLEL_LIMIT),
             None => allowed,
         }
     }
@@ -295,6 +314,17 @@ impl BoundDef {
     /// * [`Error::Build`] when a tool needs state that [`state`](Self::state) did not give.
     pub fn model(self, model: DynModel, alias: impl Into<String>) -> Result<Assembly, Error> {
         let default_alias = alias.into();
+        // The five session tools are made once, here, because their bounds need what `bind` does
+        // not know: the deployment's `MAX_PARALLEL_TOOL_CALLS` (ADR 0054 slice 1 part 2). The root
+        // is the only agent that has them, and the root is built first.
+        let session_tools = match self.nodes.first() {
+            Some(root) => self.session_tools(root),
+            None => None,
+        };
+        let session_bounds = session_tools
+            .as_ref()
+            .map(SessionTools::bounds)
+            .unwrap_or_default();
         let mut resolved: Vec<String> = Vec::with_capacity(self.nodes.len());
         let mut agents = Vec::with_capacity(self.nodes.len());
         let mut info = Vec::with_capacity(self.nodes.len());
@@ -321,7 +351,16 @@ impl BoundDef {
                 node,
                 &origin,
                 &model,
-                (&alias, effort, cap),
+                Built {
+                    alias: &alias,
+                    effort,
+                    cap,
+                    sessions: if node.parent.is_none() {
+                        session_tools.as_ref()
+                    } else {
+                        None
+                    },
+                },
                 fallback,
                 choices,
             )?);
@@ -338,7 +377,17 @@ impl BoundDef {
                 model_choices,
                 reasoning_effort: effort,
                 prompt: node.prompt.clone(),
-                tools: node.tools.iter().map(|(name, _)| name.clone()).collect(),
+                tools: {
+                    let mut tools: Vec<String> =
+                        node.tools.iter().map(|(name, _)| name.clone()).collect();
+                    // The five session tools are built at `model`, not at `bind` (ADR 0054
+                    // slice 1 part 2): they come after everything `bind` made, as they always
+                    // have.
+                    if node.parent.is_none() && !node.session_targets.is_empty() {
+                        tools.extend(SESSION_TOOLS.iter().map(|name| (*name).to_owned()));
+                    }
+                    tools
+                },
                 skills: node.skills.clone(),
                 preloaded: node.preloaded.clone(),
                 when: node.when.clone(),
@@ -377,6 +426,7 @@ impl BoundDef {
             info,
             remotes,
             session_limits: self.session_limits,
+            session_bounds,
             #[cfg(feature = "sessions")]
             child_sessions: self.child_sessions,
             #[cfg(feature = "mcp")]
@@ -712,6 +762,79 @@ impl BoundDef {
         Ok(cap)
     }
 
+    /// The five session tools of `node`, or `None` when it has no subagent (ADR 0054 slice 1
+    /// part 2): each subagent's [`SessionBounds`], made here because the deployment's
+    /// `MAX_PARALLEL_TOOL_CALLS` is known and `bind` did not know it. The names and order are the
+    /// ones `bind` fixed.
+    fn session_tools(&self, node: &Node) -> Option<SessionTools> {
+        if node.session_targets.is_empty() {
+            return None;
+        }
+        let mut agents = Vec::with_capacity(node.session_targets.len());
+        for target in &node.session_targets {
+            agents.push(SessionAgent {
+                name: target.name.clone(),
+                agent: target.agent.clone(),
+                description: target.description.clone(),
+                within: target.within,
+                remote: target.remote,
+                bounds: self.bounds_of(target),
+            });
+        }
+        Some(SessionTools::new(agents).with_limits(self.session_limits))
+    }
+
+    /// The bounds of one subagent a session may be started on (ADR 0054 decision 2): each option
+    /// as the subagent's folder or the deployment resolves it.
+    ///
+    /// * `max_turns`, `max_tool_calls` and `max_output_tokens` are the folder's (`0` for the cap
+    ///   when it names none, which leaves it to the model: ADR 0064), else the loop's defaults.
+    /// * `context_window` is `None`: the window is a fact of the model alias (ADR 0054 decision
+    ///   11), which the assembly does not have here, and `admit` applies only its floor.
+    /// * `max_parallel_tool_calls` is the deployment's `MAX_PARALLEL_TOOL_CALLS` lowered by the
+    ///   folder's [`limits.max_parallel`](adam_agent_fs::Limits), which may never raise it: a folder
+    ///   above the deployment's is clamped to it ([`Self::parallel_of`], ADR 0049, ADR 0054
+    ///   decision 3). What a *round asks for* above this bound is what `SessionBounds::admit`
+    ///   refuses, naming the option (decision 2).
+    /// * `time_limit` is the round's own limit (`limits.max_minutes`, or the remote's wait), and
+    ///   `max_rounds` the root's effective `max_session_rounds`: the deployment's, lowered by the
+    ///   root's file.
+    fn bounds_of(&self, target: &SessionTarget) -> SessionBounds {
+        // A remote subagent's rounds are runs of an agent of its own, and the ADR refuses every
+        // option but `time_limit`, `max_rounds` and `instructions` on one: the loop's defaults
+        // stand for the rest.
+        let local = self.nodes.iter().find(|node| node.name == target.agent);
+        let (max_turns, max_tool_calls, max_output_tokens, parallel) = match local {
+            Some(node) => (
+                node.limits.max_turns,
+                node.limits.max_tool_calls,
+                node.max_output_tokens.unwrap_or(0),
+                self.parallel_of(node),
+            ),
+            None => (
+                Limits::default().max_turns,
+                Limits::default().max_tool_calls,
+                0,
+                DEFAULT_MAX_PARALLEL,
+            ),
+        };
+        SessionBounds {
+            max_turns,
+            max_tool_calls,
+            max_output_tokens,
+            context_window: None,
+            // `parallel_of` never gives more than the loop's own limit (32), so nothing is lost
+            // here. If a hand-made value ever could not be carried, the bound is that limit — the
+            // most the loop runs at once — and never "no bound", which would widen.
+            max_parallel_tool_calls: u32::try_from(parallel).unwrap_or(MAX_PARALLEL_LIMIT as u32),
+            // A round with no limit (`None`) is `0` here, which means the same: no limit.
+            time_limit: target.within.map_or(0, |within| {
+                u32::try_from(within.as_secs() / 60).unwrap_or(u32::MAX)
+            }),
+            max_rounds: self.session_limits.max_rounds(),
+        }
+    }
+
     /// The tool as the agent gets it: a session tool is scrubbed when the deployment gave a scrub.
     fn guarded(&self, name: &str, tool: &DynTool) -> DynTool {
         match &self.scrub {
@@ -741,7 +864,12 @@ impl BoundDef {
         node: &Node,
         origin: &Origin,
         model: &DynModel,
-        (alias, effort, cap): (&str, Option<ReasoningEffort>, u32),
+        Built {
+            alias,
+            effort,
+            cap,
+            sessions,
+        }: Built<'_>,
         fallback: Option<ModelBinding>,
         choices: Vec<ModelBinding>,
     ) -> Result<LlmAgent, Error> {
@@ -774,6 +902,14 @@ impl BoundDef {
         }
         for (name, tool) in &node.tools {
             builder = builder.dyn_tool(self.guarded(name, tool));
+        }
+        // The five session tools come after everything `bind` made, as they always have: they are
+        // made at `model`, where each subagent's bounds are known (ADR 0054 slice 1 part 2).
+        if let Some(sessions) = sessions {
+            for tool in sessions.tools() {
+                let name = tool.spec().name;
+                builder = builder.dyn_tool(self.guarded(&name, &tool));
+            }
         }
         if !node.session_agents.is_empty() {
             builder = builder.session_agents(node.session_agents.clone());
@@ -882,6 +1018,7 @@ pub struct Assembly {
     info: Vec<AgentInfo>,
     remotes: Vec<RemoteInfo>,
     session_limits: SessionLimits,
+    session_bounds: Vec<(String, SessionBounds)>,
     #[cfg(feature = "sessions")]
     child_sessions: Option<adam_a2a_runtime::ChildSessions>,
     #[cfg(feature = "mcp")]
@@ -893,6 +1030,18 @@ impl Assembly {
     /// ([`AgentDef::session_limits`](crate::AgentDef::session_limits)) lowered by the root's file.
     pub fn session_limits(&self) -> SessionLimits {
         self.session_limits
+    }
+
+    /// The bounds of each subagent the root may start a session on ([ADR 0054] decision 2), by the
+    /// name the model writes in `agent`, in the order of the root's manifest: what the five
+    /// session tools' [`SessionBounds::admit`] holds a `subagent_start`'s `config` to. Each is
+    /// what the subagent's folder declares, narrowed by what the deployment allows; read from the
+    /// [`SessionTools`] the root was built with, so a card and a client see what the tool enforces.
+    /// Empty when the root has no subagent.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub fn session_bounds(&self) -> &[(String, SessionBounds)] {
+        &self.session_bounds
     }
 
     /// What the root's A2A front serves `child-sessions/v1` for, as

@@ -131,6 +131,15 @@ event's bytes: the engine never calls it, and a future caller that streams a tas
 store, since the ring withholds them. Approvals are slice 5: today a run waits only on a question, and `answer`
 answers it.
 
+## `uploads/v1`
+
+The engine has no HTTP surface, so it lists no agent card and applies no `uploads/v1` itself: the extension (a presigned `PUT` the
+orchestrator's thread tools give for a file too large for a message) belongs to a process that serves A2A. A host that embeds the
+engine and serves A2A itself lists [`ExtensionConfig::uploads`](../adam-a2a/src/extensions.rs) (`adam-a2a`) on its card, reads the
+folder's `limits.max_inline_upload_bytes` from the definition (`AgentDef::manifest().frontmatter.limits`), and makes the request to the
+bucket itself; the engine neither signs nor sends one. `adam-agent` and `adam-coder` do this through `adam-service`
+(`UPLOADS_INLINE_MAX_BYTES`, the folder's limit wins).
+
 ## A run's events
 
 ```rust

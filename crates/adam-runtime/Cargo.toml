@@ -14,6 +14,8 @@ adam-core.workspace = true
 # The token counts of a model call (`Usage`), carried by `RunEvent::Usage` and `UsageTotals`: data
 # types only, no client.
 adam-model.workspace = true
+# Observers of the events that follow a commit (ADR 0050, H4).
+adam-plugin.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 futures.workspace = true

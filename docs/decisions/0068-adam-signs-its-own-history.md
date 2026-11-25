@@ -1,8 +1,9 @@
 # 0068. adam signs its own history
 
 Status: **Accepted** (2026-11-22). The owner decided on 2026-11-22 that adam uses, **by default** and for security, the same
-kind of signature the model providers use for their reasoning continuity. Nothing of it is built: the slices are at the
-end, after ADR 0067's S8b and S8c.
+kind of signature the model providers use for their reasoning continuity. Slice T1 (the port, its Ed25519 implementation and
+the form) is built: see *Amended 2026-11-25 (slice T1)*. Nothing signs or verifies a run yet; the other slices are at the
+end.
 
 It has two parts. **Part 1 is not decided here**: adam carries every opaque member a provider attaches (Gemini 3's
 `thought_signature` in a tool call's `extra_content`) byte for byte, sends it back only to the model that made it, and
@@ -296,3 +297,45 @@ After ADR 0067's S8b and S8c.
 * **What the orchestrator does with `signed-turns/v1`**: storing the rows in its log, sending them back on a fork, and
   checking them. That is another-agentic-system's decision.
 * **Signing a person's messages** on their way in (by the orchestrator, for the person): another key and another trust.
+
+## Amended 2026-11-25 (slice T1)
+
+Slice T1 is built in `adam-core`: `crates/adam-core/src/turn/` (the port `TurnKeys`, `Ed25519TurnKeys`, `KeySet`, the form,
+the payload and the chain, `turn::testkit`), `crates/adam-core/src/jcs.rs` (`canonicalize`, moved from `adam-a2a`, which
+re-exports it), and two cases of `adam-store-testkit`. Nothing signs or verifies a run, and no variable is read (T2, T3).
+What building it changed or settled:
+
+1. **Ed25519 is `ed25519-dalek` 3.0.0, not `aws-lc-rs`** (decision 10). The engine's tree may hold neither `aws-lc-rs`
+   nor `ring` (`tools/embedded-deps/check.sh`, [ADR 0047](0047-adam-rs-can-be-embedded-in-an-application.md)), and
+   decision 9 has the engine sign (`ephemeral`) and verify, so the implementation in `adam-core` is pure Rust. Six
+   packages are added to `Cargo.lock` (`ed25519-dalek`, `ed25519`, `signature`, `curve25519-dalek`,
+   `curve25519-dalek-derive`, `fiat-crypto`), against "no package is added": BSD-3-Clause, Apache-2.0 OR MIT and
+   MIT OR Apache-2.0 OR BSD-1-Clause, all in `deny.toml`'s list. Verification is strict (RFC 8032, a non-canonical
+   signature refused) and a weak public key is refused. A test in `adam-a2a` holds that it gives the bytes `aws-lc-rs`
+   gives for the same key. **Measured** (`crates/adam-core/examples/turn_signature_timing.rs`, release build, one core
+   of a 2.1 GHz Xeon, 2026-11-25): a signature 20 µs and a verification 49 µs over 64 bytes; a 2 KB turn signed with its
+   RFC 8785 form 45 µs, verified 67 µs; the chain over 1,000 such turns 7.3 ms.
+2. **The port answers a key id or a certificate chain, and whether it is renewing** (the owner, 2026-11-25: the cloud's
+   turn key will come from a PKI certificate). `current()` gives a `CurrentKey`: a `KeyIdentity`, `Id(kid)` or
+   `Certificate(chain)` (leaf first, named by its leaf's `x5t#S256` unless the adapter names it), and a `KeyStatus`,
+   `Active` or `Renewing` (both closed); `sign(kid, input)` signs with the key that id names, or answers `NotSigning`
+   (class `Conflict`: ask again); `key_set()`. A chain rides in the header as `x5c` (RFC 7515 §4.1.6, at most four
+   certificates of 2 KiB), so the header of decision 3 is `alg`, `kid`, `typ` and, for a chain, `x5c`. T1 verifies by
+   `kid` against the key set and carries the chain without trusting it: trusting a PKI is the certificate adapter's work.
+3. **The chain's first link** is `h(-1) = SHA-256(JCS({typ: "adam-chain/v1", run, cnv}))`: decision 3 named the members,
+   not the `typ`; a `typ` of its own keeps it apart from a turn's payload. `run` is the run's UUID as text, `cnv` and
+   `prv` are base64url without padding, `idx` is the body row's `u32`.
+4. **Where the member is.** `extra_content.adam` is a member of the message object itself, not of #322's
+   `provider.members` (a model switch drops those). `msg` is the message without `extra_content.adam`, and without
+   `extra_content` when that was its only member, so adding the signature never changes what it signs.
+5. **One encoding.** `verify_detached` accepts only the header adam writes: its RFC 8785 bytes, those members, `EdDSA`,
+   the expected `typ`, 64 bytes of signature, and at most `MAX_SIGNATURE_LEN` (16 KiB) in all, refused before it is
+   decoded. A key id is 1 to 256 bytes of printable ASCII. With a 19-character `kid` the member is 222 bytes
+   (`{"extra_content":{"adam":{"turn_signature":…}}}`), as the *Consequences* estimated.
+6. **`TurnKeys::ephemeral()`** is `<dyn TurnKeys>::ephemeral()` (and `Ed25519TurnKeys::ephemeral()`), and returns a
+   `Result`: a system with no random numbers is an error (`Internal`), not a panic.
+7. **The store round trip** (*Consequences*, *unverified* until now): `a_message_canonicalizes_as_it_was_written` and
+   `body_a_row_canonicalizes_as_it_was_written` write floats, integers either side of 2^53, `i64`'s extremes, `-0` and
+   names that sort differently by UTF-16 into a state, a commit, a journal payload and a body row. *Verified 2026-11-25*
+   on `MemoryStore`, SQLite and PostgreSQL 16.15; MongoDB is *unverified* (no server where this was built; CI runs it).
+   A `u64` above `i64::MAX` is not in it: MongoDB refuses it at the write, as before.

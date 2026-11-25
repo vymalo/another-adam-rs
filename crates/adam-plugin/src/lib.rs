@@ -1,25 +1,35 @@
-//! Plugins around the agent loop (ADR 0050, slice **H1**): the vocabulary, and the shapes the loop
-//! records when it uses them.
+//! Plugins around the agent loop (ADR 0050, slices **H1** and **H1b**): the vocabulary, and the
+//! shapes the loop records when it uses them.
 //!
-//! A **plugin** is a compiled hook set: it may rewrite a tool call before it runs, refuse it, ask a
-//! person, stop the run, or rewrite what the tool answered. Three rules make it safe:
+//! A **plugin** is a compiled hook set: it may allow, rewrite or refuse a person's message
+//! (`message.received`), rewrite a tool call before it runs, refuse it, ask a person, stop the run,
+//! or rewrite what the tool answered. Three rules make it safe:
 //!
-//! 1. **Fail closed.** A hook that errors, panics or misses its deadline never lets the call through:
-//!    [`HookSet`] answers an error, and the caller denies. A panic is [`ErrorClass::Invalid`]: a
-//!    plugin that cannot run is buggy, not unlucky.
-//! 2. **A transient failure is retried, once.** [`HookError::is_retryable`] says whether the call may
-//!    be tried again in the same step (a deadline is `Transient`); past the retries the call is
-//!    denied like any other error.
+//! 1. **Fail closed.** A hook that errors, panics or misses its deadline never lets the call or the
+//!    message through: [`HookSet`] answers an error, and the caller refuses. A panic is
+//!    [`ErrorClass::Invalid`]: a plugin that cannot run is buggy, not unlucky.
+//! 2. **A transient failure is retried, once.** [`HookError::is_retryable`] says whether the hook
+//!    may be tried again in the same step (a deadline is `Transient`); past the retries the call or
+//!    the message is refused like any other error.
 //! 3. **Order is the declaration order**, and the first verdict other than [`Verdict::Continue`] is
 //!    the set's: a later plugin is not asked once one has decided.
 //!
-//! The loop runs a set **inside** the journaled step `tool:<call id>`, with
-//! `LlmAgentBuilder::hooks` of `adam-llm-agent`: after a source's `withhold` and before the tool for
-//! `before_tool`, and once the tool answered for `after_tool`. The verdict is recorded beside the
-//! call's output, so a replay that finds the step recorded asks no hook again. A hook gets no `Ctx`
-//! and cannot add a step.
+//! The loop runs a set **inside** the journaled step it affects, with `LlmAgentBuilder::hooks` of
+//! `adam-llm-agent`: in the step that takes a message in for `message.received`, inside
+//! `tool:<call id>` for `before_tool` (after a source's `withhold` and before the tool) and
+//! `after_tool` (once the tool answered). The verdict is recorded in that step, so a replay that
+//! finds it recorded asks no hook again. A hook gets no `Ctx` and cannot add a step.
 
 #![warn(missing_docs)]
+
+mod audit;
+mod events;
+
+pub use audit::Audit;
+pub use events::{
+    EVENT_MAX, EventHeader, EventKind, EventQueue, FIELD_MAX, FlushReport, HookEvent, JSON_MAX,
+    ObserveLimits,
+};
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -42,6 +52,37 @@ pub struct HookedCall<'a> {
 pub struct HookedText<'a> {
     /// The tool's answer as text (an artifact or an image is summarised, as the loop does).
     pub text: &'a mut String,
+}
+
+/// The point where a person's message is about to reach a model (ADR 0050, decision 9). It may
+/// allow the message, rewrite [`HookedMessage::text`] in place, or refuse it with [`Verdict::Deny`].
+pub const MESSAGE_RECEIVED: &str = "message.received";
+
+/// A file a person sent with a message, as a `message.received` hook sees it: **by reference**,
+/// never its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageFile {
+    /// The file name the sender gave it, when there is one.
+    pub name: Option<String>,
+    /// The media type the sender claims, checked against the bytes before the file is kept.
+    pub media_type: Option<String>,
+    /// The size in bytes.
+    pub size: u64,
+    /// The reference the loop keeps the file under (its SHA-256), when it has kept it or is about
+    /// to; absent when the bytes could not be read or were not admitted.
+    pub reference: Option<String>,
+}
+
+/// What a person's message is, as a `message.received` hook sees it: its text, which a plugin may
+/// rewrite in place, and its files by reference.
+///
+/// A rewrite is what the model reads and what the run's history holds; the hook reads the text as
+/// the loop will send it (scrubbed and bounded), never the bytes of a file.
+pub struct HookedMessage<'a> {
+    /// The message's text.
+    pub text: &'a mut String,
+    /// The files that came with it, in the order the person sent them.
+    pub files: &'a [MessageFile],
 }
 
 /// What a deciding hook says about the call it runs at.
@@ -121,6 +162,13 @@ pub trait Plugin: Send + Sync {
     /// The plugin's name, as a report and an error name it.
     fn name(&self) -> &str;
 
+    /// A person's message is about to reach a model: allow it, rewrite its text, or refuse it with
+    /// [`Verdict::Deny`] and the reason the person reads. `Ask` and `Stop` are not verdicts of this
+    /// point, and the loop treats them as a hook failure (a refusal).
+    fn message_received(&self, _message: &mut HookedMessage<'_>) -> HookResult {
+        Ok(Verdict::Continue)
+    }
+
     /// Before the call runs: rewrite its arguments, refuse it, ask, or stop the run.
     fn before_tool(&self, _call: &mut HookedCall<'_>) -> HookResult {
         Ok(Verdict::Continue)
@@ -130,6 +178,23 @@ pub trait Plugin: Send + Sync {
     fn after_tool(&self, _call: &HookedCall<'_>, _output: &mut HookedText<'_>) -> HookResult {
         Ok(Verdict::Continue)
     }
+
+    /// An event of the catalogue happened (ADR 0050, slice H2). An observer only reads: it runs
+    /// outside the journal, its failure is counted and dropped, and it cannot change the run. The
+    /// event's `key` is stable across replays: a plugin that writes elsewhere dedupes on it.
+    fn observe(&self, _event: &HookEvent) -> Result<(), HookError> {
+        Ok(())
+    }
+}
+
+/// What a hook says, and which plugin said it: the record of a decision names both (ADR 0050,
+/// decision 2), so a refusal a person reads can name the plugin that made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decided<'a> {
+    /// The plugin that decided.
+    pub plugin: &'a str,
+    /// What it said.
+    pub verdict: Verdict,
 }
 
 /// How long one hook may take, and how many times a transient failure is tried again.
@@ -154,8 +219,9 @@ impl Default for HookLimits {
 /// An ordered set of plugins, with their limits.
 #[derive(Default)]
 pub struct HookSet {
-    plugins: Vec<Arc<dyn Plugin>>,
+    pub(crate) plugins: Vec<Arc<dyn Plugin>>,
     limits: HookLimits,
+    pub(crate) observe_limits: ObserveLimits,
 }
 
 impl std::fmt::Debug for HookSet {
@@ -200,6 +266,23 @@ impl HookSet {
         self.plugins.is_empty()
     }
 
+    /// Runs every plugin's `message_received` in order, until one decides. `None` when every plugin
+    /// said [`Verdict::Continue`].
+    ///
+    /// # Errors
+    /// As [`HookSet::before_tool`]. The caller refuses the message on an error: a hook that cannot
+    /// say `Continue` never lets a message reach a model.
+    pub fn message_received(
+        &self,
+        message: &mut HookedMessage<'_>,
+    ) -> Result<Option<Decided<'_>>, HookError> {
+        self.run_decided(MESSAGE_RECEIVED, |plugin| {
+            guard(plugin.name(), self.limits.deadline, || {
+                plugin.message_received(message)
+            })
+        })
+    }
+
     /// Runs every plugin's `before_tool` in order, until one decides.
     ///
     /// # Errors
@@ -226,12 +309,27 @@ impl HookSet {
         })
     }
 
-    fn run(&self, point: &str, mut one: impl FnMut(&Arc<dyn Plugin>) -> HookResult) -> HookResult {
+    fn run(&self, point: &str, one: impl FnMut(&Arc<dyn Plugin>) -> HookResult) -> HookResult {
+        self.run_decided(point, one)
+            .map(|decided| decided.map_or(Verdict::Continue, |one| one.verdict))
+    }
+
+    /// [`run`](Self::run), naming the plugin whose verdict decided.
+    fn run_decided(
+        &self,
+        point: &str,
+        mut one: impl FnMut(&Arc<dyn Plugin>) -> HookResult,
+    ) -> Result<Option<Decided<'_>>, HookError> {
         for plugin in &self.plugins {
             let mut attempt = 0u8;
             loop {
                 match one(plugin) {
-                    Ok(verdict) if verdict.decides() => return Ok(verdict),
+                    Ok(verdict) if verdict.decides() => {
+                        return Ok(Some(Decided {
+                            plugin: plugin.name(),
+                            verdict,
+                        }));
+                    }
                     Ok(_) => break,
                     Err(error) if error.is_retryable() && attempt < self.limits.retries => {
                         attempt += 1;
@@ -247,7 +345,7 @@ impl HookSet {
                 }
             }
         }
-        Ok(Verdict::Continue)
+        Ok(None)
     }
 }
 
@@ -341,5 +439,69 @@ mod tests {
             .expect_err("a panicking hook denies");
         assert_eq!(error.class, ErrorClass::Invalid);
         assert!(error.reason.contains("before_tool"), "{error}");
+    }
+
+    struct RefusesMessages;
+
+    impl Plugin for RefusesMessages {
+        fn name(&self) -> &str {
+            "refuses-messages"
+        }
+
+        fn message_received(&self, message: &mut HookedMessage<'_>) -> HookResult {
+            if message.text.contains("secret") {
+                return Ok(Verdict::Deny("no secrets here".into()));
+            }
+            message.text.push_str(" (read)");
+            Ok(Verdict::Continue)
+        }
+    }
+
+    #[test]
+    fn a_message_hook_may_rewrite_or_refuse_and_sees_files_by_reference() {
+        let files = [MessageFile {
+            name: Some("note.txt".into()),
+            media_type: Some("text/plain".into()),
+            size: 12,
+            reference: Some("abc".into()),
+        }];
+        let mut text = String::from("hello");
+        let set = HookSet::new().with(Arc::new(RefusesMessages));
+        let decided = set
+            .message_received(&mut HookedMessage {
+                text: &mut text,
+                files: &files,
+            })
+            .expect("a verdict");
+        assert!(
+            decided.is_none(),
+            "a rewrite continues: the text is the decision"
+        );
+        assert_eq!(text, "hello (read)", "a rewrite is made in place");
+
+        let mut text = String::from("a secret");
+        let decided = set
+            .message_received(&mut HookedMessage {
+                text: &mut text,
+                files: &files,
+            })
+            .expect("a verdict")
+            .expect("a refusal");
+        assert_eq!(decided.verdict, Verdict::Deny("no secrets here".into()));
+        assert_eq!(decided.plugin, "refuses-messages");
+    }
+
+    #[test]
+    fn an_empty_set_allows_a_message() {
+        let mut text = String::from("hello");
+        let set = HookSet::new();
+        let decided = set
+            .message_received(&mut HookedMessage {
+                text: &mut text,
+                files: &[],
+            })
+            .expect("no plugin, no failure");
+        assert!(decided.is_none(), "an empty set decides nothing");
+        assert_eq!(text, "hello");
     }
 }

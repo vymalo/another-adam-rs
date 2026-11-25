@@ -125,6 +125,9 @@ impl Listing {
 pub struct SourceCtx {
     run_id: RunId,
     root_run: RunId,
+    /// The run whose workspace the run reads (ADR 0045 slice 7): the root unless the run's session
+    /// names another.
+    workspace_run: RunId,
     conversation_id: Option<String>,
     context: Arc<Map<String, Value>>,
     task: Option<Arc<str>>,
@@ -142,6 +145,7 @@ impl SourceCtx {
         Self {
             run_id,
             root_run,
+            workspace_run: root_run,
             conversation_id,
             context,
             task: None,
@@ -182,6 +186,22 @@ impl SourceCtx {
     /// task (the tier a person set, the notes of the task) reads for a subagent.
     pub fn root_run_id(&self) -> RunId {
         self.root_run
+    }
+
+    /// This context with the run whose workspace the run reads, when it is not
+    /// [`root_run_id`](Self::root_run_id): a [`ToolSource`] that lists what a worktree holds reads
+    /// it, so that a round a person started lists the repository of the task it serves.
+    #[must_use]
+    pub fn with_workspace_run(mut self, run: RunId) -> Self {
+        self.workspace_run = run;
+        self
+    }
+
+    /// The run whose workspace this run works in: [`root_run_id`](Self::root_run_id) unless the
+    /// run's session names another ([`ToolCtx::workspace_run_id`](crate::ToolCtx::workspace_run_id)).
+    /// What a source that looks at the worktree reads; the notes stay on the root.
+    pub fn workspace_run_id(&self) -> RunId {
+        self.workspace_run
     }
 
     /// The conversation the run belongs to, if any.

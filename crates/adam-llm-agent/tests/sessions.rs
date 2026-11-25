@@ -356,6 +356,7 @@ impl Rig {
                 description: "Does a piece of work.".into(),
                 within: self.within,
                 remote: false,
+                bounds: adam_runtime::SessionBounds::default(),
             },
             SessionAgent {
                 name: "far".into(),
@@ -363,6 +364,7 @@ impl Rig {
                 description: "Lives on another system.".into(),
                 within: None,
                 remote: true,
+                bounds: adam_runtime::SessionBounds::default(),
             },
         ]);
         match self.limits {
@@ -805,6 +807,7 @@ async fn start_persons_round(rt: &Runtime, rig: &Rig, conversation: &str, text: 
         closing: false,
         round: 1,
         root: None,
+        workspace: None,
         // The A2A front sets it: only a request that activated `child-sessions/v1` starts a
         // person's round, so the person sees the session (ADR 0045 decision 9).
         visible: true,
@@ -865,6 +868,12 @@ mod cases {
         let view = session_until(&rt, &conv, session, |v| v.state == SessionState::Idle).await;
         let header = view.header.clone().expect("a header");
         assert_eq!(header.root, Some(parent), "set when the session opens");
+        // A session a task opens reads that task's workspace (ADR 0045 slice 7), which is its root.
+        assert_eq!(
+            header.workspace,
+            Some(parent),
+            "the workspace of the task that opened it"
+        );
 
         // A person's message to the session: the next header, and no root run of its own.
         let mut next = header.clone();
@@ -906,6 +915,13 @@ mod cases {
         .await;
         let header = view.header.clone().expect("a header");
         assert_eq!(header.root, Some(second), "the task that sent round three");
+        // The workspace a session was opened on is kept: a later task's round reads the same
+        // repository (ADR 0045 slice 7).
+        assert_eq!(
+            header.workspace,
+            Some(parent),
+            "the workspace the session was opened on"
+        );
 
         // A person's next round names what the latest header names.
         let mut next = header.clone();
@@ -2496,6 +2512,7 @@ mod cases {
                 description: "Does a piece of work.".into(),
                 within: Some(Duration::from_secs(5)),
                 remote: false,
+                bounds: adam_runtime::SessionBounds::default(),
             },
             SessionAgent {
                 name: "far".into(),
@@ -2503,6 +2520,7 @@ mod cases {
                 description: "Lives on another system.".into(),
                 within: None,
                 remote: true,
+                bounds: adam_runtime::SessionBounds::default(),
             },
         ]);
         let again: Vec<adam_model::ToolSpec> = again.tools().iter().map(|t| t.spec()).collect();
@@ -2765,6 +2783,7 @@ mod cases {
             closing: false,
             round: 1,
             root: None,
+            workspace: None,
             visible: false,
             config: None,
         };
@@ -4145,6 +4164,7 @@ mod cases {
             closing: true,
             round: 2,
             root: None,
+            workspace: None,
             visible: false,
             config: None,
         };
@@ -4863,6 +4883,7 @@ fn limits_do_not_change_the_specs() {
             description: "Does a piece of work.".into(),
             within: None,
             remote: false,
+            bounds: adam_runtime::SessionBounds::default(),
         }]
     };
     let specs = |tools: SessionTools| {
@@ -4887,6 +4908,7 @@ fn the_five_specs_are_pinned() {
             description: "Reviews a diff.".into(),
             within: None,
             remote: false,
+            bounds: adam_runtime::SessionBounds::default(),
         },
         SessionAgent {
             name: "explorer".into(),
@@ -4894,6 +4916,7 @@ fn the_five_specs_are_pinned() {
             description: "Reads the repository and answers where and how.".into(),
             within: None,
             remote: false,
+            bounds: adam_runtime::SessionBounds::default(),
         },
     ]);
     let specs: Vec<adam_model::ToolSpec> = roster.tools().iter().map(|t| t.spec()).collect();
