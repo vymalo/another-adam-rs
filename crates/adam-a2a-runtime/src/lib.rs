@@ -59,7 +59,7 @@ pub use backend::{DEFAULT_POLL_INTERVAL, MAX_REFERENCES, RuntimeTaskBackend};
 pub use caller::{CONTEXT_CALLER, UNREADABLE_CALLER, asked_by_an_agent};
 pub use child_sessions::{
     CONTEXT_CHILD_SESSIONS, ChildSessionAgent, ChildSessions, MAX_DESCRIPTION_CHARS,
-    MAX_SESSION_ROUNDS, MAX_WORKSPACE_SCAN,
+    MAX_SESSION_ROUNDS,
 };
 pub use commands::{
     CommandRefusal, Commands, MAX_COMMAND_ARGUMENTS, MAX_COMMAND_EXPANSION, RemoteCommand,

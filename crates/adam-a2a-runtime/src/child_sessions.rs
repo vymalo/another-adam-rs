@@ -53,6 +53,7 @@ use adam_runtime::{
     SESSION_STATE_KEY, SessionHeader, SessionLimits, SessionState, SessionSummary, SessionView,
     closing_round_payload, parse_session_conversation_id, session_conversation_id,
 };
+use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -71,19 +72,13 @@ pub const MAX_SESSION_ROUNDS: u32 = 20;
 /// most recently updated first.
 const CLOSED_LISTED: usize = 16;
 
-/// The most runs a person's session start reads of its parent context while it looks for the latest
-/// task of it, and the number of runs a context can hold before that search gives up.
-///
-/// A context holds one run per task and per subagent child run registered under the root's own agent
-/// name, and it only grows, so a bound is needed: the scan reads pages of 64 runs and stops here. A
-/// context with **more than this many runs of the agent, none of them a task among the newest ones**,
-/// finds none: the session's rounds answer in words, as they do in a context nobody sent a task to,
-/// and nothing is an error. That is the documented limit, not a silent `None` — a person's context
-/// that long is one whose newest run of a task is older than this many later updates of it.
-pub const MAX_WORKSPACE_SCAN: usize = 256;
+/// The most pages one workspace scan reads before it stops: a **loop-safety** guard, not a bound on
+/// a context. A store answers a short page at the end of a context, so this only trips on a store
+/// that never does — a broken adapter — which would otherwise spin forever. It is logged when it
+/// trips, and it is 256 pages of [`WORKSPACE_PAGE`], far past any context a person produces.
+const WORKSPACE_MAX_PAGES: usize = 256;
 
-/// How many runs one page of that scan reads. Smaller than the bound, so the scan pages rather than
-/// reading a context's whole history in one query.
+/// How many runs one page of that scan reads.
 const WORKSPACE_PAGE: usize = 64;
 
 /// The context key under which a request says its client **shows child sessions**: `true` when it
@@ -488,6 +483,85 @@ pub(crate) struct Round {
     pub by_person: bool,
 }
 
+/// Where one page of a workspace scan comes from: the store, in the front, and a stub in the tests
+/// (a page that never ends is the one case the loop-safety guard exists for).
+#[async_trait]
+trait ContextPages {
+    /// The next page after `after`, in the store's `(updated_at, id)` descending order, of at most
+    /// `limit` runs.
+    async fn page(
+        &self,
+        after: Option<(Timestamp, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<RunRecord>, BackendError>;
+}
+
+/// The runs of one agent in one conversation, page by page.
+struct StorePages<'a> {
+    store: &'a dyn adam_core::Store,
+    agent: &'a str,
+    parent: &'a str,
+}
+
+#[async_trait]
+impl ContextPages for StorePages<'_> {
+    async fn page(
+        &self,
+        after: Option<(Timestamp, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<RunRecord>, BackendError> {
+        let query = RunQuery {
+            after,
+            ..RunQuery::new(
+                self.agent.to_owned(),
+                ConversationScope::Exact(self.parent.to_owned()),
+                limit,
+            )
+        };
+        self.store
+            .list_runs(&query)
+            .await
+            .map_err(|e| map_err(e.into()))
+    }
+}
+
+/// The latest task of a context: the best `(created_at, id)` **root** over every page of it, or
+/// `None` when the context holds no root run at all — which is the single meaning of `None` here.
+///
+/// A page is ordered by `updated_at`, and the selection is by `created_at`, so the scan cannot stop
+/// at the first root it sees: it reads the context to its end and keeps the best. [`WORKSPACE_PAGE`]
+/// is the page size; the scan stops when a page comes back short, which is the store's own statement
+/// that the context ended. [`WORKSPACE_MAX_PAGES`] is the loop-safety guard for a store that never
+/// makes that statement, and it is logged when it trips.
+async fn best_root_of(pages: &impl ContextPages) -> Result<Option<RunId>, BackendError> {
+    let mut best: Option<(Timestamp, RunId)> = None;
+    let mut after: Option<(Timestamp, RunId)> = None;
+    for read in 0..WORKSPACE_MAX_PAGES {
+        let page = pages.page(after, WORKSPACE_PAGE).await?;
+        let Some(last) = page.last() else {
+            return Ok(best.map(|(_, id)| id));
+        };
+        for run in &page {
+            if run.parent_id.is_none()
+                && best.is_none_or(|(at, id)| (run.created_at, run.id) > (at, id))
+            {
+                best = Some((run.created_at, run.id));
+            }
+        }
+        after = Some((last.updated_at, last.id));
+        if page.len() < WORKSPACE_PAGE {
+            return Ok(best.map(|(_, id)| id));
+        }
+        if read + 1 == WORKSPACE_MAX_PAGES {
+            tracing::warn!(
+                pages = WORKSPACE_MAX_PAGES,
+                "a context's runs never came to an end: the workspace scan stopped"
+            );
+        }
+    }
+    Ok(best.map(|(_, id)| id))
+}
+
 impl RuntimeTaskBackend {
     fn sessions(&self) -> Result<&ChildSessions, BackendError> {
         self.child_sessions
@@ -549,9 +623,9 @@ impl RuntimeTaskBackend {
 
     /// The run whose workspace a session started in the stored parent conversation `parent` reads
     /// (ADR 0045 slice 7): the latest task of that context — the task **most recently created** of
-    /// this agent in it, which is the worktree the person is looking at. `None` when the context
-    /// holds no task of this agent yet (a start from a context nobody sent a task to), which is a
-    /// session whose rounds answer in words.
+    /// this agent in it, which is the worktree the person is looking at. `None` means exactly one
+    /// thing: the context holds no task of this agent (a start from a context nobody sent a task
+    /// to), which is a session whose rounds answer in words.
     ///
     /// Created, not updated: [`Store::list_runs`](adam_core::Store::list_runs) orders a page by
     /// `(updated_at, id)` descending, and `updated_at` moves whenever a run progresses — so an
@@ -563,57 +637,18 @@ impl RuntimeTaskBackend {
     /// session, a subagent's child run and another agent's run are registered under other agent
     /// names or in other conversations, and a child run registered under its root's name would
     /// still be skipped, since a child has no workspace of its own. Those children can outnumber the
-    /// tasks, so the scan pages ([`WORKSPACE_PAGE`]) until the bound
-    /// ([`MAX_WORKSPACE_SCAN`]) instead of trusting one window: it keeps the best
-    /// `(created_at, id)` root over the pages it reads, and stops early only when this page's own
-    /// `updated_at` order proves no later page can hold an older-created root — a run's `created_at`
-    /// never exceeds its `updated_at`, and a later page's `updated_at` is at most this page's
-    /// smallest. A context past the bound answers `None`, which is a session answered in words, as
-    /// [`MAX_WORKSPACE_SCAN`] documents.
+    /// tasks and sit in front of them, so the scan reads the **whole** context, a page at a time
+    /// ([`WORKSPACE_PAGE`]), and keeps the best `(created_at, id)` root of everything it read: it
+    /// stops when a page comes back short, which is the store's own statement that the context ended.
+    /// No count of runs makes this answer `None`. The only other stop is [`WORKSPACE_MAX_PAGES`], a
+    /// loop-safety guard for a store that never ends a page, which is logged.
     async fn context_workspace(&self, parent: &str) -> Result<Option<RunId>, BackendError> {
-        let mut best: Option<(Timestamp, RunId)> = None;
-        let mut after: Option<(Timestamp, RunId)> = None;
-        let mut scanned = 0usize;
-        loop {
-            let limit = WORKSPACE_PAGE.min(MAX_WORKSPACE_SCAN.saturating_sub(scanned));
-            let query = RunQuery {
-                after,
-                ..RunQuery::new(
-                    self.agent.clone(),
-                    ConversationScope::Exact(parent.to_owned()),
-                    limit,
-                )
-            };
-            let page = self
-                .runtime
-                .store()
-                .list_runs(&query)
-                .await
-                .map_err(|e| map_err(e.into()))?;
-            let Some(last) = page.last() else {
-                break;
-            };
-            for run in &page {
-                if run.parent_id.is_none()
-                    && best.is_none_or(|(at, id)| (run.created_at, run.id) > (at, id))
-                {
-                    best = Some((run.created_at, run.id));
-                }
-            }
-            scanned += page.len();
-            after = Some((last.updated_at, last.id));
-            // A page is ordered by `(updated_at, id)` descending, so its last run is the oldest of
-            // it, and no later page can hold a run updated after that. A run's `created_at` never
-            // exceeds its `updated_at`; so once the best root was created strictly after the oldest
-            // run of this page, no later page can hold an older-created one either.
-            if page.len() < limit
-                || scanned >= MAX_WORKSPACE_SCAN
-                || best.is_some_and(|(at, _)| at > last.updated_at)
-            {
-                break;
-            }
-        }
-        Ok(best.map(|(_, id)| id))
+        let pages = StorePages {
+            store: self.runtime.store().as_ref(),
+            agent: &self.agent,
+            parent,
+        };
+        best_root_of(&pages).await
     }
 
     /// The session `session` of parent context `context`, if it is the caller's and a helper's.
@@ -1428,6 +1463,7 @@ fn put_header(inbound: &mut Inbound, header: &SessionHeader) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use a2a::{Part, Role};
+    use adam_core::RunStatus;
     use proptest::prelude::*;
 
     use super::*;
@@ -1480,6 +1516,57 @@ mod tests {
         assert_eq!(card.params["maxOpen"], 16);
         assert_eq!(card.params["agents"][1]["name"], "researcher");
         assert_eq!(sessions().with_max_rounds(0).max_rounds, 2);
+    }
+
+    /// A context that never makes the store's statement — a page always comes back full. Only a
+    /// broken adapter does this; the guard exists so the scan cannot spin forever on it.
+    struct NeverEnding {
+        pages: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ContextPages for NeverEnding {
+        async fn page(
+            &self,
+            _after: Option<(Timestamp, RunId)>,
+            limit: usize,
+        ) -> Result<Vec<RunRecord>, BackendError> {
+            let nth = self.pages.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let nth = i64::try_from(nth).expect("a page number");
+            let limit = i64::try_from(limit).expect("a page size");
+            let oldest = 1_000_000 + nth * limit;
+            Ok((0..limit)
+                .map(|i| RunRecord {
+                    id: RunId::new(),
+                    agent: "root".into(),
+                    conversation_id: Some("ctx".into()),
+                    parent_id: None,
+                    status: RunStatus::Done,
+                    state: Value::Null,
+                    wake_at: None,
+                    version: 1,
+                    created_at: Timestamp::from_millisecond(oldest + i).expect("a timestamp"),
+                    updated_at: Timestamp::from_millisecond(oldest).expect("a timestamp"),
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_workspace_scan_stops_on_a_page_that_never_ends() {
+        let pages = NeverEnding {
+            pages: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let best = best_root_of(&pages).await.expect("a scan");
+        assert_eq!(
+            pages.pages.load(std::sync::atomic::Ordering::SeqCst),
+            WORKSPACE_MAX_PAGES,
+            "the guard is the only way out when no page is short"
+        );
+        assert!(
+            best.is_some(),
+            "the best root of the pages read is still the answer"
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ use adam_a2a::{
     ACCESS_TIER_EXTENSION, AccessTier, AccessTiers, BackendError, CHILD_SESSIONS_EXTENSION, Caller,
     STEER_EXTENSION, TaskBackend, TaskQuery,
 };
-use adam_a2a_runtime::{ChildSessionAgent, ChildSessions, MAX_WORKSPACE_SCAN, RuntimeTaskBackend};
+use adam_a2a_runtime::{ChildSessionAgent, ChildSessions, RuntimeTaskBackend};
 use adam_core::{DynStore, MemoryStore, NewRun, RunId, RunStatus, RunUpdate, Timestamp};
 use adam_llm_agent::{LlmAgent, SessionAgent, SessionTools, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::{
@@ -665,75 +665,6 @@ async fn a_context_whose_newest_runs_are_children_still_names_its_root_task() {
             rig.round_header(session).await.workspace,
             Some(root_run),
             "the only task of the context, {CHILDREN} child runs behind it"
-        );
-        rig.stop().await;
-    }
-}
-
-/// The scan is **bounded**, and the bound is documented behaviour rather than a silent `None`
-/// ([`MAX_WORKSPACE_SCAN`]): a context with at most that many runs of the agent still names its
-/// task, and one run past the bound does not — the session's rounds answer in words, as they do in
-/// a context nobody sent a task to.
-#[tokio::test]
-async fn a_context_longer_than_the_scan_bound_answers_none_and_says_so_in_words() {
-    for store in stores().await {
-        let rig = Rig::new(&store);
-        rig.helper_mock
-            .push_text("bounded")
-            .push_text("still bounded");
-        rig.parent_mock.push_text("root");
-        let root = rig
-            .submit(&alice(), said("work", Some("ctx-long")), None)
-            .await
-            .unwrap();
-        rig.until(&alice(), &root.id, TaskState::Completed).await;
-        let root_run = RunId::from(Uuid::parse_str(&root.id).expect("a task id is a run id"));
-        let rec = store
-            .load_run(root_run)
-            .await
-            .expect("store")
-            .expect("the root task");
-        let conversation = rec.conversation_id.expect("a task has a conversation");
-        clock_past(rec.updated_at).await;
-
-        // `MAX_WORKSPACE_SCAN - 1` children and the root is the last of exactly the bound's runs.
-        for _ in 0..MAX_WORKSPACE_SCAN - 1 {
-            child_run(&store, &rig.parent, &conversation, root_run).await;
-        }
-        let inside = rig
-            .start(&alice(), Some("ctx-long"), "where is it?", true)
-            .await;
-        let (_, session) = parse_session_conversation_id(&inside.context_id).unwrap();
-        assert_eq!(
-            rig.round_header(session).await.workspace,
-            Some(root_run),
-            "the root task is the last run of the bound, and is found"
-        );
-        rig.until(&alice(), &inside.id, TaskState::Completed).await;
-
-        // One child more puts the root past the bound: the answer is `None`, not an error, and the
-        // round still runs and answers in words.
-        child_run(&store, &rig.parent, &conversation, root_run).await;
-        let past = rig
-            .start(&alice(), Some("ctx-long"), "and where is it?", true)
-            .await;
-        let (_, session) = parse_session_conversation_id(&past.context_id).unwrap();
-        assert_eq!(
-            rig.round_header(session).await.workspace,
-            None,
-            "past {MAX_WORKSPACE_SCAN} runs the scan stops, as documented"
-        );
-        let answered = rig.until(&alice(), &past.id, TaskState::Completed).await;
-        assert_eq!(
-            answered
-                .status
-                .message
-                .as_ref()
-                .and_then(|m| m.parts.first())
-                .and_then(a2a::Part::as_text)
-                .unwrap_or_default(),
-            "still bounded",
-            "past the bound a person's session answers in words"
         );
         rig.stop().await;
     }
