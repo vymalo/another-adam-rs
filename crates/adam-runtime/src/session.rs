@@ -197,11 +197,14 @@ pub struct SessionHeader {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<RunId>,
     /// The run whose workspace this session's rounds work in: the task a session a **task** opened
-    /// reads (its root run), and for a session a **person** opened, the latest task of the parent
-    /// context it was opened in, which the A2A front resolves from the store. A round a task sends
-    /// keeps it, so every round of one session reads the same repository. `None` when the parent
-    /// context holds no task with a workspace, which is a round that works in words only — not an
-    /// error — and what a header written before it existed reads. Absent when `None`.
+    /// reads (its root run), and for a session a **person** opened, the **most recently created**
+    /// task of the parent context it was opened in, which the A2A front resolves from the store
+    /// (`context_workspace`, bounded by `adam_a2a_runtime::MAX_WORKSPACE_SCAN`). Created, not
+    /// updated: a task's `updated_at` moves with every commit, so it is not the task the person is
+    /// in. A round a task sends keeps it, so every round of one session reads the same repository.
+    /// `None` when the parent context holds no task with a workspace, which is a round that works in
+    /// words only — not an error — and what a header written before it existed reads. Absent when
+    /// `None`.
     ///
     /// It is **not** [`root`](Self::root): that is the run a round's model calls name, which is the
     /// round's own task for a person's round. A tool that keys a workspace, an environment session
