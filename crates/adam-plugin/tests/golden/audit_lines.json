@@ -1,0 +1,51 @@
+[
+  {
+    "agent": "scripted",
+    "at": "t1",
+    "fields": {
+      "turn": 0
+    },
+    "key": "run-1/model:0/turn.started/0",
+    "name": "turn.started",
+    "root_run": "run-1",
+    "run": "run-1"
+  },
+  {
+    "agent": "scripted",
+    "at": "t1",
+    "fields": {
+      "arguments": {
+        "path": "a.txt",
+        "token": "[redacted]"
+      },
+      "tool": "read"
+    },
+    "key": "run-1/tool:c1/tool.started/0",
+    "name": "tool.started",
+    "root_run": "run-1",
+    "run": "run-1"
+  },
+  {
+    "agent": "scripted",
+    "at": "t1",
+    "fields": {
+      "output": "hello [redacted]",
+      "tool": "read"
+    },
+    "key": "run-1/tool:c1/tool.completed/0",
+    "name": "tool.completed",
+    "root_run": "run-1",
+    "run": "run-1"
+  },
+  {
+    "agent": "scripted",
+    "at": "t1",
+    "fields": {
+      "calls": 1
+    },
+    "key": "run-1/model:0/turn.ended/0",
+    "name": "turn.ended",
+    "root_run": "run-1",
+    "run": "run-1"
+  }
+]

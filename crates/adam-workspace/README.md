@@ -705,8 +705,8 @@ lock". So each of them takes two locks on the mirror, in this order:
    (`git/<host>/<owner>/<name>.git.lock`), never inside it. The lock ends with the file handle, so
    a crashed process frees it.
 
-*Verified 2026-09-29:* `File::lock` and `File::unlock` are stable since Rust 1.89 (the MSRV is
-1.94), and a second handle on the same file gets `WouldBlock` from `try_lock` until the first one
+*Verified 2026-09-29:* `File::lock` and `File::unlock` are stable since Rust 1.89 (the MSRV was
+1.94; now 1.98), and a second handle on the same file gets `WouldBlock` from `try_lock` until the first one
 unlocks (a test program built with 1.94.1). *Unverified:* that `flock` is honoured on **NFS and
 Longhorn RWX** volumes. A volume that refuses the lock fails the operation with
 `WorkspaceError::Io` ("cannot lock the mirror") instead of running unlocked. Test two workers

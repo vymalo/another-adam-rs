@@ -243,6 +243,9 @@ pub struct ServiceConfig {
     /// `SESSION_*`: the limits on the sessions of one conversation and how long an idle one stays
     /// open. Read by every role.
     pub sessions: SessionSettings,
+    /// `RUN_RETENTION_DAYS`, `RUN_RETENTION_SWEEP_SECS`: how long finished runs are kept (90 days
+    /// by default; `off` keeps all). Read by every role; swept by the roles that run workers.
+    pub retention: crate::retention::RetentionSettings,
     /// `DEFAULT_LOCALE`: the agent's default language, a BCP 47 tag; the card lists `locale/v1`
     /// with it when set (ADR 0069). `None`: the card lists nothing.
     pub default_locale: Option<adam_a2a::Locale>,
@@ -394,6 +397,7 @@ impl ServiceConfig {
             worker,
             a2a,
             sessions: SessionSettings::parse(lookup, problems),
+            retention: crate::retention::RetentionSettings::parse(lookup, problems),
             default_locale,
             uploads_inline_max_bytes,
             prompt_statement: is_injector(lookup)

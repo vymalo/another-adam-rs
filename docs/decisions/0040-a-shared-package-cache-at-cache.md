@@ -173,3 +173,27 @@ of ADR 0041.
 `1.98.1-8c297d3` (`sha256:b465808bfb8a1baae5e59a429bf292726b021e3b37322f759dbda3ee2c57ed67`; *verified 2026-11-19*: an anonymous
 ghcr.io token and a manifest request). Its config keeps `CARGO_HOME=/cache/cargo`, so the caches this decision places there are
 unchanged; the chart's `runPods.image` (tag and digest) moved with it, and the coder image (`image.tag`) is rebuilt on it.
+
+*2026-11-24 (the owner's choice, ANR-Q52):* the open decision of ADR 0041 is closed. The owner chose: *"(c) Read-only in run pods,
+filled by a pull-through proxy to the public registries (a proxy to build and run)"*. What changes, and what is built in later slices:
+
+* **Run pods mount `/cache` read-only.** The admission policy (ADR 0041, decision 7) refuses a run pod that mounts the cache claim
+  read-write. A run can no longer write into what another person's build reads. The coder's own container is not a run pod and keeps
+  the claim as before until the proxy is the only writer; a run that needs a package the cache lacks fetches it through the proxy.
+* **One writer, the proxy.** The "proxy, later" section above is now the plan: the proxy is the only process that writes the volume
+  (or its own storage), and every run pod reads it. "One trust domain: every run on it is the owner's" is replaced by "the proxy is
+  the only writer".
+* **Design: one proxy per ecosystem, behind one Service**, not one product that covers all three. npm and pnpm share the npm registry
+  protocol, so one registry proxy serves both; cargo needs a sparse-index proxy (`[source]` replacement) and GitHub's git is left out
+  until a run needs it. Reasons: each ecosystem has a dedicated, small proxy, and a single multi-ecosystem repository manager is a
+  larger service to run and secure (*reasoning, not a verified comparison*).
+* **Candidates, not chosen.** For npm and pnpm: a lightweight registry proxy such as Verdaccio. For cargo: a sparse-registry mirror or a
+  repository manager that speaks it. **Every claim about these products (licence, behaviour, cargo sparse support, pnpm
+  compatibility) is *unverified*** and must be checked, with date and source, in the slice that picks one. Adopting a product with its
+  own terms is the owner's to confirm: the slice names the product and asks before building.
+* **Egress.** Run pods reach the proxy through `runPods.networkPolicy.extraEgress` or, since ADR 0042, through the egress proxy; the
+  slice decides which and adds the proxy's host to the allow-list.
+
+Slices: (1) this amendment; (2) the admission policy refuses a read-write cache mount, with a kind scenario in which run A cannot
+write the cache path; (3) the proxy in the chart, filling the cache, with a kind scenario in which a package fetched through it lands
+in the cache.

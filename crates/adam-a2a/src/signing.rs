@@ -306,10 +306,22 @@ fn checked(text: &str) -> Result<&str, SigningError> {
 }
 
 /// RFC 7638: the SHA-256 of the JWK's required members in lexicographic order, base64url.
+///
+/// The text is built member by member from sorted keys, never from `Map`'s own order: a dependency
+/// in the binary's feature set (`serde_json/preserve_order`) turns `Map` into an insertion-ordered map.
 fn thumbprint(members: &Map<String, Value>) -> String {
-    // `Map` is a BTreeMap (no `preserve_order`): members are already in lexicographic order, and
-    // `to_string` has no whitespace.
-    let text = Value::Object(members.clone()).to_string();
+    let mut keys: Vec<&String> = members.keys().collect();
+    keys.sort_unstable();
+    let mut text = String::from("{");
+    for (i, key) in keys.into_iter().enumerate() {
+        if i > 0 {
+            text.push(',');
+        }
+        text.push_str(&Value::String(key.clone()).to_string());
+        text.push(':');
+        text.push_str(&members[key].to_string());
+    }
+    text.push('}');
     URL_SAFE_NO_PAD.encode(Sha256::digest(text.as_bytes()))
 }
 
@@ -693,6 +705,35 @@ mod tests {
             assert_eq!(header["kid"], signer.kid());
             assert!(header.get("jku").is_none());
         }
+    }
+
+    #[test]
+    fn the_thumbprint_is_rfc_7638_whatever_the_order_members_were_added_in() {
+        // RFC 7638 §3.1's example key; the members are inserted out of order on purpose.
+        let mut members = Map::new();
+        members.insert("kty".into(), json!("RSA"));
+        members.insert("n".into(), json!("0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw"));
+        members.insert("e".into(), json!("AQAB"));
+        assert_eq!(
+            thumbprint(&members),
+            "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+        );
+    }
+
+    #[test]
+    fn the_ed25519_thumbprint_is_rfc_8037s() {
+        // RFC 8037 appendix A.3: the Ed25519 public key's thumbprint.
+        let mut members = Map::new();
+        members.insert(
+            "x".into(),
+            json!("11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"),
+        );
+        members.insert("kty".into(), json!("OKP"));
+        members.insert("crv".into(), json!("Ed25519"));
+        assert_eq!(
+            thumbprint(&members),
+            "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k"
+        );
     }
 
     #[test]

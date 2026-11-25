@@ -804,6 +804,7 @@ async fn run(
     let workers = role.runs_workers().then_some(options.concurrency);
     let worker_id = options.worker_id.clone();
     let component_store = store.clone();
+    let agent_name = name.clone();
     let service = Service::new_with(
         register(Runtime::builder(store)),
         name,
@@ -966,6 +967,15 @@ async fn run(
 
     // The binary's own components: they run in the worker tier, so the host stops them with the
     // workers (and never starts them in a control plane).
+    let host = if role.runs_workers() {
+        let store = component_store.clone();
+        let settings = config.retention;
+        host.worker("retention", move |stop| {
+            crate::retention::run(store, agent_name, settings, Default::default(), stop)
+        })
+    } else {
+        host
+    };
     let host = components.into_iter().fold(host, |host, (name, start)| {
         let store = component_store.clone();
         host.worker(name, move |stop| start(store, stop))

@@ -861,6 +861,7 @@ async fn transition(
     {
         Ok(Some(committed)) => {
             announce(inner, &committed, &next).await;
+            observe_commit(inner, &committed, &next).await;
             // After the commit, never before: the parent's timer is the fallback for a crash here.
             // The report is built from what was just written: the store does not echo the state.
             inner
@@ -1513,6 +1514,80 @@ async fn commit(
     }
     tracing::warn!(%run, "gave up merging a commit after repeated conflicts");
     Ok(None)
+}
+
+/// Offers the events that follow a commit to the observers (ADR 0050, H4): one `run.parked`,
+/// `run.ended` or `run.error` for the transition's outcome, then one `artifact.kept` per artifact
+/// it kept. Keys are `<run>/commit:<version>/<event>/<index>`: a version is committed once, so a key
+/// is never reused. Best effort and after the commit: nothing here changes the run.
+async fn observe_commit(inner: &Inner, committed: &RunRecord, next: &Next) {
+    use adam_plugin::{EventHeader, EventKind, HookEvent};
+    let Some(set) = inner.observers.clone() else {
+        return;
+    };
+    let kind = match (committed.status, next.status) {
+        (RunStatus::Parked, _) => Some(EventKind::RunParked),
+        (RunStatus::Done | RunStatus::Failed, _) => Some(EventKind::RunEnded),
+        (RunStatus::Runnable, _) if next.retry_detail.is_some() => Some(EventKind::RunError),
+        _ => None,
+    };
+    if kind.is_none() && next.artifacts.is_empty() {
+        return;
+    }
+    let mut root = committed.id;
+    let mut parent = committed.parent_id;
+    for _ in 0..16 {
+        let Some(p) = parent else { break };
+        root = p;
+        parent = match inner.store.run_header(p).await {
+            Ok(Some(h)) => h.parent_id,
+            _ => None,
+        };
+    }
+    let at = inner.clock.now().to_string();
+    let header = |name: &str, index: usize| EventHeader {
+        key: format!(
+            "{}/commit:{}/{name}/{index}",
+            committed.id, committed.version
+        ),
+        run: committed.id.to_string(),
+        root_run: root.to_string(),
+        agent: committed.agent.clone(),
+        at: at.clone(),
+    };
+    let keep = |text: &str| text.to_owned();
+    let mut events = Vec::new();
+    if let Some(kind) = kind {
+        let mut event = HookEvent::new(kind, header(kind.name(), 0))
+            .plain("version", committed.version)
+            .plain("status", format!("{:?}", committed.status).to_lowercase());
+        if let Some(detail) = next.retry_detail.as_deref() {
+            event = event
+                .text("detail", detail, &keep)
+                .plain("attempt", next.attempt);
+        }
+        if let Some(error) = next.error.as_deref() {
+            event = event.text("error", error, &keep);
+        }
+        events.push(event.bounded());
+    }
+    for (i, artifact) in next.artifacts.iter().enumerate() {
+        let mut event = HookEvent::new(EventKind::ArtifactKept, header("artifact.kept", i))
+            .text("name", &artifact.name, &keep)
+            .plain("file", artifact.file.is_some());
+        if let Some(mime) = artifact.mime_type.as_deref() {
+            event = event.text("mime_type", mime, &keep);
+        }
+        events.push(event.bounded());
+    }
+    let run = committed.id;
+    match tokio::task::spawn_blocking(move || set.observe(&events)).await {
+        Ok(report) if report.failed > 0 || report.dropped > 0 => {
+            tracing::warn!(%run, failed = report.failed, dropped = report.dropped, "an observer failed or was too slow");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(%run, error = %e, "observers did not finish"),
+    }
 }
 
 /// Emit the status event for a committed transition.

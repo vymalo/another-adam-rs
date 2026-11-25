@@ -508,3 +508,9 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
     * The sandbox is a container of the coder's pod, not a user or a machine: a flaw in the container runtime's isolation or a capability the
       deployment adds back would reach the coder's. It is the same boundary the run pods rely on.
     * The sandbox's output is untrusted by design and the coder treats it as data; nothing here makes `git`'s answers true.
+
+* **2026-11-24, open decision 2 closed (the owner, ANR-Q52).** *"(c) Read-only in run pods, filled by a pull-through proxy to the public
+  registries (a proxy to build and run)."* The shared package cache ([ADR 0040](0040-a-shared-package-cache-at-cache.md)) is mounted
+  read-only in run pods and only the pull-through proxy writes it; the admission policy will refuse a run pod that mounts the cache
+  claim read-write. A cache for each person is not chosen. The risk named under decision 2 above (one run writing what another
+  person's build reads) stays open until the admission slice and the proxy slice are built; this note records the choice and builds nothing.

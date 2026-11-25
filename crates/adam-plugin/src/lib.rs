@@ -22,8 +22,10 @@
 
 #![warn(missing_docs)]
 
+mod audit;
 mod events;
 
+pub use audit::Audit;
 pub use events::{
     EVENT_MAX, EventHeader, EventKind, EventQueue, FIELD_MAX, FlushReport, HookEvent, JSON_MAX,
     ObserveLimits,
