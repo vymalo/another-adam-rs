@@ -11,7 +11,7 @@ use adam_core::{RunId, RunStatus};
 use adam_error::report;
 use adam_model::{
     Classify, DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse,
-    ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
+    PromptStatement, ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_plugin::{HookSet, HookedCall, HookedMessage, HookedText, MessageFile, Plugin, Verdict};
 use adam_runtime::{
@@ -38,7 +38,8 @@ use crate::conversation::{
     ArtifactRef, Conversation, LOCALE_CONTEXT_KEY, LimitHit, LimitKind, Loaded, Loader,
     MODEL_CONTEXT_KEY, ModelSwitch, PendingQuestion, PendingRemote, PendingRun, PendingSession,
     PendingWait, REASONING_EFFORT_CONTEXT_KEY, Repeats, asks_to_close, parse_context,
-    parse_model_run, parse_root_run, parse_root_step, parse_session, parse_user_text,
+    parse_model_run, parse_prompt_statement, parse_root_run, parse_root_step, parse_session,
+    parse_user_text,
 };
 use crate::history::{RunChars, record_shortenings};
 use crate::images::{
@@ -397,6 +398,7 @@ type OwnedRootFacts = (
     Option<Plan>,
     Option<RunId>,
     Option<RunId>,
+    Option<PromptStatement>,
 );
 
 /// [`OwnedRootFacts`], borrowed from it for one call.
@@ -406,6 +408,7 @@ type RootFacts<'a> = (
     Option<&'a Plan>,
     Option<RunId>,
     Option<RunId>,
+    Option<&'a PromptStatement>,
 );
 
 /// What the calls of a turn that starts while the model writes need from the run, owned: taken
@@ -504,6 +507,7 @@ impl<'a> Early<'a> {
             self.facts.root.2.as_ref(),
             self.facts.root.3,
             self.facts.root.4,
+            self.facts.root.5.as_ref(),
         )
     }
 
@@ -2113,6 +2117,10 @@ impl LlmAgent {
                     if let Some(context) = parse_context(&inbound.payload) {
                         state.merge_context(context);
                     }
+                    // New values replace the run's; a message that brings none keeps them.
+                    if let Some(prompt) = parse_prompt_statement(&inbound.payload) {
+                        state.prompt_statement = Some(prompt);
+                    }
                     let items = admitted.get(&inbound.id).cloned().unwrap_or_default();
                     texts.push((text, inbound.payload, items));
                 }
@@ -2676,6 +2684,7 @@ impl LlmAgent {
         request.tools = self.specs.clone();
         request.prompt_cache_key = ctx.conversation_id().map(prompt_cache_key);
         request.run = Some(model_run(state, ctx).to_string());
+        request.prompt_statement = state.prompt_statement.clone();
         if closing {
             // The tools stay, so the prefix of the request is the one the provider has cached and
             // the calls in the history still have their tools; only the choice changes.
@@ -2761,6 +2770,7 @@ impl LlmAgent {
                 state.plan.clone(),
                 model_run_of(state),
                 workspace_run_of(state),
+                state.prompt_statement.clone(),
             ),
             kept: Arc::clone(&state.kept_outputs),
             kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
@@ -3415,6 +3425,7 @@ impl LlmAgent {
         request.tool_choice = ToolChoice::None;
         request.prompt_cache_key = ctx.conversation_id().map(prompt_cache_key);
         request.run = Some(model_run(state, ctx).to_string());
+        request.prompt_statement = state.prompt_statement.clone();
         request.max_output_tokens = Some(compaction::summary_output_tokens(live.max_output_tokens));
         // A summary is not a reasoning choice: it asks for no level, whatever the run or the agent
         // set (ADR 0063, decision 6).
@@ -3677,6 +3688,7 @@ impl LlmAgent {
                     state.plan.as_ref(),
                     model_run_of(state),
                     workspace_run_of(state),
+                    state.prompt_statement.as_ref(),
                 ),
                 &state.source_notes,
                 "report",
@@ -4061,6 +4073,7 @@ impl LlmAgent {
                         state.plan.as_ref(),
                         model_run_of(state),
                         workspace_run_of(state),
+                        state.prompt_statement.as_ref(),
                     ),
                     &state.source_notes,
                     &call,
@@ -4327,6 +4340,7 @@ impl LlmAgent {
             state.plan.as_ref(),
             model_run_of(state),
             workspace_run_of(state),
+            state.prompt_statement.as_ref(),
         );
         let facts_of_ctx = CtxFacts::of(ctx);
         let mut slots: Vec<Option<Slot>> = Vec::with_capacity(n);
@@ -5447,7 +5461,7 @@ impl LlmAgent {
         &self,
         ctx: &CtxFacts,
         context: Option<&Arc<Map<String, Value>>>,
-        (root_run, root_step, plan, model_run, workspace_run): RootFacts<'_>,
+        (root_run, root_step, plan, model_run, workspace_run, prompt_statement): RootFacts<'_>,
         notes: &[ToolNote],
         call_id: &str,
         tool: &str,
@@ -5470,6 +5484,7 @@ impl LlmAgent {
         .with_model_run(model_run.or(root_run).unwrap_or(ctx.run))
         .with_workspace_run(workspace_run.or(root_run).unwrap_or(ctx.run))
         .with_plan(plan.cloned())
+        .with_prompt_statement(prompt_statement.cloned())
     }
 
     /// How a call of the tool `name` is drawn as a step: the tool's own [`Tool::step_style`]; for a
@@ -5629,6 +5644,7 @@ impl LlmAgent {
                     state.plan.as_ref(),
                     model_run_of(state),
                     workspace_run_of(state),
+                    state.prompt_statement.as_ref(),
                 ),
                 &state.source_notes,
                 &wait.call_id,
@@ -5894,6 +5910,7 @@ fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
     conversation.model_run = parse_model_run(&input.payload);
     conversation.root_step = parse_root_step(&input.payload);
     conversation.session = parse_session(&input.payload);
+    conversation.prompt_statement = parse_prompt_statement(&input.payload);
     if let Some(context) = parse_context(&input.payload) {
         conversation.merge_context(context);
     }
@@ -6177,6 +6194,8 @@ fn continue_conversation(
     conversation.root_run = parse_root_run(&input.payload);
     conversation.model_run = parse_model_run(&input.payload);
     conversation.root_step = parse_root_step(&input.payload);
+    // A later task brings its own; a round of a session, the run that sent it.
+    conversation.prompt_statement = parse_prompt_statement(&input.payload);
     if let Some(header) = parse_session(&input.payload) {
         conversation.session = Some(header);
     }

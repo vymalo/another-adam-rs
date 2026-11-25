@@ -741,7 +741,8 @@ pub(crate) struct Node {
     /// asks for, before the preset, the model's profile and the fallback. `None` when the file
     /// says nothing.
     pub(crate) max_output_tokens: Option<u32>,
-    /// `limits.max_parallel` of the agent's file: it lowers the deployment's setting for this agent.
+    /// `limits.max_parallel` of the agent's file: it lowers the deployment's setting for this
+    /// agent, and a larger value is clamped to it (ADR 0049, ADR 0054 decision 3).
     pub(crate) max_parallel: Option<usize>,
     /// `retry:` of the agent's file: the retry policy per tool, by name, each one of its tools
     /// (ADR 0061). The agent's own; a subagent's are its file's.

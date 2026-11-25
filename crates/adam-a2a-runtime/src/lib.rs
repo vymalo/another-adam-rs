@@ -42,6 +42,7 @@ mod list;
 mod model_park;
 mod model_pick;
 mod person;
+mod prompt_statement;
 #[cfg(feature = "push")]
 mod push;
 mod reasoning;
@@ -73,6 +74,7 @@ pub use list::MAX_SCAN;
 pub use model_park::NOT_PARKED;
 pub use model_pick::CONTEXT_MODEL;
 pub use person::{CONTEXT_PERSON, person_said};
+pub use prompt_statement::PAYLOAD_PROMPT_STATEMENT;
 #[cfg(feature = "push")]
 pub use push::StorePushStore;
 pub use reasoning::CONTEXT_REASONING_EFFORT;
