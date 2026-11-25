@@ -577,7 +577,8 @@ backend reads it in `submit`, after the locale, and in the three places a person
 (`src/child_sessions.rs`), with `adam_a2a::statement_of_request`: a request that activated the extension and carries
 an entry puts `PAYLOAD_PROMPT_STATEMENT` in the inbound payload; any other leaves none (a key an inbound function
 wrote is removed). The loop keeps the values in `Conversation::prompt_statement` (a later message that brings new ones
-replaces them, one that brings none keeps them) and the injector sends them on every model call of the run. A
+replaces them, one that brings none keeps them) and the injector, or `SignedRequests`, sends them on every model call
+of the run. A device's entry is the envelope alone (`{"user"}`, ADR 0077 amended 2026-11-25). A
 malformed entry refuses the message before anything is written, with a sentence that quotes no value.
 `tests/prompt_statement.rs` drives it through the real client to a `wiremock` endpoint (below).
 
@@ -687,7 +688,12 @@ model calls go through `adam-model-openai` with `InjectedRun` to a `wiremock` se
 subagent and of a session's round carries `Prompt-Statement` and `Prompt-User-Signature` beside `X-Run-Id`; a steer
 that brings new values replaces them for every later call, one that brings none keeps them, a malformed entry is
 `InvalidParams` quoting no value; a request that did not activate the extension (or a data part that spells the payload
-key) sends neither; and no value is in any log line, at any level (one global subscriber for the binary). Always runs.
+key) sends neither; and no value is in any log line, at any level (one global subscriber for the binary). With
+`adam_model::SignedRequests` (ADR 0068 amended 2026-11-25), `every_model_call_of_the_run_is_signed`: each call of the
+root, of the local subagent and of the session's round carries its own `Turn-Signature`, which verifies over the
+request the mock received (its `X-Run-Id`, method, path and exact body) and binds the statement's `jti`; and
+`a_device_envelope_alone_is_sent_and_its_nonce_is_signed`: `{"user"}` alone sends `Prompt-User-Signature` and no
+`Prompt-Statement`, and binds the envelope's `nonce`; no signature is in any log line. Always runs.
 
 `tests/backend.rs` drives the backend with a real A2A client over HTTP and a
 scripted agent (its `listing` module: the caller's tasks newest first and each state told from the others, including

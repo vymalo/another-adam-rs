@@ -281,7 +281,9 @@ of use, prove it over the request, or send a run's tag with no key.
 
 * The provider is told the method (`POST`), the full URL, the attempt and the request's `run` (`ModelRequest::run`), on the
   first try and on the retry after a 401, for a completion and a stream alike. With `adam_model::InjectedRun` the call
-  carries `X-Run-Id` and no `Authorization`: the key of the `OpenAiConfig` is replaced, and a call with no run sends nothing. A request's `prompt_statement` is given to the provider as `CredentialRequest::prompt_statement`, so the injector also sends `Prompt-Statement` and `Prompt-User-Signature` (ADR 0077); it is never in the body.
+  carries `X-Run-Id` and no `Authorization`: the key of the `OpenAiConfig` is replaced, and a call with no run sends nothing. A request's `prompt_statement` is given to the provider as `CredentialRequest::prompt_statement`, so the injector also sends `Prompt-Statement` and `Prompt-User-Signature` (ADR 0077); it is never in the body. The
+  provider is also given the body's exact bytes (`CredentialRequest::body`), and the URL is kept as the URL parser writes
+  it, so `adam_model::SignedRequests` signs the request target and the body that are sent (ADR 0068 amended 2026-11-25).
   No `extra_headers` entry may carry a credential: `authorization` and `proxy-authorization` (any case) are refused
   when the client is built (`CredentialHeader`), so nothing but the provider sends one. Its headers are sent as sensitive values and
   replace any of the same name; `content-type`, `content-length`, `accept`, `host` and `transfer-encoding` are refused, as is
@@ -337,6 +339,10 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
   `Authorization` (a key in the configuration is never sent), the run is in no body, the retry after a 401 names the run
   too, a call with no run sends no request, and a request with a prompt statement carries `Prompt-Statement` and
   `Prompt-User-Signature` (the statement alone without an envelope, neither without one), never in the body. Always runs.
+* `tests/request_signature.rs`: `SignedRequests` over the injector against a `wiremock` server: every completion and
+  stream carries a `Turn-Signature` that verifies over the run, method, path and exact body the server received and the
+  statement's `jti`, each with its own nonce; the retry after a 401 is signed anew; a call with no run sends nothing.
+  Always runs.
 * `tests/refusals.rs`: refusals against a `wiremock` server: under `InjectedRun` each slug of the table, completed and
   streamed, is `Refused` with its park, status, slug and `Retry-After` (120 s is a 120 s timer, 5 s a 30 s one) in one
   request, and its class follows its status; a `Retry-After` in the year 9999 or too large for a `u64` parks for 24 h

@@ -1654,6 +1654,7 @@ async fn each_failure_maps_to_the_exit_code_of_its_cause() {
         device_grant: None,
         injected_run: false,
         ca_roots: None,
+        turn_keys: None,
         park_limit: std::time::Duration::from_secs(24 * 60 * 60),
         alias: "m".into(),
         model_aliases_file: None,

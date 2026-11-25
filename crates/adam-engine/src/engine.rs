@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use a2a::{Message, Part, Role, Task};
 use adam_a2a::{
-    BackendError, CHILD_SESSIONS_EXTENSION, Caller, STEER_EXTENSION, TaskBackend, TaskQuery,
+    BackendError, CHILD_SESSIONS_EXTENSION, Caller, PROMPT_STATEMENT_EXTENSION, STEER_EXTENSION,
+    TaskBackend, TaskQuery,
 };
 use adam_a2a_runtime::{Commands, RuntimeTaskBackend, default_inbound, task_id_for};
 use adam_agent_fs::{AgentManifest, Command, Subagent};
@@ -432,11 +433,12 @@ impl EngineBuilder {
             let _ = said.send(Some(how));
         });
         // The engine's caller activates `child-sessions/v1` when the agent has helpers: a message to
-        // a session's conversation, and the listing of its rounds, are refused without it.
+        // a session's conversation, and the listing of its rounds, are refused without it. It always
+        // activates `prompt-statement/v1`: a `Say` that carries none carries no entry.
         let extensions: &[&str] = if sessions.is_some() {
-            &[CHILD_SESSIONS_EXTENSION]
+            &[CHILD_SESSIONS_EXTENSION, PROMPT_STATEMENT_EXTENSION]
         } else {
-            &[]
+            &[PROMPT_STATEMENT_EXTENSION]
         };
         let caller = Caller::new(SUBJECT).with_extensions(extensions.iter().copied());
         let steering = Caller::new(SUBJECT)
@@ -1585,15 +1587,22 @@ fn inbound(message: &Message) -> Result<adam_runtime::Inbound, String> {
     Ok(inbound)
 }
 
-/// `say` as the message the backend reads: its text, under its id, and the model it names.
+/// `say` as the message the backend reads: its text, under its id, the model it names and the
+/// prompt statement it carries.
 fn message(say: &Say) -> Message {
     let mut message = Message::new(Role::User, vec![Part::text(say.text.clone())]);
     message.message_id = say.id.clone();
+    let mut metadata = std::collections::HashMap::new();
     if let Some(alias) = &say.model {
-        message.metadata = Some(std::collections::HashMap::from([(
-            MODEL_KEY.to_owned(),
-            serde_json::json!({ "model": alias }),
-        )]));
+        metadata.insert(MODEL_KEY.to_owned(), serde_json::json!({ "model": alias }));
+    }
+    if let Some(prompt) = &say.prompt_statement
+        && let Ok(entry) = serde_json::to_value(prompt)
+    {
+        metadata.insert(PROMPT_STATEMENT_EXTENSION.to_owned(), entry);
+    }
+    if !metadata.is_empty() {
+        message.metadata = Some(metadata);
     }
     message
 }

@@ -75,6 +75,7 @@ an agent does.
 | `COMMAND_CPU_MAX` | the CPU one command may use: cores (`2`, `1.5`) or millicores (`500m`); at least `100m` | half the cores, at least 1 |
 | `MODEL_TOKENS_PER_MINUTE` | the model's tokens per minute, 1 to 100000000, charged to one bucket the whole process shares (ADR 0065); unset or blank meters none | unset |
 | `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `MODEL_AUTH`, `MODEL_OAUTH_*` | the model (`ModelConfig`); `MODEL_AUTH` is `key`, `device` or `injector` (no key: each call names its root run in `X-Run-Id` and carries a run's prompt statement, and the card lists `prompt-statement/v1`; a non-empty `MODEL_API_KEY` or a `MODEL_OAUTH_*` beside it is exit 78) | required by the binaries that call `ModelConfig::parse`, for the roles that run workers |
+| `TURN_SIGNING_KEY_FILE`, `TURN_SIGNING_KEY_ID`, `TURN_VERIFY_KEYS_FILE` | the turn key (`ModelConfig::turn_keys`, **a new public field**): set, every model call is signed (`adam_model::SignedRequests` around the credentials: `Turn-Signature`, `X-Run-Id`, the prompt headers; ADR 0068 amended 2026-11-25) and the card lists `prompt-statement/v1`; a key file that cannot be read or is not an Ed25519 private key, a bad id, or an id or a verify set without a key file is exit 78 | unset: nothing is signed |
 | `MODEL_CA_FILE` | a PEM file of certificates trusted for the model endpoint beside the default roots (`ModelConfig::ca_roots`, ADR 0067); a file that cannot be read, is not PEM or holds no certificate is a problem naming the variable (exit 78 in the binaries) | unset: the default roots |
 | `MODEL_PARK_LIMIT` | how long parks on a timer in a row may last before the run fails with the last reason (`ModelConfig::park_limit`, ADR 0067; a binary gives it to its agents as `adam_llm_agent::ModelParking`, with `injected_run` saying whether an unreachable gateway parks); whole seconds or a number with `s`, `m`, `h` or `d`, 60 s to 30 d, anything else a problem (exit 78) | `24h` |
 | `MODEL_ALIASES_FILE` | the per-model profiles (ADR 0063, ADR 0064; `ModelConfig::model_aliases_file` and `profiles`, **JSON only for now**): one object with `profiles` (by model id) and `presets` (by name). A file that cannot be read, is not JSON, or breaks a rule (an unknown level or wire, a duplicate, a bad budget, a cap above the model's limit, an unknown preset, a reserved `extraBody` member) is a startup problem naming the file and the key (exit 78 in the binaries) | unset: no model has a profile |
@@ -186,7 +187,9 @@ from a worker not a 69.
   refused with exit 78, `model_auth_injector_sends_the_run_and_refuses_a_key`; `MODEL_CA_FILE` read, a missing or empty file
   exit 78, `model_ca_file_is_read_at_startup_and_a_bad_one_is_78`; `MODEL_PARK_LIMIT` a day by default, its units and
   its range, `model_park_limit_is_a_day_by_default_and_a_minute_to_thirty_days`; `prompt_statement` set exactly by
-  `MODEL_AUTH=injector`, `the_prompt_statement_follows_model_auth_injector`), the
+  `MODEL_AUTH=injector` or a turn key, `the_prompt_statement_follows_model_auth_injector`; the turn key read, its id
+  given, a bad key or id exit 78, an id without a key exit 78, no key nothing signed,
+  `the_turn_signing_key_turns_on_request_signing`), the
   MCP flags, `A2A_DOCS` (on by default, `false` turns it off, a bad value is a problem, a worker ignores it), secrets
   hidden from `Debug`.
 * `tests/model_auth.rs`: `MODEL_AUTH=injector` from the variable to the wire: the request carries `x-run-id` and no

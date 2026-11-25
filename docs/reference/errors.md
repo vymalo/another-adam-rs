@@ -202,6 +202,17 @@ A provider that does not park (a key of one's own, the device grant) keeps the e
 before. Nothing parks a run yet: the LLM agent treats these errors as any other of their class (the runtime retries a `429`,
 a `503` and `Unreachable`; the rest fail the run).
 
+A model call that must be signed ([turn signing](environment.md#turn-signing), [ADR 0068](../decisions/0068-adam-signs-its-own-history.md)
+amended 2026-11-25) and cannot be is never sent:
+
+| Cause | Error | Class |
+|---|---|---|
+| the call names no run, its URL has no request target, or the run's prompt statement has no readable `jti` (an envelope alone, no `nonce`) | `InvalidRequest` | `Invalid` |
+| the turn keys cannot be reached (`TurnKeyError::Unavailable`), or name a key they no longer sign with, twice | `Transient` | `Transient` |
+| the turn keys refuse to sign (`TurnKeyError::Refused`) | `Auth` | `Unauthenticated` |
+
+None of the messages holds a key, a signature or the request.
+
 ## What each class decides
 
 ```mermaid

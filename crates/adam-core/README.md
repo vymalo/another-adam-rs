@@ -41,10 +41,12 @@ database driver.
 | `CurrentKey`, `KeyIdentity`, `KeyStatus`, `CertificateChain`, `KeyId`, `Signature` | how the signing key is named (`Id`, or `Certificate`: a chain that rides as `x5c`), whether it is `Active` or `Renewing` (both enums closed), a key id (printable ASCII, at most 256 bytes) |
 | `Ed25519TurnKeys` | `TurnKeys` over one Ed25519 key: `from_pkcs8_pem`, `from_files` (the PEM and the verify JWKS a server mounts), `ephemeral` |
 | `KeySet`, `PublicKey` | the public keys by `kid` and the revoked ids, read from and written as a JWKS (`from_jwks`, `to_jwks`); a private member is refused |
-| `sign_detached`, `verify_detached`, `SignatureType`, `MAX_SIGNATURE_LEN` | the detached EdDSA JWS of a payload as `adam-turn/v1`, `adam-head/v1` or `adam-step/v1` |
+| `sign_detached`, `verify_detached`, `SignatureType`, `MAX_SIGNATURE_LEN` | the detached EdDSA JWS of a payload as `adam-turn/v1`, `adam-head/v1` or `adam-step/v1`; **`SignatureType::Request` (`adam-request/v1`) is a new variant of the closed enum**: a `match` on it needs one more arm |
+| `sign_attached`, `verify_attached` | the same JWS with the payload attached (`header.payload.signature`): the header and the signing input are the detached form's |
+| `ModelCall`, `request_payload`, `sign_request`, `sign_request_at`, `verify_request`, `VerifiedRequest`, `body_sha256`, `TURN_SIGNATURE_HEADER`, `REQUEST_NONCE_LEN`, `REQUEST_MAX_AGE_SECS`, `REQUEST_MAX_SKEW_SECS` | the request signature ([ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md), *Amended 2026-11-25 (the request signature)*): the payload `{typ, run, method, path, body_sha256, prompt_jti, iat, nonce}` attached, signed now with a random nonce (`sign_request`) or at a given `iat` and nonce for a test vector; `verify_request(set, jws, call, now)` checks the form, the key and the signature, each member against the request (`Mismatch { member }`), then the window, 300 s before to 60 s after (`Expired`). `ModelCall`'s `Debug` shows the body's length only |
 | `turn_payload`, `sign_turn`, `verify_turn`, `TurnPosition`, `ChainHash`, `ConversationHash`, `turn_signature`, `set_turn_signature` | a turn's payload `{typ, run, cnv, idx, prv, msg}`, the chain `prv`, and the member `extra_content.adam.turn_signature` |
 | `TurnKeyError`, `TurnKeyConfigError`, `KeySetError`, `TurnSignatureError` | see *Errors* |
-| `turn::testkit`, `turn_keys_conformance!` | the cases every `TurnKeys` passes |
+| `turn::testkit`, `turn_keys_conformance!` | the cases every `TurnKeys` passes, and `testkit::Certified`: a key named by a certificate chain, whose signatures carry `x5c` |
 | `testing` (`#[doc(hidden)]`) | `test_env`, `skipped`, `require_db`: gate for database-backed tests, not part of the supported API |
 
 ```rust
@@ -299,7 +301,7 @@ The turn errors carry no key, no signed content and no signature; they name a ke
 | `TurnKeyError::Unavailable`, `Refused` | `Transient`, `Unauthenticated` |
 | `TurnKeyConfigError` (a key file that cannot be read, is not an Ed25519 PKCS#8 private key, a public key, a revoked signing key, a bad verify set) | `Invalid`; `NoRandomness` is `Internal` |
 | `KeySetError`, `BadKeyId`, `BadCertificateChain` | `Invalid` |
-| `TurnSignatureError` (unsigned, too long, malformed, another type, an unknown or revoked key, does not verify) | `Corrupt` |
+| `TurnSignatureError` (unsigned, too long, malformed, another type, an unknown or revoked key, does not verify; for a request signature, a member that is not the request's, an `iat` outside the window) | `Corrupt` |
 
 `InvalidInput` is data the store cannot hold (an integer above `i64::MAX`, a
 bad table prefix); `Corrupt` is data read back that
@@ -335,7 +337,13 @@ own, RFC 8037's thumbprint, and a turn whose payload and signature were made out
 Python and OpenSSL), each payload field changed, a `kid` outside the set, both keys of a rotation, a
 public-only key, a revoked key, no `Debug` or error holding a key, the size bound, the form, a
 certificate chain in the header, and the conformance suite run on the ephemeral, PEM and
-certificate keys; `src/turn/ed25519.rs` reads PKCS#8 v1 and both forms of v2. The round trip of a
+certificate keys; `src/turn/ed25519.rs` reads PKCS#8 v1 and both forms of v2.
+`tests/request_signature.rs` reproduces the shared prompt-signature contract's vector V7 byte for byte
+(`tests/fixtures/request-signature/`, test material only, its README says where it comes from): V7a by a key
+named by a certificate chain (`x5c`, `testkit::Certified`), V7b by a `kid`; both verify, and a changed body,
+method, path, `prompt_jti` or run, a changed byte of the signature and an `iat` outside the window fail; a request
+signature is neither a history signature nor a detached one; no prompt signs `null`, and each signature has its
+own nonce. The round trip of a
 signed message through every store is `a_message_canonicalizes_as_it_was_written` and
 `body_a_row_canonicalizes_as_it_was_written` in `adam-store-testkit`. Database gating is described in the
 [testing guide](../../docs/guides/testing.md).

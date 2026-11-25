@@ -255,6 +255,68 @@ async fn send_starts_then_continues() {
     rig.stop().await;
 }
 
+/// A device's envelope given with a `Say` reaches the model calls of the run it starts; the next run
+/// of the conversation is its own prompt, and a `Say` with none carries none. The
+/// host's client sends and signs it (`SignedRequests`); this checks the engine hands it over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_say_carries_the_persons_envelope_to_every_model_call() {
+    use adam_engine::adam_model::PromptStatement;
+    const ENVELOPE: &str =
+        "eyJhbGciOiJFZERTQSIsIm5vbmNlIjoibi0xIn0.eyJ0eXAiOiJwcm9tcHQvdjEifQ.c2ln";
+    let rig = Rig::new(None).await;
+    rig.mock
+        .push_text("one")
+        .push_text("two")
+        .push_text("three");
+    let first = rig
+        .engine
+        .send(
+            None,
+            Say::new("hi").with_prompt_statement(PromptStatement::envelope(ENVELOPE).unwrap()),
+        )
+        .await
+        .unwrap();
+    rig.wait(first.run, RunState::Done).await;
+    let second = rig
+        .engine
+        .send(Some(&first.conversation), Say::new("and then"))
+        .await
+        .unwrap();
+    rig.wait(second.run, RunState::Done).await;
+    let plain = rig
+        .engine
+        .send(None, Say::new("no envelope"))
+        .await
+        .unwrap();
+    rig.wait(plain.run, RunState::Done).await;
+
+    let carried: Vec<Option<(Option<String>, Option<String>)>> = rig
+        .mock
+        .requests()
+        .iter()
+        .map(|r| {
+            r.prompt_statement.as_ref().map(|p| {
+                (
+                    p.statement().map(str::to_owned),
+                    p.user().map(str::to_owned),
+                )
+            })
+        })
+        .collect();
+    let envelope = Some((None, Some(ENVELOPE.to_owned())));
+    assert_eq!(carried, vec![envelope, None, None]);
+    assert_eq!(
+        rig.mock.requests()[0]
+            .prompt_statement
+            .as_ref()
+            .unwrap()
+            .prompt_jti()
+            .unwrap(),
+        "n-1"
+    );
+    rig.stop().await;
+}
+
 /// A message sent while the model writes the run's answer is read before the run ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn steer_reaches_a_working_run() {

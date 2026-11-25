@@ -392,7 +392,14 @@ impl OpenAiCompatible {
         Ok(Self {
             http,
             default_headers: headers,
-            url: format!("{base}/chat/completions"),
+            // As the URL parser writes it, so the request target a signature names
+            // (`adam_model::request_target`) is the one sent.
+            url: reqwest::Url::parse(&format!("{base}/chat/completions"))
+                .map_err(|e| OpenAiConfigError::InvalidBaseUrl {
+                    reason: e.to_string(),
+                    source: Some(Box::new(e)),
+                })?
+                .to_string(),
             endpoint: endpoint_id(base),
             credentials: Arc::new(StaticBearer::new(config.api_key.clone())),
             timeout: config.timeout,
@@ -597,6 +604,7 @@ impl OpenAiCompatible {
                 attempt,
                 run,
                 prompt_statement,
+                body: &body,
             };
             let credentials = self.credentials.headers(call).await?;
             let mut request = self
