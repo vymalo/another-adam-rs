@@ -816,6 +816,7 @@ dependencies = [
  "adam-core",
  "adam-error",
  "adam-model",
+ "adam-plugin",
  "adam-store-mongodb",
  "adam-store-postgres",
  "adam-store-testkit",

@@ -3463,6 +3463,86 @@ mod cases {
         worker.stop().await;
     }
 
+    /// ADR 0050, H4: one event per park, end, failed try and kept artifact, after the commit.
+    pub async fn observers_get_one_event_per_park_end_failed_try_and_artifact(store: DynStore) {
+        struct Seen(Arc<Mutex<Vec<(String, String)>>>);
+        impl adam_plugin::Plugin for Seen {
+            fn name(&self) -> &str {
+                "seen"
+            }
+            fn observe(
+                &self,
+                event: &adam_plugin::HookEvent,
+            ) -> Result<(), adam_plugin::HookError> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((event.kind.name().to_owned(), event.header.key.clone()));
+                Ok(())
+            }
+        }
+        let name = uniq("observed");
+        let failed = Arc::new(AtomicBool::new(false));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let failed = failed.clone();
+                move |ctx, state| {
+                    let failed = failed.clone();
+                    async move {
+                        match phase(&state) {
+                            0 => {
+                                ctx.emit(RunEvent::Artifact {
+                                    id: None,
+                                    name: "report".into(),
+                                    mime_type: Some("text/markdown".into()),
+                                    data: json!("# hi"),
+                                    file: None,
+                                })
+                                .await;
+                                Ok(Transition::Continue(json!({"phase": 1})))
+                            }
+                            1 => Ok(Transition::Park {
+                                state: json!({"phase": 2}),
+                                wake_at: None,
+                            }),
+                            _ if !failed.swap(true, SeqCst) => Err(AgentError::transient("once")),
+                            _ => Ok(Transition::Done {
+                                state,
+                                output: json!("ok"),
+                            }),
+                        }
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let rt = builder(&store, &uniq("w"), &agent)
+            .retry(
+                RetryPolicy::new(3)
+                    .with_backoff(Duration::from_millis(10), Duration::from_millis(20)),
+            )
+            .observers(adam_plugin::HookSet::new().with(Arc::new(Seen(seen.clone()))))
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        wait_waiting(&rt, run).await;
+        rt.deliver(run, late()).await.expect("deliver");
+        wait_done(&rt, run).await;
+        worker.stop().await;
+
+        let seen = seen.lock().unwrap().clone();
+        let names: Vec<&str> = seen.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            ["artifact.kept", "run.parked", "run.error", "run.ended"],
+            "exactly one event each, in commit order: {seen:?}"
+        );
+        let keys: HashSet<&String> = seen.iter().map(|(_, k)| k).collect();
+        assert_eq!(keys.len(), 4, "keys are distinct: {seen:?}");
+    }
+
     pub async fn events_and_durable_artifacts(store: DynStore) {
         let name = uniq("events");
         let agent = fn_agent(
@@ -8543,6 +8623,7 @@ macro_rules! runtime_suite {
                 a_claimed_run_says_so_before_its_first_commit,
                 a_lease_that_ran_out_is_not_a_claim,
                 events_and_durable_artifacts,
+                observers_get_one_event_per_park_end_failed_try_and_artifact,
                 broadcast_sink_streams_a_run,
                 panic_is_a_transient_failure,
                 deliver_wakes_local_workers_immediately,
