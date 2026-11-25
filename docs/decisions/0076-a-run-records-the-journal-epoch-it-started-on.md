@@ -106,7 +106,7 @@ Rulings behind the middle row, each from the code above:
 * **`busy` is reused as the skip set** because it already means "never offered, not counted against `limit`" and
   needs no `Store` change. Its limit is spin: until slice 5, each old pod claims and releases a newer run once per skip
   period. *Unverified:* how many such runs a rollout produces; slice 3's test measures claims per run, not a rate.
-* **The failure of the last row** uses `Permanent` (`worker.rs:1107-1109`, status `Failed`); whether the class rides
+* **The failure of the last row** uses `Permanent` (`worker.rs:1108`, status `Failed`); whether the class rides
   on its source as `Unsupported` is Open question 2.
 
 ### 4. The operator's side: roll in two steps, with no chart change in this ADR
@@ -209,10 +209,10 @@ golden fixture of the old journal.
 | # | Question | Recommendation |
 |---|---|---|
 | 1 | Is the epoch an integer the author bumps, or derived (image tag, folder digest)? | An integer: only a step-list change needs it, and a test catches a forgotten bump (slice 4). |
-| 2 | Does the refusal of a too-old run use `AgentError::Permanent` carrying `Unsupported`, or `Rejected`? | `Permanent` with an `Unsupported` source; `Rejected` means a policy refused the input (`worker.rs:1111`). Verify how `Permanent` carries a class before slice 2. |
+| 2 | Does the refusal of a too-old run use `AgentError::Permanent` carrying `Unsupported`, or `Rejected`? | `Permanent` with an `Unsupported` source; `Rejected` means a policy refused the input (`worker.rs:1113`). Verify how `Permanent` carries a class before slice 2. |
 | 3 | Is the envelope enough, or should the epoch be a store column from the start? | The envelope now; the column only with slice 5, and only when routing by epoch or a cheap count is wanted. |
 | 4 | How long may a refused run wait? | Until a worker of its epoch is up; the run is not failed for waiting, but a platform should alarm on a run claimed and refused for longer than its limit (slice 6). |
-| 5 | Does a conversation's follow-up run start on the current epoch? | Yes: a new run is a new journal (ADR 0055). Only a run that continues mid-transition keeps its epoch. |
+| 5 | Does a conversation's follow-up run start on the current epoch? | Yes: a new run is a new journal. Only a run that continues mid-transition keeps its epoch. |
 | 6 | Do children follow the parent's epoch? | No: each run records its own, since a child is a run with its own journal (`docs/reference/child-runs.md`). |
 | 7 | Is the `partition` canary worth a chart value? | Only after one rollout shows the epoch rule is not enough; it is a parity row and a contract with the repository that renders this chart. |
 
