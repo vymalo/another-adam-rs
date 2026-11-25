@@ -1091,7 +1091,8 @@ async fn the_card_lists_locale_exactly_when_the_deployment_names_a_default_langu
 }
 
 /// The card lists `uploads/v1` with no `params`, whatever the folder or `UPLOADS_INLINE_MAX_BYTES`
-/// say about the inline threshold (the contract gives the entry none).
+/// say about the inline threshold (the contract gives the entry none). The threshold those two
+/// resolve to is the pure helper's, asserted without a database in `serve.rs`.
 #[tokio::test]
 async fn the_card_lists_uploads_with_no_params() {
     use a2a_client::agent_card::AgentCardResolver;
@@ -1099,13 +1100,13 @@ async fn the_card_lists_uploads_with_no_params() {
 
     let Some(url) = database() else { return };
 
-    let cases: [(Option<&str>, Option<u64>, u64); 4] = [
-        (None, None, 0),
-        (Some("2048"), None, 2048),
-        (None, Some(4096), 4096),
-        (Some("2048"), Some(4096), 4096),
+    let cases: [(Option<&str>, Option<u64>); 4] = [
+        (None, None),
+        (Some("2048"), None),
+        (None, Some(4096)),
+        (Some("2048"), Some(4096)),
     ];
-    for (env, folder, expected) in cases {
+    for (env, folder) in cases {
         let name = unique("serve-uploads");
         let (listener, port) = listen().await;
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
@@ -1140,7 +1141,7 @@ async fn the_card_lists_uploads_with_no_params() {
             .expect("listed");
         assert!(
             entry.params.as_ref().is_none_or(|p| p.is_empty()),
-            "{env:?} {folder:?} {expected}"
+            "{env:?} {folder:?}"
         );
         running.finish().await;
     }

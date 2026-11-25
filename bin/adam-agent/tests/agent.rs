@@ -224,6 +224,23 @@ async fn the_card_is_the_one_the_folder_declares() {
     assert_eq!(card.name, "Chat");
 }
 
+/// The contract reads a card that lists `uploads/v1` alone as listing neither extension, so the
+/// card a process serves carries `thread-tools/v1` beside it. The binaries build the card with the
+/// screen's extensions (`card_of`); `adam_service::serve` adds `uploads/v1` to it when the
+/// process serves the extension, so this is that card.
+#[test]
+fn the_card_that_lists_uploads_lists_thread_tools_beside_it() {
+    let card = card_of(&def_of(&assistant()), &url())
+        .unwrap()
+        .with_extension(adam_a2a::ExtensionConfig::uploads());
+    let uris: Vec<&str> = card.extensions.iter().map(|e| e.uri.as_str()).collect();
+    assert!(
+        uris.contains(&adam_a2a::THREAD_TOOLS_EXTENSION),
+        "uploads/v1 alone is read as neither: {uris:?}"
+    );
+    assert!(uris.contains(&adam_a2a::UPLOADS_EXTENSION), "{uris:?}");
+}
+
 /// A folder with `commands/` lists them on the card (`commands/v1`, sorted) and the agent expands
 /// a message that names one, as `/name arguments`, before it is stored.
 #[tokio::test]
