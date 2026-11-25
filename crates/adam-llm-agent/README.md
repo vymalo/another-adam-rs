@@ -649,6 +649,13 @@ sending task's, so a round names the task that sent it), else `Conversation::roo
 reads it as `ToolCtx::model_run_id()`, and every child it starts and every session it opens or sends to is handed it,
 so the whole tree under a task or a round names one run; `root_run` (whose task hears a subagent's steps) is unchanged.
 Never a message's context, which a person can set.
+**The prompt statement** ([ADR 0077](../../docs/decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md)):
+`Conversation::prompt_statement` holds the statement and the person's envelope of the run (`PROMPT_STATEMENT_KEY`,
+`prompt_statement`, of its first message, which the A2A front writes for a request that activated `prompt-statement/v1`);
+a later message of the task that brings new ones replaces them, one that brings none keeps them, and a later task
+starts with none of them. Every model call, the summary call included, carries them in `ModelRequest::prompt_statement`
+(`InjectedRun` sends the headers), and a child and a session's round start with the values of the run that started
+them (`child_message`). Not in the context, so no tool reads them; their `Debug` holds no value.
 (`tests/root_run.rs` is the chain of three runs, every model call of which names the top, and the limits it hands down, the tier and who the message was sent for; `tests/child_runs.rs` starts children with a `Runtime` it holds, which works too; `tests/compaction.rs` checks the summary call names the run, a child's included (`a_childs_summary_call_names_the_top_run`), and `tests/sessions.rs` `every_round_names_the_root_that_opened_its_session` the rounds of a session (round one, a person's later round, a round a later task sends, which names that task, and a person's round after it) and a session a person opened, whose round names itself; `everything_under_a_persons_round_names_what_the_round_names` a subagent under a person's round; `tests/prefix.rs` checks each request names a run of its rig; `adam-a2a-runtime`'s `tests/model_run.rs` that a message's metadata and data parts cannot name the run.)
 
 ## Remote tasks

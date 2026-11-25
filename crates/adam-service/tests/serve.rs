@@ -1090,6 +1090,58 @@ async fn the_card_lists_locale_exactly_when_the_deployment_names_a_default_langu
     }
 }
 
+/// `MODEL_AUTH=injector` reaches the card through `serve`: the card lists `prompt-statement/v1`
+/// with no `params` when the model calls go through the injector, and nothing with a key (ADR 0077).
+#[tokio::test]
+async fn the_card_lists_prompt_statement_exactly_behind_the_injector() {
+    use a2a_client::agent_card::AgentCardResolver;
+    use adam_a2a::PROMPT_STATEMENT_EXTENSION;
+
+    let Some(url) = database() else { return };
+
+    for auth in [Some("injector"), Some("key"), None] {
+        let name = unique("serve-prompt");
+        let (listener, port) = listen().await;
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let more: Vec<(&str, String)> = auth
+            .map(|a| ("MODEL_AUTH", a.to_owned()))
+            .into_iter()
+            .collect();
+        let cfg = config_with(&url, "control-plane", port, &more);
+        let card = AgentCardConfig::new(
+            &name,
+            "A test agent.",
+            format!("http://{addr}/").parse().unwrap(),
+            "0.0.1",
+        );
+        let agents = agents(&name, &cfg);
+        let running = Running::start(listener, cfg, agents.card(card));
+        until_ok(addr, "/healthz", &running.handle).await;
+
+        let public = AgentCardResolver::new(None)
+            .resolve(&format!("http://{addr}"))
+            .await
+            .unwrap();
+        let entries: Vec<_> = public
+            .capabilities
+            .extensions
+            .iter()
+            .flatten()
+            .filter(|e| e.uri == PROMPT_STATEMENT_EXTENSION)
+            .collect();
+        if auth == Some("injector") {
+            assert_eq!(entries.len(), 1, "listed once");
+            assert!(
+                entries[0].params.as_ref().is_none_or(|p| p.is_empty()),
+                "no params"
+            );
+        } else {
+            assert!(entries.is_empty(), "{auth:?}: not listed");
+        }
+        running.finish().await;
+    }
+}
+
 /// The card lists `uploads/v1` with no `params`, whatever the folder or `UPLOADS_INLINE_MAX_BYTES`
 /// say about the inline threshold (the contract gives the entry none).
 #[tokio::test]

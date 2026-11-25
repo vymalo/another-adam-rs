@@ -248,6 +248,11 @@ pub struct ServiceConfig {
     /// [`DEFAULT_UPLOADS_INLINE_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES). The agent folder's
     /// `limits.max_inline_upload_bytes` wins over it ([`Agents::uploads_inline_max_bytes`](crate::Agents)).
     pub uploads_inline_max_bytes: Option<u64>,
+    /// `MODEL_AUTH=injector`, read by every role (the word only): the process's model calls carry a
+    /// message's prompt statement and the person's envelope, so the card lists
+    /// `prompt-statement/v1` (ADR 0077). `false` with a key or a device grant: such a card does not
+    /// list it, and no message is read for it.
+    pub prompt_statement: bool,
 }
 
 impl std::fmt::Debug for ServiceConfig {
@@ -268,6 +273,7 @@ impl std::fmt::Debug for ServiceConfig {
             .field("worker", &self.worker)
             .field("a2a", &self.a2a)
             .field("sessions", &self.sessions)
+            .field("prompt_statement", &self.prompt_statement)
             .finish()
     }
 }
@@ -386,6 +392,7 @@ impl ServiceConfig {
             sessions: SessionSettings::parse(lookup, problems),
             default_locale,
             uploads_inline_max_bytes,
+            prompt_statement: is_injector(lookup),
         }
     }
 }
@@ -1882,6 +1889,22 @@ mod tests {
             let mut vars = full();
             vars.insert("DEFAULT_LOCALE", bad);
             assert!(mentions(&problems_of(&vars), "DEFAULT_LOCALE"), "{bad:?}");
+        }
+    }
+
+    /// `prompt-statement/v1` is listed exactly when the model calls go through the injector, which
+    /// is the only provider that sends the headers (ADR 0077).
+    #[test]
+    fn the_prompt_statement_follows_model_auth_injector() {
+        assert!(!parse(&full()).expect("valid").prompt_statement);
+        for (auth, listed) in [("injector", true), ("Injector", true), ("key", false)] {
+            let mut vars = full();
+            vars.insert("MODEL_AUTH", auth);
+            assert_eq!(
+                parse(&vars).expect("valid").prompt_statement,
+                listed,
+                "{auth}"
+            );
         }
     }
 
