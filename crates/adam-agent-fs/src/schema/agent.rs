@@ -135,8 +135,8 @@ pub const MAX_WORKING_SESSIONS_LIMIT: u32 = 32;
 /// The smallest and largest `limits.max_session_rounds`.
 pub const MAX_SESSION_ROUNDS_LIMIT: (u32, u32) = (2, 200);
 
-/// The largest `limits.max_upload_bytes`: 4 GiB, the orchestrator's own ceiling.
-pub const MAX_UPLOAD_BYTES_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+/// The largest `limits.max_inline_upload_bytes`: 4 GiB, the orchestrator's own ceiling.
+pub const MAX_INLINE_UPLOAD_BYTES_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 
 /// The most `retry.<tool>.attempts` may say (ADR 0061, decision 6).
 pub const MAX_RETRY_ATTEMPTS: u32 = 20;
@@ -340,10 +340,13 @@ pub struct Limits {
     /// `SESSION_MAX_ROUNDS`.
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxSessionRounds")]
     pub max_session_rounds: Option<u32>,
-    /// The largest file the agent asks the orchestrator for an upload slot for (`uploads/v1`), in
-    /// bytes, 1 to 4 GiB. Root agent only; the card lists it and it wins over `UPLOADS_MAX_BYTES`.
-    #[serde(skip_serializing_if = "Option::is_none", alias = "maxUploadBytes")]
-    pub max_upload_bytes: Option<u64>,
+    /// The largest file the agent sends inline (`uploads/v1`; a larger one asks for a slot), in
+    /// bytes, 1 to 4 GiB. Root agent only; the card says nothing of it; it wins over `UPLOADS_INLINE_MAX_BYTES`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "maxInlineUploadBytes"
+    )]
+    pub max_inline_upload_bytes: Option<u64>,
     /// Keys this schema does not know.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,

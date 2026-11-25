@@ -1934,20 +1934,20 @@ check "... the error lists the tiers" says "$message" 'plan, edits, auto or bypa
 check "refused: the cap in extraEnv beside the value" \
   fails helm template coder "$chart" --namespace coder-ns --set accessTiers.max=edits --set-string config.extraEnv.MAX_ACCESS_TIER=bypass
 
-# uploads.maxBytes (UPLOADS_MAX_BYTES): nothing for the default, one variable per pod that serves A2A when set.
+# uploads.inlineMaxBytes (UPLOADS_INLINE_MAX_BYTES): nothing for the default, one variable per pod that serves A2A when set.
 helm template coder "$chart" --namespace coder-ns > "$out"
-check "the default renders no UPLOADS_MAX_BYTES (the binary's own default is 1 GiB)" lacks 'name: UPLOADS_MAX_BYTES'
-helm template coder "$chart" --namespace coder-ns --set uploads.maxBytes=1073741824 > "$out"
-check "uploads.maxBytes reaches the coder as UPLOADS_MAX_BYTES" count 'name: UPLOADS_MAX_BYTES' 1
+check "the default renders no UPLOADS_INLINE_MAX_BYTES (the binary's own default is 10 MiB)" lacks 'name: UPLOADS_INLINE_MAX_BYTES'
+helm template coder "$chart" --namespace coder-ns --set uploads.inlineMaxBytes=1073741824 > "$out"
+check "uploads.inlineMaxBytes reaches the coder as UPLOADS_INLINE_MAX_BYTES" count 'name: UPLOADS_INLINE_MAX_BYTES' 1
 check "... as plain digits, not a float" has 'value: "1073741824"'
-helm template coder "$chart" --namespace coder-ns --set topology=split --set-string uploads.maxBytes=2048 > "$out"
-check "with topology=split the front and the worker both get it" count 'name: UPLOADS_MAX_BYTES' 2
+helm template coder "$chart" --namespace coder-ns --set topology=split --set-string uploads.inlineMaxBytes=2048 > "$out"
+check "with topology=split the front and the worker both get it" count 'name: UPLOADS_INLINE_MAX_BYTES' 2
 for bad in 0 -5 ten 1.5 4294967297; do
-  check "refused: uploads.maxBytes $bad" \
-    fails helm template coder "$chart" --namespace coder-ns --set-string uploads.maxBytes=$bad
+  check "refused: uploads.inlineMaxBytes $bad" \
+    fails helm template coder "$chart" --namespace coder-ns --set-string uploads.inlineMaxBytes=$bad
 done
 check "refused: the limit in extraEnv beside the value" \
-  fails helm template coder "$chart" --namespace coder-ns --set uploads.maxBytes=2048 --set-string config.extraEnv.UPLOADS_MAX_BYTES=1
+  fails helm template coder "$chart" --namespace coder-ns --set uploads.inlineMaxBytes=2048 --set-string config.extraEnv.UPLOADS_INLINE_MAX_BYTES=1
 
 # The package cache (ADR 0040): one volume at /cache. Off by default and then invisible (the default render
 # equals the golden above); on, mounted by the pods that run toolchains and by nothing else.

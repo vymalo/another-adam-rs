@@ -166,11 +166,12 @@ accessTiers:
   # it only for a deployment whose GitHub credentials you are willing to see used that way.
   max: ""
 
-# The largest file the agent asks the orchestrator for an upload slot for (uploads/v1). Every role that serves A2A.
+# The largest file the agent sends inline (uploads/v1): a larger one asks the orchestrator for an upload slot.
+# Set it to the orchestrator's artifacts.maxFileBytes. Every role that serves A2A. The card carries no params.
 uploads:
-  # UPLOADS_MAX_BYTES: a whole number of bytes, 1 to 4294967296 (4 GiB). Empty (default): the binary's own
-  # 1 GiB, and nothing is rendered. The agent folder's `limits.max_upload_bytes` wins over it.
-  maxBytes: ""
+  # UPLOADS_INLINE_MAX_BYTES: a whole number of bytes, 1 to 4294967296 (4 GiB). Empty (default): the binary's own
+  # 10 MiB, and nothing is rendered. The agent folder's `limits.max_inline_upload_bytes` wins over it.
+  inlineMaxBytes: ""
 
 # How the coder authenticates to GitHub (ADR 0009). Roles that run workers only: a control
 # plane renders none of it.

@@ -11,10 +11,11 @@ mod skill;
 
 pub use agent::{
     AgentFrontmatter, Card, CardSkill, DEFAULT_RETRY_BACKOFF, DEFAULT_RETRY_MAX_BACKOFF,
-    ExtendedCard, Limits, MAX_MINUTES_LIMIT, MAX_OPEN_SESSIONS_LIMIT, MAX_PARALLEL_LIMIT,
-    MAX_PROCESSES_LIMIT, MAX_RETRY_ATTEMPTS, MAX_RETRY_BACKOFF, MAX_SESSION_ROUNDS_LIMIT,
-    MAX_UPLOAD_BYTES_LIMIT, MAX_WORKING_SESSIONS_LIMIT, ModelRef, RETRY_CLASS_NAMES, RetryDef,
-    SkillSelection, ToolList, ToolsLoading, is_retry_tool_name, retry_duration,
+    ExtendedCard, Limits, MAX_INLINE_UPLOAD_BYTES_LIMIT, MAX_MINUTES_LIMIT,
+    MAX_OPEN_SESSIONS_LIMIT, MAX_PARALLEL_LIMIT, MAX_PROCESSES_LIMIT, MAX_RETRY_ATTEMPTS,
+    MAX_RETRY_BACKOFF, MAX_SESSION_ROUNDS_LIMIT, MAX_WORKING_SESSIONS_LIMIT, ModelRef,
+    RETRY_CLASS_NAMES, RetryDef, SkillSelection, ToolList, ToolsLoading, is_retry_tool_name,
+    retry_duration,
 };
 pub use command::CommandFrontmatter;
 pub use mcp::{
