@@ -59,6 +59,7 @@ spec:
             {{- /* uploads.inlineMaxBytes: the largest upload the card lists (uploads/v1). Nothing is rendered for the default. */}}
             - name: UPLOADS_INLINE_MAX_BYTES
               value: {{ . | quote }}
+            {{- end }}
             {{- with (include "coder.sessionEnv" . | trim) }}
             {{- . | nindent 12 }}
             {{- end }}
