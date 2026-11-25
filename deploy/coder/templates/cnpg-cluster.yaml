@@ -9,6 +9,10 @@ metadata:
     {{- include "coder.labels" . | nindent 4 }}
 spec:
   instances: {{ .Values.database.instances }}
+{{- with .Values.database.resources }}
+  resources:
+    {{- toYaml . | nindent 4 }}
+{{- end }}
   storage:
     size: {{ .Values.database.storage.size | quote }}
     storageClass: {{ .Values.database.storage.storageClass | quote }}

@@ -112,7 +112,7 @@ in it that you would not give every holder of a token.
 
 With `A2A_CARD_SIGNING_KEY_FILE` the public and the extended card carry one JWS in `signatures` (RFC 7515 over the RFC 8785
 canonical card, *verified 2026-10-07*, specification §8.4): `alg` `ES256` (a P-256 key) or `EdDSA` (Ed25519), `typ: JOSE`,
-`kid` (the key's RFC 7638 thumbprint unless `A2A_CARD_SIGNING_KEY_ID`), `jku` only if `A2A_CARD_SIGNING_JKU`. The public key
+`kid` (the key's RFC 7638 thumbprint unless `A2A_CARD_SIGNING_KEY_ID`) (before this fix, binaries built with `serde_json/preserve_order` hashed the members in insertion order, so their default `kid` was not the RFC value and changes now; a client that pins the old default `kid` must pin the new one, or set `A2A_CARD_SIGNING_KEY_ID`; the signature itself is unaffected), `jku` only if `A2A_CARD_SIGNING_JKU`. The public key
 set is served at `GET /.well-known/jwks.json`. To verify: take the card as you received it (either JSON form parses to the
 same card), remove `signatures`, remove `null`s and empty arrays and objects except `capabilities`, `defaultInputModes`,
 `defaultOutputModes`, `skills`, `supportedInterfaces` and a skill's `tags`, remove an extension's `required: false`, leave
@@ -384,6 +384,28 @@ the two rules (`bin/adam-coder/agent/instructions.md`, "Language" and "Never wri
 `adam-agent` and the deployment's own tag are ADR 0069's slice 3, and the client's half is slice 4. Until a card lists
 it, no request can activate it, so no agent reads a hint and each follows the person's language — which the same rule
 says.
+
+## The prompt statement (`prompt-statement/v1`)
+
+An agent whose card lists `https://agents.vymalo.com/a2a/extensions/prompt-statement/v1` (no `params`) carries a
+message's prompt statement and the person's envelope to the gateway in front of the model
+([ADR 0077](../decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md)). The card lists
+it only with `MODEL_AUTH=injector`, the one provider that sends them.
+
+A request that **activates** it may carry `metadata[URI] = {"statement": "<JWS>", "user": "<JWS>"}` (`user` may be
+absent). Each must be a compact JWS of at most 8 KiB; anything else refuses the message with `InvalidParams`, which
+names the member and never its value. A request that did not activate it carries nothing.
+
+| Message | The run's values |
+|---|---|
+| the first, with values | set |
+| a later one of the task (a steer, an answer), with values | replaced |
+| a later one without values | kept |
+| a later task of the conversation | its own message's, none otherwise |
+
+Every model call of the run carries `Prompt-Statement` and, when there is an envelope, `Prompt-User-Signature`, byte
+for byte, beside `X-Run-Id`: the root's calls, a local subagent's (started with its parent's values) and a session
+round's. The values live in the run's state, not its context, and are in no log line.
 
 ## The reasoning effort (`reasoning/v1`)
 

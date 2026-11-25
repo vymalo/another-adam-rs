@@ -893,6 +893,11 @@ impl RuntimeTaskBackend {
         // A message that activated `locale/v1` names the interface language of this message, or
         // names none and takes an earlier one away; one that did not is read as it always was.
         vymalo::locale_into(caller, &message, &mut inbound);
+        // A message that activated `prompt-statement/v1` brings the statement and the person's
+        // envelope its run's model calls carry; a malformed entry is refused before anything is
+        // written (ADR 0077).
+        crate::prompt_statement::put(caller, &message, &mut inbound)
+            .map_err(BackendError::InvalidParams)?;
         // A client that activated `child-sessions/v1` shows the sessions of this run: the fact
         // rides the run's context so a session the model starts is one the person can answer
         // (ADR 0045 decision 9).

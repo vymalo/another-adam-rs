@@ -44,3 +44,5 @@ denies, a transient failure is retried once then continues, one that keeps faili
 its deadline is retryable, `after_tool` runs its plugins, and `message_received` runs its plugins and a
 refusal decides. The panic case was **seen red** with `catch_unwind` removed (the panic escaped into
 the test).
+
+`Audit<W: Write + Send>` (ADR 0050, slice H6b): a plugin that writes each observed event as one JSON line (the event the loop built, already bounded and scrubbed) to `W`, once per event key, so a replay adds nothing. Off unless a deployment registers it and an agent file names it in `plugins:` (H6a); a failing writer is a counted observer failure. Tests: `tests/audit.rs` (golden `tests/golden/audit_lines.json`, written with `UPDATE_GOLDEN=1`).

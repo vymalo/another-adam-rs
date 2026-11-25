@@ -586,6 +586,7 @@ impl OpenAiCompatible {
         streaming: bool,
         model: &str,
         run: Option<&str>,
+        prompt_statement: Option<&adam_model::PromptStatement>,
     ) -> Result<reqwest::Response, ModelError> {
         let body = Bytes::from(body);
         let mut attempt = 0;
@@ -595,6 +596,7 @@ impl OpenAiCompatible {
                 url: &self.url,
                 attempt,
                 run,
+                prompt_statement,
             };
             let credentials = self.credentials.headers(call).await?;
             let mut request = self
@@ -937,7 +939,13 @@ impl ModelClient for OpenAiCompatible {
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
         let body = wire::build_request(&req, false, self.options())?;
         let response = self
-            .send(body, false, &req.model, req.run.as_deref())
+            .send(
+                body,
+                false,
+                &req.model,
+                req.run.as_deref(),
+                req.prompt_statement.as_ref(),
+            )
             .await?;
         let bytes = read_body(response).await?;
         let parsed = wire::parse_completion(&bytes).map(|r| self.echoed(r, &req.model));
@@ -960,7 +968,13 @@ impl ModelClient for OpenAiCompatible {
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
         let body = wire::build_request(&req, true, self.options())?;
         let response = self
-            .send(body, true, &req.model, req.run.as_deref())
+            .send(
+                body,
+                true,
+                &req.model,
+                req.run.as_deref(),
+                req.prompt_statement.as_ref(),
+            )
             .await?;
         let this = self.clone();
         let model = req.model.clone();

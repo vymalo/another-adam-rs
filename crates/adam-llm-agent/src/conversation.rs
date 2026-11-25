@@ -57,6 +57,22 @@ pub(crate) fn parse_model_run(payload: &Value) -> Option<RunId> {
     serde_json::from_value(payload.get(MODEL_RUN_KEY)?.clone()).ok()
 }
 
+/// The key of an inbound payload that carries the prompt statement and the person's envelope
+/// (`prompt-statement/v1`, [ADR 0077]): `{"statement": "<JWS>", "user"?: "<JWS>"}`. The A2A front
+/// writes it from a message whose request activated the extension (and removes it otherwise), and
+/// [`ToolCtx::start_child`](crate::ToolCtx::start_child) and the session tools write the run's own
+/// into a child's or a round's first message. The run keeps it in
+/// [`Conversation::prompt_statement`], never in its context.
+///
+/// [ADR 0077]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md
+pub const PROMPT_STATEMENT_KEY: &str = "prompt_statement";
+
+/// The values named by [`PROMPT_STATEMENT_KEY`] in an inbound payload, when they are there and
+/// valid ([`PromptStatement`](adam_model::PromptStatement) checks them again).
+pub(crate) fn parse_prompt_statement(payload: &Value) -> Option<adam_model::PromptStatement> {
+    serde_json::from_value(payload.get(PROMPT_STATEMENT_KEY)?.clone()).ok()
+}
+
 /// The key of the payload of a child's first message that names the step of the **root** run the
 /// child's work is under: the root's call of a subagent tool (`tool:<call id>`), handed down to a
 /// child's own children. Written by [`ToolCtx::start_child`](crate::ToolCtx::start_child) only, like
@@ -774,6 +790,18 @@ pub struct Conversation {
     /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_run: Option<RunId>,
+    /// The prompt statement and the person's envelope every model call of this run carries
+    /// ([`ModelRequest::prompt_statement`](adam_model::ModelRequest::prompt_statement), [ADR 0077]):
+    /// set by the message the run starts with, **replaced** by a later message of the task that
+    /// brings new ones and **kept** by one that brings none. A child run and a session's round start
+    /// with their parent's. Not in [`context`](Self::context), so no tool reads it; its `Debug`
+    /// holds no value. Part of the durable state, so a restart or another worker sends the same; a
+    /// run that continues another (a later task) does not inherit it. Absent from state written
+    /// before it existed, and not written while it is `None`.
+    ///
+    /// [ADR 0077]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_statement: Option<adam_model::PromptStatement>,
     /// The step of the [`root_run`](Self::root_run) this child run works under: the root's call of a
     /// subagent tool (`tool:<call id>`), put in the child's first message by the tool that started it
     /// and handed down to the child's own children. The report of each of this run's model calls
