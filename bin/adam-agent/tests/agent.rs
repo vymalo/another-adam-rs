@@ -2511,7 +2511,7 @@ fn check_tool_golden(generated: &str) {
 /// not counted: it is the same "hi" in every measurement.
 #[tokio::test]
 async fn a_folder_agents_first_request_stays_under_the_lean_budget() {
-    const BASELINE_BYTES: usize = 17437; // measured 2026-11-21, `origin/main` at e62e00b
+    const BASELINE_BYTES: usize = 16806; // re-recorded 2026-11-25 after the assistant folder trim (ANR-596); was 17437 on 2026-11-21
     const GROWTH_ALLOWED: usize = 1024;
     const LEAN_BUDGET_TOKENS: usize = 5000;
 
