@@ -1546,7 +1546,7 @@ impl LlmAgentBuilder {
     }
 
     /// The most times the `run.ending` hooks may keep one run going (ADR 0050, decision 10; default
-    /// [`DEFAULT_RUN_CONTINUATIONS`], at most [`MAX_RUN_CONTINUATIONS`]). Past it the run ends and
+    /// `DEFAULT_RUN_CONTINUATIONS`, at most `MAX_RUN_CONTINUATIONS`). Past it the run ends and
     /// the step `end:<turn>` records `capped`; `0` never lets a hook keep a run going.
     #[must_use]
     pub fn max_run_continuations(mut self, max: u32) -> Self {
