@@ -100,6 +100,21 @@ pub struct HookedMessage<'a> {
     pub files: &'a [MessageFile],
 }
 
+/// The point where a model call is about to be made, inside the call's step (ADR 0050, slice H3).
+pub const MODEL_REQUEST: &str = "model.request";
+
+/// What a model call is, as a `model.request` hook sees it: only the sampling temperature, the
+/// bound on the answer's length and the call's metadata, each of which a plugin may rewrite in
+/// place. The system prompt, the history, the model, its endpoint and its key are not here.
+pub struct HookedModelRequest<'a> {
+    /// The sampling temperature; absent leaves the model's own.
+    pub temperature: &'a mut Option<f32>,
+    /// The upper bound on generated tokens; absent leaves the model's own.
+    pub max_output_tokens: &'a mut Option<u32>,
+    /// What is forwarded as request metadata where the backend supports it.
+    pub metadata: &'a mut std::collections::BTreeMap<String, String>,
+}
+
 /// What a deciding hook says about the call it runs at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -187,6 +202,13 @@ pub trait Plugin: Send + Sync {
     /// The run would end with an answer: allow it, or return [`Verdict::Deny`] with the reason the
     /// model is asked again with. Called once per such end, in the journaled step `end:<turn>`.
     fn run_ending(&self, _end: &HookedEnd<'_>) -> HookResult {
+        Ok(Verdict::Continue)
+    }
+
+    /// A model call is about to be made: rewrite its temperature, its bound on output tokens or its
+    /// metadata, or stop the run with [`Verdict::Stop`]. `Deny` and `Ask` are not verdicts of this
+    /// point, and the loop treats them as a hook failure.
+    fn model_request(&self, _request: &mut HookedModelRequest<'_>) -> HookResult {
         Ok(Verdict::Continue)
     }
 
@@ -327,6 +349,18 @@ impl HookSet {
         self.run("before_tool", |plugin| {
             guard(plugin.name(), self.limits.deadline, || {
                 plugin.before_tool(call)
+            })
+        })
+    }
+
+    /// Runs every plugin's `model_request` in order, until one decides.
+    ///
+    /// # Errors
+    /// As [`HookSet::before_tool`]. The caller does not make the call on an error.
+    pub fn model_request(&self, request: &mut HookedModelRequest<'_>) -> HookResult {
+        self.run(MODEL_REQUEST, |plugin| {
+            guard(plugin.name(), self.limits.deadline, || {
+                plugin.model_request(request)
             })
         })
     }

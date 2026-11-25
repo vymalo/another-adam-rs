@@ -14,7 +14,8 @@ use adam_model::{
     PromptStatement, ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_plugin::{
-    HookSet, HookedCall, HookedEnd, HookedMessage, HookedText, MessageFile, Plugin, Verdict,
+    HookSet, HookedCall, HookedEnd, HookedMessage, HookedModelRequest, HookedText, MessageFile,
+    Plugin, Verdict,
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
@@ -990,6 +991,22 @@ impl ModelFailure {
             Some("RateLimited") => adam_error::ErrorClass::RateLimited,
             Some("Conflict") => adam_error::ErrorClass::Conflict,
             _ => adam_error::ErrorClass::Transient,
+        }
+    }
+
+    /// A `model.request` hook ended the call before it was made: `retryable` for a hook failure
+    /// that is worth another try, else the run fails with the message.
+    fn by_hook(message: String, retryable: bool) -> Self {
+        Self {
+            retryable,
+            message,
+            retry_after_ms: None,
+            class: None,
+            context_length: false,
+            refused: false,
+            park: None,
+            unreachable: false,
+            locked: None,
         }
     }
 
@@ -2956,6 +2973,44 @@ impl LlmAgent {
                     Some(plan) => plan.tell(&mut request).await,
                     None => (Vec::new(), None),
                 };
+                // The `model.request` hooks (ADR 0050, slice H3) run here, inside the step, on the
+                // final request: a replay of a recorded turn asks none. They may rewrite only the
+                // temperature, the bound on output tokens and the metadata.
+                if !agent.hooks.is_empty() {
+                    let mut temperature = request.temperature;
+                    let mut max_output_tokens = request.max_output_tokens;
+                    let mut metadata = request.metadata.clone();
+                    let verdict = agent.hooks.model_request(&mut HookedModelRequest {
+                        temperature: &mut temperature,
+                        max_output_tokens: &mut max_output_tokens,
+                        metadata: &mut metadata,
+                    });
+                    match verdict {
+                        Ok(Verdict::Continue) => {
+                            request.temperature = temperature;
+                            request.max_output_tokens = max_output_tokens;
+                            request.metadata = metadata;
+                        }
+                        Ok(Verdict::Stop(reason)) => {
+                            return Err(ModelFailure::by_hook(
+                                format!("stopped by a plugin: {reason}"),
+                                false,
+                            ));
+                        }
+                        Ok(Verdict::Deny(_) | Verdict::Ask(_)) => {
+                            return Err(ModelFailure::by_hook(
+                                "a hook may only continue or stop at model.request".to_owned(),
+                                false,
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(ModelFailure::by_hook(
+                                format!("the hook `{}` failed: {}", error.plugin, error.reason),
+                                error.is_retryable(),
+                            ));
+                        }
+                    }
+                }
                 if !stream_text {
                     // The request races the run's cancellation: a cancel drops it, and with it the
                     // connection, instead of letting the provider finish an answer nobody will read.

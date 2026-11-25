@@ -99,7 +99,7 @@ fn binary() -> &'static Path {
 
 impl GitSandboxServer {
     /// Start a server whose socket and log are in `dir` and whose work volume is `root` (an
-    /// existing directory), and wait until it listens.
+    /// existing directory), and wait until it accepts a connection.
     ///
     /// # Panics
     ///
@@ -119,8 +119,13 @@ impl GitSandboxServer {
             .spawn()
             .expect("the server starts");
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !socket.exists() {
-            assert!(Instant::now() < deadline, "the server made no socket");
+        // The socket file appears at `bind`, before `listen`: only a connect that is accepted
+        // shows the server answers.
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "the sandbox did not listen within 20 s"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         Self { child, socket, log }

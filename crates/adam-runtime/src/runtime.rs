@@ -288,6 +288,8 @@ pub(crate) struct Config {
     pub concurrency: usize,
     pub lease_renewal: bool,
     pub session_idle_ttl: Duration,
+    /// How long a stopping worker waits for in-flight steps; `None` waits for ever.
+    pub drain_grace: Option<Duration>,
 }
 
 /// One entry of the registry: a full agent, or a start-only starter. Closed on
@@ -902,6 +904,16 @@ impl RuntimeBuilder {
         self
     }
 
+    /// How long a stopping worker waits for the steps in flight. Default: for ever.
+    ///
+    /// When the grace ends, the steps still running are aborted (nothing of them is committed)
+    /// and their leases are released, so each run is `Runnable` for the next claimer at once
+    /// instead of after the lease expires. A step that finishes inside the grace commits as usual.
+    pub fn drain_grace(mut self, grace: Duration) -> Self {
+        self.cfg.drain_grace = Some(grace);
+        self
+    }
+
     /// How often an idle worker polls for due runs. Default 250 ms.
     /// `deliver`/`start` on the same `Runtime` wake local workers at once, and
     /// with a [`notifier`](Self::notifier) so do those of other processes.
@@ -1021,6 +1033,7 @@ impl Runtime {
                 concurrency: 4,
                 lease_renewal: true,
                 session_idle_ttl: crate::DEFAULT_SESSION_IDLE_TTL,
+                drain_grace: None,
             },
         }
     }

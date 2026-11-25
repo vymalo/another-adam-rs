@@ -2809,6 +2809,67 @@ mod cases {
         assert_eq!(count(&calls), 1, "nobody took the run over");
     }
 
+    /// A worker told to stop while a step is slow gives up after its drain grace: the step is
+    /// aborted, its lease released, and a second worker finishes the run at once, with one
+    /// commit and no step done twice.
+    pub async fn drain_grace_releases_the_lease_of_a_slow_step(store: DynStore) {
+        let name = uniq("drain");
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let (invocations, started) = (invocations.clone(), started.clone());
+                move |_ctx, state| {
+                    let (invocations, started) = (invocations.clone(), started.clone());
+                    async move {
+                        if invocations.fetch_add(1, SeqCst) == 0 {
+                            started.notify_one();
+                            tokio::time::sleep(Duration::from_secs(3600)).await;
+                        }
+                        Ok(Transition::Done {
+                            state,
+                            output: json!("finished"),
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let a = builder(&store, "drain-a", &agent)
+            .drain_grace(Duration::from_millis(300))
+            .build();
+        let b = builder(&store, "drain-b", &agent).build();
+        let run = a.start(&name, inbound(), None).await.expect("start");
+        let wa = spawn_worker(&a);
+        notified(&started, "the slow step").await;
+
+        let stopping = std::time::Instant::now();
+        wa.stop().await;
+        assert!(
+            stopping.elapsed() < Duration::from_secs(5),
+            "the worker stops within its grace"
+        );
+        let mid = b.view(run).await.expect("view").expect("run");
+        assert!(
+            mid.output.is_none(),
+            "nothing was committed by the aborted step"
+        );
+
+        // The lease was released, not left to expire (it is 10 s here).
+        let wb = spawn_worker(&b);
+        let done = tokio::time::timeout(Duration::from_secs(5), wait_done(&b, run))
+            .await
+            .expect("the second worker takes the run over at once");
+        assert_eq!(done.output, Some(json!("finished")));
+        assert_eq!(
+            count(&invocations),
+            2,
+            "the aborted step ran once more, committed once"
+        );
+        wb.stop().await;
+    }
+
     /// Without renewal a second worker takes over, and the stale commit of the
     /// first is rejected by the version CAS.
     ///
@@ -8619,6 +8680,7 @@ macro_rules! runtime_suite {
                 cancel_running_drops_the_workers_commit,
                 lease_renewal_keeps_the_lease,
                 stale_commit_is_rejected_without_renewal,
+                drain_grace_releases_the_lease_of_a_slow_step,
                 graceful_shutdown,
                 conversation_delivers_to_the_open_run,
                 start_with_id_is_idempotent,

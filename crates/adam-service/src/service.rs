@@ -41,6 +41,9 @@ pub struct RuntimeOptions {
     /// [`serve`]: crate::serve
     /// [`ServiceConfig::sessions`]: crate::ServiceConfig::sessions
     pub session_idle_ttl: Duration,
+    /// How long a stopping worker waits for steps in flight before it aborts them and releases
+    /// their leases ([`adam_runtime::RuntimeBuilder::drain_grace`]); `None` waits for ever.
+    pub drain_grace: Option<Duration>,
 }
 
 impl Default for RuntimeOptions {
@@ -54,6 +57,7 @@ impl Default for RuntimeOptions {
             cancel_poll_interval: Duration::from_secs(1),
             view_poll_interval: Duration::from_secs(2),
             session_idle_ttl: adam_runtime::DEFAULT_SESSION_IDLE_TTL,
+            drain_grace: None,
         }
     }
 }
@@ -149,6 +153,9 @@ impl Service {
             .session_idle_ttl(options.session_idle_ttl);
         if let Some(id) = &options.worker_id {
             builder = builder.worker_id(id.clone());
+        }
+        if let Some(grace) = options.drain_grace {
+            builder = builder.drain_grace(grace);
         }
         if let Some(notifier) = notifier {
             builder = builder.notifier(notifier);
