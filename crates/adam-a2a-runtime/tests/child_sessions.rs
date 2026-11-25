@@ -18,8 +18,8 @@ use adam_a2a::{
     ACCESS_TIER_EXTENSION, AccessTier, AccessTiers, BackendError, CHILD_SESSIONS_EXTENSION, Caller,
     STEER_EXTENSION, TaskBackend, TaskQuery,
 };
-use adam_a2a_runtime::{ChildSessionAgent, ChildSessions, RuntimeTaskBackend};
-use adam_core::{DynStore, MemoryStore, RunId};
+use adam_a2a_runtime::{ChildSessionAgent, ChildSessions, MAX_WORKSPACE_SCAN, RuntimeTaskBackend};
+use adam_core::{DynStore, MemoryStore, NewRun, RunId, RunStatus, Timestamp};
 use adam_llm_agent::{LlmAgent, SessionAgent, SessionTools, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::{
     DynModel, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse, ToolCall,
@@ -33,6 +33,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::sync::{Notify, oneshot};
+use uuid::Uuid;
 
 async fn stores() -> Vec<DynStore> {
     let mut all: Vec<DynStore> = vec![Arc::new(MemoryStore::new())];
@@ -131,6 +132,9 @@ struct Rig {
     helper_mock: Arc<MockModel>,
     hidden_mock: Arc<MockModel>,
     hidden: String,
+    /// The agent name the backend serves (`RuntimeTaskBackend::new`'s third argument), as the
+    /// runner registers it.
+    parent: String,
     gate: Arc<Gate>,
     /// Holds the parent's model, when `hold_parent_on` says.
     parent_gate: Arc<Gate>,
@@ -254,7 +258,7 @@ impl Rig {
             Some(limits) => sessions.with_limits(limits),
             None => sessions,
         };
-        let mut backend = RuntimeTaskBackend::new(runtime.clone(), events, parent)
+        let mut backend = RuntimeTaskBackend::new(runtime.clone(), events, parent.clone())
             .with_poll_interval(options.view_poll)
             .with_child_sessions(sessions);
         if options.tiers {
@@ -279,6 +283,7 @@ impl Rig {
             helper_mock,
             hidden_mock,
             hidden,
+            parent,
             gate,
             parent_gate,
             helper,
@@ -350,6 +355,55 @@ fn said(text: &str, context: Option<&str>) -> Message {
     let mut message = Message::new(Role::User, vec![Part::text(text)]);
     message.context_id = context.map(str::to_owned);
     message
+}
+
+/// The instant the store wrote as `created_at` of `run`.
+async fn created_at(store: &DynStore, run: RunId) -> Timestamp {
+    store
+        .load_run(run)
+        .await
+        .expect("store")
+        .expect("the run")
+        .created_at
+}
+
+/// The instant the store wrote as `updated_at` of `run`.
+async fn updated_at(store: &DynStore, run: RunId) -> Timestamp {
+    store
+        .load_run(run)
+        .await
+        .expect("store")
+        .expect("the run")
+        .updated_at
+}
+
+/// Wait until the store's clock is strictly past `at`, so a run created next is strictly later
+/// than `at` by both stamps. The stores keep milliseconds, so two runs made back to back can share
+/// one; a test that means "created later" says so by waiting for the clock rather than by timing.
+async fn clock_past(at: Timestamp) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Timestamp::now() <= at {
+        assert!(
+            Instant::now() < deadline,
+            "the clock did not move past {at:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// A child run of `root`, in the same conversation and registered under the **same agent name** as
+/// the root: the case ADR 0045 slice 7 names, an agent registered under its root's name, whose run
+/// a listing of the context's tasks must skip. `done` so no worker claims it.
+async fn child_run(store: &DynStore, agent: &str, conversation: &str, root: RunId) -> RunId {
+    let run = NewRun::new(agent, json!({ "kind": "child" }))
+        .conversation(conversation)
+        .parent(root)
+        .status(RunStatus::Done);
+    store
+        .create_run(run)
+        .await
+        .expect("create the child run")
+        .id
 }
 
 fn alice() -> Caller {
@@ -439,12 +493,17 @@ async fn a_person_starts_a_session_and_it_is_the_round_of_a_new_child_context() 
     }
 }
 
-/// ADR 0045 slice 7: a session a person starts reads the workspace of the **latest task of the
-/// context it was opened in** — the repository the person is looking at — and every later round of
-/// it reads the same one, though the round itself has no task of its own. A context nobody has sent
-/// a task to has none: the session answers in words, and that is not an error.
+/// ADR 0045 slice 7: a session a person starts reads the workspace of the **most recently created
+/// task of the context it was opened in** — the repository the person is looking at — and every
+/// later round of it reads the same one, though the round itself has no task of its own. A context
+/// nobody has sent a task to has none: the session answers in words, and that is not an error.
+///
+/// Created, not written: the store lists a context's runs by `updated_at` descending
+/// ([`RunQuery`](adam_core::RunQuery)), and `updated_at` moves whenever a run progresses. The older
+/// task of a context is written after the newer one was created here, on purpose, so the task the
+/// person is *in* is the second by `created_at` and the first by `updated_at`.
 #[tokio::test]
-async fn a_persons_session_reads_the_workspace_of_the_latest_task_of_its_context() {
+async fn a_persons_session_reads_the_workspace_of_the_most_recently_created_task_of_its_context() {
     for store in stores().await {
         let rig = Rig::new(&store);
         rig.helper_mock
@@ -452,7 +511,7 @@ async fn a_persons_session_reads_the_workspace_of_the_latest_task_of_its_context
             .push_text("one")
             .push_text("two");
 
-        // A context nobody has sent a task to: no workspace, and the round still runs.
+        // A context nobody has sent a task to: no workspace, and the round answers in words.
         let lonely = rig.start(&alice(), Some("ctx-empty"), "look", true).await;
         let (_, session) = parse_session_conversation_id(&lonely.context_id).unwrap();
         assert_eq!(
@@ -460,31 +519,63 @@ async fn a_persons_session_reads_the_workspace_of_the_latest_task_of_its_context
             None,
             "no task in the context, so no workspace"
         );
-        rig.until(&alice(), &lonely.id, TaskState::Completed).await;
+        let answered = rig.until(&alice(), &lonely.id, TaskState::Completed).await;
+        assert_eq!(
+            answered
+                .status
+                .message
+                .as_ref()
+                .and_then(|m| m.parts.first())
+                .and_then(a2a::Part::as_text)
+                .unwrap_or_default(),
+            "lonely",
+            "a context with no task is answered in words, not refused"
+        );
 
-        // Two tasks in one context: the later one is the task the person is looking at.
-        rig.parent_mock.push_text("first").push_text("second");
+        // Two tasks in one context: the second by `created_at` is the task the person is in.
+        rig.parent_mock
+            .push_text("first")
+            .push_text("second")
+            .push_text("carry on");
         let first = rig
             .submit(&alice(), said("start", Some("ctx-ws")), None)
             .await
             .unwrap();
         rig.until(&alice(), &first.id, TaskState::Completed).await;
-        let latest = rig
+        let first_run = RunId::from(Uuid::parse_str(&first.id).expect("a task id is a run id"));
+        // Strictly later by the store's clock, so the two tasks cannot share a `created_at` millisecond.
+        clock_past(created_at(&store, first_run).await).await;
+        let newer = rig
             .submit(&alice(), said("again", Some("ctx-ws")), None)
             .await
             .unwrap();
-        assert_ne!(first.id, latest.id);
+        assert_ne!(first.id, newer.id);
+        let newer_run = RunId::from(Uuid::parse_str(&newer.id).expect("a task id is a run id"));
+        rig.until(&alice(), &newer.id, TaskState::Completed).await;
 
-        // A person starts a session there: its round names the latest task as its workspace.
+        // The older task is written again **after** the newer one was created — a follow-up, as a
+        // person sending a message to it — so it is now the most recently *updated* task of the
+        // context, and the newer task is still the one the person opened the session in.
+        let mut again = said("carry on", Some("ctx-ws"));
+        again.message_id = "m-first-again".into();
+        let carried = rig.submit(&alice(), again, Some(&first.id)).await.unwrap();
+        assert_eq!(carried.id, first.id, "a follow-up continues the task");
+        assert!(
+            updated_at(&store, first_run).await > created_at(&store, newer_run).await,
+            "the older task was updated after the newer one was created"
+        );
+
+        // A person starts a session there: its round names the most recently created task.
         let start = rig
             .start(&alice(), Some("ctx-ws"), "where is it?", true)
             .await;
         let (_, session) = parse_session_conversation_id(&start.context_id).unwrap();
         let header = rig.round_header(session).await;
         assert_eq!(
-            header.workspace.map(|run| run.to_string()).as_deref(),
-            Some(latest.id.as_str()),
-            "the workspace of the latest task of the context"
+            header.workspace,
+            Some(newer_run),
+            "the workspace of the most recently created task of the context, \
+             though the older task was written more recently"
         );
         assert_eq!(
             header.root, None,
@@ -499,11 +590,142 @@ async fn a_persons_session_reads_the_workspace_of_the_latest_task_of_its_context
         assert_ne!(round.id, start.id, "a new round");
         let header = rig.round_header(session).await;
         assert_eq!(
-            header.workspace.map(|run| run.to_string()).as_deref(),
-            Some(latest.id.as_str()),
+            header.workspace,
+            Some(newer_run),
             "round 2 reads the workspace round 1 read"
         );
         assert_eq!(header.round, 2);
+        rig.stop().await;
+    }
+}
+
+/// The same slice, for the window the front used to trust: a context's **newest runs are not
+/// always its tasks**. A subagent's child run registered under the root agent's own name lands in
+/// the same conversation (ADR 0045 slice 7), and a context can hold more of them than any one
+/// window: the root task must still be found behind them.
+///
+/// This is what a fixed `limit: 4` hid: four child runs newer than the only task filled the page,
+/// no root was in it, and a person's `explorer` silently answered in words with the repository
+/// right there. `CHILDREN` is past one scan page too, so the answer cannot come from one query.
+#[tokio::test]
+async fn a_context_whose_newest_runs_are_children_still_names_its_root_task() {
+    /// More than the old window (4) and more than one scan page (64).
+    const CHILDREN: usize = 96;
+    for store in stores().await {
+        let rig = Rig::new(&store);
+        rig.helper_mock.push_text("here");
+        rig.parent_mock.push_text("root");
+        let root = rig
+            .submit(&alice(), said("work", Some("ctx-children")), None)
+            .await
+            .unwrap();
+        rig.until(&alice(), &root.id, TaskState::Completed).await;
+        let root_run = RunId::from(Uuid::parse_str(&root.id).expect("a task id is a run id"));
+        let rec = store
+            .load_run(root_run)
+            .await
+            .expect("store")
+            .expect("the root task");
+        let conversation = rec.conversation_id.expect("a task has a conversation");
+        // The children are the newest runs of the context, strictly after the root's last write.
+        clock_past(rec.updated_at).await;
+        for _ in 0..CHILDREN {
+            child_run(&store, &rig.parent, &conversation, root_run).await;
+        }
+        assert_eq!(
+            store
+                .list_runs(&adam_core::RunQuery::new(
+                    rig.parent.clone(),
+                    adam_core::ConversationScope::Exact(conversation.clone()),
+                    1,
+                ))
+                .await
+                .expect("store")
+                .first()
+                .map(|run| run.parent_id.is_some()),
+            Some(true),
+            "the newest run of the context is a child, not the task"
+        );
+
+        // A person starts a session there: the root task is still the workspace.
+        let start = rig
+            .start(&alice(), Some("ctx-children"), "where is it?", true)
+            .await;
+        let (_, session) = parse_session_conversation_id(&start.context_id).unwrap();
+        assert_eq!(
+            rig.round_header(session).await.workspace,
+            Some(root_run),
+            "the only task of the context, {CHILDREN} child runs behind it"
+        );
+        rig.stop().await;
+    }
+}
+
+/// The scan is **bounded**, and the bound is documented behaviour rather than a silent `None`
+/// ([`MAX_WORKSPACE_SCAN`]): a context with at most that many runs of the agent still names its
+/// task, and one run past the bound does not — the session's rounds answer in words, as they do in
+/// a context nobody sent a task to.
+#[tokio::test]
+async fn a_context_longer_than_the_scan_bound_answers_none_and_says_so_in_words() {
+    for store in stores().await {
+        let rig = Rig::new(&store);
+        rig.helper_mock
+            .push_text("bounded")
+            .push_text("still bounded");
+        rig.parent_mock.push_text("root");
+        let root = rig
+            .submit(&alice(), said("work", Some("ctx-long")), None)
+            .await
+            .unwrap();
+        rig.until(&alice(), &root.id, TaskState::Completed).await;
+        let root_run = RunId::from(Uuid::parse_str(&root.id).expect("a task id is a run id"));
+        let rec = store
+            .load_run(root_run)
+            .await
+            .expect("store")
+            .expect("the root task");
+        let conversation = rec.conversation_id.expect("a task has a conversation");
+        clock_past(rec.updated_at).await;
+
+        // `MAX_WORKSPACE_SCAN - 1` children and the root is the last of exactly the bound's runs.
+        for _ in 0..MAX_WORKSPACE_SCAN - 1 {
+            child_run(&store, &rig.parent, &conversation, root_run).await;
+        }
+        let inside = rig
+            .start(&alice(), Some("ctx-long"), "where is it?", true)
+            .await;
+        let (_, session) = parse_session_conversation_id(&inside.context_id).unwrap();
+        assert_eq!(
+            rig.round_header(session).await.workspace,
+            Some(root_run),
+            "the root task is the last run of the bound, and is found"
+        );
+        rig.until(&alice(), &inside.id, TaskState::Completed).await;
+
+        // One child more puts the root past the bound: the answer is `None`, not an error, and the
+        // round still runs and answers in words.
+        child_run(&store, &rig.parent, &conversation, root_run).await;
+        let past = rig
+            .start(&alice(), Some("ctx-long"), "and where is it?", true)
+            .await;
+        let (_, session) = parse_session_conversation_id(&past.context_id).unwrap();
+        assert_eq!(
+            rig.round_header(session).await.workspace,
+            None,
+            "past {MAX_WORKSPACE_SCAN} runs the scan stops, as documented"
+        );
+        let answered = rig.until(&alice(), &past.id, TaskState::Completed).await;
+        assert_eq!(
+            answered
+                .status
+                .message
+                .as_ref()
+                .and_then(|m| m.parts.first())
+                .and_then(a2a::Part::as_text)
+                .unwrap_or_default(),
+            "still bounded",
+            "past the bound a person's session answers in words"
+        );
         rig.stop().await;
     }
 }
