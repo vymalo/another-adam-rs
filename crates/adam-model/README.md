@@ -33,7 +33,7 @@ the provider asked to wait, and the runtime owns backoff.
 | `InjectedRun`, `RUN_HEADER` | `MODEL_AUTH=injector` ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)): no key, exactly one header, `X-Run-Id: <run>`, and no `Authorization`, for an injector in front of the model that adds the run's credential. A call with no run (or an empty one) is refused with `InvalidRequest` ("a model call through the injector names no run"), so nothing is sent. It gives up on a rejection |
 | `PromptStatement`, `NotAPromptStatement`, `NoPromptId`, `PROMPT_STATEMENT_HEADER`, `PROMPT_USER_SIGNATURE_HEADER`, `MAX_PROMPT_JWS_BYTES` | `prompt-statement/v1` ([ADR 0077](../../docs/decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md)): the prompt statement and the person's envelope of a run, each a compact JWS of at most 8 KiB (checked, never verified), kept as they came; `new(statement, user)`, `envelope(user)` for a device's envelope alone, `from_parts`; **`statement()` is an `Option` since the device path (ADR 0077 amended 2026-11-25)**; `prompt_jti()` reads the statement's `jti`, or the envelope's `nonce` without a statement (the one thing read, for the request signature). `Debug` holds no value and an error names the member, never its content. `ModelRequest::prompt_statement` (not serialized, never journaled) and `CredentialRequest::prompt_statement` carry it to the provider; `InjectedRun` and `SignedRequests` send `Prompt-Statement` and `Prompt-User-Signature` (each when its value is there), byte for byte, beside `X-Run-Id`; no other provider sends them |
 | `SignedRequests`, `TURN_SIGNATURE_HEADER`, `request_target` | every model request signed ([ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md), *Amended 2026-11-25 (the request signature)*): `SignedRequests::new(inner, turn_keys)` wraps any provider and adds to every call `X-Run-Id`, the prompt headers and `Turn-Signature`, adam's attached JWS (`adam-request/v1`) over the run, the method, the request target, the SHA-256 of the exact body, the prompt's id (`null` without one), `iat` and a nonce, signed anew for each attempt (`adam_core::turn::sign_request`). A call it cannot sign is not sent: `InvalidRequest` (no run, no target, an unreadable prompt id), `Transient` (keys unreachable), `Auth` (keys refuse). It forwards `rejected` and `parks`. `request_target(url)` is the path and query an HTTP client sends. Depends on `adam-core` for the keys |
-| `Refusal`, `ProblemType`, `Park`, `FIRST_PARK`, `MAX_PARK`, `MODEL_LOCKED_SLUG` | what a client asks `parks` about: `Refusal { status, problem, retry_after }` (no body, no header; `#[non_exhaustive]`, built with `Refusal::new(status)`, `.with_slug(..)`, `.with_problem(..)`, `.with_retry_after(..)`, read with `.slug()`), whose `problem` is `ProblemType::Absent` (no problem document, no `type`, `about:blank`), `Slug(word)` or `Unreadable` (a `type` that is there and is no word); the answer, `Park::No`, `OnTimer(Duration)` or `UntilWoken` (closed on purpose); `FIRST_PARK` is 30 s, the first step of the agent's backoff, and `MAX_PARK` 24 h, the longest timer whatever `Retry-After` says; `MODEL_LOCKED_SLUG` is `model_locked` (see *Refusals*) |
+| `Refusal`, `ProblemType`, `Park`, `FIRST_PARK`, `MAX_PARK`, `MODEL_LOCKED_SLUG` | what a client asks `parks` about: `Refusal { status, problem, retry_after }` (no body, no header; `#[non_exhaustive]`, built with `Refusal::new(status)`, `.with_slug(..)`, `.with_problem(..)`, `.with_retry_after(..)`, read with `.slug()`), whose `problem` is `ProblemType::Absent` (no problem document, no `type`, `about:blank`), `Slug(word)` or `Unreadable` (a `type` that is there and is no word); the answer, `Park::No`, `OnTimer(Duration)` or `UntilWoken` (closed on purpose); `FIRST_PARK` is 30 s, the first step of the agent's backoff, and `MAX_PARK` 24 h, the longest timer whatever `Retry-After` says; `MODEL_LOCKED_SLUG` is `model_locked` and `OVER_LIMIT_SLUG` is `over_limit`, the slug a `402` reads as (see *Refusals*) |
 | `RenewingCredentials` | a test double: `token-1`, `token-2`, ... moved on by each rejection, which it asks to retry; `issued()`, `rejections()` |
 | `MockModel`, `RecordedCall` | scripted `ModelClient` that records requests; always compiled, no feature flag; `.with_provider(label)` and `.with_context_window(alias, n)` say what a real client would |
 
@@ -201,18 +201,21 @@ or `PartialEq`: match on the variant or the class.
 decision 3. A client that gets an answer of status 400 or above builds a `Refusal` and asks its provider
 `parks(&refusal)`. `Park::No` keeps the error the call always had (`StaticBearer`, the device grant and
 `RenewingCredentials` answer it, so a wrong key fails as before); any other answer is `Refused { .., park }`.
-The slug `model_locked` is `ModelLocked` for every provider. Nothing parks a run yet: callers fail the new
-errors as any other of their class (the LLM agent's park is the next slice).
+The slug `model_locked` on a status other than `402` is `ModelLocked` for every provider. A `402` is `Refused`
+with the slug `over_limit` whatever the gateway's problem document called it, so the person reads one event: the run
+tries another model once and parks until it is woken when none is left (ADR 0067 decision 3, amended
+2026-11-25). Nothing parks a run in this crate: the LLM agent's park is its own slice.
 
-`InjectedRun` answers by the slug, whatever the status:
+`InjectedRun` answers by the slug, whatever the status, and a `402` says the person's usage limit is
+reached whatever the slug:
 
-| Slug | Park |
+| Answer | Park |
 |---|---|
 | `unauthenticated`, `run_not_bound`, `lease_expired` | `OnTimer(FIRST_PARK)` |
-| `over_limit` | `UntilWoken` |
+| any `402` (`over_limit`, `model_locked`, or no problem document) | `UntilWoken` |
 | `rate_limited`, `unavailable` | `OnTimer` of `Retry-After`, clamped to `FIRST_PARK ..= MAX_PARK` |
 | none (`ProblemType::Absent`), on a `401` or `403` | `OnTimer(FIRST_PARK)`, as `unauthenticated` (*unverified* that an edge's denial has no problem body) |
-| `model_locked`, another slug, a `type` that cannot be read (`ProblemType::Unreadable`), none on another status | `No` |
+| `model_locked` on another status, another slug, a `type` that cannot be read (`ProblemType::Unreadable`), none on another status | `No` |
 
 ## Features and environment
 

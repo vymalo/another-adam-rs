@@ -238,7 +238,8 @@ Failures map onto `adam_model::ModelError`, which is classified (see
 |---|---|---|
 | HTTP 429 (`Retry-After` kept) | `RateLimited` | `RateLimited` |
 | a refusal the provider parks (below) | `Refused { status, slug, retry_after, park }` | by its status |
-| a refusal whose problem type is `model_locked`, for every provider | `ModelLocked { model }` | `Rejected` |
+| a `402` the provider parks, whatever its problem type (`over_limit`, `model_locked`, none) | `Refused` with the slug `over_limit` | `Rejected` |
+| a refusal whose problem type is `model_locked` on another status, for every provider | `ModelLocked { model }` | `Rejected` |
 | a connection that could not be made (`reqwest::Error::is_connect`, not a timeout, not a TLS failure) | `Unreachable` | `Transient` |
 | HTTP 408, 5xx; timeout; a failed TLS handshake; transport error; a stream or body that ended before the model said why it stopped | `Transient` | `Transient` |
 | HTTP 401, 403 | `Auth` | `Unauthenticated` |
@@ -258,9 +259,11 @@ longest wait, not none) and the problem type, read only from an `application/pro
 case). It is `Absent` for no body, no `type` member or `about:blank`; a `Slug` when the `type`'s last path segment, or
 the member as is when it holds no `/`, is a word of at most 64 letters, digits, `_`, `-` and `.`; and `Unreadable` for
 any other `type` (a `urn:`, a query, a fragment, a trailing `/`, not a string) or a body that is not a JSON object,
-which `InjectedRun` never parks on. The slug `model_locked` is `ModelLocked`; otherwise the provider is asked `parks`: `No`
-keeps the table's error exactly (a key of one's own fails as before), any other answer is `Refused`, which holds no body
-and no header. `InjectedRun`'s answers are in [`adam-model`](../adam-model/README.md#refusals). A gateway refuses before a
+which `InjectedRun` never parks on. The provider is asked `parks`: `No` keeps the table's error exactly (a key of
+one's own fails as before); any other answer is `Refused`, which holds no body and no header. A `402` the provider
+parks is `Refused` with the slug `over_limit` whatever the problem document called it — the person's usage limit is
+reached, and the run tries another model before it parks (ADR 0067 decision 3, amended 2026-11-25). The slug
+`model_locked` on another status is `ModelLocked`, for every provider. `InjectedRun`'s answers are in [`adam-model`](../adam-model/README.md#refusals). A gateway refuses before a
 response streams, so an error object inside a stream is never a refusal.
 
 An error object inside a `200` or a stream is `RateLimited` for a
@@ -349,8 +352,9 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
   and is kept as said, and an HTTP date two minutes ahead parks for about two minutes; a problem `type` that cannot be
   read (`urn:`, a query, a fragment, a trailing `/`, 65 characters) parks nothing on a 401, 403 or 402, while no `type`
   or `about:blank` on a 403 parks as `unauthenticated`; a 401 or a 403 with no body, a plain body, a JSON body that is no problem
-  document or only a `Retry-After` parks for 30 s; `model_locked` is `ModelLocked` under the injector and a fixed key; an
-  unknown slug, a slugless 500 and a 402 whose `type` is in plain JSON are today's errors; under `StaticBearer` every answer
+  document or only a `Retry-After` parks for 30 s; a `402` is `over_limit` under the injector whatever its problem document
+  calls it (`over_limit`, `model_locked`, or none at all), and `model_locked` at another status is `ModelLocked` under the
+  injector and a fixed key; an unknown slug and a slugless 500 are today's errors; under `StaticBearer` every answer
   is today's error, against `Display` goldens of what `errors::from_http` gave at `9f40a3b`; no `Refused` nor `ModelLocked` holds the body's
   words or a secret in its `Display`, `Debug` or source chain; an error object inside a stream is not a refusal; a port with
   nothing listening is `Unreachable` (class `Transient`) for a completion and a stream, and a timeout is `Transient`, not

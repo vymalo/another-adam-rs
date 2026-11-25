@@ -1505,10 +1505,12 @@ impl LlmAgentBuilder {
     }
 
     /// The model the run continues on, once, when a model call of it is refused with
-    /// [`ModelError::ModelLocked`] (ADR 0064, amended 2026-11-23): an agent folder's `model_fallback`,
+    /// [`ModelError::ModelLocked`] or over the person's limit ([`ModelError::Refused`] of status
+    /// `402`, ADR 0064 amended 2026-11-23 and 2026-11-25): an agent folder's `model_fallback`,
     /// resolved by the assembly with its profile. The run says so as a step, reports the calls after
     /// it under this alias, and never switches back; a second `ModelLocked` fails the run naming
-    /// both models. Without one, a locked model fails the run as before.
+    /// both models, and a second `402` parks it as over limit. Without one, a locked model fails the
+    /// run as before, and a 402 parks it.
     #[must_use]
     pub fn model_fallback(mut self, fallback: ModelBinding) -> Self {
         self.fallback = Some(fallback);
@@ -1846,7 +1848,9 @@ impl LlmAgentBuilder {
 /// * A refusal whose provider parks the run (`ModelError::Refused`), and, with
 ///   [`ModelParking::when_unreachable`], an endpoint that cannot be reached once the step's retries
 ///   are spent: the run parks on the model (below), and fails only past [`ModelParking::limit`], or
-///   on a park until woken in a run nobody can wake (a schedule's firing).
+///   on a park until woken in a run nobody can wake (a schedule's firing). A refusal of status
+///   `402` (the person's usage limit reached) first tries the fallback once, as a locked model
+///   does, and parks only when no model is left.
 /// * Other model error, `ModelError::ModelLocked` (naming the model) among them: the run fails
 ///   (`model call failed: ...`). So does a refusal under a provider that does not park
 ///   (`StaticBearer`'s `401` is `ModelError::Auth`).
@@ -2415,9 +2419,36 @@ impl LlmAgent {
         }
     }
 
+    /// A 402, the person's usage limit reached for the model the call named, takes the switch of a
+    /// `model_locked` refusal once (ADR 0064, amended 2026-11-25): the run asks another model, and
+    /// parks as over limit only when none is left. `None` when the failure is no 402, or when the
+    /// switch is spent, so the caller parks it as it always has.
+    async fn switched_on_limit(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        failure: &ModelFailure,
+    ) -> Result<Option<Flow>, AgentError> {
+        if !failure.park.as_ref().is_some_and(|p| p.status == 402) {
+            return Ok(None);
+        }
+        let from = self.live_model(state).alias.to_owned();
+        match self
+            .switched_on_lock(ctx, state, &from, &failure.message)
+            .await
+        {
+            Flow::Next => {
+                state.model_wait = None;
+                Ok(Some(Flow::Next))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// What a model call the endpoint refused as locked does (ADR 0064, amended 2026-11-23): the
     /// first time, with a fallback, the run switches to it, says so as a step, and asks the turn
-    /// again; a lock on the fallback, or with no fallback, fails the run.
+    /// again; a lock on the fallback, or with no fallback, fails the run, save for a 402, which
+    /// parks it as over limit ([`switched_on_limit`](Self::switched_on_limit)).
     async fn switched_on_lock(
         &self,
         ctx: &mut Ctx,
@@ -2935,6 +2966,17 @@ impl LlmAgent {
         // by the worker's commit.
         if ctx.is_cancelled() {
             return Ok((Flow::Fail(CANCELLED.into()), early));
+        }
+        // A 402 is the person's usage limit reached for the model the call named: a run with another
+        // model tries it once, and parks only when none is left (ADR 0064, amended 2026-11-25). The
+        // calls that started end; their results go, as for a park.
+        if let Err(f) = &recorded
+            && let Some(flow) = self.switched_on_limit(ctx, state, f).await?
+        {
+            if let Some(mut early) = early {
+                early.settle().await;
+            }
+            return Ok((flow, None));
         }
         // A refusal that parks the run (ADR 0067): the conversation stays as it was before the call,
         // which is made again when the run wakes. The calls that started end; their results go.
@@ -3491,6 +3533,14 @@ impl LlmAgent {
                 })
             })
             .await?;
+        // A 402 is the person's usage limit reached: the summary is asked of the fallback once, as
+        // for a turn, and parks only when no model is left (ADR 0064, amended 2026-11-25).
+        if let Err(f) = &recorded
+            && let Some(flow) = self.switched_on_limit(ctx, state, f).await?
+        {
+            state.compact_next = asked;
+            return Ok(Compacted::Parked(flow));
+        }
         // A refusal that parks the run parks it here too (ADR 0067): the summary is asked for again
         // when the run wakes, from the history as it is.
         if let Err(f) = &recorded

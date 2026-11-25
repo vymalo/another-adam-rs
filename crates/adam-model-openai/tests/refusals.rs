@@ -265,21 +265,14 @@ async fn a_402_is_the_over_limit_refusal_for_the_injector() {
 
 #[tokio::test]
 async fn what_the_injector_does_not_park_is_todays_error() {
-    // An unknown slug, a slugless answer of another status, and a problem type in a body that is
-    // not a problem document.
+    // An unknown slug, an invalid-token slug and a slugless 500. (A 402 parks whatever its problem
+    // document says, so it is the over-limit refusal above.)
     let (err, _) = refused_with(injected(), problem(400, "something_else", None), false).await;
     assert!(matches!(err, ModelError::InvalidRequest { .. }), "{err:?}");
     let (err, _) = refused_with(injected(), problem(401, "invalid_token", None), false).await;
     assert!(matches!(err, ModelError::Auth(_)), "{err:?}");
     let (err, _) = refused_with(injected(), ResponseTemplate::new(500), false).await;
     assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
-    let (err, _) = refused_with(
-        injected(),
-        ResponseTemplate::new(402).set_body_raw(problem_body("over_limit"), "application/json"),
-        false,
-    )
-    .await;
-    assert!(matches!(err, ModelError::InvalidRequest { .. }), "{err:?}");
 }
 
 /// A deployment with its own key fails as before (ADR 0058 decision 3): every answer of the table
