@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    Conversation, HookDecision, HookResult, HookSet, HookedCall, HookedOutput, HookedText,
-    LlmAgent, Plugin, Tool, ToolAccess, ToolCtx, ToolError, ToolOutput, Verdict, user_message,
+    Conversation, HookDecision, HookResult, HookSet, HookedCall, HookedModelRequest, HookedOutput,
+    HookedText, LlmAgent, Plugin, Tool, ToolAccess, ToolCtx, ToolError, ToolOutput, Verdict,
+    user_message,
 };
 use adam_model::{Message, MockModel, ToolCall, ToolSpec};
 use adam_runtime::{RunView, Runtime, RuntimeBuilder};
@@ -960,4 +961,148 @@ async fn a_denied_call_is_a_denied_event_with_its_reason() {
     let names: Vec<_> = seen.iter().map(|e| e.kind.name()).collect();
     assert_eq!(names, ["tool.started", "tool.denied"]);
     assert_eq!(seen[1].fields["reason"], json!("not from here"));
+}
+
+// ---------------------------------------------------------------------------
+// model.request (ADR 0050, slice H3)
+// ---------------------------------------------------------------------------
+
+/// Sets the three things the point may change, and counts its calls; or stops.
+struct ModelHook {
+    asked: Arc<AtomicUsize>,
+    stop: bool,
+}
+
+impl Plugin for ModelHook {
+    fn name(&self) -> &str {
+        "model-hook"
+    }
+
+    fn model_request(&self, request: &mut HookedModelRequest<'_>) -> HookResult {
+        self.asked.fetch_add(1, SeqCst);
+        if self.stop {
+            return Ok(Verdict::Stop("no more model calls".into()));
+        }
+        *request.temperature = Some(0.25);
+        *request.max_output_tokens = Some(321);
+        request.metadata.insert("tenant".into(), "t-1".into());
+        Ok(Verdict::Continue)
+    }
+}
+
+/// The model sees the rewrite, and only the rewrite: the system prompt and the model are untouched.
+#[tokio::test]
+async fn the_model_sees_the_rewritten_temperature_tokens_and_metadata() {
+    let h = Harness::new();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let agent = h
+        .agent()
+        .instructions("be brief")
+        .plugin(ModelHook {
+            asked: asked.clone(),
+            stop: false,
+        })
+        .build();
+    h.mock.push_text("hello");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].temperature, Some(0.25));
+    assert_eq!(requests[0].max_output_tokens, Some(321));
+    assert_eq!(
+        requests[0].metadata.get("tenant").map(String::as_str),
+        Some("t-1")
+    );
+    assert_eq!(requests[0].model, "test-model");
+    assert!(
+        requests[0]
+            .system
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("be brief")
+    );
+    assert_eq!(asked.load(SeqCst), 1);
+}
+
+/// A replay of a recorded model step asks no hook: the first worker records the turn and dies in
+/// the tool, and the survivor replays `model:0` without asking the hook for it again.
+#[tokio::test]
+async fn a_replay_of_a_recorded_model_step_asks_no_model_hook() {
+    let h = Harness::new();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let (a, _a_calls) = Echo::new("a");
+    let reached = Arc::new(Notify::new());
+    let agent = h
+        .agent()
+        .tool(a)
+        .tool(Stalls {
+            reached: reached.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .plugin(ModelHook {
+            asked: asked.clone(),
+            stop: false,
+        })
+        .build();
+    h.mock
+        .push_tool_calls(vec![call("c1", "a", json!({})), call("c2", "b", json!({}))])
+        .push_text("done");
+    let (rt_a, rt_b) = (
+        h.runtime_with(&agent, "crash-a", short_lease),
+        h.runtime_with(&agent, "crash-b", short_lease),
+    );
+    let run = rt_a
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let doomed = spawn_worker(&rt_a);
+    notified(&reached, "the second call starting").await;
+    doomed.handle.abort();
+    let _ = doomed.handle.await;
+    assert_eq!(asked.load(SeqCst), 1, "the first turn asked once");
+
+    let survivor = spawn_worker(&rt_b);
+    wait_done(&rt_b, run).await;
+    survivor.stop().await;
+    // Turn 0 was replayed (not asked again); the following turn asked once.
+    assert_eq!(
+        asked.load(SeqCst),
+        2,
+        "only the turn never recorded asks the hook"
+    );
+}
+
+/// A `Stop` fails the run and the model is never called.
+#[tokio::test]
+async fn a_model_request_stop_fails_the_run() {
+    let h = Harness::new();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let agent = h
+        .agent()
+        .plugin(ModelHook {
+            asked: asked.clone(),
+            stop: true,
+        })
+        .build();
+    h.mock.push_text("never said");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+
+    let error = view.error.clone().unwrap_or_default();
+    assert!(error.contains("no more model calls"), "{error}");
+    assert!(h.mock.requests().is_empty(), "the model was not called");
 }

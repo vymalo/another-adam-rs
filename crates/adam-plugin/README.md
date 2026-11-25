@@ -19,7 +19,7 @@ neither the loop nor the runtime.
 
 | Item | What it is |
 |---|---|
-| `Plugin` | `name`, `message_received`, `before_tool` and `after_tool`, each with a do-nothing default, so a plugin that cares about one point implements one method |
+| `Plugin` | `name`, `message_received`, `model_request` (inside the `model:<turn>` step: it may rewrite `temperature`, `max_output_tokens` and `metadata` of the call, or `Stop` the run; a replay asks none), `before_tool` and `after_tool`, each with a do-nothing default, so a plugin that cares about one point implements one method |
 | `Verdict` | `Continue`, `Deny(reason)`, `Ask(reason)`, `Stop(reason)`: the first verdict other than `Continue` is the set's, and a later plugin is not asked |
 | `HookError` | the plugin's name, an `adam-error` class and a reason (never an argument or a tool's answer); `is_retryable` follows the class |
 | `HookLimits` | the deadline of one hook (1 s by default) and how many times a retryable failure is tried again (1) |
