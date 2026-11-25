@@ -1,5 +1,6 @@
-//! `limits.max_parallel` of an agent file and the deployment's setting (ADR 0049): the file may only
-//! lower what the deployment allows, and a subagent has its own value.
+//! `limits.max_parallel` of an agent file and the deployment's setting (ADR 0049): the file may
+//! only lower what the deployment allows (a larger value is clamped to it), and a subagent has its
+//! own value.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
@@ -73,26 +74,20 @@ fn a_file_may_lower_the_setting_for_its_agent_only() {
 }
 
 #[test]
-fn a_file_above_the_setting_is_refused() {
-    // 8 asks for more than the deployment allows: refused, not clamped (ADR 0054 decision 2). The
-    // message names the option, the value asked and the value the deployment allows.
-    for (limits, deployment, asked) in [
-        ("max_parallel: 8", 4, 8),
-        ("max_parallel: 32", 4, 32),
-        ("max_parallel: 5", 1, 5),
+fn a_file_above_the_setting_is_clamped_to_it() {
+    // 8 asks for more than the deployment allows: clamped to it, not refused (ADR 0049, ADR 0054
+    // decision 3 — a folder is portable across deployments, and a lower setting narrows it). The
+    // root runs at the deployment's value; the child's file says nothing and gets the same.
+    for (limits, deployment, clamped) in [
+        ("max_parallel: 8", 4, 4),
+        ("max_parallel: 32", 4, 4),
+        ("max_parallel: 5", 1, 1),
     ] {
-        let why = family(limits, "")
-            .bind(tools(&[]))
-            .unwrap()
-            .max_parallel(deployment)
-            .model(Arc::new(MockModel::new()), "m")
-            .expect_err("a file may only lower what the deployment allows");
-        let text = why.to_string();
-        assert!(text.contains("limits.max_parallel"), "{text}");
-        assert!(text.contains(&asked.to_string()), "the value asked: {text}");
-        assert!(
-            text.contains(&format!("at most {deployment}")),
-            "the value the deployment allows: {text}"
+        let got = assemble(family(limits, ""), Some(deployment));
+        assert_eq!(
+            parallel_of(&got),
+            (clamped, deployment),
+            "{limits} under a deployment of {deployment}"
         );
     }
 }

@@ -515,6 +515,13 @@ which anyone may add): list the owners here. The coder asks the person before ev
 tier below), makes the repository private and empty unless asked otherwise, and refuses an owner that is not allowed. A GitHub
 App creates for organisations only; a token needs the `repo` scope.
 
+### Uploads
+
+`uploads.maxBytes` (env `UPLOADS_MAX_BYTES`, every role that serves A2A; empty renders nothing and the card says 1 GiB) is the largest
+file the agent asks the orchestrator for a presigned upload slot for: the card lists `uploads/v1` with it as `params.maxBytes`, from 1 byte to
+4 GiB, and the orchestrator's own limits lower it further. The agent folder's `limits.max_upload_bytes` wins over it. Do not also set
+`config.extraEnv.UPLOADS_MAX_BYTES`: the chart refuses the render.
+
 ### The access tiers
 
 The person picks an access tier for each message (`plan`, `edits`, `auto`, `bypass`; the default is `auto`;
@@ -566,7 +573,7 @@ creation** in addition to **Administration**. A token needs the `repo` scope for
 
 ## Agent files
 
-The served card lists `child-sessions/v1` (`explorer` and `reviewer` as sessions a person opens; `maxOpen` is `SESSION_MAX_OPEN`, 16 by default, which `config.extraEnv` sets; no chart value and no template changed). A person's round has no workspace yet ([`bin/adam-coder/README.md`](../../bin/adam-coder/README.md#sessions-a-person-opens)). Roll the workers before the control plane (`topology: split`): a round for a helper an older worker does not know stays `working`.
+The served card lists `child-sessions/v1` (`explorer` and `reviewer` as sessions a person opens; `maxOpen` is `SESSION_MAX_OPEN`, 16 by default, which `config.extraEnv` sets; no chart value and no template changed). A person's round reads the workspace of the latest task of the context it was opened in, and every later round of the session reads the same one (ADR 0045 slice 7; [`bin/adam-coder/README.md`](../../bin/adam-coder/README.md#sessions-a-person-opens)). Roll the workers before the control plane (`topology: split`): a round for a helper an older worker does not know stays `working`.
 
 The binary reads its prompt, card and skills from the folder `ADAM_AGENT_DIR` names, once, at startup
 (`bin/adam-coder/README.md`, "Where the prompt and the card live"); unset, it runs the copy embedded in the

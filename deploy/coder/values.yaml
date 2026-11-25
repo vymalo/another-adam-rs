@@ -7,7 +7,7 @@ image:
   # Bumped on every green build of main by .github/workflows/coder.yml
   # (`sha-<first 7 of the commit>`). A plain key so the workflow can edit it.
   # sha-0000000 is the placeholder that exists before the first build.
-  tag: sha-9c1484d
+  tag: sha-2d143d7
   pullPolicy: IfNotPresent
 
 # The image package may be private; name a pull secret here if so.
@@ -165,6 +165,12 @@ accessTiers:
   # `bypass` (renaming and deleting repositories, no consent form for a repository) is opt-in: set
   # it only for a deployment whose GitHub credentials you are willing to see used that way.
   max: ""
+
+# The largest file the agent asks the orchestrator for an upload slot for (uploads/v1). Every role that serves A2A.
+uploads:
+  # UPLOADS_MAX_BYTES: a whole number of bytes, 1 to 4294967296 (4 GiB). Empty (default): the binary's own
+  # 1 GiB, and nothing is rendered. The agent folder's `limits.max_upload_bytes` wins over it.
+  maxBytes: ""
 
 # How the coder authenticates to GitHub (ADR 0009). Roles that run workers only: a control
 # plane renders none of it.

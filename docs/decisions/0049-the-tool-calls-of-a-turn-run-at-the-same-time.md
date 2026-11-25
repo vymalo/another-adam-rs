@@ -308,3 +308,10 @@ The gate is otherwise unchanged: a refused call still waits for the turn, exactl
 and the at-least-once rules are the ones above. The empty-name fix of the same day is in `adam-model-openai`: a call whose
 arguments are whole before its name arrives is announced when the name arrives, not silently skipped.
 
+## Accepted 2026-11-24: the owner's word on both amendments
+
+The owner answered **ANR-Q72** on 2026-11-24: *"Accept the amendment as written"*. So the two amendments above — a call
+starts when its arguments are complete, and a conflict with an earlier call that did not start early — are **accepted as
+written**, not proposals. Nothing in the decision changes; this note records the date and the question, which the
+amendment text of 2026-11-18 asked for. The finishing slice is ANR-248 (`adam`), and the code the amendments describe
+shipped in `adam#191`.

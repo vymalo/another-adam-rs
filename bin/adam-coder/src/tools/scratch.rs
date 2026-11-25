@@ -72,7 +72,7 @@ pub async fn start_scratch(
     name: Option<String>,
 ) -> Outcome {
     let name = name.as_deref().and_then(non_empty).unwrap_or(DEFAULT_NAME);
-    let run = ctx.root_run_id().to_string();
+    let run = ctx.workspace_run_id().to_string();
     let workspace = env.workspaces.run(&run).map_err(|e| workspace_error(&e))?;
     let slot = match workspace
         .add_scratch_for(name, &env.settings.identity, ctx.conversation_id())
@@ -183,7 +183,10 @@ pub async fn publish_scratch(
     let Some(url) = non_empty(&repo_url) else {
         return Ok(ToolOutput::error("repo_url is required"));
     };
+    // The grant is the task's (the root's notes); the project is published into the workspace the
+    // run reads (ADR 0045 slice 7).
     let run = ctx.root_run_id().to_string();
+    let workspace_run = ctx.workspace_run_id().to_string();
 
     // The grant comes before anything that talks to a remote, as in prepare_workspace: a
     // repository nobody named costs no request, no credential and no mirror. An argument the
@@ -199,7 +202,10 @@ pub async fn publish_scratch(
         )));
     }
 
-    let workspace = env.workspaces.run(&run).map_err(|e| workspace_error(&e))?;
+    let workspace = env
+        .workspaces
+        .run(&workspace_run)
+        .map_err(|e| workspace_error(&e))?;
     let slots = workspace.slots().await.map_err(|e| workspace_error(&e))?;
     // A reference is read and never published to, unless the person named the repository too.
     if let Some(key) = key_of_argument(url)

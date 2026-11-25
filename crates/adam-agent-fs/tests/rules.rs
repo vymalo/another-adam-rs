@@ -537,6 +537,24 @@ fn cases() -> Vec<Case> {
             "`limits.max_session_rounds` is from 2 to 200",
         ),
         (
+            "max_upload_bytes of 0",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_upload_bytes: 0 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_upload_bytes` is from 1 to 4294967296",
+        ),
+        (
+            "max_upload_bytes of 5 GiB",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_upload_bytes: 5368709120 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_upload_bytes` is from 1 to 4294967296",
+        ),
+        (
             "more working sessions than open ones",
             vec![(
                 "agent/instructions.md",

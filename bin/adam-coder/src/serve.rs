@@ -401,7 +401,8 @@ pub async fn serve(
 
     // What a person may open a session on (`child-sessions/v1`): the root's helpers with the
     // effective limits, read from the files alone so every role that serves A2A lists and serves the
-    // same. A round of a person's has no workspace of the run's yet (ADR 0045 slice 7).
+    // same. A person's round reads the workspace of the latest task of the context it was opened
+    // in (ADR 0045 slice 7), which the backend resolves; nothing here depends on it.
     let helpers = files
         .def()
         .map_err(|e| *e)
@@ -493,6 +494,15 @@ pub async fn serve(
         .commands(commands);
     let agents = match sessions {
         Some(sessions) => agents.child_sessions(sessions),
+        None => agents,
+    };
+    // The largest upload the card lists (`uploads/v1`): the folder's, else the environment's.
+    let agents = match files
+        .def()
+        .ok()
+        .and_then(|def| def.manifest().frontmatter.limits.as_ref()?.max_upload_bytes)
+    {
+        Some(bytes) => agents.uploads_max_bytes(bytes),
         None => agents,
     };
     // The card of the files this process runs, like the workers' agent.

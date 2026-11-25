@@ -243,6 +243,11 @@ pub struct ServiceConfig {
     /// `DEFAULT_LOCALE`: the agent's default language, a BCP 47 tag; the card lists `locale/v1`
     /// with it when set (ADR 0069). `None`: the card lists nothing.
     pub default_locale: Option<adam_a2a::Locale>,
+    /// `UPLOADS_MAX_BYTES`: the largest file the agent asks the orchestrator for an upload slot
+    /// for, 1 byte to 4 GiB; the card lists `uploads/v1` with it. `None`: the card says
+    /// [`DEFAULT_UPLOADS_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_MAX_BYTES). The agent folder's
+    /// `limits.max_upload_bytes` wins over it ([`Agents::uploads_max_bytes`](crate::Agents)).
+    pub uploads_max_bytes: Option<u64>,
 }
 
 impl std::fmt::Debug for ServiceConfig {
@@ -357,6 +362,18 @@ impl ServiceConfig {
                 .map_err(|e| problems.push(format!("DEFAULT_LOCALE is invalid: {e}")))
                 .ok()
         });
+        let uploads_max_bytes = get("UPLOADS_MAX_BYTES").and_then(|raw| {
+            match raw.trim().parse::<u64>() {
+                Ok(n) if (1..=adam_a2a::UPLOADS_MAX_BYTES_CEILING).contains(&n) => Some(n),
+                _ => {
+                    problems.push(format!(
+                        "UPLOADS_MAX_BYTES is invalid: a whole number of bytes from 1 to {} (4 GiB), got {raw:?}",
+                        adam_a2a::UPLOADS_MAX_BYTES_CEILING
+                    ));
+                    None
+                }
+            }
+        });
         Self {
             role,
             database_url: SecretString::from(database_url),
@@ -368,6 +385,7 @@ impl ServiceConfig {
             a2a,
             sessions: SessionSettings::parse(lookup, problems),
             default_locale,
+            uploads_max_bytes,
         }
     }
 }
@@ -1827,6 +1845,25 @@ mod tests {
                 .model_tokens_per_minute,
             None
         );
+    }
+
+    #[test]
+    fn uploads_max_bytes_is_a_size_in_range_or_a_startup_problem() {
+        assert!(parse(&full()).expect("valid").uploads_max_bytes.is_none());
+        let mut vars = full();
+        vars.insert("UPLOADS_MAX_BYTES", "1048576");
+        assert_eq!(
+            parse(&vars).expect("valid").uploads_max_bytes,
+            Some(1_048_576)
+        );
+        for bad in ["0", "-1", "ten", "1.5", "4294967297"] {
+            let mut vars = full();
+            vars.insert("UPLOADS_MAX_BYTES", bad);
+            assert!(
+                mentions(&problems_of(&vars), "UPLOADS_MAX_BYTES"),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

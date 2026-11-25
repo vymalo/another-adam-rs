@@ -1109,6 +1109,9 @@ fn plan(
         Err(AgentError::Permanent { message, source }) => {
             failed(with_cause(message, source.as_deref()))
         }
+        // A policy refused the input (ADR 0050, slice H1b): the run fails with the reason a person
+        // reads, and nothing retries it.
+        Err(AgentError::Rejected { message }) => failed(message),
         Err(AgentError::NonDeterminism { message, source }) => failed(format!(
             "non-deterministic replay: {}",
             with_cause(message, source.as_deref())

@@ -2185,7 +2185,8 @@ async fn a_control_plane_refuses_a_prompt_it_cannot_expand_and_warns_at_start() 
 }
 
 /// `MAX_PARALLEL_TOOL_CALLS` reaches the folder's agents, and the folder's own `limits.max_parallel`
-/// can only lower it (ADR 0049).
+/// can only lower it: a larger value is **clamped** to the deployment's (ADR 0049, ADR 0054
+/// decision 3 — the bounds are clamped to the bounds of that time, and nothing is raised back).
 #[tokio::test]
 async fn the_deployments_parallel_limit_reaches_the_agent_and_the_file_only_lowers_it() {
     let limit = |folder: &tempfile::TempDir, setting: usize| {

@@ -647,6 +647,12 @@ pub mod cases {
         );
     }
 
+    /// Bytes no earlier run of the suite wrote: these cases assert a purge deletes their digest, and
+    /// a stale run on a reused database would still reference a fixed one.
+    fn unique_bytes(what: &str) -> Vec<u8> {
+        format!("{what}: {}", Uuid::new_v4()).into_bytes()
+    }
+
     pub async fn blob_unknown_id_is_none(store: DynStore) {
         let _turn = BLOB_SUITE.lock().await;
         keeps_blobs(&store);
@@ -697,7 +703,7 @@ pub mod cases {
         let _turn = BLOB_SUITE.lock().await;
         keeps_blobs(&store);
         let agent = agent();
-        let bytes = b"kept by a live run's reference".to_vec();
+        let bytes = unique_bytes("kept by a live run's reference");
         let id = blob_digest(&bytes);
         store.put_blob(&id, &bytes).await.unwrap();
         let run = store
@@ -725,7 +731,7 @@ pub mod cases {
         // A second commit names a **different** digest and not the first: a store unions each
         // commit's delta with the references it already has, so both must survive the sweep. A
         // store that replaced the set with the delta fails here.
-        let other_bytes = b"a second file the same run names".to_vec();
+        let other_bytes = unique_bytes("a second file the same run names");
         let other = blob_digest(&other_bytes);
         store.put_blob(&other, &other_bytes).await.unwrap();
         store
@@ -777,7 +783,7 @@ pub mod cases {
     pub async fn blob_a_shared_digest_survives_until_the_last_run_is_purged(store: DynStore) {
         let _turn = BLOB_SUITE.lock().await;
         keeps_blobs(&store);
-        let bytes = b"shared by two runs".to_vec();
+        let bytes = unique_bytes("shared by two runs");
         let id = blob_digest(&bytes);
         store.put_blob(&id, &bytes).await.unwrap();
         // Two agents, so each purge is one run's.
@@ -816,7 +822,7 @@ pub mod cases {
     pub async fn blob_purge_respects_before(store: DynStore) {
         let _turn = BLOB_SUITE.lock().await;
         keeps_blobs(&store);
-        let bytes = b"written now".to_vec();
+        let bytes = unique_bytes("written now");
         let id = blob_digest(&bytes);
         // A cutoff a minute ago: nothing this suite wrote is older than it, whatever the
         // millisecond rounding of the clock.
@@ -843,7 +849,7 @@ pub mod cases {
         let _turn = BLOB_SUITE.lock().await;
         keeps_blobs(&store);
         let agent = agent();
-        let bytes = b"collected with its run".to_vec();
+        let bytes = unique_bytes("collected with its run");
         let id = blob_digest(&bytes);
         store.put_blob(&id, &bytes).await.unwrap();
         let run = store

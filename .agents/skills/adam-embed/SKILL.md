@@ -68,14 +68,19 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      it the level is dropped silently (ADR 0063 decision 6; `.models(..)` on the engine does not reach the client).
      Details and the tool rules:
      `crates/adam/README.md` ("`#[tool]`", "Agent directories"), `docs/reference/agent-files.md`.
-   * **A host may put compiled hooks around every tool call** (ADR 0050, slice H1):
-     `LlmAgentBuilder::hooks(HookSet)` or `.plugin(one)` (`adam-plugin`, re-exported by
-     `adam-llm-agent`) runs `before_tool` and `after_tool` **inside** the call's journaled step
-     `tool:<call id>`, so a hook may rewrite the arguments or the text the model reads, deny the
-     call, ask (not built: the call is not run) or stop the run, and a replay that finds the step
-     recorded asks no hook. The verdict is recorded with the call, in `HookedOutput`. A hook gets no
-     `Ctx` and adds no step. `EngineBuilder` takes no `HookSet` yet, and an agent file's `plugins:`
-     is a later slice, so a served folder agent installs none.
+   * **A host may put compiled hooks around every tool call and around a person's message** (ADR 0050,
+     slices H1 and H1b): `LlmAgentBuilder::hooks(HookSet)` or `.plugin(one)` (`adam-plugin`, re-exported
+     by `adam-llm-agent`) runs `before_tool` and `after_tool` **inside** the call's journaled step
+     `tool:<call id>`, so a hook may rewrite the arguments or the text the model reads, deny the call,
+     ask (not built: the call is not run) or stop the run, and a replay that finds the step recorded
+     asks no hook. `message_received` runs in the step that takes a person's message in
+     (`message:start`, `message:<inbound id>`; taken only when a set is installed): a hook may allow
+     the message, rewrite its text, or refuse it — a refused start fails the run `Rejected` with the
+     reason, and one refused while the task works is left out and the task goes on. A message's files
+     reach the hook by reference (name, media type, size, SHA-256), never their bytes. The verdict is
+     recorded with the call (`HookedOutput`) or the message (`MessageDecision`). A hook gets no `Ctx`
+     and adds no step of its own. `EngineBuilder` takes no `HookSet` yet, and an agent file's
+     `plugins:` is a later slice, so a served folder agent installs none.
      https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
    * **Limiting commands in your own tools** (ADR 0065): `adam_code_tools::Governor` pairs an
      `adam_budget::Admission` (`adam-admission-local`'s `LocalAdmission` over a `Budget`) with a
