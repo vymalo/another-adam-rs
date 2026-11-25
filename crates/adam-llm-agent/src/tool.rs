@@ -17,7 +17,8 @@ use serde_json::{Map, Value};
 
 use crate::access::ToolAccess;
 use crate::conversation::{
-    Loaded, MODEL_RUN_KEY, PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message,
+    Loaded, MODEL_RUN_KEY, PROMPT_STATEMENT_KEY, PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY,
+    ROOT_STEP_KEY, user_message,
 };
 use crate::images::{ImageGate, ImageOutcome, ImagePolicy, ImageStore, KeptImage};
 use crate::kept::KeptOutput;
@@ -1068,6 +1069,9 @@ pub struct ToolCtx {
     workspace_run: RunId,
     /// The run this run's model calls name (ADR 0067), handed to its children and its sessions.
     model_run: RunId,
+    /// The run's prompt statement and the person's envelope (ADR 0077), handed to its children and
+    /// its sessions' rounds. Its `Debug` holds no value.
+    prompt_statement: Option<adam_model::PromptStatement>,
     /// The step of the root run this run works under, when it is a child (see
     /// `Conversation::root_step`); `None` for a run that is nobody's child.
     root_step: Option<String>,
@@ -1149,6 +1153,7 @@ impl ToolCtx {
             root_run: root_run.unwrap_or(run_id),
             workspace_run: root_run.unwrap_or(run_id),
             model_run: root_run.unwrap_or(run_id),
+            prompt_statement: None,
             root_step,
             step,
             note: None,
@@ -1547,6 +1552,17 @@ impl ToolCtx {
         self
     }
 
+    /// With the run's prompt statement and the person's envelope (ADR 0077), which a child this
+    /// call starts, and a round of a session it opens or sends to, start with.
+    #[must_use]
+    pub(crate) fn with_prompt_statement(
+        mut self,
+        prompt_statement: Option<adam_model::PromptStatement>,
+    ) -> Self {
+        self.prompt_statement = prompt_statement;
+        self
+    }
+
     /// The run this run's model calls name ([`ModelRequest::run`](adam_model::ModelRequest::run),
     /// ADR 0067), which an injector in front of the model looks the run's credential up by: the
     /// [`root_run_id`](Self::root_run_id) of a task, the root a session's round names. A child this
@@ -1703,6 +1719,13 @@ impl ToolCtx {
             );
             // The step of the root the child works under: this call's own when this run is the
             // root, the one this run works under when it is a child itself.
+            // The prompt statement of this run is the child's: its model calls carry the same
+            // headers (ADR 0077).
+            if let Some(prompt) = &self.prompt_statement
+                && let Ok(value) = serde_json::to_value(prompt)
+            {
+                payload.insert(PROMPT_STATEMENT_KEY.to_owned(), value);
+            }
             let root_step = self.root_step.as_deref().unwrap_or(&self.step.id);
             payload.insert(
                 ROOT_STEP_KEY.to_owned(),

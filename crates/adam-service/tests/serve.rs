@@ -1090,27 +1090,80 @@ async fn the_card_lists_locale_exactly_when_the_deployment_names_a_default_langu
     }
 }
 
-/// The card lists `uploads/v1` with the largest upload: the folder's value wins over
-/// `UPLOADS_MAX_BYTES`, which wins over the default.
+/// `MODEL_AUTH=injector` reaches the card through `serve`: the card lists `prompt-statement/v1`
+/// with no `params` when the model calls go through the injector, and nothing with a key (ADR 0077).
 #[tokio::test]
-async fn the_card_lists_uploads_with_the_folder_then_the_environment_then_the_default() {
+async fn the_card_lists_prompt_statement_exactly_behind_the_injector() {
     use a2a_client::agent_card::AgentCardResolver;
-    use adam_a2a::{DEFAULT_UPLOADS_MAX_BYTES, UPLOADS_EXTENSION};
+    use adam_a2a::PROMPT_STATEMENT_EXTENSION;
 
     let Some(url) = database() else { return };
 
-    let cases: [(Option<&str>, Option<u64>, u64); 4] = [
-        (None, None, DEFAULT_UPLOADS_MAX_BYTES),
-        (Some("2048"), None, 2048),
-        (None, Some(4096), 4096),
-        (Some("2048"), Some(4096), 4096),
+    for auth in [Some("injector"), Some("key"), None] {
+        let name = unique("serve-prompt");
+        let (listener, port) = listen().await;
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let more: Vec<(&str, String)> = auth
+            .map(|a| ("MODEL_AUTH", a.to_owned()))
+            .into_iter()
+            .collect();
+        let cfg = config_with(&url, "control-plane", port, &more);
+        let card = AgentCardConfig::new(
+            &name,
+            "A test agent.",
+            format!("http://{addr}/").parse().unwrap(),
+            "0.0.1",
+        );
+        let agents = agents(&name, &cfg);
+        let running = Running::start(listener, cfg, agents.card(card));
+        until_ok(addr, "/healthz", &running.handle).await;
+
+        let public = AgentCardResolver::new(None)
+            .resolve(&format!("http://{addr}"))
+            .await
+            .unwrap();
+        let entries: Vec<_> = public
+            .capabilities
+            .extensions
+            .iter()
+            .flatten()
+            .filter(|e| e.uri == PROMPT_STATEMENT_EXTENSION)
+            .collect();
+        if auth == Some("injector") {
+            assert_eq!(entries.len(), 1, "listed once");
+            assert!(
+                entries[0].params.as_ref().is_none_or(|p| p.is_empty()),
+                "no params"
+            );
+        } else {
+            assert!(entries.is_empty(), "{auth:?}: not listed");
+        }
+        running.finish().await;
+    }
+}
+
+/// The card lists `uploads/v1` with no `params`, whatever the folder or `UPLOADS_INLINE_MAX_BYTES`
+/// say about the inline threshold (the contract gives the entry none). The threshold those two
+/// resolve to is the pure helper's, asserted without a database in `serve.rs`.
+#[tokio::test]
+async fn the_card_lists_uploads_with_no_params() {
+    use a2a_client::agent_card::AgentCardResolver;
+    use adam_a2a::UPLOADS_EXTENSION;
+
+    let Some(url) = database() else { return };
+
+    let cases: [(Option<&str>, Option<u64>); 4] = [
+        (None, None),
+        (Some("2048"), None),
+        (None, Some(4096)),
+        (Some("2048"), Some(4096)),
     ];
-    for (env, folder, expected) in cases {
+    for (env, folder) in cases {
         let name = unique("serve-uploads");
         let (listener, port) = listen().await;
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
         let more: Vec<(&str, String)> = env
-            .map(|t| ("UPLOADS_MAX_BYTES", t.to_owned()))
+            .map(|t| ("UPLOADS_INLINE_MAX_BYTES", t.to_owned()))
             .into_iter()
             .collect();
         let cfg = config_with(&url, "all", port, &more);
@@ -1122,7 +1175,7 @@ async fn the_card_lists_uploads_with_the_folder_then_the_environment_then_the_de
         );
         let agents = agents(&name, &cfg).card(card);
         let agents = match folder {
-            Some(bytes) => agents.uploads_max_bytes(bytes),
+            Some(bytes) => agents.uploads_inline_max_bytes(bytes),
             None => agents,
         };
         let running = Running::start(listener, cfg, agents);
@@ -1138,8 +1191,10 @@ async fn the_card_lists_uploads_with_the_folder_then_the_environment_then_the_de
             .as_ref()
             .and_then(|all| all.iter().find(|e| e.uri == UPLOADS_EXTENSION))
             .expect("listed");
-        let params = entry.params.as_ref().expect("params");
-        assert_eq!(params["maxBytes"], expected, "{env:?} {folder:?}");
+        assert!(
+            entry.params.as_ref().is_none_or(|p| p.is_empty()),
+            "{env:?} {folder:?}"
+        );
         running.finish().await;
     }
 }

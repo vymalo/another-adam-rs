@@ -231,12 +231,12 @@ pub struct Agents {
     /// full agent or its starter), or [`serve`] stops with [`ServeError::ChildSessions`]. `None`:
     /// the extension is never listed or read. Only the roles that serve A2A use it.
     pub child_sessions: Option<adam_a2a_runtime::ChildSessions>,
-    /// The largest upload the card says (`uploads/v1`'s `params.maxBytes`), from the agent
-    /// folder's `limits.max_upload_bytes`. It wins over `UPLOADS_MAX_BYTES`
-    /// ([`ServiceConfig::uploads_max_bytes`]), which wins over
-    /// [`DEFAULT_UPLOADS_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_MAX_BYTES). Only the roles that
+    /// The largest file sent inline (`uploads/v1`: above it, the agent asks a presigned slot; the
+    /// card says nothing of it), from the agent folder's `limits.max_inline_upload_bytes`. It wins over `UPLOADS_INLINE_MAX_BYTES`
+    /// ([`ServiceConfig::uploads_inline_max_bytes`]), which wins over
+    /// [`DEFAULT_UPLOADS_INLINE_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES). Only the roles that
     /// serve A2A use it.
-    pub uploads_max_bytes: Option<u64>,
+    pub uploads_inline_max_bytes: Option<u64>,
     /// The components the binary adds to the worker tier ([`Agents::worker_component`]).
     components: Vec<(String, StartComponent)>,
 }
@@ -258,7 +258,7 @@ impl Agents {
             reasoning_efforts: None,
             commands: None,
             child_sessions: None,
-            uploads_max_bytes: None,
+            uploads_inline_max_bytes: None,
             components: Vec::new(),
         }
     }
@@ -332,10 +332,10 @@ impl Agents {
 
 impl Agents {
     /// The agent's folder says the largest upload the card lists (`uploads/v1`). See
-    /// [`Agents::uploads_max_bytes`](struct@Agents#structfield.uploads_max_bytes).
+    /// [`Agents::uploads_inline_max_bytes`](struct@Agents#structfield.uploads_inline_max_bytes).
     #[must_use]
-    pub fn uploads_max_bytes(mut self, bytes: u64) -> Self {
-        self.uploads_max_bytes = Some(bytes);
+    pub fn uploads_inline_max_bytes(mut self, bytes: u64) -> Self {
+        self.uploads_inline_max_bytes = Some(bytes);
         self
     }
 }
@@ -397,7 +397,7 @@ impl std::fmt::Debug for Agents {
             .field("reasoning_efforts", &self.reasoning_efforts)
             .field("commands", &self.commands.as_ref().map(|c| !c.is_empty()))
             .field("child_sessions", &self.child_sessions.is_some())
-            .field("uploads_max_bytes", &self.uploads_max_bytes)
+            .field("uploads_inline_max_bytes", &self.uploads_inline_max_bytes)
             .field(
                 "components",
                 &self
@@ -759,6 +759,17 @@ enum Listen {
     Bound(TcpListener),
 }
 
+/// The threshold one process serves for `uploads/v1`: the agent folder's
+/// `limits.max_inline_upload_bytes`, else `UPLOADS_INLINE_MAX_BYTES`
+/// ([`ServiceConfig::uploads_inline_max_bytes`]), else
+/// [`DEFAULT_UPLOADS_INLINE_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES). Both are
+/// already inside the ceiling the deployment's configuration enforced.
+fn inline_upload_threshold(folder: Option<u64>, env: Option<u64>) -> u64 {
+    folder
+        .or(env)
+        .unwrap_or(adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES)
+}
+
 async fn run(
     config: &ServiceConfig,
     agents: Agents,
@@ -777,7 +788,7 @@ async fn run(
         reasoning_efforts,
         commands,
         child_sessions,
-        uploads_max_bytes,
+        uploads_inline_max_bytes,
         components,
     } = agents;
     if role.runs_control_plane() && card.is_none() {
@@ -793,6 +804,7 @@ async fn run(
     let workers = role.runs_workers().then_some(options.concurrency);
     let worker_id = options.worker_id.clone();
     let component_store = store.clone();
+    let agent_name = name.clone();
     let service = Service::new_with(
         register(Runtime::builder(store)),
         name,
@@ -811,18 +823,29 @@ async fn run(
         card.extensions
             .push(adam_a2a::ExtensionConfig::locale(locale));
     }
-    // The largest upload the card says: the folder's, else the environment's, else the default.
+    // Only a process whose model calls carry the statement lists the extension (ADR 0077): with a
+    // key or a device grant the headers are never sent, so no message is read for them.
+    if let Some(card) = card.as_mut()
+        && config.prompt_statement
+        && !card
+            .extensions
+            .iter()
+            .any(|listed| listed.uri == adam_a2a::PROMPT_STATEMENT_EXTENSION)
+    {
+        card.extensions
+            .push(adam_a2a::ExtensionConfig::prompt_statement());
+    }
+    // The card entry has no params (the contract's). The inline threshold is the folder's, else
+    // the environment's, else the default (10 MiB); the upload tool of the next card reads it.
+    let _inline_upload_threshold =
+        inline_upload_threshold(uploads_inline_max_bytes, config.uploads_inline_max_bytes);
     if let Some(card) = card.as_mut()
         && !card
             .extensions
             .iter()
             .any(|listed| listed.uri == adam_a2a::UPLOADS_EXTENSION)
     {
-        card.extensions.push(adam_a2a::ExtensionConfig::uploads(
-            uploads_max_bytes
-                .or(config.uploads_max_bytes)
-                .unwrap_or(adam_a2a::DEFAULT_UPLOADS_MAX_BYTES),
-        ));
+        card.extensions.push(adam_a2a::ExtensionConfig::uploads());
     }
     if let (Some(card), Some(choices)) = (card.as_mut(), service.model_choices())
         && let Some(extension) = adam_a2a::ExtensionConfig::model_pick(choices)
@@ -944,6 +967,15 @@ async fn run(
 
     // The binary's own components: they run in the worker tier, so the host stops them with the
     // workers (and never starts them in a control plane).
+    let host = if role.runs_workers() {
+        let store = component_store.clone();
+        let settings = config.retention;
+        host.worker("retention", move |stop| {
+            crate::retention::run(store, agent_name, settings, Default::default(), stop)
+        })
+    } else {
+        host
+    };
     let host = components.into_iter().fold(host, |host, (name, start)| {
         let store = component_store.clone();
         host.worker(name, move |stop| start(store, stop))
@@ -957,6 +989,22 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The folder's value wins over the environment's, which wins over the default. What consumes
+    /// the threshold (the upload tool of the next card) does not exist yet, so the rule is the
+    /// helper's and is asserted here.
+    #[test]
+    fn the_inline_upload_threshold_is_the_folders_then_the_environments_then_the_default() {
+        let default = adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES;
+        assert_eq!(inline_upload_threshold(None, None), default);
+        assert_eq!(inline_upload_threshold(None, Some(4096)), 4096);
+        assert_eq!(inline_upload_threshold(Some(2048), None), 2048);
+        assert_eq!(
+            inline_upload_threshold(Some(2048), Some(4096)),
+            2048,
+            "the folder wins over the environment"
+        );
+    }
 
     /// The connection the helper accepts writes at once: `TCP_NODELAY` is on it.
     ///

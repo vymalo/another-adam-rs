@@ -333,6 +333,8 @@ pub(crate) struct Inner {
     /// The file bytes a view's reader has fetched, bounded and shared by every clone: a poll of a
     /// run whose file was already served does not read the blob again.
     pub blobs: Mutex<BlobCache>,
+    /// Observers of the events that follow a commit (ADR 0050, H4); `None`: nobody observes.
+    pub observers: Option<Arc<adam_plugin::HookSet>>,
 }
 
 impl Inner {
@@ -802,10 +804,20 @@ pub struct RuntimeBuilder {
     sink: DynEventSink,
     clock: DynClock,
     notifier: Option<DynNotifier>,
+    observers: Option<Arc<adam_plugin::HookSet>>,
     cfg: Config,
 }
 
 impl RuntimeBuilder {
+    /// The plugins whose `observe` receives `run.parked`, `run.ended`, `run.error` and
+    /// `artifact.kept` after each commit (ADR 0050, slice H4). Best effort: an observer's failure
+    /// is logged and changes nothing, and a crash between a commit and its events loses them.
+    #[must_use]
+    pub fn observers(mut self, set: adam_plugin::HookSet) -> Self {
+        self.observers = Some(Arc::new(set));
+        self
+    }
+
     /// Register an agent: it can start runs and step them. Registering a
     /// second agent or starter with the same name replaces the first.
     pub fn agent<A: Agent>(self, agent: A) -> Self {
@@ -968,6 +980,7 @@ impl RuntimeBuilder {
                 sink: self.sink,
                 clock: self.clock,
                 notifier: self.notifier,
+                observers: self.observers,
                 cfg: self.cfg,
                 wake: watch::channel(0).0,
                 in_flight: Mutex::default(),
@@ -997,6 +1010,7 @@ impl Runtime {
             sink: Arc::new(NoopSink),
             clock: Arc::new(SystemClock),
             notifier: None,
+            observers: None,
             cfg: Config {
                 worker_id: format!("worker-{}", uuid::Uuid::new_v4()),
                 claim_scope: ClaimScope::Any,

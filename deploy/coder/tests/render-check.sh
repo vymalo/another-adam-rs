@@ -1122,6 +1122,13 @@ extdb='--set database.enabled=false --set database.existingSecret.name=coder-db-
 helm_db > "$out"
 check "database default: the CNPG Cluster and its app Secret, key uri" dburl_is 1 coder-db-app uri
 check "database default: no existing Secret is named" lacks 'coder-db-uri'
+check "database default: no instances override and no resources in the Cluster" lacks '^  resources:'
+# shellcheck disable=SC2086
+helm_db --set database.instances=3 --set database.resources.requests.cpu=500m --set database.resources.requests.memory=1Gi --set database.resources.limits.memory=2Gi > "$out"
+check "database.instances 3 renders on the Cluster" has '^  instances: 3$'
+check "database.resources renders on the Cluster" has '^    limits:'
+check "database.resources renders the requests" has '^      cpu: 500m$'
+check "database.resources renders the memory limit" has '^      memory: 2Gi$'
 # shellcheck disable=SC2086
 helm_db $extdb > "$out"
 check "existing database: no CNPG Cluster is rendered" lacks '^kind: Cluster$'
@@ -1550,6 +1557,10 @@ check "policy: fails closed" rhas ValidatingAdmissionPolicy "$pn" 'failurePolicy
 check "policy: only CREATE of pods" rhas ValidatingAdmissionPolicy "$pn" 'operations: \["CREATE"\]'
 check "policy: refuses a pod without the run label and the managed-by label" policy_has "$pn" "'adam.vymalo.com/run' in object.metadata.labels"
 check "policy: ... or without the priority class" policy_has "$pn" "object.spec.priorityClassName == 'coder-run'"
+policy_refuses_secrets() { policy_has "$pn" "!has(e.valueFrom.secretKeyRef)" && policy_has "$pn" "!has(f.secretRef)"; }
+check "policy: refuses a secretKeyRef and an envFrom secretRef (ADR 0038)" policy_refuses_secrets
+check "policy: ... and says no Secret volume, secretKeyRef or envFrom in its message" \
+  policy_has "$pn" "no Secret volume, no secretKeyRef, no envFrom"
 check "policy: ... or with another image (the run image by digest and the coder's)" \
   policy_has "$pn" "c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-8c297d3@sha256:b465808bfb8a1baae5e59a429bf292726b021e3b37322f759dbda3ee2c57ed67', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234']"
 check "policy: ... or a hostPath: only emptyDir and the work claim" \
@@ -1934,20 +1945,22 @@ check "... the error lists the tiers" says "$message" 'plan, edits, auto or bypa
 check "refused: the cap in extraEnv beside the value" \
   fails helm template coder "$chart" --namespace coder-ns --set accessTiers.max=edits --set-string config.extraEnv.MAX_ACCESS_TIER=bypass
 
-# uploads.maxBytes (UPLOADS_MAX_BYTES): nothing for the default, one variable per pod that serves A2A when set.
+# uploads.inlineMaxBytes (UPLOADS_INLINE_MAX_BYTES): nothing for the default, one variable per pod that serves A2A when set.
 helm template coder "$chart" --namespace coder-ns > "$out"
-check "the default renders no UPLOADS_MAX_BYTES (the binary's own default is 1 GiB)" lacks 'name: UPLOADS_MAX_BYTES'
-helm template coder "$chart" --namespace coder-ns --set uploads.maxBytes=1073741824 > "$out"
-check "uploads.maxBytes reaches the coder as UPLOADS_MAX_BYTES" count 'name: UPLOADS_MAX_BYTES' 1
-check "... as plain digits, not a float" has 'value: "1073741824"'
-helm template coder "$chart" --namespace coder-ns --set topology=split --set-string uploads.maxBytes=2048 > "$out"
-check "with topology=split the front and the worker both get it" count 'name: UPLOADS_MAX_BYTES' 2
-for bad in 0 -5 ten 1.5 4294967297; do
-  check "refused: uploads.maxBytes $bad" \
-    fails helm template coder "$chart" --namespace coder-ns --set-string uploads.maxBytes=$bad
+check "the default renders no UPLOADS_INLINE_MAX_BYTES (the binary's own default is 10 MiB)" lacks 'name: UPLOADS_INLINE_MAX_BYTES'
+helm template coder "$chart" --namespace coder-ns --set uploads.inlineMaxBytes=1048576 > "$out"
+check "uploads.inlineMaxBytes reaches the coder as UPLOADS_INLINE_MAX_BYTES" count 'name: UPLOADS_INLINE_MAX_BYTES' 1
+check "... as plain digits, not a float" has 'value: "1048576"'
+helm template coder "$chart" --namespace coder-ns --set topology=split --set-string uploads.inlineMaxBytes=2048 > "$out"
+check "with topology=split the front and the worker both get it" count 'name: UPLOADS_INLINE_MAX_BYTES' 2
+helm template coder "$chart" --namespace coder-ns --set uploads.inlineMaxBytes=268435456 > "$out"
+check "the ceiling itself (256 MiB) is accepted" has 'value: "268435456"'
+for bad in 0 -5 ten 1.5 268435457; do
+  check "refused: uploads.inlineMaxBytes $bad" \
+    fails helm template coder "$chart" --namespace coder-ns --set-string uploads.inlineMaxBytes=$bad
 done
 check "refused: the limit in extraEnv beside the value" \
-  fails helm template coder "$chart" --namespace coder-ns --set uploads.maxBytes=2048 --set-string config.extraEnv.UPLOADS_MAX_BYTES=1
+  fails helm template coder "$chart" --namespace coder-ns --set uploads.inlineMaxBytes=2048 --set-string config.extraEnv.UPLOADS_INLINE_MAX_BYTES=1
 
 # The package cache (ADR 0040): one volume at /cache. Off by default and then invisible (the default render
 # equals the golden above); on, mounted by the pods that run toolchains and by nothing else.

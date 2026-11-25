@@ -56,6 +56,14 @@ pub enum EventKind {
     CompactionEnded,
     /// The agent saw its cancel during a step.
     RunCancelled,
+    /// The runtime committed a park (H4).
+    RunParked,
+    /// The runtime committed the end of a run, done or failed (H4).
+    RunEnded,
+    /// The runtime committed a failed try that will be retried (H4).
+    RunError,
+    /// The runtime committed a transition that kept an artifact (H4).
+    ArtifactKept,
 }
 
 impl EventKind {
@@ -75,6 +83,10 @@ impl EventKind {
             EventKind::TurnEnded => "turn.ended",
             EventKind::CompactionEnded => "compaction.ended",
             EventKind::RunCancelled => "run.cancelled",
+            EventKind::RunParked => "run.parked",
+            EventKind::RunEnded => "run.ended",
+            EventKind::RunError => "run.error",
+            EventKind::ArtifactKept => "artifact.kept",
         }
     }
 }

@@ -1,6 +1,6 @@
 //! The A2A extensions an agent that draws on a screen declares: the URIs, and the card entries.
 //!
-//! Fifteen extensions, each optional (a client that does not know one ignores it), detected by the
+//! Seventeen extensions, each optional (a client that does not know one ignores it), detected by the
 //! client from the card it reads, and removable without breaking plain A2A:
 //!
 //! | Extension | URI | What it is |
@@ -19,7 +19,8 @@
 //! | `child-sessions/v1` | [`CHILD_SESSIONS_EXTENSION`] | the card lists the helpers a person may start a session with; a client that activates it sees the agent's sessions, follows their rounds as tasks, and starts, talks to and closes one |
 //! | `locale/v1` | [`LOCALE_EXTENSION`] | a message names the person's interface language (a BCP 47 tag) and the agent answers in it, unless the person writes in another; a hint for the agent's own words, never a translation layer (ADR 0069) |
 //! | `reasoning/v1` | [`REASONING_EXTENSION`] | the card lists the root model's reasoning levels and the resolved default, and an activated message names one (`effort`); a level the model does not take is refused (ADR 0063, decision 5) |
-//! | `uploads/v1` | [`UPLOADS_EXTENSION`] | the card lists the largest file the agent asks a presigned `PUT` for (`params.maxBytes`); a message that activates it carries the orchestrator's limits |
+//! | `uploads/v1` | [`UPLOADS_EXTENSION`] | the card lists it with no `params`; a message that activates it carries the orchestrator's limits |
+//! | `prompt-statement/v1` | [`PROMPT_STATEMENT_EXTENSION`] | a message carries the prompt statement and the person's envelope (two JWS); every model call of the run carries them as headers to the injector in front of the model (ADR 0077) |
 //! | `model-pick/v1` | [`MODEL_PICK_EXTENSION`] | the card lists the model aliases the deployment offers, and an activated message names one (`model`) for its run; an alias outside the list is refused as `model_not_offered` (ADR 0064, amended 2026-11-23) |
 //!
 //! The contracts are the orchestration layer's (`docs/api/ui-catalog-v2.md`,
@@ -137,19 +138,34 @@ pub const REASONING_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/
 /// amended 2026-11-23).
 pub const MODEL_PICK_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/model-pick/v1";
 
+/// The URI of the `prompt-statement/v1` extension (proposed): a message that activates it carries,
+/// in its metadata under this URI, `{"statement": "<JWS>", "user": "<JWS>"}` (`user` may be absent):
+/// the statement of the prompt and the person's envelope. The agent keeps both with the run and
+/// every model call of the run carries them as the headers `Prompt-Statement` and
+/// `Prompt-User-Signature`, byte for byte ([`crate::statement_of_request`]). The card's entry has
+/// no `params`. The contract is the shared prompt-signature contract; ADR 0077 is this
+/// repository's side.
+pub const PROMPT_STATEMENT_EXTENSION: &str =
+    "https://agents.vymalo.com/a2a/extensions/prompt-statement/v1";
+
 /// The URI of the `uploads/v1` extension: a message that activates it carries the orchestrator's
 /// limits (`{"maxBytes", "ttlSecs"}`) and the agent may ask the thread tools for a presigned `PUT`
 /// (`request_upload`) for a file too large for a message. The contract is the orchestration
 /// layer's (`docs/api/uploads-v1.md` of `vymalo/another-agentic-system`); it gives the card entry
-/// no `params`, and this repository adds one, `maxBytes`, the largest file the agent asks a slot
-/// for, which the orchestrator's own limit lowers further and which a reader may ignore.
+/// no `params`, so the card carries none. The setting of this repository, the largest file sent
+/// inline, is the agent's own and is never on the card.
 pub const UPLOADS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/uploads/v1";
 
-/// The most `maxBytes` of `uploads/v1` may be: the orchestrator's own ceiling, 4 GiB.
-pub const UPLOADS_MAX_BYTES_CEILING: u64 = 4 * 1024 * 1024 * 1024;
+/// The most the inline threshold of `uploads/v1` may be: the orchestrator's own ceiling for one
+/// file, `artifacts.maxFileBytes`, 256 MiB (`sys:docs/api/config.md`, verified 2026-11-25). Its
+/// 4 GiB `artifacts.maxPerJobBytes` is a job's total, not one file's; an inline threshold above
+/// 256 MiB would tell an agent to send inline a file the orchestrator can never keep.
+pub const UPLOADS_INLINE_MAX_BYTES_CEILING: u64 = 268_435_456;
 
-/// The largest upload the card says when no folder, variable or chart value names one: 1 GiB.
-pub const DEFAULT_UPLOADS_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// The largest file sent inline when no folder, variable or chart value names one: 10 MiB, the
+/// orchestrator's own `artifacts.maxFileBytes`, the size at which a file stops fitting a message.
+/// A larger file asks for an upload slot.
+pub const DEFAULT_UPLOADS_INLINE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 /// One helper of the card's `child-sessions/v1` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,14 +464,25 @@ impl ExtensionConfig {
     }
 
     /// The `uploads/v1` extension: the agent can ask the thread tools for a presigned `PUT` for a
-    /// file larger than a message carries. `params.maxBytes` is the largest file it asks a slot for
-    /// (a setting of the agent, never above [`UPLOADS_MAX_BYTES_CEILING`]). Optional.
-    pub fn uploads(max_bytes: u64) -> Self {
+    /// file larger than a message carries. The entry has no `params` (the contract gives it none).
+    /// Optional.
+    pub fn uploads() -> Self {
         let mut extension = Self::new(UPLOADS_EXTENSION);
         extension.description = Some(
             "Uploads large files to the bucket by a presigned URL the thread tools give.".into(),
         );
-        extension.params.insert("maxBytes".into(), json!(max_bytes));
+        extension
+    }
+
+    /// The `prompt-statement/v1` extension: the agent carries a message's prompt statement and the
+    /// person's envelope on every model call of its run. Optional, no parameters. Listed only by a
+    /// process that forwards them (`MODEL_AUTH=injector`, ADR 0077): a card that lists it promises
+    /// the headers.
+    pub fn prompt_statement() -> Self {
+        let mut extension = Self::new(PROMPT_STATEMENT_EXTENSION);
+        extension.description = Some(
+            "Carries the message's prompt statement and the person's envelope to the model.".into(),
+        );
         extension
     }
 
@@ -579,6 +606,10 @@ mod tests {
             MODEL_PICK_EXTENSION,
             "https://agents.vymalo.com/a2a/extensions/model-pick/v1"
         );
+        assert_eq!(
+            PROMPT_STATEMENT_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/prompt-statement/v1"
+        );
     }
 
     #[test]
@@ -696,6 +727,7 @@ mod tests {
             ExtensionConfig::mentions(),
             ExtensionConfig::steer(),
             ExtensionConfig::usage(),
+            ExtensionConfig::prompt_statement(),
         ] {
             assert!(!e.required, "{}", e.uri);
             assert!(e.params.is_empty(), "{}", e.uri);
@@ -858,15 +890,14 @@ mod tests {
     }
 
     #[test]
-    fn the_uploads_entry_lists_the_limit_and_nothing_else() {
-        let e = ExtensionConfig::uploads(5_000);
+    fn the_uploads_entry_carries_no_params() {
+        let e = ExtensionConfig::uploads();
         assert_eq!(e.uri, UPLOADS_EXTENSION);
         assert_eq!(
             UPLOADS_EXTENSION,
             "https://agents.vymalo.com/a2a/extensions/uploads/v1"
         );
-        assert_eq!(e.params.len(), 1);
-        assert_eq!(e.params["maxBytes"], json!(5_000));
+        assert!(e.params.is_empty());
         assert!(!e.required);
     }
 

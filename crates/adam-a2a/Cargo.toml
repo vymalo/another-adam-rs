@@ -21,7 +21,6 @@ server = [
   "dep:rustls-pki-types",
   "dep:utoipa-swagger-ui",
   "dep:memchr",
-  "dep:ryu-js",
   "dep:subtle",
   "dep:uuid",
   "tokio/net",
@@ -40,7 +39,6 @@ a2a-lf.workspace = true
 aws-lc-rs = { workspace = true, optional = true }
 base64.workspace = true
 rustls-pki-types = { workspace = true, optional = true }
-ryu-js = { workspace = true, optional = true }
 # Push-notification delivery: one client that never follows a redirect and only connects to the
 # addresses the guarded resolver allows.
 reqwest = { workspace = true, optional = true, features = ["rustls"] }

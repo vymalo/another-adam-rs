@@ -316,8 +316,22 @@ rollout):
 | Value | Default | |
 |---|---|---|
 | `database.enabled` | `true` | The chart creates a CloudNativePG `Cluster` named `<release>-db` (`database.name`, `owner`, `instances`, `storage`) and every pod reads `DATABASE_URL` from the `uri` key of the Secret CNPG creates, `<release>-db-app`. The render is the one this chart always had (`tests/golden/combined.yaml`). |
+| `database.instances` | `1` | Instances of the `Cluster`. With `database.enabled: true` only. |
+| `database.resources` | `{}` | CPU and memory requests and limits of each instance. Empty renders nothing, so the default render is unchanged. |
 | `database.existingSecret.name` | `""` | With `database.enabled: false`: a Secret in the release namespace that holds the connection string. Required then, refused with `enabled: true`. |
 | `database.existingSecret.key` | `uri` | The key of that Secret; empty means `uri`. |
+
+Starting points for three instances (not measurements; size them from your own load):
+
+```yaml
+database:
+  instances: 3
+  resources:
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {memory: 2Gi}
+```
+
+Backups and a transaction-mode pooler are not part of this chart.
 
 ```sh
 helm template coder deploy/coder \
@@ -517,10 +531,10 @@ App creates for organisations only; a token needs the `repo` scope.
 
 ### Uploads
 
-`uploads.maxBytes` (env `UPLOADS_MAX_BYTES`, every role that serves A2A; empty renders nothing and the card says 1 GiB) is the largest
-file the agent asks the orchestrator for a presigned upload slot for: the card lists `uploads/v1` with it as `params.maxBytes`, from 1 byte to
-4 GiB, and the orchestrator's own limits lower it further. The agent folder's `limits.max_upload_bytes` wins over it. Do not also set
-`config.extraEnv.UPLOADS_MAX_BYTES`: the chart refuses the render.
+`uploads.inlineMaxBytes` (env `UPLOADS_INLINE_MAX_BYTES`, every role that serves A2A; empty renders nothing and the agent uses 10 MiB, the orchestrator's `artifacts.maxFileBytes`) is the largest
+file the agent sends inline: a larger one asks the orchestrator for a presigned upload slot. From 1 byte to
+268435456 (256 MiB); set it to the orchestrator's `artifacts.maxFileBytes`. The card lists `uploads/v1` with no `params`, as the contract says. The agent folder's `limits.max_inline_upload_bytes` wins over it. Do not also set
+`config.extraEnv.UPLOADS_INLINE_MAX_BYTES`: the chart refuses the render.
 
 ### The access tiers
 

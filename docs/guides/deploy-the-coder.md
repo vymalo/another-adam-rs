@@ -73,7 +73,7 @@ flowchart LR
 
 `docker/coder/Dockerfile`, built from the **repository root**, has three stages: it compiles `adam-coder`,
 `adam-agent`, `adam-kube-exec`, `adam-egress` and the two binaries of `adam-git-sandbox` for
-`x86_64-unknown-linux-musl` on a pinned `rust:1.94-trixie` (tag and digest, plus `musl-tools` for the C
+`x86_64-unknown-linux-musl` on a pinned `rust:1.98-trixie` (tag and digest, plus `musl-tools` for the C
 sources), so each is statically linked with `mimalloc` as its allocator and starts in any x86-64 Linux image
 whatever its C library ([ADR 0053](../decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)
 decision 11; the image's smoke test runs each in `debian:bookworm-slim` and Alpine, as uid 10001, and expects

@@ -68,12 +68,12 @@ means the coder's own default, auto, and nothing is rendered.
 {{- end -}}
 
 {{/*
-uploads.maxBytes (the largest file the agent asks the orchestrator for an upload slot for), as the digits
+uploads.inlineMaxBytes (the largest file the agent sends inline; a larger one asks for an upload slot), as the digits
 of a whole number. A YAML number is read as a float by Helm, so it is formatted, not printed. Empty
-means the binary's own default (1 GiB) and nothing is rendered.
+means the binary's own default (10 MiB) and nothing is rendered.
 */}}
-{{- define "coder.uploadsMaxBytes" -}}
-{{- $v := .Values.uploads.maxBytes -}}
+{{- define "coder.uploadsInlineMaxBytes" -}}
+{{- $v := .Values.uploads.inlineMaxBytes -}}
 {{- if kindIs "float64" $v -}}{{- printf "%d" (int64 $v) -}}{{- else -}}{{- default "" $v | toString | trim -}}{{- end -}}
 {{- end -}}
 

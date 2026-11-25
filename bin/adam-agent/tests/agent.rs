@@ -224,6 +224,27 @@ async fn the_card_is_the_one_the_folder_declares() {
     assert_eq!(card.name, "Chat");
 }
 
+/// The contract reads a card that lists `uploads/v1` alone as listing neither extension, so the
+/// card a process serves carries `thread-tools/v1` beside it. The binaries build the card with the
+/// screen's extensions (`card_of`); `adam_service::serve` adds `uploads/v1` to it when the
+/// process serves the extension, so this is that card.
+#[test]
+fn the_card_that_lists_uploads_lists_thread_tools_beside_it() {
+    let card = card_of(&def_of(&assistant()), &url())
+        .unwrap()
+        .with_extension(adam_a2a::ExtensionConfig::uploads());
+    let uris = card.extension_uris();
+    assert!(
+        uris.iter()
+            .any(|uri| uri == adam_a2a::THREAD_TOOLS_EXTENSION),
+        "uploads/v1 alone is read as neither: {uris:?}"
+    );
+    assert!(
+        uris.iter().any(|uri| uri == adam_a2a::UPLOADS_EXTENSION),
+        "{uris:?}"
+    );
+}
+
 /// A folder with `commands/` lists them on the card (`commands/v1`, sorted) and the agent expands
 /// a message that names one, as `/name arguments`, before it is stored.
 #[tokio::test]
@@ -2511,7 +2532,7 @@ fn check_tool_golden(generated: &str) {
 /// not counted: it is the same "hi" in every measurement.
 #[tokio::test]
 async fn a_folder_agents_first_request_stays_under_the_lean_budget() {
-    const BASELINE_BYTES: usize = 17437; // measured 2026-11-21, `origin/main` at e62e00b
+    const BASELINE_BYTES: usize = 16806; // re-recorded 2026-11-25 after the assistant folder trim (ANR-596); was 17437 on 2026-11-21
     const GROWTH_ALLOWED: usize = 1024;
     const LEAN_BUDGET_TOKENS: usize = 5000;
 
