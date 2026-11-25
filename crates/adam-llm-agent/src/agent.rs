@@ -13,7 +13,9 @@ use adam_model::{
     Classify, DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse,
     PromptStatement, ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
-use adam_plugin::{HookSet, HookedCall, HookedMessage, HookedText, MessageFile, Plugin, Verdict};
+use adam_plugin::{
+    HookSet, HookedCall, HookedEnd, HookedMessage, HookedText, MessageFile, Plugin, Verdict,
+};
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
     CancelToken, ChildLook, ChildStarter, ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES,
@@ -792,6 +794,9 @@ pub struct Limits {
     /// yet are never touched, and the journal still holds the original outputs. `0` disables
     /// truncation.
     pub max_history_tokens: u32,
+    /// Most times a `run.ending` hook may keep one run going (ADR 0050, slice H1c). Past it the run
+    /// ends, its output marked `capped`. `0` lets no hook keep a run going.
+    pub max_end_continuations: u32,
 }
 
 impl Default for Limits {
@@ -801,6 +806,7 @@ impl Default for Limits {
             max_tool_calls: 200,
             max_output_tokens: 4096,
             max_history_tokens: 100_000,
+            max_end_continuations: 2,
         }
     }
 }
@@ -3255,10 +3261,35 @@ impl LlmAgent {
                 }
                 return Ok((Flow::Next, early));
             }
+            let mut capped = false;
+            if !self.hooks.is_empty() {
+                let step = end_step(turn);
+                let decision = decide_end(
+                    &self.hooks,
+                    ctx,
+                    &step,
+                    &text,
+                    state.end_continuations,
+                    self.limits.max_end_continuations,
+                )
+                .await?;
+                match decision {
+                    EndDecision::End => {}
+                    EndDecision::Keep { reason, .. } => {
+                        state.end_continuations += 1;
+                        state.messages.push(Message::user_text(reason));
+                        return Ok((Flow::Next, early));
+                    }
+                    EndDecision::Capped { .. } => capped = true,
+                }
+            }
             let mut output = json!({
                 "text": text,
                 "artifacts": state.artifacts,
             });
+            if capped {
+                output["capped"] = json!(true);
+            }
             if finish == FinishReason::Length {
                 output["truncated"] = json!(true);
             }
@@ -6092,6 +6123,81 @@ fn start_text(input: &Inbound) -> Result<String, AgentError> {
 /// The name of the step that decides the message a run starts with (`message.received`, ADR 0050
 /// slice H1b). It is taken only when a hook set is installed.
 const START_MESSAGE_STEP: &str = "message:start";
+
+/// The step that asks the `run.ending` hooks about the answer of turn `turn`: `end:<turn>`.
+fn end_step(turn: u32) -> String {
+    format!("end:{turn}")
+}
+
+/// What the `run.ending` hooks decided, as the step `end:<turn>` records it. A replay that finds
+/// the step recorded applies it and asks no hook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+enum EndDecision {
+    /// No hook objected: the run ends.
+    End,
+    /// A hook kept the run going: the model is asked again with `reason`.
+    Keep { plugin: String, reason: String },
+    /// A hook would keep the run going but the cap of continuations is spent: the run ends, marked
+    /// `capped`, and the record says which hook and why.
+    Capped { plugin: String, reason: String },
+}
+
+/// Why a `run.ending` hook could not decide. A retryable failure fails the transition.
+#[derive(Debug, Serialize, Deserialize)]
+struct EndStepError {
+    plugin: String,
+    reason: String,
+    retryable: bool,
+}
+
+/// Asks the `run.ending` hooks inside the journaled step `name`. A hook that cannot decide never
+/// keeps a run going: a permanent failure ends it.
+async fn decide_end(
+    agent_hooks: &Arc<HookSet>,
+    ctx: &mut Ctx,
+    name: &str,
+    text: &str,
+    used: u32,
+    cap: u32,
+) -> Result<EndDecision, AgentError> {
+    let hooks = Arc::clone(agent_hooks);
+    let text = text.to_owned();
+    let decided = ctx
+        .step(name, move || async move {
+            let end = HookedEnd {
+                text: &text,
+                continuations: used,
+            };
+            match hooks.run_ending(&end) {
+                Ok(Some(decided)) => match decided.verdict {
+                    Verdict::Deny(reason) if used >= cap => Ok(EndDecision::Capped {
+                        plugin: decided.plugin.to_owned(),
+                        reason,
+                    }),
+                    Verdict::Deny(reason) => Ok(EndDecision::Keep {
+                        plugin: decided.plugin.to_owned(),
+                        reason,
+                    }),
+                    _ => Ok(EndDecision::End),
+                },
+                Ok(None) => Ok(EndDecision::End),
+                Err(error) if error.is_retryable() => Err(EndStepError {
+                    plugin: error.plugin,
+                    reason: error.reason,
+                    retryable: true,
+                }),
+                Err(_) => Ok(EndDecision::End),
+            }
+        })
+        .await?;
+    decided.map_err(|error| {
+        AgentError::transient(format!(
+            "the hook {} could not decide how a run ends: {}",
+            error.plugin, error.reason
+        ))
+    })
+}
 
 /// The step that decides one message delivered to a running run: `message:<inbound id>`.
 fn message_step(inbound: &Inbound) -> String {

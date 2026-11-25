@@ -58,6 +58,21 @@ pub struct HookedText<'a> {
 /// allow the message, rewrite [`HookedMessage::text`] in place, or refuse it with [`Verdict::Deny`].
 pub const MESSAGE_RECEIVED: &str = "message.received";
 
+/// The point where the model has answered without a tool call and the run is about to end
+/// (ADR 0050, slice H1c). [`Verdict::Deny`] keeps the run going: its text is what the model is asked
+/// again with. [`Verdict::Continue`] lets the run end; `Ask` and `Stop` are not verdicts of this
+/// point and count as a hook failure, which ends the run (a hook that cannot say `Continue` never
+/// keeps one going).
+pub const RUN_ENDING: &str = "run.ending";
+
+/// The answer a run is about to end with, as a `run.ending` hook sees it.
+pub struct HookedEnd<'a> {
+    /// The words that end the run.
+    pub text: &'a str,
+    /// How many times a hook has already kept this run going.
+    pub continuations: u32,
+}
+
 /// A file a person sent with a message, as a `message.received` hook sees it: **by reference**,
 /// never its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +181,12 @@ pub trait Plugin: Send + Sync {
     /// [`Verdict::Deny`] and the reason the person reads. `Ask` and `Stop` are not verdicts of this
     /// point, and the loop treats them as a hook failure (a refusal).
     fn message_received(&self, _message: &mut HookedMessage<'_>) -> HookResult {
+        Ok(Verdict::Continue)
+    }
+
+    /// The run is about to end with an answer: let it, or keep it going with [`Verdict::Deny`] and the
+    /// reason the model is asked again with.
+    fn run_ending(&self, _end: &HookedEnd<'_>) -> HookResult {
         Ok(Verdict::Continue)
     }
 
@@ -279,6 +300,18 @@ impl HookSet {
         self.run_decided(MESSAGE_RECEIVED, |plugin| {
             guard(plugin.name(), self.limits.deadline, || {
                 plugin.message_received(message)
+            })
+        })
+    }
+
+    /// Runs every plugin's `run_ending` in order, until one decides, and names the plugin that did.
+    ///
+    /// # Errors
+    /// As [`HookSet::before_tool`].
+    pub fn run_ending(&self, end: &HookedEnd<'_>) -> Result<Option<Decided<'_>>, HookError> {
+        self.run_decided(RUN_ENDING, |plugin| {
+            guard(plugin.name(), self.limits.deadline, || {
+                plugin.run_ending(end)
             })
         })
     }

@@ -1484,6 +1484,7 @@ fn limits(file: Option<&FileLimits>) -> Limits {
         max_history_tokens: file
             .max_history_tokens
             .unwrap_or(default.max_history_tokens),
+        max_end_continuations: default.max_end_continuations,
     }
 }
 
