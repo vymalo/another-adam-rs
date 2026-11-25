@@ -153,14 +153,13 @@ impl A2aServer {
     }
 
     /// [`health_router`](Self::health_router) plus `routes`, which need the bearer `auth` asks for.
-    /// `GET /healthz` stays public; any other route, `routes` included, is behind authentication.
+    /// `GET /healthz` stays public; `routes` are behind authentication, and any other path is a plain 404 (a worker has no A2A).
     pub fn health_router_with_routes(auth: AuthConfig, routes: Router) -> Router {
-        Self::health_router()
-            .merge(routes)
-            .layer(middleware::from_fn_with_state(
-                Arc::new(Authenticator::new(auth)),
-                auth::authenticate,
-            ))
+        let protected = routes.layer(middleware::from_fn_with_state(
+            Arc::new(Authenticator::new(auth)),
+            auth::authenticate,
+        ));
+        Self::health_router().merge(protected)
     }
 
     /// [`router`](Self::router) with [`ServerOptions`].
