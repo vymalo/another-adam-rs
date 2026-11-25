@@ -35,6 +35,7 @@ fn call() -> CredentialRequest<'static> {
         attempt: 0,
         run: None,
         prompt_statement: None,
+        body: b"",
     }
 }
 

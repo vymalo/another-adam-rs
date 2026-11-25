@@ -66,6 +66,10 @@ pub struct Say {
     /// ([`with_model`](Self::with_model)). `None`: the agent's own model, or the one an earlier
     /// message of the run named.
     pub model: Option<String>,
+    /// The prompt statement and the person's envelope this message carries
+    /// ([`with_prompt_statement`](Self::with_prompt_statement)); `None`: a steer leaves the run the
+    /// ones it has, a new run has none. Its `Debug` holds no value.
+    pub prompt_statement: Option<adam_model::PromptStatement>,
 }
 
 impl Say {
@@ -80,6 +84,7 @@ impl Say {
             id: id.into(),
             text: text.into(),
             model: None,
+            prompt_statement: None,
         }
     }
 
@@ -94,6 +99,18 @@ impl Say {
     #[must_use]
     pub fn with_model(mut self, alias: impl Into<String>) -> Self {
         self.model = Some(alias.into());
+        self
+    }
+
+    /// Carry `prompt` with the message (`prompt-statement/v1`, ADR 0077): on a device, the person's
+    /// envelope alone ([`PromptStatement::envelope`](adam_model::PromptStatement::envelope)). The
+    /// run it starts or steers keeps it, every model call of that run carries it, and a request
+    /// signature binds its id when the model client signs ([`adam_model::SignedRequests`], ADR 0068
+    /// amended 2026-11-25). A steer that carries none keeps it; one that carries another replaces
+    /// it; the conversation's next run starts with none.
+    #[must_use]
+    pub fn with_prompt_statement(mut self, prompt: adam_model::PromptStatement) -> Self {
+        self.prompt_statement = Some(prompt);
         self
     }
 

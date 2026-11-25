@@ -139,9 +139,10 @@ pub const REASONING_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/
 pub const MODEL_PICK_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/model-pick/v1";
 
 /// The URI of the `prompt-statement/v1` extension (proposed): a message that activates it carries,
-/// in its metadata under this URI, `{"statement": "<JWS>", "user": "<JWS>"}` (`user` may be absent):
-/// the statement of the prompt and the person's envelope. The agent keeps both with the run and
-/// every model call of the run carries them as the headers `Prompt-Statement` and
+/// in its metadata under this URI, `{"statement": "<JWS>", "user": "<JWS>"}`: the statement of the
+/// prompt and the person's envelope. `user` may be absent; `statement` may be absent on a device,
+/// which has no orchestrator to state the prompt, and then `user` is required. The agent keeps both
+/// with the run and every model call of the run carries them as the headers `Prompt-Statement` and
 /// `Prompt-User-Signature`, byte for byte ([`crate::statement_of_request`]). The card's entry has
 /// no `params`. The contract is the shared prompt-signature contract; ADR 0077 is this
 /// repository's side.

@@ -18,8 +18,8 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::{ModelError, PROMPT_STATEMENT_HEADER, PROMPT_USER_SIGNATURE_HEADER, PromptStatement};
 
-/// The call a provider is asked to authorise.
-#[derive(Debug, Clone, Copy)]
+/// The call a provider is asked to authorise. Its `Debug` shows the body's length, never the body.
+#[derive(Clone, Copy)]
 pub struct CredentialRequest<'a> {
     /// The HTTP method, upper case (`POST`).
     pub method: &'a str,
@@ -38,6 +38,22 @@ pub struct CredentialRequest<'a> {
     ///
     /// [ADR 0077]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md
     pub prompt_statement: Option<&'a PromptStatement>,
+    /// The exact bytes of the call's body, as they are sent: what a request signature hashes
+    /// ([`SignedRequests`](crate::SignedRequests)). Empty for a call with no body.
+    pub body: &'a [u8],
+}
+
+impl fmt::Debug for CredentialRequest<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CredentialRequest")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("attempt", &self.attempt)
+            .field("run", &self.run)
+            .field("prompt_statement", &self.prompt_statement)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// Why the endpoint refused a call: what a provider needs to decide whether a new credential would help.
@@ -300,6 +316,27 @@ impl ModelCredentials for StaticBearer {
     }
 }
 
+/// `headers` and the values of `prompt`: [`PROMPT_STATEMENT_HEADER`] when it has a statement,
+/// [`PROMPT_USER_SIGNATURE_HEADER`] when it has the person's envelope, each byte for byte.
+pub(crate) fn with_prompt(
+    mut headers: CredentialHeaders,
+    prompt: &PromptStatement,
+) -> CredentialHeaders {
+    if let Some(statement) = prompt.statement() {
+        headers = headers.with(
+            PROMPT_STATEMENT_HEADER,
+            SecretString::from(statement.to_owned()),
+        );
+    }
+    if let Some(user) = prompt.user() {
+        headers = headers.with(
+            PROMPT_USER_SIGNATURE_HEADER,
+            SecretString::from(user.to_owned()),
+        );
+    }
+    headers
+}
+
 /// The name of the header [`InjectedRun`] sends.
 pub const RUN_HEADER: &str = "X-Run-Id";
 
@@ -309,10 +346,11 @@ pub const RUN_HEADER: &str = "X-Run-Id";
 /// secret.
 ///
 /// A call whose run has a prompt statement ([`CredentialRequest::prompt_statement`], ADR 0077) also
-/// carries [`PROMPT_STATEMENT_HEADER`] and, when the person's envelope is there,
-/// [`PROMPT_USER_SIGNATURE_HEADER`], each byte for byte; a run without one sends neither. Only this
-/// provider sends them: a key or a device grant talks to the model's own endpoint, which has no use
-/// for the person's signature.
+/// carries [`PROMPT_STATEMENT_HEADER`] when it has a statement and [`PROMPT_USER_SIGNATURE_HEADER`]
+/// when the person's envelope is there, each byte for byte; a run without one sends neither. Of the
+/// providers here only this one and [`SignedRequests`](crate::SignedRequests) send them: a key or a
+/// device grant alone talks to the model's own endpoint, which has no use for the person's
+/// signature.
 ///
 /// A call that names no run is refused with [`ModelError::InvalidRequest`] before anything is sent:
 /// there is no fallback to a key.
@@ -350,16 +388,7 @@ impl ModelCredentials for InjectedRun {
                 let mut headers =
                     CredentialHeaders::none().with(RUN_HEADER, SecretString::from(run.to_owned()));
                 if let Some(prompt) = call.prompt_statement {
-                    headers = headers.with(
-                        PROMPT_STATEMENT_HEADER,
-                        SecretString::from(prompt.statement().to_owned()),
-                    );
-                    if let Some(user) = prompt.user() {
-                        headers = headers.with(
-                            PROMPT_USER_SIGNATURE_HEADER,
-                            SecretString::from(user.to_owned()),
-                        );
-                    }
+                    headers = with_prompt(headers, prompt);
                 }
                 Ok(headers)
             }
@@ -466,6 +495,7 @@ mod tests {
             attempt: 0,
             run: None,
             prompt_statement: None,
+            body: b"",
         }
     }
 
