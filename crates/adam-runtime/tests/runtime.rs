@@ -6928,6 +6928,12 @@ mod cases {
         let parent = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
         let done = wait_done(&rt, parent).await;
+        // The parent does not wait for its child: it can finish before the child's step has taken
+        // the resume from its inbox. The child's own effect is what is awaited.
+        wait_until("the child to take the resume", || {
+            !seen.lock().unwrap().is_empty()
+        })
+        .await;
         worker.stop().await;
         assert_eq!(done.output, Some(json!(null)));
         let seen = seen.lock().unwrap();
