@@ -270,10 +270,21 @@ impl TurnKeys for Flaky {
 
     async fn key_set(&self) -> Result<Arc<KeySet>, TurnKeyError> {
         self.reads.fetch_add(1, SeqCst);
-        let once = self
-            .failures
-            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-            .is_ok();
+        // A compare-and-swap loop: `fetch_update` is deprecated from Rust 1.99 and its
+        // replacement, `try_update`, is newer than the MSRV.
+        let mut current = self.failures.load(SeqCst);
+        let once = loop {
+            let Some(next) = current.checked_sub(1) else {
+                break false;
+            };
+            match self
+                .failures
+                .compare_exchange_weak(current, next, SeqCst, SeqCst)
+            {
+                Ok(_) => break true,
+                Err(actual) => current = actual,
+            }
+        };
         if once || self.down.load(SeqCst) {
             return Err(TurnKeyError::Unavailable(Box::new(std::io::Error::other(
                 "the key set is down",
