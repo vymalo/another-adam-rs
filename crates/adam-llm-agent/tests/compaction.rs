@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store};
 use adam_llm_agent::{
-    COMPACTION_TURN, CompactionReason, Conversation, Limits, LlmAgent, LlmAgentBuilder, Plan,
-    PlanItem, PlanStatus, ReadOutput, SessionAgent, SessionTools, Tool, ToolCtx, ToolError,
-    ToolOutput, user_message,
+    COMPACTION_TURN, CompactionReason, Conversation, HookResult, HookedCompaction, Limits,
+    LlmAgent, LlmAgentBuilder, Plan, PlanItem, PlanStatus, Plugin, ReadOutput, SessionAgent,
+    SessionTools, Tool, ToolCtx, ToolError, ToolOutput, Verdict, user_message,
 };
 use adam_model::{
     DynModel, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
@@ -2294,4 +2294,124 @@ async fn a_childs_summary_call_names_the_top_run() {
     for request in &requests {
         assert_eq!(request.run, Some(top.to_string()), "not the child {child}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// compaction.before (ADR 0050, slice H9)
+// ---------------------------------------------------------------------------
+
+/// Adds a line to the summary request, and counts its calls.
+struct CompactionContext {
+    asked: Arc<AtomicUsize>,
+}
+
+impl Plugin for CompactionContext {
+    fn name(&self) -> &str {
+        "compaction-context"
+    }
+
+    fn compaction_before(&self, compaction: &mut HookedCompaction<'_>) -> HookResult {
+        self.asked.fetch_add(1, SeqCst);
+        compaction.context.push_str("THE HOOK ADDED THIS");
+        Ok(Verdict::Continue)
+    }
+}
+
+/// The summary request carries what a `compaction.before` hook adds, and the hook is asked once.
+#[tokio::test]
+async fn the_summary_request_carries_the_context_a_hook_adds() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        b.plugin(CompactionContext {
+            asked: asked.clone(),
+        })
+    });
+    script_one_compaction(&rig.mock, "SUMMARY: four results of x");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+
+    let summaries: Vec<_> = requests
+        .iter()
+        .filter(|r| r.tool_choice == ToolChoice::None)
+        .collect();
+    assert_eq!(summaries.len(), 1, "one summary");
+    assert!(
+        summaries[0]
+            .messages
+            .iter()
+            .any(|m| m.text().contains("THE HOOK ADDED THIS")),
+        "the summary request carries the added context: {:?}",
+        summaries[0].messages
+    );
+    assert_eq!(asked.load(SeqCst), 1);
+    assert_eq!(state.compactions.len(), 1);
+    assert!(
+        state
+            .summary
+            .as_deref()
+            .is_some_and(|s| s.contains("SUMMARY: four")),
+        "{:?}",
+        state.summary
+    );
+}
+
+/// A veto asks for no summary: the history is shortened instead, and the run goes on.
+struct VetoesCompaction;
+
+impl Plugin for VetoesCompaction {
+    fn name(&self) -> &str {
+        "vetoes-compaction"
+    }
+
+    fn compaction_before(&self, _compaction: &mut HookedCompaction<'_>) -> HookResult {
+        Ok(Verdict::Deny("not this history".into()))
+    }
+}
+
+#[tokio::test]
+async fn a_vetoed_compaction_shortens_the_history_instead() {
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| b.plugin(VetoesCompaction));
+    rig.mock
+        .push_tool_calls(vec![big("c0", 1200)])
+        .push_tool_calls(vec![big("c1", 1200)])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_text("answered without a summary");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+
+    assert_eq!(state.compactions.len(), 0, "the summary was vetoed");
+    assert!(
+        requests.iter().all(|r| r.tool_choice != ToolChoice::None),
+        "no summary request was made"
+    );
+    assert!(state.summary.is_none());
+    assert!(
+        !state.shortenings.is_empty(),
+        "the history is shortened instead: {state:#?}"
+    );
+}
+
+/// A replay of the recorded summary asks the hook no second time.
+#[tokio::test]
+async fn a_replay_of_the_summary_asks_no_compaction_hook() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        b.plugin(CompactionContext {
+            asked: asked.clone(),
+        })
+    });
+    script_one_compaction(&rig.mock, "S");
+    // Calls 0 to 3 are the turns and call 4 is the summary: its step's commit is the one lost.
+    rig.lose_the_commit_after_call(4, false);
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+
+    let summaries = requests
+        .iter()
+        .filter(|r| r.tool_choice == ToolChoice::None)
+        .count();
+    assert_eq!(summaries, 1, "the summary is not asked again");
+    assert_eq!(asked.load(SeqCst), 1, "the replay asks no hook");
+    assert_eq!(state.compactions.len(), 1);
 }

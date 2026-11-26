@@ -46,12 +46,14 @@ credential: [Run it locally](docs/guides/run-locally.md). Every suite and end-to
 - **Conventional Commits:** `feat(scope): ...`, `fix`, `docs`, `test`, and so on. Nothing here enforces them (no hook,
   no CI check), but the history and the bump workflow use them. Please follow them.
 - **Decisions are ADRs** in `docs/decisions/NNNN-kebab-title.md`, the next number, headed `# NNNN. Title` and
-  `Status: **Accepted** (date)`. Add a row to the table in [`docs/README.md`](docs/README.md). Change a past decision
+  `Status: **Accepted** (date)`. Add a row to the table in [`docs/decisions/README.md`](docs/decisions/README.md). Change a past decision
   with a dated *Amended* note, never silently. Use *Proposed* when the owner has yet to confirm it.
 - **Mark facts** about third parties, and about what has been tried, as *verified* (date and source) or *unverified*.
 - **Docs stay short and true.** Tables over prose, link instead of copying. A process gets a Mermaid pair: a
   `sequenceDiagram` and a `stateDiagram-v2`. A change that alters behaviour updates its page in the same pull request
-  (the table in [`CLAUDE.md`](CLAUDE.md#documentation) says which). Comments in code only where the reason is not obvious.
+  ([writing docs](.agents/docs/writing-docs.md#which-page-a-change-updates) says which). `docs/` is for people;
+  evidence and procedures go on the agent page of the same path in `.agents/docs/`
+  ([ADR 0079](docs/decisions/0079-docs-for-people-and-docs-for-agents-live-apart.md)). Comments in code only where the reason is not obvious.
 - **Every crate has a `README.md`** next to its `Cargo.toml`. Update it in the same pull request as any change to the
   crate's public API, environment variables or tests. `docs-check` fails on a missing one.
 - **A new required trait method breaks implementers.** Say so in the pull request and in the crate README.

@@ -14,8 +14,8 @@ use adam_model::{
     PromptStatement, ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_plugin::{
-    HookSet, HookedCall, HookedEnd, HookedMessage, HookedModelRequest, HookedText, MessageFile,
-    Plugin, Verdict,
+    HookSet, HookedCall, HookedCompaction, HookedEnd, HookedMessage, HookedModelRequest,
+    HookedText, MessageFile, ModelCallKind, Plugin, Verdict,
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
@@ -178,6 +178,10 @@ struct Summarised {
     cut: usize,
     usage: adam_model::Usage,
     call: String,
+    /// Why a `compaction.before` hook refused the summary (ADR 0050, slice H9): the history is
+    /// shortened instead, and the reason is what the step says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vetoed: Option<String>,
 }
 
 /// The id of the summary call `n` of `run` in its usage report: made inside the journaled step, like
@@ -2984,6 +2988,7 @@ impl LlmAgent {
                     let mut max_output_tokens = request.max_output_tokens;
                     let mut metadata = request.metadata.clone();
                     let verdict = agent.hooks.model_request(&mut HookedModelRequest {
+                        kind: ModelCallKind::Turn,
                         temperature: &mut temperature,
                         top_p: &mut top_p,
                         headers: &mut headers,
@@ -3674,6 +3679,7 @@ impl LlmAgent {
         );
         let images_state = Arc::clone(&state.images);
         let images_cache = Arc::clone(&self.images_cache);
+        let hooks = &self.hooks;
         let recorded: Result<Summarised, ModelFailure> = ctx
             .step(&id, move || async move {
                 if !named.is_empty() {
@@ -3687,6 +3693,118 @@ impl LlmAgent {
                     .await;
                 }
                 apply_sources(&sources, source_ctx.as_ref(), &mut request, ordered).await;
+                // The compaction hooks (ADR 0050, slice H9) run here, inside the journaled step:
+                // a replay of a recorded summary asks none. A hook may add context to the request
+                // or veto the summary, and the history is shortened instead; it never writes the
+                // summary itself.
+                if !hooks.is_empty() {
+                    let mut context = String::new();
+                    match hooks.compaction_before(&mut HookedCompaction {
+                        context: &mut context,
+                    }) {
+                        Ok(Verdict::Continue) => {}
+                        Ok(Verdict::Deny(reason)) => {
+                            return Ok(Summarised {
+                                summary: None,
+                                cut: at,
+                                usage: adam_model::Usage::default(),
+                                call: compaction_call_id(run, n),
+                                vetoed: Some(reason),
+                            });
+                        }
+                        Ok(Verdict::Stop(reason)) => {
+                            return Err(ModelFailure::by_hook(
+                                format!("stopped by a plugin: {reason}"),
+                                false,
+                            ));
+                        }
+                        Ok(Verdict::Ask(_)) => {
+                            return Err(ModelFailure::by_hook(
+                                "a hook may only continue, deny or stop at compaction.before"
+                                    .to_owned(),
+                                false,
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(ModelFailure::by_hook(
+                                format!("the hook `{}` failed: {}", error.plugin, error.reason),
+                                error.is_retryable(),
+                            ));
+                        }
+                    }
+                    if !context.is_empty() {
+                        request.messages.push(Message::user_text(context));
+                    }
+                    // The summary is a model call too: `model.request` sees it, and knows which
+                    // kind it is (ADR 0050, slice H9).
+                    let mut temperature = request.temperature;
+                    let mut top_p = request.top_p;
+                    let mut headers = request.headers.clone();
+                    let mut extra_body = request.extra_body.clone();
+                    let mut max_output_tokens = request.max_output_tokens;
+                    let mut metadata = request.metadata.clone();
+                    match hooks.model_request(&mut HookedModelRequest {
+                        kind: ModelCallKind::Compaction,
+                        temperature: &mut temperature,
+                        top_p: &mut top_p,
+                        headers: &mut headers,
+                        extra_body: &mut extra_body,
+                        max_output_tokens: &mut max_output_tokens,
+                        metadata: &mut metadata,
+                    }) {
+                        Ok(Verdict::Continue) => {
+                            if let Some(name) = headers
+                                .keys()
+                                .find(|name| adam_model::is_credential_header(name))
+                            {
+                                return Err(ModelFailure::by_hook(
+                                    format!(
+                                        "a hook set the header `{name}`, which looks like a credential: the model's key is the deployment's"
+                                    ),
+                                    false,
+                                ));
+                            }
+                            if let Some(key) = adam_model::RESERVED_BODY_KEYS.iter().find(|key| {
+                                extra_body.as_ref().is_some_and(|b| b.contains_key(**key))
+                            }) {
+                                return Err(ModelFailure::by_hook(
+                                    format!("a hook set the body member `{key}`, which the client owns"),
+                                    false,
+                                ));
+                            }
+                            if top_p.is_some_and(|p| !p.is_finite()) {
+                                return Err(ModelFailure::by_hook(
+                                    "a hook set a top_p that is not finite".to_owned(),
+                                    false,
+                                ));
+                            }
+                            request.top_p = top_p;
+                            request.headers = headers;
+                            request.extra_body = extra_body;
+                            request.temperature = temperature;
+                            request.max_output_tokens = max_output_tokens;
+                            request.metadata = metadata;
+                        }
+                        Ok(Verdict::Stop(reason)) => {
+                            return Err(ModelFailure::by_hook(
+                                format!("stopped by a plugin: {reason}"),
+                                false,
+                            ));
+                        }
+                        Ok(Verdict::Deny(_) | Verdict::Ask(_)) => {
+                            return Err(ModelFailure::by_hook(
+                                "a hook may only continue or stop at model.request".to_owned(),
+                                false,
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(ModelFailure::by_hook(
+                                format!("the hook `{}` failed: {}", error.plugin, error.reason),
+                                error.is_retryable(),
+                            ));
+                        }
+                    }
+                }
                 let answer = tokio::select! {
                     biased;
                     () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
@@ -3698,6 +3816,7 @@ impl LlmAgent {
                     cut: at,
                     usage: answer.usage.accounted(),
                     call: compaction_call_id(run, n),
+                    vetoed: None,
                 })
             })
             .await?;
@@ -3741,6 +3860,20 @@ impl LlmAgent {
             state.model_wait = None;
         }
         let (summary, cut_at, rejected) = match recorded {
+            // A compaction hook vetoed the summary: the history is shortened instead (ADR 0050,
+            // slice H9), as when no summary can be made, and the reason is what the step says.
+            Ok(Summarised {
+                vetoed: Some(reason),
+                ..
+            }) => {
+                tracing::warn!(run = %run, "a compaction hook vetoed the summary: the history is shortened instead");
+                state.compact_failed = Some(state.turns);
+                ctx.emit(RunEvent::Step(step(StepState::Failed).with_detail(format!(
+                    "no summary could be made (vetoed by a plugin: {reason}); the history is shortened instead"
+                ))))
+                .await;
+                return Ok(Compacted::No);
+            }
             Ok(done) => {
                 // The call was made and counts, whatever its summary is worth.
                 self.report_usage(ctx, state, done.call.clone(), &live_alias, done.usage, None)

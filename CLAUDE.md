@@ -1,6 +1,8 @@
 # Agent guide — another-adam-rs
 
-`AGENTS.md` is a symlink to this file. Edit `CLAUDE.md` only.
+`AGENTS.md` is a symlink to this file. Edit `CLAUDE.md` only. This is the index for coding agents: people start at
+`README.md` and `docs/`; the procedures, invariants and evidence for agents are in `.agents/docs/`
+([ADR 0079](docs/decisions/0079-docs-for-people-and-docs-for-agents-live-apart.md)).
 
 ## What this is
 
@@ -17,6 +19,7 @@ that integrate adam-rs.
 | Path | What |
 |---|---|
 | `README.md`, `docs/` | the human docs: `docs/README.md` (index), `architecture.md`, `guides/`, `reference/`, `roadmap.md` (the library's own; the product roadmap is `ROADMAP.md` in another-agentic-system, https://github.com/vymalo/another-agentic-system/blob/main/ROADMAP.md), `decisions/NNNN-*.md` (ADRs) |
+| `.agents/docs/` | the docs for agents, not published: [its index](.agents/docs/README.md), [writing docs](.agents/docs/writing-docs.md) (the split, which page a change updates, the checks), [skills](.agents/docs/skills.md), and the agent page of a `docs/` page at the same relative path |
 | `CONTRIBUTING.md`, `SECURITY.md` | how to contribute (claim an issue, build, test, open a pull request) and how to report a vulnerability privately; the front door for outside contributors |
 | `crates/`, `bin/adam-coder`, `bin/adam-agent` | libraries, one per concern, and the two agents (library and binary each); each has a `README.md` |
 | `deploy/coder/`, `docker/coder/` | the Helm chart (`bump-tag.sh`, `tests/`: renders, goldens, schemas) and the image with its smoke tests. **`deploy/coder` is read by another repository**: vymalo/another-agentic-platform renders its parity goldens from this chart at a pinned revision (its `tools/adam-parity/regen.sh`), so what the chart renders for a given value is a contract; say so in the pull request when it changes |
@@ -44,36 +47,22 @@ that integrate adam-rs.
 7. **Tests that need a database skip when their variable is unset**, and fail instead under
    `ADAM_TEST_REQUIRE_DB=1` (CI sets it).
 8. **Decisions are ADRs** in `docs/decisions/NNNN-kebab-title.md`, next number, headed `# NNNN. Title` and
-   `Status: **Accepted** (date)`. Change a past decision with a dated *Amended* note, never silently.
+   `Status: **Accepted** (date)`, with a row in `docs/decisions/README.md`. Change a past decision with a dated
+   *Amended* note, never silently.
 9. **Mark facts** about third parties *verified* (date and source) or *unverified*.
-10. **Documentation**: keep the human docs short and current, and comments rare (below).
+10. **Documentation**: `docs/` is for people, `.agents/docs/` for agents, and each pair links both ways (ADR 0079).
+    Keep the human docs short and current, and comments rare (below).
 
 ## Documentation
 
-Humans read `README.md` and `docs/`: colleagues who test the system need short, targeted pages, clear
-architecture with pictures, and deploy instructions. Agent-only context lives here and in skills, never in `docs/`.
-
-* **A change that alters behaviour updates its page in the same PR:**
-
-  | You change | Update |
-  |---|---|
-  | an environment variable, default or exit code | `docs/reference/environment.md`, `docs/reference/errors.md`, the crate README |
-  | a process, lifecycle, port, role or the store schema | `docs/architecture.md` (diagram and tables) |
-  | the agent file format, validation, `#[tool]` | `docs/reference/agent-files.md`, `docs/guides/write-an-agent.md` |
-  | the chart or the image | `deploy/coder/README.md`, `docs/guides/deploy-the-coder.md` |
-  | compose, a mock, a scripted model, an e2e script | `docs/reference/dev-stack.md`, `docs/guides/run-locally.md`, `docs/guides/testing.md` |
-  | a path a first-party skill cites | the skill (docs-check fails on a missing path) |
-  | a setting or a feature of any surface (coder, folder agent, engine, the card) | `docs/reference/parity.md`: fill every column, or list the gap |
-
-* **Short.** Short sentences, tables, no repeated explanations: link instead of copying, never copy a crate
-  README. `README.md` stays about 100 lines; a guide covers one task.
-* **Pictures.** A process gets a Mermaid pair, a `sequenceDiagram` for the interaction and a
-  `stateDiagram-v2` for the lifecycle; prose says only what they cannot. Every node, edge, state and call
-  must exist in the code; cite files (`crates/adam-runtime/src/runtime.rs`).
-* **Comments in code** only where the reason is not obvious: no restating the code, no essays, no history
-  ("added in slice N"). What a user needs belongs in a README or `docs/`.
-* `node tools/docs-check/check-docs.mjs` parses every diagram, resolves every relative link and `#heading`,
-  requires a README per crate and checks the first-party skills.
+* `README.md` and `docs/` are for **people**: the answer first, short sentences, tables, Mermaid pairs, file names
+  but no `path:line`. They are published as the site.
+* `.agents/docs/` is for **agents**: procedures, invariants to check, evidence (`path:line`, tests, commits), the gates.
+  A page there sits at the same relative path as its page for people, and the two link to each other.
+* **A change that alters behaviour updates its page in the same PR.** Which page, how to write it, and what
+  `docs-check` enforces: [writing docs](.agents/docs/writing-docs.md).
+* `node tools/docs-check/check-docs.mjs` parses every diagram, resolves every relative link and `#heading`
+  (`.agents/docs` included), requires a README per crate, checks the first-party skills, and holds the split.
 
 ## Commands
 
@@ -125,18 +114,6 @@ file's *Rules* → first-party skills (`adam-*`) → vendored skills. Start with
 Off-domain here: `domain-cli`, `domain-embedded`, `domain-fintech`, `domain-iot`, `domain-ml`. Not for direct
 use: the `core-*` helpers, `meta-cognition-parallel`, `rust-skill-creator`, `rust-daily`, `m14-mental-model`.
 
-**Skills this repo provides.** Other repositories install the six public ones (`adam-agent-folder`,
-`adam-embed`, `adam-store-adapter`, `adam-a2a-extensions`, `adam-coder-deploy`, `adam-upgrade`) with the CLI:
-
-```sh
-npx skills add vymalo/another-adam-rs --list
-npx skills add vymalo/another-adam-rs --skill adam-agent-folder --skill adam-upgrade -a claude-code -y
-npx skills update -p -y                   # later, in the consumer
-```
-
-The consumer's `skills-lock.json` pins them and each skill says to read adam-rs files at the pinned revision.
-`update-vendored-skills` is `metadata.internal: true` and not listed; the CLI hides internal skills and those in
-this repository's own `skills-lock.json` (*verified 2026-10-03* in `skills@1.7.0`, `dist/cli.mjs`
-`discoverSkills`), so never list a first-party skill there. Skills are written for a reader outside this
-repository: no relative links, adam-rs paths as code spans plus an absolute GitHub URL. docs-check checks
-their frontmatter, mirrors and cited paths.
+**Skills this repo provides.** Other repositories install the six public ones (`adam-agent-folder`, `adam-embed`,
+`adam-store-adapter`, `adam-a2a-extensions`, `adam-coder-deploy`, `adam-upgrade`) with `npx skills add
+vymalo/another-adam-rs`. How they are installed, pinned and written: [skills](.agents/docs/skills.md).

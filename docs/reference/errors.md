@@ -6,6 +6,17 @@ the A2A error a client sees and the process exit code decide from the class, nev
 Every enum implements `Classify` and its test matches every variant exhaustively, so a new variant
 forces a class decision.
 
+## On this page
+
+* [Classes](#classes)
+* [Which variant maps to which class](#which-variant-maps-to-which-class)
+* [What each class decides](#what-each-class-decides)
+* [What the model is told](#what-the-model-is-told)
+* [Retry](#retry)
+* [Admission refusals](#admission-refusals)
+* [Exit codes](#exit-codes)
+* [Rules for an error enum](#rules-for-an-error-enum)
+
 ## Classes
 
 | Class | Meaning | Retry | Alert | A2A error (`adam-a2a`) | Exit code |
@@ -283,7 +294,7 @@ Where each decision is made:
   that cannot be created) is 71. Anything else is 1. The process logs one
   structured line, `adam-coder failed`, with the whole cause chain and none of
   the process's secrets. The values are BSD `sysexits.h` numbers (*unverified*,
-  see [Verified and unverified](../architecture.md#verified-and-unverified)).
+  see [Verified and unverified](../../.agents/docs/architecture.md#verified-and-unverified)).
 
 
 ## What the model is told
@@ -445,9 +456,4 @@ a `WorkspaceError::Corrupt` that names the file; git never makes any of them, so
 
 ## Rules for an error enum
 
-`thiserror` in libraries and `anyhow` only in binaries; `#[non_exhaustive]`; an `impl Classify` with an
-exhaustive `match` in its test; a `#[source]` for every wrapped error (`BoxError` for a driver or SDK type,
-so none appears in a trait signature); a message that describes its own layer only. Nothing interpolates
-its source: `adam_error::report(&e)` prints the chain (`a: b: c`) once, only where an error is flattened:
-the journal, a response to a client, a log line. Details: the
-[`adam-error` README](../../crates/adam-error/README.md).
+The rules a new or changed error enum must keep, the checks a reviewer makes: [errors, for agents](../../.agents/docs/reference/errors.md#rules-for-an-error-enum).

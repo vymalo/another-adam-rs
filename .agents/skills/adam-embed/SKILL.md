@@ -76,7 +76,11 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      asks no hook. `message_received` runs in the step that takes a person's message in
      (`message:start`, `message:<inbound id>`; taken only when a set is installed): a hook may allow
      the message, rewrite its text, or refuse it — a refused start fails the run `Rejected` with the
-     reason, and one refused while the task works is left out and the task goes on. A message's files
+     reason, and one refused while the task works is left out and the task goes on. `model_request`
+     (H3) runs inside `model:<turn>` with `HookedModelRequest { kind, temperature, max_output_tokens,
+     metadata }`, where `kind` is `Turn` or `Compaction`; `compaction_before` (H9) runs inside the
+     journaled `compact:` step, may append `context` to the summary request, and `Deny` vetoes the
+     summary — the history is shortened instead. A message's files
      reach the hook by reference (name, media type, size, SHA-256), never their bytes. The verdict is
      recorded with the call (`HookedOutput`) or the message (`MessageDecision`). A hook gets no `Ctx`
      and adds no step of its own. `EngineBuilder` takes no `HookSet` yet, and an agent file's

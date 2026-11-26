@@ -1,0 +1,10 @@
+{
+  "mcp": {
+    "servers": {
+      "corntchap-and": {
+        "type": "remote",
+        "url": "https://corntchap.camer.digital/mcp/ANR"
+      }
+    }
+  }
+}

@@ -1,0 +1,26 @@
+# Docs for agents
+
+For people: [`docs/`](../../docs/README.md). This tree holds what a coding agent needs to change adam-rs and check
+the change: procedures, invariants to verify, evidence, and how to run the gates. It is not published. The convention
+is [ADR 0079](../../docs/decisions/0079-docs-for-people-and-docs-for-agents-live-apart.md); the entry point is
+[`CLAUDE.md`](../../CLAUDE.md).
+
+A page here that has a page for people sits at the same relative path, and the two link to each other.
+
+| Page | For people | What it holds |
+|---|---|---|
+| [Writing docs](writing-docs.md) | [Writing these docs](../../docs/README.md#writing-these-docs) | the split, which page a change updates, how to write a page for people, what `docs-check` checks |
+| [Skills](skills.md) | none | the skills this repository provides, how consumers install them, how to write and keep one |
+| [Architecture: the evidence](architecture.md) | [Architecture](../../docs/architecture.md) | what was verified, when and how, and what is still unverified |
+| [Errors: rules to check](reference/errors.md) | [Errors](../../docs/reference/errors.md) | the rules every error enum keeps |
+| [Agent files: the decisions to keep](reference/agent-files.md) | [Agent files](../../docs/reference/agent-files.md) | the owner's decisions behind the folder format |
+| [Child runs: the tests](reference/child-runs.md) | [Child runs](../../docs/reference/child-runs.md) | the test of every failure interleaving, and how the tests make each happen |
+
+## Still mixed
+
+Pages for people that still carry agent evidence, to split one at a time:
+
+| Page | What is still in it |
+|---|---|
+| [`docs/reference/parity.md`](../../docs/reference/parity.md) | the `repo:path:line` citation of every cell, the pins and *How to keep parity*; it is listed by name in `docs-check` until split |
+| the crate READMEs | file citations and test lists, for people who change or embed the crate; long ones (`bin/adam-coder`, `adam-llm-agent`, `adam-assembly`) mix guide, reference and evidence |

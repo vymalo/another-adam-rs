@@ -192,6 +192,40 @@ Push notifications are on when the allow-list is not empty; the card signature w
 {{- define "coder.a2aCardSigningDir" -}}/var/run/secrets/card-signing{{- end -}}
 
 {{/*
+The turn key (values `externalSecrets.properties.turnSigningKey`, adam ADR 0068). Every role reads
+it, so it is not under coder.runsWorkers. On when the ExternalSecret is enabled and names the
+property; the chart never carries the key itself.
+*/}}
+{{- define "coder.turnSigning" -}}
+{{- if and .Values.externalSecrets.enabled .Values.externalSecrets.properties.turnSigningKey -}}true{{- end -}}
+{{- end -}}
+{{/* Where the turn key's Secret is mounted. */}}
+{{- define "coder.turnSigningDir" -}}/var/run/secrets/turn-signing{{- end -}}
+{{/* The verify set, when the ExternalSecret also copies one. */}}
+{{- define "coder.turnVerifyKeys" -}}
+{{- if and (include "coder.turnSigning" .) .Values.externalSecrets.properties.turnVerifyKeys -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The environment of the turn key, as list items for a container's `env`. Include it in every role:
+a control plane signs and verifies too (ADR 0068 decision 9).
+*/}}
+{{- define "coder.turnSigningEnv" -}}
+{{- if include "coder.turnSigning" . }}
+- name: TURN_SIGNING_KEY_FILE
+  value: {{ printf "%s/private-key.pem" (include "coder.turnSigningDir" .) | quote }}
+{{- with .Values.turnSigning.keyId }}
+- name: TURN_SIGNING_KEY_ID
+  value: {{ . | quote }}
+{{- end }}
+{{- if include "coder.turnVerifyKeys" . }}
+- name: TURN_VERIFY_KEYS_FILE
+  value: {{ printf "%s/verify-keys.json" (include "coder.turnSigningDir" .) | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
 The environment of the optional A2A features, as list items for a container's `env`. Include it only in
 a pod that serves A2A (the combined StatefulSet, the split front).
 */}}

@@ -7,7 +7,7 @@ image:
   # Bumped on every green build of main by .github/workflows/coder.yml
   # (`sha-<first 7 of the commit>`). A plain key so the workflow can edit it.
   # sha-0000000 is the placeholder that exists before the first build.
-  tag: sha-69dccb7
+  tag: sha-07c3b7d
   pullPolicy: IfNotPresent
 
 # The image package may be private; name a pull secret here if so.
@@ -667,6 +667,18 @@ database:
   # requests. Known risk.
 
 # Secret values come from AWS Secrets Manager through External Secrets.
+# The turn key (adam ADR 0068): every role signs a run's history with it. On when
+# externalSecrets.properties.turnSigningKey names the AWS property that holds the key: a PKCS#8 PEM
+# Ed25519 private key (`openssl genpkey -algorithm ed25519`). The ExternalSecret copies it into the
+# Secret as TURN_SIGNING_KEY.pem, and the chart mounts it read-only at /var/run/secrets/turn-signing
+# and sets TURN_SIGNING_KEY_FILE. The chart never carries the key itself, and the key is read at
+# startup, so a rotation is a rollout of every role.
+turnSigning:
+  # The `kid` of the signature (TURN_SIGNING_KEY_ID): the key's vault reference,
+  # `vault:<name>#v<n>`. Empty: the key's RFC 7638 thumbprint. With `#v<n>` above 1, the verify set
+  # must name every earlier version, 1 to n-1, or the process refuses to start.
+  keyId: ""
+
 externalSecrets:
   enabled: true
   apiVersion: external-secrets.io/v1
@@ -688,6 +700,15 @@ externalSecrets:
     githubToken: adam_coder_github_token
     # Comma-separated bearer tokens the A2A server accepts.
     a2aBearerTokens: adam_coder_a2a_bearer_tokens
+    # The turn key (adam ADR 0068): a PKCS#8 PEM Ed25519 private key, copied into the Secret as
+    # TURN_SIGNING_KEY.pem and mounted as a file. Empty (default): no turn key, and the chart renders
+    # nothing of it. Set the AWS property before turning it on: a missing property fails the whole
+    # ExternalSecret sync. Read by every role, unlike the model key.
+    turnSigningKey: ""
+    # A JWKS of the public keys of earlier versions and their `revoked` list (TURN_VERIFY_KEYS_FILE),
+    # copied as TURN_VERIFY_KEYS.json. Empty (default): only the signing key's own public key is
+    # accepted, which is right until the key rotates.
+    turnVerifyKeys: ""
     # The tokens of the extra MCP servers (mcp.* above), read only by the roles that run workers and
     # only when that server is on. Found under the same `key` as the others: a deployment that turns
     # them on sets `key` to the AWS secret that holds all of them.

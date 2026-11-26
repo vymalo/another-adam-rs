@@ -19,12 +19,13 @@ neither the loop nor the runtime.
 
 | Item | What it is |
 |---|---|
-| `Plugin` | `name`, `message_received`, `model_request` (inside the `model:<turn>` step: it may rewrite `temperature`, `top_p`, `max_output_tokens`, `metadata`, `headers` and an `extra_body` of the call, or `Stop` the run; a header whose name looks like a credential or a body member the client owns fails the run; a replay asks none), `run_ending` (`Deny` keeps the run going with the reason), `before_tool` and `after_tool`, each with a do-nothing default, so a plugin that cares about one point implements one method |
+| `Plugin` | `name`, `message_received`, `model_request` (inside the `model:<turn>` step: it sees `kind` — `Turn` or `Compaction` — and may rewrite `temperature`, `top_p`, `max_output_tokens`, `metadata`, `headers` and an `extra_body` of the call, or `Stop` the run; a header whose name looks like a credential or a body member the client owns fails the run; a replay asks none), `compaction_before` (inside the `compact:` step: it may add `context` to the summary request, or `Deny` it and the history is shortened instead), `run_ending` (`Deny` keeps the run going with the reason), `before_tool` and `after_tool`, each with a do-nothing default, so a plugin that cares about one point implements one method |
 | `Verdict` | `Continue`, `Deny(reason)`, `Ask(reason)`, `Stop(reason)`: the first verdict other than `Continue` is the set's, and a later plugin is not asked |
 | `HookError` | the plugin's name, an `adam-error` class and a reason (never an argument or a tool's answer); `is_retryable` follows the class |
 | `HookLimits` | the deadline of one hook (1 s by default) and how many times a retryable failure is tried again (1) |
 | `HookSet` | the ordered plugins and their limits; `message_received`, `before_tool` and `after_tool` run them, `catch_unwind` each call, and stop at the first decision |
 | `HookedCall`, `HookedText` | what a hook sees: the tool's name and its arguments (rewritable), and the text the model will read (rewritable) |
+| `HookedModelRequest`, `ModelCallKind`, `HookedCompaction` | what a `model.request` hook sees (the call's kind, temperature, output bound and metadata) and what a `compaction.before` hook sees (the `context` it may add to the summary request). `HookedModelRequest` gained the public field `kind` (2026-11-26), so a hand-built literal needs it |
 | `HookedMessage`, `MessageFile` | what a `message.received` hook sees: the text (rewritable) and the files **by reference** (name, media type, size, the SHA-256 the image step records), never their bytes |
 
 ## The rules
