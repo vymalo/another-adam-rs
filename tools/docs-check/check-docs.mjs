@@ -12,7 +12,10 @@
 //      docker/, dev/, tools/ or .github/; spans with a placeholder or a glob are not paths), and
 //   6. the split of ADR 0079 holds: a page of .agents/docs (for agents) and the page of docs/ at the
 //      same relative path (for people) link to each other, and no page for people outside the dated
-//      records (docs/decisions, docs/reviews) cites a `path:line`.
+//      records (docs/decisions, docs/reviews) cites a `path:line`, and
+//   7. every extension URI the card builder can list (the `*EXTENSION*` constants of
+//      crates/adam-a2a/src/extensions.rs, and any extension URI written as a literal in a non-test
+//      Rust source) has a table row in docs/reference/extensions.md, and the constants in its agent page.
 // Usage (from the repo root):  npm --prefix tools/docs-check ci && node tools/docs-check/check-docs.mjs
 // Exits 1 on any failure, listing file:line for each.
 import fs from 'node:fs';
@@ -238,7 +241,51 @@ for (const file of markdownFiles(path.join(root, 'docs'))) {
   }
 }
 
-console.log(`${diagrams} diagrams, ${links} relative links, ${crates} crate READMEs, ${skills} first-party skills (${skillPaths} cited paths), ${pairs} people/agent page pairs checked`);
+// Rule 7: the extensions page lists every URI the card builder can list. The constants are the
+// builder's own list; a literal URI in another non-test source is an extension written around them.
+const extensionsFile = path.join('crates', 'adam-a2a', 'src', 'extensions.rs');
+const extensionPages = [path.join('docs', 'reference', 'extensions.md'), path.join('.agents', 'docs', 'reference', 'extensions.md')];
+let extensionUris = 0;
+if (fs.existsSync(path.join(root, extensionsFile))) {
+  const declared = new Map(); // uri -> where it is declared
+  const constants = fs.readFileSync(path.join(root, extensionsFile), 'utf8');
+  for (const m of constants.matchAll(/pub const (\w*EXTENSION\w*)\s*:\s*&str\s*=\s*"(https:\/\/[^"]+)"/g)) {
+    declared.set(m[2], `${extensionsFile}: ${m[1]}`);
+  }
+  const literal = /https:\/\/(?:agents\.vymalo\.com\/a2a\/extensions\/[a-z0-9-]+\/v\d+|a2ui\.org\/a2a-extension\/[a-z0-9./-]+)/g;
+  const literalOnly = new Set();
+  const sources = function* (dir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (skipDirs.has(entry.name) || entry.name === 'tests' || entry.isSymbolicLink()) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) yield* sources(full);
+      else if (entry.name.endsWith('.rs')) yield full;
+    }
+  };
+  for (const top of crateRoots) {
+    if (!fs.existsSync(path.join(root, top))) continue;
+    for (const file of sources(path.join(root, top))) {
+      // Code only: a `//` comment may name a URI it describes, a string literal declares one.
+      const code = fs.readFileSync(file, 'utf8').split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n');
+      for (const m of code.matchAll(literal)) {
+        if (!declared.has(m[0]) && !literalOnly.has(m[0])) { literalOnly.add(m[0]); declared.set(m[0], `${path.relative(root, file)}: a literal`); }
+      }
+    }
+  }
+  extensionUris = declared.size;
+  for (const page of extensionPages) {
+    const full = path.join(root, page);
+    const rows = fs.existsSync(full)
+      ? fs.readFileSync(full, 'utf8').split('\n').filter((l) => l.startsWith('|')).join('\n')
+      : '';
+    for (const [uri, where] of declared) {
+      if (page.startsWith('.agents') && literalOnly.has(uri)) continue; // the agent page lists the builder's constants
+      if (!rows.includes('`' + uri + '`')) failures.push(`${page}: no row for the extension URI ${uri} (${where})`);
+    }
+  }
+}
+
+console.log(`${diagrams} diagrams, ${links} relative links, ${crates} crate READMEs, ${skills} first-party skills (${skillPaths} cited paths), ${pairs} people/agent page pairs checked, ${extensionUris} extension URIs`);
 if (failures.length) {
   console.error(failures.join('\n'));
   console.error(`${failures.length} problem(s)`);

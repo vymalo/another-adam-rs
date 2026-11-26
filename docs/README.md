@@ -32,6 +32,7 @@ These pages are for people. The procedures and evidence that coding agents use l
 | Group | Page | What it answers |
 |---|---|---|
 | API | [The A2A server](reference/a2a-server.md) | the methods, follow-ups, continuing a finished task, push notifications, `ListTasks`, the extended card and its signature, the steps, text and reasoning streams, and the A2A extensions an agent serves |
+| API | [Extensions](reference/extensions.md) | every A2A extension URI an adam card can list: when it is listed, whether it is served, and its contract on the system's site |
 | Configuration | [Environment variables](reference/environment.md) | every variable of the binaries, the compose stack and the tests |
 | Configuration | [Agent files and `#[tool]`](reference/agent-files.md) | the folder layout and formats, validation, skills, subagents, MCP, dev reload, the macro |
 | Configuration | [The chart](../deploy/coder/README.md) | every value of the coder's Helm chart |
