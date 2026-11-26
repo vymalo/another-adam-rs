@@ -91,6 +91,13 @@ impl ChainHash {
         self.0
     }
 
+    /// The link written by [`Display`](fmt::Display) (base64url, no padding): `None` for anything
+    /// that is not exactly 32 bytes of it.
+    pub fn parse(text: &str) -> Option<Self> {
+        let bytes = URL_SAFE_NO_PAD.decode(text).ok()?;
+        <[u8; 32]>::try_from(bytes).ok().map(Self)
+    }
+
     fn text(&self) -> String {
         URL_SAFE_NO_PAD.encode(self.0)
     }
@@ -147,6 +154,76 @@ fn without_adam(message: &Value) -> Value {
         }
     }
     message
+}
+
+/// The bytes a head signature covers ([ADR 0068] decision 4): the RFC 8785 form of
+/// `{typ: "adam-head/v1", run, cnv, len, chain, head}`. `len` is the number of body rows, `chain` is
+/// `h(len - 1)` over them ([`ChainHash::over`]) and `head` is the run's state document **as the
+/// runtime wrote it, without its signature** (the caller decides which members that is: see the
+/// runtime's `seal` module). A changed head member, a row appended or dropped (`len`, `chain`), and
+/// a run moved to another run id or conversation (`run`, `cnv`) each change these bytes.
+///
+/// [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+pub fn head_payload(
+    run: RunId,
+    cnv: &ConversationHash,
+    len: u32,
+    chain: &ChainHash,
+    head: &Value,
+) -> Vec<u8> {
+    canonicalize(&json!({
+        "typ": SignatureType::Head.typ(),
+        "run": run.to_string(),
+        "cnv": cnv.text(),
+        "len": len,
+        "chain": chain.text(),
+        "head": head,
+    }))
+}
+
+/// Sign a run's head with the current key of `keys`: the detached JWS of [`head_payload`].
+///
+/// # Errors
+///
+/// [`TurnKeyError`] from the keys.
+pub async fn sign_head(
+    keys: &(impl TurnKeys + ?Sized),
+    run: RunId,
+    cnv: &ConversationHash,
+    len: u32,
+    chain: &ChainHash,
+    head: &Value,
+) -> Result<String, TurnKeyError> {
+    sign_detached(
+        keys,
+        SignatureType::Head,
+        &head_payload(run, cnv, len, chain, head),
+    )
+    .await
+}
+
+/// Verify `jws` as the head signature of this run, conversation, length, chain and head, with
+/// `set`; the id of the key that made it.
+///
+/// # Errors
+///
+/// [`TurnSignatureError`], all of class `Corrupt`; a turn signature offered as a head's is
+/// [`WrongType`](TurnSignatureError::WrongType).
+pub fn verify_head(
+    set: &KeySet,
+    run: RunId,
+    cnv: &ConversationHash,
+    len: u32,
+    chain: &ChainHash,
+    head: &Value,
+    jws: &str,
+) -> Result<KeyId, TurnSignatureError> {
+    verify_detached(
+        set,
+        SignatureType::Head,
+        &head_payload(run, cnv, len, chain, head),
+        jws,
+    )
 }
 
 /// Sign `message` at `position` with the current key of `keys`: the value of its

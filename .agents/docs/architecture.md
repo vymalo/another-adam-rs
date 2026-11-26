@@ -31,6 +31,34 @@ bindings ([ADR 0031](../../docs/decisions/0031-swagger-ui-and-the-a2a-rest-bindi
 * The chart was rendered, not applied to a cluster; how it reaches the cluster after the tag bump is
   outside this repository.
 
+## Signed heads (ADR 0068, slice T3a-2)
+
+For people: [Signed turns](../../docs/architecture.md#signed-turns-each-assistant-and-tool-turn-is-signed-when-it-is-committed).
+Written 2026-11-26 on top of #453.
+
+* **Payload.** `adam_core::turn::head_payload` (`crates/adam-core/src/turn/chain.rs`): JCS of `{typ: "adam-head/v1", run,
+  cnv, len, chain, head}`. Test `tests/turn_signature.rs` `the_head_signature_binds_each_member_of_its_payload`.
+* **`head`** is the stored state document minus `signature`, `seal` and `body.generation`, through `storable`
+  (`crates/adam-runtime/src/seal.rs` `signed_head`). The generation is excluded because the store patches it after the
+  runtime signs (`set_head_body`); `len` is in the payload.
+* **Write sites.** Step commit: `worker.rs` `seal_update`, after `build_update`, in the CAS retry loop (a v5 head with a
+  split: `Seal::over(next.split rows)`; a head that carries its rows: the base `seal`; a v4 state: the chain over
+  `Inner::transcript_of(agent, next.agent)`). Delivery and cancel: `Inner::reseal` (`runtime.rs`), after the last mutation
+  and before `carried`. A signing failure at commit is a `StoreError::Backend` with the keys' class: the run keeps its
+  lease. Not re-signed because the state is unchanged: `park_again`, the failed-run write of `transition`.
+* **Read sites.** `Inner::join_head` (after the row prefix is complete, before `join`), `join_stored` and `claimed` for a
+  v4 state (`check_full`). They verify against `rec.state`, the record as read. Everything that decodes goes through one of
+  them: `Runtime::state`, `view` does not (it reads the head only).
+* **Adoption.** `Sealer::check_read`: no `signature` and no row with `extra_content.adam.turn_signature` is accepted; any
+  turn signature without a head signature is `Corrupt`. A delivery or cancel never signs an unsigned document.
+* **`seal`** `{len, chain}` is a head-only carry; a reader recomputes. A v4 state has none (its chain is recomputed from
+  the agent's `split`; `transcript` moved to `ErasedStarter` so a start-only runtime can do it).
+* **Errors.** `RuntimeError::Corrupt` (source `TurnSignatureError`) for a refused head, new `RuntimeError::TurnKeys` for a
+  key set that cannot be read or keys that cannot sign. A claimed run that does not verify is committed `Failed`, state as
+  found, by the existing unreadable-state path.
+* **Checked 2026-11-26:** `cargo test -p adam-core -p adam-runtime --locked`; breaking `seal.rs` `check_read` (chain over no
+  rows) fails 6 of 12 cases of `head_signature.rs`.
+
 ## Signed turns at commit (ADR 0068, slice T3a-1)
 
 For people: [Signed turns](../../docs/architecture.md#signed-turns-each-assistant-and-tool-turn-is-signed-when-it-is-committed).

@@ -34,6 +34,7 @@ use crate::retry::{
     Decision, RUNTIME_RETRY_KEY, RetryRecord, StepRetry, Verdict, class_name, decide,
 };
 use crate::runtime::{Inner, MAX_COMMIT_RETRIES, Runtime, RuntimeError};
+use crate::seal::{Seal, attach, chain_over};
 
 type InFlight = Arc<Mutex<HashSet<RunId>>>;
 
@@ -1297,6 +1298,7 @@ fn build_update(
         remaining_secs: next.remaining_secs,
         agent_wake,
         hb: heartbeat,
+        signature: None,
     };
     let mut update = RunUpdate::new(status, Value::Null);
     update.wake_at = wake_at;
@@ -1360,6 +1362,70 @@ fn build_update(
         (_, None) | (Some(_), _) => update.state = env.encode()?,
     }
     Ok(update)
+}
+
+/// Sign the document `update` writes as the run's state ([ADR 0068] decision 4): the v5 head, or
+/// the v4 state of a run that is not split. With no turn keys the document is left as built, which
+/// carries no signature.
+///
+/// A head whose transcript this commit writes is chained over the rows it writes (`next.split`).
+/// One that carries its rows is signed again with the `{len, chain}` it read, and a head that had
+/// none (an unsigned run, adopted by decision 11) stays unsigned until a commit that writes rows. A
+/// v4 state is chained over the agent's own transcript, the one a reader takes from it.
+///
+/// A key that cannot sign is the commit's failure, with the keys' class: the run keeps its lease
+/// and is tried again, and nothing is written unsigned by a runtime that has keys.
+///
+/// [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+async fn seal_update(
+    inner: &Inner,
+    rec: &RunRecord,
+    next: &Next,
+    base: Option<&HeadParts>,
+    update: &mut RunUpdate,
+) -> StoreResult<()> {
+    let Some(sealer) = &inner.sealer else {
+        return Ok(());
+    };
+    let refuse = |e: RuntimeError| match e {
+        RuntimeError::TurnKeys(e) => StoreError::Backend {
+            class: e.class(),
+            source: Box::new(e),
+        },
+        other => StoreError::InvalidInput(other.to_string()),
+    };
+    let conversation = rec.conversation_id.as_deref();
+    let doc = match update.head.as_mut() {
+        Some(head) => head,
+        None if update.state.is_object() => &mut update.state,
+        None => return Ok(()),
+    };
+    let is_head = doc.get("v").and_then(Value::as_u64) == Some(u64::from(crate::head::VERSION));
+    let (len, chain, seal) = if is_head {
+        match &next.split {
+            Some((_, rows)) if !next.split_refused => {
+                let (seal, chain) = Seal::over(rec.id, conversation, rows).map_err(refuse)?;
+                (seal.len, chain, Some(seal))
+            }
+            _ => match base.and_then(|base| base.seal.clone()) {
+                Some(seal) => match seal.parts() {
+                    Some((len, chain)) => (len, chain, Some(seal)),
+                    None => return Ok(()),
+                },
+                None => return Ok(()),
+            },
+        }
+    } else {
+        let rows = inner.transcript_of(&rec.agent, &next.agent);
+        let (len, chain) = chain_over(rec.id, conversation, &rows).map_err(refuse)?;
+        (len, chain, None)
+    };
+    let signature = sealer
+        .sign(rec.id, conversation, len, &chain, doc)
+        .await
+        .map_err(|e| refuse(e.into()))?;
+    attach(doc, signature, seal.as_ref());
+    Ok(())
 }
 
 /// Inline the bytes of every file a v5 head names into `artifacts`, so a demoted v4 state carries
@@ -1531,6 +1597,7 @@ async fn commit(
             body_writer,
             keeps_bodies,
         )?;
+        seal_update(inner, cur_rec, next, cur_head, &mut update).await?;
         update.blobs = blobs;
         match inner.store.commit_run(run, cur_rec.version, update).await {
             Ok(rec) => {
