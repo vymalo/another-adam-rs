@@ -103,16 +103,40 @@ pub struct HookedMessage<'a> {
 /// The point where a model call is about to be made, inside the call's step (ADR 0050, slice H3).
 pub const MODEL_REQUEST: &str = "model.request";
 
+/// The point where a history is about to be summarised, inside the summary's journaled step
+/// (ADR 0050, slice H9).
+pub const COMPACTION_BEFORE: &str = "compaction.before";
+
+/// Which model call a `model.request` hook runs at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelCallKind {
+    /// A turn's call: the run's own answer.
+    Turn,
+    /// A compaction's summary call (ADR 0050, slice H9).
+    Compaction,
+}
+
 /// What a model call is, as a `model.request` hook sees it: only the sampling temperature, the
-/// bound on the answer's length and the call's metadata, each of which a plugin may rewrite in
-/// place. The system prompt, the history, the model, its endpoint and its key are not here.
+/// bound on the answer's length, the call's metadata and what kind of call it is, each of which a
+/// plugin may read, and the first three rewritten in place. The system prompt, the history, the
+/// model, its endpoint and its key are not here.
 pub struct HookedModelRequest<'a> {
+    /// A turn's call, or a compaction's summary.
+    pub kind: ModelCallKind,
     /// The sampling temperature; absent leaves the model's own.
     pub temperature: &'a mut Option<f32>,
     /// The upper bound on generated tokens; absent leaves the model's own.
     pub max_output_tokens: &'a mut Option<u32>,
     /// What is forwarded as request metadata where the backend supports it.
     pub metadata: &'a mut std::collections::BTreeMap<String, String>,
+}
+
+/// What a compaction is, as a `compaction.before` hook sees it: the context a plugin may add to the
+/// summary request. The history, the cut and the model are not here, and a hook never writes the
+/// summary itself.
+pub struct HookedCompaction<'a> {
+    /// Text a plugin adds to the summary request; empty adds nothing.
+    pub context: &'a mut String,
 }
 
 /// What a deciding hook says about the call it runs at.
@@ -209,6 +233,14 @@ pub trait Plugin: Send + Sync {
     /// metadata, or stop the run with [`Verdict::Stop`]. `Deny` and `Ask` are not verdicts of this
     /// point, and the loop treats them as a hook failure.
     fn model_request(&self, _request: &mut HookedModelRequest<'_>) -> HookResult {
+        Ok(Verdict::Continue)
+    }
+
+    /// A history is about to be summarised (ADR 0050, slice H9): add context to the summary request,
+    /// or refuse the compaction with [`Verdict::Deny`], and the history is shortened instead. `Ask`
+    /// is not a verdict of this point and the loop treats it as a hook failure; `Stop` ends the run.
+    /// A hook never writes the summary itself.
+    fn compaction_before(&self, _compaction: &mut HookedCompaction<'_>) -> HookResult {
         Ok(Verdict::Continue)
     }
 
@@ -361,6 +393,18 @@ impl HookSet {
         self.run(MODEL_REQUEST, |plugin| {
             guard(plugin.name(), self.limits.deadline, || {
                 plugin.model_request(request)
+            })
+        })
+    }
+
+    /// Runs every plugin's `compaction_before` in order, until one decides.
+    ///
+    /// # Errors
+    /// As [`HookSet::before_tool`]. The caller does not summarise on an error: it shortens instead.
+    pub fn compaction_before(&self, compaction: &mut HookedCompaction<'_>) -> HookResult {
+        self.run(COMPACTION_BEFORE, |plugin| {
+            guard(plugin.name(), self.limits.deadline, || {
+                plugin.compaction_before(compaction)
             })
         })
     }
