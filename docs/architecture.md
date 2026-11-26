@@ -884,6 +884,13 @@ character, [ADR 0051](decisions/0051-a-nul-is-stored-as-the-replacement-characte
 shortening, which moves rows or changes their bytes, clears the signature of every row after the change, so the next
 commit signs those rows again. A signing failure fails the step: no turn is committed unsigned.
 
+The runtime signs the run's **head** too ([slice T3a-2](decisions/0068-adam-signs-its-own-history.md)). At every commit
+it signs the run, its conversation, how many rows the transcript has, a hash of all of them and the rest of the run's
+state (the inbox, the owed calls, the summary, the counters). When it reads a run back it recomputes the hash and checks
+that one signature before the agent runs. Change a field, add or drop a row, or move the run to another conversation and
+the run fails as corrupt, with no model call. This is on only when the runtime is given keys; without them nothing
+changes. A run with no signature at all, from before the keys, is accepted and signed at its next commit. If the keys cannot be reached when a run is picked up, the run waits and is tried again; it is not failed for it. A parent that reads a finished child's result checks the child first, and a child that does not check out is reported as failed, never as its forged output.
+
 ### The access tier: which tools a step may use
 
 The person picks a tier for each message (`plan`, `edits`, `auto`, `bypass`; the A2A extension `access-tier/v1`, [ADR 0036](decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)).

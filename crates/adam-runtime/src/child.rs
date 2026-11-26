@@ -444,6 +444,16 @@ impl ChildStatus {
         }
     }
 
+    /// A child whose record did not verify (ADR 0068): `Failed`, with the reason and none of what
+    /// the record says.
+    pub(crate) fn refused(e: &RuntimeError) -> Self {
+        Self {
+            status: RunStatus::Failed,
+            output: None,
+            error: Some(format!("the child run's record is refused: {e}")),
+        }
+    }
+
     /// The status a commit this process just made reports, from the values it wrote: a store
     /// returns the record without its state ([`Store::commit_run`](adam_core::Store::commit_run)),
     /// so the caller reports from what it holds instead of decoding what it just sent.

@@ -23,7 +23,7 @@ over A2A).
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
 | `AgentError` | `Transient { retry_after, class, retry, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`; `class` the retryable class; `retry` a step's own policy), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
 | `Ctx`, `Emitter`, `ReservedStep` | `Ctx::step` journals a side effect's outcome; `Ctx::reserve_steps(&names)` takes the next seqs in order for steps that run at the same time (each `ReservedStep` has `seq()`, `name()`, `is_recorded()` and `run(f)`, with `step`'s contract), and `Ctx::step_all(steps, at_once)` runs them at most `at_once` at a time and returns the outcomes in the order given (see *Steps that run at the same time*); `Ctx::step_race(name, contenders)` races them as one step and records the winner (see *A race of steps*); `Ctx::step_retrying(name, key, policy, f)` is `step` under the step's own retry policy, and `Ctx::retries_left()` how many more tries the runtime allows after this one (see *Retries per step*); `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::arrived()` counts the messages delivered while the transition runs, `Ctx::reopen_on_arrival()` makes a `Done` that the transition returns go on instead, and `Ctx::read_already(&ids)` names the messages the run has read, whose copies are not counted (see *A message that arrives while a run finishes*); `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children, `Ctx::child_look(run)` its status and the head of its state in one read, `Ctx::child_state(run)` its agent's own state (all live reads of the run's own children only), and `Ctx::resume_child(run, id)` wakes one of them with a resume (see *Child runs*); `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*); `Ctx::run_starter()` gives an owned `RunStarter` |
-| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_child_continuing`, `list_sessions`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `state`, `artifact_bytes`, `header`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.observers(HookSet)` (the plugins that observe `run.parked`, `run.ended`, `run.error` and `artifact.kept` after each commit: ADR 0050 H4, best effort, keys `<run>/commit:<version>/<event>/<index>`), `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*), `.poll_interval(..)` (the worker's idle poll, 250 ms) and `.cancel_poll_interval(..)` (a step's cancel watch, 1 s; see *Several processes*), `.drain_grace(..)` (how long a stopping worker waits for steps in flight, default for ever; after it the steps are aborted, nothing of them committed, and their leases released so another worker claims the runs at once), and the getters `worker_id()`, `claim_scope()` |
+| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_child_continuing`, `list_sessions`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `state`, `artifact_bytes`, `header`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.observers(HookSet)` (the plugins that observe `run.parked`, `run.ended`, `run.error` and `artifact.kept` after each commit: ADR 0050 H4, best effort, keys `<run>/commit:<version>/<event>/<index>`), `.turn_keys(DynTurnKeys)` (sign every state the runtime commits and check every one it reads: *Signed heads*), `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*), `.poll_interval(..)` (the worker's idle poll, 250 ms) and `.cancel_poll_interval(..)` (a step's cancel watch, 1 s; see *Several processes*), `.drain_grace(..)` (how long a stopping worker waits for steps in flight, default for ever; after it the steps are aborted, nothing of them committed, and their leases released so another worker claims the runs at once), and the getters `worker_id()`, `claim_scope()` |
 | `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`). `RunView::claimed` is true while a worker holds an unexpired lease on a runnable run (read with `Store::lease_until` against the runtime's clock, before the head, so a step that commits and releases between the two reads never reads as unclaimed at version 1): the first step of a run commits nothing until it ends, and this is how a reader, in any process, tells a run being stepped from one nobody has taken. `RunView::state` is the agent's **head** (a v5 run) or the whole agent state (a v4 one), `RunView::artifacts` is a `Vec<ArtifactRef>` (a file is a `FileRef`, inline or a blob), `Runtime::state(run)` joins the head and its body generation (the only full-state read), and `Runtime::artifact_bytes(&FileRef)` fetches a file's blob once into a bounded cache |
 | `RunHeader` (re-exported from `adam-core`), `Runtime::header`, `view_from_record`, `Runtime::now` | the record without its state: `Runtime::header(run)` is one `Store::run_header` call (an adapter that overrides it projects the header and the lease; the trait's default reads the lease and the record), for a reader that only needs the run's own bookkeeping (a cancel watch, a parent check; an A2A task's state also needs `waiting`, so a status poll reads `view`). `RunHeader::claimed(now)` is `RunView::claimed`'s rule, one `adam_core::claimed(..)` helper. `view_from_record(record, claimed)` builds the `RunView` of a record a caller already holds (a listing), so it does not read the run again; `Runtime::now()` is the clock to compare a lease against, so the result agrees with `view` |
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
@@ -514,6 +514,43 @@ environment that measures wins. `SandboxEnvironment` is `Local` or `Kubernetes`;
 (Rule 2):** `Devcontainer` is gone (ADR 0052); a state that says `devcontainer` still loads, as `Local` (both are not
 measured), and is written as `local` from now on.
 
+## Signed heads
+
+`RuntimeBuilder::turn_keys(keys)` ([ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md) decision 4,
+slice T3a-2) makes the runtime sign what it commits as a run's state and check it on every decode.
+
+* **Signed.** At every commit (a step, a delivery, a cancel) the document written as the run's state, the v5 head or the
+  v4 state of a run that is not split, carries `signature`: the detached JWS `adam-head/v1` over
+  `{typ, run, cnv, len, chain, head}` (`adam_core::turn::head_payload`). `len` and `chain` are the transcript's: the body
+  rows the head names, or, for a v4 state, the agent's own `split` rows. `head` is the document without `signature`,
+  `seal` and `body.generation` (the store resolves the generation after the runtime signs).
+* **Checked.** `join_head`, the v4 branch of `join_stored` and `claimed` read the rows, recompute the chain and verify the
+  one signature before the agent is stepped or a view is built: a head with a changed member, a row appended or removed, a
+  run moved to another run or conversation, or a key outside the set is `RuntimeError::Corrupt`, and a claimed run fails
+  with no step and no model call.
+* **`seal`.** A v5 head also carries `{len, chain}`, so a delivery or a cancel, which change the inbox or the error and
+  not the rows, sign again without reading them. A reader never uses it. A delivery verifies the head it read (against its
+  `seal`) before it signs, and is refused `Corrupt` otherwise; a cancel, which must end a corrupt run too, writes it unsigned.
+* **No keys, no change.** Nothing is signed or required, a signature already in a state is not read, and a write without
+  keys drops it. **With** keys, a run with no signature at all is adopted (ADR 0068 decision 11, release N) and signed at
+  its next commit that writes rows; a head with no signature over a row that carries a turn signature is refused.
+* **Failures.** A head that does not verify is `Corrupt` and a claimed run fails with no step. A key set that cannot be
+  read at a claim does **not** fail the run: the lease is kept and the run is tried again when it expires (a persistent
+  `NotSigning` or `Refused` retries for as long as it lasts). A cancel fails during a key outage and writes nothing; a corrupt
+  run is still cancelled (written unsigned).
+* **A process that hosts no agent** reads and delivers to a signed v4 run, but cannot chain the agent's rows: the read checks
+  nothing of the state and a delivery writes it unsigned (register the agent as a starter to avoid it).
+* **A parent's read of a child** (`Ctx::child_status` of a finished child, `Ctx::child_look`) verifies the child's head
+  first (a signed head against its own `seal`, no row read); a child that does not verify is reported `Failed`, never
+  as its output. `Runtime::view`, `view_from_record` and A2A `GetTask` and `ListTasks` check nothing.
+* **Mixed fleets.** A worker without keys drops head signatures when it writes, so a signed turn later makes that head
+  refused; and release N gives an agent that does not sign its turns no downgrade resistance (stripping `signature` passes
+  adoption).
+* **Not done** (T3a-3 and T2): the turns' own signatures are not verified on re-entry, the journal is not signed, and no
+  host sets the keys yet (the engine and the service), so only an embedder that calls `turn_keys` is affected.
+
+Tests: `tests/head_signature.rs`.
+
 ## Several processes
 
 Processes share nothing but the store. A worker finds due runs by polling it
@@ -612,7 +649,9 @@ decides from the class (see [`adam-error`](../adam-error/README.md)).
 | `Finished`, `ConversationBusy` (`is_busy()`), `TooManyRounds { runs, max }` | `Rejected` |
 | `Corrupt { run, reason, source }` | `Corrupt` |
 | `Contended` | `Conflict` |
-| `Agent(e)`, `Store(e)` | the class of `e` |
+| `Agent(e)`, `Store(e)`, `TurnKeys(e)` | the class of `e` (`TurnKeys`: the keys could not sign, or their key set could not be read; **a new variant** of the `non_exhaustive` enum) |
+
+A head that does not verify is `Corrupt` (see *Signed heads*).
 
 Build an `AgentError` with `AgentError::transient(msg)`,
 `transient_after(msg, wait)`, `permanent(msg)` or `non_determinism(msg)`, then
@@ -712,6 +751,8 @@ suite's `a_race_is_won_by_the_first_success_and_the_losers_are_stopped`,
 No Cargo features, no environment variables at runtime.
 
 ## Tests
+
+`tests/head_signature.rs` is the signed head (*Signed heads*): the payload re-verified by hand from the store, a changed head field, a changed runtime member, a row appended past `len`, a changed row, a run moved to another run and conversation, an unsigned head (adopted, and refused over a signed turn), a foreign key, no keys, and a refused run that is not stepped, on a store that keeps bodies and one that does not.
 
 `tests/runtime.rs` is one behavioural suite (including
 `a_starter_only_runtime_starts_and_a_full_runtime_steps`, the continuation cases

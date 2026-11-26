@@ -18,8 +18,8 @@
 //! * [`testkit`]: the cases every `TurnKeys` passes, [`turn_keys_conformance!`](crate::turn_keys_conformance),
 //!   and [`testkit::Certified`], a key named by a certificate chain.
 //!
-//! Slice T1 of the ADR builds the history's form; nothing signs or verifies a run's history yet
-//! (T3). Every model request is signed when the host gives keys (`adam_model::SignedRequests`).
+//! Slice T1 of the ADR builds the history's form; the turns are signed by the agent loop (T3a-1)
+//! and the head by the runtime (T3a-2, [`head_payload`]); nothing verifies a turn on its own yet. Every model request is signed when the host gives keys (`adam_model::SignedRequests`).
 //!
 //! [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
 
@@ -40,8 +40,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 
 pub use chain::{
-    ChainHash, ConversationHash, TurnPosition, set_turn_signature, sign_turn, turn_payload,
-    turn_signature, verify_turn,
+    ChainHash, ConversationHash, TurnPosition, head_payload, set_turn_signature, sign_head,
+    sign_turn, turn_payload, turn_signature, verify_head, verify_turn,
 };
 pub use ed25519::{Ed25519TurnKeys, TurnKeyConfigError};
 pub use form::{

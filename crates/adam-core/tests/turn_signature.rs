@@ -801,3 +801,63 @@ fn a_bad_key_set_is_refused() {
                               "use": "sig", "key_ops": ["verify"]}]});
     assert!(KeySet::from_jwks(&ok).is_ok());
 }
+
+/// The head signature (ADR 0068 decision 4): each member of `{typ, run, cnv, len, chain, head}` is
+/// bound, a head signature is not a turn's, and the chain parses back from its text.
+#[tokio::test]
+async fn the_head_signature_binds_each_member_of_its_payload() {
+    use adam_core::turn::{sign_head, verify_head};
+    let keys = ephemeral().await;
+    let set = keys.key_set().await.unwrap();
+    let run = run();
+    let cnv = ConversationHash::of(Some("conversation"), run);
+    let rows = [
+        json!({"role": "user", "text": "hi"}),
+        json!({"role": "assistant", "text": "yo"}),
+    ];
+    let chain = ChainHash::over(run, &cnv, &rows);
+    assert_eq!(ChainHash::parse(&chain.to_string()), Some(chain));
+    assert_eq!(ChainHash::parse("short"), None);
+    let head = json!({"v": 5, "agent": {"turns": 1}, "inbox": []});
+    let jws = sign_head(keys.as_ref(), run, &cnv, 2, &chain, &head)
+        .await
+        .unwrap();
+    verify_head(&set, run, &cnv, 2, &chain, &head, &jws).unwrap();
+
+    let other_chain = ChainHash::over(run, &cnv, &rows[..1]);
+    let other_cnv = ConversationHash::of(Some("another"), run);
+    let changed = json!({"v": 5, "agent": {"turns": 2}, "inbox": []});
+    assert!(
+        verify_head(&set, run, &cnv, 3, &chain, &head, &jws).is_err(),
+        "len"
+    );
+    assert!(
+        verify_head(&set, run, &cnv, 2, &other_chain, &head, &jws).is_err(),
+        "chain"
+    );
+    assert!(
+        verify_head(&set, run, &cnv, 2, &chain, &changed, &jws).is_err(),
+        "head"
+    );
+    assert!(
+        verify_head(&set, run, &other_cnv, 2, &chain, &head, &jws).is_err(),
+        "cnv"
+    );
+    assert!(
+        verify_head(&set, RunId::new(), &cnv, 2, &chain, &head, &jws).is_err(),
+        "run"
+    );
+
+    // A turn signature does not verify as a head's.
+    let position = TurnPosition {
+        run,
+        cnv,
+        idx: 0,
+        prv: ChainHash::seed(run, &cnv),
+    };
+    let turn = sign_turn(keys.as_ref(), &position, &rows[1]).await.unwrap();
+    assert!(matches!(
+        verify_head(&set, run, &cnv, 2, &chain, &head, &turn),
+        Err(TurnSignatureError::WrongType)
+    ));
+}

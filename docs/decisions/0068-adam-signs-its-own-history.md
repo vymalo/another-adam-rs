@@ -7,7 +7,8 @@ end. Every model **request** is signed when the deployment gives a turn key: see
 signature)*.
 
 *Amended 2026-11-26:* slice T3a-1 signs each assistant and tool turn at commit (see *Amended 2026-11-26 (slice T3a-1)*
-below); verifying on re-entry (T3a-3) is not built.
+below), and slice T3a-2 signs the run's head at commit and checks it on decode (see *Amended 2026-11-26 (slice T3a-2)*);
+verifying each turn on re-entry (T3a-3) is not built.
 
 It has two parts. **Part 1 is not decided here**: adam carries every opaque member a provider attaches (Gemini 3's
 `thought_signature` in a tool call's `extra_content`) byte for byte, sends it back only to the model that made it, and
@@ -293,7 +294,8 @@ After ADR 0067's S8b and S8c.
 | T2 | the server variables and exit 78, every role; the chart's key from the ExternalSecret and the verify set; `EngineBuilder::turn_keys`, and `Engine::start` refusing a file store without keys | the configuration table; exit 78 for a missing, unreadable or non-Ed25519 key; the chart's goldens; the engine's refusal and `ephemeral` on a `MemoryStore` |
 | T3 | sign turns at commit in the agent loop and the head in the worker; verify on re-entry; the journal's signature in each adapter; re-signing after a compaction, a shortening and a carry; release N's adoption | each re-entry of the *Context* table (a resume after a kill, a new task, a session round, the engine reopening its file, a journal replay, the store service) with a forged assistant row, a forged tool row, a changed user row, an appended user row, a row spliced from another run, a reordering, a changed head field and a run moved to another conversation: the run fails `Corrupt` and the mock model got no call; a forged journal entry is refused on replay; a compaction re-signs; a legacy run is adopted once; #322's members inside the signed bytes; the testkit's journal round trip |
 | T3a-1 | sign each assistant and tool turn at commit in `LlmAgent` (**built**, 2026-11-26): the row as stored, the chain, signatures cleared after a compaction or a shortening | the golden vector (`tests/vectors/turn_chain_vector.py`); a NUL verifies after the store; a compaction re-signs; failing keys commit no unsigned turn |
-| T3a-3 | verify on re-entry (**not built**) | the forged-row cases of T3 |
+| T3a-2 | sign the run's head at every commit and check it on every decode in `adam-runtime` (**built**, 2026-11-26): `RuntimeBuilder::turn_keys`, `head_payload`, `Head.signature` and `seal` | a changed head field, a row appended past `len` and a run moved to another run and conversation are each `Corrupt` before any step; a v4 state is covered the same way; a store that keeps bodies and one that does not both round-trip; no keys changes nothing; adoption and its refusal over a signed turn |
+| T3a-3 | verify the turns on re-entry (**not built**) | the forged-row cases of T3 |
 | T4 | `signed-turns/v1`, behind a deployment setting: the card lists it and its JWKS the turn keys; the rows on the task's message; a message that continues from signed rows | a client that kept the earlier rows verifies a task's rows with the card's key set, and one that did not checks them against the given `prv`; a fork from them is verified and re-signed under the new run; a forged or reordered row, and rows of another subject's conversation, are `-32602` with nothing written; off by default, the card does not list it; plain A2A, a data part shaped like signed rows without the extension, is one user turn |
 | T5 | release N+1: no adoption | an unsigned assistant or tool row is refused `Corrupt`, with an error that names this ADR's migration |
 
@@ -444,3 +446,71 @@ What building it settled:
    clear the turn signature of every row from the first one whose position or preceding bytes changed (`unsign_from`),
    and the next commit signs them again. A row that cannot be written, or sits past `u32::MAX`, fails the step
    `Internal`; nothing is signed as `null` or clamped.
+
+## Amended 2026-11-26 (slice T3a-2: the head)
+
+`RuntimeBuilder::turn_keys` makes `adam-runtime` sign the head at every commit and check it on every decode
+(`crates/adam-runtime/src/seal.rs`; `adam_core::turn::head_payload`). What building it settled:
+
+1. **What `head` is.** The stored state document without `signature`, `seal` and `body.generation`. The generation is the
+   store's: the runtime leaves it `null` and the store patches it after the runtime has signed, and it names where the rows
+   are, not what the state is (the rows are covered by `len` and `chain`). Everything else is signed: the inbox, `rev`,
+   the artifacts, the error, the agent's head.
+2. **Which documents.** A v5 head (`len` and `chain` over the body rows it names) and the v4 state of a run that is not
+   split or whose store keeps no bodies (the whole state signed; `chain` over the agent's own `split` rows, `len` their
+   count, none when the agent does not split).
+3. **A new head member, `seal`** `{len, chain}`. Writers that leave the transcript alone (a delivery, a cancel, a step that
+   does not split) must sign again, and reading every row to do it would make a message cost the whole transcript. The seal
+   carries the pair. A reader never uses it: it recomputes both from the rows, so a wrong seal only makes the next check
+   fail. A delivery first verifies the head it read against its seal, so it never signs over a document that did not
+   verify; a cancel, which has to end a corrupt run as well, writes such a head unsigned.
+4. **Where.** Step commit: `worker::seal_update`, inside the CAS retry loop. Delivery and cancel: `Inner::reseal`. Read:
+   `join_head`, `join_stored` and `claimed` (a claim, `Runtime::state`, a cancel's hook, a continued run's prior state).
+   `Runtime::view` reads the head alone and checks nothing.
+5. **Adoption (decision 11, release N).** With keys, a document with no signature is accepted when no row carries a turn
+   signature, and is signed at its next commit that writes rows (a delivery or a step that does not split does not sign
+   what it found unsigned). A head with no signature over a signed turn is `Corrupt`. Without keys a state's signature is
+   not read, and a write drops it.
+6. **Failures.** A refused head is `RuntimeError::Corrupt`; a claimed run is committed `Failed` by the unreadable-state
+   path, before its agent is stepped. A key that cannot sign fails the commit with the keys' class, and the run keeps its
+   lease. `RuntimeError` gains `TurnKeys` (the enum is `non_exhaustive`). A key set that cannot be read at a claim also
+   fails that run: a remote key set that is down is not told apart from a forged one yet.
+7. **Not done.** No host sets the keys (the engine's and the service's wiring, T2); the turns are not verified on re-entry
+   (T3a-3); the journal is not signed. A commit's CAS retry does not verify the head it reloads (only the inbox and
+   artifacts are taken from it, and a reader recomputes). The store testkit is unchanged: the signature rides in the
+   state JSON, so no `Store` method changed.
+
+## Amended 2026-11-26 (slice T3a-2, review of the pull request)
+
+What the review of T3a-2 changed. The text above stands; where it says otherwise, this is what is built.
+
+1. **A key set that cannot be read at a claim no longer fails the run** (amends point 6). A `TurnKeys` error at a claim
+   (`Unavailable`, `NotSigning`, `Refused`) leaves the run as it is: the lease is kept and the run is found again when it
+   expires. Only a head that does not verify (`Corrupt`) is committed `Failed`. A **persistent** misconfiguration
+   (`NotSigning`, `Refused`) therefore retries until the keys are fixed, once per lease, and never fails the run.
+2. **A process that hosts no agent** no longer reads `[]` for the agent's transcript. `Inner::transcript_of` is `None` for
+   an agent that is not registered, and a state that does not decode as the agent's is `Corrupt`. A v4 state whose agent is
+   not registered here is **not chain-checked** on a read (`Runtime::state`), and a delivery to it is written **unsigned**:
+   this is a gap, chosen so that these front-end calls keep working as before. A worker that hosts the agent adopts it again
+   (decision 11), unless a row carries a turn signature, in which case that run is refused as an unsigned head over signed
+   turns: a front end that hosts no agent should register the agent as a starter (a start-only registration chains).
+3. **A cancel swallows only `Corrupt`** (amends point 3). A key outage during a cancel is the cancel's error and writes
+   nothing; a corrupt head is still cancelled and written unsigned.
+4. **A parent no longer trusts a child's result unverified.** `Ctx::child_status` (finished children) and `Ctx::child_look`
+   verify the child's record first: a signed v5 head against its own `seal` (no row read), an unsigned head by its rows
+   (stripping the signature must not pass), a v4 state as in point 2. A child that does not verify is reported as `Failed`
+   with an error that says the record is refused, never as its output; a key set that cannot be read is the call's own
+   transient error. **Still unverified, by design of point 4:** `Runtime::view`, `view_from_record`, A2A `GetTask` and
+   `ListTasks` read the head alone (a run refused as `Corrupt` has to stay viewable), `ChildStatus::from_record` in the
+   session listings, and a child's rows (a parent reads the head, which holds the output and the error).
+5. **The CAS retry checks what it reloads.** The commit that lost its CAS to a delivery and reloads the record now verifies
+   it (a signed head against its `seal`, a signed v4 state against the agent's rows) before signing over its inbox and
+   artifacts; failure is the commit's `Corrupt`. `seal_update` likewise refuses (`Corrupt`) a signed base head whose `seal`
+   is missing or unparsable, as `reseal`'s strict path does, instead of writing it unsigned.
+6. **Known gaps.**
+   * In a mixed fleet, or after a rollback, a worker **without keys** drops head signatures when it writes; a later signed
+     turn then makes that head refused (an unsigned head over a signed turn). Roll keys out to every process that writes.
+   * Release N gives an agent that does **not** sign its turns no downgrade resistance: stripping `signature` (and `seal`)
+     passes adoption, because there is no signed turn to contradict it.
+   * A v4 state is not verified in a process without its agent (point 2).
+

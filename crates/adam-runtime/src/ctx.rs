@@ -8,7 +8,7 @@ use futures::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use adam_core::{DynStore, JournalEntry, RunId, StoreError};
+use adam_core::{DynStore, JournalEntry, RunId, RunRecord, StoreError};
 
 use crate::agent::{AgentError, Inbound};
 use crate::cancel::CancelToken;
@@ -626,7 +626,31 @@ impl Ctx {
                 self.run
             )));
         }
+        // A finished child's result is what the parent signs as its own turn: the child's head is
+        // checked first (an open child's status carries nothing of the record).
+        if rec.status.is_terminal()
+            && let Err(e) = self.runtime.inner.verify_child(&rec).await
+        {
+            return Self::refused_child(&rec, e).map(Some);
+        }
         Ok(Some(ChildStatus::from_record(&rec)))
+    }
+
+    /// What a parent is told of a child whose head did not verify: a failed child with the reason,
+    /// never the forged output ([`ChildStatus::refused`]). Only a `Corrupt` verdict is a report; a
+    /// key set that cannot be read now is the call's own (transient) failure, so the parent asks
+    /// again instead of taking the child as failed.
+    fn refused_child(rec: &RunRecord, e: RuntimeError) -> Result<ChildStatus, AgentError> {
+        match e {
+            RuntimeError::Corrupt { .. } => {
+                tracing::warn!(run = %rec.id, error = %adam_error::report(&e), "a child's head does not verify; the parent is told it failed");
+                Ok(ChildStatus::refused(&e))
+            }
+            other => Err(AgentError::from_classified(
+                "the child's head could not be checked",
+                other,
+            )),
+        }
     }
 
     /// The child run `run`'s own state, as its agent last committed it (what its agent serialized,
@@ -686,6 +710,10 @@ impl Ctx {
                 "run {run} is not a child of run {}",
                 self.run
             )));
+        }
+        // The head the parent reads is the child's agent state, whatever its status.
+        if let Err(e) = self.runtime.inner.verify_child(&rec).await {
+            return Self::refused_child(&rec, e).map(|status| Some(ChildLook::finished(status)));
         }
         Ok(Some(ChildLook::from_record(&rec)))
     }
