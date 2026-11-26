@@ -15,7 +15,9 @@ use adam_a2a_runtime::{Commands, RuntimeTaskBackend, default_inbound, task_id_fo
 use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
 use adam_budget::{DeviceRules, DynAdmission, Throttled};
-use adam_core::{ConversationScope, DynSecretSource, DynStore, RunId, RunQuery, RunStatus};
+use adam_core::{
+    ConversationScope, DynSecretSource, DynStore, DynTurnKeys, RunId, RunQuery, RunStatus, TurnKeys,
+};
 use adam_device_state::{DeviceReadings, DeviceState, DynDeviceState};
 use adam_llm_agent::{DEFAULT_MAX_PARALLEL, ToolSet};
 use adam_model::{DynModel, ModelProfiles, ReasoningEffort};
@@ -158,6 +160,7 @@ pub struct EngineBuilder {
     admission: Option<DynAdmission>,
     device: Option<DynDeviceState>,
     device_rules: DeviceRules,
+    turn_keys: Option<DynTurnKeys>,
 }
 
 impl std::fmt::Debug for EngineBuilder {
@@ -206,6 +209,20 @@ impl EngineBuilder {
     /// [`admission`](Self::admission) only.
     pub fn device_rules(mut self, rules: DeviceRules) -> Self {
         self.device_rules = rules;
+        self
+    }
+
+    /// The turn keys ([`adam_core::TurnKeys`], [ADR 0068]): what the engine signs a run's history
+    /// with, and what it checks a history against when that history comes back from the store. A
+    /// store that outlives the process ([`Store::outlives_the_process`](adam_core::Store::outlives_the_process))
+    /// needs one and [`start`](Self::start) refuses it without: the host reads it from a keychain, a
+    /// KMS or an HSM, and adam never reads the key itself. A store that dies with the process signs
+    /// with [`TurnKeys::ephemeral`](adam_core::TurnKeys::ephemeral), a key made at start that dies
+    /// with it, as the history does.
+    ///
+    /// [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+    pub fn turn_keys(mut self, keys: DynTurnKeys) -> Self {
+        self.turn_keys = Some(keys);
         self
     }
 
@@ -295,6 +312,7 @@ impl EngineBuilder {
             admission,
             device,
             device_rules,
+            turn_keys,
         } = self;
         if limits.lease_ttl.is_zero() {
             return Err(EngineError::Invalid(
@@ -312,6 +330,15 @@ impl EngineBuilder {
                 "the worker's id must not be empty".to_owned(),
             ));
         }
+        // ADR 0068 decision 9: a store that outlives the process needs a turn key, and there is no
+        // switch to run without one. A store that dies with the process signs with a key that dies
+        // with it, as the history does.
+        let turn_keys = match turn_keys {
+            Some(keys) => keys,
+            None if store.outlives_the_process() => return Err(EngineError::NoTurnKeys),
+            None => <dyn TurnKeys>::ephemeral()
+                .map_err(|e| EngineError::internal(format!("no ephemeral turn key: {e}")))?,
+        };
         refuse_what_is_not_embedded(agent.manifest(), agent.name())?;
         let name = agent.name().to_owned();
         let schedules = agent.manifest().schedules.clone();
@@ -464,6 +491,7 @@ impl EngineBuilder {
                 helper_agents,
                 caller,
                 backend,
+                turn_keys,
                 runtime: reader,
                 store: lister,
                 events,
@@ -592,6 +620,9 @@ impl DeviceState for DeviceSlot {
 
 pub(crate) struct Shared {
     backend: RuntimeTaskBackend,
+    /// The keys the engine signs a run's history with ([`EngineBuilder::turn_keys`], ADR 0068):
+    /// the host's, or the ephemeral one a store that dies with the process gets.
+    turn_keys: DynTurnKeys,
     /// The aliases a [`Say::model`] may name: the root agent's own and the models it can be bound
     /// to (they have a profile).
     models: Vec<String>,
@@ -699,6 +730,12 @@ impl std::fmt::Debug for Engine {
 }
 
 impl Engine {
+    /// The keys this engine signs a run's history with ([`EngineBuilder::turn_keys`], ADR 0068): the
+    /// host's, or the ephemeral one a store that dies with the process gets.
+    pub fn turn_keys(&self) -> &DynTurnKeys {
+        &self.shared.turn_keys
+    }
+
     /// An engine for `agent` over `store`, whose agents talk to `model`; `alias` is the model
     /// alias of an agent whose file names none.
     pub fn builder(
@@ -720,6 +757,7 @@ impl Engine {
             admission: None,
             device: None,
             device_rules: DeviceRules::default(),
+            turn_keys: None,
         }
     }
 
