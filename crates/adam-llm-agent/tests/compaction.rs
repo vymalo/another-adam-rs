@@ -2415,3 +2415,41 @@ async fn a_replay_of_the_summary_asks_no_compaction_hook() {
     assert_eq!(asked.load(SeqCst), 1, "the replay asks no hook");
     assert_eq!(state.compactions.len(), 1);
 }
+
+/// ADR 0068, slice T3a-1: a compaction moves the kept tail to other positions behind other bytes,
+/// so its old turn signatures cannot hold; the commit signs those rows again, and the transcript
+/// the run ends with verifies at every assistant and tool row, at the position it is stored at.
+#[tokio::test]
+async fn a_compacted_transcript_is_signed_again_and_verifies_at_its_new_positions() {
+    use adam_core::turn::{
+        ChainHash, ConversationHash, TurnKeys, TurnPosition, turn_signature, verify_turn,
+    };
+    let keys = <dyn TurnKeys>::ephemeral().unwrap();
+    let set = keys.key_set().await.unwrap();
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| b.turn_keys(keys.clone()));
+    script_one_compaction(&rig.mock, "SUMMARY: four results of x");
+    let run = rig.start().await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "the run was compacted");
+    let stored = rig.rt.state(run).await.unwrap().unwrap();
+    let rows = stored["messages"].as_array().unwrap();
+    assert_eq!(rows[0]["role"], "user", "the summary row leads");
+    assert!(rows.len() > 3);
+    let cnv = ConversationHash::of(None, run);
+    let mut signed_rows = 0;
+    for (idx, row) in rows.iter().enumerate() {
+        if row["role"] == "user" {
+            assert!(turn_signature(row).is_none());
+            continue;
+        }
+        let at = TurnPosition {
+            run,
+            cnv,
+            idx: u32::try_from(idx).unwrap(),
+            prv: ChainHash::over(run, &cnv, &rows[..idx]),
+        };
+        verify_turn(&set, &at, row).unwrap_or_else(|e| panic!("row {idx} ({}): {e}", row["role"]));
+        signed_rows += 1;
+    }
+    assert!(signed_rows >= 4, "{signed_rows} assistant and tool rows");
+}

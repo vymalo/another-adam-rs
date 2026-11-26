@@ -1010,16 +1010,28 @@ With `LlmAgentBuilder::turn_keys(keys)` every step signs what it commits: each a
 signed. The seam is one wrapper, `LlmAgent::sign_transition`, over the state `step` hands the runtime (every `messages.push`
 of the loop is covered, and the chain is folded once, in order, over the messages as stored), in `src/signing.rs`.
 
+* **As stored.** Before a message is hashed or signed it is made what the store will keep: a NUL in a string or a key
+  becomes U+FFFD (the store's own `adam_core::storable`, ADR 0051), in the message itself, so the signed bytes are the
+  bytes a read returns. A NUL in an answer or a tool call's arguments therefore does not break a signature.
+* **A compaction or a shortening clears signatures.** Both move rows or change their bytes, so the turn signature of every
+  assistant and tool row from the first changed position on is removed (`signing::unsign_from`; the summary row leads a
+  compacted transcript, so every kept row after it) and the next commit signs those rows again at their new positions.
+  Rows a continued run copies from another run keep their old signatures until the carry slice.
+* **A signing failure fails the step** with the keys' own class (`Refused` is `Unauthenticated`, `Unavailable` is
+  `Transient`, retried by the runtime); a row that cannot be written, or an index past `u32::MAX`, is `Internal`. Nothing
+  is committed unsigned.
+
 * **No keys, no change**: without `turn_keys` (the default, until the host configures them) the transcript is the bytes it
   was. A host sets the keys itself; no variable is read here.
 * A signature is never sent to a model: the wire sends no `extra_content` of a message (`adam-model-openai`).
 * **Nothing verifies yet.** Re-entry checks (a resume, a new task, the engine reopening its file) are slice T3a-3; the head's
-  signature, the journal's, re-signing after a compaction or a shortening, and adopting a run that predates the keys are
-  later slices of T3. A message shortened or replaced after it was signed keeps its old signature until then.
+  signature, the journal's, re-signing a carried row, and adopting a run that predates the keys are later slices of T3.
 * Cost: the chain is folded over the whole transcript each time a step commits a new turn (one RFC 8785 form and one
   SHA-256 per message), and not at all when no turn is new.
-* Tests: `src/signing.rs` (a vector made independently in Python: the chain and both signatures byte for byte, the user
-  row unsigned, a second pass signs nothing, a provider's members kept) and `tests/turn_signatures.rs` (a real `Runtime`:
+* Tests: `src/signing.rs` (a vector made independently in Python, `tests/vectors/turn_chain_vector.py`: the chain and both
+  signatures byte for byte, the user row unsigned, a second pass signs nothing, a provider's members kept, a NUL replaced
+  before signing, failing keys, `unsign_from`), `tests/compaction.rs` (a compacted run verifies at every row) and
+  `tests/turn_signatures.rs` (a real `Runtime`: failing keys commit no unsigned turn, a NUL verifies after the store,
   rows verify against the key set at their position, an earlier change breaks every later `prv`, a moved row fails, no keys
   means no signature, and through `adam-model-openai` to a mock server no request body holds the member).
 

@@ -808,6 +808,9 @@ pub(crate) fn apply(
     state.messages = std::iter::once(Message::User { content: parts })
         .chain(tail)
         .collect();
+    // The tail moved to other positions behind other bytes: its turn signatures no longer hold,
+    // and the next commit signs those rows again (ADR 0068).
+    crate::signing::unsign_from(&mut state.messages, 1);
     state.summary = Some(body);
     state.last_prompt = None;
 }

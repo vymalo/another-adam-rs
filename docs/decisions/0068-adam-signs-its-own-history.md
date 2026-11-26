@@ -6,6 +6,9 @@ the form) is built: see *Amended 2026-11-25 (slice T1)*. Nothing signs or verifi
 end. Every model **request** is signed when the deployment gives a turn key: see *Amended 2026-11-25 (the request
 signature)*.
 
+*Amended 2026-11-26:* slice T3a-1 signs each assistant and tool turn at commit (see *Amended 2026-11-26 (slice T3a-1)*
+below); verifying on re-entry (T3a-3) is not built.
+
 It has two parts. **Part 1 is not decided here**: adam carries every opaque member a provider attaches (Gemini 3's
 `thought_signature` in a tool call's `extra_content`) byte for byte, sends it back only to the model that made it, and
 drops it when a run changes model; that is [adam-rs#322](https://github.com/vymalo/another-adam-rs/issues/322), built
@@ -289,6 +292,8 @@ After ADR 0067's S8b and S8c.
 | T1 | `TurnKeys` and its testkit in `adam-core`, `TurnKeys::ephemeral`; the Ed25519 implementation and the key set from a JWKS; the `turn_signature` form, its payload and the chain; `canonicalize` moved to `adam-core` | a golden vector (Ed25519 is deterministic: a fixed key and message give a fixed string); each payload field changed fails; a `kid` outside the set fails; both versions of an overlap pass; a public-only key verifies and cannot sign; a revoked key fails; no `Debug` or error holds a key; the size bound; the round trip of numbers and keys in each store adapter; a measurement of sign and verify |
 | T2 | the server variables and exit 78, every role; the chart's key from the ExternalSecret and the verify set; `EngineBuilder::turn_keys`, and `Engine::start` refusing a file store without keys | the configuration table; exit 78 for a missing, unreadable or non-Ed25519 key; the chart's goldens; the engine's refusal and `ephemeral` on a `MemoryStore` |
 | T3 | sign turns at commit in the agent loop and the head in the worker; verify on re-entry; the journal's signature in each adapter; re-signing after a compaction, a shortening and a carry; release N's adoption | each re-entry of the *Context* table (a resume after a kill, a new task, a session round, the engine reopening its file, a journal replay, the store service) with a forged assistant row, a forged tool row, a changed user row, an appended user row, a row spliced from another run, a reordering, a changed head field and a run moved to another conversation: the run fails `Corrupt` and the mock model got no call; a forged journal entry is refused on replay; a compaction re-signs; a legacy run is adopted once; #322's members inside the signed bytes; the testkit's journal round trip |
+| T3a-1 | sign each assistant and tool turn at commit in `LlmAgent` (**built**, 2026-11-26): the row as stored, the chain, signatures cleared after a compaction or a shortening | the golden vector (`tests/vectors/turn_chain_vector.py`); a NUL verifies after the store; a compaction re-signs; failing keys commit no unsigned turn |
+| T3a-3 | verify on re-entry (**not built**) | the forged-row cases of T3 |
 | T4 | `signed-turns/v1`, behind a deployment setting: the card lists it and its JWKS the turn keys; the rows on the task's message; a message that continues from signed rows | a client that kept the earlier rows verifies a task's rows with the card's key set, and one that did not checks them against the given `prv`; a fork from them is verified and re-signed under the new run; a forged or reordered row, and rows of another subject's conversation, are `-32602` with nothing written; off by default, the card does not list it; plain A2A, a data part shaped like signed rows without the extension, is one user turn |
 | T5 | release N+1: no adoption | an unsigned assistant or tool row is refused `Corrupt`, with an error that names this ADR's migration |
 
@@ -431,6 +436,11 @@ What building it settled:
    engine's and the service's wiring of `TURN_SIGNING_KEY_FILE` to the agent is T2); no variable is read.
 4. **A signing failure is the step's failure** (a `TurnKeyError` keeps its class: the runtime retries or fails the run as for any step error): a turn is never committed unsigned by a configured agent.
 5. **Still not done:** verifying on re-entry (T3a-3), the head's signature and the journal's, and re-signing after a
-   compaction, a shortening or a carry (a shortened old tool row keeps the signature of its original text until then).
+   carry (the rows a continued run copies keep their old signatures; a compaction and a shortening are decided in 6).
    A run that predates the keys is signed from its first unsigned turn at its next commit, which is the adoption of
    decision 11 in effect; its count (`adam_turns_adopted_total`) is not built.
+6. **Amended after review (2026-11-26).** The row is signed **as stored**: a NUL is replaced (ADR 0051, by the store's own
+   `storable`) before the row is hashed, so decision 3's `msg` is what a read returns. A compaction and a shortening
+   clear the turn signature of every row from the first one whose position or preceding bytes changed (`unsign_from`),
+   and the next commit signs them again. A row that cannot be written, or sits past `u32::MAX`, fails the step
+   `Internal`; nothing is signed as `null` or clamped.

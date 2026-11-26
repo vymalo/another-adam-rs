@@ -240,3 +240,126 @@ async fn the_signature_never_reaches_a_model_request() {
         }
     }
 }
+
+/// Turn keys that cannot sign: `current` fails as `error` says.
+struct Failing(fn() -> adam_core::turn::TurnKeyError);
+
+#[async_trait]
+impl TurnKeys for Failing {
+    async fn current(&self) -> Result<adam_core::turn::CurrentKey, adam_core::turn::TurnKeyError> {
+        Err((self.0)())
+    }
+
+    async fn sign(
+        &self,
+        _kid: &adam_core::turn::KeyId,
+        _input: &[u8],
+    ) -> Result<adam_core::turn::Signature, adam_core::turn::TurnKeyError> {
+        Err((self.0)())
+    }
+
+    async fn key_set(&self) -> Result<Arc<adam_core::turn::KeySet>, adam_core::turn::TurnKeyError> {
+        Err((self.0)())
+    }
+}
+
+/// A run whose turn keys fail ends `Failed`, and nothing of what its steps produced is committed:
+/// the transcript the store holds is the person's message alone, never an unsigned assistant or
+/// tool row (ADR 0068, slice T3a-1 decision 4). A refusal is permanent and fails at once; an
+/// unavailable KMS is retried and fails when the retries are spent.
+#[tokio::test]
+async fn failing_keys_fail_the_run_and_commit_no_unsigned_turn() {
+    use adam_core::turn::TurnKeyError;
+    use adam_runtime::RetryPolicy;
+    type Make = fn() -> TurnKeyError;
+    let cases: [(&str, Make); 2] = [
+        ("refused", || TurnKeyError::Refused("locked".into())),
+        ("unavailable", || {
+            TurnKeyError::Unavailable("kms down".into())
+        }),
+    ];
+    for (name, error) in cases {
+        let keys: DynTurnKeys = Arc::new(Failing(error));
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let agent = LlmAgent::builder("llm", scripted(), "test-model")
+            .tool(Echo)
+            .turn_keys(keys)
+            .build();
+        let rt = Runtime::builder(store)
+            .agent(agent)
+            .event_sink(CollectingSink::new())
+            .worker_id("w")
+            .poll_interval(Duration::from_millis(10))
+            .retry(
+                RetryPolicy::new(2)
+                    .with_backoff(Duration::from_millis(5), Duration::from_millis(5))
+                    .with_multiplier(1.0),
+            )
+            .build();
+        let run = rt
+            .start("llm", user_message("say it"), None)
+            .await
+            .expect("start");
+        let (stop, rx) = oneshot::channel::<()>();
+        let worker = {
+            let rt = rt.clone();
+            tokio::spawn(async move {
+                rt.run_worker(async {
+                    let _ = rx.await;
+                })
+                .await
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let view = loop {
+            let view = rt.view(run).await.unwrap().unwrap();
+            if matches!(view.status, RunStatus::Done | RunStatus::Failed) {
+                break view;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{name}: timed out {:?}",
+                view.status
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let _ = stop.send(());
+        worker.await.unwrap().unwrap();
+        assert_eq!(view.status, RunStatus::Failed, "{name}: {view:?}");
+        let state = rt.state(run).await.unwrap().expect("state");
+        let rows = state["messages"].as_array().expect("rows");
+        let roles: Vec<_> = rows.iter().map(role).collect();
+        assert_eq!(roles, ["user"], "{name}: no unsigned turn was committed");
+    }
+}
+
+/// A NUL in an assistant's text and in a tool call's arguments (a string and a key) is replaced by
+/// the store (ADR 0051). The signature and the chain cover the row **as stored**, so every row
+/// still verifies when it is read back.
+#[tokio::test]
+async fn rows_with_a_nul_verify_as_the_store_keeps_them() {
+    let keys = <dyn TurnKeys>::ephemeral().unwrap();
+    let set = keys.key_set().await.unwrap();
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![ToolCall {
+        id: "c1".into(),
+        name: "echo".into(),
+        arguments: json!({"cmd": "a\u{0}b", "k\u{0}ey": ["x\u{0}"]}),
+        ..Default::default()
+    }]);
+    mock.push_text("nul\u{0}in the answer");
+    let (run, rows) = run_to_done(mock, Some(keys), None).await;
+    let text = serde_json::to_string(&rows).unwrap();
+    assert!(
+        !text.contains("\\u0000"),
+        "the store replaced every NUL: {text}"
+    );
+    assert!(
+        text.contains("a\u{FFFD}b") && text.contains("nul\u{FFFD}in"),
+        "{text}"
+    );
+    for (idx, row) in rows.iter().enumerate().skip(1) {
+        verify_turn(&set, &position(run, None, &rows, idx), row)
+            .unwrap_or_else(|e| panic!("row {idx}: {e}"));
+    }
+}

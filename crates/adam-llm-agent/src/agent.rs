@@ -45,7 +45,7 @@ use crate::conversation::{
     parse_model_run, parse_prompt_statement, parse_root_run, parse_root_step, parse_session,
     parse_user_text,
 };
-use crate::history::{RunChars, record_shortenings};
+use crate::history::{RunChars, record_shortenings_from};
 use crate::images::{
     ImageCache, ImageGate, ImageStore, InboundImage, Item, KeptImage,
     MAX_RUN_JOURNALED_IMAGE_BYTES, admit_inbound, answer_with, described, for_sending, image_data,
@@ -7625,12 +7625,15 @@ impl LlmAgent {
                 state.compactions.len(),
             )
         };
-        if record_shortenings(
+        if let Some(first) = record_shortenings_from(
             &mut state.messages,
             self.limits.max_history_tokens,
             &output_id_of,
             &mut counted,
         ) {
+            // A shortened row's bytes changed, and every later row's `prv` with it: their turn
+            // signatures no longer hold, and the commit signs them again (ADR 0068).
+            crate::signing::unsign_from(&mut state.messages, first);
             state.shortenings.push(state.turns);
             state.last_prompt = None;
             // The images of a result that was shortened left the history with it.
