@@ -103,12 +103,18 @@ pub struct HookedMessage<'a> {
 /// The point where a model call is about to be made, inside the call's step (ADR 0050, slice H3).
 pub const MODEL_REQUEST: &str = "model.request";
 
-/// What a model call is, as a `model.request` hook sees it: only the sampling temperature, the
-/// bound on the answer's length and the call's metadata, each of which a plugin may rewrite in
+/// What a model call is, as a `model.request` hook sees it: only the sampling temperature and
+/// top-p, the bound on the answer's length, the call's metadata, headers and extra body, each of which a plugin may rewrite in
 /// place. The system prompt, the history, the model, its endpoint and its key are not here.
 pub struct HookedModelRequest<'a> {
     /// The sampling temperature; absent leaves the model's own.
     pub temperature: &'a mut Option<f32>,
+    /// Nucleus sampling mass; absent leaves the model's own.
+    pub top_p: &'a mut Option<f32>,
+    /// Headers for this call. A credential-like name fails the call; the key is the deployment's.
+    pub headers: &'a mut std::collections::BTreeMap<String, String>,
+    /// Members merged over the call's body. The members the client owns are refused.
+    pub extra_body: &'a mut Option<serde_json::Map<String, serde_json::Value>>,
     /// The upper bound on generated tokens; absent leaves the model's own.
     pub max_output_tokens: &'a mut Option<u32>,
     /// What is forwarded as request metadata where the backend supports it.

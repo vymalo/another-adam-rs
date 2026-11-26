@@ -2975,18 +2975,52 @@ impl LlmAgent {
                 };
                 // The `model.request` hooks (ADR 0050, slice H3) run here, inside the step, on the
                 // final request: a replay of a recorded turn asks none. They may rewrite only the
-                // temperature, the bound on output tokens and the metadata.
+                // temperature and top-p, the bound on output tokens, the metadata, the headers and an extra body.
                 if !agent.hooks.is_empty() {
                     let mut temperature = request.temperature;
+                    let mut top_p = request.top_p;
+                    let mut headers = request.headers.clone();
+                    let mut extra_body = request.extra_body.clone();
                     let mut max_output_tokens = request.max_output_tokens;
                     let mut metadata = request.metadata.clone();
                     let verdict = agent.hooks.model_request(&mut HookedModelRequest {
                         temperature: &mut temperature,
+                        top_p: &mut top_p,
+                        headers: &mut headers,
+                        extra_body: &mut extra_body,
                         max_output_tokens: &mut max_output_tokens,
                         metadata: &mut metadata,
                     });
                     match verdict {
                         Ok(Verdict::Continue) => {
+                            if let Some(name) = headers
+                                .keys()
+                                .find(|name| adam_model::is_credential_header(name))
+                            {
+                                return Err(ModelFailure::by_hook(
+                                    format!(
+                                        "a hook set the header `{name}`, which looks like a credential: the model's key is the deployment's"
+                                    ),
+                                    false,
+                                ));
+                            }
+                            if let Some(key) = adam_model::RESERVED_BODY_KEYS.iter().find(|key| {
+                                extra_body.as_ref().is_some_and(|b| b.contains_key(**key))
+                            }) {
+                                return Err(ModelFailure::by_hook(
+                                    format!("a hook set the body member `{key}`, which the client owns"),
+                                    false,
+                                ));
+                            }
+                            if top_p.is_some_and(|p| !p.is_finite()) {
+                                return Err(ModelFailure::by_hook(
+                                    "a hook set a top_p that is not finite".to_owned(),
+                                    false,
+                                ));
+                            }
+                            request.top_p = top_p;
+                            request.headers = headers;
+                            request.extra_body = extra_body;
                             request.temperature = temperature;
                             request.max_output_tokens = max_output_tokens;
                             request.metadata = metadata;
