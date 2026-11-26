@@ -205,7 +205,10 @@ const linksTo = (from, to) => {
   const src = fs.readFileSync(from, 'utf8').replace(/```[\s\S]*?```/g, '').replace(/`[^`\n]+`/g, '');
   for (const m of src.matchAll(/\]\(([^)\s#]+)(#[^)\s]*)?\)/g)) {
     if (/^[a-z][a-z0-9+.-]*:/i.test(m[1])) continue;
-    if (path.resolve(path.dirname(from), decodeURI(m[1])) === to) return true;
+    // A malformed `%` is the main link loop's failure to report, not a reason to abort here.
+    let resolved;
+    try { resolved = path.resolve(path.dirname(from), decodeURI(m[1])); } catch { continue; }
+    if (resolved === to) return true;
   }
   return false;
 };
