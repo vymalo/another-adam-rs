@@ -12,6 +12,7 @@ These pages are for people. The procedures and evidence that coding agents use l
 
 | Page | When |
 |---|---|
+| [Get started](getting-started.md) | you want one success in minutes: the stack up and a folder agent answering over A2A |
 | [Try the agents](guides/try-the-agents.md) | you want to chat with the Assistant, give Adam a task and write your own agent, all on mocks, then on a real model |
 | [Run it locally](guides/run-locally.md) | you want the coder and the general agent running on your machine in minutes |
 
