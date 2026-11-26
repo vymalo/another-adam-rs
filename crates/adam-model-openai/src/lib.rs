@@ -854,8 +854,6 @@ impl BoundedBody {
     }
 }
 
-/// The headers a provider gave, as a request's: names checked, values sensitive (never in `Debug`).
-/// A provider may not set the headers that frame the request.
 /// The headers one call asks for ([`ModelRequest::headers`]): none that looks like a credential or
 /// frames the request, so a hook can never set the model's key. Values are hidden from `Debug`.
 fn request_headers(headers: &BTreeMap<String, String>) -> Result<HeaderMap, ModelError> {
@@ -885,6 +883,8 @@ fn request_headers(headers: &BTreeMap<String, String>) -> Result<HeaderMap, Mode
     Ok(out)
 }
 
+/// The headers a provider gave, as a request's: names checked, values sensitive (never in `Debug`).
+/// A provider may not set the headers that frame the request.
 fn credential_headers(credentials: &CredentialHeaders) -> Result<HeaderMap, ModelError> {
     const FRAMING: [&str; 5] = [
         "content-type",

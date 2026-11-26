@@ -2998,37 +2998,15 @@ impl LlmAgent {
                     });
                     match verdict {
                         Ok(Verdict::Continue) => {
-                            if let Some(name) = headers
-                                .keys()
-                                .find(|name| adam_model::is_credential_header(name))
-                            {
-                                return Err(ModelFailure::by_hook(
-                                    format!(
-                                        "a hook set the header `{name}`, which looks like a credential: the model's key is the deployment's"
-                                    ),
-                                    false,
-                                ));
-                            }
-                            if let Some(key) = adam_model::RESERVED_BODY_KEYS.iter().find(|key| {
-                                extra_body.as_ref().is_some_and(|b| b.contains_key(**key))
-                            }) {
-                                return Err(ModelFailure::by_hook(
-                                    format!("a hook set the body member `{key}`, which the client owns"),
-                                    false,
-                                ));
-                            }
-                            if top_p.is_some_and(|p| !p.is_finite()) {
-                                return Err(ModelFailure::by_hook(
-                                    "a hook set a top_p that is not finite".to_owned(),
-                                    false,
-                                ));
-                            }
-                            request.top_p = top_p;
-                            request.headers = headers;
-                            request.extra_body = extra_body;
-                            request.temperature = temperature;
-                            request.max_output_tokens = max_output_tokens;
-                            request.metadata = metadata;
+                            apply_hooked(
+                                &mut request,
+                                temperature,
+                                top_p,
+                                headers,
+                                extra_body,
+                                max_output_tokens,
+                                metadata,
+                            )?;
                         }
                         Ok(Verdict::Stop(reason)) => {
                             return Err(ModelFailure::by_hook(
@@ -3753,37 +3731,15 @@ impl LlmAgent {
                         metadata: &mut metadata,
                     }) {
                         Ok(Verdict::Continue) => {
-                            if let Some(name) = headers
-                                .keys()
-                                .find(|name| adam_model::is_credential_header(name))
-                            {
-                                return Err(ModelFailure::by_hook(
-                                    format!(
-                                        "a hook set the header `{name}`, which looks like a credential: the model's key is the deployment's"
-                                    ),
-                                    false,
-                                ));
-                            }
-                            if let Some(key) = adam_model::RESERVED_BODY_KEYS.iter().find(|key| {
-                                extra_body.as_ref().is_some_and(|b| b.contains_key(**key))
-                            }) {
-                                return Err(ModelFailure::by_hook(
-                                    format!("a hook set the body member `{key}`, which the client owns"),
-                                    false,
-                                ));
-                            }
-                            if top_p.is_some_and(|p| !p.is_finite()) {
-                                return Err(ModelFailure::by_hook(
-                                    "a hook set a top_p that is not finite".to_owned(),
-                                    false,
-                                ));
-                            }
-                            request.top_p = top_p;
-                            request.headers = headers;
-                            request.extra_body = extra_body;
-                            request.temperature = temperature;
-                            request.max_output_tokens = max_output_tokens;
-                            request.metadata = metadata;
+                            apply_hooked(
+                                &mut request,
+                                temperature,
+                                top_p,
+                                headers,
+                                extra_body,
+                                max_output_tokens,
+                                metadata,
+                            )?;
                         }
                         Ok(Verdict::Stop(reason)) => {
                             return Err(ModelFailure::by_hook(
@@ -7221,6 +7177,52 @@ fn tool_transient(
         Some((tool, policy)) => error.with_retry(tool_retry_key(tool), policy),
         None => error,
     }
+}
+
+/// Checks what a `model.request` hook left in a request and, if it is allowed, writes it back:
+/// no header that looks like a credential, no body member the client owns, a finite top-p.
+fn apply_hooked(
+    request: &mut ModelRequest,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    headers: std::collections::BTreeMap<String, String>,
+    extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+    max_output_tokens: Option<u32>,
+    metadata: std::collections::BTreeMap<String, String>,
+) -> Result<(), ModelFailure> {
+    if let Some(name) = headers
+        .keys()
+        .find(|name| adam_model::is_credential_header(name))
+    {
+        return Err(ModelFailure::by_hook(
+            format!(
+                "a hook set the header `{name}`, which looks like a credential: the model's key is the deployment's"
+            ),
+            false,
+        ));
+    }
+    if let Some(key) = adam_model::RESERVED_BODY_KEYS
+        .iter()
+        .find(|key| extra_body.as_ref().is_some_and(|b| b.contains_key(**key)))
+    {
+        return Err(ModelFailure::by_hook(
+            format!("a hook set the body member `{key}`, which the client owns"),
+            false,
+        ));
+    }
+    if top_p.is_some_and(|p| !p.is_finite()) {
+        return Err(ModelFailure::by_hook(
+            "a hook set a top_p that is not finite".to_owned(),
+            false,
+        ));
+    }
+    request.top_p = top_p;
+    request.headers = headers;
+    request.extra_body = extra_body;
+    request.temperature = temperature;
+    request.max_output_tokens = max_output_tokens;
+    request.metadata = metadata;
+    Ok(())
 }
 
 /// Whether `doom_loop` would refuse a call of `key` now, from the committed state alone: the third
