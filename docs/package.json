@@ -1,0 +1,17 @@
+{
+  "name": "another-adam-rs-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node gen-a2a-api.mjs && vitepress dev",
+    "build": "node gen-a2a-api.mjs && vitepress build",
+    "preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "@vaam-apps/vitepress-md3": "1.0.2",
+    "mermaid": "11.17.2",
+    "vitepress": "1.6.4",
+    "vitepress-plugin-mermaid": "2.0.17",
+    "vue": "3.5.13"
+  }
+}

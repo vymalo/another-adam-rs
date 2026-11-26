@@ -1,0 +1,50 @@
+name: Docs site
+
+# The documentation site (docs/.vitepress, @vaam-apps/vitepress-md3) is built on every change to docs/ and deployed to
+# GitHub Pages from main. The structure it follows is docs/.vitepress/STRUCTURE.md.
+on:
+  pull_request:
+    paths: ["docs/**", ".github/workflows/docs-site.yml"]
+  push:
+    branches: [main]
+    paths: ["docs/**", ".github/workflows/docs-site.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      - name: Install the pinned site dependencies
+        run: npm --prefix docs ci --no-fund --no-audit
+      - name: Build the site
+        run: npm --prefix docs run build
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs/.vitepress/dist
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
