@@ -1107,3 +1107,63 @@ fn schemas() -> Value {
     }
     Value::Object(schemas)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The published copy: for people reading the docs, not a deployment's own document.
+    const PUBLISHED: &str = "../../docs/api/a2a-server.openapi.json";
+
+    /// The command that rewrites it, in the failure message so nobody has to find it.
+    const REGENERATE: &str = "ADAM_UPDATE_GOLDEN=1 cargo test -p adam-a2a --lib the_committed_document_is_the_one_the_code_builds";
+
+    /// The card the committed document is written for: one fixed card, so the file changes only
+    /// when the code does. The flags are the default posture (a bearer token is required; push
+    /// notifications and the extended card are off); a deployment's own card and switches are not
+    /// in the file, which is why it is the same document for every server.
+    fn documented_card() -> AgentCardConfig {
+        AgentCardConfig::new(
+            "adam",
+            "A durable AI agent: a task in, a verified pull request out.",
+            "http://localhost:8080/"
+                .parse()
+                .expect("a literal URL is valid"),
+            "1.0.0",
+        )
+    }
+
+    #[test]
+    fn the_committed_document_is_the_one_the_code_builds() {
+        let document = document(
+            &documented_card(),
+            Flags {
+                bearer: true,
+                push: false,
+                extended: false,
+            },
+            false,
+        );
+        let built = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&document).expect("a JSON value")
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(PUBLISHED);
+        if std::env::var_os("ADAM_UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().expect("the file has a parent"))
+                .expect("create docs/api");
+            std::fs::write(&path, &built).expect("write the document");
+            return;
+        }
+        let committed = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "{}: {error}; regenerate it with {REGENERATE}",
+                path.display()
+            )
+        });
+        assert_eq!(
+            committed, built,
+            "docs/api/a2a-server.openapi.json no longer matches crates/adam-a2a/src/openapi.rs; regenerate it with {REGENERATE}"
+        );
+    }
+}
