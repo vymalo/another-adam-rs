@@ -2,11 +2,30 @@
 
 The reference for agents authored as Markdown folders plus `#[tool]` functions: layout, formats, what is
 validated, and how each piece behaves at run time. The task-oriented version is
-[Write an agent](../guides/write-an-agent.md). Decisions D1 to D6 (accepted 2026-09-29) are at the end.
+[Write an agent](../guides/write-an-agent.md). The owner's decisions D1 to D6 behind the format (accepted 2026-09-29) are on
+[the agent page](../../.agents/docs/reference/agent-files.md).
 Facts about third parties are marked *verified* (date and source) or *unverified*.
 
 The goal, in the owner's words: agents, skills and more configured through plain Markdown files, and tools
 configured in code, very easily, through macros. Where a standard exists, adam-rs follows the standard.
+
+## On this page
+
+* [The idea in six lines](#the-idea-in-six-lines)
+* [Layout](#layout)
+* [File formats](#file-formats)
+* [Parsing and validation](#parsing-and-validation)
+* [Build time: `build.rs` and `include_agent!`](#build-time-buildrs-and-include_agent)
+* [The `#[tool]` contract](#the-tool-contract)
+* [Binding: manifest to agents](#binding-manifest-to-agents)
+* [Skills at run time](#skills-at-run-time)
+* [Subagents at run time](#subagents-at-run-time)
+* [MCP tools at run time (feature `mcp`)](#mcp-tools-at-run-time-feature-mcp)
+* [Dev reload (feature `dev`)](#dev-reload-feature-dev)
+* [Run-time folders](#run-time-folders)
+* [Mapping: eve to adam-rs to standard](#mapping-eve-to-adam-rs-to-standard)
+* [Why this format](#why-this-format)
+* [Open questions](#open-questions)
 
 ## The idea in six lines
 
@@ -1168,24 +1187,10 @@ A2A card "skills" and Agent Skills are unrelated; they never map implicitly. The
 read it as instructions for editing that folder. An agent that works on repositories reads the target
 repository's nearest `AGENTS.md` at run time instead.
 
-## Decisions (accepted by the owner, 2026-09-29)
+## Why this format
 
-The owner accepted D1 to D6 as recommended, and added one rule: **keep the structure of eve.dev, GitHub
-Copilot and Claude Code for agents and subagents.** The layout is eve's; the file format is the Claude
-Code / Copilot custom agent; `.agent.md` is accepted and the name is the stem without `.agent`; unknown
-Claude or Copilot keys are accepted with a warning.
-
-| | Decision | Rejected alternative |
-|---|---|---|
-| D1 | Configuration is YAML frontmatter, not `agent.toml`: one schema shared with Claude Code, Copilot, OpenCode and Agent Skills | TOML: Rust-native, but no agent convention |
-| D2 | Tools live in `src/` with an explicit `tools![]`, not `agent/tools/*.rs` auto-discovery | included files are invisible to `cargo fmt` |
-| D3 | A subagent that omits `tools:` gets none | inherit all: Claude-compatible, surprising for a durable backend |
-| D4 | Unknown frontmatter keys and Agent Skills violations warn (`.strict()` opts in to errors); a missing `description` always fails | fail the build on any |
-| D5 | One tool per subagent, named after it | a single `delegate { agent, message }` tool |
-| D6 | The `dev` feature ships in the facade and is off by default | on by default |
-
-Also confirmed: adam-rs domain types are **closed enums** (no `#[non_exhaustive]` unless an existing
-type already sets the pattern).
+The layout is eve's, the file format is the Claude Code and Copilot custom agent, and the owner's six decisions
+behind it (with the alternatives rejected) are on [agent files, for agents](../../.agents/docs/reference/agent-files.md).
 
 ## Open questions
 

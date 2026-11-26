@@ -9,7 +9,10 @@
 //      mirrored by a symlink that resolves in .claude/, .goose/ and .kiro/, has no relative Markdown
 //      link (a skill is installed into other repositories, where it would break), and cites only
 //      repository paths that exist (code spans that start with crates/, bin/, docs/, deploy/,
-//      docker/, dev/, tools/ or .github/; spans with a placeholder or a glob are not paths).
+//      docker/, dev/, tools/ or .github/; spans with a placeholder or a glob are not paths), and
+//   6. the split of ADR 0079 holds: a page of .agents/docs (for agents) and the page of docs/ at the
+//      same relative path (for people) link to each other, and no page for people outside the dated
+//      records (docs/decisions, docs/reviews) cites a `path:line`.
 // Usage (from the repo root):  npm --prefix tools/docs-check ci && node tools/docs-check/check-docs.mjs
 // Exits 1 on any failure, listing file:line for each.
 import fs from 'node:fs';
@@ -17,13 +20,16 @@ import path from 'node:path';
 import { JSDOM } from 'jsdom';
 
 const root = process.cwd();
-// Build output, dependencies, and the vendored agent skills (not this repository's docs).
-const skipDirs = new Set(['.git', 'node_modules', 'target', '.claude', '.agents', '.goose', '.kiro']);
+// Build output, dependencies, and the agent skills (checked by rule 5, not as docs). The agent
+// pages in .agents/docs are docs: their diagrams, links and anchors are checked like any other.
+const skipDirs = new Set(['.git', 'node_modules', 'target', '.claude', '.goose', '.kiro']);
+const skipPaths = new Set([path.join('.agents', 'skills')]);
 
 function* markdownFiles(dir) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     if (skipDirs.has(entry.name)) continue;
     const full = path.join(dir, entry.name);
+    if (skipPaths.has(path.relative(root, full))) continue;
     if (entry.isSymbolicLink()) continue; // symlinks are checked at their target
     if (entry.isDirectory()) yield* markdownFiles(full);
     else if (entry.name.endsWith('.md')) yield full;
@@ -194,7 +200,45 @@ if (fs.existsSync(skillsDir)) {
   }
 }
 
-console.log(`${diagrams} diagrams, ${links} relative links, ${crates} crate READMEs, ${skills} first-party skills (${skillPaths} cited paths) checked`);
+// Rule 6 (ADR 0079): docs/ is for people, .agents/docs/ for agents, at the same relative path.
+const linksTo = (from, to) => {
+  const src = fs.readFileSync(from, 'utf8').replace(/```[\s\S]*?```/g, '').replace(/`[^`\n]+`/g, '');
+  for (const m of src.matchAll(/\]\(([^)\s#]+)(#[^)\s]*)?\)/g)) {
+    if (/^[a-z][a-z0-9+.-]*:/i.test(m[1])) continue;
+    // A malformed `%` is the main link loop's failure to report, not a reason to abort here.
+    let resolved;
+    try { resolved = path.resolve(path.dirname(from), decodeURI(m[1])); } catch { continue; }
+    if (resolved === to) return true;
+  }
+  return false;
+};
+const agentDocs = path.join(root, '.agents', 'docs');
+let pairs = 0;
+if (fs.existsSync(agentDocs)) {
+  for (const agentPage of markdownFiles(agentDocs)) {
+    const relPath = path.relative(agentDocs, agentPage);
+    const humanPage = path.join(root, 'docs', relPath);
+    if (relPath === 'README.md' || !fs.existsSync(humanPage)) continue;
+    pairs++;
+    if (!linksTo(humanPage, agentPage)) failures.push(`docs/${relPath}: does not link to its agent page .agents/docs/${relPath}`);
+    if (!linksTo(agentPage, humanPage)) failures.push(`.agents/docs/${relPath}: does not link back to docs/${relPath}`);
+  }
+}
+// A page for people names files, never a `path:line`: that evidence is an agent page's.
+// A page listed here mixes the two today and is split in a later change (ADR 0079, Consequences).
+const mixedPages = new Set([path.join('docs', 'reference', 'parity.md')]);
+const records = [path.join('docs', 'decisions'), path.join('docs', 'reviews')];
+const pathLine = /`[^`\s]*\.(rs|sh|ya?ml|toml|mjs|js|json|tpl|md):[0-9]+/g;
+for (const file of markdownFiles(path.join(root, 'docs'))) {
+  const rel = path.relative(root, file);
+  if (mixedPages.has(rel) || records.some((r) => rel.startsWith(r + path.sep))) continue;
+  const src = fs.readFileSync(file, 'utf8');
+  for (const m of src.matchAll(pathLine)) {
+    failures.push(`${rel}:${lineOf(src, m.index)} a path:line in a page for people (move it to .agents/docs, ADR 0079): ${m[0]}`);
+  }
+}
+
+console.log(`${diagrams} diagrams, ${links} relative links, ${crates} crate READMEs, ${skills} first-party skills (${skillPaths} cited paths), ${pairs} people/agent page pairs checked`);
 if (failures.length) {
   console.error(failures.join('\n'));
   console.error(`${failures.length} problem(s)`);

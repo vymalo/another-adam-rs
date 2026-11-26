@@ -13,6 +13,17 @@ for it: tools find the workspace and the budgets of the **root run** (`ToolCtx::
 The model decides the order of the tools. **The tools enforce the rules**, so they hold even if the model
 ignores its prompt.
 
+## On this page
+
+* [What it does](#what-it-does)
+* [The same flow as states](#the-same-flow-as-states)
+* [Rules in code](#rules-in-code)
+* [Continuing a task](#continuing-a-task)
+* [Where state lives](#where-state-lives)
+* [Images](#images)
+* [Secrets](#secrets)
+* [Limits and cancel](#limits-and-cancel)
+
 ## What it does
 
 ```mermaid
