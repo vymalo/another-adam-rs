@@ -871,6 +871,19 @@ compaction is the first of a new prefix, and `Conversation::compactions` lists t
 `shortenings`; `tests/prefix.rs` holds the rule. Rolling back to a build without compaction turns a run that
 has compacted into a `NonDeterminism` error.
 
+### Signed turns: each assistant and tool turn is signed when it is committed
+
+An `LlmAgent` given turn keys signs every assistant message and tool result in the step that commits it
+([ADR 0068](decisions/0068-adam-signs-its-own-history.md), slice T3a-1). The signature names the run, the
+conversation, the row's position and a hash of every row before it, so a changed, moved or reordered row no longer
+verifies. A person's message is hashed but never signed. Without keys nothing changes. **Nothing verifies on re-entry
+yet** (T3a-3): a forged row is not refused today.
+
+Two rules keep a signature true. What is signed is the row **as the store keeps it** (a NUL is already the replacement
+character, [ADR 0051](decisions/0051-a-nul-is-stored-as-the-replacement-character.md)). And a compaction or a
+shortening, which moves rows or changes their bytes, clears the signature of every row after the change, so the next
+commit signs those rows again. A signing failure fails the step: no turn is committed unsigned.
+
 ### The access tier: which tools a step may use
 
 The person picks a tier for each message (`plan`, `edits`, `auto`, `bypass`; the A2A extension `access-tier/v1`, [ADR 0036](decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)).
