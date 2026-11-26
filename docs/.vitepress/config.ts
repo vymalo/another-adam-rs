@@ -34,7 +34,13 @@ const sidebar = [
     collapsed: true,
     items: [{ text: "A2A server (OpenAPI)", link: "/api/a2a-server" }, ...pages("reference")],
   },
-  { text: "Architecture", items: [{ text: "Architecture", link: "/architecture" }] },
+  {
+    text: "Architecture",
+    items: [
+      { text: "Concepts", link: "/concepts" },
+      { text: "Architecture", link: "/architecture" },
+    ],
+  },
   { text: "Decisions", collapsed: true, items: [{ text: "ADR index", link: "/decisions/" }, ...pages("decisions")] },
   { text: "Contributing", items: [{ text: "How to contribute", link: "/contributing" }] },
 ];

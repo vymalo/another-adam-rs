@@ -11,6 +11,7 @@ A page here that has a page for people sits at the same relative path, and the t
 |---|---|---|
 | [Writing docs](writing-docs.md) | [Writing these docs](../../docs/README.md#writing-these-docs) | the split, which page a change updates, how to write a page for people, what `docs-check` checks |
 | [Skills](skills.md) | none | the skills this repository provides, how consumers install them, how to write and keep one |
+| [Concepts: the evidence](concepts.md) | [Concepts](../../docs/concepts.md) | where the code defines each term of the glossary |
 | [Architecture: the evidence](architecture.md) | [Architecture](../../docs/architecture.md) | what was verified, when and how, and what is still unverified |
 | [Errors: rules to check](reference/errors.md) | [Errors](../../docs/reference/errors.md) | the rules every error enum keeps |
 | [Agent files: the decisions to keep](reference/agent-files.md) | [Agent files](../../docs/reference/agent-files.md) | the owner's decisions behind the folder format |
