@@ -305,14 +305,38 @@ fn operation_text(operation: &str, flags: Flags) -> (&'static str, String) {
 }
 
 /// The `curl` that a streaming operation's description gives.
+/// The same value with every object's keys sorted. `serde_json` keeps its map in insertion order
+/// when something in the build enables `preserve_order` — `schemars` does, and the `schema` feature
+/// brings it — so anything this document embeds as text would otherwise depend on the feature set.
+/// A document's key order is not part of its meaning.
+fn sorted(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by_key(|(key, _)| key.as_str());
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), sorted(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+        other => other.clone(),
+    }
+}
+
 fn stream_curl(base: &str, path: &str, method: &str, body: Option<&Value>, bearer: bool) -> String {
     let mut curl = format!("curl -N -X {method}");
     if bearer {
         curl.push_str(" -H \"Authorization: Bearer $A2A_TOKEN\"");
     }
     if let Some(body) = body {
+        // Sorted, so the example reads the same whichever `serde_json` map the build has: a
+        // feature that enables `preserve_order` (`schemars` does) would otherwise reorder it.
         curl.push_str(&format!(
-            " -H 'Content-Type: application/json' --data '{body}'"
+            " -H 'Content-Type: application/json' --data '{}'",
+            sorted(body)
         ));
     }
     curl.push_str(&format!(" {base}{path}"));
@@ -1131,27 +1155,6 @@ mod tests {
                 .expect("a literal URL is valid"),
             "1.0.0",
         )
-    }
-
-    /// The same value with every object's keys sorted. `serde_json` keeps its map in insertion
-    /// order when something in the build enables `preserve_order` — `schemars` does, and the
-    /// `schema` feature brings it — so one document's bytes would otherwise depend on the feature
-    /// set. A document's key order is not part of its meaning.
-    fn sorted(value: &Value) -> Value {
-        match value {
-            Value::Object(map) => {
-                let mut entries: Vec<(&String, &Value)> = map.iter().collect();
-                entries.sort_by_key(|(key, _)| key.as_str());
-                Value::Object(
-                    entries
-                        .into_iter()
-                        .map(|(key, value)| (key.clone(), sorted(value)))
-                        .collect(),
-                )
-            }
-            Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
-            other => other.clone(),
-        }
     }
 
     #[test]
