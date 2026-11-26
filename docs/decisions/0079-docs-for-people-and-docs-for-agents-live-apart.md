@@ -1,8 +1,7 @@
 # 0079. Docs for people and docs for agents live apart
 
-Status: **Proposed** (2026-11-26). The owner asked on 2026-11-26: *"revamp the doc in -adam-rs and related, so that
-easy to read. Re-organize, so that agent's and human doc are separated"*. The separation is his decision; where each
-part lives, below, is for him to confirm.
+Status: **Accepted** (2026-11-26). The owner asked on 2026-11-26: *"revamp the doc in -adam-rs and related, so that
+easy to read. Re-organize, so that agent's and human doc are separated"*, and accepted the layout below the same day.
 
 ## Context
 
