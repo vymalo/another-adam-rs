@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use adam_engine::adam_agent_fs::{Dir, Strictness};
 use adam_engine::adam_assembly::AgentDef;
-use adam_engine::adam_core::{DynStore, RunId};
+use adam_engine::adam_core::{DynStore, DynTurnKeys, RunId, TurnKeys};
 use adam_engine::adam_model::{
     DynModel, Message as ModelMessage, MockModel, ModelClient, ModelDelta, ModelError,
     ModelRequest, ModelResponse, ToolCall,
@@ -66,6 +66,12 @@ fn limits(fixed: bool) -> Limits {
 #[allow(clippy::unused_async)] // the callers await it, as they would a store that connects
 async fn durable_store(path: &Path) -> Result<DynStore, Box<dyn std::error::Error>> {
     Ok(Arc::new(adam_store_sqlite::SqliteStore::open(path)?))
+}
+
+/// The turn key an engine over a store that outlives the process needs (ADR 0068 decision 9): one
+/// made at start, as a test's history is.
+fn turn_keys() -> DynTurnKeys {
+    <dyn TurnKeys>::ephemeral().expect("a key")
 }
 
 #[test]
@@ -164,6 +170,7 @@ fn child(dir: PathBuf, fixed: bool) {
             "m",
         )
         .limits(limits(fixed))
+        .turn_keys(turn_keys())
         .start()
         .await
         .unwrap();
@@ -223,6 +230,7 @@ fn parent(fixed: bool) {
             "m",
         )
         .limits(limits(fixed))
+        .turn_keys(turn_keys())
         .start()
         .await
         .unwrap();
