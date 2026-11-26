@@ -1133,6 +1133,27 @@ mod tests {
         )
     }
 
+    /// The same value with every object's keys sorted. `serde_json` keeps its map in insertion
+    /// order when something in the build enables `preserve_order` — `schemars` does, and the
+    /// `schema` feature brings it — so one document's bytes would otherwise depend on the feature
+    /// set. A document's key order is not part of its meaning.
+    fn sorted(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                entries.sort_by_key(|(key, _)| key.as_str());
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key.clone(), sorted(value)))
+                        .collect(),
+                )
+            }
+            Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+            other => other.clone(),
+        }
+    }
+
     #[test]
     fn the_committed_document_is_the_one_the_code_builds() {
         let document = document(
@@ -1146,7 +1167,7 @@ mod tests {
         );
         let built = format!(
             "{}\n",
-            serde_json::to_string_pretty(&document).expect("a JSON value")
+            serde_json::to_string_pretty(&sorted(&document)).expect("a JSON value")
         );
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(PUBLISHED);
         if std::env::var_os("ADAM_UPDATE_GOLDEN").is_some() {
@@ -1161,8 +1182,15 @@ mod tests {
                 path.display()
             )
         });
+        let committed: Value = serde_json::from_str(&committed).unwrap_or_else(|error| {
+            panic!(
+                "{}: {error}; regenerate it with {REGENERATE}",
+                path.display()
+            )
+        });
         assert_eq!(
-            committed, built,
+            committed,
+            sorted(&document),
             "docs/api/a2a-server.openapi.json no longer matches crates/adam-a2a/src/openapi.rs; regenerate it with {REGENERATE}"
         );
     }
