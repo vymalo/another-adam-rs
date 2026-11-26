@@ -1032,6 +1032,75 @@ async fn the_model_sees_the_rewritten_temperature_tokens_and_metadata() {
     assert_eq!(asked.load(SeqCst), 1);
 }
 
+/// Sets top-p, a header and an extra body (slice H3b), or a header that looks like a credential.
+struct ModelHookB {
+    header: &'static str,
+}
+
+impl Plugin for ModelHookB {
+    fn name(&self) -> &str {
+        "model-hook-b"
+    }
+
+    fn model_request(&self, request: &mut HookedModelRequest<'_>) -> HookResult {
+        *request.top_p = Some(0.5);
+        request.headers.insert(self.header.into(), "v-1".into());
+        let mut body = serde_json::Map::new();
+        body.insert("seed".into(), json!(7));
+        *request.extra_body = Some(body);
+        Ok(Verdict::Continue)
+    }
+}
+
+/// The model sees top-p, the header and the extra body.
+#[tokio::test]
+async fn the_model_sees_the_rewritten_top_p_header_and_extra_body() {
+    let h = Harness::new();
+    let agent = h.agent().plugin(ModelHookB { header: "x-tenant" }).build();
+    h.mock.push_text("hello");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].top_p, Some(0.5));
+    assert_eq!(
+        requests[0].headers.get("x-tenant").map(String::as_str),
+        Some("v-1")
+    );
+    assert_eq!(
+        requests[0].extra_body.as_ref().and_then(|b| b.get("seed")),
+        Some(&json!(7))
+    );
+}
+
+/// A header that looks like a credential fails the run and the model is never called.
+#[tokio::test]
+async fn a_credential_like_header_from_a_hook_is_refused() {
+    for name in ["Authorization", "x-api-key", "Cookie", "X_Auth_Token"] {
+        let h = Harness::new();
+        let agent = h.agent().plugin(ModelHookB { header: name }).build();
+        h.mock.push_text("never said");
+        let rt = h.runtime(&agent);
+        let run = rt
+            .start("llm", user_message("go"), None)
+            .await
+            .expect("start");
+        let worker = spawn_worker(&rt);
+        let view = wait_failed(&rt, run).await;
+        worker.stop().await;
+        let error = view.error.clone().unwrap_or_default();
+        assert!(error.contains("credential"), "{name}: {error}");
+        assert!(h.mock.requests().is_empty(), "{name}: the model was called");
+    }
+}
+
 /// A replay of a recorded model step asks no hook: the first worker records the turn and dies in
 /// the tool, and the survivor replays `model:0` without asking the hook for it again.
 #[tokio::test]
