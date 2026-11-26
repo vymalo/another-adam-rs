@@ -216,6 +216,21 @@ impl Gen<'_> {
             }
             self.close("],");
         }
+        if a.modes.is_empty() {
+            self.line("modes: &[],");
+        } else {
+            self.open("modes: &[");
+            for m in &a.modes {
+                self.open(format!("{p}::EmbeddedMode {{"));
+                self.line(format!("name: {},", lit(&m.name)));
+                self.line(format!("path: {},", self.rel(&m.path)?));
+                // The file's text, not its parts: the embedded path parses it with the same
+                // parser and schema as a directory's, so there is no second one.
+                self.line(format!("text: include_str!({}),", self.abs(&m.path)?));
+                self.close("},");
+            }
+            self.close("],");
+        }
         self.close(format!("}}{close_suffix}"));
         Ok(())
     }

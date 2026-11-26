@@ -25,6 +25,7 @@ the extended card, the card's signature, and the three live streams (steps, text
 * [The prompt statement (`prompt-statement/v1`)](#the-prompt-statement-prompt-statementv1)
 * [The reasoning effort (`reasoning/v1`)](#the-reasoning-effort-reasoningv1)
 * [The model a message picks (`model-pick/v1`)](#the-model-a-message-picks-model-pickv1)
+* [Modes (`agent-mode/v1`)](#modes-agent-modev1)
 * [Child sessions (`child-sessions/v1`)](#child-sessions-child-sessionsv1)
 * [Commands (`commands/v1`)](#commands-commandsv1)
 * [Tokens of each model call](#tokens-of-each-model-call)
@@ -529,8 +530,51 @@ default): it assembles the agent, and the choices it advertises are the root's b
 `control-plane` process of the split topology lists nothing yet — it assembles no agent and reads no
 profiles file — so a deployment that wants a pick runs `ROLE=all` for now.
 
-## Child sessions (`child-sessions/v1`)
+## Modes (`agent-mode/v1`)
 
+An agent whose folder declares `modes/<name>.md` lists
+`https://agents.vymalo.com/a2a/extensions/agent-mode/v1` and works in the mode a person picks **for
+each message**, as they pick the access tier ([ADR 0039](../decisions/0039-the-agent-loop-takes-opencodes-structure-and-agents-get-plugins.md),
+decision 3; the contract page is the orchestration layer's, `docs/api/agent-mode-v1.md`,
+ANR-979). The card's `params` are `{"modes": [{"name", "title", "description"}, ..], "default":
+"<name>"}`, in the order the folder gives, and `adam_a2a::ExtensionConfig::agent_mode` builds it
+from `adam_a2a::AgentModes`. A folder without `modes/` lists no extension and works as it always
+did.
+
+A request that **activates** the extension **must** carry `metadata[URI] = {"mode": "<name>"}` on the
+message. `adam_a2a::AgentModes::requested` reads it and returns the refusal sentence for every other
+shape; the runtime turns that into `InvalidParams` (`-32602`) before anything is written:
+
+* a missing entry;
+* an entry that is not an object;
+* a missing, blank or non-string `mode`;
+* a mode the card does not declare.
+
+The sentence begins with the code `mode_not_offered` and names the modes, so a client can tell it
+from any other refusal and offer what the card lists. Other members of the entry are ignored. A
+message that does not activate the extension carries no mode, whatever its metadata says.
+
+**In the run.** The backend reads the mode in `submit`, beside the tier: it is the run's inbound
+context key `vymalo.mode` (`CONTEXT_MODE` in `crates/adam-a2a-runtime/src/mode.rs`), `{"mode": ..}`,
+and it holds until a later message names another, as the tier does. The mode is one of the run's
+**protected** context keys (`adam_llm_agent::PROTECTED_CONTEXT_KEYS` holds
+`adam_llm_agent::MODE_CONTEXT_KEY`), so a message whose context is too large to keep still keeps it,
+and a subagent starts in its parent's mode. A run that names none works in the folder's default
+mode.
+
+**What the mode does.** It is a tool source of the agent (`adam_assembly`, `crates/adam-assembly/src/modes.rs`):
+it withholds every tool the mode's `tools:` does not list, and adds the mode's words to the agent's
+instructions. A tool the mode does not offer is not shown, and a call to one is refused with a
+result that tells the model to say what it did not do. **A mode only narrows**: the access tier
+still holds back what it does not allow, and a mode can neither raise the tier nor offer a tool the
+agent does not have.
+
+**Which processes list it.** Both roles: the card comes from the folder
+(`adam_assembly::card_of`), and both roles read the same files (`Agents::agent_modes`). A card that
+lists the extension while the backend was given no modes stops the process at start
+(`ServeError::AgentModes`, exit 78), so the card never promises a choice nothing keeps.
+
+## Child sessions (`child-sessions/v1`)
 A session ([ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)) is a chain of runs of a helper agent
 that share one conversation. A client that **activates** `https://agents.vymalo.com/a2a/extensions/child-sessions/v1` (the
 contract is the orchestration layer's `docs/api/child-sessions-v1.md`) sees the sessions of a parent context on the parent task,

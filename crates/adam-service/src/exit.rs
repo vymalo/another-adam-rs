@@ -80,7 +80,10 @@ fn code_of(
     if let Some(e) = cause.downcast_ref::<ServeError>() {
         match e {
             ServeError::Host(_) => return Some(EX_SOFTWARE),
-            ServeError::NoCard | ServeError::ChildSessions { .. } | ServeError::Push(_) => {
+            ServeError::NoCard
+            | ServeError::ChildSessions { .. }
+            | ServeError::AgentModes
+            | ServeError::Push(_) => {
                 return Some(EX_CONFIG);
             }
             ServeError::StoreNotBuilt { .. }

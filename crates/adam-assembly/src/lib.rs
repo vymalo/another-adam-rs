@@ -154,6 +154,7 @@ mod error;
 mod folder;
 mod groups;
 mod mcp;
+mod modes;
 #[cfg(feature = "remote")]
 mod remote;
 #[cfg(feature = "remote")]
@@ -188,6 +189,8 @@ pub use remote_session::{RemoteRoundAgent, RemoteRoundStarter};
 pub use skills::{
     LOAD_SKILL, READ_SKILL_FILE, RunSkills, SkillError, SkillFiles, run_skills_conformance,
 };
+#[cfg(feature = "sessions")]
+pub use modes::agent_modes_of;
 pub use subagent::{DEFAULT_SUBAGENT_MINUTES, SubagentTool};
 pub use template::TemplateProblem;
 

@@ -148,6 +148,7 @@ mod tests {
             mcp: None,
             schedules: Vec::new(),
             commands: Vec::new(),
+            modes: Vec::new(),
         }
     }
 

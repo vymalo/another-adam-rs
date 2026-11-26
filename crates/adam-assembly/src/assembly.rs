@@ -927,6 +927,11 @@ impl BoundDef {
         for apply in &self.state {
             builder = apply(builder);
         }
+        // The modes of `agent-mode/v1` first: they hold back what the mode does not offer, and
+        // every other source's holds still apply beside theirs (a mode only narrows).
+        if let Some(modes) = &node.modes {
+            builder = builder.tool_source(crate::modes::ModeSource::new(Arc::clone(modes)));
+        }
         // The agent's own sources first (the `mcp.json` servers a run loads only when its task
         // matches), then the deployment's, in the order it added them.
         for source in &node.sources {
@@ -1055,6 +1060,14 @@ impl Assembly {
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     pub fn session_bounds(&self) -> &[(String, SessionBounds)] {
         &self.session_bounds
+    }
+
+    /// The modes the root agent declares (`agent-mode/v1`, ADR 0039 decision 3), as the card lists
+    /// them and the A2A front refuses a message for: `None` when the folder has no `modes/`. What
+    /// the source narrows is the same set, so the card and the run cannot disagree.
+    #[cfg(feature = "sessions")]
+    pub fn agent_modes(&self) -> Option<adam_a2a::AgentModes> {
+        crate::modes::agent_modes_of(&self.manifest)
     }
 
     /// What the root's A2A front serves `child-sessions/v1` for, as

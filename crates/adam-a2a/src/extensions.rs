@@ -1,6 +1,6 @@
 //! The A2A extensions an agent that draws on a screen declares: the URIs, and the card entries.
 //!
-//! Seventeen extensions, each optional (a client that does not know one ignores it), detected by the
+//! Eighteen extensions, each optional (a client that does not know one ignores it), detected by the
 //! client from the card it reads, and removable without breaking plain A2A:
 //!
 //! | Extension | URI | What it is |
@@ -22,6 +22,7 @@
 //! | `uploads/v1` | [`UPLOADS_EXTENSION`] | the card lists it with no `params`; a message that activates it carries the orchestrator's limits |
 //! | `prompt-statement/v1` | [`PROMPT_STATEMENT_EXTENSION`] | a message carries the prompt statement and the person's envelope (two JWS); every model call of the run carries them as headers to the injector in front of the model (ADR 0077) |
 //! | `model-pick/v1` | [`MODEL_PICK_EXTENSION`] | the card lists the model aliases the deployment offers, and an activated message names one (`model`) for its run; an alias outside the list is refused as `model_not_offered` (ADR 0064, amended 2026-11-23) |
+//! | `agent-mode/v1` | [`AGENT_MODE_EXTENSION`] | the card lists the primary modes the folder declares (`build`, `plan`) and the default; an activated message names one (`mode`) and it holds until another is picked; a mode outside the list is refused, and a mode only narrows (ADR 0039, decision 3) |
 //!
 //! The contracts are the orchestration layer's (`docs/api/ui-catalog-v2.md`,
 //! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md`,
@@ -138,6 +139,16 @@ pub const REASONING_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/
 /// amended 2026-11-23).
 pub const MODEL_PICK_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/model-pick/v1";
 
+/// The URI of the `agent-mode/v1` extension: a folder declares primary modes (`modes/<name>.md`),
+/// and a message that activates this extension names the one its run works in, in its metadata
+/// under this URI, as `{"mode": "<name>"}`. The card's `params` are `{"modes": [{"name", "title",
+/// "description"}, ..], "default": "<name>"}`. A mode holds until a later message picks another,
+/// and a mode only narrows: the access tier still caps every tool it allows. An agent that declares
+/// no mode lists no extension and works as before. The reading is [`crate::AgentModes`] (ADR 0039,
+/// decision 3); the contract page is the orchestration layer's (`docs/api/agent-mode-v1.md` of
+/// `vymalo/another-agentic-system`, ANR-979).
+pub const AGENT_MODE_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/agent-mode/v1";
+
 /// The URI of the `prompt-statement/v1` extension (proposed): a message that activates it carries,
 /// in its metadata under this URI, `{"statement": "<JWS>", "user": "<JWS>"}`: the statement of the
 /// prompt and the person's envelope. `user` may be absent; `statement` may be absent on a device,
@@ -197,6 +208,32 @@ pub struct CommandInfo {
     pub description: String,
     /// What follows the name, for a client to show.
     pub argument_hint: Option<String>,
+}
+
+/// One mode of the card's `agent-mode/v1` entry (`modes/<name>.md`, ADR 0039 decision 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeInfo {
+    /// The name a message's `mode` names, and the file's stem.
+    pub name: String,
+    /// What a client shows.
+    pub title: String,
+    /// One line on what the mode does.
+    pub description: String,
+}
+
+impl ModeInfo {
+    /// The mode `name`, titled `title`, described by `description`.
+    pub fn new(
+        name: impl Into<String>,
+        title: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            title: title.into(),
+            description: description.into(),
+        }
+    }
 }
 
 /// What a build's revision, and the `+<revision>` of its card version, say when none was baked in.
@@ -505,6 +542,25 @@ impl ExtensionConfig {
             .insert("choices".into(), json!(choices.entries()));
         Some(extension)
     }
+
+    /// The `agent-mode/v1` extension: the card lists the primary modes the folder declares,
+    /// `params.modes` (`{"name", "title", "description"}`, in the order given), and the one a
+    /// message that names none works in, `params.default`. An agent that declares no mode does not
+    /// call this: it lists no extension and works as before.
+    /// Optional; the description is this repository's until the orchestration layer publishes the
+    /// contract (`docs/api/agent-mode-v1.md`, ANR-979).
+    pub fn agent_mode(modes: &crate::AgentModes) -> Self {
+        let mut extension = Self::new(AGENT_MODE_EXTENSION);
+        extension.description =
+            Some("Works in the mode the person picks for each message.".into());
+        extension
+            .params
+            .insert("modes".into(), json!(modes.entries()));
+        extension
+            .params
+            .insert("default".into(), json!(modes.default_mode()));
+        extension
+    }
 }
 
 /// The member of an artifact's `metadata` that says its id is **its own and kept**: the run replaces
@@ -606,6 +662,10 @@ mod tests {
         assert_eq!(
             MODEL_PICK_EXTENSION,
             "https://agents.vymalo.com/a2a/extensions/model-pick/v1"
+        );
+        assert_eq!(
+            AGENT_MODE_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/agent-mode/v1"
         );
         assert_eq!(
             PROMPT_STATEMENT_EXTENSION,
@@ -974,8 +1034,75 @@ mod tests {
     }
 
     #[test]
-    fn a_model_that_takes_no_level_lists_no_reasoning_extension() {
-        // No entry at all, an entry with no level, and another agent's levels: none is the root's.
+    fn the_agent_mode_entry_is_the_contracts_word_for_word() {
+        let modes = crate::AgentModes::new(
+            [
+                ModeInfo::new("build", "Build", "Changes the repository."),
+                ModeInfo::new("plan", "Plan", "Reads and proposes."),
+            ],
+            "build",
+        )
+        .expect("declared");
+        let e = ExtensionConfig::agent_mode(&modes);
+        assert_eq!(e.uri, AGENT_MODE_EXTENSION);
+        assert_eq!(
+            AGENT_MODE_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/agent-mode/v1"
+        );
+        assert!(
+            !e.required,
+            "a client that does not know it must still talk to the agent"
+        );
+        assert_eq!(
+            e.description.as_deref(),
+            Some("Works in the mode the person picks for each message.")
+        );
+        // The ADR's shape: `params {modes: [{name, title, description}], default}`.
+        assert_eq!(
+            serde_json::Value::Object(e.params),
+            json!({
+                "modes": [
+                    {"name": "build", "title": "Build", "description": "Changes the repository."},
+                    {"name": "plan", "title": "Plan", "description": "Reads and proposes."},
+                ],
+                "default": "build"
+            })
+        );
+    }
+
+    /// The extension is activatable only on a card that lists it: the URIs a card offers are the
+    /// ones its entries name, and nothing else switches it on.
+    #[cfg(feature = "server")]
+    #[test]
+    fn the_agent_mode_is_activated_only_on_a_card_that_lists_it() {
+        let modes = crate::AgentModes::new([ModeInfo::new("build", "Build", "d")], "build")
+            .expect("declared");
+        let with = crate::AgentCardConfig::new(
+            "coder",
+            "Codes",
+            "http://127.0.0.1:8080/".parse().expect("a URL"),
+            "0.1.0",
+        )
+        .with_extension(ExtensionConfig::agent_mode(&modes));
+        assert_eq!(
+            crate::activation::activated(&with.extension_uris(), [AGENT_MODE_EXTENSION], []),
+            [AGENT_MODE_EXTENSION]
+        );
+        let without = crate::AgentCardConfig::new(
+            "coder",
+            "Codes",
+            "http://127.0.0.1:8080/".parse().expect("a URL"),
+            "0.1.0",
+        )
+        .with_extension(ExtensionConfig::usage());
+        assert!(
+            crate::activation::activated(&without.extension_uris(), [AGENT_MODE_EXTENSION], [])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_model_that_takes_no_level_lists_no_reasoning_extension() {        // No entry at all, an entry with no level, and another agent's levels: none is the root's.
         assert!(ExtensionConfig::reasoning(&ReasoningEfforts::new(), "coder").is_none());
         let empty = ReasoningEfforts::new().with_agent("coder", [], Some(ReasoningEffort::Low));
         assert!(ExtensionConfig::reasoning(&empty, "coder").is_none());

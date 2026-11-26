@@ -268,6 +268,9 @@ pub async fn agents(
     let name = def.name().to_owned();
     // The commands the card lists (`commands/v1`): the backend expands a message that names one.
     let commands = adam_a2a_runtime::Commands::from_manifest(&def.manifest().commands);
+    // The modes the folder declares (`agent-mode/v1`, ADR 0039 decision 3): the card lists them and
+    // the backend refuses a message that names another. Both roles read the same files.
+    let modes = adam::assembly::agent_modes_of(def.manifest());
     // The helpers a person may start a session with (`child-sessions/v1`), from the folder alone and
     // with the effective limits, so every role that serves A2A lists and serves the same.
     let sessions = def.child_sessions();
@@ -384,6 +387,10 @@ pub async fn agents(
     };
     let agents = match efforts {
         Some(efforts) => agents.reasoning_efforts(efforts),
+        None => agents,
+    };
+    let agents = match modes {
+        Some(modes) => agents.agent_modes(modes),
         None => agents,
     };
     Ok(match sessions {

@@ -3,6 +3,7 @@
 mod agent;
 mod command;
 mod mcp;
+mod mode;
 mod names;
 mod reference;
 mod scalar;
@@ -18,6 +19,7 @@ pub use agent::{
     retry_duration,
 };
 pub use command::CommandFrontmatter;
+pub use mode::ModeFrontmatter;
 pub use mcp::{
     EnvRef, MAX_GROUP_NAME_CHARS, MAX_WHEN_KEYWORD_CHARS, MAX_WHEN_KEYWORDS, McpConfig, McpServer,
     McpSettings, McpWhen, RemoteKind, Segment, group_name_fits, split_env_references,

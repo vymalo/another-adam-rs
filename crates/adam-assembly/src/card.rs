@@ -77,6 +77,10 @@ fn card_of(manifest: &AgentManifest, url: Url, version: String) -> Result<AgentC
             config = config.with_extended_card(extra);
         }
     }
+    // `modes/`: the card lists the extension when, and only when, the folder declares modes.
+    if let Some(modes) = crate::modes::agent_modes_of(manifest) {
+        config = config.with_extension(ExtensionConfig::agent_mode(&modes));
+    }
     // `commands/`: the card lists the extension when, and only when, the agent has commands.
     let commands: Vec<CommandInfo> = manifest
         .commands
