@@ -477,3 +477,13 @@ that says a plugin asked, and clears an announced answer. The count is `Conversa
 `LlmAgentBuilder::max_run_continuations` (3 by default, at most 20) and the service setting `MAX_RUN_CONTINUATIONS`
 (exit 78 outside 0 to 20). Wiring the setting into the agents the assembly builds is not done: the service parses it,
 and a host that builds its agent by hand passes it to the builder.
+
+*Amended 2026-11-26 (slice **H9** built):* `Plugin::compaction_before(&HookedCompaction { context })` runs in the
+journaled `compact:<n>:<turn>` step, after the sources were applied and before the summary call: `context` is text the
+plugin appends, sent as one more user message after the summary instruction; `Verdict::Continue` summarises,
+`Deny(reason)` vetoes and the history is shortened instead (the reason is what the step reports, and no summary call is
+made), `Stop(reason)` fails the run as a `model.request` stop does, and `Ask` or a hook failure is a refusal. The hook
+never writes the summary. `model.request` gained `kind: ModelCallKind` (`Turn` or `Compaction`), so a plugin sees the
+summary call too; the point still may only rewrite `temperature`, `max_output_tokens` and `metadata`, and a `Stop`
+fails the run. Both run inside the step, so a replay of the recorded summary asks neither. The summary the model
+returns is unchanged: an empty answer is still "no summary" and drops the turns.
