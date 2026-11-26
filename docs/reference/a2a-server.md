@@ -78,12 +78,8 @@ at the same URL (`PUBLIC_URL`): the REST paths are relative to it.
 
 [`docs/api/a2a-server.openapi.json`](../api/a2a-server.openapi.json) is the same document, committed so a site can render it
 without a running server. It is built from one fixed default card (a bearer token required; push notifications and the
-extended card off), so it changes only when `crates/adam-a2a/src/openapi.rs` does. A test holds the two equal; when it fails
-it names the command that rewrites the file:
-
-```sh
-ADAM_UPDATE_GOLDEN=1 cargo test -p adam-a2a --lib the_committed_document_is_the_one_the_code_builds
-```
+extended card off), so it changes only when the server's code does. How it is held equal to the code, and how to rewrite
+it: [the document, for agents](../../.agents/docs/reference/a2a-server.md#the-committed-document).
 
 ## Push notifications
 
