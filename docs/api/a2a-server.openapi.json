@@ -1,0 +1,3068 @@
+{
+  "components": {
+    "schemas": {
+      "AgentCard": {
+        "description": "The agent card (A2A 1.0 §4.4.1); the members other than these are described there.",
+        "properties": {
+          "capabilities": {
+            "type": "object"
+          },
+          "defaultInputModes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "defaultOutputModes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "securityRequirements": {
+            "type": "array"
+          },
+          "securitySchemes": {
+            "type": "object"
+          },
+          "signatures": {
+            "type": "array"
+          },
+          "skills": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "supportedInterfaces": {
+            "items": {
+              "$ref": "#/components/schemas/AgentInterface"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "version",
+          "supportedInterfaces",
+          "capabilities"
+        ],
+        "type": "object"
+      },
+      "AgentInterface": {
+        "properties": {
+          "protocolBinding": {
+            "examples": [
+              "JSONRPC",
+              "HTTP+JSON"
+            ],
+            "type": "string"
+          },
+          "protocolVersion": {
+            "type": "string"
+          },
+          "tenant": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "protocolBinding",
+          "protocolVersion"
+        ],
+        "type": "object"
+      },
+      "Artifact": {
+        "properties": {
+          "artifactId": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "extensions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Free-form; numbers come back as floats (ProtoJSON).",
+            "type": "object"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parts": {
+            "items": {
+              "$ref": "#/components/schemas/Part"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "artifactId",
+          "parts"
+        ],
+        "type": "object"
+      },
+      "AuthenticationInfo": {
+        "properties": {
+          "credentials": {
+            "description": "Write-only.",
+            "type": "string"
+          },
+          "scheme": {
+            "description": "Sent as `Authorization: <scheme> <credentials>`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scheme"
+        ],
+        "type": "object"
+      },
+      "CancelTaskRequest": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Free-form; numbers come back as floats (ProtoJSON).",
+            "type": "object"
+          },
+          "tenant": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "DeleteTaskPushNotificationConfigRequest": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "taskId": {
+            "type": "string"
+          },
+          "tenant": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId",
+          "id"
+        ],
+        "type": "object"
+      },
+      "GetExtendedAgentCardRequest": {
+        "properties": {
+          "tenant": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "GetTaskPushNotificationConfigRequest": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "taskId": {
+            "type": "string"
+          },
+          "tenant": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId",
+          "id"
+        ],
+        "type": "object"
+      },
+      "GetTaskRequest": {
+        "properties": {
+          "historyLength": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "tenant": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "JsonRpcCancelTaskRequest": {
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/JsonRpcId"
+          },
+          "jsonrpc": {
+            "const": "2.0",
+            "type": "string"
+          },
+          "method": {
+            "const": "CancelTask",
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/components/schemas/CancelTaskRequest"
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "id",
+          "method",
+          "params"
+        ],
+        "title": "CancelTask",
+        "type": "object"
+      },
+      "JsonRpcCreateTaskPushNotificationConfigRequest": {
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/JsonRpcId"
+          },
+          "jsonrpc": {
+            "const": "2.0",
+            "type": "string"
+          },
+          "method": {
+            "const": "CreateTaskPushNotificationConfig",
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/components/schemas/TaskPushNotificationConfig"
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "id",
+          "method",
+          "params"
+        ],
+        "title": "CreateTaskPushNotificationConfig",
+        "type": "object"
+      },
+      "JsonRpcDeleteTaskPushNotificationConfigRequest": {
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/JsonRpcId"
+          },
+          "jsonrpc": {
+            "const": "2.0",
+            "type": "string"
+          },
+          "method": {
+            "const": "DeleteTaskPushNotificationConfig",
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/components/schemas/DeleteTaskPushNotificationConfigRequest"
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "id",
+          "method",
+          "params"
+        ],
+        "title": "DeleteTaskPushNotificationConfig",
+        "type": "object"
+      },
+      "JsonRpcError": {
+        "properties": {
+          "code": {
+            "type": "integer"
+          },
+          "data": {},
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "JsonRpcGetExtendedAgentCardRequest": {
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/JsonRpcId"
+          },
+          "jsonrpc": {
+            "const": "2.0",
+            "type": "string"
+          },
+          "method": {
+            "const": "GetExtendedAgentCard",
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/components/schemas/GetExtendedAgentCardRequest"
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "id",
+          "method",
+          "params"
+        ],
+        "title": "GetExtendedAgentCard",
+        "type": "object"
+      },
+      "JsonRpcGetTaskPushNotificationConfigRequest": {
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/JsonRpcId"
+          },
+          "jsonrpc": {
+            "const": "2.0",
+            "type": "string"
+          },
+          "method": {
+            "const": "GetTaskPushNotificationConfig",
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/components/schemas/GetTaskPushNotificationConfigRequest"
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "id",
+          "method",
+          "params"
+        ],
+        "title": "GetTaskPushNotificationConfig",
+        "type": "object"
+      },
+      "JsonRpcGetTaskRequest": {
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/JsonRpcId"
+          },
+          "jsonrpc": {
+            "const": "2.0",
+            "type": "string"
+          },
+          "method": {
+            "const": "GetTask",
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/components/schemas/GetTaskRequest"
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "id",
+          "method",
+          "params"
+        ],
+        "title": "GetTask",
+        "type": "object"
+      },
+      "JsonRpcId": {
+        "type": [
+          "string",
+          "integer",
+          "null"
+        ]
+      },
+      "JsonRpcListTaskPushNotificationConfigsRequest": {
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/JsonRpcId"
+          },
+          "jsonrpc": {
+            "const": "2.0",
+            "type": "string"
+          },
+          "method": {
+            "const": "ListTaskPushNotificationConfigs",
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/components/schemas/ListTaskPushNotificationConfigsRequest"
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "id",
+          "method",
+          "params"
+        ],
+        "title": "ListTaskPushNotificationConfigs",
+        "type": "object"
+      },
+      "JsonRpcListTasksRequest": {
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/JsonRpcId"
+          },
+          "jsonrpc": {
+            "const": "2.0",
+            "type": "string"
+          },
+          "method": {
+            "const": "ListTasks",
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/components/schemas/ListTasksRequest"
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "id",
+          "method",
+          "params"
+        ],
+        "title": "ListTasks",
+        "type": "object"
+      },
+      "JsonRpcResponse": {
+        "oneOf": [
+          {
+            "required": [
+              "result"
+            ]
+          },
+          {
+            "required": [
+              "error"
+            ]
+          }
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/JsonRpcError"
+          },
+          "id": {
+            "$ref": "#/components/schemas/JsonRpcId"
+          },
+          "jsonrpc": {
+            "const": "2.0",
+            "type": "string"
+          },
+          "result": {}
+        },
+        "required": [
+          "jsonrpc",
+          "id"
+        ],
+        "type": "object"
+      },
+      "JsonRpcSendMessageRequest": {
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/JsonRpcId"
+          },
+          "jsonrpc": {
+            "const": "2.0",
+            "type": "string"
+          },
+          "method": {
+            "const": "SendMessage",
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/components/schemas/SendMessageRequest"
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "id",
+          "method",
+          "params"
+        ],
+        "title": "SendMessage",
+        "type": "object"
+      },
+      "JsonRpcSendStreamingMessageRequest": {
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/JsonRpcId"
+          },
+          "jsonrpc": {
+            "const": "2.0",
+            "type": "string"
+          },
+          "method": {
+            "const": "SendStreamingMessage",
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/components/schemas/SendMessageRequest"
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "id",
+          "method",
+          "params"
+        ],
+        "title": "SendStreamingMessage",
+        "type": "object"
+      },
+      "JsonRpcSubscribeToTaskRequest": {
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/JsonRpcId"
+          },
+          "jsonrpc": {
+            "const": "2.0",
+            "type": "string"
+          },
+          "method": {
+            "const": "SubscribeToTask",
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/components/schemas/SubscribeToTaskRequest"
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "id",
+          "method",
+          "params"
+        ],
+        "title": "SubscribeToTask",
+        "type": "object"
+      },
+      "ListTaskPushNotificationConfigsRequest": {
+        "properties": {
+          "pageSize": {
+            "format": "int32",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "pageToken": {
+            "type": "string"
+          },
+          "taskId": {
+            "type": "string"
+          },
+          "tenant": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId"
+        ],
+        "type": "object"
+      },
+      "ListTaskPushNotificationConfigsResponse": {
+        "properties": {
+          "configs": {
+            "items": {
+              "$ref": "#/components/schemas/TaskPushNotificationConfig"
+            },
+            "type": "array"
+          },
+          "nextPageToken": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ListTasksRequest": {
+        "properties": {
+          "contextId": {
+            "type": "string"
+          },
+          "historyLength": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "includeArtifacts": {
+            "type": "boolean"
+          },
+          "pageSize": {
+            "format": "int32",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "pageToken": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskState"
+          },
+          "statusTimestampAfter": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "tenant": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ListTasksResponse": {
+        "description": "ProtoJSON leaves out members that hold their default (an empty list, `0`, `\"\"`).",
+        "properties": {
+          "nextPageToken": {
+            "type": "string"
+          },
+          "pageSize": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "tasks": {
+            "items": {
+              "$ref": "#/components/schemas/Task"
+            },
+            "type": "array"
+          },
+          "totalSize": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "Message": {
+        "properties": {
+          "contextId": {
+            "type": "string"
+          },
+          "extensions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "messageId": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Free-form; numbers come back as floats (ProtoJSON).",
+            "type": "object"
+          },
+          "parts": {
+            "items": {
+              "$ref": "#/components/schemas/Part"
+            },
+            "type": "array"
+          },
+          "referenceTaskIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "taskId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "messageId",
+          "role",
+          "parts"
+        ],
+        "type": "object"
+      },
+      "Part": {
+        "description": "Exactly one of `text`, `raw` (base64), `url` or `data`.",
+        "oneOf": [
+          {
+            "required": [
+              "text"
+            ]
+          },
+          {
+            "required": [
+              "raw"
+            ]
+          },
+          {
+            "required": [
+              "url"
+            ]
+          },
+          {
+            "required": [
+              "data"
+            ]
+          }
+        ],
+        "properties": {
+          "data": {},
+          "filename": {
+            "type": "string"
+          },
+          "mediaType": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Free-form; numbers come back as floats (ProtoJSON).",
+            "type": "object"
+          },
+          "raw": {
+            "contentEncoding": "base64",
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "RestError": {
+        "properties": {
+          "error": {
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "details": {
+                "items": {
+                  "properties": {
+                    "@type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "@type"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "message": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "status",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "Role": {
+        "enum": [
+          "ROLE_USER",
+          "ROLE_AGENT",
+          "ROLE_UNSPECIFIED"
+        ],
+        "type": "string"
+      },
+      "SendMessageConfiguration": {
+        "properties": {
+          "acceptedOutputModes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "historyLength": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "returnImmediately": {
+            "type": "boolean"
+          },
+          "taskPushNotificationConfig": {
+            "$ref": "#/components/schemas/TaskPushNotificationConfig"
+          }
+        },
+        "type": "object"
+      },
+      "SendMessageRequest": {
+        "properties": {
+          "configuration": {
+            "$ref": "#/components/schemas/SendMessageConfiguration"
+          },
+          "message": {
+            "$ref": "#/components/schemas/Message"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Free-form; numbers come back as floats (ProtoJSON).",
+            "type": "object"
+          },
+          "tenant": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
+      "SendMessageResponse": {
+        "oneOf": [
+          {
+            "properties": {
+              "task": {
+                "$ref": "#/components/schemas/Task"
+              }
+            },
+            "required": [
+              "task"
+            ]
+          },
+          {
+            "properties": {
+              "message": {
+                "$ref": "#/components/schemas/Message"
+              }
+            },
+            "required": [
+              "message"
+            ]
+          }
+        ],
+        "type": "object"
+      },
+      "StreamResponse": {
+        "description": "Exactly one of `task`, `message`, `statusUpdate` or `artifactUpdate`.",
+        "oneOf": [
+          {
+            "properties": {
+              "task": {
+                "$ref": "#/components/schemas/Task"
+              }
+            },
+            "required": [
+              "task"
+            ]
+          },
+          {
+            "properties": {
+              "message": {
+                "$ref": "#/components/schemas/Message"
+              }
+            },
+            "required": [
+              "message"
+            ]
+          },
+          {
+            "properties": {
+              "statusUpdate": {
+                "$ref": "#/components/schemas/TaskStatusUpdateEvent"
+              }
+            },
+            "required": [
+              "statusUpdate"
+            ]
+          },
+          {
+            "properties": {
+              "artifactUpdate": {
+                "$ref": "#/components/schemas/TaskArtifactUpdateEvent"
+              }
+            },
+            "required": [
+              "artifactUpdate"
+            ]
+          }
+        ],
+        "type": "object"
+      },
+      "SubscribeToTaskRequest": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "tenant": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "Task": {
+        "properties": {
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/Artifact"
+            },
+            "type": "array"
+          },
+          "contextId": {
+            "type": "string"
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Free-form; numbers come back as floats (ProtoJSON).",
+            "type": "object"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskStatus"
+          }
+        },
+        "required": [
+          "id",
+          "contextId",
+          "status"
+        ],
+        "type": "object"
+      },
+      "TaskArtifactUpdateEvent": {
+        "properties": {
+          "append": {
+            "type": "boolean"
+          },
+          "artifact": {
+            "$ref": "#/components/schemas/Artifact"
+          },
+          "contextId": {
+            "type": "string"
+          },
+          "lastChunk": {
+            "type": "boolean"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Free-form; numbers come back as floats (ProtoJSON).",
+            "type": "object"
+          },
+          "taskId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId",
+          "contextId",
+          "artifact"
+        ],
+        "type": "object"
+      },
+      "TaskPushNotificationConfig": {
+        "properties": {
+          "authentication": {
+            "$ref": "#/components/schemas/AuthenticationInfo"
+          },
+          "id": {
+            "type": "string"
+          },
+          "taskId": {
+            "description": "In HTTP+JSON, the task of the path (a different one is refused).",
+            "type": "string"
+          },
+          "tenant": {
+            "type": "string"
+          },
+          "token": {
+            "description": "Sent as `A2A-Notification-Token`; write-only.",
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "TaskState": {
+        "enum": [
+          "TASK_STATE_SUBMITTED",
+          "TASK_STATE_WORKING",
+          "TASK_STATE_COMPLETED",
+          "TASK_STATE_FAILED",
+          "TASK_STATE_CANCELED",
+          "TASK_STATE_INPUT_REQUIRED",
+          "TASK_STATE_REJECTED",
+          "TASK_STATE_AUTH_REQUIRED",
+          "TASK_STATE_UNSPECIFIED"
+        ],
+        "type": "string"
+      },
+      "TaskStatus": {
+        "properties": {
+          "message": {
+            "$ref": "#/components/schemas/Message"
+          },
+          "state": {
+            "$ref": "#/components/schemas/TaskState"
+          },
+          "timestamp": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      "TaskStatusUpdateEvent": {
+        "properties": {
+          "contextId": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Free-form; numbers come back as floats (ProtoJSON).",
+            "type": "object"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskStatus"
+          },
+          "taskId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId",
+          "contextId",
+          "status"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "bearerFormat": "opaque",
+        "description": "One of the tokens the deployment configured (`A2A_BEARER_TOKENS`).",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "A durable AI agent: a task in, a verified pull request out.\n\nAn A2A 1.0 agent. Two bindings answer at the same base URL and go through the same handler: **JSON-RPC** (`POST /`, the method in the body) and **HTTP+JSON** (`POST /message:send`, `GET /tasks/{id}`, ...). Every call needs a bearer token: press **Authorize** and paste one. This page and the document are public; the calls are not.\n\nPush notifications: **off**. Extended agent card: **off**. Streaming calls answer `text/event-stream`, which Swagger UI cannot show as it arrives: their descriptions give the `curl` to use.",
+    "title": "adam (A2A 1.0)",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/": {
+      "post": {
+        "description": "One endpoint for every A2A 1.0 method: pick one in **Examples**.\n\n* `SendMessage` (`params`: `SendMessageRequest`): Send a message; `result`: `SendMessageResponse`.\n* `SendStreamingMessage` (`params`: `SendMessageRequest`): Send a message and stream the task; each event's `result`: `StreamResponse`.\n* `GetTask` (`params`: `GetTaskRequest`): Get a task; `result`: `Task`.\n* `ListTasks` (`params`: `ListTasksRequest`): List the caller's tasks; `result`: `ListTasksResponse`.\n* `CancelTask` (`params`: `CancelTaskRequest`): Cancel a task; `result`: `Task`.\n* `SubscribeToTask` (`params`: `SubscribeToTaskRequest`): Stream a task's updates; each event's `result`: `StreamResponse`.\n* `CreateTaskPushNotificationConfig` (`params`: `TaskPushNotificationConfig`): Register a webhook for a task; `result`: `TaskPushNotificationConfig`.\n* `GetTaskPushNotificationConfig` (`params`: `GetTaskPushNotificationConfigRequest`): Get a webhook of a task; `result`: `TaskPushNotificationConfig`.\n* `ListTaskPushNotificationConfigs` (`params`: `ListTaskPushNotificationConfigsRequest`): List the webhooks of a task; `result`: `ListTaskPushNotificationConfigsResponse`.\n* `DeleteTaskPushNotificationConfig` (`params`: `DeleteTaskPushNotificationConfigRequest`): Remove a webhook of a task; `result`: empty.\n* `GetExtendedAgentCard` (`params`: `GetExtendedAgentCardRequest`): Get the extended agent card; `result`: `AgentCard`.\n\nErrors come back as HTTP 200 with a JSON-RPC error object, A2A's codes (`-32001` task not found, ...). `SendStreamingMessage` and `SubscribeToTask` answer `text/event-stream`, which Swagger UI cannot show as it arrives: the examples give the `curl`.",
+        "operationId": "jsonrpc",
+        "parameters": [
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "CancelTask": {
+                  "description": "Cancels a task that has not finished; a finished one is `TaskNotCancelable`.",
+                  "summary": "Cancel a task",
+                  "value": {
+                    "id": 1,
+                    "jsonrpc": "2.0",
+                    "method": "CancelTask",
+                    "params": {
+                      "id": "replace-with-a-task-id"
+                    }
+                  }
+                },
+                "CreateTaskPushNotificationConfig": {
+                  "description": "The deployment's policy decides which webhooks are allowed. `token` and `authentication.credentials` are write-only: no answer returns them. Push notifications are **off** on this server (the card's `capabilities.pushNotifications`); when off, this answers `PushNotificationNotSupported`.",
+                  "summary": "Register a webhook for a task",
+                  "value": {
+                    "id": 1,
+                    "jsonrpc": "2.0",
+                    "method": "CreateTaskPushNotificationConfig",
+                    "params": {
+                      "taskId": "replace-with-a-task-id",
+                      "token": "a-value-the-webhook-checks",
+                      "url": "https://hooks.example.com/a2a"
+                    }
+                  }
+                },
+                "DeleteTaskPushNotificationConfig": {
+                  "description": "Push notifications are **off** on this server (the card's `capabilities.pushNotifications`); when off, this answers `PushNotificationNotSupported`.",
+                  "summary": "Remove a webhook of a task",
+                  "value": {
+                    "id": 1,
+                    "jsonrpc": "2.0",
+                    "method": "DeleteTaskPushNotificationConfig",
+                    "params": {
+                      "id": "replace-with-a-config-id",
+                      "taskId": "replace-with-a-task-id"
+                    }
+                  }
+                },
+                "GetExtendedAgentCard": {
+                  "description": "What an authenticated caller sees on top of the public card. The extended card is **off** on this server; when off, this answers `UnsupportedOperation`.",
+                  "summary": "Get the extended agent card",
+                  "value": {
+                    "id": 1,
+                    "jsonrpc": "2.0",
+                    "method": "GetExtendedAgentCard",
+                    "params": {}
+                  }
+                },
+                "GetTask": {
+                  "description": "The task as it is now. `historyLength` keeps the last messages only. Another caller's task is `TaskNotFound`.",
+                  "summary": "Get a task",
+                  "value": {
+                    "id": 1,
+                    "jsonrpc": "2.0",
+                    "method": "GetTask",
+                    "params": {
+                      "historyLength": 10,
+                      "id": "replace-with-a-task-id"
+                    }
+                  }
+                },
+                "GetTaskPushNotificationConfig": {
+                  "description": "Without `token` and `credentials`. Push notifications are **off** on this server (the card's `capabilities.pushNotifications`); when off, this answers `PushNotificationNotSupported`.",
+                  "summary": "Get a webhook of a task",
+                  "value": {
+                    "id": 1,
+                    "jsonrpc": "2.0",
+                    "method": "GetTaskPushNotificationConfig",
+                    "params": {
+                      "id": "replace-with-a-config-id",
+                      "taskId": "replace-with-a-task-id"
+                    }
+                  }
+                },
+                "ListTaskPushNotificationConfigs": {
+                  "description": "Without `token` and `credentials`. Push notifications are **off** on this server (the card's `capabilities.pushNotifications`); when off, this answers `PushNotificationNotSupported`.",
+                  "summary": "List the webhooks of a task",
+                  "value": {
+                    "id": 1,
+                    "jsonrpc": "2.0",
+                    "method": "ListTaskPushNotificationConfigs",
+                    "params": {
+                      "pageSize": 10,
+                      "taskId": "replace-with-a-task-id"
+                    }
+                  }
+                },
+                "ListTasks": {
+                  "description": "The caller's own tasks, most recently updated first, a page at a time (`pageSize` 1 to 100, 50 by default; `nextPageToken` is empty on the last page).",
+                  "summary": "List the caller's tasks",
+                  "value": {
+                    "id": 1,
+                    "jsonrpc": "2.0",
+                    "method": "ListTasks",
+                    "params": {
+                      "pageSize": 10
+                    }
+                  }
+                },
+                "SendMessage": {
+                  "description": "Starts a task, or continues one (`message.taskId`). The example sets `configuration.returnImmediately`, so the task comes back at once: poll it with `GetTask`. Without it the call waits until the task finishes or needs input. The `messageId` identifies the message: sending the same one again is a retry and gives the same task, so change it for a new message.",
+                  "summary": "Send a message",
+                  "value": {
+                    "id": 1,
+                    "jsonrpc": "2.0",
+                    "method": "SendMessage",
+                    "params": {
+                      "configuration": {
+                        "returnImmediately": true
+                      },
+                      "message": {
+                        "messageId": "swagger-1",
+                        "parts": [
+                          {
+                            "text": "Hello"
+                          }
+                        ],
+                        "role": "ROLE_USER"
+                      }
+                    }
+                  }
+                },
+                "SendStreamingMessage": {
+                  "description": "Like `SendMessage`, answered with Server-Sent Events: the task, then its status and artifact updates, until it finishes or needs input.\n\n**Swagger UI cannot show a stream as it arrives**: it waits for the whole response, which ends only when the task finishes or needs input. Use `curl` instead (`$A2A_TOKEN` holds a bearer token; the URL is the card's):\n\n```sh\ncurl -N -X POST -H \"Authorization: Bearer $A2A_TOKEN\" -H 'Content-Type: application/json' --data '{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"SendStreamingMessage\",\"params\":{\"message\":{\"messageId\":\"swagger-1\",\"parts\":[{\"text\":\"Hello\"}],\"role\":\"ROLE_USER\"}}}' http://localhost:8080/\n```",
+                  "summary": "Send a message and stream the task",
+                  "value": {
+                    "id": 1,
+                    "jsonrpc": "2.0",
+                    "method": "SendStreamingMessage",
+                    "params": {
+                      "message": {
+                        "messageId": "swagger-1",
+                        "parts": [
+                          {
+                            "text": "Hello"
+                          }
+                        ],
+                        "role": "ROLE_USER"
+                      }
+                    }
+                  }
+                },
+                "SubscribeToTask": {
+                  "description": "Server-Sent Events from the task's current state on, on any replica; a finished task is `UnsupportedOperation`.\n\n**Swagger UI cannot show a stream as it arrives**: it waits for the whole response, which ends only when the task finishes or needs input. Use `curl` instead (`$A2A_TOKEN` holds a bearer token; the URL is the card's):\n\n```sh\ncurl -N -X POST -H \"Authorization: Bearer $A2A_TOKEN\" -H 'Content-Type: application/json' --data '{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"SubscribeToTask\",\"params\":{\"id\":\"replace-with-a-task-id\"}}' http://localhost:8080/\n```",
+                  "summary": "Stream a task's updates",
+                  "value": {
+                    "id": 1,
+                    "jsonrpc": "2.0",
+                    "method": "SubscribeToTask",
+                    "params": {
+                      "id": "replace-with-a-task-id"
+                    }
+                  }
+                }
+              },
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/JsonRpcSendMessageRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JsonRpcSendStreamingMessageRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JsonRpcGetTaskRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JsonRpcListTasksRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JsonRpcCancelTaskRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JsonRpcSubscribeToTaskRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JsonRpcCreateTaskPushNotificationConfigRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JsonRpcGetTaskPushNotificationConfigRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JsonRpcListTaskPushNotificationConfigsRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JsonRpcDeleteTaskPushNotificationConfigRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JsonRpcGetExtendedAgentCardRequest"
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonRpcResponse"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "A JSON-RPC response (result or error), or, for a streaming method, Server-Sent Events whose `data` lines are JSON-RPC responses with a `StreamResponse` result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonRpcResponse"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          }
+        },
+        "summary": "Call a JSON-RPC method",
+        "tags": [
+          "JSON-RPC"
+        ]
+      }
+    },
+    "/.well-known/agent-card.json": {
+      "get": {
+        "operationId": "getAgentCard",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentCard"
+                }
+              }
+            },
+            "description": "The card: the interfaces (JSON-RPC first, then HTTP+JSON, at the same URL), skills, extensions and security schemes."
+          }
+        },
+        "security": [],
+        "summary": "The public agent card",
+        "tags": [
+          "Discovery"
+        ]
+      }
+    },
+    "/agent-card/extended": {
+      "get": {
+        "deprecated": true,
+        "description": "An alias of an earlier draft that the SDK still answers: use `GET /extendedAgentCard` instead.\n\nWhat an authenticated caller sees on top of the public card. The extended card is **off** on this server; when off, this answers `UnsupportedOperation`.",
+        "operationId": "GetExtendedAgentCard_get_agent_card_extended",
+        "parameters": [
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentCard"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Get the extended agent card",
+        "tags": [
+          "HTTP+JSON aliases"
+        ]
+      }
+    },
+    "/extendedAgentCard": {
+      "get": {
+        "description": "What an authenticated caller sees on top of the public card. The extended card is **off** on this server; when off, this answers `UnsupportedOperation`.",
+        "operationId": "GetExtendedAgentCard",
+        "parameters": [
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentCard"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Get the extended agent card",
+        "tags": [
+          "HTTP+JSON"
+        ]
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "const": "ok",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "`ok`"
+          }
+        },
+        "security": [],
+        "summary": "Liveness",
+        "tags": [
+          "Discovery"
+        ]
+      }
+    },
+    "/message/send": {
+      "post": {
+        "deprecated": true,
+        "description": "An alias of an earlier draft that the SDK still answers: use `POST /message:send` instead.\n\nStarts a task, or continues one (`message.taskId`). The example sets `configuration.returnImmediately`, so the task comes back at once: poll it with `GetTask`. Without it the call waits until the task finishes or needs input. The `messageId` identifies the message: sending the same one again is a retry and gives the same task, so change it for a new message.",
+        "operationId": "SendMessage_post_message_send",
+        "parameters": [
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/a2a+json": {
+              "example": {
+                "configuration": {
+                  "returnImmediately": true
+                },
+                "message": {
+                  "messageId": "swagger-1",
+                  "parts": [
+                    {
+                      "text": "Hello"
+                    }
+                  ],
+                  "role": "ROLE_USER"
+                }
+              },
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            },
+            "application/json": {
+              "example": {
+                "configuration": {
+                  "returnImmediately": true
+                },
+                "message": {
+                  "messageId": "swagger-1",
+                  "parts": [
+                    {
+                      "text": "Hello"
+                    }
+                  ],
+                  "role": "ROLE_USER"
+                }
+              },
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendMessageResponse"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Send a message",
+        "tags": [
+          "HTTP+JSON aliases"
+        ]
+      }
+    },
+    "/message/stream": {
+      "post": {
+        "deprecated": true,
+        "description": "An alias of an earlier draft that the SDK still answers: use `POST /message:stream` instead.\n\nLike `SendMessage`, answered with Server-Sent Events: the task, then its status and artifact updates, until it finishes or needs input.\n\n**Swagger UI cannot show a stream as it arrives**: it waits for the whole response, which ends only when the task finishes or needs input. Use `curl` instead (`$A2A_TOKEN` holds a bearer token; the URL is the card's):\n\n```sh\ncurl -N -X POST -H \"Authorization: Bearer $A2A_TOKEN\" -H 'Content-Type: application/json' --data '{\"message\":{\"messageId\":\"swagger-1\",\"parts\":[{\"text\":\"Hello\"}],\"role\":\"ROLE_USER\"}}' http://localhost:8080/message/stream\n```",
+        "operationId": "SendStreamingMessage_post_message_stream",
+        "parameters": [
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/a2a+json": {
+              "example": {
+                "message": {
+                  "messageId": "swagger-1",
+                  "parts": [
+                    {
+                      "text": "Hello"
+                    }
+                  ],
+                  "role": "ROLE_USER"
+                }
+              },
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            },
+            "application/json": {
+              "example": {
+                "message": {
+                  "messageId": "swagger-1",
+                  "parts": [
+                    {
+                      "text": "Hello"
+                    }
+                  ],
+                  "role": "ROLE_USER"
+                }
+              },
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Server-Sent Events: each `data` line is a `StreamResponse` (A2A 1.0 §11.7)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Send a message and stream the task",
+        "tags": [
+          "HTTP+JSON aliases"
+        ]
+      }
+    },
+    "/message:send": {
+      "post": {
+        "description": "Starts a task, or continues one (`message.taskId`). The example sets `configuration.returnImmediately`, so the task comes back at once: poll it with `GetTask`. Without it the call waits until the task finishes or needs input. The `messageId` identifies the message: sending the same one again is a retry and gives the same task, so change it for a new message.",
+        "operationId": "SendMessage",
+        "parameters": [
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/a2a+json": {
+              "example": {
+                "configuration": {
+                  "returnImmediately": true
+                },
+                "message": {
+                  "messageId": "swagger-1",
+                  "parts": [
+                    {
+                      "text": "Hello"
+                    }
+                  ],
+                  "role": "ROLE_USER"
+                }
+              },
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            },
+            "application/json": {
+              "example": {
+                "configuration": {
+                  "returnImmediately": true
+                },
+                "message": {
+                  "messageId": "swagger-1",
+                  "parts": [
+                    {
+                      "text": "Hello"
+                    }
+                  ],
+                  "role": "ROLE_USER"
+                }
+              },
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendMessageResponse"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Send a message",
+        "tags": [
+          "HTTP+JSON"
+        ]
+      }
+    },
+    "/message:stream": {
+      "post": {
+        "description": "Like `SendMessage`, answered with Server-Sent Events: the task, then its status and artifact updates, until it finishes or needs input.\n\n**Swagger UI cannot show a stream as it arrives**: it waits for the whole response, which ends only when the task finishes or needs input. Use `curl` instead (`$A2A_TOKEN` holds a bearer token; the URL is the card's):\n\n```sh\ncurl -N -X POST -H \"Authorization: Bearer $A2A_TOKEN\" -H 'Content-Type: application/json' --data '{\"message\":{\"messageId\":\"swagger-1\",\"parts\":[{\"text\":\"Hello\"}],\"role\":\"ROLE_USER\"}}' http://localhost:8080/message:stream\n```",
+        "operationId": "SendStreamingMessage",
+        "parameters": [
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/a2a+json": {
+              "example": {
+                "message": {
+                  "messageId": "swagger-1",
+                  "parts": [
+                    {
+                      "text": "Hello"
+                    }
+                  ],
+                  "role": "ROLE_USER"
+                }
+              },
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            },
+            "application/json": {
+              "example": {
+                "message": {
+                  "messageId": "swagger-1",
+                  "parts": [
+                    {
+                      "text": "Hello"
+                    }
+                  ],
+                  "role": "ROLE_USER"
+                }
+              },
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Server-Sent Events: each `data` line is a `StreamResponse` (A2A 1.0 §11.7)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Send a message and stream the task",
+        "tags": [
+          "HTTP+JSON"
+        ]
+      }
+    },
+    "/tasks": {
+      "get": {
+        "description": "The caller's own tasks, most recently updated first, a page at a time (`pageSize` 1 to 100, 50 by default; `nextPageToken` is empty on the last page).",
+        "operationId": "ListTasks",
+        "parameters": [
+          {
+            "description": "Only the tasks of this context.",
+            "in": "query",
+            "name": "contextId",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only the tasks in this state.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/TaskState"
+            }
+          },
+          {
+            "description": "Tasks per page (50 by default).",
+            "in": "query",
+            "name": "pageSize",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The `nextPageToken` of the page before.",
+            "in": "query",
+            "name": "pageToken",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Keep only the last messages of each task's history.",
+            "in": "query",
+            "name": "historyLength",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only the tasks whose status changed after this time.",
+            "in": "query",
+            "name": "statusTimestampAfter",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include the artifacts (left out by default).",
+            "in": "query",
+            "name": "includeArtifacts",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListTasksResponse"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "List the caller's tasks",
+        "tags": [
+          "HTTP+JSON"
+        ]
+      }
+    },
+    "/tasks/{id}": {
+      "get": {
+        "description": "The task as it is now. `historyLength` keeps the last messages only. Another caller's task is `TaskNotFound`.",
+        "operationId": "GetTask",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Keep only the last messages of the history.",
+            "in": "query",
+            "name": "historyLength",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Get a task",
+        "tags": [
+          "HTTP+JSON"
+        ]
+      }
+    },
+    "/tasks/{id}/cancel": {
+      "post": {
+        "deprecated": true,
+        "description": "An alias of an earlier draft that the SDK still answers: use `POST /tasks/{id}:cancel` instead.\n\nCancels a task that has not finished; a finished one is `TaskNotCancelable`.",
+        "operationId": "CancelTask_post_tasks_id_cancel",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Cancel a task",
+        "tags": [
+          "HTTP+JSON aliases"
+        ]
+      }
+    },
+    "/tasks/{id}/push-configs": {
+      "get": {
+        "deprecated": true,
+        "description": "An alias of an earlier draft that the SDK still answers: use `GET /tasks/{id}/pushNotificationConfigs` instead.\n\nWithout `token` and `credentials`. Push notifications are **off** on this server (the card's `capabilities.pushNotifications`); when off, this answers `PushNotificationNotSupported`.",
+        "operationId": "ListTaskPushNotificationConfigs_get_tasks_id_push_configs",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Configs per page.",
+            "in": "query",
+            "name": "pageSize",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The `nextPageToken` of the page before.",
+            "in": "query",
+            "name": "pageToken",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListTaskPushNotificationConfigsResponse"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "List the webhooks of a task",
+        "tags": [
+          "HTTP+JSON aliases"
+        ]
+      },
+      "post": {
+        "deprecated": true,
+        "description": "An alias of an earlier draft that the SDK still answers: use `POST /tasks/{id}/pushNotificationConfigs` instead.\n\nThe deployment's policy decides which webhooks are allowed. `token` and `authentication.credentials` are write-only: no answer returns them. Push notifications are **off** on this server (the card's `capabilities.pushNotifications`); when off, this answers `PushNotificationNotSupported`.",
+        "operationId": "CreateTaskPushNotificationConfig_post_tasks_id_push_configs",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/a2a+json": {
+              "example": {
+                "token": "a-value-the-webhook-checks",
+                "url": "https://hooks.example.com/a2a"
+              },
+              "schema": {
+                "$ref": "#/components/schemas/TaskPushNotificationConfig"
+              }
+            },
+            "application/json": {
+              "example": {
+                "token": "a-value-the-webhook-checks",
+                "url": "https://hooks.example.com/a2a"
+              },
+              "schema": {
+                "$ref": "#/components/schemas/TaskPushNotificationConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskPushNotificationConfig"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Register a webhook for a task",
+        "tags": [
+          "HTTP+JSON aliases"
+        ]
+      }
+    },
+    "/tasks/{id}/push-configs/{configId}": {
+      "delete": {
+        "deprecated": true,
+        "description": "An alias of an earlier draft that the SDK still answers: use `DELETE /tasks/{id}/pushNotificationConfigs/{configId}` instead.\n\nPush notifications are **off** on this server (the card's `capabilities.pushNotifications`); when off, this answers `PushNotificationNotSupported`.",
+        "operationId": "DeleteTaskPushNotificationConfig_delete_tasks_id_push_configs_configId",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The webhook config's id.",
+            "in": "path",
+            "name": "configId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Removed (an empty body)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Remove a webhook of a task",
+        "tags": [
+          "HTTP+JSON aliases"
+        ]
+      },
+      "get": {
+        "deprecated": true,
+        "description": "An alias of an earlier draft that the SDK still answers: use `GET /tasks/{id}/pushNotificationConfigs/{configId}` instead.\n\nWithout `token` and `credentials`. Push notifications are **off** on this server (the card's `capabilities.pushNotifications`); when off, this answers `PushNotificationNotSupported`.",
+        "operationId": "GetTaskPushNotificationConfig_get_tasks_id_push_configs_configId",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The webhook config's id.",
+            "in": "path",
+            "name": "configId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskPushNotificationConfig"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Get a webhook of a task",
+        "tags": [
+          "HTTP+JSON aliases"
+        ]
+      }
+    },
+    "/tasks/{id}/pushNotificationConfigs": {
+      "get": {
+        "description": "Without `token` and `credentials`. Push notifications are **off** on this server (the card's `capabilities.pushNotifications`); when off, this answers `PushNotificationNotSupported`.",
+        "operationId": "ListTaskPushNotificationConfigs",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Configs per page.",
+            "in": "query",
+            "name": "pageSize",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The `nextPageToken` of the page before.",
+            "in": "query",
+            "name": "pageToken",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListTaskPushNotificationConfigsResponse"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "List the webhooks of a task",
+        "tags": [
+          "HTTP+JSON"
+        ]
+      },
+      "post": {
+        "description": "The deployment's policy decides which webhooks are allowed. `token` and `authentication.credentials` are write-only: no answer returns them. Push notifications are **off** on this server (the card's `capabilities.pushNotifications`); when off, this answers `PushNotificationNotSupported`.",
+        "operationId": "CreateTaskPushNotificationConfig",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/a2a+json": {
+              "example": {
+                "token": "a-value-the-webhook-checks",
+                "url": "https://hooks.example.com/a2a"
+              },
+              "schema": {
+                "$ref": "#/components/schemas/TaskPushNotificationConfig"
+              }
+            },
+            "application/json": {
+              "example": {
+                "token": "a-value-the-webhook-checks",
+                "url": "https://hooks.example.com/a2a"
+              },
+              "schema": {
+                "$ref": "#/components/schemas/TaskPushNotificationConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskPushNotificationConfig"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Register a webhook for a task",
+        "tags": [
+          "HTTP+JSON"
+        ]
+      }
+    },
+    "/tasks/{id}/pushNotificationConfigs/{configId}": {
+      "delete": {
+        "description": "Push notifications are **off** on this server (the card's `capabilities.pushNotifications`); when off, this answers `PushNotificationNotSupported`.",
+        "operationId": "DeleteTaskPushNotificationConfig",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The webhook config's id.",
+            "in": "path",
+            "name": "configId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Removed (an empty body)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Remove a webhook of a task",
+        "tags": [
+          "HTTP+JSON"
+        ]
+      },
+      "get": {
+        "description": "Without `token` and `credentials`. Push notifications are **off** on this server (the card's `capabilities.pushNotifications`); when off, this answers `PushNotificationNotSupported`.",
+        "operationId": "GetTaskPushNotificationConfig",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The webhook config's id.",
+            "in": "path",
+            "name": "configId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskPushNotificationConfig"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Get a webhook of a task",
+        "tags": [
+          "HTTP+JSON"
+        ]
+      }
+    },
+    "/tasks/{id}/subscribe": {
+      "get": {
+        "deprecated": true,
+        "description": "An alias of an earlier draft that the SDK still answers: use `POST /tasks/{id}:subscribe` instead.\n\nServer-Sent Events from the task's current state on, on any replica; a finished task is `UnsupportedOperation`.\n\n**Swagger UI cannot show a stream as it arrives**: it waits for the whole response, which ends only when the task finishes or needs input. Use `curl` instead (`$A2A_TOKEN` holds a bearer token; the URL is the card's):\n\n```sh\ncurl -N -X GET -H \"Authorization: Bearer $A2A_TOKEN\" http://localhost:8080/tasks/replace-with-a-task-id/subscribe\n```",
+        "operationId": "SubscribeToTask_get_tasks_id_subscribe",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Server-Sent Events: each `data` line is a `StreamResponse` (A2A 1.0 §11.7)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Stream a task's updates",
+        "tags": [
+          "HTTP+JSON aliases"
+        ]
+      },
+      "post": {
+        "deprecated": true,
+        "description": "An alias of an earlier draft that the SDK still answers: use `POST /tasks/{id}:subscribe` instead.\n\nServer-Sent Events from the task's current state on, on any replica; a finished task is `UnsupportedOperation`.\n\n**Swagger UI cannot show a stream as it arrives**: it waits for the whole response, which ends only when the task finishes or needs input. Use `curl` instead (`$A2A_TOKEN` holds a bearer token; the URL is the card's):\n\n```sh\ncurl -N -X POST -H \"Authorization: Bearer $A2A_TOKEN\" http://localhost:8080/tasks/replace-with-a-task-id/subscribe\n```",
+        "operationId": "SubscribeToTask_post_tasks_id_subscribe",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Server-Sent Events: each `data` line is a `StreamResponse` (A2A 1.0 §11.7)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Stream a task's updates",
+        "tags": [
+          "HTTP+JSON aliases"
+        ]
+      }
+    },
+    "/tasks/{id}:cancel": {
+      "post": {
+        "description": "Cancels a task that has not finished; a finished one is `TaskNotCancelable`.",
+        "operationId": "CancelTask",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Cancel a task",
+        "tags": [
+          "HTTP+JSON"
+        ]
+      }
+    },
+    "/tasks/{id}:subscribe": {
+      "get": {
+        "deprecated": true,
+        "description": "An alias of an earlier draft that the SDK still answers: use `POST /tasks/{id}:subscribe` instead.\n\nServer-Sent Events from the task's current state on, on any replica; a finished task is `UnsupportedOperation`.\n\n**Swagger UI cannot show a stream as it arrives**: it waits for the whole response, which ends only when the task finishes or needs input. Use `curl` instead (`$A2A_TOKEN` holds a bearer token; the URL is the card's):\n\n```sh\ncurl -N -X GET -H \"Authorization: Bearer $A2A_TOKEN\" http://localhost:8080/tasks/replace-with-a-task-id:subscribe\n```",
+        "operationId": "SubscribeToTask_get_tasks_id__subscribe",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Server-Sent Events: each `data` line is a `StreamResponse` (A2A 1.0 §11.7)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Stream a task's updates",
+        "tags": [
+          "HTTP+JSON aliases"
+        ]
+      },
+      "post": {
+        "description": "Server-Sent Events from the task's current state on, on any replica; a finished task is `UnsupportedOperation`.\n\n**Swagger UI cannot show a stream as it arrives**: it waits for the whole response, which ends only when the task finishes or needs input. Use `curl` instead (`$A2A_TOKEN` holds a bearer token; the URL is the card's):\n\n```sh\ncurl -N -X POST -H \"Authorization: Bearer $A2A_TOKEN\" http://localhost:8080/tasks/replace-with-a-task-id:subscribe\n```",
+        "operationId": "SubscribeToTask",
+        "parameters": [
+          {
+            "description": "The task's id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated URIs of the extensions this call activates; only those the card declares count, and the response's `A2A-Extensions` header lists them. The public card declares none.",
+            "in": "header",
+            "name": "A2A-Extensions",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Server-Sent Events: each `data` line is a `StreamResponse` (A2A 1.0 §11.7)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "Missing or wrong bearer token (`WWW-Authenticate: Bearer`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestError"
+                }
+              }
+            },
+            "description": "An A2A error as `google.rpc.Status` (A2A 1.0 §11.6): the HTTP status of the error and an `ErrorInfo` detail whose `reason` names it (`TASK_NOT_FOUND`, ...)."
+          }
+        },
+        "summary": "Stream a task's updates",
+        "tags": [
+          "HTTP+JSON"
+        ]
+      }
+    }
+  },
+  "security": [
+    {
+      "bearer": []
+    }
+  ],
+  "servers": [
+    {
+      "description": "This server, at the address this document was read from",
+      "url": "."
+    }
+  ],
+  "tags": [
+    {
+      "description": "A2A 1.0 over JSON-RPC 2.0: one endpoint, the method in the body. The card lists it first.",
+      "name": "JSON-RPC"
+    },
+    {
+      "description": "A2A 1.0 over HTTP+JSON (REST), A2A 1.0 §11. The same handler as JSON-RPC.",
+      "name": "HTTP+JSON"
+    },
+    {
+      "description": "Paths of earlier drafts that the SDK still answers. Use the paths above.",
+      "name": "HTTP+JSON aliases"
+    },
+    {
+      "description": "Public: no credential.",
+      "name": "Discovery"
+    }
+  ]
+}

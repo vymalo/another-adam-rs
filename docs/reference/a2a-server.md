@@ -47,6 +47,17 @@ at the same URL (`PUBLIC_URL`): the REST paths are relative to it.
   pick a method in the example dropdown. Swagger UI cannot show a stream as it arrives: a streaming operation's description
   gives the `curl`. The page loads nothing from another origin and the document holds no secret.
 
+## The document, as a file
+
+[`docs/api/a2a-server.openapi.json`](../api/a2a-server.openapi.json) is the same document, committed so a site can render it
+without a running server. It is built from one fixed default card (a bearer token required; push notifications and the
+extended card off), so it changes only when `crates/adam-a2a/src/openapi.rs` does. A test holds the two equal; when it fails
+it names the command that rewrites the file:
+
+```sh
+ADAM_UPDATE_GOLDEN=1 cargo test -p adam-a2a --lib the_committed_document_is_the_one_the_code_builds
+```
+
 ## Push notifications
 
 A client names a webhook for a task and is told when the task changes, without holding a stream open. **A notification
