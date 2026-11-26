@@ -280,6 +280,23 @@ impl PgConfig {
         self
     }
 
+    /// Bound every statement of every connection this config opens to `millis` milliseconds
+    /// (`statement_timeout`, sent as a start-up option, after any `options` the URL carried).
+    /// `0` leaves the server's own setting. A statement that runs longer fails with SQLSTATE
+    /// `57014`.
+    pub fn with_statement_timeout_ms(mut self, millis: u64) -> Self {
+        if millis == 0 {
+            return self;
+        }
+        let option = format!("-c statement_timeout={millis}");
+        let options = match self.config.get_options() {
+            Some(existing) if !existing.is_empty() => format!("{existing} {option}"),
+            _ => option,
+        };
+        self.config.options(&options);
+        self
+    }
+
     /// The TLS mode the URL asked for, for logs and tests.
     pub fn tls_mode(&self) -> &'static str {
         match self.mode {
@@ -709,6 +726,23 @@ mod tests {
 
     /// `sqlx` read the query with `Url::query_pairs` (`form_urlencoded`), where `+` is a space. A
     /// URL that spells a space that way worked before this crate existed and must keep working:
+    #[test]
+    fn a_statement_timeout_joins_the_url_options() {
+        let config =
+            parse("postgres://u@h/d?options=-c+search_path%3Dadam").with_statement_timeout_ms(2500);
+        assert_eq!(
+            config.driver().get_options(),
+            Some("-c search_path=adam -c statement_timeout=2500")
+        );
+        let bare = parse("postgres://u@h/d").with_statement_timeout_ms(2500);
+        assert_eq!(
+            bare.driver().get_options(),
+            Some("-c statement_timeout=2500")
+        );
+        let off = parse("postgres://u@h/d").with_statement_timeout_ms(0);
+        assert_eq!(off.driver().get_options(), None);
+    }
+
     /// `application_name=adam+coder` names the process "adam coder", not "adam+coder".
     #[test]
     fn a_plus_in_a_query_value_is_the_space_sqlx_read_it_as() {

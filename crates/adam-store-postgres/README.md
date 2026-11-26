@@ -15,6 +15,7 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 
 * `PgStore::connect(url)`: a pool of `ADAM_PG_POOL_SIZE` connections (default 16, 2 to 65535, per
   process).
+* `ADAM_PG_STATEMENT_TIMEOUT_MS` (0 to 86400000, unset = none): sets `statement_timeout` on the store's own pool in `from_config` (so `connect*` too), not on `from_pool` pools or the notify listener; a cancelled statement is a transient error (`57014`) and `migrate` is exempt (`SET statement_timeout = 0` on its own connection).
 * `PgStore::connect_with_pool_size(url, n)`: the same with an explicit size (2 to 65535).
 * `PgStore::connect_lazy(url)`: the same `ADAM_PG_POOL_SIZE` pool, opening no connection until first use, and `ping()` opens one, for a process that
   checks its own configuration before it needs the database (`adam-service`'s `serve`).

@@ -157,3 +157,28 @@ async fn a_lost_connection_is_transient() {
     assert_eq!(mapped.class(), ErrorClass::Transient, "{mapped:?}");
     assert!(mapped.is_retryable());
 }
+
+/// A statement that outlasts `statement_timeout` is cancelled by the server as a transient error,
+/// and the pool is usable afterwards. The option is the one `PgStore::from_config` sets from
+/// `ADAM_PG_STATEMENT_TIMEOUT_MS` (the environment is not touched here: tests share a process).
+#[tokio::test]
+async fn a_statement_past_the_timeout_is_transient_and_the_pool_survives() {
+    let Some(url) = support::test_url() else {
+        return;
+    };
+    let config = PgConfig::parse(&url)
+        .unwrap()
+        .with_statement_timeout_ms(200);
+    let pool = config.pool(2).unwrap();
+    let client = pool.get().await.unwrap();
+    let err = classify(
+        client
+            .batch_execute("SELECT pg_sleep(5)")
+            .await
+            .unwrap_err(),
+    );
+    drop(client);
+    assert_eq!(err.class(), ErrorClass::Transient, "{err:?}");
+    let client = pool.get().await.unwrap();
+    client.batch_execute("SELECT 1").await.unwrap();
+}

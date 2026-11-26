@@ -104,6 +104,9 @@ const PURGE_BATCH: i64 = 500;
 /// process.
 pub const DEFAULT_POOL_SIZE: u32 = 16;
 
+/// The longest `ADAM_PG_STATEMENT_TIMEOUT_MS` accepts, one day.
+pub const MAX_STATEMENT_TIMEOUT_MS: u64 = 86_400_000;
+
 /// The smallest pool `ADAM_PG_POOL_SIZE` or [`PgStore::connect_with_pool_size`] accepts.
 ///
 /// Two, not one: a one-connection pool serializes every store call behind whichever query is
@@ -199,6 +202,9 @@ impl PgStore {
                  a one-connection pool cannot serve the notify listener and a query at the same time"
             )));
         }
+        // The bound is on the store's own connections only: the clone keeps the caller's config,
+        // which the notification listener shares, free of it.
+        let config = config.with_statement_timeout_ms(statement_timeout_ms_from_env()?);
         let pool = config.pool(max_connections as usize)?;
         Ok(Self::from_pool(pool))
     }
@@ -485,6 +491,37 @@ fn pool_size_from_text(raw: &str) -> StoreResult<u32> {
         )));
     }
     Ok(size)
+}
+
+/// `ADAM_PG_STATEMENT_TIMEOUT_MS`: the longest one statement of the store's pool may run, in
+/// milliseconds (1 to [`MAX_STATEMENT_TIMEOUT_MS`]); the server cancels it after that
+/// (SQLSTATE `57014`, a transient error) and the connection stays usable.
+///
+/// Unset or `0` means no bound, as before. Migrations are exempt. A value that is not an integer in
+/// range is [`StoreError::InvalidInput`], not a silent fallback.
+pub fn statement_timeout_ms_from_env() -> StoreResult<u64> {
+    match std::env::var("ADAM_PG_STATEMENT_TIMEOUT_MS") {
+        Ok(raw) => statement_timeout_ms_from_text(&raw),
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(std::env::VarError::NotUnicode(_)) => Err(StoreError::InvalidInput(
+            "ADAM_PG_STATEMENT_TIMEOUT_MS is not valid unicode".into(),
+        )),
+    }
+}
+
+/// [`statement_timeout_ms_from_env`]'s rule for one value.
+fn statement_timeout_ms_from_text(raw: &str) -> StoreResult<u64> {
+    let millis: u64 = raw.trim().parse().map_err(|_| {
+        StoreError::InvalidInput(format!(
+            "ADAM_PG_STATEMENT_TIMEOUT_MS {raw:?} is not an integer (0 to {MAX_STATEMENT_TIMEOUT_MS})"
+        ))
+    })?;
+    if millis > MAX_STATEMENT_TIMEOUT_MS {
+        return Err(StoreError::InvalidInput(format!(
+            "ADAM_PG_STATEMENT_TIMEOUT_MS {raw:?} is out of range (0 to {MAX_STATEMENT_TIMEOUT_MS})"
+        )));
+    }
+    Ok(millis)
 }
 
 /// SQL text with table names baked in, built once per store.
@@ -1273,6 +1310,12 @@ impl Store for PgStore {
         // connection another task would reuse; dropping it closes the connection and releases the
         // lock.
         let mut client = Object::take(object);
+        // A migration may legitimately run past `ADAM_PG_STATEMENT_TIMEOUT_MS` (a concurrent index
+        // build): it is exempt, on this connection only, which is closed when it ends.
+        client
+            .batch_execute("SET statement_timeout = 0")
+            .await
+            .map_err(classify)?;
         let stmt = client
             .prepare_cached("SELECT pg_advisory_lock(hashtext($1))")
             .await
@@ -2241,6 +2284,25 @@ impl PgStore {
 mod tests {
     use super::*;
     use adam_error::Classify;
+
+    #[test]
+    fn the_statement_timeout_is_validated() {
+        assert_eq!(statement_timeout_ms_from_text("0").unwrap(), 0);
+        assert_eq!(statement_timeout_ms_from_text(" 5000 ").unwrap(), 5000);
+        assert_eq!(
+            statement_timeout_ms_from_text(&MAX_STATEMENT_TIMEOUT_MS.to_string()).unwrap(),
+            MAX_STATEMENT_TIMEOUT_MS
+        );
+        for bad in ["", "ten", "-1", "1.5", "86400001"] {
+            assert!(
+                matches!(
+                    statement_timeout_ms_from_text(bad),
+                    Err(StoreError::InvalidInput(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
 
     #[test]
     fn the_pool_size_is_validated_and_defaults_to_sixteen() {

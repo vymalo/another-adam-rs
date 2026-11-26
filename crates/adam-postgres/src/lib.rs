@@ -96,13 +96,16 @@ where
 ///
 /// SQLSTATE classes are from the PostgreSQL manual, Appendix A: `08` connection exception, `53`
 /// insufficient resources, `40001` serialization failure, `40P01` deadlock, `57P01`..`57P03`
-/// shutdown and start-up.
+/// shutdown and start-up, `57014` a statement cancelled (a `statement_timeout`).
 pub fn classify(err: tokio_postgres::Error) -> StoreError {
     let class = if let Some(db) = err.as_db_error() {
         let code = db.code().code();
         if code.starts_with("08")
             || code.starts_with("53")
-            || matches!(code, "40001" | "40P01" | "57P01" | "57P02" | "57P03")
+            || matches!(
+                code,
+                "40001" | "40P01" | "57014" | "57P01" | "57P02" | "57P03"
+            )
         {
             ErrorClass::Transient
         } else {
