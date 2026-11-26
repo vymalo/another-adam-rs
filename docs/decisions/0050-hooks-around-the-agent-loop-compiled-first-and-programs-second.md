@@ -482,8 +482,10 @@ and a host that builds its agent by hand passes it to the builder.
 journaled `compact:<n>:<turn>` step, after the sources were applied and before the summary call: `context` is text the
 plugin appends, sent as one more user message after the summary instruction; `Verdict::Continue` summarises,
 `Deny(reason)` vetoes and the history is shortened instead (the reason is what the step reports, and no summary call is
-made), `Stop(reason)` fails the run as a `model.request` stop does, and `Ask` or a hook failure is a refusal. The hook
-never writes the summary. `model.request` gained `kind: ModelCallKind` (`Turn` or `Compaction`), so a plugin sees the
-summary call too; the point still may only rewrite `temperature`, `max_output_tokens` and `metadata`, and a `Stop`
-fails the run. Both run inside the step, so a replay of the recorded summary asks neither. The summary the model
-returns is unchanged: an empty answer is still "no summary" and drops the turns.
+made), `Stop(reason)` fails the run as a `model.request` stop does, and `Ask` or a hook failure is a verdict the point
+does not allow — a failure of class `Invalid` that ends the run (decision 8's table: elsewhere the step fails for good).
+Only `Deny` shortens; a hook that cannot decide never lets a summary through. The hook never writes the summary.
+`model.request` gained `kind: ModelCallKind` (`Turn` or `Compaction`), so a plugin sees the summary call too; the point
+still may only rewrite `temperature`, `max_output_tokens` and `metadata`, and a `Stop` fails the run. Both run inside
+the step, so a replay of the recorded summary asks neither. The summary the model returns is unchanged: an empty answer
+is still "no summary" and drops the turns.
