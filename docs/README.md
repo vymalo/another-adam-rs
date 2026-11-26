@@ -49,6 +49,7 @@ These pages are for people. The procedures and evidence that coding agents use l
 
 | Page | What it answers |
 |---|---|
+| [Concepts](concepts.md) | the ideas in one screen (run, journal, lease, store, host role, agent folder, tool, A2A server) and a glossary of terms with their files |
 | [Architecture](architecture.md) | the mental model, the crate map, the ports, the path of a task, the run lifecycle, the data schema, signals, errors |
 
 ## Decisions

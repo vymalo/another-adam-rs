@@ -606,7 +606,7 @@ activated message that names none takes it away from the next job of the thread)
 
 ## Commands
 
-`commands/v1` (ADR 0044, decision 9; the consumer's contract page `docs/api/commands-v1.md` of `vymalo/another-agentic-system` is not written yet). With `with_commands(commands)`, for an agent whose card lists the extension (`ExtensionConfig::commands`), `submit` reads every message right after the inbound function, once, and the expansion is what is stored:
+`commands/v1` (ADR 0044, decision 9; the consumer's contract page is [`commands-v1`](https://vymalo.github.io/another-agentic-system/api/commands-v1)). With `with_commands(commands)`, for an agent whose card lists the extension (`ExtensionConfig::commands`), `submit` reads every message right after the inbound function, once, and the expansion is what is stored:
 
 | | |
 |---|---|
