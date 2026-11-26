@@ -237,9 +237,9 @@ pub trait Plugin: Send + Sync {
     }
 
     /// A history is about to be summarised (ADR 0050, slice H9): add context to the summary request,
-    /// or refuse the compaction with [`Verdict::Deny`], and the history is shortened instead. `Ask`
-    /// is not a verdict of this point and the loop treats it as a hook failure; `Stop` ends the run.
-    /// A hook never writes the summary itself.
+    /// or refuse the compaction with [`Verdict::Deny`], and the history is shortened instead.
+    /// `Stop` fails the run; `Ask` is not a verdict of this point, so it is a failure of class
+    /// `Invalid` and the run fails too (decision 8). A hook never writes the summary itself.
     fn compaction_before(&self, _compaction: &mut HookedCompaction<'_>) -> HookResult {
         Ok(Verdict::Continue)
     }
@@ -400,7 +400,8 @@ impl HookSet {
     /// Runs every plugin's `compaction_before` in order, until one decides.
     ///
     /// # Errors
-    /// As [`HookSet::before_tool`]. The caller does not summarise on an error: it shortens instead.
+    /// As [`HookSet::before_tool`]. The caller does not summarise on an error: the run fails for
+    /// good (decision 8); only a [`Verdict::Deny`] shortens the history instead.
     pub fn compaction_before(&self, compaction: &mut HookedCompaction<'_>) -> HookResult {
         self.run(COMPACTION_BEFORE, |plugin| {
             guard(plugin.name(), self.limits.deadline, || {
