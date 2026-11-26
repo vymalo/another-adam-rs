@@ -60,6 +60,8 @@ removed the container engine this chart never turned on; a deployment that still
 | `A2A_BEARER_TOKENS` | `adam_coder_a2a_bearer_tokens` (comma-separated) | roles that serve A2A (`all`, `control-plane`): the front with `topology: split`, not the worker |
 | `SEARCH_MCP_TOKEN` | `search_mcp_token` (`externalSecrets.properties.searchMcpToken`) | roles that run workers, only with `mcp.websearch.url` set, see [Extra MCP servers](#extra-mcp-servers-web-search-and-context7) |
 | `CONTEXT7_API_KEY` | `context7_api_key` (`externalSecrets.properties.context7ApiKey`) | roles that run workers, only with `mcp.context7.enabled`, same section |
+| `TURN_SIGNING_KEY_FILE` | `turn_signing_key` (`externalSecrets.properties.turnSigningKey`) | **every role**: the key is mounted as a file, not a variable, see [The turn key](#the-turn-key) |
+| `TURN_VERIFY_KEYS_FILE` | `turn_verify_keys` (`externalSecrets.properties.turnVerifyKeys`) | every role, only with the turn key and a verify set, same section |
 
 `MODEL_BASE_URL` is a secret only by choice: the default is a literal from `config.modelBaseUrl`. With `config.role=control-plane` the chart renders neither `MODEL_API_KEY` nor `GITHUB_TOKEN`,
 in the pod or in the `ExternalSecret`, and `externalSecrets.properties.modelApiKey` and
@@ -68,6 +70,42 @@ without them fails (`githubToken` only with `github.auth: token`; see [GitHub](#
 
 The orchestrator holds one of the bearer tokens (its agent list names the
 environment variable it reads it from).
+
+## The turn key
+
+adam signs a run's history with an Ed25519 turn key ([ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md)).
+The chart never carries the key: it copies it from the AWS secret through its `ExternalSecret` and mounts it as a
+file, because `TURN_SIGNING_KEY_FILE` names a path, not a value.
+
+```yaml
+externalSecrets:
+  key: prod/another-agentic/env
+  properties:
+    turnSigningKey: turn_signing_key     # a PKCS#8 PEM Ed25519 private key
+    turnVerifyKeys: turn_verify_keys     # optional: a JWKS of earlier public keys, with `revoked`
+turnSigning:
+  keyId: "vault:adam#v1"                 # optional: the key's vault reference
+```
+
+| What | Where |
+|---|---|
+| The key | `TURN_SIGNING_KEY.pem` in the `ExternalSecret`'s Secret, mounted at `/var/run/secrets/turn-signing/private-key.pem` (mode `0440`) |
+| The key's id | `TURN_SIGNING_KEY_ID` (`turnSigning.keyId`); empty is the key's RFC 7638 thumbprint |
+| The verify set | `TURN_VERIFY_KEYS.json`, mounted beside the key and named by `TURN_VERIFY_KEYS_FILE`; only when `externalSecrets.properties.turnVerifyKeys` is set |
+
+Every role reads it, the control plane included (a `control-plane` renders the mount too, unlike the model key).
+Generate a key with `openssl genpkey -algorithm ed25519`, and put its PEM in the AWS property as it is, newlines
+included. With `externalSecrets.enabled: false` the property is refused at render: a key has nowhere else to come
+from.
+
+A rotation is a rollout of every role: the key and the set are read at startup, and a worker that has not
+restarted would go on signing with the old key. During the overlap the set holds both public keys. A `keyId` of
+`vault:<name>#v<n>` with `n` above 1 needs the set to name every earlier version, `1` to `n-1`, as a key or as
+revoked, or the process refuses to start.
+
+**Status.** The binary still treats the key as optional (no key: no signature), so a deployment that has not set
+the property starts as before. The chart is the half that ships first: provision `turn_signing_key` now, then the
+requiredness lands (ADR 0068 slice T2).
 
 ## The model gateway's URL from the secret
 
