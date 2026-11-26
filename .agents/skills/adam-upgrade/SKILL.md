@@ -12,8 +12,9 @@ mappings, scripts). adam-rs has no changelog and no semver releases: the history
 the changelog.
 
 Every adam-rs path below is in `vymalo/another-adam-rs` at the revision you pin (replace `main`
-by that revision). Entry point:
-https://github.com/vymalo/another-adam-rs/blob/main/docs/README.md.
+by that revision). Entry point for people:
+https://github.com/vymalo/another-adam-rs/blob/main/docs/README.md; the procedures and evidence for agents are in
+https://github.com/vymalo/another-adam-rs/blob/main/.agents/docs/README.md (ADR 0079).
 
 ## When to use
 
@@ -143,6 +144,6 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/README.md.
 
 ## See also
 
-* `docs/decisions/` (every behaviour decision, with a dated status), `docs/architecture.md`.
+* `docs/decisions/README.md` (every behaviour decision in one line, each with a dated status), `docs/architecture.md`.
 * `adam-store-adapter`, `adam-embed`, `adam-coder-deploy`, `adam-a2a-extensions`.
 * https://github.com/vymalo/another-adam-rs/tree/main/docs/decisions
