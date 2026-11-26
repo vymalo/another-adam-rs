@@ -342,6 +342,7 @@ async fn model_calls_tool_a_then_b_then_answers() {
     let expected = vec![
         Message::user_text("please do a then b"),
         Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![a_call.clone()],
             reasoning: None,
@@ -349,6 +350,7 @@ async fn model_calls_tool_a_then_b_then_answers() {
         },
         Message::tool_result("c1", "a-out"),
         Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![b_call.clone()],
             reasoning: None,
@@ -396,6 +398,7 @@ async fn parallel_calls_in_one_message_run_in_order() {
     h.mock
         .push_response(ModelResponse {
             message: Message::Assistant {
+                extra_content: None,
                 content: vec![adam_model::ContentPart::text("on it")],
                 tool_calls: vec![call("c1", "a", json!({})), call("c2", "b", json!({}))],
                 reasoning: None,
@@ -1346,6 +1349,7 @@ async fn turns_cut_while_thinking_past_the_bound_fail_the_run() {
 fn thinking_only_cut_echoed() -> ModelResponse {
     let mut cut = thinking_only_cut();
     cut.message = Message::Assistant {
+        extra_content: None,
         content: Vec::new(),
         tool_calls: Vec::new(),
         reasoning: Some("a long chain of thought".into()),
@@ -1386,6 +1390,7 @@ async fn a_cut_turn_whose_reasoning_is_echoed_stays_in_the_next_request() {
     let (first, second) = requests_after_a_cut(thinking_only_cut_echoed()).await;
     let mut want = first;
     want.push(Message::Assistant {
+        extra_content: None,
         content: Vec::new(),
         tool_calls: Vec::new(),
         reasoning: Some("a long chain of thought".into()),
@@ -1898,6 +1903,7 @@ async fn a_run_that_continues_a_cancelled_one_answers_the_calls_that_were_owed()
         [
             Message::user_text("do the thing"),
             Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: vec![
                     call("c1", "ask", json!({})),
@@ -2352,6 +2358,7 @@ async fn a_closing_turn_that_calls_tools_anyway_keeps_only_its_text() {
     looping(&h);
     h.mock.push_response(ModelResponse {
         message: Message::Assistant {
+            extra_content: None,
             content: vec![ContentPart::Text {
                 text: "summary".into(),
             }],
@@ -2699,6 +2706,7 @@ async fn max_tool_calls_answers_an_oversized_turn_not_run_and_then_closes() {
 fn invalid_call_response(id: &str, name: &str, raw: &str, finish: FinishReason) -> ModelResponse {
     ModelResponse {
         message: Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![ToolCall::with_invalid_arguments(id, name, raw)],
             reasoning: None,
@@ -2840,7 +2848,7 @@ async fn a_replayed_invalid_call_calls_no_model_and_answers_the_same() {
         .await
         .expect("start");
     let recorded = json!({
-        "message": serde_json::to_value(Message::Assistant {
+        "message": serde_json::to_value(Message::Assistant { extra_content: None,
             content: vec![],
             tool_calls: vec![ToolCall::with_invalid_arguments("c1", "a", "{oops")],
             reasoning: None,
@@ -3298,6 +3306,7 @@ fn finished_conversation() -> Conversation {
         messages: vec![
             Message::user_text("first task"),
             Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: vec![call("c1", "a", json!({}))],
                 reasoning: None,
@@ -3497,6 +3506,7 @@ async fn a_run_cancelled_on_a_question_continues_without_the_stale_wait() {
         [
             Message::user_text("deploy"),
             Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: vec![call("c1", "ask", json!({}))],
                 reasoning: None,
@@ -3523,6 +3533,7 @@ fn the_carried_history_is_bounded_shortening_first_and_the_task_is_kept() {
         vec![
             Message::user_text(format!("task {i}")),
             Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: vec![call(&format!("c{i}"), "a", json!({}))],
                 reasoning: None,

@@ -158,6 +158,7 @@ async fn tool_call_by_keyword_and_by_header_then_final_answer() {
         // though the keyword / header is still there: the agent loop ends.
         let mut follow_up = tool_request(prompt);
         follow_up.messages.push(Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![ToolCall {
                 id: calls[0].id.clone(),
@@ -436,6 +437,7 @@ async fn the_scripted_models_stream_what_they_complete() {
     let looked = vec![
         Message::user_text("Hi"),
         Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
@@ -516,6 +518,7 @@ async fn the_scratch_script_asks_where_to_publish_and_goes_on_when_told() {
         unreachable!("an assistant message")
     };
     history.push(Message::Assistant {
+        extra_content: None,
         content,
         tool_calls: vec![ToolCall {
             id: "stop00004".into(),
@@ -679,6 +682,7 @@ async fn the_create_repo_script_publishes_to_the_new_repository_and_stops_when_t
             unreachable!("an assistant message")
         };
         history.push(Message::Assistant {
+            extra_content: None,
             content,
             tool_calls: vec![ToolCall {
                 id: "stop00004".into(),
@@ -762,6 +766,7 @@ async fn the_coders_last_answer_arrives_over_time() {
     let client = client(&format!("{root}/v1"), None);
     let mut history = vec![Message::user_text("add hello.txt")];
     history.push(Message::Assistant {
+        extra_content: None,
         content: vec![],
         tool_calls: vec![ToolCall {
             id: "coder-call-5".into(),

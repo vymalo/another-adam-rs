@@ -195,6 +195,7 @@ pub(crate) fn message_chars(m: &Message) -> usize {
             tool_calls,
             reasoning,
             provider,
+            ..
         } => {
             // The reasoning a client echoes is sent, so it counts; so do the carrier's opaque
             // members, a call's own, and a raw reasoning block (all sent with the request).
@@ -438,6 +439,7 @@ mod tests {
 
     fn call(id: &str) -> Message {
         Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![ToolCall {
                 id: id.into(),
@@ -565,6 +567,7 @@ mod tests {
     /// count pays for once per historical call.
     fn big_call(n: usize) -> Message {
         Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![ToolCall {
                 id: format!("c{n}"),
@@ -675,6 +678,7 @@ mod tests {
     #[test]
     fn the_carrier_counts_toward_the_estimate() {
         let plain = Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![ToolCall::new("c", "t", json!({}))],
             reasoning: None,
@@ -913,6 +917,7 @@ mod tests {
                 text.prop_map(Message::user_text),
                 text.prop_map(Message::assistant_text),
                 ("[a-z]{1,3}", 0usize..3, text).prop_map(|(id, n, args)| Message::Assistant {
+                    extra_content: None,
                     content: vec![],
                     tool_calls: (0..n)
                         .map(|i| ToolCall {

@@ -829,6 +829,7 @@ mod tests {
         };
         let response = ModelResponse {
             message: Message::Assistant {
+                extra_content: None,
                 content: vec![adam_model::ContentPart::text("Let me look.")],
                 tool_calls: vec![call],
                 reasoning: None,

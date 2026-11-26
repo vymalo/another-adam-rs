@@ -360,6 +360,7 @@ impl Rig {
         for n in 0..history {
             let id = format!("old{n}");
             conversation.messages.push(Message::Assistant {
+                extra_content: None,
                 content: Vec::new(),
                 tool_calls: vec![ToolCall {
                     id: id.clone(),
@@ -371,6 +372,7 @@ impl Rig {
                 provider: None,
             });
             conversation.messages.push(Message::Tool {
+                extra_content: None,
                 call_id: id,
                 content: format!("old{n}:{}", "x".repeat(1200)),
                 is_error: false,
