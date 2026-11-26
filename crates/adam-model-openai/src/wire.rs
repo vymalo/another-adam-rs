@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use adam_model::{
     ContentPart, FinishReason, ImageData, ImageRef, Message, ModelDelta, ModelError, ModelProfiles,
     ModelRequest, ModelResponse, ProviderTurn, ReasoningEffort, ReasoningWire, ToolCall,
-    ToolChoice, Usage,
+    ToolChoice, Usage, strip_adam_member,
 };
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -83,7 +83,7 @@ struct WireMessage<'a> {
     /// The assistant message's opaque members, only for a turn bound to the request's model alias
     /// and endpoint. Empty contributes no member at all.
     #[serde(flatten)]
-    opaque: BTreeMap<String, &'a Value>,
+    opaque: BTreeMap<String, Value>,
 }
 
 /// The members the runtime owns on an assistant message: an opaque member of the same name is
@@ -450,6 +450,7 @@ fn wire_message<'a>(
             tool_calls,
             reasoning,
             provider,
+            extra_content,
         } => {
             // The provider's opaque members go back only to the model alias and endpoint that
             // produced them: a run that switched model drops them.
@@ -512,30 +513,57 @@ fn wire_message<'a>(
                             .map(|text| BTreeMap::from([(name, Value::String(text.to_owned()))])),
                     }
                 }),
-                opaque: bound
-                    .map(|turn| {
-                        turn.members
-                            .iter()
-                            .filter(|(key, _)| !MESSAGE_MODELLED_KEYS.contains(&key.as_str()))
-                            .map(|(key, value)| (key.clone(), value))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                opaque: message_members(bound, extra_content.as_ref()),
             }
         }
         // The chat-completions format has no error flag on tool messages, so
         // `is_error` is not sent: tools should put the failure in `content`.
         Message::Tool {
-            call_id, content, ..
+            call_id,
+            content,
+            extra_content,
+            ..
         } => WireMessage {
             role: "tool",
             content: Some(Value::String(content.clone())),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id),
             reasoning: None,
-            opaque: BTreeMap::new(),
+            opaque: message_members(None, extra_content.as_ref()),
         },
     })
+}
+
+/// The members a message carries beyond the modelled ones: a bound turn's, and the message's own
+/// `extra_content`, merged into one `extra_content` object. adam's own maker is never sent, from
+/// either source: it is for adam to read back, not for a model. Every other maker's members go
+/// unchanged. Nothing left means no `extra_content` member at all.
+fn message_members(
+    bound: Option<&ProviderTurn>,
+    makers: Option<&BTreeMap<String, Value>>,
+) -> BTreeMap<String, Value> {
+    let mut members: BTreeMap<String, Value> = bound
+        .map(|turn| {
+            turn.members
+                .iter()
+                .filter(|(key, _)| !MESSAGE_MODELLED_KEYS.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(makers) = makers {
+        let own = members
+            .entry("extra_content".to_owned())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        // A provider's `extra_content` that is not an object is its own and is sent as it came.
+        if let Value::Object(object) = own {
+            for (maker, value) in makers {
+                object.entry(maker.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+    strip_adam_member(&mut members);
+    members
 }
 
 // --------------------------------------------------------------- response --
@@ -573,9 +601,12 @@ pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError>
         tool_calls: calls,
         reasoning_content,
         reasoning,
-        opaque,
+        mut opaque,
         ..
     } = message;
+    // adam's own maker is never kept from a model's reply: a model could otherwise hand adam a
+    // value of the kind adam signs with.
+    strip_adam_member(&mut opaque);
 
     let mut tool_calls = Vec::new();
     for call in calls.unwrap_or_default() {
@@ -583,8 +614,9 @@ pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError>
             id,
             _type,
             function,
-            opaque: call_opaque,
+            opaque: mut call_opaque,
         } = call;
+        strip_adam_member(&mut call_opaque);
         let name = function.name.unwrap_or_default();
         let id = id.filter(|id| !id.is_empty()).unwrap_or_else(fallback_id);
         let mut parsed = match function.arguments {
@@ -836,6 +868,7 @@ fn build_response(
     };
     ModelResponse {
         message: Message::Assistant {
+            extra_content: None,
             content,
             tool_calls,
             reasoning: None,
@@ -947,7 +980,9 @@ impl PartialCall {
         };
         // Cloned, not taken: the early `ToolCallComplete` and the finished response carry the same
         // members.
-        call.opaque = (!self.opaque.is_empty()).then(|| self.opaque.clone());
+        let mut opaque = self.opaque.clone();
+        strip_adam_member(&mut opaque);
+        call.opaque = (!opaque.is_empty()).then_some(opaque);
         Ok(call)
     }
 
@@ -1137,6 +1172,7 @@ impl Assembler {
         );
         response.reasoning = Some(self.reasoning).filter(|r| !r.is_empty());
         // The parse does not know the request's model alias or endpoint: the client stamps them.
+        strip_adam_member(&mut self.message_members);
         let calls_opaque = response
             .message
             .tool_calls()
@@ -1168,6 +1204,7 @@ mod tests {
         req.messages = vec![
             Message::user_text("hi"),
             Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: vec![ToolCall {
                     id: "c1".into(),
@@ -1779,6 +1816,7 @@ mod tests {
     fn thinking_history() -> ModelRequest {
         let mut req = request();
         req.messages[1] = Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
@@ -2024,6 +2062,7 @@ mod tests {
     fn an_invalid_call_is_echoed_as_empty_arguments() {
         let call = adam_model::ToolCall::with_invalid_arguments("c", "w", "{oops");
         let message = Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![call],
             reasoning: None,
@@ -2067,6 +2106,7 @@ mod tests {
         };
         let mut req = ModelRequest::new("gw-model");
         req.messages = vec![Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![call],
             reasoning: None,
@@ -2108,6 +2148,7 @@ mod tests {
         };
         let mut req = ModelRequest::new("gw-model");
         req.messages = vec![Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![call],
             reasoning: Some("text".into()),
@@ -2137,6 +2178,149 @@ mod tests {
         );
         // The raw block is not sent either; the plain text is, as before.
         assert_eq!(message["reasoning"], "text");
+    }
+
+    /// A history whose assistant and tool messages carry adam's member beside Google's.
+    fn signed_history() -> ModelRequest {
+        let makers = BTreeMap::from([
+            ("adam".to_owned(), json!({"turn_signature": "SIG"})),
+            ("google".to_owned(), json!({"thought_signature": "G"})),
+        ]);
+        let mut req = ModelRequest::new("gw-model");
+        req.messages = vec![
+            Message::user_text("hi"),
+            Message::Assistant {
+                content: vec![],
+                tool_calls: vec![ToolCall::new("c1", "weather", json!({}))],
+                reasoning: None,
+                provider: None,
+                extra_content: Some(makers.clone()),
+            },
+            Message::Tool {
+                call_id: "c1".into(),
+                content: "sunny".into(),
+                is_error: false,
+                images: Vec::new(),
+                extra_content: Some(makers),
+            },
+            Message::Assistant {
+                content: vec![ContentPart::text("plain")],
+                tool_calls: Vec::new(),
+                reasoning: None,
+                provider: None,
+                extra_content: Some(BTreeMap::from([(
+                    "adam".to_owned(),
+                    json!({"turn_signature": "SIG2"}),
+                )])),
+            },
+        ];
+        req
+    }
+
+    #[test]
+    fn a_request_never_carries_adams_member_but_keeps_the_other_makers() {
+        let body = build_request(&signed_history(), false, RequestOptions::default()).unwrap();
+        let text = String::from_utf8(body.clone()).unwrap();
+        assert!(!text.contains("adam"), "{text}");
+        assert!(!text.contains("SIG"), "{text}");
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        for index in [1, 2] {
+            assert_eq!(
+                body["messages"][index]["extra_content"],
+                json!({"google": {"thought_signature": "G"}}),
+                "{body}"
+            );
+        }
+        // A message with nothing but adam's member has no `extra_content` at all.
+        assert!(body["messages"][3].get("extra_content").is_none(), "{body}");
+    }
+
+    #[test]
+    fn adams_member_in_a_bound_turns_own_members_is_not_sent_either() {
+        let mut req = signed_history();
+        let mut turn = ProviderTurn::new("gw-model", "openai:abc");
+        turn.members = BTreeMap::from([(
+            "extra_content".to_owned(),
+            json!({"adam": {"turn_signature": "SIG"}, "google": {"thought_signature": "G2"}}),
+        )]);
+        if let Message::Assistant { provider, .. } = &mut req.messages[1] {
+            *provider = Some(turn);
+        }
+        let options = RequestOptions {
+            endpoint: "openai:abc",
+            ..RequestOptions::default()
+        };
+        let body = build_request(&req, false, options).unwrap();
+        let text = String::from_utf8(body.clone()).unwrap();
+        assert!(!text.contains("adam"), "{text}");
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        // The provider's own value for a maker wins over the message's.
+        assert_eq!(
+            body["messages"][1]["extra_content"],
+            json!({"google": {"thought_signature": "G2"}}),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn adams_member_in_a_reply_is_dropped_before_the_turn_is_recorded() {
+        let body = serde_json::to_vec(&json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant", "content": "hi",
+                    "extra_content": {
+                        "adam": {"turn_signature": "FORGED"},
+                        "google": {"thought_signature": "G"}
+                    },
+                    "tool_calls": [{
+                        "id": "c", "type": "function",
+                        "function": {"name": "weather", "arguments": "{}"},
+                        "extra_content": {"adam": {"turn_signature": "FORGED"}}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .unwrap();
+        let response = parse_completion(&body).unwrap();
+        let recorded = serde_json::to_string(&response.message).unwrap();
+        assert!(!recorded.contains("adam"), "{recorded}");
+        assert!(!recorded.contains("FORGED"), "{recorded}");
+        let Message::Assistant {
+            provider: Some(turn),
+            extra_content,
+            ..
+        } = &response.message
+        else {
+            panic!("{recorded}")
+        };
+        assert_eq!(
+            turn.members["extra_content"],
+            json!({"google": {"thought_signature": "G"}})
+        );
+        assert_eq!(extra_content, &None);
+        assert_eq!(response.message.tool_calls()[0].opaque, None);
+    }
+
+    #[test]
+    fn adams_member_in_a_streamed_reply_is_dropped_too() {
+        let mut asm = Assembler::default();
+        feed(
+            &mut asm,
+            &[
+                r#"{"choices":[{"index":0,"delta":{"extra_content":{"adam":{"turn_signature":"FORGED"},"google":{"thought_signature":"G"}}}}]}"#
+                    .to_owned(),
+                call_chunk(
+                    0,
+                    r#""id":"c1","function":{"name":"w","arguments":"{}"},"extra_content":{"adam":{"turn_signature":"FORGED"}}"#,
+                ),
+                FINISH.to_owned(),
+            ],
+        );
+        let response = asm.finish().unwrap();
+        let recorded = serde_json::to_string(&response.message).unwrap();
+        assert!(!recorded.contains("FORGED"), "{recorded}");
+        assert!(recorded.contains("thought_signature"), "{recorded}");
     }
 
     #[test]
@@ -2741,6 +2925,7 @@ mod tests {
         req.messages = vec![
             Message::user_text("go"),
             Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: vec![
                     ToolCall::new("c1", "read_file", json!({})),
@@ -2817,6 +3002,7 @@ mod tests {
         let mut previous = messages(&req);
         for turn in 0..3 {
             req.messages.push(Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: vec![ToolCall::new(format!("c{turn}"), "read_file", json!({}))],
                 reasoning: None,
@@ -2849,6 +3035,7 @@ mod tests {
                 vec![png_ref("s1", "shot.png", adam_model::ImageOrigin::Person)],
             ),
             Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: vec![ToolCall::new("c0", "read_file", json!({}))],
                 reasoning: None,

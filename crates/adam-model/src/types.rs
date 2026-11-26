@@ -205,6 +205,13 @@ pub enum Message {
         /// journal decodes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<ProviderTurn>,
+        /// Members of the message object itself, namespaced by maker (`{"adam": {…}}` beside
+        /// `{"google": {…}}`), the shape of a provider's `extra_content`. `None` when there are
+        /// none, so a message without them is the same bytes as before and an older journal
+        /// decodes. The `adam` maker is adam's own and is never sent to a model nor kept from
+        /// one ([`ADAM_MAKER`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extra_content: Option<BTreeMap<String, Value>>,
     },
     /// The result of running a tool the model asked for.
     Tool {
@@ -221,7 +228,26 @@ pub enum Message {
         /// image is the same bytes as before and an older journal decodes.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageRef>,
+        /// The same carrier as [`Message::Assistant::extra_content`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extra_content: Option<BTreeMap<String, Value>>,
     },
+}
+
+/// The maker name of adam's own members in a message's `extra_content`. It is adam's alone: a
+/// request never carries it and a model's reply never keeps it ([`strip_adam_member`]).
+pub const ADAM_MAKER: &str = "adam";
+
+/// Remove adam's maker from the `extra_content` member of a provider's members map (a reply's
+/// message members, or a tool call's), dropping the member if nothing else is in it. Other
+/// makers' members are untouched.
+pub fn strip_adam_member(members: &mut BTreeMap<String, Value>) {
+    if let Some(Value::Object(makers)) = members.get_mut("extra_content") {
+        makers.remove(ADAM_MAKER);
+        if makers.is_empty() {
+            members.remove("extra_content");
+        }
+    }
 }
 
 impl Message {
@@ -239,6 +265,7 @@ impl Message {
             tool_calls: Vec::new(),
             reasoning: None,
             provider: None,
+            extra_content: None,
         }
     }
 
@@ -249,6 +276,7 @@ impl Message {
             content: content.into(),
             is_error: false,
             images: Vec::new(),
+            extra_content: None,
         }
     }
 
@@ -259,6 +287,7 @@ impl Message {
             content: content.into(),
             is_error: true,
             images: Vec::new(),
+            extra_content: None,
         }
     }
 
@@ -269,6 +298,7 @@ impl Message {
         images: Vec<ImageRef>,
     ) -> Self {
         Self::Tool {
+            extra_content: None,
             call_id: call_id.into(),
             content: content.into(),
             is_error: false,
@@ -580,6 +610,7 @@ impl ModelResponse {
     pub fn tool_calls(tool_calls: Vec<ToolCall>) -> Self {
         Self {
             message: Message::Assistant {
+                extra_content: None,
                 content: Vec::new(),
                 tool_calls,
                 reasoning: None,
@@ -808,6 +839,7 @@ mod tests {
     fn response() -> ModelResponse {
         ModelResponse {
             message: Message::Assistant {
+                extra_content: None,
                 content: vec![ContentPart::text("checking")],
                 tool_calls: vec![tool_call()],
                 reasoning: None,
@@ -863,12 +895,14 @@ mod tests {
         roundtrip(Message::user_text("hi"));
         roundtrip(Message::assistant_text("hi"));
         roundtrip(Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![tool_call()],
             reasoning: None,
             provider: None,
         });
         roundtrip(Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![tool_call()],
             reasoning: Some("thinking".into()),
@@ -876,6 +910,99 @@ mod tests {
         });
         roundtrip(Message::tool_result("c", "out"));
         roundtrip(Message::tool_error("c", "boom"));
+    }
+
+    fn makers() -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("adam".to_owned(), json!({"turn_signature": "SIG"})),
+            ("google".to_owned(), json!({"thought_signature": "G"})),
+        ])
+    }
+
+    #[test]
+    fn the_extra_content_member_roundtrips_with_and_without_a_value() {
+        let signed = Message::Assistant {
+            content: vec![ContentPart::text("yo")],
+            tool_calls: Vec::new(),
+            reasoning: None,
+            provider: None,
+            extra_content: Some(makers()),
+        };
+        roundtrip(signed.clone());
+        assert_eq!(
+            serde_json::to_value(&signed).unwrap()["extra_content"],
+            json!({"adam": {"turn_signature": "SIG"}, "google": {"thought_signature": "G"}})
+        );
+        let tool = Message::Tool {
+            call_id: "c".into(),
+            content: "out".into(),
+            is_error: false,
+            images: Vec::new(),
+            extra_content: Some(makers()),
+        };
+        roundtrip(tool.clone());
+        assert_eq!(
+            serde_json::to_value(&tool).unwrap()["extra_content"]["adam"],
+            json!({"turn_signature": "SIG"})
+        );
+        // Without a value the member is not written: an unsigned history is the same bytes.
+        for unsigned in [
+            Message::assistant_text("yo"),
+            Message::tool_result("c", "o"),
+        ] {
+            roundtrip(unsigned.clone());
+            assert!(
+                serde_json::to_value(&unsigned)
+                    .unwrap()
+                    .get("extra_content")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn an_older_history_decodes_with_the_member_absent() {
+        let assistant: Message = serde_json::from_value(
+            json!({"role": "assistant", "content": [{"type": "text", "text": "x"}]}),
+        )
+        .unwrap();
+        let tool: Message = serde_json::from_value(
+            json!({"role": "tool", "call_id": "c", "content": "o", "is_error": false}),
+        )
+        .unwrap();
+        assert!(matches!(
+            assistant,
+            Message::Assistant {
+                extra_content: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            tool,
+            Message::Tool {
+                extra_content: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn adams_maker_is_stripped_from_a_members_map_and_the_rest_kept() {
+        let mut members = BTreeMap::from([(
+            "extra_content".to_owned(),
+            json!({"adam": {"turn_signature": "X"}, "google": {"thought_signature": "G"}}),
+        )]);
+        strip_adam_member(&mut members);
+        assert_eq!(
+            members["extra_content"],
+            json!({"google": {"thought_signature": "G"}})
+        );
+        let mut only = BTreeMap::from([(
+            "extra_content".to_owned(),
+            json!({"adam": {"turn_signature": "X"}}),
+        )]);
+        strip_adam_member(&mut only);
+        assert!(only.is_empty());
     }
 
     #[test]
@@ -897,6 +1024,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Message::assistant_text("yo")).unwrap(),
             serde_json::to_value(Message::Assistant {
+                extra_content: None,
                 content: vec![ContentPart::text("yo")],
                 tool_calls: Vec::new(),
                 reasoning: None,
@@ -906,6 +1034,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: Vec::new(),
                 reasoning: Some("r".into()),
@@ -936,6 +1065,7 @@ mod tests {
         )]);
         provider.reasoning = Some(json!({"blocks": [{"text": "thought"}]}));
         let message = Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![call.clone()],
             reasoning: None,
@@ -965,6 +1095,7 @@ mod tests {
         assert_eq!(
             old,
             Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: vec![ToolCall::new("c", "w", json!({}))],
                 reasoning: None,
@@ -1138,6 +1269,7 @@ mod tests {
     #[test]
     fn helpers() {
         let m = Message::Assistant {
+            extra_content: None,
             content: vec![ContentPart::text("a"), ContentPart::text("b")],
             tool_calls: vec![tool_call()],
             reasoning: Some("why".into()),

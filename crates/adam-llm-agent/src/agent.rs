@@ -212,6 +212,7 @@ fn shortened_for_overflow(messages: &[Message]) -> Vec<Message> {
                 content,
                 is_error,
                 images,
+                extra_content,
             } => {
                 let len = content.chars().count();
                 let short = (len > OVERFLOW_OUTPUT_CHARS)
@@ -220,6 +221,7 @@ fn shortened_for_overflow(messages: &[Message]) -> Vec<Message> {
                     })
                     .flatten();
                 Message::Tool {
+                    extra_content: extra_content.clone(),
                     call_id: call_id.clone(),
                     content: short.unwrap_or_else(|| content.clone()),
                     is_error: *is_error,
@@ -1162,12 +1164,14 @@ fn report_messages(reports: &[RoundReport], paged: bool) -> Vec<Message> {
         })
         .collect();
     let mut messages = vec![Message::Assistant {
+        extra_content: None,
         content: Vec::new(),
         tool_calls: calls.clone(),
         reasoning: None,
         provider: None,
     }];
     messages.extend(reports.iter().zip(&calls).map(|(r, call)| Message::Tool {
+        extra_content: None,
         call_id: call.id.clone(),
         content: backstop(&r.output.content, SUBAGENT_READ, paged).into_owned(),
         is_error: false,
@@ -6293,6 +6297,7 @@ async fn output_message(
         )
     };
     let message = Message::Tool {
+        extra_content: None,
         call_id: call_id.to_owned(),
         // After the journal: the journal holds the whole output, and the cut (which the history, the
         // model and the step event carry) is a pure function of it.
@@ -7876,6 +7881,7 @@ mod thinking_cut_tests {
     #[test]
     fn a_cut_turn_with_a_reasoning_block_or_a_carrier_stays() {
         let mut block = Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![],
             reasoning: None,
@@ -7907,6 +7913,7 @@ mod thinking_cut_tests {
         assert!(!LlmAgent::cut_turn_has_nothing_to_send(&block));
 
         let empty = Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![],
             reasoning: None,
@@ -7914,6 +7921,7 @@ mod thinking_cut_tests {
         };
         assert!(LlmAgent::cut_turn_has_nothing_to_send(&empty));
         let echoed = Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![],
             reasoning: Some("r".into()),
@@ -8483,6 +8491,7 @@ mod compaction_gate_tests {
         let mut state = Conversation::new("task");
         for n in 0..turns {
             state.messages.push(Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: vec![adam_model::ToolCall {
                     id: format!("c{n}"),

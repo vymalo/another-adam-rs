@@ -180,6 +180,7 @@ async fn tool_results_round_trip_into_the_next_request() {
     .await;
     let mut req = request();
     req.messages.push(Message::Assistant {
+        extra_content: None,
         content: vec![],
         tool_calls: vec![adam_model::ToolCall {
             id: "call_9".into(),
@@ -872,6 +873,7 @@ async fn an_invalid_call_is_echoed_with_empty_object_arguments() {
     .await;
     let mut req = request();
     req.messages.push(Message::Assistant {
+        extra_content: None,
         content: vec![],
         tool_calls: vec![adam_model::ToolCall::with_invalid_arguments(
             "c",
@@ -1364,6 +1366,7 @@ async fn reasoning_goes_back_only_through_a_client_set_to_echo_it() {
     let history = || {
         let mut req = request();
         req.messages.push(Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![adam_model::ToolCall {
                 id: "call_1".into(),

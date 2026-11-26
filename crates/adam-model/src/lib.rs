@@ -112,7 +112,7 @@ pub use prompt::{
 };
 pub use signed::{SignedRequests, TURN_SIGNATURE_HEADER, request_target};
 pub use types::{
-    ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, ImageData, ImageLimits, ImageOrigin,
-    ImageRef, InputModalities, Message, ModelDelta, ModelRequest, ModelResponse, ProviderTurn,
-    ToolCall, ToolChoice, ToolSpec, Usage, human_bytes, type_word,
+    ADAM_MAKER, ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, ImageData, ImageLimits,
+    ImageOrigin, ImageRef, InputModalities, Message, ModelDelta, ModelRequest, ModelResponse,
+    ProviderTurn, ToolCall, ToolChoice, ToolSpec, Usage, human_bytes, strip_adam_member, type_word,
 };

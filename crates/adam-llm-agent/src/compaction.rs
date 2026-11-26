@@ -1093,6 +1093,7 @@ mod tests {
 
     fn call(id: &str, name: &str, args: serde_json::Value) -> Message {
         Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![ToolCall {
                 id: id.into(),

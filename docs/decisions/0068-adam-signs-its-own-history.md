@@ -404,3 +404,11 @@ request signature is another type, built with the same port and header writer. B
 9. **Never logged.** The headers are secret values (`SecretString`, a sensitive `HeaderValue`); the `Debug` of
    `CredentialRequest` and of `ModelCall` shows the body's length, never the body; `SignedRequests`' shows the keys'
    kind. The end-to-end test reads every log line of a run and finds no signature.
+
+## Amended 2026-11-26 (the carrier)
+
+`Message::Assistant` and `Message::Tool` carry `extra_content: Option<BTreeMap<String, Value>>`, a member of the message
+object itself, one entry per maker (`crates/adam-model/src/types.rs`). Nothing writes `extra_content.adam` yet. The
+OpenAI wire never sends the `adam` maker and drops it from a model's reply, streamed or not
+(`crates/adam-model-openai/src/wire.rs`); other makers' members in the carrier are sent unbound, as the carrier has no
+model binding.
