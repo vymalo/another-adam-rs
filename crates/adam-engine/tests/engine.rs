@@ -261,6 +261,7 @@ async fn send_starts_then_continues() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_say_carries_the_persons_envelope_to_every_model_call() {
     use adam_engine::adam_model::PromptStatement;
+    // opengrep-ignore: a fake prompt envelope fixture, not a token (its body is {"typ":"prompt/v1"})
     const ENVELOPE: &str =
         "eyJhbGciOiJFZERTQSIsIm5vbmNlIjoibi0xIn0.eyJ0eXAiOiJwcm9tcHQvdjEifQ.c2ln";
     let rig = Rig::new(None).await;
