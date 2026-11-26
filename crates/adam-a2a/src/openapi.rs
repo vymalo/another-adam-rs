@@ -305,14 +305,38 @@ fn operation_text(operation: &str, flags: Flags) -> (&'static str, String) {
 }
 
 /// The `curl` that a streaming operation's description gives.
+/// The same value with every object's keys sorted. `serde_json` keeps its map in insertion order
+/// when something in the build enables `preserve_order` — `schemars` does, and the `schema` feature
+/// brings it — so anything this document embeds as text would otherwise depend on the feature set.
+/// A document's key order is not part of its meaning.
+fn sorted(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by_key(|(key, _)| key.as_str());
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), sorted(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+        other => other.clone(),
+    }
+}
+
 fn stream_curl(base: &str, path: &str, method: &str, body: Option<&Value>, bearer: bool) -> String {
     let mut curl = format!("curl -N -X {method}");
     if bearer {
         curl.push_str(" -H \"Authorization: Bearer $A2A_TOKEN\"");
     }
     if let Some(body) = body {
+        // Sorted, so the example reads the same whichever `serde_json` map the build has: a
+        // feature that enables `preserve_order` (`schemars` does) would otherwise reorder it.
         curl.push_str(&format!(
-            " -H 'Content-Type: application/json' --data '{body}'"
+            " -H 'Content-Type: application/json' --data '{}'",
+            sorted(body)
         ));
     }
     curl.push_str(&format!(" {base}{path}"));
@@ -1146,7 +1170,7 @@ mod tests {
         );
         let built = format!(
             "{}\n",
-            serde_json::to_string_pretty(&document).expect("a JSON value")
+            serde_json::to_string_pretty(&sorted(&document)).expect("a JSON value")
         );
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(PUBLISHED);
         if std::env::var_os("ADAM_UPDATE_GOLDEN").is_some() {
@@ -1161,8 +1185,15 @@ mod tests {
                 path.display()
             )
         });
+        let committed: Value = serde_json::from_str(&committed).unwrap_or_else(|error| {
+            panic!(
+                "{}: {error}; regenerate it with {REGENERATE}",
+                path.display()
+            )
+        });
         assert_eq!(
-            committed, built,
+            committed,
+            sorted(&document),
             "docs/api/a2a-server.openapi.json no longer matches crates/adam-a2a/src/openapi.rs; regenerate it with {REGENERATE}"
         );
     }
