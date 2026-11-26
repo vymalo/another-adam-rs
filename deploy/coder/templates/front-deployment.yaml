@@ -68,6 +68,9 @@ spec:
               value: {{ $value | quote }}
             {{- end }}
             {{- include "coder.databaseUrlEnv" . | nindent 12 }}
+            {{- with (include "coder.turnSigningEnv" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- if .Values.externalSecrets.enabled }}
             - name: A2A_BEARER_TOKENS
               valueFrom:
@@ -100,14 +103,22 @@ spec:
             timeoutSeconds: 3
           resources:
             {{- toYaml .Values.front.resources | nindent 12 }}
-          {{- if include "coder.a2aCardSigning" . }}
+          {{- if or (include "coder.a2aCardSigning" .) (include "coder.turnSigning" .) }}
           volumeMounts:
+            {{- if include "coder.a2aCardSigning" . }}
             - name: card-signing
               mountPath: {{ include "coder.a2aCardSigningDir" . }}
               readOnly: true
+            {{- end }}
+            {{- if include "coder.turnSigning" . }}
+            - name: turn-signing
+              mountPath: {{ include "coder.turnSigningDir" . }}
+              readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if include "coder.a2aCardSigning" . }}
+      {{- if or (include "coder.a2aCardSigning" .) (include "coder.turnSigning" .) }}
       volumes:
+        {{- if include "coder.a2aCardSigning" . }}
         - name: card-signing
           secret:
             secretName: {{ .Values.a2a.cardSigning.secretName }}
@@ -116,6 +127,21 @@ spec:
             items:
               - key: private-key.pem
                 path: private-key.pem
+        {{- end }}
+        {{- if include "coder.turnSigning" . }}
+        - name: turn-signing
+          secret:
+            # The ExternalSecret's own Secret: the chart copies the key from AWS and never carries it.
+            secretName: {{ include "coder.secretName" . }}
+            defaultMode: 0440
+            items:
+              - key: TURN_SIGNING_KEY.pem
+                path: private-key.pem
+              {{- if include "coder.turnVerifyKeys" . }}
+              - key: TURN_VERIFY_KEYS.json
+                path: verify-keys.json
+              {{- end }}
+        {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

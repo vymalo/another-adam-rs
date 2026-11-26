@@ -6,6 +6,33 @@ the extended card, the card's signature, and the three live streams (steps, text
 `crates/adam-a2a-runtime` (backend over the runtime). Extensions: the `adam-a2a-extensions` skill and
 [ADR 0006](../decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md).
 
+## On this page
+
+* [Methods](#methods)
+* [Two bindings, one handler](#two-bindings-one-handler)
+* [Push notifications](#push-notifications)
+* [ListTasks](#listtasks)
+* [The extended card](#the-extended-card)
+* [The card's signature](#the-cards-signature)
+* [A run that ends at its limit](#a-run-that-ends-at-its-limit)
+* [Follow-ups](#follow-ups)
+* [A run parked on the model](#a-run-parked-on-the-model)
+* [A new task that continues a finished one](#a-new-task-that-continues-a-finished-one)
+* [Steps](#steps)
+* [Which build answers](#which-build-answers)
+* [The access tier](#the-access-tier)
+* [The interface language (`locale/v1`)](#the-interface-language-localev1)
+* [The prompt statement (`prompt-statement/v1`)](#the-prompt-statement-prompt-statementv1)
+* [The reasoning effort (`reasoning/v1`)](#the-reasoning-effort-reasoningv1)
+* [The model a message picks (`model-pick/v1`)](#the-model-a-message-picks-model-pickv1)
+* [Child sessions (`child-sessions/v1`)](#child-sessions-child-sessionsv1)
+* [Commands (`commands/v1`)](#commands-commandsv1)
+* [Tokens of each model call](#tokens-of-each-model-call)
+* [Images in](#images-in)
+* [The artifacts of a run](#the-artifacts-of-a-run)
+* [Streamed text](#streamed-text)
+* [Reasoning](#reasoning)
+
 ## Methods
 
 All of A2A 1.0's JSON-RPC methods are served (`crates/adam-a2a/src/handler.rs`); what is optional is off
@@ -46,6 +73,13 @@ at the same URL (`PUBLIC_URL`): the REST paths are relative to it.
 * **Swagger UI** (`/docs`) documents both bindings: press **Authorize**, paste a token, then **Try it out**. For JSON-RPC,
   pick a method in the example dropdown. Swagger UI cannot show a stream as it arrives: a streaming operation's description
   gives the `curl`. The page loads nothing from another origin and the document holds no secret.
+
+## The document, as a file
+
+[`docs/api/a2a-server.openapi.json`](../api/a2a-server.openapi.json) is the same document, committed so a site can render it
+without a running server. It is built from one fixed default card (a bearer token required; push notifications and the
+extended card off), so it changes only when the server's code does. How it is held equal to the code, and how to rewrite
+it: [the document, for agents](../../.agents/docs/reference/a2a-server.md#the-committed-document).
 
 ## Push notifications
 

@@ -83,10 +83,12 @@ each step. Any worker can resume a run another one left: [the architecture](docs
 
 | | |
 |---|---|
-| [`docs/`](docs/README.md) | the index |
-| [Guides](docs/guides/) | [try the agents](docs/guides/try-the-agents.md), [run locally](docs/guides/run-locally.md), [write an agent](docs/guides/write-an-agent.md), [embed adam](docs/guides/embed-adam.md), [deploy the coder](docs/guides/deploy-the-coder.md), [testing](docs/guides/testing.md) |
-| [Reference](docs/reference/) | [environment variables](docs/reference/environment.md), [agent files](docs/reference/agent-files.md), [the A2A server](docs/reference/a2a-server.md), [errors](docs/reference/errors.md), [the local stack](docs/reference/dev-stack.md) |
-| [Decisions](docs/decisions/) | ADRs: why it is the way it is |
+| [`docs/`](docs/README.md) | the index, by what you want to do |
+| Get started | [try the agents](docs/guides/try-the-agents.md), [run locally](docs/guides/run-locally.md) |
+| Guides | [write an agent](docs/guides/write-an-agent.md), [deploy the coder](docs/guides/deploy-the-coder.md), [embed adam](docs/guides/embed-adam.md), [embed in an application](docs/guides/embed-in-an-app.md) |
+| Reference | [the A2A server](docs/reference/a2a-server.md), [environment variables](docs/reference/environment.md), [agent files](docs/reference/agent-files.md), [errors](docs/reference/errors.md), [the local stack](docs/reference/dev-stack.md) |
+| [Architecture](docs/architecture.md) | how it works inside |
+| [Decisions](docs/decisions/README.md) | ADRs: why it is the way it is |
 | [Benchmark](bench/README.md) | adam-coder against OpenCode on the same tasks and model |
 
 ## Roadmap and contributing
@@ -98,9 +100,9 @@ each step. Any worker can resume a run another one left: [the architecture](docs
   commits are Conventional Commits; the checks CI runs are in [Testing](docs/guides/testing.md#the-commands-ci-runs).
   Update the matching guide, reference or crate README in the same change as any change to behaviour.
 - **Security:** report a vulnerability privately, as [`SECURITY.md`](SECURITY.md) says.
-- **AI assistants:** read [`CLAUDE.md`](CLAUDE.md). The skills for repositories that integrate adam-rs install with
-  `npx skills add vymalo/another-adam-rs --list` (`adam-agent-folder`, `adam-embed`, `adam-store-adapter`,
-  `adam-a2a-extensions`, `adam-coder-deploy`, `adam-upgrade`).
+- **AI assistants:** `docs/` is written for people. A coding agent starts at [`CLAUDE.md`](CLAUDE.md) (`AGENTS.md`
+  links to it) and finds its procedures and evidence in [`.agents/docs/`](.agents/docs/README.md). Repositories that
+  integrate adam-rs install its skills with `npx skills add vymalo/another-adam-rs --list`.
 
 ## License
 

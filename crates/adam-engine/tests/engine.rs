@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use adam_engine::adam_agent_fs::{Dir, Strictness};
 use adam_engine::adam_assembly::{AgentDef, EffortSource, Error as AssemblyError};
-use adam_engine::adam_core::{DynStore, MemoryStore, RunId, Store};
+use adam_engine::adam_core::{DynStore, MemoryStore, RunId, Store, TurnKeys};
 use adam_engine::adam_error::{Classify, ErrorClass};
 use adam_engine::adam_llm_agent::{FnTool, ToolError, ToolOutput, ToolSet};
 use adam_engine::adam_model::{
@@ -261,6 +261,7 @@ async fn send_starts_then_continues() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_say_carries_the_persons_envelope_to_every_model_call() {
     use adam_engine::adam_model::PromptStatement;
+    // opengrep-ignore: a fake prompt envelope fixture, not a token (its body is {"typ":"prompt/v1"})
     const ENVELOPE: &str =
         "eyJhbGciOiJFZERTQSIsIm5vbmNlIjoibi0xIn0.eyJ0eXAiOiJwcm9tcHQvdjEifQ.c2ln";
     let rig = Rig::new(None).await;
@@ -644,6 +645,44 @@ fn start_outside_a_tokio_runtime_is_refused() {
     let error = started.expect_err("no runtime");
     assert!(matches!(error, EngineError::NoRuntime), "{error:?}");
     assert_eq!(error.class(), ErrorClass::Invalid);
+}
+
+/// ADR 0068 decision 9: a store that outlives the process refuses to start without a turn key, and
+/// a store that dies with the process signs with one made at start that dies with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_memory_store_signs_with_an_ephemeral_turn_key() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let engine = Engine::builder(store, chat(), MockModel::new().into_dyn(), "m")
+        .start()
+        .await
+        .expect("a memory store needs no key of the host's");
+    assert_eq!(engine.turn_keys().kind(), "ephemeral");
+    assert!(engine.turn_keys().current().await.is_ok());
+    engine.shutdown().await.unwrap();
+}
+
+/// The other half of decision 9: the file a run outlives the process in needs the host's key, and
+/// `start` names the builder method rather than making one that would die with the process.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_that_outlives_the_process_needs_a_turn_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adam.sqlite");
+    let store: DynStore = Arc::new(adam_store_sqlite::SqliteStore::open(&path).unwrap());
+    let refused = Engine::builder(store.clone(), chat(), MockModel::new().into_dyn(), "m")
+        .start()
+        .await
+        .expect_err("a durable store without a turn key");
+    assert!(matches!(refused, EngineError::NoTurnKeys), "{refused:?}");
+    assert_eq!(refused.class(), ErrorClass::Invalid);
+
+    let keys = <dyn TurnKeys>::ephemeral().unwrap();
+    let engine = Engine::builder(store, chat(), MockModel::new().into_dyn(), "m")
+        .turn_keys(keys)
+        .start()
+        .await
+        .expect("the host's key is enough");
+    engine.shutdown().await.unwrap();
 }
 
 /// A `send` to a conversation whose run works steers it, and the same `Say` twice is read once.

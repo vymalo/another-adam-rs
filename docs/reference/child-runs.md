@@ -1,12 +1,25 @@
 # Child runs and remote tasks
 
 A subagent is a run started by a tool of another run. This page is the full design of the runtime half:
-the local case, the remote (A2A) case, every failure interleaving with the test that makes it happen,
+the local case, the remote (A2A) case, every failure interleaving and what the design does about it,
 and what the design refuses. The picture is in [Architecture](../architecture.md#child-runs); how a
 folder declares subagents is in [Agent files](agent-files.md#subagents-at-run-time).
 
 Code: `crates/adam-runtime` (`start_child`, `child_status`, `child_look`, `resume_child`, the notices), `crates/adam-llm-agent`
 (`pending_wait`, `AwaitRun`, `AwaitRemote`), `crates/adam-assembly` (`SubagentTool`, `RemoteSubagentTool`).
+
+Every interleaving below has a test that makes it happen. The test of each row, and how the tests hold a step
+or move the clock: [child runs, for agents](../../.agents/docs/reference/child-runs.md).
+
+## On this page
+
+* [A local child](#a-local-child)
+* [Failure interleavings](#failure-interleavings)
+* [Cancel cascades and time limits](#cancel-cascades-and-time-limits)
+* [Sessions (ADR 0045, slices 1 to 4)](#sessions-adr-0045-slices-1-to-4)
+* [A child that asks the person](#a-child-that-asks-the-person)
+* [Remote sessions](#remote-sessions)
+* [Remote tasks: the same wait without a message](#remote-tasks-the-same-wait-without-a-message)
 
 ## A local child
 
@@ -80,31 +93,25 @@ wakes the child through itself:
 
 ## Failure interleavings
 
-Each one has a test that makes it happen without sleeping: steps are held at gates, the 60 s timer is
-moved with a `ManualClock`, and a fault is scripted on one run of the `FaultyStore` (`fail_run`,
-`fail_run_after_apply`). Names are in `crates/adam-runtime/tests/runtime.rs` (memory, PostgreSQL and
-MongoDB) and `crates/adam-llm-agent/tests/child_runs.rs`.
-
-| # | What happens | What the design does | Test |
-|---|---|---|---|
-| 1 | The child's terminal commit lands, then its process dies, or delivering to the parent fails | The parent stays parked on its timer. At the timer it reads the child, finds it terminal and answers. Nothing else knows anything is missing | `a_lost_notice_is_recovered_by_the_timer`, `a_lost_notice_is_recovered_when_the_timer_fires` |
-| 2 | The child's terminal commit is applied but its acknowledgement is lost | The worker treats the commit as failed and sends nothing (the run is `Done` in the store and nobody claims it again). Same recovery as 1 | `a_lost_terminal_ack_sends_no_notice_and_the_timer_recovers`, `a_lost_terminal_ack_is_recovered_when_the_timer_fires` |
-| 3 | The message is delivered twice, or three times, or again after the answer is in, or after the run is over | The first match answers the call and clears the wait. Later copies match no wait and are dropped. On a finished parent `deliver` answers `Finished`, which the sender ignores. The model is not asked again | `a_duplicate_notice_is_ignored`, `only_the_awaited_childs_notice_answers` |
-| 4 | The parent is cancelled while it waits | **The child is cancelled too** ([below](#cancel-cascades-and-time-limits)): its worker sees the parent is `Failed` within one poll, fails the child with `cancelled: the parent run ended` and fires its step's token. What the child would have answered is dropped, and the parent stays `Failed` with `cancelled: <reason>`, untouched | `cancelling_a_waiting_parent_cancels_its_child`, `cancelling_the_parent_cancels_the_child_too`, `a_running_child_and_its_child_are_told_within_one_poll`, `cancel_task_reaches_the_subagent_run` |
-| 5 | The child fails, is cancelled, or was purged | The parent gets `status: failed` and the reason (or, for a purged child, finds it gone) and the tool result is an error result. The run continues | `a_failed_or_cancelled_child_tells_its_parent_why`, `a_failing_child_is_an_error_result`, `a_cancelled_child_is_an_error_result`, `a_child_that_is_gone_is_an_error_result_after_a_purge`, `a_purged_child_reads_as_gone` |
-| 6 | The parent's lease is lost while it waits, or while it starts the child | Fencing is the version compare-and-swap, not the lease. The worker that took over replays the step: the journal has the start, and `start_child` would answer `false` anyway, so there is one child. The first worker's late commit is refused. The message is delivered with the same compare-and-swap, so it lands on whichever version is current. The parent resumes once. The same holds for the step that answers the call: its consumption of the message commits with it, so a worker that takes over sees the message again and answers the same way | `a_parent_that_loses_its_lease_does_not_start_or_resume_twice`, `a_worker_that_loses_its_lease_while_answering_changes_nothing` |
-| 7 | The message arrives before the parent has parked | While the tool step runs: the message waits in the inbox, and the commit turns the park into a wake-up (the rule that already keeps a parked agent from sleeping through a message that arrived during its step). In a replay or a retry of that step: the snapshot the step starts from already holds the message but the wait is not recorded yet, so the agent matches it *after* the tool has returned `AwaitRun`, in the same transition, and never parks | `a_notice_that_beats_the_park_is_not_lost`, `a_notice_that_beats_the_park_is_used`, `a_retry_finds_the_notice_before_the_wait_is_recorded` |
-| 8 | The timer fires and the child is still working | One `child_status` read, no answer, a new timer one interval later. No second child, no model call | `a_parent_woken_early_parks_again`, `the_parent_looks_at_the_child_when_the_timer_fires` |
-| 9 | A user message arrives while the parent waits | It wakes the parent, which finds nothing to answer with and parks again. The message is kept and appended after the tool result, as for any owed result | `a_message_while_waiting_queues_behind_the_result` |
-| 10 | A forged, stray or malformed `adam.run.finished` | Matched by the child's run id only, and only a final status counts. Otherwise it is dropped without becoming user text. `child_status` refuses runs that are not the caller's children | `only_the_awaited_childs_notice_answers`, `child_status_reads_only_the_callers_children` |
-| 11 | Two workers start the same child | `create_run` refuses the second (`AlreadyExists`), `start_child` returns `false`. One row | `start_child_records_the_parent_and_is_idempotent` |
-| 12 | The process that finishes the child has never heard of the parent's agent | Delivering needs only the parent's run id: it does not have to register the parent's agent. The parent's own worker steps it | the split `front` and `back` runtimes of cases 1, 2, 5 and 6 |
-| 13 | The message races the timer: the parent reads the finished child at its timer, and the message lands while that step finishes (during the final model call, or before its commit) | The message answers nothing: the wait is settled. `Ctx::arrived` and the commit's reopen rule do not count a child's notice, so the parent finishes with its answer, as it would if the message came after the commit (then `deliver` answers `Finished`). The model is not asked again | `a_childs_notice_that_lands_while_a_run_finishes_does_not_reopen_it`, `a_notice_that_lands_while_the_parent_finishes_costs_no_model_turn` |
-
-| 14 | A child runs past its time limit | The runtime fails it with `cancelled: time limit: the run did not finish within 30 min`: before a step, within one poll for a step in flight (its token fires), and at the wake it set at the deadline for a parked one. The parent gets "the run failed: cancelled: time limit: ..." as the tool result and goes on | `a_child_past_its_deadline_fails_and_wakes_at_it`, `a_child_past_its_limit_is_an_error_result_for_its_parent` |
-| 15 | A child is created after its parent was cancelled | It is cancelled when it is claimed, before it steps. A `Done` parent changes nothing, and a parent that is not in the store is unknown and cancels nothing | `a_child_created_after_the_cancel_never_steps`, `a_child_follows_a_parent_that_failed_but_not_one_that_is_done`, `a_done_parent_that_was_purged_leaves_its_open_child_running`, `a_child_parked_on_a_question_is_cancelled_when_its_parent_is`, `a_grandchild_under_a_parked_child_follows`, `a_healthy_parked_child_is_woken_without_stepping_the_agent` |
-| 16 | The same cancel arrives twice | The second is a no-op: a terminal run is left as it is | `a_child_created_after_the_cancel_never_steps` |
-| 17 | The parent is cancelled while a worker claims it (it was woken by a notice), and the claim reads the run after the cancel (the MongoDB store reads after setting the lease) | The worker gets the parent already `Failed` and does not step it: the cancel stands, so the child sees its parent end and the hook runs for it | `a_claimed_run_that_is_cancelled_already_is_not_stepped` (`src/worker.rs`), `a_parent_cascade_and_a_deadline_run_the_hook` |
+| # | What happens | What the design does |
+|---|---|---|
+| 1 | The child's terminal commit lands, then its process dies, or delivering to the parent fails | The parent stays parked on its timer. At the timer it reads the child, finds it terminal and answers. Nothing else knows anything is missing |
+| 2 | The child's terminal commit is applied but its acknowledgement is lost | The worker treats the commit as failed and sends nothing (the run is `Done` in the store and nobody claims it again). Same recovery as 1 |
+| 3 | The message is delivered twice, or three times, or again after the answer is in, or after the run is over | The first match answers the call and clears the wait. Later copies match no wait and are dropped. On a finished parent `deliver` answers `Finished`, which the sender ignores. The model is not asked again |
+| 4 | The parent is cancelled while it waits | **The child is cancelled too** ([below](#cancel-cascades-and-time-limits)): its worker sees the parent is `Failed` within one poll, fails the child with `cancelled: the parent run ended` and fires its step's token. What the child would have answered is dropped, and the parent stays `Failed` with `cancelled: <reason>`, untouched |
+| 5 | The child fails, is cancelled, or was purged | The parent gets `status: failed` and the reason (or, for a purged child, finds it gone) and the tool result is an error result. The run continues |
+| 6 | The parent's lease is lost while it waits, or while it starts the child | Fencing is the version compare-and-swap, not the lease. The worker that took over replays the step: the journal has the start, and `start_child` would answer `false` anyway, so there is one child. The first worker's late commit is refused. The message is delivered with the same compare-and-swap, so it lands on whichever version is current. The parent resumes once. The same holds for the step that answers the call: its consumption of the message commits with it, so a worker that takes over sees the message again and answers the same way |
+| 7 | The message arrives before the parent has parked | While the tool step runs: the message waits in the inbox, and the commit turns the park into a wake-up (the rule that already keeps a parked agent from sleeping through a message that arrived during its step). In a replay or a retry of that step: the snapshot the step starts from already holds the message but the wait is not recorded yet, so the agent matches it *after* the tool has returned `AwaitRun`, in the same transition, and never parks |
+| 8 | The timer fires and the child is still working | One `child_status` read, no answer, a new timer one interval later. No second child, no model call |
+| 9 | A user message arrives while the parent waits | It wakes the parent, which finds nothing to answer with and parks again. The message is kept and appended after the tool result, as for any owed result |
+| 10 | A forged, stray or malformed `adam.run.finished` | Matched by the child's run id only, and only a final status counts. Otherwise it is dropped without becoming user text. `child_status` refuses runs that are not the caller's children |
+| 11 | Two workers start the same child | `create_run` refuses the second (`AlreadyExists`), `start_child` returns `false`. One row |
+| 12 | The process that finishes the child has never heard of the parent's agent | Delivering needs only the parent's run id: it does not have to register the parent's agent. The parent's own worker steps it |
+| 13 | The message races the timer: the parent reads the finished child at its timer, and the message lands while that step finishes (during the final model call, or before its commit) | The message answers nothing: the wait is settled. `Ctx::arrived` and the commit's reopen rule do not count a child's notice, so the parent finishes with its answer, as it would if the message came after the commit (then `deliver` answers `Finished`). The model is not asked again |
+| 14 | A child runs past its time limit | The runtime fails it with `cancelled: time limit: the run did not finish within 30 min`: before a step, within one poll for a step in flight (its token fires), and at the wake it set at the deadline for a parked one. The parent gets "the run failed: cancelled: time limit: ..." as the tool result and goes on |
+| 15 | A child is created after its parent was cancelled | It is cancelled when it is claimed, before it steps. A `Done` parent changes nothing, and a parent that is not in the store is unknown and cancels nothing |
+| 16 | The same cancel arrives twice | The second is a no-op: a terminal run is left as it is |
+| 17 | The parent is cancelled while a worker claims it (it was woken by a notice), and the claim reads the run after the cancel (the MongoDB store reads after setting the lease) | The worker gets the parent already `Failed` and does not step it: the cancel stands, so the child sees its parent end and the hook runs for it |
 
 ## Cancel cascades and time limits
 
@@ -395,29 +402,26 @@ answer has streamed, not before the call.
 
 ### Session interleavings
 
-Each has a test in `crates/adam-llm-agent/tests/sessions.rs` (memory, PostgreSQL and MongoDB, with no fixed sleeps; the report
-is read from the store, the notice is only a wake-up).
-
-| # | What happens | What the design does | Test |
-|---|---|---|---|
-| S1 | The parent's start call is made again (a replay, a retry after the call acted) | The id of the session is derived from the call: a repeat finds the round, so one child ran, and the tool answers what it answered | `a_retried_try_starts_nothing_twice` |
-| S2 | A worker takes over between any two steps | Every read of the store or the clock in the loop is a journaled step (`tool:`, `poll:`, `sessions:`): a copy of the journal gives the same history with no child started and no model asked | `every_step_replays_from_the_journal_to_the_same_history` |
-| S3 | The round's notice is lost | The parent is parked on its timer, and the step that wakes it reads the session through the tool | `a_lost_notice_is_recovered_by_the_timer` |
-| S4 | The notice arrives again, or a forged one arrives | It wakes the parent, which looks, finds the round still working and parks again with no model call; the report is never taken from a notice | `a_duplicate_notice_is_ignored` |
-| S5 | `subagent_read` waits and the round ends | One resume, with the report as the call's result; three reads that do not wait and say "working" are refused on the third | `a_read_with_wait_parks_and_resumes_once_with_the_report`, `polling_is_refused_and_waiting_is_not` |
-| S6 | The model answers while a session works | The run waits for it and calls the model again with the report | `a_start_returns_at_once_and_the_turn_end_waits_for_the_report` |
-| S7 | The parent is cancelled while a session works | The round is failed by the cascade; a kept-open session is idle and a later task of the conversation reads it and sends it a round that continues it | `cancelling_the_parent_leaves_a_kept_open_session_idle` |
-| S8 | A message reaches a working round, or a close request does | The message is read as a steer (the round's next request ends with it); the request makes the round the last and costs no model turn | `a_message_to_a_working_round_is_steered`, `closing_a_working_session_lets_the_round_finish` |
-| S9 | An id that is unknown, malformed or another conversation's | An error result in words that say what to do; nothing is started | `a_session_that_is_not_ours_is_refused_in_words` |
-| S10 | A session on a remote subagent | A round of the agent registered under the subagent's name, which talks to the remote ([below](#remote-sessions)) | `a_remote_subagent_starts_a_round_of_its_registered_agent` |
-| S11 | A round ends while the parent does other work, and a closing round may follow it | The next model call lists the sessions and is given the round's report as a `subagent_read` call and result, with no read by the model; the request starts with the one before; a closing round does not hide it | `a_report_that_ends_mid_turn_reaches_the_next_model_call`, `reports_during_a_turn_keep_the_prefix`, `a_closing_round_does_not_hide_the_report_of_the_round_before` |
-| S12 | A round ends during the parent's final model call | The turn does not end on that answer: `sessions:<turn>` finds the round due and `wait_<turn>` reads it at once | `a_report_during_the_final_model_call_reopens_the_turn` |
-| S13 | The notice of that end is lost, or comes twice | The next call finds the report in the store; a copy of a notice matches nothing: no second report, no extra model call | `a_report_is_found_in_the_store_when_its_notice_is_lost`, `a_lost_notice_while_the_parent_is_parked_costs_one_turn`, `a_duplicate_report_notice_matches_nothing` |
-| S14 | A person's round ended | It is reported at the next listing, in this task while a session is open or at the first call of a task that continues this one, once (a task that does not continue another is not told of a round that ended before it began); the header says "started by the person" and the person's words are not in it | `a_persons_round_is_reported_as_the_persons`, `a_persons_round_is_reported_in_a_later_task`, `a_fresh_task_tells_only_the_persons_rounds_that_ended_after_it_began` |
-| S15 | The model read the report itself, or the run has no session | A report the model read is not appended again; a run that never opens a session lists once, at its first call | `a_report_read_by_the_model_is_not_appended_again`, `a_run_without_sessions_lists_only_at_its_first_model_call` |
-| S16 | A journal from before slice 3, or one with reports, is replayed, with a message that arrived since | The same history, no model asked, no child run, no disagreement; the rounds are counted once even when the answer is dropped as stale | `a_journal_from_before_reports_replays_to_the_same_history`, `a_replay_appends_the_same_reports`, `a_replay_of_a_stale_answer_counts_each_round_once` |
-| S17 | A session has sat idle for `idle_ttl` | It reads closed, frees its place, refuses a send in words; a working round never expires; its unreported report is told once | `each_limit_refuses_in_words`, `an_idle_expired_session_refuses_a_send_as_closed`, `an_expired_sessions_report_is_still_told_once` |
-| S18 | A round asks the person, and one that may not asks anyway | A shown kept-open round parks `input-required` and the parent's read says `blocked`; an answer in the child context resumes it; a child that may not ask is told `NOT_ASKABLE` and goes on | `a_persons_round_that_asks_the_person_is_blocked_and_the_answer_resumes_it`, `a_child_run_that_is_no_shown_session_cannot_ask`, `a_shown_round_asks_the_person_who_answers_it_in_the_child_context` |
+| # | What happens | What the design does |
+|---|---|---|
+| S1 | The parent's start call is made again (a replay, a retry after the call acted) | The id of the session is derived from the call: a repeat finds the round, so one child ran, and the tool answers what it answered |
+| S2 | A worker takes over between any two steps | Every read of the store or the clock in the loop is a journaled step (`tool:`, `poll:`, `sessions:`): a copy of the journal gives the same history with no child started and no model asked |
+| S3 | The round's notice is lost | The parent is parked on its timer, and the step that wakes it reads the session through the tool |
+| S4 | The notice arrives again, or a forged one arrives | It wakes the parent, which looks, finds the round still working and parks again with no model call; the report is never taken from a notice |
+| S5 | `subagent_read` waits and the round ends | One resume, with the report as the call's result; three reads that do not wait and say "working" are refused on the third |
+| S6 | The model answers while a session works | The run waits for it and calls the model again with the report |
+| S7 | The parent is cancelled while a session works | The round is failed by the cascade; a kept-open session is idle and a later task of the conversation reads it and sends it a round that continues it |
+| S8 | A message reaches a working round, or a close request does | The message is read as a steer (the round's next request ends with it); the request makes the round the last and costs no model turn |
+| S9 | An id that is unknown, malformed or another conversation's | An error result in words that say what to do; nothing is started |
+| S10 | A session on a remote subagent | A round of the agent registered under the subagent's name, which talks to the remote ([below](#remote-sessions)) |
+| S11 | A round ends while the parent does other work, and a closing round may follow it | The next model call lists the sessions and is given the round's report as a `subagent_read` call and result, with no read by the model; the request starts with the one before; a closing round does not hide it |
+| S12 | A round ends during the parent's final model call | The turn does not end on that answer: `sessions:<turn>` finds the round due and `wait_<turn>` reads it at once |
+| S13 | The notice of that end is lost, or comes twice | The next call finds the report in the store; a copy of a notice matches nothing: no second report, no extra model call |
+| S14 | A person's round ended | It is reported at the next listing, in this task while a session is open or at the first call of a task that continues this one, once (a task that does not continue another is not told of a round that ended before it began); the header says "started by the person" and the person's words are not in it |
+| S15 | The model read the report itself, or the run has no session | A report the model read is not appended again; a run that never opens a session lists once, at its first call |
+| S16 | A journal from before slice 3, or one with reports, is replayed, with a message that arrived since | The same history, no model asked, no child run, no disagreement; the rounds are counted once even when the answer is dropped as stale |
+| S17 | A session has sat idle for `idle_ttl` | It reads closed, frees its place, refuses a send in words; a working round never expires; its unreported report is told once |
+| S18 | A round asks the person, and one that may not asks anyway | A shown kept-open round parks `input-required` and the parent's read says `blocked`; an answer in the child context resumes it; a child that may not ask is told `NOT_ASKABLE` and goes on |
 
 **Tokens.** Each round a run started or sent to is counted once in the run's `usage_totals`: a journaled step `usage:<call id>` reads it when a report is given to the model and, at the latest, when the run ends (`sessions_end`), whether or not the report was read; a store error on the read is retried. **Known limit:** the checks scan every round of the conversation, and past 5,000 rounds of one subagent a start **and a send** are refused.
 
@@ -611,20 +615,18 @@ look, or report. Every call to the remote is a journaled step (`card`, `send:<n>
 
 ### Remote session interleavings
 
-Each has a test in `crates/adam-assembly/tests/remote_sessions.rs` (memory, and PostgreSQL when set).
-
-| # | What happens | What the design does | Test |
-|---|---|---|---|
-| R1 | A second round | It sends the remote's `contextId` and `referenceTaskIds` of the task before | `a_remote_session_keeps_its_context_across_rounds` |
-| R2 | A message while the task works, the card lists `steer/v1` | Sent to the task as a steer, `delivered: steered`, no new task | `a_message_to_a_working_remote_session_is_steered_when_the_card_lists_steer` |
-| R3 | The same, the card does not list it | Queued, sent as the next task of the round, `delivered: queued`; the report has both answers | `a_message_is_queued_and_sent_as_the_next_task_when_the_card_does_not` |
-| R4 | The process restarts while the task works | The task id is in the state: the new process looks at it and sends nothing again | `a_restart_mid_round_resumes_polling_without_sending_again` |
-| R5 | The send's response is lost | The step is retried with the same message id and finds the task | `a_lost_send_response_is_retried_under_the_same_message_id` |
-| R6 | The remote fails | The round fails with the remote's words and the session stays usable | `a_remote_round_that_fails_reads_failed_and_the_session_stays_usable` |
-| R7 | The remote asks a question | It is the report, and the next message answers that task | `a_question_is_reported_and_the_next_round_answers_by_task_id` |
-| R8 | The session is closed | The closing round calls nothing and repeats the last report | `closing_a_remote_session_is_local` |
-| R9 | The round is cancelled: `subagent_close` with `cancel`, the parent, or the time limit | `Agent::on_cancelled` sends `CancelTask` (10 s limit, best effort) | `cancelling_a_remote_session_sends_cancel_task`, `cancelling_the_parent_sends_cancel_task`, `a_round_past_its_limit_cancels_the_remote_task` |
-| R10 | The cancel is lost | The next round of the session cancels the task the round before left working (`cancel-prior`) | `a_lost_cancel_is_sent_by_the_next_round` |
+| # | What happens | What the design does |
+|---|---|---|
+| R1 | A second round | It sends the remote's `contextId` and `referenceTaskIds` of the task before |
+| R2 | A message while the task works, the card lists `steer/v1` | Sent to the task as a steer, `delivered: steered`, no new task |
+| R3 | The same, the card does not list it | Queued, sent as the next task of the round, `delivered: queued`; the report has both answers |
+| R4 | The process restarts while the task works | The task id is in the state: the new process looks at it and sends nothing again |
+| R5 | The send's response is lost | The step is retried with the same message id and finds the task |
+| R6 | The remote fails | The round fails with the remote's words and the session stays usable |
+| R7 | The remote asks a question | It is the report, and the next message answers that task |
+| R8 | The session is closed | The closing round calls nothing and repeats the last report |
+| R9 | The round is cancelled: `subagent_close` with `cancel`, the parent, or the time limit | `Agent::on_cancelled` sends `CancelTask` (10 s limit, best effort) |
+| R10 | The cancel is lost | The next round of the session cancels the task the round before left working (`cancel-prior`) |
 
 **Limits.** The cancel is not durable, and every cancel here (`on_cancelled`, `cancel-prior`, `cancel-limit`) is one try:
 a failed `CancelTask` is logged and not repeated. The send's request is committed before the call (`sending`), so a cancel
@@ -699,14 +701,14 @@ stateDiagram-v2
   the same task). The journal makes the call once per recorded outcome regardless.
 * **Failure interleavings.**
 
-| # | What happens | What the design does | Test |
-|---|---|---|---|
-| 1 | The process dies while the parent waits | The wait is in the run's committed state. A new process claims the run at the timer and polls the recorded task: no second send | `a_restart_mid_wait_resumes_polling_without_sending_again` (`adam-assembly`), `a_new_process_keeps_polling_without_starting_the_task_again` (`adam-llm-agent`) |
-| 2 | The send reaches the remote and its response is lost | The step fails transiently and is retried; the retry sends the same `messageId`, and a deduplicating remote returns the task it made | `a_send_whose_response_is_lost_is_retried_under_the_same_message_id` |
-| 3 | The remote finishes while nobody polls | The next timer wake finds it final and answers | the restart case above |
-| 4 | The task never ends | At the deadline (default one hour, `AgentDef::remote_timeout`) the call is answered with an error result; the remote task keeps running | `a_task_that_never_ends_is_given_up_on_after_the_limit`, `a_task_that_outlives_its_timeout_is_an_error_result_without_another_look` |
-| 5 | The remote fails, cancels, rejects, or wants input | An error result naming the state and the remote's message; the run goes on | `a_remote_task_that_fails_is_an_error_result_and_the_parent_goes_on`, `a_remote_task_that_is_canceled_is_an_error_result`, `a_remote_that_needs_input_is_an_error_result_because_nobody_can_answer` |
-| 6 | The remote answers 401 or the card points the token elsewhere | An error result; nothing is sent to the other origin | `a_wrong_token_is_an_error_result_not_a_failed_run_and_the_token_stays_out_of_it`, `a_card_that_points_the_token_at_another_origin_is_refused_before_anything_is_sent` |
+| # | What happens | What the design does |
+|---|---|---|
+| 1 | The process dies while the parent waits | The wait is in the run's committed state. A new process claims the run at the timer and polls the recorded task: no second send |
+| 2 | The send reaches the remote and its response is lost | The step fails transiently and is retried; the retry sends the same `messageId`, and a deduplicating remote returns the task it made |
+| 3 | The remote finishes while nobody polls | The next timer wake finds it final and answers |
+| 4 | The task never ends | At the deadline (default one hour, `AgentDef::remote_timeout`) the call is answered with an error result; the remote task keeps running |
+| 5 | The remote fails, cancels, rejects, or wants input | An error result naming the state and the remote's message; the run goes on |
+| 6 | The remote answers 401 or the card points the token elsewhere | An error result; nothing is sent to the other origin |
 
 * **What it refuses to do.** No streaming yet (`SubscribeToTask` would end the wait sooner; the poll stays as
   the fallback); no cancel of the remote task when the parent is cancelled or the wait times out (the tool has no

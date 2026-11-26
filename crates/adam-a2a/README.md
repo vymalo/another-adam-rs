@@ -93,6 +93,11 @@ the page reads `../openapi.json` (relative, so a nested router works), the docum
 address the page came from: Swagger UI resolves it against the document's URL, *verified 2026-10-07* in the bundled
 `swagger-ui-bundle.js` and in headless Chromium), the validator badge and `?url=` are off and the token is not persisted.
 
+A copy of that document for the published docs is committed at `docs/api/a2a-server.openapi.json`, built from one fixed
+default card (bearer required, push notifications and the extended card off) so that it changes only when `src/openapi.rs`
+does. The test `the_committed_document_is_the_one_the_code_builds` holds the two equal, and its failure names the command
+that rewrites the file: `ADAM_UPDATE_GOLDEN=1 cargo test -p adam-a2a --lib the_committed_document_is_the_one_the_code_builds`.
+
 Protocol notes (details in the crate docs, `src/lib.rs`; the SDK's `RequestHandler` is implemented in `src/handler.rs`):
 
 * Serves A2A **1.0** method names: `SendMessage`, `SendStreamingMessage`,

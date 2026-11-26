@@ -665,6 +665,14 @@ impl Store for MemoryStore {
         true
     }
 
+    /// Everything this store holds is lost when the process exits, so it is the one store that may
+    /// sign with an ephemeral turn key ([ADR 0068] decision 9).
+    ///
+    /// [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+    fn outlives_the_process(&self) -> bool {
+        false
+    }
+
     async fn gc_body(
         &self,
         run: RunId,

@@ -334,8 +334,9 @@ A struct literal of `SessionSummary` stops compiling.
 **Breaking:** cancelling a parent cancels its children. A subagent run stops after 30 minutes unless its file says
 otherwise (`limits.max_minutes`). Take the inbox in every step that can park, including the
 step that starts the child: a message already in the inbox when a step starts is not "arrived during the step",
-and an agent that parks without reading it sleeps until its timer. The design, the failure interleavings and
-the tests that make each happen are in [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#failure-interleavings).
+and an agent that parks without reading it sleeps until its timer. The design and the failure interleavings are in
+[`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#failure-interleavings), and the test that makes
+each happen in [`.agents/docs/reference/child-runs.md`](../../.agents/docs/reference/child-runs.md).
 
 ### Child sessions (ADR 0045, slices 1 and 2)
 
