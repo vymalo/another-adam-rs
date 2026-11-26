@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use adam_budget::{Admission, Ask, ConversationId, DynAdmission, Permit, Pool, Refused};
 use adam_core::time::Timestamp;
+use adam_core::turn::DynTurnKeys;
 use adam_core::{RunId, RunStatus};
 use adam_error::report;
 use adam_model::{
@@ -1343,6 +1344,7 @@ pub struct LlmAgentBuilder {
     admission: Option<DynAdmission>,
     hooks: HookSet,
     max_run_continuations: u32,
+    turn_keys: Option<DynTurnKeys>,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -1579,6 +1581,20 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// The keys that sign every assistant and tool turn this agent commits ([ADR 0068], slice
+    /// T3a-1): each carries `extra_content.adam.turn_signature`, bound to its run, conversation,
+    /// position and the chain of every message before it. A person's message is chained, never
+    /// signed. Without keys (the default) nothing is signed and a run commits as it always did.
+    /// Nothing is verified here (re-entry is slice T3a-3), and the signature is never sent to a
+    /// model.
+    ///
+    /// [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+    #[must_use]
+    pub fn turn_keys(mut self, keys: DynTurnKeys) -> Self {
+        self.turn_keys = Some(keys);
+        self
+    }
+
     /// Append one plugin to the hook set ([`LlmAgentBuilder::hooks`]); the order plugins are added in
     /// is the order their hooks run in.
     #[must_use]
@@ -1771,6 +1787,7 @@ impl LlmAgentBuilder {
             admission: self.admission,
             hooks: Arc::new(self.hooks),
             max_run_continuations: self.max_run_continuations.min(MAX_RUN_CONTINUATIONS),
+            turn_keys: self.turn_keys,
         }
     }
 }
@@ -2006,6 +2023,8 @@ pub struct LlmAgent {
     hooks: Arc<HookSet>,
     /// The most times `run.ending` hooks may keep one run going (ADR 0050, decision 10).
     max_run_continuations: u32,
+    /// The keys that sign each assistant and tool turn at commit ([`LlmAgentBuilder::turn_keys`]).
+    turn_keys: Option<DynTurnKeys>,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -2117,6 +2136,7 @@ impl LlmAgent {
             admission: None,
             hooks: HookSet::new(),
             max_run_continuations: DEFAULT_RUN_CONTINUATIONS,
+            turn_keys: None,
         }
     }
 
@@ -7399,43 +7419,34 @@ pub(crate) fn render_output(output: Option<&Value>) -> String {
     }
 }
 
-#[async_trait]
-impl Agent for LlmAgent {
-    type State = Conversation;
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The input is the first user message: payload `{"text": "..."}` or a bare
-    /// JSON string (see [`user_message`](crate::user_message)); its `kind` is
-    /// not inspected. The same as [`LlmStarter::init`].
-    fn init(&self, input: Inbound) -> Result<Conversation, AgentError> {
-        start_conversation(input)
-    }
-
-    /// The prior run's conversation with the input as its newest user message, see
-    /// [`Conversation::continued`] for what is carried, dropped and reset. The same as
-    /// [`LlmStarter::init_continuing`].
-    fn init_continuing(
+impl LlmAgent {
+    /// `transition` with every assistant and tool message of its state signed
+    /// (`signing::sign_messages`); unchanged when the agent has no [`turn_keys`](LlmAgentBuilder::turn_keys).
+    async fn sign_transition(
         &self,
-        input: Inbound,
-        prior: &Conversation,
-        prior_run: RunId,
-    ) -> Result<Conversation, AgentError> {
-        continue_conversation(&input, prior, prior_run)
+        ctx: &Ctx,
+        mut transition: Transition<Conversation>,
+    ) -> Result<Transition<Conversation>, AgentError> {
+        let Some(keys) = &self.turn_keys else {
+            return Ok(transition);
+        };
+        let (Transition::Continue(state)
+        | Transition::Park { state, .. }
+        | Transition::Done { state, .. }
+        | Transition::Fail { state, .. }) = &mut transition;
+        crate::signing::sign_messages(
+            keys,
+            ctx.run_id(),
+            ctx.conversation_id(),
+            &mut state.messages,
+        )
+        .await
+        .map_err(|e| AgentError::from_classified("signing the turns of a step failed", e))?;
+        Ok(transition)
     }
 
-    fn split(&self, state: &Conversation) -> Option<(Conversation, Vec<Value>)> {
-        Some(state.split())
-    }
-
-    fn join(&self, head: Conversation, rows: Vec<Value>) -> Result<Conversation, AgentError> {
-        Conversation::join(head, rows)
-    }
-
-    #[tracing::instrument(skip_all, fields(run = %ctx.run_id(), agent = %self.name))]
-    async fn step(
+    /// The transition of one step, before its turns are signed ([`LlmAgent::sign_transition`]).
+    async fn step_unsigned(
         &self,
         ctx: &mut Ctx,
         mut state: Conversation,
@@ -7918,6 +7929,52 @@ impl Agent for LlmAgent {
                 Transition::Fail { state, error }
             }
         })
+    }
+}
+
+#[async_trait]
+impl Agent for LlmAgent {
+    type State = Conversation;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The input is the first user message: payload `{"text": "..."}` or a bare
+    /// JSON string (see [`user_message`](crate::user_message)); its `kind` is
+    /// not inspected. The same as [`LlmStarter::init`].
+    fn init(&self, input: Inbound) -> Result<Conversation, AgentError> {
+        start_conversation(input)
+    }
+
+    /// The prior run's conversation with the input as its newest user message, see
+    /// [`Conversation::continued`] for what is carried, dropped and reset. The same as
+    /// [`LlmStarter::init_continuing`].
+    fn init_continuing(
+        &self,
+        input: Inbound,
+        prior: &Conversation,
+        prior_run: RunId,
+    ) -> Result<Conversation, AgentError> {
+        continue_conversation(&input, prior, prior_run)
+    }
+
+    fn split(&self, state: &Conversation) -> Option<(Conversation, Vec<Value>)> {
+        Some(state.split())
+    }
+
+    fn join(&self, head: Conversation, rows: Vec<Value>) -> Result<Conversation, AgentError> {
+        Conversation::join(head, rows)
+    }
+
+    #[tracing::instrument(skip_all, fields(run = %ctx.run_id(), agent = %self.name))]
+    async fn step(
+        &self,
+        ctx: &mut Ctx,
+        state: Conversation,
+    ) -> Result<Transition<Conversation>, AgentError> {
+        let transition = self.step_unsigned(ctx, state).await?;
+        self.sign_transition(ctx, transition).await
     }
 }
 

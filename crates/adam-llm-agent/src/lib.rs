@@ -156,6 +156,7 @@ mod schedule;
 #[cfg(feature = "schema")]
 mod schema;
 mod sessions;
+mod signing;
 mod source;
 mod state;
 mod step_io;

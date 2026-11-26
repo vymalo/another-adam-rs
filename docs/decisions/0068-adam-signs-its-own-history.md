@@ -414,3 +414,23 @@ namespace only. Another maker's member (`google`, ...) belongs to the bound `pro
 only to the model that produced it, and nowhere else; a maker set in the carrier would have crossed a model switch,
 the leak #324 closed. A model's reply drops the `adam` maker from the provider's members, streamed or not, and leaves
 everything else as sent (an empty `extra_content` object stays one).
+
+## Amended 2026-11-26 (slice T3a-1: signing at commit)
+
+An `LlmAgent` given `LlmAgentBuilder::turn_keys` signs what each step commits (`crates/adam-llm-agent/src/signing.rs`).
+What building it settled:
+
+1. **One seam, not ten.** The loop pushes messages at about ten sites. `Agent::step` is now a wrapper: the old body is
+   `step_unsigned`, and `sign_transition` takes the state of whatever `Transition` it returns (`Continue`, `Park`, `Done`
+   or `Fail`) and signs there, so a new push site is covered with no change.
+2. **Which messages.** Every assistant and tool message without a turn signature, in order, at its transcript index, with
+   `prv` the chain over the messages before it as stored. The chain is folded once per commit, a person's message
+   included and unsigned, each link taken over the message with its signature. Messages after the last unsigned one are
+   not read, and a commit with no new turn does no work. A message that already has a signature is left as it is.
+3. **No keys, no change.** Without `turn_keys` the transcript is byte for byte what it was. The host sets the keys (the
+   engine's and the service's wiring of `TURN_SIGNING_KEY_FILE` to the agent is T2); no variable is read.
+4. **A signing failure is the step's failure** (a `TurnKeyError` keeps its class: the runtime retries or fails the run as for any step error): a turn is never committed unsigned by a configured agent.
+5. **Still not done:** verifying on re-entry (T3a-3), the head's signature and the journal's, and re-signing after a
+   compaction, a shortening or a carry (a shortened old tool row keeps the signature of its original text until then).
+   A run that predates the keys is signed from its first unsigned turn at its next commit, which is the adoption of
+   decision 11 in effect; its count (`adam_turns_adopted_total`) is not built.
