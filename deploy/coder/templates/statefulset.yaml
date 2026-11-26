@@ -2,6 +2,8 @@
 {{- $githubApp := include "coder.githubApp" . -}}
 {{- /* The signing key is for the pod that serves A2A: the combined one, not the split worker. */ -}}
 {{- $cardSigning := and (not $split) (include "coder.a2aCardSigning" .) -}}
+{{- /* The turn key (ADR 0068) is for every role, the split worker included. */ -}}
+{{- $turnSigning := include "coder.turnSigning" . -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -381,6 +383,9 @@ spec:
               value: {{ $value | quote }}
             {{- end }}
             {{- include "coder.databaseUrlEnv" . | nindent 12 }}
+            {{- with (include "coder.turnSigningEnv" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- if .Values.externalSecrets.enabled }}
             {{- if include "coder.runsWorkers" . }}
             - name: MODEL_API_KEY
@@ -496,7 +501,12 @@ spec:
               mountPath: {{ include "coder.a2aCardSigningDir" . }}
               readOnly: true
             {{- end }}
-      {{- if or (include "coder.sharedWork" .) (include "coder.cache" .) $githubApp (include "coder.extraMcp" .) (include "coder.modelProfiles" .) (include "coder.references" .) (include "coder.runPods" .) $cardSigning }}
+            {{- if $turnSigning }}
+            - name: turn-signing
+              mountPath: {{ include "coder.turnSigningDir" . }}
+              readOnly: true
+            {{- end }}
+      {{- if or (include "coder.sharedWork" .) (include "coder.cache" .) $githubApp (include "coder.extraMcp" .) (include "coder.modelProfiles" .) (include "coder.references" .) (include "coder.runPods" .) $cardSigning $turnSigning }}
       volumes:
         {{- if include "coder.sharedWork" . }}
         - name: work
@@ -583,6 +593,20 @@ spec:
             items:
               - key: private-key.pem
                 path: private-key.pem
+        {{- end }}
+        {{- if $turnSigning }}
+        - name: turn-signing
+          secret:
+            # The ExternalSecret's own Secret: the chart copies the key from AWS and never carries it.
+            secretName: {{ include "coder.secretName" . }}
+            defaultMode: 0440
+            items:
+              - key: TURN_SIGNING_KEY.pem
+                path: private-key.pem
+              {{- if include "coder.turnVerifyKeys" . }}
+              - key: TURN_VERIFY_KEYS.json
+                path: verify-keys.json
+              {{- end }}
         {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}

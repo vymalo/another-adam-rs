@@ -278,6 +278,16 @@ from service.yaml, which every render contains, so they always run.
 {{- fail "config.modelBaseUrlFromSecret is on: externalSecrets.properties.modelBaseUrl must name the AWS property that holds the gateway's URL (model_base_url)" -}}
 {{- end -}}
 {{- end -}}
+{{- /* The turn key (ADR 0068): a key is never a chart value, and the verify set needs the key. */ -}}
+{{- if and .Values.externalSecrets.properties.turnSigningKey (not .Values.externalSecrets.enabled) -}}
+{{- fail "externalSecrets.properties.turnSigningKey is set and externalSecrets.enabled=false: the turn key comes from the ExternalSecret only. Set externalSecrets.enabled=true, or empty the property" -}}
+{{- end -}}
+{{- if and .Values.turnSigning.keyId (not .Values.externalSecrets.properties.turnSigningKey) -}}
+{{- fail "turnSigning.keyId is set and externalSecrets.properties.turnSigningKey is empty: a key id names a key the chart is not given. Set the property, or empty turnSigning.keyId" -}}
+{{- end -}}
+{{- if and .Values.externalSecrets.properties.turnVerifyKeys (not .Values.externalSecrets.properties.turnSigningKey) -}}
+{{- fail "externalSecrets.properties.turnVerifyKeys is set and externalSecrets.properties.turnSigningKey is empty: a verify set without a signing key is never read. Set the key's property, or empty the verify set's" -}}
+{{- end -}}
 {{- /* config.modelAuth: MODEL_AUTH, a string, one of key, device or injector (the binary folds case but not whitespace; the chart normalises before rendering). */ -}}
 {{- if not (kindIs "string" .Values.config.modelAuth) -}}
 {{- fail (printf "config.modelAuth must be a string: key, device or injector, or empty for the binary's default (key); got %q" (toString .Values.config.modelAuth)) -}}

@@ -955,6 +955,20 @@ pub trait Store: Send + Sync + 'static {
         false
     }
 
+    /// Whether this store outlives the process that writes it: `true` (the default) for a file, a
+    /// database or a service, `false` for a store that dies with the process
+    /// ([`MemoryStore`](crate::MemoryStore)).
+    ///
+    /// The engine reads it at start ([ADR 0068] decision 9): a store that outlives the process
+    /// refuses to start without a turn key, because the history it keeps has to be signed; one that
+    /// dies with the process signs with an ephemeral key, as the history does. An adapter that
+    /// forgets this method is treated as durable, so the mistake fails closed.
+    ///
+    /// [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+    fn outlives_the_process(&self) -> bool {
+        true
+    }
+
     /// The rows of generation `generation` of `run`, ordered by [`idx`](BodyRow::idx); empty when
     /// it does not exist (never written, or collected after a compaction).
     ///
