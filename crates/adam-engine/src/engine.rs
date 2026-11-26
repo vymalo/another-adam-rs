@@ -217,8 +217,8 @@ impl EngineBuilder {
     /// store that outlives the process ([`Store::outlives_the_process`](adam_core::Store::outlives_the_process))
     /// needs one and [`start`](Self::start) refuses it without: the host reads it from a keychain, a
     /// KMS or an HSM, and adam never reads the key itself. A store that dies with the process signs
-    /// with [`TurnKeys::ephemeral`](adam_core::TurnKeys::ephemeral), a key made at start that dies
-    /// with it, as the history does.
+    /// with `<dyn TurnKeys>::ephemeral()`, a key made at start that dies with it, as the history
+    /// does.
     ///
     /// [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
     pub fn turn_keys(mut self, keys: DynTurnKeys) -> Self {
