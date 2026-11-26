@@ -534,6 +534,18 @@ slice T3a-2) makes the runtime sign what it commits as a run's state and check i
 * **No keys, no change.** Nothing is signed or required, a signature already in a state is not read, and a write without
   keys drops it. **With** keys, a run with no signature at all is adopted (ADR 0068 decision 11, release N) and signed at
   its next commit that writes rows; a head with no signature over a row that carries a turn signature is refused.
+* **Failures.** A head that does not verify is `Corrupt` and a claimed run fails with no step. A key set that cannot be
+  read at a claim does **not** fail the run: the lease is kept and the run is tried again when it expires (a persistent
+  `NotSigning` or `Refused` retries for as long as it lasts). A cancel fails during a key outage and writes nothing; a corrupt
+  run is still cancelled (written unsigned).
+* **A process that hosts no agent** reads and delivers to a signed v4 run, but cannot chain the agent's rows: the read checks
+  nothing of the state and a delivery writes it unsigned (register the agent as a starter to avoid it).
+* **A parent's read of a child** (`Ctx::child_status` of a finished child, `Ctx::child_look`) verifies the child's head
+  first (a signed head against its own `seal`, no row read); a child that does not verify is reported `Failed`, never
+  as its output. `Runtime::view`, `view_from_record` and A2A `GetTask` and `ListTasks` check nothing.
+* **Mixed fleets.** A worker without keys drops head signatures when it writes, so a signed turn later makes that head
+  refused; and release N gives an agent that does not sign its turns no downgrade resistance (stripping `signature` passes
+  adoption).
 * **Not done** (T3a-3 and T2): the turns' own signatures are not verified on re-entry, the journal is not signed, and no
   host sets the keys yet (the engine and the service), so only an embedder that calls `turn_keys` is affected.
 

@@ -889,7 +889,7 @@ it signs the run, its conversation, how many rows the transcript has, a hash of 
 state (the inbox, the owed calls, the summary, the counters). When it reads a run back it recomputes the hash and checks
 that one signature before the agent runs. Change a field, add or drop a row, or move the run to another conversation and
 the run fails as corrupt, with no model call. This is on only when the runtime is given keys; without them nothing
-changes. A run with no signature at all, from before the keys, is accepted and signed at its next commit.
+changes. A run with no signature at all, from before the keys, is accepted and signed at its next commit. If the keys cannot be reached when a run is picked up, the run waits and is tried again; it is not failed for it. A parent that reads a finished child's result checks the child first, and a child that does not check out is reported as failed, never as its forged output.
 
 ### The access tier: which tools a step may use
 

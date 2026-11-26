@@ -56,6 +56,14 @@ Written 2026-11-26 on top of #453.
 * **Errors.** `RuntimeError::Corrupt` (source `TurnSignatureError`) for a refused head, new `RuntimeError::TurnKeys` for a
   key set that cannot be read or keys that cannot sign. A claimed run that does not verify is committed `Failed`, state as
   found, by the existing unreadable-state path.
+* **Review of #454 (2026-11-26).** `Inner::transcript_of(run, agent, state)` is `Result<Option<rows>>`: `None` for an agent
+  not registered here (the v4 chain check is skipped, `check_full`; `reseal` writes unsigned), `Corrupt` for a state that does
+  not decode. `worker.rs` `transition`: a `RuntimeError::TurnKeys` from `claimed` returns `false` (lease kept), only `Corrupt`
+  commits `Failed`. `Inner::reseal` swallows only `Corrupt` when not strict. `Inner::verify_child` (`runtime.rs`) is called by
+  `Ctx::child_status` (terminal children) and `Ctx::child_look`; `Sealer::check_sealed` checks a head by its own `seal`.
+  `worker.rs` `verify_reloaded` checks the record the CAS retry reloads; `seal_update` refuses a signed base with no usable
+  seal (`StoreError::Corrupt`). Tests: `tests/head_signature.rs` (outage, front end, cancel, child), `worker.rs` `claim_tests`.
+  Broken on purpose: `verify_reloaded` and `verify_child` made to return `Ok` fail their tests.
 * **Checked 2026-11-26:** `cargo test -p adam-core -p adam-runtime --locked`; breaking `seal.rs` `check_read` (chain over no
   rows) fails 6 of 12 cases of `head_signature.rs`.
 

@@ -8,10 +8,13 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use adam_core::turn::{ChainHash, ConversationHash, DynTurnKeys, TurnKeys, verify_head};
+use adam_core::turn::{
+    ChainHash, ConversationHash, CurrentKey, DynTurnKeys, KeyId, KeySet, Signature, TurnKeyError,
+    TurnKeys, verify_head,
+};
 use adam_core::{
     BodyRow, BodyWrite, DynStore, MemoryStore, RunId, RunStatus, RunUpdate, head_body,
 };
@@ -235,6 +238,51 @@ fn without_bodies() -> DynStore {
     Arc::new(common::recording::RecordingStore::new(memory()).without_bodies())
 }
 
+/// Keys whose key set can be taken down: while `down` is set, or for the next `failures` reads,
+/// `key_set` answers `Unavailable` (class `Transient`); signing is untouched.
+struct Flaky {
+    inner: DynTurnKeys,
+    down: AtomicBool,
+    failures: AtomicUsize,
+    reads: AtomicUsize,
+}
+
+impl Flaky {
+    fn over(inner: &DynTurnKeys) -> Arc<Self> {
+        Arc::new(Self {
+            inner: inner.clone(),
+            down: AtomicBool::new(false),
+            failures: AtomicUsize::new(0),
+            reads: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl TurnKeys for Flaky {
+    async fn current(&self) -> Result<CurrentKey, TurnKeyError> {
+        self.inner.current().await
+    }
+
+    async fn sign(&self, kid: &KeyId, input: &[u8]) -> Result<Signature, TurnKeyError> {
+        self.inner.sign(kid, input).await
+    }
+
+    async fn key_set(&self) -> Result<Arc<KeySet>, TurnKeyError> {
+        self.reads.fetch_add(1, SeqCst);
+        let once = self
+            .failures
+            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if once || self.down.load(SeqCst) {
+            return Err(TurnKeyError::Unavailable(Box::new(std::io::Error::other(
+                "the key set is down",
+            ))));
+        }
+        self.inner.key_set().await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // What is written
 // ---------------------------------------------------------------------------
@@ -390,6 +438,9 @@ async fn a_member_of_the_runtime_changed_is_refused_corrupt() {
     assert_eq!(err.class(), ErrorClass::Corrupt);
 }
 
+/// Appending a row makes the **store** raise the head's `body.len` (the head is written back
+/// otherwise unchanged), so what this exercises is a `len` that no longer matches the signed one,
+/// and a chain that no longer matches the rows: either alone refuses the run.
 #[tokio::test]
 async fn a_row_appended_past_len_is_refused_corrupt() {
     let store = memory();
@@ -590,4 +641,331 @@ async fn a_refused_run_fails_before_its_agent_is_stepped() {
     .await;
     worker.stop().await;
     assert_eq!(agent.steps.load(SeqCst), 1, "the agent was not stepped");
+}
+
+// ---------------------------------------------------------------------------
+// What is not a forgery
+// ---------------------------------------------------------------------------
+
+/// A key set that cannot be read says nothing about the run: the claim leaves the run (lease kept)
+/// instead of failing it, and the run is stepped when the keys are back.
+#[tokio::test]
+async fn a_key_outage_at_claim_leaves_the_run_and_it_completes_later() {
+    for store in [memory(), without_bodies()] {
+        let keys = keys();
+        let agent = ChatAgent::new("outage", true);
+        let first = runtime(&store, &agent, Some(&keys));
+        let run = parked_run(&first, &agent, "c").await;
+        first.deliver(run, hello("again")).await.expect("deliver");
+
+        let flaky = Flaky::over(&keys);
+        flaky.failures.store(1, SeqCst);
+        let flaky_keys: DynTurnKeys = flaky.clone();
+        let rt = Runtime::builder(store.clone())
+            .agent(agent.clone())
+            .worker_id(format!("w-{}", Uuid::new_v4().simple()))
+            .poll_interval(Duration::from_millis(10))
+            .lease_ttl(Duration::from_millis(300))
+            .turn_keys(flaky_keys)
+            .build();
+        let worker = spawn_worker(&rt);
+        parked_after(&rt, run, 2).await;
+        worker.stop().await;
+
+        assert!(flaky.reads.load(SeqCst) >= 2, "the first read failed");
+        assert_eq!(
+            agent.steps.load(SeqCst),
+            2,
+            "stepped once, after the outage"
+        );
+        let view = rt.view(run).await.unwrap().unwrap();
+        assert_ne!(view.status, RunStatus::Failed, "{view:#?}");
+        assert!(view.error.is_none(), "{view:#?}");
+        rt.state(run).await.expect("readable").expect("run");
+    }
+}
+
+/// A front end that hosts no agent still reads a signed v4 run and delivers to it: it cannot chain
+/// the agent's rows, so it checks none (a documented gap), and what it writes is unsigned and
+/// adopted by the worker's next read.
+#[tokio::test]
+async fn a_front_end_without_the_agent_reads_and_delivers_to_a_signed_v4_run() {
+    let store = without_bodies();
+    let keys = keys();
+    // A splitting agent on a store with no bodies: a v4 state chained over the agent's own rows.
+    let agent = ChatAgent::new("front", true);
+    let worker_rt = runtime(&store, &agent, Some(&keys));
+    let run = parked_run(&worker_rt, &agent, "c").await;
+    let rec = store.load_run(run).await.unwrap().unwrap();
+    assert_eq!(rec.state["v"], 1, "a v4 state, the whole run");
+    assert!(rec.state["signature"].is_string());
+
+    let front = Runtime::builder(store.clone())
+        .turn_keys(keys.clone())
+        .build();
+    let state = front
+        .state(run)
+        .await
+        .expect("a front end reads a signed v4 run it cannot chain")
+        .expect("run");
+    assert_eq!(state["turns"], 1);
+    front
+        .deliver(run, hello("from the front"))
+        .await
+        .expect("a front end delivers to it");
+    let delivered = store.load_run(run).await.unwrap().unwrap();
+    assert!(
+        delivered.state.get("signature").is_none(),
+        "it could not sign what it could not chain"
+    );
+
+    // The worker adopts it (no signed turn) and the run goes on.
+    let worker = spawn_worker(&worker_rt);
+    parked_after(&worker_rt, run, 2).await;
+    worker.stop().await;
+    assert!(store.load_run(run).await.unwrap().unwrap().state["signature"].is_string());
+}
+
+/// A state that does not decode as the agent's is `Corrupt`, never an empty transcript.
+#[tokio::test]
+async fn a_v4_state_the_agent_cannot_decode_is_refused_corrupt() {
+    let store = without_bodies();
+    let keys = keys();
+    let agent = ChatAgent::new("undecodable", true);
+    let rt = runtime(&store, &agent, Some(&keys));
+    let run = parked_run(&rt, &agent, "c").await;
+    tamper(&store, run, |doc| {
+        doc["agent"] = json!({"messages": "not rows"})
+    })
+    .await;
+    assert_corrupt(rt.state(run).await);
+}
+
+// ---------------------------------------------------------------------------
+// A cancel
+// ---------------------------------------------------------------------------
+
+/// A cancel during a key outage fails and writes nothing (it does not strip a good signature); a
+/// cancel of a corrupt run still ends it.
+#[tokio::test]
+async fn a_cancel_during_a_key_outage_fails_and_a_cancel_of_a_corrupt_run_ends_it() {
+    for store in [memory(), without_bodies()] {
+        let keys = keys();
+        let agent = ChatAgent::new("cancel", store.keeps_bodies());
+        let flaky = Flaky::over(&keys);
+        let flaky_keys: DynTurnKeys = flaky.clone();
+        let rt = runtime(&store, &agent, Some(&flaky_keys));
+        let run = parked_run(&rt, &agent, "c").await;
+        let before = store.load_run(run).await.unwrap().unwrap();
+
+        flaky.down.store(true, SeqCst);
+        let err = rt.cancel(run, "stop").await.expect_err("keys are down");
+        assert_eq!(err.class(), ErrorClass::Transient, "{err}");
+        assert!(matches!(err, RuntimeError::TurnKeys(_)), "{err}");
+        let after = store.load_run(run).await.unwrap().unwrap();
+        assert_eq!(after.version, before.version, "nothing was written");
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.state, before.state);
+
+        // Keys back: the same cancel lands, signed.
+        flaky.down.store(false, SeqCst);
+        rt.cancel(run, "stop").await.expect("cancel");
+        let cancelled = store.load_run(run).await.unwrap().unwrap();
+        assert_eq!(cancelled.status, RunStatus::Failed);
+        assert!(cancelled.state["signature"].is_string());
+
+        // A corrupt run is cancelled too, and the head it writes is unsigned.
+        let corrupt = parked_run(&rt, &agent, "c2").await;
+        tamper(&store, corrupt, |doc| doc["error"] = json!("forged")).await;
+        rt.cancel(corrupt, "stop")
+            .await
+            .expect("a corrupt run can be cancelled");
+        let ended = store.load_run(corrupt).await.unwrap().unwrap();
+        assert_eq!(ended.status, RunStatus::Failed);
+        assert!(ended.state.get("signature").is_none(), "{}", ended.state);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A child's result
+// ---------------------------------------------------------------------------
+
+/// Finishes at its first step with the output `"real"`.
+#[derive(Clone)]
+struct Finisher {
+    name: String,
+    splits: bool,
+}
+
+#[async_trait]
+impl Agent for Finisher {
+    type State = Chat;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn init(&self, input: Inbound) -> Result<Chat, AgentError> {
+        Ok(Chat {
+            messages: vec![json!({"role": "user", "text": input.payload["text"]})],
+            turns: 0,
+        })
+    }
+
+    fn split(&self, state: &Chat) -> Option<(Chat, Vec<Value>)> {
+        if !self.splits {
+            return None;
+        }
+        let mut head = state.clone();
+        let rows = std::mem::take(&mut head.messages);
+        Some((head, rows))
+    }
+
+    fn join(&self, head: Chat, rows: Vec<Value>) -> Result<Chat, AgentError> {
+        Ok(Chat {
+            messages: rows,
+            ..head
+        })
+    }
+
+    async fn step(&self, _ctx: &mut Ctx, state: Chat) -> Result<Transition<Chat>, AgentError> {
+        Ok(Transition::Done {
+            state,
+            output: json!("real"),
+        })
+    }
+}
+
+/// Waits for `go`, then reads its child both ways and finishes with what it was told.
+#[derive(Clone)]
+struct Parent {
+    name: String,
+}
+
+#[async_trait]
+impl Agent for Parent {
+    type State = Value;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn init(&self, input: Inbound) -> Result<Value, AgentError> {
+        Ok(input.payload)
+    }
+
+    async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Transition<Value>, AgentError> {
+        let inbox = ctx.take_inbox();
+        if !inbox.iter().any(|i| i.kind == "go") {
+            return Ok(Transition::Park {
+                state,
+                wake_at: None,
+            });
+        }
+        let child: RunId = serde_json::from_value(state["child"].clone()).unwrap();
+        let status = ctx.child_status(child).await?;
+        let look = ctx.child_look(child).await?;
+        Ok(Transition::Done {
+            state,
+            output: json!({
+                "status": status,
+                "look": look.map(|look| json!({"status": look.status, "head": look.head})),
+            }),
+        })
+    }
+}
+
+/// A finished child whose head was changed after it was signed is not handed to its parent as its
+/// output: the parent is told the child failed, by `child_status` and by `child_look` alike. The
+/// control, an untouched child, reaches the parent whole.
+#[tokio::test]
+async fn a_tampered_finished_child_is_not_passed_to_its_parent() {
+    for splits in [true, false] {
+        let store = if splits { memory() } else { without_bodies() };
+        let keys = keys();
+        let child_agent = Finisher {
+            name: format!("kid-{}", Uuid::new_v4().simple()),
+            splits,
+        };
+        let parent_agent = Parent {
+            name: format!("parent-{}", Uuid::new_v4().simple()),
+        };
+        let rt = Runtime::builder(store.clone())
+            .agent(child_agent.clone())
+            .agent(parent_agent.clone())
+            .worker_id(format!("w-{}", Uuid::new_v4().simple()))
+            .poll_interval(Duration::from_millis(10))
+            .turn_keys(keys.clone())
+            .build();
+
+        let mut parents = Vec::new();
+        for _ in 0..2 {
+            let child = RunId::new();
+            let parent = rt
+                .start(
+                    &parent_agent.name,
+                    Inbound::new("start", json!({"child": child})),
+                    None,
+                )
+                .await
+                .expect("start");
+            rt.start_child(parent, child, &child_agent.name, hello("work"))
+                .await
+                .expect("child");
+            parents.push((parent, child));
+        }
+        let worker = spawn_worker(&rt);
+        for (parent, child) in &parents {
+            wait_for(&rt, *child, "the child to finish", |v| {
+                v.status == RunStatus::Done
+            })
+            .await;
+            wait_for(&rt, *parent, "the parent to wait", |v| v.waiting).await;
+        }
+
+        // The second child is changed after it was signed; the first is the control.
+        let (_, forged) = parents[1];
+        tamper(&store, forged, |doc| doc["output"] = json!("forged")).await;
+
+        for (parent, _) in &parents {
+            rt.deliver(*parent, Inbound::new("go", json!({})))
+                .await
+                .expect("go");
+        }
+        for (parent, _) in &parents {
+            wait_for(&rt, *parent, "the parent to finish", |v| {
+                v.status == RunStatus::Done
+            })
+            .await;
+        }
+        worker.stop().await;
+
+        let control = rt
+            .view(parents[0].0)
+            .await
+            .unwrap()
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(control["status"]["status"], "done", "{control}");
+        assert_eq!(control["status"]["output"], "real", "{control}");
+        assert_eq!(control["look"]["status"]["output"], "real", "{control}");
+
+        let told = rt
+            .view(parents[1].0)
+            .await
+            .unwrap()
+            .unwrap()
+            .output
+            .unwrap();
+        for status in [&told["status"], &told["look"]["status"]] {
+            assert_eq!(status["status"], "failed", "{told}");
+            assert!(status.get("output").is_none(), "{told}");
+            assert!(
+                status["error"].as_str().unwrap().contains("refused"),
+                "{told}"
+            );
+        }
+        assert!(!told.to_string().contains("forged"), "{told}");
+    }
 }

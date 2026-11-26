@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
 
-use adam_core::turn::{DynTurnKeys, TurnKeyError};
+use adam_core::turn::{ChainHash, DynTurnKeys, TurnKeyError};
 use adam_core::{
     ClaimScope, ConversationScope, DynStore, NewRun, RunHeader, RunId, RunQuery, RunRecord,
     RunStatus, RunUpdate, StoreError,
@@ -434,32 +434,81 @@ impl Inner {
     }
 
     /// The transcript the agent of `agent` splits `state` into: the rows a run whose state is not
-    /// split is chained over (ADR 0068 decision 4). Empty when the agent does not split, is not
-    /// registered here, or the state does not decode: a writer and a reader of one agent agree on
-    /// that, so the chain they take is the same.
-    pub(crate) fn transcript_of(&self, agent: &str, state: &Value) -> Vec<Value> {
-        self.agents
-            .get(agent)
-            .and_then(|registered| {
-                registered
-                    .starter()
-                    .transcript(state.clone())
-                    .ok()
-                    .flatten()
+    /// split is chained over (ADR 0068 decision 4). `Some(empty)` when the agent does not split:
+    /// a writer and a reader of one agent agree on that, so the chain they take is the same.
+    ///
+    /// `Ok(None)` when the agent is **not registered here**: this process cannot say what the
+    /// rows are, and must not guess an empty transcript (a signed run would read as forged). A
+    /// caller that needs no agent for anything else skips its chain check, which is a documented
+    /// gap of ADR 0068 (a front end that hosts no agent verifies nothing of a v4 state's rows).
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::Corrupt`] when the state does not decode as the agent's.
+    pub(crate) fn transcript_of(
+        &self,
+        run: RunId,
+        agent: &str,
+        state: &Value,
+    ) -> Result<Option<Vec<Value>>, RuntimeError> {
+        let Some(registered) = self.agents.get(agent) else {
+            return Ok(None);
+        };
+        registered
+            .starter()
+            .transcript(state.clone())
+            .map(|rows| Some(rows.unwrap_or_default()))
+            .map_err(|e| RuntimeError::Corrupt {
+                run,
+                reason: "the agent's state does not decode, so its transcript cannot be chained"
+                    .into(),
+                source: Some(Box::new(e)),
             })
-            .unwrap_or_default()
     }
 
     /// Check the signature of a v4 record (the whole state): the chain over the agent's own
-    /// transcript, and the signature over everything.
+    /// transcript, and the signature over everything. A process that does not host the agent
+    /// cannot chain the rows and checks nothing here (see [`transcript_of`](Self::transcript_of)).
     async fn check_full(&self, rec: &RunRecord, agent_state: &Value) -> Result<(), RuntimeError> {
         let Some(sealer) = &self.sealer else {
             return Ok(());
         };
-        let rows = self.transcript_of(&rec.agent, agent_state);
+        let Some(rows) = self.transcript_of(rec.id, &rec.agent, agent_state)? else {
+            tracing::debug!(run = %rec.id, agent = %rec.agent, "the agent is not registered here: the v4 state's head is not checked");
+            return Ok(());
+        };
         sealer
             .check_read(rec.id, rec.conversation_id.as_deref(), &rows, &rec.state)
             .await
+    }
+
+    /// What a writer that does not touch the transcript signs again, after it has checked the
+    /// document it read: `Some((len, chain, seal))`, or `None` when this process cannot say (a v4
+    /// state whose agent is not registered here).
+    async fn resealable(
+        &self,
+        sealer: &Sealer,
+        rec: &RunRecord,
+        stored: &Stored,
+    ) -> Result<Option<(u32, ChainHash, Option<Seal>)>, RuntimeError> {
+        let conversation = rec.conversation_id.as_deref();
+        let (len, chain, seal) = match stored {
+            Stored::Head(head) => {
+                let (len, chain) = sealer.seal_parts(rec.id, head.seal.as_ref())?;
+                (len, chain, head.seal.clone())
+            }
+            Stored::Full(envelope) => {
+                let Some(rows) = self.transcript_of(rec.id, &rec.agent, &envelope.agent)? else {
+                    return Ok(None);
+                };
+                let (len, chain) = chain_over(rec.id, conversation, &rows)?;
+                (len, chain, None)
+            }
+        };
+        sealer
+            .check(rec.id, conversation, len, &chain, &rec.state)
+            .await?;
+        Ok(Some((len, chain, seal)))
     }
 
     /// Re-sign `stored`, a record's document after a writer that does not touch the transcript
@@ -470,8 +519,14 @@ impl Inner {
     /// that did not verify. A document with no signature stays unsigned (it is adopted, decision
     /// 11). Without keys the document is written unsigned.
     ///
-    /// With `strict` a head that does not verify is the error; without it (a cancel, which must
-    /// end a corrupt run too) the document is written unsigned.
+    /// With `strict` a head that does not verify is the error. Without it (a cancel, which must
+    /// end a corrupt run too) only a [`Corrupt`](RuntimeError::Corrupt) head is let through, written
+    /// unsigned: a key set that cannot be read is the error either way, so a cancel during an
+    /// outage fails and writes nothing instead of stripping a good signature.
+    ///
+    /// A v4 state whose agent is not registered in this process (a front end that hosts none)
+    /// cannot be chained, so it is written **unsigned** with a warning: the gap is in the ADR
+    /// amendment.
     async fn reseal(
         &self,
         rec: &RunRecord,
@@ -487,39 +542,20 @@ impl Inner {
             return Ok(());
         }
         let conversation = rec.conversation_id.as_deref();
-        let corrupt = |reason: &str| RuntimeError::Corrupt {
-            run: rec.id,
-            reason: format!("the run's head is refused (ADR 0068): {reason}"),
-            source: None,
-        };
-        let (len, chain, seal) = match stored {
-            Stored::Head(head) => match head.seal.as_ref().and_then(Seal::parts) {
-                Some((len, chain)) => (len, chain, head.seal.clone()),
-                None => {
-                    if strict {
-                        return Err(corrupt("it is signed and carries no usable seal"));
-                    }
-                    stored.set_signature(None, None);
-                    return Ok(());
-                }
-            },
-            Stored::Full(envelope) => {
-                let rows = self.transcript_of(&rec.agent, &envelope.agent);
-                let (len, chain) = chain_over(rec.id, conversation, &rows)?;
-                (len, chain, None)
+        let (len, chain, seal) = match self.resealable(sealer, rec, stored).await {
+            Ok(Some(basis)) => basis,
+            Ok(None) => {
+                tracing::warn!(run = %rec.id, agent = %rec.agent, "the agent is not registered here, so the v4 state cannot be chained: it is written unsigned");
+                stored.set_signature(None, None);
+                return Ok(());
             }
-        };
-        if let Err(e) = sealer
-            .check(rec.id, conversation, len, &chain, &rec.state)
-            .await
-        {
-            if strict {
-                return Err(e);
+            Err(e @ RuntimeError::Corrupt { .. }) if !strict => {
+                tracing::warn!(run = %rec.id, error = %adam_error::report(&e), "the cancelled run's head does not verify; it is written unsigned");
+                stored.set_signature(None, None);
+                return Ok(());
             }
-            tracing::warn!(run = %rec.id, error = %adam_error::report(&e), "the cancelled run's head does not verify; it is written unsigned");
-            stored.set_signature(None, None);
-            return Ok(());
-        }
+            Err(e) => return Err(e),
+        };
         let doc = match &*stored {
             Stored::Full(envelope) => envelope.encode()?,
             Stored::Head(head) => head.encode()?,
@@ -529,16 +565,13 @@ impl Inner {
         Ok(())
     }
 
-    /// [`join_stored`](Self::join_stored) for the head of a v5 run: the rows of the generation it
-    /// names, read and joined with the agent's `join`.
-    async fn join_head(
+    /// The rows the head of `rec` names (its generation's prefix of `body.len`), or `None` when
+    /// the prefix is short or has a hole.
+    async fn head_rows(
         &self,
         rec: &RunRecord,
         head: &Head,
-    ) -> Result<Option<(Value, Vec<Value>)>, RuntimeError> {
-        let Some(registered) = self.agents.get(&rec.agent) else {
-            return Err(RuntimeError::UnknownAgent(rec.agent.clone()));
-        };
+    ) -> Result<Option<Vec<Value>>, RuntimeError> {
         let Some(generation) = head.body.generation else {
             return Err(RuntimeError::Corrupt {
                 run: rec.id,
@@ -565,7 +598,63 @@ impl Inner {
         {
             return Ok(None);
         }
-        let rows: Vec<Value> = rows.into_iter().map(|row| row.message).collect();
+        Ok(Some(rows.into_iter().map(|row| row.message).collect()))
+    }
+
+    /// Check the record of a **child** before its parent reads its result: what a parent signs as
+    /// its own turn must not be a forgery (ADR 0068 decision 4, amended 2026-11-26).
+    ///
+    /// A signed v5 head is verified against its own `seal` with no row read (the parent reads the
+    /// head's output, error and agent state, all covered by the one signature; the rows are not
+    /// re-chained here). An **unsigned** one is adopted only if no row carries a turn signature, so
+    /// its rows are read: stripping the signature of a forged child must not pass. A v4 state is
+    /// checked as [`check_full`](Self::check_full) does, which needs the child's agent registered
+    /// here. Without keys nothing is checked.
+    pub(crate) async fn verify_child(&self, rec: &RunRecord) -> Result<(), RuntimeError> {
+        let Some(sealer) = &self.sealer else {
+            return Ok(());
+        };
+        match Stored::decode(rec.id, &rec.state)? {
+            Stored::Full(envelope) => self.check_full(rec, &envelope.agent).await,
+            Stored::Head(head) => {
+                if rec.state.get("signature").is_some() {
+                    sealer
+                        .check_sealed(
+                            rec.id,
+                            rec.conversation_id.as_deref(),
+                            head.seal.as_ref(),
+                            &rec.state,
+                        )
+                        .await
+                } else {
+                    let Some(rows) = self.head_rows(rec, &head).await? else {
+                        return Err(RuntimeError::Corrupt {
+                            run: rec.id,
+                            reason: "the head names rows its generation does not hold".into(),
+                            source: None,
+                        });
+                    };
+                    sealer
+                        .check_read(rec.id, rec.conversation_id.as_deref(), &rows, &rec.state)
+                        .await
+                }
+            }
+        }
+    }
+
+    /// [`join_stored`](Self::join_stored) for the head of a v5 run: the rows of the generation it
+    /// names, read and joined with the agent's `join`.
+    async fn join_head(
+        &self,
+        rec: &RunRecord,
+        head: &Head,
+    ) -> Result<Option<(Value, Vec<Value>)>, RuntimeError> {
+        let Some(registered) = self.agents.get(&rec.agent) else {
+            return Err(RuntimeError::UnknownAgent(rec.agent.clone()));
+        };
+        let Some(rows) = self.head_rows(rec, head).await? else {
+            return Ok(None);
+        };
         // Before the agent joins anything: the chain over exactly these rows, and the signature
         // over the head, the length and the run (ADR 0068 decision 4).
         if let Some(sealer) = &self.sealer {
@@ -938,9 +1027,15 @@ impl RuntimeBuilder {
     ///
     /// At every commit the runtime signs the run's head (`adam-head/v1`: the run, its conversation,
     /// the number of transcript rows, the chain over them, and the state document without its
-    /// signature). On every decode (a claim, a view, a cancel's hook) it recomputes the chain over
-    /// the rows and checks that one signature, and a head that does not verify fails the run
-    /// `Corrupt` before the agent is stepped. The transcript's own turns are signed by the agent
+    /// signature). Where it checks: a claim, [`Runtime::state`], a continued run's prior state and
+    /// a cancel's hook recompute the chain over the rows and verify that one signature; a delivery
+    /// and a cancel verify the head they read against its own `seal` before they sign again;
+    /// a parent's read of a child ([`Ctx::child_status`](crate::Ctx::child_status), `child_look`)
+    /// verifies a signed head against its `seal` only. [`Runtime::view`], [`view_from_record`] and
+    /// the A2A `GetTask` and `ListTasks` check **nothing**, by design: a view reads the head alone,
+    /// and a run refused as `Corrupt` stays viewable, so a control plane can show why it failed.
+    /// A head that does not verify is `Corrupt`, and a claimed run fails before the agent
+    /// is stepped. The transcript's own turns are signed by the agent
     /// ([`LlmAgentBuilder::turn_keys`](https://docs.rs/adam-llm-agent), ADR 0068 slice T3a-1).
     ///
     /// Without keys the runtime is as it was: nothing is signed, nothing is required, and a

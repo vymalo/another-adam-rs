@@ -173,6 +173,38 @@ impl Sealer {
             .map_err(|e| refused(run, "its signature does not verify", Some(e)))
     }
 
+    /// The `{len, chain}` a **signed** v5 head's `seal` carries, or `Corrupt`: a head with a
+    /// signature and no usable seal cannot be checked without its rows, and a writer that does not
+    /// read them must not sign over it.
+    pub(crate) fn seal_parts(
+        &self,
+        run: RunId,
+        seal: Option<&Seal>,
+    ) -> Result<(u32, ChainHash), RuntimeError> {
+        seal.and_then(Seal::parts)
+            .ok_or_else(|| refused(run, "it is signed and carries no usable seal", None))
+    }
+
+    /// Check a v5 head against the `{len, chain}` of its own `seal`, without reading a row: what a
+    /// writer that does not touch the transcript, and a reader of a head only, can verify. The
+    /// signature covers `len` and `chain`, so a forged seal cannot make a forged head verify; what
+    /// it does not check is that the rows still chain to it. A head with **no** signature is left
+    /// to the caller (adoption needs the rows).
+    ///
+    /// # Errors
+    ///
+    /// As [`check`](Self::check), and `Corrupt` for a signed head with no usable seal.
+    pub(crate) async fn check_sealed(
+        &self,
+        run: RunId,
+        conversation: Option<&str>,
+        seal: Option<&Seal>,
+        doc: &Value,
+    ) -> Result<(), RuntimeError> {
+        let (len, chain) = self.seal_parts(run, seal)?;
+        self.check(run, conversation, len, &chain, doc).await
+    }
+
     /// Check the head of a record read with its rows: the rows are chained and the one signature
     /// is verified. A document with **no** signature is adopted (decision 11, release N) unless a
     /// row carries a turn signature, which a run that was signed once must keep.

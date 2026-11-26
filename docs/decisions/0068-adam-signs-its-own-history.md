@@ -479,3 +479,38 @@ What building it settled:
    (T3a-3); the journal is not signed. A commit's CAS retry does not verify the head it reloads (only the inbox and
    artifacts are taken from it, and a reader recomputes). The store testkit is unchanged: the signature rides in the
    state JSON, so no `Store` method changed.
+
+## Amended 2026-11-26 (slice T3a-2, review of the pull request)
+
+What the review of T3a-2 changed. The text above stands; where it says otherwise, this is what is built.
+
+1. **A key set that cannot be read at a claim no longer fails the run** (amends point 6). A `TurnKeys` error at a claim
+   (`Unavailable`, `NotSigning`, `Refused`) leaves the run as it is: the lease is kept and the run is found again when it
+   expires. Only a head that does not verify (`Corrupt`) is committed `Failed`. A **persistent** misconfiguration
+   (`NotSigning`, `Refused`) therefore retries until the keys are fixed, once per lease, and never fails the run.
+2. **A process that hosts no agent** no longer reads `[]` for the agent's transcript. `Inner::transcript_of` is `None` for
+   an agent that is not registered, and a state that does not decode as the agent's is `Corrupt`. A v4 state whose agent is
+   not registered here is **not chain-checked** on a read (`Runtime::state`), and a delivery to it is written **unsigned**:
+   this is a gap, chosen so that these front-end calls keep working as before. A worker that hosts the agent adopts it again
+   (decision 11), unless a row carries a turn signature, in which case that run is refused as an unsigned head over signed
+   turns: a front end that hosts no agent should register the agent as a starter (a start-only registration chains).
+3. **A cancel swallows only `Corrupt`** (amends point 3). A key outage during a cancel is the cancel's error and writes
+   nothing; a corrupt head is still cancelled and written unsigned.
+4. **A parent no longer trusts a child's result unverified.** `Ctx::child_status` (finished children) and `Ctx::child_look`
+   verify the child's record first: a signed v5 head against its own `seal` (no row read), an unsigned head by its rows
+   (stripping the signature must not pass), a v4 state as in point 2. A child that does not verify is reported as `Failed`
+   with an error that says the record is refused, never as its output; a key set that cannot be read is the call's own
+   transient error. **Still unverified, by design of point 4:** `Runtime::view`, `view_from_record`, A2A `GetTask` and
+   `ListTasks` read the head alone (a run refused as `Corrupt` has to stay viewable), `ChildStatus::from_record` in the
+   session listings, and a child's rows (a parent reads the head, which holds the output and the error).
+5. **The CAS retry checks what it reloads.** The commit that lost its CAS to a delivery and reloads the record now verifies
+   it (a signed head against its `seal`, a signed v4 state against the agent's rows) before signing over its inbox and
+   artifacts; failure is the commit's `Corrupt`. `seal_update` likewise refuses (`Corrupt`) a signed base head whose `seal`
+   is missing or unparsable, as `reseal`'s strict path does, instead of writing it unsigned.
+6. **Known gaps.**
+   * In a mixed fleet, or after a rollback, a worker **without keys** drops head signatures when it writes; a later signed
+     turn then makes that head refused (an unsigned head over a signed turn). Roll keys out to every process that writes.
+   * Release N gives an agent that does **not** sign its turns no downgrade resistance: stripping `signature` (and `seal`)
+     passes adoption, because there is no signed turn to contradict it.
+   * A v4 state is not verified in a process without its agent (point 2).
+
