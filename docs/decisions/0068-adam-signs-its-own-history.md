@@ -409,6 +409,8 @@ request signature is another type, built with the same port and header writer. B
 
 `Message::Assistant` and `Message::Tool` carry `extra_content: Option<BTreeMap<String, Value>>`, a member of the message
 object itself, one entry per maker (`crates/adam-model/src/types.rs`). Nothing writes `extra_content.adam` yet. The
-OpenAI wire never sends the `adam` maker and drops it from a model's reply, streamed or not
-(`crates/adam-model-openai/src/wire.rs`); other makers' members in the carrier are sent unbound, as the carrier has no
-model binding.
+OpenAI wire never sends `Message::extra_content` at all (`crates/adam-model-openai/src/wire.rs`): the carrier is adam's
+namespace only. Another maker's member (`google`, ...) belongs to the bound `provider.members` of #322, which goes back
+only to the model that produced it, and nowhere else; a maker set in the carrier would have crossed a model switch,
+the leak #324 closed. A model's reply drops the `adam` maker from the provider's members, streamed or not, and leaves
+everything else as sent (an empty `extra_content` object stays one).

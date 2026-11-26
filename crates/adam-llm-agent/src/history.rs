@@ -1,6 +1,6 @@
 //! Fitting the history into the model's context budget.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use adam_core::RunId;
 use adam_model::{ContentPart, Message};
@@ -186,18 +186,6 @@ fn reset_serialisations() {
     SERIALISATIONS.with(|n| n.set(0));
 }
 
-/// Characters of a message's `extra_content` that a request carries: every maker's but adam's own,
-/// which is never sent.
-fn maker_chars(makers: Option<&BTreeMap<String, serde_json::Value>>) -> usize {
-    makers.map_or(0, |makers| {
-        makers
-            .iter()
-            .filter(|(maker, _)| maker.as_str() != adam_model::ADAM_MAKER)
-            .map(|(_, value)| value_chars(value))
-            .sum()
-    })
-}
-
 /// Characters a message contributes to the estimate.
 pub(crate) fn message_chars(m: &Message) -> usize {
     match m {
@@ -207,7 +195,7 @@ pub(crate) fn message_chars(m: &Message) -> usize {
             tool_calls,
             reasoning,
             provider,
-            extra_content,
+            ..
         } => {
             // The reasoning a client echoes is sent, so it counts; so do the carrier's opaque
             // members, a call's own, and a raw reasoning block (all sent with the request).
@@ -229,18 +217,10 @@ pub(crate) fn message_chars(m: &Message) -> usize {
                     .sum::<usize>()
                 + carrier
                 + opaque
-                + maker_chars(extra_content.as_ref())
         }
         Message::Tool {
-            content,
-            images,
-            extra_content,
-            ..
-        } => {
-            content.chars().count()
-                + images.len() * IMAGE_CHARS
-                + maker_chars(extra_content.as_ref())
-        }
+            content, images, ..
+        } => content.chars().count() + images.len() * IMAGE_CHARS,
     }
 }
 

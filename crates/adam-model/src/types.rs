@@ -239,14 +239,14 @@ pub enum Message {
 pub const ADAM_MAKER: &str = "adam";
 
 /// Remove adam's maker from the `extra_content` member of a provider's members map (a reply's
-/// message members, or a tool call's), dropping the member if nothing else is in it. Other
-/// makers' members are untouched.
+/// message members, or a tool call's), dropping the member only if adam's maker was in it and
+/// nothing else is. Everything else stays as the provider sent it, an empty object included.
 pub fn strip_adam_member(members: &mut BTreeMap<String, Value>) {
-    if let Some(Value::Object(makers)) = members.get_mut("extra_content") {
-        makers.remove(ADAM_MAKER);
-        if makers.is_empty() {
-            members.remove("extra_content");
-        }
+    if let Some(Value::Object(makers)) = members.get_mut("extra_content")
+        && makers.remove(ADAM_MAKER).is_some()
+        && makers.is_empty()
+    {
+        members.remove("extra_content");
     }
 }
 
@@ -1003,6 +1003,10 @@ mod tests {
         )]);
         strip_adam_member(&mut only);
         assert!(only.is_empty());
+        // Nothing of adam's in it: the provider's member, even an empty object, is left as sent.
+        let mut empty = BTreeMap::from([("extra_content".to_owned(), json!({}))]);
+        strip_adam_member(&mut empty);
+        assert_eq!(empty["extra_content"], json!({}));
     }
 
     #[test]

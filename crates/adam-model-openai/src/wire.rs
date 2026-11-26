@@ -450,7 +450,7 @@ fn wire_message<'a>(
             tool_calls,
             reasoning,
             provider,
-            extra_content,
+            ..
         } => {
             // The provider's opaque members go back only to the model alias and endpoint that
             // produced them: a run that switched model drops them.
@@ -513,35 +513,30 @@ fn wire_message<'a>(
                             .map(|text| BTreeMap::from([(name, Value::String(text.to_owned()))])),
                     }
                 }),
-                opaque: message_members(bound, extra_content.as_ref()),
+                opaque: message_members(bound),
             }
         }
         // The chat-completions format has no error flag on tool messages, so
         // `is_error` is not sent: tools should put the failure in `content`.
         Message::Tool {
-            call_id,
-            content,
-            extra_content,
-            ..
+            call_id, content, ..
         } => WireMessage {
             role: "tool",
             content: Some(Value::String(content.clone())),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id),
             reasoning: None,
-            opaque: message_members(None, extra_content.as_ref()),
+            opaque: BTreeMap::new(),
         },
     })
 }
 
-/// The members a message carries beyond the modelled ones: a bound turn's, and the message's own
-/// `extra_content`, merged into one `extra_content` object. adam's own maker is never sent, from
-/// either source: it is for adam to read back, not for a model. Every other maker's members go
-/// unchanged. Nothing left means no `extra_content` member at all.
-fn message_members(
-    bound: Option<&ProviderTurn>,
-    makers: Option<&BTreeMap<String, Value>>,
-) -> BTreeMap<String, Value> {
+/// The members a message carries beyond the modelled ones: a bound turn's own, and nothing else.
+/// `Message::extra_content` is adam's namespace and is never sent (a provider's members are
+/// bound to their model in `ProviderTurn`, and nowhere else), so a maker set there cannot reach
+/// a model after a switch. adam's maker is stripped from the turn's own members too. Nothing
+/// left means no `extra_content` member at all.
+fn message_members(bound: Option<&ProviderTurn>) -> BTreeMap<String, Value> {
     let mut members: BTreeMap<String, Value> = bound
         .map(|turn| {
             turn.members
@@ -551,17 +546,6 @@ fn message_members(
                 .collect()
         })
         .unwrap_or_default();
-    if let Some(makers) = makers {
-        let own = members
-            .entry("extra_content".to_owned())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        // A provider's `extra_content` that is not an object is its own and is sent as it came.
-        if let Value::Object(object) = own {
-            for (maker, value) in makers {
-                object.entry(maker.clone()).or_insert_with(|| value.clone());
-            }
-        }
-    }
     strip_adam_member(&mut members);
     members
 }
@@ -2218,48 +2202,54 @@ mod tests {
     }
 
     #[test]
-    fn a_request_never_carries_adams_member_but_keeps_the_other_makers() {
+    fn a_requests_message_extra_content_is_never_sent() {
         let body = build_request(&signed_history(), false, RequestOptions::default()).unwrap();
         let text = String::from_utf8(body.clone()).unwrap();
         assert!(!text.contains("adam"), "{text}");
         assert!(!text.contains("SIG"), "{text}");
+        // A non-adam maker set on `extra_content` has no way to the wire either.
+        assert!(!text.contains("google"), "{text}");
         let body: Value = serde_json::from_slice(&body).unwrap();
-        for index in [1, 2] {
-            assert_eq!(
-                body["messages"][index]["extra_content"],
-                json!({"google": {"thought_signature": "G"}}),
+        for index in 1..=3 {
+            assert!(
+                body["messages"][index].get("extra_content").is_none(),
                 "{body}"
             );
         }
-        // A message with nothing but adam's member has no `extra_content` at all.
-        assert!(body["messages"][3].get("extra_content").is_none(), "{body}");
     }
 
     #[test]
-    fn adams_member_in_a_bound_turns_own_members_is_not_sent_either() {
+    fn a_makers_extra_content_does_not_follow_a_turn_to_another_model() {
         let mut req = signed_history();
-        let mut turn = ProviderTurn::new("gw-model", "openai:abc");
+        let mut turn = ProviderTurn::new("model-a", "openai:abc");
         turn.members = BTreeMap::from([(
             "extra_content".to_owned(),
-            json!({"adam": {"turn_signature": "SIG"}, "google": {"thought_signature": "G2"}}),
+            json!({"google": {"thought_signature": "G2"}}),
         )]);
         if let Message::Assistant { provider, .. } = &mut req.messages[1] {
             *provider = Some(turn);
         }
-        let options = RequestOptions {
-            endpoint: "openai:abc",
-            ..RequestOptions::default()
+        let send = |model: &str| {
+            let mut req = req.clone();
+            req.model = model.to_owned();
+            let options = RequestOptions {
+                endpoint: "openai:abc",
+                ..RequestOptions::default()
+            };
+            let body = build_request(&req, false, options).unwrap();
+            serde_json::from_slice::<Value>(&body).unwrap()
         };
-        let body = build_request(&req, false, options).unwrap();
-        let text = String::from_utf8(body.clone()).unwrap();
-        assert!(!text.contains("adam"), "{text}");
-        let body: Value = serde_json::from_slice(&body).unwrap();
-        // The provider's own value for a maker wins over the message's.
+        // The bound members still go to the model that produced them, and only the turn's own:
+        // the message's `extra_content` ("G") is not merged in.
         assert_eq!(
-            body["messages"][1]["extra_content"],
-            json!({"google": {"thought_signature": "G2"}}),
-            "{body}"
+            send("model-a")["messages"][1]["extra_content"],
+            json!({"google": {"thought_signature": "G2"}})
         );
+        // After a switch, neither the bound members nor the message's own reach model-b.
+        let switched = send("model-b");
+        let text = switched.to_string();
+        assert!(!text.contains("google"), "{text}");
+        assert!(!text.contains("thought_signature"), "{text}");
     }
 
     #[test]
