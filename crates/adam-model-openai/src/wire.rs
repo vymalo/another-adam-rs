@@ -57,6 +57,8 @@ struct WireRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<Value>,
@@ -200,6 +202,7 @@ pub(crate) fn build_request(
         max_tokens,
         max_completion_tokens,
         temperature: req.temperature,
+        top_p: req.top_p,
         stream: stream.then_some(true),
         stream_options: stream.then(|| json!({"include_usage": true})),
         metadata: (!req.metadata.is_empty()).then_some(&req.metadata),
@@ -211,8 +214,22 @@ pub(crate) fn build_request(
     let not_serializable =
         |e| ModelError::invalid_request("request is not serializable").with_source(e);
     let extra = options.extra_body.filter(|extra| !extra.is_empty());
+    let call_extra = req.extra_body.as_ref().filter(|extra| !extra.is_empty());
+    if let Some(key) = RESERVED_BODY_KEYS
+        .iter()
+        .find(|key| call_extra.is_some_and(|extra| extra.contains_key(**key)))
+    {
+        return Err(ModelError::invalid_request(format!(
+            "the request's extra body sets `{key}`, which the client owns"
+        )));
+    }
+    if let Some(p) = req.top_p
+        && !p.is_finite()
+    {
+        return Err(ModelError::invalid_request("top_p must be finite"));
+    }
     let reasoning = reasoning_member(req, options.profiles)?;
-    if extra.is_none() && reasoning.is_none() {
+    if extra.is_none() && call_extra.is_none() && reasoning.is_none() {
         return serde_json::to_vec(&wire).map_err(not_serializable);
     }
     // The deployment's own members (a flag that makes a gateway emit reasoning) are merged over
@@ -222,6 +239,11 @@ pub(crate) fn build_request(
     if let Value::Object(members) = &mut body {
         if let Some(extra) = extra {
             for (key, value) in extra {
+                members.insert(key.clone(), value.clone());
+            }
+        }
+        if let Some(call_extra) = call_extra {
+            for (key, value) in call_extra {
                 members.insert(key.clone(), value.clone());
             }
         }
@@ -1273,6 +1295,25 @@ mod tests {
             echo_reasoning: echo,
             ..RequestOptions::default()
         }
+    }
+
+    #[test]
+    fn a_requests_top_p_and_extra_body_are_sent_and_a_reserved_member_is_refused() {
+        let mut req = request();
+        req.top_p = Some(0.5);
+        let mut body = serde_json::Map::new();
+        body.insert("seed".into(), json!(7));
+        req.extra_body = Some(body);
+        let sent: Value =
+            serde_json::from_slice(&build_request(&req, false, RequestOptions::default()).unwrap())
+                .unwrap();
+        assert_eq!(sent["top_p"], json!(0.5));
+        assert_eq!(sent["seed"], json!(7));
+
+        let mut reserved = serde_json::Map::new();
+        reserved.insert("model".into(), json!("other"));
+        req.extra_body = Some(reserved);
+        assert!(build_request(&req, false, RequestOptions::default()).is_err());
     }
 
     #[test]

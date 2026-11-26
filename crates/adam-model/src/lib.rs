@@ -114,5 +114,6 @@ pub use signed::{SignedRequests, TURN_SIGNATURE_HEADER, request_target};
 pub use types::{
     ADAM_MAKER, ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, ImageData, ImageLimits,
     ImageOrigin, ImageRef, InputModalities, Message, ModelDelta, ModelRequest, ModelResponse,
-    ProviderTurn, ToolCall, ToolChoice, ToolSpec, Usage, human_bytes, strip_adam_member, type_word,
+    ProviderTurn, RESERVED_BODY_KEYS, ToolCall, ToolChoice, ToolSpec, Usage, human_bytes,
+    is_credential_header, strip_adam_member, type_word,
 };

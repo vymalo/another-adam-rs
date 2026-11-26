@@ -29,6 +29,17 @@ pub struct ModelRequest {
     /// Sampling temperature.
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Nucleus sampling mass; absent leaves the model's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Headers for this call alone, beside the client's own. A name that looks like a credential
+    /// is refused ([`is_credential_header`]): the model's key is the deployment's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Members merged over this call's body at its top level, after the client's own extra body.
+    /// The members the client owns ([`RESERVED_BODY_KEYS`]) are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_body: Option<serde_json::Map<String, Value>>,
     /// How much the model should reason for this call (ADR 0063), when the caller sets a level.
     /// Absent sends nothing and leaves the model's own default, which may reason. The client sends
     /// it through the wire of the request's model profile; a level that profile does not declare is
@@ -60,6 +71,29 @@ pub struct ModelRequest {
     /// image. A reference with no entry here is sent as its stand-in text.
     #[serde(skip)]
     pub image_data: ImageData,
+}
+
+/// The body members a client owns: no extra body may set them.
+pub const RESERVED_BODY_KEYS: [&str; 5] = ["model", "messages", "tools", "tool_choice", "stream"];
+
+/// Whether a header name looks like it carries a credential (`authorization`, an API key, a cookie,
+/// a token, a secret, a password, a signature and the like), so a hook can never set the model's key.
+/// Case and `_` against `-` do not matter.
+pub fn is_credential_header(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase().replace('_', "-");
+    const PARTS: [&str; 10] = [
+        "authorization",
+        "authentication",
+        "api-key",
+        "apikey",
+        "cookie",
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "signature",
+    ];
+    name == "auth" || name.starts_with("x-auth") || PARTS.iter().any(|part| name.contains(part))
 }
 
 /// The bytes of the images of one [`ModelRequest`], by SHA-256. Its `Debug` says how many and how
@@ -1367,5 +1401,35 @@ mod tests {
     fn the_label_names_the_image_by_what_the_model_may_say() {
         assert_eq!(shot().label(), "shot.png (png, 120.0 KiB, 800\u{d7}600)");
         assert_eq!(human_bytes(1_468_006), "1.4 MiB");
+    }
+}
+
+#[cfg(test)]
+mod credential_header_tests {
+    use super::is_credential_header;
+
+    #[test]
+    fn names_that_look_like_credentials_are_found_and_plain_ones_are_not() {
+        for name in [
+            "Authorization",
+            "proxy-authorization",
+            "x-api-key",
+            "X_API_KEY",
+            "Cookie",
+            "x-auth-token",
+            "x-amz-security-token",
+            "client-secret",
+            "Prompt-User-Signature",
+        ] {
+            assert!(is_credential_header(name), "{name}");
+        }
+        for name in [
+            "x-tenant",
+            "x-request-id",
+            "openai-organization",
+            "user-agent",
+        ] {
+            assert!(!is_credential_header(name), "{name}");
+        }
     }
 }
