@@ -23,6 +23,7 @@ const sidebar = [
   {
     text: "Get started",
     items: [
+      { text: "First success", link: "/getting-started" },
       { text: "Run it locally", link: "/guides/run-locally" },
       { text: "Try the agents", link: "/guides/try-the-agents" },
     ],
