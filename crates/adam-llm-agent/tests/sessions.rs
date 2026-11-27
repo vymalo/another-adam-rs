@@ -3538,6 +3538,98 @@ mod cases {
         assert_eq!(config.max_tool_calls, None, "nothing is filled in");
     }
 
+    /// A remote subagent takes only `time_limit` and `max_rounds` (ADR 0054 decision 4): any other
+    /// option is refused by name, since nothing would enforce it, and nothing starts.
+    pub async fn a_remote_subagent_refuses_every_option_but_time_limit_and_max_rounds(
+        store: DynStore,
+    ) {
+        let rig = Rig::new();
+        let far_mock = Arc::new(MockModel::new());
+        far_mock.push_text("the far answer");
+        let far_model: DynModel = far_mock.clone();
+        let far = LlmAgent::builder("far", far_model, "m").build();
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig
+            .builder(&store, "w")
+            .agent(parent_agent.clone())
+            .agent(child_agent)
+            .agent(far)
+            .build();
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let start = |id: &str, config: Value| {
+            call(
+                id,
+                "subagent_start",
+                json!({"agent": "far", "description": "d", "prompt": "p", "config": config}),
+            )
+        };
+        rig.parent_mock
+            .push_tool_calls(vec![start("turns", json!({"max_turns": 5}))])
+            .push_tool_calls(vec![start("ok", json!({"time_limit": 5}))])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        let (_, text, is_error) = result_of(&results, "turns");
+        assert!(
+            *is_error && text.contains("config.max_turns is not an option of a remote subagent"),
+            "{text}"
+        );
+        let (_, text, is_error) = result_of(&results, "ok");
+        assert!(!*is_error, "{text}");
+        let listed = rt.list_sessions(&conv, &["far"], 0, 10).await.unwrap();
+        assert_eq!(
+            listed.sessions.len(),
+            1,
+            "only the admitted start opened one"
+        );
+    }
+
+    /// A value of the wrong type is refused naming its option and never echoing what was written.
+    pub async fn a_config_value_of_the_wrong_type_is_refused_naming_the_option(store: DynStore) {
+        let rig = Rig::new();
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let start = |id: &str, config: Value| {
+            call(
+                id,
+                "subagent_start",
+                json!({"agent": "helper", "description": "d", "prompt": "p", "config": config}),
+            )
+        };
+        let long = "x".repeat(5_000);
+        rig.parent_mock
+            .push_tool_calls(vec![
+                start("string", json!({"max_turns": long})),
+                start("negative", json!({"max_tool_calls": -1})),
+                start("fraction", json!({"time_limit": 1.5})),
+                start("huge", json!({"max_rounds": 4_294_967_296_u64})),
+            ])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        for (id, option) in [
+            ("string", "max_turns"),
+            ("negative", "max_tool_calls"),
+            ("fraction", "time_limit"),
+            ("huge", "max_rounds"),
+        ] {
+            let (_, text, is_error) = result_of(&results, id);
+            assert!(
+                *is_error && text.contains(&format!("config.{option} must be a positive integer")),
+                "{id}: {text}"
+            );
+            assert!(!text.contains("xxxx"), "{id}: the value is never echoed");
+        }
+        assert!(rig.child_mock.requests().is_empty(), "nothing started");
+    }
+
     /// Round 2 copies the session's config and **clamps it to the bounds of that moment** (ADR 0054
     /// decision 3), and it is the clamped `time_limit` that its deadline is. The header here holds
     /// values a deployment that lowered its limits since would refuse (a person's session, as an
@@ -5416,6 +5508,8 @@ macro_rules! session_suite {
                 a_closing_round_does_not_hide_the_newest_round_that_worked,
                 each_limit_refuses_in_words,
                 a_start_config_beyond_the_bounds_is_refused_and_one_within_is_recorded,
+                a_remote_subagent_refuses_every_option_but_time_limit_and_max_rounds,
+                a_config_value_of_the_wrong_type_is_refused_naming_the_option,
                 round_two_carries_the_config_clamped_to_the_bounds_of_now,
                 a_sessions_time_limit_is_the_deadline_of_its_round,
                 a_sessions_own_max_rounds_is_enforced_by_a_send,

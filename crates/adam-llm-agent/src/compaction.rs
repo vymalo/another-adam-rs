@@ -207,6 +207,10 @@ fn is_true(b: &bool) -> bool {
 /// `context_window`. **The minimum with the model's window, never instead of it**: with no known
 /// window the session's alone applies, and a model's smaller window wins over a larger ask.
 ///
+/// This is the **only** place the model-window ceiling is enforced: the bounds the assembly gives
+/// `SessionBounds::admit` carry `context_window: None` (the window is a fact of the model alias, not
+/// known there), so `admit` checks the floor alone and a larger ask is clamped here, at run time.
+///
 /// A session's window is held to at least [`CONTEXT_WINDOW_PROMPT_TOKENS`](adam_runtime::CONTEXT_WINDOW_PROMPT_TOKENS) + the cap of the request +
 /// [`CONTEXT_WINDOW_HEADROOM_TOKENS`](adam_runtime::CONTEXT_WINDOW_HEADROOM_TOKENS), so a budget is always left: a smaller window would leave the
 /// history none (a budget of one token compacts at every turn) and never reach what

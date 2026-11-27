@@ -230,6 +230,16 @@ const CONFIG_OPTIONS: [(&str, &str); 7] = [
     ("max_rounds", "maxRounds"),
 ];
 
+/// The options a remote subagent refuses: every one but `time_limit` and `max_rounds` (ADR 0054
+/// decision 4).
+const REMOTE_REFUSED: [&str; 5] = [
+    "max_turns",
+    "max_tool_calls",
+    "max_output_tokens",
+    "context_window",
+    "max_parallel_tool_calls",
+];
+
 /// The [`SessionConfig`] a `subagent_start` call asked for, or the sentence that says what is wrong
 /// with it. **An unknown option is refused** (ADR 0054 decision 1): an ignored narrowing fails open.
 fn config_of(value: &Value) -> Result<SessionConfig, String> {
@@ -246,6 +256,19 @@ fn config_of(value: &Value) -> Result<SessionConfig, String> {
                 options.join(", ")
             ));
         };
+        // Every option is a whole number of 32 bits. Say so by name here, so the refusal is ours:
+        // serde's names no option and echoes what the model wrote, without a bound. A `0` passes
+        // to `admit`, which refuses it with the words of each option.
+        match value {
+            Value::Null => continue,
+            Value::Number(n) if n.as_u64().is_some_and(|n| u32::try_from(n).is_ok()) => {}
+            _ => {
+                return Err(format!(
+                    "config.{key} must be a positive integer (a whole number, at most {})",
+                    u32::MAX
+                ));
+            }
+        }
         wire.insert((*name).to_owned(), value.clone());
     }
     SessionConfig::from_value(Value::Object(wire)).map_err(|why| why.message().to_owned())
@@ -664,6 +687,19 @@ impl Tool for Start {
         let config = match args.get("config") {
             None | Some(Value::Null) => None,
             Some(value) => match config_of(value).and_then(|asked| {
+                // A remote subagent's loop is another system's: it takes `time_limit` and
+                // `max_rounds` and refuses the rest by name (ADR 0054 decision 4), never records
+                // an option nothing would enforce.
+                if agent.remote
+                    && let Some(option) = REMOTE_REFUSED
+                        .iter()
+                        .find(|own| value.get(**own).is_some_and(|v| !v.is_null()))
+                {
+                    return Err(format!(
+                        "config.{option} is not an option of a remote subagent; it takes only \
+                         time_limit and max_rounds"
+                    ));
+                }
                 agent
                     .bounds
                     .admit(asked)
@@ -868,7 +904,12 @@ impl Tool for Send {
                 .header
                 .as_ref()
                 .and_then(|h| h.config.as_ref())
-                .map(|asked| agent.map_or_else(|| asked.clone(), |a| a.bounds.clamp(asked)));
+                .map(|asked| match agent {
+                    Some(a) => a.bounds.clamp(asked),
+                    // The agent left the roster: clamp to the loop's own defaults, which never
+                    // raise what the session asked for beyond what any folder would allow.
+                    None => SessionBounds::default().clamp(asked),
+                });
             let max_rounds = config
                 .as_ref()
                 .and_then(|c| c.max_rounds)

@@ -257,6 +257,10 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
   limit is checked. `subagent_start` takes `config` in snake_case and admits it with `SessionBounds::admit`. **Not in this part:**
   `config` on the A2A `start` (the front), and *list and read showing the config* (the head line of `subagent_read`, the
   `subagent_list` row), which stay open in slice 1; a re-configuration of a running session is `subagent_edit` (slice 4).
+  The `subagent_start` schema grew (the `config` object), which **changes the stable prompt prefix, and so the prompt cache,
+  of every agent that has subagents**: the first requests after the deploy miss the cache once. A `config` on a remote subagent
+  is refused by option name unless it is `time_limit` or `max_rounds`, and a value that is not a whole number of 32 bits is
+  refused naming its option.
 
 **2. The system prompt section** (decision 9). Depends on 1.
 * Files: `sessions.rs` (the table, `SessionTools::guide`), `crates/adam-assembly/src/def.rs` or `assembly.rs` (append at bind),
