@@ -94,10 +94,10 @@ jobs:
           runs="$RUNNER_TEMP/coder-runs"
           while :; do
             gh api "repos/$GITHUB_REPOSITORY/actions/workflows/coder.yml/runs?head_sha=$GITHUB_SHA&per_page=50" \
-              --jq '.workflow_runs[] | "\(.id) \(.status) \(.conclusion // "none")"' > "$runs"
+              --jq '.workflow_runs[] | "\(.id) \(.status)"' > "$runs"
             passed=
             pending=
-            while read -r id status conclusion; do
+            while read -r id status; do
               # The image job decides, not the run: a later job (the bump) may be cancelled or fail.
               job=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?per_page=100" \
                 --jq ".jobs[] | select(.name == \"$JOB\") | .conclusion // \"none\"")
