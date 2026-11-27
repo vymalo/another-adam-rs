@@ -132,6 +132,32 @@ fn carried_loaded(source_ctx: &SourceCtx, request: &ModelRequest) -> Vec<String>
         .collect()
 }
 
+/// The heading a session's `instructions` are rendered under (ADR 0054, decision 4): they follow the
+/// folder's own text, and the text above wins — which is what the heading says.
+const SESSION_INSTRUCTIONS_HEADING: &str = "## Instructions from the parent agent or the person\n\n\
+They are added to the instructions above, which take precedence over them.\n\n";
+
+/// `system` with the session's `instructions` after it, when the round's header carries any: a
+/// session's text never replaces the folder's, it follows it under the heading.
+fn with_session_instructions(
+    system: Option<String>,
+    config: Option<&adam_runtime::SessionConfig>,
+) -> Option<String> {
+    let Some(text) = config
+        .and_then(|c| c.instructions.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        return system;
+    };
+    Some(match system {
+        Some(own) if !own.trim().is_empty() => {
+            format!("{own}\n\n{SESSION_INSTRUCTIONS_HEADING}{text}")
+        }
+        _ => format!("{SESSION_INSTRUCTIONS_HEADING}{text}"),
+    })
+}
+
 /// The sources' part of [`apply_sources`], and what a session's narrowing holds back.
 async fn offered_by(
     sources: &[DynToolSource],
@@ -3039,7 +3065,10 @@ impl LlmAgent {
         let live = self.live_model(state);
         let live_alias = live.alias.to_owned();
         let mut request = ModelRequest::new(live_alias.clone());
-        request.system = self.instructions.clone();
+        request.system = with_session_instructions(
+            self.instructions.clone(),
+            state.session.as_ref().and_then(|h| h.config.as_ref()),
+        );
         // What is sent about an image is decided here, from the reference and the deployment's
         // settings now, and recorded nowhere: the same settings give the same lines every turn.
         let image_limits = self.model.input_modalities(&live_alias).images;
@@ -3864,7 +3893,10 @@ impl LlmAgent {
         let live = self.live_model(state);
         let live_alias = live.alias.to_owned();
         let mut request = ModelRequest::new(live_alias.clone());
-        request.system = self.instructions.clone();
+        request.system = with_session_instructions(
+            self.instructions.clone(),
+            state.session.as_ref().and_then(|h| h.config.as_ref()),
+        );
         // The summary request is the request before it and one more message, so a provider's cache
         // serves it: its images are the ones the last request sent. A history that a provider
         // rejected as too long is sent shorter, with each image said in a few words.
@@ -9332,5 +9364,40 @@ mod compaction_gate_tests {
         );
         let room = agent(1100);
         assert!(room.compaction_due(&state), "the tail fits");
+    }
+}
+
+#[cfg(test)]
+mod session_instructions_tests {
+    use super::*;
+
+    /// A session's `instructions` follow the folder's, under a heading that says where they come
+    /// from and that the text above wins (ADR 0054, decision 4). Nothing is added without them.
+    #[test]
+    fn a_sessions_instructions_follow_the_folders_under_a_heading() {
+        let config = adam_runtime::SessionConfig::from_value(serde_json::json!({
+            "instructions": "Answer in one paragraph."
+        }))
+        .expect("a config");
+        let out = with_session_instructions(Some("You are the coder.".into()), Some(&config))
+            .expect("a system");
+        assert!(out.starts_with("You are the coder."), "{out}");
+        assert!(
+            out.contains("Instructions from the parent agent or the person"),
+            "{out}"
+        );
+        assert!(out.ends_with("Answer in one paragraph."), "{out}");
+
+        // No session, and a session that asks for nothing: the folder's text alone, no heading.
+        assert_eq!(
+            with_session_instructions(Some("You are the coder.".into()), None),
+            Some("You are the coder.".into())
+        );
+        let none =
+            adam_runtime::SessionConfig::from_value(serde_json::json!({})).expect("a config");
+        assert_eq!(
+            with_session_instructions(Some("You are the coder.".into()), Some(&none)),
+            Some("You are the coder.".into())
+        );
     }
 }

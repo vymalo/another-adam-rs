@@ -720,7 +720,18 @@ pub struct SessionConfig {
     /// when `tools` matches it too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_tools: Option<Vec<String>>,
+    /// Text the parent agent (or the person) adds to this session, **after** the folder's own
+    /// instructions and never replacing them: at most [`MAX_SESSION_INSTRUCTIONS_CHARS`] characters,
+    /// rendered under a fixed heading that says where it comes from and that the text above wins
+    /// ([ADR 0054], decision 4).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
+
+/// The most characters a session's `instructions` may hold ([ADR 0054], decision 4).
+pub const MAX_SESSION_INSTRUCTIONS_CHARS: usize = 4_000;
 
 impl SessionConfig {
     /// Whether no option is asked for: the folder's own settings, exactly as no `config` at all.
@@ -734,6 +745,7 @@ impl SessionConfig {
             && self.max_rounds.is_none()
             && self.tools.is_none()
             && self.deny_tools.is_none()
+            && self.instructions.is_none()
     }
 
     /// What a round's context carries of this config under `vymalo.session.tools`
@@ -979,6 +991,18 @@ impl SessionBounds {
         if let Some(entries) = &requested.deny_tools {
             self.admit_tool_entries("deny_tools", entries)?;
         }
+        if let Some(text) = &requested.instructions {
+            let chars = text.chars().count();
+            if chars > MAX_SESSION_INSTRUCTIONS_CHARS {
+                return Err(Refusal::new(
+                    Some("instructions"),
+                    format!(
+                        "config.instructions is {chars} characters; at most \
+                         {MAX_SESSION_INSTRUCTIONS_CHARS}"
+                    ),
+                ));
+            }
+        }
         Ok(requested)
     }
 
@@ -1133,6 +1157,9 @@ impl SessionBounds {
             // nothing withholds nothing it should not.
             tools: config.tools.clone(),
             deny_tools: config.deny_tools.clone(),
+            // Text has no bound to clamp to: `admit` already refused one that is too long, and a
+            // later round keeps what the session was started with.
+            instructions: config.instructions.clone(),
         }
     }
 }
