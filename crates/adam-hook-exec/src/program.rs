@@ -22,7 +22,7 @@
 //! broken, so a slow program cannot hold the loop.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
