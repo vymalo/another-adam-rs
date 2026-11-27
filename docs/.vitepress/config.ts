@@ -34,7 +34,7 @@ const sidebar = [
     collapsed: true,
     items: [
       { text: "Use", items: pages("guides", [], ["write-an-agent.md"]) },
-      { text: "Deploy", items: pages("guides", [], ["deploy-the-coder.md"]) },
+      { text: "Deploy", items: pages("guides", [], ["deploy-the-coder.md", "releases.md"]) },
       {
         text: "Operate",
         items: pages("guides", [], [

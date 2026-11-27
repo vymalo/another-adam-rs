@@ -43,8 +43,10 @@ credential: [Run it locally](docs/guides/run-locally.md). Every suite and end-to
 
 ## Conventions
 
-- **Conventional Commits:** `feat(scope): ...`, `fix`, `docs`, `test`, and so on. Nothing here enforces them (no hook,
-  no CI check), but the history and the bump workflow use them. Please follow them.
+- **Conventional Commits:** `feat(scope): ...`, `fix`, `docs`, `test`, and so on. A pull request is squashed, so its
+  **title** is the commit on main, and release-please reads it to pick the next version and write the changelog
+  ([Releases](docs/guides/releases.md)). The `Commit Lint` check refuses a title or a commit that is not one;
+  `git config core.hooksPath .githooks` runs the same check (`tools/commit-lint.sh`) when you commit.
 - **Decisions are ADRs** in `docs/decisions/NNNN-kebab-title.md`, the next number, headed `# NNNN. Title` and
   `Status: **Accepted** (date)`. Add a row to the table in [`docs/decisions/README.md`](docs/decisions/README.md). Change a past decision
   with a dated *Amended* note, never silently. Use *Proposed* when the owner has yet to confirm it.

@@ -13,7 +13,8 @@ commands and the evidence. Checked at `257175c` on 2026-11-26. The skill for a r
    ```
 
    The StatefulSet is the worker (the whole process with `topology: combined`); `<fullname>-front` is the front with `topology: split`.
-2. **Name B.** A commit of `main` whose image exists. Anonymous pull works for the package:
+2. **Name B.** A release `X.Y.Z` (read its digest with `sh tools/release/registry-digest.sh ghcr.io/vymalo/another-adam-rs/coder X.Y.Z`,
+   [releases](releases.md#read-a-releases-digests)) or a commit of `main` whose image exists. Anonymous pull works for the package:
 
    ```sh
    TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:vymalo/another-adam-rs/coder:pull" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
@@ -23,7 +24,8 @@ commands and the evidence. Checked at `257175c` on 2026-11-26. The skill for a r
 
    `200` and a digest mean the tag exists. The image's revision label is the full commit: read the manifest's `config.digest`, fetch that blob, compare
    `.config.Labels["org.opencontainers.image.revision"]` with B (`adam-upgrade`, step 7). The chart renders `<image.repository>:<image.tag>`
-   (`deploy/coder/templates/statefulset.yaml:83`); there is no digest value, and whether a `tag@sha256:...` string passes the chart's checks was not tried here.
+   (`deploy/coder/templates/statefulset.yaml:83`); there is no digest value. *Tried 2026-11-27* (ADR 0084): `--set image.tag=X.Y.Z@sha256:<64 hex>` renders with the defaults and with
+   `runPods.enabled=true` (every coder image, the run-pod template and the admission policy carry the pair), and the default render validates with kubeconform 1.37.0.
 3. **List what changed**, in a clone of this repository:
 
    ```sh

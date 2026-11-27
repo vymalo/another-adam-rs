@@ -1,6 +1,6 @@
 ---
 name: adam-coder-deploy
-description: "Build, publish and deploy the adam-rs coder image (ghcr.io/vymalo/another-adam-rs/coder, which also carries adam-agent) and its Helm chart deploy/coder: image tags sha-<7>, the CI that builds and bumps image.tag, chart topologies and placements, secrets, render checks. Use when changing docker/coder or deploy/coder, releasing the image, or deploying the coder or a folder agent to Kubernetes."
+description: "Build, publish and deploy the adam-rs coder image (ghcr.io/vymalo/another-adam-rs/coder, which also carries adam-agent) and its Helm chart deploy/coder: image tags sha-<7> for development and releases X.Y.Z (signed images and the OCI chart, cut by release-please), the CI that builds and bumps image.tag, chart topologies and placements, secrets, render checks. Use when changing docker/coder or deploy/coder, releasing the image, or deploying the coder or a folder agent to Kubernetes."
 ---
 
 # Build, publish and deploy the coder image and chart
@@ -8,8 +8,8 @@ description: "Build, publish and deploy the adam-rs coder image (ghcr.io/vymalo/
 One image, `ghcr.io/vymalo/another-adam-rs/coder`, carries six static binaries: `adam-coder` (the
 entrypoint), `adam-agent` (run with `--entrypoint tini ... -- adam-agent`, see `adam-agent-folder`),
 `adam-kube-exec`, `adam-egress`, `adam-git-sandbox` and `adam-git` (run pods and the git sandbox, see
-`deploy/coder/README.md`). One Helm chart, `deploy/coder`, deploys the coder. There is no second image
-or package.
+`deploy/coder/README.md`). One Helm chart, `deploy/coder`, deploys the coder. There is no second image.
+A release also publishes the chart as an OCI package, `oci://ghcr.io/vymalo/another-adam-rs/charts/coder`.
 
 On Kubernetes the coder (or a folder agent) can also run as `AgentService` and `AgentConfig` custom
 resources under the operator of vymalo/another-agentic-platform instead of this chart
@@ -23,7 +23,8 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
 ## When to use
 
 * Changing `docker/coder/Dockerfile`, the base image, a pinned tool, or the chart.
-* Releasing a new image, or finding which image tag a commit produced.
+* Releasing a version (`vX.Y.Z`), releasing a new development image, or finding which image tag a
+  commit produced.
 * Deploying the coder (or an `adam-agent` folder agent) on Kubernetes, or in compose.
 * Not for choosing which adam-rs revision a consumer pins: `adam-upgrade`.
 * Not for running agents as custom resources: the operator is in vymalo/another-agentic-platform, not here.
@@ -54,8 +55,34 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
    `deploy/coder/bump-tag.sh deploy/coder/values.yaml sha-<7>` and pushes
    `chore(deploy): bump coder to sha-<7>` to main (it is idempotent, edits only `image.tag`, and
    skips when `main` moved on). Pull requests get a dry run that shows the edit. Do not edit
-   `image.tag` by hand in a pull request.
-4. **The chart** (`deploy/coder/README.md` documents every value):
+   `image.tag` by hand in a pull request. This is development: `sha-<7>` images are unsigned.
+4. **Releases (ADR 0084).** release-please (`.github/workflows/release-please.yml`,
+   `release-please-config.json`, `.release-please-manifest.json`) keeps one release pull request,
+   `chore: release main`, open on `main`; merging it tags `vX.Y.Z`. One version for the repository:
+   every line marked `# x-release-please-version` (the workspace `version`, every path dependency's
+   `version`, `deploy/coder/Chart.yaml`'s `version` and `appVersion`) moves together, and the job
+   then runs `tools/release/sync.sh` on the release branch (`cargo metadata` for the lockfiles,
+   `deploy/coder/tests/render-goldens.sh` for the goldens, whose labels and ConfigMap checksums carry
+   the chart's version). On the tag, `.github/workflows/release.yml` waits for `coder.yml`'s image
+   job to pass on that commit, builds the image again with `provenance: mode=max` and `sbom: true`,
+   pushes it by digest, smoke-tests that digest, signs it with cosign keyless and only then tags it
+   `X.Y.Z` and `X.Y` (never `latest`); it packages `deploy/coder` with `image.tag` set to `X.Y.Z` in a
+   copy (`bump-tag.sh` accepts `X.Y.Z`), pushes it to `oci://ghcr.io/vymalo/another-adam-rs/charts`
+   and signs it. A new path dependency with a version needs the mark, or
+   `sh tools/release/check-versions.sh` (CI, job `fmt`) fails. The release needs a GitHub App
+   (secrets `RELEASE_PLEASE_APP_CLIENT_ID`, `RELEASE_PLEASE_APP_PRIVATE_KEY`): a tag made with
+   `GITHUB_TOKEN` starts no workflow. Every pull request title is a Conventional Commit
+   (`tools/commit-lint.sh`, workflow `commit-lint.yml`): it is the commit release-please reads.
+   **Production deploys a release**, pinned `X.Y.Z@sha256:<digest>`:
+
+   ```sh
+   helm install coder oci://ghcr.io/vymalo/another-adam-rs/charts/coder --version X.Y.Z \
+     -n <ns> -f my-values.yaml --set image.tag=X.Y.Z@sha256:<digest>
+   cosign verify ghcr.io/vymalo/another-adam-rs/coder:X.Y.Z \
+     --certificate-identity "https://github.com/vymalo/another-adam-rs/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+   ```
+5. **The chart** (`deploy/coder/README.md` documents every value):
    * `topology: combined` (default, one StatefulSet) or `split` (a front Deployment with
      `ROLE=control-plane` plus the worker StatefulSet).
    * `database.enabled: true` (default) creates a CloudNativePG `Cluster`; `database.enabled: false`
@@ -144,7 +171,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      A repository may bring its own `devcontainer.json`: with `runPods.repositoryImages.allowedPrefixes` (empty by
      default) the coder offers `use_repository_environment` and the policy admits an image under a prefix for the `run`
      container alone (ADR 0052, `docs/decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md`).
-5. **Change the chart with its guards.** Render-time validation is in
+6. **Change the chart with its guards.** Render-time validation is in
    `deploy/coder/templates/_validate.tpl`; the default render is pinned by
    `deploy/coder/tests/golden/combined.yaml`; `deploy/coder/tests/render-check.sh` asserts the
    guarantees on the render. A new CRD kind needs its schema in `deploy/coder/tests/schemas`
@@ -152,11 +179,11 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
    `kubeVersion` floor is **Kubernetes 1.37**: `helm template --kube-version 1.36.0` fails. Helm 4 installs with
    server-side apply, `--wait` is the kstatus watcher (`--wait=legacy` for the old behaviour) and `--atomic` is
    deprecated for `--rollback-on-failure`.
-6. **Deploy a folder agent from the same image**: run the image with the entrypoint
+7. **Deploy a folder agent from the same image**: run the image with the entrypoint
    `tini -- adam-agent`, the folder mounted at `ADAM_AGENT_DIR`, readable by uid 10001
    (`adam-agent-folder`). The chart deploys the coder only. For a folder agent use an `AgentService`
    (the platform's operator, https://github.com/vymalo/another-agentic-platform/blob/main/deploy/operator/README.md) or write your own manifest, using the chart's StatefulSet as a model for the variables.
-7. **Local stack**: `docker compose --profile app up -d --build --wait` (see `compose.yaml` and
+8. **Local stack**: `docker compose --profile app up -d --build --wait` (see `compose.yaml` and
    `docs/guides/run-locally.md` and `docs/reference/dev-stack.md`).
 
 ## Verify
@@ -166,6 +193,8 @@ helm lint deploy/coder
 helm template coder deploy/coder --namespace <ns> > /dev/null
 sh deploy/coder/tests/render-check.sh        # from the repository root
 sh deploy/coder/tests/bump-tag-test.sh
+sh tools/release/check-versions.sh           # every version a release moves is marked, and the Cargo lines agree
+sh deploy/coder/tests/render-goldens.sh && git diff --exit-code deploy/coder/tests/golden   # goldens are the chart's render
 shellcheck deploy/coder/bump-tag.sh deploy/coder/tests/*.sh docker/coder/test/*.sh dev/*.sh
 docker buildx build -f docker/coder/Dockerfile -t coder:smoke --load .
 sh docker/coder/test/static-smoke.sh coder:smoke    # `file` says static; each binary starts in debian:bookworm-slim and alpine
@@ -218,7 +247,14 @@ Then the compose scenarios of the `image` job in `.github/workflows/coder.yml`
   and a shared one needs `kubectl delete statefulset <release>-coder --cascade=orphan` before
   `helm upgrade` (chart README, "Workspace placement").
 * `topology: split` moves the Service selector to the front: upgrade at a quiet moment.
-* Do not push `image.tag` yourself: a human bump races the workflow's.
+* Do not push `image.tag` yourself: a human bump races the workflow's. Never set it to a release on
+  `main`: the release sets `X.Y.Z` in the packaged copy only.
+* Do not edit a version line by hand, or the release pull request: release-please owns them. A
+  release changes the chart's render (two labels per object and the ConfigMap checksums), and the
+  release pull request carries the re-rendered goldens.
+* A release's image digest differs from its commit's `sha-<7>`: it is rebuilt, with provenance and an
+  SBOM. Renaming `release.yml` breaks every `cosign verify` of past releases (the identity is the file).
+* The chart's OCI package is private until its owner makes it public, like any new GHCR package.
 
 ## See also
 
@@ -226,3 +262,5 @@ Then the compose scenarios of the `image` job in `.github/workflows/coder.yml`
   ("Image and compose"), `docs/guides/deploy-the-coder.md`.
 * `adam-agent-folder`, `adam-upgrade`.
 * https://github.com/vymalo/another-adam-rs/blob/main/.github/workflows/coder.yml
+* https://github.com/vymalo/another-adam-rs/blob/main/.github/workflows/release.yml and
+  https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/releases.md

@@ -1,15 +1,23 @@
 ---
 name: adam-upgrade
-description: "Move a repository that consumes adam-rs from revision A to revision B: find the breaking changes between them (trait methods, env vars, paths, decisions), migrate the code, and pin the coder image by tag and digest. Use for 'bump adam-rs', 'update the adam pin', 'sha-xxxxxxx of the coder image', or when a build broke after changing an adam git rev."
+description: "Move a repository that consumes adam-rs from revision A to revision B: find the breaking changes between them (trait methods, env vars, paths, decisions), migrate the code, and pin the coder image by tag and digest (a release X.Y.Z@sha256 in production, or a sha-<7>). Use for 'bump adam-rs', 'update the adam pin', 'move to release X.Y.Z', 'sha-xxxxxxx of the coder image', or when a build broke after changing an adam git rev."
 ---
 
 # Upgrade a consumer of adam-rs
 
-A consumer pins adam-rs in up to three places, which must move together: git dependencies on the
-adam crates (`rev = "<40-hex sha>"`), the coder image (`ghcr.io/vymalo/another-adam-rs/coder`,
-tag `sha-<7>` plus digest) and any files copied from the repository (agent folders, WireMock
-mappings, scripts). adam-rs has no changelog and no semver releases: the history and the docs are
-the changelog.
+A consumer pins adam-rs in up to four places, which must move together: git dependencies on the
+adam crates (`rev = "<40-hex sha>"`), the coder image (`ghcr.io/vymalo/another-adam-rs/coder`, a
+tag plus its digest), the chart if it installs one, and any files copied from the repository (agent
+folders, WireMock mappings, scripts).
+
+adam-rs has **releases** (ADR 0084): a tag `vX.Y.Z` cut by release-please, one version for every
+crate, the image and the chart, with `CHANGELOG.md`. A release publishes the image
+`ghcr.io/vymalo/another-adam-rs/coder:X.Y.Z` (and `:X.Y`, the newest patch of the minor; never
+`latest`) and the chart `oci://ghcr.io/vymalo/another-adam-rs/charts/coder` at version `X.Y.Z`
+(its `image.tag` is `X.Y.Z`), both signed with cosign keyless. **Production pins a release:
+`X.Y.Z@sha256:<digest>`.** Every commit of `main` also has a development image `sha-<7>`;
+between two commits the history and the docs are the changelog. Before 1.0 a breaking change moves
+the minor (`0.6.x` to `0.7.0`), so read every minor you cross.
 
 Every adam-rs path below is in `vymalo/another-adam-rs` at the revision you pin (replace `main`
 by that revision). Entry point for people:
@@ -25,10 +33,12 @@ https://github.com/vymalo/another-adam-rs/blob/main/.agents/docs/README.md (ADR 
 
 ## Procedure
 
-1. **Name A and B.** A is the sha you pin now (the `rev` of every adam crate; the image tag's
-   `sha-<7>` is the first seven characters of a commit). B is the commit you want: the image of a
-   commit exists only if CI pushed it, so choose B from the commits on `main` whose image
-   exists (step 7). Clone adam-rs next to your repository to read it
+1. **Name A and B.** A is what you pin now (the `rev` of every adam crate; the image tag is
+   `X.Y.Z` for a release or `sha-<7>`, the first seven characters of a commit). B is a release
+   `vX.Y.Z` (production) or a commit whose image exists: the image of a commit exists only if CI
+   pushed it, so choose B from the commits on `main` whose image exists (step 7). The `rev` of a
+   release is the full sha of its tag's commit (`git rev-parse vX.Y.Z^{commit}`), never the tag
+   name. Clone adam-rs next to your repository to read it
    (`git clone https://github.com/vymalo/another-adam-rs`).
 2. **List what changed**, from the adam-rs clone:
 
@@ -39,9 +49,11 @@ https://github.com/vymalo/another-adam-rs/blob/main/.agents/docs/README.md (ADR 
      crates/adam-a2a/src/backend.rs crates/adam-host/src/lib.rs
    ```
 
-   Commits whose subject has `!` (for example `feat(runtime)!:`) say they break;
+   Between two releases read `CHANGELOG.md` first (`git diff vA..vB -- CHANGELOG.md`), then the same
+   log with `vA..vB`. Commits whose subject has `!` (for example `feat(runtime)!:`) say they break;
    `git log --format='%h %s' A..B | grep '!:'` lists them. Commits that only say
-   `chore(deploy): bump coder to sha-<7>` are image bumps: they are not changes.
+   `chore(deploy): bump coder to sha-<7>` are image bumps, and `chore: release main` is a release
+   moving the versions: neither is a change.
 3. **Read the docs that changed**: a crate's README is updated in the same change as its public
    API, environment variables or tests, so `git diff A..B -- crates/<crate>/README.md` for each
    crate you use is the migration note. The configuration tables (`bin/adam-agent/README.md`
@@ -113,8 +125,21 @@ https://github.com/vymalo/another-adam-rs/blob/main/.agents/docs/README.md (ADR 
      https://ghcr.io/v2/vymalo/another-adam-rs/coder/manifests/sha-<7> | grep -i '^docker-content-digest'
    ```
 
-   `200` and a `docker-content-digest` line mean the tag exists; pin it as
-   `ghcr.io/vymalo/another-adam-rs/coder:sha-<7>@sha256:<digest>`. Check it is B: read the
+   For a release, ask for `manifests/X.Y.Z` instead (or run `sh tools/release/registry-digest.sh
+   ghcr.io/vymalo/another-adam-rs/coder X.Y.Z` in the adam-rs clone). `200` and a
+   `docker-content-digest` line mean the tag exists; pin it as
+   `ghcr.io/vymalo/another-adam-rs/coder:X.Y.Z@sha256:<digest>` (or `:sha-<7>@sha256:<digest>`); with
+   the chart, `--set image.tag=X.Y.Z@sha256:<digest>` renders that pair. A release's digest is not its
+   commit's `sha-<7>` digest: the release builds the image again with provenance and an SBOM. Check
+   a release's signature:
+
+   ```sh
+   cosign verify ghcr.io/vymalo/another-adam-rs/coder:X.Y.Z \
+     --certificate-identity "https://github.com/vymalo/another-adam-rs/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+   ```
+
+   Check the image is B: read the
    manifest's `config.digest`, fetch that blob (`curl -sL` with the token, `.../blobs/<config digest>`)
    and compare `.config.Labels["org.opencontainers.image.revision"]` with B's full sha. If the
    manifest request answers an index (a `manifests` list), take the platform's manifest first.
@@ -134,7 +159,10 @@ https://github.com/vymalo/another-adam-rs/blob/main/.agents/docs/README.md (ADR 
 * Pinning an image tag whose commit CI did not push (a tag that does not exist, or a package that
   is private: the token request still answers, the manifest request does not return `200`).
 * Moving the crates and not the image (or the other way): the A2A behaviour of the two differs.
-* A tag alone is not a pin: a digest is.
+* A tag alone is not a pin: a digest is. A release tag `X.Y.Z` is never moved by the release
+  workflow, but `X.Y` is, and a registry tag can be moved by hand: pin the digest.
+* A `sha-<7>` in production: development images are unsigned and carry no provenance; production
+  pins a release.
 * Skipping a commit marked `!` because the build still compiles: runtime behaviour (leases,
   claims, A2A states) can change without a compile error; read the ADRs the log names.
 * Files copied from the repository drift: re-copy them from B and diff them against yours.
