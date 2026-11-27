@@ -49,6 +49,9 @@ pub struct BoundDef {
     step_io: Option<StepIo>,
     scrub: Option<Scrub>,
     scrub_longest: Option<crate::scrub::Longest>,
+    /// The host's hooks, which every agent runs before the plugins its file names
+    /// ([`hooks`](Self::hooks)).
+    hooks: Option<adam_plugin::HookSet>,
     #[cfg(feature = "mcp")]
     prompt_commands: Vec<adam_mcp::PromptCommand>,
 }
@@ -107,6 +110,7 @@ impl BoundDef {
             step_io: None,
             scrub: None,
             scrub_longest: None,
+            hooks: None,
             #[cfg(feature = "mcp")]
             prompt_commands: Vec::new(),
         }
@@ -273,6 +277,18 @@ impl BoundDef {
     #[must_use]
     pub fn step_io(mut self, step_io: StepIo) -> Self {
         self.step_io = Some(step_io);
+        self
+    }
+
+    /// The host's own hooks (ADR 0050), for **every** agent built here, the root and each subagent:
+    /// they run first, in their order and under the set's limits, then the plugins the agent's file
+    /// names in `plugins:` ([`AgentDef::plugin`](crate::AgentDef::plugin)). A host that must be asked
+    /// before a tool runs (an application that embeds the engine, ADR 0047 slice 5) gives the plugin
+    /// here, so no agent file can leave it out. [`AgentInfo::plugins`] lists the file's plugins only.
+    /// Calling this again replaces the set.
+    #[must_use]
+    pub fn hooks(mut self, hooks: adam_plugin::HookSet) -> Self {
+        self.hooks = Some(hooks);
         self
     }
 
@@ -868,11 +884,13 @@ impl BoundDef {
         for (tool, _, policy) in &node.retry {
             builder = builder.tool_retry(tool.clone(), *policy);
         }
-        if !node.plugins.is_empty() {
+        // The host's hooks first (`hooks`), then the plugins the file names.
+        let host = self.hooks.as_ref().filter(|hooks| !hooks.is_empty());
+        if host.is_some() || !node.plugins.is_empty() {
             let hooks = node
                 .plugins
                 .iter()
-                .fold(adam_plugin::HookSet::new(), |hooks, (_, plugin)| {
+                .fold(host.cloned().unwrap_or_default(), |hooks, (_, plugin)| {
                     hooks.with(Arc::clone(plugin))
                 });
             builder = builder.hooks(hooks);
