@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "corntchap-anr-adam": {
+      "type": "http",
+      "url": "https://corntchap.camer.digital/mcp/ANR"
+    }
+  }
+}

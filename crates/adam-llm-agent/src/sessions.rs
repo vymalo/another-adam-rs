@@ -321,8 +321,9 @@ const GUIDE: [GuideTool; 5] = [
     GuideTool {
         name: SUBAGENT_CLOSE,
         purpose: "close a session for good: it takes no more messages. A working round \
-                  finishes unless you pass `cancel`.",
-        args: &[("session", true), ("cancel", false)],
+                  finishes unless you pass `cancel`, and `delete` removes an idle session from \
+                  every listing.",
+        args: &[("session", true), ("cancel", false), ("delete", false)],
     },
     GuideTool {
         name: SUBAGENT_LIST,
@@ -926,6 +927,7 @@ impl Tool for Start {
             keep_open: keep,
             closed: false,
             closing: false,
+            deleted: false,
             round: 1,
             // The run this call's model calls name, which the orchestrator bound: the round's
             // calls name it too (ADR 0067).
@@ -1104,6 +1106,7 @@ impl Tool for Send {
                 keep_open: true,
                 closed: false,
                 closing: false,
+                deleted: false,
                 round: 0,
                 root: None,
                 workspace: None,
@@ -1313,6 +1316,11 @@ impl Tool for Close {
                         "default": false,
                         "description": "Stop a working round instead of letting it finish.",
                     },
+                    "delete": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Delete the session: it is gone from every listing and every tool refuses it. Its runs stay in the store. An idle session is deleted at once; a working one is refused, so close it first.",
+                    },
                 },
                 "required": required_of(SUBAGENT_CLOSE),
                 "additionalProperties": false,
@@ -1337,6 +1345,10 @@ impl Tool for Close {
             Ok(cancel) => cancel,
             Err(why) => return refuse(why),
         };
+        let delete = match bool_arg(&args, "delete", false) {
+            Ok(delete) => delete,
+            Err(why) => return refuse(why),
+        };
         let starter = ctx.child_starter()?;
         let round_id = ctx.child_run_id();
         let mut note = None;
@@ -1348,8 +1360,16 @@ impl Tool for Close {
             else {
                 return refuse(no_such_session(session));
             };
-            if view.latest_run == round_id || (view.closed && view.state != SessionState::Working) {
+            if view.latest_run == round_id
+                || (view.closed && view.state != SessionState::Working && !delete)
+            {
                 return Ok(closed(session, note));
+            }
+            if delete && view.state == SessionState::Working {
+                return refuse(format!(
+                    "session `{session}` is working; it is not deleted while a round runs: close \
+                     it with `cancel: true` first, then delete it"
+                ));
             }
             if view.state == SessionState::Working {
                 if cancel {
@@ -1391,6 +1411,7 @@ impl Tool for Close {
                 keep_open: true,
                 closed: false,
                 closing: false,
+                deleted: false,
                 round: 0,
                 root: None,
                 workspace: None,
@@ -1400,6 +1421,7 @@ impl Tool for Close {
             header.round = view.round + 1;
             header.closed = true;
             header.closing = true;
+            header.deleted = delete;
             let input = Inbound::new(MESSAGE_KIND, adam_runtime::closing_round_payload(&header));
             match starter
                 .start_round(
@@ -1583,6 +1605,7 @@ mod tests {
             keep_open: true,
             closed: false,
             closing: false,
+            deleted: false,
             idle_expired: false,
             started_by: by.or(Some(me)),
             report: ReportRound {

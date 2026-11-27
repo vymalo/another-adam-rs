@@ -6,7 +6,7 @@ The session tools (an argument marked `?` is optional):
 - `subagent_start` (`agent`, `description`, `prompt`, `keep_open?`, `config?`): start a session on a helper and get its session id at once. Give it a `config` to narrow its limits, and `keep_open` to keep it for more messages.
 - `subagent_send` (`session`, `message`): send a message to a session. It starts the next round of an idle session, and is steered into a round that works. A closed session takes none.
 - `subagent_read` (`session`, `wait?`, `offset?`, `limit?`): read the report of a session's latest round, paged by lines. Pass `wait` to wait for a working round to end; never poll.
-- `subagent_close` (`session`, `cancel?`): close a session for good: it takes no more messages. A working round finishes unless you pass `cancel`.
+- `subagent_close` (`session`, `cancel?`, `delete?`): close a session for good: it takes no more messages. A working round finishes unless you pass `cancel`, and `delete` removes an idle session from every listing.
 - `subagent_list` (`offset?`, `limit?`): list the sessions of this conversation and their state, the open ones first, paged by sessions.
 
 Options of `config`: `max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit`, `max_rounds`. They only narrow what a helper allows: a value above what the helper allows is refused, and the refusal names the option and says what is allowed. An option you leave out is the helper's own.

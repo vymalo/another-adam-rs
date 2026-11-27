@@ -1281,6 +1281,7 @@ impl RuntimeTaskBackend {
             keep_open: start.keep_open,
             closed: false,
             closing: false,
+            deleted: false,
             round: 1,
             // A person's session is its own parent: no run opened it, so each round's model calls
             // name the round's own task, which the orchestrator binds as any task it creates
@@ -1611,6 +1612,7 @@ fn next_header(view: &SessionView, session: RunId) -> SessionHeader {
         keep_open: false,
         closed: false,
         closing: false,
+        deleted: false,
         round: 0,
         root: None,
         workspace: None,
@@ -2081,6 +2083,7 @@ mod tests {
             keep_open: true,
             closed: false,
             closing: false,
+            deleted: false,
             round: 1,
             root: None,
             workspace: None,
