@@ -112,17 +112,20 @@ A release is now also a binary. The decisions:
    the release event both follow the one App-made release; a second workflow would run beside the gate and not behind it,
    and cosign's identity is the workflow file, so the binaries would need a second identity to verify. The price is that
    the tag's push can arrive before the release is published, so `adam-agent-preflight` waits for it (30 minutes) and
-   requires a published release authored by a bot, the release App's when `RELEASE_PLEASE_APP_SLUG` is set. A tag pushed
-   by hand has no release and ships no binary.
+   requires a published release authored by the release App itself (`<app-slug>[bot]`, the slug read from the App's token,
+   so there is no variable to forget and nothing is accepted by default). A tag pushed by hand has no release and ships
+   no binary. A published asset is never replaced: the archives and the signed checksums all present means a re-run builds
+   and attaches nothing and tests what is there; some present stops the run for a person.
 2. **Four native builds**, not cross-compiled: `x86_64` and `aarch64` `unknown-linux-musl` (static, `file` checked) on
    `ubuntu-24.04` and `ubuntu-24.04-arm`; `aarch64` and `x86_64` `apple-darwin` on `macos-26` and `macos-26-intel`,
    GitHub-hosted, because Apple's targets cannot be linked from Linux. Archives are `adam-agent_X.Y.Z_<os>_<arch>.tar.gz`.
-   macOS binaries are not notarized (out of scope until the owner asks).
+   macOS binaries are not notarized (out of scope until the owner asks); Linux's are static, macOS's link system libraries only.
 3. **`SHA256SUMS` is signed**, `cosign sign-blob` keyless with a bundle, under the identity of the image
    (`release.yml@refs/tags/vX.Y.Z`); the archives are checked through it.
 4. **The formula is generated and proposed, never pushed**: the release App opens or updates one pull request on
    `vymalo/homebrew-tap` (`bot/adam-agent`), after Homebrew installed the formula on four platforms. A person merges it.
-   Monotonic: a version older than the tap's is not proposed.
+   Monotonic: a version older than the tap's is not proposed. The job's concurrency is `queue: max` with
+   `cancel-in-progress: false`: no pending update is dropped, and an older release that arrives last is a no-op.
 5. **`adam-agent` gains `--version` and `--help`**, answered before any configuration is read. Before, any argument
    was ignored and the process tried to start (exit 78 without a folder), so the formula's `test do` could not pass.
 6. `aapctl` (another-agentic-platform) takes the same shape in its own repository; it is not decided here.

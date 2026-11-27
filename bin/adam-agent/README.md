@@ -12,7 +12,7 @@ A2A_BEARER_TOKENS=dev-token PUBLIC_URL=http://127.0.0.1:8080/ \
   cargo run -p adam-agent
 ```
 
-Installed with Homebrew (`brew install vymalo/tap/adam-agent`, a static binary for Linux and macOS, arm64 and x86_64,
+Installed with Homebrew (`brew install vymalo/tap/adam-agent`, one binary for Linux (static) and macOS, arm64 and x86_64,
 built from each release) it is the same process: `adam-agent --version` and `adam-agent --help` answer before any
 configuration is read; every other invocation is configured by its environment alone, and no configuration is exit 78.
 A laptop needs the folder, a model endpoint, a bearer token, a `PUBLIC_URL` and `DATABASE_URL=sqlite://<file>` (no

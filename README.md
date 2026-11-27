@@ -75,7 +75,7 @@ library's own plan is [the roadmap](docs/roadmap.md); every setting by surface i
 
 ## Install `adam-agent`
 
-`adam-agent` is one static binary that serves an agent folder over A2A. On macOS or Linux (arm64 or x86_64):
+`adam-agent` is one binary that serves an agent folder over A2A. On macOS or Linux (arm64 or x86_64):
 
 ```sh
 brew install vymalo/tap/adam-agent

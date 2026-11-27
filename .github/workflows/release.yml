@@ -339,8 +339,10 @@ jobs:
   # build never keeps a binary from a release (re-run the failed jobs).
   # ---------------------------------------------------------------------------------------------------------
 
-  # The tag has a published GitHub release that the release App made. release-please creates the tag and the
-  # release in one call, but the push event can arrive first, so wait for it.
+  # The tag has a published GitHub release that the release App made, and says which of its assets exist.
+  # release-please creates the tag and the release in one call, but the push event can arrive first, so wait.
+  # The App is identified by its own slug (`app-slug` of the token action), not by a variable: with nothing to
+  # compare against, nothing is accepted.
   adam-agent-preflight:
     name: adam-agent, the release is the App's and published
     needs: gate
@@ -348,15 +350,30 @@ jobs:
     timeout-minutes: 40
     permissions:
       contents: read
+    outputs:
+      # none: nothing of adam-agent is on the release, build and attach it. complete: the four archives and the
+      # signed checksums are there already (a re-run): build nothing, attach nothing, test what is published.
+      assets: ${{ steps.release.outputs.assets }}
     steps:
-      - name: Wait for the published release and check who made it
+      - name: Mint the release App token (read only), for its slug
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_PLEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          repositories: another-adam-rs
+          permission-contents: read
+      - name: Wait for the published release, check who made it and what it holds
+        id: release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_REPO: ${{ github.repository }}
-          APP_SLUG: ${{ vars.RELEASE_PLEASE_APP_SLUG }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
         run: |
           set -eu
+          test -n "$APP_SLUG"
           tag=${GITHUB_REF#refs/tags/}
+          version=${tag#v}
           case "$tag" in
             v[0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "::error::$tag is not vX.Y.Z"; exit 1 ;;
@@ -376,15 +393,26 @@ jobs:
             echo "::error::release $tag is a draft or a prerelease"
             exit 1
           fi
-          case "$author" in
-            *"[bot]") ;;
-            *) echo "::error::release $tag was made by $author, not by the release App"; exit 1 ;;
-          esac
-          if [ -n "$APP_SLUG" ] && [ "$author" != "${APP_SLUG}[bot]" ]; then
-            echo "::error::release $tag was made by $author, want ${APP_SLUG}[bot]"
+          if [ "$author" != "${APP_SLUG}[bot]" ]; then
+            echo "::error::release $tag was made by $author, not by ${APP_SLUG}[bot]"
             exit 1
           fi
-          echo "release $tag by $author"
+          # A published asset is never replaced (the formula in the tap names its checksum): all of it or none.
+          have=0
+          for name in "adam-agent_${version}_linux_amd64.tar.gz" "adam-agent_${version}_linux_arm64.tar.gz" \
+                      "adam-agent_${version}_darwin_amd64.tar.gz" "adam-agent_${version}_darwin_arm64.tar.gz" \
+                      SHA256SUMS SHA256SUMS.sigstore.json; do
+            if gh release view "$tag" --json assets --jq '.assets[].name' | grep -Fxq "$name"; then
+              have=$((have + 1))
+            fi
+          done
+          case "$have" in
+            0) assets=none ;;
+            6) assets=complete ;;
+            *) echo "::error::release $tag holds $have of the 6 adam-agent assets. A person must look: nothing published is overwritten."; exit 1 ;;
+          esac
+          echo "release $tag by $author, adam-agent assets: $assets"
+          echo "assets=$assets" >> "$GITHUB_OUTPUT"
 
   # One native build per target; nothing is cross-compiled. The Linux targets are musl, so the binary is static
   # and runs on any distribution (ADR 0053 decision 11, the coder image's six binaries are the same). The macOS
@@ -394,8 +422,9 @@ jobs:
   adam-agent-build:
     name: adam-agent ${{ matrix.os }} ${{ matrix.arch }}
     needs: [gate, adam-agent-preflight]
+    if: needs.adam-agent-preflight.outputs.assets == 'none'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     strategy:
@@ -456,6 +485,9 @@ jobs:
           env -i PATH="$PATH" "$bin" > /dev/null 2>&1 || code=$?
           test "$code" -eq 78
       - name: Archive adam-agent_${{ needs.gate.outputs.version }}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz
+        env:
+          # macOS tar would add AppleDouble `._` entries for extended attributes.
+          COPYFILE_DISABLE: "1"
         run: |
           set -eu
           name="adam-agent_${VERSION}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
@@ -473,7 +505,8 @@ jobs:
   # The only other job with an OIDC token (the signing identity is this workflow at this tag, as for the image).
   adam-agent-publish:
     name: adam-agent, sign and attach to the release
-    needs: [gate, adam-agent-build]
+    needs: [gate, adam-agent-preflight, adam-agent-build]
+    if: needs.adam-agent-preflight.outputs.assets == 'none'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -507,7 +540,8 @@ jobs:
             --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${tag}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com
           gh release view "$tag" > /dev/null
-          gh release upload "$tag" --clobber adam-agent_*.tar.gz SHA256SUMS SHA256SUMS.sigstore.json
+          # No --clobber: an asset that appeared since the preflight makes this fail, and nothing is replaced.
+          gh release upload "$tag" adam-agent_*.tar.gz SHA256SUMS SHA256SUMS.sigstore.json
           {
             echo "### adam-agent $VERSION"
             echo
@@ -518,11 +552,13 @@ jobs:
 
   # Install through Homebrew on the four platforms before the tap hears of the release. The formula is the
   # one the tap gets, built from the release's own SHA256SUMS and put in a local tap, so what is tested is what
-  # is proposed. Homebrew is preinstalled on these runners (*unverified* on `ubuntu-24.04-arm`; the script says
-  # so when it is not).
+  # is proposed. Homebrew is preinstalled on these runners (the system's homebrew-smoke.yml runs on all four, and the tap's
+  # another-agentic 0.6.0, vymalo/homebrew-tap#5, passed it).
   adam-agent-smoke:
     name: Homebrew install, ${{ matrix.name }}
-    needs: [gate, adam-agent-publish]
+    needs: [gate, adam-agent-preflight, adam-agent-publish]
+    # After `publish`, or, when the assets were all there already, without it.
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.adam-agent-preflight.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.adam-agent-publish.result) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     permissions:
@@ -542,6 +578,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.0.0
         with:
           node-version: 24
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
       - name: Install adam-agent with Homebrew and run it
         env:
           GH_TOKEN: ${{ github.token }}
@@ -549,22 +586,29 @@ jobs:
           VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -eu
-          gh release download "v$VERSION" --pattern SHA256SUMS --dir "$RUNNER_TEMP/sums"
+          gh release download "v$VERSION" --pattern 'SHA256SUMS*' --dir "$RUNNER_TEMP/sums"
+          # What is published, whether this run attached it or an earlier one did, is signed by this workflow.
+          cosign verify-blob "$RUNNER_TEMP/sums/SHA256SUMS" --bundle "$RUNNER_TEMP/sums/SHA256SUMS.sigstore.json" \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/v${VERSION}$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
           sh tools/release/homebrew-smoke.sh "$VERSION" "$RUNNER_TEMP/sums/SHA256SUMS" Cargo.toml
 
   # The tap's pull request: one open branch, `bot/adam-agent`, rebuilt from the tap's default branch, never
   # older than what the tap has. The release App's token is scoped to this repository and the tap.
   adam-agent-tap:
     name: adam-agent, propose the Homebrew tap update
-    needs: [gate, adam-agent-publish, adam-agent-smoke]
+    needs: [gate, adam-agent-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
-      # One at a time. A newer pending run replaces an older pending one, which is right here: the branch is
-      # rebuilt from the tap's default branch with the newest version, so a release skipped while another
-      # waits is never written, and the monotonic check refuses to move the tap backwards.
+      # One at a time, and none dropped: `queue: max` keeps up to 100 pending runs (the default, `single`, replaces
+      # a pending run with the one that arrives later, whatever its version). `cancel-in-progress: false` keeps a
+      # running update from being cut off. Arrival order is not version order, so the script refuses a version
+      # older than the tap's or the open branch's: an older run that comes last is a no-op.
+      # actionlint (no release parses `queue` yet) is told to ignore this one message: .github/actionlint.yaml.
       group: homebrew-tap-adam-agent
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
     steps:

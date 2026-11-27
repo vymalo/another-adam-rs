@@ -111,7 +111,7 @@ chart and a binary together or the run says which one is missing.
 | `adam-agent_X.Y.Z_darwin_amd64.tar.gz` | GitHub-hosted macOS, Intel | system libraries only |
 
 The macOS archives are built on macOS runners because Apple's targets cannot be linked from Linux. They are not
-notarized, so macOS may ask for an approval the first time. Each archive holds the binary and the two licence files.
+notarized. Each archive holds the binary and the two licence files.
 
 Check one:
 
@@ -123,11 +123,14 @@ sha256sum --check --ignore-missing SHA256SUMS
 ```
 
 Homebrew is never reached by a tag alone. Only a GitHub release made by the release App (so one that release-please
-made when the release pull request merged) goes on: the four archives and the signed checksums are attached, the
+made when the release pull request merged; the workflow reads the App's own slug and accepts no other author) goes on: the four archives and the signed checksums are attached, the
 formula is installed with Homebrew on Linux and macOS, arm64 and x86_64, and runs `adam-agent --version`, and only then
 does the App open **one pull request** on [`vymalo/homebrew-tap`](https://github.com/vymalo/homebrew-tap) (branch
 `bot/adam-agent`) with `Formula/adam-agent.rb` and a row of the tap's README. A person merges it; a newer release
-rewrites the same branch, and a version older than the tap's is never proposed.
+rewrites the same branch, and a version older than the tap's is never proposed. A published archive is never replaced:
+a re-run of a release whose archives and signed checksums are all on the release builds nothing and tests what is
+there; a release that holds some of them stops for a person. If GitHub's immutable releases are ever switched on,
+attaching assets after the release is published fails, and this path must move to a draft release first.
 
 ## Set up once (the owner)
 
@@ -137,8 +140,8 @@ rewrites the same branch, and a version older than the tap's is never proposed.
    App ID) and `RELEASE_PLEASE_APP_PRIVATE_KEY` (a private key of the App). These are vpay's names.
 3. After the first release, make the package `another-adam-rs/charts/coder` public, and check an anonymous pull.
 4. For the Homebrew formula, install the same App on `vymalo/homebrew-tap` too (Contents and Pull requests, read and
-   write), and optionally set the repository variable `RELEASE_PLEASE_APP_SLUG` to the App's slug: the release must then
-   be authored by `<slug>[bot]`, and without it by any bot.
+   write). Nothing else: the release must be authored by `<the App's slug>[bot]`, which the workflow reads from the
+   App's token.
 
 Until the App is set up, `release-please.yml` fails at its first step and nothing is released. The tag must come from
 the App: a tag made with the workflow's own token starts no workflow.

@@ -11,7 +11,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const REPO = "vymalo/another-adam-rs";
-export const DESC = "Serve an agent folder over A2A: one static binary, SQLite on a laptop";
+export const DESC = "Serve an agent folder over A2A: one binary, SQLite on a laptop";
 
 // The four archives of a release, named adam-agent_<version>_<os>_<arch>.tar.gz.
 export const TARGETS = [
@@ -97,7 +97,25 @@ const BEGIN = "<!-- cli-packages:begin -->";
 const END = "<!-- cli-packages:end -->";
 export const ROW = `| adam-agent | \`brew install vymalo/tap/adam-agent\` | ${DESC}; [another-adam-rs](https://github.com/${REPO}) |`;
 
+// The prose of the tap README that says "the app" learns that the tap has command-line tools too. Each sentence is
+// replaced only where the old one is still there, so a second run, or a README already edited, changes nothing.
+const PROSE = [
+  [
+    "The tap provides a macOS Cask and a Linux AppImage Formula, each for arm64 and x86_64. Windows is not distributed.",
+    "The tap provides a macOS Cask and a Linux AppImage Formula, each for arm64 and x86_64, and [command-line tools](#command-line-tools). Windows is not distributed.",
+  ],
+  [
+    "Then upgrade only this app:",
+    "Then upgrade one package. A command-line tool: `brew upgrade vymalo/tap/adam-agent`. The desktop app:",
+  ],
+  [
+    "Run the command for your platform:",
+    "A command-line tool: `brew uninstall vymalo/tap/adam-agent`. The desktop app, for your platform:",
+  ],
+];
+
 export function readmeWithRow(readme, row = ROW) {
+  for (const [from, to] of PROSE) readme = readme.replace(from, to);
   const name = row.split("|")[1].trim();
   const key = `| ${name} |`;
   const start = readme.indexOf(BEGIN);
@@ -105,7 +123,7 @@ export function readmeWithRow(readme, row = ROW) {
   if (start === -1 && stop === -1) {
     const section = `## Command-line tools
 
-Static binaries for Linux and macOS, arm64 and x86_64, from [GitHub Releases](https://github.com/${REPO}/releases). \`brew install\` names the formula; the SHA-256 of each download is in the formula.
+Command-line programs for Linux and macOS, arm64 and x86_64, from [GitHub Releases](https://github.com/${REPO}/releases). \`brew install\` names the formula; the SHA-256 of each download is in the formula.
 
 ${BEGIN}
 | Formula | Install | What it is |

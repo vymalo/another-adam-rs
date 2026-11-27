@@ -1,5 +1,5 @@
 class AdamAgent < Formula
-  desc "Serve an agent folder over A2A: one static binary, SQLite on a laptop"
+  desc "Serve an agent folder over A2A: one binary, SQLite on a laptop"
   homepage "https://github.com/vymalo/another-adam-rs"
   version "0.6.1"
   license any_of: ["MIT", "Apache-2.0"]

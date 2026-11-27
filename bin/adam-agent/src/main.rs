@@ -62,7 +62,7 @@ fn info_for(mut args: impl Iterator<Item = String>) -> Option<String> {
             "adam-agent {}\n\n\
              Serves one agent folder over A2A. It takes no arguments: it is configured by its environment.\n\n\
              A laptop needs, at least:\n  \
-             ADAM_AGENT_DIR       the agent folder (instructions.md, card, skills, mcp.json)\n  \
+             ADAM_AGENT_DIR       the folder that holds agent/instructions.md (and skills/, mcp.json, ...)\n  \
              DATABASE_URL         sqlite:///path/to/adam.db (one file, ROLE=all), or postgres:// or mongodb://\n  \
              MODEL_BASE_URL       an OpenAI-compatible endpoint, with /v1\n  \
              MODEL, MODEL_API_KEY the model alias and its key (the key may be empty)\n  \
