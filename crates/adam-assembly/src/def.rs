@@ -12,7 +12,9 @@ use adam_agent_fs::{
     ToolsLoading,
 };
 use adam_core::{DynSecretSource, ProcessEnv};
-use adam_llm_agent::{DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, ToolSet};
+use adam_llm_agent::{
+    DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionTools, ToolSet,
+};
 use adam_model::ReasoningEffort;
 use adam_runtime::{RuntimeBuilder, SessionLimits};
 use secrecy::SecretString;
@@ -1142,6 +1144,14 @@ impl Walk<'_> {
             &mut tools,
             parent.is_none().then_some(self.session_limits),
         )?;
+        // An agent that has the session tools reads what they are, after the skills catalog: the
+        // same bytes for the same helpers, whatever the deployment's limits (ADR 0054 decision 9).
+        if !session_targets.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&SessionTools::guide_for(
+                session_targets.iter().map(|target| target.name.as_str()),
+            ));
+        }
         let retry = retry_policies(&origin, manifest, &tools)?;
         let plugins = self.plugins_of(&origin, manifest, parent)?;
         // The root's modes: a name in a mode's `tools:` is one of the agent's tools (fail closed),
