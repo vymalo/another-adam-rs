@@ -54,7 +54,7 @@
 //! model reads; it is never put inline, and a refused upload (the orchestrator's `too_large`,
 //! `over_limit`, ..., or a bucket that says no) is the same kind of result. Text the process
 //! hides is scrubbed out of a text file **before** it is hashed and sent. A file is held in memory
-//! while it goes: at most [`MAX_UPLOADED_FILE_BYTES`].
+//! while it goes: at most `MAX_UPLOADED_FILE_BYTES` (256 MiB).
 //!
 //! # Retry safety
 //!
