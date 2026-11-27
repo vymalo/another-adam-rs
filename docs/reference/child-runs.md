@@ -285,7 +285,10 @@ background as a session that is sent more messages. The runtime half (slice 1) i
 `subagent_read` reads the latest round: working, or its report as a numbered page; with `wait: true` and a working round it
 returns `ToolError::AwaitSession` and the parent parks on a `PendingWait::Session`. `subagent_close` asks a working round to be
 the last (`SESSION_CLOSE_KIND` in its inbox: it finishes, then the session takes no more) or, with `cancel`, cancels it; an idle
-session is closed by a round that calls no model (`header.closing`) and ends with the last answer again.
+session is closed by a round that calls no model (`header.closing`) and ends with the last answer again. `delete: true`
+closes it with a **tombstone** (`header.deleted`): a deleted session is never listed again and every tool refuses it as `no
+session`, while **its runs stay in the store**. Only an idle session is deleted; a working one is refused, so close it first
+(cancelling a working round on delete is not built yet).
 `subagent_list` pages the sessions of the conversation. The sessions are reached by **the conversation**, not by the task: a
 later task finds the sessions an earlier one started, and no run reaches another conversation's (an id that is not one of
 this conversation's is "no session"). At most 16 sessions that are not closed and 20 rounds per session (decision 5's
@@ -348,12 +351,16 @@ stateDiagram-v2
     Idle --> Working: subagent_send starts the next round
     Idle --> Closed: subagent_close starts a round that calls no model
     Idle --> Closed: idle for idle_ttl (read, not written)
+    Idle --> Deleted: subagent_close with delete (a tombstone in the closing round)
+    Closed --> Deleted: subagent_close with delete
     Closed --> [*]
+    Deleted --> [*]
 ```
 
 A closed session is **never reopened**, and `Closed` is derived, not stored: the latest round's header says `closed`, or a close
 request waits in its inbox, or the round has ended in a session that is not kept open (which is why a round cancelled by its
-parent closes such a session, and leaves a kept-open one idle).
+parent closes such a session, and leaves a kept-open one idle). `Deleted` is derived the same way, from the latest
+round's header: nothing removes a run.
 
 **The turn-end wait.** A turn whose model answers with no tool call while a session this run started still works, or a round
 ended and was not reported, does not end the run: the loop reads the sessions in a journaled step `sessions:<turn>` (skipped when no
