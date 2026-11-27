@@ -300,6 +300,22 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
   `crates/adam-llm-agent/tests/prefix.rs`.
 * Accepted when: a root with subagents has the section after its catalog and one without has none; the section is byte-equal
   under any `SessionLimits`; the drift test fails when a spec argument is renamed alone; ADR 0044's prefix test holds.
+* *Built (2026-11-27, ANR-208):* `SessionTools::guide()` and `SessionTools::guide_for(helpers)` in `sessions.rs` make the *Child
+  sessions* section from one table (`GUIDE`: each tool's name, purpose and arguments, and the options of `config` from
+  `CONFIG_OPTIONS`). It names the five tools that exist (`subagent_start`, `_send`, `_read`, `_close`, `_list`): *edit* and
+  *delete* are slices 4 and 5 and join the table with their tools. `def.rs` appends it at bind, after the skills catalog, to the
+  root that has subagents (`guide_for` takes the helper names: the section needs no bounds, but `SessionTools` is not built at bind
+  because a `SessionAgent` needs them), so it is in
+  `AgentInfo::prompt`, in `LlmAgent::instructions` and in `fixed_chars`. It has no limit and no count, so it is the same bytes
+  under any `SessionLimits`. **The table generates the argument lists; the descriptions are written twice and no test compares
+  them:** each spec's `required` is built
+  from it (`required_of`), a unit test holds each spec's `properties` keys (and `required`) to the table's arguments, and the specs stay
+  pinned byte for byte by `tests/fixtures/session-tools.json`. The drift test (`tests/sessions.rs`,
+  `the_guide_and_the_specs_name_the_same_tools_and_arguments`) holds the guide's tools,
+  arguments, required flags and `config` options to the live specs in both directions, and a second test proves the check fails
+  on a rename on either side. **Consequence:** the prompt of every agent that has subagents grows by about 1.7 KB
+  (the coder's baseline in `first_request.rs` moved by the section's size), which **changes the stable prefix and so the prompt
+  cache once** at the deploy. `tests/prefix.rs` is unchanged: it holds for any instructions, the section is part of them.
 
 **3. `tools` and `deny_tools`.** Depends on 1.
 * Files: `agent.rs` (the session withhold, both points), `sessions.rs`, `def.rs` (the bound tool names).

@@ -5448,6 +5448,206 @@ fn limits_do_not_change_the_specs() {
     );
 }
 
+/// The tools and arguments the guide documents, in its own order: each `- `tool` (`arg`, `opt?`):`
+/// line, with the arguments sorted and whether each is required.
+fn documented(guide: &str) -> Vec<(String, Vec<(String, bool)>)> {
+    guide
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("- `")?;
+            let (name, rest) = rest.split_once("` (")?;
+            let (args, _) = rest.split_once("): ")?;
+            let mut args: Vec<(String, bool)> = args
+                .split(", ")
+                .map(|arg| {
+                    let arg = arg.trim_matches('`');
+                    match arg.strip_suffix('?') {
+                        Some(name) => (name.to_owned(), false),
+                        None => (arg.to_owned(), true),
+                    }
+                })
+                .collect();
+            args.sort();
+            Some((name.to_owned(), args))
+        })
+        .collect()
+}
+
+/// The options of `config` the guide lists, sorted.
+fn documented_options(guide: &str) -> Vec<String> {
+    let line = guide
+        .lines()
+        .find_map(|line| line.strip_prefix("Options of `config`: "))
+        .expect("the guide lists the options of `config`");
+    let list = line.split(". ").next().unwrap();
+    let mut options: Vec<String> = list
+        .split(", ")
+        .map(|option| option.trim_matches('`').to_owned())
+        .collect();
+    options.sort();
+    options
+}
+
+/// What the specs say, in the guide's shape: each tool and its arguments (sorted, with whether
+/// each is in `required`).
+fn specified(specs: &[adam_model::ToolSpec]) -> Vec<(String, Vec<(String, bool)>)> {
+    specs
+        .iter()
+        .map(|spec| {
+            let required: Vec<&str> = spec.parameters["required"]
+                .as_array()
+                .map(|names| names.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let mut args: Vec<(String, bool)> = spec.parameters["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|key| (key.clone(), required.contains(&key.as_str())))
+                .collect();
+            args.sort();
+            (spec.name.clone(), args)
+        })
+        .collect()
+}
+
+/// Every way `guide` and `specs` disagree: a tool, an argument, whether it is required, or an
+/// option of `config`, that one names and the other does not. Empty when they agree.
+fn drift(guide: &str, specs: &[adam_model::ToolSpec]) -> Vec<String> {
+    let (said, made) = (documented(guide), specified(specs));
+    let mut found = Vec::new();
+    if said
+        .iter()
+        .map(|(name, _)| name)
+        .ne(made.iter().map(|(name, _)| name))
+    {
+        found.push(format!(
+            "tools: the guide has {:?}, the specs {:?}",
+            said.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            made.iter().map(|(name, _)| name).collect::<Vec<_>>()
+        ));
+    }
+    for (name, args) in &said {
+        let Some((_, spec_args)) = made.iter().find(|(spec, _)| spec == name) else {
+            continue;
+        };
+        if args != spec_args {
+            found.push(format!(
+                "{name}: the guide has {args:?}, the specs {spec_args:?}"
+            ));
+        }
+    }
+    let start = specs
+        .iter()
+        .find(|spec| spec.name == "subagent_start")
+        .unwrap();
+    let mut options: Vec<String> = start.parameters["properties"]["config"]["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    options.sort();
+    if documented_options(guide) != options {
+        found.push(format!(
+            "config: the guide has {:?}, the specs {options:?}",
+            documented_options(guide)
+        ));
+    }
+    found
+}
+
+fn guide_roster() -> SessionTools {
+    SessionTools::new(["reviewer", "explorer"].map(|name| SessionAgent {
+        name: name.into(),
+        agent: format!("coder/{name}"),
+        description: "Does a piece of work.".into(),
+        within: None,
+        remote: false,
+        bounds: adam_runtime::SessionBounds::default(),
+    }))
+}
+
+/// A tool or an argument the guide names that the specs lack, or the other way round, fails here
+/// (ADR 0054 decision 9): the guide and the specs are held to each other, whichever one moves.
+#[test]
+fn the_guide_and_the_specs_name_the_same_tools_and_arguments() {
+    let roster = guide_roster();
+    let specs: Vec<adam_model::ToolSpec> = roster.tools().iter().map(|t| t.spec()).collect();
+    let guide = roster.guide();
+    assert_eq!(drift(&guide, &specs), Vec::<String>::new());
+    let names: Vec<String> = documented(&guide)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(names, adam_llm_agent::SESSION_TOOLS);
+}
+
+/// The check can fail: an argument renamed in the guide alone, or in a spec alone, a tool dropped
+/// from either, and an option of `config` renamed are each found.
+#[test]
+fn the_drift_check_finds_each_way_the_guide_and_the_specs_part() {
+    let roster = guide_roster();
+    let specs: Vec<adam_model::ToolSpec> = roster.tools().iter().map(|t| t.spec()).collect();
+    let guide = roster.guide();
+
+    let renamed_in_the_guide = guide.replace("`cancel?`", "`stop?`");
+    assert_ne!(renamed_in_the_guide, guide, "the guide documents `cancel`");
+    assert!(!drift(&renamed_in_the_guide, &specs).is_empty());
+
+    let mut renamed_in_a_spec = specs.clone();
+    let close = renamed_in_a_spec
+        .iter_mut()
+        .find(|spec| spec.name == "subagent_close")
+        .unwrap();
+    let properties = close.parameters["properties"].as_object_mut().unwrap();
+    *properties = std::mem::take(properties)
+        .into_iter()
+        .map(|(key, value)| {
+            let key = if key == "cancel" {
+                "stop".to_owned()
+            } else {
+                key
+            };
+            (key, value)
+        })
+        .collect();
+    assert!(!drift(&guide, &renamed_in_a_spec).is_empty());
+
+    let without_a_tool: String = guide
+        .lines()
+        .filter(|line| !line.starts_with("- `subagent_list`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!drift(&without_a_tool, &specs).is_empty());
+    assert!(!drift(&guide, &specs[..4]).is_empty());
+
+    let renamed_option = guide.replace("`max_rounds`", "`most_rounds`");
+    assert_ne!(renamed_option, guide, "the guide lists `max_rounds`");
+    assert!(!drift(&renamed_option, &specs).is_empty());
+}
+
+/// The guide names the tools and the helpers and nothing per session: the same bytes under any
+/// limits, and whatever order the helpers are given in, which sorts them as the roster does.
+#[test]
+fn the_guide_is_the_same_bytes_under_any_limits_and_any_order() {
+    let default = guide_roster().guide();
+    let limited = SessionLimits::new(3, 2, 5).unwrap();
+    assert_eq!(default, guide_roster().with_limits(limited).guide());
+    let big = SessionLimits::new(20, 8, 99).unwrap();
+    assert_eq!(default, guide_roster().with_limits(big).guide());
+    assert_eq!(default, SessionTools::guide_for(["explorer", "reviewer"]));
+    assert_eq!(default, SessionTools::guide_for(["reviewer", "explorer"]));
+    assert!(
+        default.contains("`explorer`, `reviewer`."),
+        "the helpers are sorted: {default}"
+    );
+    // No limit and no count: not one digit.
+    assert!(
+        !default.chars().any(|c| c.is_ascii_digit()),
+        "the guide has a number in it: {default}"
+    );
+}
+
 /// The five specs, as the model sees them, pinned: a spec is the model's contract, so a change is
 /// deliberate. Regenerate with `ADAM_UPDATE_SNAPSHOTS=1 cargo test -p adam-llm-agent --test sessions`.
 #[test]
