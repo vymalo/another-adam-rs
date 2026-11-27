@@ -32,7 +32,7 @@
 //! [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
 
 use adam_core::turn::{
-    ChainHash, ConversationHash, DynTurnKeys, TurnKeyError, TurnKeys, TurnPosition,
+    ChainHash, ConversationHash, DynTurnKeys, KeySet, TurnKeyError, TurnKeys, TurnPosition,
     TurnSignatureError, sign_head, turn_signature, verify_head, verify_turn,
 };
 use adam_core::{RunId, storable};
@@ -116,6 +116,23 @@ fn refused(run: RunId, reason: &str, cause: Option<TurnSignatureError>) -> Runti
     }
 }
 
+/// The signature text of a head, or the refusal of one that carries none or no string.
+fn head_signature(run: RunId, doc: &Value) -> Result<&str, RuntimeError> {
+    match doc.get("signature") {
+        None => Err(refused(
+            run,
+            "it carries no signature",
+            Some(TurnSignatureError::Unsigned),
+        )),
+        Some(Value::String(jws)) => Ok(jws),
+        Some(_) => Err(refused(
+            run,
+            "its signature is not a string",
+            Some(TurnSignatureError::Malformed),
+        )),
+    }
+}
+
 /// The keys a runtime signs its heads with and checks them against.
 #[derive(Clone)]
 pub(crate) struct Sealer {
@@ -157,28 +174,50 @@ impl Sealer {
         chain: &ChainHash,
         doc: &Value,
     ) -> Result<(), RuntimeError> {
-        let jws = match doc.get("signature") {
-            None => {
-                return Err(refused(
-                    run,
-                    "it carries no signature",
-                    Some(TurnSignatureError::Unsigned),
-                ));
-            }
-            Some(Value::String(jws)) => jws,
-            Some(_) => {
-                return Err(refused(
-                    run,
-                    "its signature is not a string",
-                    Some(TurnSignatureError::Malformed),
-                ));
-            }
-        };
+        let jws = head_signature(run, doc)?;
         let set = self.keys.key_set().await?;
+        Self::verify_head_with(&set, run, conversation, len, chain, doc, jws)
+    }
+
+    /// The head check against a key set the caller already read, so a decode that also checks the
+    /// turns reads the set once.
+    fn verify_head_with(
+        set: &KeySet,
+        run: RunId,
+        conversation: Option<&str>,
+        len: u32,
+        chain: &ChainHash,
+        doc: &Value,
+        jws: &str,
+    ) -> Result<(), RuntimeError> {
         let cnv = ConversationHash::of(conversation, run);
-        verify_head(&set, run, &cnv, len, chain, &signed_head(doc), jws)
+        verify_head(set, run, &cnv, len, chain, &signed_head(doc), jws)
             .map(drop)
             .map_err(|e| refused(run, "its signature does not verify", Some(e)))
+    }
+
+    /// Refuse to sign over a history whose assistant or tool rows are not signed: a runtime with
+    /// turn keys and an agent that does not sign its turns (`LlmAgent::turn_keys`) would otherwise
+    /// commit a signed head that its own next decode refuses for good. Only the presence of a turn
+    /// signature is checked here (a decode verifies each one in full); no key is read.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::UnsignedTurns`] (class `Invalid`, permanent: a configuration the same run
+    /// never recovers from) naming the first row that is a turn and carries no signature.
+    pub(crate) fn require_signed_turns(run: RunId, rows: &[Value]) -> Result<(), RuntimeError> {
+        match rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| is_turn(row) && turn_signature(row).is_none())
+        {
+            None => Ok(()),
+            Some((row, value)) => Err(RuntimeError::UnsignedTurns {
+                run,
+                row,
+                role: role_of(value).to_owned(),
+            }),
+        }
     }
 
     /// The `{len, chain}` a **signed** v5 head's `seal` carries, or `Corrupt`: a head with a
@@ -240,9 +279,12 @@ impl Sealer {
             }
             return Ok(());
         }
+        let jws = head_signature(run, doc)?;
         let (len, chain) = chain_over(run, conversation, rows)?;
-        self.check(run, conversation, len, &chain, doc).await?;
-        self.check_turns(run, conversation, rows).await
+        // One read of the key set for the head and every turn of this decode.
+        let set = self.keys.key_set().await?;
+        Self::verify_head_with(&set, run, conversation, len, &chain, doc, jws)?;
+        Self::verify_turns_with(&set, run, conversation, rows)
     }
 
     /// Check every assistant and tool row of `rows` (the whole transcript a decode read, in order)
@@ -255,6 +297,7 @@ impl Sealer {
     /// malformed, signed by a key that is not in the set or is revoked, or that does not verify
     /// where it stands; [`RuntimeError::TurnKeys`] when the key set cannot be read (the caller keeps
     /// the lease, as for a head).
+    #[cfg(test)]
     pub(crate) async fn check_turns(
         &self,
         run: RunId,
@@ -265,6 +308,19 @@ impl Sealer {
             return Ok(());
         }
         let set = self.keys.key_set().await?;
+        Self::verify_turns_with(&set, run, conversation, rows)
+    }
+
+    /// [`check_turns`](Self::check_turns) against a key set already read.
+    fn verify_turns_with(
+        set: &KeySet,
+        run: RunId,
+        conversation: Option<&str>,
+        rows: &[Value],
+    ) -> Result<(), RuntimeError> {
+        if !rows.iter().any(is_turn) {
+            return Ok(());
+        }
         let cnv = ConversationHash::of(conversation, run);
         let mut prv = ChainHash::seed(run, &cnv);
         for (idx, row) in rows.iter().enumerate() {
@@ -283,7 +339,7 @@ impl Sealer {
                     idx: position,
                     prv,
                 };
-                verify_turn(&set, &at, &stored).map_err(|cause| RuntimeError::Corrupt {
+                verify_turn(set, &at, &stored).map_err(|cause| RuntimeError::Corrupt {
                     run,
                     reason: format!(
                         "a turn is refused (ADR 0068): row {idx} ({}) does not verify",
@@ -579,6 +635,73 @@ mod turn_tests {
         let err = down.check_turns(run(), CONV, &rows).await.unwrap_err();
         assert!(matches!(err, RuntimeError::TurnKeys(_)), "{err}");
         assert_ne!(err.class(), ErrorClass::Corrupt);
+    }
+
+    /// A decode reads the key set once, however many turns it checks (the head and every turn
+    /// share the read).
+    #[tokio::test]
+    async fn a_decode_reads_the_key_set_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting {
+            inner: DynTurnKeys,
+            reads: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl TurnKeys for Counting {
+            async fn current(&self) -> Result<CurrentKey, TurnKeyError> {
+                self.inner.current().await
+            }
+
+            async fn sign(&self, kid: &KeyId, input: &[u8]) -> Result<Signature, TurnKeyError> {
+                self.inner.sign(kid, input).await
+            }
+
+            async fn key_set(&self) -> Result<Arc<KeySet>, TurnKeyError> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.inner.key_set().await
+            }
+        }
+
+        let inner = keys();
+        let rows = signed(&inner, run(), CONV, transcript()).await;
+        let counting = Arc::new(Counting {
+            inner,
+            reads: AtomicUsize::new(0),
+        });
+        let sealer = Sealer::new(counting.clone());
+        let head = head_over(&sealer, run(), CONV, &rows).await;
+        counting.reads.store(0, Ordering::SeqCst);
+        sealer.check_read(run(), CONV, &rows, &head).await.unwrap();
+        assert_eq!(counting.reads.load(Ordering::SeqCst), 1);
+    }
+
+    /// The commit guard looks for a turn signature on every assistant and tool row, reads no key,
+    /// and names the first row that has none; a row that is not a turn is never asked for one.
+    #[tokio::test]
+    async fn the_commit_guard_names_the_first_unsigned_turn() {
+        let keys = keys();
+        let all = signed(&keys, run(), CONV, transcript()).await;
+        Sealer::require_signed_turns(run(), &all).expect("signed");
+        Sealer::require_signed_turns(run(), &transcript()[..1]).expect("a user row is no turn");
+        for unsigned in [transcript(), {
+            let mut rows = all.clone();
+            rows[3].as_object_mut().unwrap().remove("extra_content");
+            rows
+        }] {
+            let err = Sealer::require_signed_turns(run(), &unsigned).unwrap_err();
+            assert!(matches!(err, RuntimeError::UnsignedTurns { .. }), "{err}");
+            assert_eq!(err.class(), ErrorClass::Invalid);
+            assert!(!err.class().is_retryable());
+            assert!(err.to_string().contains("LlmAgent::turn_keys"), "{err}");
+        }
+        let RuntimeError::UnsignedTurns { row, role, .. } =
+            Sealer::require_signed_turns(run(), &transcript()).unwrap_err()
+        else {
+            unreachable!()
+        };
+        assert_eq!((row, role.as_str()), (1, "assistant"));
     }
 
     /// A transcript with no turn does not read the key set at all.

@@ -56,12 +56,30 @@ For people: [Signed turns](../../docs/architecture.md#signed-turns-each-assistan
   `prior_state` before they got there. A compaction and a shortening already `unsign_from` the changed rows (T3a-1).
   A starter has no keys, so the strip is unconditional: a keyless process carries rows unsigned, as a legacy run.
 * **Cost.** One Ed25519 verify and one canonical-JSON form per turn on every decode that reads the rows, beside the one
-  SHA-256 pass the head already needed. Decision 4 said one check for the newest turn would do; this checks all of them
-  (a rotation could revoke a key that signed an early turn).
+  SHA-256 pass the head already needed: O(rows), and **one** `key_set().await` per decode (`check_read` reads it once and
+  hands it to `verify_head_with` and `verify_turns_with`; `seal::turn_tests::a_decode_reads_the_key_set_once`). The
+  "small against a model call" argument holds for a claim only. `Runtime::state` (the engine's reopen) and `prior_state`
+  have no model call behind them. A2A `GetTask`/`ListTasks` use `Runtime::view`, which decodes the head record only and
+  verifies nothing, so polling pays none of this (`runtime.rs` `view`). No cache is built; a follow-up if a long run read by
+  `state` in a loop shows (a verified-prefix cache keyed by run, version and key-set generation). Decision 4 said one check
+  for the newest turn would do; this checks all of them (a rotation could revoke a key that signed an early turn).
+* **Revocation.** Revoking a key makes every past run it signed permanently `Corrupt` on `state`, claim and continuation.
+  Rotate (keep the old key in the set, unrevoked) to retire it without losing history.
+* **Commit guard.** `Sealer::require_signed_turns` (presence of a turn signature on every assistant/tool row) runs in
+  `worker.rs` `plan` (a step whose rows hold an unsigned turn is turned into a `Failed` transition with the state untouched,
+  error `RuntimeError::UnsignedTurns`, class `Invalid`) and again in `seal_update` before any head is signed (a commit error
+  of class `Invalid`; an adopted unsigned v4 run that ends is written unsigned). Tests:
+  `tests/head_signature.rs` `a_keyed_runtime_with_an_agent_that_does_not_sign_fails_the_run_and_stores_no_signed_head`,
+  `seal.rs` `the_commit_guard_names_the_first_unsigned_turn`.
+* **Key outage at a continuation.** `TurnKeys` at `prior_state` is `Transient`, makes no run, and A2A maps it to
+  `Unavailable` (`backend.rs` `map_err` by class); test `turn_reentry.rs`
+  `a_key_outage_at_the_prior_state_makes_no_run_and_the_request_succeeds_later`.
+* **Adoption plus carry (release N).** A store attacker who strips the head signature, `seal` and every turn signature gets
+  the history adopted; a carry then signs it as a validly signed new run. Closed by T5 (no adoption).
 * **Tests.** `crates/adam-runtime/src/seal.rs` `turn_tests` (the head verifies, the turn does not: forged assistant, forged tool,
   changed user, spliced, unsigned, reordered, revoked key, a non-turn row left alone, key set down); `crates/adam-llm-agent/tests/turn_reentry.rs`
   (resume, new task, session round, each with four forgeries and no model call; a carry signed again under the new run; adoption once;
-  revoked key).
+  revoked key; an appended user row and a changed head field at a resume; a key outage at `prior_state`).
 
 ## Signed heads (ADR 0068, slice T3a-2)
 

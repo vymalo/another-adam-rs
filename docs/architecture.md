@@ -896,7 +896,7 @@ starts its next round, the embedded engine reopens its file), each assistant and
 signature that verifies where the row stands, over everything before it, with a key that is still in the key set. A forged,
 unsigned, moved or revoked-key row fails the run before any model call. A history that is carried into a new run is signed
 again under the new run, so no signature names a run it does not belong to; a compaction and a shortening do the same for the
-rows they change. A run with no signature at all is still accepted once and signed at its next commit.
+rows they change. A run with no signature at all is still accepted once and signed at its next commit. A runtime that has keys but an agent that does not sign its turns fails the run at its first step, with an error that says to give the agent the same keys, instead of storing a history it could not read back. Reading a run's history back costs one signature check per turn, with no model call behind it when you ask for its state or continue it; polling a task's status does not pay it. Revoking a key makes every run it signed unreadable for good: to retire a key, add its replacement and keep the old one in the set.
 
 ### The access tier: which tools a step may use
 

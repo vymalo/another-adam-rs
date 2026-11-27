@@ -40,6 +40,7 @@ pub(crate) const MAX_COMMIT_RETRIES: usize = 16;
 /// Why a [`Runtime`] call failed.
 ///
 /// Decide from [`Classify::class`]: `UnknownAgent`, `WrongAgent` and `ForeignConversation` are `Invalid`, `NotFound` is `NotFound`,
+/// `UnsignedTurns` is `Invalid` (a keyed runtime over an agent that does not sign, ADR 0068),
 /// `Finished` and `ConversationBusy` are `Rejected`, `Corrupt` is `Corrupt` (a head whose
 /// signature does not verify is one, ADR 0068), `Contended` is `Conflict`, and `Agent`, `Store` and
 /// `TurnKeys` carry the class of the error they wrap.
@@ -115,6 +116,22 @@ pub enum RuntimeError {
         #[source]
         source: Option<BoxError>,
     },
+    /// The runtime has turn keys and the agent did not sign its turns (ADR 0068): the commit is
+    /// refused, because a head signed over unsigned assistant or tool rows is one the runtime's own
+    /// next decode would refuse for good. A configuration error and permanent (`Invalid`): the fix
+    /// is to give the agent the same keys (`LlmAgent::turn_keys`), and nothing is committed.
+    #[error(
+        "run {run}: the runtime has turn keys but the agent did not sign its turns (row {row}, \
+         role {role}); give the agent the same keys, e.g. `LlmAgent::turn_keys`"
+    )]
+    UnsignedTurns {
+        /// The run.
+        run: RunId,
+        /// The position of the first turn with no signature.
+        row: usize,
+        /// Its role (`assistant` or `tool`).
+        role: String,
+    },
     /// Gave up after repeatedly losing commit races on the same run.
     #[error("too much contention on {0}, gave up retrying")]
     Contended(String),
@@ -151,6 +168,7 @@ impl Classify for RuntimeError {
             Self::Finished { .. } | Self::ConversationBusy { .. } | Self::TooManyRounds { .. } => {
                 ErrorClass::Rejected
             }
+            Self::UnsignedTurns { .. } => ErrorClass::Invalid,
             Self::Corrupt { .. } => ErrorClass::Corrupt,
             Self::Contended(_) => ErrorClass::Conflict,
             Self::Agent(e) => e.class(),
@@ -2165,6 +2183,7 @@ mod error_tests {
             RuntimeError::InvalidSession { .. } => ErrorClass::Invalid,
             RuntimeError::ForeignConversation { .. } => ErrorClass::Invalid,
             RuntimeError::TooManyRounds { .. } => ErrorClass::Rejected,
+            RuntimeError::UnsignedTurns { .. } => ErrorClass::Invalid,
             RuntimeError::Corrupt { .. } => ErrorClass::Corrupt,
             RuntimeError::Contended(_) => ErrorClass::Conflict,
             RuntimeError::Agent(e) => e.class(),
@@ -2212,6 +2231,11 @@ mod error_tests {
                 conversation_id: "token-1:chat".into(),
             },
             RuntimeError::TurnKeys(TurnKeyError::Unavailable(Box::new(Lower))),
+            RuntimeError::UnsignedTurns {
+                run,
+                row: 1,
+                role: "assistant".into(),
+            },
         ];
         for e in &samples {
             assert_eq!(e.class(), expected(e), "{e}");
@@ -2223,7 +2247,7 @@ mod error_tests {
             retryable,
             [
                 false, false, false, false, false, false, true, false, true, true, true, false,
-                false, false, false, true
+                false, false, false, true, false
             ]
         );
         assert_eq!(samples[8].retry_after(), Some(Duration::from_secs(3)));

@@ -552,3 +552,45 @@ head check with `Sealer::check_turns`. What building it settled:
 7. **Not done.** The journal's signature and its replay check; `adam_turns_adopted_total`; the A2A `signed-turns/v1`
    (T4); the engine's and the service's wiring of the keys to the runtime and the agent (T2); verifying a v4 state in a
    process that hosts no agent (T3a-2's gap stays).
+
+### What the review of T3a-3 changed (2026-11-27)
+
+The text above stands; where it says otherwise, this does.
+
+1. **A keyed runtime over an agent that does not sign.** Building a runtime with keys did not check the agent, so its first
+   commit signed a head over assistant rows with no turn signature, and the next claim, `state` or `prior_state` of that run
+   was `Corrupt` for good. The commit now refuses first. Before the runtime signs a head it checks that every `assistant` and
+   `tool` row it signs carries a turn signature (presence, not verification: the agent just wrote them, and every decode
+   verifies them in full). A step whose rows fail the check **ends the run `Failed`** with its state untouched and an error
+   that names the row, its role and the fix ("the runtime has turn keys but the agent did not sign its turns; give the agent
+   the same keys, e.g. `LlmAgent::turn_keys`"). The class is `Invalid`, a configuration error and permanent (`RuntimeError::UnsignedTurns`):
+   retrying would call the model again for the same refusal. The commit's own signing path (`seal_update`) holds the same
+   guard, so no path signs a head over unsigned turns; an adopted run that ends is the one exception, written unsigned as it
+   was read. Nothing signed over unsigned turns is stored.
+2. **The cost, said plainly.** Decision 4's argument that one check per turn is small against a model call holds for a
+   claim, which is followed by a step. It does not hold for the reads with no model call behind them: `Runtime::state` (the
+   embedded engine calls it when it reopens a run) and the `prior_state` of a new task or a session round. Each decode is
+   O(rows): one SHA-256 pass, one Ed25519 verification and one canonical-JSON form per turn, and **one** key-set read (the head
+   and the turns share it; before this review a decode read it twice). A2A `GetTask`, `ListTasks` and `SendMessage` to an open
+   task use `Runtime::view`, which reads the head record and checks nothing, so polling a task does not pay it. A long run
+   read by `Runtime::state` in a loop pays in full each time. **No cache is built here.** If it shows, the follow-up is a
+   verified-prefix cache keyed by run, version and key-set generation.
+3. **Revoking a key (decision stated 2026-11-27).** Revoking a key makes every past run that key signed, its head or any
+   of its turns, permanently unreadable: `Corrupt` at a claim, at `Runtime::state` and at any continuation (a new task or a
+   session round on that conversation); `GetTask` still reports the status. That is the point of a revocation for a
+   compromised key, and a trap for a routine one. **Rotating is the non-destructive path:** add the new key, keep the old one in
+   the set and not revoked, sign new commits with the new one, and revoke the old key only when it is compromised, or when its
+   history may be lost.
+4. **Adoption and a carry, in release N (stated 2026-11-27).** Release N adopts a run whose head has no signature and whose
+   rows have no turn signature (decision 11). A store attacker who strips the head signature, the `seal` and every turn
+   signature of a history therefore gets it adopted, and a carry (a new task, a session round) then **signs that history as a
+   validly signed new run**: the carry clears the old signatures and signs every row under the new run's id. What the
+   signature proves in release N is that adam signed what it signed from now on, not that a run it adopted was ever adam's.
+   This closes with the release that does not adopt (T5, release N+1: an unsigned assistant or tool row is refused `Corrupt`).
+   Until then, the downgrade is not resisted by design (decision 11).
+5. **A key outage at `prior_state`.** The key set that cannot be read at the read of the prior run is `RuntimeError::TurnKeys`
+   (class `Transient`), not `Corrupt`: no run is made, the prior is not given up on (the A2A layer drops a prior only for
+   `NotFound` or `Corrupt`), and A2A answers `Unavailable`. The same request succeeds once the keys are back. Tests:
+   `crates/adam-llm-agent/tests/turn_reentry.rs`, `crates/adam-a2a-runtime/src/backend.rs` (`runtime_errors_map_by_class`).
+6. **More re-entry tests.** An appended user row (the head names one more row) and a changed head field at a resume are each
+   `Corrupt` with no model call.

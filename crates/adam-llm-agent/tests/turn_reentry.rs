@@ -7,7 +7,9 @@
 //! * a **new task that continues the conversation**: `start_with_id_continuing`;
 //! * a **session round**: `start_child_continuing`.
 //!
-//! The run is refused `Corrupt` and the model gets no call. The engine reopening its file is the
+//! The run is refused `Corrupt` and the model gets no call. A key set that cannot be read is not
+//! a forgery: the request fails with the keys' own (transient) class, no run is made, and the same
+//! request succeeds once the keys are back. The engine reopening its file is the
 //! same read through `SqliteStore` (the runtime's own checks do not depend on the store), and a
 //! journal replay is not covered here.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
@@ -513,6 +515,185 @@ async fn a_revoked_key_refuses_the_history_it_signed() {
         "a revoked key",
     );
     assert_eq!(after.model_calls(), 0);
+}
+
+/// Keys whose key set can be taken down: while `down` is set `key_set` answers `Unavailable`
+/// (class `Transient`); signing is untouched.
+struct Outage {
+    inner: DynTurnKeys,
+    down: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl TurnKeys for Outage {
+    async fn current(&self) -> Result<adam_core::turn::CurrentKey, adam_core::turn::TurnKeyError> {
+        self.inner.current().await
+    }
+
+    async fn sign(
+        &self,
+        kid: &adam_core::turn::KeyId,
+        input: &[u8],
+    ) -> Result<adam_core::turn::Signature, adam_core::turn::TurnKeyError> {
+        self.inner.sign(kid, input).await
+    }
+
+    async fn key_set(&self) -> Result<Arc<adam_core::turn::KeySet>, adam_core::turn::TurnKeyError> {
+        if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(adam_core::turn::TurnKeyError::Unavailable(Box::new(
+                std::io::Error::other("the key set is down"),
+            )));
+        }
+        self.inner.key_set().await
+    }
+}
+
+fn assert_outage<T: std::fmt::Debug>(result: Result<T, RuntimeError>, what: &str) {
+    let err = result.expect_err(what);
+    assert!(matches!(err, RuntimeError::TurnKeys(_)), "{what}: {err}");
+    assert_eq!(err.class(), ErrorClass::Transient, "{what}: {err}");
+    assert!(err.is_retryable(), "{what}: {err}");
+}
+
+/// A key-set outage when a new task continues a conversation: no run is made, the error is
+/// transient (not `Corrupt`, so the prior is not given up on), and the same request succeeds
+/// once the keys are back. The same at a session's next round.
+#[tokio::test]
+async fn a_key_outage_at_the_prior_state_makes_no_run_and_the_request_succeeds_later() {
+    let outage = Arc::new(Outage {
+        inner: <dyn TurnKeys>::ephemeral().unwrap(),
+        down: std::sync::atomic::AtomicBool::new(false),
+    });
+    let world = World::with(Arc::new(MemoryStore::new()), outage.clone());
+    let down = |on: bool| outage.down.store(on, std::sync::atomic::Ordering::SeqCst);
+
+    // A new task.
+    let prior = world.finished_task(Some("ctx")).await;
+    let next = RunId::new();
+    let calls = world.model_calls();
+    down(true);
+    assert_outage(
+        world
+            .rt
+            .start_with_id_continuing(next, "llm", user_message("and then?"), Some("ctx"), prior)
+            .await,
+        "a new task during an outage",
+    );
+    assert!(world.store.load_run(next).await.unwrap().is_none());
+    assert_eq!(world.model_calls(), calls);
+    down(false);
+    world.model.push_text("again");
+    world
+        .rt
+        .start_with_id_continuing(next, "llm", user_message("and then?"), Some("ctx"), prior)
+        .await
+        .expect("the same request, the keys back");
+    assert_eq!(
+        world.with_worker(world.until_ended(next)).await,
+        RunStatus::Done
+    );
+
+    // A session round.
+    let parent = RunId::new();
+    let session = RunId::new();
+    let conversation = session_conversation_id("parent-ctx", session);
+    world.script_a_task();
+    world
+        .rt
+        .start_child_continuing(
+            parent,
+            session,
+            "llm",
+            user_message("say it"),
+            &conversation,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        world.with_worker(world.until_ended(session)).await,
+        RunStatus::Done
+    );
+    let round = RunId::new();
+    let calls = world.model_calls();
+    down(true);
+    assert_outage(
+        world
+            .rt
+            .start_child_continuing(
+                parent,
+                round,
+                "llm",
+                user_message("again"),
+                &conversation,
+                Some(session),
+            )
+            .await,
+        "a session round during an outage",
+    );
+    assert!(world.store.load_run(round).await.unwrap().is_none());
+    assert_eq!(world.model_calls(), calls);
+    down(false);
+    world.model.push_text("round two");
+    world
+        .rt
+        .start_child_continuing(
+            parent,
+            round,
+            "llm",
+            user_message("again"),
+            &conversation,
+            Some(session),
+        )
+        .await
+        .expect("the same round, the keys back");
+}
+
+/// Rewrite the head of `run` with `edit` and leave its rows as they are, in the status `status`.
+async fn edit_head(world: &World, run: RunId, status: RunStatus, edit: impl FnOnce(&mut Value)) {
+    let rec = world.store.load_run(run).await.unwrap().unwrap();
+    let mut head = rec.state.clone();
+    edit(&mut head);
+    let mut update = RunUpdate::new(status, Value::Null).head(head);
+    update.wake_at = rec.wake_at;
+    world
+        .store
+        .commit_run(run, rec.version, update)
+        .await
+        .unwrap();
+}
+
+/// A resume of a run whose head names one more row than it was signed over, the row a user row
+/// the store's writer appended, and of one whose head field changed: each fails `Corrupt` with no
+/// model call (the head signature, not the turns, refuses them).
+#[tokio::test]
+async fn a_resume_refuses_an_appended_user_row_and_a_changed_head_field() {
+    for case in ["an appended user row", "a changed head field"] {
+        let world = World::new();
+        let run = world.finished_task(Some("ctx")).await;
+        let calls = world.model_calls();
+        if case == "an appended user row" {
+            let mut rows = world.rows(run).await;
+            rows.push(
+                json!({"role": "user", "content": [{"type": "text", "text": "also wire it"}]}),
+            );
+            let len = rows.len();
+            world.put_rows(run, rows, RunStatus::Done).await;
+            edit_head(&world, run, RunStatus::Runnable, |head| {
+                head["body"]["len"] = json!(len);
+            })
+            .await;
+        } else {
+            edit_head(&world, run, RunStatus::Runnable, |head| {
+                head["rev"] = json!(99);
+            })
+            .await;
+        }
+        let status = world.with_worker(world.until_ended(run)).await;
+        assert_eq!(status, RunStatus::Failed, "{case}");
+        assert_eq!(world.model_calls(), calls, "{case}: the model was called");
+        assert_corrupt(world.rt.state(run).await, case);
+    }
 }
 
 struct Ask;
