@@ -31,6 +31,6 @@ The session tools (an argument marked `?` is optional):
 - `subagent_close` (`session`, `cancel?`, `delete?`): close a session for good: it takes no more messages. A working round finishes unless you pass `cancel`, and `delete` removes an idle session from every listing.
 - `subagent_list` (`offset?`, `limit?`): list the sessions of this conversation and their state, the open ones first, paged by sessions.
 
-Options of `config`: `max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit`, `max_rounds`. They only narrow what a helper allows: a value above what the helper allows is refused, and the refusal names the option and says what is allowed. An option you leave out is the helper's own.
+Options of `config`: `max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit`, `max_rounds`, `token_budget`, `tools`, `deny_tools`, `report_schema`. They only narrow what a helper allows: a value above what the helper allows is refused, and the refusal names the option and says what is allowed. An option you leave out is the helper's own.
 
 A helper does not see this conversation: put everything it needs in `prompt`. By default a session closes when its round has ended. Keep one open (`keep_open`) only when you will send it more, and close what you kept open with `subagent_close` when you are done.

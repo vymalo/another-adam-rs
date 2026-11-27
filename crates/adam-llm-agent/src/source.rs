@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::access::ToolAccess;
 use crate::conversation::{Loaded, Loader};
+use crate::session_tools::SessionNarrowing;
 use crate::tool::{ToolCtx, ToolError, ToolOutput};
 
 /// The most tools the sources of an agent may offer on one model turn, all sources together. The
@@ -601,14 +602,16 @@ pub(crate) async fn appended_by(sources: &[DynToolSource], ctx: &SourceCtx) -> V
     out
 }
 
-/// What `sources` hold back of `tools` on this turn, in order: the names, each once, with the first
-/// reason. A name a source answers that is not among `tools` is not kept.
+/// What the run holds back of `tools` on this turn, in order: the names, each once, with the first
+/// reason. The session's own narrowing ([`SessionNarrowing`], ADR 0054 slice 3) comes **first**,
+/// then each source's holds. A name a source answers that is not among `tools` is not kept.
 pub(crate) async fn withheld(
+    narrowing: &SessionNarrowing,
     sources: &[DynToolSource],
     ctx: &SourceCtx,
     tools: &[&str],
 ) -> Vec<Withheld> {
-    let mut held: Vec<Withheld> = Vec::new();
+    let mut held: Vec<Withheld> = narrowing.held(tools);
     for source in sources {
         for one in source.withhold(ctx, tools).await {
             if tools.contains(&one.tool.as_str()) && !held.iter().any(|h| h.tool == one.tool) {

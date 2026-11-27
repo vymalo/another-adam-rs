@@ -287,18 +287,19 @@ returns `ToolError::AwaitSession` and the parent parks on a `PendingWait::Sessio
 the last (`SESSION_CLOSE_KIND` in its inbox: it finishes, then the session takes no more) or, with `cancel`, cancels it; an idle
 session is closed by a round that calls no model (`header.closing`) and ends with the last answer again. `delete: true`
 closes it with a **tombstone** (`header.deleted`): a deleted session is never listed again and every tool refuses it as `no
-session`, while **its runs stay in the store**. Only an idle session is deleted; a working one is refused, so close it first
-(cancelling a working round on delete is not built yet).
+session`, while **its runs stay in the store**. It **implies `cancel: true`** (ADR 0054 decision 10): a working round is
+stopped as a close with cancel stops it, and the closing round then writes the tombstone.
 `subagent_list` pages the sessions of the conversation. The sessions are reached by **the conversation**, not by the task: a
 later task finds the sessions an earlier one started, and no run reaches another conversation's (an id that is not one of
 this conversation's is "no session"). At most 16 sessions that are not closed and 20 rounds per session (decision 5's
 `max_open` and `max_rounds` as constants for now).
 
 **A session's own limits** ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md),
-slice 1). `subagent_start` takes an optional `config` of nine options: `max_turns`, `max_tool_calls`, `max_output_tokens`,
-`context_window`, `max_parallel_tool_calls`, `time_limit` (minutes), `max_rounds`, `token_budget` and `report_schema`. An option chooses within what the
+slice 1). `subagent_start` takes an optional `config` of eleven options: eight numbers, `max_turns`, `max_tool_calls`,
+`max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit` (minutes), `max_rounds` and `token_budget`
+(below), two lists of tool names, `tools` and `deny_tools` (below), and `report_schema` (below). An option chooses within what the
 subagent's folder allows and **never widens it**: a value above its bound is refused, in words that name the option
-(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the nine is refused too. What was
+(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the eleven is refused too. What was
 admitted is kept in the session's header, and the round reads its limits from it. Five of them apply at the next model call
 (`max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, and `token_budget`, below); `time_limit` and
 `max_rounds` apply to the next round. A later round copies the config and **clamps it to the bounds of that moment**, so a
@@ -313,6 +314,18 @@ the **closing turn**, and the round ends with `limit: "token_budget"` — or, wh
 session object's listing read it from the round's record, and a **send to a spent session is refused** (`subagent_send` in
 words, the A2A front as `UnsupportedOperation`) from the header the send already reads: no round starts and no model is
 called. A session with no budget spends and is never refused.
+
+`config` also takes `tools` and `deny_tools` (ADR 0054, slice 3): lists of tool names, in the folder's own syntax (an exact name or
+a `*` pattern; `github__*` selects an MCP server). The session is offered only the tools `tools` matches, less the ones `deny_tools`
+matches (the deny-list is applied after the allow-list); `read_output` always stays. A hidden tool is not in the model's request,
+and a call to it anyway is refused without running; this holds even when an oversized message context was dropped, because the session's header, not the
+context, is the truth. At most 32 entries, each at most 200 characters, none blank. **Which names are
+checked at the start depends on what the starter knows.** The tool names of a subagent are known where the agent is bound (a
+worker), not on a control plane that only answers A2A; and a worker knows the whole set only when no source adds tools to the
+agent while it runs. **Neither shipped agent has the whole set** (both add tools through sources), so in practice: a concrete
+`deny_tools` name that is none of the subagent's tools is refused with the list (it is almost always a typo; to deny a tool a
+source adds, use a pattern, `name*`), and a `tools` entry or a pattern that selects nothing is admitted and just offers less.
+A remote subagent takes neither. They apply from the next model call; a later round carries them on.
 
 `report_schema` is a JSON Schema (draft 2020-12, at most 16 KiB, no reference outside itself) that the subagent's final answer
 must match, for a helper that runs here (a remote one refuses it). The subagent is not shown the schema unless its first answer
@@ -360,6 +373,7 @@ stateDiagram-v2
     Idle --> Working: subagent_send starts the next round
     Idle --> Closed: subagent_close starts a round that calls no model
     Idle --> Closed: idle for idle_ttl (read, not written)
+    Working --> Deleted: subagent_close with delete (it cancels the round first)
     Idle --> Deleted: subagent_close with delete (a tombstone in the closing round)
     Closed --> Deleted: subagent_close with delete
     Closed --> [*]

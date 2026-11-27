@@ -30,7 +30,7 @@
         },
         "config": {
           "type": "object",
-          "description": "Optional limits for this session, each at most what the subagent's folder allows (a value above it is refused, naming the option). An option you leave out is the folder's own.",
+          "description": "Optional settings for this session, each within what the subagent's folder allows (a value outside it is refused, naming the option). An option you leave out is the folder's own.",
           "properties": {
             "max_turns": {
               "type": "integer",
@@ -65,6 +65,22 @@
               "type": "integer",
               "minimum": 1000,
               "description": "The most tokens the whole session may spend, input and output: a round that reaches it ends with a closing answer, and a spent session takes no more messages."
+            },
+            "tools": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 32,
+              "description": "Only these tools: names or * patterns (github__* is one MCP server)."
+            },
+            "deny_tools": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 32,
+              "description": "Hide these tools, same syntax; applied after tools."
             },
             "report_schema": {
               "type": "object",
@@ -153,7 +169,7 @@
         "delete": {
           "type": "boolean",
           "default": false,
-          "description": "Delete the session: it is gone from every listing and every tool refuses it. Its runs stay in the store. An idle session is deleted at once; a working one is refused, so close it first."
+          "description": "Delete the session: it is gone from every listing and every tool refuses it, and its runs stay in the store. It implies cancel: true — a working round is stopped, as a close with cancel does, and then the tombstone is written."
         }
       },
       "required": [

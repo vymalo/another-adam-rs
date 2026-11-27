@@ -698,6 +698,19 @@ pub const MIN_SESSION_TOKEN_BUDGET: u64 = 1_000;
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
 pub const MAX_SESSION_TOKEN_BUDGET: u64 = (1 << 53) - 1;
 
+/// The most entries of a session's `tools` or of its `deny_tools` ([ADR 0054], decision 4).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_SESSION_TOOL_ENTRIES: usize = 32;
+
+/// The most characters of one entry of a session's `tools` or `deny_tools` ([ADR 0054], decision 4).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_SESSION_TOOL_ENTRY_CHARS: usize = 200;
+
+/// The most tool names a refusal lists before it says `and N more`.
+const REFUSAL_LIST_NAMES: usize = 50;
+
 /// The most bytes of a session's `report_schema` as compact JSON: 16 KiB ([ADR 0054], decision 4).
 ///
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
@@ -752,6 +765,16 @@ pub struct SessionConfig {
     /// ceiling today: any value narrows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,
+    /// An allow-list of the subagent's tools, in the folder's own syntax: exact names and `*`
+    /// patterns (`github__*` selects an MCP server). The session is offered only the tools it
+    /// matches, and `read_output` stays whatever it says. At most [`MAX_SESSION_TOOL_ENTRIES`]
+    /// entries of at most [`MAX_SESSION_TOOL_ENTRY_CHARS`] characters, none blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    /// A deny-list in the same syntax, applied after `tools`: a tool it matches is withheld even
+    /// when `tools` matches it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_tools: Option<Vec<String>>,
     /// A JSON Schema (draft 2020-12) the round's final answer must match: one JSON value, checked
     /// by the loop at the final answer ([ADR 0054], slice 9). At most [`MAX_REPORT_SCHEMA_BYTES`],
     /// no `$ref` outside itself, and it must compile ([`SessionBounds::admit`]). Local subagents
@@ -784,8 +807,29 @@ impl SessionConfig {
             && self.time_limit.is_none()
             && self.max_rounds.is_none()
             && self.token_budget.is_none()
+            && self.tools.is_none()
+            && self.deny_tools.is_none()
             && self.report_schema.is_none()
             && self.instructions.is_none()
+    }
+
+    /// What a round's context carries of this config under `vymalo.session.tools`
+    /// (`adam_llm_agent::SESSION_TOOLS_CONTEXT_KEY`, [ADR 0054] slice 3): `{"tools": [..],
+    /// "denyTools": [..]}`, only the members the config sets, and `{}` when it sets neither, so a
+    /// round never inherits another round's value. One function for the model's tools and the A2A
+    /// front, so the two write the same bytes.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[must_use]
+    pub fn tools_context(&self) -> Value {
+        let mut entry = serde_json::Map::new();
+        if let Some(tools) = &self.tools {
+            entry.insert("tools".to_owned(), serde_json::json!(tools));
+        }
+        if let Some(deny) = &self.deny_tools {
+            entry.insert("denyTools".to_owned(), serde_json::json!(deny));
+        }
+        Value::Object(entry)
     }
 
     /// Read a `config` object ([ADR 0054], decision 1). **An unknown member is refused**, unlike the
@@ -793,8 +837,8 @@ impl SessionConfig {
     ///
     /// # Errors
     ///
-    /// A [`Refusal`] naming the member that is not an option, or the one whose value is not a
-    /// number.
+    /// A [`Refusal`] naming the member that is not an option, or the one whose value is not of its
+    /// type: a number, or for `tools` and `deny_tools` a list of strings.
     ///
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     pub fn from_value(value: Value) -> Result<Self, Refusal> {
@@ -870,11 +914,33 @@ pub struct SessionBounds {
     ///
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     pub token_budget: Option<u64>,
+    /// The names of the tools the folder and the deployment can offer the subagent (its own, and
+    /// an MCP server's as `server__tool`), **as far as the caller knows them**: a worker fills them
+    /// from the node it binds. Empty for a caller that knows none: a control plane binds no agent
+    /// and cannot list an MCP server's tools without calling the server.
+    pub tools: Vec<String>,
+    /// Whether [`tools`](Self::tools) is **every** tool the subagent can have: `false` when a
+    /// source adds tools while a run goes (an `mcp.json` server loaded by the task, or a source the
+    /// deployment gave), whose names no list made at startup holds. `admit` uses the two so that a
+    /// narrowing is never silently ignored (ADR 0054 decision 2):
+    ///
+    /// * a `tools` entry that matches no name is refused, listing the names, **only when the set is
+    ///   complete**; otherwise the shape alone is checked (an allow entry that matches nothing
+    ///   offers nothing, so it fails narrow);
+    /// * a `deny_tools` entry **without a `*`** that matches no name is refused **whenever any name
+    ///   is known**, even when the set is incomplete: a concrete name nobody knows is far more often
+    ///   a typo than a tool a source adds, and the refusal says to use a pattern for the latter;
+    /// * an entry with a `*` is checked only when the set is complete.
+    ///
+    /// With no name known (a control plane) only the shape is checked, so it admits what a worker
+    /// will accept.
+    pub tools_complete: bool,
 }
 
 impl Default for SessionBounds {
     /// The loop's own defaults: 50 turns, 200 tool calls, 4,096 output tokens, 10 calls at once,
-    /// 30 minutes, 20 rounds, no token budget and no known window.
+    /// 30 minutes, 20 rounds, no token budget, no known window and no known tools (an incomplete,
+    /// empty set).
     fn default() -> Self {
         Self {
             max_turns: 50,
@@ -885,6 +951,8 @@ impl Default for SessionBounds {
             time_limit: 30,
             max_rounds: 20,
             token_budget: None,
+            tools: Vec::new(),
+            tools_complete: false,
         }
     }
 }
@@ -1007,6 +1075,12 @@ impl SessionBounds {
                 ));
             }
         }
+        if let Some(entries) = &requested.tools {
+            self.admit_tool_entries("tools", entries)?;
+        }
+        if let Some(entries) = &requested.deny_tools {
+            self.admit_tool_entries("deny_tools", entries)?;
+        }
         if let Some(text) = &requested.instructions {
             let chars = text.chars().count();
             if chars > MAX_SESSION_INSTRUCTIONS_CHARS {
@@ -1024,6 +1098,103 @@ impl SessionBounds {
         }
         Ok(requested)
     }
+
+    /// The entries of `tools` or `deny_tools`: each non-blank and short, not too many, and, as far
+    /// as the bound tool names are known (see [`tools_complete`](Self::tools_complete)), each
+    /// matching at least one of them.
+    fn admit_tool_entries(&self, option: &str, entries: &[String]) -> Result<(), Refusal> {
+        if entries.len() > MAX_SESSION_TOOL_ENTRIES {
+            return Err(Refusal::new(
+                Some(option),
+                format!(
+                    "config.{option} has {} entries; at most {MAX_SESSION_TOOL_ENTRIES}",
+                    entries.len()
+                ),
+            ));
+        }
+        for entry in entries {
+            if entry.trim().is_empty() {
+                return Err(Refusal::new(
+                    Some(option),
+                    format!("config.{option} has a blank entry; name a tool or a pattern"),
+                ));
+            }
+            let chars = entry.chars().count();
+            if chars > MAX_SESSION_TOOL_ENTRY_CHARS {
+                return Err(Refusal::new(
+                    Some(option),
+                    format!(
+                        "config.{option} has an entry of {chars} characters; at most \
+                         {MAX_SESSION_TOOL_ENTRY_CHARS}"
+                    ),
+                ));
+            }
+        }
+        let names = &self.tools;
+        for entry in entries {
+            let pattern = entry.contains('*');
+            // What is checked, and so refused: see `tools_complete`.
+            let checked = if option == "tools" || pattern {
+                self.tools_complete
+            } else {
+                self.tools_complete || !names.is_empty()
+            };
+            if !checked || names.iter().any(|name| glob(entry, name)) {
+                continue;
+            }
+            let listed: Vec<&str> = names
+                .iter()
+                .take(REFUSAL_LIST_NAMES)
+                .map(String::as_str)
+                .collect();
+            let mut list = if listed.is_empty() {
+                "none".to_owned()
+            } else {
+                listed.join(", ")
+            };
+            if names.len() > REFUSAL_LIST_NAMES {
+                list.push_str(&format!(" and {} more", names.len() - REFUSAL_LIST_NAMES));
+            }
+            let hint = if self.tools_complete {
+                String::new()
+            } else {
+                format!(
+                    "; the agent may get more tools while it runs: a pattern such as \"{entry}*\" \
+                     names those"
+                )
+            };
+            return Err(Refusal::new(
+                Some(option),
+                format!(
+                    "config.{option} has {entry:?}, which matches none of its tools: {list}{hint}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Whether `name` matches `pattern`, where `*` stands for any run of characters: the folder's own
+/// syntax for a list of tools or skills (`github__*` selects an MCP server). Without a `*` the
+/// two must be equal. A session's `tools` and `deny_tools` and the folder's `tools:` use this one
+/// function, so a pattern means the same in both.
+pub fn glob(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    // `split` yields at least one piece; without a `*` there is exactly one.
+    let (first, rest) = (parts[0], &parts[1..]);
+    let Some((last, middles)) = rest.split_last() else {
+        return pattern == name;
+    };
+    let Some(mut tail) = name.strip_prefix(first) else {
+        return false;
+    };
+    for middle in middles {
+        let Some(at) = tail.find(middle) else {
+            return false;
+        };
+        tail = &tail[at + middle.len()..];
+    }
+    tail.ends_with(last)
 }
 
 impl SessionBounds {
@@ -1079,6 +1250,11 @@ impl SessionBounds {
                 let ceiling = self.token_budget.unwrap_or(MAX_SESSION_TOKEN_BUDGET);
                 v.max(MIN_SESSION_TOKEN_BUDGET).min(ceiling)
             }),
+            // Entries narrow and are matched against the tools the round really has, so a
+            // deployment that dropped a tool since changes nothing here: an entry that matches
+            // nothing withholds nothing it should not.
+            tools: config.tools.clone(),
+            deny_tools: config.deny_tools.clone(),
             report_schema: config.report_schema.clone(),
             // Text has no bound to clamp to: `admit` already refused one that is too long, and a
             // later round keeps what the session was started with.
@@ -2350,6 +2526,8 @@ mod tests {
             time_limit: 30,
             max_rounds: 12,
             token_budget: None,
+            tools: Vec::new(),
+            tools_complete: false,
         }
     }
 
@@ -2773,6 +2951,8 @@ mod tests {
             time_limit: 10,
             max_rounds: 5,
             token_budget: Some(4_000),
+            tools: Vec::new(),
+            tools_complete: false,
         };
         let clamped = lowered.clamp(&ask);
         assert_eq!(clamped.max_turns, Some(40));
@@ -2979,5 +3159,210 @@ mod tests {
                 "version {v}"
             );
         }
+    }
+
+    // ── ADR 0054 slice 3: `tools` and `deny_tools` ───────────────────────────────────────────
+
+    /// Bounds of a worker that binds `reviewer` with these tools: two of its own and two of an MCP
+    /// server.
+    fn bound_with_tools() -> SessionBounds {
+        SessionBounds {
+            tools: [
+                "read_file",
+                "write_file",
+                "linear__list_issues",
+                "linear__get_issue",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            tools_complete: true,
+            ..bounds()
+        }
+    }
+
+    /// The same, for an agent a source adds tools to while it runs (both shipped agents): the
+    /// names are known, but not all of them.
+    fn bound_with_incomplete_tools() -> SessionBounds {
+        SessionBounds {
+            tools_complete: false,
+            ..bound_with_tools()
+        }
+    }
+
+    fn listing(tools: &[&str], deny: &[&str]) -> SessionConfig {
+        let own = |names: &[&str]| {
+            (!names.is_empty()).then(|| names.iter().map(|n| (*n).to_owned()).collect())
+        };
+        SessionConfig {
+            tools: own(tools),
+            deny_tools: own(deny),
+            ..SessionConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_star_matches_any_run() {
+        assert!(glob("linear__*", "linear__list_issues"));
+        assert!(glob("linear__*", "linear__"));
+        assert!(!glob("linear__*", "github__list"));
+        assert!(!glob("linear__*", "linear_"));
+        assert!(glob("*_issues", "linear__list_issues"));
+        assert!(glob("*", "anything"));
+        assert!(glob("a*b*c", "aXbYc"));
+        assert!(glob("a*b*c", "abc"));
+        assert!(!glob("a*b*c", "acb"));
+        assert!(!glob("a*b*c", "aXbY"));
+        assert!(glob("exact", "exact"));
+        assert!(!glob("exact", "exactly"));
+        // The pieces of a pattern cannot overlap: `ab*ba` needs four characters.
+        assert!(!glob("ab*ba", "aba"));
+    }
+
+    #[test]
+    fn a_tools_pattern_that_matches_no_bound_tool_is_refused_with_the_list() {
+        for (option, asked) in [
+            ("tools", listing(&["red_file"], &[])),
+            ("deny_tools", listing(&[], &["red_file"])),
+        ] {
+            let why = bound_with_tools().admit(asked).expect_err("matches none");
+            assert_eq!(why.option(), Some(option));
+            assert!(
+                why.message().contains(&format!(
+                    "config.{option} has \"red_file\", which matches none of its tools: \
+                     read_file, write_file, linear__list_issues, linear__get_issue"
+                )),
+                "{why}"
+            );
+        }
+        // The positive control: names and patterns that match something are admitted as asked.
+        let ok = listing(&["read_file", "linear__*"], &["write_*"]);
+        assert_eq!(bound_with_tools().admit(ok.clone()).expect("matches"), ok);
+    }
+
+    #[test]
+    fn an_incomplete_set_refuses_a_concrete_deny_entry_it_does_not_know_and_checks_no_pattern() {
+        let bound = bound_with_incomplete_tools();
+        // A typo of a concrete deny entry: refused, with the list and the way to name the rest.
+        let why = bound
+            .admit(listing(&[], &["red_file"]))
+            .expect_err("a concrete name no tool has");
+        assert_eq!(why.option(), Some("deny_tools"));
+        assert!(
+            why.message().contains(
+                "config.deny_tools has \"red_file\", which matches none of its tools: read_file, \
+                 write_file, linear__list_issues, linear__get_issue; the agent may get more tools \
+                 while it runs: a pattern such as \"red_file*\" names those"
+            ),
+            "{why}"
+        );
+        // A pattern, and an allow entry, are not checked: a source may add what they select.
+        let ok = listing(&["github__*", "later_tool"], &["github__*", "later_*"]);
+        assert_eq!(bound.admit(ok.clone()).expect("not checked"), ok);
+        // A known name is admitted.
+        assert!(bound.admit(listing(&[], &["write_file"])).is_ok());
+        // With no name known at all (a control plane) even a concrete deny entry is shape only.
+        assert!(bounds().admit(listing(&[], &["red_file"])).is_ok());
+    }
+
+    #[test]
+    fn a_complete_set_checks_patterns_and_allow_entries_too() {
+        let bound = bound_with_tools();
+        for asked in [
+            listing(&["github__*"], &[]),
+            listing(&[], &["github__*"]),
+            listing(&["later_tool"], &[]),
+        ] {
+            assert!(bound.admit(asked.clone()).is_err(), "{asked:?}");
+        }
+        // No hint to name more tools by pattern: the set is every tool there is.
+        let why = bound.admit(listing(&["x"], &[])).unwrap_err();
+        assert!(!why.message().contains("while it runs"), "{why}");
+        // A complete empty set (an agent with no tools) refuses with `none`.
+        let bare = SessionBounds {
+            tools: Vec::new(),
+            tools_complete: true,
+            ..bounds()
+        };
+        assert!(
+            bare.admit(listing(&["x"], &[]))
+                .unwrap_err()
+                .message()
+                .ends_with("matches none of its tools: none")
+        );
+    }
+
+    #[test]
+    fn a_server_pattern_selects_the_tools_of_an_mcp_server() {
+        let admitted = bound_with_tools()
+            .admit(listing(&["linear__*"], &[]))
+            .expect("linear__ matches linear__list_issues");
+        assert_eq!(admitted.tools, Some(vec!["linear__*".to_owned()]));
+        assert!(glob("linear__*", "linear__list_issues"));
+        // A server the agent has no tool of selects nothing.
+        let why = bound_with_tools()
+            .admit(listing(&["github__*"], &[]))
+            .expect_err("no github tools");
+        assert!(why.message().contains("\"github__*\""), "{why}");
+    }
+
+    #[test]
+    fn a_long_list_of_tools_is_cut_at_fifty_names() {
+        let many = SessionBounds {
+            tools: (0..53).map(|n| format!("tool_{n:02}")).collect(),
+            tools_complete: true,
+            ..bounds()
+        };
+        let why = many.admit(listing(&["nope"], &[])).expect_err("none");
+        assert!(why.message().contains("tool_49 and 3 more"), "{why}");
+        assert!(!why.message().contains("tool_50"), "{why}");
+    }
+
+    #[test]
+    fn without_known_tools_an_entry_is_admitted_by_its_shape_alone() {
+        let unknown = bounds();
+        assert!(unknown.tools.is_empty() && !unknown.tools_complete);
+        let ask = listing(&["anything_at_all", "server__*"], &["x"]);
+        assert_eq!(unknown.admit(ask.clone()).expect("shape only"), ask);
+        // The shape is still held.
+        for (asked, words) in [
+            (listing(&["  "], &[]), "config.tools has a blank entry"),
+            (listing(&[], &[""]), "config.deny_tools has a blank entry"),
+            (
+                listing(&[&"x".repeat(201)], &[]),
+                "config.tools has an entry of 201 characters; at most 200",
+            ),
+            (
+                listing(&[&"x".repeat(200)], &[&"y".repeat(201)]),
+                "config.deny_tools has an entry of 201 characters; at most 200",
+            ),
+        ] {
+            let why = unknown.admit(asked).expect_err("bad shape");
+            assert!(why.message().contains(words), "{why}");
+        }
+        let names: Vec<String> = (0..33).map(|n| format!("t{n}")).collect();
+        let too_many = SessionConfig {
+            tools: Some(names.clone()),
+            ..SessionConfig::default()
+        };
+        let why = unknown.admit(too_many).expect_err("33 entries");
+        assert_eq!(why.message(), "config.tools has 33 entries; at most 32");
+        let at_most = SessionConfig {
+            deny_tools: Some(names[..32].to_vec()),
+            ..SessionConfig::default()
+        };
+        assert!(unknown.admit(at_most).is_ok());
+    }
+
+    #[test]
+    fn tools_and_deny_tools_count_as_set_and_survive_a_clamp() {
+        assert!(!listing(&["a"], &[]).is_empty());
+        assert!(!listing(&[], &["a"]).is_empty());
+        let both = listing(&["a*"], &["ab"]);
+        assert_eq!(bounds().clamp(&both), both);
+        // The wire is camelCase and carries only what is set.
+        assert_eq!(
+            serde_json::to_value(&both).expect("serialises"),
+            serde_json::json!({"tools": ["a*"], "denyTools": ["ab"]})
+        );
     }
 }

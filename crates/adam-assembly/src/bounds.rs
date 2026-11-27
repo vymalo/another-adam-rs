@@ -5,7 +5,10 @@
 //! (the session tools' bounds, which a worker holds a `subagent_start` to) and
 //! [`AgentDef::session_bounds`](crate::AgentDef::session_bounds) (the bounds a process that binds
 //! no agent, the control plane of a split deployment, holds a person's `start.config` to) both
-//! call [`bounds_of`], so the two cannot disagree. It reads the root's manifest, the roster
+//! call [`bounds_of`], so the two agree on every number. **They do not agree on tool names**: a worker
+//! knows the names of the tools it binds (`tools`, and whether they are every tool, `tools_complete`)
+//! and a control plane, which binds no agent, knows none, so it checks the shape of a
+//! `tools` or `deny_tools` entry only. It reads the root's manifest, the roster
 //! ([`SessionTarget`]) and three settings of the deployment: `MAX_PARALLEL_TOOL_CALLS`, the root's
 //! effective `max_session_rounds` and nothing else. It is pure: no model, no I/O.
 //!
@@ -74,6 +77,11 @@ fn is_local(manifest: &AgentManifest, target: &SessionTarget) -> bool {
 ///   `max_rounds` the root's effective `max_session_rounds`.
 /// * `token_budget` is `None`: no folder caps a session's tokens today (ADR 0054 decision 4), so
 ///   `SessionBounds::admit` holds the request to the ADR's own 1,000 to 2^53 − 1.
+/// * `tools` and `tools_complete` are what the caller passes: the names the subagent is bound with
+///   and whether they are every tool it can have (a worker, which binds the agent; see
+///   `SessionBounds::tools_complete`), else an empty, incomplete set (the control plane, which binds
+///   none). A remote target has the empty, incomplete set whatever is passed: its tools are another
+///   system's, and the option is refused.
 ///
 /// A remote subagent's rounds are runs of an agent of its own, and the ADR refuses every option
 /// but `time_limit`, `max_rounds` and `instructions` on one: the loop's defaults stand for the
@@ -83,6 +91,8 @@ pub(crate) fn bounds_of(
     target: &SessionTarget,
     deployment_parallel: Option<usize>,
     max_rounds: u32,
+    tools: Vec<String>,
+    tools_complete: bool,
 ) -> SessionBounds {
     let (max_turns, max_tool_calls, max_output_tokens, parallel) = if is_local(manifest, target) {
         let file = folder_limits(manifest, target);
@@ -122,5 +132,7 @@ pub(crate) fn bounds_of(
         // No folder caps a session's tokens today (ADR 0054, decision 4): any value narrows, and
         // `admit` holds a request to the ADR's own ceiling.
         token_budget: None,
+        tools: if target.remote { Vec::new() } else { tools },
+        tools_complete: tools_complete && !target.remote,
     }
 }

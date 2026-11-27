@@ -23,14 +23,15 @@ use adam_core::time::Timestamp;
 use adam_core::RunId;
 use adam_model::ToolSpec;
 use adam_runtime::{
-    Inbound, MAX_SESSION_PAGE, RuntimeError, SESSION_CLOSE_KIND, SessionBounds, SessionConfig,
-    SessionHeader, SessionLimits, SessionState, SessionSummary, SessionView,
+    Inbound, MAX_SESSION_PAGE, MAX_SESSION_TOOL_ENTRIES, RuntimeError, SESSION_CLOSE_KIND,
+    SessionBounds, SessionConfig, SessionHeader, SessionLimits, SessionState, SessionSummary,
+    SessionView,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::agent::render_output;
-use crate::conversation::MESSAGE_KIND;
+use crate::conversation::{MESSAGE_KIND, SESSION_TOOLS_CONTEXT_KEY};
 use crate::paging::{
     PAGE_LINES, PageError, clip_item, end_line, escape_text, more_line, page_lines, window,
     window_args,
@@ -352,7 +353,7 @@ fn required_of(tool: &str) -> Vec<&'static str> {
 
 /// The options of `config` as the model writes them (snake_case, like the other arguments), and
 /// the camelCase the wire and the header use for the same names.
-const CONFIG_OPTIONS: [(&str, &str); 9] = [
+const CONFIG_OPTIONS: [(&str, &str); 11] = [
     ("max_turns", "maxTurns"),
     ("max_tool_calls", "maxToolCalls"),
     ("max_output_tokens", "maxOutputTokens"),
@@ -361,8 +362,13 @@ const CONFIG_OPTIONS: [(&str, &str); 9] = [
     ("time_limit", "timeLimit"),
     ("max_rounds", "maxRounds"),
     ("token_budget", "tokenBudget"),
+    ("tools", "tools"),
+    ("deny_tools", "denyTools"),
     ("report_schema", "reportSchema"),
 ];
+
+/// The options of `config` that are lists of tool names rather than numbers.
+const CONFIG_LISTS: [&str; 2] = ["tools", "deny_tools"];
 
 /// A session's config as a list and a read say it: `max_turns 20, time_limit 10`, the options that
 /// are set, in the model's own names. `None` when none is, so nothing is shown (ADR 0054
@@ -377,7 +383,18 @@ fn config_words(config: &SessionConfig) -> Option<String> {
             if *own == "report_schema" {
                 return Some("report_schema set".to_owned());
             }
-            value.as_u64().map(|n| format!("{own} {n}"))
+            match value {
+                Value::Number(n) => Some(format!("{own} {n}")),
+                Value::Array(names) => Some(format!(
+                    "{own} {}",
+                    names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                _ => None,
+            }
         })
         .collect();
     (!parts.is_empty()).then(|| parts.join(", "))
@@ -385,13 +402,15 @@ fn config_words(config: &SessionConfig) -> Option<String> {
 
 /// The options a remote subagent refuses: every one but `time_limit` and `max_rounds` (ADR 0054
 /// decision 4).
-const REMOTE_REFUSED: [&str; 7] = [
+const REMOTE_REFUSED: [&str; 9] = [
     "max_turns",
     "max_tool_calls",
     "max_output_tokens",
     "context_window",
     "max_parallel_tool_calls",
     "token_budget",
+    "tools",
+    "deny_tools",
     "report_schema",
 ];
 
@@ -411,6 +430,25 @@ fn config_of(value: &Value) -> Result<SessionConfig, String> {
                 options.join(", ")
             ));
         };
+        if CONFIG_LISTS.contains(&key.as_str()) {
+            if value.is_null() {
+                continue;
+            }
+            let named = value.as_array().is_some_and(|entries| {
+                entries
+                    .iter()
+                    .all(|entry| entry.as_str().is_some_and(|name| !name.trim().is_empty()))
+            });
+            if !named {
+                return Err(format!(
+                    "config.{key} must be a list of tool names or patterns, none blank"
+                ));
+            }
+            wire.insert((*name).to_owned(), value.clone());
+            continue;
+        }
+        // Every other option is a whole number of 32 bits. Say so by name here, so the refusal is
+        // ours: serde's names no option and echoes what the model wrote, without a bound. A `0` passes
         // The report schema is a JSON Schema, an object: `admit` holds it to the rest (its size, its
         // references, that it compiles).
         if *name == "reportSchema" {
@@ -720,7 +758,9 @@ fn header_json(header: &SessionHeader) -> Value {
 }
 
 /// The message that starts or continues a round: the child message of this run with the session's
-/// header in it.
+/// header in it, and in its context the tools the header's config narrows (ADR 0054 slice 3).
+/// Both `subagent_start` and `subagent_send` make a round's message here, from the config they
+/// carry in the header (a send's is the clamped copy), so every round writes the key.
 fn round_message(ctx: &ToolCtx, text: &str, header: &SessionHeader) -> Inbound {
     let mut message = ctx.child_message(text);
     if let Some(payload) = message.payload.as_object_mut() {
@@ -728,6 +768,23 @@ fn round_message(ctx: &ToolCtx, text: &str, header: &SessionHeader) -> Inbound {
             adam_runtime::SESSION_STATE_KEY.to_owned(),
             header_json(header),
         );
+        let context = payload
+            .entry("context")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        // `child_message` writes an object or nothing; anything else is replaced, never left to
+        // carry a round with no narrowing.
+        if !context.is_object() {
+            *context = Value::Object(serde_json::Map::new());
+        }
+        if let Some(context) = context.as_object_mut() {
+            context.insert(
+                SESSION_TOOLS_CONTEXT_KEY.to_owned(),
+                header
+                    .config
+                    .as_ref()
+                    .map_or_else(|| json!({}), SessionConfig::tools_context),
+            );
+        }
     }
     message
 }
@@ -885,8 +942,8 @@ impl Tool for Start {
                     },
                     "config": {
                         "type": "object",
-                        "description": "Optional limits for this session, each at most what the \
-                                        subagent's folder allows (a value above it is refused, \
+                        "description": "Optional settings for this session, each within what the \
+                                        subagent's folder allows (a value outside it is refused, \
                                         naming the option). An option you leave out is the \
                                         folder's own.",
                         "properties": {
@@ -908,6 +965,19 @@ impl Tool for Start {
                                                 input and output: a round that reaches it ends \
                                                 with a closing answer, and a spent session takes \
                                                 no more messages.",
+                            },
+                            "tools": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "maxItems": MAX_SESSION_TOOL_ENTRIES,
+                                "description": "Only these tools: names or * patterns (github__* \
+                                                is one MCP server).",
+                            },
+                            "deny_tools": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "maxItems": MAX_SESSION_TOOL_ENTRIES,
+                                "description": "Hide these tools, same syntax; applied after tools.",
                             },
                             "report_schema": {
                                 "type": "object",
@@ -1469,7 +1539,7 @@ impl Tool for Close {
                     "delete": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Delete the session: it is gone from every listing and every tool refuses it. Its runs stay in the store. An idle session is deleted at once; a working one is refused, so close it first.",
+                        "description": "Delete the session: it is gone from every listing and every tool refuses it, and its runs stay in the store. It implies cancel: true — a working round is stopped, as a close with cancel does, and then the tombstone is written.",
                     },
                 },
                 "required": required_of(SUBAGENT_CLOSE),
@@ -1499,6 +1569,9 @@ impl Tool for Close {
             Ok(delete) => delete,
             Err(why) => return refuse(why),
         };
+        // `delete: true` implies `cancel: true` (ADR 0054 decision 10): it stops a working round as
+        // a close with cancel does, and the closing round it starts then writes the tombstone.
+        let cancel = cancel || delete;
         let starter = ctx.child_starter()?;
         let round_id = ctx.child_run_id();
         let mut note = None;
@@ -1515,12 +1588,6 @@ impl Tool for Close {
             {
                 return Ok(closed(session, note));
             }
-            if delete && view.state == SessionState::Working {
-                return refuse(format!(
-                    "session `{session}` is working; it is not deleted while a round runs: close \
-                     it with `cancel: true` first, then delete it"
-                ));
-            }
             if view.state == SessionState::Working {
                 if cancel {
                     starter
@@ -1535,7 +1602,7 @@ impl Tool for Close {
                         Some(now) => view = now,
                         None => return refuse(no_such_session(session)),
                     }
-                    if view.closed {
+                    if view.closed && !delete {
                         return Ok(closed(session, None));
                     }
                 } else if view.closed {
