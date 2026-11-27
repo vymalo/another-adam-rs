@@ -234,6 +234,34 @@ pub struct SessionHeader {
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<SessionConfig>,
+    /// The tokens the session has spent so far ([ADR 0054], decision 6): the earlier rounds' and
+    /// this round's, input and output, as `usage/v1` counts them. Each round's agent writes it into
+    /// the state it commits, so a listing reads it from the round's record like the rest of the
+    /// header, and a send refuses a session that spent its
+    /// [`config.token_budget`](SessionConfig::token_budget) without another store read. Absent when
+    /// `0`, which is what a header written before it existed reads.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub spent: u64,
+}
+
+impl SessionHeader {
+    /// The cap on the session's tokens, when it set one ([`SessionConfig::token_budget`]).
+    pub fn token_budget(&self) -> Option<u64> {
+        self.config.as_ref().and_then(|config| config.token_budget)
+    }
+
+    /// Whether the session has spent its token budget: a send is refused, and the next model call
+    /// of a round is its closing turn. One rule for the tool, the A2A front and the listing.
+    pub fn is_spent(&self) -> bool {
+        self.token_budget()
+            .is_some_and(|budget| self.spent >= budget)
+    }
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 /// The header a round's agent state holds, if it holds one.
@@ -436,6 +464,9 @@ pub struct SessionSummary {
     /// The configuration the session runs with, as its latest round's header says
     /// ([`SessionHeader::config`], ADR 0054); `None` when it has none.
     pub config: Option<SessionConfig>,
+    /// The tokens the session has spent so far, as its latest round's header says
+    /// ([`SessionHeader::spent`], ADR 0054 decision 6); `0` for a session with no header.
+    pub spent: u64,
 }
 
 /// The round a session's report is of ([`SessionSummary::report`]).
@@ -655,6 +686,18 @@ pub const CONTEXT_WINDOW_PROMPT_TOKENS: u32 = 20_000;
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
 pub const CONTEXT_WINDOW_HEADROOM_TOKENS: u32 = 8_000;
 
+/// The least `token_budget` a session may ask for ([ADR 0054], decision 4): below it a session is
+/// not worth the tokens of the answer.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MIN_SESSION_TOKEN_BUDGET: u64 = 1_000;
+
+/// The most `token_budget` a session may ask for ([ADR 0054], decision 4): 2^53 − 1, the largest
+/// whole number a JSON number carries without losing one.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_SESSION_TOKEN_BUDGET: u64 = (1 << 53) - 1;
+
 /// The most entries of a session's `tools` or of its `deny_tools` ([ADR 0054], decision 4).
 ///
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
@@ -667,6 +710,7 @@ pub const MAX_SESSION_TOOL_ENTRY_CHARS: usize = 200;
 
 /// The most tool names a refusal lists before it says `and N more`.
 const REFUSAL_LIST_NAMES: usize = 50;
+
 /// The most bytes of a session's `report_schema` as compact JSON: 16 KiB ([ADR 0054], decision 4).
 ///
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
@@ -676,9 +720,9 @@ pub const MAX_REPORT_SCHEMA_BYTES: usize = 16 * 1024;
 /// ever **narrows** what the subagent's folder and the deployment allow ([`SessionBounds::admit`]).
 ///
 /// An absent option stays absent and means "the folder's": nothing is filled in. The type is
-/// `#[non_exhaustive]` because the decision adds options slice by slice (`tools`, `token_budget`,
-/// `model`, …), and an option added must not break a builder. It serialises camelCase, which is how
-/// it crosses the wire in `start.config` and how it is journaled in a [`SessionHeader`].
+/// `#[non_exhaustive]` because the decision adds options slice by slice (`tools`, `model`, …), and
+/// an option added must not break a builder. It serialises camelCase, which is how it crosses the
+/// wire in `start.config` and how it is journaled in a [`SessionHeader`].
 ///
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -714,6 +758,13 @@ pub struct SessionConfig {
     /// The most rounds the session may have, 1 to the root's effective `max_session_rounds`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
+    /// A cap on the tokens of the whole session, input and output, as `usage/v1` counts them
+    /// ([`MIN_SESSION_TOKEN_BUDGET`] to [`MAX_SESSION_TOKEN_BUDGET`]). Before each model call,
+    /// `spent` reaching it ends the round with the closing turn and the words `token budget
+    /// reached`, and a send to a session that spent it is refused. Nothing bounds it below that
+    /// ceiling today: any value narrows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
     /// An allow-list of the subagent's tools, in the folder's own syntax: exact names and `*`
     /// patterns (`github__*` selects an MCP server). The session is offered only the tools it
     /// matches, and `read_output` stays whatever it says. At most [`MAX_SESSION_TOOL_ENTRIES`]
@@ -755,6 +806,7 @@ impl SessionConfig {
             && self.max_parallel_tool_calls.is_none()
             && self.time_limit.is_none()
             && self.max_rounds.is_none()
+            && self.token_budget.is_none()
             && self.tools.is_none()
             && self.deny_tools.is_none()
             && self.report_schema.is_none()
@@ -856,6 +908,12 @@ pub struct SessionBounds {
     pub time_limit: u32,
     /// The root's effective `max_session_rounds`.
     pub max_rounds: u32,
+    /// The folder's own cap on the session's tokens, when it ever sets one: **no folder does
+    /// today** ([ADR 0054], decision 4, "none today: any value narrows"), so this is `None` and
+    /// [`admit`](Self::admit) holds a request to the ADR's own ceiling.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub token_budget: Option<u64>,
     /// The names of the tools the folder and the deployment can offer the subagent (its own, and
     /// an MCP server's as `server__tool`), **as far as the caller knows them**: a worker fills them
     /// from the node it binds. Empty for a caller that knows none: a control plane binds no agent
@@ -881,7 +939,8 @@ pub struct SessionBounds {
 
 impl Default for SessionBounds {
     /// The loop's own defaults: 50 turns, 200 tool calls, 4,096 output tokens, 10 calls at once,
-    /// 30 minutes, 20 rounds, no known window and no known tools (an incomplete, empty set).
+    /// 30 minutes, 20 rounds, no token budget, no known window and no known tools (an incomplete,
+    /// empty set).
     fn default() -> Self {
         Self {
             max_turns: 50,
@@ -891,6 +950,7 @@ impl Default for SessionBounds {
             max_parallel_tool_calls: 10,
             time_limit: 30,
             max_rounds: 20,
+            token_budget: None,
             tools: Vec::new(),
             tools_complete: false,
         }
@@ -997,6 +1057,23 @@ impl SessionBounds {
         }
         if let Some(v) = requested.max_rounds {
             within("max_rounds", v, 1, self.max_rounds)?;
+        }
+        if let Some(v) = requested.token_budget {
+            // The floor and the ceiling are the ADR's, not the folder's; a folder that ever sets a
+            // cap of its own lowers the ceiling further and never raises it.
+            if v < MIN_SESSION_TOKEN_BUDGET {
+                return Err(Refusal::new(
+                    Some("token_budget"),
+                    format!("config.token_budget is {v}; at least {MIN_SESSION_TOKEN_BUDGET}"),
+                ));
+            }
+            let ceiling = self.token_budget.unwrap_or(MAX_SESSION_TOKEN_BUDGET);
+            if v > ceiling {
+                return Err(Refusal::new(
+                    Some("token_budget"),
+                    format!("config.token_budget is {v}; at most {ceiling}"),
+                ));
+            }
         }
         if let Some(entries) = &requested.tools {
             self.admit_tool_entries("tools", entries)?;
@@ -1126,8 +1203,9 @@ impl SessionBounds {
     /// nothing is raised back. Unlike [`admit`](Self::admit) it refuses nothing: a value above its
     /// bound becomes the bound, and an absent option stays absent. A value below the least an option
     /// takes is raised to that least (`max_output_tokens` is never `0`, which would widen it;
-    /// `time_limit` never `0`, which would mean no limit; a `context_window` leaves a budget), but
-    /// never above the bound itself.
+    /// `time_limit` never `0`, which would mean no limit; `token_budget` never below
+    /// [`MIN_SESSION_TOKEN_BUDGET`]; a `context_window` leaves a budget), but never above the bound
+    /// itself.
     ///
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     #[must_use]
@@ -1168,6 +1246,10 @@ impl SessionBounds {
             max_rounds: config
                 .max_rounds
                 .map(|v| v.clamp(1, self.max_rounds.max(1))),
+            token_budget: config.token_budget.map(|v| {
+                let ceiling = self.token_budget.unwrap_or(MAX_SESSION_TOKEN_BUDGET);
+                v.max(MIN_SESSION_TOKEN_BUDGET).min(ceiling)
+            }),
             // Entries narrow and are matched against the tools the round really has, so a
             // deployment that dropped a tool since changes nothing here: an entry that matches
             // nothing withholds nothing it should not.
@@ -1396,6 +1478,7 @@ pub(crate) fn page_of_sessions(
                 started_by: latest.parent_id,
                 report,
                 config: read.header.as_ref().and_then(|h| h.config.clone()),
+                spent: read.header.as_ref().map_or(0, |h| h.spent),
             })
         })
         .collect();
@@ -1602,9 +1685,14 @@ mod tests {
             decoded.workspace, None,
             "a header stored before `workspace`"
         );
+        assert_eq!(
+            decoded.spent, 0,
+            "a header stored before `spent` has spent nothing"
+        );
         let encoded = serde_json::to_value(&decoded).unwrap();
         assert!(encoded.get("root").is_none(), "absent when None");
         assert!(encoded.get("workspace").is_none(), "absent when None");
+        assert!(encoded.get("spent").is_none(), "absent when 0");
         let root = RunId::new();
         let header = SessionHeader {
             root: Some(root),
@@ -1634,6 +1722,7 @@ mod tests {
             workspace: Some(workspace),
             visible: false,
             config: None,
+            spent: 0,
         };
         let encoded = serde_json::to_value(&header).unwrap();
         assert_eq!(
@@ -1672,11 +1761,81 @@ mod tests {
             workspace: None,
             visible: false,
             config: None,
+            spent: 0,
         };
         let payload = closing_round_payload(&header);
         assert_eq!(payload[SESSION_CLOSE_ROUND_KEY], Value::Bool(true));
         assert_eq!(payload.as_object().map(|o| o.len()), Some(2));
         assert_eq!(header_of(&payload), Some(header));
+    }
+
+    /// The tokens a session spent ([ADR 0054], decision 6) are a field of its header: they
+    /// round-trip, they are absent at `0`, and whether a session is spent is the header's rule
+    /// alone, so the tool, the A2A front and the listing cannot disagree.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn a_header_carries_the_tokens_the_session_spent() {
+        let mut header = header(RunId::new(), true, false);
+        header.config = Some(SessionConfig {
+            token_budget: Some(MIN_SESSION_TOKEN_BUDGET),
+            ..SessionConfig::default()
+        });
+        assert_eq!(header.token_budget(), Some(MIN_SESSION_TOKEN_BUDGET));
+        assert!(!header.is_spent(), "nothing spent yet");
+        header.spent = MIN_SESSION_TOKEN_BUDGET - 1;
+        assert!(!header.is_spent(), "one token left");
+        header.spent = MIN_SESSION_TOKEN_BUDGET;
+        assert!(header.is_spent(), "the budget itself is spent");
+
+        let encoded = serde_json::to_value(&header).unwrap();
+        assert_eq!(
+            encoded["spent"],
+            serde_json::json!(MIN_SESSION_TOKEN_BUDGET),
+            "written as a number"
+        );
+        let back: SessionHeader = serde_json::from_value(encoded).unwrap();
+        assert_eq!(back.spent, MIN_SESSION_TOKEN_BUDGET);
+
+        // No budget: any number of tokens is not a spent session.
+        header.config = None;
+        assert_eq!(header.token_budget(), None);
+        assert!(!header.is_spent());
+    }
+
+    /// The listing reads `spent` from the latest round's header, like the rest of it: a session
+    /// with no header reads `0`.
+    #[test]
+    fn a_listing_reads_the_spent_of_the_latest_round() {
+        let session = RunId::new();
+        let conversation = session_conversation_id("p", session);
+        let mut first = header(session, true, false);
+        first.spent = 700;
+        let mut second = header(session, true, false);
+        second.round = 2;
+        second.spent = 1_800;
+        let mut one = with_header(session, Some(first), RunStatus::Done, vec![]);
+        one.conversation_id = Some(conversation.clone());
+        let mut two = with_header(RunId::new(), Some(second), RunStatus::Done, vec![]);
+        two.conversation_id = Some(conversation.clone());
+        let list = page_of_sessions("p", rounds(vec![one, two]), 0, 10, t0(), idle_ttl());
+        assert_eq!(list.sessions.len(), 1);
+        assert_eq!(
+            list.sessions[0].spent, 1_800,
+            "the latest round's header says it"
+        );
+
+        // A session with no header has spent nothing to read.
+        let bare = RunId::new();
+        let list = page_of_sessions(
+            "p",
+            rounds(vec![with_header(bare, None, RunStatus::Done, vec![])]),
+            0,
+            10,
+            t0(),
+            idle_ttl(),
+        );
+        assert_eq!(list.sessions[0].spent, 0);
     }
 
     fn record(
@@ -1851,6 +2010,7 @@ mod tests {
             workspace: None,
             visible: false,
             config: None,
+            spent: 0,
         }
     }
 
@@ -2355,7 +2515,7 @@ mod tests {
 
     /// Bounds as the assembly computes them for a `reviewer` whose folder allows more than any
     /// test asks for: 200 turns, 500 tool calls, 4,096 output tokens, a 200,000-token window, 10
-    /// calls at once, 30 minutes and 12 rounds.
+    /// calls at once, 30 minutes, 12 rounds and no token budget of its own.
     fn bounds() -> SessionBounds {
         SessionBounds {
             max_turns: 200,
@@ -2365,6 +2525,7 @@ mod tests {
             max_parallel_tool_calls: 10,
             time_limit: 30,
             max_rounds: 12,
+            token_budget: None,
             tools: Vec::new(),
             tools_complete: false,
         }
@@ -2544,6 +2705,72 @@ mod tests {
         );
     }
 
+    /// `token_budget` is bounded by the ADR alone ([ADR 0054], decision 4: "none today: any value
+    /// narrows"): 1,000 to 2^53 − 1, with a folder's own cap, when it ever sets one, lowering the
+    /// ceiling and never raising it.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn token_budget_has_a_floor_and_the_adrs_ceiling() {
+        let ask = |v: u64| SessionConfig {
+            token_budget: Some(v),
+            ..SessionConfig::default()
+        };
+        let why = bounds().admit(ask(999)).expect_err("below the floor");
+        assert_eq!(why.option(), Some("token_budget"));
+        assert!(
+            why.message()
+                .contains("config.token_budget is 999; at least 1000"),
+            "{why}"
+        );
+        assert_eq!(
+            bounds()
+                .admit(ask(MIN_SESSION_TOKEN_BUDGET))
+                .expect("the floor itself")
+                .token_budget,
+            Some(MIN_SESSION_TOKEN_BUDGET)
+        );
+        assert_eq!(
+            bounds()
+                .admit(ask(MAX_SESSION_TOKEN_BUDGET))
+                .expect("the ceiling itself")
+                .token_budget,
+            Some(MAX_SESSION_TOKEN_BUDGET)
+        );
+        let why = bounds()
+            .admit(ask(MAX_SESSION_TOKEN_BUDGET + 1))
+            .expect_err("above the ceiling");
+        assert_eq!(why.option(), Some("token_budget"));
+        assert!(
+            why.message()
+                .contains(&format!("at most {MAX_SESSION_TOKEN_BUDGET}")),
+            "{why}"
+        );
+
+        // A folder's own cap, when there ever is one, lowers the ceiling and never raises it.
+        let folder = SessionBounds {
+            token_budget: Some(50_000),
+            ..bounds()
+        };
+        assert!(folder.admit(ask(50_001)).is_err());
+        assert_eq!(
+            folder
+                .admit(ask(50_000))
+                .expect("the folder's cap itself")
+                .token_budget,
+            Some(50_000)
+        );
+
+        // Clamp raises a value below the floor to it, and brings one above the ceiling down to it.
+        assert_eq!(
+            bounds().clamp(&ask(1)).token_budget,
+            Some(MIN_SESSION_TOKEN_BUDGET)
+        );
+        assert_eq!(folder.clamp(&ask(80_000)).token_budget, Some(50_000));
+        // Absent stays absent: nothing is filled in.
+        assert_eq!(bounds().clamp(&SessionConfig::default()).token_budget, None);
+    }
+
     #[test]
     fn admit_takes_a_lower_value_for_every_option_and_fills_nothing_in() {
         let requested = SessionConfig {
@@ -2554,7 +2781,9 @@ mod tests {
             max_parallel_tool_calls: Some(2),
             time_limit: Some(3),
             max_rounds: Some(4),
+            token_budget: Some(5_000),
             report_schema: Some(serde_json::json!({"type": "object"})),
+            ..SessionConfig::default()
         };
         let admitted = bounds().admit(requested.clone()).expect("all lowered");
         assert_eq!(
@@ -2708,7 +2937,9 @@ mod tests {
             max_parallel_tool_calls: Some(8),
             time_limit: Some(25),
             max_rounds: Some(10),
+            token_budget: Some(8_000),
             report_schema: Some(serde_json::json!({"type": "object"})),
+            ..SessionConfig::default()
         };
         // A deployment that lowered every limit since the session started.
         let lowered = SessionBounds {
@@ -2719,6 +2950,7 @@ mod tests {
             max_parallel_tool_calls: 3,
             time_limit: 10,
             max_rounds: 5,
+            token_budget: Some(4_000),
             tools: Vec::new(),
             tools_complete: false,
         };
@@ -2730,6 +2962,7 @@ mod tests {
         assert_eq!(clamped.max_parallel_tool_calls, Some(3));
         assert_eq!(clamped.time_limit, Some(10));
         assert_eq!(clamped.max_rounds, Some(5));
+        assert_eq!(clamped.token_budget, Some(4_000));
         // Within the bounds: unchanged. Absent: stays absent.
         assert_eq!(bounds().clamp(&ask), ask);
         assert_eq!(

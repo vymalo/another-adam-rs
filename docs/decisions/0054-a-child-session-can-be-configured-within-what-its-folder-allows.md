@@ -384,6 +384,19 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
 * Files: `agent.rs` (the check and the closing turn), `conversation.rs` (`spent`), `session.rs` (the listing reads it), `sessions.rs`.
 * Accepted when: a round that reaches the budget ends with the closing turn and `token budget reached`; `spent` carries across
   rounds; a send to a spent session is refused; an edit that raises the budget within its bound lets it work again.
+* *2026-11-27 (ANR-213):* **`token_budget` and `spent` are built, except the edit case, which waits for slice 4.** `SessionConfig::token_budget`
+  is `Option<u64>`, 1,000 to 2^53 − 1 (`MIN_SESSION_TOKEN_BUDGET`, `MAX_SESSION_TOKEN_BUDGET`); no folder bounds it today, so
+  `SessionBounds::token_budget` is `None` and `admit` holds the request to that range (a folder's own cap, if one ever exists, lowers
+  the ceiling). `Conversation::spent` starts from the header's `spent` at `init` (round 2 starts from round 1's), adds every model
+  call of the round as `usage/v1` counts it (input + output; the compaction summary included) and writes it into
+  `SessionHeader::spent` in the state the round commits, so `SessionSummary::spent` and `SessionView::header` read it from the
+  record. Before each model call, `spent >= token_budget` makes that call the closing turn (`LimitKind::TokenBudget`,
+  `limit: "token_budget"`); a closing turn with no words fails the round with `token budget reached: the session has spent N of
+  its M tokens`. A send to a spent session is refused from the header the view already carries: `subagent_send` in words,
+  `message_to_session` as `UnsupportedOperation` (so the engine's `send` too). A header stored before this slice decodes
+  `spent: 0`, and a round resumed from such a journal counts only the calls it makes after the resume. **Not testable here:** the
+  last accepted case, an edit that raises the budget within its bound, because `subagent_edit` is slice 4 and is not built; the
+  budget is read from the header at every model call, so the slice's edit needs no change here.
 
 **7. `instructions` and `skills`.** Depends on 1.
 * Files: `def.rs` (the catalog kept apart from the body), `agent.rs` (the run's `system`), `crates/adam-assembly/src/skills.rs` (`load_skill`).

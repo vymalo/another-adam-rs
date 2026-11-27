@@ -928,6 +928,7 @@ async fn start_persons_round_with(
         // person's round, so the person sees the session (ADR 0045 decision 9).
         visible: true,
         config,
+        spent: 0,
     };
     let mut first = user_message(text);
     first.payload["session"] = serde_json::to_value(&header).unwrap();
@@ -1416,6 +1417,108 @@ mod cases {
         assert_eq!(
             list.sessions[0].round, 1,
             "nothing was started by the refused send"
+        );
+    }
+
+    /// The tokens a session spent carry from one round to the next (ADR 0054, decision 6): round 2
+    /// starts from round 1's spend, its own calls add to it, and the runtime's listing reads the
+    /// total from the latest round's record.
+    pub async fn spent_carries_across_rounds_and_the_listing_reads_it(store: DynStore) {
+        let rig = Rig::new();
+        rig.child_mock
+            .push_response(answer_with("answer one", 600, 500))
+            .push_response(answer_with("answer two", 100, 50));
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![call(
+                "c1",
+                "subagent_start",
+                json!({"agent": "helper", "description": "look at it", "prompt": "do the work",
+                       "keep_open": true, "config": {"token_budget": 10_000}}),
+            )])
+            .push_tool_calls(vec![read_call("c2", session, true)])
+            .push_tool_calls(vec![send_call("c3", session, "and now this")])
+            .push_tool_calls(vec![read_call("c4", session, true)])
+            .push_text("two rounds");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+
+        let view = rt.session_view(&conv, session).await.unwrap().unwrap();
+        let header = view.header.clone().expect("a header");
+        assert_eq!(header.round, 2);
+        assert_eq!(
+            header.spent, 1_250,
+            "round 1's 1,100 carried, plus round 2's 150"
+        );
+        assert!(
+            !header.is_spent(),
+            "1,250 of 10,000: the session takes another message"
+        );
+        // The listing reads the same number from the latest round's record.
+        let list = rt
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(list.sessions[0].spent, 1_250);
+        assert_eq!(
+            list.sessions[0].config.as_ref().unwrap().token_budget,
+            Some(10_000)
+        );
+    }
+
+    /// A send to a session that spent its `token_budget` is refused in words, from the header the
+    /// send already read: no round starts and no model is called (ADR 0054, decision 6).
+    pub async fn a_send_to_a_session_that_spent_its_token_budget_is_refused(store: DynStore) {
+        let rig = Rig::new();
+        // 1,100 tokens of a 1,000 budget: the round answered once, and the budget is spent.
+        rig.child_mock
+            .push_response(answer_with("answer one", 600, 500));
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![call(
+                "c1",
+                "subagent_start",
+                json!({"agent": "helper", "description": "look at it", "prompt": "do the work",
+                       "keep_open": true, "config": {"token_budget": 1_000}}),
+            )])
+            .push_tool_calls(vec![read_call("c2", session, true)])
+            .push_tool_calls(vec![send_call("c3", session, "more please")])
+            .push_text("it refused");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+
+        let results = tool_results(&state_of(&rt, parent).await);
+        let (_, refusal, is_error) = result_of(&results, "c3");
+        assert!(*is_error, "{refusal}");
+        assert!(refusal.contains("has spent its token budget"), "{refusal}");
+        assert!(refusal.contains("1100 of 1000 tokens"), "{refusal}");
+        assert!(
+            refusal.contains("subagent_close") && refusal.contains("subagent_start"),
+            "it says what to do: {refusal}"
+        );
+        let list = rt
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            list.sessions[0].round, 1,
+            "nothing was started by the refused send"
+        );
+        assert_eq!(list.sessions[0].spent, 1_100);
+        assert_eq!(
+            rig.child_mock.requests().len(),
+            1,
+            "no round two called the model"
         );
     }
 
@@ -2903,6 +3006,7 @@ mod cases {
             workspace: None,
             visible: false,
             config: None,
+            spent: 0,
         };
         let mut first = user_message("old work");
         first.payload["session"] = serde_json::to_value(&header).unwrap();
@@ -5223,6 +5327,7 @@ mod cases {
             workspace: None,
             visible: false,
             config: None,
+            spent: 0,
         };
         rt.start_child_continuing(
             cleanup,
@@ -6206,6 +6311,8 @@ macro_rules! session_suite {
                 a_read_without_wait_answers_working_and_parks_nothing,
                 a_read_with_wait_parks_and_resumes_once_with_the_report,
                 a_session_closes_by_default_and_refuses_a_send,
+                spent_carries_across_rounds_and_the_listing_reads_it,
+                a_send_to_a_session_that_spent_its_token_budget_is_refused,
                 a_kept_open_session_continues_in_round_two,
                 a_message_to_a_working_round_is_steered,
                 closing_an_idle_session_takes_a_round_that_calls_no_model,

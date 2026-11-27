@@ -327,6 +327,7 @@ mod tests {
                 workspace: None,
                 visible: false,
                 config: Some(config(Some(&["read_file"]), None)),
+                spent: 0,
             }),
             ..Conversation::default()
         };

@@ -809,6 +809,7 @@ mod tests {
             workspace: None,
             visible: false,
             config: None,
+            spent: 0,
         };
         a_session_with(
             store,
