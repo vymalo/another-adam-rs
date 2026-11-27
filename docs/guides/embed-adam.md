@@ -5,6 +5,8 @@ crates, and the shipped `adam-agent` and `adam-coder` are two such compositions.
 agent made of files, do not embed: [Write an agent](write-an-agent.md). This page is about a server program; for adam
 inside an application, with no server at all (a desktop or a phone), read [Embed adam in an application](embed-in-an-app.md).
 
+The generated API of every library crate is on the site: [Rust API](../rust/adam/index.html){target="_self"}.
+
 ## Pick a level
 
 | You want | Depend on | Entry point |

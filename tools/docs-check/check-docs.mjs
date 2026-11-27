@@ -100,6 +100,7 @@ for (const file of markdownFiles(root)) {
   for (const m of prose.matchAll(/\]\(([^)\s]+)\)/g)) {
     const [pathPart, fragment] = m[1].split('#');
     if (/^[a-z][a-z0-9+.-]*:/i.test(pathPart)) continue; // http(s):, mailto:
+    if (/^(\/|(\.\.\/)*)rust\//.test(pathPart)) continue; // the rustdoc the docs-site workflow publishes; not in the tree
     if (!pathPart && !fragment) continue;
     links++;
     const decodedPath = pathPart ? decode(pathPart, decodeURI) : '';
