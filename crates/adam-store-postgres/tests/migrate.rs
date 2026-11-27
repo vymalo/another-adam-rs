@@ -111,7 +111,7 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
     store.migrate().await.unwrap();
     assert!(has_owner_column(&pool, &p).await, "the column was added");
     assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
-    assert_eq!(SCHEMA_VERSION, 6);
+    assert_eq!(SCHEMA_VERSION, 7);
     // The push table exists now (a missing table would be a backend error).
     assert!(
         store

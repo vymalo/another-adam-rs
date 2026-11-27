@@ -9,6 +9,7 @@ metadata:
     {{- include "coder.labels" . | nindent 4 }}
 spec:
   instances: {{ .Values.database.instances }}
+  imageName: {{ .Values.database.imageName | toString | trim | quote }}
 {{- with .Values.database.resources }}
   resources:
     {{- toYaml . | nindent 4 }}

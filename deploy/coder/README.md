@@ -366,6 +366,7 @@ rollout):
 | Value | Default | |
 |---|---|---|
 | `database.enabled` | `true` | The chart creates a CloudNativePG `Cluster` named `<release>-db` (`database.name`, `owner`, `instances`, `storage`) and every pod reads `DATABASE_URL` from the `uri` key of the Secret CNPG creates, `<release>-db-app`. The render is the one this chart always had (`tests/golden/combined.yaml`). |
+| `database.imageName` | `ghcr.io/cloudnative-pg/postgresql:18.7-system-trixie@sha256:c437b7c6…` (the full digest is in `values.yaml`) | The `Cluster`'s PostgreSQL image, by tag and digest. With `database.enabled: true` only; empty is refused, and so is a tag whose major is below 18 (below). |
 | `database.instances` | `1` | Instances of the `Cluster`. With `database.enabled: true` only. |
 | `database.resources` | `{}` | CPU and memory requests and limits of each instance. Empty renders nothing, so the default render is unchanged. |
 | `database.existingSecret.name` | `""` | With `database.enabled: false`: a Secret in the release namespace that holds the connection string. Required then, refused with `enabled: true`. |
@@ -382,6 +383,34 @@ database:
 ```
 
 Backups and a transaction-mode pooler are not part of this chart.
+
+### PostgreSQL 18
+
+The store refuses a server older than PostgreSQL 18 at startup
+([ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md),
+decision 11): `migrate()` fails with class `Invalid` and the pod exits 78, before any DDL. The chart
+therefore pins the `Cluster`'s image, `database.imageName`, at 18.7 by tag and digest. It used to name
+no image, so the operator's default applied, and that default is the operator release's own: 17 up
+to CloudNativePG 1.27, 18 in 1.28 to 1.30, 19 on its main branch (*verified 2026-11-27*:
+`pkg/versions/versions.go` at the tags `v1.25.0` to `v1.30.0` and at `main`). This chart names no
+operator release, so only a pin makes the floor hold. The `system` flavour on Debian `trixie` is the
+flavour of the operator's default since 1.28.
+
+**An existing `Cluster` changes image on the upgrade that brings this pin.** CloudNativePG (1.26 or
+later) upgrades the major version in place when `imageName` names a higher one: offline, with
+`pg_upgrade`, and only between images of the same distribution (*verified 2026-11-27*: its
+documentation, "Offline In-Place Major Upgrades", at `v1.26.0`). Before that upgrade:
+
+* back the database up (this chart makes no backups);
+* look at the image the `Cluster` runs now (`kubectl get cluster <release>-db -o jsonpath='{.status.image}'`).
+  On a 17 image of Debian `bookworm` (the default of CloudNativePG 1.27 and older), set
+  `database.imageName` to the bookworm variant of 18,
+  `ghcr.io/cloudnative-pg/postgresql:18.7-system-bookworm@sha256:17b1b2d8b41398e4a5aa5466b49c866cb500dcaf08e9a4923ca443f2cd13c25a`
+  (*verified 2026-11-27* from ghcr.io), so the in-place upgrade stays on one distribution; on an 18
+  image the pin is a change of minor version, which the operator rolls out as usual;
+* with `database.enabled: false`, upgrade the existing server to 18 before the coder.
+
+A coder of an older release runs on 18 as well (it needs 12 or later), so the database can move first.
 
 ```sh
 helm template coder deploy/coder \
@@ -413,6 +442,8 @@ What the existing database must be:
   and a later release's migration runs as the same role. The tables are named with the prefix
   `adam_`, so the database can be shared with other applications' tables but not with another
   coder release (two would share one ledger): give each release its own database.
+* **The server is PostgreSQL 18 or later.** An older one is refused at startup (exit 78), before
+  any DDL ([PostgreSQL 18](#postgresql-18)).
 * **Reach the primary directly**, for example the `-rw` Service of a CNPG cluster. The runtime
   signals wake-ups and cancels with `LISTEN`/`NOTIFY` on the store's pool
   (`crates/adam-store-postgres`, `adam-notify-postgres`), which needs session-level connections;
@@ -1084,7 +1115,9 @@ that the pods can write to it, and a hit across two pods.
   `WhyThatFunction/home-os`, 2026-09-29).
 * The CNPG `Cluster` fields and the `<cluster>-app` Secret with a `uri` key are
   from the CloudNativePG documentation; not yet checked against the installed
-  operator version on the cluster.
+  operator version on the cluster. Which operator release and which PostgreSQL image a deployed
+  `Cluster` runs today is *unverified*, so whether the `database.imageName` pin is a minor or a major
+  upgrade for it is too ([PostgreSQL 18](#postgresql-18)).
 * Rendered with Helm v4.3.2 (`helm lint`, `helm template`, `tests/render-check.sh`); kubeconform checks the core
   kinds and the two CRDs in CI; not applied to a cluster.
 * The git sandbox ([above](#the-git-sandbox)): the render's guarantees are asserted by `tests/render-check.sh`; that the sandbox container of a pod made from

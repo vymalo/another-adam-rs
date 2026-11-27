@@ -5,6 +5,8 @@ which states the decision. This page holds the survey it was written from (every
 its `path:line`), the third-party facts with their sources, and what each slice must prove.
 
 Surveyed at `origin/main` `45abb141` on 2026-11-27. Line numbers are at that commit; re-read them before a slice.
+Slice P0 is built (2026-11-27): [its proofs](#p0-built-2026-11-27). The survey's `src/lib.rs` lines are still
+`45abb141`'s; P0 moved most of them down by about 150 lines.
 
 ## How to check a slice against this page
 
@@ -22,7 +24,10 @@ Surveyed at `origin/main` `45abb141` on 2026-11-27. Line numbers are at that com
 4. The fresh-database test (P0) lists every function; a slice that adds one adds it to the list, or the test fails.
 5. The fixture `crates/adam-store-postgres/tests/fixtures/schema-v6.sql` becomes `schema-v7.sql`; the unit test
    `the_statements_equal_the_version_6_fixture` (`crates/adam-store-postgres/src/lib.rs:2369`) follows it, regenerated
-   with `ADAM_WRITE_FIXTURE=1`.
+   with `ADAM_WRITE_FIXTURE=1`. *Done in P0* (`the_statements_equal_the_version_7_fixture`). A later slice that adds a
+   function bumps `SCHEMA_VERSION` (decision 10's note of 2026-11-27) and so gets `schema-v8.sql`, and so on: run the
+   test twice with `ADAM_WRITE_FIXTURE=1` (it writes, then compares with the file it compiled in), `git mv` the
+   fixture first so the diff shows the change, and update the `assert_eq!(SCHEMA_VERSION, n)` the test opens with.
 
 ## The survey: `adam-store-postgres`
 
@@ -110,13 +115,16 @@ complete.
 | `RETURNING` returns no row the `WHERE` did not match | *unverified* (the page implies it: "Returning Data from Modified Rows"; it does not say it) | https://www.postgresql.org/docs/18/dml-returning.html |
 | Generated columns are virtual by default (18): computed when read; the expression only immutable, the current row, no other generated column; a virtual one uses only built-in functions and types, operators and casts included; no value can be written to one in `INSERT` or `UPDATE` | *verified 2026-11-27* | https://www.postgresql.org/docs/18/ddl-generated-columns.html, https://www.postgresql.org/docs/18/release-18.html |
 | "Adding a virtual generated column never requires a rewrite" | *verified 2026-11-27* | https://www.postgresql.org/docs/18/sql-altertable.html (Notes) |
-| `jsonb_typeof` and the `jsonb` and integer `=` operators of the served expression are immutable | *unverified*: the server refuses a generated column whose expression is not, so P0's migration of a fresh database is the proof | — |
+| `jsonb_typeof` and the `jsonb` and integer `=` operators of the served expression are immutable | *unverified*: the server refuses a generated column whose expression is not, so the migration of a fresh database that adds the column is the proof (P1: the column is P1's, not P0's) | — |
 | A virtual generated column can be read in `UPDATE .. RETURNING` (the claim) | *unverified*: P2's claim cases are the proof | — |
 | PostgreSQL 18.0 was released 2025-09-25 | *verified 2026-11-27* | https://www.postgresql.org/docs/18/release-18.html |
 | The bundled SQLite is 3.54.1 (`RETURNING`, triggers with `RAISE`, `GLOB`) | *verified 2026-11-27* | `Cargo.lock`: `libsqlite3-sys` 0.39.1, its `sqlite3/sqlite3.h` |
 | The supported range today: PostgreSQL 12+, CI 12 and 17, compose 16 | *verified 2026-11-27* | `crates/adam-store-postgres/README.md:3`, `.github/workflows/ci.yml:319`–`:320`, `compose.yaml:29`, `docs/reference/store-adapters.md:111` |
 | Other servers below 18 that P0 moves: the second Postgres job of `ci.yml` and the coder workflow's service run 17 | *verified 2026-11-27* | `.github/workflows/ci.yml:384`, `.github/workflows/coder.yml:275` |
-| The chart's CloudNativePG `Cluster` names no `imageName`, so the operator's default major version applies | *verified 2026-11-27* (no `imageName` in `deploy/coder/templates/cnpg-cluster.yaml`); which major that is: *unverified* | — |
+| The chart's CloudNativePG `Cluster` names no `imageName`, so the operator's default major version applies | *verified 2026-11-27* (no `imageName` in `deploy/coder/templates/cnpg-cluster.yaml`); which major that is: *unverified* | — (superseded by P0: the chart pins it, below) |
+| The operator's default image is its release's own: `postgresql:17.2` at `v1.25.0`, `17.5` at `v1.26.0` and `v1.27.0`, `18.1-system-trixie` at `v1.28.0`, `18.3-system-trixie` at `v1.29.0`, `18.4-system-trixie` at `v1.30.0`, `19.0-system-trixie` at `main` (`1.31.0-rc1`) | *verified 2026-11-27* | `pkg/versions/versions.go` (`DefaultImageName`) of cloudnative-pg/cloudnative-pg at each tag, raw.githubusercontent.com |
+| CloudNativePG performs an offline in-place major upgrade when `.spec.imageName` names a higher major, only between images of the same distribution | *verified 2026-11-27* | `docs/src/postgres_upgrades.md`, "Offline In-Place Major Upgrades", at `v1.26.0` |
+| From 18 the `postgres` image keeps its data in `/var/lib/postgresql/18/docker`, declares `VOLUME /var/lib/postgresql`, and refuses to start with a mount at `/var/lib/postgresql/data` or old data under `/var/lib/postgresql` | *verified 2026-11-27* | docker-library/postgres `18/trixie/Dockerfile` (lines 197–200) and `docker-entrypoint.sh` (`docker_error_old_databases`), master; and run: `postgres:18.7-alpine` with a volume at `/var/lib/postgresql` serves `data_directory = /var/lib/postgresql/18/docker`, with one at `/var/lib/postgresql/data` exits with "Error: in 18+, …" |
 
 ### Snapshots: why some functions are PL/pgSQL
 
@@ -136,11 +144,64 @@ Row 9 compares a stored message with the one this attempt would write. Rust comp
 stored row was decoded from `jsonb` either way, so the difference can only adopt a row that differs in a number's
 spelling; P5 states which it keeps and adds a case for it.
 
+## P0, built (2026-11-27)
+
+Commits on the branch of ANR-1148 (`e834a48f` the store and the `AD` table, `dbeda9a8` CI and compose, `f4ede13e` the
+chart, and the documentation commit after them).
+
+### What it is
+
+| Piece | Where | What |
+|---|---|---|
+| The floor | `crates/adam-store-postgres/src/lib.rs:102` (`MIN_SERVER_VERSION_NUM = 180_000`), `:1406` (`server_version_num`), `:1420` (`check_server_version`), `:1449` (the call) | `migrate()` → `migrate_with_floor(MIN_SERVER_VERSION_NUM)`: `SELECT current_setting('server_version_num')::integer` on the migration's connection, **before** `SET statement_timeout`, the session advisory lock and any DDL; below the floor `StoreError::InvalidInput("PostgreSQL 17.6 is older than 18, … nothing was changed")`, class `Invalid`, which `adam-service`'s `exit_code` maps to 78 (`crates/adam-service/src/exit.rs`, `ServeError::Migrate` falls through to the cause's class) |
+| The version 7 step | `src/lib.rs:96` (`SCHEMA_VERSION = 7`, its doc), `:868` (`migrate_functions`, empty) | the function statements go into `Sql::migrate` after the blob and body DDL and before the version row, so they run in the migration transaction under the advisory locks, each by `batch_execute` (one simple-protocol message). A database at 6 or older runs the transaction (no separate step: nothing to build concurrently); a database at 7 runs nothing. The comment at `:868` carries decision 1's and 10's rules for the slices |
+| The `AD` table | `crates/adam-postgres/src/sqlstate.rs:28` (`AdamSqlState`: `code`, `class`, `from_code`, `of`, `ALL`), `ADAM_SQLSTATE_CLASS` | closed enum; `classify` gives an `AD` code its row's class (`crates/adam-postgres/src/lib.rs:115`), so an unbuilt one is never `Internal`; an `AD` code this release does not know (`AD005`) stays `Internal` |
+| The store's variants | `src/lib.rs:486` (`Call`: run, expected version, journal step), `:504` (`refused`: the driver error to a `StoreError`, or the error back), `:525` (`refusal`: the pure table) | `AD001` → `InvalidInput(message)`, `AD002` → `NonDeterminism { recorded: DETAIL, requested: the call's step }`, `AD003` → `Corrupt(message)`, `AD004` → `Conflict { actual: expected }` (what the Rust body write reports today, `src/lib.rs` body write). No caller yet: `#[cfg_attr(not(test), expect(dead_code))]`, which turns into an error the day P4 or P5 calls them, so the attribute cannot outlive its reason |
+| The fresh-database test | `crates/adam-store-postgres/tests/functions.rs:21` (`FUNCTIONS`, empty), `:85` `every_function_is_created_and_answers`, `:121` `the_function_check_reports_an_unlisted_and_a_missing_function`, `:150` `a_version_6_database_gets_the_functions`, `:197` `a_server_below_18_is_refused_before_any_ddl` | `pg_proc` of `to_regnamespace(current_schema())` whose name starts with the test's own prefix, as `name(identity arguments)`, against the list; each listed call is run. The second case is the mutation of the slice table kept as a test (an extra `{p}stray(n integer)` and a listed `ghost()` are each reported). The last case runs only where `ADAM_TEST_POSTGRES_BELOW_FLOOR_URL` names an older server; it skips otherwise, **even under `ADAM_TEST_REQUIRE_DB=1`**, because CI runs no server below 18 |
+| The floor, on CI's one server | `src/lib.rs:2699` `a_server_below_the_floor_is_refused_before_any_ddl` | `migrate_with_floor(server + 1)` is refused `Invalid`, then `pg_class` and `pg_proc` hold no object of the prefix; then `migrate()` at the real floor succeeds |
+| Unit tests | `src/lib.rs:2546` `the_floor_is_postgresql_18`, `:2570` `each_refusal_is_the_variant_of_its_code_with_its_class`, `:2627` `sqlstates_are_classified_against_a_real_server` (gains `AD001`–`AD005` and the variants built from a real `RAISE .. DETAIL`), `:2520` the fixture; `crates/adam-postgres/src/sqlstate.rs` three tests (the table row by row, the round trip, the format rules) | |
+| Images | `.github/workflows/ci.yml:327` (conformance; the matrix is `{ mongodb: "5.0" }`, `{ mongodb: "8.0" }`), `:391` (coverage), `.github/workflows/coder.yml:277`, `compose.yaml:34`, `bench/compose.yaml:89` (and `bench/test/stack.test.mjs`) | all `postgres:18.7@sha256:64c8b0d31e4ab6ea665e8426ea406a94bf52de3c05b3a4a8bf713704eefa9328`; the compose volumes are `postgres-18-data` at `/var/lib/postgresql` |
+| The chart | `deploy/coder/values.yaml:664` (`database.imageName`), `templates/cnpg-cluster.yaml:12`, `templates/_validate.tpl:21` (empty refused; a tag `:N` with N below 18 refused), `tests/render-check.sh:1128` (ten checks), the four goldens | `ghcr.io/cloudnative-pg/postgresql:18.7-system-trixie@sha256:c437b7c6c00aa7e66f5d6de1dd83602391fdebd4ff776ffb1ab7aaba5e7351ad`; the bookworm variant for a `Cluster` on a bookworm 17 image is `…:18.7-system-bookworm@sha256:17b1b2d8b41398e4a5aa5466b49c866cb500dcaf08e9a4923ca443f2cd13c25a` (chart README, "PostgreSQL 18") |
+
+### The pins
+
+| Image | Digest (OCI index) | Source, *verified 2026-11-27* |
+|---|---|---|
+| `postgres:18.7` | `sha256:64c8b0d31e4ab6ea665e8426ea406a94bf52de3c05b3a4a8bf713704eefa9328` | `HEAD https://registry-1.docker.io/v2/library/postgres/manifests/18.7` (anonymous token), `docker-content-digest`; the same for `18.7-trixie`; 18.7 is the newest 18 tag in the tag list |
+| `ghcr.io/cloudnative-pg/postgresql:18.7-system-trixie` | `sha256:c437b7c6c00aa7e66f5d6de1dd83602391fdebd4ff776ffb1ab7aaba5e7351ad` | `HEAD https://ghcr.io/v2/cloudnative-pg/postgresql/manifests/18.7-system-trixie`; the index's annotations say "A system PostgreSQL 18.7 container image", created 2026-11-23, linux/amd64 and linux/arm64 |
+| `ghcr.io/cloudnative-pg/postgresql:18.7-system-bookworm` | `sha256:17b1b2d8b41398e4a5aa5466b49c866cb500dcaf08e9a4923ca443f2cd13c25a` | the same request for that tag (named in the chart README only) |
+
+Why a pin and not the operator's default: the default is the operator release's (the evidence row above), the chart
+names no operator release, and on CloudNativePG 1.27 or older it is 17, below the floor.
+
+### What was run (2026-11-27, toolchain 1.98.1)
+
+| Gate | Result |
+|---|---|
+| `cargo test -p adam-store-postgres -p adam-postgres` against `postgres:18.7-alpine` (`ADAM_TEST_POSTGRES_URL`, `ADAM_TEST_REQUIRE_DB=1`) and the below-floor case against a PostgreSQL 16.15 server (`ADAM_TEST_POSTGRES_BELOW_FLOOR_URL`) | `adam-postgres` 17 passed; `adam-store-postgres` lib 10, `body_writers` 6, `claim` 2, `conformance` 79, `errors` 6, `fixture` 1, `functions` 4, `head_view` 2, `migrate` 8, `time` 4 passed; 0 failed, 0 ignored |
+| `cargo test -p adam-notify-postgres` against 18.7 | 31 + 4 + 9 + 4 passed |
+| broken on purpose | a floor of 17 (`num >= floor - 10_000`): `the_floor_is_postgresql_18` and `a_server_below_the_floor_is_refused_before_any_ddl` fail; the check moved after `migrate_locked`: both refusal tests fail on "created something"; a `BEGIN ATOMIC` function `{p}probe(n integer)` added to `migrate_functions` and not to `FUNCTIONS`: `every_function_is_created_and_answers` and `a_version_6_database_gets_the_functions` fail, and pass once it is listed (which also ran a SQL-standard body through `batch_execute` in the migration transaction on 18.7) |
+| `cargo clippy -p adam-store-postgres -p adam-postgres -p adam-notify-postgres --all-targets --locked -- -D warnings`, `cargo fmt --all --check`, `RUSTDOCFLAGS=-D warnings cargo doc --no-deps -p adam-store-postgres -p adam-postgres`, doctests | clean |
+| `actionlint` 1.7.12 (with shellcheck) on `ci.yml` and `coder.yml`; `docker compose config -q` for both stacks; `node --test bench/test/*.test.mjs` | clean; 763 passed, 4 skipped (as on `main`) |
+| `deploy/coder/tests/render-check.sh` with helm v4.3.2 | 1290 ok, 0 FAIL; kubeconform (`-strict`, the vendored `Cluster` schema) accepts the rendered `Cluster` |
+
+### Unverified until CI runs it
+
+- The conformance, coverage and coder-image jobs on the pinned `postgres:18.7` image itself (the local runs used
+  `postgres:18.7-alpine`, the same server version on another base; Docker Hub refused a pull of the pinned digest with
+  `429` from where this was built).
+- The bench's dry run (`bench-dry-run.yml`, `workflow_dispatch` only) on 18.7.
+- The chart on a cluster: that an existing `Cluster` takes the pin (a minor change on an 18 image, an offline major
+  upgrade on a 17 one of the same distribution), and which operator release and image the deployed `Cluster` runs
+  today.
+- The required checks of the repository: the conformance jobs were named after both matrix values and are now named
+  after MongoDB's alone.
+
 ## Slice proofs
 
 | Slice | Functions | Decisive cases (the testkit's names) | Broken on purpose |
 |---|---|---|---|
-| P0 | none yet; the version 7 step, the `AD` table in `adam-postgres`, the server check | a new `every_function_is_created_and_answers` (fresh database, `migrate`, call each listed function, compare `pg_proc` for the prefix with the list); a server below 18 refused before any DDL (`server_version_num` below 180000); the CI matrix's two rows `{ postgres: "18" }`, `ci.yml:384`, `coder.yml:275` and `compose.yaml:29` on 18; the chart's `cnpg-cluster.yaml` pins `imageName` at 18, or the pull request shows the operator's default is 18 or later (a pin changes the chart's render, which another repository reads: say so) | list a function the schema lacks, and one it has but the list does not; let a 17 server through the check |
+| P0 (built 2026-11-27, [above](#p0-built-2026-11-27)) | none yet; the version 7 step, the `AD` table in `adam-postgres`, the server check | a new `every_function_is_created_and_answers` (fresh database, `migrate`, call each listed function, compare `pg_proc` for the prefix with the list); a server below 18 refused before any DDL (`server_version_num` below 180000); the CI matrix's two rows `{ postgres: "18" }`, `ci.yml:384`, `coder.yml:275` and `compose.yaml:29` on 18; the chart's `cnpg-cluster.yaml` pins `imageName` at 18, or the pull request shows the operator's default is 18 or later (a pin changes the chart's render, which another repository reads: say so) | list a function the schema lacks, and one it has but the list does not; let a 17 server through the check |
 | P1 | the `served` column; the inline reads, `list_runs`, `count_runs` select it | `body_every_read_serves_the_current_head`, `body_a_stale_head_serves_the_state`, `body_a_tombstoned_run_with_a_stale_head_serves_the_head`, `body_a_head_that_is_json_null_is_not_a_head`, `list_runs_*`, `count_runs_ignores_the_page`, `run_header_matches_the_record`; `tests/head_view.rs` counts still one lease and one head | serve the state when the head is current (in the column's expression); drop the `starts_with` (in the inline statement) |
 | P2 | `claim_due` (renewal, release, `lease_until` and `activity` stay inline) | `claim_is_exclusive_under_concurrency`, `claim_skips_busy_runs`, `pinned_claims_are_exclusive_and_stable_under_concurrency`, `pinned_claim_never_gives_a_run_to_another_worker`, `any_claim_ignores_and_never_sets_the_owner`, `lease_expiry_allows_takeover`, `renew_and_release_lease`; `activity_conformance!` | remove `SKIP LOCKED`; drop the owner filter; let a renewal extend an ended lease |
 | P3 | `sched_at`, `commit_run` (headless); the inline create calls `sched_at` | `concurrent_commits_single_winner`, `commit_stale_version_conflicts`, `commit_missing_run`, `claim_respects_due_rules`, `conversation_race_single_winner`, `create_duplicate_id`, `two_creates_with_different_ids_in_one_conversation_leave_one_open_run`; `headless_measurement!` | compute `sched_at` from `updated_at` for a parked run; report `actual = expected` |

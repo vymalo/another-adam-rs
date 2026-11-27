@@ -1,9 +1,9 @@
 //! A database built by the previous (`sqlx`) release opens with no migration, and the upgrade to
-//! schema version 6 adds the head and the body.
+//! the current schema adds the head and the body (version 6) and the functions step (version 7).
 //!
 //! `tests/fixtures/schema-v5.sql` is the schema exactly as that release emitted it. This applies it
 //! with `batch_execute` into a database of its own, opens the store **without calling `migrate`**
-//! and takes a create/load round trip, then migrates to version 6 and commits a head and a body.
+//! and takes a create/load round trip, then migrates to the current version and commits a head and a body.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod support;
@@ -92,7 +92,7 @@ async fn a_sqlx_migrated_database_opens_and_upgrades_to_the_head_and_body() {
             .get(0)
     };
     assert_eq!(version, SCHEMA_VERSION.to_string());
-    assert_eq!(version, "6");
+    assert_eq!(version, "7");
 
     // The old run reads as it was written: no head, so the whole state is served.
     let loaded = store

@@ -1,5 +1,5 @@
--- The schema version 6 that adam-store-postgres emits.
--- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_6_fixture
+-- The schema version 7 that adam-store-postgres emits.
+-- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_7_fixture
 CREATE TABLE IF NOT EXISTS adam_meta (
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -110,6 +110,6 @@ CREATE TABLE IF NOT EXISTS adam_body (
 
 CREATE INDEX IF NOT EXISTS adam_body_written ON adam_body (written_at);
 
-INSERT INTO adam_meta (key, value) VALUES ('schema_version', '6')
+INSERT INTO adam_meta (key, value) VALUES ('schema_version', '7')
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
               WHERE adam_meta.value::INT < EXCLUDED.value::INT;

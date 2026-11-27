@@ -221,7 +221,7 @@ from a worker not a 69.
   `params`, with `MODEL_AUTH=injector`, and not with `key` or none (Postgres).
 
 ```sh
-docker run -d -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
+docker run -d -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:18.7   # 18 or later: the store refuses an older server
 ADAM_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres ADAM_TEST_REQUIRE_DB=1 \
   cargo test -p adam-service --features mcp
 ```
