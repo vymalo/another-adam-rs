@@ -438,7 +438,7 @@ sequenceDiagram
 * **YAML 1.2** (`serde-saphyr` 1.3.0, *verified 2026-09-29*, MIT or Apache-2.0), with `strict_booleans`, so `no`
   is a string. Unknown keys are read into `serde_json::Value` and become warnings.
 * **Agent files.** One schema, `AgentFrontmatter`, for the root agent, a directory subagent and a flat
-  subagent file: `name`, `description`, `tools`, `model`, `skills`, `preload_skills`, `limits`, `vars`,
+  subagent file: `name`, `description`, `tools`, `model`, `skills`, `preload_skills`, `si_memory`, `limits`, `vars`,
   `card` (root only), `a2a` and `auth` (remote subagent), `metadata`. A subagent needs a `description`. The
   keys `api_key`, `apiKey`, `token`, `secret`, `password` and `base_url` are errors (compared without case,
   `_` and `-`), and so is a `model` that is a URL. Claude Code, Copilot and OpenCode keys adam does not act on
@@ -697,6 +697,32 @@ stateDiagram-v2
   replaced and the skills added (a public id is replaced). It is served only to authenticated callers and only when the
   server authenticates ([the A2A server](a2a-server.md#the-extended-card)); an empty `extended: {}` declares nothing, and a
   file holds no secret, so put nothing in it that you would not give every holder of a token.
+
+## The self-improvement memory (`si_memory:`)
+
+[ADR 0081](../decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md)
+decision 11: `adam-coder` and `adam-agent` run a self-improvement memory by default, and a folder tunes or turns
+it off.
+
+```yaml
+si_memory: off            # nothing is built: no folder is read and no memory tool is offered
+si_memory: on             # on, with the deployment's bounds
+si_memory:                # on, tuned
+  recall: false           # whether `si_recall` is offered
+  record: true            # whether `si_record` is offered
+  preload_kib: 8          # how much is read into the first request
+  scopes: [agent, repository]
+```
+
+* **The deployment's ceiling wins downwards.** `SI_MEMORY=off` ([environment](environment.md#environment-variables))
+  is off whatever the folder says; a folder's `off` is off whatever the deployment allows; an absent key follows the
+  ceiling. Neither can widen the other.
+* **Fail closed.** An unknown option under `si_memory:` is a **load error**, not a warning — memory on with a
+  misspelt option would run with bounds nobody wrote — and so is a secret-looking one (`si_memory.token`).
+* **`memory:` is not this key.** Claude Code's `memory:` stays ignored with a warning; the key is `si_memory`.
+* A remote subagent (`a2a:`) has no local memory: the key is ignored there with a warning, like `tools:` and
+  `limits:`.
+
 
 ## Skills at run time
 
