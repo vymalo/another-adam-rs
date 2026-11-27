@@ -393,7 +393,7 @@ pub(crate) struct Start {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Asked {
     Nothing,
-    Start(Start),
+    Start(Box<Start>),
     Close { cancel: bool },
 }
 
@@ -423,7 +423,9 @@ pub(crate) fn asked(message: &Message, sessions: &ChildSessions) -> Result<Asked
     match (start, close) {
         (None, None) => Ok(Asked::Nothing),
         (Some(_), Some(_)) => Err("a message starts a session or closes one, not both".into()),
-        (Some(start), None) => parse_start(start, sessions).map(Asked::Start),
+        (Some(start), None) => {
+            parse_start(start, sessions).map(|start| Asked::Start(Box::new(start)))
+        }
         (None, Some(close)) => parse_close(close).map(|cancel| Asked::Close { cancel }),
     }
 }
@@ -1207,7 +1209,7 @@ impl RuntimeTaskBackend {
                         caller,
                         message,
                         inbound,
-                        start,
+                        *start,
                         context_id.map(str::to_owned),
                     )
                     .await?;
@@ -1890,12 +1892,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             ok,
-            Asked::Start(Start {
+            Asked::Start(Box::new(Start {
                 agent: "planner".into(),
                 description: "Plan it".into(),
                 keep_open: true,
                 config: None,
-            })
+            }))
         );
         let default_close = asked(
             &message(Some(
@@ -1906,10 +1908,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             default_close,
-            Asked::Start(Start {
-                keep_open: false,
-                ..
-            })
+            Asked::Start(start) if !start.keep_open
         ));
         let long = "x".repeat(81);
         for entry in [
