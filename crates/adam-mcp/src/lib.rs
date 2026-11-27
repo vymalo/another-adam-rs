@@ -30,6 +30,7 @@ mod redact;
 mod servers;
 mod text;
 mod tool;
+mod upload;
 mod url;
 
 pub use error::{Error, UrlProblem, VarProblem};
@@ -42,3 +43,6 @@ pub use policy::{
 pub use prompts::{PromptCommand, PromptError};
 pub use servers::{MAX_INSTRUCTIONS_BYTES, MAX_SERVER_INSTRUCTIONS_BYTES, McpServers};
 pub use text::MAX_RESULT_BYTES;
+pub use upload::{
+    DEFAULT_PUT_TIMEOUT, REQUEST_UPLOAD, UploadError, UploadRequest, UploadSlot, Uploaded, Uploader,
+};

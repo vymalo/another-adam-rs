@@ -44,6 +44,20 @@ use crate::{
     ToolEnv, WorkerConfig, agent_card_for, coder_tools,
 };
 
+/// The folder's `limits.max_inline_upload_bytes`, when it sets one: the first of the three places
+/// the inline threshold of `uploads/v1` comes from (then `UPLOADS_INLINE_MAX_BYTES`, then the
+/// default), read once for the card and once for `share_file`.
+fn folder_inline_upload_limit(files: &AgentFiles) -> Option<u64> {
+    files
+        .def()
+        .ok()?
+        .manifest()
+        .frontmatter
+        .limits
+        .as_ref()?
+        .max_inline_upload_bytes
+}
+
 /// The complete coder agent for a role that runs workers: the model client, the GitHub client and
 /// the workspaces, assembled from `files`. The clients are only constructed here; nothing calls the
 /// model or GitHub until a worker steps a run. `redactor` is built from the whole configuration, so
@@ -55,6 +69,7 @@ async fn build_agent(
     redactor: Redactor,
     files: &AgentFiles,
     sessions: adam_service::SessionSettings,
+    inline_upload_threshold: u64,
 ) -> anyhow::Result<(CoderAgent, Janitor, CommandsSweep)> {
     let model: DynModel = worker.model.client().context("building the model client")?;
     if worker.commands_can_read_the_app_key() {
@@ -211,7 +226,10 @@ async fn build_agent(
             .with_credentials_hint(worker.github.check_hint())
             // The URL a message announces for the conversation's tools is an MCP server's: the
             // deployment's policy (MCP_ALLOW_INSECURE, timeouts) decides.
-            .with_mcp_policy(worker.mcp.policy()),
+            .with_mcp_policy(worker.mcp.policy())
+            // A file over the threshold `uploads/v1` serves (the same number the card is built
+            // with) goes to the bucket by reference, not inline.
+            .with_inline_upload_threshold(inline_upload_threshold),
     );
     // The GitHub MCP server holds no credentials: the deployment binds its name and its origin
     // (`GITHUB_MCP_URL`) to the coder's own credentials, which give each call the token that fits
@@ -425,6 +443,10 @@ pub async fn serve(
                 Redactor::from_config(&config),
                 &files,
                 config.service.sessions,
+                adam_service::inline_upload_threshold(
+                    folder_inline_upload_limit(&files),
+                    config.service.uploads_inline_max_bytes,
+                ),
             )
             .await?;
             // The prompts of the MCP servers the deployment adds (`ADAM_EXTRA_MCP_FILE`) are
@@ -510,13 +532,7 @@ pub async fn serve(
         None => agents,
     };
     // The largest upload the card lists (`uploads/v1`): the folder's, else the environment's.
-    let agents = match files.def().ok().and_then(|def| {
-        def.manifest()
-            .frontmatter
-            .limits
-            .as_ref()?
-            .max_inline_upload_bytes
-    }) {
+    let agents = match folder_inline_upload_limit(&files) {
         Some(bytes) => agents.uploads_inline_max_bytes(bytes),
         None => agents,
     };

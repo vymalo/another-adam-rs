@@ -39,6 +39,45 @@ pub const MAX_RUN_FILE_BYTES: usize = 6 * 1024 * 1024;
 /// The longest filename of a file artifact, in bytes (what a file system takes).
 pub const MAX_ARTIFACT_FILENAME_BYTES: usize = 255;
 
+/// The media type of an artifact that names a file sent by reference (`uploads/v1`,
+/// [`Artifact::upload_ref`]). Not a type a client ever sees: the A2A server serves such an artifact
+/// as the file's own `mediaType` on a data part.
+pub const UPLOAD_REF_MEDIA_TYPE: &str = "application/vnd.adam.upload-ref+json";
+
+/// The longest upload id the contract allows, in bytes.
+pub const MAX_UPLOAD_ID_BYTES: usize = 1024;
+
+/// An uploaded file as an artifact names it: no bytes, only what the contract's data part holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadRef<'a> {
+    /// The name the file is saved under.
+    pub filename: &'a str,
+    /// The file's media type.
+    pub media_type: &'a str,
+    /// The id the orchestrator issued for the upload.
+    pub upload_id: &'a str,
+}
+
+/// The upload an artifact's `mime_type` and `data` name, when they are [`Artifact::upload_ref`]'s
+/// shape: the media type is [`UPLOAD_REF_MEDIA_TYPE`] and the data holds the three strings. Anything
+/// else is `None`, and the artifact is served as the JSON it is.
+pub fn upload_ref_of<'a>(mime_type: Option<&str>, data: &'a Value) -> Option<UploadRef<'a>> {
+    if mime_type != Some(UPLOAD_REF_MEDIA_TYPE) {
+        return None;
+    }
+    let text = |key: &str| {
+        data.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let upload_id = text("uploadId").filter(|id| id.len() <= MAX_UPLOAD_ID_BYTES)?;
+    Some(UploadRef {
+        filename: text("filename")?,
+        media_type: text("mediaType")?,
+        upload_id,
+    })
+}
+
 /// Why a file cannot be an artifact.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -58,6 +97,9 @@ pub enum ArtifactFileError {
     /// The media type is not of the form `type/subtype`.
     #[error("`{0}` is not a media type (type/subtype)")]
     BadMediaType(String),
+    /// The upload id is empty or over [`MAX_UPLOAD_ID_BYTES`].
+    #[error("the upload id is empty or over {MAX_UPLOAD_ID_BYTES} bytes")]
+    BadUploadId,
 }
 
 /// The file of a file artifact: its name and its bytes. The media type is the artifact's
@@ -192,6 +234,47 @@ impl Artifact {
             data: Value::Null,
             file: Some(ArtifactFile { filename, bytes }),
         })
+    }
+
+    /// A file that was sent **by reference** (`uploads/v1`): the bytes went straight to the
+    /// bucket, and the artifact names the `upload_id` the orchestrator issued for them. It holds
+    /// **no bytes**, here or in the journal, and is a JSON artifact whose media type is
+    /// [`UPLOAD_REF_MEDIA_TYPE`] and whose data is `{filename, mediaType, uploadId}`: the A2A
+    /// server serves it as the contract's data part (see [`upload_ref_of`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ArtifactFileError`]: the filename is not a name, the media type is not `type/subtype`,
+    /// or the id is empty or over [`MAX_UPLOAD_ID_BYTES`].
+    pub fn upload_ref(
+        name: impl Into<String>,
+        media_type: impl Into<String>,
+        filename: impl Into<String>,
+        upload_id: impl Into<String>,
+    ) -> Result<Self, ArtifactFileError> {
+        let (media_type, filename, upload_id) =
+            (media_type.into(), filename.into(), upload_id.into());
+        if !is_file_name(&filename) {
+            return Err(ArtifactFileError::BadFilename(filename));
+        }
+        let bad_type = media_type.split_once('/').is_none_or(|(kind, sub)| {
+            kind.is_empty()
+                || sub.is_empty()
+                || media_type
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace())
+        });
+        if bad_type {
+            return Err(ArtifactFileError::BadMediaType(media_type));
+        }
+        if upload_id.is_empty() || upload_id.len() > MAX_UPLOAD_ID_BYTES {
+            return Err(ArtifactFileError::BadUploadId);
+        }
+        Ok(Self::new(
+            name,
+            Some(UPLOAD_REF_MEDIA_TYPE.to_owned()),
+            serde_json::json!({"filename": filename, "mediaType": media_type, "uploadId": upload_id}),
+        ))
     }
 
     /// The bytes of the file, `0` for a JSON artifact.
@@ -1412,5 +1495,66 @@ mod tests {
         for kept in [0, 2, 3] {
             assert!(replay.runs.contains_key(&runs[kept]), "{kept}");
         }
+    }
+
+    #[test]
+    fn an_upload_reference_holds_names_and_an_id_and_no_bytes() {
+        let artifact = Artifact::upload_ref("The report", "application/pdf", "r.pdf", "k.p.m")
+            .expect("a reference");
+        assert!(artifact.file.is_none());
+        assert_eq!(artifact.file_len(), 0);
+        assert_eq!(artifact.mime_type.as_deref(), Some(UPLOAD_REF_MEDIA_TYPE));
+        let upload = upload_ref_of(artifact.mime_type.as_deref(), &artifact.data).expect("read");
+        assert_eq!(
+            (upload.filename, upload.media_type, upload.upload_id),
+            ("r.pdf", "application/pdf", "k.p.m")
+        );
+        // A file id is not replaced by anything: it is a file's reference, content-addressed.
+        assert_eq!(artifact.id, None);
+    }
+
+    #[test]
+    fn an_upload_reference_refuses_what_a_file_refuses_and_a_bad_id() {
+        assert!(matches!(
+            Artifact::upload_ref("x", "application/pdf", "a/b.pdf", "id"),
+            Err(ArtifactFileError::BadFilename(_))
+        ));
+        assert!(matches!(
+            Artifact::upload_ref("x", "pdf", "b.pdf", "id"),
+            Err(ArtifactFileError::BadMediaType(_))
+        ));
+        for id in [String::new(), "x".repeat(MAX_UPLOAD_ID_BYTES + 1)] {
+            assert_eq!(
+                Artifact::upload_ref("x", "application/pdf", "b.pdf", id),
+                Err(ArtifactFileError::BadUploadId)
+            );
+        }
+        assert!(
+            Artifact::upload_ref(
+                "x",
+                "application/pdf",
+                "b.pdf",
+                "x".repeat(MAX_UPLOAD_ID_BYTES)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn only_the_reference_media_type_with_all_three_strings_is_read_as_an_upload() {
+        let data = serde_json::json!({"filename": "a", "mediaType": "a/b", "uploadId": "i"});
+        assert!(upload_ref_of(Some(UPLOAD_REF_MEDIA_TYPE), &data).is_some());
+        assert!(upload_ref_of(Some("application/json"), &data).is_none());
+        assert!(upload_ref_of(None, &data).is_none());
+        for missing in ["filename", "mediaType", "uploadId"] {
+            let mut cut = data.clone();
+            cut.as_object_mut().unwrap().remove(missing);
+            assert!(
+                upload_ref_of(Some(UPLOAD_REF_MEDIA_TYPE), &cut).is_none(),
+                "{missing}"
+            );
+        }
+        let blank = serde_json::json!({"filename": "a", "mediaType": "a/b", "uploadId": ""});
+        assert!(upload_ref_of(Some(UPLOAD_REF_MEDIA_TYPE), &blank).is_none());
     }
 }

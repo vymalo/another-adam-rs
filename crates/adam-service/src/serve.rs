@@ -769,7 +769,11 @@ enum Listen {
 /// ([`ServiceConfig::uploads_inline_max_bytes`]), else
 /// [`DEFAULT_UPLOADS_INLINE_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES). Both are
 /// already inside the ceiling the deployment's configuration enforced.
-fn inline_upload_threshold(folder: Option<u64>, env: Option<u64>) -> u64 {
+///
+/// Public so that a tool that holds a file (the coder's `share_file`) decides with the very number
+/// the card is served under.
+#[must_use]
+pub fn inline_upload_threshold(folder: Option<u64>, env: Option<u64>) -> u64 {
     folder
         .or(env)
         .unwrap_or(adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES)
@@ -841,9 +845,13 @@ async fn run(
             .push(adam_a2a::ExtensionConfig::prompt_statement());
     }
     // The card entry has no params (the contract's). The inline threshold is the folder's, else
-    // the environment's, else the default (10 MiB); the upload tool of the next card reads it.
-    let _inline_upload_threshold =
-        inline_upload_threshold(uploads_inline_max_bytes, config.uploads_inline_max_bytes);
+    // the environment's, else the default (10 MiB); a tool that holds a file reads it through
+    // [`inline_upload_threshold`] (the coder's `share_file` is built with it). Said once.
+    tracing::info!(
+        inline_upload_threshold =
+            inline_upload_threshold(uploads_inline_max_bytes, config.uploads_inline_max_bytes),
+        "uploads/v1: a file over this many bytes goes by reference"
+    );
     if let Some(card) = card.as_mut()
         && !card
             .extensions
