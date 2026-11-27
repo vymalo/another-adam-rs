@@ -1,0 +1,79 @@
+# 0088. A tool result is bounded when it is made, and a command that succeeds can say only that
+
+Status: **Accepted** (2026-11-27). The owner decided on 2026-11-27: *"Yes do the ADR on capping tool. One idea too. For
+bash scripts, we hide the response by default if no error and add an option to view the responses even if successful."*
+Decision 3's per-tool defaults (`run_command` keeps showing its output) and decision 2's bound for MCP results are this
+ADR's choices for the owner to confirm. Builds on
+[ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) (paged tools, a stable
+prompt prefix) and [ADR 0086](0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md) (the history
+budget).
+
+## Context
+
+A provider caches a request's prefix: tools, then the system prompt, then the messages. A tool result appended at the end
+is read from the cache on every later call, **as long as nothing before it changes**. Two things change the past: a
+compaction (by design) and the shortening of old tool results. Every result also costs its tokens on every later call,
+cached or not.
+
+What adam does today (*verified 2026-11-27*):
+
+* **Commands are bounded when they run.** `run_command`, `run` and `run_checks` show an output that fits
+  `CHECK_OUTPUT_TAIL_BYTES` (16 KiB) whole. A longer one is shown as head and tail and kept whole under an output id that
+  `read_output` pages (`crates/adam-code-tools/src/output.rs`, `crates/adam-llm-agent/src/kept.rs`).
+* **An MCP result is bounded at 64 KiB**, four times the command bound, then kept and paged (`MAX_RESULT_BYTES`,
+  `crates/adam-mcp/src/tool.rs`).
+* **Old results are shortened only past the history budget**, in place, oldest first, down to three quarters of the
+  budget, so it happens rarely and the cached prefix moves once per shortening, not per call
+  (`record_shortenings_from`, `crates/adam-llm-agent/src/history.rs`).
+* **A command that succeeds shows its output like one that fails.** A clean `cargo build` or `npm install` puts up to
+  16 KiB of progress lines in the history, where they cost tokens on every later call and push the run toward a
+  shortening, for nothing the model needs.
+
+## Decision
+
+1. **Every tool result is bounded when it is made, never later by design.** A result the model reads in full is at most
+   the deployment's tool-result bound. The bound is today's `CHECK_OUTPUT_TAIL_BYTES` for commands. Anything longer is
+   kept and paged with `read_output`, as commands do now. Shortening of old results stays, but only as the last resort past
+   the history budget. Each shortening is counted in the run's usage, so a deployment sees it.
+2. **An MCP result takes the same bound as a command** (16 KiB by default instead of 64 KiB): one rule for every tool, so
+   the cost of a call does not depend on which kind of tool made it.
+3. **A command takes `output`, a closed enum (Rule 3), chosen per call:**
+
+   | Value | On success (exit 0) | On failure |
+   |---|---|---|
+   | `on_error` | one line: `exit code 0`, the size, and the output id; nothing else | the output as today (head and tail, kept) |
+   | `full` | the output as today | the output as today |
+
+   * The output is **always kept**, whatever `output` says, so `read_output` can show a successful command's output
+     later. Hiding is about what enters the history, never about losing data.
+   * Defaults per tool, because the tools have different jobs:
+
+     | Tool | Default | Why |
+     |---|---|---|
+     | `run_checks` | `on_error` | a check that passes needs no output |
+     | `run` (builds, installs, generators) | `on_error` | its result is the files it made |
+     | `run_command` | `full` | it exists to look around (`ls`, `cat`, `git log`): its output is the answer |
+
+   * A folder's `limits` may set each tool's default; a call's `output` wins.
+4. **The tools' descriptions say it**, in one sentence each: what `on_error` shows, and that `read_output` reads a hidden
+   output. The prompt prefix changes once, when this ships.
+5. **It is measured before it is kept.** The bench (ADR 0048) compares, on the same tasks, calls per task, `read_output`
+   calls, input tokens per task and the cache share of the prompt, before and after. If hidden outputs make the model call
+   `read_output` more often than they save, the default goes back to `full` for that tool.
+
+## Slices
+
+| Slice | What |
+|---|---|
+| T1 | `output` on `run_checks`, `run` and `run_command`, with the defaults above; the success line; the output always kept; tests for each value and tool. |
+| T2 | The MCP bound follows the tool-result bound; shortenings counted in the run's usage. |
+| T3 | A folder's `limits` sets the defaults; `docs/reference/agent-files.md`, `docs/reference/coder-agent.md`, `docs/reference/environment.md`. |
+| T4 | The bench comparison of decision 5, and the result written in `bench/NUMBERS.md`. |
+
+## Consequences
+
+* A typical run (several builds and test passes that succeed) keeps far fewer tokens in its history, so each later call is
+  cheaper and a shortening, which moves the cached prefix, is rarer.
+* The model loses nothing: every output is kept and one `read_output` call away.
+* The exporter's samples (ADR 0085) show the success line, which is what the model saw.
+* No `Store`, `Notifier` or `ModelClient` method changes.
