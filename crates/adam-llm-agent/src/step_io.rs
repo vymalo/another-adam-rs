@@ -103,6 +103,30 @@ impl StepIo {
         self
     }
 
+    /// What the report that starts a call's step says of `arguments`: scrubbed by the redactor, then
+    /// cut to the contract's bounds, exactly as [`StepEvent::input`](adam_runtime::StepEvent::input)
+    /// carries it. `None` when a step would carry none (the switch is off, or the arguments are not
+    /// an object with a member). For a host that shows a call outside a step (ADR 0047 slice 5: the
+    /// call a person is asked to approve), so it shows no more than the step would.
+    #[must_use]
+    pub fn shown_input(&self, arguments: &Value) -> Option<Map<String, Value>> {
+        let (input, max) = self.input(arguments)?;
+        adam_runtime::StepEvent::new(
+            "input",
+            adam_runtime::StepKind::Tool,
+            "input",
+            adam_runtime::StepState::Running,
+        )
+        .with_input_within(input, max)
+        .input
+    }
+
+    /// `text` scrubbed by the redactor, as a step's output is before it is cut; unchanged without one.
+    #[must_use]
+    pub fn redacted(&self, text: &str) -> String {
+        self.scrub(text)
+    }
+
     /// `text` scrubbed with the agent's scrubber, if it has one (ADR 0050: what an observer reads).
     pub(crate) fn scrub(&self, text: &str) -> String {
         match &self.redact {
@@ -193,6 +217,35 @@ mod tests {
                 "headers": {REDACTED_MARKER: [format!("a {REDACTED_MARKER} b"), 3]},
                 "n": 1
             })
+        );
+    }
+
+    /// What a host shows of a call outside its step is what the step carries: scrubbed, then cut.
+    #[test]
+    fn the_shown_input_is_the_steps_own() {
+        let io = StepIo::default().redact(secret_out);
+        let args = json!({"token": "hunter2-hunter2", "long": "x".repeat(10_000)});
+        let shown = io.shown_input(&args).unwrap();
+        let (input, max) = io.input(&args).unwrap();
+        let step = adam_runtime::StepEvent::new(
+            "tool:c1",
+            adam_runtime::StepKind::Tool,
+            "t",
+            adam_runtime::StepState::Running,
+        )
+        .with_input_within(input, max);
+        assert_eq!(Some(&shown), step.input.as_ref());
+        assert_eq!(shown["token"], json!(REDACTED_MARKER));
+        assert!(
+            !serde_json::to_string(&shown)
+                .unwrap()
+                .contains("hunter2-hunter2")
+        );
+        assert_eq!(StepIo::off().shown_input(&args), None);
+        assert_eq!(io.shown_input(&json!({})), None);
+        assert_eq!(
+            io.redacted("say hunter2-hunter2"),
+            format!("say {REDACTED_MARKER}")
         );
     }
 
