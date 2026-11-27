@@ -2008,7 +2008,8 @@ mod tests {
         }
     }
 
-    fn summary(state: SessionState, closed: bool, closing: bool, age: i64) -> SessionSummary {
+    fn summary(state: SessionState, closed: bool, closing: bool,
+ deleted: false, age: i64) -> SessionSummary {
         SessionSummary {
             id: RunId::new(),
             agent: "root/planner".into(),
