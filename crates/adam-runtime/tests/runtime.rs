@@ -10555,3 +10555,55 @@ async fn a_store_without_blobs_clears_the_split() {
         None
     );
 }
+
+/// A blob an agent stores from inside a step ([`Ctx::blob_writer`]) and names after it
+/// ([`Ctx::reference_blobs`]) is recorded by the commit that keeps the state, so a purge keeps its
+/// bytes; a blob stored and never named is collected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blob_an_agent_names_is_recorded_by_its_commit() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let recording = Arc::new(common::recording::RecordingStore::new(inner.clone()));
+    let store: DynStore = recording.clone();
+    let agent = fn_agent(
+        &uniq("blobs"),
+        step_fn(|ctx, state| {
+            async move {
+                let writer = ctx.blob_writer();
+                assert!(writer.keeps_blobs());
+                let id: Result<adam_core::BlobId, String> = ctx
+                    .step("put", move || async move {
+                        writer.put(b"named").await.map_err(|e| e.to_string())
+                    })
+                    .await?;
+                let id = id.map_err(AgentError::permanent)?;
+                let stray = ctx.blob_writer().put(b"stray").await.expect("put");
+                assert_eq!(stray, adam_runtime::blob_id(b"stray"));
+                ctx.reference_blobs([id.clone(), id]);
+                Ok(Transition::Done {
+                    state,
+                    output: json!(null),
+                })
+            }
+            .boxed()
+        }),
+    );
+    let rt = runtime(&store, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let named = adam_runtime::blob_id(b"named");
+    let commit = recording.commits_of(run).pop().expect("a commit");
+    assert_eq!(
+        commit.blobs,
+        vec![named.clone()],
+        "named once, the stray not"
+    );
+    let far = adam_core::store::now() + jiff::SignedDuration::from_hours(1);
+    assert_eq!(inner.purge_blobs(far).await.expect("purge"), 1, "the stray");
+    assert_eq!(
+        inner.get_blob(&named).await.expect("read"),
+        Some(b"named".to_vec())
+    );
+}

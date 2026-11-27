@@ -153,6 +153,7 @@ mod order;
 pub mod paging;
 mod plan;
 mod redact;
+mod request;
 mod schedule;
 #[cfg(feature = "schema")]
 mod schema;
@@ -234,6 +235,7 @@ pub use model_wait::{
 pub use order::{AFTER_PREVIOUS, INSTRUCTION as AFTER_PREVIOUS_INSTRUCTION};
 pub use plan::{MAX_PLAN_ITEMS, Plan, PlanItem, PlanStatus};
 pub use redact::{REDACTED_MARKER, is_ordinary_word, is_value_position};
+pub use request::{RecordedRequest, RequestContent};
 #[cfg(feature = "schema")]
 pub use schema::{ToolSpecExt, spec_for};
 pub use sessions::{

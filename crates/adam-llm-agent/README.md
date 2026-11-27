@@ -53,6 +53,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `Approval`, `Conversation::approval`, `approval_step`, `approves`, `NOT_APPROVABLE` | ADR 0050 slice H8, see *`Ask` parks for the person's approval*: the call a hook asked a person to approve (`call_id`, `tool`, `question`, `arguments`, `approved`), the name of the step that runs it once approved (`tool:<call id>:approved`), the rule that reads a yes, and what a run nobody can approve answers the call with |
 | `Conversation::continued(&self, text, from: RunId)`, `LlmAgent::init_continuing`, `LlmStarter::init_continuing` | the conversation of a new run that carries on this one with one more user message; what is carried, dropped and reset is in *Continuing a conversation* |
 | `Conversation::is_omission_marker(message, part)` | whether that text part is the marker (the second part of the first message while `omitted_turns` is not zero), so a rule that reads what the user said skips exactly it: the coder's `person_texts` |
+| `Conversation::request`, `RecordedRequest`, `RequestContent` | the system prompt and tools of the run's last model call, stored as content-addressed blobs (ADR 0085 decision 7): `RecordedRequest { turn, system: Option<BlobId>, tools: BlobId }`, read back with `RecordedRequest::load(&store)`; `RecordedRequest::tools_bytes` is the encoding; see *The recorded request* |
 | `MAX_CARRIED_BYTES`, `OMITTED_MARKER_PREFIX` | the cap on the history a continuation carries (256 KiB of JSON), and the prefix of the marker text part that stands in for the turns dropped to fit it |
 | `COMPACTION_TURN`, `Compaction`, `CompactionReason`, `PromptSize`, `MAX_COMPACTIONS`, `WINDOW_MARGIN_TOKENS`, `summary_output_tokens` | compaction (below): the instruction a summary request ends with, one recorded compaction (`turn`, `dropped_turns`, `reason`, `sessions`, and the facts the marker lists), why it was made (`Budget` or `Overflow`), the last call's reported prompt size, and the most compactions a run makes (8, not counting the one record a continued run carries); `WINDOW_MARGIN_TOKENS` is the 20,000-token margin the budget and the assembly's cap clamp keep free; `summary_output_tokens(cap)` is `min(4,096, cap)`, or 4,096 when the cap is `0` |
 | `Tool::poll_remote`, `RemotePoll` | how a tool that returned `AwaitRemote` answers "how does the task stand": `Ready(ToolOutput)` or `Working`; the default refuses |
@@ -1147,6 +1148,30 @@ of the loop is covered, and the chain is folded once, in order, over the message
   rows verify against the key set at their position, an earlier change breaks every later `prv`, a moved row fails, no keys
   means no signature, and through `adam-model-openai` to a mock server no request body holds the member).
 
+## The recorded request (ADR 0085, slice E3)
+
+Every turn's model step records the **final** request (sources applied, tools final, the `model.request` hooks run) for
+export: the system prompt as its UTF-8 bytes and the tools as the RFC 8785 canonical JSON of the `Vec<ToolSpec>`
+(`RecordedRequest::tools_bytes`, so equal lists are equal bytes), each stored under its SHA-256 with the runtime's
+`BlobWriter` (`Ctx::blob_writer`, `Store::put_blob`). The ids are journaled with the answer (`request` in the record of
+`model:N`), so a replay names the same blobs without storing or reading anything, and the turn keeps them in
+`Conversation::request` (`RecordedRequest { turn, system, tools }`: the last call's; `system` is absent when the request
+had none). The transition names the ids with `Ctx::reference_blobs`, so the commit that keeps the state records them
+(`RunUpdate::blobs`) and the bytes survive until no run references them (`Store::purge_blobs`).
+
+* **Stored once.** The puts run beside the model call, not before it. A blob the state's `request` already names is not
+  sent again (no store call at all on a turn whose prompt and tools did not change), and the runtime's writer checks
+  `Store::blob_stored` before it puts, so a second run with the same prompt and tools stores nothing new.
+* **Reading it.** `state.request.unwrap().load(&store)` gives `RequestContent { system: Option<String>, tools:
+  Vec<ToolSpec> }`, `Ok(None)` when a blob is gone; by hand, `store.get_blob(&id)` then `String::from_utf8` for the
+  prompt and `serde_json::from_slice::<Vec<ToolSpec>>` for the tools.
+* **Fail-open.** The record is training metadata, not the run's truth: a store that keeps no blobs (`keeps_blobs()` is
+  `false`), or a put that fails, never fails the call. That turn records no request (`Conversation::request` is `None`,
+  never a stale record of an earlier call); the first failure in a process is a warning, the rest and the "keeps no blobs"
+  line are at `debug`. A model call that fails leaves `request` as it was. A continuation starts with none.
+* **No images**: they are in the messages, never in the system prompt or the tools.
+* State and journals written before the field decode with `request` absent, and a state without one writes no member.
+
 ## Features and environment
 
 | Feature | Default | What |
@@ -1163,6 +1188,14 @@ the run's answer the second one); no message, no extra turn; the same message se
 message is read; a recorded answer that predates a message read in the next transition is dropped and not said; a journal
 from before `seen` reads as current; state from before `read_ids` loads. Memory always, PostgreSQL when
 `ADAM_TEST_POSTGRES_URL` is set; models and tools are held at gates, nothing sleeps. `src/conversation.rs` bounds the ids.
+
+`tests/recorded_request.rs` is the suite of *The recorded request* (real `Runtime`, scripted `MockModel`, a `FaultyStore`
+over `MemoryStore` that counts the blob calls): two turns with the same prompt and tools leave the last call's request in
+the state, its blobs decode to exactly what the model was sent, one put and one existence check per content, a purge keeps
+them, and a second run stores nothing new; a commit lost after the call replays it without the model and names the same
+request and blobs, storing nothing; a store that refuses every put does not fail the run and records none; an older state
+decodes and a state without a request writes the same bytes. `src/request.rs` pins the canonical tool bytes and the
+record's shape; `src/agent.rs` (`a_recorded_model_call_reads_a_journal_from_before_streaming`) pins the journal member.
 
 `tests/usage.rs`: one report per completed call with its tokens, alias, provider and window, and the totals; a call without
 usage reported with zeros; **a subagent's calls (and its own child's) reported on the root's task under the root's step**,

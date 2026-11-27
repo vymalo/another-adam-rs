@@ -124,6 +124,62 @@ pub fn blob_id(bytes: &[u8]) -> BlobId {
     BlobId::from_sha256(&digest)
 }
 
+/// An owned, cloneable handle that stores bytes as content-addressed blobs from inside a
+/// [`Ctx::step`](crate::Ctx::step), taken with [`Ctx::blob_writer`](crate::Ctx::blob_writer).
+///
+/// It **only stores** the bytes: the run references them when the agent names the ids with
+/// [`Ctx::reference_blobs`](crate::Ctx::reference_blobs) after the step, so the commit that keeps
+/// them records them ([`RunUpdate::blobs`](adam_core::RunUpdate::blobs)) and the bytes survive
+/// until no run references them ([`Store::purge_blobs`](adam_core::Store::purge_blobs)). Naming
+/// them after the step, not inside it, is what covers a replay: a recorded step does not run its
+/// closure again, but its recorded ids are named all the same.
+#[derive(Clone)]
+pub struct BlobWriter {
+    store: DynStore,
+}
+
+impl std::fmt::Debug for BlobWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobWriter")
+            .field("keeps_blobs", &self.store.keeps_blobs())
+            .finish()
+    }
+}
+
+impl BlobWriter {
+    pub(crate) fn new(store: DynStore) -> Self {
+        Self { store }
+    }
+
+    /// Whether the store keeps blobs at all ([`Store::keeps_blobs`](adam_core::Store::keeps_blobs)).
+    /// A store that does not refuses every [`put`](Self::put).
+    pub fn keeps_blobs(&self) -> bool {
+        self.store.keeps_blobs()
+    }
+
+    /// Store `bytes` under their content address ([`blob_id`]) and return it.
+    ///
+    /// Idempotent: bytes the store already holds are not sent again (one existence check), and a
+    /// second put of the same id writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidInput`](adam_core::StoreError::InvalidInput) when the store keeps no
+    /// blobs, or the store's own error when the put fails.
+    pub async fn put(&self, bytes: &[u8]) -> StoreResult<BlobId> {
+        let id = blob_id(bytes);
+        if !self.store.keeps_blobs() {
+            return Err(adam_core::StoreError::InvalidInput(
+                "this store keeps no blobs".into(),
+            ));
+        }
+        if !self.store.blob_stored(&id).await.unwrap_or(false) {
+            self.store.put_blob(&id, bytes).await?;
+        }
+        Ok(id)
+    }
+}
+
 /// What one [`upload_all`] pass found: the digests of the file artifacts (with their sizes) and
 /// whether every one of them is stored.
 pub(crate) struct Uploaded {
@@ -350,5 +406,19 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(upload_files(&store, &[file.clone(), file]).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_writer_stores_bytes_under_their_id_once() {
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let writer = BlobWriter::new(store.clone());
+        assert!(writer.keeps_blobs());
+        let id = writer.put(b"prompt").await.expect("put");
+        assert_eq!(id, blob_id(b"prompt"));
+        assert_eq!(writer.put(b"prompt").await.expect("again"), id);
+        assert_eq!(
+            store.get_blob(&id).await.expect("get"),
+            Some(b"prompt".to_vec())
+        );
     }
 }

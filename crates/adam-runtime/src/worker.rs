@@ -539,6 +539,10 @@ struct Next {
     head_artifacts: Option<Vec<Artifact>>,
     /// The digests the shadow's upload pass stored (the union the commit references).
     shadow_blobs: Vec<BlobId>,
+    /// The blobs the agent's state references, named with [`Ctx::reference_blobs`]: the commit
+    /// records them beside the file artifacts' digests. Empty for a transition whose state is not
+    /// kept (a failure, a retry).
+    blobs: Vec<BlobId>,
     /// The digest and size of every file artifact in the head's upload pass, in artifact order, so
     /// `Head::of` does not re-hash the bytes.
     shadow_files: Vec<(BlobId, u64)>,
@@ -970,6 +974,7 @@ fn plan(
         reopen,
         read,
         artifacts,
+        blobs,
     } = out;
     // Starting point for a transition that made progress. A v5 run's step must split: its state is
     // the head plus the body, and a step that writes no head would put the whole state in the head,
@@ -996,6 +1001,7 @@ fn plan(
             split_refused,
             head_artifacts: None,
             shadow_blobs: Vec::new(),
+            blobs: blobs.clone(),
             shadow_files: Vec::new(),
             deadline: base.deadline,
             remaining_secs: base.remaining_secs,
@@ -1021,6 +1027,7 @@ fn plan(
         split_refused: false,
         head_artifacts: None,
         shadow_blobs: Vec::new(),
+        blobs: Vec::new(),
         shadow_files: Vec::new(),
         deadline: base.deadline,
         remaining_secs: base.remaining_secs,
@@ -1097,6 +1104,7 @@ fn plan(
                     split_refused: false,
                     head_artifacts: None,
                     shadow_blobs: Vec::new(),
+                    blobs: Vec::new(),
                     shadow_files: Vec::new(),
                     deadline: base.deadline,
                     remaining_secs: base.remaining_secs,
@@ -1697,6 +1705,7 @@ async fn commit(
             blobs.extend(crate::blob::upload_files(&inner.store, &next.artifacts).await);
             (blobs, None)
         };
+        blobs.extend(next.blobs.iter().cloned());
         blobs.sort();
         blobs.dedup();
         let mut update = build_update(
@@ -2057,6 +2066,7 @@ mod claim_tests {
             split_refused: false,
             head_artifacts: None,
             shadow_blobs: Vec::new(),
+            blobs: Vec::new(),
             shadow_files: Vec::new(),
             deadline: None,
             remaining_secs: None,

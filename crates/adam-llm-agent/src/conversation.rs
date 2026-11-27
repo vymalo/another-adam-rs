@@ -15,6 +15,7 @@ use serde_json::{Map, Value, json};
 use crate::compaction::{Compaction, CompactionReason, PromptSize};
 use crate::images::{InboundImage, KeptImage, StateImage};
 use crate::plan::Plan;
+use crate::request::RecordedRequest;
 use crate::source::ToolNote;
 
 /// Recommended [`Inbound::kind`] of a user message. The agent does not inspect
@@ -967,6 +968,14 @@ pub struct Conversation {
     /// while `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_started: Option<Timestamp>,
+    /// The system prompt and tools of the run's last model call, by content address
+    /// ([`RecordedRequest`], ADR 0085 decision 7): what an export attaches as the exact request the
+    /// run's answers were made from. Set by every turn's model call: `None` when that call recorded
+    /// none (the store keeps no blobs, or a put failed: recording is fail-open), so a stale record
+    /// never stands for a later call. A call that failed leaves it as it was. Not carried to a later
+    /// task. Absent from state written before it existed, and not written while `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<RecordedRequest>,
 }
 
 /// How many rounds a run remembers having reported ([`Conversation::reported_rounds`]): the oldest

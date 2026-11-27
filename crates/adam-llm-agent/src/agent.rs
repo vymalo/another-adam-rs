@@ -61,6 +61,7 @@ use crate::model_wait::{
 use crate::order;
 use crate::paging::backstop;
 use crate::plan::Plan;
+use crate::request::RecordedRequest;
 use crate::schedule::{self, Entry, Ordered, Queue, Segment};
 use crate::sessions::{
     DueFacts, SUBAGENT_CLOSE, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, is_due, report_call_id,
@@ -1210,6 +1211,13 @@ struct Recorded {
     /// Absent when it did not, and in journals written before it existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     grew: bool,
+    /// The final request's system prompt and tools, stored as blobs while the model answered
+    /// ([`RecordedRequest`], ADR 0085 decision 7): the turn transition keeps it in
+    /// [`Conversation::request`](crate::Conversation::request) and names its blobs in the commit,
+    /// so a replay does the same without storing or reading anything. Absent when the store keeps
+    /// no blobs or a put failed (recording is fail-open), and in journals written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<RecordedRequest>,
 }
 
 /// The report of one round, read for a model call that did not ask for it: the result of a
@@ -3150,6 +3158,10 @@ impl LlmAgent {
         let early_slot: Arc<Mutex<Option<Early<'_>>>> = Arc::new(Mutex::new(None));
         let slot = Arc::clone(&early_slot);
         let agent = self;
+        // The request is recorded for export (ADR 0085 decision 7) through the store's blobs; the
+        // blobs the state already names are not sent again.
+        let blob_writer = ctx.blob_writer();
+        let known_request = state.request.clone();
         let recorded: Result<Recorded, ModelFailure> = ctx
             .step(&format!("model:{turn}"), move || async move {
                 if !named.is_empty() {
@@ -3261,14 +3273,29 @@ impl LlmAgent {
                         }
                     }
                 }
+                // The request is final: its system prompt and tools are stored as blobs while the
+                // model answers, and their ids journaled with the answer. Fail-open: this is
+                // training metadata, not the run's truth, so a store that keeps no blobs or a put
+                // that fails records nothing and never fails the call. No image is recorded: the
+                // images are in the messages, never in the system prompt or the tools.
+                let pending = crate::request::Pending::of(&blob_writer, turn, &request);
+                let recording = async {
+                    match pending {
+                        Some(pending) => pending.store(&blob_writer, known_request.as_ref()).await,
+                        None => None,
+                    }
+                };
                 if !stream_text {
                     // The request races the run's cancellation: a cancel drops it, and with it the
                     // connection, instead of letting the provider finish an answer nobody will read.
-                    let answer = tokio::select! {
-                        biased;
-                        () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
-                        answer = model.complete(request) => answer.map_err(ModelFailure::from)?,
-                    };
+                    let (recorded_request, answer) = tokio::join!(recording, async {
+                        tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => Err(ModelFailure::cancelled()),
+                            answer = model.complete(request) => answer.map_err(ModelFailure::from),
+                        }
+                    });
+                    let answer = answer?;
                     return Ok(Recorded {
                         response: unthought(&emitter, run, turn, false, answer).await,
                         stream: None,
@@ -3283,6 +3310,7 @@ impl LlmAgent {
                         loaders,
                         task_loaded,
                         grew,
+                        request: recorded_request,
                     });
                 }
                 // The words go out while they are written, under an id made here, inside the step, and
@@ -3291,16 +3319,18 @@ impl LlmAgent {
                 // The notes are this turn's (a source's listing, read above): a source's call
                 // reports and is labelled as the turn says, not as the turn before it did.
                 let mut early = Early::new(agent, early_facts, notes.clone(), own_order.clone());
-                let streamed = text_stream::stream_response(
-                    &model,
-                    request,
-                    &emitter,
-                    &cancel,
-                    Some(&mut early),
-                    move || stream_id(run, turn),
-                    move || reasoning_stream_id(run, turn),
-                )
-                .await;
+                let (recorded_request, streamed) = tokio::join!(
+                    recording,
+                    text_stream::stream_response(
+                        &model,
+                        request,
+                        &emitter,
+                        &cancel,
+                        Some(&mut early),
+                        move || stream_id(run, turn),
+                        move || reasoning_stream_id(run, turn),
+                    )
+                );
                 // The batch goes back to the turn, whatever the stream did with it: the calls that
                 // started are the turn's to settle (their steps are written only after it).
                 *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(early);
@@ -3319,6 +3349,7 @@ impl LlmAgent {
                     loaders,
                     task_loaded,
                     grew,
+                    request: recorded_request,
                 })
             })
             .await?;
@@ -3389,7 +3420,15 @@ impl LlmAgent {
                 loaders,
                 task_loaded,
                 grew,
+                request,
             }) => {
+                // The last call's request, as recorded (or not) by this call, and its blobs named
+                // in this transition's commit so their bytes are kept while the run references
+                // them. A replay names the same ids from the journal.
+                if let Some(request) = &request {
+                    ctx.reference_blobs(request.blob_ids());
+                }
+                state.request = request;
                 // What the request carried **before the tier withheld any** is the truth of the
                 // loaded set: every loaded tool it did not carry is journaled as removed, and a
                 // growth is recorded only when the final request actually grew.
@@ -8763,6 +8802,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            request: None,
         };
         let json = serde_json::to_value(&streamed).unwrap();
         assert_eq!(json["stream"], "run-m0-a1b2c3d4");
@@ -8790,6 +8830,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            request: None,
         };
         assert_eq!(serde_json::to_value(&plain).unwrap(), bare);
 
@@ -8809,6 +8850,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            request: None,
         };
         let json = serde_json::to_value(&noted).unwrap();
         assert_eq!(
@@ -8835,6 +8877,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            request: None,
         };
         let json = serde_json::to_value(&reported).unwrap();
         assert_eq!(json["call"], "run-c0-a1b2c3d4");
@@ -8865,6 +8908,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            request: None,
         };
         let json = serde_json::to_value(&told).unwrap();
         assert_eq!(json["sessions_open"], true);
@@ -8872,6 +8916,23 @@ mod failure_tests {
         assert_eq!(back.reports.len(), 1);
         assert_eq!(back.reports[0].round, round);
         assert_eq!(back.sessions_open, Some(true));
+
+        // The recorded request (ADR 0085 decision 7) is beside the response, and absent from an old
+        // record, which reads as none.
+        assert_eq!(old.request, None);
+        let request = RecordedRequest {
+            turn: 0,
+            system: Some(adam_runtime::blob_id(b"You are a test agent.")),
+            tools: adam_runtime::blob_id(b"[]"),
+        };
+        let with_request = Recorded {
+            request: Some(request.clone()),
+            ..plain
+        };
+        let json = serde_json::to_value(&with_request).unwrap();
+        assert_eq!(json["request"]["turn"], 0);
+        let back: Recorded = serde_json::from_value(json).unwrap();
+        assert_eq!(back.request, Some(request));
     }
 
     fn plain_json_has_reports(record: &Recorded) -> bool {
