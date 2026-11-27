@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use adam_agent_fs::{
     AgentManifest, Diagnostic, EmbeddedAgent, InstructionPart, Instructions, Limits as FileLimits,
-    ManifestSource, McpConfig, ModelRef, SkillSelection, Strictness, Subagent, ToolList,
-    ToolsLoading,
+    ManifestSource, McpConfig, ModelRef, SiMemoryKey, SiMemoryOptions, SiMemoryWord,
+    SkillSelection, Strictness, Subagent, ToolList, ToolsLoading,
 };
 use adam_core::{DynSecretSource, ProcessEnv};
 use adam_llm_agent::{
@@ -129,6 +129,38 @@ impl Default for RemoteSettings {
     }
 }
 
+/// The deployment's ceiling on the self-improvement memory (ADR 0081 decision 11): `SI_MEMORY`,
+/// `on` for `adam-coder` and `adam-agent`, `off` for `adam-engine`.
+///
+/// It only **narrows** the folder's `si_memory:` key: `Off` here is off whatever the folder says,
+/// and a folder's `off` is off whatever the ceiling says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SiMemoryCeiling {
+    /// The folder's key decides; an absent key is on.
+    #[default]
+    On,
+    /// No self-improvement memory, whatever the folder says.
+    Off,
+}
+
+/// What a run's self-improvement memory is, once the deployment's ceiling and the folder's
+/// `si_memory:` key are both read ([`AgentDef::si_memory`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SiMemorySetting {
+    /// No memory: nothing is built, no folder is read and no tool is offered.
+    Off,
+    /// On, with the folder's options (the deployment's bounds where it names none).
+    On(SiMemoryOptions),
+}
+
+impl SiMemorySetting {
+    /// Whether a run holds a memory at all.
+    #[must_use]
+    pub fn is_on(&self) -> bool {
+        matches!(self, Self::On(_))
+    }
+}
+
 /// An agent as its files describe it, before it is tied to tools, state and a model.
 ///
 /// Made from a manifest with [`from_manifest`](Self::from_manifest) (the embedded one from
@@ -178,6 +210,8 @@ pub struct AgentDef {
     reasoning_effort: Option<ReasoningEffort>,
     /// The compiled plugins `plugins:` may name ([`plugin`](Self::plugin)).
     plugins: BTreeMap<String, PluginFactory>,
+    /// The deployment's ceiling on the self-improvement memory ([`si_memory_ceiling`](Self::si_memory_ceiling)).
+    si_memory_ceiling: SiMemoryCeiling,
 }
 
 /// The plugins one agent runs, by registered name.
@@ -216,6 +250,7 @@ impl AgentDef {
             max_parallel: None,
             reasoning_effort: None,
             plugins: BTreeMap::new(),
+            si_memory_ceiling: SiMemoryCeiling::default(),
         })
     }
 
@@ -442,6 +477,39 @@ impl AgentDef {
     pub fn reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
         self.reasoning_effort = effort;
         self
+    }
+
+    /// The deployment's ceiling on the self-improvement memory (ADR 0081 decision 11): `SI_MEMORY`,
+    /// `on` by default and `off` for a deployment that runs none. It reaches
+    /// [`si_memory`](Self::si_memory), which the process reads to decide whether a run holds a
+    /// memory at all.
+    #[must_use]
+    pub fn si_memory_ceiling(mut self, ceiling: SiMemoryCeiling) -> Self {
+        self.si_memory_ceiling = ceiling;
+        self
+    }
+
+    /// What the run's self-improvement memory is: the deployment's ceiling
+    /// ([`si_memory_ceiling`](Self::si_memory_ceiling)) and the folder's `si_memory:` key, both
+    /// read (ADR 0081 decision 11).
+    ///
+    /// Either can only narrow the other: a ceiling of [`SiMemoryCeiling::Off`] is
+    /// [`SiMemorySetting::Off`] whatever the folder says, a folder's `si_memory: off` is
+    /// [`SiMemorySetting::Off`] whatever the deployment allows, and an absent key follows the
+    /// ceiling. Pure, so a control plane that serves the card reads what the workers that run the
+    /// agent will do.
+    #[must_use]
+    pub fn si_memory(&self) -> SiMemorySetting {
+        if self.si_memory_ceiling == SiMemoryCeiling::Off {
+            return SiMemorySetting::Off;
+        }
+        match &self.manifest.frontmatter.si_memory {
+            Some(SiMemoryKey::Word(SiMemoryWord::Off)) => SiMemorySetting::Off,
+            Some(SiMemoryKey::Options(options)) => SiMemorySetting::On(options.clone()),
+            Some(SiMemoryKey::Word(SiMemoryWord::On)) | None => {
+                SiMemorySetting::On(SiMemoryOptions::default())
+            }
+        }
     }
 
     /// The limits the sessions of the root agent run under: the deployment's
@@ -1870,6 +1938,69 @@ fn render_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One agent whose file carries `extra` as additional frontmatter lines.
+    fn def_with(extra: &str) -> AgentDef {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        std::fs::create_dir_all(root.path().join("agent")).expect("the folder");
+        std::fs::write(
+            root.path().join("agent/instructions.md"),
+            format!("---\nname: chat\ndescription: Chats.\ntools: []\n{extra}---\nHello.\n"),
+        )
+        .expect("the instructions");
+        AgentDef::from_source(&adam_agent_fs::Dir::new(root.path()), Strictness::Lenient)
+            .expect("a loadable folder")
+            .remove(0)
+    }
+
+    /// ADR 0081 decision 11: the folder's `off` is off whatever the deployment allows, the
+    /// deployment's `off` is off whatever the folder says, and an absent key follows the ceiling.
+    #[test]
+    fn a_folder_says_off_and_the_deployment_says_off_and_either_wins() {
+        assert_eq!(
+            def_with("si_memory: off\n").si_memory(),
+            SiMemorySetting::Off
+        );
+        assert_eq!(
+            def_with("si_memory: off\n")
+                .si_memory_ceiling(SiMemoryCeiling::On)
+                .si_memory(),
+            SiMemorySetting::Off,
+            "the folder's off is off"
+        );
+        assert_eq!(
+            def_with("si_memory: on\n")
+                .si_memory_ceiling(SiMemoryCeiling::Off)
+                .si_memory(),
+            SiMemorySetting::Off,
+            "SI_MEMORY=off beats a folder's on"
+        );
+        assert_eq!(
+            def_with("")
+                .si_memory_ceiling(SiMemoryCeiling::Off)
+                .si_memory(),
+            SiMemorySetting::Off,
+            "an absent key follows the ceiling"
+        );
+        assert_eq!(
+            def_with("").si_memory(),
+            SiMemorySetting::On(SiMemoryOptions::default()),
+            "on by default"
+        );
+    }
+
+    /// A folder that names options turns memory on and keeps them, so the run reads the bounds it
+    /// wrote rather than the defaults.
+    #[test]
+    fn a_folder_that_names_options_keeps_them() {
+        let setting = def_with("si_memory:\n  recall: false\n  preload_kib: 8\n").si_memory();
+        let SiMemorySetting::On(ref options) = setting else {
+            panic!("options are on");
+        };
+        assert_eq!(options.recall, Some(false));
+        assert_eq!(options.preload_kib, Some(8));
+        assert!(setting.is_on());
+    }
 
     #[test]
     fn a_subagents_run_limit_is_30_minutes_unless_its_file_says_otherwise() {
