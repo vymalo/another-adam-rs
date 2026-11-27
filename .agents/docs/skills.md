@@ -1,6 +1,6 @@
 # Skills: what this repository provides and how they are kept
 
-For agents. The table of which skill to use when is in [`CLAUDE.md`](../../CLAUDE.md#skills); the first-party skills
+For people: [Agent skills](../../docs/skills.md). For agents, this page. The table of which skill to use when is in [`CLAUDE.md`](../../CLAUDE.md#skills); the first-party skills
 themselves are in `.agents/skills/adam-*`.
 
 ## Skills this repo provides

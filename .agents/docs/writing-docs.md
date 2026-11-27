@@ -1,6 +1,6 @@
 # Writing docs: the rules and the checks
 
-For agents. The convention is [ADR 0079](../../docs/decisions/0079-docs-for-people-and-docs-for-agents-live-apart.md);
+For people: [Writing docs](../../docs/writing-docs.md). For agents, this page. The convention is [ADR 0079](../../docs/decisions/0079-docs-for-people-and-docs-for-agents-live-apart.md);
 the short version for people is [Writing these docs](../../docs/README.md#writing-these-docs).
 
 ## Two audiences, two trees

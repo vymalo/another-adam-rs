@@ -60,7 +60,12 @@ const sidebar = [
   { text: "Decisions", collapsed: true, items: [{ text: "ADR index", link: "/decisions/" }, ...pages("decisions")] },
   {
     text: "Contributing",
-    items: [{ text: "How to contribute", link: "/contributing" }, ...pages("guides", [], ["testing.md"])],
+    items: [
+      { text: "How to contribute", link: "/contributing" },
+      ...pages("guides", [], ["testing.md"]),
+      { text: "Writing docs", link: "/writing-docs" },
+      { text: "Agent skills", link: "/skills" },
+    ],
   },
 ];
 
