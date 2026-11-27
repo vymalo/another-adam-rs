@@ -62,7 +62,8 @@ fn bound_of(assembly: &Assembly) -> SessionBounds {
 }
 
 /// The bounds with the one fact only a worker has taken out: the names of the tools the subagent is
-/// bound with (`tools`, ADR 0054 slice 3), which a control plane that binds no agent does not know.
+/// bound with (`tools` and `tools_complete`, ADR 0054 slice 3), which a control plane that binds no
+/// agent does not know. Every number is equal; the tool names are the one thing that is not.
 fn without_tools(bounds: &[(String, SessionBounds)]) -> Vec<(String, SessionBounds)> {
     bounds
         .iter()
@@ -70,7 +71,8 @@ fn without_tools(bounds: &[(String, SessionBounds)]) -> Vec<(String, SessionBoun
             (
                 name.clone(),
                 SessionBounds {
-                    tools: None,
+                    tools: Vec::new(),
+                    tools_complete: false,
                     ..bound.clone()
                 },
             )
@@ -465,9 +467,10 @@ fn a_worker_bounds_hold_the_names_of_the_subagents_tools_and_a_definitions_do_no
     let bound = bound_of(&worker);
     assert_eq!(
         bound.tools,
-        Some(vec!["read_file".to_owned(), "write_file".to_owned()]),
+        ["read_file", "write_file"],
         "only the subagent's own tools, not the root's"
     );
+    assert!(bound.tools_complete, "no source adds a tool at run time");
     let asked = |value| SessionConfig::from_value(value).expect("a config");
     assert!(bound.admit(asked(json!({"tools": ["read_*"]}))).is_ok());
     let why = bound
@@ -481,11 +484,77 @@ fn a_worker_bounds_hold_the_names_of_the_subagents_tools_and_a_definitions_do_no
     );
 
     let control_plane = definition.session_bounds().remove(0).1;
-    assert_eq!(control_plane.tools, None);
+    assert!(control_plane.tools.is_empty() && !control_plane.tools_complete);
     assert!(
         control_plane
             .admit(asked(json!({"denyTools": ["delete_repository"]})))
             .is_ok(),
         "a control plane checks the shape only"
+    );
+}
+
+/// A source that offers nothing: what matters is that the agent has one, as both shipped agents do.
+struct Quiet;
+
+#[async_trait::async_trait]
+impl adam_llm_agent::ToolSource for Quiet {
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<adam_model::ToolSpec> {
+        Vec::new()
+    }
+
+    async fn call(
+        &self,
+        _ctx: &adam_llm_agent::ToolCtx,
+        _name: &str,
+        _args: serde_json::Value,
+    ) -> Option<Result<adam_llm_agent::ToolOutput, adam_llm_agent::ToolError>> {
+        None
+    }
+}
+
+/// ADR 0054 slice 3: an agent a source adds tools to at run time has a **known but incomplete** set
+/// of names. A concrete `deny_tools` entry no tool has is refused (a typo is far likelier than a
+/// tool a source adds), and a pattern or a `tools` entry is not checked: a source may add what it
+/// selects, and an allow entry that selects nothing offers nothing.
+#[test]
+fn an_agent_with_a_source_has_an_incomplete_set_that_still_catches_a_deny_typo() {
+    let definition = def(&[
+        (
+            "agent/instructions.md",
+            &instructions("name: coder", "You are the root."),
+        ),
+        (
+            "agent/subagents/reviewer.md",
+            &instructions(
+                "description: Reviews a change.\ntools: [read_file, write_file]",
+                "You review.",
+            ),
+        ),
+    ]);
+    let worker = definition
+        .bind(tools(&["read_file", "write_file"]))
+        .unwrap()
+        .tool_source(Quiet)
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    let bound = bound_of(&worker);
+    assert_eq!(bound.tools, ["read_file", "write_file"]);
+    assert!(!bound.tools_complete, "a source adds tools at run time");
+    let asked = |value| SessionConfig::from_value(value).expect("a config");
+    let why = bound
+        .admit(asked(json!({"denyTools": ["write_fil"]})))
+        .expect_err("a typo of a concrete name");
+    assert_eq!(why.option(), Some("deny_tools"));
+    assert!(
+        why.message().contains("matches none of its tools: read_file, write_file; the agent may get more tools while it runs"),
+        "{why}"
+    );
+    assert!(
+        bound
+            .admit(asked(
+                json!({"tools": ["github__*", "later"], "denyTools": ["later_*", "write_file"]})
+            ))
+            .is_ok(),
+        "a pattern and an allow entry are not checked on an incomplete set"
     );
 }

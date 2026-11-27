@@ -679,8 +679,8 @@ impl Tool for Start {
                     },
                     "config": {
                         "type": "object",
-                        "description": "Optional limits for this session, each at most what the \
-                                        subagent's folder allows (a value above it is refused, \
+                        "description": "Optional settings for this session, each within what the \
+                                        subagent's folder allows (a value outside it is refused, \
                                         naming the option). An option you leave out is the \
                                         folder's own.",
                         "properties": {

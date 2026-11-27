@@ -237,7 +237,6 @@ pub use plan::{MAX_PLAN_ITEMS, Plan, PlanItem, PlanStatus};
 pub use redact::{REDACTED_MARKER, is_ordinary_word, is_value_position};
 #[cfg(feature = "schema")]
 pub use schema::{ToolSpecExt, spec_for};
-pub use session_tools::SessionToolFilter;
 pub use sessions::{
     MAX_DESCRIPTION_CHARS, MAX_OPEN_SESSIONS, MAX_SESSION_ROUNDS, MAX_TEXT_CHARS,
     MAX_WORKING_ROUNDS, SESSION_TOOL_TIME_LIMIT, SESSION_TOOLS, SUBAGENT_CLOSE, SUBAGENT_LIST,

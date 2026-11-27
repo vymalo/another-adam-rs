@@ -163,9 +163,12 @@ pub const MODE_CONTEXT_KEY: &str = "vymalo.mode";
 /// The context key under which a session's round carries the tools its `config` narrows (ADR 0054
 /// slice 3): `{"tools": [..], "denyTools": [..]}`, only the members the config sets, and an empty
 /// object when it sets neither, so a round never inherits another round's value. Written by
-/// `subagent_start` and `subagent_send` (and the A2A front) from the header's clamped config, and
-/// read by [`SessionToolFilter`](crate::SessionToolFilter), which withholds every tool the lists leave out.
-/// `read_output` is never withheld.
+/// `subagent_start` and `subagent_send` (and the A2A front) from the header's clamped config.
+///
+/// **A second reading, not the truth**: the loop reads the lists from the run's session header
+/// (`Conversation::session`), which is committed with the run, and from this key too, holding back
+/// a tool when either says so (`read_output` is never held back). The key cannot be the truth: an
+/// oversized context is dropped, and a narrowing must not go with it.
 ///
 /// **Not one of [`PROTECTED_CONTEXT_KEYS`]**: a child of the session must not inherit its parent's
 /// narrowing, so the key is not copied into a child run

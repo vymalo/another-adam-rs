@@ -812,36 +812,41 @@ impl BoundDef {
 
     /// The bounds of one subagent a session may be started on (ADR 0054 decision 2): the one
     /// function of `crate::bounds`, which `AgentDef::session_bounds` calls too, so a worker's tools
-    /// and a control plane's A2A front cannot disagree, but for the one fact only a worker has:
-    /// the names of the tools the subagent is bound with ([`bound_tool_names`](Self::bound_tool_names)).
+    /// and a control plane's A2A front agree on every number. They differ in one fact only a worker
+    /// has: the names of the tools the subagent is bound with
+    /// ([`bound_tool_names`](Self::bound_tool_names)).
     fn bounds_of(&self, target: &SessionTarget) -> SessionBounds {
+        let (names, complete) = self.bound_tool_names(target);
         crate::bounds::bounds_of(
             &self.manifest,
             target,
             self.max_parallel,
             self.session_limits.max_rounds(),
-            self.bound_tool_names(target),
+            names,
+            complete,
         )
     }
 
-    /// The names of the tools the subagent `target` is bound with, for `tools` and `deny_tools`
-    /// to be checked against (ADR 0054 slice 3): the node whose registered name is the target's,
-    /// and what it holds (its own tools and the `mcp.json` servers' as `server__tool`).
+    /// The names of the tools the subagent `target` is bound with, for `tools` and `deny_tools` to
+    /// be checked against (ADR 0054 slice 3), and whether they are **every** tool it can have: the
+    /// node whose registered name is the target's, and what it holds (its own tools and the
+    /// `mcp.json` servers' as `server__tool`).
     ///
-    /// `None` when the names are **not exactly known**: a remote target (no node), and an agent
-    /// that a source adds tools to at run time, which no list made now can name: a server whose
-    /// `when` loads it by the task, or a source the deployment gave (the coder's references and
-    /// UI). Then `admit` checks the shape of each entry only, and the round applies it to the
-    /// tools it really has.
-    fn bound_tool_names(&self, target: &SessionTarget) -> Option<Vec<String>> {
-        if target.remote || !self.sources.is_empty() {
-            return None;
+    /// The set is **incomplete** when a source adds tools at run time, which no list made now can
+    /// name: a server whose `when` loads it by the task, or a source the deployment gave (both
+    /// shipped agents have some: the coder's references and UI, the folder agent's UI). A remote
+    /// target, and a name no node has, give no names.
+    fn bound_tool_names(&self, target: &SessionTarget) -> (Vec<String>, bool) {
+        if target.remote {
+            return (Vec::new(), false);
         }
-        let node = self.nodes.iter().find(|node| node.name == target.agent)?;
-        if !node.sources.is_empty() {
-            return None;
-        }
-        Some(node.tools.iter().map(|(name, _)| name.clone()).collect())
+        let Some(node) = self.nodes.iter().find(|node| node.name == target.agent) else {
+            return (Vec::new(), false);
+        };
+        (
+            node.tools.iter().map(|(name, _)| name.clone()).collect(),
+            self.sources.is_empty() && node.sources.is_empty(),
+        )
     }
 
     /// The tool as the agent gets it: a session tool is scrubbed when the deployment gave a scrub.
@@ -942,9 +947,6 @@ impl BoundDef {
         if let Some(modes) = &node.modes {
             builder = builder.tool_source(crate::modes::ModeSource::new(Arc::clone(modes)));
         }
-        // The tools a session's `config` narrows (ADR 0054 slice 3), for every agent: it holds
-        // back nothing for a run that is not a round of a configured session.
-        builder = builder.tool_source(adam_llm_agent::SessionToolFilter::new());
         // The agent's own sources first (the `mcp.json` servers a run loads only when its task
         // matches), then the deployment's, in the order it added them.
         for source in &node.sources {

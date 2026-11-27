@@ -286,6 +286,34 @@ impl Tool for Counted {
     }
 }
 
+/// A tool source that offers `extra_tool` and notes each call it runs: a tool of a source is
+/// narrowed by a session's lists like the agent's own.
+struct Extra {
+    ran: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl adam_llm_agent::ToolSource for Extra {
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<adam_model::ToolSpec> {
+        vec![adam_model::ToolSpec {
+            name: "extra_tool".into(),
+            description: "a source's tool".into(),
+            parameters: json!({"type": "object"}),
+        }]
+    }
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        (name == "extra_tool").then(|| {
+            self.ran.lock().unwrap().push(name.to_owned());
+            Ok(ToolOutput::text("extra ran"))
+        })
+    }
+}
+
 struct Rig {
     parent_name: String,
     child_name: String,
@@ -312,6 +340,8 @@ struct Rig {
     asks: bool,
     /// The child agent has `read_file`, `write_file` and `read_output`; the calls its two tools ran.
     child_tools: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    /// The child agent has a tool source that offers `extra_tool`; the calls it ran.
+    child_source: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// How long a kept-open session may sit idle (`None`: the runtime's default).
     idle_ttl: Option<Duration>,
     sink: CollectingSink,
@@ -337,6 +367,7 @@ impl Rig {
             limits: None,
             asks: false,
             child_tools: None,
+            child_source: None,
             idle_ttl: None,
             sink: CollectingSink::new(),
             clock: ManualClock::new(),
@@ -359,6 +390,13 @@ impl Rig {
     fn with_child_tools(mut self) -> (Self, Arc<std::sync::Mutex<Vec<String>>>) {
         let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
         self.child_tools = Some(ran.clone());
+        (self, ran)
+    }
+
+    /// Give the child a tool source that offers `extra_tool`, and the list of the calls it ran.
+    fn with_child_source(mut self) -> (Self, Arc<std::sync::Mutex<Vec<String>>>) {
+        let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.child_source = Some(ran.clone());
         (self, ran)
     }
 
@@ -472,6 +510,9 @@ impl Rig {
                     ran: ran.clone(),
                 })
                 .tool(adam_llm_agent::ReadOutput);
+        }
+        if let Some(ran) = &self.child_source {
+            builder = builder.tool_source(Extra { ran: ran.clone() });
         }
         builder.build()
     }
@@ -3891,6 +3932,53 @@ mod cases {
         );
     }
 
+    /// The narrowing holds on an agent that has a tool source too: a source's tool is hidden from the
+    /// request and refused unrun like the agent's own, and a session with no config is offered it.
+    pub async fn a_sources_tool_is_narrowed_like_the_agents_own(store: DynStore) {
+        let (rig, _ran) = Rig::new().with_child_tools();
+        let (rig, source_ran) = rig.with_child_source();
+        rig.child_mock
+            .push_tool_calls(vec![call("x", "extra_tool", json!({}))])
+            .push_text("narrowed done")
+            .push_text("plain done");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        let narrowed = child_run_id(parent, "narrowed");
+        let plain = child_run_id(parent, "plain");
+        rig.parent_mock
+            .push_tool_calls(vec![call(
+                "narrowed",
+                "subagent_start",
+                json!({"agent": "helper", "description": "d", "prompt": "p",
+                       "config": {"deny_tools": ["extra_*"]}}),
+            )])
+            .push_tool_calls(vec![read_call("r1", narrowed, true)])
+            .push_tool_calls(vec![start_call("plain", false)])
+            .push_tool_calls(vec![read_call("r2", plain, true)])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let requests = rig.child_mock.requests();
+        assert!(
+            !offered(&requests[0]).contains(&"extra_tool".to_owned()),
+            "{:?}",
+            offered(&requests[0])
+        );
+        assert!(offered(&requests[2]).contains(&"extra_tool".to_owned()));
+        let results = tool_results(&state_of(&rt, narrowed).await);
+        let (_, refusal, is_error) = result_of(&results, "x");
+        assert!(
+            *is_error && refusal.contains("`extra_tool` is not offered"),
+            "{refusal}"
+        );
+        assert!(
+            source_ran.lock().unwrap().is_empty(),
+            "the source ran nothing"
+        );
+    }
+
     /// `deny_tools` is applied after `tools`: a tool both lists name is hidden, and a pattern in
     /// either list selects what it matches.
     pub async fn deny_tools_wins_over_tools_and_a_pattern_selects(store: DynStore) {
@@ -5876,6 +5964,7 @@ macro_rules! session_suite {
                 a_config_value_of_the_wrong_type_is_refused_naming_the_option,
                 round_two_carries_the_config_clamped_to_the_bounds_of_now,
                 a_hidden_tool_is_not_offered_and_a_call_to_it_is_refused_unrun,
+                a_sources_tool_is_narrowed_like_the_agents_own,
                 deny_tools_wins_over_tools_and_a_pattern_selects,
                 round_two_carries_the_tools_its_config_narrows,
                 a_session_without_tools_carries_an_empty_value,
