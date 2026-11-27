@@ -60,6 +60,11 @@
             "max_rounds": {
               "type": "integer",
               "minimum": 1
+            },
+            "token_budget": {
+              "type": "integer",
+              "minimum": 1000,
+              "description": "The most tokens the whole session may spend, input and output: a round that reaches it ends with a closing answer, and a spent session takes no more messages."
             }
           },
           "additionalProperties": false

@@ -220,7 +220,7 @@ impl SessionTools {
 
 /// The options of `config` as the model writes them (snake_case, like the other arguments), and
 /// the camelCase the wire and the header use for the same names.
-const CONFIG_OPTIONS: [(&str, &str); 7] = [
+const CONFIG_OPTIONS: [(&str, &str); 8] = [
     ("max_turns", "maxTurns"),
     ("max_tool_calls", "maxToolCalls"),
     ("max_output_tokens", "maxOutputTokens"),
@@ -228,6 +228,7 @@ const CONFIG_OPTIONS: [(&str, &str); 7] = [
     ("max_parallel_tool_calls", "maxParallelToolCalls"),
     ("time_limit", "timeLimit"),
     ("max_rounds", "maxRounds"),
+    ("token_budget", "tokenBudget"),
 ];
 
 /// A session's config as a list and a read say it: `max_turns 20, time_limit 10`, the options that
@@ -248,12 +249,13 @@ fn config_words(config: &SessionConfig) -> Option<String> {
 
 /// The options a remote subagent refuses: every one but `time_limit` and `max_rounds` (ADR 0054
 /// decision 4).
-const REMOTE_REFUSED: [&str; 5] = [
+const REMOTE_REFUSED: [&str; 6] = [
     "max_turns",
     "max_tool_calls",
     "max_output_tokens",
     "context_window",
     "max_parallel_tool_calls",
+    "token_budget",
 ];
 
 /// The [`SessionConfig`] a `subagent_start` call asked for, or the sentence that says what is wrong
@@ -272,16 +274,28 @@ fn config_of(value: &Value) -> Result<SessionConfig, String> {
                 options.join(", ")
             ));
         };
-        // Every option is a whole number of 32 bits. Say so by name here, so the refusal is ours:
-        // serde's names no option and echoes what the model wrote, without a bound. A `0` passes
-        // to `admit`, which refuses it with the words of each option.
+        // Every option is a whole number: 32 bits, but `token_budget`, which counts tokens and goes
+        // to 2^53 − 1. Say so by name here, so the refusal is ours: serde's names no option and
+        // echoes what the model wrote, without a bound. A `0` passes to `admit`, which refuses it
+        // with the words of each option.
         match value {
             Value::Null => continue,
-            Value::Number(n) if n.as_u64().is_some_and(|n| u32::try_from(n).is_ok()) => {}
+            Value::Number(n)
+                if n.as_u64().is_some_and(|n| {
+                    if *name == "tokenBudget" {
+                        n <= adam_runtime::MAX_SESSION_TOKEN_BUDGET
+                    } else {
+                        u32::try_from(n).is_ok()
+                    }
+                }) => {}
             _ => {
+                let most = if *name == "tokenBudget" {
+                    adam_runtime::MAX_SESSION_TOKEN_BUDGET
+                } else {
+                    u64::from(u32::MAX)
+                };
                 return Err(format!(
-                    "config.{key} must be a positive integer (a whole number, at most {})",
-                    u32::MAX
+                    "config.{key} must be a positive integer (a whole number, at most {most})"
                 ));
             }
         }
@@ -371,6 +385,16 @@ fn closed_words(session: RunId, idle_expired: bool) -> String {
         "session `{session}` is closed and takes no more messages{why} (a closed session is never \
          reopened). Start a new one with `{SUBAGENT_START}`, and put what it needs in `prompt`: it \
          does not see the closed session's conversation."
+    )
+}
+
+/// Why a session that spent its token budget takes no more messages (ADR 0054, decision 6).
+fn spent_words(session: RunId, header: &SessionHeader) -> String {
+    let budget = header.token_budget().unwrap_or_default();
+    format!(
+        "session `{session}` has spent its token budget ({} of {budget} tokens) and takes no more \
+         messages: close it with `{SUBAGENT_CLOSE}` and start a new one with `{SUBAGENT_START}`",
+        header.spent
     )
 }
 
@@ -644,6 +668,14 @@ impl Tool for Start {
                                 "description": "Minutes one round may take.",
                             },
                             "max_rounds": { "type": "integer", "minimum": 1 },
+                            "token_budget": {
+                                "type": "integer",
+                                "minimum": 1000,
+                                "description": "The most tokens the whole session may spend, \
+                                                input and output: a round that reaches it ends \
+                                                with a closing answer, and a spent session takes \
+                                                no more messages.",
+                            },
                         },
                         "additionalProperties": false,
                     },
@@ -806,6 +838,7 @@ impl Tool for Start {
             // may a round of it ask them (ADR 0045 decision 9).
             visible: ctx.context(crate::CHILD_SESSIONS_CONTEXT_KEY) == Some(&Value::Bool(true)),
             config,
+            spent: 0,
         };
         let input = round_message(ctx, prompt, &header);
         let within = round_within(agent, header.config.as_ref());
@@ -907,6 +940,11 @@ impl Tool for Send {
             if view.closed {
                 return refuse(closed_words(session, view.idle_expired));
             }
+            // A session that spent its token budget takes no more messages (ADR 0054, decision 6),
+            // and the header the view already carries says so: no second store read.
+            if let Some(header) = view.header.as_ref().filter(|h| h.is_spent()) {
+                return refuse(spent_words(session, header));
+            }
             let steered = || user_inbound(message, ctx.call_id());
             if view.state == SessionState::Working {
                 match starter.steer(&view, steered()).await {
@@ -978,6 +1016,7 @@ impl Tool for Send {
                 workspace: None,
                 visible: false,
                 config: None,
+                spent: 0,
             });
             header.config = config;
             header.round = view.round + 1;
@@ -1265,6 +1304,7 @@ impl Tool for Close {
                 workspace: None,
                 visible: false,
                 config: None,
+                spent: 0,
             });
             header.round = view.round + 1;
             header.closed = true;
@@ -1462,6 +1502,7 @@ mod tests {
                 updated_at: Timestamp::now(),
             },
             config: None,
+            spent: 0,
         }
     }
 

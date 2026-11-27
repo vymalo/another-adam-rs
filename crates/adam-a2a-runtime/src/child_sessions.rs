@@ -477,7 +477,7 @@ fn parse_start(start: &Value, sessions: &ChildSessions) -> Result<Start, String>
 
 /// The options of `start.config`, as the wire spells them, and as the model's tool and the
 /// refusals of [`SessionBounds::admit`] spell them.
-const CONFIG_OPTIONS: [(&str, &str); 7] = [
+const CONFIG_OPTIONS: [(&str, &str); 8] = [
     ("maxTurns", "max_turns"),
     ("maxToolCalls", "max_tool_calls"),
     ("maxOutputTokens", "max_output_tokens"),
@@ -485,16 +485,18 @@ const CONFIG_OPTIONS: [(&str, &str); 7] = [
     ("maxParallelToolCalls", "max_parallel_tool_calls"),
     ("timeLimit", "time_limit"),
     ("maxRounds", "max_rounds"),
+    ("tokenBudget", "token_budget"),
 ];
 
 /// The options a remote helper refuses: every one but `timeLimit` and `maxRounds` (ADR 0054
 /// decision 4), the rule `subagent_start` applies to a remote subagent.
-const REMOTE_REFUSED: [&str; 5] = [
+const REMOTE_REFUSED: [&str; 6] = [
     "maxTurns",
     "maxToolCalls",
     "maxOutputTokens",
     "contextWindow",
     "maxParallelToolCalls",
+    "tokenBudget",
 ];
 
 /// `start.config`, read and admitted ([ADR 0054], decisions 1 and 2): **an unknown member is
@@ -522,12 +524,24 @@ fn parse_config(
         }
         match value {
             Value::Null => continue,
-            // A whole number of 32 bits; a `0` goes on to `admit`, which says it by option.
-            Value::Number(n) if n.as_u64().is_some_and(|n| u32::try_from(n).is_ok()) => {}
+            // A whole number: 32 bits, but `tokenBudget`, which counts tokens and goes to 2^53 − 1.
+            // A `0` goes on to `admit`, which says it by option.
+            Value::Number(n)
+                if n.as_u64().is_some_and(|n| {
+                    if key == "tokenBudget" {
+                        n <= adam_runtime::MAX_SESSION_TOKEN_BUDGET
+                    } else {
+                        u32::try_from(n).is_ok()
+                    }
+                }) => {}
             _ => {
+                let most = if key == "tokenBudget" {
+                    adam_runtime::MAX_SESSION_TOKEN_BUDGET
+                } else {
+                    u64::from(u32::MAX)
+                };
                 return Err(format!(
-                    "`start.config.{key}` is a whole number, at most {}",
-                    u32::MAX
+                    "`start.config.{key}` is a whole number, at most {most}"
                 ));
             }
         }
@@ -1296,6 +1310,7 @@ impl RuntimeTaskBackend {
             // What the person asked, admitted by the helper's bounds when the message was read:
             // a replay reads it from here and never recomputes it (ADR 0054 decision 3).
             config: start.config,
+            spent: 0,
         };
         put_header(&mut inbound, &header).map_err(BackendError::InvalidParams)?;
         self.runtime
@@ -1382,6 +1397,16 @@ impl RuntimeTaskBackend {
                 };
                 return Err(BackendError::UnsupportedOperation(format!(
                     "session {session} is closed and takes no more messages{why}"
+                )));
+            }
+            // A session that spent its token budget takes no more messages (ADR 0054, decision 6),
+            // and the header the view already carries says so: no second store read.
+            if let Some(header) = view.header.as_ref().filter(|h| h.is_spent()) {
+                return Err(BackendError::UnsupportedOperation(format!(
+                    "session {session} has spent its token budget ({} of {} tokens) and takes no \
+                     more messages",
+                    header.spent,
+                    header.token_budget().unwrap_or_default()
                 )));
             }
             let mut inbound = inbound
@@ -1616,6 +1641,7 @@ fn next_header(view: &SessionView, session: RunId) -> SessionHeader {
         workspace: None,
         visible: false,
         config: None,
+        spent: 0,
     });
     header.round = view.round + 1;
     // The round before may have been one that only cleaned up after a cancel.
@@ -1890,7 +1916,8 @@ mod tests {
     fn a_start_carries_its_config_in_camel_case_admitted_by_the_bounds() {
         let Ok(Asked::Start(start)) = start_with(json!({
             "maxTurns": 20, "maxToolCalls": 100, "maxOutputTokens": 2048,
-            "contextWindow": 60000, "maxParallelToolCalls": 4, "timeLimit": 10, "maxRounds": 5
+            "contextWindow": 60000, "maxParallelToolCalls": 4, "timeLimit": 10, "maxRounds": 5,
+            "tokenBudget": 50000
         })) else {
             panic!("a config within the bounds is admitted");
         };
@@ -1902,6 +1929,7 @@ mod tests {
         assert_eq!(config.max_parallel_tool_calls, Some(4));
         assert_eq!(config.time_limit, Some(10));
         assert_eq!(config.max_rounds, Some(5));
+        assert_eq!(config.token_budget, Some(50_000));
         // No config, a null one and an empty one all mean the folder's settings.
         for entry in [json!(null), json!({})] {
             let Ok(Asked::Start(start)) = start_with(entry) else {
@@ -1933,11 +1961,16 @@ mod tests {
             ("timeLimit", json!(31)),
             ("maxRounds", json!(21)),
             ("maxTurns", json!(0)),
+            // `token_budget` is held to the ADR's own floor and ceiling (1,000 to 2^53 − 1).
+            ("tokenBudget", json!(999)),
+            ("tokenBudget", json!(9_007_199_254_740_992_u64)),
         ] {
             let why = start_with(json!({ member: value })).unwrap_err();
             assert!(why.contains(&format!("start.config.{member}")), "{why}");
             assert!(!why.contains("config.max_"), "no snake_case name: {why}");
         }
+        // 2^53 − 1 itself is admitted: the refusal above is the ceiling, not the type.
+        assert!(start_with(json!({"tokenBudget": 9_007_199_254_740_991_u64})).is_ok());
         for value in [json!(-1), json!("5"), json!(1.5), json!(5_000_000_000_u64)] {
             let why = start_with(json!({"maxTurns": value})).unwrap_err();
             assert!(why.contains("start.config.maxTurns"), "{why}");
@@ -1974,6 +2007,8 @@ mod tests {
         let why = ask(&remote, json!({"maxTurns": 3})).unwrap_err();
         assert!(why.contains("start.config.maxTurns"), "{why}");
         assert!(why.contains("remote"), "{why}");
+        let why = ask(&remote, json!({"tokenBudget": 5_000})).unwrap_err();
+        assert!(why.contains("start.config.tokenBudget"), "{why}");
         let Ok(Asked::Start(start)) = ask(&remote, json!({"timeLimit": 5, "maxRounds": 3})) else {
             panic!("a remote helper takes timeLimit and maxRounds");
         };
@@ -2030,6 +2065,7 @@ mod tests {
                 updated_at: adam_core::store::now(),
             },
             config: None,
+            spent: 0,
         }
     }
 
@@ -2086,6 +2122,7 @@ mod tests {
             workspace: None,
             visible: false,
             config: None,
+            spent: 0,
         };
         let mut text = Inbound::new("message", json!("hi"));
         put_header(&mut text, &header).unwrap();

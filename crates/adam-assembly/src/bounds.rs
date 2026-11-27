@@ -72,6 +72,8 @@ fn is_local(manifest: &AgentManifest, target: &SessionTarget) -> bool {
 ///   option (decision 2); a *folder* above the deployment's is clamped (decision 3).
 /// * `time_limit` is the round's own limit (`limits.max_minutes`, or the remote's wait), and
 ///   `max_rounds` the root's effective `max_session_rounds`.
+/// * `token_budget` is `None`: no folder caps a session's tokens today (ADR 0054 decision 4), so
+///   `SessionBounds::admit` holds the request to the ADR's own 1,000 to 2^53 − 1.
 ///
 /// A remote subagent's rounds are runs of an agent of its own, and the ADR refuses every option
 /// but `time_limit`, `max_rounds` and `instructions` on one: the loop's defaults stand for the
@@ -117,5 +119,8 @@ pub(crate) fn bounds_of(
             u32::try_from(within.as_secs() / 60).unwrap_or(u32::MAX)
         }),
         max_rounds,
+        // No folder caps a session's tokens today (ADR 0054, decision 4): any value narrows, and
+        // `admit` holds a request to the ADR's own ceiling.
+        token_budget: None,
     }
 }

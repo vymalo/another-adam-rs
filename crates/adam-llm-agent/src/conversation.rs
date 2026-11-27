@@ -409,6 +409,11 @@ pub enum LimitKind {
     /// The model called the same tool, with the same arguments and the same result before, over
     /// and over (`doom_loop`): the third call in a row was refused twice.
     RepeatedCall,
+    /// The session spent its `token_budget` ([ADR 0054], decision 6): the next model call was its
+    /// closing turn.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    TokenBudget,
 }
 
 impl LimitKind {
@@ -418,6 +423,7 @@ impl LimitKind {
             Self::MaxTurns => "max_turns",
             Self::MaxToolCalls => "max_tool_calls",
             Self::RepeatedCall => "repeated_call",
+            Self::TokenBudget => "token_budget",
         }
     }
 }
@@ -630,6 +636,17 @@ pub struct Conversation {
     /// [`usage_totals`](Self::usage_totals)).
     #[serde(default)]
     pub usage: Usage,
+    /// The tokens of the session this run is a round of, so far ([ADR 0054], decision 6): the
+    /// earlier rounds', carried by the header ([`SessionHeader::spent`](adam_runtime::SessionHeader)),
+    /// plus this round's own model calls, input and output as `usage/v1` counts them. The loop
+    /// writes it into the header at every commit, so the runtime's listing reads it from the
+    /// round's record, and a send refuses a session that spent its budget without another store
+    /// read. `0` for a run that is no round of a session, and what state written before it existed
+    /// reads; not written while `0`.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub spent: u64,
     /// The tokens of every model call of the task, one entry per provider and model: this run's own
     /// calls and, once each child run has answered, the children's (theirs, and their own children's).
     /// What the A2A server writes on the task as the `usage/v1` totals when it ends or waits. Absent
@@ -998,6 +1015,10 @@ impl Conversation {
 }
 
 fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 
@@ -1790,6 +1811,9 @@ impl Conversation {
             context: self.context.clone(),
             plan: self.plan.clone(),
             session: self.session.clone(),
+            // The session's spend comes with its header: a run that continues a round of a session
+            // goes on from the tokens its earlier rounds and it already spent.
+            spent: self.spent,
             // The groups the run loaded are still loaded: its first request must offer the tools
             // the run before ended with, or the array would lose them. The turns the array grew at
             // are not carried: this run has no request before its first. The loaders and the

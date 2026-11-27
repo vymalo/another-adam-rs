@@ -292,15 +292,24 @@ this conversation's is "no session"). At most 16 sessions that are not closed an
 `max_open` and `max_rounds` as constants for now).
 
 **A session's own limits** ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md),
-slice 1). `subagent_start` takes an optional `config` of seven options: `max_turns`, `max_tool_calls`, `max_output_tokens`,
-`context_window`, `max_parallel_tool_calls`, `time_limit` (minutes) and `max_rounds`. An option chooses within what the
+slice 1). `subagent_start` takes an optional `config` of eight options: `max_turns`, `max_tool_calls`, `max_output_tokens`,
+`context_window`, `max_parallel_tool_calls`, `time_limit` (minutes), `max_rounds` and `token_budget`. An option chooses within what the
 subagent's folder allows and **never widens it**: a value above its bound is refused, in words that name the option
-(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the seven is refused too. What was
+(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the eight is refused too. What was
 admitted is kept in the session's header, and the round reads its limits from it. Five of them apply at the next model call
-(`max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`); `time_limit` and
+(`max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, and `token_budget`, below); `time_limit` and
 `max_rounds` apply to the next round. A later round copies the config and **clamps it to the bounds of that moment**, so a
 deployment that lowered a limit is obeyed and nothing is raised back. `max_output_tokens` is never `0` (that would leave the cap
 to the model) and a `context_window` is never so small that no history fits: it is held to the least that leaves room.
+
+**The token budget** (slice 6). `token_budget` caps the whole session's tokens, input and output as `usage/v1` counts them:
+1,000 to 2^53 − 1, and no folder bounds it today, so any value narrows. Before each model call, the tokens the session has
+spent (`spent`: the earlier rounds' carried by the header, plus this round's own calls) reaching the budget makes that call
+the **closing turn**, and the round ends with `limit: "token_budget"` — or, when the closing turn says nothing, with the words
+`token budget reached`. `spent` is written into the header at every commit, so `subagent_list`, `subagent_read` and the A2A
+session object's listing read it from the round's record, and a **send to a spent session is refused** (`subagent_send` in
+words, the A2A front as `UnsupportedOperation`) from the header the send already reads: no round starts and no model is
+called. A session with no budget spends and is never refused.
 
 ```mermaid
 sequenceDiagram
