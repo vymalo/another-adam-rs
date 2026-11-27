@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adam-core"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "adam-error",
  "async-trait",
@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "adam-error"
-version = "0.1.0"
+version = "0.6.0"
 
 [[package]]
 name = "adam-sqlite-probe"
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "adam-store-sqlite"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "adam-core",
  "adam-error",

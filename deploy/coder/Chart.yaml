@@ -4,8 +4,8 @@ description: "The adam-rs coder agent (A2A): coding task to verified pull reques
 type: application
 # release-please owns both versions (release-please-config.json, ADR 0084): a release sets them, and the
 # workspace's crates, to one number. The markers are comments, so they change no render.
-version: 0.5.0 # x-release-please-version
-appVersion: "0.1.0" # x-release-please-version
+version: 0.6.0 # x-release-please-version
+appVersion: "0.6.0" # x-release-please-version
 kubeVersion: ">=1.37.0-0"
 sources:
   - https://github.com/vymalo/another-adam-rs
