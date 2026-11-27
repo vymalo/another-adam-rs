@@ -5,7 +5,7 @@ which states the decision. This page holds the survey it was written from (every
 its `path:line`), the third-party facts with their sources, and what each slice must prove.
 
 Surveyed at `origin/main` `45abb141` on 2026-11-27. Line numbers are at that commit; re-read them before a slice.
-Slice P0 is built (2026-11-27): [its proofs](#p0-built-2026-11-27). Slice P1 is built (2026-11-27): [its proofs](#p1-built-2026-11-27). The survey's `src/lib.rs` lines are still
+Slice P0 is built (2026-11-27): [its proofs](#p0-built-2026-11-27). Slice P1 is built (2026-11-27): [its proofs](#p1-built-2026-11-27). Slice P2 is built (2026-11-27): [its proofs](#p2-built-2026-11-27). The survey's `src/lib.rs` lines are still
 `45abb141`'s; P0 moved most of them down by about 150 lines.
 
 ## How to check a slice against this page
@@ -116,7 +116,7 @@ complete.
 | Generated columns are virtual by default (18): computed when read; the expression only immutable, the current row, no other generated column; a virtual one uses only built-in functions and types, operators and casts included; no value can be written to one in `INSERT` or `UPDATE` | *verified 2026-11-27* | https://www.postgresql.org/docs/18/ddl-generated-columns.html, https://www.postgresql.org/docs/18/release-18.html |
 | "Adding a virtual generated column never requires a rewrite" | *verified 2026-11-27* | https://www.postgresql.org/docs/18/sql-altertable.html (Notes) |
 | `jsonb_typeof` and the `jsonb` and integer `=` operators of the served expression are immutable | *verified 2026-11-27*: the server refuses a generated column whose expression is not, and the migration of a fresh database and of a version 7 one added it on 18.7 (P1, `tests/migrate.rs`) | `crates/adam-store-postgres/tests/migrate.rs` `a_version_7_schema_gets_the_served_column_without_a_rewrite` |
-| A virtual generated column can be read in `UPDATE .. RETURNING` (the claim) | *verified 2026-11-27* on 18.7: P1's inline claim returns `r.served`, and the claim cases of `store_conformance!` and `tests/claim.rs` pass | `claim_due_sql` in `crates/adam-store-postgres/src/lib.rs` |
+| A virtual generated column can be read in `UPDATE .. RETURNING` (the claim) | *verified 2026-11-27* on 18.7: P1's inline claim returns `r.served`, and the claim cases of `store_conformance!` and `tests/claim.rs` pass | `claim_due_function` (was `claim_due_sql`) in `crates/adam-store-postgres/src/lib.rs` |
 | PostgreSQL 18.0 was released 2025-09-25 | *verified 2026-11-27* | https://www.postgresql.org/docs/18/release-18.html |
 | The bundled SQLite is 3.54.1 (`RETURNING`, triggers with `RAISE`, `GLOB`) | *verified 2026-11-27* | `Cargo.lock`: `libsqlite3-sys` 0.39.1, its `sqlite3/sqlite3.h` |
 | The supported range today: PostgreSQL 12+, CI 12 and 17, compose 16 | *verified 2026-11-27* | `crates/adam-store-postgres/README.md:3`, `.github/workflows/ci.yml:319`–`:320`, `compose.yaml:29`, `docs/reference/store-adapters.md:111` |
@@ -241,6 +241,48 @@ conversation id `a`, U+10FFFF, `b`, and the id `a`, U+10FFFF itself. U+10FFFF is
 unlikely to hold it. An exact bound is the prefix's successor (its last code point raised by one, skipping the
 surrogates, dropping trailing U+10FFFF, and no bound at all for a prefix made only of them). Not changed here: it is a
 change of what a listing returns, outside P1.
+
+## P2, built (2026-11-27)
+
+Branch `claude/magical-babbage-mdud6w` on `origin/main` `03e7bcda`.
+
+### What it is
+
+| Piece | Where | What |
+|---|---|---|
+| The function | `crates/adam-store-postgres/src/lib.rs`, `claim_due_function`, in `migrate_functions` | survey row 13. `CREATE OR REPLACE FUNCTION {p}claim_due(in_agents text[], in_worker text, in_pinned boolean, in_busy uuid[], in_now timestamptz, in_until timestamptz, in_limit bigint) RETURNS TABLE (..) LANGUAGE sql BEGIN ATOMIC`: a `WITH due AS (.. ORDER BY sched_at, id LIMIT .. FOR UPDATE SKIP LOCKED), claimed AS (UPDATE .. FROM due .. RETURNING ..) SELECT .. ORDER BY sched_at, id`. One function for both scopes: `pinned` adds `owner IS NULL OR owner = worker` to the candidates and `COALESCE(owner, worker)` to the update, and `false` applies no owner filter and writes `owner` back unchanged. Every column is qualified (`d.`, `r.`, `c.`): a parameter and an output column share a name in a SQL body, and the column wins |
+| The call | `Sql::claim_due` (one statement, `SELECT <served_columns> FROM {p}claim_due($1..$7)`), `PgStore::claim_due` | the two statements `claim_due_any` and `claim_due_pinned` and the Rust sort are gone; the function returns claim order. `agents.is_empty() \|\| limit == 0` still returns before any call |
+| The version | `SCHEMA_VERSION = 9`, `tests/fixtures/schema-v9.sql` (`git mv` from v8, regenerated with `ADAM_WRITE_FIXTURE=1`), `the_statements_equal_the_version_9_fixture`; `tests/migrate.rs`, `tests/fixture.rs` | the 8 → 9 step is the ordinary migration transaction: one `CREATE OR REPLACE FUNCTION`, no lock on `runs` beyond the catalog |
+| The tests | `tests/functions.rs`: `FUNCTIONS` lists `claim_due` with its identity arguments and a call; `a_version_8_database_gets_the_claim_function_and_claims` (drop the function, stamp 8, migrate, claim through the store) | `every_function_is_created_and_answers` is the fresh-database test of decision 10 |
+| A column under the function | `tests/support::drop_claim_function`, used by `tests/migrate.rs` (the version 5 and version 7 steps drop columns) and `tests/errors.rs` (changes `created_at`'s type) | PostgreSQL refuses to alter or drop a column a SQL-standard body depends on; decision 10 said so, and these three tests now do what such a migration must |
+
+### What was run (2026-11-27, toolchain 1.98.1, `postgres:18.7` at the pinned digest, `ADAM_TEST_REQUIRE_DB=1`)
+
+| Gate | Result |
+|---|---|
+| `cargo test -p adam-store-postgres --no-fail-fast` | lib 10, `body_writers` 6, `claim` 2, `conformance` 79, `errors` 6, `fixture` 1, `functions` 5 (one new), `head_view` 2, `migrate` 9, `time` 4 passed; 0 failed, 0 ignored |
+| Not run here | `adam-runtime` and `adam-notify-postgres` against the server and the workspace-wide gates (the disk is shared); this slice changes no code of theirs. CI is the proof for those |
+
+### Broken on purpose
+
+| Mutation | Failing cases |
+|---|---|
+| `SKIP LOCKED` removed from the function | `tests/claim.rs::a_run_claim_skips_a_row_another_transaction_holds` (the claim waits for the locked row). **No conformance case fails**: a claim that waits is still exclusive, so `claim_is_exclusive_under_concurrency` cannot see it. The same was true of the inline statement |
+| the pinned owner filter replaced by `AND true` | `any_claim_ignores_and_never_sets_the_owner`, `pinned_claim_never_gives_a_run_to_another_worker`, `pinned_claim_sets_the_owner_on_first_claim`, `pinned_claims_are_exclusive_and_stable_under_concurrency` (4 of 79); `tests/migrate.rs::a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs` |
+| the final `ORDER BY c.sched_at, c.id` reversed on `sched_at` | `claim_filters_agents_and_limit` (1 of 79). The order moved into the function, so this is the case that now holds it |
+| the lease-free test `(d.lease_until IS NULL OR d.lease_until <= in_now)` replaced by `true` (a held lease is claimed again) | `claim_filters_agents_and_limit`, `claim_skips_busy_runs`, `claim_respects_due_rules`, `lease_expiry_allows_takeover`, `renew_and_release_lease`; `claim_is_exclusive_under_concurrency` never finishes (every claim takes the same runs again) and was killed |
+| `d.sched_at <= in_now` replaced by `true` (a run not yet due is claimed) | `claim_respects_due_rules`, `activity_counts_a_claimed_run_and_reports_the_next_schedule` (2 of 79) |
+| `d.id <> ALL(in_busy)` replaced by `true` (a busy run is claimed) | `claim_skips_busy_runs` (1 of 79) |
+
+A mutation of the function body is seen only on a fresh table prefix (a start on a current schema runs no DDL); each
+run used its own `ADAM_TEST_TABLE_PREFIX`.
+
+### The cost of a call (measured, not yet a finding)
+
+Server side only, in a `DO` loop on one connection of `postgres:18.7` (no round trip), 5000 due runs of one agent:
+1000 claims of one run took 1.32 s through the function and 1.48 s through the P1 statement; 100 claims of 50 runs
+took 284 ms through the function. A claim scans the due rows past those it leased, which is the same work either way.
+The cost of a call from a worker (one round trip either way) is *unverified*.
 
 ## Slice proofs
 

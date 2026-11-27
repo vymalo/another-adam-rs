@@ -54,3 +54,16 @@ where
         .unwrap_or_else(|e| panic!("{sql}: {e}"))
         .map(|row| row.get(0))
 }
+
+/// Drop the claim function (schema version 9) of the store with this table prefix. A test that
+/// alters or drops a column the function names must do it first: PostgreSQL refuses the change
+/// while a function's body depends on the column (ADR 0082, decision 10).
+pub async fn drop_claim_function(pool: &Pool, prefix: &str) {
+    exec(
+        pool,
+        &format!(
+            "DROP FUNCTION IF EXISTS {prefix}claim_due(text[], text, boolean, uuid[], timestamptz, timestamptz, bigint)"
+        ),
+    )
+    .await;
+}
