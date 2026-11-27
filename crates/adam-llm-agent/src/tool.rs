@@ -1410,6 +1410,16 @@ impl ToolCtx {
         self
     }
 
+    /// The context of a **part of a call**: a tool that runs several things at once gives each part
+    /// the call's id and a suffix of its own, so that an output each part keeps has its own id
+    /// ([`output_id_of`](crate::output_id_of)). Everything else — the run, the step, the state, the
+    /// cancel token — is the call's.
+    #[must_use]
+    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
+        self.call_id = call_id.into();
+        self
+    }
+
     /// The conversation's plan as this call starts: the one a tool before it in the same turn left,
     /// since calls run one after the other. `None` while there is none. Return the new plan with
     /// [`ToolOutput::with_plan`]; this value is a copy, and changing nothing here changes nothing

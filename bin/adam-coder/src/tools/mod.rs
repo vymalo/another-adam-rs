@@ -14,7 +14,7 @@
 //! | `read_file { path, offset?, limit? }` (paged; `start_line` and `end_line` are aliases), `read_files { paths }` (1 to 16 files in one call), `write_file { path, content }`, `edit_file { path, old, new, replace_all? }`, `apply_patch { patch }` | [`files`] |
 //! | `file_diagnostics { path, repo?, wait?, offset?, limit? }`, `find_definition { path, line, symbol, occurrence?, repo?, wait? }`, `find_references { path, line, symbol, occurrence?, include_declaration?, repo?, wait?, offset?, limit? }`: what a language server says about a file; read only, kept between calls | [`lsp`] |
 //! | `share_file { path, repo?, name? }` | [`share`]: a file of the workspace, shown to the person as a file artifact |
-//! | `run_checks { command }` | [`checks`] |
+//! | `run_checks { command \| commands }`: one command, or several independent ones at the same time | [`checks`] |
 //! | `use_repository_environment { repo?, config?, off? }` | [`environment`] (offered only with run pods, an allowed image prefix and a configuration) |
 //! | `commit_and_push { message }` / `open_pull_request { title, body }` | [`publish`] |
 //! | `merge_pull_request { repo, number, method?, delete_branch? }` (tier `auto`), `rename_repository { repo, new_name }` and `delete_repository { repo, confirm }` (tier `bypass`) | [`admin`] |
@@ -43,7 +43,8 @@
 //!   time, a pull request already open for the head is reported as it is (the run continued a
 //!   branch an earlier task opened it for, or the call is repeated), and
 //!   `CodeHost::open_pull_request` returns it instead of a second one in any case.
-//! * `run_checks`: failures are counted per call id ([`notes`]).
+//! * `run_checks`: failures are counted per call id, and a call of several commands counts once
+//!   ([`notes`]).
 //! * `run`: a command that was killed or never recorded runs again and makes the same files (it
 //!   is for commands that can run twice, as every build is); it writes nothing to the notes.
 //! * `edit_file`: the replacement is exact and the file is written whole, so a repeat after a

@@ -47,6 +47,14 @@ a question (`stop_as_question`) unless the run failed.
    0010), the login shell, a `cwd` inside the worktree, `CHECK_TIMEOUT_SECS` and the output cap, the process's secrets hidden
    from the child, a missing tool reported as a missing toolchain. The three descriptions say which is which.
 
+   *Amended 2026-11-28 (the independent checks of a call run at the same time):* `run_checks` takes one command with
+   `command`, or several **independent** ones with `commands` (a JSON array; exactly one of the two, and giving both or
+   neither is an error that names both), and runs them at the same time, at most `MAX_PARALLEL_TOOL_CALLS` at once, each
+   through the process pool (`MAX_PROCESSES`). The verdict is the one running them one after another gave: every command
+   still runs, each keeps its own output tail and its place, `passed` is true only when all of them passed, `findings`
+   names the failing ones in the caller's order, and a call spends **one** check cycle when any of them fails. The
+   failure the notes reuse on an unchanged tree is keyed on the whole list. (Epic "adam: a faster coder", card ANR-243.)
+
 2. **`run` keeps files and nothing of git.** The worktree is snapshotted before the command as `run_command` does it (git
    directory, `.git` file, `HEAD`, branch, refs, local configuration, `info/exclude`); after it, everything but the files is
    compared. A command that changed any of it is **undone entirely, its files included, and refused**: one that moved `HEAD`

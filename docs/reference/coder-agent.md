@@ -61,7 +61,7 @@ sequenceDiagram
     end
 
     loop until green, or the check cycles are used up
-        A->>Sh: run_checks(command), with a time limit
+        A->>Sh: run_checks(command, or commands at the same time), with a time limit
         Sh-->>A: exit code and output tail
         opt exit code is not 0, in a repository (not a scratch project, not a timeout)
             A->>G: add_base_checkout: origin/base, detached, beside the worktree
@@ -103,7 +103,10 @@ Artifacts:
   `pull_request` of a `commit_and_push`, which runs the same gate and the same code path in the same call.
 * `checks` (`passed`, `commit`, `tree`, optional `summary`, `findings`, and `preexisting` with `base_commit` when the
   command fails on the base too): reported by every `run_checks` that ran; `commit_and_push` emits one bound to the pushed commit (the last run's report if it ran on the
-  pushed tree, else `passed: false`). An orchestrator gates on the last `checks` whose `commit` is the
+  pushed tree, else `passed: false`). A call names one command, or several independent ones with `commands`
+  (a JSON array) which run at the same time, at most `MAX_PARALLEL_TOOL_CALLS` at once: one artifact, `passed` only
+  when every one of them passed, the failing ones in the caller's order, and one check cycle when any fails.
+  An orchestrator gates on the last `checks` whose `commit` is the
   pushed SHA. A call answered from a failure already recorded on exactly the same unchanged tree runs
   nothing and reports no artifact: the earlier run's is the verdict on that tree. Schema: [coder README](../../bin/adam-coder/README.md#artifacts).
 * `branch`.
