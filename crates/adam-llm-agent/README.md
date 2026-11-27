@@ -529,15 +529,15 @@ parks the run and returns.
   limit, so a lowered deployment limit is obeyed and the session's own `max_rounds` is enforced. Tests:
   `tests/session_limits.rs`, `tests/compaction.rs` and `tests/sessions.rs`.
 * **`report_schema`** (ADR 0054 slice 9, local subagents only). The round's final answer must be one JSON value that matches
-  the schema (draft 2020-12, checked with `jsonschema` without its default features: nothing is fetched, so the crate still
-  holds no HTTP client or TLS stack for the embedded set). `LlmAgent::report_gate` checks it where the round would end: a
+  the schema (draft 2020-12, so a `format` is an annotation and is not enforced; checked with `jsonschema` without its default features: nothing is fetched, so the crate still
+  holds no HTTP client or TLS stack for the embedded set). `LlmAgent::report_gate` checks it where the round would end (the words that end a turn, an announced answer and a tool's `final_answer`): a
   mismatch (or an answer that is not JSON) is put to the model as a turn with the first three problems (the first also tells the
   schema), **twice at most**, each a model call counted in `max_turns` (`Conversation::report_corrections`, absent while `0`,
   reset by a message); then the round fails with `report does not match report_schema` (`REPORT_MISMATCH`) and the last
   problems. An answer at a closing turn (a limit was reached, no correction left) must match or the round fails the same way.
   The read's `config:` line says `report_schema set`. Admission is `SessionBounds::admit` (see `adam-runtime`). Tests:
   `tests/session_limits.rs` (`a_matching_answer_is_the_report_and_costs_no_extra_turn`,
-  `a_mismatch_gets_two_corrective_turns_and_then_fails_the_round_with_the_reason`, and the cases beside them) and
+  `a_mismatch_gets_two_corrective_turns_and_then_fails_the_round_with_the_reason`, `a_tools_final_answer_is_held_to_the_report_schema_and_never_ends_the_round_unchecked`, and the cases beside them) and
   `tests/sessions.rs` (`a_report_schema_is_refused_at_start_when_it_cannot_be_enforced_and_recorded_when_it_can`,
   `a_remote_subagent_refuses_a_report_schema`).
 * **Auto-close.** With `keep_open: false` the session is closed as soon as its round has ended (the report can still be read;

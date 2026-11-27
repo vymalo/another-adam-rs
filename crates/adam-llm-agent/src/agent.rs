@@ -2740,6 +2740,10 @@ impl LlmAgent {
         if retry && state.report_corrections < MAX_REPORT_CORRECTIONS {
             let first = state.report_corrections == 0;
             state.report_corrections += 1;
+            // The answer that did not match is not the answer any more: a tool's announcement
+            // would otherwise be checked again, and end the round, in place of the corrected words.
+            state.announced = None;
+            state.announced_final = false;
             state.messages.push(Message::user_text(report_correction(
                 &problems,
                 first.then_some(&schema),
@@ -8477,6 +8481,16 @@ impl LlmAgent {
                         && state.deferred.is_empty()
                         && ctx.arrived().await? == 0
                     {
+                        // The answer a tool handed over is the round's report: it is held to the
+                        // session's `report_schema` like the words of a turn are.
+                        match self.report_gate(&mut state, &text, true) {
+                            Some(Flow::Fail(error)) => {
+                                self.forget_chars(ctx.run_id());
+                                return Ok(Transition::Fail { state, error });
+                            }
+                            Some(_) => return Ok(Transition::Continue(state)),
+                            None => {}
+                        }
                         if self.run_ending(ctx, &mut state, &text).await? {
                             return Ok(Transition::Continue(state));
                         }

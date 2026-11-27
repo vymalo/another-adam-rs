@@ -750,7 +750,8 @@ impl Tool for Start {
                                 "description": "A JSON Schema (draft 2020-12, at most 16 KiB, \
                                                 with no reference outside itself) that the \
                                                 subagent's final answer must match: one JSON \
-                                                value. The subagent is not shown it unless a \
+                                                value (a `format` is only an annotation, not \
+                                                enforced). The subagent is not shown it unless a \
                                                 first answer fails it: describe the shape in \
                                                 `prompt` too. Not for a remote subagent.",
                             },

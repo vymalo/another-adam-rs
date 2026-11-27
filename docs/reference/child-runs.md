@@ -306,7 +306,8 @@ to the model) and a `context_window` is never so small that no history fits: it 
 must match, for a helper that runs here (a remote one refuses it). The subagent is not shown the schema unless its first answer
 fails it, so describe the shape in `prompt` too. An answer that is not one JSON value, or does not match, is sent back to the
 model with the first three problems, twice at most, and each of those turns counts in `max_turns`; after that the round fails
-with `report does not match report_schema`. It applies from the next round.
+with `report does not match report_schema`. It applies to every round of the session, the first included; a `format`
+is only an annotation under draft 2020-12 and is not enforced.
 
 ```mermaid
 sequenceDiagram
