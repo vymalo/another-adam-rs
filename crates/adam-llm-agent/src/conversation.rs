@@ -976,7 +976,26 @@ pub struct Conversation {
     /// task. Absent from state written before it existed, and not written while `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<RecordedRequest>,
+    /// The distinct requests of the run's model calls, oldest first (ADR 0085, slice E5): an entry
+    /// is appended when a call recorded its request ([`request`](Self::request)) and the request's
+    /// system prompt or tools are not the ones the entry before names, so a run whose tools never
+    /// change has one entry, and a run whose tools change (a group loaded, a tool removed) has one
+    /// more per change. The request of turn `n` is the entry with the latest `turn` at or before
+    /// `n`. Derived from the journaled answer of each call and the state before it, so a replay
+    /// writes the same list. At most [`MAX_RECORDED_REQUESTS`]: the oldest entry is given up. A
+    /// call that recorded nothing (fail-open) appends nothing. Not carried to a later task. Absent
+    /// from state written before it existed, and not written while empty.
+    ///
+    /// **Breaking:** a new public field of a struct that is not `#[non_exhaustive]`: a
+    /// `Conversation` built with a struct literal outside the workspace needs it (or
+    /// `..Default::default()`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<RecordedRequest>,
 }
+
+/// How many distinct requests a run remembers ([`Conversation::requests`]): the oldest is given
+/// up. A run's tools change a few times (a group loaded, a tool removed), not at every turn.
+pub const MAX_RECORDED_REQUESTS: usize = 64;
 
 /// How many rounds a run remembers having reported ([`Conversation::reported_rounds`]): the oldest
 /// is given up. A round given up that is still due is not told again if its report is still in the
@@ -1003,6 +1022,25 @@ impl Conversation {
         self.read_ids.push(id.to_owned());
         let extra = self.read_ids.len().saturating_sub(MAX_READ_IDS);
         self.read_ids.drain(..extra);
+    }
+
+    /// Keep what a model call recorded of its request: it is the last call's
+    /// ([`request`](Self::request), `None` when the call recorded none), and it is appended to
+    /// [`requests`](Self::requests) when its system prompt or tools are not the ones the last
+    /// entry names, giving up the oldest entry past [`MAX_RECORDED_REQUESTS`].
+    pub(crate) fn note_request(&mut self, request: Option<RecordedRequest>) {
+        if let Some(recorded) = &request {
+            let same = self
+                .requests
+                .last()
+                .is_some_and(|last| last.system == recorded.system && last.tools == recorded.tools);
+            if !same {
+                self.requests.push(recorded.clone());
+                let extra = self.requests.len().saturating_sub(MAX_RECORDED_REQUESTS);
+                self.requests.drain(..extra);
+            }
+        }
+        self.request = request;
     }
 }
 
@@ -1864,6 +1902,38 @@ mod tests {
             note: format!("what {loader} is for"),
             note_is_server: false,
         }
+    }
+
+    /// A recorded request is appended only when its prompt or tools differ from the last entry's,
+    /// a call that recorded nothing appends nothing (and clears `request`), and the list keeps the
+    /// newest [`MAX_RECORDED_REQUESTS`].
+    #[test]
+    fn a_request_is_listed_once_per_change_and_the_list_is_bounded() {
+        use adam_runtime::blob_id;
+        let recorded = |turn: u32, tools: &[u8]| RecordedRequest {
+            turn,
+            system: Some(blob_id(b"system")),
+            tools: blob_id(tools),
+        };
+        let mut state = Conversation::default();
+        state.note_request(Some(recorded(0, b"[]")));
+        state.note_request(Some(recorded(1, b"[]")));
+        assert_eq!(state.requests, [recorded(0, b"[]")]);
+        assert_eq!(state.request, Some(recorded(1, b"[]")));
+        state.note_request(None);
+        assert_eq!(state.request, None);
+        assert_eq!(state.requests.len(), 1);
+        state.note_request(Some(recorded(3, b"[1]")));
+        state.note_request(Some(recorded(4, b"[]")));
+        let turns: Vec<u32> = state.requests.iter().map(|r| r.turn).collect();
+        assert_eq!(turns, [0, 3, 4], "a change back is a change");
+
+        let mut long = Conversation::default();
+        for turn in 0..u32::try_from(MAX_RECORDED_REQUESTS + 5).unwrap() {
+            long.note_request(Some(recorded(turn, turn.to_string().as_bytes())));
+        }
+        assert_eq!(long.requests.len(), MAX_RECORDED_REQUESTS);
+        assert_eq!(long.requests[0].turn, 5, "the oldest are given up");
     }
 
     /// A load is state: the list merges by loader name, in call order, and the turn of the next

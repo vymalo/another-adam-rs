@@ -53,7 +53,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `Approval`, `Conversation::approval`, `approval_step`, `approves`, `NOT_APPROVABLE` | ADR 0050 slice H8, see *`Ask` parks for the person's approval*: the call a hook asked a person to approve (`call_id`, `tool`, `question`, `arguments`, `approved`), the name of the step that runs it once approved (`tool:<call id>:approved`), the rule that reads a yes, and what a run nobody can approve answers the call with |
 | `Conversation::continued(&self, text, from: RunId)`, `LlmAgent::init_continuing`, `LlmStarter::init_continuing` | the conversation of a new run that carries on this one with one more user message; what is carried, dropped and reset is in *Continuing a conversation* |
 | `Conversation::is_omission_marker(message, part)` | whether that text part is the marker (the second part of the first message while `omitted_turns` is not zero), so a rule that reads what the user said skips exactly it: the coder's `person_texts` |
-| `Conversation::request`, `RecordedRequest`, `RequestContent` | the system prompt and tools of the run's last model call, stored as content-addressed blobs (ADR 0085 decision 7): `RecordedRequest { turn, system: Option<BlobId>, tools: BlobId }`, read back with `RecordedRequest::load(&store)`; `RecordedRequest::tools_bytes` is the encoding; see *The recorded request* |
+| `Conversation::request`, `RecordedRequest`, `RequestContent` | the system prompt and tools of the run's last model call, stored as content-addressed blobs (ADR 0085 decision 7): `RecordedRequest { turn, system: Option<BlobId>, tools: BlobId }`, read back with `RecordedRequest::load(&store)`; `RecordedRequest::tools_bytes` is the encoding; `Conversation::requests` the run's distinct requests, one per change of prompt or tools, at most `MAX_RECORDED_REQUESTS` (64; ADR 0085 slice E5); see *The recorded request* |
 | `MAX_CARRIED_BYTES`, `OMITTED_MARKER_PREFIX` | the cap on the history a continuation carries (256 KiB of JSON), and the prefix of the marker text part that stands in for the turns dropped to fit it |
 | `COMPACTION_TURN`, `Compaction`, `CompactionReason`, `PromptSize`, `MAX_COMPACTIONS`, `WINDOW_MARGIN_TOKENS`, `summary_output_tokens` | compaction (below): the instruction a summary request ends with, one recorded compaction (`turn`, `dropped_turns`, `reason`, `sessions`, and the facts the marker lists), why it was made (`Budget` or `Overflow`), the last call's reported prompt size, and the most compactions a run makes (8, not counting the one record a continued run carries); `WINDOW_MARGIN_TOKENS` is the 20,000-token margin the budget and the assembly's cap clamp keep free; `summary_output_tokens(cap)` is `min(4,096, cap)`, or 4,096 when the cap is `0` |
 | `Tool::poll_remote`, `RemotePoll` | how a tool that returned `AwaitRemote` answers "how does the task stand": `Ready(ToolOutput)` or `Working`; the default refuses |
@@ -1170,7 +1170,17 @@ had none). The transition names the ids with `Ctx::reference_blobs`, so the comm
   never a stale record of an earlier call); the first failure in a process is a warning, the rest and the "keeps no blobs"
   line are at `debug`. A model call that fails leaves `request` as it was. A continuation starts with none.
 * **No images**: they are in the messages, never in the system prompt or the tools.
-* State and journals written before the field decode with `request` absent, and a state without one writes no member.
+* **Every distinct request (slice E5).** `Conversation::requests` lists the requests of the run's calls oldest first:
+  a call that recorded one appends it when its `system` or `tools` id is not the last entry's, so a run whose tools
+  never change has one entry (its first call's) and one more per change (a group loaded, a tool removed, a source that
+  lists otherwise). The request of turn `n` is the entry with the latest `turn` at or before `n`; `request` stays the
+  last call's. The list is derived from the journaled ids and the state before the call, so a replay writes the same
+  one; its blobs were referenced by the commits that added them. At most `MAX_RECORDED_REQUESTS` (64): the oldest
+  entry is given up. A call that recorded nothing appends nothing (its turn then reads the entry before), and a
+  continuation starts with none. **Breaking** for a `Conversation { .. }` literal outside the workspace (a new public
+  field), as `model_wait` was.
+* State and journals written before the fields decode with `request` absent and `requests` empty, and a state without
+  them writes no member.
 
 ## Features and environment
 
@@ -1194,7 +1204,10 @@ over `MemoryStore` that counts the blob calls): two turns with the same prompt a
 the state, its blobs decode to exactly what the model was sent, one put and one existence check per content, a purge keeps
 them, and a second run stores nothing new; a commit lost after the call replays it without the model and names the same
 request and blobs, storing nothing; a store that refuses every put does not fail the run and records none; an older state
-decodes and a state without a request writes the same bytes. `src/request.rs` pins the canonical tool bytes and the
+decodes and a state without a request writes the same bytes; tools that change mid-run record one entry per change in
+`requests`, and the run replayed after a lost commit writes the same list without the model
+(`tools_that_change_mid_run_record_one_request_per_change`); unchanged tools record one entry. `src/conversation.rs`
+(`a_request_is_listed_once_per_change_and_the_list_is_bounded`) pins the rule and the cap. `src/request.rs` pins the canonical tool bytes and the
 record's shape; `src/agent.rs` (`a_recorded_model_call_reads_a_journal_from_before_streaming`) pins the journal member.
 
 `tests/usage.rs`: one report per completed call with its tokens, alias, provider and window, and the totals; a call without

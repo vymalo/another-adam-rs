@@ -3428,7 +3428,7 @@ impl LlmAgent {
                 if let Some(request) = &request {
                     ctx.reference_blobs(request.blob_ids());
                 }
-                state.request = request;
+                state.note_request(request);
                 // What the request carried **before the tier withheld any** is the truth of the
                 // loaded set: every loaded tool it did not carry is journaled as removed, and a
                 // growth is recorded only when the final request actually grew.
