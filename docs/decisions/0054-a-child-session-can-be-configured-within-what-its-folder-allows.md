@@ -367,3 +367,15 @@ The work proceeds with these; a different answer is a dated note here.
 6. The card lists each helper's named sets (models, tools, skills); they are not secrets, and the card already lists the helpers.
 7. `model` chooses among aliases of one endpoint; several endpoints wait for the model relay.
 8. A set reasoning effort replaces a `MODEL_EXTRA_BODY` member of the same name *(amended 2026-11-21, ADR 0063: the members the model's wire would duplicate)*.
+
+## Amended 2026-11-27 (slice 5, split in two)
+
+Slice 5 — `subagent_close {delete}` — lands in two pieces, because a working round cannot be given the closing
+round that writes the tombstone until it has ended.
+
+1. **The first piece (ANR-1213)** adds `SessionHeader.deleted`, makes `SessionView::from_rounds` answer `None` for
+   a deleted session (so it is never listed again and every tool refuses it as *no session*), and accepts
+   `delete: true` on an **idle** session, whose closing round writes the tombstone. Its runs stay in the store.
+2. **A working session is refused**, with words that say to close it first — *not* cancelled by the delete, which is
+   what decision 10 says. The cancel-then-delete order is the second piece, together with the due rule and the
+   parent parked on `AwaitSession`, and it carries its own tests on the three stores.
