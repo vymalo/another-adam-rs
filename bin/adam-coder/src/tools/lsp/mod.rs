@@ -570,7 +570,8 @@ impl Call<'_> {
             Err(e) => return Ok(self.gone(&server, &e.to_string()).await),
         };
         // The wait starts when the server is up and told what changed: starting it has its own time.
-        let deadline = Instant::now() + self.ask.wait;
+        let started = Instant::now();
+        let deadline = started + self.ask.wait;
         let ready = server.ready(deadline).await;
 
         let answer = match self.ask.op {
@@ -614,8 +615,9 @@ impl Call<'_> {
         let mut out = String::new();
         if still {
             out.push_str(&format!(
-                "[still indexing after {} s (server up {} s): the result may be incomplete; call \
-                 again, the server is kept]\n",
+                "[still indexing after {} s of at most {} s (server up {} s): the result may be \
+                 incomplete; call again, the server is kept]\n",
+                started.elapsed().as_secs_f64().ceil() as u64,
                 self.ask.wait.as_secs(),
                 server.up().as_secs()
             ));
