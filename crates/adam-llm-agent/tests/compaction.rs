@@ -1374,6 +1374,145 @@ async fn with_a_window_the_reported_tokens_trigger_it() {
     assert!(state.compactions.is_empty());
 }
 
+/// A round of a session with `config` in its header (ADR 0054): the first message the A2A front
+/// writes.
+fn session_message(config: Value) -> (adam_runtime::Inbound, RunId) {
+    let session = RunId::new();
+    let mut first = user_message("go");
+    first.payload["session"] = json!({
+        "id": session,
+        "agent": "llm",
+        "description": "a round",
+        "keep_open": false,
+        "round": 1,
+        "config": config,
+    });
+    (first, session)
+}
+
+impl Rig {
+    async fn start_session(&self, config: Value) -> RunId {
+        let (first, session) = session_message(config);
+        self.rt
+            .start_child_continuing(
+                session,
+                session,
+                "llm",
+                first,
+                &adam_runtime::session_conversation_id("conversation", session),
+                None,
+            )
+            .await
+            .expect("start");
+        *self.arm.run.lock().unwrap() = Some(session);
+        session
+    }
+}
+
+/// Ten turns that report a prompt of `input` tokens, and a summary when `summary`.
+fn script_reports(mock: &MockModel, input: u64, summary: bool) {
+    for n in 0..10 {
+        mock.push_response(reported(
+            ModelResponse::tool_calls(vec![big(&format!("c{n}"), 20)]),
+            input,
+        ));
+    }
+    if summary {
+        mock.push_text("SUMMARY");
+    }
+    mock.push_response(reported(ModelResponse::text("done"), input));
+}
+
+fn with_cap(b: LlmAgentBuilder) -> LlmAgentBuilder {
+    b.limits(Limits {
+        max_output_tokens: 4096,
+        max_history_tokens: 0,
+        ..Limits::default()
+    })
+}
+
+#[tokio::test]
+async fn a_sessions_context_window_starts_compaction_sooner() {
+    // The model's window is 100,000: a budget of 75,904, and 9,000 reported tokens are far under
+    // it. The session asks for 32,096, which leaves 8,000, so the same run compacts.
+    let plain = Rig::with(
+        MockModel::new().with_context_window("test-model", 100_000),
+        0,
+        with_cap,
+    );
+    script_reports(&plain.mock, 9_000, false);
+    let run = plain.start().await;
+    let (_, state) = plain.finish(run).await;
+    assert!(
+        state.compactions.is_empty(),
+        "no session: the model's window"
+    );
+
+    let sooner = Rig::with(
+        MockModel::new().with_context_window("test-model", 100_000),
+        0,
+        with_cap,
+    );
+    script_reports(&sooner.mock, 9_000, true);
+    let run = sooner.start_session(json!({"contextWindow": 32_096})).await;
+    let (_, state) = sooner.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "{:?}", state.compactions);
+}
+
+#[tokio::test]
+async fn a_sessions_context_window_is_the_minimum_with_the_models_never_instead_of_it() {
+    // The model's window leaves a budget of 2,000. A session that asks for more does not widen it.
+    let rig = Rig::with(
+        MockModel::new().with_context_window("test-model", 26_096),
+        0,
+        with_cap,
+    );
+    script_reports(&rig.mock, 2_500, true);
+    let run = rig.start_session(json!({"contextWindow": 200_000})).await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "the model's window still holds");
+
+    // With no window known, the session's alone is the window.
+    let none = Rig::with(MockModel::new(), 0, with_cap);
+    script_reports(&none.mock, 9_000, true);
+    let run = none.start_session(json!({"contextWindow": 32_096})).await;
+    let (_, state) = none.finish(run).await;
+    assert_eq!(state.compactions.len(), 1);
+}
+
+#[tokio::test]
+async fn a_sessions_window_that_leaves_no_budget_does_not_turn_compaction_into_a_loop_or_off() {
+    // 1,000 is below 20,000 + 4,096 + 8,000: the window is held to that floor, a budget of 8,000.
+    // A prompt of 300 tokens is under it and is not compacted (a budget of one token would
+    // compact every turn); one of 9,000 is over it and is.
+    let small = Rig::with(MockModel::new(), 0, with_cap);
+    script_reports(&small.mock, 300, false);
+    let run = small.start_session(json!({"contextWindow": 1_000})).await;
+    let (_, state) = small.finish(run).await;
+    assert!(state.compactions.is_empty(), "{:?}", state.compactions);
+
+    let big_prompt = Rig::with(MockModel::new(), 0, with_cap);
+    script_reports(&big_prompt.mock, 9_000, true);
+    let run = big_prompt
+        .start_session(json!({"contextWindow": 1_000}))
+        .await;
+    let (_, state) = big_prompt.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "compaction is not off");
+}
+
+#[tokio::test]
+async fn a_sessions_floor_follows_its_narrower_output_cap() {
+    // With a 512-token cap the floor is 28,512 and the budget 8,000 again: a window of 28,512
+    // compacts a prompt of 9,000.
+    let rig = Rig::with(MockModel::new(), 0, with_cap);
+    script_reports(&rig.mock, 9_000, true);
+    let run = rig
+        .start_session(json!({"contextWindow": 28_512, "maxOutputTokens": 512}))
+        .await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1);
+}
+
 #[tokio::test]
 async fn a_failed_summary_call_falls_back_to_recorded_shortenings() {
     let rig = Rig::new(BUDGET);

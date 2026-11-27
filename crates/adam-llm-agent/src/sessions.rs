@@ -23,8 +23,8 @@ use adam_core::time::Timestamp;
 use adam_core::RunId;
 use adam_model::ToolSpec;
 use adam_runtime::{
-    Inbound, MAX_SESSION_PAGE, RuntimeError, SESSION_CLOSE_KIND, SessionBounds, SessionHeader,
-    SessionLimits, SessionState, SessionSummary, SessionView,
+    Inbound, MAX_SESSION_PAGE, RuntimeError, SESSION_CLOSE_KIND, SessionBounds, SessionConfig,
+    SessionHeader, SessionLimits, SessionState, SessionSummary, SessionView,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -217,6 +217,53 @@ impl SessionTools {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The options of `config` as the model writes them (snake_case, like the other arguments), and
+/// the camelCase the wire and the header use for the same names.
+const CONFIG_OPTIONS: [(&str, &str); 7] = [
+    ("max_turns", "maxTurns"),
+    ("max_tool_calls", "maxToolCalls"),
+    ("max_output_tokens", "maxOutputTokens"),
+    ("context_window", "contextWindow"),
+    ("max_parallel_tool_calls", "maxParallelToolCalls"),
+    ("time_limit", "timeLimit"),
+    ("max_rounds", "maxRounds"),
+];
+
+/// The [`SessionConfig`] a `subagent_start` call asked for, or the sentence that says what is wrong
+/// with it. **An unknown option is refused** (ADR 0054 decision 1): an ignored narrowing fails open.
+fn config_of(value: &Value) -> Result<SessionConfig, String> {
+    let Some(object) = value.as_object() else {
+        return Err("`config` must be an object of options".to_owned());
+    };
+    let mut wire = serde_json::Map::new();
+    for (key, value) in object {
+        let Some((_, name)) = CONFIG_OPTIONS.iter().find(|(own, _)| own == key) else {
+            let options: Vec<&str> = CONFIG_OPTIONS.iter().map(|(own, _)| *own).collect();
+            return Err(format!(
+                "config.{} is not an option; the options are: {}",
+                escape_text(key.chars().take(80).collect::<String>().as_bytes()),
+                options.join(", ")
+            ));
+        };
+        wire.insert((*name).to_owned(), value.clone());
+    }
+    SessionConfig::from_value(Value::Object(wire)).map_err(|why| why.message().to_owned())
+}
+
+/// The time limit of a round of `agent`: the session's own `time_limit` (minutes, already held to
+/// the bounds), or the folder's when it asks none; the smaller when both are set, so a session's
+/// limit never lifts the folder's.
+fn round_within(agent: &SessionAgent, config: Option<&SessionConfig>) -> Option<Duration> {
+    let own = config
+        .and_then(|c| c.time_limit)
+        .filter(|minutes| *minutes > 0)
+        .map(|minutes| Duration::from_secs(u64::from(minutes) * 60));
+    match (own, agent.within) {
+        (Some(own), Some(folder)) => Some(own.min(folder)),
+        (own, folder) => own.or(folder),
+    }
+}
 
 fn refuse(text: impl Into<String>) -> Result<ToolOutput, ToolError> {
     Ok(ToolOutput::error(text))
@@ -529,6 +576,27 @@ impl Tool for Start {
                         "description": "Keep the session open after its first report, to send it \
                                         more. By default it closes when its round has ended.",
                     },
+                    "config": {
+                        "type": "object",
+                        "description": "Optional limits for this session, each at most what the \
+                                        subagent's folder allows (a value above it is refused, \
+                                        naming the option). An option you leave out is the \
+                                        folder's own.",
+                        "properties": {
+                            "max_turns": { "type": "integer", "minimum": 1 },
+                            "max_tool_calls": { "type": "integer", "minimum": 1 },
+                            "max_output_tokens": { "type": "integer", "minimum": 1 },
+                            "context_window": { "type": "integer", "minimum": 1 },
+                            "max_parallel_tool_calls": { "type": "integer", "minimum": 1 },
+                            "time_limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Minutes one round may take.",
+                            },
+                            "max_rounds": { "type": "integer", "minimum": 1 },
+                        },
+                        "additionalProperties": false,
+                    },
                 },
                 "required": ["agent", "description", "prompt"],
                 "additionalProperties": false,
@@ -591,6 +659,21 @@ impl Tool for Start {
             Err(why) => return refuse(why),
         };
 
+        // The session's own settings, held to what the subagent's folder allows by the one function
+        // the A2A front uses (ADR 0054 decision 2): a request above a bound starts nothing.
+        let config = match args.get("config") {
+            None | Some(Value::Null) => None,
+            Some(value) => match config_of(value).and_then(|asked| {
+                agent
+                    .bounds
+                    .admit(asked)
+                    .map_err(|why| why.message().to_owned())
+            }) {
+                Ok(config) if config.is_empty() => None,
+                Ok(config) => Some(config),
+                Err(why) => return refuse(why),
+            },
+        };
         let starter = ctx.child_starter()?;
         let session = ctx.child_run_id();
         let started = json!({
@@ -659,11 +742,12 @@ impl Tool for Start {
             // A session is one the person sees when their client shows child sessions: only then
             // may a round of it ask them (ADR 0045 decision 9).
             visible: ctx.context(crate::CHILD_SESSIONS_CONTEXT_KEY) == Some(&Value::Bool(true)),
-            config: None,
+            config,
         };
         let input = round_message(ctx, prompt, &header);
+        let within = round_within(agent, header.config.as_ref());
         starter
-            .start_round(session, session, &agent.agent, input, None, agent.within)
+            .start_round(session, session, &agent.agent, input, None, within)
             .await
             .map_err(|e| runtime_error(&e))?;
         Ok(ToolOutput::text(started.to_string()))
@@ -776,11 +860,24 @@ impl Tool for Send {
                 }
             }
             let limits = self.roster.limits;
-            if view.countable_rounds() >= limits.max_rounds() {
+            // This round's config is the header's, clamped to the bounds of now (ADR 0054
+            // decision 3), and it is the clamped copy the round limit reads: a session's own
+            // `max_rounds` is held here, never above the deployment's.
+            let agent = self.roster.by_registered(&view.agent);
+            let config = view
+                .header
+                .as_ref()
+                .and_then(|h| h.config.as_ref())
+                .map(|asked| agent.map_or_else(|| asked.clone(), |a| a.bounds.clamp(asked)));
+            let max_rounds = config
+                .as_ref()
+                .and_then(|c| c.max_rounds)
+                .map_or(limits.max_rounds(), |own| own.min(limits.max_rounds()));
+            if view.countable_rounds() >= max_rounds {
                 return refuse(format!(
                     "session `{session}` has had {} rounds, the most a session may have: close \
                      it and start a new one with `{SUBAGENT_START}`",
-                    limits.max_rounds()
+                    max_rounds
                 ));
             }
             // A message that starts a round makes another work, like a start does.
@@ -814,6 +911,7 @@ impl Tool for Send {
                 visible: false,
                 config: None,
             });
+            header.config = config;
             header.round = view.round + 1;
             // The round before may have been one that only cleaned up after a cancel.
             header.closing = false;
@@ -825,10 +923,7 @@ impl Tool for Send {
             // round before left says so.
             header.visible = header.visible
                 || ctx.context(crate::CHILD_SESSIONS_CONTEXT_KEY) == Some(&Value::Bool(true));
-            let within = self
-                .roster
-                .by_registered(&view.agent)
-                .and_then(|a| a.within);
+            let within = agent.and_then(|a| round_within(a, header.config.as_ref()));
             let input = round_message(ctx, message, &header);
             match starter
                 .start_round(

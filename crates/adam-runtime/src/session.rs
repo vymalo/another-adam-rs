@@ -900,6 +900,58 @@ impl SessionBounds {
     }
 }
 
+impl SessionBounds {
+    /// `config` narrowed to these bounds **as they are now** ([ADR 0054], decision 3): what a later
+    /// round copies, so a deployment that lowered a limit since the session started is obeyed and
+    /// nothing is raised back. Unlike [`admit`](Self::admit) it refuses nothing: a value above its
+    /// bound becomes the bound, and an absent option stays absent. A value below the least an option
+    /// takes is raised to that least (`max_output_tokens` is never `0`, which would widen it;
+    /// `time_limit` never `0`, which would mean no limit; a `context_window` leaves a budget), but
+    /// never above the bound itself.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[must_use]
+    pub fn clamp(&self, config: &SessionConfig) -> SessionConfig {
+        let max_output_tokens = config.max_output_tokens.map(|v| {
+            let ceiling = if self.max_output_tokens == 0 {
+                MAX_SESSION_MAX_OUTPUT_TOKENS
+            } else {
+                self.max_output_tokens
+            };
+            v.max(MIN_SESSION_MAX_OUTPUT_TOKENS).min(ceiling)
+        });
+        let output = max_output_tokens.unwrap_or(self.max_output_tokens);
+        let floor = CONTEXT_WINDOW_PROMPT_TOKENS
+            .saturating_add(output)
+            .saturating_add(CONTEXT_WINDOW_HEADROOM_TOKENS);
+        SessionConfig {
+            max_turns: config.max_turns.map(|v| v.clamp(1, self.max_turns.max(1))),
+            max_tool_calls: config
+                .max_tool_calls
+                .map(|v| v.clamp(1, self.max_tool_calls.max(1))),
+            max_output_tokens,
+            context_window: config.context_window.map(|v| {
+                let v = v.max(floor);
+                self.context_window.map_or(v, |model| v.min(model))
+            }),
+            max_parallel_tool_calls: config
+                .max_parallel_tool_calls
+                .map(|v| v.clamp(1, self.max_parallel_tool_calls.max(1))),
+            time_limit: config.time_limit.map(|v| {
+                let v = v.max(1);
+                if self.time_limit == 0 {
+                    v
+                } else {
+                    v.min(self.time_limit)
+                }
+            }),
+            max_rounds: config
+                .max_rounds
+                .map(|v| v.clamp(1, self.max_rounds.max(1))),
+        }
+    }
+}
+
 /// `value` between `min` and `max`, or the sentence that says the option and the range.
 fn within(option: &str, value: u32, min: u32, max: u32) -> Result<(), Refusal> {
     if value < min {
@@ -2233,6 +2285,70 @@ mod tests {
                 "{option}: {why}"
             );
         }
+    }
+
+    #[test]
+    fn clamp_brings_every_option_down_to_the_bounds_of_now_and_never_raises_one() {
+        let ask = SessionConfig {
+            max_turns: Some(150),
+            max_tool_calls: Some(400),
+            max_output_tokens: Some(4_000),
+            context_window: Some(150_000),
+            max_parallel_tool_calls: Some(8),
+            time_limit: Some(25),
+            max_rounds: Some(10),
+        };
+        // A deployment that lowered every limit since the session started.
+        let lowered = SessionBounds {
+            max_turns: 40,
+            max_tool_calls: 90,
+            max_output_tokens: 1_000,
+            context_window: Some(60_000),
+            max_parallel_tool_calls: 3,
+            time_limit: 10,
+            max_rounds: 5,
+        };
+        let clamped = lowered.clamp(&ask);
+        assert_eq!(clamped.max_turns, Some(40));
+        assert_eq!(clamped.max_tool_calls, Some(90));
+        assert_eq!(clamped.max_output_tokens, Some(1_000));
+        assert_eq!(clamped.context_window, Some(60_000));
+        assert_eq!(clamped.max_parallel_tool_calls, Some(3));
+        assert_eq!(clamped.time_limit, Some(10));
+        assert_eq!(clamped.max_rounds, Some(5));
+        // Within the bounds: unchanged. Absent: stays absent.
+        assert_eq!(bounds().clamp(&ask), ask);
+        assert_eq!(
+            bounds().clamp(&SessionConfig::default()),
+            SessionConfig::default()
+        );
+    }
+
+    #[test]
+    fn clamp_never_produces_a_value_that_widens() {
+        let zero = SessionConfig {
+            max_output_tokens: Some(0),
+            time_limit: Some(0),
+            max_turns: Some(0),
+            ..SessionConfig::default()
+        };
+        let clamped = bounds().clamp(&zero);
+        assert_eq!(
+            clamped.max_output_tokens,
+            Some(MIN_SESSION_MAX_OUTPUT_TOKENS),
+            "0 would leave the cap to the model"
+        );
+        assert_eq!(clamped.time_limit, Some(1), "0 would mean no limit");
+        assert_eq!(clamped.max_turns, Some(1));
+        // A window that leaves no budget is raised to the least that leaves one, with the cap it
+        // really has, and a model's smaller window still wins.
+        let small = SessionConfig {
+            context_window: Some(1_000),
+            max_output_tokens: Some(2_000),
+            ..SessionConfig::default()
+        };
+        let floor = CONTEXT_WINDOW_PROMPT_TOKENS + 2_000 + CONTEXT_WINDOW_HEADROOM_TOKENS;
+        assert_eq!(bounds().clamp(&small).context_window, Some(floor));
     }
 
     #[test]
