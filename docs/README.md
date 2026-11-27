@@ -42,7 +42,7 @@ These pages are for people. The procedures and evidence that coding agents use l
 | Configuration | [The chart](../deploy/coder/README.md) | every value of the coder's Helm chart |
 | Configuration | [Parity of the surfaces](reference/parity.md) | every setting and feature by surface (coder, folder agent, embedded engine, orchestrator, platform), and the gaps |
 | Errors | [Errors](reference/errors.md) | error classes, the variant-to-class tree, A2A codes and exit codes |
-| Rust API | [The crate map](architecture.md#the-crate-map) | which crate does what; each crate's README is its reference |
+| Rust API | [Rustdoc of the library crates](rust/adam/index.html){target="_self"} | the generated API of every library crate (published with the site); [the crate map](architecture.md#the-crate-map) says which crate does what, and each crate's README is its guide |
 | Behaviour | [The coder agent](reference/coder-agent.md) | its flow and states, the rules its tools enforce, how a run ends |
 | Behaviour | [Child runs and remote tasks](reference/child-runs.md) | how a subagent waits, and every failure interleaving |
 | Behaviour | [Workspace and environments](reference/workspace-and-environments.md) | placement, a run's slots, devcontainers and run pods |

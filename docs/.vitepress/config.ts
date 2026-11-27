@@ -48,7 +48,13 @@ const sidebar = [
   {
     text: "Reference",
     collapsed: true,
-    items: [{ text: "A2A server (OpenAPI)", link: "/api/a2a-server" }, ...pages("reference")],
+    items: [
+      { text: "A2A server (OpenAPI)", link: "/api/a2a-server" },
+      // rustdoc of the library crates, built by the docs-site workflow into /rust/ (not a VitePress page);
+      // target "_self" makes it a full page load, since the client router skips links with a target.
+      { text: "Rust API", link: "/rust/adam/index.html", target: "_self" },
+      ...pages("reference"),
+    ],
   },
   {
     text: "Architecture",
@@ -107,7 +113,8 @@ export default withMermaid(
     cleanUrls: true,
     rewrites: { "README.md": "index.md", "decisions/README.md": "decisions/index.md" },
     // Pages link to source files outside docs/ (checked by tools/docs-check); every other dead link fails the build.
-    ignoreDeadLinks: [/^\.\/(\.\.\/)+/, /(^|\/)\.agents\//],
+    // /rust/ is the rustdoc the workflow copies in after this build, so it does not exist yet while links are checked.
+    ignoreDeadLinks: [/^\.\/(\.\.\/)+/, /(^|\/)\.agents\//, /^(\/|(\.\.\/)*)rust\//],
     srcExclude: ["**/node_modules/**"],
     themeConfig: {
       md3: { style: "expressive", seed: "#0f766e" },
