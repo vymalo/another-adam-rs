@@ -89,6 +89,12 @@ jobs:
       - run: helm template coder deploy/coder --namespace another-agentic-system > /dev/null
       - name: Rendered chart keeps its guarantees
         run: sh deploy/coder/tests/render-check.sh
+      # The release writes the goldens with render-goldens.sh (tools/release/sync.sh): it must write
+      # exactly what render-check.sh compares against, or the release pull request fails.
+      - name: render-goldens.sh writes the committed goldens
+        run: |
+          sh deploy/coder/tests/render-goldens.sh
+          git diff --exit-code -- deploy/coder/tests/golden
       # Schema-check the render: core kinds against the Kubernetes schemas, the
       # CNPG Cluster and the ExternalSecret against the CRD schemas vendored in
       # deploy/coder/tests/schemas (a pinned copy of the datreeio catalog: a live

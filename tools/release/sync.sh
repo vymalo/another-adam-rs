@@ -4,14 +4,14 @@
 #
 #   * every tracked Cargo.lock outside .agents/: `cargo metadata` records the workspace crates at their new
 #     version (it resolves and compiles nothing; a missed mark fails here, not at someone's next build);
-#   * the chart's goldens (deploy/coder/tests/golden/*.yaml): every object carries
-#     `helm.sh/chart: coder-<version>` and `app.kubernetes.io/version: "<appVersion>"`, and those two
-#     labels are the only lines a version moves. render-check.sh, run on the release pull request,
-#     proves the edit equals what helm renders.
+#   * the chart's goldens (deploy/coder/tests/golden/*.yaml), rendered again by
+#     deploy/coder/tests/render-goldens.sh: a version moves two labels of every object and, through them,
+#     the checksum annotations of the ConfigMaps a pod reads, so rewriting the labels alone leaves the
+#     checksums stale. render-check.sh, run on the release pull request, proves them right.
 #
 #   sh tools/release/sync.sh        (from the repository root; CARGO_NET_OFFLINE=true works offline)
 #
-# Needs git, cargo, sed and awk.
+# Needs git, cargo, sed and helm 4.
 set -eu
 
 chart=deploy/coder/Chart.yaml
@@ -29,19 +29,5 @@ for lock in $(git ls-files -- 'Cargo.lock' '*/Cargo.lock'); do
   (cd "$(dirname "$lock")" && cargo metadata --format-version 1 > /dev/null)
 done
 
-for golden in deploy/coder/tests/golden/*.yaml; do
-  tmp=$(mktemp)
-  awk -v version="$version" -v app="$app" '
-    /^ *helm\.sh\/chart: coder-/ { sub(/coder-.*$/, "coder-" version); chart++ }
-    /^ *app\.kubernetes\.io\/version: "/ { sub(/"[^"]*"$/, "\"" app "\""); appv++ }
-    { print }
-    END { if (!chart || !appv) exit 1 }
-  ' "$golden" > "$tmp" || {
-    rm -f "$tmp"
-    echo "sync: $golden has no helm.sh/chart or app.kubernetes.io/version label; the label's shape changed" >&2
-    exit 1
-  }
-  cat "$tmp" > "$golden"
-  rm -f "$tmp"
-done
+sh deploy/coder/tests/render-goldens.sh
 echo "sync: the lockfiles, and the goldens at coder-$version and \"$app\""
