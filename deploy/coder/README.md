@@ -792,7 +792,7 @@ extended agent card needs no value: it is `card.extended` in the agent's folder.
 that scales the service. **Off by default**, and then nothing of it is rendered (the goldens do not move): the route is on
 the A2A port behind the A2A tokens, a form that is **deprecated**. On, the route has a port of its own and tokens of its own,
 so its caller holds no A2A token and gets no path to the A2A port
-([ADR 0081](../../docs/decisions/0081-the-activity-route-has-a-listener-and-tokens-of-its-own.md)).
+([ADR 0083](../../docs/decisions/0083-the-activity-route-has-a-listener-and-tokens-of-its-own.md)).
 
 | Value | Renders | Effect |
 |---|---|---|

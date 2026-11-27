@@ -61,7 +61,7 @@ an agent does.
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required by `all` and `control-plane` |
 | `LISTEN_ADDR` | bind address: the A2A server, or a worker's `/healthz` listener | `0.0.0.0:8080` |
-| `ACTIVITY_LISTEN_ADDR` | turns on the activity listener: `GET /internal/activity` alone, on this address, behind `ACTIVITY_BEARER_TOKENS`; the route then leaves `LISTEN_ADDR`. Any role; another port than `LISTEN_ADDR`'s (ADR 0081) | unset: the route stays on `LISTEN_ADDR` (deprecated) |
+| `ACTIVITY_LISTEN_ADDR` | turns on the activity listener: `GET /internal/activity` alone, on this address, behind `ACTIVITY_BEARER_TOKENS`; the route then leaves `LISTEN_ADDR`. Any role; another port than `LISTEN_ADDR`'s (ADR 0083) | unset: the route stays on `LISTEN_ADDR` (deprecated) |
 | `ACTIVITY_BEARER_TOKENS` | comma-separated tokens of the activity listener, none an A2A token; required with `ACTIVITY_LISTEN_ADDR` (exit 78), refused without it | unset |
 | `A2A_PUSH_ALLOWED_URLS` | turns A2A push notifications **on** and names the webhooks they may reach: comma-separated URL prefixes or hosts (`PushSettings`); a client's webhook that matches none, is not `https` or is a private address is refused | unset: off, the card says so |
 | `A2A_PUSH_ALLOW_PRIVATE` | also allow loopback, private and link-local webhooks and `http` to loopback: development only | `false` |
@@ -237,7 +237,7 @@ Retention: `retention::RetentionSettings` from `RUN_RETENTION_DAYS` (1-36500 or 
 `ActivitySettings`): that listener serves this route and nothing else (every other path, `/healthz` included, is a 404),
 behind `ACTIVITY_BEARER_TOKENS` alone, and `LISTEN_ADDR` no longer serves it. So its caller (an operator that scales the
 service) holds no A2A token and needs no path to the A2A port, and a token of either list is refused on the other listener
-([ADR 0081](../../docs/decisions/0081-the-activity-route-has-a-listener-and-tokens-of-its-own.md)). Fail closed, exit 78:
+([ADR 0083](../../docs/decisions/0083-the-activity-route-has-a-listener-and-tokens-of-its-own.md)). Fail closed, exit 78:
 the address with no usable token, tokens with no address, an address that takes `LISTEN_ADDR`'s port, a token in both lists.
 **Breaking:** `ServiceConfig` gained `activity`, so a struct literal stops compiling.
 

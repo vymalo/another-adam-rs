@@ -109,7 +109,7 @@ Protocol notes (details in the crate docs, `src/lib.rs`; the SDK's `RequestHandl
   bearer authentication (*verified 2026-10-07*,
   <https://a2a-protocol.org/latest/specification/> §3.3.4).
 * `A2aServer::health_router_with_routes(auth, routes)` is `health_router()` plus `routes` behind the bearer; `/healthz` stays public.
-* `A2aServer::protected_router(auth, routes)` is `routes` alone behind the bearer `auth` asks for: no `/healthz`, no card, nothing of A2A, any other path a plain 404. For a listener of its own with tokens of its own (the service's `GET /internal/activity` on `ACTIVITY_LISTEN_ADDR`, [ADR 0081](../../docs/decisions/0081-the-activity-route-has-a-listener-and-tokens-of-its-own.md)). Test: `protected_router_serves_its_routes_behind_its_token_and_nothing_else`.
+* `A2aServer::protected_router(auth, routes)` is `routes` alone behind the bearer `auth` asks for: no `/healthz`, no card, nothing of A2A, any other path a plain 404. For a listener of its own with tokens of its own (the service's `GET /internal/activity` on `ACTIVITY_LISTEN_ADDR`, [ADR 0083](../../docs/decisions/0083-the-activity-route-has-a-listener-and-tokens-of-its-own.md)). Test: `protected_router_serves_its_routes_behind_its_token_and_nothing_else`.
 * `A2aServer::health_router()` is the `/healthz` route alone (200, `ok`), for a process that
   answers probes but serves no A2A, such as a worker.
 * Every route except the agent card, `/healthz`, the docs and (when signed) the key set answers 401 without a valid

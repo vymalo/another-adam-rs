@@ -87,8 +87,8 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      `activity.tokensSecret.name`/`.key`, a Secret you manage, never a value), on the pods the Service selects, a
      Service port `activity`, and a NetworkPolicy rule that gives `activity.allowedNamespace` that port alone. The A2A
      port then stops serving the route; without it the route stays on the A2A port behind the A2A tokens
-     (**deprecated**). An activity token that is also an A2A token, or the address without tokens, is exit 78 (ADR 0081,
-     `docs/decisions/0081-the-activity-route-has-a-listener-and-tokens-of-its-own.md`; chart README, "The activity port").
+     (**deprecated**). An activity token that is also an A2A token, or the address without tokens, is exit 78 (ADR 0083,
+     `docs/decisions/0083-the-activity-route-has-a-listener-and-tokens-of-its-own.md`; chart README, "The activity port").
      The chart's render is read by another-agentic-platform's parity goldens: say so in the pull request.
    * The model gateway's URL (`MODEL_BASE_URL`) is the literal `config.modelBaseUrl` (a placeholder by
      default). To keep it out of git set `config.modelBaseUrlFromSecret: true`: the workers read it by
