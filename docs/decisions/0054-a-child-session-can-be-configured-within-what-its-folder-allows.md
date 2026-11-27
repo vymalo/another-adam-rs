@@ -47,6 +47,9 @@ amendment is the owner's to make there.
      (`SessionBounds`, new, `crates/adam-runtime/src/session.rs`). The starter's own grant (its tier) is added at the call.
    * One pure function, `SessionBounds::admit(requested) -> Result<SessionConfig, Refusal>` (new), serves the tool and the
      A2A front, so they cannot disagree. It fills nothing in: an absent option stays absent and means "the folder's".
+     *Amended 2026-11-27 (ANR-210, slice 3)*: "cannot disagree" holds for every **number**, not for **tool names**: a control
+     plane binds no agent and knows none, so it checks the shape of `tools` and `deny_tools` only, and a worker, which knows the
+     names, may still refuse what the control plane admitted (see the amendment below the table and the slice 3 note).
    * A refusal names the option, the value asked and the allowed set or range, in words (`config.max_turns is 500; at most
      200 for reviewer`). A list is cut at 50 names with "and N more". Nothing is started.
 3. **The effective config is recorded in the session header**, which is journaled with the round's state:
@@ -82,6 +85,17 @@ amendment is the owner's to make there.
    A **remote** (`a2a:`) subagent takes `time_limit`, `max_rounds` and `instructions` (sent ahead of the first message, as
    text); every other option is refused in words: its loop is another system's. Tools the loop itself needs (`read_output`)
    are never removed by `tools` or `deny_tools`.
+
+   *Amended 2026-11-27 (ANR-210, slice 3), the `tools` and `deny_tools` rows:* "each entry matches at least one bound tool" holds
+   only as far as the starter knows the bound tools. `SessionBounds` carries `tools` (the names known) and `tools_complete` (they
+   are all of them: no source adds tools while a run goes). A `tools` entry, or an entry with a `*`, that matches none is refused
+   with the list **only when the set is complete**; a concrete `deny_tools` name (no `*`) that matches none is refused **whenever
+   any name is known**, even when the set is incomplete (a typo is far likelier than a tool a source adds; the refusal says to use a
+   pattern for the latter); with no name known (a control plane) only the shape is checked. The column "Enforced by" is the loop
+   itself, not "a session withhold" of a source: the narrowing is consulted in `agent.rs` first, before every source's holds, at
+   both points, and is read from the session header (see the slice 3 note).
+   This is an **interim**: the owner's answer to ANR-Q144 (2026-11-27) is that every source declares its tools (card ANR-1319),
+   which makes the set complete on every agent and the rule of the row above hold as written.
 
    *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the declaration is the **model entry** in
    `MODEL_ALIASES_FILE` (the alias's `reasoning` object: its levels and its wire), not a global variable. A folder or
@@ -321,6 +335,39 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
 * Files: `agent.rs` (the session withhold, both points), `sessions.rs`, `def.rs` (the bound tool names).
 * Accepted when: a hidden tool is not in the request and a call to it is refused without running; a pattern matching no tool is
   refused with the list; an MCP server is selected by `server__*`; `read_output` stays.
+* *2026-11-27 (ANR-210, slice 3):* **`tools` and `deny_tools`** are built, with the narrowings listed here. `subagent_start`'s
+  `config` takes both as lists of strings, and a person's `start.config` takes `tools` and `denyTools`; entries are the folder's own
+  syntax (exact names and `*` patterns, `github__*` selecting an MCP server; `glob` moved from `adam-assembly` to `adam-runtime`),
+  and **both fronts admit them with the same `SessionBounds::admit`**: at most 32 entries of at most 200 characters each, none
+  blank. A remote subagent takes neither.
+  * **What `admit` checks depends on what the starter knows (the amendments above), and what ships here is an interim.** The
+    **target** is the owner's answer of 2026-11-27 to ANR-Q144, *every source declares its tools*: a defaulted
+    `ToolSource::declared` names the tools a source can offer, so `SessionBounds` knows the complete set and decision 4's rule
+    ("a pattern matching no tool is refused with the list") holds on every agent (card ANR-1319, not built here). **The interim
+    this slice ships** is `SessionBounds::tools` (the names the worker binds the subagent with) and `tools_complete`, which is
+    `false` on **both shipped agents**: `adam-agent` adds its UI tools and `adam-coder` its references and UI through sources (an
+    `mcp.json` server with a `when` is one too), whose names no list made at startup holds. So today the strict check is the
+    **concrete `deny_tools` name** on a worker (refused with the list, and a hint to name a source's tools by pattern), and a
+    `tools` entry or a pattern is strict **only on an agent with no sources**; elsewhere a `tools` entry that matches nothing is
+    admitted, recorded in the header and offers less, never more. The control plane knows no name and checks the shape. ANR-1319
+    ends the interim; this is a step, not the decision.
+  * **The loop applies it**, not a tool source, so an embedder that builds an agent with `LlmAgentBuilder` has it too:
+    `SessionNarrowing` (`crates/adam-llm-agent/src/session_tools.rs`) is consulted in `agent.rs` before every source's holds, at the
+    request (`apply_sources`: a hidden tool is not shown) and at the call (`step_work`: a call to one is refused without running),
+    with or without sources. Both points read the lists from **the run's session header** (`Conversation::session`), the truth,
+    committed with the run, and from the round's context under `vymalo.session.tools` (`SESSION_TOOLS_CONTEXT_KEY`; `{"tools": [..],
+    "denyTools": [..]}`, `{}` when none), a tool being held when either says so. The key is written by `round_message` (the tools:
+    rounds 1 and later, from the clamped config) and `put_header` (the A2A front, **over** whatever a person's message said); it is
+    **not** protected, so a child of the session does not inherit it, and an oversized context drops it, which is why the header
+    is the truth. `read_output` is never held back; a value of the wrong shape (a mixed array too) fails closed. The words tell the
+    model to say in plain words what it did not do and not to look for another way.
+  * **Cost.** The `subagent_start` schema grew by two properties and its `config` description changed: **the prompt prefix, and the
+    prompt cache, of every agent that has subagents change once.** The coder's tool table row is 2,520 to 2,811 bytes, and **91 B
+    remain** under `BASELINE_TOOLS_BYTES + GROWTH_ALLOWED`: the next slice that grows `subagent_start` needs a reviewed baseline bump.
+    `list` and `read` print the lists (`tools read_file, *, deny_tools write_file`).
+  * *Not in this slice:* the card's `agents[].config` listing the bound tool names (slice 10), an edit of a running session's tools
+    (slice 4), and the loader groups of ADR 0066: `tools: ["github__*"]` withholds the loader of a lazily loaded group, so a server
+    loaded on demand cannot be loaded in such a session (follow-up).
 
 **4. `subagent_edit`** (decision 11). Depends on 1 and 3.
 * Files: `sessions.rs`, `crates/adam-runtime/src/session.rs` (`adam.session.edit`, `edits`), `agent.rs` (read at the next step).

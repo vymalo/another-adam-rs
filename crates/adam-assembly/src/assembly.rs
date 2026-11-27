@@ -812,13 +812,40 @@ impl BoundDef {
 
     /// The bounds of one subagent a session may be started on (ADR 0054 decision 2): the one
     /// function of `crate::bounds`, which `AgentDef::session_bounds` calls too, so a worker's tools
-    /// and a control plane's A2A front cannot disagree.
+    /// and a control plane's A2A front agree on every number. They differ in one fact only a worker
+    /// has: the names of the tools the subagent is bound with
+    /// ([`bound_tool_names`](Self::bound_tool_names)).
     fn bounds_of(&self, target: &SessionTarget) -> SessionBounds {
+        let (names, complete) = self.bound_tool_names(target);
         crate::bounds::bounds_of(
             &self.manifest,
             target,
             self.max_parallel,
             self.session_limits.max_rounds(),
+            names,
+            complete,
+        )
+    }
+
+    /// The names of the tools the subagent `target` is bound with, for `tools` and `deny_tools` to
+    /// be checked against (ADR 0054 slice 3), and whether they are **every** tool it can have: the
+    /// node whose registered name is the target's, and what it holds (its own tools and the
+    /// `mcp.json` servers' as `server__tool`).
+    ///
+    /// The set is **incomplete** when a source adds tools at run time, which no list made now can
+    /// name: a server whose `when` loads it by the task, or a source the deployment gave (both
+    /// shipped agents have some: the coder's references and UI, the folder agent's UI). A remote
+    /// target, and a name no node has, give no names.
+    fn bound_tool_names(&self, target: &SessionTarget) -> (Vec<String>, bool) {
+        if target.remote {
+            return (Vec::new(), false);
+        }
+        let Some(node) = self.nodes.iter().find(|node| node.name == target.agent) else {
+            return (Vec::new(), false);
+        };
+        (
+            node.tools.iter().map(|(name, _)| name.clone()).collect(),
+            self.sources.is_empty() && node.sources.is_empty(),
         )
     }
 

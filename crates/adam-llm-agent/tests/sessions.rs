@@ -265,6 +265,55 @@ fn ask_call(id: &str, question: &str) -> ToolCall {
     call(id, "ask", json!({"question": question}))
 }
 
+/// A tool of the child's that notes each call it runs: the proof that a refused call ran nothing.
+struct Counted {
+    name: &'static str,
+    ran: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Tool for Counted {
+    fn spec(&self) -> adam_model::ToolSpec {
+        adam_model::ToolSpec {
+            name: self.name.into(),
+            description: format!("the {} tool", self.name),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        self.ran.lock().unwrap().push(self.name.to_owned());
+        Ok(ToolOutput::text(format!("{} ran", self.name)))
+    }
+}
+
+/// A tool source that offers `extra_tool` and notes each call it runs: a tool of a source is
+/// narrowed by a session's lists like the agent's own.
+struct Extra {
+    ran: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl adam_llm_agent::ToolSource for Extra {
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<adam_model::ToolSpec> {
+        vec![adam_model::ToolSpec {
+            name: "extra_tool".into(),
+            description: "a source's tool".into(),
+            parameters: json!({"type": "object"}),
+        }]
+    }
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        (name == "extra_tool").then(|| {
+            self.ran.lock().unwrap().push(name.to_owned());
+            Ok(ToolOutput::text("extra ran"))
+        })
+    }
+}
+
 struct Rig {
     parent_name: String,
     child_name: String,
@@ -289,6 +338,10 @@ struct Rig {
     limits: Option<SessionLimits>,
     /// The child agent has a tool that asks the person ([`Ask`]).
     asks: bool,
+    /// The child agent has `read_file`, `write_file` and `read_output`; the calls its two tools ran.
+    child_tools: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    /// The child agent has a tool source that offers `extra_tool`; the calls it ran.
+    child_source: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// How long a kept-open session may sit idle (`None`: the runtime's default).
     idle_ttl: Option<Duration>,
     sink: CollectingSink,
@@ -313,6 +366,8 @@ impl Rig {
             reports_off: false,
             limits: None,
             asks: false,
+            child_tools: None,
+            child_source: None,
             idle_ttl: None,
             sink: CollectingSink::new(),
             clock: ManualClock::new(),
@@ -328,6 +383,21 @@ impl Rig {
     fn asking(mut self) -> Self {
         self.asks = true;
         self
+    }
+
+    /// Give the child `read_file`, `write_file` and `read_output`, and the list of the calls its
+    /// first two ran.
+    fn with_child_tools(mut self) -> (Self, Arc<std::sync::Mutex<Vec<String>>>) {
+        let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.child_tools = Some(ran.clone());
+        (self, ran)
+    }
+
+    /// Give the child a tool source that offers `extra_tool`, and the list of the calls it ran.
+    fn with_child_source(mut self) -> (Self, Arc<std::sync::Mutex<Vec<String>>>) {
+        let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.child_source = Some(ran.clone());
+        (self, ran)
     }
 
     /// Give the parent the `hold` tool.
@@ -428,6 +498,21 @@ impl Rig {
         let mut builder = LlmAgent::builder(&self.child_name, model, "m");
         if self.asks {
             builder = builder.tool(Ask);
+        }
+        if let Some(ran) = &self.child_tools {
+            builder = builder
+                .tool(Counted {
+                    name: "read_file",
+                    ran: ran.clone(),
+                })
+                .tool(Counted {
+                    name: "write_file",
+                    ran: ran.clone(),
+                })
+                .tool(adam_llm_agent::ReadOutput);
+        }
+        if let Some(ran) = &self.child_source {
+            builder = builder.tool_source(Extra { ran: ran.clone() });
         }
         builder.build()
     }
@@ -3885,6 +3970,316 @@ mod cases {
         );
     }
 
+    /// The names of the tools a model request offers.
+    fn offered(request: &ModelRequest) -> Vec<String> {
+        request.tools.iter().map(|t| t.name.clone()).collect()
+    }
+
+    /// A session started with `tools: ["read_file"]` is **not shown** `write_file` and a call to it
+    /// is refused without running it, and `read_output` stays offered (ADR 0054 slice 3). A session
+    /// with no config sees every tool it always did.
+    pub async fn a_hidden_tool_is_not_offered_and_a_call_to_it_is_refused_unrun(store: DynStore) {
+        let (rig, ran) = Rig::new().with_child_tools();
+        // The narrowed session calls the hidden tool, then ends; the plain one calls both.
+        rig.child_mock
+            .push_tool_calls(vec![call("w", "write_file", json!({}))])
+            .push_text("narrowed done")
+            .push_tool_calls(vec![
+                call("r", "read_file", json!({})),
+                call("w", "write_file", json!({})),
+            ])
+            .push_text("plain done");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let narrowed = child_run_id(parent, "narrowed");
+        let plain = child_run_id(parent, "plain");
+        let start = |id: &str, extra: Value| {
+            let mut args = json!({"agent": "helper", "description": "look at it",
+                                  "prompt": "do the work"});
+            if !extra.is_null() {
+                args["config"] = extra;
+            }
+            call(id, "subagent_start", args)
+        };
+        rig.parent_mock
+            .push_tool_calls(vec![start("narrowed", json!({"tools": ["read_file"]}))])
+            .push_tool_calls(vec![read_call("r1", narrowed, true)])
+            .push_tool_calls(vec![start("plain", Value::Null)])
+            .push_tool_calls(vec![read_call("r2", plain, true)])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+
+        let requests = rig.child_mock.requests();
+        assert_eq!(requests.len(), 4, "two turns per session");
+        let names = |i: usize| {
+            let mut names = offered(&requests[i]);
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(0),
+            ["read_file", "read_output"],
+            "the allow-list leaves `write_file` out of the request, and `read_output` stays"
+        );
+        assert_eq!(names(1), ["read_file", "read_output"], "and on every turn");
+        let all = ["read_file", "read_output", "write_file"];
+        assert_eq!(names(2), all, "a session with no config sees every tool");
+        let results = tool_results(&state_of(&rt, narrowed).await);
+        let (_, refusal, is_error) = result_of(&results, "w");
+        assert!(
+            *is_error && refusal.contains("`write_file` is not offered to this session"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("Do not look for another way"), "{refusal}");
+        let results = tool_results(&state_of(&rt, plain).await);
+        assert!(!result_of(&results, "w").2, "the plain session may write");
+        assert_eq!(
+            *ran.lock().unwrap(),
+            ["read_file", "write_file"],
+            "the refused call ran nothing: only the plain session's two calls ran"
+        );
+    }
+
+    /// The narrowing holds on an agent that has a tool source too: a source's tool is hidden from the
+    /// request and refused unrun like the agent's own, and a session with no config is offered it.
+    pub async fn a_sources_tool_is_narrowed_like_the_agents_own(store: DynStore) {
+        let (rig, _ran) = Rig::new().with_child_tools();
+        let (rig, source_ran) = rig.with_child_source();
+        rig.child_mock
+            .push_tool_calls(vec![call("x", "extra_tool", json!({}))])
+            .push_text("narrowed done")
+            .push_text("plain done");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        let narrowed = child_run_id(parent, "narrowed");
+        let plain = child_run_id(parent, "plain");
+        rig.parent_mock
+            .push_tool_calls(vec![call(
+                "narrowed",
+                "subagent_start",
+                json!({"agent": "helper", "description": "d", "prompt": "p",
+                       "config": {"deny_tools": ["extra_*"]}}),
+            )])
+            .push_tool_calls(vec![read_call("r1", narrowed, true)])
+            .push_tool_calls(vec![start_call("plain", false)])
+            .push_tool_calls(vec![read_call("r2", plain, true)])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let requests = rig.child_mock.requests();
+        assert!(
+            !offered(&requests[0]).contains(&"extra_tool".to_owned()),
+            "{:?}",
+            offered(&requests[0])
+        );
+        assert!(offered(&requests[2]).contains(&"extra_tool".to_owned()));
+        let results = tool_results(&state_of(&rt, narrowed).await);
+        let (_, refusal, is_error) = result_of(&results, "x");
+        assert!(
+            *is_error && refusal.contains("`extra_tool` is not offered"),
+            "{refusal}"
+        );
+        assert!(
+            source_ran.lock().unwrap().is_empty(),
+            "the source ran nothing"
+        );
+    }
+
+    /// `deny_tools` is applied after `tools`: a tool both lists name is hidden, and a pattern in
+    /// either list selects what it matches.
+    pub async fn deny_tools_wins_over_tools_and_a_pattern_selects(store: DynStore) {
+        let (rig, ran) = Rig::new().with_child_tools();
+        rig.child_mock
+            .push_tool_calls(vec![call("w", "write_file", json!({}))])
+            .push_text("done");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![call(
+                "c1",
+                "subagent_start",
+                json!({"agent": "helper", "description": "look at it", "prompt": "do the work",
+                       "config": {"tools": ["read_*", "write_file"],
+                                  "deny_tools": ["write_*"]}}),
+            )])
+            .push_tool_calls(vec![read_call("r", session, true)])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let mut names = offered(&rig.child_mock.requests()[0]);
+        names.sort();
+        assert_eq!(names, ["read_file", "read_output"], "the deny-list won");
+        let results = tool_results(&state_of(&rt, session).await);
+        assert!(result_of(&results, "w").2);
+        assert!(ran.lock().unwrap().is_empty(), "nothing ran");
+    }
+
+    /// Round 2 writes the key again, from the config the header carries (clamped): a send's round
+    /// narrows its tools like round 1, and a session with no config writes an empty value.
+    pub async fn round_two_carries_the_tools_its_config_narrows(store: DynStore) {
+        let (rig, _ran) = Rig::new().with_child_tools();
+        rig.child_mock.push_text("one").push_text("two");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![call(
+                "c1",
+                "subagent_start",
+                json!({"agent": "helper", "description": "look at it", "prompt": "do the work",
+                       "keep_open": true,
+                       "config": {"tools": ["read_file"], "deny_tools": ["write_*"]}}),
+            )])
+            .push_tool_calls(vec![read_call("c2", session, true)])
+            .push_tool_calls(vec![send_call("c3", session, "again")])
+            .push_tool_calls(vec![read_call("c4", session, true)])
+            .push_text("ok");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let list = rt
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        let second = list.sessions[0].latest_run;
+        assert_ne!(second, session);
+        for run in [session, second] {
+            let c = state_of(&rt, run).await;
+            assert_eq!(
+                c.context.get(adam_llm_agent::SESSION_TOOLS_CONTEXT_KEY),
+                Some(&json!({"tools": ["read_file"], "denyTools": ["write_*"]})),
+                "{run}"
+            );
+        }
+        let requests = rig.child_mock.requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            let mut names = offered(request);
+            names.sort();
+            assert_eq!(names, ["read_file", "read_output"]);
+        }
+    }
+
+    /// A session with no config (or a config that sets neither list) carries an empty value, never
+    /// another round's, and a child of the round does not inherit the key.
+    pub async fn a_session_without_tools_carries_an_empty_value(store: DynStore) {
+        let (rig, _ran) = Rig::new().with_child_tools();
+        rig.child_mock.push_text("one");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", false)])
+            .push_tool_calls(vec![read_call("c2", session, true)])
+            .push_text("ok");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let c = state_of(&rt, session).await;
+        assert_eq!(
+            c.context.get(adam_llm_agent::SESSION_TOOLS_CONTEXT_KEY),
+            Some(&json!({}))
+        );
+        assert!(
+            !adam_llm_agent::PROTECTED_CONTEXT_KEYS
+                .contains(&adam_llm_agent::SESSION_TOOLS_CONTEXT_KEY),
+            "a child of a session must not inherit its narrowing"
+        );
+    }
+
+    /// Bad `tools` and `deny_tools` are refused in words naming the option, and a remote subagent
+    /// takes neither.
+    pub async fn a_bad_tools_list_is_refused_and_a_remote_subagent_takes_none(store: DynStore) {
+        let rig = Rig::new();
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        let start = |id: &str, agent: &str, config: Value| {
+            call(
+                id,
+                "subagent_start",
+                json!({"agent": agent, "description": "d", "prompt": "p", "config": config}),
+            )
+        };
+        let too_many: Vec<String> = (0..33).map(|n| format!("t{n}")).collect();
+        rig.parent_mock
+            .push_tool_calls(vec![start("str", "helper", json!({"tools": "read_file"}))])
+            .push_tool_calls(vec![start("num", "helper", json!({"deny_tools": [1]}))])
+            .push_tool_calls(vec![start("blank", "helper", json!({"tools": ["a", " "]}))])
+            .push_tool_calls(vec![start("many", "helper", json!({"tools": too_many}))])
+            .push_tool_calls(vec![start("far", "far", json!({"tools": ["a"]}))])
+            .push_tool_calls(vec![start("far2", "far", json!({"deny_tools": ["a"]}))])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        for (id, words) in [
+            ("str", "config.tools must be a list of tool names"),
+            ("num", "config.deny_tools must be a list of tool names"),
+            ("blank", "config.tools must be a list of tool names"),
+            ("many", "config.tools has 33 entries; at most 32"),
+            ("far", "config.tools is not an option of a remote subagent"),
+            (
+                "far2",
+                "config.deny_tools is not an option of a remote subagent",
+            ),
+        ] {
+            let (_, text, is_error) = result_of(&results, id);
+            assert!(*is_error && text.contains(words), "{id}: {text}");
+        }
+        assert!(rig.child_mock.requests().is_empty(), "nothing started");
+    }
+
+    /// The listing row and the head of a read say the lists: `tools read_file, *`.
+    pub async fn list_and_read_show_the_tools_a_session_narrows(store: DynStore) {
+        let rig = Rig::new();
+        rig.child_mock.push_text("one says 1");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![call(
+                "c1",
+                "subagent_start",
+                json!({"agent": "helper", "description": "d", "prompt": "p", "keep_open": true,
+                       "config": {"tools": ["read_file", "*"], "deny_tools": ["write_file"]}}),
+            )])
+            .push_tool_calls(vec![read_call("r1", session, true)])
+            .push_tool_calls(vec![call("l1", "subagent_list", json!({}))])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        let read = &result_of(&results, "r1").1;
+        assert!(
+            read.contains("config: tools read_file, *, deny_tools write_file"),
+            "{read}"
+        );
+        assert!(
+            result_of(&results, "l1")
+                .1
+                .contains("config: tools read_file, *, deny_tools write_file"),
+            "{}",
+            result_of(&results, "l1").1
+        );
+    }
+
     /// A session's own `time_limit` is the deadline of its rounds, under the folder's: 5 minutes
     /// of a 30-minute folder fails at 6, and the folder's own 30 is no longer the limit.
     pub async fn a_sessions_time_limit_is_the_deadline_of_its_round(store: DynStore) {
@@ -5883,6 +6278,13 @@ macro_rules! session_suite {
                 a_remote_subagent_refuses_a_report_schema,
                 a_config_value_of_the_wrong_type_is_refused_naming_the_option,
                 round_two_carries_the_config_clamped_to_the_bounds_of_now,
+                a_hidden_tool_is_not_offered_and_a_call_to_it_is_refused_unrun,
+                a_sources_tool_is_narrowed_like_the_agents_own,
+                deny_tools_wins_over_tools_and_a_pattern_selects,
+                round_two_carries_the_tools_its_config_narrows,
+                a_session_without_tools_carries_an_empty_value,
+                a_bad_tools_list_is_refused_and_a_remote_subagent_takes_none,
+                list_and_read_show_the_tools_a_session_narrows,
                 a_sessions_time_limit_is_the_deadline_of_its_round,
                 a_sessions_own_max_rounds_is_enforced_by_a_send,
                 a_close_then_a_start_is_not_refused_by_the_closing_round,

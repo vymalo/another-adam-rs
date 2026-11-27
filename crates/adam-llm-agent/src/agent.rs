@@ -62,6 +62,7 @@ use crate::order;
 use crate::paging::backstop;
 use crate::plan::Plan;
 use crate::schedule::{self, Entry, Ordered, Queue, Segment};
+use crate::session_tools::{SessionNarrowing, narrowing_of};
 use crate::sessions::{
     DueFacts, MAX_REPORT_CORRECTIONS, REPORT_MISMATCH, ReportVerdict, SUBAGENT_CLOSE,
     SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, check_report, is_due, report_call_id,
@@ -89,12 +90,17 @@ fn has_started_session(state: &Conversation) -> bool {
 async fn apply_sources(
     sources: &[DynToolSource],
     source_ctx: Option<&SourceCtx>,
+    narrowing: &SessionNarrowing,
     request: &mut ModelRequest,
     inject: bool,
 ) -> Sourced {
     let (notes, offered, carried) = match source_ctx {
-        Some(source_ctx) => offered_by(sources, source_ctx, request).await,
-        None => (Vec::new(), Vec::new(), Vec::new()),
+        Some(source_ctx) => offered_by(sources, source_ctx, narrowing, request).await,
+        None => {
+            // No sources, but a session's `tools` and `deny_tools` hold all the same.
+            narrowing.retain(&mut request.tools);
+            (Vec::new(), Vec::new(), Vec::new())
+        }
     };
     let own = order::prepare(&mut request.tools, inject);
     Sourced {
@@ -154,10 +160,11 @@ fn with_session_instructions(
     })
 }
 
-/// The sources' part of [`apply_sources`].
+/// The sources' part of [`apply_sources`], and what a session's narrowing holds back.
 async fn offered_by(
     sources: &[DynToolSource],
     source_ctx: &SourceCtx,
+    narrowing: &SessionNarrowing,
     request: &mut ModelRequest,
 ) -> (Vec<ToolNote>, Vec<String>, Vec<String>) {
     let (more, notes) = offered(sources, source_ctx, &request.tools).await;
@@ -183,7 +190,7 @@ async fn offered_by(
     };
     // What a source holds back is not shown, the agent's own tools included.
     let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
-    let held = withheld(sources, source_ctx, &names).await;
+    let held = withheld(narrowing, sources, source_ctx, &names).await;
     if !held.is_empty() {
         request
             .tools
@@ -409,6 +416,9 @@ struct Prepared {
     tool_ctx: ToolCtx,
     /// The sources and what they see of the run, to check what a source holds back.
     holding: Option<(Vec<DynToolSource>, SourceCtx)>,
+    /// What the run's session narrows (ADR 0054 slice 3), checked **before** the sources' holds and
+    /// whether or not the agent has sources.
+    narrowing: Arc<SessionNarrowing>,
     unjournaled: Arc<Mutex<SandboxUsage>>,
     /// A person can approve a call of this run ([`CallFacts::approvable`]).
     approvable: bool,
@@ -491,6 +501,8 @@ struct CallFacts {
     loaded: Arc<[Loaded]>,
     /// The loaded tools a request did not carry (`Conversation::removed_tools`).
     removed_tools: Arc<[String]>,
+    /// The tools the run's session holds back ([`SessionNarrowing`]).
+    narrowing: Arc<SessionNarrowing>,
     /// How many custom events the transition's calls have emitted: one counter for all of them.
     event_budget: Arc<AtomicUsize>,
     /// Whether a person can approve a call a hook asks about (ADR 0050, slice H8): the run may ask
@@ -540,6 +552,8 @@ struct EarlyFacts {
     loaded: Arc<[Loaded]>,
     /// The loaded tools a request did not carry, as the turn starts.
     removed_tools: Arc<[String]>,
+    /// The tools the run's session holds back, as the turn starts.
+    narrowing: Arc<SessionNarrowing>,
     /// The transition's counter of custom events ([`CallFacts::event_budget`]).
     event_budget: Arc<AtomicUsize>,
     /// Whether a person can approve a call of the turn ([`CallFacts::approvable`]).
@@ -696,6 +710,7 @@ impl<'a> Early<'a> {
             task: self.facts.task.clone(),
             loaded: Arc::clone(&self.facts.loaded),
             removed_tools: Arc::clone(&self.facts.removed_tools),
+            narrowing: Arc::clone(&self.facts.narrowing),
             event_budget: Arc::clone(&self.facts.event_budget),
             approvable: self.facts.approvable,
         };
@@ -3125,6 +3140,7 @@ impl LlmAgent {
 
         let model = self.model.clone();
         let sources = self.sources.clone();
+        let narrowing = Arc::new(narrowing_of(state, context.map(|c| &**c)));
         let turn = state.turns;
         // The step start seeded a journal written before `loaded` existed; a fresh run (or a
         // continuation) has no seed, and its task-loaded groups are journaled here.
@@ -3205,6 +3221,7 @@ impl LlmAgent {
             task: state.task().map(Arc::from),
             loaded: Arc::from(state.loaded.clone()),
             removed_tools: Arc::from(state.removed_tools.clone()),
+            narrowing: Arc::new(narrowing_of(state, context.map(|c| &**c))),
             event_budget: Arc::clone(&state.event_budget.0),
             approvable: approvable(ctx, state),
             turn: crate::early::Turn {
@@ -3239,7 +3256,14 @@ impl LlmAgent {
                     own_order,
                     offered,
                     mut carried,
-                } = apply_sources(&sources, source_ctx.as_ref(), &mut request, ordered).await;
+                } = apply_sources(
+                    &sources,
+                    source_ctx.as_ref(),
+                    &narrowing,
+                    &mut request,
+                    ordered,
+                )
+                .await;
                 let loaders = match source_ctx.as_ref() {
                     Some(ctx) if need_loaders => {
                         Some(crate::source::loaders_offered(&sources, ctx).await)
@@ -3946,6 +3970,7 @@ impl LlmAgent {
         let model = self.model.clone();
         let ordered = self.max_parallel > 1;
         let sources = self.sources.clone();
+        let narrowing = Arc::new(narrowing_of(state, Some(&state.context)));
         let source_ctx = (!sources.is_empty()).then(|| {
             SourceCtx::new(
                 ctx.run_id(),
@@ -3990,7 +4015,14 @@ impl LlmAgent {
                     )
                     .await;
                 }
-                apply_sources(&sources, source_ctx.as_ref(), &mut request, ordered).await;
+                apply_sources(
+                    &sources,
+                    source_ctx.as_ref(),
+                    &narrowing,
+                    &mut request,
+                    ordered,
+                )
+                .await;
                 // The compaction hooks (ADR 0050, slice H9) run here, inside the journaled step:
                 // a replay of a recorded summary asks none. A hook may add context to the request
                 // or veto the summary, and the history is shortened instead; it never writes the
@@ -4768,6 +4800,7 @@ impl LlmAgent {
                         task: state.task().map(Arc::from),
                         loaded: Arc::from(state.loaded.clone()),
                         removed_tools: Arc::from(state.removed_tools.clone()),
+                        narrowing: Arc::new(narrowing_of(state, context.map(|c| &**c))),
                         event_budget: Arc::clone(&state.event_budget.0),
                         approvable: approvable(ctx, state),
                     },
@@ -5121,6 +5154,7 @@ impl LlmAgent {
                 task: state.task().map(Arc::from),
                 loaded: Arc::from(state.loaded.clone()),
                 removed_tools: Arc::from(state.removed_tools.clone()),
+                narrowing: Arc::new(narrowing_of(state, context.map(|c| &**c))),
                 event_budget: Arc::clone(&state.event_budget.0),
                 approvable: approvable(ctx, state),
             };
@@ -5656,6 +5690,7 @@ impl LlmAgent {
             task,
             loaded,
             removed_tools,
+            narrowing,
             event_budget,
             approvable,
             ..
@@ -5696,6 +5731,7 @@ impl LlmAgent {
         Prepared {
             tool_ctx,
             holding,
+            narrowing,
             // What the call reported as sandbox usage rides in its result, which the step journals; a
             // call that ends in an error has no result to carry it, and leaves it here.
             unjournaled: Arc::new(Mutex::new(SandboxUsage::new())),
@@ -5726,6 +5762,7 @@ impl LlmAgent {
         let Prepared {
             tool_ctx,
             holding,
+            narrowing,
             unjournaled,
             approvable,
         } = prepared;
@@ -5741,8 +5778,14 @@ impl LlmAgent {
                 Duration::from_millis(ms) + SOURCE_LIMIT_MARGIN
             });
         async move {
+            // A session's own narrowing, first and with or without sources (ADR 0054 slice 3).
+            if let Some(held) = narrowing.hold(&name) {
+                return Ok(HookedOutput::plain(
+                    ToolOutput::error(held.reason).sanitized(),
+                ));
+            }
             if let Some((sources, source_ctx)) = &holding
-                && let Some(held) = withheld(sources, source_ctx, &[name.as_str()])
+                && let Some(held) = withheld(&narrowing, sources, source_ctx, &[name.as_str()])
                     .await
                     .into_iter()
                     .next()

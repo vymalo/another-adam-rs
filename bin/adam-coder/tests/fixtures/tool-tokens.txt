@@ -38,6 +38,6 @@ subagent_close	709	177
 subagent_list	776	194
 subagent_read	1115	278
 subagent_send	769	192
-subagent_start	2520	630
+subagent_start	2811	702
 ui_catalog	474	118
 write_file	975	243
