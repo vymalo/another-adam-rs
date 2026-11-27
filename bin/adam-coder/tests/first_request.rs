@@ -24,8 +24,10 @@ use common::Fixture;
 
 /// The coder's first request, measured on the commit that pinned it. A kilobyte of growth is
 /// allowed (a tool's description may gain a sentence); anything more is a reviewed decision.
-// measured 2026-11-21 on the merged head (b16c076a), plus the 1698 bytes of the session tools' section
-// (ADR 0054 decision 9, "\n\n" and 1696 bytes for the helpers `explorer` and `reviewer`); not remeasured.
+// The old pin (30814, measured 2026-11-21 on the merged head b16c076a) plus 1698 bytes: "\n\n" and
+// the 1696 bytes of `SessionTools::guide_for(["explorer", "reviewer"])` (ADR 0054 decision 9). The
+// delta is computed, not measured: re-pin this from the `system N B` line this test prints on the
+// first green CI run.
 const BASELINE_PROMPT_BYTES: usize = 32512;
 const BASELINE_TOOLS_BYTES: usize = 62293; // measured 2026-11-21 on the merged head (b16c076a)
 const GROWTH_ALLOWED: usize = 1024;

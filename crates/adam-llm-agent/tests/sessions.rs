@@ -5597,8 +5597,17 @@ fn the_drift_check_finds_each_way_the_guide_and_the_specs_part() {
         .find(|spec| spec.name == "subagent_close")
         .unwrap();
     let properties = close.parameters["properties"].as_object_mut().unwrap();
-    let cancel = properties.remove("cancel").unwrap();
-    properties.insert("stop".to_owned(), cancel);
+    *properties = std::mem::take(properties)
+        .into_iter()
+        .map(|(key, value)| {
+            let key = if key == "cancel" {
+                "stop".to_owned()
+            } else {
+                key
+            };
+            (key, value)
+        })
+        .collect();
     assert!(!drift(&guide, &renamed_in_a_spec).is_empty());
 
     let without_a_tool: String = guide

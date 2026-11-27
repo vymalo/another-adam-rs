@@ -332,6 +332,19 @@ const GUIDE: [GuideTool; 5] = [
     },
 ];
 
+/// The arguments of `tool` that a call must give, in the table's order: the `required` of its spec,
+/// so the table and the spec cannot name different ones. (`subagent_list` has none and its spec has
+/// no `required`, which keeps its bytes as they were.)
+fn required_of(tool: &str) -> Vec<&'static str> {
+    GUIDE
+        .iter()
+        .filter(|row| row.name == tool)
+        .flat_map(|row| row.args.iter())
+        .filter(|(_, required)| *required)
+        .map(|(name, _)| *name)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -766,7 +779,7 @@ impl Tool for Start {
                         "additionalProperties": false,
                     },
                 },
-                "required": ["agent", "description", "prompt"],
+                "required": required_of(SUBAGENT_START),
                 "additionalProperties": false,
             }),
         }
@@ -967,7 +980,7 @@ impl Tool for Send {
                         "description": "What to tell the subagent.",
                     },
                 },
-                "required": ["session", "message"],
+                "required": required_of(SUBAGENT_SEND),
                 "additionalProperties": false,
             }),
         }
@@ -1200,7 +1213,7 @@ impl Tool for Read {
                         "description": "The most report lines to return.",
                     },
                 },
-                "required": ["session"],
+                "required": required_of(SUBAGENT_READ),
                 "additionalProperties": false,
             }),
         }
@@ -1301,7 +1314,7 @@ impl Tool for Close {
                         "description": "Stop a working round instead of letting it finish.",
                     },
                 },
-                "required": ["session"],
+                "required": required_of(SUBAGENT_CLOSE),
                 "additionalProperties": false,
             }),
         }
@@ -1593,6 +1606,31 @@ mod tests {
                 since: None,
             },
         )
+    }
+
+    #[test]
+    fn each_spec_takes_the_arguments_the_table_lists() {
+        let tools = SessionTools::new(Vec::<SessionAgent>::new()).tools();
+        assert_eq!(tools.len(), GUIDE.len());
+        for (tool, row) in tools.iter().zip(GUIDE.iter()) {
+            let spec = tool.spec();
+            assert_eq!(spec.name, row.name);
+            let mut have: Vec<&str> = spec.parameters["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            have.sort_unstable();
+            let mut want: Vec<&str> = row.args.iter().map(|(name, _)| *name).collect();
+            want.sort_unstable();
+            assert_eq!(have, want, "{}", row.name);
+            let required: Vec<&str> = spec.parameters["required"]
+                .as_array()
+                .map(|names| names.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(required, required_of(row.name), "{}", row.name);
+        }
     }
 
     #[test]

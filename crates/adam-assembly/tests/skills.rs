@@ -15,9 +15,7 @@ use adam_assembly::{
     AgentDef, Assembly, Error, LOAD_SKILL, READ_SKILL_FILE, RunSkills, SkillField,
     run_skills_conformance,
 };
-use adam_llm_agent::{
-    Conversation, SessionTools, ToolCtx, ToolError, ToolOutput, ToolSet, user_message,
-};
+use adam_llm_agent::{Conversation, ToolCtx, ToolError, ToolOutput, ToolSet, user_message};
 use adam_model::{Message, MockModel, ModelRequest, ToolCall};
 use common::{instructions, plain, runtime, spawn_worker, tools, wait_done, write};
 use serde_json::{Value, json};
@@ -93,14 +91,13 @@ fn info<'a>(assembly: &'a Assembly, name: &str) -> &'a adam_assembly::AgentInfo 
     assembly.info().iter().find(|i| i.name == name).unwrap()
 }
 
-/// The prompt of a root that has `helper` for a subagent, without the section about the session
-/// tools that ends it (asserted whole in `tests/sessions_guide.rs`).
-fn without_sessions(prompt: &str) -> String {
-    let guide = SessionTools::guide_for(["helper"]);
+/// The prompt of a root that has subagents, without the section about the session tools that ends
+/// it (asserted whole in `tests/sessions_guide.rs`).
+fn without_sessions(prompt: &str) -> &str {
     prompt
-        .strip_suffix(&format!("\n\n{guide}"))
+        .split_once("\n\n## Child sessions")
         .unwrap_or_else(|| panic!("the prompt ends with the session tools' section: {prompt}"))
-        .to_owned()
+        .0
 }
 
 fn call(id: &str, tool: &str, args: Value) -> ToolCall {
@@ -1203,7 +1200,7 @@ async fn with_run_skills_the_root_has_both_tools_without_folder_skills() {
     let coder = info(&assembly, "coder");
     assert_eq!(coder.tools[..2], [LOAD_SKILL, READ_SKILL_FILE]);
     assert!(
-        coder.prompt.ends_with(
+        without_sessions(&coder.prompt).ends_with(
             "</available_skills>\n\nOther skills may be listed to you during the run, named \
              `<source>/<skill>`; load them with load_skill the same way."
         ),
@@ -1352,7 +1349,7 @@ async fn skills_empty_turns_run_skills_off() {
             .iter()
             .any(|t| t == LOAD_SKILL || t == READ_SKILL_FILE)
     );
-    assert_eq!(coder.prompt, "You are the coder.");
+    assert_eq!(without_sessions(&coder.prompt), "You are the coder.");
     run(&assembly, "coder").await;
     // The model made up a call: it is an unknown tool, and `RunSkills` was not asked.
     assert!(result(&model.last_request().unwrap(), "c").1);
