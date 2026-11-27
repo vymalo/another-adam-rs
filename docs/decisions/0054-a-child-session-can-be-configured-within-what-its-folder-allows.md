@@ -322,13 +322,17 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
   syntax (exact names and `*` patterns, `github__*` selecting an MCP server; `glob` moved from `adam-assembly` to `adam-runtime`),
   and **both fronts admit them with the same `SessionBounds::admit`**: at most 32 entries of at most 200 characters each, none
   blank. A remote subagent takes neither.
-  * **What `admit` checks depends on what the starter knows (the amendments above).** `SessionBounds::tools` holds the names the
-    worker binds the subagent with and `tools_complete` says whether they are all of them. **Neither shipped agent has a complete
-    set**: `adam-agent` adds its UI tools and `adam-coder` its references and UI through sources (and an `mcp.json` server with a
-    `when` is one too), whose names no list made at startup holds. So in both, the strict check applies to a **concrete
-    `deny_tools` name** (refused with the list, and a hint to name a source's tools by pattern), and to `tools` entries and
-    patterns **only on an agent with no sources**; elsewhere a `tools` entry that matches nothing is admitted, is recorded in the
-    header and offers less, never more. The control plane knows no name and checks the shape.
+  * **What `admit` checks depends on what the starter knows (the amendments above), and what ships here is an interim.** The
+    **target** is the owner's answer of 2026-11-27 to ANR-Q144, *every source declares its tools*: a defaulted
+    `ToolSource::declared` names the tools a source can offer, so `SessionBounds` knows the complete set and decision 4's rule
+    ("a pattern matching no tool is refused with the list") holds on every agent (card ANR-1319, not built here). **The interim
+    this slice ships** is `SessionBounds::tools` (the names the worker binds the subagent with) and `tools_complete`, which is
+    `false` on **both shipped agents**: `adam-agent` adds its UI tools and `adam-coder` its references and UI through sources (an
+    `mcp.json` server with a `when` is one too), whose names no list made at startup holds. So today the strict check is the
+    **concrete `deny_tools` name** on a worker (refused with the list, and a hint to name a source's tools by pattern), and a
+    `tools` entry or a pattern is strict **only on an agent with no sources**; elsewhere a `tools` entry that matches nothing is
+    admitted, recorded in the header and offers less, never more. The control plane knows no name and checks the shape. ANR-1319
+    ends the interim; this is a step, not the decision.
   * **The loop applies it**, not a tool source, so an embedder that builds an agent with `LlmAgentBuilder` has it too:
     `SessionNarrowing` (`crates/adam-llm-agent/src/session_tools.rs`) is consulted in `agent.rs` before every source's holds, at the
     request (`apply_sources`: a hidden tool is not shown) and at the call (`step_work`: a call to one is refused without running),
