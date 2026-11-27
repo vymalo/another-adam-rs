@@ -20,6 +20,35 @@ exists.
 
 *Amended 2026-11-14 ([ADR 0046](0046-the-operator-lives-in-the-platform-repository.md)):* `AgentConfig` `spec.workers` (decision on worker dependencies) was a field of the operator removed from this repository; it belongs to the operator of `vymalo/another-agentic-platform`.
 
+*Amended 2026-11-27 (owner ruling, ANR-1288):* **sub-agent workspace isolation is a port, and the coder is one adapter of
+it.** The owner, on ANR-1140: *"worktrees doesn't exist on chat sub-agents. Maybe do it with port and adapters, the adapter
+on adam for chat using worktrees?"* This replaces decision 11, and ANR-1140's plain `add_worker` slice is paused (its
+partial attempt was never pushed).
+
+*What exists today*, measured at `f7d7cd81` on 2026-11-27:
+
+* Decision 11's `SubagentSetup` and `BoundDef::subagent_setup` are **not built**: they appear in this ADR and nowhere in
+  `crates/` or `bin/`. The seam the amendment names is therefore new work, not an existing hook.
+* A local subagent works in the **root run's** workspace. The run whose workspace its calls read is
+  `ToolCtx::workspace_run_id` (`crates/adam-llm-agent/src/tool.rs:1718`), chosen by `workspace_run_of`
+  (`crates/adam-llm-agent/src/agent.rs:6973`) from the session header, and the coder keys the slot and the environment it
+  hands a call by `root_run_id` (`bin/adam-coder/src/tools/mod.rs:456`, `:516`, `:1106`).
+* The workspace is a concrete type, `adam_workspace::Workspaces` (`crates/adam-workspace/src/workspace.rs:116`); a run's
+  slots are `RunWorkspace` (`crates/adam-workspace/src/run_workspace.rs:48`); the **environment** behind them is already a
+  port, `Environment` / `DynEnvironment` (`crates/adam-workspace/src/environment.rs:331`, `:338`).
+
+The decision:
+
+1. **Isolation is a port**, chosen where an agent is bound, beside the environment port and by the same rule
+   ([CLAUDE.md](../../CLAUDE.md) rule 2: infrastructure is a trait with a conformance testkit, and no driver type in a trait
+   signature). A subagent is given an isolation adapter, or none.
+2. **The coder's adapter makes a git worktree per worker slot**, which is what decision 11 meant: a worker edits in a
+   branch of its own and Adam merges it, the gates staying on Adam.
+3. **A chat or folder agent registers no adapter, or a no-op one**, so its subagents work in the root's workspace exactly as
+   they do today. Isolation is never gained silently, and an agent without an adapter gets the behaviour it has now.
+4. **Decision 11 is superseded.** `SubagentSetup` is not the seam to build; the port is. ANR-1140, ANR-1141 and ANR-206 are
+   rewritten against it, and none of them may add a coder-only hook.
+
 ## Context
 
 In a thread of 2026-10-11 the owner asked Adam to "create sub-agents to work faster" on a React rewrite. Adam said it
