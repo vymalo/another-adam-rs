@@ -43,6 +43,10 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            {{- /* activity.*: GET /internal/activity on a port of its own; the Service selects the front (ADR 0081). */}}
+            {{- with (include "coder.activityPort" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           env:
             - name: LISTEN_ADDR
               value: "0.0.0.0:8080"
@@ -80,6 +84,10 @@ spec:
             {{- end }}
             {{- /* a2a.*: the optional A2A features, off by default. */}}
             {{- with (include "coder.a2aEnv" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- /* activity.*: its listener and its own tokens, from the Secret that was named. */}}
+            {{- with (include "coder.activityEnv" . | trim) }}
             {{- . | nindent 12 }}
             {{- end }}
           startupProbe:

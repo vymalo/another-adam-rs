@@ -2252,4 +2252,82 @@ check "a key id without a key is refused" \
 check "a verify set without a key is refused" \
   fails helm template coder "$chart" --set image.tag=sha-abc1234 --set externalSecrets.properties.turnVerifyKeys=k
 
+# GET /internal/activity on a port of its own, with tokens of its own (activity.*, adam ADR 0081). Off by
+# default and then invisible (the goldens, byte for byte); on, on the pods the Service selects, the tokens from
+# the Secret that was named and never a value, and the NetworkPolicy lets its caller reach that port only.
+helm_act() { helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 "$@"; }
+helm_act_on() {
+  helm_act --set activity.enabled=true --set activity.tokensSecret.name=coder-activity \
+    --set activity.allowedNamespace=agent-platform "$@"
+}
+# act_value <Kind> <name>: the plain value of the variable <name> in that kind's container (empty when none).
+act_value() { doc "$1" | env_value "$2"; }
+# act_ref <Kind> <name>: the four lines after `- name: <name>` in that kind's container (its valueFrom).
+act_ref() { doc "$1" | grep -A4 -- "^            - name: $2\$"; }
+# The policy rule that names agent-platform: from that line to the end of its ports.
+act_rule() { doc NetworkPolicy | awk '/kubernetes.io\/metadata.name: agent-platform/ { on = 1 } on'; }
+a2a_rule() { doc NetworkPolicy | awk '/kubernetes.io\/metadata.name: another-agentic-system/ { on = 1 } /^    - from:/ && on { exit } on'; }
+
+helm_act > "$out"
+check "activity off: no ACTIVITY_ variable, no activity port" lacks 'ACTIVITY_|name: activity$|targetPort: activity'
+check "activity off: the default render is still the golden" cmp -s "$out" "$golden"
+helm_act --set activity.enabled=false --set activity.tokensSecret.name=coder-activity --set activity.port=9100 \
+  --set activity.allowedNamespace=agent-platform > "$out"
+check "activity off, its other values set: the render equals the golden" cmp -s "$out" "$golden"
+helm_act --set topology=split > "$out"
+check "activity off, split: no ACTIVITY_ variable, no activity port" lacks 'ACTIVITY_|name: activity$|targetPort: activity'
+
+helm_act_on > "$out"
+check "activity on: ACTIVITY_LISTEN_ADDR is the port, in the StatefulSet" \
+  test "$(act_value StatefulSet ACTIVITY_LISTEN_ADDR)" = "0.0.0.0:8081"
+check "activity on: ACTIVITY_BEARER_TOKENS has no value ..." test -z "$(act_value StatefulSet ACTIVITY_BEARER_TOKENS)"
+check "... it is a secretKeyRef to the Secret that was named" sh -c 'printf "%s\n" "$1" | grep -q "secretKeyRef:" && printf "%s\n" "$1" | grep -q "name: coder-activity$"' _ "$(act_ref StatefulSet ACTIVITY_BEARER_TOKENS)"
+check "... under the default key" sh -c 'printf "%s\n" "$1" | grep -q "key: ACTIVITY_BEARER_TOKENS$"' _ "$(act_ref StatefulSet ACTIVITY_BEARER_TOKENS)"
+check "activity on: the container has the port activity" dhas StatefulSet 'containerPort: 8081$'
+check "... named activity" dcount StatefulSet '^            - name: activity$' 1
+check "activity on: the Service has a port activity, to the container's" dhas Service 'targetPort: activity$'
+check "... on 8081" dhas Service 'port: 8081$'
+check "activity on: the Service keeps its A2A port" dhas Service 'targetPort: http$'
+check "activity on: the policy lets agent-platform reach 8081" sh -c 'printf "%s\n" "$1" | grep -q "port: 8081$"' _ "$(act_rule)"
+check "... and not the A2A port" sh -c '! printf "%s\n" "$1" | grep -q "port: 8080$"' _ "$(act_rule)"
+check "activity on: the A2A rule still gives 8080 alone to the orchestrator's namespace" \
+  sh -c 'printf "%s\n" "$1" | grep -q "port: 8080$" && ! printf "%s\n" "$1" | grep -q "port: 8081$"' _ "$(a2a_rule)"
+check "activity on: the chart renders no Secret, and no ExternalSecret key, for its tokens" \
+  lacks '^kind: Secret$|secretKey: ACTIVITY_'
+check "activity on: the A2A variables are unchanged" dhas StatefulSet 'key: A2A_BEARER_TOKENS$'
+helm_act_on --set activity.port=9100 --set activity.tokensSecret.key=tokens > "$out"
+check "activity: the port is a value" test "$(act_value StatefulSet ACTIVITY_LISTEN_ADDR)" = "0.0.0.0:9100"
+check "... in the Service too" dhas Service 'port: 9100$'
+check "activity: the Secret's key is a value" sh -c 'printf "%s\n" "$1" | grep -q "key: tokens$"' _ "$(act_ref StatefulSet ACTIVITY_BEARER_TOKENS)"
+helm_act_on --set networkPolicy.enabled=false --set activity.allowedNamespace= > "$out"
+check "activity on without the NetworkPolicy: no namespace is needed" dhas StatefulSet 'name: ACTIVITY_LISTEN_ADDR$'
+
+# topology=split: the Service selects the front, so the front has it and the worker has none of it.
+helm_act_on --set topology=split > "$out"
+check "split: the front has ACTIVITY_LISTEN_ADDR" test "$(act_value Deployment ACTIVITY_LISTEN_ADDR)" = "0.0.0.0:8081"
+check "split: the front has its tokens from the Secret" sh -c 'printf "%s\n" "$1" | grep -q "name: coder-activity$"' _ "$(act_ref Deployment ACTIVITY_BEARER_TOKENS)"
+check "split: the front has the port" dhas Deployment 'containerPort: 8081$'
+check "split: the worker has none of it" dlacks StatefulSet 'ACTIVITY_|containerPort: 8081|name: activity$'
+check "split: the Service has the port" dhas Service 'targetPort: activity$'
+
+# Refusals: a mistake stops the render, not a rollout.
+message=$(helm_act --set activity.enabled=true --set activity.allowedNamespace=agent-platform 2>&1 || true)
+check "refused: on without the tokens' Secret" fails helm_act --set activity.enabled=true --set activity.allowedNamespace=agent-platform
+check "... the error names activity.tokensSecret.name" says "$message" 'activity.tokensSecret.name'
+check "refused: a Secret name that is not one" fails helm_act_on --set activity.tokensSecret.name=Not_A_Secret
+check "refused: a key that is not one" fails helm_act_on --set 'activity.tokensSecret.key=a b'
+check "refused: the A2A port" fails helm_act_on --set activity.port=8080
+check "refused: the GitHub MCP sidecar's port" fails helm_act_on --set activity.port=8082
+check "refused: port 0" fails helm_act_on --set activity.port=0
+check "refused: a port out of range" fails helm_act_on --set activity.port=70000
+check "refused: a port that is not a number" fails helm_act_on --set activity.port=http
+message=$(helm_act --set activity.enabled=true --set activity.tokensSecret.name=coder-activity 2>&1 || true)
+check "refused: on with the NetworkPolicy and no namespace" fails helm_act --set activity.enabled=true --set activity.tokensSecret.name=coder-activity
+check "... the error names activity.allowedNamespace" says "$message" 'activity.allowedNamespace'
+check "refused: a namespace that is not one" fails helm_act_on --set activity.allowedNamespace=Not_A_Namespace
+check "refused: enabled that is not a boolean" fails helm_act --set-string activity.enabled=maybe
+check "refused: the tokens as a value in extraEnv, even with activity off" \
+  fails helm_act --set-string config.extraEnv.ACTIVITY_BEARER_TOKENS=t
+check "refused: the address in extraEnv" fails helm_act_on --set-string config.extraEnv.ACTIVITY_LISTEN_ADDR=0.0.0.0:9100
+
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

@@ -60,7 +60,7 @@ axum::serve(listener, app).await?;
 | Route | Auth |
 |---|---|
 | `GET /.well-known/agent-card.json`, `GET /healthz` | public |
-| routes the host adds with `ServerOptions::with_protected_routes` (the service adds `GET /internal/activity`) | required |
+| routes the host adds with `ServerOptions::with_protected_routes` (the service adds `GET /internal/activity` while `ACTIVITY_LISTEN_ADDR` is unset, a deprecated form) | required |
 | `GET /.well-known/jwks.json` (only when the card is signed) | public |
 | `GET /docs` (303 to `docs/`), `GET /docs/` and the files it loads, `GET /openapi.json` (unless `with_docs(false)`) | public |
 | `POST /`: JSON-RPC, every A2A 1.0 method | bearer token |
@@ -109,6 +109,7 @@ Protocol notes (details in the crate docs, `src/lib.rs`; the SDK's `RequestHandl
   bearer authentication (*verified 2026-10-07*,
   <https://a2a-protocol.org/latest/specification/> §3.3.4).
 * `A2aServer::health_router_with_routes(auth, routes)` is `health_router()` plus `routes` behind the bearer; `/healthz` stays public.
+* `A2aServer::protected_router(auth, routes)` is `routes` alone behind the bearer `auth` asks for: no `/healthz`, no card, nothing of A2A, any other path a plain 404. For a listener of its own with tokens of its own (the service's `GET /internal/activity` on `ACTIVITY_LISTEN_ADDR`, [ADR 0081](../../docs/decisions/0081-the-activity-route-has-a-listener-and-tokens-of-its-own.md)). Test: `protected_router_serves_its_routes_behind_its_token_and_nothing_else`.
 * `A2aServer::health_router()` is the `/healthz` route alone (200, `ok`), for a process that
   answers probes but serves no A2A, such as a worker.
 * Every route except the agent card, `/healthz`, the docs and (when signed) the key set answers 401 without a valid

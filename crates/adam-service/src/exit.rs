@@ -8,7 +8,7 @@
 //! | Code | Name | Root cause |
 //! |---|---|---|
 //! | 0 | | clean shutdown after a signal (not an error) |
-//! | 78 | `EX_CONFIG` | [`ConfigError`], `OpenAiConfigError`, [`ServeError::NoCard`], [`ServeError::ChildSessions`] (a helper of `child-sessions/v1` that is not registered), [`ServeError::Push`] (push notifications are on and cannot be set up), [`ServeError::UnsupportedScheme`], [`ServeError::StoreNotBuilt`], [`ServeError::SqliteWithoutPath`], [`ServeError::SplitRoleOnSqlite`], or any error whose class is `Invalid` (a mistake in the agent's files, for the errors a binary classifies with [`exit_code_with`]) |
+//! | 78 | `EX_CONFIG` | [`ConfigError`], `OpenAiConfigError`, [`ServeError::NoCard`], [`ServeError::ChildSessions`] (a helper of `child-sessions/v1` that is not registered), [`ServeError::Push`] (push notifications are on and cannot be set up), [`ServeError::ActivityWithoutTokens`] (an activity listener with no tokens of its own), [`ServeError::UnsupportedScheme`], [`ServeError::StoreNotBuilt`], [`ServeError::SqliteWithoutPath`], [`ServeError::SplitRoleOnSqlite`], or any error whose class is `Invalid` (a mistake in the agent's files, for the errors a binary classifies with [`exit_code_with`]) |
 //! | 69 | `EX_UNAVAILABLE` | a dependency is unreachable: a `Transient`, `RateLimited` or `Conflict` error, such as Postgres or an MCP server |
 //! | 71 | `EX_OSERR` | an [`std::io::Error`], and [`ServeError::Bind`]: a listener that cannot bind, a directory that cannot be created |
 //! | 70 | `EX_SOFTWARE` | [`HostError`] (a component of the process stopped, panicked or ended while still needed), a panicked task, or a `Corrupt` or `Internal` error |
@@ -80,7 +80,10 @@ fn code_of(
     if let Some(e) = cause.downcast_ref::<ServeError>() {
         match e {
             ServeError::Host(_) => return Some(EX_SOFTWARE),
-            ServeError::NoCard | ServeError::ChildSessions { .. } | ServeError::Push(_) => {
+            ServeError::NoCard
+            | ServeError::ChildSessions { .. }
+            | ServeError::Push(_)
+            | ServeError::ActivityWithoutTokens => {
                 return Some(EX_CONFIG);
             }
             ServeError::StoreNotBuilt { .. }
@@ -171,6 +174,7 @@ mod tests {
             78
         );
         assert_eq!(coded(ServeError::Push("no TLS backend".into())), 78);
+        assert_eq!(coded(ServeError::ActivityWithoutTokens), 78);
     }
 
     #[test]

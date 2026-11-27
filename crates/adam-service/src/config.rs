@@ -16,6 +16,8 @@
 //! | `A2A_CARD_SIGNING_JKU` | the `jku` (URL of the key set) in the signature header; the server serves the key set at `/.well-known/jwks.json` | unset: no `jku` |
 //! | `A2A_DOCS` | Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, both public (the calls still need a token); `false` turns them off ([`A2aSettings::docs`]) | `true` |
 //! | `LISTEN_ADDR` | bind address: the A2A server, or for `worker` its `/healthz` listener | `0.0.0.0:8080` |
+//! | `ACTIVITY_LISTEN_ADDR` | turns on the **activity listener**: a bind address that serves `GET /internal/activity` and nothing else, behind `ACTIVITY_BEARER_TOKENS`; the A2A port then stops serving the route ([`ActivitySettings`]). Read by every role; it must differ from `LISTEN_ADDR` | unset: the route stays on `LISTEN_ADDR` behind `A2A_BEARER_TOKENS` (**deprecated**) |
+//! | `ACTIVITY_BEARER_TOKENS` | comma-separated tokens the activity listener accepts, none of them an A2A token; required with `ACTIVITY_LISTEN_ADDR` (fail closed: exit 78), refused without it | unset |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
 //! | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (`1` is one at a time); an agent file's `limits.max_parallel` may lower it for that agent; read by the roles that run workers ([`WorkerSettings::max_parallel_tool_calls`]), which refuse a bad value; **every role also reads it, leniently** (a bad value is the default and no problem), because a control plane holds a person's `start.config` to the same bound ([`SessionSettings::max_parallel_tool_calls`]) | `10` |
 //! | `MAX_TOOL_CALLS_IN_FLIGHT` | the most tool calls of the whole process that run at the same time, 1 to 256: the process's pool, inside which `MAX_PARALLEL_TOOL_CALLS` still bounds one turn (ADR 0065) | `4` |
@@ -236,6 +238,10 @@ pub struct ServiceConfig {
     pub public_url: Option<Url>,
     /// `LISTEN_ADDR`: the A2A server, or the `/healthz` listener of a worker.
     pub listen_addr: SocketAddr,
+    /// `ACTIVITY_LISTEN_ADDR` and `ACTIVITY_BEARER_TOKENS`: the listener of its own that serves
+    /// `GET /internal/activity`. `None`: the route is on [`listen_addr`](Self::listen_addr) behind
+    /// the A2A tokens, as before (deprecated). Read by every role.
+    pub activity: Option<ActivitySettings>,
     /// `WORKERS` and `WORKER_ID`. `Some` exactly when [`Role::runs_workers`].
     pub worker: Option<WorkerSettings>,
     /// The optional A2A features (push notifications, the signature of the card): read only by a
@@ -278,6 +284,7 @@ impl std::fmt::Debug for ServiceConfig {
                     .map(|u| endpoint_for_logs(u.as_str())),
             )
             .field("listen_addr", &self.listen_addr)
+            .field("activity", &self.activity)
             .field("worker", &self.worker)
             .field("a2a", &self.a2a)
             .field("sessions", &self.sessions)
@@ -360,6 +367,8 @@ impl ServiceConfig {
             problems,
         );
 
+        let activity = ActivitySettings::parse(lookup, listen_addr, &a2a_bearer_tokens, problems);
+
         let notify_local_only = parse_flag(&get, "NOTIFY_LOCAL_ONLY", problems);
 
         let worker = role
@@ -395,6 +404,7 @@ impl ServiceConfig {
             a2a_bearer_tokens,
             public_url,
             listen_addr,
+            activity,
             worker,
             a2a,
             sessions: SessionSettings::parse(lookup, problems),
@@ -405,6 +415,117 @@ impl ServiceConfig {
                 || not_blank(lookup, "TURN_SIGNING_KEY_FILE").is_some(),
         }
     }
+}
+
+/// `ACTIVITY_LISTEN_ADDR` and `ACTIVITY_BEARER_TOKENS`: `GET /internal/activity` on a listener of
+/// its own, with tokens of its own (ADR 0081).
+///
+/// The caller of the route (an operator that scales the service) then holds no A2A token and needs
+/// no path to the A2A port: a token of this list is refused on the A2A listener, and an A2A token
+/// is refused here. The listener serves that one route; every other path is a 404.
+#[derive(Clone)]
+pub struct ActivitySettings {
+    /// `ACTIVITY_LISTEN_ADDR`: where the route is served. Never [`ServiceConfig::listen_addr`].
+    pub listen_addr: SocketAddr,
+    /// `ACTIVITY_BEARER_TOKENS`: the tokens it accepts. Never empty, and none of them is one of
+    /// [`ServiceConfig::a2a_bearer_tokens`].
+    pub bearer_tokens: Vec<SecretString>,
+}
+
+impl std::fmt::Debug for ActivitySettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivitySettings")
+            .field("listen_addr", &self.listen_addr)
+            .field("bearer_tokens", &self.bearer_tokens.len())
+            .finish()
+    }
+}
+
+impl ActivitySettings {
+    /// Read the two variables. `None` when `ACTIVITY_LISTEN_ADDR` is unset or blank (the route
+    /// stays on `listen_addr`). Each of these adds a problem, so the process exits 78 before
+    /// anything binds: an address with no usable token (fail closed), tokens with no address, an
+    /// address that is not one or that `listen_addr` already takes, and a token that is also in
+    /// `a2a_tokens`. No message carries a token.
+    pub fn parse(
+        lookup: &impl Fn(&str) -> Option<String>,
+        listen_addr: SocketAddr,
+        a2a_tokens: &[SecretString],
+        problems: &mut Vec<String>,
+    ) -> Option<Self> {
+        use secrecy::ExposeSecret as _;
+        let get = |name: &str| not_blank(lookup, name);
+        let tokens_raw = get("ACTIVITY_BEARER_TOKENS");
+        let Some(addr_raw) = get("ACTIVITY_LISTEN_ADDR") else {
+            if tokens_raw.is_some() {
+                problems.push(
+                    "ACTIVITY_BEARER_TOKENS is set and ACTIVITY_LISTEN_ADDR is not: the tokens are \
+                     read only by the activity listener. Set ACTIVITY_LISTEN_ADDR, or unset the tokens"
+                        .into(),
+                );
+            }
+            return None;
+        };
+        let addr = match addr_raw.trim().parse::<SocketAddr>() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                problems.push(format!(
+                    "ACTIVITY_LISTEN_ADDR is invalid ({addr_raw:?}): {e}"
+                ));
+                None
+            }
+        };
+        let tokens: Vec<SecretString> = tokens_raw
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| SecretString::from(t.to_owned()))
+            .collect();
+        match &tokens_raw {
+            None => problems.push(
+                "ACTIVITY_BEARER_TOKENS is required when ACTIVITY_LISTEN_ADDR is set: the activity \
+                 listener has tokens of its own and accepts no other (fail closed)"
+                    .into(),
+            ),
+            Some(_) if tokens.is_empty() => {
+                problems.push("ACTIVITY_BEARER_TOKENS has no usable token".into());
+            }
+            Some(_) => {}
+        }
+        let shared = tokens.iter().any(|token| {
+            a2a_tokens
+                .iter()
+                .any(|a2a| a2a.expose_secret() == token.expose_secret())
+        });
+        if shared {
+            problems.push(
+                "ACTIVITY_BEARER_TOKENS and A2A_BEARER_TOKENS share a token: each listener needs \
+                 tokens of its own, so that a caller of the activity route cannot reach A2A"
+                    .into(),
+            );
+        }
+        let addr = addr?;
+        if same_port(addr, listen_addr) {
+            problems.push(format!(
+                "ACTIVITY_LISTEN_ADDR ({addr}) takes the port of LISTEN_ADDR ({listen_addr}): the \
+                 activity route has a listener of its own, on another port"
+            ));
+        }
+        Some(Self {
+            listen_addr: addr,
+            bearer_tokens: tokens,
+        })
+    }
+}
+
+/// Whether two bind addresses would take the same port: the same non-zero port, on the same
+/// address or with either one unspecified (`0.0.0.0`, `::`). Port 0 picks a free port each time.
+fn same_port(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() != 0
+        && a.port() == b.port()
+        && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
 }
 
 /// The default of `SESSION_IDLE_DAYS`.
@@ -2324,6 +2445,138 @@ mod tests {
                 assert!(problem.contains(accepted), "{problem}");
             }
         }
+    }
+
+    #[test]
+    fn the_activity_listener_is_off_unless_its_address_is_set() {
+        let c = parse(&full()).expect("valid");
+        assert!(c.activity.is_none(), "{:?}", c.activity);
+        let mut vars = full();
+        vars.insert("ACTIVITY_LISTEN_ADDR", "  ");
+        assert!(parse(&vars).expect("blank is unset").activity.is_none());
+    }
+
+    #[test]
+    fn the_activity_listener_reads_its_address_and_its_own_tokens_on_every_role() {
+        for role in ["all", "control-plane", "worker"] {
+            let mut vars = with_role(role);
+            vars.insert("ACTIVITY_LISTEN_ADDR", "0.0.0.0:8081");
+            vars.insert("ACTIVITY_BEARER_TOKENS", " act-1 ,, act-2 ");
+            let c = parse(&vars).unwrap_or_else(|e| panic!("{role}: {e}"));
+            let activity = c.activity.as_ref().expect("on");
+            assert_eq!(activity.listen_addr, "0.0.0.0:8081".parse().unwrap());
+            let tokens: Vec<_> = activity
+                .bearer_tokens
+                .iter()
+                .map(|t| t.expose_secret().to_owned())
+                .collect();
+            assert_eq!(tokens, ["act-1", "act-2"], "{role}");
+            // Debug says how many, never which.
+            let debug = format!("{c:?}");
+            assert!(
+                !debug.contains("act-1") && !debug.contains("act-2"),
+                "{debug}"
+            );
+        }
+    }
+
+    /// Fail closed: an activity listener with no token of its own is a startup error (exit 78), it
+    /// never falls back to the A2A tokens or to serving anyone.
+    #[test]
+    fn an_activity_address_without_its_own_tokens_is_refused() {
+        for role in ["all", "control-plane", "worker"] {
+            let mut vars = with_role(role);
+            vars.insert("ACTIVITY_LISTEN_ADDR", "0.0.0.0:8081");
+            let problems = problems_of(&vars);
+            let problem = problems
+                .iter()
+                .find(|p| p.starts_with("ACTIVITY_BEARER_TOKENS is required"))
+                .unwrap_or_else(|| panic!("{role}: {problems:?}"));
+            assert!(problem.contains("fail closed"), "{problem}");
+            vars.insert("ACTIVITY_BEARER_TOKENS", " , ");
+            assert!(
+                problems_of(&vars)
+                    .iter()
+                    .any(|p| p == "ACTIVITY_BEARER_TOKENS has no usable token"),
+                "{role}"
+            );
+        }
+        let mut vars = full();
+        vars.insert("ACTIVITY_LISTEN_ADDR", "0.0.0.0:8081");
+        let error = parse(&vars).unwrap_err();
+        assert_eq!(crate::exit_code(&error), 78);
+    }
+
+    #[test]
+    fn activity_tokens_without_an_address_are_refused() {
+        let mut vars = full();
+        vars.insert("ACTIVITY_BEARER_TOKENS", "act-1");
+        let problems = problems_of(&vars);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p
+                    .starts_with("ACTIVITY_BEARER_TOKENS is set and ACTIVITY_LISTEN_ADDR is not")),
+            "{problems:?}"
+        );
+    }
+
+    /// A token in both lists would open A2A to the caller of the activity route (and the reverse):
+    /// refused, without saying which token.
+    #[test]
+    fn an_activity_token_that_is_also_an_a2a_token_is_refused() {
+        let mut vars = full();
+        vars.insert("ACTIVITY_LISTEN_ADDR", "0.0.0.0:8081");
+        vars.insert("ACTIVITY_BEARER_TOKENS", "act-1,two");
+        let problems = problems_of(&vars);
+        let problem = problems
+            .iter()
+            .find(|p| p.starts_with("ACTIVITY_BEARER_TOKENS and A2A_BEARER_TOKENS share a token"))
+            .unwrap_or_else(|| panic!("{problems:?}"));
+        assert!(
+            !problem.contains("two") && !problem.contains("act-1"),
+            "{problem}"
+        );
+    }
+
+    #[test]
+    fn the_activity_address_must_be_an_address_on_another_port() {
+        for (listen, activity) in [
+            ("0.0.0.0:8080", "0.0.0.0:8080"),
+            ("0.0.0.0:8080", "127.0.0.1:8080"),
+            ("127.0.0.1:8080", "0.0.0.0:8080"),
+            ("[::]:8080", "127.0.0.1:8080"),
+        ] {
+            let mut vars = full();
+            vars.insert("LISTEN_ADDR", listen);
+            vars.insert("ACTIVITY_LISTEN_ADDR", activity);
+            vars.insert("ACTIVITY_BEARER_TOKENS", "act-1");
+            assert!(
+                problems_of(&vars)
+                    .iter()
+                    .any(|p| p.starts_with("ACTIVITY_LISTEN_ADDR") && p.contains("LISTEN_ADDR")),
+                "{listen} {activity}"
+            );
+        }
+        // Another port, another address on the same port, and port 0 (a free port each) are fine.
+        for (listen, activity) in [
+            ("0.0.0.0:8080", "0.0.0.0:8081"),
+            ("127.0.0.1:8080", "127.0.0.2:8080"),
+            ("127.0.0.1:0", "127.0.0.1:0"),
+        ] {
+            let mut vars = full();
+            vars.insert("LISTEN_ADDR", listen);
+            vars.insert("ACTIVITY_LISTEN_ADDR", activity);
+            vars.insert("ACTIVITY_BEARER_TOKENS", "act-1");
+            assert!(parse(&vars).is_ok(), "{listen} {activity}");
+        }
+        let mut vars = full();
+        vars.insert("ACTIVITY_LISTEN_ADDR", "everywhere");
+        vars.insert("ACTIVITY_BEARER_TOKENS", "act-1");
+        assert!(mentions(
+            &problems_of(&vars),
+            "ACTIVITY_LISTEN_ADDR is invalid"
+        ));
     }
 
     #[test]

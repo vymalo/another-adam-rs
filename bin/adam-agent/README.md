@@ -207,6 +207,7 @@ same way; every problem is reported at once at startup):
 | `A2A_CARD_SIGNING_KEY_FILE`, `A2A_CARD_SIGNING_KEY_ID`, `A2A_CARD_SIGNING_JKU` | a PKCS#8 PEM key (ECDSA P-256 or Ed25519) that signs the agent card, its `kid` (default: the key's thumbprint) and its `jku` ; the server serves the key set at `/.well-known/jwks.json` | unset: unsigned |
 | `A2A_DOCS` | Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, public; `false` turns them off ([`adam-service`](../../crates/adam-service/README.md#environment)) | `true` |
 | `LISTEN_ADDR` | bind address: the A2A server, or a worker's `/healthz` listener | `0.0.0.0:8080` |
+| `ACTIVITY_LISTEN_ADDR`, `ACTIVITY_BEARER_TOKENS` | `GET /internal/activity` alone on a listener of its own, behind tokens of its own (none an A2A token; the address without tokens is exit 78), and gone from `LISTEN_ADDR` ([ADR 0081](../../docs/decisions/0081-the-activity-route-has-a-listener-and-tokens-of-its-own.md), `adam-service`) | unset: the route stays on `LISTEN_ADDR` behind the A2A tokens (deprecated) |
 | `WORKERS` | runs advanced concurrently | `4` |
 | `WORKER_ID` | lease identity of this worker: 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process |
 | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (else exit 78); a folder's `limits.max_parallel` may lower it for its agent, never raise it | `10` |

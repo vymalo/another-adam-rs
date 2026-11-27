@@ -285,6 +285,28 @@ a2a:
     # example https://<public host>/.well-known/jwks.json. Empty: none.
     jku: ""
 
+# GET /internal/activity on a port of its own, with tokens of its own (adam ADR 0081): what the run
+# store says about the agent's work ({"busy": N, "nextDueAt": ...}, no run content), for a caller
+# that scales the service and must hold no A2A token. Off by default, and then nothing of it is
+# rendered: the route stays on the A2A port behind the A2A tokens (deprecated). On, the pods that
+# serve A2A (the StatefulSet, or the front with topology=split) listen on `port` for that route
+# alone (ACTIVITY_LISTEN_ADDR), the Service gets a port `activity`, and the A2A port stops serving
+# the route.
+activity:
+  enabled: false
+  # The container's and the Service's port. Not 8080 (A2A) nor githubMcp.port.
+  port: 8081
+  # The Secret, in the release namespace, that holds the tokens (comma-separated) under `key`
+  # (ACTIVITY_BEARER_TOKENS). You (or another ExternalSecret) manage it; the chart never carries a
+  # token. Required when enabled. No token of it may be an A2A token: the process refuses to start.
+  tokensSecret:
+    name: ""
+    key: ACTIVITY_BEARER_TOKENS
+  # With networkPolicy.enabled: the namespace whose pods may reach `port` (the caller of the route,
+  # for example the platform's operator). Required then. It is given that port only, not the A2A
+  # port.
+  allowedNamespace: ""
+
 # The GitHub MCP server the coder reads GitHub through (ADR 0017, D4), as a native sidecar of every pod
 # that runs workers (an init container with restartPolicy: Always; Kubernetes 1.29 and later, GA in
 # 1.33). It is `github-mcp-server http --read-only --toolsets context,repos,issues,pull_requests` from

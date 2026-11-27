@@ -21,3 +21,10 @@ spec:
       port: {{ .Values.service.port }}
       targetPort: http
       protocol: TCP
+    {{- if include "coder.activity" . }}
+    {{- /* activity.*: GET /internal/activity alone, behind its own tokens (ADR 0081). */}}
+    - name: activity
+      port: {{ int64 .Values.activity.port }}
+      targetPort: activity
+      protocol: TCP
+    {{- end }}
