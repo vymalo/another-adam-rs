@@ -123,8 +123,8 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_inline_upload_bytes: 10485760 # root only: the largest file sent inline (`uploads/v1`; a larger one asks for a slot; the card carries no params), 1 to 268435456 (256 MiB); wins over UPLOADS_INLINE_MAX_BYTES (a subagent's value is ignored, with a warning)
   max_session_rounds: 10       # root only: most rounds one session may have, 2 to 200; lowers SESSION_MAX_ROUNDS (a subagent's value is ignored, with a warning)
 retry:                         # a retry policy per tool (below); this agent's own, none inherits
-plugins: [audit]                # compiled plugins the deployment registered; subagents inherit them (ADR 0050); an unknown name exits 78
   web_search: { attempts: 5, backoff: 2s, max_backoff: 5m, on: [rate-limited] }
+plugins: [audit]                # compiled hooks the deployment registered (below); a subagent inherits them; a name nobody registered exits 78
 vars: { max_check_cycles: 3 }  # defaults for {{placeholders}} in the body; code may override
 references:                    # root only: repositories the coder reads and never writes (below)
   - { name: design-system, url: "https://github.com/acme/design-system", description: Tokens and components the UI follows. }
@@ -184,7 +184,7 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   `lazy` (the default) starts lean, and a run loads tools in groups; `eager` puts every tool in every request, as
   before the key existed, and **a server whose `mcp.json` entry has a `when` is offered too** (nothing is withheld).
   `searchable` is accepted and behaves as `lazy` until searchable groups land.
-* **`plugins:` names compiled plugins** ([ADR 0050](../decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md), slice H6): each entry is a name or `{name, options}` of scalars. The deployment registers plugins by name (`AgentDef::plugin`); a name it did not register stops the agent (exit 78). A subagent runs its parent's plugins and then its own. An option that looks like a secret is refused. An agent file never declares a hook program.
+* **`plugins:` names compiled hooks the deployment registered** ([ADR 0050](../decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md), slices H6a and H6b): each entry is a name or `{name, options}` of scalars, and the name is one the **deployment** registered — `AgentDef::plugin` for a plugin that serves every agent alike, `AgentDef::plugin_with` when the entry's options decide how it is made. A name nobody registered stops the agent at startup (exit 78); an option whose name looks like a secret is refused; a subagent runs its parent's plugins and then its own. An agent file never declares a hook program, and `hooks:` stays an ignored key. **No shipped binary registers one yet** (*verified 2026-11-27*: no `bin/` names a plugin), so `adam-agent` and `adam-coder` read the key and have nothing to bind: `plugins:` in a folder they serve is exit 78 until a binary or an embedding host registers the name. `adam-plugin` ships `Audit`, which writes each observed event as one JSON line (slice H6b) and is registered under whatever name the deployment chooses.
 * **`retry:` is a retry policy per tool** ([ADR 0061](../decisions/0061-a-step-names-its-retry-policy.md)): a map from
   one of the agent's tool names (its own, an MCP server's `<server>__<tool>`, a skill or subagent tool) to `attempts`
   (required, 1 to 20, the tries in all), `backoff` and `max_backoff` (`500ms`, `1s`, `30m`, `1h`; at most `1h`, and
