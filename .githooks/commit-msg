@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+# Refuse a commit whose message is not a Conventional Commit, with the same check as CI.
+#
+#   git config core.hooksPath .githooks       (once per clone)
+#
+# git commit --no-verify skips it for one commit.
+exec "$(git rev-parse --show-toplevel)/tools/commit-lint.sh" --file "$1"

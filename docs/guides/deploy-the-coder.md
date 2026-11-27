@@ -357,6 +357,11 @@ Pin a consumer to an image by tag **and** digest (`adam-upgrade`). The build con
 A new GHCR package is private until its owner makes it public: check an anonymous pull before pointing a
 deployment at it.
 
+`sha-<7>` is for development. Production deploys a **release**: the image `X.Y.Z`, built, smoke-tested and signed on
+the tag `vX.Y.Z`, and the chart `oci://ghcr.io/vymalo/another-adam-rs/charts/coder` at the same version, whose
+`image.tag` is already `X.Y.Z`. `values.yaml` on `main` never holds a release. How one is cut, which tag to pin and how
+to check it: [Releases](releases.md).
+
 ## Known risks
 
 * **No database backups.** Losing the CNPG volume loses the run ledger, not the pushed branches or pull requests.

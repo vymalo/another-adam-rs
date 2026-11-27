@@ -39,6 +39,13 @@ main (`deploy/coder/bump-tag.sh`, also run as a dry run on pull requests). The i
 `ADAM_BUILD_REVISION`, so the agent card's `version` ends in `+<sha7>` and `build/v1` says the commit and the digest of the
 agent's files ([ADR 0028](../../docs/decisions/0028-the-card-says-which-build-answers.md)): the tag and the card agree.
 
+That is development. A **release** `vX.Y.Z` publishes this chart as `oci://ghcr.io/vymalo/another-adam-rs/charts/coder`
+at version `X.Y.Z` with `image.tag: X.Y.Z`, set in the packaged copy and never in `values.yaml`; `Chart.yaml`'s `version` and `appVersion`
+are release-please's, and move with the crates' version
+([Releases](../../docs/guides/releases.md), [ADR 0084](../../docs/decisions/0084-releases-are-cut-by-release-please-and-production-pins-a-version.md)).
+Production pins `image.tag: X.Y.Z@sha256:<digest>`. `tests/render-goldens.sh` writes the four goldens again, which a
+release does on its branch (the chart's version is in two labels of every object).
+
 ## Where a run's commands run
 
 The chart's default keeps every command in the coder's own pod (`RUN_ENVIRONMENT=local`). With
