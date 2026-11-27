@@ -34,6 +34,7 @@ adam-device-state = { path = "crates/adam-device-state", version = "0.1.0" } # x
 adam-device-state-testkit = { path = "crates/adam-device-state-testkit", version = "0.1.0" } # x-release-please-version
 adam-env-kubernetes = { path = "crates/adam-env-kubernetes", version = "0.1.0" } # x-release-please-version
 adam-error = { path = "crates/adam-error", version = "0.1.0" } # x-release-please-version
+adam-export = { path = "crates/adam-export", version = "0.1.0" } # x-release-please-version
 adam-git-sandbox = { path = "crates/adam-git-sandbox", version = "0.1.0" } # x-release-please-version
 adam-host = { path = "crates/adam-host", version = "0.1.0" } # x-release-please-version
 adam-llm-agent = { path = "crates/adam-llm-agent", version = "0.1.0" } # x-release-please-version
