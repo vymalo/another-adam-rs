@@ -352,6 +352,10 @@ pub async fn agents(
         None => {
             let starter = LlmStarter::new(&name);
             let helpers = def.clone();
+            // The bounds of a person's `start.config` on each helper, from the folder and the
+            // deployment's settings alone (`AgentDef::session_bounds`, given `session_limits` and
+            // `session_max_parallel`): the very function a worker's assembly calls.
+            let bounds = def.session_bounds();
             // A control plane connects no MCP server, so it cannot expand a prompt: a message that
             // names the prompt of one of the folder's servers is refused, not sent to the model as
             // plain text.
@@ -369,9 +373,7 @@ pub async fn agents(
                 // card lists neither.
                 None,
                 None,
-                // A control plane binds no agent, so it knows no bounds: it refuses a
-                // `start.config`.
-                Vec::new(),
+                bounds,
             )
         }
     };
