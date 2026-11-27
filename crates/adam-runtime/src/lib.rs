@@ -138,12 +138,12 @@ pub use retry::{
 pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError, view_from_record};
 pub use session::{
     CONTEXT_WINDOW_HEADROOM_TOKENS, CONTEXT_WINDOW_PROMPT_TOKENS, DEFAULT_SESSION_IDLE_TTL,
-    MAX_SESSION_CONVERSATION_BYTES, MAX_SESSION_MAX_OUTPUT_TOKENS, MAX_SESSION_PAGE,
-    MAX_SESSION_ROUNDS_SCANNED, MIN_SESSION_MAX_OUTPUT_TOKENS, Refusal, ReportRound, RoundOutcome,
-    SESSION_CLOSE_KIND, SESSION_CLOSE_ROUND_KEY, SESSION_STATE_KEY, SessionBounds, SessionConfig,
-    SessionHeader, SessionLimits, SessionList, SessionState, SessionSummary, SessionView,
-    closing_round_payload, parse_session_conversation_id, session_conversation_id,
-    session_conversation_prefix,
+    MAX_REPORT_SCHEMA_BYTES, MAX_SESSION_CONVERSATION_BYTES, MAX_SESSION_MAX_OUTPUT_TOKENS,
+    MAX_SESSION_PAGE, MAX_SESSION_ROUNDS_SCANNED, MIN_SESSION_MAX_OUTPUT_TOKENS, Refusal,
+    ReportRound, RoundOutcome, SESSION_CLOSE_KIND, SESSION_CLOSE_ROUND_KEY, SESSION_STATE_KEY,
+    SessionBounds, SessionConfig, SessionHeader, SessionLimits, SessionList, SessionState,
+    SessionSummary, SessionView, closing_round_payload, parse_session_conversation_id,
+    session_conversation_id, session_conversation_prefix,
 };
 pub use starter::{RunStarter, SCHEDULE_CONVERSATION_PREFIX, UNATTENDED_CONTEXT_KEY};
 pub use step::{
