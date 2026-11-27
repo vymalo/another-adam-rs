@@ -3,7 +3,7 @@
 - **Status:** **Accepted (2026-11-24)** for the seam and the conformance kit, on the owner's answer to
   ANR-Q63: *(a) "Write the ADR for the port seam and a conformance test kit only; adopt no outside service now;
   drop the Docker host (ADR 0052 stands)"*. **Adopting a service (E2B, Daytona or any other) is not decided here**
-  and stays the owner's, with its own card. Recorded in another-context `decisions-2026-11-24.md` row 15.
+  and stays the owner's, with its own card. Recorded in the owner's private decision log (2026-11-24).
 - **It closes gap 3 of ANR-12** ("Pluggable sandboxes: E2B, Daytona and a Docker host"). It does **not** amend
   [ADR 0052](0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md): that decision stands.
 

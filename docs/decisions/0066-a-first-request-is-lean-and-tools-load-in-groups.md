@@ -14,8 +14,8 @@ ruled on 2026-11-21 that a greeting must not cost that, without touching the cod
 - a person who adds their own MCP server chooses how it loads;
 - no router: a lean request is enough.
 
-The measurements and the full design are the plan `2026-11-21-lean-first-request.md` and its tool table
-`2026-11-21-tool-loading-table.md`, both in `skyengpro/another-context`. The numbers below are `cl100k` tokens
+The measurements and the full design are in the owner's private plan and its tool table
+(2026-11-21), not published. The numbers below are `cl100k` tokens
 counted on the real request (`origin/main` at `1dee409`); a number with `~` is an estimate.
 
 ## Decision
